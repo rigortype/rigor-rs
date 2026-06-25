@@ -9,15 +9,108 @@ use rigor_infer::Typer;
 use rigor_parse::{LoweredAst, Node};
 use rigor_types::{Interner, Scalar, Type};
 
-/// A diagnostic finding, identified by `rule_id` + location (ADR-0002 parity is
-/// defined over this pair). Skeleton.
+// ---------------------------------------------------------------------------
+// Severity enum
+// ---------------------------------------------------------------------------
+
+/// The three severity levels (ADR-0030). Matches the reference's
+/// `:error` / `:warning` / `:info` atoms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+    Info,
+}
+
+impl Severity {
+    /// Render as the reference spells it in JSON/text output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Info => "info",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic struct
+// ---------------------------------------------------------------------------
+
+/// A diagnostic finding, identified by `rule_id` + location (ADR-0002 parity
+/// is defined over this pair).
+///
+/// `receiver_type` and `method_name` are omitted from the struct (None) for
+/// rules that don't operate on a call dispatch subject.
+///
+/// # TODO(spec)
+/// - `project_definition_site: Option<String>` — `"path:line"` for
+///   `call.undefined-method` when the project defines the called method via a
+///   monkey-patch or `pre_eval:`. Set by `call.undefined-method` once the
+///   project-index layer is implemented (ADR-0017).
 #[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub rule_id: &'static str,
     pub start_offset: usize,
     pub end_offset: usize,
     pub message: String,
+    /// Authored severity before any profile re-stamping.
+    pub severity: Severity,
+    /// Identifies the rule source: `"builtin"` for all rules shipped with
+    /// rigor-rs. Future values: `"plugin.<id>"`, `"rbs_extended"`,
+    /// `"generated.<provider>"` (ADR-0030).
+    ///
+    /// # TODO(spec)
+    /// Implement the full source_family set once plugins / RBS extensions land.
+    pub source_family: &'static str,
+    /// Rendered receiver class/type for call/def rules; `None` for other rules.
+    pub receiver_type: Option<String>,
+    /// Called / defined method name for call/def rules; `None` otherwise.
+    pub method_name: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Rule catalogue
+// ---------------------------------------------------------------------------
+
+/// Per-rule static properties that enrich the JSON output stream but are NOT
+/// carried on the `Diagnostic` object itself (ADR-0030 / reference ADR-65).
+pub struct RuleEntry {
+    pub default_severity: Severity,
+    /// Confidence tier for consumers routing attention: `"high"` | `"medium"` |
+    /// `"low"`. Omitted (None) for informational / plugin rules.
+    pub evidence_tier: &'static str,
+    /// Stable per-rule documentation URL.
+    pub documentation_url: &'static str,
+}
+
+/// Static catalogue of the three rules implemented in this slice.
+///
+/// `catalog(rule_id)` returns the entry for a known rule, `None` for unknown.
+pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
+    match rule_id {
+        CALL_UNDEFINED_METHOD => Some(&RuleEntry {
+            default_severity: Severity::Error,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-undefined-method",
+        }),
+        CALL_WRONG_ARITY => Some(&RuleEntry {
+            default_severity: Severity::Error,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-wrong-arity",
+        }),
+        CALL_POSSIBLE_NIL_RECEIVER => Some(&RuleEntry {
+            default_severity: Severity::Warning,
+            evidence_tier: "medium",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-possible-nil-receiver",
+        }),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule IDs
+// ---------------------------------------------------------------------------
 
 /// The stable id of the headline tracer-bullet rule (ADR-0030 taxonomy).
 pub const CALL_UNDEFINED_METHOD: &str = "call.undefined-method";
@@ -31,6 +124,10 @@ pub const CALL_WRONG_ARITY: &str = "call.wrong-arity";
 /// literal-`nil` case is owned by `call.undefined-method` (matching the
 /// reference, which routes `nil.foo` to undefined-method).
 pub const CALL_POSSIBLE_NIL_RECEIVER: &str = "call.possible-nil-receiver";
+
+// ---------------------------------------------------------------------------
+// analyze()
+// ---------------------------------------------------------------------------
 
 /// Analyze a lowered AST and return all diagnostics, in source order.
 ///
@@ -84,6 +181,10 @@ pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> 
     out
 }
 
+// ---------------------------------------------------------------------------
+// Rule implementations
+// ---------------------------------------------------------------------------
+
 /// Apply `call.undefined-method` to a single call with a receiver.
 ///
 /// Zero-false-positive gate (ADR-0023): emit *only* when the receiver types to
@@ -119,11 +220,23 @@ fn check_call(
     let receiver_render = render_receiver(interner, recv_ty, class_name);
     let message = format!("undefined method `{method}' for {receiver_render}");
 
+    let severity = catalog(CALL_UNDEFINED_METHOD)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
+
+    // `receiver_type` in the structured field matches the reference's rendering:
+    // for a Constant receiver it is the rendered value (e.g. `"\"Hello\""` for
+    // a String literal, `"nil"` for nil), not the bare class name. This matches
+    // the reference's JSON output which sets `receiver_type` to `"\"Hello\""`.
     Some(Diagnostic {
         rule_id: CALL_UNDEFINED_METHOD,
         start_offset: message_span.0,
         end_offset: message_span.1,
         message,
+        severity,
+        source_family: "builtin",
+        receiver_type: Some(receiver_render),
+        method_name: Some(method.to_string()),
     })
 }
 
@@ -185,11 +298,19 @@ fn check_wrong_arity(
         "wrong number of arguments to `{method}' on {class_name} (given {given}, expected {expected})"
     );
 
+    let severity = catalog(CALL_WRONG_ARITY)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
+
     Some(Diagnostic {
         rule_id: CALL_WRONG_ARITY,
         start_offset: message_span.0,
         end_offset: message_span.1,
         message,
+        severity,
+        source_family: "builtin",
+        receiver_type: Some(class_name.to_string()),
+        method_name: Some(method.to_string()),
     })
 }
 
@@ -225,6 +346,10 @@ fn check_nil_receiver(
     None
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 /// Render the receiver for the diagnostic message: the bare literal value for a
 /// value-pinned `Constant`, else the resolved class name.
 fn render_receiver(interner: &Interner, ty: rigor_types::TypeId, class_name: &str) -> String {
@@ -248,6 +373,10 @@ fn render_scalar(scalar: &Scalar) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,6 +397,13 @@ mod tests {
         let d = &diags[0];
         assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
         assert_eq!(d.message, "undefined method `lenght' for \"Hello\"");
+        // Severity must be Error for undefined-method.
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.source_family, "builtin");
+        // receiver_type matches the reference's rendering: the literal value
+        // `"Hello"` (with surrounding double quotes), not the bare class name.
+        assert_eq!(d.receiver_type.as_deref(), Some("\"Hello\""));
+        assert_eq!(d.method_name.as_deref(), Some("lenght"));
         // The span must cover exactly `lenght`.
         assert_eq!(&src[d.start_offset..d.end_offset], b"lenght");
     }
@@ -293,6 +429,10 @@ mod tests {
         assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
         let d = &diags[0];
         assert_eq!(d.rule_id, CALL_WRONG_ARITY);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.source_family, "builtin");
+        assert_eq!(d.receiver_type.as_deref(), Some("String"));
+        assert_eq!(d.method_name.as_deref(), Some("include?"));
         assert_eq!(
             d.message,
             "wrong number of arguments to `include?' on String (given 2, expected 1)"
@@ -309,6 +449,9 @@ mod tests {
         assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
         let d = &diags[0];
         assert_eq!(d.rule_id, CALL_WRONG_ARITY);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.receiver_type.as_deref(), Some("String"));
+        assert_eq!(d.method_name.as_deref(), Some("gsub"));
         assert_eq!(
             d.message,
             "wrong number of arguments to `gsub' on String (given 3, expected 1..2)"
@@ -333,6 +476,7 @@ mod tests {
         assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
         let d = &diags[0];
         assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(d.severity, Severity::Error);
         assert_eq!(d.message, "undefined method `upcase' for nil");
         assert_eq!(&src[d.start_offset..d.end_offset], b"upcase");
     }
@@ -356,5 +500,23 @@ mod tests {
         // envelope => wrong-arity must NOT fire regardless of arg count.
         let diags = run(b"s = \"x\"\ns.chars(\"a\", \"b\")\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn catalog_entries_are_correct() {
+        let entry = catalog(CALL_UNDEFINED_METHOD).expect("catalog entry must exist");
+        assert_eq!(entry.default_severity, Severity::Error);
+        assert_eq!(entry.evidence_tier, "high");
+        assert!(entry.documentation_url.contains("call-undefined-method"));
+
+        let entry = catalog(CALL_WRONG_ARITY).expect("catalog entry must exist");
+        assert_eq!(entry.default_severity, Severity::Error);
+        assert_eq!(entry.evidence_tier, "high");
+
+        let entry = catalog(CALL_POSSIBLE_NIL_RECEIVER).expect("catalog entry must exist");
+        assert_eq!(entry.default_severity, Severity::Warning);
+        assert_eq!(entry.evidence_tier, "medium");
+
+        assert!(catalog("unknown.rule").is_none());
     }
 }
