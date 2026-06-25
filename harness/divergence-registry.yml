@@ -1,0 +1,41 @@
+# Divergence Registry (ADR-0011)
+#
+# Purpose
+# -------
+# Records cases where rigor-rs intentionally diverges from the reference
+# implementation. Each entry excuses one `extra` diagnostic (emitted by
+# rigor-rs but NOT by the reference) from being treated as a regression.
+#
+# Discipline (ADR-0011):
+#   - An entry is ONLY valid for a rigor-rs diagnostic that the reference
+#     does NOT emit AND for which the reference behaviour is considered a
+#     defect (not merely a coverage gap).
+#   - Every entry MUST link an upstream issue/PR on rigortype/rigor
+#     (https://github.com/rigortype/rigor/issues) so the fix can eventually
+#     land and the registry entry can be removed.
+#   - Coverage gaps (reference emits, rigor-rs does not) are NOT registered
+#     here — they are expected missing diagnostics and never cause CI failure.
+#   - When the upstream fix lands and the pinned reference is bumped, the
+#     entry MUST be removed (the two implementations agree again).
+#
+# Format
+# ------
+# Each entry is a mapping with these required keys:
+#   fixture:  relative path from repo root to the corpus fixture file
+#   rule:     the diagnostic rule id (e.g. "call.undefined-method")
+#   line:     1-based line number
+#   column:   1-based column number
+#   reason:   human explanation of why this is a reference defect
+#   upstream: URL of the issue/PR on rigortype/rigor tracking the fix
+#
+# Example (commented out — no current excused divergences):
+# - fixture: harness/corpus/01_string_typo.rb
+#   rule: call.undefined-method
+#   line: 2
+#   column: 3
+#   reason: |
+#     The reference fails to flag this because of <reason>. rigor-rs's
+#     behaviour is correct per the spec in docs/manual/04-diagnostics.md.
+#   upstream: https://github.com/rigortype/rigor/issues/NNNN
+
+divergences: []
