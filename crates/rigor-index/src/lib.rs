@@ -314,8 +314,11 @@ pub fn method_arity(class: &str, method: &str) -> Option<(usize, Option<usize>)>
         ("String", "downcase") => (0, Some(0)),
         ("String", "length") => (0, Some(0)),
         ("String", "size") => (0, Some(0)),
-        ("String", "gsub") => (2, Some(2)),
-        ("String", "sub") => (2, Some(2)),
+        // `gsub`/`sub` accept either a replacement String (2 args) or a block
+        // (1 arg), so the positional-arity envelope is 1..2 (matches the
+        // reference's `expected 1..2`). 3+ positional args is wrong-arity.
+        ("String", "gsub") => (1, Some(2)),
+        ("String", "sub") => (1, Some(2)),
         ("String", "include?") => (1, Some(1)),
         ("String", "+") => (1, Some(1)),
         ("String", "*") => (1, Some(1)),
@@ -427,7 +430,7 @@ mod tests {
 
     #[test]
     fn method_arity_curated_set() {
-        assert_eq!(method_arity("String", "gsub"), Some((2, Some(2))));
+        assert_eq!(method_arity("String", "gsub"), Some((1, Some(2))));
         assert_eq!(method_arity("String", "upcase"), Some((0, Some(0))));
         assert_eq!(method_arity("Array", "push"), Some((0, None)));
         assert_eq!(method_arity("String", "unmodeled"), None);

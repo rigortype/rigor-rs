@@ -71,12 +71,22 @@ impl<'i> Typer<'i> {
             Node::IntegerLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Int(*value)))
             }
+            Node::FloatLit { value, .. } => {
+                interner.intern(Type::Constant(Scalar::Float(*value)))
+            }
+            Node::SymbolLit { value, .. } => {
+                interner.intern(Type::Constant(Scalar::Sym(value.clone())))
+            }
+            Node::NilLit { .. } => interner.intern(Type::Constant(Scalar::Nil)),
+            Node::TrueLit { .. } => interner.intern(Type::Constant(Scalar::Bool(true))),
+            Node::FalseLit { .. } => interner.intern(Type::Constant(Scalar::Bool(false))),
             Node::LocalVariableRead { name, .. } => env
                 .get(name)
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
-            Node::Call { receiver: Some(r), method, .. } => {
-                self.type_call(ast, *r, method, env, interner)
+            Node::Call { receiver: Some(r), method, args, .. } => {
+                let (r, method, args) = (*r, method.clone(), args.clone());
+                self.type_call(ast, r, &method, &args, env, interner)
             }
             // A call with no receiver (implicit self) or any other carrier is
             // unknown -> Dynamic[top] (never guess).
@@ -103,18 +113,22 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         receiver: NodeId,
         method: &str,
+        args: &[NodeId],
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
         let recv_ty = self.type_of(ast, receiver, env, interner);
 
-        // Tier 1: constant folding on a value-pinned receiver.
+        // Tier 1: constant folding on a value-pinned receiver. Fold only when
+        // EVERY argument also types to a value-pinned `Constant` (ADR-0008
+        // zero-FP: a non-pinned arg means we can't prove the result, so we
+        // decline and widen to the nominal return / Dynamic below — never
+        // guess). The nullary case (`args` empty) folds the no-arg core.
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
-            // Arguments are not lowered in this slice, so fold only the nullary
-            // (no-arg) core; a non-nullary fold would need typed args.
-            // TODO(spec): thread typed argument scalars once arguments lower.
-            if let Some(folded) = folding::fold(&scalar, method, &[]) {
-                return interner.intern(Type::Constant(folded));
+            if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
+                if let Some(folded) = folding::fold(&scalar, method, &arg_scalars) {
+                    return interner.intern(Type::Constant(folded));
+                }
             }
         }
 
@@ -132,6 +146,29 @@ impl<'i> Typer<'i> {
 
         // Tier 5: unknown -> Dynamic[top].
         interner.untyped()
+    }
+
+    /// Type each argument and, if *every* one is a value-pinned `Constant`,
+    /// return the owned scalars in order — the input [`folding::fold`] needs to
+    /// compute a byte-exact result. Returns `None` the moment any argument is
+    /// not a pinned `Constant` (Dynamic / Nominal / unknown), so the caller
+    /// declines to fold rather than guessing (ADR-0008 zero-FP).
+    fn pin_arg_scalars(
+        &self,
+        ast: &LoweredAst,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<Vec<Scalar>> {
+        let mut out = Vec::with_capacity(args.len());
+        for &arg in args {
+            let ty = self.type_of(ast, arg, env, interner);
+            match interner.get(ty) {
+                Type::Constant(scalar) => out.push(scalar.clone()),
+                _ => return None,
+            }
+        }
+        Some(out)
     }
 
     /// Walk the top-level statement sequence in source order, binding each
@@ -271,10 +308,21 @@ mod tests {
 
     #[test]
     fn folds_integer_addition_to_constant() {
-        // `1 + 2` lowers to a Call `+` on receiver `1` with arg `2`; but args
-        // aren't lowered, so we drive folding directly on receiver `(1).succ`
-        // (nullary) AND verify binary folding through the folding module is
-        // wired by typing `42.succ`.
+        // `1 + 2` lowers to a Call `+` on receiver `1` with positional arg `2`;
+        // now that args are lowered, binary folding runs and pins Constant[3].
+        let ast = lower_src(b"1 + 2\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, "+");
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(3)));
+    }
+
+    #[test]
+    fn folds_nullary_integer_succ_to_constant() {
+        // Nullary folding still works with the new arg threading.
         let ast = lower_src(b"42.succ\n");
         let idx = CoreIndex::new();
         let typer = Typer::new(&idx);
@@ -283,6 +331,46 @@ mod tests {
         let call = find_call(&ast, "succ");
         let ty = typer.type_of(&ast, call, &env, &mut i);
         assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(43)));
+    }
+
+    #[test]
+    fn typed_literals_pin_constants() {
+        let ast = lower_src(b"nil\ntrue\nfalse\n:foo\n2.5\n");
+        let mut i = Interner::new();
+        let env = TypeEnv::new();
+        let pick = |ast: &LoweredAst, pred: fn(&Node) -> bool| {
+            ast.iter().find_map(|(id, n)| pred(n).then_some(id)).unwrap()
+        };
+        let nil = pick(&ast, |n| matches!(n, Node::NilLit { .. }));
+        let t = pick(&ast, |n| matches!(n, Node::TrueLit { .. }));
+        let f = pick(&ast, |n| matches!(n, Node::FalseLit { .. }));
+        let sym = pick(&ast, |n| matches!(n, Node::SymbolLit { .. }));
+        let fl = pick(&ast, |n| matches!(n, Node::FloatLit { .. }));
+        let ty_of = |i: &mut Interner, id| {
+            let t = type_of(&ast, id, &env, i);
+            i.get(t).clone()
+        };
+        assert_eq!(ty_of(&mut i, nil), Type::Constant(Scalar::Nil));
+        assert_eq!(ty_of(&mut i, t), Type::Constant(Scalar::Bool(true)));
+        assert_eq!(ty_of(&mut i, f), Type::Constant(Scalar::Bool(false)));
+        assert_eq!(ty_of(&mut i, sym), Type::Constant(Scalar::Sym("foo".into())));
+        assert_eq!(ty_of(&mut i, fl), Type::Constant(Scalar::Float(2.5)));
+    }
+
+    #[test]
+    fn non_pinned_argument_declines_folding() {
+        // `x` is never assigned -> Dynamic, so `"a" + x` can't fold; the call
+        // widens to the nominal String return rather than minting a Constant.
+        let ast = lower_src(b"\"a\" + x\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, "+");
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        // String#+ -> String nominal (return-type path), NOT a folded Constant.
+        assert_eq!(idx.class_name_of(&i, ty), Some("String"));
+        assert!(!matches!(i.get(ty), Type::Constant(_)));
     }
 
     #[test]

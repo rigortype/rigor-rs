@@ -44,12 +44,27 @@ pub enum Node {
     StringLit { value: String, span: Span },
     /// An integer literal (`42`).
     IntegerLit { value: i64, span: Span },
+    /// A float literal (`3.14`); `value` is the parsed `f64`.
+    FloatLit { value: f64, span: Span },
+    /// A symbol literal (`:foo`); `value` is the symbol name (no leading colon).
+    SymbolLit { value: String, span: Span },
+    /// The `nil` literal.
+    NilLit { span: Span },
+    /// The `true` literal.
+    TrueLit { span: Span },
+    /// The `false` literal.
+    FalseLit { span: Span },
     /// A method call. `receiver` is `None` for an implicit-self call.
     /// `message_span` is the precise span of the *method name* token — the
     /// location a `call.undefined-method` diagnostic keys on (ADR-0002/0030).
     Call {
         receiver: Option<NodeId>,
         method: String,
+        /// Positional argument expressions in source order (ADR-0023: needed
+        /// for argument-contract rules such as `call.wrong-arity` and for
+        /// argument-dependent constant folding). Splat/keyword/block args are
+        /// intentionally not collected here in this slice.
+        args: Vec<NodeId>,
         /// Span of the method-name token (`lenght`), the diagnostic anchor.
         message_span: Span,
         /// Span of the whole call expression.
@@ -75,6 +90,11 @@ impl Node {
             | Node::LocalVariableRead { span, .. }
             | Node::StringLit { span, .. }
             | Node::IntegerLit { span, .. }
+            | Node::FloatLit { span, .. }
+            | Node::SymbolLit { span, .. }
+            | Node::NilLit { span }
+            | Node::TrueLit { span }
+            | Node::FalseLit { span }
             | Node::Call { span, .. }
             | Node::Other { span } => *span,
         }
@@ -211,21 +231,63 @@ impl Builder {
             });
         }
 
+        if let Some(f) = node.as_float_node() {
+            return self.push(Node::FloatLit {
+                value: f.value(),
+                span: span_of(&f.location()),
+            });
+        }
+
+        if let Some(sym) = node.as_symbol_node() {
+            // `unescaped()` is the decoded symbol name (`:foo` -> foo).
+            let value = String::from_utf8_lossy(sym.unescaped()).into_owned();
+            return self.push(Node::SymbolLit {
+                value,
+                span: span_of(&sym.location()),
+            });
+        }
+
+        if let Some(n) = node.as_nil_node() {
+            return self.push(Node::NilLit {
+                span: span_of(&n.location()),
+            });
+        }
+
+        if let Some(t) = node.as_true_node() {
+            return self.push(Node::TrueLit {
+                span: span_of(&t.location()),
+            });
+        }
+
+        if let Some(fa) = node.as_false_node() {
+            return self.push(Node::FalseLit {
+                span: span_of(&fa.location()),
+            });
+        }
+
         if let Some(call) = node.as_call_node() {
             let receiver = call.receiver().map(|r| self.lower_node(&r));
             let method = constant_string(call.name().as_slice());
+            // Lower positional arguments in source order (ADR-0023: argument
+            // contracts + arg-dependent folding). Splat/keyword/block args lower
+            // like any other node — a downstream rule that needs to distinguish
+            // them does so by inspecting the lowered child, never here.
+            // TODO(spec): mark splat/keyword/block args so the arity rule can
+            // bail on non-plain-positional shapes (it is conservative regardless).
+            let args = call
+                .arguments()
+                .map(|a| self.lower_body(&a.arguments()))
+                .unwrap_or_default();
             // The message_loc is the method-name token; fall back to the whole
             // call span if Prism elides it (e.g. operator-ish forms).
             let message_span = call
                 .message_loc()
                 .map(|l| span_of(&l))
                 .unwrap_or(span);
-            // NOTE: arguments and blocks are intentionally not lowered in this
-            // slice — the rule only needs receiver + method name.
-            // TODO(spec): lower arguments/blocks for argument-contract rules.
             return self.push(Node::Call {
                 receiver,
                 method,
+                args,
                 message_span,
                 span: span_of(&call.location()),
             });
@@ -295,6 +357,48 @@ mod tests {
         });
         assert!(has_write, "expected a LocalVariableWrite for `s`");
         assert!(has_str, "expected a StringLit \"Hello\"");
+    }
+
+    #[test]
+    fn lowers_call_positional_arguments() {
+        // `s.include?("e", "x")` lowers two positional string-literal args, in
+        // source order, as children of the Call node.
+        let src = b"s = \"Hello\"\ns.include?(\"e\", \"x\")\n";
+        let result = crate::parse(src);
+        let ast = lower(&result);
+
+        let args = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::Call { method, args, .. } if method == "include?" => Some(args.clone()),
+                _ => None,
+            })
+            .expect("expected an include? Call node");
+        assert_eq!(args.len(), 2, "expected two positional args");
+        let vals: Vec<String> = args
+            .iter()
+            .map(|id| match ast.get(*id) {
+                Node::StringLit { value, .. } => value.clone(),
+                other => panic!("expected StringLit arg, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(vals, vec!["e".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn lowers_nil_true_false_symbol_float_literals() {
+        let src = b"nil\ntrue\nfalse\n:foo\n3.5\n";
+        let result = crate::parse(src);
+        let ast = lower(&result);
+        assert!(ast.iter().any(|(_, n)| matches!(n, Node::NilLit { .. })));
+        assert!(ast.iter().any(|(_, n)| matches!(n, Node::TrueLit { .. })));
+        assert!(ast.iter().any(|(_, n)| matches!(n, Node::FalseLit { .. })));
+        assert!(ast
+            .iter()
+            .any(|(_, n)| matches!(n, Node::SymbolLit { value, .. } if value == "foo")));
+        assert!(ast
+            .iter()
+            .any(|(_, n)| matches!(n, Node::FloatLit { value, .. } if (*value - 3.5).abs() < f64::EPSILON)));
     }
 
     #[test]
