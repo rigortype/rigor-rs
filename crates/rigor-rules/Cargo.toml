@@ -6,3 +6,5 @@ edition.workspace = true
 [dependencies]
 rigor-infer = { path = "../rigor-infer" }
 rigor-types = { path = "../rigor-types" }
+rigor-parse = { path = "../rigor-parse" }
+rigor-index = { path = "../rigor-index" }

@@ -8,8 +8,12 @@
 
 pub use ruby_prism;
 
-/// Parse Ruby source with Prism. The borrowed result will be lowered into an
-/// owned, `NodeId`-indexed AST before inference (ADR-0012).
+pub mod ast;
+
+pub use ast::{lower, LoweredAst, Node, NodeId, Span};
+
+/// Parse Ruby source with Prism. The borrowed result is lowered into an owned,
+/// `NodeId`-indexed AST ([`ast::lower`]) before inference (ADR-0012).
 pub fn parse(source: &[u8]) -> ruby_prism::ParseResult<'_> {
     ruby_prism::parse(source)
 }

@@ -10,3 +10,5 @@ path = "src/main.rs"
 [dependencies]
 rigor-parse = { path = "../rigor-parse" }
 rigor-rules = { path = "../rigor-rules" }
+rigor-index = { path = "../rigor-index" }
+rigor-types = { path = "../rigor-types" }

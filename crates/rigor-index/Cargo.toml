@@ -2,3 +2,6 @@
 name = "rigor-index"
 version.workspace = true
 edition.workspace = true
+
+[dependencies]
+rigor-types = { path = "../rigor-types" }
