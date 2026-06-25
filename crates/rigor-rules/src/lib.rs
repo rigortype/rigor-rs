@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use rigor_index::CoreIndex;
-use rigor_infer::{build_toplevel_env, type_of};
+use rigor_infer::Typer;
 use rigor_parse::{LoweredAst, Node};
 use rigor_types::{Interner, Scalar, Type};
 
@@ -28,7 +28,10 @@ pub const CALL_UNDEFINED_METHOD: &str = "call.undefined-method";
 /// environment once, then visits every node, applying each rule. Only
 /// `call.undefined-method` exists in this slice.
 pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> Vec<Diagnostic> {
-    let env = build_toplevel_env(ast, interner);
+    // Build a typer over the real index so non-folded nominal returns
+    // (e.g. `Integer#to_s -> String`) resolve for chained-call typing.
+    let typer = Typer::new(index);
+    let env = typer.build_toplevel_env(ast, interner);
     let mut out = Vec::new();
 
     // Visit nodes in id order, which is source-discovery order, so diagnostics
@@ -47,7 +50,8 @@ pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> 
         .collect();
 
     for (_id, recv, method, message_span) in calls {
-        if let Some(diag) = check_call(ast, recv, &method, message_span, &env, interner, index) {
+        if let Some(diag) = check_call(ast, recv, &method, message_span, &env, &typer, interner, index)
+        {
             out.push(diag);
         }
     }
@@ -67,10 +71,11 @@ fn check_call(
     method: &str,
     message_span: (usize, usize),
     env: &rigor_infer::TypeEnv,
+    typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
-    let recv_ty = type_of(ast, receiver, env, interner);
+    let recv_ty = typer.type_of(ast, receiver, env, interner);
 
     // Resolve the receiver's class name; `None` => Dynamic/unknown => silent.
     let class_name = index.class_name_of(interner, recv_ty)?;
