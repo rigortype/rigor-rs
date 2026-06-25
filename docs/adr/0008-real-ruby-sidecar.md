@@ -7,7 +7,7 @@ Status: accepted
 The reference implementation reaches its precision by **executing real Ruby** in two places:
 
 - **Constant folding** — it calls the real `Integer#+`, `String#upcase`, `(1..10).first(3)`, etc. on literal values it constructed, gated by a purity allowlist + a method catalogue + a result check. Non-deterministic methods (`Array#sample`, `Object#hash`) are never folded.
-- **Plugin target-library invocation** ([ADR-39](../../../ruby/rigor/docs/adr/39-plugin-target-library-invocation.md)) — plugins call their target library's pure, allow-listed methods (e.g. `ActiveSupport::Inflector.pluralize`), **declining (→ silence) rather than approximating** when the library is absent, because an approximation that diverges from the library's real rules is a false positive.
+- **Plugin target-library invocation** ([ADR-39](../../../../ruby/rigor/docs/adr/39-plugin-target-library-invocation.md)) — plugins call their target library's pure, allow-listed methods (e.g. `ActiveSupport::Inflector.pluralize`), **declining (→ silence) rather than approximating** when the library is absent, because an approximation that diverges from the library's real rules is a false positive.
 
 Because an approximation is by design a false positive, reaching [diagnostic-set parity](0002-diagnostic-set-parity.md) — especially in the plugin phase — **requires executing real Ruby**. Reimplementing inflection (or other target-library facts) in Rust would be exactly the approximation ADR-39 forbids. The analyzed application's *own* code is never executed (the reference's ADR-2 line; unchanged here).
 

@@ -55,3 +55,27 @@ _Avoid_: ignore list, allowlist (those imply silent suppression; entries here ar
 **Plugin**:
 A host-agnostic fact producer / RBS synthesizer for a target library or DSL (e.g. Rails routes, ActiveRecord) — it returns facts, synthetic RBS, and diagnostics that the inference engine consumes; it is not itself part of the inference engine. A plugin is hosted either as a real Ruby plugin in the Ruby sidecar (default) or as a native Rust port.
 _Avoid_: extension, addon (use "plugin")
+
+**Certainty**:
+The trinary result of a type relation — `yes`, `no`, or `maybe` — paired with evidence. `maybe` never refines as `yes`, never manufactures the complementary false-edge fact, and never promotes by repetition; it is also distinct from a budget / incomplete-inference cutoff, which names itself.
+_Avoid_: confidence, probability (it is trinary, not numeric)
+
+**Subtyping**:
+The `<:` relation — value-set inclusion, reflexive and transitive, checked against a type's static facet. Drives method availability, member access, and refinement.
+_Avoid_: assignability (reserve that for the gradual-consistency direction)
+
+**Gradual consistency**:
+The symmetric, non-transitive relation that is the only way a `Dynamic[T]` value may cross a typed boundary. Distinct from subtyping; `untyped` is not `top`.
+_Avoid_: compatibility, assignable (name it; it is not `<:`)
+
+**Normalization**:
+The deterministic canonical form of a type. Equivalent inputs must produce identical output; because diagnostics render normalized types, it is a bit-for-bit parity surface (e.g. `1 | Integer` does not collapse; `true | false` reads as `bool` for display only).
+_Avoid_: simplification, canonicalization (use "normalization")
+
+**Fact bucket**:
+A named partition of a scope snapshot (local-binding, captured-local, object-content, global-storage, dynamic-origin, relational) with bucket-specific invalidation — e.g. an unknown call sweeps object-content but leaves local-binding intact.
+_Avoid_: fact store (that is the cross-plugin channel — a different thing)
+
+**Flow-effect bundle**:
+The data contract a plugin or RBS annotation returns to the inference engine: a normal return plus truthy/falsey-edge facts, post-return assertions, exceptional/escape/mutation/invalidation effects, dynamic-reflection members, and provenance + certainty. Merged deterministically by the analyzer (core/RBS authoritative; plugins refine, never weaken).
+_Avoid_: contribution, hook result (name it)
