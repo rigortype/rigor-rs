@@ -16,6 +16,8 @@ A comparison with Astral's ruff and Mago (both of which hand-wrote their parsers
 
 If Prism's spans/trivia are coarser than needed, add a thin span/trivia-recovery layer in `rigor-parse` rather than abandoning the binding.
 
+**Status (2026-06-26): confirmed.** A spike verified comments-with-location, precise node spans (the `lenght` token in `s.lenght`), and error recovery — in both the Ruby Prism and the Rust `ruby-prism` binding (built offline; libprism C via clang). See [docs/notes/20260626-spike-findings.md](../notes/20260626-spike-findings.md).
+
 ## Considered options
 
 - **A from-scratch or third-party Ruby parser in Rust** (e.g. lib-ruby-parser) — rejected: guarantees AST divergence from the reference and cannot track Ruby 4.0 + Prism edge cases; breaks parity at the root.

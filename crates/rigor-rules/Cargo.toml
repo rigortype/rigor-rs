@@ -1,0 +1,8 @@
+[package]
+name = "rigor-rules"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rigor-infer = { path = "../rigor-infer" }
+rigor-types = { path = "../rigor-types" }

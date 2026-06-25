@@ -1,0 +1,9 @@
+[package]
+name = "rigor-infer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rigor-types = { path = "../rigor-types" }
+rigor-parse = { path = "../rigor-parse" }
+rigor-index = { path = "../rigor-index" }

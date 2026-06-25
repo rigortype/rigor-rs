@@ -1,0 +1,12 @@
+[package]
+name = "rigor-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rigor"
+path = "src/main.rs"
+
+[dependencies]
+rigor-parse = { path = "../rigor-parse" }
+rigor-rules = { path = "../rigor-rules" }

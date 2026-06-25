@@ -27,6 +27,8 @@ rigor-rs therefore reuses parsers and RBS data freely, owns the index and infere
 1. **`ruby-rbs` exposes typed method definitions** (return types, parameter types, variance) from its parse AST — needed regardless, since rigor-rs owns the type translation. If not, add a thin type-extraction layer over its AST (still far smaller than a from-scratch RBS parser).
 2. **Only if considering Rubydex as accelerator**: does it expose populator-grade detail (typed method defs, ancestor linearization with visibility, refinement/generic hooks) and build/link cleanly against the Ruby 4.0 corpus? If not, skip Rubydex entirely.
 
+**Status (2026-06-26): premise confirmed; Rust API gated on network.** A spike (`spike/probe_rbs.rb`, RBS 4.0.x) confirmed RBS carries typed method definitions — return/parameter types, variance, generics, block types, unions, real-stdlib overloads — so item 1's data exists. Confirming the Rust `ruby-rbs` crate's *public API* surfaces it (vs. needing the thin extraction layer) is gated on crate access (crates.io blocked in the spike environment). See [docs/notes/20260626-spike-findings.md](../notes/20260626-spike-findings.md).
+
 ## Considered options
 
 - **Delegate the index layer to Rubydex** (this ADR's initial draft) — demoted to optional accelerator: pzoom shows the index/populator needs analysis-specific detail external indexers don't expose; the surviving ADR-21 objection hits this layer; parity control favors owning it.

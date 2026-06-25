@@ -1,0 +1,4 @@
+[package]
+name = "rigor-index"
+version.workspace = true
+edition.workspace = true

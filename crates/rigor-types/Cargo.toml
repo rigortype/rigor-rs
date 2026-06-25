@@ -1,0 +1,4 @@
+[package]
+name = "rigor-types"
+version.workspace = true
+edition.workspace = true

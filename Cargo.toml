@@ -1,0 +1,14 @@
+# rigor-rs workspace (ADR-0005): separated crates along the analysis pipeline
+# and the index / inference seam. The spike/ crates are standalone (excluded).
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["spike/prism_probe"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.85"
+
+[workspace.dependencies]
+ruby-prism = "1.9"

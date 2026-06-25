@@ -1,0 +1,8 @@
+[package]
+name = "prism_probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ruby-prism = "1.9"
