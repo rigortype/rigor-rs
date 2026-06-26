@@ -184,12 +184,23 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins:
 - `CoreIndex` is a stub standing in for the real RBS index — every entry is
   provisional until the `ruby-rbs` index lands.
 
-## Network-gated (🔒) — unblock when crates.io is reachable
+## Network — RESTORED (2026-06-26)
 
-- `ruby-rbs` crate (or git submodule) → real index layer (§3).
-- serde / serde_json / serde_yaml → JSON/SARIF/config (§6, §7).
-- rayon → parallelism (§9). messagepack crate → sidecar IPC (§4).
+crates.io is reachable again: the sparse index, `.crate` downloads, and
+`cargo build` of fresh external crates all work; GitHub is reachable (submodules
+OK). Verified fetchable: `ruby-rbs` 0.3.0 (+ `ruby-rbs-sys`), `serde` 1.0.228,
+`serde_json`, `rayon` 1.12, `rmp-serde` 1.3. The previously 🔒 items are now
+actionable:
+
+- `ruby-rbs` → real index layer (§3) — **the biggest single accuracy jump**;
+  start by confirming its public API surfaces typed method definitions
+  (ADR-0004 spike), then replace the `CoreIndex` stub.
+- serde / serde_json (/ a YAML crate) → real JSON/SARIF (§6) + config loader (§7).
+- rayon → parallelism (§9). rmp-serde → sidecar IPC (§4).
 - Rubydex evaluation as optional accelerator (§3).
+
+(`ruby-rbs-sys` ships a native component like `ruby-prism-sys`; clang is present,
+so it should build — confirm on first integration.)
 
 ## Immediate next candidates (highest leverage; pick dynamically)
 
