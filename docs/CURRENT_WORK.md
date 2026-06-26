@@ -74,9 +74,14 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
 ### 3. Index layer — `lib/rigor/environment*.rb`, `scope_indexer.rb` → `rigor-index` (ADR-0004/0007)
 - 🟡 `CoreIndex` **stub**: hardcoded method/return/arity tables for a handful of
   core classes; class registry; `class_name_of`.
-- 🔒 Real RBS-backed index via the `ruby-rbs` crate — **gate confirmed**: RBS
-  carries typed method defs (spike). Pending crate access (or git submodule),
-  then the thin type-extraction layer if its API doesn't surface types directly.
+- ✅ **`ruby-rbs` gate fully confirmed** (`spike/rbs_probe`): builds, parses real
+  `string.rbs` (129 methods) via the `Visit` trait (classes/super/method-defs/
+  function-types/variance). Parse-only → build the index on top.
+  RBS core sigs live at `…/gems/rbs-4.0.3/core/*.rbs` (62 files).
+  Generated node API: `target/.../out/bindings.rs` in the rbs_probe build dir.
+- ⬜ **Wire `ruby-rbs` into `rigor-index`** (NEXT): load core RBS, build real
+  method/return/arity/ancestor index behind the existing `CoreIndex` API; keep
+  the harness at 0 false positives. Then project `sig/` + stdlib + gem RBS.
 - ⬜ RBS stdlib shipping: vendor + build-time pre-parse + embed; merge project
   `sig/` ⊕ gem RBS (bundler / rbs_collection auto-detect) ⊕ inline; `target_ruby`
   version overlays (ADR-0007).

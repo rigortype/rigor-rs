@@ -3,7 +3,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["spike/prism_probe"]
+exclude = ["spike/prism_probe", "spike/rbs_probe"]
 
 [workspace.package]
 version = "0.0.0"

@@ -1,0 +1,13 @@
+# Standalone spike (its own [workspace], excluded from the rigor-rs workspace) —
+# confirm ruby-rbs builds and its API exposes typed method definitions +
+# ancestors (the ADR-0004 gate).
+[package]
+name = "rbs_probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ruby-rbs = "0.3"
+
+[workspace]
