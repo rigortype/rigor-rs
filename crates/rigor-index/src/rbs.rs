@@ -76,8 +76,15 @@ const SELF_RETURN: &str = "\0self";
 /// return class + arity), its direct superclass, and its included modules.
 #[derive(Default, Clone)]
 struct ClassEntry {
-    /// `method name -> (return class name if resolvable, arity envelope)`.
-    methods: HashMap<&'static str, (Option<&'static str>, Arity)>,
+    /// `method name -> (return class name if resolvable, arity envelope,
+    /// nilable)`. `nilable` is `true` iff the RBS return is an `Optional`
+    /// (`String?`) over a resolvable `ClassInstanceType` — i.e. the method
+    /// yields `C | nil`. It is `false` for a plain non-optional return, and
+    /// is meaningful ONLY when the return class name is `Some` (a `None`
+    /// return collapses to Dynamic and carries no nilability). Consumed solely
+    /// by `call.possible-nil-receiver` via [`CoreData::method_return_nilable`];
+    /// no existing rule reads it (return-class / arity stay as before).
+    methods: HashMap<&'static str, (Option<&'static str>, Arity, bool)>,
     /// `method name -> block-overload return class name`, populated ONLY for
     /// methods that declare a block-bearing overload whose return is a
     /// resolvable concrete class (a `ClassInstanceType` like `Hash#filter { }
@@ -435,7 +442,25 @@ impl CoreData {
     /// return is not a known concrete class (or the method is unknown).
     pub fn method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
         let (chain, _) = self.ancestors(class_name);
-        self.lookup_on_chain(&chain, method).and_then(|(ret, _)| ret)
+        self.lookup_on_chain(&chain, method).and_then(|(ret, _, _)| ret)
+    }
+
+    /// Resolve `class_name#method` to `(return class, nilable)` over the
+    /// ancestor chain — the nil-aware variant of [`Self::method_return`], used
+    /// ONLY by `call.possible-nil-receiver`. `nilable` is `true` iff the RBS
+    /// return is an `Optional` (`String?` ⇒ `(String, true)`); a plain return
+    /// is `(C, false)`. `None` when the return is not a resolvable concrete
+    /// class (so the nil-receiver pass never mints `T | nil` from a Dynamic /
+    /// unknown return). Nilability rides the same alias resolution as the class
+    /// (`String#size -> length` inherits `length`'s nilability).
+    pub fn method_return_nilable(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        let (chain, _) = self.ancestors(class_name);
+        self.lookup_on_chain(&chain, method)
+            .and_then(|(ret, _, nilable)| ret.map(|c| (c, nilable)))
     }
 
     /// Resolve the RETURN class of `class_name#method` **when called with a
@@ -500,7 +525,7 @@ impl CoreData {
     /// method is unknown on the chain.
     pub fn method_arity(&self, class_name: &str, method: &str) -> Option<Arity> {
         let (chain, _) = self.ancestors(class_name);
-        self.lookup_on_chain(&chain, method).map(|(_, arity)| arity)
+        self.lookup_on_chain(&chain, method).map(|(_, arity, _)| arity)
     }
 
     /// Find `method`'s `(return, arity)` on the flattened ancestor chain,
@@ -513,7 +538,7 @@ impl CoreData {
         &self,
         chain: &[&'static str],
         method: &str,
-    ) -> Option<(Option<&'static str>, Arity)> {
+    ) -> Option<(Option<&'static str>, Arity, bool)> {
         self.lookup_on_chain_depth(chain, method, 0)
     }
 
@@ -522,7 +547,7 @@ impl CoreData {
         chain: &[&'static str],
         method: &str,
         depth: usize,
-    ) -> Option<(Option<&'static str>, Arity)> {
+    ) -> Option<(Option<&'static str>, Arity, bool)> {
         // A direct definition anywhere on the chain wins.
         for anc in chain {
             if let Some(entry) = self.classes.get(anc) {
@@ -597,9 +622,12 @@ impl CoreData {
                        superclass: Option<&'static str>,
                        includes: Vec<&'static str>,
                        methods: &[(&'static str, Option<&'static str>, Arity)]| {
-            let mut m: HashMap<&'static str, (Option<&'static str>, Arity)> = HashMap::new();
+            let mut m: HashMap<&'static str, (Option<&'static str>, Arity, bool)> = HashMap::new();
             for (n, ret, ar) in methods {
-                m.insert(n, (*ret, *ar));
+                // The stub never models nilable returns (no `?` shapes here) ⇒
+                // `false` keeps the fallback conservative: nothing mints
+                // `T | nil`, so `possible-nil-receiver` stays silent under it.
+                m.insert(n, (*ret, *ar, false));
             }
             classes.insert(
                 name,
@@ -921,7 +949,7 @@ impl Builder {
             match member {
                 Node::MethodDefinition(md) => {
                     let mname = intern(md.name().as_str());
-                    let (ret, arity) = method_signature(&md);
+                    let (ret, arity, nilable) = method_signature(&md);
                     let block_ret = block_overload_return(&md);
                     let kind = md.kind();
                     // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
@@ -932,7 +960,7 @@ impl Builder {
                         MethodDefinitionKind::Instance
                             | MethodDefinitionKind::SingletonInstance
                     ) {
-                        entry.methods.entry(mname).or_insert((ret, arity));
+                        entry.methods.entry(mname).or_insert((ret, arity, nilable));
                         if let Some(br) = block_ret {
                             entry.block_returns.entry(mname).or_insert(br);
                         }
@@ -1165,13 +1193,26 @@ fn is_toplevel_name(tn: &ruby_rbs::node::TypeNameNode) -> bool {
 /// plain `ClassInstanceType` (a concrete class), or `self`/`instance` mapped to
 /// the receiver class by the caller (we record `self` returns as the receiver's
 /// own name when known). A union (`bool`), generic, `void`, etc. ⇒ `None`.
+///
+/// An `Optional` return (`String?`) is unwrapped to its inner
+/// `ClassInstanceType` (the class) PLUS a `nilable: true` bit — so a nilable
+/// return is preserved, not discarded (it previously fell through to `None` ⇒
+/// Dynamic, losing the optionality). The nilable bit obeys the SAME
+/// all-overloads-agree discipline as the class: across overloads we adopt the
+/// `(class, nilable)` pair only if every resolvable overload agrees on BOTH;
+/// any disagreement ⇒ `None` (never guess, never invent nil — being
+/// conservative here only loses recall in `possible-nil-receiver`, never an FP).
 fn method_signature(
     md: &ruby_rbs::node::MethodDefinitionNode,
-) -> (Option<&'static str>, Arity) {
+) -> (Option<&'static str>, Arity, bool) {
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = Some(0);
     let mut variadic = false;
+    // The agreed `(class, nilable)` pair across overloads. `ret` carries the
+    // class (as before); `ret_nilable` carries the matching nil bit. They move
+    // together so a disagreement on EITHER collapses the return to `None`.
     let mut ret: Option<&'static str> = None;
+    let mut ret_nilable = false;
     let mut ret_seen = false;
 
     for overload in md.overloads().iter() {
@@ -1197,23 +1238,37 @@ fn method_signature(
             max = max.map(|m| m.max(hi));
         }
 
-        // Return type: only resolve a concrete ClassInstanceType. Across
-        // overloads, only adopt a return if ALL resolvable overloads agree;
-        // any disagreement ⇒ leave None (never guess).
-        let this_ret = match ft.return_type() {
-            Node::ClassInstanceType(ci) => type_name_str(&ci.name()),
-            _ => None,
+        // Return type: resolve a concrete ClassInstanceType, OR an `Optional`
+        // wrapping one (`String?` ⇒ class `String`, nilable). Across overloads,
+        // only adopt a return if ALL resolvable overloads agree on BOTH the
+        // class AND the nil bit; any disagreement ⇒ leave None (never guess).
+        let (this_ret, this_nilable) = match ft.return_type() {
+            Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), false),
+            // `String?` lowers to `OptionalType(ClassInstanceType String)`.
+            // Recurse into the inner type; a nested optional/union/generic
+            // inside the optional is not a single concrete class ⇒ None.
+            Node::OptionalType(opt) => match opt.type_() {
+                Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), true),
+                _ => (None, false),
+            },
+            _ => (None, false),
         };
         if !ret_seen {
             ret = this_ret;
+            ret_nilable = this_nilable;
             ret_seen = true;
-        } else if ret != this_ret {
+        } else if ret != this_ret || ret_nilable != this_nilable {
+            // Disagreement on class or nilability ⇒ drop the return entirely
+            // (and with it the nil bit), the conservative choice.
             ret = None;
+            ret_nilable = false;
         }
     }
 
     let arity = (min.unwrap_or(0), if variadic { None } else { max });
-    (ret, arity)
+    // `ret_nilable` is only meaningful when `ret` is Some; callers read it via
+    // `method_return_nilable`, which gates on `ret` being present.
+    (ret, arity, ret_nilable)
 }
 
 /// The RETURN class of the method's **block-bearing overload** — the overload
@@ -1323,5 +1378,36 @@ mod embedded_tests {
         // Method existence parity for a known method, and absence for a typo.
         assert!(idx.class_has_method("String", "upcase"));
         assert!(!idx.class_has_method("String", "lenght"));
+    }
+
+    /// Step 1 (nilable-RBS-return): an `Optional` return (`String?`) is
+    /// preserved as `(class, nilable=true)`; a plain return is `(class, false)`;
+    /// and overloads that DISAGREE on nilability collapse to `None` (never
+    /// invent nil). `byteslice` is uniformly `-> String?`; `upcase` is plainly
+    /// `-> String`; `try_convert`'s overloads mix `String` and `String?`.
+    #[test]
+    fn nilable_return_preserved_and_conservative() {
+        let idx = CoreData::load();
+        // Nilable return: `String#byteslice : (...) -> String?` ⇒ (String, true).
+        assert_eq!(
+            idx.method_return_nilable("String", "byteslice"),
+            Some(("String", true)),
+            "byteslice's String? must surface nilable=true"
+        );
+        // Plain return: `String#upcase : () -> String` ⇒ (String, false).
+        assert_eq!(
+            idx.method_return_nilable("String", "upcase"),
+            Some(("String", false)),
+            "upcase's plain String must surface nilable=false"
+        );
+        // Disagreeing overloads (String vs String?) ⇒ conservative None.
+        assert_eq!(
+            idx.method_return_nilable("String", "try_convert"),
+            None,
+            "overloads disagreeing on nilability must collapse to None"
+        );
+        // The existing non-nil accessors are unchanged by the new bit.
+        assert_eq!(idx.method_return("String", "upcase"), Some("String"));
+        assert_eq!(idx.method_return("String", "byteslice"), Some("String"));
     }
 }

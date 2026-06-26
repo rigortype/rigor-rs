@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 280 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 316 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 280 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 316 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -168,10 +168,12 @@ Ranked next levers:
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 308. **Parity:** `run.rb` PASS (26 fixtures incl. the plugin-enabled +
-  gate-guard pair, the tier-4b param-binding witness/decline pair, and the four
+- **Tests:** 316. **Parity:** `run.rb` PASS (28 fixtures incl. the plugin-enabled +
+  gate-guard pair, the tier-4b param-binding witness/decline pair, the four
   `def.override-visibility-reduced` fixtures — superclass + module-include positives, the
-  reopened-class split, and the adversarial negatives bundle), 0 FP; `run_corpus.rb`
+  reopened-class split, and the adversarial negatives bundle — and the two
+  `call.possible-nil-receiver` fixtures: a byte-exact true positive + a guarded-negatives
+  bundle), 0 FP; `run_corpus.rb`
   validated to **3829 real files, 0 FP, 637/637 matched** (`def.override-visibility-reduced`
   added **+79 matched net**, of which **+44 are override-visibility witnesses on
   mastodon+gitlab, 44/44 reference-equal**; 100% precision; embedded RBS == runtime path,
@@ -295,7 +297,27 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ✅ `call.undefined-method` (witnesses **core/RBS receivers only** — literals, RBS-method
   returns, core `X.new`; in-source/non-core `.new` instances are lenient, matching
   `check_rules.rb:556` `rbs_class_known?`) · ✅ `call.wrong-arity` · 🟡 `call.possible-nil-receiver`
-  (inert until union/flow types exist).
+  (**partial — the nilable-RBS-return slice**, ref `check_rules.rb:1069` `nil_receiver_diagnostic`).
+  Fires `error` (balanced) when a method-local `x = recv.m(..)` has a CERTAIN nilable core RBS
+  return (`String#byteslice -> String?`) on a **non-constant Nominal** core receiver — minting
+  `C | nil` — and the called method is present on `C` but absent on NilClass, with **no guard**.
+  The keystone is the nil-source restriction: nil is minted ONLY from a certain nilable RBS return
+  on a known core class — NEVER from Dynamic / unknown / project receivers, a non-nilable return,
+  or a **Constant** RHS receiver (the reference CONSTANT-FOLDS a literal-receiver core call to a
+  concrete non-nil value, so it stays silent there — minting on a Constant would be a guaranteed
+  FP). Replaces the reference's full flow-narrowing with a conservative whole-method-body
+  **DECLINE scan** (same span-scan as `dead-assignment`): declines silently if anything touches
+  `x` — `.nil?`, an `if`/`unless`/`while`/`until`/ternary predicate, a `&&`/`||` operand, safe-nav,
+  any op-write (`||=`), or `present?`/`blank?`/`presence` (the reference does NOT narrow on the
+  last three, so declining only loses recall — never an FP). A scoped per-method-body local env
+  (`Typer::build_method_body_env`, used ONLY by this rule) types the nil-source RHS receiver
+  without perturbing the top-level-only typing of the other rules. Substrate added: RBS `Optional`
+  return preserved as `(class, nilable)` (`method_return_nilable`, was discarded → Dynamic) +
+  `Node::Call.safe_nav`. **+0 net corpus matched** (637 → 637, 0 FP) — accepted: the corpus
+  nil-sources are params / `@ivar = nil` seeds / project-method returns, all DEFERRED here; the
+  value is the reusable nilable substrate + converting the inert stub to a real, byte-exact rule.
+  **Deferred** (needs ADR-0022 flow scopes for full narrowing): `T | nil` param nil-sources,
+  class-ivar `@x = nil` seeds (ref ADR-58 WD1), project-method nilable returns, chained receivers.
 - ✅ **Metaclass-constructor guard** (`CLASS_RETURNING_NEW` in `rigor-infer`): `Struct.new(...)`,
   `Data.define(...)`, `Class.new` return a CLASS, not an instance — never typed as an instance
   of the receiver (was a chained-`.new` FP).
@@ -481,7 +503,8 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   auto-detection.
 
 ### 14. Parity harness & QA (ADR-0002/0011)
-- ✅ `harness/run.rb` (fixture gate, 20 fixtures incl. alias regression, the ADR-25
+- ✅ `harness/run.rb` (fixture gate, 28 fixtures incl. alias regression, the
+  `call.possible-nil-receiver` TP + guarded-negatives pair, the ADR-25
   plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars, and the tier-4b
   param-binding witness/decline pair) + divergence-registry.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).

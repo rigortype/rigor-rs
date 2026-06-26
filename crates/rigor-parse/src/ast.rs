@@ -161,6 +161,12 @@ pub enum Node {
         block_body: Vec<NodeId>,
         /// Span of the method-name token (`lenght`), the diagnostic anchor.
         message_span: Span,
+        /// `true` for a safe-navigation call (`x&.foo`), `false` for a plain
+        /// dot call (`x.foo`). Prism's `CallNode::is_safe_navigation()` drives
+        /// this. Consumed by `call.possible-nil-receiver` (the reference's
+        /// safe-nav suppression clause): a `&.` call short-circuits on a nil
+        /// receiver at runtime, so a nil-bearing receiver is not a bug there.
+        safe_nav: bool,
         /// Span of the whole call expression.
         span: Span,
     },
@@ -594,6 +600,9 @@ impl Builder {
                 args,
                 block_body,
                 message_span,
+                // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
+                // `call.possible-nil-receiver` can faithfully suppress on `&.`.
+                safe_nav: call.is_safe_navigation(),
                 span: span_of(&call.location()),
             });
         }
@@ -1782,6 +1791,24 @@ mod tests {
             matches!(n, Node::Call { method, block_body, .. } if method == "each" && !block_body.is_empty())
         });
         assert!(has_block, "the each call should record its block body");
+    }
+
+    #[test]
+    fn safe_nav_flag_distinguishes_dot_from_amp_dot() {
+        // `x&.foo` lowers with safe_nav: true; `x.foo` with safe_nav: false.
+        let safe = lower(&crate::parse(b"x&.foo\n"));
+        let safe_flag = safe.iter().find_map(|(_, n)| match n {
+            Node::Call { method, safe_nav, .. } if method == "foo" => Some(*safe_nav),
+            _ => None,
+        });
+        assert_eq!(safe_flag, Some(true), "x&.foo must lower safe_nav: true");
+
+        let plain = lower(&crate::parse(b"x.foo\n"));
+        let plain_flag = plain.iter().find_map(|(_, n)| match n {
+            Node::Call { method, safe_nav, .. } if method == "foo" => Some(*safe_nav),
+            _ => None,
+        });
+        assert_eq!(plain_flag, Some(false), "x.foo must lower safe_nav: false");
     }
 
     #[test]

@@ -173,6 +173,16 @@ impl CoreIndex {
         self.data.method_return_with_block(class, method)
     }
 
+    /// The RETURN class of a core method together with whether the RBS return is
+    /// nilable (`Optional`, `String?`) — `(class, nilable)`, or `None` when the
+    /// return is not a resolvable concrete class. Used ONLY by
+    /// `call.possible-nil-receiver` to mint a `C | nil` carrier from a CERTAIN
+    /// nilable RBS return on a KNOWN core receiver; no other rule consumes the
+    /// nil bit. See [`crate::rbs::CoreData::method_return_nilable`].
+    pub fn method_return_nilable(&self, class: &str, method: &str) -> Option<(&'static str, bool)> {
+        self.data.method_return_nilable(class, method)
+    }
+
     /// The arity envelope `(min, max)` of a core method over THIS index's data —
     /// the instance counterpart of [`method_arity`], plugin-aware so a config-
     /// gated plugin's reopened method has its arity checked (ADR-25).

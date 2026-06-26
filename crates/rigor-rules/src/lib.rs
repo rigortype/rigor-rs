@@ -100,7 +100,11 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-wrong-arity",
         }),
         CALL_POSSIBLE_NIL_RECEIVER => Some(&RuleEntry {
-            default_severity: Severity::Warning,
+            // `error` under the default `balanced` profile (reference
+            // severity_profile.rb), matching the sibling call.* rules whose
+            // catalog default mirrors their balanced severity. An FP here would
+            // be an ERROR on guarded code — hence the zero-FP decline scan.
+            default_severity: Severity::Error,
             evidence_tier: "medium",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-possible-nil-receiver",
         }),
@@ -203,6 +207,7 @@ pub fn analyze_with_source(
                 args,
                 block_body,
                 message_span,
+                safe_nav,
                 ..
             } => Some((
                 id,
@@ -211,12 +216,13 @@ pub fn analyze_with_source(
                 args.clone(),
                 !block_body.is_empty(),
                 *message_span,
+                *safe_nav,
             )),
             _ => None,
         })
         .collect();
 
-    for (_id, recv, method, args, has_block, message_span) in calls {
+    for (call_id, recv, method, args, has_block, message_span, safe_nav) in calls {
         // Rule precedence at one call site (avoid double-emit):
         //   1. undefined-method  (method absent on the receiver class, incl. nil)
         //   2. wrong-arity       (method present but arg count out of envelope)
@@ -228,7 +234,10 @@ pub fn analyze_with_source(
                 check_wrong_arity(ast, recv, &method, &args, has_block, message_span, &env, &typer, interner, index)
             })
             .or_else(|| {
-                check_nil_receiver(ast, recv, &method, message_span, &env, &typer, interner, index)
+                check_nil_receiver(
+                    ast, call_id, recv, &method, message_span, safe_nav, &env, &typer, interner,
+                    index,
+                )
             });
         if let Some(diag) = diag {
             out.push(diag);
@@ -650,34 +659,321 @@ fn check_wrong_arity(
 
 /// Apply `call.possible-nil-receiver` to a single call with a receiver.
 ///
-/// In this slice the rule is intentionally narrow: it fires only when the
-/// receiver type proves nil-on-some-path via a UNION carrier containing a nil
-/// member, while a non-nil arm still defines the method. The literal-`nil`
-/// receiver (`x = nil; x.upcase`) is deliberately NOT handled here — that types
-/// to exactly `Constant[Nil]` and is owned by `call.undefined-method` (matching
-/// the reference, which routes a definitely-nil receiver to undefined-method).
+/// ## Slice 1 — the nilable-RBS-return slice with a conservative decline scan
 ///
-/// The tracer-bullet type lattice does not yet produce union receivers through
-/// flow narrowing, so this rule is currently inert on the corpus; it exists to
-/// hold the rule id + gate shape without ever introducing a false positive.
+/// The reference fires when flow analysis proves the receiver is `T | nil` on a
+/// live path AND no guard narrowed nil away (ADR-58 + Slice-6 local narrowing).
+/// rigor-rs has no flow scopes yet (ADR-0022 deferred), so this slice replaces
+/// the full narrowing with a **whole-method-body syntactic DECLINE scan**: we
+/// mint a `C | nil` receiver only from a CERTAIN nilable RBS return on a KNOWN
+/// core class, and then DECLINE silently if ANY guard-like construct touches the
+/// candidate local. Recall is intentionally small; **soundness (zero FP) is the
+/// invariant** — this rule is error-severity, so an FP would be an error on
+/// legitimately guarded code.
+///
+/// The firing conditions, in order (every `None`/decline is FP-safe):
+/// 1. NOT a safe-nav call (`x&.foo` short-circuits on nil ⇒ not a bug —
+///    reference clause 2).
+/// 2. The receiver is a bare `LocalVariableRead x` (the only narrowing surface
+///    the reference itself trusts; chained/method-call receivers are deferred).
+/// 3. `x` is bound, within the enclosing `def`, by EXACTLY ONE assignment
+///    `x = <call>` whose RHS call has a CERTAIN nilable RBS return on a KNOWN
+///    core receiver class — yielding the single non-nil arm `C` (`C | nil`).
+///    Nil is NEVER minted from a Dynamic / unknown / project receiver, nor from
+///    a non-nilable return (the keystone: `method_return_nilable` carries the
+///    `?` bit straight from RBS).
+/// 4. The DECLINE scan finds NOTHING that guards/mutates `x` (see
+///    [`nil_local_is_guarded`]).
+/// 5. `method` is ABSENT on `NilClass` (else the call is sound on the nil arm —
+///    `to_s`/`to_a`/`inspect`/`nil?`/… all live on NilClass and must not fire).
+/// 6. `method` is PRESENT on `C` (the non-nil arm defines it — otherwise this is
+///    `call.undefined-method`'s job, exactly one diagnostic per call site).
 //
-// TODO(spec): nil-on-a-live-path via union/flow narrowing — once a guard like
-// `return if x.nil?` or a `T | nil` parameter produces a `Type::Union` with a
-// nil arm, fire here when the called method exists on the non-nil arm(s) but
-// not on NilClass (ADR-0022 flow narrowing).
+// TODO(spec): full nil-source coverage (T | nil params, `@ivar = nil` seeds,
+// project-method nilable returns) + true flow narrowing needs ADR-0022 scopes;
+// this slice deliberately models ONLY the core nilable-RBS-return nil-source.
+#[allow(clippy::too_many_arguments)]
 fn check_nil_receiver(
-    _ast: &LoweredAst,
-    _receiver: rigor_parse::NodeId,
-    _method: &str,
-    _message_span: (usize, usize),
-    _env: &rigor_infer::TypeEnv,
-    _typer: &Typer,
-    _interner: &mut Interner,
-    _index: &CoreIndex,
+    ast: &LoweredAst,
+    call_id: rigor_parse::NodeId,
+    receiver: rigor_parse::NodeId,
+    method: &str,
+    message_span: (usize, usize),
+    safe_nav: bool,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
 ) -> Option<Diagnostic> {
-    // No union/flow narrowing in this slice => never fires. Returning `None`
-    // keeps the zero-false-positive contract until flow narrowing lands.
-    None
+    // (1) Safe-nav calls short-circuit on nil at runtime ⇒ never a bug.
+    if safe_nav {
+        return None;
+    }
+
+    // (2) Receiver must be a bare local read `x`.
+    let Node::LocalVariableRead { name: x, .. } = ast.get(receiver) else {
+        return None;
+    };
+
+    // (2b) Find the enclosing named `def` body (span-containment, the
+    // `dead_assignments_in_def` pattern). The call's message span must lie
+    // within exactly this def. Corpus nil-receiver hits all live in `def`
+    // bodies; a top-level call has no enclosing def and is deferred (silent).
+    let (def_span, def_body) = enclosing_def(ast, message_span)?;
+
+    // (3) Resolve `x`'s nil-source: the single assignment `x = <call>` inside
+    // this def whose RHS call has a CERTAIN nilable core RBS return ⇒ class `C`
+    // (the single non-nil arm of `C | nil`). Anything less certain ⇒ None.
+    let core_arm = nilable_local_core_arm(ast, x, def_span, env, typer, interner, index)?;
+
+    // (4) The DECLINE scan — any guard/mutation touching `x` ⇒ silent.
+    if nil_local_is_guarded(ast, x, def_span, &def_body, receiver) {
+        return None;
+    }
+
+    // (5) The method must be ABSENT on NilClass (else sound on the nil arm).
+    if index.class_has_method("NilClass", method) {
+        return None;
+    }
+
+    // (6) The method must be PRESENT on the non-nil arm `C` (else this is
+    // `call.undefined-method`'s call, not ours — one diagnostic per site).
+    if !index.class_has_method(core_arm, method) {
+        return None;
+    }
+
+    // Fire. Message is byte-exact with the reference's
+    // `build_nil_receiver_diagnostic`: ``possible nil receiver: `m' is
+    // undefined on NilClass``. Severity resolves to the catalog default
+    // (`error` under balanced — matching the reference's severity_profile).
+    let _ = call_id; // (call id reserved for future scoping; span is the anchor)
+    let message = format!("possible nil receiver: `{method}' is undefined on NilClass");
+    let severity = catalog(CALL_POSSIBLE_NIL_RECEIVER)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
+    Some(Diagnostic {
+        rule_id: CALL_POSSIBLE_NIL_RECEIVER,
+        start_offset: message_span.0,
+        end_offset: message_span.1,
+        message,
+        severity,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: Some(method.to_string()),
+    })
+}
+
+/// The enclosing named `def`'s `(span, body)` for a node at `inner_span`: the
+/// SMALLEST `Node::Definition { name: Some(_) }` whose span contains
+/// `inner_span`. `None` when no named def encloses it (a top-level call —
+/// deferred in this slice). Smallest-enclosing handles nested defs correctly.
+fn enclosing_def(
+    ast: &LoweredAst,
+    inner_span: (usize, usize),
+) -> Option<(rigor_parse::Span, Vec<rigor_parse::NodeId>)> {
+    let mut best: Option<(rigor_parse::Span, &[rigor_parse::NodeId])> = None;
+    for (_id, n) in ast.iter() {
+        if let Node::Definition {
+            name: Some(_),
+            body,
+            span,
+            ..
+        } = n
+        {
+            if span_within(inner_span, *span) {
+                let take = match best {
+                    None => true,
+                    // Prefer the tighter (smaller) enclosing span.
+                    Some((b, _)) => (span.1 - span.0) < (b.1 - b.0),
+                };
+                if take {
+                    best = Some((*span, body));
+                }
+            }
+        }
+    }
+    best.map(|(s, b)| (s, b.to_vec()))
+}
+
+/// Resolve a local `x`'s nilable core arm WITHIN one `def`: if `x` is bound by
+/// EXACTLY ONE plain assignment `x = <call>` (span-contained in `def_span`)
+/// whose RHS call types to a KNOWN core receiver class on which the called
+/// method has a CERTAIN nilable RBS return (`method_return_nilable` ⇒
+/// `(C, true)`), return `Some(C)` — the single non-nil arm of `C | nil`.
+///
+/// This is the slice's ONLY nil-source. It is the zero-FP keystone: nil is
+/// minted ONLY from a certain nilable-RBS-return on a known core class — never
+/// from a Dynamic / unknown / project receiver, a non-nilable return, or any
+/// non-call RHS. More than one assignment to `x`, or any assignment whose RHS
+/// is not such a call, ⇒ `None` (decline; the multi-write case is also caught
+/// by the guard scan, but we bail here first).
+fn nilable_local_core_arm(
+    ast: &LoweredAst,
+    x: &str,
+    def_span: rigor_parse::Span,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+) -> Option<&'static str> {
+    // Gather the plain `x = …` writes inside this def (op-writes excluded — they
+    // read+write and are handled by the guard scan).
+    let mut sources: Vec<rigor_parse::NodeId> = Vec::new();
+    for (id, n) in ast.iter() {
+        if let Node::LocalVariableWrite { name, span, .. } = n {
+            if name == x && span_within(*span, def_span) {
+                sources.push(id);
+            }
+        }
+    }
+    // Exactly one source assignment (a re-assignment defeats the single-arm
+    // certainty and is also a guard-scan decline).
+    if sources.len() != 1 {
+        return None;
+    }
+    let Node::LocalVariableWrite { value, .. } = ast.get(sources[0]) else {
+        return None;
+    };
+
+    // The RHS must be a Call `recv.m(...)` whose `recv` types to a KNOWN core
+    // class and whose `m` has a CERTAIN nilable RBS return on that class.
+    let Node::Call {
+        receiver: Some(rhs_recv),
+        method: rhs_method,
+        ..
+    } = ast.get(*value)
+    else {
+        return None;
+    };
+    // Type the RHS receiver using a method-body-local env (so `s = String.new;
+    // s.byteslice(..)` resolves `s` to `Nominal[String]` — the corpus shape).
+    // SCOPED to this rule (does not perturb other rules' top-level-only typing).
+    let body_env = typer.build_method_body_env(ast, def_span, env, interner);
+    let rhs_recv_ty = typer.type_of(ast, *rhs_recv, &body_env, interner);
+    // CRITICAL parity gate (zero-FP keystone vs. the oracle's constant-folding):
+    // the reference CONSTANT-FOLDS a literal-receiver core call (`"hi".byteslice`
+    // ⇒ `"hi"`) to a concrete NON-nil value, so it never sees `C | nil` and stays
+    // silent. rigor-rs does NOT fold, so it would mint a spurious union and fire
+    // — an FP. We therefore mint nil ONLY from a NON-constant `Nominal` core
+    // receiver (the unfoldable case, e.g. `String.new`, where the oracle DOES
+    // type `C | nil` and fire). A `Constant` RHS receiver ⇒ decline.
+    if matches!(interner.get(rhs_recv_ty), Type::Constant(_)) {
+        return None;
+    }
+    let rhs_class = index.class_name_of(interner, rhs_recv_ty)?;
+    if !index.knows_class(rhs_class) {
+        return None;
+    }
+    // `(C, nilable)` — require nilable=true (a plain return mints NO nil).
+    match index.method_return_nilable(rhs_class, rhs_method) {
+        Some((core, true)) if index.knows_class(core) => Some(core),
+        _ => None,
+    }
+}
+
+/// The DECLINE scan (zero-FP keystone): `true` if ANY guard-like or mutating
+/// construct touches local `x` anywhere in the `def` body, so the nil-receiver
+/// rule must stay silent. We UNDER-approximate aggressively — declining costs
+/// only recall, never soundness. `fire_use` is the firing receiver read, which
+/// is the ONE use we expect and do not count against ourselves.
+///
+/// Declines on (mirroring every narrowing surface the reference has, plus a few
+/// it does NOT narrow on — declining there only loses recall):
+///   - a `.nil?` call on `x` anywhere (`x.nil?`);
+///   - `x` appearing in ANY condition position — predicate of
+///     `if`/`unless`/`while`/`until`/ternary (the `If`/`Loop` predicate), or an
+///     operand of `&&`/`||` (`Logical` left/right);
+///   - a safe-nav call on `x` anywhere (`x&.…`);
+///   - any reassignment of `x` after the source (a second `LocalVariableWrite`
+///     or any `LocalVariableOpWrite` incl. `||=`);
+///   - `x` as receiver of `present?` / `blank?` / `presence` (the reference does
+///     NOT narrow on these, so it would FIRE through them; declining here is the
+///     safe under-approximation — loses recall, never an FP).
+fn nil_local_is_guarded(
+    ast: &LoweredAst,
+    x: &str,
+    def_span: rigor_parse::Span,
+    _def_body: &[rigor_parse::NodeId],
+    fire_use: rigor_parse::NodeId,
+) -> bool {
+    // Helper: does node `id` resolve to a read of local `x`?
+    let is_read_of_x = |id: rigor_parse::NodeId| -> bool {
+        matches!(ast.get(id), Node::LocalVariableRead { name, .. } if name == x)
+    };
+
+    for (_id, n) in ast.iter() {
+        match n {
+            // Any op-write of x (`x ||= d`, `x += …`) is a reassignment/guard
+            // ⇒ decline. (Plain re-writes are already excluded upstream:
+            // `nilable_local_core_arm` requires EXACTLY ONE plain write of x, so
+            // a two-write body never reaches the scan — the source resolver
+            // returns None first.)
+            Node::LocalVariableOpWrite { name, span, .. }
+                if name == x && span_within(*span, def_span) =>
+            {
+                return true;
+            }
+            Node::Call {
+                receiver: Some(recv),
+                method,
+                safe_nav,
+                span,
+                ..
+            } if span_within(*span, def_span) && is_read_of_x(*recv) => {
+                // Safe-nav on x, or a nil?/present?/blank?/presence guard on x.
+                if *safe_nav {
+                    return true;
+                }
+                if matches!(method.as_str(), "nil?" | "present?" | "blank?" | "presence") {
+                    return true;
+                }
+            }
+            // x in an if/unless/ternary predicate, or a while/until predicate.
+            Node::If { predicate, span, .. } if span_within(*span, def_span) => {
+                if predicate_mentions_local(ast, *predicate, x) {
+                    return true;
+                }
+            }
+            Node::Loop {
+                predicate: Some(predicate),
+                span,
+                ..
+            } if span_within(*span, def_span) => {
+                if predicate_mentions_local(ast, *predicate, x) {
+                    return true;
+                }
+            }
+            // x as an operand of && / || (Logical).
+            Node::Logical {
+                left, right, span, ..
+            } if span_within(*span, def_span) => {
+                if predicate_mentions_local(ast, *left, x)
+                    || predicate_mentions_local(ast, *right, x)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let _ = fire_use;
+    false
+}
+
+/// Whether the (possibly compound) condition node `cond` mentions a read of
+/// local `x` anywhere in its subtree — span-contained. Used to detect `x` in a
+/// predicate / logical-operand position. Span-scan (not structural recursion)
+/// for the same orphan-proof reason as the dead-assignment collector: a read of
+/// `x` lands in the arena regardless of any lossy lowering link, and lies within
+/// the condition node's span. We OVER-detect (any read of x whose span is inside
+/// the condition's span), which is FP-safe (over-declining loses only recall).
+fn predicate_mentions_local(ast: &LoweredAst, cond: rigor_parse::NodeId, x: &str) -> bool {
+    let cond_span = ast.get(cond).span();
+    ast.iter().any(|(_, n)| {
+        matches!(n, Node::LocalVariableRead { name, span }
+            if name == x && span_within(*span, cond_span))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1145,6 +1441,113 @@ mod tests {
         // `x` is never assigned => Dynamic[top] => never guess.
         let diags = run(b"x.foo\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    // --- call.possible-nil-receiver (the nilable-RBS-return slice) -----------
+
+    /// Diagnostics filtered to just the nil-receiver rule.
+    fn nil_diags(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_POSSIBLE_NIL_RECEIVER)
+            .collect()
+    }
+
+    #[test]
+    fn nil_receiver_fires_on_nilable_core_return_no_guard() {
+        // `s : String` (via String.new), `s.byteslice -> String?` mints
+        // `String | nil`; `upcase` is on String, absent on NilClass; no guard
+        // ⇒ fire. Byte-exact with the oracle (verified against the reference:
+        // line 4, col 5, error). The nil-source RHS receiver `s` is a
+        // NON-constant Nominal (the unfoldable case the oracle also fires on).
+        let src = b"def f\n  s = String.new\n  x = s.byteslice(0, 2)\n  x.upcase\nend\n";
+        let diags = nil_diags(src);
+        assert_eq!(diags.len(), 1, "expected one nil-receiver diag, got {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.rule_id, CALL_POSSIBLE_NIL_RECEIVER);
+        assert_eq!(d.severity, Severity::Error, "balanced profile ⇒ error");
+        assert_eq!(d.source_family, "builtin");
+        assert_eq!(d.method_name.as_deref(), Some("upcase"));
+        assert_eq!(
+            d.message,
+            "possible nil receiver: `upcase' is undefined on NilClass"
+        );
+        // Anchored on the method-name token `upcase`.
+        assert_eq!(&src[d.start_offset..d.end_offset], b"upcase");
+    }
+
+    #[test]
+    fn nil_receiver_silent_on_constant_receiver_oracle_folds() {
+        // A LITERAL receiver (`"hello".byteslice`) is constant-folded by the
+        // reference to a concrete non-nil value ⇒ it never sees `C | nil` and
+        // stays silent. rigor-rs must NOT mint nil from a Constant RHS receiver
+        // (the zero-FP keystone vs. the oracle's folding).
+        let src = b"def f\n  x = \"hello\".byteslice(0, 2)\n  x.upcase\nend\n";
+        assert!(
+            nil_diags(src).is_empty(),
+            "constant receiver must not mint nil (oracle folds it)"
+        );
+    }
+
+    #[test]
+    fn nil_receiver_silent_on_method_present_on_nilclass() {
+        // `to_s` lives on NilClass ⇒ the call is sound on the nil arm ⇒ silent
+        // (matches NilClass's tiny method set: to_s/to_a/inspect/nil?/…).
+        let src = b"def f\n  s = String.new\n  x = s.byteslice(0, 2)\n  x.to_s\nend\n";
+        assert!(nil_diags(src).is_empty(), "to_s is on NilClass ⇒ silent");
+    }
+
+    #[test]
+    fn nil_receiver_silent_on_guards() {
+        // Every guard form the decline scan recognizes ⇒ ZERO diagnostics
+        // (each verified against the oracle, which narrows and stays silent).
+        let prelude = "def f\n  s = String.new\n  x = s.byteslice(0, 2)\n";
+        let cases: &[&str] = &[
+            // `.nil?` guard then use.
+            "  return if x.nil?\n  x.upcase\nend\n",
+            // truthy guard via `unless`.
+            "  raise unless x\n  x.upcase\nend\n",
+            // x in an `if` predicate.
+            "  if x then x.upcase end\nend\n",
+            // x as a `&&` operand.
+            "  x && x.upcase\nend\n",
+            // safe-nav on x.
+            "  x&.upcase\nend\n",
+            // reassignment guarded by nil?.
+            "  x = \"d\" if x.nil?\n  x.upcase\nend\n",
+            // `||=` reassignment (op-write).
+            "  x ||= \"d\"\n  x.upcase\nend\n",
+        ];
+        for tail in cases {
+            let src = format!("{prelude}{tail}");
+            let diags = nil_diags(src.as_bytes());
+            assert!(
+                diags.is_empty(),
+                "guarded case must be silent:\n{src}\ngot {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nil_receiver_silent_on_dynamic_and_chained_receiver() {
+        // RHS receiver is a method param (Dynamic) ⇒ no known core class ⇒ no
+        // mint. And a chained `n.to_s.byteslice` (n.to_s is Dynamic) ⇒ silent.
+        let param = b"def f(s)\n  x = s.byteslice(0, 2)\n  x.upcase\nend\n";
+        assert!(nil_diags(param).is_empty(), "Dynamic RHS receiver ⇒ silent");
+        let chained = b"def f(n)\n  x = n.to_s.byteslice(0, 2)\n  x.upcase\nend\n";
+        assert!(nil_diags(chained).is_empty(), "chained Dynamic ⇒ silent");
+    }
+
+    #[test]
+    fn nil_receiver_silent_on_non_nilable_return() {
+        // `s.upcase -> String` (NOT nilable) ⇒ no nil minted ⇒ silent even
+        // though `lenght` is absent (that path is undefined-method's job, and
+        // here `length` is present so nothing fires at all).
+        let src = b"def f\n  s = String.new\n  x = s.upcase\n  x.length\nend\n";
+        assert!(
+            nil_diags(src).is_empty(),
+            "non-nilable return must not mint nil"
+        );
     }
 
     #[test]
@@ -1685,7 +2088,8 @@ mod tests {
         assert_eq!(entry.evidence_tier, "high");
 
         let entry = catalog(CALL_POSSIBLE_NIL_RECEIVER).expect("catalog entry must exist");
-        assert_eq!(entry.default_severity, Severity::Warning);
+        // `error` under the default balanced profile (matches the oracle).
+        assert_eq!(entry.default_severity, Severity::Error);
         assert_eq!(entry.evidence_tier, "medium");
 
         let entry = catalog(FLOW_DEAD_ASSIGNMENT).expect("catalog entry must exist");
