@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 542 at this size, 100%
-precision). 211 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 226 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 211 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 226 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -114,7 +114,9 @@ project-RBS / plugins):
 2. ✅ **Drop-in readiness landed** (this session): inline `# rigor:disable` suppression,
    minimal `.rigor.yml` (disable/exclude), `github` + `sarif` + `gitlab` + `checkstyle` +
    `junit` + `teamcity` output (all four new formats byte-identical to the reference) and
-   **CI auto-detection** (ADR-51, full provider table). Remaining §6/§7: full config schema + baseline.
+   **CI auto-detection** (ADR-51, full provider table) and **baseline read/write** (ADR-22 —
+   byte-compatible `.rigor-baseline.yml`, `check --baseline`, `baseline generate`/`dump`).
+   Remaining §7: full config schema; baseline `regenerate`/`drift`/`prune` + `--baseline-strict`.
 3. **Plugin phase** (§10, ADR-0013) — the real Rails-coverage unlock (sidecar-hosted Ruby
    plugins). Biggest phase; **the bulk of remaining undefined-method coverage lives here**
    (the gap analysis confirms most misses are Rails receivers needing project-RBS/plugins).
@@ -268,7 +270,8 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   `def.ivar-write-mismatch` (ref ADR-58).
 - ⬜ `dump.type` / `assert.type-mismatch`; discriminated-union narrowing (ref ADR-66);
   `rbs.coverage.missing-gem` + config/coverage diagnostics.
-- ⬜ Severity resolution precedence + suppression order (baseline last) + per-rule canonical
+- 🟡 Suppression order (inline → config `disable:` → baseline LAST) is wired in
+  `main.rs`/`baseline.rs` (ADR-22 WD6). ⬜ Severity resolution precedence + per-rule canonical
   severities + token expansion (ADR-0030); diagnostic enrichment remainder
   (`project_definition_site`, full `source_family`).
 
@@ -304,7 +307,26 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ⬜ Full key schema (target_ruby/paths/plugins/libraries/signature_paths/severity_profile/
   auto_detect/budget_overrun_strategy/bleeding_edge/plugins_isolation); `.rigor.dist.yml`,
   winner-takes-all `includes:` stack, relative-to-config paths, config-validation warnings.
-- ⬜ Baseline read/write (same format; `message:` field; `--match-mode`; drift) — ref ADR-22.
+- ✅ **Baseline read/write** (ref ADR-22) — `crates/rigor-cli/src/baseline.rs`. Byte-compatible
+  `.rigor-baseline.yml` (`version: 1`; `ignored:` rows `file`/`rule`/`message?`/`count`;
+  `ignored: []` when empty). Hand-rolled writer/reader (the `.rigor.yml`-loader precedent) plus a
+  faithful Ruby-`Regexp.escape` port. **`--match-mode rule` (default) baselines are byte-identical
+  to the reference's, verified both directions** (the file/rule/count rows match exactly, and a
+  reference-generated rule baseline suppresses rigor-rs diagnostics and vice-versa). `message`-mode
+  baselines are byte-identical **only where the underlying diagnostic message matches** — they embed
+  the rendered `message:`, so a literal receiver (`[1, 2].firts`) diverges (`for \[1,\ 2\]` in the
+  reference vs `for Array` in rigor-rs) because of the **pre-existing literal-vs-nominal receiver
+  render gap** (rigor-rs types literals to a bare `Array`/`Hash` nominal; not a baseline-format bug).
+  So rule-mode is the fully-interchangeable mode; message-mode interchange is exact only for
+  core/RBS receivers. WD4 bucket semantics
+  (`actual <= count` → all silenced; `> count` → whole bucket surfaces) and WD6 ordering
+  (baseline applied LAST, after inline + config suppression) match; message-pattern rows take
+  precedence over rule-ID rows (`regex` crate, already in Cargo.lock). `check` gains `--baseline
+  <path>` / `--no-baseline` plus the `.rigor.yml` `baseline:` key (string activates, `false`/absent
+  = off); paths keyed project-root-relative like `Dir.pwd`. With no baseline the `check` path is a
+  no-op (harness-gated, byte-identical). 🟡 **Deferred:** `baseline regenerate`/`drift`/`prune` and
+  `check --baseline-strict` (they depend on `configuration.paths`, which rigor-rs's CLI does not yet
+  model) — recognized with a clear message + exit 2.
 
 ### 8. Caching & incremental — `lib/rigor/cache/` → (ADR-0017/0028)
 - ⬜ Content-addressed persistent analysis cache (`.rigor/cache`), LRU; six-slot descriptor +
@@ -323,7 +345,10 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ✅ Full surface presented; unimplemented commands report clearly. ✅ `check`
   (`--format text|json|github|sarif|gitlab|checkstyle|junit|teamcity`, `--config <path>`,
   project two-phase pass, inline + config suppression, CI auto-detection on `--format text`).
-- ⬜ `annotate` · `type-of` · `explain` · `init` · `diff` · `baseline` · `triage` ·
+- ✅ `baseline` — `generate [--match-mode rule|message] [--output PATH] [--force] [--config PATH]
+  <file...>` (byte-compatible `.rigor-baseline.yml`) · `dump [--baseline PATH]`. `regenerate`/
+  `drift`/`prune` recognized but deferred (need `configuration.paths`).
+- ⬜ `annotate` · `type-of` · `explain` · `init` · `diff` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugins`/`plugin` · `docs` ·
   `sig-gen` (ref ADR-14) · `skill`/`describe` · `doctor` (ref ADR-77) · `lsp` · `mcp` ·
   `trace` · `type-scan`.

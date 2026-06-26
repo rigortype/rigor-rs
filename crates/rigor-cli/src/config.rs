@@ -33,6 +33,12 @@ pub struct Config {
     pub disable: Vec<String>,
     /// Path glob patterns whose matching files are skipped entirely.
     pub exclude: Vec<String>,
+    /// ADR-22 baseline path. `baseline: <path>` activates a baseline for
+    /// `check`; `baseline: false` is the explicit-disable form. Absent / `null`
+    /// means no baseline. Deserialized as an untyped value so both the string
+    /// and `false` spellings are accepted, then coerced by [`Config::baseline_path`].
+    #[serde(default)]
+    pub baseline: serde_yaml::Value,
 }
 
 impl Config {
@@ -84,6 +90,17 @@ impl Config {
     #[must_use]
     pub fn disable_matcher(&self) -> SuppressSet {
         SuppressSet::from_tokens(&self.disable)
+    }
+
+    /// The effective baseline path from `.rigor.yml`'s `baseline:` key, or
+    /// `None` when absent / `null` / `false` (ADR-22 WD2: presence of the file
+    /// on disk alone never activates it — config or `--baseline` must name it).
+    #[must_use]
+    pub fn baseline_path(&self) -> Option<String> {
+        match &self.baseline {
+            serde_yaml::Value::String(s) => Some(s.clone()),
+            _ => None, // null / false / absent / non-string → no baseline
+        }
     }
 
     /// Whether `path` (as given on the command line) matches any `exclude:`
@@ -142,7 +159,11 @@ mod tests {
 
     #[test]
     fn exclude_glob_matching() {
-        let cfg = Config { disable: vec![], exclude: vec!["vendor/**".into(), "*.rb".into()] };
+        let cfg = Config {
+            disable: vec![],
+            exclude: vec!["vendor/**".into(), "*.rb".into()],
+            ..Default::default()
+        };
         assert!(cfg.is_excluded("vendor/x/y.rb"));
         assert!(cfg.is_excluded("a.rb"));
         // `*.rb` matches a bare filename; non-matches stay false.
@@ -153,13 +174,24 @@ mod tests {
     #[test]
     fn invalid_glob_pattern_is_inert() {
         // A malformed pattern must never panic; it simply matches nothing.
-        let cfg = Config { disable: vec![], exclude: vec!["[".into()] };
+        let cfg = Config { disable: vec![], exclude: vec!["[".into()], ..Default::default() };
         assert!(!cfg.is_excluded("anything.rb"));
     }
 
     #[test]
     fn disable_never_suppresses_internal_error() {
-        let cfg = Config { disable: vec!["all".into()], exclude: vec![] };
+        let cfg = Config { disable: vec!["all".into()], exclude: vec![], ..Default::default() };
         assert!(!cfg.disable_matcher().suppresses("internal-error"));
+    }
+
+    #[test]
+    fn baseline_path_coercion() {
+        // String → Some(path); false / null / absent → None (ADR-22 WD2).
+        let s: Config = serde_yaml::from_str("baseline: .rigor-baseline.yml\n").unwrap();
+        assert_eq!(s.baseline_path().as_deref(), Some(".rigor-baseline.yml"));
+        let f: Config = serde_yaml::from_str("baseline: false\n").unwrap();
+        assert_eq!(f.baseline_path(), None);
+        let n: Config = serde_yaml::from_str("disable: []\n").unwrap();
+        assert_eq!(n.baseline_path(), None);
     }
 }

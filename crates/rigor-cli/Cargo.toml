@@ -20,3 +20,7 @@ serde_yaml = "0.9"
 glob = "0.3"
 # SARIF output is built as a serde_json::Value tree (already in Cargo.lock).
 serde_json = "1"
+# Baseline message-mode rows are Ruby-`Regexp.escape`d sources matched as
+# regexes (reference ADR-22). `regex` 1.12.3 is already in Cargo.lock as a
+# transitive dep and cached in ~/.cargo/registry, so this is offline-safe.
+regex = "1"

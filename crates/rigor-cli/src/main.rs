@@ -23,6 +23,8 @@ use config::Config;
 mod ci_detector;
 mod diagnostic_formats;
 use diagnostic_formats::Rendered;
+mod baseline;
+use baseline::{Baseline, MatchMode, DEFAULT_BASELINE_PATH};
 
 /// The reference's full subcommand surface (ADR-0015).
 const COMMANDS: &[&str] = &[
@@ -35,6 +37,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("check") => cmd_check(&args[1..]),
+        Some("baseline") => cmd_baseline(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => {
             eprintln!("rigor-rs: `{cmd}` is recognized but not yet implemented in this phase");
             ExitCode::from(2)
@@ -58,6 +61,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let mut format = OutputFormat::Text;
     let mut files: Vec<&str> = Vec::new();
     let mut explicit_config: Option<&str> = None;
+    // ADR-22 baseline resolution (mirrors the reference's precedence in
+    // `apply_baseline_filter`): `--no-baseline` (Off) > `--baseline PATH`
+    // (Path) > `.rigor.yml`'s `baseline:` (Unset → config).
+    let mut baseline_arg = BaselineArg::Unset;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -86,6 +93,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
                     return ExitCode::from(64);
                 }
             },
+            "--baseline" => match it.next() {
+                Some(path) => baseline_arg = BaselineArg::Path(path.clone()),
+                None => {
+                    eprintln!("rigor check: --baseline expects a path");
+                    return ExitCode::from(64);
+                }
+            },
+            "--no-baseline" => baseline_arg = BaselineArg::Off,
             other => files.push(other),
         }
     }
@@ -100,128 +115,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // Degrades to default (= inert) on any error, so the differential harness —
     // which runs from a directory with no `.rigor.yml` — is unaffected.
     let cfg = Config::load(explicit_config.map(Path::new));
-    let disable_matcher = cfg.disable_matcher();
 
-    let index = CoreIndex::new();
-    // Each entry: (input_order_key, path, source_or_empty, diagnostic).
-    // The order key is the file's index in `files`, used to keep diagnostics
-    // grouped per file in INPUT order even though the project pass emits
-    // parse/lower-panic diagnostics (stage 1) before analyze diagnostics (stage
-    // 3). `source` is empty string for internal-error diagnostics (no source to
-    // compute line/col from — the offset is 0).
-    let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();
-    let mut had_io_error = false;
+    // Run the analysis pipeline (config `exclude:`/`disable:` + inline
+    // `# rigor:disable` applied). Shared with `baseline generate`.
+    let (mut findings, had_io_error) = analyze_files(&files, &cfg, "check");
 
-    // PROJECT PASS (ADR-0023 cross-file): the bare-constant singleton gate must
-    // know every class the PROJECT defines (across ALL files) so a model
-    // referenced where it is not defined (`Group.where(...)`) is never
-    // singleton-typed and stays silent. So we parse+lower EVERY file first,
-    // collect their owned ASTs, build ONE project-wide SourceIndex, then analyze
-    // each file against it.
-    //
-    // Per-file panic isolation (ADR-0016) is preserved at BOTH stages: a file
-    // that panics in parse/lower is dropped from the project set with a synthetic
-    // internal-error diagnostic (and never contributes class names); a file that
-    // panics in analyze likewise yields the synthetic diagnostic.
-
-    // Stage 1: read + parse + lower every file (panic-isolated). Keep the per-file
-    // source text and owned AST for files that lowered cleanly, in input order.
-    struct Prepared {
-        order: usize,
-        path: String,
-        source: String,
-        ast: rigor_parse::LoweredAst,
-        /// The file's comments as `(1-based line, text)`, captured inside the
-        /// parse closure (the borrowed `ParseResult` cannot escape it). Drives
-        /// in-source `# rigor:disable` suppression in stage 3.
-        comments: Vec<(usize, String)>,
+    // ADR-22 — baseline filter, applied LAST (after inline `# rigor:disable`
+    // and config `disable:`, per reference WD6). With no resolved baseline this
+    // is a no-op, so the no-baseline path stays byte-identical (harness-gated).
+    if let Some(path) = resolve_baseline_path(&baseline_arg, &cfg) {
+        findings = apply_baseline(findings, &path);
     }
-    let mut prepared: Vec<Prepared> = Vec::new();
-
-    for (order, path) in files.iter().enumerate() {
-        // Config `exclude:` — skip the file entirely before reading/analyzing it
-        // (no diagnostics, no internal-error, no project-index contribution).
-        if cfg.is_excluded(path) {
-            continue;
-        }
-
-        let source = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("rigor check: cannot read {path}: {e}");
-                had_io_error = true;
-                continue;
-            }
-        };
-
-        let path_owned = path.to_string();
-        let source_bytes = source.as_bytes().to_vec();
-        let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
-            let result = parse(&source_bytes);
-            // Capture comments here: the borrowed `ParseResult` cannot escape
-            // this closure, so collect the owned `(line, text)` vec alongside
-            // the AST (ADR-0012 lifetime boundary).
-            let comments = rigor_parse::comment_lines(&result, &source_bytes);
-            (lower(&result), comments)
-        }));
-
-        match lowered {
-            Ok((ast, comments)) => {
-                prepared.push(Prepared { order, path: path_owned, source, ast, comments });
-            }
-            Err(panic_val) => {
-                let msg = panic_message(&panic_val);
-                eprintln!("rigor check: internal panic on {path}: {msg}");
-                findings.push((order, path_owned, String::new(), internal_error_diag(msg)));
-            }
-        }
-    }
-
-    // Stage 2: build ONE project-wide source index from all cleanly-lowered ASTs.
-    let asts: Vec<&rigor_parse::LoweredAst> = prepared.iter().map(|p| &p.ast).collect();
-    let project_source = rigor_infer::SourceIndex::build_project(&asts, &index);
-
-    // Stage 3: analyze each file against the shared project source (panic-isolated),
-    // emitting diagnostics grouped per file in input order.
-    for p in &prepared {
-        let Prepared { order, path, source, ast, comments } = p;
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut interner = Interner::new();
-            analyze_with_source(ast, &mut interner, &index, &project_source)
-        }));
-
-        match result {
-            Ok(diags) => {
-                // Apply in-source `# rigor:disable` / `-file` suppression per file
-                // (line numbers are per file). Pair each diagnostic with its
-                // 1-based line, filter, then push the survivors.
-                let with_lines: Vec<(usize, Diagnostic)> = diags
-                    .into_iter()
-                    .map(|diag| (line_col(source, diag.start_offset).0, diag))
-                    .collect();
-                for (_line, diag) in rigor_rules::filter_suppressed(with_lines, comments) {
-                    // Config `disable:` — drop diagnostics whose rule matches the
-                    // expanded disable set (composes with inline suppression; the
-                    // internal-error sentinel is never matched by it).
-                    if disable_matcher.suppresses(diag.rule_id) {
-                        continue;
-                    }
-                    findings.push((*order, path.clone(), source.clone(), diag));
-                }
-            }
-            Err(panic_val) => {
-                let msg = panic_message(&panic_val);
-                eprintln!("rigor check: internal panic on {path}: {msg}");
-                findings.push((*order, path.clone(), String::new(), internal_error_diag(msg)));
-            }
-        }
-    }
-
-    // Restore input order: stage 1 (parse/lower panics) and stage 3 (analyze)
-    // push interleaved, so stable-sort by the file's input-order key to recover
-    // the per-file grouping in input order. Stable keeps a file's own diagnostics
-    // in source order.
-    findings.sort_by_key(|(order, _, _, _)| *order);
 
     match format {
         OutputFormat::Text => print_text(&findings),
@@ -252,6 +156,366 @@ fn cmd_check(args: &[String]) -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// The analysis pipeline shared by `check` and `baseline generate`: read +
+/// parse + lower every file (project pass), then analyze each against the
+/// shared project source, applying config `exclude:`/`disable:` and inline
+/// `# rigor:disable` suppression. Returns `(findings, had_io_error)` with
+/// findings in input order. The baseline filter is NOT applied here — that is
+/// the LAST stage, applied only by `check` (reference WD6). `verb` labels the
+/// command in error messages (`check` / `baseline`).
+fn analyze_files(
+    files: &[&str],
+    cfg: &Config,
+    verb: &str,
+) -> (Vec<(usize, String, String, Diagnostic)>, bool) {
+    let disable_matcher = cfg.disable_matcher();
+    let index = CoreIndex::new();
+    // Each entry: (input_order_key, path, source_or_empty, diagnostic).
+    let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();
+    let mut had_io_error = false;
+
+    // PROJECT PASS (ADR-0023 cross-file): parse+lower EVERY file first, build
+    // ONE project-wide SourceIndex, then analyze each file against it.
+    // Per-file panic isolation (ADR-0016) is preserved at BOTH stages.
+    struct Prepared {
+        order: usize,
+        path: String,
+        source: String,
+        ast: rigor_parse::LoweredAst,
+        comments: Vec<(usize, String)>,
+    }
+    let mut prepared: Vec<Prepared> = Vec::new();
+
+    for (order, path) in files.iter().enumerate() {
+        // Config `exclude:` — skip the file entirely before reading/analyzing it.
+        if cfg.is_excluded(path) {
+            continue;
+        }
+
+        let source = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("rigor {verb}: cannot read {path}: {e}");
+                had_io_error = true;
+                continue;
+            }
+        };
+
+        let path_owned = path.to_string();
+        let source_bytes = source.as_bytes().to_vec();
+        let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
+            let result = parse(&source_bytes);
+            let comments = rigor_parse::comment_lines(&result, &source_bytes);
+            (lower(&result), comments)
+        }));
+
+        match lowered {
+            Ok((ast, comments)) => {
+                prepared.push(Prepared { order, path: path_owned, source, ast, comments });
+            }
+            Err(panic_val) => {
+                let msg = panic_message(&panic_val);
+                eprintln!("rigor {verb}: internal panic on {path}: {msg}");
+                findings.push((order, path_owned, String::new(), internal_error_diag(msg)));
+            }
+        }
+    }
+
+    // Stage 2: build ONE project-wide source index from all cleanly-lowered ASTs.
+    let asts: Vec<&rigor_parse::LoweredAst> = prepared.iter().map(|p| &p.ast).collect();
+    let project_source = rigor_infer::SourceIndex::build_project(&asts, &index);
+
+    // Stage 3: analyze each file against the shared project source (panic-isolated).
+    for p in &prepared {
+        let Prepared { order, path, source, ast, comments } = p;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut interner = Interner::new();
+            analyze_with_source(ast, &mut interner, &index, &project_source)
+        }));
+
+        match result {
+            Ok(diags) => {
+                let with_lines: Vec<(usize, Diagnostic)> = diags
+                    .into_iter()
+                    .map(|diag| (line_col(source, diag.start_offset).0, diag))
+                    .collect();
+                for (_line, diag) in rigor_rules::filter_suppressed(with_lines, comments) {
+                    // Config `disable:` — drop diagnostics whose rule matches the
+                    // expanded disable set (the internal-error sentinel is never matched).
+                    if disable_matcher.suppresses(diag.rule_id) {
+                        continue;
+                    }
+                    findings.push((*order, path.clone(), source.clone(), diag));
+                }
+            }
+            Err(panic_val) => {
+                let msg = panic_message(&panic_val);
+                eprintln!("rigor {verb}: internal panic on {path}: {msg}");
+                findings.push((*order, path.clone(), String::new(), internal_error_diag(msg)));
+            }
+        }
+    }
+
+    // Restore input order (stage 1 and stage 3 push interleaved).
+    findings.sort_by_key(|(order, _, _, _)| *order);
+    (findings, had_io_error)
+}
+
+// ---------------------------------------------------------------------------
+// `rigor baseline` subcommand (ADR-22)
+// ---------------------------------------------------------------------------
+
+/// `rigor baseline <subcommand>` — record/inspect the suppression baseline.
+///
+/// Subcommands (mirroring the reference's surface where cheap):
+/// - `generate [--match-mode rule|message] [--output PATH] [--force] <file...>`
+///   — write a fresh baseline from a `check` run over the given files.
+/// - `dump [--baseline PATH]` — print the contents of an existing baseline.
+///
+/// `regenerate`/`drift`/`prune` from the reference are NOT yet implemented in
+/// this phase (they depend on `configuration.paths`, which rigor-rs's CLI does
+/// not yet model); a clear message + exit 2 is reported for them.
+fn cmd_baseline(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        None | Some("help") | Some("-h") | Some("--help") => {
+            print_baseline_help();
+            ExitCode::SUCCESS
+        }
+        Some("generate") => baseline_generate(&args[1..]),
+        Some("dump") => baseline_dump(&args[1..]),
+        Some(sub @ ("regenerate" | "drift" | "prune")) => {
+            eprintln!(
+                "rigor baseline: `{sub}` is recognized but not yet implemented in this phase"
+            );
+            ExitCode::from(2)
+        }
+        Some(other) => {
+            eprintln!("rigor baseline: unknown subcommand `{other}`");
+            print_baseline_help();
+            ExitCode::from(64)
+        }
+    }
+}
+
+fn print_baseline_help() {
+    eprintln!(
+        "Usage: rigor baseline <subcommand> [options]\n\n\
+         Subcommands:\n\
+         \x20 generate   Write a fresh baseline from a check run over the given files.\n\
+         \x20 dump       Print the contents of an existing baseline.\n\n\
+         generate options:\n\
+         \x20 --match-mode rule|message   Row form: rule (default) or message\n\
+         \x20 --output PATH               Write baseline to PATH (default: {DEFAULT_BASELINE_PATH})\n\
+         \x20 --force                     Overwrite an existing baseline file\n\
+         \x20 --config PATH               Path to .rigor.yml"
+    );
+}
+
+/// `rigor baseline generate` — run `check` over the files and write a baseline.
+fn baseline_generate(args: &[String]) -> ExitCode {
+    let mut files: Vec<&str> = Vec::new();
+    let mut output = DEFAULT_BASELINE_PATH.to_string();
+    let mut mode = MatchMode::Rule;
+    let mut force = false;
+    let mut explicit_config: Option<&str> = None;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--output" => match it.next() {
+                Some(p) => output = p.clone(),
+                None => {
+                    eprintln!("rigor baseline generate: --output expects a path");
+                    return ExitCode::from(64);
+                }
+            },
+            "--match-mode" => match it.next().map(String::as_str) {
+                Some("rule") => mode = MatchMode::Rule,
+                Some("message") => mode = MatchMode::Message,
+                other => {
+                    eprintln!(
+                        "rigor baseline generate: --match-mode expects `rule` or `message`, got {other:?}"
+                    );
+                    return ExitCode::from(64);
+                }
+            },
+            "--config" => match it.next() {
+                Some(p) => explicit_config = Some(p),
+                None => {
+                    eprintln!("rigor baseline generate: --config expects a path");
+                    return ExitCode::from(64);
+                }
+            },
+            "--force" => force = true,
+            other => files.push(other),
+        }
+    }
+
+    if files.is_empty() {
+        eprintln!("rigor baseline generate: expected at least one file");
+        return ExitCode::from(64);
+    }
+    if Path::new(&output).exists() && !force {
+        eprintln!(
+            "rigor: {output} already exists. Re-run with --force to overwrite."
+        );
+        return ExitCode::from(64);
+    }
+
+    let cfg = Config::load(explicit_config.map(Path::new));
+    // IMPORTANT (reference parity): generate must record the UNFILTERED set —
+    // it never applies an existing baseline (`analyze_files` does not), so the
+    // new file records the live diagnostics, not the post-baseline (empty) surface.
+    let (findings, _had_io_error) = analyze_files(&files, &cfg, "baseline");
+
+    // Key on project-root-relative paths, like the reference's `Dir.pwd`.
+    let cwd = std::env::current_dir().ok();
+    let entries: Vec<(String, &Diagnostic)> = findings
+        .iter()
+        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
+        .collect();
+
+    let baseline = Baseline::from_diagnostics(&entries, mode);
+    if let Err(e) = std::fs::write(&output, baseline.to_yaml()) {
+        eprintln!("rigor baseline generate: cannot write {output}: {e}");
+        return ExitCode::from(1);
+    }
+    let mode_str = match mode {
+        MatchMode::Rule => "rule",
+        MatchMode::Message => "message",
+    };
+    eprintln!(
+        "rigor: wrote baseline to {output} ({} bucket(s) covering {} diagnostic(s); match-mode: {mode_str})",
+        baseline.size(),
+        entries.len()
+    );
+    ExitCode::SUCCESS
+}
+
+/// `rigor baseline dump` — print an existing baseline's rows.
+fn baseline_dump(args: &[String]) -> ExitCode {
+    let mut path = DEFAULT_BASELINE_PATH.to_string();
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--baseline" => match it.next() {
+                Some(p) => path = p.clone(),
+                None => {
+                    eprintln!("rigor baseline dump: --baseline expects a path");
+                    return ExitCode::from(64);
+                }
+            },
+            other => {
+                eprintln!("rigor baseline dump: unexpected argument `{other}`");
+                return ExitCode::from(64);
+            }
+        }
+    }
+    if !Path::new(&path).exists() {
+        eprintln!("rigor: baseline file not found: {path}");
+        return ExitCode::from(64);
+    }
+    let baseline = match Baseline::load(Path::new(&path)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("rigor: baseline load failed: {e}");
+            return ExitCode::from(64);
+        }
+    };
+    let mut total = 0usize;
+    for b in baseline.buckets() {
+        total += b.count;
+        match &b.message {
+            Some(m) => println!("{}  [{}]  count={}  ~/{m}/", b.file, b.rule, b.count),
+            None => println!("{}  [{}]  count={}", b.file, b.rule, b.count),
+        }
+    }
+    println!("Total: {} bucket(s), {total} occurrence(s)", baseline.size());
+    ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// Baseline integration (ADR-22)
+// ---------------------------------------------------------------------------
+
+/// CLI baseline state for `check`, resolved against config in
+/// `resolve_baseline_path` (reference `apply_baseline_filter` precedence).
+enum BaselineArg {
+    /// No `--baseline`/`--no-baseline` flag — fall through to `.rigor.yml`.
+    Unset,
+    /// `--baseline PATH` — overrides config.
+    Path(String),
+    /// `--no-baseline` — ignore any configured baseline for this run.
+    Off,
+}
+
+/// Resolve the effective baseline path: `--no-baseline` wins (None),
+/// then `--baseline PATH`, then `.rigor.yml`'s `baseline:` key.
+fn resolve_baseline_path(arg: &BaselineArg, cfg: &Config) -> Option<String> {
+    match arg {
+        BaselineArg::Off => None,
+        BaselineArg::Path(p) => Some(p.clone()),
+        BaselineArg::Unset => cfg.baseline_path(),
+    }
+}
+
+/// Apply the baseline filter to the sorted findings. Loads the baseline; on a
+/// load error reports to stderr and continues WITHOUT a baseline (graceful
+/// degradation, matching the reference's "continuing without baseline"). The
+/// matcher keys each diagnostic on its project-root-relative path, exactly as
+/// the reference normalizes `diag.path` against `Dir.pwd`.
+fn apply_baseline(
+    findings: Vec<(usize, String, String, Diagnostic)>,
+    path: &str,
+) -> Vec<(usize, String, String, Diagnostic)> {
+    let baseline = match Baseline::load(Path::new(path)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("rigor: baseline load failed: {e} (continuing without baseline)");
+            return findings;
+        }
+    };
+    if baseline.is_empty() {
+        return findings;
+    }
+
+    // Pair each finding with its relative path; internal-error diagnostics
+    // (no rule the baseline can address — they have no catalog entry) bypass
+    // the filter and always surface, like the reference's `unkeyable` set.
+    let cwd = std::env::current_dir().ok();
+    let entries: Vec<(String, &Diagnostic)> = findings
+        .iter()
+        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
+        .collect();
+
+    let (surfaced_idx, silenced) = baseline.filter(&entries);
+    if silenced > 0 {
+        eprintln!("rigor: {silenced} diagnostic(s) silenced by baseline {path}");
+    }
+
+    // Keep only the surfaced indices, preserving order.
+    let keep: std::collections::HashSet<usize> = surfaced_idx.into_iter().collect();
+    findings
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, f)| if keep.contains(&i) { Some(f) } else { None })
+        .collect()
+}
+
+/// Normalize a path to project-root-relative (against cwd), matching the
+/// reference's `Pathname#relative_path_from(Dir.pwd)`. A path outside the root
+/// (or when cwd is unknown) is returned unchanged, as the reference falls back
+/// to the original on `ArgumentError`.
+fn relative_path(path: &str, cwd: Option<&Path>) -> String {
+    let Some(cwd) = cwd else { return path.to_string() };
+    let p = Path::new(path);
+    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
+    match abs.strip_prefix(cwd) {
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        Err(_) => path.to_string(),
     }
 }
 
