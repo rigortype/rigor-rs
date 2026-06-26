@@ -289,3 +289,145 @@ jobs:
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           gem push "rigortype-rs-${version}.gem"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Homebrew formula channel (ADR-0010, co-equal with Releases/binstall + gem).
+  # PURELY ADDITIVE + DOWNSTREAM of `build` (`needs: build`): never runs until
+  # the release assets + their `.sha256` sidecars exist. It regenerates the
+  # in-repo TEMPLATE `HomebrewFormula/rigor.rb` — substituting the real version
+  # and the four real per-target sha256s (read from the uploaded
+  # `rigor-<v>-<target>.tar.gz.sha256` sidecars) in place of the `0`×64
+  # placeholders — and uploads the FILLED formula as a release/workflow artifact.
+  #
+  # The tap push is DEFERRED + GATED (mirrors the gem `gem push` gate): pushing
+  # to `rigortype/homebrew-tap` needs that repo to exist + a token, so this job
+  # only PRODUCES the filled formula. The push step below is guarded by a
+  # `HOMEBREW_TAP_TOKEN` secret AND the manual `release` environment, so a tag
+  # push NEVER auto-publishes the formula. See HomebrewFormula/README.md.
+  homebrew-formula:
+    name: homebrew formula
+    needs: build
+    runs-on: ubuntu-latest
+    # Manual-approval gate (same `release` environment as the gem push). The
+    # regenerate/upload steps run unconditionally; only the tap push is gated.
+    environment: release
+    env:
+      HAS_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pull just the `.sha256` sidecars for the four release targets (no need
+      # to download the full archives — the sidecars carry the verified hashes).
+      - name: Download release sha256 sidecars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-gnu; do
+            gh release download "${GITHUB_REF_NAME}" \
+              --pattern "rigor-${version}-${target}.tar.gz.sha256" --dir .
+          done
+
+      # Regenerate HomebrewFormula/rigor.rb in place: real version + the four
+      # real sha256s. The sidecars are `shasum -a 256` output (`<hash>  <file>`);
+      # we take the leading hash field. Each placeholder line is matched by its
+      # target comment on the preceding line, so substitution is unambiguous.
+      - name: Regenerate formula with real version + sha256s
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          formula="HomebrewFormula/rigor.rb"
+
+          declare -A sha
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-gnu; do
+            sidecar="rigor-${version}-${target}.tar.gz.sha256"
+            sha["$target"]="$(awk '{print $1}' "${sidecar}")"
+          done
+
+          # Filled formula via a Ruby rewriter: bump `version` and replace each
+          # placeholder sha256 by the asset's target (matched from the URL on the
+          # same `url ...` line context). Keeps the template structure intact.
+          ruby - "$formula" "$version" \
+            "${sha[aarch64-apple-darwin]}" \
+            "${sha[x86_64-apple-darwin]}" \
+            "${sha[aarch64-unknown-linux-gnu]}" \
+            "${sha[x86_64-unknown-linux-gnu]}" <<'RUBY'
+          path, version, mac_arm, mac_intel, lin_arm, lin_intel = ARGV
+          src = File.read(path, encoding: "UTF-8")
+          # version stanza
+          src.sub!(/^(\s*version )"[^"]*"/) { "#{$1}\"#{version}\"" }
+          # Map each target substring to its real sha256.
+          targets = {
+            "aarch64-apple-darwin"      => mac_arm,
+            "x86_64-apple-darwin"       => mac_intel,
+            "aarch64-unknown-linux-gnu" => lin_arm,
+            "x86_64-unknown-linux-gnu"  => lin_intel,
+          }
+          out = []
+          pending = nil
+          src.each_line do |line|
+            targets.each_key { |t| pending = targets[t] if line.include?("url ") && line.include?(t) }
+            if pending && line =~ /^\s*sha256 "/
+              line = line.sub(/sha256 "[0-9a-f]*"/, "sha256 \"#{pending}\"")
+              pending = nil
+            end
+            out << line
+          end
+          File.write(path, out.join)
+          # Fail loudly if any placeholder survived (never ship `0`*64).
+          if File.read(path, encoding: "UTF-8").include?("0000000000000000000000000000000000000000000000000000000000000000")
+            abort "placeholder sha256 survived regeneration"
+          end
+          RUBY
+
+          echo "::group::regenerated formula"
+          cat "$formula"
+          echo "::endgroup::"
+
+      - name: Verify regenerated formula is valid Ruby
+        run: ruby -c HomebrewFormula/rigor.rb
+
+      # The filled formula, available for review + the (deferred) tap push.
+      - name: Upload formula as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rigor-homebrew-formula
+          path: HomebrewFormula/rigor.rb
+
+      - name: Attach formula to the GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HomebrewFormula/rigor.rb
+
+      # GATED/DEFERRED tap push — never auto-runs. Requires the
+      # HOMEBREW_TAP_TOKEN secret AND the `release` environment approval, AND
+      # the `rigortype/homebrew-tap` repo to exist. Until then this is inert.
+      - name: Push formula to tap (gated / deferred)
+        if: env.HAS_TAP_TOKEN == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          tmp="$(mktemp -d)"
+          gh repo clone rigortype/homebrew-tap "$tmp/tap"
+          mkdir -p "$tmp/tap/Formula"
+          cp HomebrewFormula/rigor.rb "$tmp/tap/Formula/rigor.rb"
+          git -C "$tmp/tap" add Formula/rigor.rb
+          git -C "$tmp/tap" -c user.name="rigor-rs release bot" \
+            -c user.email="release-bot@rigortype.invalid" \
+            commit -m "rigor ${version}"
+          git -C "$tmp/tap" push

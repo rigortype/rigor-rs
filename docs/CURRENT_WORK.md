@@ -633,9 +633,41 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
     `gem-fallback` job builds the `ruby` gem. `gem push` is GATED behind a `RUBYGEMS_API_KEY`
     secret + a manual `release` environment — never auto-pushes.
   - **DEFERRED:** RubyGems account + API key + MFA setup; the first real tag to validate the
-    multi-platform CI build/push end-to-end; Homebrew formula; musl + Windows targets; sidecar
+    multi-platform CI build/push end-to-end; musl + Windows targets; sidecar
     Ruby auto-detection. (The `rigortype` name takeover is NOT deferred but NOT planned — rigor-rs
     coexists with the Ruby mainstream per ADR-0001.)
+- ✅ **Homebrew formula scaffold landed (ADR-0010 co-equal channel — purely additive: a new
+    `HomebrewFormula/` dir + a downstream `homebrew-formula` job appended to `release.yml`; the
+    existing `build`/`gem`/`gem-fallback` jobs are BYTE-UNCHANGED, no `crates/`/`Cargo.toml`/
+    dev-loop/`gem/` change).**
+  - **Template:** `HomebrewFormula/rigor.rb` — `class Rigor < Formula`, `desc`/`homepage` (the
+    repository URL)/`license "MPL-2.0"`/`version "0.1.0"`; per-OS/per-arch blocks
+    (`on_macos`+`on_arm`/`on_intel`, `on_linux`+`on_arm`/`on_intel`) each with the matching
+    `url ".../releases/download/v#{version}/rigor-#{version}-<target>.tar.gz"` + `sha256`.
+    Arch→target map: macOS arm → `aarch64-apple-darwin`, macOS intel → `x86_64-apple-darwin`,
+    linux arm → `aarch64-unknown-linux-gnu`, linux intel → `x86_64-unknown-linux-gnu` (consistent
+    with the release asset naming + the cargo-binstall `pkg-url`). `def install; bin.install
+    "rigor"; end` (bare binary at archive root); `test do` asserts `rigor #{version}` from
+    `--version` + a trivial `rigor check`.
+  - **Placeholder sha256s** (`0`×64, obvious + prominently commented) — NOT shipped as-is; the CI
+    job regenerates them. `HomebrewFormula/README.md` documents the template/CI-fill/deferred-tap
+    story.
+  - **CI `homebrew-formula` job (`release.yml`, `needs: build`):** downloads the four
+    `rigor-<v>-<target>.tar.gz.sha256` sidecars, rewrites `HomebrewFormula/rigor.rb` in place with
+    the real version (`${GITHUB_REF_NAME#v}`) + the four real per-target sha256s (a Ruby rewriter
+    that matches each placeholder by its target comment/URL; aborts if any `0`×64 survives),
+    re-validates with `ruby -c`, and uploads the filled formula as a workflow artifact + attaches
+    it to the Release. The **tap push** (`rigortype/homebrew-tap`,
+    `brew install rigortype/tap/rigor`) is **GATED/DEFERRED** behind a `HOMEBREW_TAP_TOKEN` secret
+    + the manual `release` environment (mirrors the gem `gem push` gate) — never auto-runs.
+  - **Local verification (ran):** `ruby -c HomebrewFormula/rigor.rb` → Syntax OK; `brew style`
+    (in a throwaway tap, since brew refuses out-of-tap formulae) → no offenses; `brew audit --new`
+    → only the expected placeholder/no-repo findings (URLs 404 — no release/repo yet; `version`
+    redundant-with-URL is a style preference, kept deliberately for DRY interpolation). The CI
+    rewriter was exercised end-to-end with fake sidecars: each target's sha lands in the correct
+    arch block, version substituted, placeholder-survival guard fires on a missing sidecar.
+  - **DEFERRED (Homebrew):** the `rigortype/homebrew-tap` repo + a `HOMEBREW_TAP_TOKEN`; the first
+    real tag to produce real sha256s; musl + Windows targets; sidecar auto-detection.
 
 ### 14. Parity harness & QA (ADR-0002/0011)
 - ✅ `harness/run.rb` (fixture gate, 28 fixtures incl. alias regression, the
