@@ -11,9 +11,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
 
-Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone.
-
-> Note: this repo has no git remote yet. Add a GitHub remote (`git remote add origin ...`) and create the repo on GitHub before these `gh` commands will work.
+Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone. The `origin` remote is `git@github.com:rigortype/rigor-rs.git` (published).
 
 ## Pull requests as a triage surface
 

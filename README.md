@@ -1,5 +1,13 @@
 # rigor-rs
 
+> [!NOTE]
+> **About this project.** rigor-rs is a **performance-oriented prototype** that
+> reimplements the Ruby **Rigor** analyzer in Rust. **The Ruby implementation is
+> the mainstream and always leads development** — replacing it with Rust is **not
+> planned**. **Full compatibility with the Ruby version is not yet verified.**
+> rigor-rs may eventually be kept in sync as a Rust implementation that preserves
+> the same behavior, but that remains a possibility, not a commitment.
+
 A Rust reimplementation of **Rigor**, the type-aware bug finder for Ruby. It
 parses Ruby with Prism, infers types from the values expressions produce, reads
 RBS as authoritative, and reports diagnostics under a **zero-false-positive
@@ -11,11 +19,14 @@ rbs-gem dependency. It is a *sound subset* of the reference Ruby implementation 
 where it cannot prove a finding it stays silent, and it never emits a diagnostic
 the reference does not.
 
-> **Status.** Parity-validated and under active development. Across 3,829 real
-> Ruby files (mastodon, gitlab-foss, conference-app, and Rigor's own source) it
-> emits **0 false positives** at 100% precision. The port is incremental; see
-> [`docs/CURRENT_WORK.md`](docs/CURRENT_WORK.md) for what is done and what
-> remains.
+> [!IMPORTANT]
+> **Status.** An early prototype under active development; **full compatibility
+> with the Ruby version is not yet verified**. On the rules it implements it is a
+> *sound subset* — across 3,829 real Ruby files (mastodon, gitlab-foss,
+> conference-app, and Rigor's own source) it emits **0 false positives** at 100%
+> precision, but it does not yet reproduce every diagnostic the Ruby version does.
+> The port is incremental; see [`docs/CURRENT_WORK.md`](docs/CURRENT_WORK.md) for
+> what is done and what remains.
 
 ## Install
 
@@ -118,10 +129,13 @@ implemented rule set.
 
 rigor-rs is a faithful port whose correctness bar is **diagnostic-set parity**
 with the reference Ruby implementation: for a given input, the `(rule id,
-location)` pairs it emits match the reference (message wording may improve; the
-set must match). A differential harness runs both tools over a shared corpus and
-fails on any divergence. The long-term goal (ADR-0001) is to reach parity and
-become the single implementation.
+location)` pairs it emits should match the reference on the rules it implements
+(message wording may improve; the set must match). A differential harness runs
+both tools over a shared corpus and fails on any divergence. **The Ruby
+implementation remains the mainstream and leads development** — rigor-rs tracks it
+for performance. Reaching full compatibility, and one day syncing as a
+behavior-preserving Rust implementation, is a possibility rather than a committed
+goal; replacing the Ruby mainstream is not planned.
 
 The standalone binary covers the sound subset that needs no Ruby. The full
 plugin long-tail (the Rails family and beyond) is delivered via opt-in bundled

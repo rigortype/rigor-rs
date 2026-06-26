@@ -14,8 +14,6 @@ Gem::Specification.new do |spec|
                      "executable on your PATH with zero runtime dependencies (no prism/rbs/lsp gems) — " \
                      "the analysis engine is compiled in. This is an opt-in, early-adopter channel for " \
                      "the Rust port; the `rigortype` name remains the reference Ruby implementation."
-  # NOTE: placeholder — no git remote is configured yet for rigor-rs. Confirm
-  # when the repository is published (mirrors the Cargo.toml `repository` note).
   spec.homepage = "https://github.com/rigortype/rigor-rs"
   spec.license = "AGPL-3.0"
   spec.required_ruby_version = ">= 3.0"

@@ -17,9 +17,6 @@
 # generated formula to that tap needs the tap repo to exist + a token, so it is
 # GATED/deferred (mirrors the gem `gem push` gate). See HomebrewFormula/README.md
 # and docs/CURRENT_WORK.md §13.
-#
-# NOTE: `https://github.com/rigortype/rigor-rs` is a PLACEHOLDER URL — no public
-# repo is configured yet. Confirm when the project is published.
 # ─────────────────────────────────────────────────────────────────────────────
 class Rigor < Formula
   desc "Inference-first static analyzer for Ruby (Rust port of Rigor)"

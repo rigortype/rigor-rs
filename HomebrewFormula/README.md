@@ -49,6 +49,3 @@ token, so the tap push is **gated/deferred** — exactly like the gem's
 `gem push` (behind a secret + a manual `release` environment). Until the tap
 repo + token exist, CI only *produces* the filled formula as an artifact; it
 never pushes.
-
-> **NOTE:** `https://github.com/rigortype/rigor-rs` is a placeholder URL — no
-> public repo is configured yet. Confirm when the project is published.

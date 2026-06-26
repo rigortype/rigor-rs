@@ -13,8 +13,6 @@ rust-version = "1.85"
 # `*.workspace = true`. rigor-rs is published under AGPL-3.0 — note this DIFFERS
 # from the reference's `rigortype.gemspec` (MPL-2.0); the LICENSE file is the
 # verbatim GNU AGPL v3.
-# NOTE: no git remote is configured yet — this URL is a best-guess based on the
-# reference's org (`rigortype/rigor`). CONFIRM when the repo is published.
 repository = "https://github.com/rigortype/rigor-rs"
 license = "AGPL-3.0"
 

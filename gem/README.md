@@ -4,8 +4,6 @@ Precompiled-binary distribution of **rigor-rs**, the Rust port of [Rigor](https:
 
 This gem is a thin shim around a **native, self-contained `rigor` binary**: installing it puts a `rigor` executable on your PATH with **zero runtime dependencies** (no `prism`/`rbs`/`language_server-protocol` gems — the analysis engine is statically compiled into the binary, ADR-0007).
 
-> **NOTE:** `https://github.com/rigortype/rigor-rs` is a placeholder URL — no public repo is configured yet. It will be confirmed when the project is published.
-
 ## Install
 
 ```sh
