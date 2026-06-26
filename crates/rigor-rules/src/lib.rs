@@ -104,6 +104,11 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "medium",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-possible-nil-receiver",
         }),
+        FLOW_DEAD_ASSIGNMENT => Some(&RuleEntry {
+            default_severity: Severity::Warning,
+            evidence_tier: "medium",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-dead-assignment",
+        }),
         _ => None,
     }
 }
@@ -124,6 +129,12 @@ pub const CALL_WRONG_ARITY: &str = "call.wrong-arity";
 /// literal-`nil` case is owned by `call.undefined-method` (matching the
 /// reference, which routes `nil.foo` to undefined-method).
 pub const CALL_POSSIBLE_NIL_RECEIVER: &str = "call.possible-nil-receiver";
+
+/// `flow.dead-assignment`: a local assigned in a method body but never read in
+/// that body (ADR-0030 taxonomy). The FIRST `flow.*` rule — a pure AST/structural
+/// check (no flow-sensitive scopes, no typer/folding), mirroring the reference's
+/// `DeadAssignmentCollector` exactly.
+pub const FLOW_DEAD_ASSIGNMENT: &str = "flow.dead-assignment";
 
 // ---------------------------------------------------------------------------
 // analyze()
@@ -204,6 +215,31 @@ pub fn analyze_with_source(
             });
         if let Some(diag) = diag {
             out.push(diag);
+        }
+    }
+
+    // Second pass — `flow.dead-assignment` (ADR-0030). A pure AST/structural
+    // check, independent of the typer/index above: it walks each NAMED method
+    // body and fires on a plain local write never read in that body. Mirrors the
+    // reference `DeadAssignmentCollector` exactly (see `dead_assignments_in_def`).
+    // Every NAMED `def` — top-level, class/module body, or nested — lowers to a
+    // `Node::Definition { name: Some(..) }` in the arena (a class's direct `def`s
+    // are lowered statements, not synthetic copies), so iterating the arena hits
+    // each method body EXACTLY ONCE, matching the reference's full DFS over every
+    // `DefNode`. A name-less Definition (`class << self`) is skipped — the
+    // reference fires only inside named `DefNode`s. The `MethodBody` harvest on
+    // ClassDef/ModuleDef is a duplicate VIEW of these same defs (for tier-4b
+    // return inference); we deliberately do NOT walk it here, to avoid a double
+    // emit.
+    for (def_id, node) in ast.iter() {
+        if let Node::Definition {
+            name: Some(def_name),
+            body,
+            span,
+            ..
+        } = node
+        {
+            dead_assignments_in_def(ast, def_id, def_name, body, *span, &mut out);
         }
     }
 
@@ -449,6 +485,181 @@ fn check_nil_receiver(
 // Helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// flow.dead-assignment (ADR-0030) — pure AST/structural, no typer/index
+// ---------------------------------------------------------------------------
+//
+// Faithful port of `DeadAssignmentCollector` (the reference firing logic) +
+// `build_dead_assignment_diagnostic` (the message/severity/name-loc). For one
+// method body:
+//   1. Gather READ names `R`: every `LocalVariableRead.name`, PLUS every
+//      `LocalVariableOpWrite.name` (an op-write reads-then-writes its target —
+//      reference `reading_assignment?`), anywhere in the body subtree INCLUDING
+//      blocks and string interpolation. Reads do NOT stop at nested defs for the
+//      reference (`gather_read_names` has no def barrier) — but a write does, and
+//      since we only ever fire on a write found OUTSIDE a nested def, and a name
+//      read only inside a nested def cannot suppress an OUTER write that the
+//      nested def can't see... we mirror the reference precisely: reads are
+//      gathered with NO def barrier (so an inner-def read of an outer local
+//      counts as a read — closure capture), writes ARE gathered with a def
+//      barrier.
+//   2. Gather WRITE candidates `W`: every plain `LocalVariableWrite`, WITHOUT
+//      descending into a nested `Definition`/`ClassDef`/`ModuleDef`. Op-writes
+//      and multi-writes (lowered to `Other`) are never candidates.
+//   3. Trailing statement: the last node of the body list, descending through a
+//      `BeginRescue` wrapper's last statement (the reference's
+//      `trailing_statement`, which unwraps `StatementsNode`/`BeginNode`).
+//   4. Fire iff the write is NOT the trailing statement, its name does NOT start
+//      with `_`, and its name is NOT in `R`.
+
+/// Collect every `flow.dead-assignment` diagnostic for one named method body.
+///
+/// ## Why reads/writes are gathered by SPAN, not structural recursion
+///
+/// The reference's `gather_read_names`/`gather_write_nodes` recurse the real
+/// Prism tree via `compact_child_nodes` — a complete parent->child link. The
+/// rigor-rs owned arena is a *lossy* lowering: several Prism nodes (a `return`,
+/// `super`, `yield`, a `*splat` arg, …) lower to `Node::Other` and DISCARD their
+/// lowered children, orphaning any `LocalVariableRead` underneath. A structural
+/// child-walk would miss those reads and FALSELY flag a write that the reference
+/// sees as read (a confirmed FP class: `return [entries, policy]`,
+/// `super(head: frozen_head)`, `[*rest.map { … }]`).
+///
+/// The faithful, orphan-proof equivalent: every read/write node STILL lands in
+/// the flat arena (lowering is total — only the *link* is lost, not the node),
+/// and its byte span lies within the enclosing `def`'s span. So we scan the arena
+/// for reads/writes whose span is contained in this def's span. This is exactly
+/// the reference's "any read anywhere in the def subtree" set, because the def
+/// span delimits precisely that subtree.
+///
+/// * Reads have NO def barrier in the reference (a read of an outer local inside
+///   a nested `def` is a closure capture and counts) — span-containment naturally
+///   includes nested-def reads, matching that.
+/// * Writes DO have a def barrier (a nested def's writes are its own unit) — so a
+///   write is a candidate here only if it is NOT inside any nested
+///   def/class/module span that itself sits within this def.
+fn dead_assignments_in_def(
+    ast: &LoweredAst,
+    def_id: rigor_parse::NodeId,
+    def_name: &str,
+    body: &[rigor_parse::NodeId],
+    def_span: rigor_parse::Span,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Spans of nested definition units WITHIN this def (the write barrier). A
+    // nested def/class/module is one whose span is strictly inside `def_span`
+    // (i.e. not this def itself). A write inside any of these belongs to that
+    // inner unit, not this one.
+    let nested_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(id, n)| {
+            if id == def_id {
+                return None;
+            }
+            match n {
+                Node::Definition { span, .. }
+                | Node::ClassDef { span, .. }
+                | Node::ModuleDef { span, .. }
+                    if span_within(*span, def_span) =>
+                {
+                    Some(*span)
+                }
+                _ => None,
+            }
+        })
+        .collect();
+
+    // (1) read names — every read/op-write target whose span is within this def
+    // (no def barrier). Orphan-proof: the node is in the arena regardless of link.
+    let mut reads: HashSet<String> = HashSet::new();
+    // (2) write candidates — plain LocalVariableWrites within this def but NOT
+    // inside a nested unit.
+    let mut writes: Vec<rigor_parse::NodeId> = Vec::new();
+    for (id, n) in ast.iter() {
+        match n {
+            Node::LocalVariableRead { name, span } if span_within(*span, def_span) => {
+                reads.insert(name.clone());
+            }
+            Node::LocalVariableOpWrite { name, span, .. } if span_within(*span, def_span) => {
+                // An op-write READS its target (reference `reading_assignment?`).
+                reads.insert(name.clone());
+            }
+            Node::LocalVariableWrite { span, .. }
+                if span_within(*span, def_span)
+                    && !nested_spans.iter().any(|ns| span_within(*span, *ns)) =>
+            {
+                writes.push(id);
+            }
+            _ => {}
+        }
+    }
+
+    // (3) trailing statement (implicit return — its write is intentional).
+    let trailing = trailing_statement(ast, body);
+
+    let severity = catalog(FLOW_DEAD_ASSIGNMENT)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Warning);
+
+    // Emit in source order (writes were collected in arena/source order already).
+    for wid in writes {
+        let Node::LocalVariableWrite {
+            name, name_span, ..
+        } = ast.get(wid)
+        else {
+            continue;
+        };
+        // (4) the gate.
+        if Some(wid) == trailing {
+            continue;
+        }
+        if name.starts_with('_') {
+            continue;
+        }
+        if reads.contains(name) {
+            continue;
+        }
+        out.push(Diagnostic {
+            rule_id: FLOW_DEAD_ASSIGNMENT,
+            start_offset: name_span.0,
+            end_offset: name_span.1,
+            message: format!("local `{name}' assigned in `{def_name}' but never read"),
+            severity,
+            source_family: "builtin",
+            receiver_type: None,
+            method_name: None,
+        });
+    }
+}
+
+/// Whether `inner` is contained within `outer` (`outer.start <= inner.start` and
+/// `inner.end <= outer.end`). Half-open byte spans; equal spans count as within.
+fn span_within(inner: rigor_parse::Span, outer: rigor_parse::Span) -> bool {
+    outer.0 <= inner.0 && inner.1 <= outer.1
+}
+
+/// The trailing statement of a method body: the last id in `body`, descending
+/// through a `BeginRescue` / `Statements` wrapper's last statement (mirrors the
+/// reference's `trailing_statement`, which unwraps `StatementsNode`/`BeginNode`).
+/// `None` for an empty body. A write that IS the trailing statement is an
+/// implicit return and is skipped.
+fn trailing_statement(ast: &LoweredAst, body: &[rigor_parse::NodeId]) -> Option<rigor_parse::NodeId> {
+    let &last = body.last()?;
+    descend_trailing(ast, last)
+}
+
+fn descend_trailing(ast: &LoweredAst, id: rigor_parse::NodeId) -> Option<rigor_parse::NodeId> {
+    match ast.get(id) {
+        // A `begin ... end` (and the lowered Statements wrapper, which uses the
+        // same owned shape) — its last statement is the real trailing node.
+        Node::BeginRescue { body, .. } | Node::Statements { body, .. } => match body.last() {
+            Some(&inner) => descend_trailing(ast, inner),
+            None => Some(id),
+        },
+        _ => Some(id),
+    }
+}
+
 /// Render the receiver for the diagnostic message: the bare literal value for a
 /// value-pinned `Constant`, else the resolved class name.
 fn render_receiver(interner: &Interner, ty: rigor_types::TypeId, class_name: &str) -> String {
@@ -494,8 +705,12 @@ const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def"];
 /// `disable all` wildcard are checked against this set, so a `call` family token
 /// only ever expands to these three (the reference expands against its full
 /// `ALL_RULES`, but the extra ids it would add match no rigor-rs diagnostic).
-const IMPLEMENTED_RULES: &[&str] =
-    &[CALL_UNDEFINED_METHOD, CALL_WRONG_ARITY, CALL_POSSIBLE_NIL_RECEIVER];
+const IMPLEMENTED_RULES: &[&str] = &[
+    CALL_UNDEFINED_METHOD,
+    CALL_WRONG_ARITY,
+    CALL_POSSIBLE_NIL_RECEIVER,
+    FLOW_DEAD_ASSIGNMENT,
+];
 
 /// Maps a legacy short alias to its canonical id (reference `LEGACY_RULE_ALIASES`).
 /// Only the three implemented ids can ever match a real diagnostic; the remaining
@@ -1130,6 +1345,134 @@ mod tests {
         assert!(diags.is_empty(), "SecureRandom.hex must be silent, got {diags:?}");
     }
 
+    // -- flow.dead-assignment --------------------------------------------
+    //
+    // Pure AST/structural; faithful port of `DeadAssignmentCollector`. Each test
+    // mirrors a skip/fire case verified against the oracle.
+
+    /// The single dead-assignment diagnostic in `src`, or panic if not exactly 1.
+    fn dead(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == FLOW_DEAD_ASSIGNMENT)
+            .collect()
+    }
+
+    #[test]
+    fn dead_assignment_fires_on_genuine_dead_write() {
+        // `def foo; result = 1; 77; end` — `result` is written, never read, and
+        // not the trailing statement ⇒ fires. Byte-exact against the oracle.
+        let src = b"def foo\n  result = 1\n  77\nend\n";
+        let diags = dead(src);
+        assert_eq!(diags.len(), 1, "expected one dead-assignment, got {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.rule_id, FLOW_DEAD_ASSIGNMENT);
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(d.source_family, "builtin");
+        assert_eq!(d.receiver_type, None);
+        assert_eq!(d.method_name, None);
+        assert_eq!(d.message, "local `result' assigned in `foo' but never read");
+        // Anchored on the NAME token `result` (col 3 in the oracle).
+        assert_eq!(&src[d.start_offset..d.end_offset], b"result");
+    }
+
+    #[test]
+    fn dead_assignment_trailing_write_is_silent() {
+        // `def foo; result = 1; end` — the write IS the trailing statement
+        // (implicit return) ⇒ silent.
+        assert!(dead(b"def foo\n  result = 1\nend\n").is_empty());
+    }
+
+    #[test]
+    fn dead_assignment_underscore_prefix_is_silent() {
+        // `_unused` is intentionally-unused by convention ⇒ silent.
+        assert!(dead(b"def foo\n  _unused = 1\n  77\nend\n").is_empty());
+    }
+
+    #[test]
+    fn dead_assignment_op_write_read_is_silent() {
+        // THE FP-GATE CASE: `total = 0; total += 1; other` — the op-write reads
+        // `total`, so `total` is read ⇒ the plain write must NOT flag.
+        let diags = dead(b"def f\n  total = 0\n  total += 1\n  other\nend\n");
+        assert!(diags.is_empty(), "op-write read must suppress dead-assignment, got {diags:?}");
+        // and the same for ||= / &&=.
+        assert!(dead(b"def f\n  x = 0\n  x ||= 5\n  y\nend\n").is_empty());
+        assert!(dead(b"def f\n  x = 0\n  x &&= 5\n  y\nend\n").is_empty());
+    }
+
+    #[test]
+    fn dead_assignment_read_in_block_is_silent() {
+        // A read inside a block body counts as a read ⇒ silent.
+        let diags = dead(b"def f\n  x = 1\n  [1].each { |n| x }\n  77\nend\n");
+        assert!(diags.is_empty(), "block read must suppress, got {diags:?}");
+    }
+
+    #[test]
+    fn dead_assignment_read_in_interpolation_is_silent() {
+        // A read inside string interpolation counts as a read ⇒ silent.
+        let diags = dead(b"def f\n  x = 1\n  \"v=#{x}\"\n  77\nend\n");
+        assert!(diags.is_empty(), "interpolation read must suppress, got {diags:?}");
+    }
+
+    #[test]
+    fn dead_assignment_nested_def_isolation() {
+        // An OUTER write read only by an INNER def is a closure capture? No — a
+        // nested `def` is a fresh scope, but the reference gathers READS with no
+        // def barrier, so an inner read of `x` DOES count. Conversely the inner
+        // def's OWN write `y` is scanned as its own unit and fires there. Here we
+        // assert: outer `x` written+read-in-inner is silent; inner `y` dead fires
+        // (one diagnostic, anchored in the inner def).
+        let src = b"def outer\n  x = 1\n  def inner\n    y = 2\n    3\n  end\n  x\nend\n";
+        let diags = dead(src);
+        assert_eq!(diags.len(), 1, "expected one (inner y), got {diags:?}");
+        assert_eq!(diags[0].message, "local `y' assigned in `inner' but never read");
+        // And the outer write is NOT a candidate inside `inner` (def barrier on
+        // writes): `def inner` body doesn't see outer `x`.
+        assert!(!diags.iter().any(|d| d.message.contains("`x'")));
+    }
+
+    #[test]
+    fn dead_assignment_multi_write_is_silent() {
+        // `a, b = foo` lowers to `Node::Other` (no LocalVariableWrite) ⇒ never a
+        // candidate ⇒ silent, matching the reference (MultiWriteNode skipped).
+        let diags = dead(b"def f\n  a, b = bar\n  77\nend\n");
+        assert!(diags.is_empty(), "multi-write must be silent, got {diags:?}");
+    }
+
+    #[test]
+    fn dead_assignment_top_level_and_class_body_writes_are_silent() {
+        // Top-level and class/module BODY assignments are never scanned (only
+        // named def bodies are) ⇒ silent.
+        assert!(dead(b"result = 1\n77\n").is_empty());
+        assert!(dead(b"class C\n  CONST_LOCAL = 1\n  77\nend\n").is_empty());
+    }
+
+    #[test]
+    fn dead_assignment_fires_inside_class_method_body() {
+        // A genuine dead write inside a class instance method fires, named by the
+        // method (`bar`), exactly once (no double-emit from the method_bodies
+        // harvest).
+        let src = b"class C\n  def bar\n    tmp = 1\n    99\n  end\nend\n";
+        let diags = dead(src);
+        assert_eq!(diags.len(), 1, "expected one, got {diags:?}");
+        assert_eq!(diags[0].message, "local `tmp' assigned in `bar' but never read");
+    }
+
+    #[test]
+    fn dead_assignment_read_after_write_is_silent() {
+        // The basic positive-control: a write that IS later read stays silent.
+        assert!(dead(b"def f\n  x = 1\n  x\n  77\nend\n").is_empty());
+    }
+
+    #[test]
+    fn dead_assignment_begin_rescue_trailing_unwrapped() {
+        // A method whose body is a `begin ... end` — the trailing statement is the
+        // begin block's last statement. `result = 1` as that tail is an implicit
+        // return ⇒ silent.
+        let src = b"def f\n  begin\n    result = 1\n  end\nend\n";
+        assert!(dead(src).is_empty(), "begin-wrapped trailing write must be silent");
+    }
+
     #[test]
     fn catalog_entries_are_correct() {
         let entry = catalog(CALL_UNDEFINED_METHOD).expect("catalog entry must exist");
@@ -1144,6 +1487,11 @@ mod tests {
         let entry = catalog(CALL_POSSIBLE_NIL_RECEIVER).expect("catalog entry must exist");
         assert_eq!(entry.default_severity, Severity::Warning);
         assert_eq!(entry.evidence_tier, "medium");
+
+        let entry = catalog(FLOW_DEAD_ASSIGNMENT).expect("catalog entry must exist");
+        assert_eq!(entry.default_severity, Severity::Warning);
+        assert_eq!(entry.evidence_tier, "medium");
+        assert!(entry.documentation_url.contains("flow-dead-assignment"));
 
         assert!(catalog("unknown.rule").is_none());
     }

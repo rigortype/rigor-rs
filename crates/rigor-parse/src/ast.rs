@@ -77,7 +77,26 @@ pub enum Node {
     Statements { body: Vec<NodeId>, span: Span },
     /// `name = <value>`. The written local feeds the inference environment as
     /// statements are walked in order (ADR-0023 tier-0 literal typing).
-    LocalVariableWrite { name: String, value: NodeId, span: Span },
+    ///
+    /// `name_span` is the precise span of the *name* token (Prism `name_loc`),
+    /// the anchor a `flow.dead-assignment` diagnostic keys on — mirroring the
+    /// reference's `Diagnostic.from_name_loc(write_node)` (it anchors on the
+    /// declared-name span, not the whole `name = value` location).
+    LocalVariableWrite {
+        name: String,
+        value: NodeId,
+        name_span: Span,
+        span: Span,
+    },
+    /// `name OP= <value>` — an operator/and/or local write (`x += 1`, `y ||= 5`,
+    /// `z &&= w`). Lowered as a dedicated variant so the dead-assignment walk can
+    /// see the target NAME (Prism would otherwise drop these into [`Node::Other`],
+    /// losing the name). Per the reference's `reading_assignment?`, an op-write
+    /// READS its target (it reads-then-writes), so the dead-assignment walk counts
+    /// this `name` as a READ — and it is NOT itself a fireable dead-write candidate
+    /// (the reference's collector fires only on plain `LocalVariableWriteNode`).
+    /// `value` is lowered for call reachability.
+    LocalVariableOpWrite { name: String, value: NodeId, span: Span },
     /// A read of a previously-written local (`s`).
     LocalVariableRead { name: String, span: Span },
     /// A string literal (`"Hello"`); `value` is the unescaped contents.
@@ -260,6 +279,7 @@ impl Node {
             Node::Program { span, .. }
             | Node::Statements { span, .. }
             | Node::LocalVariableWrite { span, .. }
+            | Node::LocalVariableOpWrite { span, .. }
             | Node::LocalVariableRead { span, .. }
             | Node::StringLit { span, .. }
             | Node::InterpolatedString { span, .. }
@@ -386,7 +406,42 @@ impl Builder {
             return self.push(Node::LocalVariableWrite {
                 name,
                 value,
+                name_span: span_of(&write.name_loc()),
                 span: span_of(&write.location()),
+            });
+        }
+
+        // Operator / and / or local writes (`x += 1`, `y ||= 5`, `z &&= w`). All
+        // three lower to the same owned variant: their target name is a READ of
+        // the prior binding (mirrors the reference `reading_assignment?`), and the
+        // assigned value is lowered for call reachability. Without this variant
+        // they fall through to `Node::Other` and the dead-assignment walk loses
+        // sight of the target read — the one false-positive risk this rule has.
+        if let Some(opw) = node.as_local_variable_operator_write_node() {
+            let name = constant_string(opw.name().as_slice());
+            let value = self.lower_node(&opw.value());
+            return self.push(Node::LocalVariableOpWrite {
+                name,
+                value,
+                span: span_of(&opw.location()),
+            });
+        }
+        if let Some(andw) = node.as_local_variable_and_write_node() {
+            let name = constant_string(andw.name().as_slice());
+            let value = self.lower_node(&andw.value());
+            return self.push(Node::LocalVariableOpWrite {
+                name,
+                value,
+                span: span_of(&andw.location()),
+            });
+        }
+        if let Some(orw) = node.as_local_variable_or_write_node() {
+            let name = constant_string(orw.name().as_slice());
+            let value = self.lower_node(&orw.value());
+            return self.push(Node::LocalVariableOpWrite {
+                name,
+                value,
+                span: span_of(&orw.location()),
             });
         }
 
@@ -949,28 +1004,58 @@ impl Builder {
             });
         }
         if let Some(interp) = node.as_interpolated_symbol_node() {
-            let _parts: Vec<NodeId> = interp
+            // `:"sym#{x}"` — lower and KEEP the parts linked (a `Statements`
+            // carrier, NOT InterpolatedString: a symbol must not type as String,
+            // which would risk a `String#typo` false positive). The link keeps a
+            // local read inside the interpolation visible to structural walks like
+            // `flow.dead-assignment`; `Statements` itself types Dynamic.
+            let parts: Vec<NodeId> = interp
                 .parts()
                 .iter()
                 .map(|p| self.lower_node(&p))
                 .collect();
-            return self.push(Node::Other {
+            return self.push(Node::Statements {
+                body: parts,
                 span: span_of(&interp.location()),
             });
         }
         if let Some(embedded) = node.as_embedded_statements_node() {
-            // The `#{ … }` inside a string: lower its statements.
-            if let Some(s) = embedded.statements() {
-                self.lower_body(&s.body());
-            }
-            return self.push(Node::Other {
+            // The `#{ … }` inside a string: lower its statements and KEEP the link
+            // (a `Statements` wrapper, mirroring Prism's tree shape). The link
+            // matters for structural walks — `flow.dead-assignment` must see a
+            // local read inside interpolation (`"v=#{x}"` reads `x`); orphaning
+            // the lowered statements would lose that read. (The env-builder only
+            // descends a `Statements` that is a direct body statement, so a nested
+            // interpolation wrapper has no effect there.)
+            let body = embedded
+                .statements()
+                .map(|s| self.lower_body(&s.body()))
+                .unwrap_or_default();
+            return self.push(Node::Statements {
+                body,
                 span: span_of(&embedded.location()),
             });
         }
 
-        // Anything outside the handled subset lowers to a span-only placeholder
-        // so the walk is total (ADR-0012/0016).
-        self.push(Node::Other { span })
+        // Anything outside the handled subset: RECOVER any meaningful descendant
+        // nodes (local reads / op-writes / calls) so structural walks see them.
+        //
+        // The long tail of Prism nodes (`return`, `super`, `yield`, a `*splat`
+        // arg, a block-arg, an assoc-splat, …) has no owned variant. Lowering them
+        // to a bare span-only `Other` would DROP their subtree — and with it any
+        // `LocalVariableRead` underneath. For `flow.dead-assignment` that is a
+        // false-positive source: `return [entries, policy]` / `super(x: a)` /
+        // `[*rest.map { … }]` read locals that would then look unread. We collect
+        // the relevant descendant nodes via the Prism `Visit` recursion and lower
+        // each into the arena, linked under a `Statements` carrier (Dynamic-typed;
+        // purely a reachability handle). This also keeps a CALL inside such a
+        // wrapper reachable for the existing call rules — a strict improvement.
+        let recovered = collect_recoverable_children(node);
+        if recovered.is_empty() {
+            return self.push(Node::Other { span });
+        }
+        let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
+        self.push(Node::Statements { body, span })
     }
 
     /// Lower a Prism `NodeList` body (statement sequence) into owned ids in
@@ -1185,6 +1270,72 @@ fn span_of(loc: &ruby_prism::Location<'_>) -> Span {
     (loc.start_offset(), loc.end_offset())
 }
 
+/// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
+/// node — a local read / write / operator-write / call — WITHOUT descending past
+/// one (so [`Builder::lower_node`] recurses into it once, normally). Used by the
+/// catch-all to recover reads/calls buried under a wrapper Prism node that has no
+/// owned variant (`return`, `super`, `*splat`, …), keeping them visible to
+/// structural walks like `flow.dead-assignment` and the call rules.
+///
+/// We deliberately do NOT collect a `def`/`class`/`module` here: those are not
+/// found inside expression wrappers in practice, and recovering one flatly (no
+/// owned `Definition`) would confuse the dead-assignment nested-unit barrier.
+fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+    use ruby_prism::Visit;
+    struct Collector<'a, 'pr> {
+        out: &'a mut Vec<PrismNode<'pr>>,
+    }
+    // Override each recoverable node type to RECORD it and stop (do not recurse —
+    // `lower_node` will recurse into it once, normally). Every OTHER node type
+    // keeps the trait's default recursion, so we descend through the unhandled
+    // wrapper(s) until we reach the outermost recoverable nodes. This guarantees
+    // each recoverable node is collected exactly once (no double-lowering, which
+    // for a call would otherwise mint a duplicate diagnostic).
+    impl<'pr> Visit<'pr> for Collector<'_, 'pr> {
+        fn visit_local_variable_read_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableReadNode<'pr>,
+        ) {
+            self.out.push(node.as_node());
+        }
+        fn visit_local_variable_write_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableWriteNode<'pr>,
+        ) {
+            self.out.push(node.as_node());
+        }
+        fn visit_local_variable_operator_write_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
+        ) {
+            self.out.push(node.as_node());
+        }
+        fn visit_local_variable_and_write_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableAndWriteNode<'pr>,
+        ) {
+            self.out.push(node.as_node());
+        }
+        fn visit_local_variable_or_write_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableOrWriteNode<'pr>,
+        ) {
+            self.out.push(node.as_node());
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            self.out.push(node.as_node());
+        }
+    }
+    let mut out = Vec::new();
+    let mut c = Collector { out: &mut out };
+    // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
+    // the unhandled root. The default `visit` dispatches the root to its own
+    // (non-overridden) per-type method, which recurses into children — exactly
+    // what we want for the root wrapper.
+    c.visit(node);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1225,6 +1376,42 @@ mod tests {
         });
         assert!(has_write, "expected a LocalVariableWrite for `s`");
         assert!(has_str, "expected a StringLit \"Hello\"");
+    }
+
+    #[test]
+    fn lowers_operator_and_or_writes_to_op_write_variant() {
+        // `x += 1`, `y ||= 2`, `z &&= w` all lower to LocalVariableOpWrite with
+        // their target name preserved (so the dead-assignment walk sees the
+        // implicit read). Each must lower its assigned value for reachability.
+        for (src, name) in [
+            (&b"x = 0\nx += 1\n"[..], "x"),
+            (&b"y = 0\ny ||= 2\n"[..], "y"),
+            (&b"z = 0\nz &&= 3\n"[..], "z"),
+        ] {
+            let ast = lower(&crate::parse(src));
+            let found = ast.iter().any(|(_, n)| {
+                matches!(n, Node::LocalVariableOpWrite { name: nm, .. } if nm == name)
+            });
+            assert!(found, "expected LocalVariableOpWrite for `{name}` in {src:?}");
+        }
+    }
+
+    #[test]
+    fn local_write_records_name_span() {
+        // The name_span anchors on the NAME token only (`result`), not the whole
+        // `result = 1` — mirroring the reference's `from_name_loc`.
+        let src = b"result = 1\n";
+        let ast = lower(&crate::parse(src));
+        let name_span = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::LocalVariableWrite { name, name_span, .. } if name == "result" => {
+                    Some(*name_span)
+                }
+                _ => None,
+            })
+            .expect("expected a LocalVariableWrite for `result`");
+        assert_eq!(&src[name_span.0..name_span.1], b"result");
     }
 
     #[test]

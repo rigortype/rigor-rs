@@ -269,6 +269,7 @@ fn node_kind(node: &Node) -> &'static str {
         Node::Program { .. } => "Program",
         Node::Statements { .. } => "Statements",
         Node::LocalVariableWrite { .. } => "LocalVariableWrite",
+        Node::LocalVariableOpWrite { .. } => "LocalVariableOpWrite",
         Node::LocalVariableRead { .. } => "LocalVariableRead",
         Node::StringLit { .. } => "StringLit",
         Node::InterpolatedString { .. } => "InterpolatedString",

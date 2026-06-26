@@ -57,8 +57,8 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
-the reference's own source; matched scales with the sweep — 542 at this size, 100%
-precision). 266 tests. The design (ADR 0001–0031) is audited and stable. The
+the reference's own source; matched scales with the sweep — 558 at this size, 100%
+precision). 280 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 266 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 280 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -298,8 +298,22 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   of the receiver (was a chained-`.new` FP).
 - ⬜ `call.self-undefined-method` (ships `:off`; needs subclass-aware gate) · `call.unresolved-toplevel`
   (ref ADR-34) · `call.argument-type-mismatch` (ref ADR-64).
+- ✅ `flow.dead-assignment` — **the first `flow.* rule`**. A pure AST/structural check (no
+  flow-sensitive scopes, no typer/folding): a local assigned in a NAMED method body but never
+  read in that body fires `warning` (`local \`x' assigned in \`m' but never read`), anchored on
+  the name token. Faithful port of `DeadAssignmentCollector` — op-write/and/or-write targets
+  count as READS (so `total += 1` suppresses), trailing-write (implicit return) / `_`-prefix /
+  multi-write are skipped, nested defs are their own unit. Reads/writes are gathered by
+  **span-containment over the def span** (orphan-proof: several Prism wrappers — `return`,
+  `super`, `*splat` — lower lossily; a structural child-walk would miss reads underneath and
+  FALSE-flag). Closing that gap required a lowering fix: a new `Node::LocalVariableOpWrite`
+  variant (op/and/or-writes) + recovering reads/calls buried under unhandled wrapper nodes
+  (the catch-all now lowers descendant reads/calls instead of dropping the subtree).
+  **+0 net corpus fires** in this unusually-clean corpus (accepted — the value is the net-new
+  `flow.*` family + the adversarial-fixture FP guarantee); 0 FP across 3829 corpus files.
 - ⬜ `flow.always-raises` · `flow.unreachable-branch` · `flow.unreachable-clause` (ref ADR-47) ·
-  `flow.dead-assignment` · `flow.always-truthy-condition`.
+  `flow.always-truthy-condition` (deferred — needs the ADR-0022 flow-scope substrate, i.e.
+  flow-sensitive scopes + narrowing in §4, which `dead-assignment` deliberately does NOT use).
 - ⬜ `def.return-type-mismatch` · `def.method-visibility-mismatch` · `def.override-*` (ref ADR-35) ·
   `def.ivar-write-mismatch` (ref ADR-58).
 - ⬜ `dump.type` / `assert.type-mismatch`; discriminated-union narrowing (ref ADR-66);
