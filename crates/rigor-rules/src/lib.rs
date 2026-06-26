@@ -873,6 +873,37 @@ mod tests {
     }
 
     #[test]
+    fn in_source_return_chain_typo_is_witnessed() {
+        // ADR-0023 tier-4b: `user.full_name.lenght` where `def full_name;
+        // "#{a} #{b}"; end` infers full_name : String, so `.lenght` on the
+        // String result is witnessed against the real String RBS.
+        let src = b"class User\n  def full_name\n    \"#{first} #{last}\"\n  end\nend\nuser = User.new\nuser.full_name.lenght\n";
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(diags[0].method_name.as_deref(), Some("lenght"));
+        assert_eq!(diags[0].receiver_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn in_source_return_chain_valid_call_stays_silent() {
+        // The other side: a VALID method on the inferred core return must NOT
+        // fire — `full_name : String`, and `.length` is valid on String.
+        let src = b"class User\n  def full_name\n    \"#{first} #{last}\"\n  end\nend\nuser = User.new\nuser.full_name.length\n";
+        let diags = run(src);
+        assert!(diags.is_empty(), "valid String#length on the inferred return must be silent, got {diags:?}");
+    }
+
+    #[test]
+    fn in_source_param_dependent_return_is_silent() {
+        // A param-dependent method types Dynamic ⇒ no return entry ⇒ the chained
+        // call stays silent (the zero-FP keystone for tier-4b).
+        let src = b"class C\n  def echo(x)\n    x\n  end\nend\nc = C.new\nc.echo(\"a\").lenght\n";
+        let diags = run(src);
+        assert!(diags.is_empty(), "param-dependent return must not be witnessed, got {diags:?}");
+    }
+
+    #[test]
     fn block_call_result_valid_call_stays_silent() {
         // The other side of the recovery: a VALID method on the (correctly
         // modeled) block result must NOT fire — `Hash#select { }` returns Hash,

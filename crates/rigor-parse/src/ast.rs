@@ -41,6 +41,18 @@ pub struct NodeId(pub u32);
 /// Prism columns are 0-based, the presenter adds 1).
 pub type Span = (usize, usize);
 
+/// A direct instance method harvested for ADR-0023 tier-4b RETURN inference:
+/// the method `name`, the lowered `body` statement ids (so the return
+/// expression can be typed), and `has_explicit_return` (any `return` in the
+/// Prism body ⇒ the inference declines). Carried on [`Node::ClassDef`] /
+/// [`Node::ModuleDef`] alongside the method-name list.
+#[derive(Clone, Debug)]
+pub struct MethodBody {
+    pub name: String,
+    pub body: Vec<NodeId>,
+    pub has_explicit_return: bool,
+}
+
 /// One owned node. Mirrors a minimal Prism subset (ADR-0012); every variant
 /// carries the byte [`Span`] needed to key a diagnostic (ADR-0030).
 #[derive(Clone, Debug)]
@@ -97,7 +109,22 @@ pub enum Node {
     /// A definition (`def` / singleton class). Carries its lowered body
     /// statements only — a definition is not a value, so the typer never types
     /// it; the body is lowered purely so nested calls are reachable.
-    Definition { body: Vec<NodeId>, span: Span },
+    ///
+    /// `name` is the method name for an instance/singleton `def` (`None` for a
+    /// singleton-class `class << self` body, which has no single name). It is
+    /// retained for ADR-0023 tier-4b in-source RETURN-type inference: the
+    /// SourceIndex pairs a class's direct instance method with its body so the
+    /// method's return expression can be typed. `has_explicit_return` is `true`
+    /// iff a `return` statement appears ANYWHERE in the Prism def body — the
+    /// tier-4b gate declines (stores no return entry) whenever it is set, because
+    /// we only look at the tail expression and an explicit `return` could carry a
+    /// different type (the reference unions both; we conservatively decline).
+    Definition {
+        name: Option<String>,
+        has_explicit_return: bool,
+        body: Vec<NodeId>,
+        span: Span,
+    },
     /// A `class` definition with structure (ADR-0023 tier-4 in-source typing):
     /// the constant-path `name` (`"Point"`, `"Foo::Bar"`), the written
     /// `superclass` name if any (`< Bar` -> `Some("Bar")`, a path keeps its last
@@ -110,6 +137,13 @@ pub enum Node {
         name: String,
         superclass: Option<String>,
         methods: Vec<String>,
+        /// Per direct instance method: `(name, lowered body node ids,
+        /// has_explicit_return)`. Parallel to `methods` (same inclusion rule —
+        /// instance-only, direct, `def self.x`/nested-class/conditional defs
+        /// excluded) but carries the lowered body so ADR-0023 tier-4b can type
+        /// the method's RETURN expression. Kept SEPARATE from `methods` so the
+        /// existing `SourceIndex::add_source` signature and tests are untouched.
+        method_bodies: Vec<MethodBody>,
         body: Vec<NodeId>,
         span: Span,
     },
@@ -120,6 +154,9 @@ pub enum Node {
     ModuleDef {
         name: String,
         methods: Vec<String>,
+        /// Per direct instance method `(name, body ids, has_explicit_return)`.
+        /// See [`Node::ClassDef::method_bodies`].
+        method_bodies: Vec<MethodBody>,
         body: Vec<NodeId>,
         span: Span,
     },
@@ -444,7 +481,22 @@ impl Builder {
             // already `Dynamic[top]` (silent), the zero-FP-safe choice — binding
             // a param to a guessed type could mint a false `undefined-method`.
             let body = self.lower_optional_body(def.body().as_ref());
+            // Retain the method name (None for a receiver-bearing `def self.x` /
+            // `def obj.x` — a singleton method, never an instance method, so it
+            // must not be harvested as a tier-4b instance-method body) and whether
+            // any explicit `return` appears in the body (the tier-4b decline gate).
+            let name = def
+                .receiver()
+                .is_none()
+                .then(|| constant_string(def.name().as_slice()));
+            let has_explicit_return = def
+                .body()
+                .as_ref()
+                .map(body_has_explicit_return)
+                .unwrap_or(false);
             return self.push(Node::Definition {
+                name,
+                has_explicit_return,
                 body,
                 span: span_of(&def.location()),
             });
@@ -466,10 +518,19 @@ impl Builder {
                 .map(direct_method_names)
                 .unwrap_or_default();
             let body = self.lower_optional_body(class.body().as_ref());
+            // Harvest per-method bodies for tier-4b RETURN inference. The DIRECT
+            // children of the lowered class body (lower_optional_body flattens the
+            // Statements wrapper) are exactly the body's top-level statements, so
+            // a direct, named `Definition` among them is a direct instance method
+            // — the same inclusion rule as `direct_method_names` (`def self.x`
+            // lowers to a name-less Definition and is skipped; a def nested in a
+            // conditional/inner class is not a direct child and is skipped).
+            let method_bodies = self.harvest_method_bodies(&body);
             return self.push(Node::ClassDef {
                 name,
                 superclass,
                 methods,
+                method_bodies,
                 body,
                 span: span_of(&class.location()),
             });
@@ -483,9 +544,11 @@ impl Builder {
                 .map(direct_method_names)
                 .unwrap_or_default();
             let body = self.lower_optional_body(module.body().as_ref());
+            let method_bodies = self.harvest_method_bodies(&body);
             return self.push(Node::ModuleDef {
                 name,
                 methods,
+                method_bodies,
                 body,
                 span: span_of(&module.location()),
             });
@@ -494,6 +557,8 @@ impl Builder {
         if let Some(sclass) = node.as_singleton_class_node() {
             let body = self.lower_optional_body(sclass.body().as_ref());
             return self.push(Node::Definition {
+                name: None, // `class << self` has no single method name.
+                has_explicit_return: false,
                 body,
                 span: span_of(&sclass.location()),
             });
@@ -907,6 +972,31 @@ impl Builder {
             }
         }
     }
+
+    /// Harvest the `(name, body, has_explicit_return)` of every DIRECT instance
+    /// method from the already-lowered class/module body's direct-child ids. A
+    /// direct child that is a `Definition` with a `name` (i.e. an instance `def`
+    /// — `def self.x` lowered to a name-less Definition) is a direct instance
+    /// method; its lowered body and explicit-return flag are recorded for
+    /// ADR-0023 tier-4b. Reads the arena read-only (the nodes already exist).
+    fn harvest_method_bodies(&self, direct_children: &[NodeId]) -> Vec<MethodBody> {
+        direct_children
+            .iter()
+            .filter_map(|&id| match &self.nodes[id.0 as usize] {
+                Node::Definition {
+                    name: Some(name),
+                    has_explicit_return,
+                    body,
+                    ..
+                } => Some(MethodBody {
+                    name: name.clone(),
+                    body: body.clone(),
+                    has_explicit_return: *has_explicit_return,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 /// Decode a Prism `ConstantId` byte slice (a method / variable name) to an
@@ -989,6 +1079,30 @@ fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
         collect(body, &mut names);
     }
     names
+}
+
+/// Whether a Prism `def` body contains an explicit `return` statement ANYWHERE
+/// (ADR-0023 tier-4b decline gate). We only infer a return type from the body's
+/// TAIL expression; an explicit `return` could carry a different type on another
+/// path (the reference unions explicit returns + the tail — we take only the
+/// tail), so the presence of ANY `return` makes us decline. A `ReturnVisitor`
+/// walks the whole subtree (the default `Visit` recursion) and trips on the
+/// first `ReturnNode`. A return nested inside a block/lambda/inner def also trips
+/// it — conservatively safe (decline is never a false positive).
+fn body_has_explicit_return(body: &PrismNode<'_>) -> bool {
+    use ruby_prism::Visit;
+    struct ReturnVisitor {
+        found: bool,
+    }
+    impl<'pr> Visit<'pr> for ReturnVisitor {
+        fn visit_return_node(&mut self, _node: &ruby_prism::ReturnNode<'pr>) {
+            self.found = true;
+            // No need to recurse further once found.
+        }
+    }
+    let mut v = ReturnVisitor { found: false };
+    v.visit(body);
+    v.found
 }
 
 /// Convert a Prism `Location` to a byte-offset [`Span`].
@@ -1297,6 +1411,70 @@ mod tests {
         assert_eq!(defs.len(), 2);
         assert_eq!(defs[0], ("C".to_string(), vec!["a".to_string()]));
         assert_eq!(defs[1], ("C".to_string(), vec!["b".to_string()]));
+    }
+
+    /// The `method_bodies` of the single ClassDef in `ast`.
+    fn class_method_bodies(ast: &LoweredAst) -> Vec<MethodBody> {
+        ast.iter()
+            .find_map(|(_, n)| match n {
+                Node::ClassDef { method_bodies, .. } => Some(method_bodies.clone()),
+                _ => None,
+            })
+            .expect("expected a ClassDef node")
+    }
+
+    #[test]
+    fn harvests_method_body_with_name() {
+        // `def full_name; "#{first} #{last}"; end` — harvested as ("full_name",
+        // <non-empty body>, has_explicit_return=false).
+        let src = b"class User\n  def full_name\n    \"#{first} #{last}\"\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let mbs = class_method_bodies(&ast);
+        assert_eq!(mbs.len(), 1);
+        assert_eq!(mbs[0].name, "full_name");
+        assert!(!mbs[0].body.is_empty(), "body ids must be captured");
+        assert!(!mbs[0].has_explicit_return);
+    }
+
+    #[test]
+    fn harvest_excludes_singleton_def() {
+        // `def self.make` is a singleton method — not harvested as a tier-4b body.
+        let src = b"class C\n  def self.make\n    1\n  end\n  def go\n    2\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let mbs = class_method_bodies(&ast);
+        let names: Vec<_> = mbs.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(names, vec!["go".to_string()]);
+    }
+
+    #[test]
+    fn harvest_excludes_nested_and_conditional_defs() {
+        // A def inside an `if` and a def inside an inner class are NOT direct
+        // children of the outer class body, so they are not harvested for it.
+        let src = b"class Outer\n  def direct\n    1\n  end\n  if cond\n    def conditional\n      2\n    end\n  end\n  class Inner\n    def nested\n      3\n    end\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        // Locate the OUTER ClassDef (name "Outer") specifically.
+        let mbs = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::ClassDef { name, method_bodies, .. } if name == "Outer" => {
+                    Some(method_bodies.clone())
+                }
+                _ => None,
+            })
+            .expect("expected an Outer ClassDef");
+        let names: Vec<_> = mbs.iter().map(|m| m.name.clone()).collect();
+        assert_eq!(names, vec!["direct".to_string()]);
+    }
+
+    #[test]
+    fn harvest_records_has_explicit_return() {
+        // A body with `return` is flagged; a tail-only body is not.
+        let with = lower(&crate::parse(
+            b"class C\n  def m\n    return 1 if x\n    2\n  end\nend\n",
+        ));
+        assert!(class_method_bodies(&with)[0].has_explicit_return);
+        let without = lower(&crate::parse(b"class C\n  def m\n    1\n  end\nend\n"));
+        assert!(!class_method_bodies(&without)[0].has_explicit_return);
     }
 
     #[test]

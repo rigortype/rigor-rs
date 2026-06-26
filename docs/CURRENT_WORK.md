@@ -56,13 +56,16 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 ## ▶ Resume here (next session)
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
-**0 false positives across 2458 real files** (mastodon, gitlab-foss, conference-app,
-the reference's own source), **367/367 matched** (100% precision). 190 tests. The
-design (ADR 0001–0031) is audited and stable. The 2026-06-26 session (a) aligned the
-undefined-method rule with the reference's leniency, (b) closed lowering-traversal +
-interpolated-string gaps, (c) landed **class-method (singleton) witnessing** with a
-cross-file project index, and (d) fixed a pre-existing block-call FP class. See the
-note below.
+**0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
+the reference's own source; matched scales with the sweep — 542 at this size, 100%
+precision). 209 tests. The design (ADR 0001–0031) is audited and stable. The
+2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
+(b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
+(singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
+block-call FP class, then in a follow-on pass: (e) **recovered block-call return
+typing** (RBS block-overload derived), (f) added **gitlab/checkstyle/junit/teamcity
+formats + CI auto-detection**, and (g) landed **cross-file in-source method RETURN-TYPE
+inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
@@ -91,12 +94,17 @@ ruby -I/Users/megurine/repo/ruby/rigor/lib /Users/megurine/repo/ruby/rigor/exe/r
 is **96%** of error/warning diagnostics — so coverage comes from *typing more receivers*
 precisely, not new rules. The remaining gap is mostly **Rails** receivers needing
 project-RBS / plugins):
-1. **Cross-file in-source RETURN-TYPE inference** (ADR-0023 tier-4 body inference, ⬜) —
-   the real in-source coverage lever (NOT witnessing on in-source instances, which the
-   reference is lenient about). Infer a project method's return type so a chained call
-   lands on a *core/RBS* receiver that DOES witness (`user.full_name.lenght` where
-   `full_name : String`). The project-wide `SourceIndex::build_project` substrate now
-   EXISTS (landed for the singleton gate) — extend it with per-method body inference.
+1. 🟡 **Cross-file in-source RETURN-TYPE inference** (ADR-0023 tier-4 body inference) —
+   **minimal slice LANDED** (this session): `SourceIndex` Pass-3 `infer_method_returns`
+   types a project method's TAIL expression under an EMPTY `TypeEnv` and, when it yields a
+   concrete **core/RBS** class, interns that core nominal so a chained typo witnesses
+   (`user.full_name.lenght` where `full_name : String`). Zero-FP by strict
+   under-approximation (witness set ⊆ reference): declines on explicit `return`, branch/loop
+   tail, param/ivar/self dependence (empty env ⇒ Dynamic), in-source method-call tail, and
+   reopen disagreement. **Deferred (next increments):** call-site param binding (`def n(x); x; end`),
+   cross-method-call return inference + fixpoint (ref ADR-55/56), branch/explicit-return
+   UNION (needs a union-consuming witness site), ivar/self typing (ADR-0022 flow), singleton
+   (`def self.x`) return inference. These are the remaining in-source coverage levers.
 2. ✅ **Drop-in readiness landed** (this session): inline `# rigor:disable` suppression,
    minimal `.rigor.yml` (disable/exclude), `github` + `sarif` + `gitlab` + `checkstyle` +
    `junit` + `teamcity` output (all four new formats byte-identical to the reference) and

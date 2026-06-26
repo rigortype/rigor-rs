@@ -40,8 +40,8 @@
 use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
-use rigor_parse::{LoweredAst, Node};
-use rigor_types::ClassId;
+use rigor_parse::{LoweredAst, MethodBody, Node};
+use rigor_types::{ClassId, Interner};
 
 /// The first [`ClassId`] handed out by the per-run registry. Chosen well above
 /// the fixed core-class id space (`CORE_CLASSES`, currently 9 entries) so a
@@ -72,6 +72,14 @@ pub struct SourceIndex {
     names: Vec<String>,
     /// Fast name -> registry position lookup.
     name_to_id: HashMap<String, u32>,
+    /// ADR-0023 tier-4b: `(class NAME, method NAME) -> inferred CORE class NAME`
+    /// (e.g. `("User", "full_name") -> "String"`). Populated in a Pass 3 of
+    /// [`build_project`] for direct instance methods whose RETURN (tail)
+    /// expression types — under an EMPTY env — to a concrete core/RBS class.
+    /// Keyed by NAME (cross-file safe); the value is a core class NAME re-interned
+    /// at the call site via [`CoreIndex::class_id`]. A method that fails ANY gate
+    /// has NO entry ⇒ the call types Dynamic (silent).
+    method_returns: HashMap<(String, String), String>,
 }
 
 impl SourceIndex {
@@ -141,6 +149,13 @@ impl SourceIndex {
             }
         }
 
+        // Pass 3 (ADR-0023 tier-4b): infer per-method RETURN types. Runs AFTER the
+        // source/registry maps are complete (so a Typer over `&idx` sees every
+        // project class), and produces a fresh map that is then assigned — we must
+        // NOT mutate `idx.method_returns` while `&idx` is immutably borrowed for
+        // typing, so the inference returns a value.
+        idx.method_returns = infer_method_returns(&idx, core, asts);
+
         idx
     }
 
@@ -191,6 +206,34 @@ impl SourceIndex {
         self.names
             .get((class.0 - SOURCE_CLASS_BASE) as usize)
             .map(|s| s.as_str())
+    }
+
+    /// The inferred CORE return-class NAME for a project method `(class,
+    /// method)`, if tier-4b inferred one. `None` ⇒ no entry ⇒ the call types
+    /// Dynamic (silent). Re-intern at the call site via [`CoreIndex::class_id`].
+    ///
+    /// [`CoreIndex::class_id`]: rigor_index::CoreIndex::class_id
+    pub fn method_return(&self, class: &str, method: &str) -> Option<&str> {
+        self.method_returns
+            .get(&(class.to_string(), method.to_string()))
+            .map(|s| s.as_str())
+    }
+
+    /// The SOURCE class name behind a `Nominal { class }` whose `ClassId` is in
+    /// the source registry range. `None` for a core-range id or a non-Nominal
+    /// carrier. This is the source-side companion to the core
+    /// `CoreIndex::class_name_of` (which returns `None` for a source-range id):
+    /// the tier-4b call hook uses it to recover the receiver's project-class name
+    /// so it can look up that class's inferred method return.
+    pub fn class_name_for_id_of(
+        &self,
+        interner: &Interner,
+        ty: rigor_types::TypeId,
+    ) -> Option<&str> {
+        match interner.get(ty) {
+            rigor_types::Type::Nominal { class, .. } => self.class_name_for_id(*class),
+            _ => None,
+        }
     }
 
     /// Decide whether `class_name` is known to LACK `method`, consulting the
@@ -255,5 +298,281 @@ impl SourceIndex {
                 }
             }
         }
+    }
+}
+
+/// ADR-0023 tier-4b RETURN inference (the zero-FP minimal slice). For every
+/// direct instance method `(class C, method m, body b)` harvested across all
+/// `asts`, type `m`'s RETURN (tail) expression under an EMPTY [`TypeEnv`] using a
+/// [`Typer`] over `core` + the already-built `idx`, and record `(C, m) -> core
+/// class NAME` ONLY when the tail types to a concrete core/RBS class.
+///
+/// ## Why an EMPTY env is the whole safety argument
+///
+/// Typing the body under an empty env means any dependence on params / `self` /
+/// ivars / branches / OTHER in-source methods naturally yields `Dynamic` (a param
+/// read isn't bound, an ivar/self/unknown-constant types Dynamic, an in-source
+/// method call resolves to a source Nominal whose core name is `None`), so the
+/// concrete-core-class gate declines automatically. The witnessed return set is a
+/// strict subset of the reference's body inference.
+///
+/// ## The gates (any failure ⇒ NO entry; see `check_rules` parity notes)
+///
+/// 1. Direct instance method — already guaranteed by harvesting (only named,
+///    direct `Definition`s are in `method_bodies`; `def self.x` is excluded).
+/// 2. Empty/absent body ⇒ decline.
+/// 3. `has_explicit_return` (any `return` in the body) ⇒ decline — we read only
+///    the tail; an explicit return could carry a different type.
+/// 4. The tail is a branch/loop carrier (`If`/`Case`/`Loop`/`Logical`/
+///    `BeginRescue`) ⇒ decline — no single concrete return.
+/// 5. The tail types (empty env) to anything but a concrete core/RBS class
+///    (Dynamic, a source Nominal, or `!knows_class`) ⇒ decline. This single
+///    check subsumes param/ivar/self/unknown-constant/in-source-call/
+///    non-foldable-call — all already Dynamic under the empty env.
+/// 6. Reopen disagreement: the same `(C, m)` inferred twice with DIFFERENT core
+///    returns ⇒ remove the entry (decline). Same return twice ⇒ keep.
+fn infer_method_returns(
+    idx: &SourceIndex,
+    core: &CoreIndex,
+    asts: &[&LoweredAst],
+) -> HashMap<(String, String), String> {
+    let typer = crate::Typer::with_source(core, idx);
+    let empty_env = crate::TypeEnv::new();
+
+    let mut returns: HashMap<(String, String), String> = HashMap::new();
+    // Track keys seen with a DISAGREEING reopen so they are never re-added.
+    let mut disagreed: HashSet<(String, String)> = HashSet::new();
+
+    for ast in asts {
+        for (_, node) in ast.iter() {
+            let (class_name, method_bodies) = match node {
+                Node::ClassDef { name, method_bodies, .. } if !name.is_empty() => {
+                    (name.as_str(), method_bodies)
+                }
+                Node::ModuleDef { name, method_bodies, .. } if !name.is_empty() => {
+                    (name.as_str(), method_bodies)
+                }
+                _ => continue,
+            };
+            for mb in method_bodies {
+                let Some(core_name) =
+                    infer_one_return(ast, &typer, core, &empty_env, mb)
+                else {
+                    continue;
+                };
+                let key = (class_name.to_string(), mb.name.clone());
+                if disagreed.contains(&key) {
+                    continue; // a prior reopen disagreed ⇒ stay declined.
+                }
+                match returns.get(&key) {
+                    Some(prev) if prev != &core_name => {
+                        // Gate 6: disagreeing reopens ⇒ remove + blacklist.
+                        returns.remove(&key);
+                        disagreed.insert(key);
+                    }
+                    _ => {
+                        returns.insert(key, core_name);
+                    }
+                }
+            }
+        }
+    }
+    returns
+}
+
+/// Run gates 2–5 for one method body and return the inferred CORE class NAME, or
+/// `None` to decline. Uses a fresh scratch [`Interner`] per call (the inferred
+/// NAME is what we keep; the interned ids are throwaway, re-interned at the call
+/// site against the analysis interner).
+fn infer_one_return(
+    ast: &LoweredAst,
+    typer: &crate::Typer<'_>,
+    core: &CoreIndex,
+    empty_env: &crate::TypeEnv,
+    mb: &MethodBody,
+) -> Option<String> {
+    // Gate 3: any explicit `return` ⇒ decline.
+    if mb.has_explicit_return {
+        return None;
+    }
+    // Gate 2: empty/absent body ⇒ decline. The return expression is the LAST
+    // direct statement (lowering flattened the Statements wrapper).
+    let &ret_id = mb.body.last()?;
+
+    // Gate 4: a branch/loop carrier tail has no single concrete return ⇒ decline.
+    if is_branch_carrier(ast.get(ret_id)) {
+        return None;
+    }
+
+    // Gate 5: type the tail under the EMPTY env; keep ONLY a concrete core/RBS
+    // class. A scratch interner is fine — we discard the ids and keep the name.
+    let mut scratch = Interner::new();
+    let ty = typer.type_of(ast, ret_id, empty_env, &mut scratch);
+    let core_name = core.class_name_of(&scratch, ty)?;
+    if core.knows_class(core_name) {
+        Some(core_name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Whether a tail node is a branch/loop carrier whose type is not a single
+/// concrete class (gate 4). `BeginRescue` also covers a lowered parenthesized
+/// expression and an inline `rescue` body — both decline conservatively.
+fn is_branch_carrier(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::If { .. }
+            | Node::Case { .. }
+            | Node::Loop { .. }
+            | Node::Logical { .. }
+            | Node::BeginRescue { .. }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    fn lower_src(src: &[u8]) -> LoweredAst {
+        lower(&parse(src))
+    }
+
+    /// Build a PROJECT index over one source string.
+    fn build_one(src: &[u8], core: &CoreIndex) -> (LoweredAst, SourceIndex) {
+        let ast = lower_src(src);
+        let idx = SourceIndex::build(&ast, core);
+        (ast, idx)
+    }
+
+    // --- tier-4b positive: tail types to a concrete core class ---------------
+
+    #[test]
+    fn infers_interpolation_return_as_string() {
+        // `def full_name; "#{first} #{last}"; end` — the tail is an interpolated
+        // String, which always types String ⇒ ("User","full_name") -> "String".
+        let core = CoreIndex::new();
+        let (_ast, idx) = build_one(
+            b"class User\n  def full_name\n    \"#{first} #{last}\"\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.method_return("User", "full_name"), Some("String"));
+    }
+
+    #[test]
+    fn infers_integer_and_array_literal_returns() {
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def n\n    42\n  end\n  def a\n    [1, 2]\n  end\nend\n", &core);
+        assert_eq!(idx.method_return("C", "n"), Some("Integer"));
+        assert_eq!(idx.method_return("C", "a"), Some("Array"));
+    }
+
+    #[test]
+    fn infers_core_call_tail_return() {
+        // `def shout; "x".upcase; end` — `"x".upcase` folds to a String constant,
+        // whose class is String ⇒ "String".
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def shout\n    \"x\".upcase\n  end\nend\n", &core);
+        assert_eq!(idx.method_return("C", "shout"), Some("String"));
+    }
+
+    #[test]
+    fn infers_cross_file_return() {
+        // A class defined in ast[0] is inferred even though it is `.new`'d in
+        // ast[1]; the return map is keyed by NAME, so it is cross-file safe.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"class User\n  def full_name\n    \"#{a} #{b}\"\n  end\nend\n");
+        let a1 = lower_src(b"u = User.new\nu.full_name.lenght\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert_eq!(idx.method_return("User", "full_name"), Some("String"));
+    }
+
+    // --- tier-4b negative: no entry under the gates --------------------------
+
+    #[test]
+    fn param_dependent_body_declines() {
+        // `def n(x); x; end` — `x` is an unbound param ⇒ Dynamic ⇒ no entry.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def n(x)\n    x\n  end\nend\n", &core);
+        assert_eq!(idx.method_return("C", "n"), None);
+    }
+
+    #[test]
+    fn ivar_body_declines() {
+        // `def name; @name; end` — an ivar read types Dynamic ⇒ no entry.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def name\n    @name\n  end\nend\n", &core);
+        assert_eq!(idx.method_return("C", "name"), None);
+    }
+
+    #[test]
+    fn explicit_return_declines() {
+        // Any explicit `return` ⇒ decline even if the tail would type.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class C\n  def m\n    return \"e\" if x\n    \"ok\"\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.method_return("C", "m"), None);
+    }
+
+    #[test]
+    fn conditional_tail_declines() {
+        // The tail is an `if` expression (branch carrier) ⇒ decline.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class C\n  def m\n    if x\n      \"a\"\n    else\n      \"b\"\n    end\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.method_return("C", "m"), None);
+    }
+
+    #[test]
+    fn in_source_method_call_tail_declines() {
+        // `def wrapper; other; end` calling another in-source (implicit-self)
+        // method ⇒ Dynamic under the empty env ⇒ decline.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class C\n  def other\n    \"x\"\n  end\n  def wrapper\n    other\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.method_return("C", "wrapper"), None);
+    }
+
+    #[test]
+    fn disagreeing_reopened_defs_decline() {
+        // `class C; def m; "s"; end; end` reopened with `def m; 1; end` —
+        // String vs Integer disagree ⇒ the entry is removed (decline).
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"class C\n  def m\n    \"s\"\n  end\nend\n");
+        let a1 = lower_src(b"class C\n  def m\n    1\n  end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert_eq!(idx.method_return("C", "m"), None);
+    }
+
+    #[test]
+    fn agreeing_reopened_defs_keep() {
+        // Same return twice ⇒ keep.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"class C\n  def m\n    \"s\"\n  end\nend\n");
+        let a1 = lower_src(b"class C\n  def m\n    \"t\"\n  end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert_eq!(idx.method_return("C", "m"), Some("String"));
+    }
+
+    #[test]
+    fn class_name_for_id_of_recovers_source_name() {
+        // A `Nominal` over a source-range id resolves to its class NAME (the
+        // companion to the core `class_name_of`, which returns None for it).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class Point\n  def x\n    1\n  end\nend\n", &core);
+        let mut i = Interner::new();
+        let class = idx.class_id("Point").expect("Point registered");
+        let ty = i.intern(rigor_types::Type::Nominal { class, args: vec![] });
+        assert_eq!(idx.class_name_for_id_of(&i, ty), Some("Point"));
+        // A Dynamic carrier ⇒ None.
+        let u = i.untyped();
+        assert_eq!(idx.class_name_for_id_of(&i, u), None);
     }
 }

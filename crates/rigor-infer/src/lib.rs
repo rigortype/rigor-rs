@@ -289,6 +289,23 @@ impl<'i> Typer<'i> {
             }
         }
 
+        // Tier 4b (ADR-0023): in-source method RETURN inference. A SOURCE-class
+        // receiver (a project `X.new` instance) whose called method has a
+        // precomputed concrete CORE return interns that CORE nominal, so the
+        // chained call witnesses against the real RBS (e.g. `user.full_name :
+        // String`, then `.lenght` flags against String). The source receiver is
+        // recovered via `class_name_for_id_of` (the core `class_name_of` above
+        // returns `None` for a source-range id, so this never overlaps tier 3).
+        // Any miss — no source receiver, no inferred return, or an unregistered
+        // core name — falls through to Dynamic (silent; zero-FP).
+        if let Some(src_name) = self.source.class_name_for_id_of(interner, recv_ty) {
+            if let Some(ret_core) = self.source.method_return(src_name, method) {
+                if let Some(class_id) = self.index.class_id(ret_core) {
+                    return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                }
+            }
+        }
+
         // Tier 5: unknown -> Dynamic[top].
         interner.untyped()
     }

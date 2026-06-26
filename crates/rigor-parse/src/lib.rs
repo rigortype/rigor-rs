@@ -10,7 +10,7 @@ pub use ruby_prism;
 
 pub mod ast;
 
-pub use ast::{lower, LoweredAst, Node, NodeId, Span};
+pub use ast::{lower, LoweredAst, MethodBody, Node, NodeId, Span};
 
 /// Parse Ruby source with Prism. The borrowed result is lowered into an owned,
 /// `NodeId`-indexed AST ([`ast::lower`]) before inference (ADR-0012).
