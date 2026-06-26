@@ -38,8 +38,10 @@ Last updated: 2026-06-26. HEAD at handoff: `82e9eb1`.
 > model `Group`/`Report`/`Status` (name-colliding with a stdlib class) from being
 > falsely witnessed. Three FP families found+fixed along the way (extend modules,
 > namespaced short-name collisions, singleton aliases). Also a pre-existing
-> **block-call** FP class fixed: a block-bearing call (`h.select { }`) now types to
-> Dynamic and never witnesses arity (block dispatch isn't modeled).
+> **block-call** FP class fixed: a block-bearing call (`h.select { }`) was first made
+> conservative (Dynamic), then (same date) **recovered to its block-overload RBS return**
+> — `h.select { } : Hash`, `arr.map { } : Array`, `x.tap { } : x` — so chained witnesses
+> fire again with 0 FP (see §4 "RECOVERED"); block-call ARITY is still deferred (silent).
 
 ## Legend
 
@@ -55,7 +57,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 2458 real files** (mastodon, gitlab-foss, conference-app,
-the reference's own source), **367/367 matched** (100% precision). 162 tests. The
+the reference's own source), **367/367 matched** (100% precision). 167 tests. The
 design (ADR 0001–0031) is audited and stable. The 2026-06-26 session (a) aligned the
 undefined-method rule with the reference's leniency, (b) closed lowering-traversal +
 interpolated-string gaps, (c) landed **class-method (singleton) witnessing** with a
@@ -64,7 +66,7 @@ note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 162 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 167 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -117,7 +119,7 @@ project-RBS / plugins):
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 162. **Parity:** `run.rb` PASS (14 fixtures), 0 FP; `run_corpus.rb` validated to **2458 real
+- **Tests:** 167. **Parity:** `run.rb` PASS (14 fixtures), 0 FP; `run_corpus.rb` validated to **2458 real
   files, 0 FP, 367/367 matched** (100% precision).
 - **Works today:** `rigor check [--format text|json] <file…>` →
   `call.undefined-method` (literals, chained calls, post-fold, **core `X.new`
@@ -128,7 +130,8 @@ project-RBS / plugins):
   isolation; a **cross-file project pass** (`build_project`) so a project model is
   known everywhere. **In-source/project-class *instances* and non-core `.new`
   instances are typed but NOT witnessed** (reference leniency); block-bearing calls
-  type to Dynamic (block dispatch unmodeled). Rails models (unknown super) stay silent.
+  type to their **block-overload RBS return** (so `arr.map { }.frist` witnesses; declines to
+  Dynamic when the block form isn't modeled). Rails models (unknown super) stay silent.
 
 ---
 
@@ -190,21 +193,33 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
   (resolve receiver class → method return → nominal); **`X.new` → instance typing**;
   array/hash literal → nominal Array/Hash; **interpolated string → String**; **bare top-level
   constant → `Singleton(class)`** (class-object, for class-method witnessing); **block-bearing
-  call → Dynamic** (block dispatch unmodeled, zero-FP).
+  call → block-overload RBS return** (`Hash#select { } -> Hash`, `arr.map { } -> Array`, `x.tap
+  { } -> x`; declines to Dynamic when the block form isn't modeled — zero-FP).
 - ✅ Rust-native constant folding (`folding.rs`) — deterministic Integer/Float/Bool/Nil/Symbol/
   ASCII-String; declines (→ None) on any doubt; arg-dependent folds (`1 + 2 → 3`).
 - 🟡 Environment is flat / top-level (no flow sensitivity yet); params/ivars/non-class-constants → Dynamic.
-- ⏳ **DEFERRED (user-accepted temporary, 2026-06-26): block-call result typing.** A
-  block-bearing call (`h.select { }`, `arr.map { }`) currently types to **Dynamic** wholesale
-  (and wrong-arity is skipped on it) — a blanket conservative choice that fixed a `select{}.keys`
-  FP class but is MORE conservative than the reference, which models block-form returns. **Recovery
-  (expected, timing at implementer's discretion):** model block returns like original Rigor —
-  `Hash#select/reject/filter { }` → `Hash`, `Enumerable#select/map/flat_map { }` → `Array`,
-  `x.tap { }` → `x` (self/receiver), `arr.each { }` → receiver, etc. — instead of Dynamic, so
-  `arr.map { }.frist`-style chains witness again. Keep the zero-FP discipline (decline to Dynamic
-  whenever the block-form return isn't precisely modeled). Touch points: the `Node::Call` arm in
-  `rigor-infer/lib.rs` (the `!block_body.is_empty()` short-circuit) + `check_wrong_arity`'s
-  `has_block` early-return in `rigor-rules/lib.rs`.
+- ✅ **RECOVERED (2026-06-26): block-call result typing.** A block-bearing call now types to its
+  **block-overload RBS return**, not Dynamic — exactly the reference's `block_required: true`
+  overload selection (`method_dispatcher/rbs_dispatch.rb` → `overload_selector.rb`). It is
+  **RBS-derived, not a hardcoded table:** the index records, per method, the return of the overload
+  that declares a `block:` clause, resolving a concrete `ClassInstanceType` (`Hash#filter { } ->
+  ::Hash`, `Enumerable#map/flat_map { } -> ::Array`) or a `self` return (`Array#each { } -> self`,
+  `Kernel#tap { } -> self`) to the receiver's own class. So `h.select { } : Hash` (alias of
+  `filter`), `h.reject { } : Hash`, `arr.map { } : Array`, `x.tap { } : x`, `arr.each { } : arr` —
+  and `arr.map { }.frist`-style chains witness again (verified byte-identical to the reference on
+  the §4 target cases + 0 FP across 831 corpus files). Zero-FP discipline preserved: when the
+  block-form return isn't precisely modeled (no block overload, or a generic/union/void/unknown
+  return — `method_return_with_block ⇒ None`), or the receiver isn't a concrete modeled class, the
+  call DECLINES to Dynamic (silent), exactly as the placeholder did; the `select{}.keys` FP-guard
+  case still types to `Hash` and stays silent. Touch points: `rigor-index/rbs.rs`
+  (`block_overload_return` + per-class `block_returns` map + `method_return_with_block`),
+  `rigor-index/lib.rs` (free `method_return_with_block`), `rigor-infer/lib.rs`
+  (`Typer::type_block_call`, replacing the `!block_body.is_empty()` short-circuit). **Block-call
+  ARITY is still deferred** (kept the `check_wrong_arity` `has_block` early-return): the reference
+  DOES witness block-form arity (the block overload takes 0 positional args), but we store only a
+  single arity envelope collapsed over all overloads and cannot isolate the block overload's
+  count — staying silent there is a missed witness, never an FP. Per-block-overload arity is the
+  follow-up to recover those.
 - ⬜ **Flow-sensitive scopes** + 5 edges + fact buckets + invalidation (ADR-0022); narrowing
   (guards, `is_a?`, truthy/falsey, equality trust, negative facts domain-relative).
 - ⬜ Full dispatch tier cascade (tier-2 shape, tier-4 in-source bodies); cross-file implicit-self

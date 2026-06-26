@@ -346,11 +346,18 @@ fn check_wrong_arity(
     interner: &mut Interner,
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
-    // A block changes a method's effective arity (`{...}.select { block }` takes
-    // zero positional args; the RBS envelope we read is the no-block overload).
-    // We don't model block-vs-positional dispatch, so never witness arity on a
-    // block-bearing call — the reference is silent there. (Zero-FP conservatism;
-    // the positional-only envelope is unreliable once a block is attached.)
+    // A block selects a DIFFERENT RBS overload, which usually has a different
+    // positional arity (`arr.select { } / arr.map { }` take 0 positional args,
+    // but the no-block envelope spans the Enumerator overloads). The reference
+    // DOES witness block-form arity by reading the block overload's own arity;
+    // we only store a single arity envelope collapsed over ALL overloads, so we
+    // cannot isolate the block overload's positional count here. Rather than
+    // witness against the wrong (collapsed) envelope — which would risk a false
+    // positive — we stay silent on arity for any block-bearing call. This is the
+    // zero-FP-safe conservative choice (a missed witness, never an extra one);
+    // block-form RETURN typing IS modeled (see `Typer::type_block_call`), so
+    // chained undefined-method on a block result is still witnessed — only the
+    // block-call's own arity is deferred until per-overload arity is stored.
     if has_block {
         return None;
     }
@@ -813,8 +820,8 @@ mod tests {
     fn block_bearing_call_is_not_witnessed() {
         // `{...}.select { block }.keys` — `select` with a block returns a Hash
         // (`.keys` is valid), and `select` with a block takes 0 positional args
-        // (no wrong-arity). We don't model block dispatch, so a block call types
-        // to Dynamic and never witnesses arity — matching the reference (silent).
+        // (no wrong-arity). Block-form RETURN typing is now modeled, but a VALID
+        // chained call on the (correct) block result must still stay silent.
         let diags = run(b"h = {a: 1}\nx = h.select { |k, v| v > 0 }.keys\n");
         assert!(diags.is_empty(), "block-call chain must be silent, got {diags:?}");
         // The same chain without the witnessing chain still silent on the block call.
@@ -823,13 +830,66 @@ mod tests {
         // The exact reported FP shape (gitlab-foss authorize_granular_scopes_service.rb:102):
         // a hash-literal-shorthand receiver chained DIRECTLY into `.select { }.keys`.
         // Two FPs must NOT fire: (a) wrong-arity on `select` (block ⇒ 0 positional
-        // args, but the no-block envelope is 1..N), and (b) undefined-method `keys`
-        // on Array (the block form returns Hash, on which `keys` is valid). The
-        // reference is silent on this whole line; rigor-rs must be too.
+        // args, but the no-block envelope is 1..N — arity stays silent on block
+        // calls), and (b) undefined-method `keys` on the block result (the block
+        // form returns Hash, on which `keys` is valid). The reference is silent on
+        // this whole line; rigor-rs must be too.
         let diags3 = run(
             b"def f(token, boundaries, permissions)\n{ token:, boundaries:, permissions: }.select { |_, value| value.nil? }.keys\nend\n",
         );
         assert!(diags3.is_empty(), "literal-receiver block chain must be silent, got {diags3:?}");
+    }
+
+    #[test]
+    fn block_call_result_typo_is_witnessed() {
+        // RECOVERED coverage (CURRENT_WORK §4): the block-form RETURN is now
+        // RBS-modeled, so a typo on the CHAINED result is witnessed again,
+        // matching the reference. Guarded on the real RBS tree (under the stub
+        // fallback block returns are unmodeled ⇒ silent ⇒ no diagnostic to find).
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Enumerable") || !idx.class_has_method("Array", "map") {
+            return;
+        }
+        // `arr.map { }.frist` -> map block form returns Array; `.frist` undefined.
+        let diags = run(b"arr = [1, 2, 3]\narr.map { |n| n + 1 }.frist\n");
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        assert_eq!(diags[0].rule_id, "call.undefined-method");
+        assert_eq!(diags[0].method_name.as_deref(), Some("frist"));
+
+        // `arr.select { }.frist` -> Array; `.frist` undefined.
+        let diags = run(b"arr = [1, 2, 3]\narr.select { |n| n > 1 }.frist\n");
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        assert_eq!(diags[0].method_name.as_deref(), Some("frist"));
+
+        // `arr.each { }.frist` -> `each` returns self (Array); `.frist` undefined.
+        let diags = run(b"arr = [1, 2, 3]\narr.each { |n| n }.frist\n");
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        assert_eq!(diags[0].method_name.as_deref(), Some("frist"));
+
+        // `s.tap { }.lenght` -> `tap` returns self (String); `.lenght` undefined.
+        let diags = run(b"s = \"hello\"\ns.tap { |x| x }.lenght\n");
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        assert_eq!(diags[0].method_name.as_deref(), Some("lenght"));
+    }
+
+    #[test]
+    fn block_call_result_valid_call_stays_silent() {
+        // The other side of the recovery: a VALID method on the (correctly
+        // modeled) block result must NOT fire — `Hash#select { }` returns Hash,
+        // so `.keys` is valid (the FP class the placeholder originally guarded).
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Enumerable") || !idx.class_has_method("Array", "map") {
+            return;
+        }
+        // `h.select { }.keys` -> Hash#keys valid -> silent.
+        let diags = run(b"h = { a: 1 }\nh.select { |k, v| v > 0 }.keys\n");
+        assert!(diags.is_empty(), "Hash#select block result is Hash; .keys valid, got {diags:?}");
+        // `h.reject { }.keys` -> Hash#reject block form returns Hash -> .keys valid.
+        let diags = run(b"h = { a: 1 }\nh.reject { |k, v| v > 0 }.keys\n");
+        assert!(diags.is_empty(), "Hash#reject block result is Hash; .keys valid, got {diags:?}");
+        // `arr.map { }.first` -> Array#first valid -> silent.
+        let diags = run(b"arr = [1, 2, 3]\narr.map { |n| n }.first\n");
+        assert!(diags.is_empty(), "Array#map block result is Array; .first valid, got {diags:?}");
     }
 
     // --- in-source / non-core `.new` instances: reference leniency -----------

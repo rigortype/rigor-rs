@@ -45,12 +45,33 @@ lib/ruby/gems/4.0.0/gems/rbs-4.0.3/core";
 /// positional rest, else the largest required+optional count.
 type Arity = (usize, Option<usize>);
 
+/// Sentinel stored in [`ClassEntry::block_returns`] for a block overload whose
+/// RBS return type is `self` (e.g. `Array#each { } -> self`, `Kernel#tap { } ->
+/// self`). At lookup time it resolves to the RECEIVER's own class name (the
+/// value `method_return_with_block` was queried with), so `x.tap { } : x` and
+/// `arr.each { } : arr`. A distinct value (not a real class name) so it can
+/// never collide with an actual `ClassInstanceType` return.
+const SELF_RETURN: &str = "\0self";
+
 /// Per-class data extracted from RBS: its instance methods (name -> resolved
 /// return class + arity), its direct superclass, and its included modules.
 #[derive(Default, Clone)]
 struct ClassEntry {
     /// `method name -> (return class name if resolvable, arity envelope)`.
     methods: HashMap<&'static str, (Option<&'static str>, Arity)>,
+    /// `method name -> block-overload return class name`, populated ONLY for
+    /// methods that declare a block-bearing overload whose return is a
+    /// resolvable concrete class (a `ClassInstanceType` like `Hash#filter { }
+    /// -> ::Hash[K,V]` / `Enumerable#map { } -> ::Array[U]`) or the literal
+    /// receiver itself (a `self` return like `Array#each { } -> self` /
+    /// `Kernel#tap { } -> self`). The latter is stored as the sentinel
+    /// [`SELF_RETURN`] and resolved to the receiver's own class at lookup time.
+    /// Mirrors the reference's `block_required: true` overload selection
+    /// (`rbs_dispatch.rb`): a block at the call site picks the block overload,
+    /// and ITS return type is what the call yields. Methods with no block
+    /// overload, or whose block overload returns a generic/union/void/unknown
+    /// shape, are simply absent here (⇒ the block call stays Dynamic / silent).
+    block_returns: HashMap<&'static str, &'static str>,
     /// Singleton (class-level) methods `def self.x` (and the singleton half of
     /// `def self?.x`). Keyed by name -> arity envelope. The singleton class
     /// inherits down the SUPERCLASS chain, so resolving a class method walks
@@ -336,6 +357,63 @@ impl CoreData {
         self.lookup_on_chain(&chain, method).and_then(|(ret, _)| ret)
     }
 
+    /// Resolve the RETURN class of `class_name#method` **when called with a
+    /// block**, over the flattened ancestor chain — the block-overload return
+    /// the reference selects via `block_required: true` (`rbs_dispatch.rb`).
+    ///
+    /// Returns `Some(class)` only when the method (or an alias of it, e.g.
+    /// `Hash#select -> filter`) declares a block-bearing overload whose return
+    /// is a resolvable concrete class. A `self`-returning block overload
+    /// (`Array#each { } -> self`, `Kernel#tap { } -> self`) resolves to
+    /// `class_name` itself (the receiver's own class). `None` ⇒ the block form
+    /// isn't precisely modeled (no block overload, or a generic/union/void/
+    /// unknown return) ⇒ the caller declines to `Dynamic` (zero-FP).
+    pub fn method_return_with_block(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        let (chain, _) = self.ancestors(class_name);
+        let ret = self.lookup_block_return_on_chain(&chain, method, 0)?;
+        if ret == SELF_RETURN {
+            // `self` block return ⇒ the receiver type itself. Hand back the
+            // receiver's interned `&'static` name (matching the stored key) only
+            // when the index actually models the class, so the result
+            // round-trips to a Nominal the rules can witness against.
+            self.classes.get_key_value(class_name).map(|(&k, _)| k)
+        } else {
+            Some(ret)
+        }
+    }
+
+    /// Walk the chain for `method`'s block-overload return, resolving instance
+    /// `alias`es exactly like [`lookup_on_chain_depth`] (so `Hash#select`, an
+    /// `alias select filter`, inherits `filter`'s block return). The first
+    /// ancestor that records a block return for `method` wins.
+    fn lookup_block_return_on_chain(
+        &self,
+        chain: &[&'static str],
+        method: &str,
+        depth: usize,
+    ) -> Option<&'static str> {
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(&ret) = entry.block_returns.get(method) {
+                    return Some(ret);
+                }
+            }
+        }
+        if depth >= 16 {
+            return None;
+        }
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(&old) = entry.aliases.get(method) {
+                    if let Some(found) = self.lookup_block_return_on_chain(chain, old, depth + 1) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Resolve a method's arity envelope over the ancestor chain (first defining
     /// ancestor wins), resolving through `alias` definitions. `None` if the
     /// method is unknown on the chain.
@@ -446,6 +524,10 @@ impl CoreData {
                 name,
                 ClassEntry {
                     methods: m,
+                    // The stub doesn't model block-form returns (no block-call
+                    // result typing under the fallback); empty keeps it
+                    // conservative ⇒ a block-bearing call stays Dynamic/silent.
+                    block_returns: HashMap::new(),
                     // The stub lists `size` directly alongside `length`, so it
                     // needs no alias table; real RBS uses `alias size length`.
                     aliases: HashMap::new(),
@@ -759,6 +841,7 @@ impl Builder {
                 Node::MethodDefinition(md) => {
                     let mname = intern(md.name().as_str());
                     let (ret, arity) = method_signature(&md);
+                    let block_ret = block_overload_return(&md);
                     let kind = md.kind();
                     // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
                     // (BOTH a class method AND an instance method); a plain
@@ -769,6 +852,9 @@ impl Builder {
                             | MethodDefinitionKind::SingletonInstance
                     ) {
                         entry.methods.entry(mname).or_insert((ret, arity));
+                        if let Some(br) = block_ret {
+                            entry.block_returns.entry(mname).or_insert(br);
+                        }
                     }
                     if matches!(
                         kind,
@@ -839,6 +925,9 @@ impl Builder {
         }
         for (k, v) in entry.methods {
             slot.methods.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.block_returns {
+            slot.block_returns.entry(k).or_insert(v);
         }
         for (k, v) in entry.singleton_methods {
             slot.singleton_methods.entry(k).or_insert(v);
@@ -1021,6 +1110,54 @@ fn method_signature(
 
     let arity = (min.unwrap_or(0), if variadic { None } else { max });
     (ret, arity)
+}
+
+/// The RETURN class of the method's **block-bearing overload** — the overload
+/// the reference picks when a block is supplied at the call site
+/// (`OverloadSelector` with `block_required: true`). We scan the overloads for
+/// one declaring a `block:` clause (`MethodTypeNode::block()`), and resolve ITS
+/// function return type:
+///
+/// - a concrete `ClassInstanceType` (`Hash#filter { } -> ::Hash[K,V]`,
+///   `Enumerable#map { } -> ::Array[U]`) ⇒ that class name;
+/// - a `self` return (`Array#each { } -> self`, `Kernel#tap { } -> self`) ⇒
+///   the [`SELF_RETURN`] sentinel, resolved to the receiver at lookup time.
+///
+/// Returns `None` (⇒ block form not modeled ⇒ caller stays Dynamic, zero-FP)
+/// when no overload has a block, or when the block overload's return is a
+/// union (`bool`), bare generic variable, `void`, nilable, or anything else we
+/// can't pin to a single concrete class. When MULTIPLE block overloads exist
+/// we require them to AGREE on the return (any disagreement ⇒ `None`), matching
+/// the conservative discipline of [`method_signature`].
+fn block_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<&'static str> {
+    let mut found: Option<Option<&'static str>> = None;
+    for overload in md.overloads().iter() {
+        let Node::MethodDefinitionOverload(ov) = overload else {
+            continue;
+        };
+        let Node::MethodType(mt) = ov.method_type() else {
+            continue;
+        };
+        // Only the block-bearing overload(s) participate.
+        if mt.block().is_none() {
+            continue;
+        }
+        let Node::FunctionType(ft) = mt.type_() else {
+            continue;
+        };
+        let this_ret = match ft.return_type() {
+            Node::ClassInstanceType(ci) => type_name_str(&ci.name()),
+            // A `self` block return (each/tap) ⇒ the receiver's own type.
+            Node::SelfType(_) => Some(SELF_RETURN),
+            _ => None,
+        };
+        match found {
+            None => found = Some(this_ret),
+            Some(prev) if prev != this_ret => return None,
+            _ => {}
+        }
+    }
+    found.flatten()
 }
 
 /// Intern a `&str` to a `&'static str` by leaking, deduplicated through a

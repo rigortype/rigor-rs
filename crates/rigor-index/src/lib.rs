@@ -199,6 +199,22 @@ pub fn method_return(class: &str, method: &str) -> Option<&'static str> {
     global().method_return(class, method)
 }
 
+/// The RETURN class name of a core method **called WITH a block**, resolved over
+/// the receiver class's flattened ancestor chain — the block-overload return the
+/// reference selects (`OverloadSelector` with `block_required: true`). This is
+/// what lets a block-bearing call chain type correctly: `arr.map { } -> Array`
+/// (so `.frist` on it is witnessed), `h.select { } -> Hash` (so `.keys` is
+/// valid and stays silent), `x.tap { } -> x` (the receiver itself).
+///
+/// Returns `None` when the block form is not precisely modeled — no block
+/// overload, or a generic/union/void/nilable/unknown block-overload return. The
+/// inference engine treats `None` as "degrade to `Dynamic[top]`" rather than
+/// guessing (zero-FP), matching the deferred-then-recovered behavior described
+/// in `docs/CURRENT_WORK.md` §4.
+pub fn method_return_with_block(class: &str, method: &str) -> Option<&'static str> {
+    global().method_return_with_block(class, method)
+}
+
 /// The arity envelope `(min, max)` of a core method, resolved over the receiver
 /// class's flattened ancestor chain. `min` is the smallest required-positional
 /// count across the method's overloads; `max` is `None` (variadic) when any
@@ -353,6 +369,34 @@ mod tests {
         assert_eq!(method_return("Integer", "to_s"), Some("String"));
         // A typo has no return.
         assert_eq!(method_return("String", "lenght"), None);
+    }
+
+    #[test]
+    fn block_form_return_resolves_rbs_overload() {
+        // The block-overload return types, RBS-derived (the reference's
+        // `block_required: true` selection). Guarded on the real RBS tree being
+        // loaded — under the stub fallback block returns are unmodeled (None,
+        // still zero-FP), so the assertions only run when Enumerable is present.
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Enumerable") || !idx.class_has_method("Array", "map") {
+            return;
+        }
+        // Enumerable/Array block forms -> Array.
+        assert_eq!(method_return_with_block("Array", "map"), Some("Array"));
+        assert_eq!(method_return_with_block("Array", "select"), Some("Array"));
+        assert_eq!(method_return_with_block("Array", "flat_map"), Some("Array"));
+        // Hash block forms: select (alias of filter) -> Hash; reject -> Hash;
+        // map -> Array (Enumerable). These are the cases the placeholder regressed.
+        assert_eq!(method_return_with_block("Hash", "select"), Some("Hash"));
+        assert_eq!(method_return_with_block("Hash", "reject"), Some("Hash"));
+        assert_eq!(method_return_with_block("Hash", "map"), Some("Array"));
+        // `self`-returning block forms resolve to the RECEIVER's own class.
+        assert_eq!(method_return_with_block("Array", "each"), Some("Array"));
+        assert_eq!(method_return_with_block("Array", "tap"), Some("Array"));
+        assert_eq!(method_return_with_block("String", "tap"), Some("String"));
+        assert_eq!(method_return_with_block("Hash", "each"), Some("Hash"));
+        // A method with no block overload, or a typo, has no block return.
+        assert_eq!(method_return_with_block("String", "lenght"), None);
     }
 
     #[test]

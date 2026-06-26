@@ -132,16 +132,28 @@ impl<'i> Typer<'i> {
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
             Node::Call { receiver: Some(r), method, args, block_body, .. } => {
-                // A block-bearing call has a block-dependent result we don't
-                // model: `h.select { } : Hash` but `enum.select { } : Array`,
-                // `x.tap { } : x`, `arr.each { } : arr`. Pinning the no-block RBS
-                // return would let a CHAINED call falsely witness against the
-                // wrong class (e.g. `h.select { }.keys` — keys IS on the Hash the
-                // block form returns). So a block call types to Dynamic (silent).
+                let (r, method) = (*r, method.clone());
                 if !block_body.is_empty() {
-                    interner.untyped()
+                    // A block changes which RBS overload applies: the reference
+                    // selects the block-bearing overload (`block_required: true`)
+                    // and the call yields ITS return type. We model that
+                    // RBS-derived behavior precisely: `arr.map { } : Array`,
+                    // `h.select { } : Hash`, `h.reject { } : Hash`, `x.tap { } :
+                    // x`, `arr.each { } : arr` (a `self` block return resolves to
+                    // the receiver's own class). This recovers chained-witnessing
+                    // (`arr.map { }.frist` flags on Array) WITHOUT the FP that the
+                    // no-block return would cause (`h.select { }.keys` — keys IS
+                    // on the Hash the block form returns, so it stays silent).
+                    //
+                    // Zero-FP discipline: when the block-form return is NOT
+                    // precisely modeled (no block overload, or a generic/union/
+                    // void/unknown return — `method_return_with_block` ⇒ None),
+                    // OR the receiver isn't a concrete class we model, we decline
+                    // to `Dynamic[top]` (silent), exactly as the prior blanket
+                    // placeholder did for every block call. Never guess a type.
+                    self.type_block_call(ast, r, &method, env, interner)
                 } else {
-                    let (r, method, args) = (*r, method.clone(), args.clone());
+                    let args = args.clone();
                     self.type_call(ast, r, &method, &args, env, interner)
                 }
             }
@@ -279,6 +291,42 @@ impl<'i> Typer<'i> {
 
         // Tier 5: unknown -> Dynamic[top].
         interner.untyped()
+    }
+
+    /// Type a method call that carries a BLOCK (`recv.method { ... }`), modeling
+    /// the block-form return like the reference's block-overload selection
+    /// (`OverloadSelector` with `block_required: true`, `rbs_dispatch.rb`):
+    /// resolve the receiver's concrete class, look up the method's
+    /// block-overload return via [`rigor_index::method_return_with_block`], and
+    /// intern it as a `Nominal` so a chained call on the result is checkable.
+    ///
+    /// Declines to `Dynamic[top]` (silent — zero-FP) whenever the receiver isn't
+    /// a concrete modeled class, the block form isn't modeled for the method, or
+    /// the returned class isn't registered. We never fall back to the no-block
+    /// return for a block call (that was the FP the placeholder guarded against).
+    fn type_block_call(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        method: &str,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let recv_ty = self.type_of(ast, receiver, env, interner);
+        // The receiver must resolve to a concrete class the index models; a
+        // Dynamic / unknown receiver ⇒ silent (never guess the block return).
+        let Some(class_name) = self.index.class_name_of(interner, recv_ty) else {
+            return interner.untyped();
+        };
+        // The block-overload return for `class_name#method`. `None` ⇒ the block
+        // form isn't precisely modeled ⇒ decline to Dynamic (silent).
+        let Some(ret_class) = rigor_index::method_return_with_block(class_name, method) else {
+            return interner.untyped();
+        };
+        match self.index.class_id(ret_class) {
+            Some(class_id) => interner.intern(Type::Nominal { class: class_id, args: vec![] }),
+            None => interner.untyped(),
+        }
     }
 
     /// Type each argument and, if *every* one is a value-pinned `Constant`,
@@ -774,6 +822,59 @@ mod tests {
             assert!(source.class_has_method(&idx, "Pathname", "basename"));
             assert!(!source.class_has_method(&idx, "Pathname", "nonexist"));
         }
+    }
+
+    // --- block-form call result typing (recovered, RBS-derived) -------------
+
+    #[test]
+    fn block_call_return_types_to_rbs_block_overload() {
+        // `arr.map { }` types to a bare Array Nominal (the block-overload
+        // return), so a chained `.frist` resolves against Array and is
+        // witnessable; `h.select { }` types to Hash; `x.tap { }` types to the
+        // receiver's own class. Guarded on the real RBS tree (under the stub
+        // fallback block returns are unmodeled ⇒ Dynamic ⇒ test is vacuous).
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Enumerable") || !idx.class_has_method("Array", "map") {
+            return;
+        }
+        // `a = []; a.map { |x| x }` -> Array nominal.
+        let ast = lower_src(b"a = [1]\na.map { |x| x }\n");
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, "map");
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        assert_eq!(idx.class_name_of(&i, ty), Some("Array"));
+
+        // `h = {}; h.select { }` -> Hash nominal (so `.keys` is valid, silent).
+        let ast = lower_src(b"h = { a: 1 }\nh.select { |k, v| v }\n");
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, "select");
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        assert_eq!(idx.class_name_of(&i, ty), Some("Hash"));
+
+        // `s = "x"; s.tap { }` -> String nominal (self block return = receiver).
+        let ast = lower_src(b"s = \"x\"\ns.tap { |x| x }\n");
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, "tap");
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        assert_eq!(idx.class_name_of(&i, ty), Some("String"));
+    }
+
+    #[test]
+    fn block_call_on_unmodeled_or_dynamic_is_silent_dynamic() {
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        // A block call on a Dynamic receiver (`x` is an implicit-self call) ⇒
+        // Dynamic (never guess). True under both real RBS and the stub.
+        let ast = lower_src(b"x.each { |e| e }\n");
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, "each");
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        assert_eq!(ty, i.untyped(), "block call on Dynamic receiver must be Dynamic[top]");
     }
 
     #[test]
