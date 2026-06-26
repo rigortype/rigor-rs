@@ -10,3 +10,7 @@ This matches the reference's never-crash + zero-false-positive discipline: a ski
 
 - **Fail-fast (stop on the first error)** — rejected: one malformed file halts analysis of an entire large codebase.
 - **Let panics propagate (Rust default)** — rejected: one file's bug crashes the whole run, contradicting never-crash.
+
+## The `internal-error` diagnostic (audit R5)
+
+The synthetic diagnostic emitted for a skipped (panicked) file is a **deliberate rigor-rs-specific signal with no reference counterpart**, so it must not be treated as a parity false positive. It is emitted at **`:info` severity**, which the [differential harness](0002-diagnostic-set-parity.md) excludes from its error/warning comparison — a crashed file therefore never counts as a divergence. Rule id `internal-error`, `source_family` `builtin`. This keeps never-crash observable to the user without breaching the one-sided parity gate.

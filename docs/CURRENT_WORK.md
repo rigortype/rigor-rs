@@ -185,12 +185,29 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins:
 
 ## Cross-cutting known issues / decisions to revisit
 
-- `internal-error` rule id is a **rigor-rs invention** (not in the reference).
-  Decide: align to the reference's actual crash behaviour, or keep as a
-  deliberate addition and record it in ADR-0016 + register in the harness.
-- Hand-rolled JSON (no serde) is a temporary, network-forced measure (🔒).
-- `CoreIndex` is a stub standing in for the real RBS index — every entry is
-  provisional until the `ruby-rbs` index lands.
+- ✅ `internal-error` rule id (audit R5) — resolved: emitted at `:info` severity so
+  the harness's error/warning gate never treats it as a parity FP; recorded in ADR-0016.
+- 🟡 Hand-rolled JSON (no serde) — network is back, so swap to serde + add SARIF/CI
+  formats (§6).
+- ✅ `CoreIndex` stub → **real RBS index landed** (§3); RBS `alias` resolution fixed
+  (was a latent `s.size` false positive surfaced by the corpus, now harness-guarded).
+
+## External audit (2026-06-26) — action items
+
+From `…/ruby/rigor/docs/notes/20260626-rigor-rs-design-audit.md` (verdict: design
+structurally avoids the Pzoom/artichoke/pylyzer traps). Tracked actions:
+
+- ✅ **R5** internal-error → `:info`, documented (above).
+- ✅ **R1** positioning recorded in ADR-0008 (standalone = sound subset; full parity
+  needs the sidecar). ⬜ remaining: surface "sidecar absent ⇒ reduced coverage" in
+  `rigor doctor` (ADR-0031, when doctor lands).
+- ✅ **R2** ADR-0007: `RIGOR_RBS_CORE_DIR` formalized as the out-of-band stdlib-RBS
+  refresh seam.
+- ✅ **R3** ADR-0001: positioning stated — rigor-rs is a performance prototype that COEXISTS
+  with the Ruby mainstream (Ruby leads; no planned retirement / single-implementation; full
+  parity + eventual sync are possibilities, not commitments).
+- ⬜ **R4 (urgent)** land OSS corpora (Redmine/Mastodon scale; start with the
+  reference's own `examples/` + `spec/`) — 12 fixtures can't grade the design (§14).
 
 ## Network — RESTORED (2026-06-26)
 

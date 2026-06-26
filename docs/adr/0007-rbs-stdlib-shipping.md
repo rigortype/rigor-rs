@@ -16,3 +16,7 @@ Pre-parsing at build time matters for the performance + low-startup-latency driv
 
 - **Ship raw RBS, parse on first run, cache to disk** — rejected: smaller binary but slow first run and cache-invalidation complexity, against the low-startup-latency driver.
 - **Invent a compact custom stub format** (selene/pzoom style) — rejected: RBS already *is* the format; a custom one would fragment rigor-rs from the Ruby ecosystem and from the reference's own RBS sources.
+
+## Out-of-band stdlib-RBS refresh (audit R2)
+
+Embedding RBS at build time couples a stdlib-RBS fix to rigor-rs's release cadence (the Ruby tool ships the same fix by bumping the `rbs` gem). To decouple, the **`RIGOR_RBS_CORE_DIR` runtime override is a supported, first-class seam** — not merely an interim spike path: a user can point rigor-rs at a newer/patched RBS tree (or the project's pinned `rbs` gem) to refresh stdlib types **without a rebuild**. The embedded copy is the default and the offline fallback; the override is the escape hatch. A future `.rigor.yml` key (`rbs.stdlib_overlay:`) formalizes the same seam in config.

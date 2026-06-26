@@ -45,3 +45,12 @@ When no project Ruby/bundle is available, rigor-rs **degrades gracefully**: non-
 - **Qualifies [ADR-0001](0001-rust-reimplementation-strategy.md) / [ADR-0003](0003-prism-rust-bindings.md)**: the *core analyzer binary* stays Ruby-free; full-fidelity folding + plugin invocation use this optional sidecar.
 - **Extends the reuse boundary of [ADR-0004](0004-own-the-index-layer.md)**: executing the real runtime / target library through a bounded harness is *data computation*, not "engine parasitism" — rigor-rs still owns its inference engine.
 - **Mirrors the reference's ADR-39** (target-library invocation) and its constant-folding tier.
+
+## Product positioning: standalone is a sound subset, not full parity (audit R1)
+
+Standalone (no-sidecar) mode and full parity cannot both hold: without the sidecar, full-fidelity folding and plugins **decline**, so standalone analysis is a *sound subset* — it never emits a wrong diagnostic, but **silently misses some** the full configuration would catch. This is the unavoidable structural trade-off of a compiled port (the Pzoom lesson) — a positioning risk, not a soundness one. A naive competitor can market "pure Rust, no sidecar," look faster on a benchmark, and quietly miss bugs.
+
+The defense is communication, surfaced *in the tool*, not buried in an ADR:
+- the core binary emits a one-time **"sidecar unavailable → reduced coverage"** notice (already specified under § Degradation);
+- `rigor doctor` (ADR-0031) reports sidecar availability and the resulting coverage posture as a first-class check;
+- docs state plainly: **standalone = fast, sound, but incomplete; full parity needs the project's Ruby sidecar.**
