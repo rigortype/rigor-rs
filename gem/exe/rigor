@@ -1,0 +1,12 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Ruby shim for the precompiled-binary gem (ADR-0010). Unlike the reference
+# `exe/rigor` (which requires `rigor/cli` and runs Ruby), this gem bundles the
+# NATIVE Rust `rigor` binary at `libexec/rigor`. We resolve it and process-
+# replace via `exec`, passing ARGV straight through so the shim is transparent
+# (same argv, same stdio, same exit status — verified by the gem-shim ===
+# bare-binary diff in the local proof).
+require_relative "../lib/rigortype_rs/binary"
+
+exec(RigortypeRs::Binary.path, *ARGV)

@@ -596,8 +596,46 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   - **Static libprism link is ALREADY DONE:** `ruby-prism`/`ruby-rbs` are `-sys` crates that
     statically compile vendored C via `cc` + `bindgen`, and the core RBS is embedded (ADR-0007).
     `otool -L target/release/rigor` shows only `libSystem` — the binary is self-contained.
-- ⬜ Deferred: precompiled-binary gem (primary channel) + Homebrew formula; musl + Windows
-  targets; sidecar Ruby auto-detection.
+- ✅ **Precompiled-binary gem scaffold landed (ADR-0010 PRIMARY channel — purely additive,
+    everything under `gem/` + a downstream `gem`/`gem-fallback` job appended to `release.yml`;
+    the existing `build` job is byte-unchanged, no `crates/`/`Cargo.toml`/dev-loop change).**
+  - **Mechanism:** platform-specific precompiled gems (4 variants + a `ruby` fallback). ONE
+    gemspec (`gem/rigortype-rs.gemspec`, platform-neutral); the Rakefile sets `spec.platform` per
+    build. Each platform gem bundles the matching native binary at `libexec/rigor`; the fallback
+    bundles none. Module name **`RigortypeRs`** (consistent across `lib/`, gemspec, sig, tests).
+  - **Name `rigortype-rs`** (NOT `rigortype` — a 0.1.0 over the reference's 0.2.5 would be a
+    downgrade; and per ADR-0001 rigor-rs COEXISTS with the Ruby mainstream — there is NO planned
+    `rigortype` name takeover, so the distinct name is permanent). Both gems install a `rigor`
+    exe → README warns not to install both in one env.
+  - **Version lockstep:** `version.rb` `VERSION="0.1.0"`, enforced by `rake version:check` reading
+    `[workspace.package] version` from `../Cargo.toml` (single source of truth). Green.
+  - The shim (`exe/rigor`) `exec`s the bundled native binary with ARGV passthrough (process-
+    replacing, no Ruby require path). `RigortypeRs::Binary.path` resolves `libexec/rigor`, raises
+    `NotFound` with guidance (supported platforms + `cargo binstall`/`brew`) when absent, defensive
+    chmod. The native binary is NOT committed — only `libexec/.keep` (staged at build/test time).
+  - **Gem::Platform map (versionless for CI/published): arm64-darwin / x86_64-darwin /
+    x86_64-linux / aarch64-linux** — note macOS arm64 is `arm64` in Gem::Platform but `aarch64` in
+    the Rust triple. The local proof builds a HOST-exact gem (`arm64-darwin-23`) so `gem install`
+    selects it on this machine.
+  - **Local end-to-end PROOF (ran, all green):** staged `target/release/rigor` → `rake build:local`
+    built `rigortype-rs-0.1.0-arm64-darwin-23.gem` (zero warnings); `gem specification` shows
+    name/version/platform/executables=[rigor]/files incl `libexec/rigor`; `gem install --local`
+    into a temp GEM_HOME → `rigor --version` prints `rigor 0.1.0`; the KEY GATE
+    `diff <(gem-shim check) <(bare-binary check)` is EMPTY (shim === bare binary); the NotFound
+    negative test (binary removed) emits the guidance message. Unit test
+    `spec/binary_resolution_spec.rb` (minitest, 4 runs/23 assertions): path resolves when present,
+    `NotFound`+guidance when absent, ARGV passthrough via a stub binary. Temp GEM_HOME + staged
+    binary cleaned up; only `libexec/.keep` committed.
+  - **CI gem job (`release.yml`, `needs: build`):** matrix over the 4 targets × versionless
+    Gem::Platform; downloads the matching `rigor-<v>-<target>.tar.gz`, stages → `gem/libexec/rigor`,
+    `rake version:check`, `rake build:platform[<gem-platform>]`, smoke-installs + runs
+    `rigor --version` on arch-matched rows (macOS + x86_64-linux; aarch64-linux smoke skipped). A
+    `gem-fallback` job builds the `ruby` gem. `gem push` is GATED behind a `RUBYGEMS_API_KEY`
+    secret + a manual `release` environment — never auto-pushes.
+  - **DEFERRED:** RubyGems account + API key + MFA setup; the first real tag to validate the
+    multi-platform CI build/push end-to-end; Homebrew formula; musl + Windows targets; sidecar
+    Ruby auto-detection. (The `rigortype` name takeover is NOT deferred but NOT planned — rigor-rs
+    coexists with the Ruby mainstream per ADR-0001.)
 
 ### 14. Parity harness & QA (ADR-0002/0011)
 - ✅ `harness/run.rb` (fixture gate, 28 fixtures incl. alias regression, the

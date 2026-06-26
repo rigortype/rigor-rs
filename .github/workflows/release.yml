@@ -129,3 +129,163 @@ jobs:
           files: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Precompiled-binary gem channel (ADR-0010 PRIMARY distribution channel).
+  # PURELY ADDITIVE + DOWNSTREAM of `build`: this job NEVER runs until the
+  # release assets exist (`needs: build`). It downloads the just-published
+  # `rigor-<v>-<target>.tar.gz`, stages the bare binary into `gem/libexec/rigor`,
+  # and builds a PLATFORM-SPECIFIC `rigortype-rs` gem whose `spec.platform` is
+  # the VERSIONLESS Gem::Platform string (so it matches every macOS/Linux
+  # version). One gemspec; the Rakefile sets the platform per build.
+  #
+  # IMPORTANT mapping gotcha: macOS arm64 is `aarch64` in the Rust triple but
+  # `arm64` in Gem::Platform. The `gem_platform` column below is encoded
+  # literally from the verified ADR-0010 table — do NOT "fix" arm64→aarch64.
+  #
+  # The `gem push` is GATED: it only runs when the `RUBYGEMS_API_KEY` secret is
+  # present AND a manual `release` environment approval is granted, so a tag
+  # push NEVER auto-publishes. RubyGems account + API key + MFA are DEFERRED
+  # (see CURRENT_WORK §13); until then this job builds + smoke-tests only.
+  gem:
+    name: gem ${{ matrix.gem_platform }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    # Manual-approval gate for the push step (configure the env with required
+    # reviewers in repo settings). Build/smoke run unconditionally; only the
+    # `gem push` step is guarded by the secret below.
+    environment: release
+    # Secrets cannot be referenced directly in a step-level `if:`, so we surface
+    # the API key's presence as a job-level env var the push step can gate on.
+    env:
+      HAS_RUBYGEMS_KEY: ${{ secrets.RUBYGEMS_API_KEY != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon macOS — versionless arm64-darwin (NOT aarch64!).
+          - target: aarch64-apple-darwin
+            gem_platform: arm64-darwin
+            os: macos-14
+            smoke: true
+          # Intel macOS.
+          - target: x86_64-apple-darwin
+            gem_platform: x86_64-darwin
+            os: macos-13
+            smoke: true
+          # x86_64 Linux (glibc).
+          - target: x86_64-unknown-linux-gnu
+            gem_platform: x86_64-linux
+            os: ubuntu-latest
+            smoke: true
+          # aarch64 Linux (glibc) — built on the x86_64 runner, so the native
+          # `rigor --version` smoke is SKIPPED (wrong arch to execute).
+          - target: aarch64-unknown-linux-gnu
+            gem_platform: aarch64-linux
+            os: ubuntu-latest
+            smoke: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      # Pull the matching release asset published by the upstream `build` job.
+      - name: Download release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="rigor-${version}-${{ matrix.target }}.tar.gz"
+          gh release download "${GITHUB_REF_NAME}" --pattern "${asset}" --dir .
+          echo "asset=${asset}" >> "$GITHUB_ENV"
+
+      # Extract + stage the bare `rigor` into gem/libexec/rigor (chmod +x). The
+      # archive holds the binary at its root (the build job's packaging layout).
+      - name: Stage native binary into gem/libexec
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="$(mktemp -d)"
+          tar -xzf "${asset}" -C "${staging}"
+          mkdir -p gem/libexec
+          cp "${staging}/rigor" gem/libexec/rigor
+          chmod +x gem/libexec/rigor
+
+      - name: Version lockstep check
+        working-directory: gem
+        run: rake version:check
+
+      - name: Build platform gem
+        working-directory: gem
+        run: rake "build:platform[${{ matrix.gem_platform }}]"
+
+      # Smoke only where the runner arch can execute the binary (macOS rows +
+      # x86_64 Linux). Cross aarch64-linux is skipped (smoke: false).
+      - name: Smoke test (install + run, native rows only)
+        if: matrix.smoke == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          export GEM_HOME="$(mktemp -d)/gemhome"
+          gem install --local --no-document gem/rigortype-rs-${version}-${{ matrix.gem_platform }}.gem
+          "${GEM_HOME}/bin/rigor" --version
+
+      # GATED PUSH — never auto-runs. Requires the RUBYGEMS_API_KEY secret AND
+      # the `release` environment approval above. DEFERRED until the RubyGems
+      # account/API key/MFA are set up (CURRENT_WORK §13).
+      - name: Push gem to RubyGems (gated)
+        if: env.HAS_RUBYGEMS_KEY == 'true'
+        working-directory: gem
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          gem push "rigortype-rs-${version}-${{ matrix.gem_platform }}.gem"
+
+  # The `ruby`-platform FALLBACK gem (no bundled binary). On an unsupported
+  # platform (musl/Windows) `rigor` raises NotFound with guidance toward
+  # `cargo binstall` / Homebrew. Built without staging any binary. Push gated
+  # identically (deferred RubyGems infra).
+  gem-fallback:
+    name: gem ruby (fallback)
+    needs: build
+    runs-on: ubuntu-latest
+    environment: release
+    env:
+      HAS_RUBYGEMS_KEY: ${{ secrets.RUBYGEMS_API_KEY != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Version lockstep check
+        working-directory: gem
+        run: rake version:check
+
+      # No libexec/rigor staged → `ruby`-platform source gem.
+      - name: Build ruby fallback gem
+        working-directory: gem
+        run: rake "build:platform[ruby]"
+
+      - name: Push gem to RubyGems (gated)
+        if: env.HAS_RUBYGEMS_KEY == 'true'
+        working-directory: gem
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          gem push "rigortype-rs-${version}.gem"

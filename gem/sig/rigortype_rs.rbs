@@ -1,0 +1,14 @@
+module RigortypeRs
+  VERSION: String
+
+  module Binary
+    class NotFound < StandardError
+    end
+
+    SUPPORTED_PLATFORMS: Array[String]
+
+    # Absolute path to the bundled native `rigor` binary; raises NotFound when
+    # no binary is bundled (the `ruby` fallback gem / unsupported platforms).
+    def self.path: () -> String
+  end
+end

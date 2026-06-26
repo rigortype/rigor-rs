@@ -1,0 +1,90 @@
+# frozen_string_literal: true
+
+require "rubygems"
+require "rubygems/package"
+require_relative "lib/rigortype_rs/version"
+
+GEM_DIR = __dir__
+GEMSPEC_PATH = File.join(GEM_DIR, "rigortype-rs.gemspec")
+LIBEXEC_BIN = File.join(GEM_DIR, "libexec", "rigor")
+CARGO_TOML = File.expand_path(File.join(GEM_DIR, "..", "Cargo.toml"))
+
+def load_gemspec
+  Gem::Specification.load(GEMSPEC_PATH) or
+    abort("rake: failed to load #{GEMSPEC_PATH}")
+end
+
+# Parse `version = "X.Y.Z"` from the `[workspace.package]` table of Cargo.toml.
+def cargo_workspace_version
+  in_section = false
+  File.foreach(CARGO_TOML) do |line|
+    stripped = line.strip
+    if stripped.start_with?("[")
+      in_section = (stripped == "[workspace.package]")
+      next
+    end
+    next unless in_section
+    if (m = stripped.match(/\Aversion\s*=\s*"([^"]+)"/))
+      return m[1]
+    end
+  end
+  abort("rake version:check: could not find `version` in [workspace.package] of #{CARGO_TOML}")
+end
+
+namespace :version do
+  desc "Assert the gem VERSION equals [workspace.package] version in ../Cargo.toml"
+  task :check do
+    cargo = cargo_workspace_version
+    gem = RigortypeRs::VERSION
+    if cargo != gem
+      abort("VERSION MISMATCH: Cargo.toml [workspace.package] version=#{cargo.inspect} " \
+            "!= RigortypeRs::VERSION=#{gem.inspect}. These MUST be in lockstep (ADR-0010).")
+    end
+    puts "version:check OK — Cargo.toml and RigortypeRs::VERSION both #{gem}"
+  end
+end
+
+namespace :build do
+  desc "Build a platform-specific gem, e.g. rake build:platform[arm64-darwin]"
+  task :platform, [:platform] do |_t, args|
+    platform = args[:platform] or
+      abort("rake build:platform[<platform>]: missing platform argument " \
+            "(e.g. arm64-darwin, x86_64-darwin, x86_64-linux, aarch64-linux, ruby)")
+
+    # The `ruby`-platform FALLBACK gem ships NO binary (it raises NotFound with
+    # guidance). Every other (precompiled) platform MUST have libexec/rigor
+    # staged.
+    if platform == "ruby"
+      if File.exist?(LIBEXEC_BIN)
+        abort("rake build:platform[ruby]: #{LIBEXEC_BIN} is present, but the " \
+              "ruby fallback gem must NOT bundle a binary. Remove it first.")
+      end
+    elsif !File.exist?(LIBEXEC_BIN)
+      abort("rake build:platform: #{LIBEXEC_BIN} is missing. Stage the native " \
+            "binary there before building a platform gem.")
+    end
+
+    spec = load_gemspec
+    spec.platform = platform == "ruby" ? Gem::Platform::RUBY : Gem::Platform.new(platform)
+    Dir.chdir(GEM_DIR) { Gem::Package.build(spec) }
+    puts "Built #{spec.full_name}.gem (platform=#{spec.platform})"
+  end
+
+  desc "Stage ../target/release/rigor and build a HOST-platform gem (local proof)"
+  task :local do
+    src = File.expand_path(File.join(GEM_DIR, "..", "target", "release", "rigor"))
+    unless File.exist?(src)
+      abort("rake build:local: #{src} not found. Run `cargo build --release` first.")
+    end
+
+    require "fileutils"
+    FileUtils.mkdir_p(File.dirname(LIBEXEC_BIN))
+    FileUtils.cp(src, LIBEXEC_BIN)
+    File.chmod(0o755, LIBEXEC_BIN)
+
+    spec = load_gemspec
+    spec.platform = Gem::Platform.local
+    Dir.chdir(GEM_DIR) { Gem::Package.build(spec) }
+    puts "Built #{spec.full_name}.gem (host platform=#{spec.platform})"
+  end
+end
