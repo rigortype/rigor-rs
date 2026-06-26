@@ -6,7 +6,7 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-06-27 (v0.0.1 release prep). See "▶ Resume here" for the
+Last updated: 2026-06-27 (v0.0.1 release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix). See "▶ Resume here" for the
 release-tag steps + the recorded next work (musl/Windows targets; quality management).
 
 > **2026-06-26 correctness finding (this session).** The reference does **not**
@@ -222,8 +222,9 @@ Ranked next levers:
 
 - **Design:** ADRs 0001–0031 (`docs/adr/`) + glossary (`CONTEXT.md`), audited
   (`…/ruby/rigor/docs/notes/20260626-rigor-rs-design-audit.md`; verdict positive, R1–R5 done).
-- **Build:** Cargo workspace, edition 2024, MSRV 1.85, `Cargo.lock` committed.
-  External deps: `ruby-prism` (parser), `ruby-rbs` (RBS parser) — both cached.
+- **Build:** Cargo workspace, edition 2024, **MSRV 1.88** (forced by the `ruby-rbs` dep's
+  let-chains; CI pins 1.88; clippy's suggestion-MSRV stays 1.85 for our own crates),
+  `Cargo.lock` committed. External deps: `ruby-prism` (parser), `ruby-rbs` (RBS parser) — cached.
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
