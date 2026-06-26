@@ -96,10 +96,22 @@ ruby -I/Users/megurine/repo/ruby/rigor/lib /Users/megurine/repo/ruby/rigor/exe/r
   `gitlab-foss/app/{models,services}`, `conference-app`, plus the reference's own `lib/` & `examples/`.
 - Spikes (excluded from the workspace): `spike/prism_probe`, `spike/rbs_probe`.
 
-**Highest-leverage next candidates** (data-driven: on real code `call.undefined-method`
-is **96%** of error/warning diagnostics — so coverage comes from *typing more receivers*
-precisely, not new rules. The remaining gap is mostly **Rails** receivers needing
-project-RBS / plugins):
+**Highest-leverage next candidates.** **STRATEGIC FINDING (this session, oracle-grounded):
+the `call.undefined-method` receiver-typing lever is now largely EXHAUSTED in rigor-rs's
+witnessing model.** `undefined-method` is ~96% of the reference's error/warning diagnostics,
+but the remaining MISSES are overwhelmingly on receivers rigor-rs *intentionally* does not
+witness — **in-source/project-class instances and non-core `.new` instances are lenient**
+(the parity invariant at the top of this file). Two investigations confirmed it: (a) the
+**ActiveRecord `dynamic_return` plugin** measured **+0 gettable witnesses** over an
+ActiveSupport-aware baseline across 581 Mastodon files (its value is on lenient project
+models, on an `ActiveRecord::Relation` surface that would need a large plugin-class-registry
++ a new "known-but-non-witnessing" invariant, or in its OWN native rules like `unknown-column`
+— none of which is a `dynamic_return` slice); and (b) **tier-4 call-site param binding**
+landed sound + zero-FP but **+0 corpus matched** (the pattern is rare in real code). So
+further coverage must come from **NET-NEW rule families (the `flow.*` family, §4) — not more
+receiver typing.** The pure-RBS `activesupport-core-ext` plugin (core-class reopens) was the
+last big receiver-typing win; the gated coverage there is real but only on plugin-enabled runs.
+Ranked next levers:
 1. 🟡 **Cross-file in-source RETURN-TYPE inference** (ADR-0023 tier-4 body inference) —
    **two slices LANDED** (this session): `SourceIndex` Pass-3 `infer_method_returns`
    types a project method's TAIL expression under an EMPTY `TypeEnv` and, when it yields a
