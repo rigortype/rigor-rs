@@ -42,6 +42,14 @@ fn empty_source() -> &'static SourceIndex {
 /// flow-sensitive in this slice.
 pub type TypeEnv = HashMap<String, TypeId>;
 
+/// Constants whose `.new`/`.define` returns a CLASS, not a plain instance of the
+/// named class: `Struct.new(...)` and `Data.define(...)` build an anonymous
+/// SUBCLASS; `Class.new` builds a `Class`. Their result must NOT be typed as an
+/// instance of the receiver — doing so would witness a chained class-method call
+/// (e.g. the second `.new` in `Struct.new(:a).new(1)`) falsely absent. We can't
+/// model the anonymous class, so the result stays Dynamic (silent).
+const CLASS_RETURNING_NEW: &[&str] = &["Struct", "Data", "Class"];
+
 /// The expression typer (ADR-0023: the reference's `ExpressionTyper` /
 /// `MethodDispatcher` split). Holds a borrow of the [`CoreIndex`] so it can
 /// resolve a receiver's class and a method's return type — the data a CHAINED
@@ -180,7 +188,13 @@ impl<'i> Typer<'i> {
         // source-range ClassId from the SourceIndex.
         if method == "new" {
             if let Node::ConstantRead { name, .. } = ast.get(receiver) {
-                if !name.is_empty() {
+                // The metaclass constructors return a CLASS, not a plain instance
+                // of the named class: `Struct.new(...)`/`Data.define(...)` build an
+                // anonymous SUBCLASS, `Class.new` builds a Class. Typing their
+                // result as an instance of `Struct`/`Data`/`Class` would wrongly
+                // witness e.g. the chained `.new` (a class method) absent. We
+                // can't model the anonymous class, so leave it Dynamic (silent).
+                if !name.is_empty() && !CLASS_RETURNING_NEW.contains(&name.as_str()) {
                     // Prefer a core (CORE_CLASSES) nominal id when the name maps
                     // to one — its method existence resolves via the core path.
                     if let Some(class_id) = self.index.class_id(name) {

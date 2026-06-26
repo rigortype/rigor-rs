@@ -141,6 +141,8 @@ pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> 
     // over the real RBS index AND that source index, so `X.new` types to an
     // instance of a project-defined (or RBS-known) class and non-folded nominal
     // returns (e.g. `Integer#to_s -> String`) resolve for chained-call typing.
+    // The source index drives RETURN-TYPE inference for chaining only; it is NOT
+    // a witnessing surface for the undefined-method rule (see `check_call`).
     let source = rigor_infer::SourceIndex::build(ast, index);
     let typer = Typer::with_source(index, &source);
     let env = typer.build_toplevel_env(ast, interner);
@@ -190,10 +192,26 @@ pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> 
 
 /// Apply `call.undefined-method` to a single call with a receiver.
 ///
-/// Zero-false-positive gate (ADR-0023): emit *only* when the receiver types to
-/// a concrete class the [`CoreIndex`] models AND that class is known to lack
-/// the method. If the receiver is `Dynamic`/unknown, or the class is outside
-/// the index, emit nothing — never guess.
+/// Zero-false-positive gate (ADR-0023): emit *only* when the receiver's concrete
+/// class is **RBS-known in the core surface** AND that class is known to lack the
+/// method. If the receiver is `Dynamic`/unknown, or its class is a project-defined
+/// (in-source) or non-core `.new` instance, emit nothing — never guess.
+///
+/// ## Why in-source / non-core `.new` instances are NOT witnessed
+///
+/// The reference gates this rule on `rbs_class_known?(class_name)`
+/// (`check_rules.rb:556`): a project-defined class — or a non-core class reached
+/// only through `X.new` — is treated **leniently**. A method MISS on such a
+/// receiver stays `Dynamic[top]` and silent, because Ruby routinely defines
+/// methods dynamically (ADR-0023 tier-4: "on a miss, the call stays Dynamic").
+/// Empirically the reference is silent on `Point.new.typo`, `MyError.new.typo`,
+/// `Pathname.new.typo`, `Set.new.typo`, and `Struct.new(...).new`, while it DOES
+/// witness on literals, RBS-method returns, and core `X.new` (`Array.new.typo`).
+///
+/// The in-source/registry surface ([`rigor_infer::SourceIndex`]) still types such
+/// instances — for chained RETURN inference and `X.new` identity — but it is
+/// never a *witnessing* surface for this rule. Honouring that boundary is the
+/// keystone that keeps real project code (incl. Rails models) false-positive-free.
 fn check_call(
     ast: &LoweredAst,
     receiver: rigor_parse::NodeId,
@@ -206,38 +224,20 @@ fn check_call(
 ) -> Option<Diagnostic> {
     let recv_ty = typer.type_of(ast, receiver, env, interner);
 
-    // Resolve the receiver's class name from EITHER the core (RBS/CORE_CLASSES)
-    // surface OR the per-run source registry (in-source classes + registered
-    // RBS-only instance classes like Pathname). `None` => Dynamic/unknown =>
-    // silent.
-    let source = typer.source();
-    if let Some(class_name) = index.class_name_of(interner, recv_ty) {
-        // Core/RBS-modeled receiver: witness absence only over a known class.
-        if !index.knows_class(class_name) {
-            return None;
-        }
-        if index.class_has_method(class_name, method) {
-            return None;
-        }
-    } else if let Some(class_name) = source_class_name(source, interner, recv_ty) {
-        // In-source / registered-instance receiver. The source index applies the
-        // conservative completeness gate (unknown ancestor ⇒ assume present); a
-        // `false` here means the entire chain is known and lacks the method.
-        if source.class_has_method(index, &class_name, method) {
-            return None;
-        }
-    } else {
-        // Neither surface resolves the receiver ⇒ Dynamic/unknown ⇒ silent.
+    // Witness ONLY over a class the core (RBS/CORE_CLASSES) surface models and
+    // round-trips by id. A receiver that resolves only through the in-source /
+    // registry surface (a project class, or a non-core `X.new` like Pathname)
+    // returns `None` here ⇒ silent (reference leniency, see the rustdoc above).
+    let class_name = index.class_name_of(interner, recv_ty)?;
+    if !index.knows_class(class_name) {
+        return None;
+    }
+    if index.class_has_method(class_name, method) {
         return None;
     }
 
-    // We have witnessed absence. Resolve the class name again for rendering
-    // (core takes precedence; else the source registry).
-    let class_name: String = index
-        .class_name_of(interner, recv_ty)
-        .map(|s| s.to_string())
-        .or_else(|| source_class_name(source, interner, recv_ty))
-        .unwrap_or_default();
+    // We have witnessed absence over a core/RBS class.
+    let class_name = class_name.to_string();
 
     // Render the receiver in the reference's value-in-message style: the bare
     // value for a `Constant` (`"Hello"`, `3`), else the class name. The
@@ -374,20 +374,6 @@ fn check_nil_receiver(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Resolve a receiver [`TypeId`] to its per-run source-registry class name, when
-/// it is a `Type::Nominal` whose `ClassId` is in the source range. `None` for any
-/// other carrier (the core path or Dynamic owns those).
-fn source_class_name(
-    source: &rigor_infer::SourceIndex,
-    interner: &Interner,
-    ty: rigor_types::TypeId,
-) -> Option<String> {
-    match interner.get(ty) {
-        Type::Nominal { class, .. } => source.class_name_for_id(*class).map(|s| s.to_string()),
-        _ => None,
-    }
-}
 
 /// Render the receiver for the diagnostic message: the bare literal value for a
 /// value-pinned `Constant`, else the resolved class name.
@@ -544,27 +530,26 @@ mod tests {
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 
-    // --- in-source class typing (ADR-0023 tier-4) end-to-end ----------------
+    // --- in-source / non-core `.new` instances: reference leniency -----------
+    //
+    // The reference does NOT witness `undefined-method` on a project-defined
+    // class instance, nor on a non-core `X.new` instance (Pathname/Set/Struct):
+    // it gates on `rbs_class_known?` (check_rules.rb:556) and treats a miss there
+    // leniently (ADR-0023 tier-4). rigor-rs mirrors that — these receivers are
+    // typed (for chaining) but never witnessed. Every case below MUST be silent.
 
     #[test]
-    fn flags_typo_on_in_source_instance_with_complete_chain() {
-        // `class Point; def x; end; end; p = Point.new; p.y` — `y` is undefined
-        // on Point and its full chain (implicit Object) is known ⇒ flag.
-        let src = b"class Point\n  def x\n  end\nend\np = Point.new\np.y\n";
-        let diags = run(src);
-        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
-        let d = &diags[0];
-        assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
-        assert_eq!(d.severity, Severity::Error);
-        assert_eq!(d.message, "undefined method `y' for Point");
-        assert_eq!(d.receiver_type.as_deref(), Some("Point"));
-        assert_eq!(d.method_name.as_deref(), Some("y"));
-        assert_eq!(&src[d.start_offset..d.end_offset], b"y");
+    fn in_source_instance_typo_is_silent_lenient() {
+        // `class Point; def x; end; end; p = Point.new; p.y` — `y` is undefined on
+        // Point, but Point is a project class (not RBS-known) ⇒ the reference stays
+        // silent (leniency: Ruby defines methods dynamically). So must rigor-rs.
+        let diags = run(b"class Point\n  def x\n  end\nend\np = Point.new\np.y\n");
+        assert!(diags.is_empty(), "project-class miss must be silent, got {diags:?}");
     }
 
     #[test]
     fn defined_in_source_method_is_silent() {
-        // `p.x` where Point defines `x` ⇒ no diagnostic.
+        // `p.x` where Point defines `x` ⇒ no diagnostic (and silent regardless).
         let diags = run(b"class Point\n  def x\n  end\nend\np = Point.new\np.x\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
@@ -579,9 +564,9 @@ mod tests {
 
     #[test]
     fn unknown_superclass_keeps_source_instance_silent() {
-        // `class User < ApplicationRecord; end; u = User.new; u.anything` — the
-        // super is unknown ⇒ chain incomplete ⇒ assume present ⇒ SILENT. This is
-        // the zero-FP keystone for Rails models.
+        // `class User < ApplicationRecord; end; u = User.new; u.anything` — silent
+        // both because the super is unknown AND because a project class is never
+        // witnessed. The zero-FP keystone for Rails models.
         let diags = run(
             b"class User < ApplicationRecord\nend\nu = User.new\nu.totally_made_up_xyz\n",
         );
@@ -589,39 +574,52 @@ mod tests {
     }
 
     #[test]
-    fn inherited_source_method_is_silent_and_typo_flagged() {
-        // `class Animal; def speak; end; end; class Dog < Animal; end` —
-        // Dog.new.speak inherited (silent); Dog.new.fly absent over a fully known
-        // chain (flag).
+    fn source_subclass_typo_is_silent_lenient() {
+        // `class Animal; def speak; end; end; class Dog < Animal; end` — neither
+        // an inherited method nor a typo is witnessed on the project class `Dog`
+        // (reference leniency), even though the chain Dog->Animal->Object is known.
         let ok = run(b"class Animal\n  def speak\n  end\nend\nclass Dog < Animal\nend\nd = Dog.new\nd.speak\n");
         assert!(ok.is_empty(), "inherited method must be silent, got {ok:?}");
         let bad = run(b"class Animal\n  def speak\n  end\nend\nclass Dog < Animal\nend\nd = Dog.new\nd.fly\n");
-        assert_eq!(bad.len(), 1, "expected typo flagged, got {bad:?}");
-        assert_eq!(bad[0].message, "undefined method `fly' for Dog");
+        assert!(bad.is_empty(), "project-class typo must be silent (leniency), got {bad:?}");
     }
 
     #[test]
-    fn reopened_source_class_unions_methods_no_fp() {
-        // Methods from both reopens are visible; a genuine typo still flags.
+    fn reopened_source_class_is_silent_lenient() {
+        // A project class is never witnessed, reopened or not — including a typo.
         assert!(run(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\nc = C.new\nc.a\n").is_empty());
-        assert!(run(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\nc = C.new\nc.b\n").is_empty());
         let typo = run(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\nc = C.new\nc.zzz\n");
-        assert_eq!(typo.len(), 1, "expected typo flagged, got {typo:?}");
+        assert!(typo.is_empty(), "project-class typo must be silent (leniency), got {typo:?}");
     }
 
     #[test]
-    fn rbs_class_new_typo_flags() {
-        // `Pathname.new("a").nonexist` — Pathname is RBS-known (needs the stdlib
-        // tree). When loaded, the typo flags; under the stub fallback Pathname is
-        // absent so the receiver is Dynamic and it stays (correctly) silent.
-        let idx = CoreIndex::new();
+    fn non_core_rbs_new_instance_typo_is_silent_lenient() {
+        // `Pathname.new("a").nonexist` — Pathname is RBS-known but NOT a core
+        // class round-tripped by id, so it resolves only through the registry
+        // surface. The reference is silent on `Pathname.new.typo` (leniency on a
+        // non-core `.new` instance); rigor-rs mirrors that — always silent.
         let diags = run(b"p = Pathname.new(\"a\")\np.nonexist\n");
-        if idx.knows_class("Pathname") {
-            assert_eq!(diags.len(), 1, "expected Pathname typo flagged, got {diags:?}");
+        assert!(diags.is_empty(), "non-core .new instance miss must be silent, got {diags:?}");
+    }
+
+    #[test]
+    fn metaclass_constructor_chained_new_is_silent() {
+        // `Struct.new(:a, :b).new(1, 2)` — `Struct.new` returns a CLASS, not a
+        // Struct instance; the chained `.new` must not be witnessed absent.
+        let diags = run(b"Struct.new(:a, :b).new(1, 2)\n");
+        assert!(diags.is_empty(), "Struct.new(...).new must be silent, got {diags:?}");
+    }
+
+    #[test]
+    fn core_new_instance_typo_still_flags() {
+        // The core `.new` path is still witnessed (matches the reference, which
+        // flags `Array.new.bogus`): `Array` IS a core class round-tripped by id.
+        let idx = CoreIndex::new();
+        let diags = run(b"Array.new.bogus_xyz\n");
+        if idx.knows_class("Array") {
+            assert_eq!(diags.len(), 1, "expected core .new typo flagged, got {diags:?}");
             assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
-            assert_eq!(diags[0].method_name.as_deref(), Some("nonexist"));
-        } else {
-            assert!(diags.is_empty(), "stub fallback: Pathname unknown ⇒ silent");
+            assert_eq!(diags[0].method_name.as_deref(), Some("bogus_xyz"));
         }
     }
 
