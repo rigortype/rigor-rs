@@ -27,6 +27,16 @@ pkg-url = "{ repo }/releases/download/v{ version }/rigor-{ version }-{ target }{
 pkg-fmt = "tgz"
 bin-dir = "rigor{ binary-ext }"
 
+# Windows release asset is a `.zip` (not tgz) — see release.yml's Windows
+# package step. cargo-binstall per-target overrides (documented syntax:
+# `[package.metadata.binstall.overrides."<target-triple>"]`) let just this
+# target use `pkg-fmt = "zip"` while every unix target keeps the default tgz
+# above. `{ archive-suffix }` in the inherited pkg-url then resolves to `.zip`
+# for this target, matching `rigor-<version>-x86_64-pc-windows-msvc.zip`, and
+# `bin-dir`'s `{ binary-ext }` resolves to `.exe`.
+[package.metadata.binstall.overrides."x86_64-pc-windows-msvc"]
+pkg-fmt = "zip"
+
 [dependencies]
 rigor-parse = { path = "../rigor-parse" }
 rigor-rules = { path = "../rigor-rules" }

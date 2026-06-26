@@ -56,6 +56,28 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
+          # ── Distribution slice 4 (§13, ADR-0010): musl + Windows ────────────
+          # x86_64 Linux (musl) — fully STATIC binary (a goal of ADR-0010).
+          # Built with `cargo-zigbuild`: zig supplies the musl C cross-toolchain
+          # the `-sys` crates' `cc` step needs, while bindgen runs on the ubuntu
+          # BUILD HOST against the runner's libclang. Smoke is skipped (keep the
+          # cross/musl rows uniform with the aarch64 row's skip).
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: false
+            use_zigbuild: true
+          # aarch64 Linux (musl) — same fully-static story, cross-arch via zig.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            cross: false
+            use_zigbuild: true
+          # x86_64 Windows (MSVC) — builds NATIVELY on a windows runner (no
+          # cross): rustup's default MSVC toolchain + the runner's preinstalled
+          # LLVM for bindgen's libclang. Binary is `rigor.exe`, packaged as a
+          # `.zip` (Windows users expect zip). Smoke runs natively.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            cross: false
 
     steps:
       - name: Checkout
@@ -76,27 +98,62 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang libclang-dev
 
+      # Windows (slice 4): bindgen needs libclang on the BUILD HOST. The
+      # windows-latest runner ships LLVM at `C:\Program Files\LLVM`; point
+      # bindgen's clang-sys at it via LIBCLANG_PATH (belt-and-suspenders — it
+      # usually autodetects, but the explicit env removes ambiguity). The MSVC
+      # C toolchain (for the `-sys` crates' `cc`) is preinstalled on the runner.
+      - name: Set libclang path (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding ascii
+
       - name: Install cross
         if: matrix.cross == true
         run: cargo install cross --locked
 
+      # musl rows (slice 4): zig provides the musl C cross-toolchain for the
+      # `-sys` crates' `cc` step; `cargo-zigbuild` drives it. bindgen still runs
+      # on the host against the clang/libclang-dev installed by the Linux-native
+      # deps step above (which also matches these cross==false Linux rows).
+      - name: Install zig + cargo-zigbuild (musl)
+        if: matrix.use_zigbuild == true
+        run: |
+          pip3 install ziglang
+          cargo install cargo-zigbuild --locked
+
       # `--locked` everywhere: build against the committed Cargo.lock for
       # reproducible releases. `cross` substitutes for `cargo` on the aarch64
-      # Linux row, building inside an arch-appropriate container.
+      # Linux row, building inside an arch-appropriate container; the musl rows
+      # use `cargo zigbuild` instead of plain `cargo`.
       - name: Build (cargo)
-        if: matrix.cross == false
+        if: matrix.cross == false && matrix.use_zigbuild != true
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Build (cross)
         if: matrix.cross == true
         run: cross build --release --locked --target ${{ matrix.target }}
 
+      - name: Build (cargo-zigbuild, musl)
+        if: matrix.use_zigbuild == true
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+
       # Smoke-test only on natively-runnable targets (the runner's own arch):
       # both macOS rows and x86_64 Linux. The aarch64-Linux cross build can't run
-      # on the x86_64 runner, so it is skipped here.
+      # on the x86_64 runner, so it is skipped here. The musl rows (use_zigbuild)
+      # are skipped too — aarch64-musl is the wrong arch and x86_64-musl is kept
+      # uniform with the cross/musl skips. Windows smokes via its own step below.
       - name: Smoke test (native targets only)
-        if: matrix.cross == false
+        if: matrix.cross == false && matrix.use_zigbuild != true && runner.os != 'Windows'
         run: ./target/${{ matrix.target }}/release/rigor doctor
+
+      # Windows smoke (slice 4): the MSVC build runs natively on the windows
+      # runner, so exercise the produced `rigor.exe`. `--version` is a cheap,
+      # dependency-free liveness check (doctor probes the environment).
+      - name: Smoke test (Windows native)
+        if: runner.os == 'Windows'
+        run: ./target/${{ matrix.target }}/release/rigor.exe --version
 
       # Package: bare `rigor` (+ LICENSE/README if present) at the archive root,
       # named `rigor-<version>-<target>.tar.gz`. `version` is the tag minus the
@@ -104,6 +161,7 @@ jobs:
       # emitted next to the archive for integrity verification.
       - name: Package
         id: package
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
@@ -123,12 +181,40 @@ jobs:
 
           echo "archive=${archive}" >> "$GITHUB_OUTPUT"
 
+      # Windows package (slice 4): `.zip` containing `rigor.exe` (+ LICENSE) at
+      # the archive root — Windows users expect zip and tar+gzip is awkward
+      # there. PowerShell `Compress-Archive` builds the zip; `Get-FileHash`
+      # emits the `.sha256` sidecar (lowercased to match `shasum` output style).
+      # The asset is `rigor-<version>-x86_64-pc-windows-msvc.zip`.
+      - name: Package (Windows zip)
+        id: package_windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = "$env:GITHUB_REF_NAME" -replace '^v', ''
+          $target = "${{ matrix.target }}"
+          $archive = "rigor-$version-$target.zip"
+
+          $staging = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "rigor-stage") -Force
+          Copy-Item "target/$target/release/rigor.exe" (Join-Path $staging "rigor.exe")
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" (Join-Path $staging "LICENSE") }
+          if (Test-Path "README.md") { Copy-Item "README.md" (Join-Path $staging "README.md") }
+
+          Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $archive -Force
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
+          "$hash  $archive" | Out-File -FilePath "$archive.sha256" -Encoding ascii -NoNewline
+
+          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding ascii
+
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             ${{ steps.package.outputs.archive }}
             ${{ steps.package.outputs.archive }}.sha256
+            ${{ steps.package_windows.outputs.archive }}
+            ${{ steps.package_windows.outputs.archive }}.sha256
 
   # ───────────────────────────────────────────────────────────────────────────
   # Precompiled-binary gem channel (ADR-0010 PRIMARY distribution channel).
@@ -184,6 +270,27 @@ jobs:
             gem_platform: aarch64-linux
             os: ubuntu-latest
             smoke: false
+          # ── Distribution slice 4 (§13): musl gem variants ───────────────────
+          # x86_64 Linux (musl) — versionless `x86_64-linux-musl` Gem::Platform
+          # (Alpine/musl Ruby hosts report `*-linux-musl`; verified that
+          # Gem::Platform.new("x86_64-linux-musl").to_s normalizes to itself).
+          # The runner is a glibc ubuntu host, so the musl binary can't execute
+          # there — smoke SKIPPED (matches the aarch64 row's cross skip).
+          - target: x86_64-unknown-linux-musl
+            gem_platform: x86_64-linux-musl
+            os: ubuntu-latest
+            smoke: false
+          # aarch64 Linux (musl) — versionless `aarch64-linux-musl`. Smoke
+          # skipped (wrong arch AND wrong libc on the glibc x86_64 runner).
+          - target: aarch64-unknown-linux-musl
+            gem_platform: aarch64-linux-musl
+            os: ubuntu-latest
+            smoke: false
+          # Windows gem: DEFERRED (slice 4). A Windows gem needs a mingw
+          # Gem::Platform (`x64-mingw-ucrt`) and packaging an MSVC `.exe` into it
+          # is finicky; it's lower-value than the binstall/Releases channel which
+          # already serves Windows via the `.zip` asset. Revisit if demand
+          # warrants — see CURRENT_WORK §13.
 
     steps:
       - name: Checkout

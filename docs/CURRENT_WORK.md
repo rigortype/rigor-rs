@@ -71,15 +71,17 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >
 > **▶▶ NEXT WORK (recorded 2026-06-27, to pick up after v0.0.1) — two tracks the maintainer
 > wants tackled incrementally:**
-> 1. **Distribution slice 4 — musl + Windows targets** (§13). Extend `release.yml`'s build
->    matrix with `x86_64`/`aarch64-unknown-linux-musl` (via `cargo-zigbuild` or `cross` — the
->    `-sys` crates' `cc`+`bindgen` static link needs a validated musl cross-toolchain) and
->    `x86_64-pc-windows-msvc` (windows runner; `.exe` binary + `.zip` packaging; libclang for
->    bindgen). Extend the gem `Gem::Platform` map (`x86_64-linux-musl`, `aarch64-linux-musl`,
->    a Windows `x64-mingw-ucrt`/`x64-mingw32` decision) and the Homebrew formula's linux block
->    where clean. **These were deferred as the HIGH-risk targets needing CI iteration** (cc+bindgen
->    on musl/MSVC) — best built WITH real CI feedback, not blind. The binary channel
->    (Releases/binstall) benefits first; gem/Homebrew extensions follow per-platform.
+> 1. **Distribution slice 4 — musl + Windows targets** (§13). ✅ **WIRED (2026-06-27), PENDING CI
+>    VALIDATION.** `release.yml`'s build matrix now has `x86_64`/`aarch64-unknown-linux-musl` (via
+>    **`cargo-zigbuild`** — zig supplies the musl C cross-toolchain, bindgen runs on the host) and
+>    `x86_64-pc-windows-msvc` (native windows runner; `.exe` + `.zip` packaging; `LIBCLANG_PATH`
+>    for bindgen). The gem `Gem::Platform` map gained `x86_64-linux-musl` + `aarch64-linux-musl`
+>    (verified normalizations). The binstall metadata gained a Windows `pkg-fmt = "zip"` override.
+>    **DEFERRED-BY-DESIGN:** the Windows gem (`x64-mingw-ucrt` mingw platform — lower-value than the
+>    binstall/`.zip` channel) and any Homebrew musl/Windows block (Homebrew Linux is glibc-only, no
+>    Windows). **STILL NEEDS A REAL CI TAG RUN** to validate the cc+bindgen musl/MSVC cross/native
+>    builds + `.zip` packaging + asset upload (no local cross-toolchain) — same caveat as the
+>    existing release targets.
 > 2. **Quality management (品質管理)** (§14). (a) ✅ DONE (2026-06-27) — workspace is
 >    clippy-clean and `ci.yml`'s clippy step is now BLOCKING (`-D warnings`, `continue-on-error`
 >    removed). The ~48 warnings were cleared behavior-preserving: doc-comment formatting (10),
@@ -724,7 +726,53 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
     rewriter was exercised end-to-end with fake sidecars: each target's sha lands in the correct
     arch block, version substituted, placeholder-survival guard fires on a missing sidecar.
   - **DEFERRED (Homebrew):** the `rigortype/homebrew-tap` repo + a `HOMEBREW_TAP_TOKEN`; the first
-    real tag to produce real sha256s; musl + Windows targets; sidecar auto-detection.
+    real tag to produce real sha256s; sidecar auto-detection. **musl/Windows are NOT added to the
+    formula by design** — Homebrew on Linux uses glibc (not musl) and has no Windows support, so
+    `HomebrewFormula/rigor.rb` stays macOS + linux-gnu (left BYTE-UNCHANGED in slice 4).
+- ✅ **Distribution slice 4 — musl + Windows binary targets WIRED (2026-06-27; purely additive
+    CI/packaging config — no `crates/` source change; the existing 4 `build` rows + the
+    `gem`/`gem-fallback`/`homebrew-formula` jobs are byte-unchanged; the only `Cargo.toml` change
+    is a binstall packaging-metadata override).**
+  - **Binary matrix (`release.yml` `build` job): +3 rows.** `x86_64-unknown-linux-musl` +
+    `aarch64-unknown-linux-musl` build via **`cargo-zigbuild`** (zig supplies the musl C
+    cross-toolchain the `-sys` crates' `cc` needs; bindgen runs on the ubuntu host against the
+    apt-installed libclang) — gated by a new `use_zigbuild: true` matrix flag (mirrors the
+    `cross` flag pattern): an "Install zig + cargo-zigbuild" step (`pip3 install ziglang` +
+    `cargo install cargo-zigbuild --locked`) and a `cargo zigbuild --release --locked --target`
+    build step, both `if: matrix.use_zigbuild == true`. musl Linux is **fully static** (an
+    ADR-0010 goal). Packaged as `.tar.gz` (bare `rigor`) like the others; smoke SKIPPED (uniform
+    with the cross/musl skips). `x86_64-pc-windows-msvc` runs **natively** on `windows-latest`
+    (rustup default MSVC toolchain; `LIBCLANG_PATH=C:\Program Files\LLVM\bin` set for bindgen),
+    `cargo build --release --locked --target` (the existing Build-cargo step, now gated
+    `&& matrix.use_zigbuild != true`, also covers Windows), packaged as a **`.zip`**
+    (`rigor-<v>-x86_64-pc-windows-msvc.zip`, `rigor.exe` + LICENSE) via PowerShell
+    `Compress-Archive` + a `Get-FileHash` `.sha256` sidecar; smoke `rigor.exe --version` runs
+    natively. The shared smoke/Package steps were tightened with `if:` guards
+    (`runner.os != 'Windows'`, `matrix.use_zigbuild != true`) so the original 4 rows' behavior is
+    unchanged; the `action-gh-release` upload glob gained the two Windows `.zip`/`.zip.sha256`
+    entries (empty on non-Windows rows, so the tar.gz upload is unaffected).
+  - **binstall consistency:** added `[package.metadata.binstall.overrides."x86_64-pc-windows-msvc"]`
+    with `pkg-fmt = "zip"` in `crates/rigor-cli/Cargo.toml` (unix targets keep the default `tgz`);
+    `{ archive-suffix }` in the inherited `pkg-url` then resolves to `.zip` for Windows. Confirmed
+    `cargo build/test --offline` (352) + clippy (`-D warnings`) stay green after the metadata add.
+  - **Gem matrix (`gem` job): +2 musl rows.** `x86_64-unknown-linux-musl` → `x86_64-linux-musl`,
+    `aarch64-unknown-linux-musl` → `aarch64-linux-musl` (VERIFIED:
+    `ruby -e 'Gem::Platform.new("x86_64-linux-musl")'` → `x86_64-linux-musl`, aarch64 likewise —
+    musl Ruby hosts e.g. Alpine report `*-linux-musl`). Both `smoke: false` (musl binary can't run
+    on the glibc x86_64 runner). The **Windows gem is DEFERRED** (commented in-job): needs a mingw
+    `Gem::Platform` (`x64-mingw-ucrt`) + packaging an MSVC `.exe` into it is finicky and lower-value
+    than the binstall/`.zip` channel that already serves Windows.
+  - **Homebrew: NO change (by design)** — see the DEFERRED note above; `HomebrewFormula/rigor.rb`
+    left byte-unchanged (glibc-only Linux, no Windows).
+  - **Local gates (all green):** `release.yml` YAML parses (`yaml.safe_load`); the original 4
+    build rows + gem/gem-fallback/homebrew jobs verified byte-unchanged (diff vs a pre-edit
+    backup shows only the 4 sanctioned `if:`/comment edits + additive hunks); `cargo build/test
+    --offline` (352), clippy `-D warnings`, `ruby harness/run.rb` (PASS, 0 FP) all green.
+  - **REQUIRES A REAL CI TAG RUN TO VALIDATE (the documented caveat, same as the existing
+    targets):** the actual `cargo-zigbuild` musl cross-builds + Windows MSVC native build, the
+    bindgen-on-host success for both, the `.zip` packaging + `.sha256` sidecar, and the
+    asset upload (incl. the broadened glob). None of these are locally runnable (no
+    zig/cross/cargo-zigbuild + no Linux/Windows cross-toolchain on this host).
 
 ### 14. Parity harness & QA (ADR-0002/0011)
 - ✅ `harness/run.rb` (fixture gate, 28 fixtures incl. alias regression, the
