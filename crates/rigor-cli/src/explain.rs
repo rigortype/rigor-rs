@@ -485,6 +485,37 @@ fn all() -> Vec<&'static Entry> {
     v
 }
 
+// ---------------------------------------------------------------------------
+// Catalogue surface reused by `rigor docs` (§11).
+//
+// `docs` is a thin view over the SAME catalogue `explain` renders: rigor-rs has
+// no bundled manual pages (the reference's `docs/manual/*.md`), so its
+// documented-content corpus IS the rule catalogue. These helpers let `docs.rs`
+// list the catalogue and render one rule's documentation without duplicating
+// the `ENTRIES` table or its rendering.
+// ---------------------------------------------------------------------------
+
+/// `(id, summary)` for every catalogue rule, id-sorted — the data `rigor docs`
+/// (no argument) lists. Mirrors the index `explain` prints, exposed as data so
+/// `docs` can frame it with its own header.
+pub fn catalogue_index() -> Vec<(&'static str, &'static str)> {
+    all().iter().map(|e| (e.id, e.summary)).collect()
+}
+
+/// Render one rule's documentation to stdout, by canonical id, legacy alias, or
+/// family token (the SAME resolution `explain` uses). Returns `false` (printing
+/// nothing) for an unknown token so the caller can emit its own error + exit
+/// code. The body is exactly `explain`'s text rendering — the rule documentation
+/// rigor-rs ships.
+pub fn render_rule_doc(token: &str) -> bool {
+    let entries = resolve(token);
+    if entries.is_empty() {
+        return false;
+    }
+    render_entries(&entries, "text");
+    true
+}
+
 /// `rigor explain [--format text|json] [<rule>]` — print rule metadata.
 /// Exit 0 on success, 64 on an unknown rule or a usage error.
 pub fn cmd_explain(args: &[String]) -> ExitCode {

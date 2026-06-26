@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 344 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 352 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 344 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 352 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -542,8 +542,31 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   a `--format json` (the reference has one; human format first). Intentionally divergent:
   the reference's doctor is a findings classifier over a real analysis pass; rigor-rs's
   surfaces the standalone/embedded setup state instead.
+- ✅ `plugins` — `[list] [--config PATH]`. Lists the bundled plugins rigor-rs ships
+  (`activesupport-core-ext`) and, per plugin, whether the discovered `.rigor.yml`'s
+  `plugins:` enables it (config-gated; reuses `rigor_index::plugins`, the same source
+  `doctor` uses). Borrows the reference's `[OK]`/loaded-vs-available framing + exit-0
+  (non-`--strict` advisory) semantics; surfaces the vendored RBS bundle's `.rbs` count
+  as the `signature_paths:` analog. **Intentional difference:** rigor-rs ships only
+  native PURE-RBS bundled plugins (no gem loader, no gem-installed plugins), so the
+  listing differs from the reference's gem-based activation report. **Deferred:**
+  gem-load status, signature-path filesystem inspection, the ADR-37 `--capabilities`
+  catalogue, `--format json`, `--strict` (no gem loader / manifest in the standalone
+  build).
+- 🟡 `docs` — `[<rule-id>]`. The reference's `docs` (ADR-74) is a bundled-MANUAL
+  renderer (gem-shipped `docs/install.md` + `docs/manual/*.md` + `docs/handbook/*.md`
+  + `llms.txt`, with `--list`/`--path`). The standalone build bundles none of that
+  prose, so this implements the tractable CORE over the documented content rigor-rs
+  *does* ship — the rule catalogue (the `explain` `RuleCatalog` port): `rigor docs`
+  lists the documented rules (id + summary); `rigor docs <rule-id>` prints that rule's
+  documentation (the same per-rule reference `explain <rule-id>` renders — canonical
+  id, legacy alias, family token all resolve); unknown id → stderr error + exit 64
+  (reuses `explain`'s contract). **Deferred** (no bundled prose corpus): the manual /
+  handbook / install pages, the `llms.txt` index, and the `--list`/`--path` flags that
+  address them; `docs` prints a note pointing at the web manual instead (no fabricated
+  content).
 - ⬜ `annotate` · `diff` · `triage` ·
-  `coverage` (incl. `--protection`, ref ADR-63/70) · `plugins`/`plugin` · `docs` ·
+  `coverage` (incl. `--protection`, ref ADR-63/70) · `plugin` ·
   `sig-gen` (ref ADR-14) · `skill`/`describe` · `lsp` · `mcp` ·
   `trace` · `type-scan`.
 

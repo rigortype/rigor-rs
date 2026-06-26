@@ -25,9 +25,11 @@ mod diagnostic_formats;
 use diagnostic_formats::Rendered;
 mod baseline;
 use baseline::{Baseline, MatchMode, DEFAULT_BASELINE_PATH};
+mod docs;
 mod doctor;
 mod explain;
 mod init;
+mod plugins_cmd;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).
@@ -46,6 +48,8 @@ fn main() -> ExitCode {
         Some("explain") => explain::cmd_explain(&args[1..]),
         Some("init") => init::cmd_init(&args[1..]),
         Some("doctor") => doctor::cmd_doctor(&args[1..]),
+        Some("plugins") => plugins_cmd::cmd_plugins(&args[1..]),
+        Some("docs") => docs::cmd_docs(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => {
             eprintln!("rigor-rs: `{cmd}` is recognized but not yet implemented in this phase");
             ExitCode::from(2)
