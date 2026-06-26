@@ -194,6 +194,17 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
 - ✅ Rust-native constant folding (`folding.rs`) — deterministic Integer/Float/Bool/Nil/Symbol/
   ASCII-String; declines (→ None) on any doubt; arg-dependent folds (`1 + 2 → 3`).
 - 🟡 Environment is flat / top-level (no flow sensitivity yet); params/ivars/non-class-constants → Dynamic.
+- ⏳ **DEFERRED (user-accepted temporary, 2026-06-26): block-call result typing.** A
+  block-bearing call (`h.select { }`, `arr.map { }`) currently types to **Dynamic** wholesale
+  (and wrong-arity is skipped on it) — a blanket conservative choice that fixed a `select{}.keys`
+  FP class but is MORE conservative than the reference, which models block-form returns. **Recovery
+  (expected, timing at implementer's discretion):** model block returns like original Rigor —
+  `Hash#select/reject/filter { }` → `Hash`, `Enumerable#select/map/flat_map { }` → `Array`,
+  `x.tap { }` → `x` (self/receiver), `arr.each { }` → receiver, etc. — instead of Dynamic, so
+  `arr.map { }.frist`-style chains witness again. Keep the zero-FP discipline (decline to Dynamic
+  whenever the block-form return isn't precisely modeled). Touch points: the `Node::Call` arm in
+  `rigor-infer/lib.rs` (the `!block_body.is_empty()` short-circuit) + `check_wrong_arity`'s
+  `has_block` early-return in `rigor-rules/lib.rs`.
 - ⬜ **Flow-sensitive scopes** + 5 edges + fact buckets + invalidation (ADR-0022); narrowing
   (guards, `is_a?`, truthy/falsey, equality trust, negative facts domain-relative).
 - ⬜ Full dispatch tier cascade (tier-2 shape, tier-4 in-source bodies); cross-file implicit-self

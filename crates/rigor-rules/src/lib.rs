@@ -820,6 +820,16 @@ mod tests {
         // The same chain without the witnessing chain still silent on the block call.
         let diags2 = run(b"[1, 2].each_with_index { |e, i| e }\n");
         assert!(diags2.is_empty(), "expected no diagnostics, got {diags2:?}");
+        // The exact reported FP shape (gitlab-foss authorize_granular_scopes_service.rb:102):
+        // a hash-literal-shorthand receiver chained DIRECTLY into `.select { }.keys`.
+        // Two FPs must NOT fire: (a) wrong-arity on `select` (block ⇒ 0 positional
+        // args, but the no-block envelope is 1..N), and (b) undefined-method `keys`
+        // on Array (the block form returns Hash, on which `keys` is valid). The
+        // reference is silent on this whole line; rigor-rs must be too.
+        let diags3 = run(
+            b"def f(token, boundaries, permissions)\n{ token:, boundaries:, permissions: }.select { |_, value| value.nil? }.keys\nend\n",
+        );
+        assert!(diags3.is_empty(), "literal-receiver block chain must be silent, got {diags3:?}");
     }
 
     // --- in-source / non-core `.new` instances: reference leniency -----------
