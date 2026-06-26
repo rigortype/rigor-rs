@@ -739,6 +739,37 @@ impl Builder {
             });
         }
 
+        if let Some(khash) = node.as_keyword_hash_node() {
+            // Bare keyword arguments — `foo(wait: 30.minutes)`. Prism wraps these
+            // in a KeywordHashNode (not a HashNode); lower each assoc's key + value
+            // so a call hiding in either is walked. Reuse the HashLit shape (Dynamic
+            // is correct here — a keyword-hash is not a precise value).
+            let mut elements = Vec::new();
+            for el in khash.elements().iter() {
+                if let Some(assoc) = el.as_assoc_node() {
+                    elements.push(self.lower_node(&assoc.key()));
+                    elements.push(self.lower_node(&assoc.value()));
+                } else {
+                    elements.push(self.lower_node(&el));
+                }
+            }
+            return self.push(Node::HashLit {
+                elements,
+                span: span_of(&khash.location()),
+            });
+        }
+
+        if let Some(parens) = node.as_parentheses_node() {
+            // A parenthesized expression — `(30.seconds)`, used as range endpoints
+            // and grouped operands. Lower the inner body for reachability; the node
+            // itself types Dynamic (precision is unnecessary for this fix).
+            let body = self.lower_optional_body(parens.body().as_ref());
+            return self.push(Node::BeginRescue {
+                body,
+                span: span_of(&parens.location()),
+            });
+        }
+
         if let Some(ivw) = node.as_instance_variable_write_node() {
             let value = self.lower_node(&ivw.value());
             return self.push(Node::VariableWrite {
@@ -1119,6 +1150,26 @@ mod tests {
         assert!(a.iter().any(|(_, n)| matches!(n, Node::ArrayLit { .. })));
         let h = lower(&crate::parse(b"{ a: 1, b: 2 }\n"));
         assert!(h.iter().any(|(_, n)| matches!(n, Node::HashLit { .. })));
+    }
+
+    #[test]
+    fn lowers_call_inside_keyword_hash_value() {
+        // Bare keyword args wrap a KeywordHashNode; the value call must be lowered.
+        let src = b"foo(wait: 30.minutes)\n";
+        let ast = lower(&crate::parse(src));
+        assert!(
+            has_call(&ast, "minutes"),
+            "keyword-hash value call must be lowered"
+        );
+    }
+
+    #[test]
+    fn lowers_calls_inside_parenthesized_range_bounds() {
+        // `(30.seconds)..(10.minutes)` — both parenthesized bounds must be reachable.
+        let src = b"x = (30.seconds)..(10.minutes)\n";
+        let ast = lower(&crate::parse(src));
+        assert!(has_call(&ast, "seconds"), "parenthesized left-bound call must be lowered");
+        assert!(has_call(&ast, "minutes"), "parenthesized right-bound call must be lowered");
     }
 
     #[test]
