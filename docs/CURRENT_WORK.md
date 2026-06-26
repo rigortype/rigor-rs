@@ -80,9 +80,15 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >    where clean. **These were deferred as the HIGH-risk targets needing CI iteration** (cc+bindgen
 >    on musl/MSVC) — best built WITH real CI feedback, not blind. The binary channel
 >    (Releases/binstall) benefits first; gem/Homebrew extensions follow per-platform.
-> 2. **Quality management (品質管理)** (§14). (a) Clear the ~37 tolerated **clippy** style
->    warnings (the deny-level `nil & x` fold error is already fixed) → then tighten
->    `ci.yml`'s advisory clippy step to BLOCKING (`-D warnings`). (b) Decide the **rustfmt**
+> 2. **Quality management (品質管理)** (§14). (a) ✅ DONE (2026-06-27) — workspace is
+>    clippy-clean and `ci.yml`'s clippy step is now BLOCKING (`-D warnings`, `continue-on-error`
+>    removed). The ~48 warnings were cleared behavior-preserving: doc-comment formatting (10),
+>    `let_and_return`/`question_mark`/`double_comparisons` (3) FIXED inline; `collapsible_match`
+>    (1 fn, 3 sites) + `too_many_arguments` (3) + `type_complexity` (1) carry surgical per-item
+>    `#[allow]`s with rationale. The 29 `collapsible_if`s were NOT collapsed: their only fix is
+>    let-chains (Rust 1.88+), which break the MSRV-1.85 floor — so a `clippy.toml` pins
+>    `msrv = "1.85"`, which makes clippy stop proposing them (they vanish, no allow needed).
+>    All 352 tests + harness (0 FP) + corpus (0 FP) stay green. (b) Decide the **rustfmt**
 >    stance — the codebase is hand-formatted (239 diffs across 25 files vs `cargo fmt`); either
 >    adopt `cargo fmt` repo-wide + enforce `fmt --check` in CI, or add a `rustfmt.toml`/`#[rustfmt::skip]`
 >    policy that matches the maintainer's hand-formatting and document it. (c) **Snapshot-mode CI
@@ -721,8 +727,9 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
 - ✅ **CI workflow** (`.github/workflows/ci.yml`): `cargo build` + `cargo test` (the
   Ruby-free gates) on push/PR over ubuntu+macos, MSRV-pinned, `--locked`, libclang for
-  bindgen, rust-cache; clippy advisory (`continue-on-error`); rustfmt NOT enforced
-  (hand-formatted codebase). The differential harnesses stay a LOCAL gate (they need the
+  bindgen, rust-cache; clippy BLOCKING (`-D warnings`; workspace is clippy-clean, `clippy.toml`
+  pins `msrv = "1.85"` so suggestions stay compilable on the pinned toolchain); rustfmt NOT
+  enforced (hand-formatted codebase). The differential harnesses stay a LOCAL gate (they need the
   reference checkout + real corpora).
 - ⬜ Continuous corpus growth (new fixtures per rule/feature); snapshot mode (pin reference,
   commit expected JSON) so the parity gate can run in CI without a Ruby runtime (ADR-0002).

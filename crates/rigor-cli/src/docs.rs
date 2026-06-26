@@ -5,8 +5,8 @@
 //! The reference's `docs` (ADR-74) is a bundled-MANUAL renderer: the `rigortype`
 //! gem ships `docs/install.md`, `docs/llms.txt`, and the full user-facing manual
 //! + handbook (`docs/manual/*.md`, `docs/handbook/*.md`), and `docs <name>`
-//! prints those prose pages from disk (with `--list` / `--path` flags + an
-//! `llms.txt` index).
+//!   prints those prose pages from disk (with `--list` / `--path` flags + an
+//!   `llms.txt` index).
 //!
 //! **The standalone rigor-rs build bundles none of that prose.** Rather than
 //! fabricate manual content, this implements the tractable CORE over the
@@ -15,10 +15,10 @@
 //!
 //! - `rigor docs`            — list the documented rules (id + one-line summary).
 //! - `rigor docs <rule-id>`  — print that rule's documentation (the same per-rule
-//!                             reference `explain <rule-id>` renders: summary,
-//!                             severity-by-profile, fires-when / does-not-fire,
-//!                             suppression, docs URL). Canonical id, legacy alias,
-//!                             and family token (`call`/`flow`/…) all resolve.
+//!   reference `explain <rule-id>` renders: summary,
+//!   severity-by-profile, fires-when / does-not-fire,
+//!   suppression, docs URL). Canonical id, legacy alias,
+//!   and family token (`call`/`flow`/…) all resolve.
 //! - unknown id → a stderr error listing the documented rules + exit 64 (matching
 //!   `explain`'s unknown-rule behaviour; the reference's `docs` lists docs + exits
 //!   1, but reusing `explain`'s contract keeps the two rule-doc paths consistent).

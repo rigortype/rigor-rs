@@ -6,8 +6,10 @@
 # real corpora and so stay a LOCAL pre-merge gate, not a CI job.
 #
 # rustfmt is intentionally not enforced (the codebase is hand-formatted);
-# clippy runs as an advisory (it currently has tolerated style warnings but no
-# deny-level errors). The release pipeline lives in release.yml.
+# clippy is BLOCKING (`-D warnings`): the workspace is clippy-clean (deliberate
+# exceptions carry surgical per-item `#[allow]`s with rationale; `clippy.toml`
+# pins the MSRV so suggestions stay compilable on the pinned toolchain), so any
+# NEW warning fails the run. The release pipeline lives in release.yml.
 name: ci
 
 on:
@@ -51,9 +53,8 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
-      # Advisory: surfaces clippy findings without failing the run (the
-      # codebase has tolerated style warnings; tightening to `-D warnings` is a
-      # follow-up once they're cleared).
-      - name: Clippy (advisory)
-        run: cargo clippy --workspace --locked
-        continue-on-error: true
+      # Blocking: the workspace is clippy-clean, so `-D warnings` fails CI on any
+      # new finding. `clippy.toml` pins the MSRV (1.85) so clippy never proposes
+      # fixes the pinned toolchain can't compile.
+      - name: Clippy
+        run: cargo clippy --workspace --locked -- -D warnings

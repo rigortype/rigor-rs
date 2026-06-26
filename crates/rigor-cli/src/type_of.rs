@@ -246,7 +246,7 @@ fn locate_node(ast: &LoweredAst, offset: usize) -> Option<NodeId> {
             match best {
                 // Strictly-narrower span wins; on an equal width prefer the later
                 // id (deeper / more specific node lowered after its container).
-                Some((_, best_w)) if width < best_w || (width == best_w) => {
+                Some((_, best_w)) if width <= best_w => {
                     best = Some((id, width));
                 }
                 None => best = Some((id, width)),

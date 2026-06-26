@@ -98,7 +98,7 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         [Scalar::Int(b)] => *b,
         _ => return None,
     };
-    let res = match method {
+    match method {
         // Overflow -> None (Ruby promotes to Bignum; we don't model Bignum, so
         // declining preserves byte-exactness).
         "+" => a.checked_add(b).map(Scalar::Int),
@@ -155,8 +155,7 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         ">=" => Some(Scalar::Bool(a >= b)),
         "==" => Some(Scalar::Bool(a == b)),
         _ => None,
-    };
-    res
+    }
 }
 
 /// Ruby's `Integer#%`: the result has the sign of the divisor.

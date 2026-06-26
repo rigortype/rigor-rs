@@ -1493,9 +1493,7 @@ fn plain_positional_params(params: Option<&ruby_prism::ParametersNode<'_>>) -> O
     // has no single name and breaks the 1:1 mapping ⇒ decline.
     let mut names = Vec::new();
     for req in params.requireds().iter() {
-        let Some(rp) = req.as_required_parameter_node() else {
-            return None;
-        };
+        let rp = req.as_required_parameter_node()?;
         names.push(constant_string(rp.name().as_slice()));
     }
     Some(names)

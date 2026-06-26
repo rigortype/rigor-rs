@@ -1,0 +1,5 @@
+# Pin clippy's MSRV to the project's declared minimum (Cargo.toml `rust-version`).
+# This keeps clippy's suggestions compilable on the CI toolchain (1.85): e.g. it
+# stops clippy proposing `collapsible_if` collapses that require let-chains (Rust
+# 1.88+), which would otherwise be un-applyable without breaking the build.
+msrv = "1.85"

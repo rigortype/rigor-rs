@@ -647,10 +647,14 @@ impl SourceIndex {
 ///   * the tail's ROOT receiver must be a bare read of one of those params;
 ///   * every step of the chain must be a no-arg call (an arg would itself need
 ///     binding, which we don't model) ⇒ decline otherwise.
+///
 /// The same gates 2/3/4 (empty body / explicit return / branch tail) and the
 /// reopen-disagreement rule apply, tracked independently from the param-
 /// independent map. A method never appears in BOTH maps (its tail is either a
 /// concrete core class under the empty env, or param-rooted — never both).
+// type_complexity: the two-map return shape is the real, documented output of this
+// pass (param-independent vs param-bound returns); a type alias would only hide it.
+#[allow(clippy::type_complexity)]
 fn infer_method_returns(
     idx: &SourceIndex,
     core: &CoreIndex,

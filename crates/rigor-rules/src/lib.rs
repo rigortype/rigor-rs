@@ -644,6 +644,9 @@ fn check_override_visibility(
 /// instances — for chained RETURN inference and `X.new` identity — but it is
 /// never a *witnessing* surface for this rule. Honouring that boundary is the
 /// keystone that keeps real project code (incl. Rails models) false-positive-free.
+// too_many_arguments: a rule-check fn threading the full typing context (ast, receiver,
+// span, env, typer, interner, index); bundling into a struct would obscure the call sites.
+#[allow(clippy::too_many_arguments)]
 fn check_call(
     ast: &LoweredAst,
     receiver: rigor_parse::NodeId,
@@ -742,6 +745,9 @@ fn check_call(
 ///
 /// A variadic method (`max == None`) only triggers on `args < min`. Any
 /// Dynamic / unknown receiver, unmodeled method, or unmodeled arity => silent.
+// too_many_arguments: a rule-check fn threading the full typing context (ast, receiver,
+// args, span, env, typer, interner, index); bundling into a struct would obscure the call sites.
+#[allow(clippy::too_many_arguments)]
 fn check_wrong_arity(
     ast: &LoweredAst,
     receiver: rigor_parse::NodeId,
@@ -841,6 +847,9 @@ fn check_wrong_arity(
 /// non-constant divisor (`5 / 0.0`, `5 / 2`, `x / y`), a Dynamic/unknown
 /// receiver, a block-bearing call, or a multi-arg call. This is the error-
 /// severity zero-FP keystone: an FP here would be an ERROR on correct code.
+// too_many_arguments: a rule-check fn threading the full typing context (ast, receiver,
+// args, span, env, typer, interner, index); bundling into a struct would obscure the call sites.
+#[allow(clippy::too_many_arguments)]
 fn check_always_raises(
     ast: &LoweredAst,
     receiver: rigor_parse::NodeId,
@@ -1154,6 +1163,10 @@ fn nilable_local_core_arm(
 ///   - `x` as receiver of `present?` / `blank?` / `presence` (the reference does
 ///     NOT narrow on these, so it would FIRE through them; declining here is the
 ///     safe under-approximation — loses recall, never an FP).
+// collapsible_match: this is the zero-FP guard scan; each match arm carries its own
+// explanatory comment and the Call arm holds two sequential guards. Folding the inner
+// `if`s into arm guards would lengthen the guards and orphan the per-arm rationale.
+#[allow(clippy::collapsible_match)]
 fn nil_local_is_guarded(
     ast: &LoweredAst,
     x: &str,
