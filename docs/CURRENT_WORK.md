@@ -6,7 +6,8 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-06-26. HEAD at handoff: `82e9eb1`.
+Last updated: 2026-06-27 (v0.0.1 release prep). See "▶ Resume here" for the
+release-tag steps + the recorded next work (musl/Windows targets; quality management).
 
 > **2026-06-26 correctness finding (this session).** The reference does **not**
 > witness `call.undefined-method` on a **project-defined (in-source) class
@@ -54,6 +55,44 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 ---
 
 ## ▶ Resume here (next session)
+
+> **▶▶ v0.0.1 RELEASE PREP (2026-06-27) — release-ready; awaiting the tag + infra.**
+> The first release is **v0.0.1** (version bumped 0.1.0 → **0.0.1** across the single
+> source `[workspace.package]` + the gem `version.rb` + the Homebrew formula; `rake
+> version:check` green; `rigor --version` → `rigor 0.0.1`). `CHANGELOG.md` records the
+> 0.0.1 surface. The release/gem/Homebrew CI is wired and tag-triggered. **To cut the
+> release, the maintainer does the infra steps the local toolchain cannot:** (1) publish
+> the GitHub repo + set the real `repository` URL (currently the placeholder
+> `rigortype/rigor-rs`); (2) tag `v0.0.1` (or `v0.0.1-rc1` first) to run the cross-compile
+> matrix + asset upload; (3) for the gem channel, a RubyGems account + `RUBYGEMS_API_KEY`
+> secret (+ MFA); (4) for Homebrew, the `rigortype/homebrew-tap` repo + `HOMEBREW_TAP_TOKEN`.
+> All push/publish CI steps are gated behind those secrets + a manual `release` environment,
+> so they never auto-fire before the infra exists.
+>
+> **▶▶ NEXT WORK (recorded 2026-06-27, to pick up after v0.0.1) — two tracks the maintainer
+> wants tackled incrementally:**
+> 1. **Distribution slice 4 — musl + Windows targets** (§13). Extend `release.yml`'s build
+>    matrix with `x86_64`/`aarch64-unknown-linux-musl` (via `cargo-zigbuild` or `cross` — the
+>    `-sys` crates' `cc`+`bindgen` static link needs a validated musl cross-toolchain) and
+>    `x86_64-pc-windows-msvc` (windows runner; `.exe` binary + `.zip` packaging; libclang for
+>    bindgen). Extend the gem `Gem::Platform` map (`x86_64-linux-musl`, `aarch64-linux-musl`,
+>    a Windows `x64-mingw-ucrt`/`x64-mingw32` decision) and the Homebrew formula's linux block
+>    where clean. **These were deferred as the HIGH-risk targets needing CI iteration** (cc+bindgen
+>    on musl/MSVC) — best built WITH real CI feedback, not blind. The binary channel
+>    (Releases/binstall) benefits first; gem/Homebrew extensions follow per-platform.
+> 2. **Quality management (品質管理)** (§14). (a) Clear the ~37 tolerated **clippy** style
+>    warnings (the deny-level `nil & x` fold error is already fixed) → then tighten
+>    `ci.yml`'s advisory clippy step to BLOCKING (`-D warnings`). (b) Decide the **rustfmt**
+>    stance — the codebase is hand-formatted (239 diffs across 25 files vs `cargo fmt`); either
+>    adopt `cargo fmt` repo-wide + enforce `fmt --check` in CI, or add a `rustfmt.toml`/`#[rustfmt::skip]`
+>    policy that matches the maintainer's hand-formatting and document it. (c) **Snapshot-mode CI
+>    parity** (ADR-0002, §14) — pin the reference's expected JSON per fixture and commit it, so the
+>    differential gate can run in CI without a Ruby runtime + the reference checkout (today it's
+>    LOCAL-only). This makes the zero-FP bar enforceable on every PR.
+>
+> Both are independent of each other and of the release; pull either next. Beyond them, the big
+> remaining levers are unchanged (the ADR-0022 flow-scope substrate for `flow.always-truthy`/the
+> deferred `possible-nil` sources; the plugin trait + the other ~30 plugins; §12 LSP/MCP).
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
@@ -576,9 +615,14 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   MCP server (read-only tools over stdio).
 
 ### 13. Distribution (ADR-0010)
+> **Version is now `0.0.1`** — the v0.0.1 first-release target (see "▶▶ v0.0.1 RELEASE PREP"
+> at the top). The distribution scaffolding below was authored at `0.1.0` and lowered to
+> `0.0.1` for the first release; the single-source `[workspace.package] version`, the gem
+> `version.rb`, and the Homebrew formula are all `0.0.1` (`rake version:check` green). Some
+> dated proof-run artifact names below still read `0.1.0`; re-running them now yields `0.0.1`.
 - ✅ **Release-pipeline foundation landed (purely additive — no dev-loop/analysis change).**
-  - Version bumped to **0.1.0** (single source: `[workspace.package] version`, inherited by all
-    crates). `repository`/`license` (**AGPL-3.0** — note this DIFFERS from the reference gemspec's MPL-2.0; LICENSE is the verbatim GNU AGPL v3) added to
+  - Version set to **0.0.1** (single source: `[workspace.package] version`, inherited by all
+    crates; the first release is `v0.0.1`). `repository`/`license` (**AGPL-3.0** — note this DIFFERS from the reference gemspec's MPL-2.0; LICENSE is the verbatim GNU AGPL v3) added to
     `[workspace.package]`; `description`/`homepage` + the `[package.metadata.binstall]` block on
     `rigor-cli`. **NOTE:** `repository`/`homepage` URL `https://github.com/rigortype/rigor-rs` is a
     PLACEHOLDER (no git remote configured yet) — confirm when the repo is published.

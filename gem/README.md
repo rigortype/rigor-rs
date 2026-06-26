@@ -24,7 +24,7 @@ RubyGems automatically selects the precompiled platform gem matching your machin
 Then:
 
 ```sh
-rigor --version      # rigor 0.1.0
+rigor --version      # rigor 0.0.1
 rigor check path/to/file.rb
 ```
 
