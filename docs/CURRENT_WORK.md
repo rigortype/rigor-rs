@@ -95,10 +95,12 @@ project-RBS / plugins):
    lands on a *core/RBS* receiver that DOES witness (`user.full_name.lenght` where
    `full_name : String`). The project-wide `SourceIndex::build_project` substrate now
    EXISTS (landed for the singleton gate) — extend it with per-method body inference.
-2. **Config loader `.rigor.yml`** (§7, serde_yaml now available) + **serde output + SARIF /
-   GitHub / CI formats** (§6) — drop-in readiness; both unblocked by network.
+2. ✅ **Drop-in readiness landed** (this session): inline `# rigor:disable` suppression,
+   minimal `.rigor.yml` (disable/exclude), `github` + `sarif` output. Remaining §6/§7:
+   GitLab/Checkstyle/JUnit formats, CI auto-detect, full config schema + baseline.
 3. **Plugin phase** (§10, ADR-0013) — the real Rails-coverage unlock (sidecar-hosted Ruby
-   plugins). Biggest phase; the bulk of remaining undefined-method coverage lives here.
+   plugins). Biggest phase; **the bulk of remaining undefined-method coverage lives here**
+   (the gap analysis confirms most misses are Rails receivers needing project-RBS/plugins).
 4. **Flow-sensitive scopes + narrowing** (§4, ADR-0022) → the `flow.*` rule family and a
    live `possible-nil-receiver`.
 5. **Vendor + embed RBS at build time** (§3, ADR-0007) → remove the runtime RBS path /
