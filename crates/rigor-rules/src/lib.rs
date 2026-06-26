@@ -490,15 +490,18 @@ mod tests {
         assert!(run(b"s = \"hi\"\ns.gsub(\"a\", \"b\")\n").is_empty());
         // Dynamic receiver with any arity stays silent (never guess).
         assert!(run(b"x.foo(1, 2, 3)\n").is_empty());
-        // A method whose arity is not modeled: no wrong-arity even with args.
-        assert!(run(b"s = \"x\"\ns.chars(1)\n").is_empty());
+        // A nullary call in its valid form stays silent.
+        assert!(run(b"s = \"x\"\ns.chars\n").is_empty());
     }
 
     #[test]
-    fn unmodeled_arity_method_does_not_fire() {
-        // `String#chars` exists in the method set but has no modeled arity
-        // envelope => wrong-arity must NOT fire regardless of arg count.
-        let diags = run(b"s = \"x\"\ns.chars(\"a\", \"b\")\n");
+    fn variadic_arity_method_does_not_fire() {
+        // `String#concat` is variadic (`(*string | Integer) -> self`), so its
+        // arity envelope has no upper bound => wrong-arity must NOT fire no
+        // matter how many positional args are passed. (Real RBS now models a
+        // concrete envelope for nearly every method; a variadic one is the case
+        // where many args are still legal.)
+        let diags = run(b"s = \"x\"\ns.concat(\"a\", \"b\")\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 

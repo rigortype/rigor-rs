@@ -1,0 +1,624 @@
+//! Real RBS-backed core data: parse a curated set of Ruby `core/*.rbs` with the
+//! `ruby-rbs` crate (parser only — ADR-0004), extract per-class method tables
+//! (return class + arity envelope) and the super/include graph, then flatten an
+//! ancestor chain so method existence is decided over the full linearization.
+//!
+//! Falls back to a hardcoded stub when the core RBS directory is absent, so the
+//! crate works without a Ruby install (CI, other machines) and never panics.
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use ruby_rbs::node::{
+    parse, ClassNode, MethodDefinitionKind, ModuleNode, Node,
+};
+
+/// The curated set of core RBS files to parse. Chosen so that String / Integer
+/// / Float / Symbol / Array / Hash / NilClass / TrueClass / FalseClass each have
+/// their FULL ancestor chain loaded (Object, BasicObject, Kernel, Comparable,
+/// Numeric, Enumerable) — the precondition for witnessing method *absence*.
+const CURATED_FILES: &[&str] = &[
+    "basic_object.rbs",
+    "object.rbs",
+    "kernel.rbs",
+    "comparable.rbs",
+    "numeric.rbs",
+    "integer.rbs",
+    "float.rbs",
+    "string.rbs",
+    "symbol.rbs",
+    "enumerable.rbs",
+    "array.rbs",
+    "hash.rbs",
+    "nil_class.rbs",
+    "true_class.rbs",
+    "false_class.rbs",
+];
+
+/// The default core-RBS directory (rbs gem under mise) used when
+/// `RIGOR_RBS_CORE_DIR` is unset. ADR-0007 will replace this runtime path with
+/// vendored, build-time-embedded RBS.
+const DEFAULT_CORE_DIR: &str = "/Users/megurine/.local/share/mise/installs/ruby/4.0.5/\
+lib/ruby/gems/4.0.0/gems/rbs-4.0.3/core";
+
+/// An arity envelope `(min, max)`: `min` is the smallest required-positional
+/// count across overloads; `max` is `None` (variadic) when any overload takes a
+/// positional rest, else the largest required+optional count.
+type Arity = (usize, Option<usize>);
+
+/// Per-class data extracted from RBS: its instance methods (name -> resolved
+/// return class + arity), its direct superclass, and its included modules.
+#[derive(Default, Clone)]
+struct ClassEntry {
+    /// `method name -> (return class name if resolvable, arity envelope)`.
+    methods: HashMap<&'static str, (Option<&'static str>, Arity)>,
+    /// Direct superclass name, if any (`None` ⇒ implicit `Object`, except the
+    /// roots which are seeded explicitly).
+    superclass: Option<&'static str>,
+    /// Included module names (in source order).
+    includes: Vec<&'static str>,
+}
+
+/// The loaded core data backing [`crate::CoreIndex`] and the free
+/// `method_return` / `method_arity` functions.
+pub struct CoreData {
+    /// `class name -> entry`. Keys are `&'static str` (leaked once at load) so
+    /// resolved return-class names can flow out as `&'static str`.
+    classes: HashMap<&'static str, ClassEntry>,
+}
+
+impl CoreData {
+    /// Build from the curated core RBS if the directory exists, else from the
+    /// hardcoded stub. Never panics: any per-file parse error is skipped.
+    pub fn load() -> Self {
+        let dir = std::env::var("RIGOR_RBS_CORE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CORE_DIR));
+
+        if dir.is_dir() {
+            let mut builder = Builder::default();
+            for file in CURATED_FILES {
+                let path = dir.join(file);
+                if let Ok(code) = std::fs::read_to_string(&path) {
+                    // Per-file isolation (ADR-0016 never-crash): a parse failure
+                    // on one file must not sink the whole index.
+                    builder.ingest(&code);
+                }
+            }
+            let classes = builder.finish();
+            if !classes.is_empty() {
+                return Self { classes };
+            }
+        }
+        // Fallback: no RBS dir (or nothing parsed) ⇒ hardcoded stub.
+        Self::stub()
+    }
+
+    /// Whether the class is in the loaded set.
+    pub fn knows_class(&self, class_name: &str) -> bool {
+        self.classes.contains_key(class_name)
+    }
+
+    /// Walk the full flattened ancestor chain; a method is present if ANY
+    /// ancestor defines it. Conservative gate: if the chain is not fully loaded
+    /// (an ancestor missing from the set), return `true` ("assume present") so
+    /// absence is never falsely witnessed. Absence (`false`) is only returned
+    /// when every ancestor is loaded and none defines the method.
+    pub fn class_has_method(&self, class_name: &str, method: &str) -> bool {
+        if !self.classes.contains_key(class_name) {
+            return false;
+        }
+        let (chain, complete) = self.ancestors(class_name);
+        for anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if entry.methods.contains_key(method) {
+                    return true;
+                }
+            }
+        }
+        // Not found across the chain. Only witness absence if the chain is
+        // fully loaded; otherwise assume present (zero false positive).
+        !complete
+    }
+
+    /// Resolve a method's return class over the ancestor chain (first defining
+    /// ancestor wins). `None` if the return is not a known concrete class.
+    pub fn method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        let (chain, _) = self.ancestors(class_name);
+        for anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some((ret, _)) = entry.methods.get(method) {
+                    return *ret;
+                }
+            }
+        }
+        None
+    }
+
+    /// Resolve a method's arity envelope over the ancestor chain (first defining
+    /// ancestor wins). `None` if the method is unknown on the chain.
+    pub fn method_arity(&self, class_name: &str, method: &str) -> Option<Arity> {
+        let (chain, _) = self.ancestors(class_name);
+        for anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some((_, arity)) = entry.methods.get(method) {
+                    return Some(*arity);
+                }
+            }
+        }
+        None
+    }
+
+    /// Compute the flattened ancestor chain for `class_name`: the class itself,
+    /// then its included modules, then its superclass's chain, recursively.
+    /// Returns `(chain, complete)` where `complete` is `false` if any ancestor
+    /// name referenced along the way is NOT in the loaded set (so absence must
+    /// not be witnessed).
+    fn ancestors(&self, class_name: &str) -> (Vec<&'static str>, bool) {
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut complete = true;
+        self.collect(class_name, &mut order, &mut seen, &mut complete);
+        (order, complete)
+    }
+
+    fn collect(
+        &self,
+        name: &str,
+        order: &mut Vec<&'static str>,
+        seen: &mut HashSet<&'static str>,
+        complete: &mut bool,
+    ) {
+        let Some((&key, entry)) = self.classes.get_key_value(name) else {
+            // Referenced ancestor not loaded ⇒ chain incomplete.
+            *complete = false;
+            return;
+        };
+        if !seen.insert(key) {
+            return;
+        }
+        order.push(key);
+        // Included modules sit between the class and its superclass in Ruby's
+        // method resolution order; for *existence* the order doesn't matter.
+        for inc in &entry.includes {
+            self.collect(inc, order, seen, complete);
+        }
+        if let Some(sup) = entry.superclass {
+            self.collect(sup, order, seen, complete);
+        }
+    }
+
+    /// Hardcoded fallback used when the core RBS directory is unavailable. The
+    /// chains here mirror the real ancestry (Object/BasicObject/Kernel/…) so the
+    /// conservative gate behaves the same, just over fewer methods.
+    fn stub() -> Self {
+        let mut classes: HashMap<&'static str, ClassEntry> = HashMap::new();
+
+        let mut put = |name: &'static str,
+                       superclass: Option<&'static str>,
+                       includes: Vec<&'static str>,
+                       methods: &[(&'static str, Option<&'static str>, Arity)]| {
+            let mut m: HashMap<&'static str, (Option<&'static str>, Arity)> = HashMap::new();
+            for (n, ret, ar) in methods {
+                m.insert(n, (*ret, *ar));
+            }
+            classes.insert(
+                name,
+                ClassEntry {
+                    methods: m,
+                    superclass,
+                    includes,
+                },
+            );
+        };
+
+        put("BasicObject", None, vec![], &[("==", Some("TrueClass"), (1, Some(1)))]);
+        put(
+            "Kernel",
+            None,
+            vec![],
+            &[
+                ("class", None, (0, Some(0))),
+                ("frozen?", Some("TrueClass"), (0, Some(0))),
+                ("tap", None, (0, Some(0))),
+                ("inspect", Some("String"), (0, Some(0))),
+                ("is_a?", Some("TrueClass"), (1, Some(1))),
+                ("nil?", Some("FalseClass"), (0, Some(0))),
+                ("to_s", Some("String"), (0, Some(0))),
+            ],
+        );
+        put("Object", Some("BasicObject"), vec!["Kernel"], &[]);
+        put(
+            "Comparable",
+            None,
+            vec![],
+            &[
+                ("<", Some("TrueClass"), (1, Some(1))),
+                (">", Some("TrueClass"), (1, Some(1))),
+                ("<=", Some("TrueClass"), (1, Some(1))),
+                (">=", Some("TrueClass"), (1, Some(1))),
+            ],
+        );
+        put(
+            "Numeric",
+            Some("Object"),
+            vec!["Comparable"],
+            &[
+                ("+", None, (1, Some(1))),
+                ("-", None, (1, Some(1))),
+                ("*", None, (1, Some(1))),
+                ("abs", None, (0, Some(0))),
+                ("zero?", Some("TrueClass"), (0, Some(0))),
+            ],
+        );
+        put(
+            "Integer",
+            Some("Numeric"),
+            vec![],
+            &[
+                ("+", Some("Integer"), (1, Some(1))),
+                ("-", Some("Integer"), (1, Some(1))),
+                ("*", Some("Integer"), (1, Some(1))),
+                ("abs", Some("Integer"), (0, Some(0))),
+                ("succ", Some("Integer"), (0, Some(0))),
+                ("pred", Some("Integer"), (0, Some(0))),
+                ("to_s", Some("String"), (0, Some(1))),
+                ("even?", Some("TrueClass"), (0, Some(0))),
+                ("odd?", Some("TrueClass"), (0, Some(0))),
+                ("times", None, (0, Some(0))),
+            ],
+        );
+        put(
+            "Float",
+            Some("Numeric"),
+            vec![],
+            &[
+                ("+", Some("Float"), (1, Some(1))),
+                ("-", Some("Float"), (1, Some(1))),
+                ("*", Some("Float"), (1, Some(1))),
+                ("abs", Some("Float"), (0, Some(0))),
+                ("round", Some("Integer"), (0, Some(1))),
+                ("ceil", Some("Integer"), (0, Some(1))),
+                ("floor", Some("Integer"), (0, Some(1))),
+                ("to_i", Some("Integer"), (0, Some(0))),
+                ("to_s", Some("String"), (0, Some(0))),
+                ("nan?", Some("TrueClass"), (0, Some(0))),
+            ],
+        );
+        put(
+            "String",
+            Some("Object"),
+            vec!["Comparable"],
+            &[
+                ("length", Some("Integer"), (0, Some(0))),
+                ("size", Some("Integer"), (0, Some(0))),
+                ("upcase", Some("String"), (0, Some(0))),
+                ("downcase", Some("String"), (0, Some(0))),
+                ("capitalize", Some("String"), (0, Some(0))),
+                ("reverse", Some("String"), (0, Some(0))),
+                ("strip", Some("String"), (0, Some(0))),
+                ("chomp", Some("String"), (0, Some(1))),
+                ("to_s", Some("String"), (0, Some(0))),
+                ("to_str", Some("String"), (0, Some(0))),
+                ("to_sym", Some("Symbol"), (0, Some(0))),
+                ("to_i", Some("Integer"), (0, Some(1))),
+                ("to_f", Some("Float"), (0, Some(0))),
+                ("index", Some("Integer"), (1, Some(2))),
+                ("gsub", Some("String"), (1, Some(2))),
+                ("sub", Some("String"), (1, Some(2))),
+                ("split", Some("Array"), (0, Some(2))),
+                ("include?", Some("TrueClass"), (1, Some(1))),
+                ("start_with?", Some("TrueClass"), (0, None)),
+                ("end_with?", Some("TrueClass"), (0, None)),
+                ("empty?", Some("TrueClass"), (0, Some(0))),
+                ("+", Some("String"), (1, Some(1))),
+                ("*", Some("String"), (1, Some(1))),
+            ],
+        );
+        put(
+            "Symbol",
+            Some("Object"),
+            vec!["Comparable"],
+            &[
+                ("to_s", Some("String"), (0, Some(0))),
+                ("to_sym", Some("Symbol"), (0, Some(0))),
+                ("to_proc", None, (0, Some(0))),
+                ("length", Some("Integer"), (0, Some(0))),
+                ("size", Some("Integer"), (0, Some(0))),
+                ("upcase", Some("Symbol"), (0, Some(0))),
+                ("downcase", Some("Symbol"), (0, Some(0))),
+            ],
+        );
+        put(
+            "Enumerable",
+            None,
+            vec![],
+            &[
+                ("map", Some("Array"), (0, Some(0))),
+                ("each", None, (0, Some(0))),
+                ("select", Some("Array"), (0, Some(0))),
+                ("reject", Some("Array"), (0, Some(0))),
+                ("include?", Some("TrueClass"), (1, Some(1))),
+                ("to_a", Some("Array"), (0, Some(0))),
+                ("first", None, (0, Some(1))),
+            ],
+        );
+        put(
+            "Array",
+            Some("Object"),
+            vec!["Enumerable"],
+            &[
+                ("length", Some("Integer"), (0, Some(0))),
+                ("size", Some("Integer"), (0, Some(0))),
+                ("push", None, (0, None)),
+                ("pop", None, (0, Some(1))),
+                ("shift", None, (0, Some(1))),
+                ("unshift", None, (0, None)),
+                ("reverse", Some("Array"), (0, Some(0))),
+                ("sort", Some("Array"), (0, Some(0))),
+                ("join", Some("String"), (0, Some(1))),
+                ("empty?", Some("TrueClass"), (0, Some(0))),
+                ("+", Some("Array"), (1, Some(1))),
+                ("<<", Some("Array"), (1, Some(1))),
+            ],
+        );
+        put(
+            "Hash",
+            Some("Object"),
+            vec!["Enumerable"],
+            &[
+                ("length", Some("Integer"), (0, Some(0))),
+                ("size", Some("Integer"), (0, Some(0))),
+                ("keys", Some("Array"), (0, Some(0))),
+                ("values", Some("Array"), (0, Some(0))),
+                ("fetch", None, (1, Some(2))),
+                ("store", None, (2, Some(2))),
+                ("merge", Some("Hash"), (0, None)),
+                ("empty?", Some("TrueClass"), (0, Some(0))),
+                ("key?", Some("TrueClass"), (1, Some(1))),
+                ("to_h", Some("Hash"), (0, Some(0))),
+            ],
+        );
+        put(
+            "NilClass",
+            Some("Object"),
+            vec![],
+            &[
+                ("to_s", Some("String"), (0, Some(0))),
+                ("to_a", Some("Array"), (0, Some(0))),
+                ("to_h", Some("Hash"), (0, Some(0))),
+                ("to_i", Some("Integer"), (0, Some(0))),
+                ("nil?", Some("TrueClass"), (0, Some(0))),
+                ("inspect", Some("String"), (0, Some(0))),
+            ],
+        );
+        put(
+            "TrueClass",
+            Some("Object"),
+            vec![],
+            &[
+                ("to_s", Some("String"), (0, Some(0))),
+                ("&", Some("TrueClass"), (1, Some(1))),
+                ("|", Some("TrueClass"), (1, Some(1))),
+                ("^", Some("TrueClass"), (1, Some(1))),
+            ],
+        );
+        put(
+            "FalseClass",
+            Some("Object"),
+            vec![],
+            &[
+                ("to_s", Some("String"), (0, Some(0))),
+                ("&", Some("FalseClass"), (1, Some(1))),
+                ("|", Some("TrueClass"), (1, Some(1))),
+                ("^", Some("TrueClass"), (1, Some(1))),
+            ],
+        );
+
+        Self { classes }
+    }
+}
+
+/// Accumulates parsed RBS declarations into per-class entries before flattening.
+#[derive(Default)]
+struct Builder {
+    classes: HashMap<&'static str, ClassEntry>,
+}
+
+impl Builder {
+    /// Parse one RBS source and fold its top-level class/module declarations in.
+    fn ingest(&mut self, code: &str) {
+        let Ok(sig) = parse(code) else {
+            return;
+        };
+        for decl in sig.declarations().iter() {
+            match decl {
+                Node::Class(c) => self.ingest_class(&c),
+                Node::Module(m) => self.ingest_module(&m),
+                _ => {}
+            }
+        }
+    }
+
+    fn ingest_class(&mut self, c: &ClassNode) {
+        let Some(name) = type_name_str(&c.name()) else {
+            return;
+        };
+        let superclass = c
+            .super_class()
+            .and_then(|s| type_name_str(&s.name()));
+        let mut entry = ClassEntry {
+            superclass,
+            ..Default::default()
+        };
+        self.collect_members(c.members().iter(), &mut entry);
+        self.merge(name, entry);
+    }
+
+    fn ingest_module(&mut self, m: &ModuleNode) {
+        let Some(name) = type_name_str(&m.name()) else {
+            return;
+        };
+        let mut entry = ClassEntry::default();
+        self.collect_members(m.members().iter(), &mut entry);
+        self.merge(name, entry);
+    }
+
+    /// Fold method definitions and `include` directives from a member list into
+    /// `entry`. Only instance, public methods are recorded (the existence check
+    /// is about instance dispatch; private/singleton are out of scope here).
+    fn collect_members<'a>(
+        &mut self,
+        members: impl Iterator<Item = Node<'a>>,
+        entry: &mut ClassEntry,
+    ) {
+        for member in members {
+            match member {
+                Node::MethodDefinition(md) => {
+                    if md.kind() != MethodDefinitionKind::Instance {
+                        continue;
+                    }
+                    let mname = intern(md.name().as_str());
+                    let (ret, arity) = method_signature(&md);
+                    entry.methods.entry(mname).or_insert((ret, arity));
+                }
+                Node::Include(inc) => {
+                    if let Some(modname) = type_name_str(&inc.name()) {
+                        if !entry.includes.contains(&modname) {
+                            entry.includes.push(modname);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Merge an entry into the map (the same class can be reopened across files,
+    /// though core mostly isn't). Methods/includes union; an explicit superclass
+    /// wins over none.
+    fn merge(&mut self, name: &'static str, entry: ClassEntry) {
+        let slot = self.classes.entry(name).or_default();
+        if slot.superclass.is_none() {
+            slot.superclass = entry.superclass;
+        }
+        for (k, v) in entry.methods {
+            slot.methods.entry(k).or_insert(v);
+        }
+        for inc in entry.includes {
+            if !slot.includes.contains(&inc) {
+                slot.includes.push(inc);
+            }
+        }
+    }
+
+    /// Finish: apply implicit-`Object` superclass defaulting (every class except
+    /// `BasicObject` and modules implicitly inherits `Object` when no `< X` was
+    /// given) and return the class map.
+    fn finish(mut self) -> HashMap<&'static str, ClassEntry> {
+        let object = intern("Object");
+        let basic = intern("BasicObject");
+        // A module has no superclass; only *classes* default to Object. We can't
+        // perfectly distinguish here, but the curated set's modules (Kernel,
+        // Comparable, Enumerable) all legitimately have no class-superclass, and
+        // giving a module an Object super would only *add* methods to its chain
+        // (never falsely witness absence) — yet to stay precise we skip the
+        // known modules.
+        let modules: HashSet<&'static str> = ["Kernel", "Comparable", "Enumerable"]
+            .into_iter()
+            .map(intern)
+            .collect();
+        for (&name, entry) in self.classes.iter_mut() {
+            if entry.superclass.is_none() && name != basic && !modules.contains(name) {
+                entry.superclass = Some(object);
+            }
+        }
+        self.classes
+    }
+}
+
+/// Resolve the **last** path component of a `TypeNameNode`'s namespace+name into
+/// a `&'static str` (interned). RBS class refs are usually bare (`Object`,
+/// `Comparable`), but a namespaced ref (`::Foo::Bar`) resolves to `Bar`.
+fn type_name_str(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
+    let sym = tn.name();
+    let s = sym.as_str();
+    if s.is_empty() {
+        None
+    } else {
+        Some(intern(s))
+    }
+}
+
+/// Extract `(return class, arity envelope)` from a method definition by reading
+/// its overloads' function types. The return class is resolved only when it is a
+/// plain `ClassInstanceType` (a concrete class), or `self`/`instance` mapped to
+/// the receiver class by the caller (we record `self` returns as the receiver's
+/// own name when known). A union (`bool`), generic, `void`, etc. ⇒ `None`.
+fn method_signature(
+    md: &ruby_rbs::node::MethodDefinitionNode,
+) -> (Option<&'static str>, Arity) {
+    let mut min: Option<usize> = None;
+    let mut max: Option<usize> = Some(0);
+    let mut variadic = false;
+    let mut ret: Option<&'static str> = None;
+    let mut ret_seen = false;
+
+    for overload in md.overloads().iter() {
+        let Node::MethodDefinitionOverload(ov) = overload else {
+            continue;
+        };
+        let Node::MethodType(mt) = ov.method_type() else {
+            continue;
+        };
+        let Node::FunctionType(ft) = mt.type_() else {
+            continue;
+        };
+
+        let required = ft.required_positionals().iter().count();
+        let optional = ft.optional_positionals().iter().count();
+        let has_rest = ft.rest_positionals().is_some();
+
+        min = Some(min.map_or(required, |m| m.min(required)));
+        if has_rest {
+            variadic = true;
+        } else {
+            let hi = required + optional;
+            max = max.map(|m| m.max(hi));
+        }
+
+        // Return type: only resolve a concrete ClassInstanceType. Across
+        // overloads, only adopt a return if ALL resolvable overloads agree;
+        // any disagreement ⇒ leave None (never guess).
+        let this_ret = match ft.return_type() {
+            Node::ClassInstanceType(ci) => type_name_str(&ci.name()),
+            _ => None,
+        };
+        if !ret_seen {
+            ret = this_ret;
+            ret_seen = true;
+        } else if ret != this_ret {
+            ret = None;
+        }
+    }
+
+    let arity = (min.unwrap_or(0), if variadic { None } else { max });
+    (ret, arity)
+}
+
+/// Intern a `&str` to a `&'static str` by leaking, deduplicated through a
+/// process-global set so equal names share one allocation. The core class/method
+/// vocabulary is small and bounded, so the leak is negligible and one-time.
+fn intern(s: &str) -> &'static str {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut guard = pool.lock().unwrap();
+    if let Some(&existing) = guard.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    guard.insert(leaked);
+    leaked
+}

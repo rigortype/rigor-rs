@@ -72,16 +72,19 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
 - ⬜ Refinement carriers catalogue (60 built-ins, kebab-case; ref imported-built-in-types).
 
 ### 3. Index layer — `lib/rigor/environment*.rb`, `scope_indexer.rb` → `rigor-index` (ADR-0004/0007)
-- 🟡 `CoreIndex` **stub**: hardcoded method/return/arity tables for a handful of
-  core classes; class registry; `class_name_of`.
-- ✅ **`ruby-rbs` gate fully confirmed** (`spike/rbs_probe`): builds, parses real
-  `string.rbs` (129 methods) via the `Visit` trait (classes/super/method-defs/
-  function-types/variance). Parse-only → build the index on top.
-  RBS core sigs live at `…/gems/rbs-4.0.3/core/*.rbs` (62 files).
-  Generated node API: `target/.../out/bindings.rs` in the rbs_probe build dir.
-- ⬜ **Wire `ruby-rbs` into `rigor-index`** (NEXT): load core RBS, build real
-  method/return/arity/ancestor index behind the existing `CoreIndex` API; keep
-  the harness at 0 false positives. Then project `sig/` + stdlib + gem RBS.
+- ✅ **Real RBS-backed `CoreIndex`** (`rbs.rs`): parses 15 core `.rbs` via the
+  `ruby-rbs` crate, flattens ancestor chains (class → includes → super), and
+  resolves method existence / return / arity (min..max across overloads) over
+  the full chain. **Conservative gate:** absence is only witnessed when the whole
+  chain is loaded — incomplete chain ⇒ assume present (zero FP). Verified:
+  inherited methods (`frozen?`/`tap`/`class`) silent; real-RBS-only methods
+  (`bytes`/`scan`) silent; typos flagged; harness still 100%, 0 FP.
+- 🟡 RBS source is a **runtime path** (`RIGOR_RBS_CORE_DIR` or the local rbs gem),
+  with a hardcoded-stub fallback when absent.
+- ⬜ Vendor + embed RBS at build time → remove the runtime path / Ruby dependency (ADR-0007).
+- ⬜ Project `sig/` + gem RBS (bundler / rbs_collection) + `target_ruby` overlays (ADR-0007).
+- ⬜ Method visibility, `prepend` order, generics/refinement resolution, in-source class defs.
+- ⬜ Constant resolution; `pre_eval` monkey-patch pass (ref ADR-17); Gemfile.lock overlays (ref ADR-72).
 - ⬜ RBS stdlib shipping: vendor + build-time pre-parse + embed; merge project
   `sig/` ⊕ gem RBS (bundler / rbs_collection auto-detect) ⊕ inline; `target_ruby`
   version overlays (ADR-0007).

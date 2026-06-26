@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 rigor-types = { path = "../rigor-types" }
+ruby-rbs = "0.3"

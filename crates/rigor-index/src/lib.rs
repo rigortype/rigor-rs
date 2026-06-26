@@ -2,26 +2,33 @@
 //! (with visibility), constant/method resolution, built on the `ruby-rbs`
 //! parser behind a rigor-rs-owned trait. Rubydex is an optional accelerator.
 //!
-//! Verified in the spike: RBS exposes typed method definitions (return types,
-//! parameter types, variance, overloads, generics) — see spike/probe_rbs.rb.
-//! The Rust `ruby-rbs` crate parses the same grammar (network-gated to confirm
-//! its public API surfaces them; else a thin extraction layer over its AST).
+//! ## Real RBS-backed index
 //!
-//! ## Tracer-bullet stub
+//! [`CoreIndex::new`] parses a curated set of Ruby's **core** RBS signatures
+//! (String, Integer, …) and their ancestors (Object, BasicObject, Kernel,
+//! Comparable, Numeric, Enumerable) out of the `rbs` gem's `core/*.rbs`, using
+//! the `ruby-rbs` crate as a *parser only* (ADR-0004: we own the index, reuse
+//! only the parser). From that parse it builds, per class: the instance-method
+//! set, each method's resolved **return type** and **arity envelope**, and the
+//! **superclass + included modules** — then flattens an **ancestor chain** so
+//! method existence is decided over the full linearization (the zero
+//! false-positive keystone).
 //!
-//! For the first vertical slice this crate ships a tiny *hardcoded* core-method
-//! table — just enough to type-check method existence on a literal receiver
-//! (ADR-0023 tier-0/tier-3 in miniature). The names below are real Ruby core
-//! methods, but the table is intentionally partial.
+//! The RBS directory is located via `RIGOR_RBS_CORE_DIR`, else a default mise
+//! path. When the directory is absent (CI, other machines), the index falls
+//! back to a small *hardcoded* core-method stub so unit tests and downstream
+//! crates still work without a Ruby install — it never panics.
 //!
-// TODO(spec): replace [`CoreIndex`] with the real RBS-backed index (`ruby-rbs`,
-// network-gated per the module preamble): full ancestor linearization,
-// visibility, overloads, generics, and the project-discovered in-source layer.
+// TODO(spec): ADR-0007 vendor + embed the RBS at build time (no runtime path /
+// no Ruby dependency): pre-parse the stdlib into an embedded `rigor-vendored`
+// form so startup is instant and distribution stays single-binary, Ruby-free.
 #![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::sync::OnceLock;
 
 use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
+
+mod rbs;
 
 /// The core classes this index registers, in a fixed order. The slice index of
 /// a name in this array IS its [`ClassId`] (see [`CoreIndex::class_id`]), so the
@@ -30,7 +37,9 @@ use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 ///
 // TODO(spec): the real RBS-backed index assigns ClassIds across the full
 // ancestor graph (user classes, modules, generics); this fixed core array is
-// the tracer-bullet stand-in (ADR-0004).
+// the carrier for nominal round-tripping in the current slice (ADR-0004). It is
+// the surface the inference engine mints `Nominal { class }` ids against, so it
+// only lists the concrete value classes a return type can resolve TO.
 const CORE_CLASSES: [&str; 9] = [
     "String",
     "Integer",
@@ -43,12 +52,15 @@ const CORE_CLASSES: [&str; 9] = [
     "FalseClass",
 ];
 
-/// A small, hardcoded table of core classes to a subset of their real instance
-/// method names. Used only to decide *method existence* on a known receiver
-/// class in the tracer-bullet slice (ADR-0023).
+/// A real, RBS-backed core index. For each loaded class it holds the resolved
+/// instance-method table (return class + arity), and the flattened ancestor
+/// chain used to decide method existence over the full linearization.
+///
+/// When the core RBS cannot be located, [`per_class`](CoreIndex::data) is built
+/// from a hardcoded stub instead (see [`rbs::CoreData::stub`]), so the public
+/// API behaves identically — just over fewer methods.
 pub struct CoreIndex {
-    /// `class name -> set of known method names`.
-    methods: HashMap<&'static str, HashSet<&'static str>>,
+    data: rbs::CoreData,
 }
 
 impl Default for CoreIndex {
@@ -58,124 +70,35 @@ impl Default for CoreIndex {
 }
 
 impl CoreIndex {
-    /// Build the hardcoded core-method table. Method lists are a real (but
-    /// partial) subset of Ruby core; absence here is *not* proof a method is
-    /// undefined in real Ruby, which is exactly why the rule only fires on a
-    /// class that is present in this table (zero-false-positive, ADR-0023).
+    /// Build the index: parse the curated core RBS if available, else fall back
+    /// to the hardcoded stub. Never panics.
     pub fn new() -> Self {
-        let mut methods: HashMap<&'static str, HashSet<&'static str>> = HashMap::new();
-
-        methods.insert(
-            "String",
-            [
-                "length", "size", "upcase", "downcase", "capitalize", "reverse",
-                "strip", "chomp", "chars", "bytes", "split", "gsub", "sub",
-                "include?", "start_with?", "end_with?", "empty?", "to_s",
-                "to_str", "to_sym", "to_i", "to_f", "+", "*", "==", "<=>", "[]",
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        methods.insert(
-            "Integer",
-            [
-                "+", "-", "*", "/", "%", "**", "abs", "succ", "pred", "times",
-                "upto", "downto", "to_s", "to_i", "to_f", "even?", "odd?",
-                "zero?", "==", "<", ">", "<=", ">=", "<=>", "digits",
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        methods.insert(
-            "Float",
-            [
-                "+", "-", "*", "/", "abs", "ceil", "floor", "round", "to_s",
-                "to_i", "to_f", "nan?", "infinite?", "==", "<=>",
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        methods.insert(
-            "Symbol",
-            [
-                "to_s", "to_sym", "to_proc", "length", "size", "upcase",
-                "downcase", "==", "<=>", "[]",
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        methods.insert(
-            "TrueClass",
-            ["to_s", "&", "|", "^", "!"].into_iter().collect(),
-        );
-        methods.insert(
-            "FalseClass",
-            ["to_s", "&", "|", "^", "!"].into_iter().collect(),
-        );
-
-        methods.insert(
-            "NilClass",
-            ["to_s", "to_a", "to_h", "to_i", "nil?", "inspect", "&", "|"]
-                .into_iter()
-                .collect(),
-        );
-
-        methods.insert(
-            "Array",
-            [
-                "length", "size", "first", "last", "push", "pop", "shift",
-                "unshift", "map", "each", "select", "reject", "include?",
-                "empty?", "reverse", "sort", "join", "to_a", "+", "*", "==",
-                "[]", "<<",
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        methods.insert(
-            "Hash",
-            [
-                "length", "size", "keys", "values", "fetch", "store", "merge",
-                "each", "map", "select", "reject", "include?", "key?", "empty?",
-                "to_h", "to_a", "==", "[]", "[]=",
-            ]
-            .into_iter()
-            .collect(),
-        );
-
-        Self { methods }
+        Self {
+            data: rbs::CoreData::load(),
+        }
     }
 
     /// Whether `class_name` is one this index models at all. The rule must stay
-    /// silent on classes outside the table (ADR-0023: never guess).
+    /// silent on classes outside the loaded set (ADR-0023: never guess).
     pub fn knows_class(&self, class_name: &str) -> bool {
-        self.methods.contains_key(class_name)
+        self.data.knows_class(class_name)
     }
 
-    /// Whether `class_name` is known to define an instance `method`. Returns
-    /// `false` both for a known class missing the method *and* for an unknown
-    /// class — callers MUST gate on [`CoreIndex::knows_class`] first to keep
-    /// the zero-false-positive contract.
+    /// Whether `class_name` is known to define an instance `method`, walking the
+    /// **full flattened ancestor chain** (the class + supers + included
+    /// modules). A method counts as present if ANY ancestor defines it.
     ///
-    /// A method counts as "known on a class" iff it appears in the union of the
-    /// curated method set AND the return-type / arity stub tables. Those tables
-    /// add real methods the bare `methods` set omits, so keeping them consistent
-    /// here prevents a folded/typed method from being flagged as undefined.
+    /// Zero-false-positive contract (the keystone of this slice): if the
+    /// ancestor chain is not *fully loaded* (some ancestor is missing from the
+    /// curated set), this returns `true` — "unknown ⇒ assume present" — so the
+    /// undefined-method rule stays silent rather than risk a false positive.
+    /// Absence is only ever witnessed (returns `false`) when every ancestor in
+    /// the chain is loaded and none defines the method.
+    ///
+    /// Returns `false` for an entirely unknown class too — callers MUST gate on
+    /// [`CoreIndex::knows_class`] first (they do).
     pub fn class_has_method(&self, class_name: &str, method: &str) -> bool {
-        if self
-            .methods
-            .get(class_name)
-            .is_some_and(|set| set.contains(method))
-        {
-            return true;
-        }
-        // Consistency: a method with a known return type or arity is a known
-        // method, even if it was omitted from the curated `methods` set.
-        method_return(class_name, method).is_some() || method_arity(class_name, method).is_some()
+        self.data.class_has_method(class_name, method)
     }
 
     // --- class registry (name <-> ClassId) -----------------------------------
@@ -214,127 +137,44 @@ impl CoreIndex {
             Type::Nominal { class, .. } => self.class_name_for_id(*class),
             // TODO(spec): resolve refined / shaped carriers (Tuple -> Array,
             // HashShape -> Hash, IntegerRange -> Integer) once the RBS-backed
-            // index lands; the tracer-bullet slice resolves literals + nominals.
+            // index lands; the current slice resolves literals + nominals.
             _ => None,
         }
     }
 }
 
-/// The RETURN class name of a curated core-method stub set: given a receiver
-/// `class` and `method`, the class of the value the call evaluates to.
-///
-/// Used by tier-3-ish dispatch (ADR-0023) so a CHAINED call types correctly:
-/// `s.downcase` -> `"String"` lets the next `.lenght` resolve against `String`
-/// and flag the typo. Returns `None` when the return is unknown / not modeled
-/// (e.g. `Array#first` whose element type we don't track) so the receiver
-/// degrades to `Dynamic[top]` rather than guessing.
-///
-/// Boolean-returning predicates report `"TrueClass"` as their representative
-/// boolean class — it is a real class that the index models and on which the
-/// common boolean methods exist, sufficient for method-existence checks in this
-/// slice.
-///
-// TODO(spec): real RBS-backed return types, overloads, generics. `Array#first`
-// needs the element type; predicate returns should be the `bool` union
-// (`true | false`) not a single class; encoding/format methods route to the
-// Ruby sidecar (ADR-0008).
-pub fn method_return(class: &str, method: &str) -> Option<&'static str> {
-    let ret = match (class, method) {
-        // String -> String
-        (
-            "String",
-            "upcase" | "downcase" | "reverse" | "strip" | "chomp" | "to_s"
-            | "to_str" | "gsub" | "sub" | "capitalize" | "+" | "*",
-        ) => "String",
-        // String -> Integer
-        ("String", "length" | "size" | "to_i" | "index") => "Integer",
-        // String -> Symbol
-        ("String", "to_sym") => "Symbol",
-        // String -> bool (represented by TrueClass)
-        ("String", "include?" | "start_with?" | "end_with?" | "empty?") => "TrueClass",
-
-        // Integer -> Integer
-        ("Integer", "+" | "-" | "*" | "/" | "%" | "**" | "abs" | "succ" | "pred") => "Integer",
-        // Integer -> String
-        ("Integer", "to_s") => "String",
-        // Integer -> bool (TrueClass)
-        ("Integer", "even?" | "odd?" | "zero?") => "TrueClass",
-
-        // Float -> Float / Integer / String
-        ("Float", "+" | "-" | "*" | "/" | "abs" | "round" | "ceil" | "floor") => "Float",
-        ("Float", "to_i") => "Integer",
-        ("Float", "to_s") => "String",
-        ("Float", "nan?" | "infinite?") => "TrueClass",
-
-        // Symbol -> String / Symbol / bool
-        ("Symbol", "to_s") => "String",
-        ("Symbol", "to_sym") => "Symbol",
-        ("Symbol", "length" | "size") => "Integer",
-
-        // Array -> Integer (size queries); element-typed methods left None.
-        ("Array", "length" | "size") => "Integer",
-        ("Array", "empty?" | "include?") => "TrueClass",
-        ("Array", "reverse" | "sort") => "Array",
-        ("Array", "join" | "to_s") => "String",
-        // Array#first / #last return the element type (unknown here) -> None.
-
-        // Hash -> Integer / Array / bool
-        ("Hash", "length" | "size") => "Integer",
-        ("Hash", "keys" | "values" | "to_a") => "Array",
-        ("Hash", "empty?" | "include?" | "key?") => "TrueClass",
-
-        // NilClass
-        ("NilClass", "to_s") => "String",
-        ("NilClass", "to_a") => "Array",
-        ("NilClass", "to_i") => "Integer",
-        ("NilClass", "nil?") => "TrueClass",
-
-        // TrueClass / FalseClass
-        ("TrueClass" | "FalseClass", "to_s") => "String",
-        ("TrueClass" | "FalseClass", "&" | "|" | "^" | "!") => "TrueClass",
-
-        _ => return None,
-    };
-    Some(ret)
+/// Process-global index used by the free [`method_return`] / [`method_arity`]
+/// functions, which have no `&self` receiver (their call sites in rigor-infer /
+/// rigor-rules pass only `(class, method)`). Built once, lazily, from the same
+/// real RBS (or stub) as [`CoreIndex::new`].
+fn global() -> &'static rbs::CoreData {
+    static GLOBAL: OnceLock<rbs::CoreData> = OnceLock::new();
+    GLOBAL.get_or_init(rbs::CoreData::load)
 }
 
-/// The arity contract `(min, max)` of a curated core-method stub set, where
-/// `max == None` means variadic (no upper bound). Returns `None` when the
-/// method's arity is not modeled here.
+/// The RETURN class name of a core method, resolved over the receiver class's
+/// flattened ancestor chain (first defining ancestor wins).
 ///
-/// Only a handful are pinned in this slice — enough to exercise the table; the
-/// rest are unmodeled.
+/// Returns `None` when the return type is unknown / not a concrete class this
+/// index models — e.g. a `bool` union (`true | false`), a generic element type,
+/// `void`, `self`, or a return to a class outside [`CORE_CLASSES`]. The
+/// inference engine treats `None` as "degrade to `Dynamic[top]`" rather than
+/// guessing (ADR-0008/0023 zero-FP).
 ///
-// TODO(spec): real RBS-backed arities, including optional/keyword/block
-// parameters and per-overload arities (ADR-0023 tier-3).
+/// Used by tier-3-ish dispatch so a CHAINED call types correctly: `s.downcase`
+/// -> `"String"` lets the next `.lenght` resolve against `String` and flag it.
+pub fn method_return(class: &str, method: &str) -> Option<&'static str> {
+    global().method_return(class, method)
+}
+
+/// The arity envelope `(min, max)` of a core method, resolved over the receiver
+/// class's flattened ancestor chain. `min` is the smallest required-positional
+/// count across the method's overloads; `max` is `None` (variadic) when any
+/// overload takes a positional rest (`*args`), else the largest
+/// required+optional count. Returns `None` when the method's arity is not
+/// modeled (method unknown on the loaded chain).
 pub fn method_arity(class: &str, method: &str) -> Option<(usize, Option<usize>)> {
-    let arity = match (class, method) {
-        // String
-        ("String", "upcase") => (0, Some(0)),
-        ("String", "downcase") => (0, Some(0)),
-        ("String", "length") => (0, Some(0)),
-        ("String", "size") => (0, Some(0)),
-        // `gsub`/`sub` accept either a replacement String (2 args) or a block
-        // (1 arg), so the positional-arity envelope is 1..2 (matches the
-        // reference's `expected 1..2`). 3+ positional args is wrong-arity.
-        ("String", "gsub") => (1, Some(2)),
-        ("String", "sub") => (1, Some(2)),
-        ("String", "include?") => (1, Some(1)),
-        ("String", "+") => (1, Some(1)),
-        ("String", "*") => (1, Some(1)),
-
-        // Integer
-        ("Integer", "abs") => (0, Some(0)),
-        ("Integer", "succ") => (0, Some(0)),
-        ("Integer", "+") => (1, Some(1)),
-        ("Integer", "to_s") => (0, Some(1)), // optional radix
-
-        // Array (variadic example)
-        ("Array", "push") => (0, None),
-
-        _ => return None,
-    };
-    Some(arity)
+    global().method_arity(class, method)
 }
 
 /// The Ruby core class name for a value-pinned scalar literal.
@@ -359,7 +199,33 @@ mod tests {
     fn known_string_methods_resolve() {
         let idx = CoreIndex::new();
         assert!(idx.knows_class("String"));
+        // Real RBS: String#length exists; a typo does not.
         assert!(idx.class_has_method("String", "length"));
+        assert!(!idx.class_has_method("String", "lenght"));
+    }
+
+    #[test]
+    fn inherited_methods_resolve() {
+        // The keystone: methods inherited from Kernel/Object must count as
+        // present (no false positive on `s.frozen?`, `s.tap`, `s.class`).
+        let idx = CoreIndex::new();
+        for m in ["frozen?", "tap", "class", "is_a?", "inspect"] {
+            assert!(
+                idx.class_has_method("String", m),
+                "inherited method String#{m} should be known"
+            );
+        }
+        // Integer / Float / Symbol see Kernel/Object too.
+        assert!(idx.class_has_method("Integer", "frozen?"));
+        assert!(idx.class_has_method("Integer", "to_s"));
+    }
+
+    #[test]
+    fn typos_on_inherited_chain_are_absent() {
+        // A genuine typo is still witnessed absent across the WHOLE chain.
+        let idx = CoreIndex::new();
+        assert!(!idx.class_has_method("Integer", "upcase"));
+        assert!(!idx.class_has_method("NilClass", "upcase"));
         assert!(!idx.class_has_method("String", "lenght"));
     }
 
@@ -417,33 +283,24 @@ mod tests {
     }
 
     #[test]
-    fn method_return_curated_set() {
-        assert_eq!(method_return("String", "downcase"), Some("String"));
+    fn method_return_resolves_self_and_known_classes() {
+        // String#upcase -> String, String#length -> Integer (real RBS).
+        assert_eq!(method_return("String", "upcase"), Some("String"));
         assert_eq!(method_return("String", "length"), Some("Integer"));
-        assert_eq!(method_return("String", "empty?"), Some("TrueClass"));
         assert_eq!(method_return("Integer", "to_s"), Some("String"));
-        assert_eq!(method_return("Integer", "succ"), Some("Integer"));
-        // Unmodeled element-typed return stays None (never guess).
-        assert_eq!(method_return("Array", "first"), None);
+        // A typo has no return.
         assert_eq!(method_return("String", "lenght"), None);
     }
 
     #[test]
-    fn method_arity_curated_set() {
+    fn method_arity_envelopes() {
+        // String#include? : (string) -> bool  =>  (1, Some(1)).
+        assert_eq!(method_arity("String", "include?"), Some((1, Some(1))));
+        // String#gsub has overloads with 1 or 2 required positionals => (1, 2).
         assert_eq!(method_arity("String", "gsub"), Some((1, Some(2))));
-        assert_eq!(method_arity("String", "upcase"), Some((0, Some(0))));
-        assert_eq!(method_arity("Array", "push"), Some((0, None)));
-        assert_eq!(method_arity("String", "unmodeled"), None);
-    }
-
-    #[test]
-    fn return_and_arity_methods_count_as_known() {
-        // `String#index` is in the return table but not the curated method set;
-        // it must still count as a known method (consistency contract).
-        let idx = CoreIndex::new();
-        assert_eq!(method_return("String", "index"), Some("Integer"));
-        assert!(idx.class_has_method("String", "index"));
-        // A genuine typo is still unknown.
-        assert!(!idx.class_has_method("String", "lenght"));
+        // Nullary length => (0, 0).
+        assert_eq!(method_arity("String", "length"), Some((0, Some(0))));
+        // A typo has no arity.
+        assert_eq!(method_arity("String", "unmodeled_xyz"), None);
     }
 }
