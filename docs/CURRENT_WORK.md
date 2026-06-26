@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 542 at this size, 100%
-precision). 226 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 242 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 226 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 242 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -348,7 +348,30 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ✅ `baseline` — `generate [--match-mode rule|message] [--output PATH] [--force] [--config PATH]
   <file...>` (byte-compatible `.rigor-baseline.yml`) · `dump [--baseline PATH]`. `regenerate`/
   `drift`/`prune` recognized but deferred (need `configuration.paths`).
-- ⬜ `annotate` · `type-of` · `explain` · `init` · `diff` · `triage` ·
+- ✅ `type-of` — `[--format text|json] FILE:LINE:COL` (or `FILE LINE COL`). Reuses
+  `check`'s parse + `Typer` + top-level env; a span-contains node-at-position lookup
+  (deepest covering node) over the owned arena locates the expression, then
+  `Typer::type_of` types it. Renders `file:line:col` / `node:` / `type:` (text) or the
+  same keys (json). Parity: the `file:line:col` line, error messages, and exit codes
+  (1 missing-file / no-expr, 64 out-of-range / usage) are byte-identical; the `type:`
+  line uses the SAME spelling `check`'s `receiver_type` uses (a Constant renders its
+  value `"hello"`, matching the reference's `"hello"`/`"HELLO"`). Intentional diffs vs
+  the reference: `node:` names the rigor-rs owned `Node` variant (`StringLit`) not the
+  Prism class (`Prism::StringNode`); an array literal types to the `Array` nominal not
+  the value-pinned `[1, 2, 3]`; json keys are serde-ordered and the reference's
+  `erased`/`fallbacks`/`--trace` fields (no `erase_to_rbs` / FallbackTracer in this
+  port) are omitted.
+- ✅ `explain` — `[--format text|json] [<rule>]`. Static catalogue mirroring the
+  reference's `RuleCatalog::ENTRIES` content verbatim (all 19 rules + legacy aliases +
+  `call`/`flow`/`assert`/`dump`/`def` family wildcards). Text AND json are
+  **byte-identical** to the reference for every canonical id, alias, family, and the
+  no-arg index; unknown rule → the reference's two-line stderr + exit 64. (json key
+  order is hand-built to match `JSON.pretty_generate`, which serde would alphabetize.)
+- ⬜ `init` — the reference HAS it (writes `.rigor.dist.yml`, a ~60-line template
+  serialising full `Configuration::DEFAULTS` + a next-steps block); left as-is here
+  because a faithful port needs the full config-defaults model, out of scope for this
+  type-of/explain slice.
+- ⬜ `annotate` · `diff` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugins`/`plugin` · `docs` ·
   `sig-gen` (ref ADR-14) · `skill`/`describe` · `doctor` (ref ADR-77) · `lsp` · `mcp` ·
   `trace` · `type-scan`.
