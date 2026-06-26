@@ -84,6 +84,21 @@ impl CoreIndex {
         self.data.knows_class(class_name)
     }
 
+    /// Whether `class_name` was declared at GENUINE top level (empty namespace)
+    /// in the loaded RBS — a conservative companion to [`CoreIndex::knows_class`].
+    ///
+    /// `knows_class` is true for any short name in the index, INCLUDING a name
+    /// that only exists because a namespaced/nested decl (`class Process::Status`)
+    /// was registered by its short key (`"Status"`). That made a project class
+    /// sharing the short name falsely resolve to the namespaced stdlib class and
+    /// inherit its (lacking) class-method surface ⇒ false positive. This method
+    /// returns `true` ONLY for names with a genuine top-level declaration, so a
+    /// caller can refuse to treat an ambiguous short name as a known top-level
+    /// class. Instance-method behavior and `knows_class` are unchanged (additive).
+    pub fn knows_toplevel_class(&self, class_name: &str) -> bool {
+        self.data.knows_toplevel_class(class_name)
+    }
+
     /// Whether `class_name` is known to define an instance `method`, walking the
     /// **full flattened ancestor chain** (the class + supers + included
     /// modules). A method counts as present if ANY ancestor defines it.
@@ -400,6 +415,19 @@ mod tests {
                 !idx.class_has_singleton_method("Array", "wrap"),
                 "Array.wrap (AS extension) must be witnessed absent"
             );
+            // Defect 1: `SecureRandom extend Random::Formatter` makes
+            // `SecureRandom.hex` a real class method. The old superclass-only
+            // walk missed it ⇒ false positive. Now it is PRESENT (true) — either
+            // a resolved extended class method, or (if Random::Formatter is not
+            // loaded) the surface is conservatively incomplete ⇒ still true.
+            // NEVER false.
+            if idx.knows_class("SecureRandom") {
+                assert!(
+                    idx.class_has_singleton_method("SecureRandom", "hex"),
+                    "SecureRandom.hex (via extend Random::Formatter) must NOT be \
+                     witnessed absent"
+                );
+            }
             // An unknown class ⇒ silent (present).
             assert!(idx.class_has_singleton_method("MyWidget", "whatever"));
 
@@ -419,5 +447,76 @@ mod tests {
             assert!(idx.class_has_singleton_method("Time", "current"));
             assert!(idx.class_has_singleton_method("MyWidget", "whatever"));
         }
+    }
+
+    #[test]
+    fn extended_singleton_methods_resolve() {
+        // Defect 1: a class method that comes from `extend M` (M's instance
+        // methods folded onto the class object) must NOT be witnessed absent.
+        // `SecureRandom` does `extend Random::Formatter`, so `SecureRandom.hex`,
+        // `.uuid`, `.alphanumeric` are real class methods. Guarded on real RBS.
+        let idx = CoreIndex::new();
+        if idx.knows_class("SecureRandom") {
+            for m in ["hex", "uuid", "alphanumeric"] {
+                assert!(
+                    idx.class_has_singleton_method("SecureRandom", m),
+                    "SecureRandom.{m} (via extend Random::Formatter) must be present"
+                );
+            }
+            eprintln!(
+                "[extend probe] SecureRandom.hex={} SecureRandom.uuid={} \
+                 SecureRandom.bogus_xyz={}",
+                idx.class_has_singleton_method("SecureRandom", "hex"),
+                idx.class_has_singleton_method("SecureRandom", "uuid"),
+                idx.class_has_singleton_method("SecureRandom", "bogus_xyz"),
+            );
+        }
+    }
+
+    #[test]
+    fn knows_toplevel_class_distinguishes_namespaced() {
+        // Defect 2: a short name that only ever appears NAMESPACED (e.g.
+        // `class Process::Status`, registered by short key "Status") must NOT be
+        // treated as a known top-level class — otherwise a project model sharing
+        // that short name resolves to the stdlib class and inherits its lacking
+        // class-method surface ⇒ false positive.
+        let idx = CoreIndex::new();
+        if idx.knows_class("Time") {
+            // Genuine top-level core classes.
+            assert!(idx.knows_toplevel_class("Time"));
+            assert!(idx.knows_toplevel_class("Array"));
+            // `Status` is in the index (Process::Status, by short key) but is
+            // NOT top-level — verified by inspection of the loaded set.
+            assert!(
+                idx.knows_class("Status"),
+                "Status is registered (Process::Status by short key)"
+            );
+            assert!(
+                !idx.knows_toplevel_class("Status"),
+                "Process::Status is namespaced-only ⇒ not a top-level class"
+            );
+            // A name absent from the index entirely is not top-level either.
+            assert!(!idx.knows_toplevel_class("MyWidget"));
+            eprintln!(
+                "[toplevel probe] Time={} Array={} Status(knows)={} \
+                 Status(toplevel)={}",
+                idx.knows_toplevel_class("Time"),
+                idx.knows_toplevel_class("Array"),
+                idx.knows_class("Status"),
+                idx.knows_toplevel_class("Status"),
+            );
+        }
+    }
+
+    #[test]
+    fn knows_toplevel_class_under_stub() {
+        // Under the stub fallback (no RBS dir), a curated class is top-level and
+        // an unknown name is not. We can only assert this branch when running on
+        // the stub; when the real RBS is live the curated names are top-level too
+        // (a superset), so the assertions below hold in BOTH cases for these
+        // genuine top-level names.
+        let idx = CoreIndex::new();
+        assert!(idx.knows_toplevel_class("Array"));
+        assert!(!idx.knows_toplevel_class("DefinitelyNotAClass_xyz"));
     }
 }

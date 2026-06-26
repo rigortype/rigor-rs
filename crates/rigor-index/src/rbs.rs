@@ -67,6 +67,11 @@ struct ClassEntry {
     superclass: Option<&'static str>,
     /// Included module names (in source order).
     includes: Vec<&'static str>,
+    /// `extend`ed module names (in source order). An `extend M` directive folds
+    /// `M`'s INSTANCE methods into THIS class/module's SINGLETON surface (the
+    /// class object gains them as class methods — e.g. `SecureRandom` does
+    /// `extend Random::Formatter`, so `SecureRandom.hex` is a real class method).
+    extends: Vec<&'static str>,
 }
 
 /// The loaded core data backing [`crate::CoreIndex`] and the free
@@ -75,6 +80,13 @@ pub struct CoreData {
     /// `class name -> entry`. Keys are `&'static str` (leaked once at load) so
     /// resolved return-class names can flow out as `&'static str`.
     classes: HashMap<&'static str, ClassEntry>,
+    /// Short names that were declared at GENUINE top level (empty namespace) in
+    /// at least one declaration — e.g. `class Time` ⇒ `"Time"`, but a name that
+    /// only ever appears namespaced (`class Process::Status`) is NOT here. Used
+    /// by [`Self::knows_toplevel_class`] so an ambiguous short name shared by a
+    /// project class and a namespaced stdlib class is not falsely treated as a
+    /// known top-level core class (defect 2).
+    toplevel_classes: HashSet<&'static str>,
 }
 
 impl CoreData {
@@ -124,9 +136,9 @@ impl CoreData {
                 }
             }
 
-            let classes = builder.finish();
+            let (classes, toplevel_classes) = builder.finish();
             if !classes.is_empty() {
-                return Self { classes };
+                return Self { classes, toplevel_classes };
             }
         }
         // Fallback: no RBS dir (or nothing parsed) ⇒ hardcoded stub.
@@ -136,6 +148,18 @@ impl CoreData {
     /// Whether the class is in the loaded set.
     pub fn knows_class(&self, class_name: &str) -> bool {
         self.classes.contains_key(class_name)
+    }
+
+    /// Whether `class_name` was declared at GENUINE top level (empty namespace)
+    /// in at least one RBS declaration. Conservative companion to
+    /// [`Self::knows_class`]: returns `true` ONLY for names that genuinely have a
+    /// top-level declaration. A name that exists in the index solely because a
+    /// namespaced/nested decl (`class Process::Status`) was registered by its
+    /// short key (`"Status"`) returns `false`, so a project class sharing that
+    /// short name is not falsely resolved to the namespaced stdlib class
+    /// (defect 2). Instance-method behavior and `knows_class` are unchanged.
+    pub fn knows_toplevel_class(&self, class_name: &str) -> bool {
+        self.toplevel_classes.contains(class_name)
     }
 
     /// Walk the full flattened ancestor chain; a method is present if ANY
@@ -165,7 +189,10 @@ impl CoreData {
     /// The singleton surface is the union of:
     ///   (a) `class_name`'s own `def self.x` methods PLUS those of every
     ///       superclass up its chain (the singleton class inherits down the
-    ///       superclass chain); AND
+    ///       superclass chain), AND the INSTANCE methods of every module each of
+    ///       those classes `extend`s (`extend M` folds `M`'s instance methods
+    ///       into the class object — e.g. `SecureRandom extend Random::Formatter`
+    ///       makes `SecureRandom.hex` a class method); AND
     ///   (b) the INSTANCE methods of `Class`/`Module`/`Object`/`Kernel`/
     ///       `BasicObject` — the class object is itself an instance of `Class`,
     ///       so e.g. `Time.name`, `Time.new`, `Time.tap`, `Time.instance_methods`
@@ -215,12 +242,17 @@ impl CoreData {
     }
 
     /// Walk `class_name` and its superclass chain collecting OWN singleton
-    /// methods. Returns `(found, complete)`: `found` is whether `method` is a
-    /// singleton method on the class or any superclass; `complete` is `false`
-    /// if a referenced superclass is not in the loaded set (chain truncated),
-    /// mirroring the completeness notion of [`Self::ancestors`].
+    /// methods AND the instance methods of every `extend`ed module on the way.
+    /// Returns `(found, complete)`: `found` is whether `method` is on that
+    /// surface; `complete` is `false` if a referenced superclass OR any
+    /// `extend`ed module is not in the loaded set (surface truncated), mirroring
+    /// the completeness notion of [`Self::ancestors`]. The incompleteness from a
+    /// missing extended module is the critical no-false-positive guard: if e.g.
+    /// `Random::Formatter` (extended by `SecureRandom`) is not loaded, the
+    /// surface is unknown ⇒ caller stays silent.
     fn singleton_lookup(&self, class_name: &str, method: &str) -> (bool, bool) {
         let mut seen: HashSet<&str> = HashSet::new();
+        let mut complete = true;
         let mut cur = Some(class_name);
         while let Some(name) = cur {
             let Some((&key, entry)) = self.classes.get_key_value(name) else {
@@ -233,10 +265,30 @@ impl CoreData {
             if entry.singleton_methods.contains_key(method) {
                 return (true, true);
             }
+            // An `extend M` directive folds M's INSTANCE methods into this
+            // class object's singleton surface. Consult each extended module's
+            // own ancestor chain (instance dispatch). If a module is unknown the
+            // surface is incomplete; record that but keep scanning the rest of
+            // the chain so a definite hit elsewhere can still short-circuit.
+            for &module in &entry.extends {
+                if !self.classes.contains_key(module) {
+                    complete = false;
+                    continue;
+                }
+                let (mod_chain, mod_complete) = self.ancestors(module);
+                if self.lookup_on_chain(&mod_chain, method).is_some() {
+                    return (true, true);
+                }
+                if !mod_complete {
+                    complete = false;
+                }
+            }
             cur = entry.superclass;
         }
         // Walked the whole superclass chain to a root (no super) without a hit.
-        (false, true)
+        // `complete` is `true` unless some extended module was unknown along the
+        // way (a truncated singleton surface ⇒ caller stays silent).
+        (false, complete)
     }
 
     /// Resolve a method's return class over the ancestor chain (first defining
@@ -367,6 +419,9 @@ impl CoreData {
                     singleton_methods: HashMap::new(),
                     superclass,
                     includes,
+                    // The stub models no `extend` directives (no class-method
+                    // surface under the fallback); empty keeps it conservative.
+                    extends: Vec::new(),
                 },
             );
         };
@@ -577,7 +632,11 @@ impl CoreData {
             ],
         );
 
-        Self { classes }
+        // Every curated stub name is a genuine top-level core class, so the
+        // whole key set is the top-level set (defect 2: `knows_toplevel_class`
+        // of a curated class is `true`, of an unknown name is `false`).
+        let toplevel_classes: HashSet<&'static str> = classes.keys().copied().collect();
+        Self { classes, toplevel_classes }
     }
 }
 
@@ -585,6 +644,10 @@ impl CoreData {
 #[derive(Default)]
 struct Builder {
     classes: HashMap<&'static str, ClassEntry>,
+    /// Short names declared at GENUINE top level (empty namespace) in at least
+    /// one declaration. Threaded out via [`Self::finish`] into
+    /// [`CoreData::toplevel_classes`] (defect 2).
+    toplevel_classes: HashSet<&'static str>,
 }
 
 impl Builder {
@@ -603,9 +666,17 @@ impl Builder {
     }
 
     fn ingest_class(&mut self, c: &ClassNode) {
-        let Some(name) = type_name_str(&c.name()) else {
+        let tn = c.name();
+        let Some(name) = type_name_str(&tn) else {
             return;
         };
+        // A top-level decl (`class Time`) has an EMPTY namespace; a namespaced
+        // one (`class Process::Status`) does not. Record only genuine top-level
+        // names (defect 2). Nested decls (collect_members re-entry) carry their
+        // own namespace, so a `class Status` nested in `Process` is non-empty.
+        if is_toplevel_name(&tn) {
+            self.toplevel_classes.insert(name);
+        }
         let superclass = c
             .super_class()
             .and_then(|s| type_name_str(&s.name()));
@@ -618,9 +689,13 @@ impl Builder {
     }
 
     fn ingest_module(&mut self, m: &ModuleNode) {
-        let Some(name) = type_name_str(&m.name()) else {
+        let tn = m.name();
+        let Some(name) = type_name_str(&tn) else {
             return;
         };
+        if is_toplevel_name(&tn) {
+            self.toplevel_classes.insert(name);
+        }
         let mut entry = ClassEntry::default();
         self.collect_members(m.members().iter(), &mut entry);
         self.merge(name, entry);
@@ -662,6 +737,18 @@ impl Builder {
                     if let Some(modname) = type_name_str(&inc.name()) {
                         if !entry.includes.contains(&modname) {
                             entry.includes.push(modname);
+                        }
+                    }
+                }
+                Node::Extend(ext) => {
+                    // `extend M` folds M's INSTANCE methods into this class
+                    // object's SINGLETON surface (e.g. `SecureRandom extend
+                    // Random::Formatter` ⇒ `SecureRandom.hex`). Record the
+                    // module name; the singleton lookup resolves it conservatively
+                    // (an unknown extended module ⇒ surface incomplete ⇒ silent).
+                    if let Some(modname) = type_name_str(&ext.name()) {
+                        if !entry.extends.contains(&modname) {
+                            entry.extends.push(modname);
                         }
                     }
                 }
@@ -714,12 +801,18 @@ impl Builder {
                 slot.includes.push(inc);
             }
         }
+        for ext in entry.extends {
+            if !slot.extends.contains(&ext) {
+                slot.extends.push(ext);
+            }
+        }
     }
 
     /// Finish: apply implicit-`Object` superclass defaulting (every class except
     /// `BasicObject` and modules implicitly inherits `Object` when no `< X` was
-    /// given) and return the class map.
-    fn finish(mut self) -> HashMap<&'static str, ClassEntry> {
+    /// given) and return the class map plus the set of names declared at genuine
+    /// top level (defect 2).
+    fn finish(mut self) -> (HashMap<&'static str, ClassEntry>, HashSet<&'static str>) {
         let object = intern("Object");
         let basic = intern("BasicObject");
         // A module has no superclass; only *classes* default to Object. We can't
@@ -737,7 +830,7 @@ impl Builder {
                 entry.superclass = Some(object);
             }
         }
-        self.classes
+        (self.classes, self.toplevel_classes)
     }
 }
 
@@ -810,6 +903,15 @@ fn type_name_str(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
     } else {
         Some(intern(s))
     }
+}
+
+/// Whether a `TypeNameNode` names a GENUINE top-level declaration — i.e. its
+/// namespace is empty. `class Time` ⇒ empty namespace ⇒ `true`; `class
+/// Process::Status` ⇒ namespace path `[Process]` ⇒ `false`. Used to refuse
+/// treating a namespaced stdlib class registered by its short key as a known
+/// top-level class (defect 2).
+fn is_toplevel_name(tn: &ruby_rbs::node::TypeNameNode) -> bool {
+    tn.namespace().path().iter().next().is_none()
 }
 
 /// Extract `(return class, arity envelope)` from a method definition by reading
