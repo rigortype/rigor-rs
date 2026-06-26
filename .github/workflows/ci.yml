@@ -8,8 +8,9 @@
 # rustfmt is intentionally not enforced (the codebase is hand-formatted);
 # clippy is BLOCKING (`-D warnings`): the workspace is clippy-clean (deliberate
 # exceptions carry surgical per-item `#[allow]`s with rationale; `clippy.toml`
-# pins the MSRV so suggestions stay compilable on the pinned toolchain), so any
-# NEW warning fails the run. The release pipeline lives in release.yml.
+# holds clippy's suggestion-MSRV at 1.85 — below the 1.88 build floor that the
+# `ruby-rbs` dep forces — so our own crates stay at 1.85-era idioms), so any NEW
+# warning fails the run. The release pipeline lives in release.yml.
 name: ci
 
 on:
@@ -34,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
 
       # Pin to the declared MSRV (Cargo.toml rust-version).
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
         with:
           components: clippy
 
@@ -54,8 +55,8 @@ jobs:
         run: cargo test --workspace --locked
 
       # Blocking: the workspace is clippy-clean, so `-D warnings` fails CI on any
-      # new finding. `clippy.toml` pins the MSRV (1.85) so clippy never proposes
-      # fixes the pinned toolchain can't compile.
+      # new finding. `clippy.toml` holds the suggestion-MSRV at 1.85 (below the
+      # 1.88 build floor) so clippy never proposes let-chain rewrites of our code.
       - name: Clippy
         run: cargo clippy --workspace --locked -- -D warnings
 
@@ -73,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.88
 
       # bindgen (ruby-prism-sys / ruby-rbs-sys) needs libclang at build time.
       - name: Install libclang

@@ -83,9 +83,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Pinned toolchain at the project MSRV (1.85); installs the matrix target.
+      # Pinned toolchain at the project MSRV (1.88, forced by the ruby-rbs dep);
+      # installs the matrix target.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@1.85
+        uses: dtolnay/rust-toolchain@1.88
         with:
           targets: ${{ matrix.target }}
 

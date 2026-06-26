@@ -88,8 +88,13 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >    `let_and_return`/`question_mark`/`double_comparisons` (3) FIXED inline; `collapsible_match`
 >    (1 fn, 3 sites) + `too_many_arguments` (3) + `type_complexity` (1) carry surgical per-item
 >    `#[allow]`s with rationale. The 29 `collapsible_if`s were NOT collapsed: their only fix is
->    let-chains (Rust 1.88+), which break the MSRV-1.85 floor — so a `clippy.toml` pins
->    `msrv = "1.85"`, which makes clippy stop proposing them (they vanish, no allow needed).
+>    let-chains (Rust 1.88+), and our own crates stay at older idioms — so a `clippy.toml` holds
+>    clippy's suggestion-MSRV at `msrv = "1.85"` (below the build floor), which makes clippy stop
+>    proposing them (they vanish, no allow needed). **(Build MSRV note:** the workspace build floor
+>    is actually **1.88**, forced by the `ruby-rbs` dependency's own let-chains — Cargo.toml
+>    `rust-version` + the CI toolchain pins are 1.88; clippy's suggestion-MSRV stays 1.85 for OUR
+>    code. CI failed once on this mismatch — `ruby-rbs` cannot compile on 1.85 — and was fixed by
+>    raising the pins to 1.88.)
 >    All 352 tests + harness (0 FP) + corpus (0 FP) stay green. (b) Decide the **rustfmt**
 >    stance — the codebase is hand-formatted (239 diffs across 25 files vs `cargo fmt`); either
 >    adopt `cargo fmt` repo-wide + enforce `fmt --check` in CI, or add a `rustfmt.toml`/`#[rustfmt::skip]`
@@ -781,9 +786,10 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   param-binding witness/decline pair) + divergence-registry.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
 - ✅ **CI workflow** (`.github/workflows/ci.yml`): `cargo build` + `cargo test` (the
-  Ruby-free gates) on push/PR over ubuntu+macos, MSRV-pinned, `--locked`, libclang for
+  Ruby-free gates) on push/PR over ubuntu+macos, toolchain pinned to the **1.88** build MSRV
+  (forced by the `ruby-rbs` dep's let-chains), `--locked`, libclang for
   bindgen, rust-cache; clippy BLOCKING (`-D warnings`; workspace is clippy-clean, `clippy.toml`
-  pins `msrv = "1.85"` so suggestions stay compilable on the pinned toolchain); rustfmt NOT
+  holds the suggestion-`msrv = "1.85"` for OUR code, below the 1.88 build floor); rustfmt NOT
   enforced (hand-formatted codebase). The differential harnesses stay a LOCAL gate (they need the
   reference checkout + real corpora).
 - ✅ **Snapshot-mode CI parity** (ADR-0002, §14 track c): shared harness logic in `harness/lib.rb`;

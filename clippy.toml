@@ -1,5 +1,7 @@
-# Pin clippy's MSRV to the project's declared minimum (Cargo.toml `rust-version`).
-# This keeps clippy's suggestions compilable on the CI toolchain (1.85): e.g. it
-# stops clippy proposing `collapsible_if` collapses that require let-chains (Rust
-# 1.88+), which would otherwise be un-applyable without breaking the build.
+# Clippy's suggestion-MSRV is DELIBERATELY held at 1.85, BELOW the workspace build
+# MSRV (1.88 in Cargo.toml). The 1.88 build floor is forced only by the `ruby-rbs`
+# dependency's let-chains, not by our own code — our crates stay at 1.85-era
+# idioms. Keeping clippy at 1.85 stops it proposing `collapsible_if` collapses that
+# require let-chains (Rust 1.88+), so the intentional nested-`if let` gate logic is
+# not rewritten and `clippy -D warnings` stays green without churn.
 msrv = "1.85"

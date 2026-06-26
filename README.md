@@ -58,7 +58,8 @@ cargo build --release            # produces target/release/rigor (standalone)
 ./target/release/rigor --version
 ```
 
-Requires a recent Rust toolchain (edition 2024, MSRV 1.85). `ruby-prism` and
+Requires a recent Rust toolchain (edition 2024, MSRV 1.88 — the `ruby-rbs`
+dependency uses let-chains). `ruby-prism` and
 `ruby-rbs` compile their vendored C at build time, so a C toolchain + libclang
 are needed to build (not to run).
 

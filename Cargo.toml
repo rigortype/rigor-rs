@@ -8,7 +8,10 @@ exclude = ["spike/prism_probe", "spike/rbs_probe"]
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+# MSRV is dictated by the `ruby-rbs` dependency, which uses let-chains (stabilized
+# in Rust 1.88). Our own crates target older idioms (see clippy.toml's msrv), but
+# the workspace cannot build below 1.88 because of that dependency.
+rust-version = "1.88"
 # Distribution metadata (§13, ADR-0010). Inherited by member crates via
 # `*.workspace = true`. rigor-rs is published under AGPL-3.0 — note this DIFFERS
 # from the reference's `rigortype.gemspec` (MPL-2.0); the LICENSE file is the
