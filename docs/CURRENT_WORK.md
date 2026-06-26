@@ -19,10 +19,27 @@ Last updated: 2026-06-26. HEAD at handoff: `82e9eb1`.
 > witnesses **only** receivers whose concrete class is RBS-known in the **core
 > surface** (literals, RBS-method returns, core `X.new` like `Array.new`); the
 > in-source/registry surface types instances for chaining but is never a
-> *witnessing* surface. Result: 0 FP across 1444 real files, **matched coverage
-> unchanged** (every real match was already a core/RBS receiver). Cross-file
-> in-source witnessing is therefore **not** a coverage lever — see the reframed
-> §3/§4 note below.
+> *witnessing* surface. Result: 0 FP, **matched coverage unchanged** (every real
+> match was already a core/RBS receiver). Cross-file in-source *instance*
+> witnessing is therefore **not** a coverage lever.
+>
+> **Coverage work that followed (same session):** a data-driven gap analysis drove
+> three zero-FP wins. (1) **Lowering traversal** — `KeywordHashNode` (`f(k: 30.minutes)`)
+> and `ParenthesesNode` (`(30.seconds)..(10.minutes)`) weren't lowered, so nested
+> calls escaped the walk; +54 matched. (2) **Interpolated strings/heredocs** now
+> type as `String` (always sound). (3) **Class-method (singleton) witnessing** —
+> `Time.current` → `singleton(Time)`. The reference witnesses class-method typos on
+> ALL top-level RBS classes; rigor-rs now matches via a new `Type::Singleton(ClassId)`
+> + `CoreIndex::class_has_singleton_method` (extend-aware, singleton-alias-aware,
+> conservative). **Singleton needs cross-file:** a bare constant types to `Singleton`
+> only when it's a genuine top-level RBS class (`knows_toplevel_class`) AND not
+> defined anywhere in the PROJECT (`!source.knows_class`, via a project-wide
+> `SourceIndex::build_project` the CLI builds once) — this is what stops a project
+> model `Group`/`Report`/`Status` (name-colliding with a stdlib class) from being
+> falsely witnessed. Three FP families found+fixed along the way (extend modules,
+> namespaced short-name collisions, singleton aliases). Also a pre-existing
+> **block-call** FP class fixed: a block-bearing call (`h.select { }`) now types to
+> Dynamic and never witnesses arity (block dispatch isn't modeled).
 
 ## Legend
 
@@ -37,14 +54,17 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 ## ▶ Resume here (next session)
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
-**0 false positives across 1444 real files** (mastodon, gitlab-foss, conference-app,
-the reference's own source), **109/109 matched** (100% precision). 113 tests. The
-design (ADR 0001–0031) is audited and stable. A 2026-06-26 correctness fix aligned
-the undefined-method rule with the reference's leniency (see the note below).
+**0 false positives across 2458 real files** (mastodon, gitlab-foss, conference-app,
+the reference's own source), **367/367 matched** (100% precision). 132 tests. The
+design (ADR 0001–0031) is audited and stable. The 2026-06-26 session (a) aligned the
+undefined-method rule with the reference's leniency, (b) closed lowering-traversal +
+interpolated-string gaps, (c) landed **class-method (singleton) witnessing** with a
+cross-file project index, and (d) fixed a pre-existing block-call FP class. See the
+note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 113 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 132 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must be 8/8, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -69,15 +89,12 @@ ruby -I/Users/megurine/repo/ruby/rigor/lib /Users/megurine/repo/ruby/rigor/exe/r
 is **96%** of error/warning diagnostics — so coverage comes from *typing more receivers*
 precisely, not new rules. The remaining gap is mostly **Rails** receivers needing
 project-RBS / plugins):
-1. ~~**Cross-file project class index** to raise in-source witnessing coverage~~ —
-   **retired by the 2026-06-26 finding.** The reference never witnesses on in-source
-   instances, so completing cross-file chains adds FP risk, not matched coverage. The
-   real coverage lever is **cross-file in-source RETURN-TYPE inference** (ADR-0023
-   tier-4 body inference, currently ⬜): infer a project method's return type so a
-   chained call lands on a *core/RBS* receiver that DOES witness (e.g.
-   `user.full_name.lenght` where `full_name : String`). A project-wide `SourceIndex`
-   pass is the right substrate for THAT — build it when body inference lands, not for
-   witnessing.
+1. **Cross-file in-source RETURN-TYPE inference** (ADR-0023 tier-4 body inference, ⬜) —
+   the real in-source coverage lever (NOT witnessing on in-source instances, which the
+   reference is lenient about). Infer a project method's return type so a chained call
+   lands on a *core/RBS* receiver that DOES witness (`user.full_name.lenght` where
+   `full_name : String`). The project-wide `SourceIndex::build_project` substrate now
+   EXISTS (landed for the singleton gate) — extend it with per-method body inference.
 2. **Config loader `.rigor.yml`** (§7, serde_yaml now available) + **serde output + SARIF /
    GitHub / CI formats** (§6) — drop-in readiness; both unblocked by network.
 3. **Plugin phase** (§10, ADR-0013) — the real Rails-coverage unlock (sidecar-hosted Ruby
@@ -98,15 +115,18 @@ project-RBS / plugins):
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 113. **Parity:** `run.rb` 8/8, 0 FP; `run_corpus.rb` validated to **1444 real
-  files, 0 FP, 109/109 matched** (100% precision) after the 2026-06-26 leniency fix.
+- **Tests:** 132. **Parity:** `run.rb` 8/8, 0 FP; `run_corpus.rb` validated to **2458 real
+  files, 0 FP, 367/367 matched** (100% precision).
 - **Works today:** `rigor check [--format text|json] <file…>` →
   `call.undefined-method` (literals, chained calls, post-fold, **core `X.new`
-  instances** like `Array.new`) and `call.wrong-arity`; Rust-native constant folding
-  (`1 + 2` → `3`, ASCII String/Integer/etc.); JSON field-identical to the reference;
-  never-crash per-file isolation. **In-source/project classes and non-core `.new`
-  instances are typed (for chaining) but NOT witnessed** — matching the reference's
-  leniency (see the 2026-06-26 finding above). Rails models (unknown super) stay silent.
+  instances** like `Array.new`, **interpolated strings/heredocs**, and **class-method
+  typos on top-level constants** like `Time.current` → `singleton(Time)`) and
+  `call.wrong-arity`; Rust-native constant folding (`1 + 2` → `3`, ASCII
+  String/Integer/etc.); JSON field-identical to the reference; never-crash per-file
+  isolation; a **cross-file project pass** (`build_project`) so a project model is
+  known everywhere. **In-source/project-class *instances* and non-core `.new`
+  instances are typed but NOT witnessed** (reference leniency); block-bearing calls
+  type to Dynamic (block dispatch unmodeled). Rails models (unknown super) stay silent.
 
 ---
 
@@ -139,20 +159,25 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
 - ✅ **Real RBS-backed `CoreIndex`** (`rbs.rs`): parses the WHOLE `core/` + the reference's
   `DEFAULT_LIBRARIES` stdlib set (json/yaml/date/uri/csv/pathname/…, transitively closed over
   each lib's `manifest.yaml` deps) via the `ruby-rbs` parser. Builds per class: instance-method
-  set, return type, arity (min..max over overloads), super + includes; flattens the ancestor
-  chain. Handles RBS `alias` (resolved through the chain) and **nested class/module decls**
-  (registered by simple name). **Conservative gate (zero-FP keystone):** absence is witnessed
+  set, **singleton (class) methods** + extends + singleton aliases, return type, arity (min..max
+  over overloads), super + includes; flattens the ancestor chain. Handles RBS `alias` (instance
+  AND singleton, resolved through the chain) and **nested class/module decls** (registered by
+  simple name; a `nested` flag keeps lexically-nested decls OUT of the top-level set so
+  `knows_toplevel_class` is sound). **Conservative gate (zero-FP keystone):** absence is witnessed
   only when the entire chain is loaded; an incomplete/unknown chain ⇒ assume present ⇒ silent.
-- ✅ **In-source class index** (`rigor-infer/source_index.rs`): a per-run map of a file's own
-  `class name → {own methods, superclass}`, used to **type `X.new`** (instance identity for
-  chained-call RETURN inference). **NOT a witnessing surface** (2026-06-26 finding): the
-  undefined-method rule never fires on a source/registry instance — the reference is lenient
-  there. `class_has_method` exists as a SourceIndex capability but is no longer consulted by
-  the rule. Per-file only (a project pass was prototyped this session, then reverted as it
-  added no matched coverage given the leniency).
+  Exposes `class_has_method` (instance), `class_has_singleton_method` (class-method,
+  extend/alias-aware), `knows_toplevel_class`.
+- ✅ **In-source class index** (`rigor-infer/source_index.rs`): a map of project class names ↔
+  registry `ClassId`s. **`build_project(asts, core)`** builds it PROJECT-WIDE (the CLI's pass);
+  `build(ast, core)` is the single-file path. Used to (a) **type `X.new`** instances (for chained
+  RETURN inference), and (b) gate **singleton typing**: a bare constant types to `Singleton` only
+  when `!source.knows_class(name)` — so a project model defined in ANY file is never class-method-
+  witnessed (the cross-file zero-FP keystone). Project-class *instances* are still NOT a
+  witnessing surface for the undefined-method rule (reference leniency).
 - 🟡 RBS source is a **runtime path** (`RIGOR_RBS_CORE_DIR`/local rbs gem) + hardcoded-stub fallback.
 - ⬜ **Vendor + embed RBS at build time** → remove runtime path / Ruby dep (ADR-0007).
-- ⬜ **Cross-file** project class/constant index (current SourceIndex is per-file).
+- ✅ **Cross-file** project class index (`build_project`) for the singleton FP gate; ⬜ cross-file
+  CONSTANT index + cross-file in-source method RETURN inference (the next real coverage lever).
 - ⬜ Project `sig/` + gem RBS (bundler / rbs_collection) + `target_ruby` overlays (ADR-0007).
 - ⬜ Method visibility, `prepend` order, generics/refinement resolution.
 - ⬜ Constant resolution (in-source > RBS precedence, `# TYPE:`); `pre_eval` monkey-patch pass
@@ -161,10 +186,12 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
 ### 4. Inference engine — `lib/rigor/inference/` → `rigor-infer` (ADR-0022/0023/0024)
 - ✅ `Typer`: pure `type_of` by node variant; literals; local env; **chained-call typing**
   (resolve receiver class → method return → nominal); **`X.new` → instance typing**;
-  array/hash literal → nominal Array/Hash.
+  array/hash literal → nominal Array/Hash; **interpolated string → String**; **bare top-level
+  constant → `Singleton(class)`** (class-object, for class-method witnessing); **block-bearing
+  call → Dynamic** (block dispatch unmodeled, zero-FP).
 - ✅ Rust-native constant folding (`folding.rs`) — deterministic Integer/Float/Bool/Nil/Symbol/
   ASCII-String; declines (→ None) on any doubt; arg-dependent folds (`1 + 2 → 3`).
-- 🟡 Environment is flat / top-level (no flow sensitivity yet); params/ivars/constants → Dynamic.
+- 🟡 Environment is flat / top-level (no flow sensitivity yet); params/ivars/non-class-constants → Dynamic.
 - ⬜ **Flow-sensitive scopes** + 5 edges + fact buckets + invalidation (ADR-0022); narrowing
   (guards, `is_a?`, truthy/falsey, equality trust, negative facts domain-relative).
 - ⬜ Full dispatch tier cascade (tier-2 shape, tier-4 in-source bodies); cross-file implicit-self
@@ -239,7 +266,7 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 
 ### 14. Parity harness & QA (ADR-0002/0011)
 - ✅ `harness/run.rb` (fixture gate, 12 fixtures incl. alias regression) + divergence-registry.
-- ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 1444 files validated 0 FP; `harness/CORPUS.md`).
+- ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
 - ⬜ Continuous corpus growth (new fixtures per rule/feature); snapshot mode (pin reference,
   commit expected JSON) for CI without a Ruby runtime (ADR-0002).
 
@@ -261,6 +288,6 @@ Pzoom/artichoke/pylyzer traps).
 - ✅ **R3** ADR-0001: positioning stated — rigor-rs is a performance prototype that COEXISTS
   with the Ruby mainstream (Ruby leads; no planned retirement / single-implementation; full
   parity + eventual sync are possibilities, not commitments).
-- ✅ **R4** graded at scale — 0 false positives across 1444 real files; the corpus harness stays
+- ✅ **R4** graded at scale — 0 false positives across 2458 real files; the corpus harness stays
   for ongoing regression as rules/inference grow.
 - ✅ **R5** internal-error → `:info`.
