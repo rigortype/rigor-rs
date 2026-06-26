@@ -157,14 +157,22 @@ pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> 
                 receiver: Some(recv),
                 method,
                 args,
+                block_body,
                 message_span,
                 ..
-            } => Some((id, *recv, method.clone(), args.clone(), *message_span)),
+            } => Some((
+                id,
+                *recv,
+                method.clone(),
+                args.clone(),
+                !block_body.is_empty(),
+                *message_span,
+            )),
             _ => None,
         })
         .collect();
 
-    for (_id, recv, method, args, message_span) in calls {
+    for (_id, recv, method, args, has_block, message_span) in calls {
         // Rule precedence at one call site (avoid double-emit):
         //   1. undefined-method  (method absent on the receiver class, incl. nil)
         //   2. wrong-arity       (method present but arg count out of envelope)
@@ -173,7 +181,7 @@ pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> 
         // returning the first that fires.
         let diag = check_call(ast, recv, &method, message_span, &env, &typer, interner, index)
             .or_else(|| {
-                check_wrong_arity(ast, recv, &method, &args, message_span, &env, &typer, interner, index)
+                check_wrong_arity(ast, recv, &method, &args, has_block, message_span, &env, &typer, interner, index)
             })
             .or_else(|| {
                 check_nil_receiver(ast, recv, &method, message_span, &env, &typer, interner, index)
@@ -282,12 +290,22 @@ fn check_wrong_arity(
     receiver: rigor_parse::NodeId,
     method: &str,
     args: &[rigor_parse::NodeId],
+    has_block: bool,
     message_span: (usize, usize),
     env: &rigor_infer::TypeEnv,
     typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
+    // A block changes a method's effective arity (`{...}.select { block }` takes
+    // zero positional args; the RBS envelope we read is the no-block overload).
+    // We don't model block-vs-positional dispatch, so never witness arity on a
+    // block-bearing call — the reference is silent there. (Zero-FP conservatism;
+    // the positional-only envelope is unreliable once a block is attached.)
+    if has_block {
+        return None;
+    }
+
     let recv_ty = typer.type_of(ast, receiver, env, interner);
 
     // Resolve the receiver's class; `None` => Dynamic/unknown => silent.
@@ -528,6 +546,19 @@ mod tests {
         // where many args are still legal.)
         let diags = run(b"s = \"x\"\ns.concat(\"a\", \"b\")\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn block_bearing_call_is_not_witnessed() {
+        // `{...}.select { block }.keys` — `select` with a block returns a Hash
+        // (`.keys` is valid), and `select` with a block takes 0 positional args
+        // (no wrong-arity). We don't model block dispatch, so a block call types
+        // to Dynamic and never witnesses arity — matching the reference (silent).
+        let diags = run(b"h = {a: 1}\nx = h.select { |k, v| v > 0 }.keys\n");
+        assert!(diags.is_empty(), "block-call chain must be silent, got {diags:?}");
+        // The same chain without the witnessing chain still silent on the block call.
+        let diags2 = run(b"[1, 2].each_with_index { |e, i| e }\n");
+        assert!(diags2.is_empty(), "expected no diagnostics, got {diags2:?}");
     }
 
     // --- in-source / non-core `.new` instances: reference leniency -----------

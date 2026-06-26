@@ -131,9 +131,19 @@ impl<'i> Typer<'i> {
                 .get(name)
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
-            Node::Call { receiver: Some(r), method, args, .. } => {
-                let (r, method, args) = (*r, method.clone(), args.clone());
-                self.type_call(ast, r, &method, &args, env, interner)
+            Node::Call { receiver: Some(r), method, args, block_body, .. } => {
+                // A block-bearing call has a block-dependent result we don't
+                // model: `h.select { } : Hash` but `enum.select { } : Array`,
+                // `x.tap { } : x`, `arr.each { } : arr`. Pinning the no-block RBS
+                // return would let a CHAINED call falsely witness against the
+                // wrong class (e.g. `h.select { }.keys` — keys IS on the Hash the
+                // block form returns). So a block call types to Dynamic (silent).
+                if !block_body.is_empty() {
+                    interner.untyped()
+                } else {
+                    let (r, method, args) = (*r, method.clone(), args.clone());
+                    self.type_call(ast, r, &method, &args, env, interner)
+                }
             }
             // An array/hash literal types to its bare nominal class so a typo'd
             // method on it (`[1,2].frist`, `{}.fetchh`) flags via the real
