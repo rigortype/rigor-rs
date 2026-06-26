@@ -1,3 +1,7 @@
 /target
 **/target
-Cargo.lock
+
+# Cargo.lock IS committed: rigor-rs ships a binary, so a committed lockfile
+# gives reproducible, supply-chain-pinned builds (see ADR-0010 distribution).
+# The spike/ probe is a throwaway, standalone crate — its lockfile stays out.
+/spike/prism_probe/Cargo.lock
