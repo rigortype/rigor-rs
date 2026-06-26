@@ -1,0 +1,131 @@
+# Release pipeline (§13, ADR-0010) — tag-triggered cross-compile + GitHub Release.
+#
+# Trigger: pushing a `vX.Y.Z` tag (or `vX.Y.Z-rcN` for an RC dry-run; the glob
+# below matches the `vMAJOR.MINOR.PATCH` core, and pre-release suffixes still
+# match `v*.*.*`). For each matrix target this builds a release `rigor` binary,
+# packages it as `rigor-<version>-<target>.tar.gz` (bare binary at the archive
+# root, the layout cargo-binstall's `bin-dir = "rigor{ binary-ext }"` expects),
+# emits a `.sha256` sidecar, and uploads everything to a single GitHub Release.
+#
+# The binary is ALREADY self-contained (ADR-0007): `ruby-prism`/`ruby-rbs` are
+# `-sys` crates that statically compile vendored C via `cc` + `bindgen`, and the
+# core RBS is embedded — so the only host requirement beyond the Rust toolchain
+# is a C toolchain + libclang (for bindgen). On macOS that ships with the runner;
+# on Linux we apt-install clang/libclang. `otool -L`/`ldd` on the result shows
+# only the system libc.
+#
+# Matrix: the two native macOS arches (built on arch-matched runners), x86_64
+# Linux (native), and aarch64 Linux (cross-compiled via `cross`, which runs the
+# bindgen-needing build inside an arch-appropriate container). musl and Windows
+# targets are intentionally DEFERRED to a later slice (musl needs a static-libc
+# bindgen story; Windows needs its own libclang setup) — see CURRENT_WORK §13.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+# Needed for softprops/action-gh-release to create the release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon macOS — native on the arm64 runner.
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+          # Intel macOS — native on the x86_64 runner.
+          - target: x86_64-apple-darwin
+            os: macos-13
+            cross: false
+          # x86_64 Linux (glibc) — native build on ubuntu.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          # aarch64 Linux (glibc) — cross-compiled via `cross` (containerized,
+          # so bindgen/libclang are provided by the cross image, not the host).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Pinned toolchain at the project MSRV (1.85); installs the matrix target.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.85
+        with:
+          targets: ${{ matrix.target }}
+
+      # bindgen needs libclang at build time; the `-sys` crates need a C
+      # compiler. macOS runners already have both. Only needed for native Linux
+      # builds — the `cross` row builds inside a container that ships them.
+      - name: Install build deps (Linux native)
+        if: runner.os == 'Linux' && matrix.cross == false
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libclang-dev
+
+      - name: Install cross
+        if: matrix.cross == true
+        run: cargo install cross --locked
+
+      # `--locked` everywhere: build against the committed Cargo.lock for
+      # reproducible releases. `cross` substitutes for `cargo` on the aarch64
+      # Linux row, building inside an arch-appropriate container.
+      - name: Build (cargo)
+        if: matrix.cross == false
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      # Smoke-test only on natively-runnable targets (the runner's own arch):
+      # both macOS rows and x86_64 Linux. The aarch64-Linux cross build can't run
+      # on the x86_64 runner, so it is skipped here.
+      - name: Smoke test (native targets only)
+        if: matrix.cross == false
+        run: ./target/${{ matrix.target }}/release/rigor doctor
+
+      # Package: bare `rigor` (+ LICENSE/README if present) at the archive root,
+      # named `rigor-<version>-<target>.tar.gz`. `version` is the tag minus the
+      # leading `v` (GITHUB_REF_NAME is e.g. `v0.1.0`). A `.sha256` sidecar is
+      # emitted next to the archive for integrity verification.
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          target="${{ matrix.target }}"
+          archive="rigor-${version}-${target}.tar.gz"
+
+          # Stage the release files in a clean dir so the binary sits at the
+          # archive root (no `target/.../release/` path prefix).
+          staging="$(mktemp -d)"
+          cp "target/${target}/release/rigor" "${staging}/rigor"
+          [ -f LICENSE ] && cp LICENSE "${staging}/LICENSE" || true
+          [ -f README.md ] && cp README.md "${staging}/README.md" || true
+
+          tar -czf "${archive}" -C "${staging}" .
+          shasum -a 256 "${archive}" > "${archive}.sha256"
+
+          echo "archive=${archive}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.package.outputs.archive }}
+            ${{ steps.package.outputs.archive }}.sha256

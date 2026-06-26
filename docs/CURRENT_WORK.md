@@ -168,7 +168,8 @@ Ranked next levers:
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 316. **Parity:** `run.rb` PASS (28 fixtures incl. the plugin-enabled +
+- **Tests:** 352 (verified `cargo test --offline`; this distribution slice added no new Rust
+  tests — version command is exercised via the CLI binary). **Parity:** `run.rb` PASS (28 fixtures incl. the plugin-enabled +
   gate-guard pair, the tier-4b param-binding witness/decline pair, the four
   `def.override-visibility-reduced` fixtures — superclass + module-include positives, the
   reopened-class split, and the adversarial negatives bundle — and the two
@@ -575,9 +576,28 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   MCP server (read-only tools over stdio).
 
 ### 13. Distribution (ADR-0010)
-- ⬜ Static libprism link; cross-compile matrix (linux gnu+musl, macOS, Windows); channels
-  (precompiled-binary gem primary + GitHub Releases + cargo-binstall + Homebrew); sidecar Ruby
-  auto-detection.
+- ✅ **Release-pipeline foundation landed (purely additive — no dev-loop/analysis change).**
+  - Version bumped to **0.1.0** (single source: `[workspace.package] version`, inherited by all
+    crates). `repository`/`license` (**AGPL-3.0** — note this DIFFERS from the reference gemspec's MPL-2.0; LICENSE is the verbatim GNU AGPL v3) added to
+    `[workspace.package]`; `description`/`homepage` + the `[package.metadata.binstall]` block on
+    `rigor-cli`. **NOTE:** `repository`/`homepage` URL `https://github.com/rigortype/rigor-rs` is a
+    PLACEHOLDER (no git remote configured yet) — confirm when the repo is published.
+  - `rigor version` / `--version` / `-v` / `-V` command — prints `rigor <version>` (mirrors the
+    reference `lib/rigor/cli.rb`), exit 0; sourced from `env!("CARGO_PKG_VERSION")`. `doctor` now
+    shows `v0.1.0` automatically.
+  - cargo-binstall metadata: `pkg-url = "{ repo }/releases/download/v{ version }/rigor-{ version }-{ target }{ archive-suffix }"`,
+    `pkg-fmt = "tgz"`, `bin-dir = "rigor{ binary-ext }"`.
+  - `.github/workflows/release.yml` — tag-triggered (`v*.*.*`) 4-target cross-compile matrix
+    (aarch64/x86_64 macOS native, x86_64 Linux native, aarch64 Linux via `cross`); builds
+    `--release --locked`, smoke-tests `rigor doctor` on native targets, packages
+    `rigor-<version>-<target>.tar.gz` (bare binary + LICENSE at root) + `.sha256` sidecar, uploads
+    via `softprops/action-gh-release@v2`. Action versions pinned. End-to-end CI validation (the
+    actual cross-builds + asset upload) requires a real tag/CI run — out of local scope.
+  - **Static libprism link is ALREADY DONE:** `ruby-prism`/`ruby-rbs` are `-sys` crates that
+    statically compile vendored C via `cc` + `bindgen`, and the core RBS is embedded (ADR-0007).
+    `otool -L target/release/rigor` shows only `libSystem` — the binary is self-contained.
+- ⬜ Deferred: precompiled-binary gem (primary channel) + Homebrew formula; musl + Windows
+  targets; sidecar Ruby auto-detection.
 
 ### 14. Parity harness & QA (ADR-0002/0011)
 - ✅ `harness/run.rb` (fixture gate, 28 fixtures incl. alias regression, the

@@ -6,9 +6,17 @@ members = ["crates/*"]
 exclude = ["spike/prism_probe", "spike/rbs_probe"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
+# Distribution metadata (§13, ADR-0010). Inherited by member crates via
+# `*.workspace = true`. rigor-rs is published under AGPL-3.0 — note this DIFFERS
+# from the reference's `rigortype.gemspec` (MPL-2.0); the LICENSE file is the
+# verbatim GNU AGPL v3.
+# NOTE: no git remote is configured yet — this URL is a best-guess based on the
+# reference's org (`rigortype/rigor`). CONFIRM when the repo is published.
+repository = "https://github.com/rigortype/rigor-rs"
+license = "AGPL-3.0"
 
 [workspace.dependencies]
 ruby-prism = "1.9"

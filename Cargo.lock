@@ -231,7 +231,7 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rigor-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "glob",
  "regex",
@@ -247,7 +247,7 @@ dependencies = [
 
 [[package]]
 name = "rigor-index"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rigor-types",
  "ruby-rbs",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "rigor-infer"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rigor-index",
  "rigor-parse",
@@ -264,14 +264,14 @@ dependencies = [
 
 [[package]]
 name = "rigor-parse"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "ruby-prism",
 ]
 
 [[package]]
 name = "rigor-rules"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rigor-index",
  "rigor-infer",
@@ -281,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "rigor-types"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "ruby-prism"

@@ -36,12 +36,22 @@ mod type_of;
 const COMMANDS: &[&str] = &[
     "check", "annotate", "type-of", "trace", "type-scan", "explain", "diff",
     "sig-gen", "baseline", "triage", "coverage", "plugins", "plugin", "lsp",
-    "mcp", "skill", "docs", "init", "doctor",
+    "mcp", "skill", "docs", "init", "doctor", "version",
 ];
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        // `version` / `--version` / `-v` / `-V` — print `rigor <version>` and
+        // exit 0 (§13). Mirrors the reference's `rigor #{Rigor::VERSION}` output
+        // (`lib/rigor/cli.rb`, which accepts `version`/`-v`/`--version`). The
+        // version is the crate version baked in at compile time, so it tracks
+        // the workspace `version` automatically. `-V` is the conventional Rust
+        // short flag; accepted alongside the reference's `-v`.
+        Some("version" | "--version" | "-v" | "-V") => {
+            println!("rigor {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Some("check") => cmd_check(&args[1..]),
         Some("baseline") => cmd_baseline(&args[1..]),
         Some("type-of") => type_of::cmd_type_of(&args[1..]),

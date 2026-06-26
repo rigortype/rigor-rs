@@ -2,10 +2,30 @@
 name = "rigor-cli"
 version.workspace = true
 edition.workspace = true
+# Distribution metadata (§13, ADR-0010). repository/license are inherited from
+# the workspace; the binary-crate-specific description/homepage live here.
+repository.workspace = true
+license.workspace = true
+description = "Inference-first static analysis for Ruby — a self-contained, sound-subset Rust port of the rigor analyzer."
+homepage = "https://github.com/rigortype/rigor-rs"
 
 [[bin]]
 name = "rigor"
 path = "src/main.rs"
+
+# cargo-binstall (https://github.com/cargo-bins/cargo-binstall) fetches a
+# prebuilt asset published by the release workflow instead of building from
+# source. The release asset is `rigor-<version>-<target>.tar.gz` containing the
+# bare `rigor` binary at the archive root (see .github/workflows/release.yml).
+# Template variables per current cargo-binstall docs: `{ repo }`, `{ version }`
+# (the bare crate version, no leading `v`), `{ target }`, `{ archive-suffix }`
+# (e.g. `.tar.gz`, derived from pkg-fmt), `{ binary-ext }` (`.exe` on Windows,
+# empty elsewhere). The download tag is `v{ version }`, matching the workflow's
+# `on: push: tags: ["v*.*.*"]` trigger.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/rigor-{ version }-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "rigor{ binary-ext }"
 
 [dependencies]
 rigor-parse = { path = "../rigor-parse" }
