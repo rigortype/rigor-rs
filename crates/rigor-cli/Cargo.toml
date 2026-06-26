@@ -13,3 +13,8 @@ rigor-rules = { path = "../rigor-rules" }
 rigor-index = { path = "../rigor-index" }
 rigor-infer = { path = "../rigor-infer" }
 rigor-types = { path = "../rigor-types" }
+# Config loader (.rigor.yml) deps — all already present in Cargo.lock / cached
+# (serde 1.0.228, serde_yaml 0.9.34, glob 0.3.3); no network fetch needed.
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+glob = "0.3"

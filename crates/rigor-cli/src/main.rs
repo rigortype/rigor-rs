@@ -10,12 +10,16 @@
 //! synthetic `internal-error` diagnostic for it and continues — the run never
 //! aborts due to one file's bug or malformed input.
 use std::panic::{self, AssertUnwindSafe};
+use std::path::Path;
 use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
 use rigor_parse::{lower, parse};
 use rigor_rules::{analyze_with_source, catalog, Diagnostic, Severity};
 use rigor_types::Interner;
+
+mod config;
+use config::Config;
 
 /// The reference's full subcommand surface (ADR-0015).
 const COMMANDS: &[&str] = &[
@@ -50,6 +54,7 @@ fn main() -> ExitCode {
 fn cmd_check(args: &[String]) -> ExitCode {
     let mut format = OutputFormat::Text;
     let mut files: Vec<&str> = Vec::new();
+    let mut explicit_config: Option<&str> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -62,6 +67,13 @@ fn cmd_check(args: &[String]) -> ExitCode {
                     return ExitCode::from(64);
                 }
             },
+            "--config" => match it.next() {
+                Some(path) => explicit_config = Some(path),
+                None => {
+                    eprintln!("rigor check: --config expects a path");
+                    return ExitCode::from(64);
+                }
+            },
             other => files.push(other),
         }
     }
@@ -70,6 +82,13 @@ fn cmd_check(args: &[String]) -> ExitCode {
         eprintln!("rigor check: expected at least one file");
         return ExitCode::from(64);
     }
+
+    // Load `.rigor.yml` (explicit `--config` path, else cwd auto-discovery).
+    // Config ONLY suppresses/scopes diagnostics; it never changes analysis.
+    // Degrades to default (= inert) on any error, so the differential harness —
+    // which runs from a directory with no `.rigor.yml` — is unaffected.
+    let cfg = Config::load(explicit_config.map(Path::new));
+    let disable_matcher = cfg.disable_matcher();
 
     let index = CoreIndex::new();
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).
@@ -108,6 +127,12 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let mut prepared: Vec<Prepared> = Vec::new();
 
     for (order, path) in files.iter().enumerate() {
+        // Config `exclude:` — skip the file entirely before reading/analyzing it
+        // (no diagnostics, no internal-error, no project-index contribution).
+        if cfg.is_excluded(path) {
+            continue;
+        }
+
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -163,6 +188,12 @@ fn cmd_check(args: &[String]) -> ExitCode {
                     .map(|diag| (line_col(source, diag.start_offset).0, diag))
                     .collect();
                 for (_line, diag) in rigor_rules::filter_suppressed(with_lines, comments) {
+                    // Config `disable:` — drop diagnostics whose rule matches the
+                    // expanded disable set (composes with inline suppression; the
+                    // internal-error sentinel is never matched by it).
+                    if disable_matcher.suppresses(diag.rule_id) {
+                        continue;
+                    }
                     findings.push((*order, path.clone(), source.clone(), diag));
                 }
             }

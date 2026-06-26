@@ -517,14 +517,41 @@ fn legacy_alias(token: &str) -> Option<&'static str> {
 /// A parsed suppression set: a flag for the `all` wildcard plus the explicit
 /// canonical rule ids. Mirrors the reference's `Set` that may contain the
 /// `"all"` sentinel alongside real ids.
+///
+/// This is the single source of truth for rule-token expansion (legacy aliases,
+/// the `call`/`flow`/… family wildcards, canonical ids, and the `all` wildcard).
+/// It backs BOTH in-source `# rigor:disable` suppression and the `.rigor.yml`
+/// `disable:` config key, so the two stay in lockstep.
 #[derive(Default, Clone)]
-struct SuppressSet {
+pub struct SuppressSet {
     all: bool,
     rules: HashSet<String>,
 }
 
 impl SuppressSet {
-    fn suppresses(&self, rule: &str) -> bool {
+    /// Build a set from a list of user-supplied rule tokens (e.g. a config
+    /// `disable:` list), expanding each through the same logic as inline
+    /// `# rigor:disable` directives. The internal-error sentinel can never be
+    /// matched here — even an explicit `internal-error`/`all` token leaves it
+    /// reportable (enforced by [`SuppressSet::suppresses`]).
+    #[must_use]
+    pub fn from_tokens<S: AsRef<str>>(tokens: &[S]) -> Self {
+        let mut set = Self::default();
+        for token in tokens {
+            set.absorb_token(token.as_ref());
+        }
+        set
+    }
+
+    /// Whether this set matches `rule` (so the diagnostic should be dropped). The
+    /// `internal-error` sentinel is NEVER matched, regardless of `all` or an
+    /// explicit token — it represents a failure the user cannot silence (reference
+    /// `rule == nil` guard).
+    #[must_use]
+    pub fn suppresses(&self, rule: &str) -> bool {
+        if rule == INTERNAL_ERROR_RULE {
+            return false;
+        }
         self.all || self.rules.contains(rule)
     }
 
@@ -1117,5 +1144,44 @@ mod tests {
         let comments = vec![(2, "# rigor:disable all".to_string())];
         // Even `disable all` cannot silence an internal-error diagnostic.
         assert_eq!(filter_suppressed(diags, &comments).len(), 1);
+    }
+
+    #[test]
+    fn suppress_set_from_tokens_legacy_alias() {
+        // The public config helper expands the legacy alias to its canonical id.
+        let set = SuppressSet::from_tokens(&["undefined-method"]);
+        assert!(set.suppresses(CALL_UNDEFINED_METHOD));
+        assert!(!set.suppresses(CALL_WRONG_ARITY));
+    }
+
+    #[test]
+    fn suppress_set_from_tokens_call_family_and_canonical() {
+        // `call` family wildcard expands to every implemented call.* id.
+        let set = SuppressSet::from_tokens(&["call"]);
+        assert!(set.suppresses(CALL_UNDEFINED_METHOD));
+        assert!(set.suppresses(CALL_WRONG_ARITY));
+        assert!(set.suppresses(CALL_POSSIBLE_NIL_RECEIVER));
+        // A canonical id passes through to itself.
+        let set = SuppressSet::from_tokens(&[CALL_WRONG_ARITY]);
+        assert!(set.suppresses(CALL_WRONG_ARITY));
+        assert!(!set.suppresses(CALL_UNDEFINED_METHOD));
+    }
+
+    #[test]
+    fn suppress_set_from_tokens_never_matches_internal_error() {
+        // Neither `all` nor an explicit `internal-error` token may match the
+        // internal-error sentinel — it stays reportable through config too.
+        assert!(!SuppressSet::from_tokens(&["all"]).suppresses(INTERNAL_ERROR_RULE));
+        assert!(!SuppressSet::from_tokens(&["internal-error"]).suppresses(INTERNAL_ERROR_RULE));
+    }
+
+    #[test]
+    fn suppress_set_from_tokens_empty_and_unknown_are_inert() {
+        let empty: [&str; 0] = [];
+        assert!(!SuppressSet::from_tokens(&empty).suppresses(CALL_UNDEFINED_METHOD));
+        // An unknown token matches no real diagnostic.
+        let set = SuppressSet::from_tokens(&["not-a-real-rule"]);
+        assert!(!set.suppresses(CALL_UNDEFINED_METHOD));
+        assert!(!set.suppresses(CALL_WRONG_ARITY));
     }
 }
