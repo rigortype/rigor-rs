@@ -115,7 +115,7 @@ project-RBS / plugins):
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 132. **Parity:** `run.rb` 8/8, 0 FP; `run_corpus.rb` validated to **2458 real
+- **Tests:** 153. **Parity:** `run.rb` 8/8, 0 FP; `run_corpus.rb` validated to **2458 real
   files, 0 FP, 367/367 matched** (100% precision).
 - **Works today:** `rigor check [--format text|json] <file…>` →
   `call.undefined-method` (literals, chained calls, post-fold, **core `X.new`
@@ -228,11 +228,17 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   Checkstyle · JUnit · TeamCity (ref ADR-51); CI auto-detection (ref ADR-51).
 
 ### 7. Config & baseline — `configuration.rb`, `analysis/baseline.rb` → (ADR-0009/0031)
-- ⬜ `.rigor.yml` / `.rigor.dist.yml` loader: winner-takes-all (no merge), `includes:` stack,
-  relative-to-config paths, hard-coded exclusions, config-validation warnings (plugin-family
-  exempt). serde_yaml available now. Full key schema (target_ruby/paths/exclude/plugins/disable/
-  libraries/signature_paths/severity_profile/auto_detect/budget_overrun_strategy/bleeding_edge/
-  plugins_isolation).
+- ✅ **In-source suppression** (`# rigor:disable <rules>` line, `# rigor:disable-file <rules>`/`all`)
+  — `rigor_parse::comment_lines` + `rigor_rules::filter_suppressed` with reference-exact token
+  expansion (legacy aliases, `call` family, canonical ids, `all`; `internal-error` never
+  suppressed). Honored with no config, matching the reference (fixtures 13/14).
+- ✅ **`.rigor.yml` loader (minimal):** `disable:` (rule tokens, reuses the suppression
+  `SuppressSet`) + `exclude:` (path globs, `glob` crate). Discovery: `--config <path>` else
+  `.rigor.yml` in **cwd only** (reference-matching + harness-safe — the repo has none, so the
+  differential gate sees no config). Malformed ⇒ default+warn; unknown keys ignored.
+- ⬜ Full key schema (target_ruby/paths/plugins/libraries/signature_paths/severity_profile/
+  auto_detect/budget_overrun_strategy/bleeding_edge/plugins_isolation); `.rigor.dist.yml`,
+  winner-takes-all `includes:` stack, relative-to-config paths, config-validation warnings.
 - ⬜ Baseline read/write (same format; `message:` field; `--match-mode`; drift) — ref ADR-22.
 
 ### 8. Caching & incremental — `lib/rigor/cache/` → (ADR-0017/0028)
@@ -249,7 +255,8 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   native-Rust ports, hottest-first (Rails family). **This is where most real-code coverage lives.**
 
 ### 11. CLI commands — `lib/rigor/cli.rb` → `rigor-cli` (ADR-0015)
-- ✅ Full surface presented; unimplemented commands report clearly. ✅ `check`.
+- ✅ Full surface presented; unimplemented commands report clearly. ✅ `check`
+  (`--format text|json`, `--config <path>`, project two-phase pass, inline + config suppression).
 - ⬜ `annotate` · `type-of` · `explain` · `init` · `diff` · `baseline` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugins`/`plugin` · `docs` ·
   `sig-gen` (ref ADR-14) · `skill`/`describe` · `doctor` (ref ADR-77) · `lsp` · `mcp` ·
