@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 332 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 344 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 332 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 344 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -205,6 +205,12 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
   `begin`/`rescue`/`ensure`, `&&`/`||`, ivar/cvar/gvar read+write, constant read+write,
   array/hash literals, `self`, ranges, interpolation, **`ClassDef`/`ModuleDef`**
   (name + superclass + direct instance-method names).
+- ✅ **`Node::If.is_unless`** — the `unless` keyword survives lowering (Prism keeps `IfNode` and
+  `UnlessNode` distinct; the lowering collapses both into one `Node::If`, so the keyword would
+  otherwise be lost). An additive `bool` field threaded at the two construction sites (`if`/ternary
+  ⇒ `false`, `unless` ⇒ `true`); all other consumers match with `..` and are byte-stable. Required
+  by `flow.unreachable-branch` (§5), which uses it to pick the correct dead branch under the
+  keyword-inversion — a latent AST-correctness fix (the keyword was previously unrecoverable).
 - ⬜ Keyword/splat/block-arg precision; string-interpolation typing; `&.`; synthetic-node
   variants (ADR-0012/0013); Tuple/HashShape from array/hash literals; ERB detection.
 
@@ -352,9 +358,26 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   on correct code). **+0 net corpus fires** (real production code never divides by a literal `0`;
   accepted — a complete, correct rule for general code, fully exercised by the harness fixtures);
   0 FP across 3829 corpus files, grand matched UNCHANGED at **637**.
-- ⬜ `flow.unreachable-branch` · `flow.unreachable-clause` (ref ADR-47) ·
-  `flow.always-truthy-condition` (deferred — needs the ADR-0022 flow-scope substrate, i.e.
-  flow-sensitive scopes + narrowing in §4, which `dead-assignment` deliberately does NOT use).
+- ✅ `flow.unreachable-branch` — a purely **SYNTACTIC**/AST check (no typer, no folding): an
+  `if`/`unless`/ternary (Prism parses a ternary as an `IfNode` too) whose predicate is a
+  **literal node** that is always truthy or always falsey, making one branch dead, fires `warning`
+  (`unreachable branch: literal predicate is always <truthy|falsey>`, evidence `high`) anchored on
+  the DEAD branch. The literal set mirrors the reference's `TRUTHY_LITERAL_NODES`/`FALSEY_LITERAL_NODES`
+  exactly: `true`/Integer/Float/String/Symbol ⇒ truthy, `false`/`nil` ⇒ falsey; a **constant or
+  variable predicate that would fold to a literal must NOT flag** (the reference uses syntactic
+  literal detection, not the folder), and an interpolated string (`"a#{x}"`) is declined (the
+  reference matches `StringNode`, not `InterpolatedStringNode`). The **keyword-inversion** is the
+  parity keystone: for `if`, truthy ⇒ ELSE dead / falsey ⇒ THEN dead; for `unless` the two INVERT
+  — so the dead-branch selection reads the new `Node::If.is_unless` flag (see §1). The dead branch
+  must be PRESENT (its node exists) — a then-dead with an empty/absent then declines, but an
+  empty-but-present `else` clause still fires (verified against the oracle). Anchor: a dead THEN
+  on its first statement, a dead ELSE on the `else` keyword. **Fires ~0 times on the real corpus**
+  (literal-predicate conditionals are vanishingly rare in production) — accepted; the value is a
+  complete, correct rule plus the `is_unless` AST-correctness fix. 0 FP across 3829 corpus files,
+  grand matched UNCHANGED at **637**.
+- ⬜ `flow.unreachable-clause` (ref ADR-47) · `flow.always-truthy-condition` (deferred — needs the
+  ADR-0022 flow-scope substrate, i.e. flow-sensitive scopes + narrowing in §4, which
+  `dead-assignment` and `unreachable-branch` deliberately do NOT use).
 - ✅ `def.override-visibility-reduced` (ref ADR-35 slice 1) — a purely **STRUCTURAL** def-family
   check (no typer, no flow scopes, no unions): an instance-method override whose visibility is
   STRICTLY MORE RESTRICTIVE than the nearest **project-source** ancestor method it overrides

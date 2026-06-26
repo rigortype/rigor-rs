@@ -120,6 +120,13 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-override-visibility-reduced",
         }),
+        FLOW_UNREACHABLE_BRANCH => Some(&RuleEntry {
+            default_severity: Severity::Warning,
+            // The oracle stamps this `high` (a purely SYNTACTIC literal-predicate
+            // check — no typer, no folding); mirror exactly.
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-unreachable-branch",
+        }),
         FLOW_ALWAYS_RAISES => Some(&RuleEntry {
             // `error` — a provable `ZeroDivisionError` (the oracle stamps it
             // error / high). An FP here would be an ERROR on correct code, so the
@@ -174,6 +181,26 @@ pub const DEF_OVERRIDE_VISIBILITY_REDUCED: &str = "def.override-visibility-reduc
 /// DECLINED — mirroring the reference's `integer_zero_division?` exactly. This is
 /// an error-severity rule, so the gate declines on any uncertainty (zero-FP).
 pub const FLOW_ALWAYS_RAISES: &str = "flow.always-raises";
+
+/// `flow.unreachable-branch`: an `if`/`unless` (including ternary, which Prism
+/// also parses as an `IfNode`) whose predicate is a SYNTACTIC LITERAL that is
+/// always truthy or always falsey, making the opposite branch dead — fired only
+/// when that dead branch is NON-EMPTY. A purely STRUCTURAL/AST check: it matches
+/// LITERAL NODES (`true`/`false`/`nil`/Integer/Float/String/Symbol), never the
+/// constant folder — a variable/constant predicate that *would* fold to a literal
+/// must NOT flag (the reference uses syntactic detection). Mirrors the reference's
+/// `unreachable_branch_diagnostic` + `literal_predicate_polarity` exactly.
+///
+/// KEYWORD INVERSION (the correctness keystone): for `if`, truthy ⇒ ELSE dead,
+/// falsey ⇒ THEN dead; for `unless` the two INVERT (truthy ⇒ THEN dead, falsey ⇒
+/// ELSE dead). The lowered `Node::If` collapses both keywords, so the dead-branch
+/// selection reads `is_unless` — anchoring on the wrong branch would land the
+/// diagnostic on LIVE code (a parity-key mismatch = an effective false positive).
+///
+/// In practice this fires ~0 times on the real corpus (literal-predicate
+/// conditionals are vanishingly rare in production); that is ACCEPTED — the value
+/// is a complete, correct rule plus the `is_unless` AST-correctness fix.
+pub const FLOW_UNREACHABLE_BRANCH: &str = "flow.unreachable-branch";
 
 /// The Integer division/modulo operators that raise `ZeroDivisionError` on a
 /// zero Integer divisor — verbatim the reference's `INTEGER_RAISING_OPERATORS`
@@ -352,7 +379,114 @@ pub fn analyze_with_source(
         }
     }
 
+    // Fourth pass — `flow.unreachable-branch` (ADR-0030). A purely SYNTACTIC,
+    // AST/structural check, independent of the typer/index above: it walks every
+    // `Node::If` (`if`/`unless`/ternary — Prism parses a ternary as an IfNode too)
+    // and fires iff the predicate is a LITERAL node and the resulting dead branch
+    // is non-empty. The keyword-inversion (read from `is_unless`) decides which
+    // branch is dead, so the diagnostic anchors on the DEAD branch — never on live
+    // code. Mirrors the reference's `unreachable_branch_diagnostic`. Iterating the
+    // arena hits every `if`/`unless` exactly once (each lowers to one Node::If).
+    for (_id, node) in ast.iter() {
+        if let Node::If {
+            predicate,
+            then_body,
+            else_body,
+            is_unless,
+            ..
+        } = node
+        {
+            if let Some(diag) =
+                check_unreachable_branch(ast, *predicate, then_body, else_body, *is_unless)
+            {
+                out.push(diag);
+            }
+        }
+    }
+
     out
+}
+
+/// `:truthy` / `:falsey` polarity of a SYNTACTICALLY-LITERAL predicate, or `None`
+/// for anything else (a variable, constant, call, interpolated string, …). In
+/// Ruby every value except `false`/`nil` is truthy — so `true`/Integer/Float/
+/// String/Symbol literals are truthy, and only `false`/`nil` are falsey. This
+/// mirrors the reference's `TRUTHY_LITERAL_NODES`/`FALSEY_LITERAL_NODES` exactly,
+/// with two parity notes carried from the oracle:
+///   - An INTERPOLATED string (`"a#{x}"`, a `Node::InterpolatedString`) is NOT a
+///     literal here — the reference matches `StringNode` only, not
+///     `InterpolatedStringNode` — so it is declined.
+///   - A bare-regexp predicate (`if /re/`) is a `MatchLastLineNode` in Prism, not
+///     a `RegularExpressionNode`, so the reference does not flag it; rigor-rs has
+///     no regexp-literal node at all, so the case is naturally absent.
+fn literal_predicate_truthy(ast: &LoweredAst, predicate: rigor_parse::NodeId) -> Option<bool> {
+    match ast.get(predicate) {
+        Node::TrueLit { .. }
+        | Node::IntegerLit { .. }
+        | Node::FloatLit { .. }
+        | Node::StringLit { .. }
+        | Node::SymbolLit { .. } => Some(true),
+        Node::FalseLit { .. } | Node::NilLit { .. } => Some(false),
+        _ => None,
+    }
+}
+
+/// Build the `flow.unreachable-branch` diagnostic for one `Node::If`, or `None`
+/// (a DECLINE — never a false positive) when the predicate is not a literal or
+/// the dead branch is empty/absent. The keyword-inversion is the keystone: for an
+/// `if`, a truthy predicate kills the ELSE branch and a falsey one kills the THEN
+/// branch; an `unless` INVERTS both. The diagnostic anchors on the DEAD branch:
+///   - THEN dead → the then-body's first statement (the reference anchors on the
+///     `StatementsNode`, whose start is its first statement — col matches).
+///   - ELSE dead → the lowered `else`/subsequent node, whose span starts at the
+///     `else` keyword (matching the reference's `from_node(node.subsequent)` /
+///     `from_node(node.else_clause)`).
+fn check_unreachable_branch(
+    ast: &LoweredAst,
+    predicate: rigor_parse::NodeId,
+    then_body: &[rigor_parse::NodeId],
+    else_body: &[rigor_parse::NodeId],
+    is_unless: bool,
+) -> Option<Diagnostic> {
+    let truthy = literal_predicate_truthy(ast, predicate)?;
+
+    // Which branch is dead, accounting for the keyword. For `if`: truthy ⇒ else
+    // dead, falsey ⇒ then dead. `unless` inverts (truthy ⇒ then dead, falsey ⇒
+    // else dead). `then_dead == truthy` for `unless`, `!truthy` for `if`.
+    let then_dead = if is_unless { truthy } else { !truthy };
+
+    // Resolve the dead branch's anchor span. A then-branch is a `Vec` of
+    // statements — anchor first-statement-start to last-statement-end (the
+    // reference's StatementsNode span). An else-branch is a single lowered node
+    // whose span already starts at the `else` keyword. Empty/absent ⇒ DECLINE.
+    let span = if then_dead {
+        let first = *then_body.first()?;
+        let last = *then_body.last()?;
+        (ast.get(first).span().0, ast.get(last).span().1)
+    } else {
+        let dead = *else_body.first()?;
+        let s = ast.get(dead).span();
+        (s.0, s.1)
+    };
+
+    // Byte-exact polarity word (verified against the oracle):
+    //   "unreachable branch: literal predicate is always <truthy|falsey>".
+    let polarity = if truthy { "truthy" } else { "falsey" };
+
+    let severity = catalog(FLOW_UNREACHABLE_BRANCH)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Warning);
+
+    Some(Diagnostic {
+        rule_id: FLOW_UNREACHABLE_BRANCH,
+        start_offset: span.0,
+        end_offset: span.1,
+        message: format!("unreachable branch: literal predicate is always {polarity}"),
+        severity,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: None,
+    })
 }
 
 /// ADR-35 slice 1: map every `ClassDef`/`ModuleDef` arena id to its FULLY
@@ -1338,6 +1472,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     FLOW_DEAD_ASSIGNMENT,
     DEF_OVERRIDE_VISIBILITY_REDUCED,
     FLOW_ALWAYS_RAISES,
+    FLOW_UNREACHABLE_BRANCH,
 ];
 
 /// The canonical rule ids rigor-rs can actually emit — the implemented coverage
@@ -2215,6 +2350,165 @@ mod tests {
         assert!(dead(src).is_empty(), "begin-wrapped trailing write must be silent");
     }
 
+    // -- flow.unreachable-branch ------------------------------------------
+    //
+    // Pure SYNTACTIC/AST; faithful port of `unreachable_branch_diagnostic`. Each
+    // case was verified byte-exact against the Ruby oracle. The keyword-inversion
+    // (`if` vs `unless`) cases are the parity keystone: anchoring on the wrong
+    // branch would land the diagnostic on LIVE code.
+
+    /// The `flow.unreachable-branch` diagnostics in `src`, in source order.
+    fn unreach(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == FLOW_UNREACHABLE_BRANCH)
+            .collect()
+    }
+
+    /// 1-based (line, column) of a byte offset in `src` — the same coordinates the
+    /// CLI/JSON reporter prints, so anchors can be asserted against the oracle.
+    fn line_col(src: &[u8], offset: usize) -> (usize, usize) {
+        let mut line = 1usize;
+        let mut col = 1usize;
+        for &b in &src[..offset] {
+            if b == b'\n' {
+                line += 1;
+                col = 1;
+            } else {
+                col += 1;
+            }
+        }
+        (line, col)
+    }
+
+    #[test]
+    fn unreachable_branch_if_false_anchors_dead_then() {
+        // `if false…else…` — falsey predicate, THEN branch dead. Oracle: 2:3
+        // (the dead then-branch's first statement), "always falsey".
+        let src = b"if false\n  dead_then\nelse\n  live_else\nend\n";
+        let d = unreach(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(d[0].message, "unreachable branch: literal predicate is always falsey");
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(line_col(src, d[0].start_offset), (2, 3));
+    }
+
+    #[test]
+    fn unreachable_branch_unless_false_anchors_dead_else() {
+        // `unless false…else…` — the KEYWORD INVERTS: falsey predicate kills the
+        // ELSE branch. Oracle: 3:1 (the `else` keyword), "always falsey".
+        let src = b"unless false\n  live_then\nelse\n  dead_else\nend\n";
+        let d = unreach(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(d[0].message, "unreachable branch: literal predicate is always falsey");
+        assert_eq!(line_col(src, d[0].start_offset), (3, 1));
+    }
+
+    #[test]
+    fn unreachable_branch_if_true_anchors_dead_else() {
+        // `if true…else…` — truthy predicate kills the ELSE branch. Oracle: 3:1
+        // (the `else` keyword), "always truthy".
+        let src = b"if true\n  live\nelse\n  dead\nend\n";
+        let d = unreach(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(d[0].message, "unreachable branch: literal predicate is always truthy");
+        assert_eq!(line_col(src, d[0].start_offset), (3, 1));
+    }
+
+    #[test]
+    fn unreachable_branch_if_nil_kills_then() {
+        // `nil` is falsey ⇒ THEN dead, "always falsey".
+        let src = b"if nil\n  dead_n\nelse\n  live_n\nend\n";
+        let d = unreach(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(d[0].message, "unreachable branch: literal predicate is always falsey");
+        assert_eq!(line_col(src, d[0].start_offset), (2, 3));
+    }
+
+    #[test]
+    fn unreachable_branch_truthy_literals_kill_else() {
+        // Integer / String / Symbol literals are all truthy in Ruby (incl. `0`,
+        // `""`) ⇒ ELSE dead, "always truthy". Verified against the oracle.
+        for src in [
+            b"if 5\n  a\nelse\n  b\nend\n".as_slice(),
+            b"if \"x\"\n  a\nelse\n  b\nend\n".as_slice(),
+            b"if :sym\n  a\nelse\n  b\nend\n".as_slice(),
+        ] {
+            let d = unreach(src);
+            assert_eq!(d.len(), 1, "expected one diagnostic for {src:?}, got {d:?}");
+            assert_eq!(
+                d[0].message,
+                "unreachable branch: literal predicate is always truthy"
+            );
+        }
+    }
+
+    #[test]
+    fn unreachable_branch_if_false_no_else_anchors_then() {
+        // `if false; dead; end` (no else) — THEN dead, still fires (no else node
+        // is needed; the dead branch is the present, non-empty then). Oracle: 2:3.
+        let src = b"if false\n  dead_only\nend\n";
+        let d = unreach(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(line_col(src, d[0].start_offset), (2, 3));
+    }
+
+    #[test]
+    fn unreachable_branch_empty_dead_then_is_silent() {
+        // `if false` with an EMPTY then but a live else — the dead (then) branch
+        // is absent ⇒ DECLINE (verified silent in the oracle).
+        let src = b"if false\nelse\n  live2\nend\n";
+        assert!(unreach(src).is_empty(), "empty dead then must be silent");
+        // `if false; end` — both branches empty ⇒ DECLINE.
+        assert!(unreach(b"if false\nend\n").is_empty(), "no branches must be silent");
+    }
+
+    #[test]
+    fn unreachable_branch_empty_else_node_still_fires() {
+        // `if true…else[empty]` — truthy kills the ELSE branch; the `else` clause
+        // NODE exists even though its body is empty, so the oracle FIRES at 3:1.
+        let src = b"if true\n  live\nelse\nend\n";
+        let d = unreach(src);
+        assert_eq!(d.len(), 1, "empty-but-present else node must fire, got {d:?}");
+        assert_eq!(line_col(src, d[0].start_offset), (3, 1));
+    }
+
+    #[test]
+    fn unreachable_branch_non_literal_is_silent() {
+        // Non-literal predicate (`if x`) ⇒ DECLINE.
+        assert!(unreach(b"if x\n  a\nelse\n  b\nend\n").is_empty(), "variable predicate silent");
+        // Constant predicate (`if DEBUG`) ⇒ DECLINE: the reference uses SYNTACTIC
+        // literal detection, NOT the folder, so a constant never flags.
+        assert!(
+            unreach(b"if DEBUG\n  a\nelse\n  b\nend\n").is_empty(),
+            "constant predicate must not fold ⇒ silent"
+        );
+        // Interpolated string (`"a#{x}"`) is NOT a plain literal ⇒ DECLINE.
+        assert!(
+            unreach(b"if \"a#{x}b\"\n  a\nelse\n  b\nend\n").is_empty(),
+            "interpolated string predicate silent"
+        );
+    }
+
+    #[test]
+    fn unreachable_branch_while_true_is_silent() {
+        // `while true` is a LOOP (a different rule's territory), not an If ⇒ this
+        // rule is silent here.
+        assert!(
+            unreach(b"while true\n  loopy\nend\n").is_empty(),
+            "while-true is not unreachable-branch"
+        );
+    }
+
+    #[test]
+    fn unreachable_branch_ternary_fires() {
+        // Prism parses a ternary as an IfNode, so a literal-predicate ternary is
+        // flagged too (verified against the oracle: `false ? a : b` fires falsey).
+        let d = unreach(b"x = false ? aa : bb\n");
+        assert_eq!(d.len(), 1, "literal-predicate ternary must fire, got {d:?}");
+        assert_eq!(d[0].message, "unreachable branch: literal predicate is always falsey");
+    }
+
     #[test]
     fn catalog_entries_are_correct() {
         let entry = catalog(CALL_UNDEFINED_METHOD).expect("catalog entry must exist");
@@ -2235,6 +2529,11 @@ mod tests {
         assert_eq!(entry.default_severity, Severity::Warning);
         assert_eq!(entry.evidence_tier, "medium");
         assert!(entry.documentation_url.contains("flow-dead-assignment"));
+
+        let entry = catalog(FLOW_UNREACHABLE_BRANCH).expect("catalog entry must exist");
+        assert_eq!(entry.default_severity, Severity::Warning);
+        assert_eq!(entry.evidence_tier, "high");
+        assert!(entry.documentation_url.contains("flow-unreachable-branch"));
 
         assert!(catalog("unknown.rule").is_none());
     }

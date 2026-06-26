@@ -256,11 +256,24 @@ pub enum Node {
     /// `if`/`unless`/ternary. `predicate`, the `then` branch and the optional
     /// `else`/`elsif` subsequent are all lowered. Typed as `Dynamic[top]` (an
     /// `if`-as-expression has no precise branch-union type in this slice).
+    ///
+    /// `is_unless` distinguishes the `unless` KEYWORD from `if`/ternary. Prism
+    /// keeps `IfNode` and `UnlessNode` as separate types; the lowering collapses
+    /// both into this one variant, so the keyword would otherwise be lost. It is
+    /// load-bearing for `flow.unreachable-branch`: an `unless` INVERTS which
+    /// branch a literal predicate makes dead (`unless false…else…` kills the
+    /// ELSE branch, where the same predicate under `if` kills the THEN branch).
+    /// Without it the diagnostic would anchor on LIVE code. For an `unless`,
+    /// `then_body` is the `unless` body and `else_body` is its `else` clause —
+    /// the same physical layout as `if`, just reached by the inverted predicate.
     // TODO(spec): branch-union typing (ADR-0022 flow narrowing).
     If {
         predicate: NodeId,
         then_body: Vec<NodeId>,
         else_body: Vec<NodeId>,
+        /// `true` iff this came from the `unless` keyword (never for `if` or a
+        /// ternary). See the variant doc for why the keyword must survive.
+        is_unless: bool,
         span: Span,
     },
     /// `case`/`when` or `case`/`in`. The optional subject predicate, every
@@ -748,6 +761,7 @@ impl Builder {
                 predicate,
                 then_body,
                 else_body,
+                is_unless: false,
                 span: span_of(&if_node.location()),
             });
         }
@@ -766,6 +780,7 @@ impl Builder {
                 predicate,
                 then_body,
                 else_body,
+                is_unless: true,
                 span: span_of(&unless_node.location()),
             });
         }
@@ -1755,6 +1770,41 @@ mod tests {
         assert!(ast.iter().any(|(_, n)| matches!(n, Node::If { .. })));
         assert!(has_call(&ast, "foo"), "then-branch call must be lowered");
         assert!(has_call(&ast, "bar"), "else-branch call must be lowered");
+    }
+
+    #[test]
+    fn lowers_if_and_unless_keyword_distinctly() {
+        // The `is_unless` flag must survive lowering: Prism keeps `IfNode` and
+        // `UnlessNode` distinct, and `flow.unreachable-branch` relies on the
+        // keyword to decide which branch a literal predicate kills. Both keywords
+        // must also preserve BOTH branches (then + else).
+        let if_ast = lower(&crate::parse(b"if x\n  a.foo\nelse\n  b.bar\nend\n"));
+        let (_, if_node) = if_ast
+            .iter()
+            .find(|(_, n)| matches!(n, Node::If { .. }))
+            .expect("if must lower to a Node::If");
+        match if_node {
+            Node::If { is_unless, then_body, else_body, .. } => {
+                assert!(!is_unless, "`if` must lower with is_unless == false");
+                assert!(!then_body.is_empty(), "then branch preserved");
+                assert!(!else_body.is_empty(), "else branch preserved");
+            }
+            _ => unreachable!(),
+        }
+
+        let unless_ast = lower(&crate::parse(b"unless x\n  a.foo\nelse\n  b.bar\nend\n"));
+        let (_, unless_node) = unless_ast
+            .iter()
+            .find(|(_, n)| matches!(n, Node::If { .. }))
+            .expect("unless must lower to a Node::If");
+        match unless_node {
+            Node::If { is_unless, then_body, else_body, .. } => {
+                assert!(is_unless, "`unless` must lower with is_unless == true");
+                assert!(!then_body.is_empty(), "then (unless body) preserved");
+                assert!(!else_body.is_empty(), "else branch preserved");
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
