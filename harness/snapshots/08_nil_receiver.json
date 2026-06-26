@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/08_nil_receiver.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 6,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    }
+  ]
+}

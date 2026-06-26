@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/11_integer_typo.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 4,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 42"
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/07_wrong_arity.rb",
+  "diagnostics": [
+    {
+      "rule": "call.wrong-arity",
+      "line": 6,
+      "column": 3,
+      "severity": "error",
+      "message": "wrong number of arguments to `include?' on String (given 2, expected 1)"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "fixture": "harness/corpus/22_dead_assignment_skips.rb",
+  "diagnostics": []
+}

@@ -1,0 +1,4 @@
+{
+  "fixture": "harness/corpus/30_always_raises_negatives.rb",
+  "diagnostics": []
+}

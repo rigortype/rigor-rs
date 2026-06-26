@@ -1,0 +1,4 @@
+{
+  "fixture": "harness/corpus/28_nil_receiver_negatives.rb",
+  "diagnostics": []
+}

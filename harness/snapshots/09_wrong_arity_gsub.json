@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/09_wrong_arity_gsub.rb",
+  "diagnostics": [
+    {
+      "rule": "call.wrong-arity",
+      "line": 6,
+      "column": 3,
+      "severity": "error",
+      "message": "wrong number of arguments to `gsub' on String (given 3, expected 1..2)"
+    }
+  ]
+}

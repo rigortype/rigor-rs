@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/17_plugin_activesupport_core_ext.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 8,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `foo' for String"
+    }
+  ]
+}

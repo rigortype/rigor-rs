@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/21_dead_assignment.rb",
+  "diagnostics": [
+    {
+      "rule": "flow.dead-assignment",
+      "line": 6,
+      "column": 3,
+      "severity": "warning",
+      "message": "local `result' assigned in `compute' but never read"
+    }
+  ]
+}

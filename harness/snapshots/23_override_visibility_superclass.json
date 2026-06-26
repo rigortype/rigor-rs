@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/23_override_visibility_superclass.rb",
+  "diagnostics": [
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 12,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to private (overrides A#foo); breaks substitutability"
+    }
+  ]
+}

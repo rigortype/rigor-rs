@@ -91,10 +91,17 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >    All 352 tests + harness (0 FP) + corpus (0 FP) stay green. (b) Decide the **rustfmt**
 >    stance — the codebase is hand-formatted (239 diffs across 25 files vs `cargo fmt`); either
 >    adopt `cargo fmt` repo-wide + enforce `fmt --check` in CI, or add a `rustfmt.toml`/`#[rustfmt::skip]`
->    policy that matches the maintainer's hand-formatting and document it. (c) **Snapshot-mode CI
->    parity** (ADR-0002, §14) — pin the reference's expected JSON per fixture and commit it, so the
->    differential gate can run in CI without a Ruby runtime + the reference checkout (today it's
->    LOCAL-only). This makes the zero-FP bar enforceable on every PR.
+>    policy that matches the maintainer's hand-formatting and document it. (c) ✅ DONE (2026-06-27) —
+>    **Snapshot-mode CI parity** (ADR-0002, §14). Shared harness logic extracted to `harness/lib.rb`;
+>    `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (32 fixtures) from the live
+>    reference — the reference's pinned `(rule,line,column,severity,message)` set, sorted/pretty so
+>    regeneration is a no-op. `harness/run_snapshot.rb` is the reference-FREE gate: it loads the
+>    snapshots, runs the binary, and applies the IDENTICAL `(rule,line,column)` comparison (FP fail,
+>    missing OK, registry honored). A new `parity` job in `ci.yml` (checkout → toolchain → build
+>    `rigor-cli` → setup-ruby → `ruby harness/run_snapshot.rb`) enforces zero-FP on every PR without
+>    the Ruby reference. Verified snapshot-mode == live-mode (28 matched / 0 FP / 12 missing, identical
+>    per-fixture) and reference-independence (passes with `REFERENCE_RIGOR_DIR` pointed at a nonexistent
+>    path). The live `harness/run.rb` stays the local source-of-truth that regenerates the snapshots.
 >
 > Both are independent of each other and of the release; pull either next. Beyond them, the big
 > remaining levers are unchanged (the ADR-0022 flow-scope substrate for `flow.always-truthy`/the
@@ -731,8 +738,14 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   pins `msrv = "1.85"` so suggestions stay compilable on the pinned toolchain); rustfmt NOT
   enforced (hand-formatted codebase). The differential harnesses stay a LOCAL gate (they need the
   reference checkout + real corpora).
-- ⬜ Continuous corpus growth (new fixtures per rule/feature); snapshot mode (pin reference,
-  commit expected JSON) so the parity gate can run in CI without a Ruby runtime (ADR-0002).
+- ✅ **Snapshot-mode CI parity** (ADR-0002, §14 track c): shared harness logic in `harness/lib.rb`;
+  `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (32 fixtures) from the live
+  reference (sorted/pretty → deterministic, `--check` flags drift); `harness/run_snapshot.rb` is the
+  reference-FREE gate (loads snapshots + runs the binary + IDENTICAL `(rule,line,column)` comparison);
+  a separate `parity` job in `ci.yml` runs it on every PR (setup-ruby, no reference checkout). Snapshot
+  mode == live mode (28 matched / 0 FP / 12 missing, identical per-fixture). The live `harness/run.rb`
+  regenerates the snapshots and remains the local source-of-truth gate.
+- ⬜ Continuous corpus growth (new fixtures per rule/feature).
 
 ---
 

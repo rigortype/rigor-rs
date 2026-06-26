@@ -1,0 +1,68 @@
+{
+  "fixture": "harness/corpus/31_unreachable_branch.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 11,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `dead_then`. If a project file defines `dead_then` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 13,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `live_else`. If a project file defines `live_else` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 19,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `live_then`. If a project file defines `live_then` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 21,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `dead_else`. If a project file defines `dead_else` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 27,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `live`. If a project file defines `live` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 29,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `dead`. If a project file defines `dead` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.unreachable-branch",
+      "line": 11,
+      "column": 3,
+      "severity": "warning",
+      "message": "unreachable branch: literal predicate is always falsey"
+    },
+    {
+      "rule": "flow.unreachable-branch",
+      "line": 20,
+      "column": 1,
+      "severity": "warning",
+      "message": "unreachable branch: literal predicate is always falsey"
+    },
+    {
+      "rule": "flow.unreachable-branch",
+      "line": 28,
+      "column": 1,
+      "severity": "warning",
+      "message": "unreachable branch: literal predicate is always truthy"
+    }
+  ]
+}

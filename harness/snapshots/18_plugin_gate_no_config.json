@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/18_plugin_gate_no_config.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 5,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `squish' for \"x\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 6,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `minutes' for 30"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 7,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `squish' for \"x\""
+    }
+  ]
+}

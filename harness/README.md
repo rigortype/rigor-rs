@@ -4,7 +4,21 @@ This directory implements the differential parity harness for rigor-rs, per
 ADR-0002 (diagnostic-set parity via snapshots) and ADR-0011 (divergence
 registry).
 
-## How to run
+## Two ways to run the gate
+
+| Script                   | Reference needed? | Role                                              |
+|--------------------------|-------------------|---------------------------------------------------|
+| `harness/run.rb`         | **Yes** (live)    | **Local source-of-truth gate**; regenerates snapshots |
+| `harness/run_snapshot.rb`| **No**            | **CI parity gate** — compares against committed snapshots |
+
+Both apply the IDENTICAL gate semantics (shared in `harness/lib.rb`): a
+`(rule, line, column)` match over error/warning severities, false positives
+fail, missing diagnostics are coverage gaps, and the divergence registry
+excuses specific extras. `run_snapshot.rb` differs only in WHERE the expected
+reference diagnostics come from (a committed JSON snapshot vs. a live reference
+run) — it never touches `REFERENCE_RIGOR_DIR`.
+
+### Live gate (local, needs the reference)
 
 From the repo root:
 
@@ -17,6 +31,44 @@ The script will:
 2. Run both the reference Ruby Rigor and rigor-rs over every `harness/corpus/*.rb` fixture.
 3. Print a per-fixture report and a summary.
 4. Exit `0` if no unregistered false positives are found; exit `1` otherwise.
+
+### Snapshot gate (CI, no reference)
+
+```
+ruby harness/run_snapshot.rb
+```
+
+Identical to `run.rb` but loads each fixture's pinned reference diagnostics
+from `harness/snapshots/NN_name.json` instead of running the live reference. It
+needs only the built `rigor` binary + Ruby + the committed snapshots — no
+reference checkout. This is the gate the `parity` job in `.github/workflows/ci.yml`
+runs on every PR.
+
+## Reference snapshots
+
+`harness/snapshots/NN_name.json` pins the reference's expected diagnostic set
+for each fixture: a stable, sorted, pretty-printed list of
+`{rule, line, column, severity, message}` (the gate keys on
+`(rule, line, column)`; `severity`/`message` are for human review). The
+absolute `path` is deliberately omitted — it is machine-specific and the
+generator already filters to the fixture.
+
+### Regenerating snapshots (needs the reference)
+
+Regenerate whenever a fixture changes or the pinned reference updates, then
+commit the diff:
+
+```
+ruby harness/snapshot.rb           # rewrite every snapshot from the live reference
+ruby harness/snapshot.rb --check   # verify snapshots are up to date (exit 1 on drift)
+```
+
+Output is deterministic (sorted, pretty, trailing newline), so a no-op
+regeneration produces no diff. The live `harness/run.rb` remains the
+source-of-truth: the snapshots are derived from it, and snapshot-mode must
+always agree with a live run (same matched / 0 FP / same missing set). Plugin
+sidecar fixtures (`NN_name.rigor.yml`) are handled exactly as `run.rb` does
+(the generator runs the live reference with the plugin `-I` + `--config`).
 
 ### Environment variables
 

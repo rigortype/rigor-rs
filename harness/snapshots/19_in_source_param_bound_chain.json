@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/19_in_source_param_bound_chain.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"hi\""
+    }
+  ]
+}

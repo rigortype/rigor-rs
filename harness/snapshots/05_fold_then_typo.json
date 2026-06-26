@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/05_fold_then_typo.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 6,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `nope' for \"HELLO\""
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/32_unreachable_branch_negatives.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 6,
+      "column": 4,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `x`. If a project file defines `x` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 7,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `a`. If a project file defines `a` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 9,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `b`. If a project file defines `b` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 15,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `a`. If a project file defines `a` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 17,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `b`. If a project file defines `b` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 24,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `live2`. If a project file defines `live2` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

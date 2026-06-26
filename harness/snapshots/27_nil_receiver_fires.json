@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/27_nil_receiver_fires.rb",
+  "diagnostics": [
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 14,
+      "column": 5,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    }
+  ]
+}

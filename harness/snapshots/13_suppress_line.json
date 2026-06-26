@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/13_suppress_line.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 7,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"x\""
+    }
+  ]
+}

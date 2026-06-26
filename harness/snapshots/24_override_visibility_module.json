@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/24_override_visibility_module.rb",
+  "diagnostics": [
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 14,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `hello' reduced from public to private (overrides Greeter#hello); breaks substitutability"
+    }
+  ]
+}

@@ -58,3 +58,39 @@ jobs:
       # fixes the pinned toolchain can't compile.
       - name: Clippy
         run: cargo clippy --workspace --locked -- -D warnings
+
+  # Snapshot-mode parity gate (ADR-0002, §14 quality-management track c).
+  #
+  # The differential parity gate WITHOUT the reference Ruby checkout: rigor-rs
+  # is compared against committed `harness/snapshots/*.json` (the reference's
+  # pinned diagnostics, regenerated locally by `harness/snapshot.rb`). This
+  # enforces the zero-false-positive bar on every PR. A separate job so a
+  # parity regression is distinct from a build/test failure. Needs Ruby + the
+  # built binary + the snapshots — NOT the reference checkout.
+  parity:
+    name: snapshot parity gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.85
+
+      # bindgen (ruby-prism-sys / ruby-rbs-sys) needs libclang at build time.
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build the rigor-rs binary the snapshot gate drives (debug is fine).
+      - name: Build rigor-rs
+        run: cargo build --locked -p rigor-cli
+
+      # Ruby runs the gate script; no reference checkout is involved.
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      # Snapshot-mode gate: loads harness/snapshots/*.json instead of the live
+      # reference, runs the binary, fails on any unregistered false positive.
+      - name: Snapshot parity gate
+        run: ruby harness/run_snapshot.rb

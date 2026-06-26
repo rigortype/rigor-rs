@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/29_always_raises.rb",
+  "diagnostics": [
+    {
+      "rule": "flow.always-raises",
+      "line": 7,
+      "column": 3,
+      "severity": "error",
+      "message": "always raises ZeroDivisionError: `/' by zero on Integer receiver"
+    },
+    {
+      "rule": "flow.always-raises",
+      "line": 8,
+      "column": 4,
+      "severity": "error",
+      "message": "always raises ZeroDivisionError: `%' by zero on Integer receiver"
+    },
+    {
+      "rule": "flow.always-raises",
+      "line": 9,
+      "column": 3,
+      "severity": "error",
+      "message": "always raises ZeroDivisionError: `div' by zero on Integer receiver"
+    },
+    {
+      "rule": "flow.always-raises",
+      "line": 10,
+      "column": 3,
+      "severity": "error",
+      "message": "always raises ZeroDivisionError: `modulo' by zero on Integer receiver"
+    },
+    {
+      "rule": "flow.always-raises",
+      "line": 11,
+      "column": 3,
+      "severity": "error",
+      "message": "always raises ZeroDivisionError: `divmod' by zero on Integer receiver"
+    }
+  ]
+}
