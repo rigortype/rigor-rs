@@ -1,0 +1,59 @@
+# Continuous integration: build + test on every push and pull request.
+#
+# This gates the checks that run WITHOUT the reference Ruby implementation —
+# `cargo build` and `cargo test`. The differential parity harnesses
+# (`harness/run.rb`, `harness/run_corpus.rb`) need the reference checkout and
+# real corpora and so stay a LOCAL pre-merge gate, not a CI job.
+#
+# rustfmt is intentionally not enforced (the codebase is hand-formatted);
+# clippy runs as an advisory (it currently has tolerated style warnings but no
+# deny-level errors). The release pipeline lives in release.yml.
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin to the declared MSRV (Cargo.toml rust-version).
+      - uses: dtolnay/rust-toolchain@1.85
+        with:
+          components: clippy
+
+      # bindgen (ruby-prism-sys / ruby-rbs-sys) needs libclang at build time.
+      - name: Install libclang (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      # Cache the registry + build artifacts across runs.
+      - uses: Swatinem/rust-cache@v2
+
+      # --locked: build against the committed Cargo.lock (reproducible).
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      # Advisory: surfaces clippy findings without failing the run (the
+      # codebase has tolerated style warnings; tightening to `-D warnings` is a
+      # follow-up once they're cleared).
+      - name: Clippy (advisory)
+        run: cargo clippy --workspace --locked
+        continue-on-error: true

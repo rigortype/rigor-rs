@@ -675,8 +675,13 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars, and the tier-4b
   param-binding witness/decline pair) + divergence-registry.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
+- ✅ **CI workflow** (`.github/workflows/ci.yml`): `cargo build` + `cargo test` (the
+  Ruby-free gates) on push/PR over ubuntu+macos, MSRV-pinned, `--locked`, libclang for
+  bindgen, rust-cache; clippy advisory (`continue-on-error`); rustfmt NOT enforced
+  (hand-formatted codebase). The differential harnesses stay a LOCAL gate (they need the
+  reference checkout + real corpora).
 - ⬜ Continuous corpus growth (new fixtures per rule/feature); snapshot mode (pin reference,
-  commit expected JSON) for CI without a Ruby runtime (ADR-0002).
+  commit expected JSON) so the parity gate can run in CI without a Ruby runtime (ADR-0002).
 
 ---
 
