@@ -231,7 +231,7 @@ fn truthy(s: &Scalar) -> Option<bool> {
 fn fold_nil(method: &str, args: &[Scalar]) -> Option<Scalar> {
     match (method, args) {
         ("!", []) => Some(Scalar::Bool(true)), // !nil == true
-        ("&", [b]) => Some(Scalar::Bool(false && truthy(b)?)), // nil & x == false
+        ("&", [_]) => Some(Scalar::Bool(false)), // nil & x == false (for any x)
         ("|", [b]) => Some(Scalar::Bool(truthy(b)?)),          // nil | x == !!x
         ("==", [Scalar::Nil]) => Some(Scalar::Bool(true)),
         ("==", [_]) => Some(Scalar::Bool(false)),
