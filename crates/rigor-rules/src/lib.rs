@@ -120,6 +120,14 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-override-visibility-reduced",
         }),
+        FLOW_ALWAYS_RAISES => Some(&RuleEntry {
+            // `error` — a provable `ZeroDivisionError` (the oracle stamps it
+            // error / high). An FP here would be an ERROR on correct code, so the
+            // decline gate in `check_always_raises` is intentionally strict.
+            default_severity: Severity::Error,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-raises",
+        }),
         _ => None,
     }
 }
@@ -156,6 +164,22 @@ pub const FLOW_DEAD_ASSIGNMENT: &str = "flow.dead-assignment";
 /// project-source ancestor chain (RBS / third-party ancestors are a deferred
 /// follow-on). Mirrors the reference's `override_visibility_diagnostic` exactly.
 pub const DEF_OVERRIDE_VISIBILITY_REDUCED: &str = "def.override-visibility-reduced";
+
+/// `flow.always-raises`: an Integer division/modulo by a constant-zero divisor —
+/// a provable `ZeroDivisionError` (ADR-0030 taxonomy). Fires iff the receiver is
+/// provably Integer-rooted (`Constant[Integer]` / `IntegerRange` /
+/// `Nominal[Integer]`), the method is one of `/ % div modulo divmod`, and the
+/// single positional argument types to a constant Integer `0`. Float division by
+/// zero is `Infinity`, NOT an error, so a Float receiver or a `0.0` divisor is
+/// DECLINED — mirroring the reference's `integer_zero_division?` exactly. This is
+/// an error-severity rule, so the gate declines on any uncertainty (zero-FP).
+pub const FLOW_ALWAYS_RAISES: &str = "flow.always-raises";
+
+/// The Integer division/modulo operators that raise `ZeroDivisionError` on a
+/// zero Integer divisor — verbatim the reference's `INTEGER_RAISING_OPERATORS`
+/// (`%i[/ % div modulo divmod]`). The op set is closed: Float `/` returns
+/// `Infinity` (no raise), and other methods are not modeled here.
+const INTEGER_RAISING_OPERATORS: &[&str] = &["/", "%", "div", "modulo", "divmod"];
 
 // ---------------------------------------------------------------------------
 // analyze()
@@ -236,6 +260,12 @@ pub fn analyze_with_source(
             .or_else(|| {
                 check_nil_receiver(
                     ast, call_id, recv, &method, message_span, safe_nav, &env, &typer, interner,
+                    index,
+                )
+            })
+            .or_else(|| {
+                check_always_raises(
+                    ast, recv, &method, &args, has_block, message_span, &env, &typer, interner,
                     index,
                 )
             });
@@ -655,6 +685,107 @@ fn check_wrong_arity(
         receiver_type: Some(class_name.to_string()),
         method_name: Some(method.to_string()),
     })
+}
+
+/// Apply `flow.always-raises` to a single call with a receiver — a provable
+/// Integer `ZeroDivisionError` (the reference's `integer_zero_division?`).
+///
+/// Zero-false-positive gate (ADR-0023), mirroring the reference exactly. Fire
+/// iff ALL hold:
+///   1. the method is one of [`INTEGER_RAISING_OPERATORS`] (`/ % div modulo
+///      divmod`),
+///   2. NO block is attached (a block changes dispatch — decline),
+///   3. exactly ONE positional argument is present (the divisor),
+///   4. the receiver types to a provably Integer-rooted type — a
+///      `Constant[Integer]`, an `IntegerRange`, or `Nominal[Integer]` with no
+///      type args (the reference's `integer_rooted_for_diagnostic?`), AND
+///   5. that one argument types to a constant Integer `0`
+///      (`Constant[Int(0)]`).
+///
+/// Any other case DECLINES (returns `None`): a Float receiver (`5.0 / 0` —
+/// Float division by zero is `Infinity`, not an error), a Float / non-zero /
+/// non-constant divisor (`5 / 0.0`, `5 / 2`, `x / y`), a Dynamic/unknown
+/// receiver, a block-bearing call, or a multi-arg call. This is the error-
+/// severity zero-FP keystone: an FP here would be an ERROR on correct code.
+fn check_always_raises(
+    ast: &LoweredAst,
+    receiver: rigor_parse::NodeId,
+    method: &str,
+    args: &[rigor_parse::NodeId],
+    has_block: bool,
+    message_span: (usize, usize),
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+) -> Option<Diagnostic> {
+    // (1) op set, (2) no block, (3) exactly one positional arg.
+    if !INTEGER_RAISING_OPERATORS.contains(&method) {
+        return None;
+    }
+    if has_block {
+        return None;
+    }
+    let [arg] = args else {
+        return None; // not exactly one positional arg ⇒ decline.
+    };
+
+    // (4) receiver provably Integer-rooted — mirrors the reference's
+    // `integer_rooted_for_diagnostic?` (Constant<Integer> | IntegerRange |
+    // Nominal[Integer] with no type args). Any other carrier (Float, Dynamic,
+    // unknown, a generic Integer subtype application) ⇒ decline.
+    let recv_ty = typer.type_of(ast, receiver, env, interner);
+    if !is_integer_rooted(interner, index, recv_ty) {
+        return None;
+    }
+
+    // (5) the divisor types to a constant Integer zero — `Constant[Int(0)]`.
+    // A Float `0.0`, a non-zero constant, or any non-constant ⇒ decline.
+    let arg_ty = typer.type_of(ast, *arg, env, interner);
+    if !matches!(interner.get(arg_ty), Type::Constant(Scalar::Int(0))) {
+        return None;
+    }
+
+    let message =
+        format!("always raises ZeroDivisionError: `{method}' by zero on Integer receiver");
+    let severity = catalog(FLOW_ALWAYS_RAISES)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
+
+    Some(Diagnostic {
+        rule_id: FLOW_ALWAYS_RAISES,
+        start_offset: message_span.0,
+        end_offset: message_span.1,
+        message,
+        severity,
+        source_family: "builtin",
+        // Not a dispatch-typo rule; the receiver render / method fields are
+        // carried for parity with the other call-family diagnostics.
+        receiver_type: Some("Integer".to_string()),
+        method_name: Some(method.to_string()),
+    })
+}
+
+/// Whether `ty` is provably Integer-rooted for `flow.always-raises` — the
+/// reference's `integer_rooted_for_diagnostic?`: a `Constant` pinned to an
+/// Integer value, any `IntegerRange`, or `Nominal[Integer]` with NO type args.
+/// Everything else (Float, Dynamic, unknown, applied generics) is NOT
+/// Integer-rooted ⇒ the caller declines.
+fn is_integer_rooted(interner: &Interner, index: &CoreIndex, ty: rigor_types::TypeId) -> bool {
+    match interner.get(ty) {
+        // A value-pinned Integer literal (`Constant[Int(5)]`).
+        Type::Constant(Scalar::Int(_)) => true,
+        // Any bounded Integer range is Integer-rooted (the reference fires on
+        // `Type::IntegerRange` unconditionally).
+        Type::IntegerRange { .. } => true,
+        // `Nominal[Integer]` with NO type args — resolve the class name through
+        // the core index (the same surface `class_name_of` uses), so this stays
+        // robust to the class id's interning.
+        Type::Nominal { class, args } => {
+            args.is_empty() && index.class_name_for_id(*class) == Some("Integer")
+        }
+        _ => false,
+    }
 }
 
 /// Apply `call.possible-nil-receiver` to a single call with a receiver.
@@ -1206,6 +1337,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     CALL_POSSIBLE_NIL_RECEIVER,
     FLOW_DEAD_ASSIGNMENT,
     DEF_OVERRIDE_VISIBILITY_REDUCED,
+    FLOW_ALWAYS_RAISES,
 ];
 
 /// The canonical rule ids rigor-rs can actually emit — the implemented coverage
@@ -2408,6 +2540,129 @@ mod tests {
         assert_eq!(
             e.documentation_url,
             "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-override-visibility-reduced"
+        );
+    }
+
+    // --- flow.always-raises (Integer ÷/% by constant-zero divisor) -----------
+
+    /// Diagnostics filtered to just the always-raises rule.
+    fn always_raises_diags(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == FLOW_ALWAYS_RAISES)
+            .collect()
+    }
+
+    #[test]
+    fn always_raises_fires_on_literal_int_div_zero() {
+        // Byte-exact with the oracle: `5 / 0` ⇒ error, message anchored on `/`.
+        let src = b"5 / 0\n";
+        let diags = always_raises_diags(src);
+        assert_eq!(diags.len(), 1, "expected one diag, got {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.rule_id, FLOW_ALWAYS_RAISES);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.source_family, "builtin");
+        assert_eq!(
+            d.message,
+            "always raises ZeroDivisionError: `/' by zero on Integer receiver"
+        );
+        // Span anchors on the operator token (the message loc), matching the
+        // oracle's column.
+        assert_eq!(&src[d.start_offset..d.end_offset], b"/");
+    }
+
+    #[test]
+    fn always_raises_fires_on_modulo_zero() {
+        let src = b"10 % 0\n";
+        let diags = always_raises_diags(src);
+        assert_eq!(diags.len(), 1, "expected one diag, got {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            "always raises ZeroDivisionError: `%' by zero on Integer receiver"
+        );
+    }
+
+    #[test]
+    fn always_raises_fires_through_local_binding() {
+        // `x = 5; x / 0` — the receiver folds to `Constant[Int(5)]` (Integer-
+        // rooted), the divisor is constant zero ⇒ fire (oracle parity).
+        let src = b"x = 5\nx / 0\n";
+        let diags = always_raises_diags(src);
+        assert_eq!(diags.len(), 1, "expected one diag, got {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            "always raises ZeroDivisionError: `/' by zero on Integer receiver"
+        );
+    }
+
+    #[test]
+    fn always_raises_fires_on_named_ops() {
+        // `div`, `modulo`, `divmod` are in the reference's op set.
+        for (src, op) in [
+            (b"7.div(0)\n" as &[u8], "div"),
+            (b"8.modulo(0)\n", "modulo"),
+            (b"9.divmod(0)\n", "divmod"),
+        ] {
+            let diags = always_raises_diags(src);
+            assert_eq!(diags.len(), 1, "expected one diag for {op}, got {diags:?}");
+            assert_eq!(
+                diags[0].message,
+                format!("always raises ZeroDivisionError: `{op}' by zero on Integer receiver")
+            );
+        }
+    }
+
+    #[test]
+    fn always_raises_silent_on_nonzero_divisor() {
+        // `5 / 2` — a valid division, never raises ⇒ silent.
+        assert!(always_raises_diags(b"5 / 2\n").is_empty());
+    }
+
+    #[test]
+    fn always_raises_silent_on_float_divisor() {
+        // `5 / 0.0` — Float division by zero is `Infinity`, NOT an error. The
+        // oracle is silent; rigor-rs must be too (the divisor is not a constant
+        // Integer zero).
+        assert!(always_raises_diags(b"5 / 0.0\n").is_empty());
+    }
+
+    #[test]
+    fn always_raises_silent_on_float_receiver() {
+        // `5.0 / 0` — Float receiver ⇒ Float division ⇒ `Infinity`, not an error.
+        // The oracle declines (receiver not Integer-rooted); rigor-rs must too.
+        assert!(always_raises_diags(b"5.0 / 0\n").is_empty());
+    }
+
+    #[test]
+    fn always_raises_silent_on_nonconstant_divisor() {
+        // `x / y` with `y` non-constant ⇒ the divisor is not a constant zero ⇒
+        // decline (never guess on a dynamic divisor).
+        assert!(always_raises_diags(b"x = 5\nx / y\n").is_empty());
+    }
+
+    #[test]
+    fn always_raises_silent_on_dynamic_receiver() {
+        // `x / 0` where `x` is never bound ⇒ Dynamic receiver, not Integer-rooted
+        // ⇒ decline (zero-FP keystone).
+        assert!(always_raises_diags(b"x / 0\n").is_empty());
+    }
+
+    #[test]
+    fn always_raises_silent_on_block_call() {
+        // A block changes dispatch ⇒ decline. `5.div(0) { }` is contrived but
+        // exercises the block gate.
+        assert!(always_raises_diags(b"5.div(0) { 1 }\n").is_empty());
+    }
+
+    #[test]
+    fn always_raises_catalog_entry_matches_oracle() {
+        let e = catalog(FLOW_ALWAYS_RAISES).expect("catalog entry must exist");
+        assert_eq!(e.default_severity, Severity::Error);
+        assert_eq!(e.evidence_tier, "high");
+        assert_eq!(
+            e.documentation_url,
+            "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-raises"
         );
     }
 }

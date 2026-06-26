@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 321 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 332 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 321 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 332 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -336,7 +336,23 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   (the catch-all now lowers descendant reads/calls instead of dropping the subtree).
   **+0 net corpus fires** in this unusually-clean corpus (accepted — the value is the net-new
   `flow.*` family + the adversarial-fixture FP guarantee); 0 FP across 3829 corpus files.
-- ⬜ `flow.always-raises` · `flow.unreachable-branch` · `flow.unreachable-clause` (ref ADR-47) ·
+- ✅ `flow.always-raises` — a provable Integer `ZeroDivisionError`. Fires `error`
+  (`always raises ZeroDivisionError: \`<op>' by zero on Integer receiver`, anchored on the
+  operator/method token) iff ALL hold: the method ∈ the reference's `INTEGER_RAISING_OPERATORS`
+  (`/ % div modulo divmod` — verbatim, op set closed), the receiver is provably **Integer-rooted**
+  (`Constant[Integer]` | `IntegerRange` | `Nominal[Integer]` with no type args — the reference's
+  `integer_rooted_for_diagnostic?`), exactly ONE positional arg, and that arg types to a constant
+  **Integer zero** (`Constant[Int(0)]`). **Float is declined on BOTH sides** (verified against the
+  oracle): a Float receiver (`5.0 / 0` → Float division is `Infinity`, not an error) and a Float
+  divisor (`5 / 0.0`) are silent; a non-constant divisor (`x / y`), a Dynamic receiver (`x / 0`,
+  `x` unbound), a non-zero divisor (`5 / 2`), and any block-bearing call all decline. Implemented
+  in the existing call-rule `.or_else` chain (`check_always_raises`) — undefined-method /
+  wrong-arity never fire on these (the ops are defined with correct arity), so no double-emit.
+  Error severity ⇒ the gate declines on any uncertainty (zero-FP keystone: an FP here is an ERROR
+  on correct code). **+0 net corpus fires** (real production code never divides by a literal `0`;
+  accepted — a complete, correct rule for general code, fully exercised by the harness fixtures);
+  0 FP across 3829 corpus files, grand matched UNCHANGED at **637**.
+- ⬜ `flow.unreachable-branch` · `flow.unreachable-clause` (ref ADR-47) ·
   `flow.always-truthy-condition` (deferred — needs the ADR-0022 flow-scope substrate, i.e.
   flow-sensitive scopes + narrowing in §4, which `dead-assignment` deliberately does NOT use).
 - ✅ `def.override-visibility-reduced` (ref ADR-35 slice 1) — a purely **STRUCTURAL** def-family
