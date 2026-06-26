@@ -217,6 +217,25 @@ mod tests {
     }
 
     #[test]
+    fn stdlib_reopen_methods_resolve() {
+        // The reference loads core ⊕ DEFAULT_LIBRARIES, so a stdlib reopen like
+        // `class Hash ... def to_json: ... -> String` (json.rbs) is in scope.
+        // No false positive on `h.to_json`; the return resolves to String.
+        // NOTE: requires the RBS stdlib tree; under the stub fallback these are
+        // absent and the class stays conservatively silent (still zero-FP).
+        let idx = CoreIndex::new();
+        if idx.class_has_method("Hash", "to_json") {
+            assert_eq!(method_return("Hash", "to_json"), Some("String"));
+            assert!(idx.class_has_method("String", "to_json"));
+            assert!(idx.class_has_method("Array", "to_json"));
+            // `Object#to_yaml` arrives via the yaml⇒psych manifest dependency.
+            assert!(idx.class_has_method("Object", "to_yaml"));
+            // A typo of the stdlib method is still witnessed absent.
+            assert!(!idx.class_has_method("Hash", "to_jsom"));
+        }
+    }
+
+    #[test]
     fn inherited_methods_resolve() {
         // The keystone: methods inherited from Kernel/Object must count as
         // present (no false positive on `s.frozen?`, `s.tap`, `s.class`).

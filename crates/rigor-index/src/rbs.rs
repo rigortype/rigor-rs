@@ -13,26 +13,25 @@ use ruby_rbs::node::{
     parse, AliasKind, ClassNode, MethodDefinitionKind, ModuleNode, Node,
 };
 
-/// The curated set of core RBS files to parse. Chosen so that String / Integer
-/// / Float / Symbol / Array / Hash / NilClass / TrueClass / FalseClass each have
-/// their FULL ancestor chain loaded (Object, BasicObject, Kernel, Comparable,
-/// Numeric, Enumerable) — the precondition for witnessing method *absence*.
-const CURATED_FILES: &[&str] = &[
-    "basic_object.rbs",
-    "object.rbs",
-    "kernel.rbs",
-    "comparable.rbs",
-    "numeric.rbs",
-    "integer.rbs",
-    "float.rbs",
-    "string.rbs",
-    "symbol.rbs",
-    "enumerable.rbs",
-    "array.rbs",
-    "hash.rbs",
-    "nil_class.rbs",
-    "true_class.rbs",
-    "false_class.rbs",
+/// The stdlib libraries loaded on top of `core/` — the reference's
+/// `DEFAULT_LIBRARIES` (`Rigor::Environment::DEFAULT_LIBRARIES`). Each name maps
+/// to `<RBS_ROOT>/stdlib/<lib>/0/*.rbs`. A lib whose dir is absent is skipped
+/// silently (e.g. `prism` / `rbs` ship RBS with their own gems, not in the rbs
+/// stdlib tree). Loading these matches the reference's default RBS universe so a
+/// stdlib reopen like `class Hash ... def to_json` is in scope (no false
+/// `call.undefined-method` on `h.to_json`).
+const DEFAULT_LIBRARIES: &[&str] = &[
+    "pathname", "optparse", "json", "yaml", "fileutils", "tempfile", "tmpdir",
+    "stringio", "forwardable", "digest", "securerandom",
+    "uri", "logger", "date",
+    "pp", "delegate", "observable", "abbrev", "find", "tsort", "singleton",
+    "shellwords", "benchmark", "base64", "did_you_mean",
+    "monitor", "mutex_m", "timeout",
+    "open3", "erb", "etc", "ipaddr", "bigdecimal", "bigdecimal-math",
+    "prettyprint", "random-formatter", "time", "open-uri", "resolv",
+    "csv", "pstore", "objspace", "io-console", "cgi", "cgi-escape",
+    "strscan",
+    "prism", "rbs",
 ];
 
 /// The default core-RBS directory (rbs gem under mise) used when
@@ -73,8 +72,11 @@ pub struct CoreData {
 }
 
 impl CoreData {
-    /// Build from the curated core RBS if the directory exists, else from the
-    /// hardcoded stub. Never panics: any per-file parse error is skipped.
+    /// Build from the real RBS universe (the reference's default: ALL of
+    /// `core/*.rbs` ⊕ the `DEFAULT_LIBRARIES` stdlib set) if the core directory
+    /// exists, else from the hardcoded stub. Never panics: any per-file parse
+    /// error is skipped, and stdlib reopens of core classes (`class Hash ...`)
+    /// merge into the existing entry (see [`Builder::merge`]).
     pub fn load() -> Self {
         let dir = std::env::var("RIGOR_RBS_CORE_DIR")
             .map(PathBuf::from)
@@ -82,14 +84,40 @@ impl CoreData {
 
         if dir.is_dir() {
             let mut builder = Builder::default();
-            for file in CURATED_FILES {
-                let path = dir.join(file);
-                if let Ok(code) = std::fs::read_to_string(&path) {
-                    // Per-file isolation (ADR-0016 never-crash): a parse failure
-                    // on one file must not sink the whole index.
-                    builder.ingest(&code);
+
+            // 1) The WHOLE core dir (~62 files), not a curated subset — so every
+            //    core class + its full ancestor chain is loaded.
+            ingest_rbs_dir(&mut builder, &dir);
+
+            // 2) The DEFAULT_LIBRARIES stdlib set, rooted at `<core>/../stdlib`,
+            //    transitively closed over each lib's `manifest.yaml` deps (the
+            //    reference resolves these — e.g. `yaml` ⇒ `psych` ships the
+            //    `Object#to_yaml` reopen, `csv` ⇒ `stringio`). Each lib is
+            //    `stdlib/<lib>/0/*.rbs`; an absent lib (e.g. `prism`/`rbs`, or a
+            //    dep like `socket` not in this tree) is skipped silently.
+            if let Some(root) = dir.parent() {
+                let stdlib = root.join("stdlib");
+                let mut loaded: HashSet<String> = HashSet::new();
+                let mut queue: Vec<String> =
+                    DEFAULT_LIBRARIES.iter().map(|s| s.to_string()).collect();
+                while let Some(lib) = queue.pop() {
+                    if !loaded.insert(lib.clone()) {
+                        continue;
+                    }
+                    let lib_dir = stdlib.join(&lib).join("0");
+                    if !lib_dir.is_dir() {
+                        continue; // ships RBS elsewhere / not in this tree ⇒ skip.
+                    }
+                    ingest_rbs_dir(&mut builder, &lib_dir);
+                    // Enqueue manifest dependencies (transitive closure).
+                    for dep in manifest_deps(&lib_dir.join("manifest.yaml")) {
+                        if !loaded.contains(&dep) {
+                            queue.push(dep);
+                        }
+                    }
                 }
             }
+
             let classes = builder.finish();
             if !classes.is_empty() {
                 return Self { classes };
@@ -541,6 +569,17 @@ impl Builder {
                     let old_name = intern(a.old_name().as_str());
                     entry.aliases.entry(new_name).or_insert(old_name);
                 }
+                // A NESTED class/module declaration (e.g. `module PP; module
+                // ObjectMixin; end; end`) must be registered too, by its simple
+                // name — otherwise an `include` that references it leaves the
+                // ancestor chain "incomplete", and the conservative gate would
+                // stop witnessing absence for EVERY class whose chain passes
+                // through the reopened owner (e.g. `Object include PP::ObjectMixin`
+                // ⇒ all typo detection silently disabled). Registering nested
+                // types by simple name keeps chains complete. (Simple-name
+                // collisions only ever ADD methods, never witness false absence.)
+                Node::Class(nested) => self.ingest_class(&nested),
+                Node::Module(nested) => self.ingest_module(&nested),
                 _ => {}
             }
         }
@@ -590,6 +629,64 @@ impl Builder {
         }
         self.classes
     }
+}
+
+/// Parse every `*.rbs` file under `dir` (recursively) and fold its declarations
+/// into `builder`. Per-file isolation (ADR-0016 never-crash): a read or parse
+/// failure on one file is skipped; the rest still load. Subdirectories are
+/// walked because both `core/` (e.g. `core/io/*.rbs`, `core/rubygems/*.rbs`) and
+/// some stdlib libs (`stdlib/<lib>/0/<sub>/*.rbs`) nest their signatures.
+fn ingest_rbs_dir(builder: &mut Builder, dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            ingest_rbs_dir(builder, &path);
+        } else if path.extension().is_some_and(|e| e == "rbs") {
+            if let Ok(code) = std::fs::read_to_string(&path) {
+                builder.ingest(&code);
+            }
+        }
+    }
+}
+
+/// Parse the `dependencies:` list out of an RBS stdlib `manifest.yaml`, returning
+/// the dependency lib names. Hand-rolled (no YAML crate): the manifests are a
+/// trivial, fixed shape — a `dependencies:` key followed by `- name: <lib>`
+/// items. A missing/garbled manifest yields no deps (never panics).
+fn manifest_deps(path: &std::path::Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut deps = Vec::new();
+    let mut in_deps = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        // Leave the `dependencies:` block when a new unindented top-level key
+        // appears (a line that isn't a list item and isn't indented).
+        if in_deps && !line.starts_with(' ') && !line.starts_with('-') {
+            in_deps = false;
+        }
+        if trimmed == "dependencies:" {
+            in_deps = true;
+            continue;
+        }
+        if in_deps {
+            // Item shape: `- name: psych` (quotes optional).
+            if let Some(rest) = trimmed.strip_prefix("- name:") {
+                let name = rest.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !name.is_empty() {
+                    deps.push(name.to_string());
+                }
+            }
+        }
+    }
+    deps
 }
 
 /// Resolve the **last** path component of a `TypeNameNode`'s namespace+name into
