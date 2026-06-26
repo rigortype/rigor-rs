@@ -100,6 +100,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
         path: String,
         source: String,
         ast: rigor_parse::LoweredAst,
+        /// The file's comments as `(1-based line, text)`, captured inside the
+        /// parse closure (the borrowed `ParseResult` cannot escape it). Drives
+        /// in-source `# rigor:disable` suppression in stage 3.
+        comments: Vec<(usize, String)>,
     }
     let mut prepared: Vec<Prepared> = Vec::new();
 
@@ -117,11 +121,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
         let source_bytes = source.as_bytes().to_vec();
         let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
             let result = parse(&source_bytes);
-            lower(&result)
+            // Capture comments here: the borrowed `ParseResult` cannot escape
+            // this closure, so collect the owned `(line, text)` vec alongside
+            // the AST (ADR-0012 lifetime boundary).
+            let comments = rigor_parse::comment_lines(&result, &source_bytes);
+            (lower(&result), comments)
         }));
 
         match lowered {
-            Ok(ast) => prepared.push(Prepared { order, path: path_owned, source, ast }),
+            Ok((ast, comments)) => {
+                prepared.push(Prepared { order, path: path_owned, source, ast, comments });
+            }
             Err(panic_val) => {
                 let msg = panic_message(&panic_val);
                 eprintln!("rigor check: internal panic on {path}: {msg}");
@@ -137,7 +147,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // Stage 3: analyze each file against the shared project source (panic-isolated),
     // emitting diagnostics grouped per file in input order.
     for p in &prepared {
-        let Prepared { order, path, source, ast } = p;
+        let Prepared { order, path, source, ast, comments } = p;
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let mut interner = Interner::new();
             analyze_with_source(ast, &mut interner, &index, &project_source)
@@ -145,7 +155,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
         match result {
             Ok(diags) => {
-                for diag in diags {
+                // Apply in-source `# rigor:disable` / `-file` suppression per file
+                // (line numbers are per file). Pair each diagnostic with its
+                // 1-based line, filter, then push the survivors.
+                let with_lines: Vec<(usize, Diagnostic)> = diags
+                    .into_iter()
+                    .map(|diag| (line_col(source, diag.start_offset).0, diag))
+                    .collect();
+                for (_line, diag) in rigor_rules::filter_suppressed(with_lines, comments) {
                     findings.push((*order, path.clone(), source.clone(), diag));
                 }
             }

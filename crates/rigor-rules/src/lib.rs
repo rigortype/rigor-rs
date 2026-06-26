@@ -466,6 +466,191 @@ fn render_scalar(scalar: &Scalar) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// In-source diagnostic suppression (reference `filter_suppressed`)
+// ---------------------------------------------------------------------------
+
+use std::collections::{HashMap, HashSet};
+
+/// The sentinel rule id of the synthetic internal-error diagnostic emitted on a
+/// per-file panic (ADR-0016). Such diagnostics carry no real rule and MUST NEVER
+/// be suppressed — they represent failures the user cannot silence away (matches
+/// the reference's `rule == nil` guard in `filter_suppressed`).
+const INTERNAL_ERROR_RULE: &str = "internal-error";
+
+/// Family-wildcard tokens (`call`, `flow`, …). A token in this set expands to
+/// every canonical rule whose id starts with `<token>.` (reference
+/// `RULE_FAMILIES`). Only `call` can match an implemented rule today; the rest
+/// are carried for forward-compat with the reference's catalogue.
+const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def"];
+
+/// The canonical rule ids rigor-rs can actually emit. Family expansion and the
+/// `disable all` wildcard are checked against this set, so a `call` family token
+/// only ever expands to these three (the reference expands against its full
+/// `ALL_RULES`, but the extra ids it would add match no rigor-rs diagnostic).
+const IMPLEMENTED_RULES: &[&str] =
+    &[CALL_UNDEFINED_METHOD, CALL_WRONG_ARITY, CALL_POSSIBLE_NIL_RECEIVER];
+
+/// Maps a legacy short alias to its canonical id (reference `LEGACY_RULE_ALIASES`).
+/// Only the three implemented ids can ever match a real diagnostic; the remaining
+/// aliases are included for forward-compat (they expand to ids no rigor-rs
+/// diagnostic carries, so they are inert).
+fn legacy_alias(token: &str) -> Option<&'static str> {
+    match token {
+        "undefined-method" => Some(CALL_UNDEFINED_METHOD),
+        "self-undefined-method" => Some("call.self-undefined-method"),
+        "wrong-arity" => Some(CALL_WRONG_ARITY),
+        "argument-type-mismatch" => Some("call.argument-type-mismatch"),
+        "possible-nil-receiver" => Some(CALL_POSSIBLE_NIL_RECEIVER),
+        "dump-type" => Some("dump.type"),
+        "assert-type" => Some("assert.type-mismatch"),
+        "always-raises" => Some("flow.always-raises"),
+        "unreachable-branch" => Some("flow.unreachable-branch"),
+        "method-visibility-mismatch" => Some("def.method-visibility-mismatch"),
+        "ivar-write-mismatch" => Some("def.ivar-write-mismatch"),
+        "dead-assignment" => Some("flow.dead-assignment"),
+        "always-truthy-condition" => Some("flow.always-truthy-condition"),
+        "unreachable-clause" => Some("flow.unreachable-clause"),
+        _ => None,
+    }
+}
+
+/// A parsed suppression set: a flag for the `all` wildcard plus the explicit
+/// canonical rule ids. Mirrors the reference's `Set` that may contain the
+/// `"all"` sentinel alongside real ids.
+#[derive(Default, Clone)]
+struct SuppressSet {
+    all: bool,
+    rules: HashSet<String>,
+}
+
+impl SuppressSet {
+    fn suppresses(&self, rule: &str) -> bool {
+        self.all || self.rules.contains(rule)
+    }
+
+    fn is_empty(&self) -> bool {
+        !self.all && self.rules.is_empty()
+    }
+
+    /// Expand one user token into this set (reference `expand_token` +
+    /// `absorb_suppression_tokens`).
+    fn absorb_token(&mut self, token: &str) {
+        if token == "all" {
+            self.all = true;
+        } else if let Some(canonical) = legacy_alias(token) {
+            self.rules.insert(canonical.to_string());
+        } else if RULE_FAMILIES.contains(&token) {
+            let prefix = format!("{token}.");
+            for rule in IMPLEMENTED_RULES {
+                if rule.starts_with(&prefix) {
+                    self.rules.insert((*rule).to_string());
+                }
+            }
+        } else {
+            // Canonical id → itself; unknown token → passes through verbatim
+            // (matches no real diagnostic ⇒ a no-op). Both paths just insert
+            // the token, matching the reference's `expand_token` fallthrough.
+            self.rules.insert(token.to_string());
+        }
+    }
+}
+
+/// Drop the diagnostics suppressed by the file's inline `# rigor:disable` /
+/// `# rigor:disable-file` comments, mirroring the reference's `filter_suppressed`
+/// (honored regardless of any config file). Each input is `(line, diagnostic)`
+/// where `line` is the diagnostic's 1-based source line; `comments` is the
+/// `(line, text)` list from [`rigor_parse::comment_lines`].
+///
+/// A diagnostic is dropped iff its `rule_id` is in the file-suppression set (or
+/// that set contains `all`), OR its `rule_id` is in its line's suppression set
+/// (or that line's set contains `all`). The internal-error sentinel is never
+/// dropped.
+#[must_use]
+pub fn filter_suppressed(
+    diagnostics: Vec<(usize, Diagnostic)>,
+    comments: &[(usize, String)],
+) -> Vec<(usize, Diagnostic)> {
+    let (line_suppressions, file_suppressions) = parse_suppression_comments(comments);
+
+    diagnostics
+        .into_iter()
+        .filter(|(line, diag)| {
+            // Never suppress the internal-error sentinel (reference: `rule.nil?`).
+            if diag.rule_id == INTERNAL_ERROR_RULE {
+                return true;
+            }
+            if file_suppressions.suppresses(diag.rule_id) {
+                return false;
+            }
+            if let Some(set) = line_suppressions.get(line) {
+                if set.suppresses(diag.rule_id) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect()
+}
+
+/// Parse the comment list into `(line_suppressions, file_suppressions)`.
+/// File-level directives (`# rigor:disable-file ...`) apply to every line; the
+/// `-file` form is checked FIRST so a `disable-file` comment is not also read as
+/// a line-level `disable` (the reference's `(?!-file)` negative lookahead).
+fn parse_suppression_comments(
+    comments: &[(usize, String)],
+) -> (HashMap<usize, SuppressSet>, SuppressSet) {
+    let mut line_suppressions: HashMap<usize, SuppressSet> = HashMap::new();
+    let mut file_suppressions = SuppressSet::default();
+
+    for (line, text) in comments {
+        if let Some(rules) = match_directive(text, "rigor:disable-file") {
+            absorb_tokens(rules, &mut file_suppressions);
+        } else if let Some(rules) = match_directive(text, "rigor:disable") {
+            absorb_tokens(rules, line_suppressions.entry(*line).or_default());
+        }
+    }
+
+    (line_suppressions, file_suppressions)
+}
+
+/// Find `#` `<ws>*` `<keyword>` `<ws>+` in `text` and return the rule-token tail
+/// (everything after the keyword's trailing whitespace). Hand-rolled equivalent
+/// of the reference's `/#\s*<keyword>\s+(?<rules>[\w.,\s-]+)/` (the `regex` crate
+/// is a cached dep, but the patterns are simple enough to scan directly and avoid
+/// pulling it into this crate). Returns `None` when the directive is absent or
+/// has no whitespace-separated tail.
+///
+/// For the `rigor:disable` keyword the caller has already tried `disable-file`
+/// first, which is how the reference's `(?!-file)` lookahead is honored: a
+/// `disable-file` comment matches the `-file` branch and never reaches here.
+fn match_directive<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
+    let hash = text.find('#')?;
+    let mut rest = &text[hash + 1..];
+    // `#\s*`
+    rest = rest.trim_start_matches([' ', '\t']);
+    let after_kw = rest.strip_prefix(keyword)?;
+    // `\s+` — at least one whitespace must follow the keyword.
+    let trimmed = after_kw.trim_start_matches([' ', '\t']);
+    if trimmed.len() == after_kw.len() {
+        return None;
+    }
+    Some(trimmed)
+}
+
+/// Split the rule-token tail on whitespace/commas and absorb each token,
+/// matching the reference's `raw.split(/[\s,]+/)`. The reference's `[\w.,\s-]+`
+/// capture stops at the first character outside that class; tokens here are split
+/// on the same delimiters, and any token is absorbed verbatim, so a trailing
+/// non-rule word is simply an unknown token (a no-op).
+fn absorb_tokens(tail: &str, target: &mut SuppressSet) {
+    for token in tail.split([' ', '\t', ',']) {
+        if !token.is_empty() {
+            target.absorb_token(token);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -799,5 +984,138 @@ mod tests {
         assert_eq!(entry.evidence_tier, "medium");
 
         assert!(catalog("unknown.rule").is_none());
+    }
+
+    // -- in-source suppression --------------------------------------------
+
+    fn diag(rule: &'static str) -> Diagnostic {
+        Diagnostic {
+            rule_id: rule,
+            start_offset: 0,
+            end_offset: 0,
+            message: String::new(),
+            severity: Severity::Error,
+            source_family: "builtin",
+            receiver_type: None,
+            method_name: None,
+        }
+    }
+
+    fn surviving_rules(
+        diags: Vec<(usize, Diagnostic)>,
+        comments: &[(usize, String)],
+    ) -> Vec<(usize, &'static str)> {
+        filter_suppressed(diags, comments)
+            .into_iter()
+            .map(|(line, d)| (line, d.rule_id))
+            .collect()
+    }
+
+    #[test]
+    fn line_disable_drops_only_that_lines_rule() {
+        let diags = vec![
+            (2, diag(CALL_UNDEFINED_METHOD)),
+            (4, diag(CALL_UNDEFINED_METHOD)),
+        ];
+        let comments = vec![(4, "# rigor:disable call.undefined-method".to_string())];
+        // Only the L4 diagnostic is suppressed; L2 survives.
+        assert_eq!(surviving_rules(diags, &comments), vec![(2, CALL_UNDEFINED_METHOD)]);
+    }
+
+    #[test]
+    fn line_disable_all_drops_every_rule_on_that_line() {
+        let diags = vec![
+            (3, diag(CALL_UNDEFINED_METHOD)),
+            (3, diag(CALL_WRONG_ARITY)),
+            (5, diag(CALL_WRONG_ARITY)),
+        ];
+        let comments = vec![(3, "# rigor:disable all".to_string())];
+        assert_eq!(surviving_rules(diags, &comments), vec![(5, CALL_WRONG_ARITY)]);
+    }
+
+    #[test]
+    fn disable_file_drops_rule_on_every_line() {
+        let diags = vec![
+            (2, diag(CALL_UNDEFINED_METHOD)),
+            (9, diag(CALL_UNDEFINED_METHOD)),
+            (9, diag(CALL_WRONG_ARITY)),
+        ];
+        // The directive sits on line 1 but scopes the whole file.
+        let comments = vec![(1, "# rigor:disable-file undefined-method".to_string())];
+        assert_eq!(surviving_rules(diags, &comments), vec![(9, CALL_WRONG_ARITY)]);
+    }
+
+    #[test]
+    fn disable_file_all_drops_everything() {
+        let diags = vec![
+            (2, diag(CALL_UNDEFINED_METHOD)),
+            (4, diag(CALL_WRONG_ARITY)),
+            (6, diag(CALL_POSSIBLE_NIL_RECEIVER)),
+        ];
+        let comments = vec![(1, "# rigor:disable-file all".to_string())];
+        assert!(filter_suppressed(diags, &comments).is_empty());
+    }
+
+    #[test]
+    fn family_token_call_expands_to_all_call_rules() {
+        let diags = vec![
+            (2, diag(CALL_UNDEFINED_METHOD)),
+            (2, diag(CALL_WRONG_ARITY)),
+            (2, diag(CALL_POSSIBLE_NIL_RECEIVER)),
+        ];
+        let comments = vec![(2, "# rigor:disable call".to_string())];
+        assert!(filter_suppressed(diags, &comments).is_empty());
+    }
+
+    #[test]
+    fn legacy_alias_resolves_to_canonical_id() {
+        let diags = vec![(4, diag(CALL_UNDEFINED_METHOD))];
+        let comments = vec![(4, "# rigor:disable undefined-method".to_string())];
+        assert!(filter_suppressed(diags, &comments).is_empty());
+    }
+
+    #[test]
+    fn comma_and_whitespace_separated_tokens() {
+        let diags = vec![
+            (2, diag(CALL_UNDEFINED_METHOD)),
+            (2, diag(CALL_WRONG_ARITY)),
+        ];
+        let comments = vec![(2, "# rigor:disable undefined-method, wrong-arity".to_string())];
+        assert!(filter_suppressed(diags, &comments).is_empty());
+    }
+
+    #[test]
+    fn unrelated_rule_or_line_is_not_suppressed() {
+        // A disable for a DIFFERENT rule on the same line must not drop it.
+        let same_line = filter_suppressed(
+            vec![(4, diag(CALL_UNDEFINED_METHOD))],
+            &[(4, "# rigor:disable wrong-arity".to_string())],
+        );
+        assert_eq!(same_line.len(), 1);
+
+        // A disable on a DIFFERENT line must not drop it.
+        let other_line = filter_suppressed(
+            vec![(4, diag(CALL_UNDEFINED_METHOD))],
+            &[(7, "# rigor:disable undefined-method".to_string())],
+        );
+        assert_eq!(other_line.len(), 1);
+    }
+
+    #[test]
+    fn disable_file_negative_lookahead_not_read_as_line_disable() {
+        // `disable-file` must NOT also register as a line-level `disable` for the
+        // comment's own line (reference `(?!-file)`).
+        let line_set =
+            parse_suppression_comments(&[(3, "# rigor:disable-file undefined-method".to_string())]);
+        assert!(line_set.0.get(&3).is_none());
+        assert!(line_set.1.suppresses(CALL_UNDEFINED_METHOD));
+    }
+
+    #[test]
+    fn internal_error_is_never_suppressed() {
+        let diags = vec![(2, diag(INTERNAL_ERROR_RULE))];
+        let comments = vec![(2, "# rigor:disable all".to_string())];
+        // Even `disable all` cannot silence an internal-error diagnostic.
+        assert_eq!(filter_suppressed(diags, &comments).len(), 1);
     }
 }
