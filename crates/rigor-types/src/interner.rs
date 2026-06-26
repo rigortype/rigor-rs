@@ -133,6 +133,8 @@ impl Interner {
                 Type::Nominal { class: ac, args: aargs },
                 Type::Nominal { class: bc, args: bargs },
             ) => ac.cmp(bc).then_with(|| self.cmp_slice(aargs, bargs)),
+            // Singleton has no args: order solely by its ClassId.
+            (Type::Singleton(ac), Type::Singleton(bc)) => ac.cmp(bc),
             (Type::Tuple(x), Type::Tuple(y)) => self.cmp_slice(x, y),
             (Type::HashShape(x), Type::HashShape(y)) => {
                 // Compare keys/optional structurally, values recursively.
@@ -226,6 +228,25 @@ mod tests {
         // A distinct literal interns to a distinct id.
         let c = i.int(8);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn singleton_interns_by_class_id() {
+        use crate::ty::ClassId;
+        let mut i = Interner::new();
+        // Two singletons of the same class intern to the same id.
+        let a = i.intern(Type::Singleton(ClassId(7)));
+        let b = i.intern(Type::Singleton(ClassId(7)));
+        assert_eq!(a, b);
+        // Singleton(7) != Singleton(8).
+        let c = i.intern(Type::Singleton(ClassId(8)));
+        assert_ne!(a, c);
+        // Singleton(7) is distinct from Nominal{class: 7} (the instance).
+        let n = i.intern(Type::Nominal {
+            class: ClassId(7),
+            args: vec![],
+        });
+        assert_ne!(a, n);
     }
 
     #[test]

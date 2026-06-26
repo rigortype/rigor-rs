@@ -313,6 +313,26 @@ mod tests {
         assert_eq!(Algebra::difference(&mut i, int, bot), int);
     }
 
+    fn singleton(i: &mut Interner, class: u32) -> TypeId {
+        i.intern(Type::Singleton(crate::ty::ClassId(class)))
+    }
+
+    #[test]
+    fn singleton_join_is_atomic_like_nominal() {
+        let mut i = Interner::new();
+        let s7 = singleton(&mut i, 7);
+        // Idempotent: Singleton(c) | Singleton(c) = Singleton(c).
+        assert_eq!(Algebra::join(&mut i, s7, s7), s7);
+
+        // Distinct singletons form a 2-member union (mirrors Nominal join).
+        let s8 = singleton(&mut i, 8);
+        let u = Algebra::join(&mut i, s7, s8);
+        match i.get(u) {
+            Type::Union(ms) => assert_eq!(ms.len(), 2, "two singletons must keep 2 members"),
+            other => panic!("expected a 2-member union, got {other:?}"),
+        }
+    }
+
     #[test]
     fn dynamic_join_identities() {
         let mut i = Interner::new();

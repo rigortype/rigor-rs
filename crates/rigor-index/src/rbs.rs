@@ -51,6 +51,12 @@ type Arity = (usize, Option<usize>);
 struct ClassEntry {
     /// `method name -> (return class name if resolvable, arity envelope)`.
     methods: HashMap<&'static str, (Option<&'static str>, Arity)>,
+    /// Singleton (class-level) methods `def self.x` (and the singleton half of
+    /// `def self?.x`). Keyed by name -> arity envelope. The singleton class
+    /// inherits down the SUPERCLASS chain, so resolving a class method walks
+    /// these maps up `superclass`. Return types are not modeled here (the
+    /// existence check is all the singleton surface needs).
+    singleton_methods: HashMap<&'static str, Arity>,
     /// Instance-method aliases `new_name -> old_name` (RBS `alias size length`).
     /// The alias target is resolved at lookup time so `new_name` inherits
     /// `old_name`'s existence / return type / arity (the old name may live on
@@ -149,6 +155,88 @@ impl CoreData {
         // Not found across the chain. Only witness absence if the chain is
         // fully loaded; otherwise assume present (zero false positive).
         !complete
+    }
+
+    /// Whether the class OBJECT `class_name` responds to a singleton (class)
+    /// method `method`. Conservative (zero false positive): returns `true`
+    /// ("present ⇒ stay silent") unless the full singleton surface is known to
+    /// lack it.
+    ///
+    /// The singleton surface is the union of:
+    ///   (a) `class_name`'s own `def self.x` methods PLUS those of every
+    ///       superclass up its chain (the singleton class inherits down the
+    ///       superclass chain); AND
+    ///   (b) the INSTANCE methods of `Class`/`Module`/`Object`/`Kernel`/
+    ///       `BasicObject` — the class object is itself an instance of `Class`,
+    ///       so e.g. `Time.name`, `Time.new`, `Time.tap`, `Time.instance_methods`
+    ///       are all present and must NOT be witnessed absent.
+    ///
+    /// Absence (`false`) is returned ONLY when the whole surface is known: the
+    /// class is loaded, its superclass chain is COMPLETE, all five base classes
+    /// are loaded, and none of (a)/(b) defines `method`. If the class is unknown,
+    /// its chain is incomplete, or any base class is missing ⇒ `true`.
+    pub fn class_has_singleton_method(&self, class_name: &str, method: &str) -> bool {
+        // Unknown class ⇒ stay silent.
+        if !self.classes.contains_key(class_name) {
+            return true;
+        }
+        // (a) Own + inherited singleton methods, walking the superclass chain.
+        let (found, complete) = self.singleton_lookup(class_name, method);
+        if found {
+            return true;
+        }
+        // (b) Instance methods of the class object's own ancestry (it is a
+        //     `Class`). Reuse the conservative `class_has_method` over the five
+        //     base classes. Their presence is also a completeness precondition:
+        //     if any of the five is missing the surface is unknown ⇒ silent.
+        const BASES: [&str; 5] =
+            ["Class", "Module", "Object", "Kernel", "BasicObject"];
+        let mut bases_loaded = true;
+        for base in BASES {
+            if !self.classes.contains_key(base) {
+                bases_loaded = false;
+                continue;
+            }
+            // `class_has_method` walks the base's own ancestor chain; a hit on
+            // any of the five means the class object responds. We test each
+            // base directly so a hit short-circuits to PRESENT.
+            let (chain, _) = self.ancestors(base);
+            if self.lookup_on_chain(&chain, method).is_some() {
+                return true;
+            }
+        }
+        // Not found anywhere. Witness absence ONLY when the whole surface is
+        // known: the singleton superclass chain is complete AND all five base
+        // classes are loaded. Otherwise stay silent.
+        if complete && bases_loaded {
+            return false;
+        }
+        true
+    }
+
+    /// Walk `class_name` and its superclass chain collecting OWN singleton
+    /// methods. Returns `(found, complete)`: `found` is whether `method` is a
+    /// singleton method on the class or any superclass; `complete` is `false`
+    /// if a referenced superclass is not in the loaded set (chain truncated),
+    /// mirroring the completeness notion of [`Self::ancestors`].
+    fn singleton_lookup(&self, class_name: &str, method: &str) -> (bool, bool) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let Some((&key, entry)) = self.classes.get_key_value(name) else {
+                // Referenced superclass not loaded ⇒ chain incomplete.
+                return (false, false);
+            };
+            if !seen.insert(key) {
+                break; // Defensive: cycle guard.
+            }
+            if entry.singleton_methods.contains_key(method) {
+                return (true, true);
+            }
+            cur = entry.superclass;
+        }
+        // Walked the whole superclass chain to a root (no super) without a hit.
+        (false, true)
     }
 
     /// Resolve a method's return class over the ancestor chain (first defining
@@ -272,6 +360,11 @@ impl CoreData {
                     // The stub lists `size` directly alongside `length`, so it
                     // needs no alias table; real RBS uses `alias size length`.
                     aliases: HashMap::new(),
+                    // The stub doesn't model singleton methods (no class-method
+                    // typo detection under the fallback); the surface gate stays
+                    // conservative because the five base classes' singleton
+                    // surface is incomplete here ⇒ always silent.
+                    singleton_methods: HashMap::new(),
                     superclass,
                     includes,
                 },
@@ -544,12 +637,26 @@ impl Builder {
         for member in members {
             match member {
                 Node::MethodDefinition(md) => {
-                    if md.kind() != MethodDefinitionKind::Instance {
-                        continue;
-                    }
                     let mname = intern(md.name().as_str());
                     let (ret, arity) = method_signature(&md);
-                    entry.methods.entry(mname).or_insert((ret, arity));
+                    let kind = md.kind();
+                    // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
+                    // (BOTH a class method AND an instance method); a plain
+                    // `def x` ⇒ Instance. Record into the matching map(s).
+                    if matches!(
+                        kind,
+                        MethodDefinitionKind::Instance
+                            | MethodDefinitionKind::SingletonInstance
+                    ) {
+                        entry.methods.entry(mname).or_insert((ret, arity));
+                    }
+                    if matches!(
+                        kind,
+                        MethodDefinitionKind::Singleton
+                            | MethodDefinitionKind::SingletonInstance
+                    ) {
+                        entry.singleton_methods.entry(mname).or_insert(arity);
+                    }
                 }
                 Node::Include(inc) => {
                     if let Some(modname) = type_name_str(&inc.name()) {
@@ -595,6 +702,9 @@ impl Builder {
         }
         for (k, v) in entry.methods {
             slot.methods.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_methods {
+            slot.singleton_methods.entry(k).or_insert(v);
         }
         for (new_name, old_name) in entry.aliases {
             slot.aliases.entry(new_name).or_insert(old_name);

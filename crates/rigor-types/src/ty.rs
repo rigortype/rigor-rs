@@ -156,6 +156,9 @@ pub enum Type {
     Dynamic(TypeId),
     /// A nominal class applied to type arguments (`Array[Integer]`, ...).
     Nominal { class: ClassId, args: Vec<TypeId> },
+    /// The class object itself (`singleton(C)`): the value of the constant `C`,
+    /// distinct from `Nominal{C}` which is an instance of `C`.
+    Singleton(ClassId),
     /// A value-pinned literal (`Constant[3]`, `Constant["hi"]`, ...).
     Constant(Scalar),
     /// Per-position array shape (`Tuple[Constant[1], Constant["a"]]`).
@@ -216,6 +219,7 @@ impl Type {
             Type::SelfType => 16,
             Type::Instance => 17,
             Type::ClassType => 18,
+            Type::Singleton(_) => 19,
         }
     }
 }

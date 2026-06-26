@@ -101,6 +101,23 @@ impl CoreIndex {
         self.data.class_has_method(class_name, method)
     }
 
+    /// Whether the class OBJECT `class_name` responds to a singleton (class)
+    /// `method` — e.g. `Time.now`, `Array.new`. The singleton surface is the
+    /// class's own + inherited `def self.x` methods (up the superclass chain)
+    /// UNION the instance methods of `Class`/`Module`/`Object`/`Kernel`/
+    /// `BasicObject` (the class object is an instance of `Class`).
+    ///
+    /// Same zero-false-positive contract as [`CoreIndex::class_has_method`]:
+    /// returns `true` ("assume present ⇒ stay silent") unless the FULL singleton
+    /// surface is loaded and known to lack the method. An unknown class, an
+    /// incomplete superclass chain, or any missing base class ⇒ `true`. Absence
+    /// (`false`, witnessable) is only returned when the whole surface is known —
+    /// this is what lets the analyzer flag e.g. `Time.current` (an ActiveSupport
+    /// extension absent from core `Time`'s singleton surface).
+    pub fn class_has_singleton_method(&self, class_name: &str, method: &str) -> bool {
+        self.data.class_has_singleton_method(class_name, method)
+    }
+
     // --- class registry (name <-> ClassId) -----------------------------------
 
     /// Intern a core class name to its stable [`ClassId`], if registered. The
@@ -333,5 +350,74 @@ mod tests {
         assert_eq!(method_arity("String", "length"), Some((0, Some(0))));
         // A typo has no arity.
         assert_eq!(method_arity("String", "unmodeled_xyz"), None);
+    }
+
+    #[test]
+    fn singleton_methods_resolve() {
+        // Class-method (singleton) resolution. Guarded on the real RBS being
+        // loaded: when `Time` and the five base classes are present, the
+        // singleton surface is complete and absence is witnessable; under the
+        // stub fallback the surface is incomplete and everything stays silent
+        // (still zero false positive), so we only assert the live behaviour
+        // when the real RBS is in scope.
+        let idx = CoreIndex::new();
+        let real_rbs = idx.knows_class("Time")
+            && idx.knows_class("Class")
+            && idx.knows_class("Module")
+            && idx.knows_class("Object")
+            && idx.knows_class("Kernel")
+            && idx.knows_class("BasicObject");
+
+        if real_rbs {
+            // Real singleton method: `Time.now` exists.
+            assert!(
+                idx.class_has_singleton_method("Time", "now"),
+                "Time.now is a real singleton method"
+            );
+            // ActiveSupport extension absent from core `Time`'s singleton
+            // surface ⇒ witnessable absent (Time < Object, fully core, complete).
+            assert!(
+                !idx.class_has_singleton_method("Time", "current"),
+                "Time.current (AS extension) must be witnessed absent"
+            );
+            // Inherited from `Module` instance methods on the class object — the
+            // critical no-false-positive case.
+            assert!(
+                idx.class_has_singleton_method("Time", "name"),
+                "Time.name (inherited from Module) must be present"
+            );
+            // Inherited Kernel instance method on the class object.
+            assert!(
+                idx.class_has_singleton_method("Time", "tap"),
+                "Time.tap (inherited from Kernel) must be present"
+            );
+            // Array.new is a real singleton method; Array.wrap is AS-only.
+            assert!(
+                idx.class_has_singleton_method("Array", "new"),
+                "Array.new is a real singleton method"
+            );
+            assert!(
+                !idx.class_has_singleton_method("Array", "wrap"),
+                "Array.wrap (AS extension) must be witnessed absent"
+            );
+            // An unknown class ⇒ silent (present).
+            assert!(idx.class_has_singleton_method("MyWidget", "whatever"));
+
+            // Report the probe results explicitly (visible with --nocapture).
+            eprintln!(
+                "[singleton probe] Time.now={} Time.current={} Time.name={} \
+                 Time.tap={} Array.new={} Array.wrap={}",
+                idx.class_has_singleton_method("Time", "now"),
+                idx.class_has_singleton_method("Time", "current"),
+                idx.class_has_singleton_method("Time", "name"),
+                idx.class_has_singleton_method("Time", "tap"),
+                idx.class_has_singleton_method("Array", "new"),
+                idx.class_has_singleton_method("Array", "wrap"),
+            );
+        } else {
+            // Stub fallback: stay conservative (always present / silent).
+            assert!(idx.class_has_singleton_method("Time", "current"));
+            assert!(idx.class_has_singleton_method("MyWidget", "whatever"));
+        }
     }
 }

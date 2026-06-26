@@ -161,6 +161,23 @@ mod tests {
     }
 
     #[test]
+    fn singleton_subtype_mirrors_nominal() {
+        let mut i = Interner::new();
+        let s7 = i.intern(Type::Singleton(ClassId(7)));
+        // Reflexive: Singleton(c) <: Singleton(c).
+        assert_eq!(subtype(&i, s7, s7).certainty, Certainty::Yes);
+        // A different singleton: not provable (mirrors unrelated Nominal).
+        let s8 = i.intern(Type::Singleton(ClassId(8)));
+        assert_eq!(subtype(&i, s7, s8).certainty, Certainty::Maybe);
+        // Singleton vs the same-class instance: also not provable.
+        let n7 = i.intern(Type::Nominal {
+            class: ClassId(7),
+            args: vec![],
+        });
+        assert_eq!(subtype(&i, s7, n7).certainty, Certainty::Maybe);
+    }
+
+    #[test]
     fn subtyping_uses_dynamic_static_facet() {
         // Dynamic[A] <: A is decided by the facet, so it is reflexive-yes.
         let mut i = Interner::new();

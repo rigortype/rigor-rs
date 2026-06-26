@@ -32,6 +32,10 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
             }
         }
 
+        // The class object itself. Renders the raw ClassId since the class
+        // name table lives elsewhere, mirroring `Nominal`'s `Class<id>` style.
+        Type::Singleton(class) => format!("singleton(Class<{}>)", class.0),
+
         // The singleton `nil` is spelled bare (special-types.md prefers the
         // `nil` singleton over `NilClass`/`Constant[nil]`).
         Type::Constant(Scalar::Nil) => "nil".to_string(),
@@ -177,6 +181,21 @@ mod tests {
         assert_eq!(describe(&i, u), "bool");
         // Identity preserved: still a 2-member union carrier.
         assert!(matches!(i.get(u), Type::Union(ms) if ms.len() == 2));
+    }
+
+    #[test]
+    fn singleton_renders_stable_and_distinct_from_nominal() {
+        let mut i = Interner::new();
+        let s = i.intern(Type::Singleton(crate::ty::ClassId(7)));
+        // Stable spelling.
+        assert_eq!(describe(&i, s), "singleton(Class<7>)");
+        // Distinct from the Nominal (instance) rendering of the same class.
+        let n = i.intern(Type::Nominal {
+            class: crate::ty::ClassId(7),
+            args: vec![],
+        });
+        assert_eq!(describe(&i, n), "Class<7>");
+        assert_ne!(describe(&i, s), describe(&i, n));
     }
 
     #[test]
