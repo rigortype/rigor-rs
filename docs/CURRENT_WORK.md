@@ -55,7 +55,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 2458 real files** (mastodon, gitlab-foss, conference-app,
-the reference's own source), **367/367 matched** (100% precision). 153 tests. The
+the reference's own source), **367/367 matched** (100% precision). 162 tests. The
 design (ADR 0001–0031) is audited and stable. The 2026-06-26 session (a) aligned the
 undefined-method rule with the reference's leniency, (b) closed lowering-traversal +
 interpolated-string gaps, (c) landed **class-method (singleton) witnessing** with a
@@ -64,7 +64,7 @@ note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 153 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 162 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -115,7 +115,7 @@ project-RBS / plugins):
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 153. **Parity:** `run.rb` PASS (14 fixtures), 0 FP; `run_corpus.rb` validated to **2458 real
+- **Tests:** 162. **Parity:** `run.rb` PASS (14 fixtures), 0 FP; `run_corpus.rb` validated to **2458 real
   files, 0 FP, 367/367 matched** (100% precision).
 - **Works today:** `rigor check [--format text|json] <file…>` →
   `call.undefined-method` (literals, chained calls, post-fold, **core `X.new`
@@ -223,9 +223,10 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   (`project_definition_site`, full `source_family`).
 
 ### 6. Output & reporters — `lib/rigor/cli/diagnostic_formats.rb` → `rigor-cli` (ADR-0014/0030)
-- ✅ text + JSON (hand-rolled; field-identical to the reference for the call rules).
-- 🟡 Swap hand-rolled JSON for serde (now available); ⬜ SARIF · GitHub annotations · GitLab ·
-  Checkstyle · JUnit · TeamCity (ref ADR-51); CI auto-detection (ref ADR-51).
+- ✅ text + JSON (hand-rolled; field-identical to the reference for the call rules — the
+  harness depends on this, keep byte-stable). ✅ **`github`** (Actions annotations) + **`sarif`**
+  (SARIF 2.1.0, serde_json) — additive, CI-consumable, NOT harness-gated.
+- ⬜ GitLab · Checkstyle · JUnit · TeamCity (ref ADR-51); CI auto-detection (ref ADR-51).
 
 ### 7. Config & baseline — `configuration.rb`, `analysis/baseline.rb` → (ADR-0009/0031)
 - ✅ **In-source suppression** (`# rigor:disable <rules>` line, `# rigor:disable-file <rules>`/`all`)
@@ -256,7 +257,7 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 
 ### 11. CLI commands — `lib/rigor/cli.rb` → `rigor-cli` (ADR-0015)
 - ✅ Full surface presented; unimplemented commands report clearly. ✅ `check`
-  (`--format text|json`, `--config <path>`, project two-phase pass, inline + config suppression).
+  (`--format text|json|github|sarif`, `--config <path>`, project two-phase pass, inline + config suppression).
 - ⬜ `annotate` · `type-of` · `explain` · `init` · `diff` · `baseline` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugins`/`plugin` · `docs` ·
   `sig-gen` (ref ADR-14) · `skill`/`describe` · `doctor` (ref ADR-77) · `lsp` · `mcp` ·
