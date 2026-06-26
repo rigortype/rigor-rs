@@ -88,10 +88,35 @@ pub enum Node {
         /// Span of the whole call expression.
         span: Span,
     },
-    /// A definition (`def` / `class` / `module` / singleton class). Carries its
-    /// lowered body statements only — a definition is not a value, so the typer
-    /// never types it; the body is lowered purely so nested calls are reachable.
+    /// A definition (`def` / singleton class). Carries its lowered body
+    /// statements only — a definition is not a value, so the typer never types
+    /// it; the body is lowered purely so nested calls are reachable.
     Definition { body: Vec<NodeId>, span: Span },
+    /// A `class` definition with structure (ADR-0023 tier-4 in-source typing):
+    /// the constant-path `name` (`"Point"`, `"Foo::Bar"`), the written
+    /// `superclass` name if any (`< Bar` -> `Some("Bar")`, a path keeps its last
+    /// component for chain-walking), and the **instance** method names defined
+    /// directly in the class body (from `def`s). `body` is still lowered so
+    /// nested calls reach the rule walk. Not a value — never typed directly; the
+    /// inference engine harvests `name`/`superclass`/`methods` into a per-run
+    /// SourceIndex so `X.new` can be typed as an instance of `X`.
+    ClassDef {
+        name: String,
+        superclass: Option<String>,
+        methods: Vec<String>,
+        body: Vec<NodeId>,
+        span: Span,
+    },
+    /// A `module` definition with structure. Like [`Node::ClassDef`] but with no
+    /// superclass (a module has none). Harvested into the SourceIndex so an
+    /// instance method defined on a module is visible when the module is included
+    /// (include resolution is future work; the name/methods are recorded now).
+    ModuleDef {
+        name: String,
+        methods: Vec<String>,
+        body: Vec<NodeId>,
+        span: Span,
+    },
     /// `if`/`unless`/ternary. `predicate`, the `then` branch and the optional
     /// `else`/`elsif` subsequent are all lowered. Typed as `Dynamic[top]` (an
     /// `if`-as-expression has no precise branch-union type in this slice).
@@ -146,9 +171,12 @@ pub enum Node {
     /// (so a call in the assigned expression is analysed). Not a value itself.
     VariableWrite { value: NodeId, span: Span },
     /// A constant read (`Foo`, `Foo::Bar`). For a path, the parent scope is
-    /// lowered. Typed `Dynamic[top]` — no constant resolution in this slice.
+    /// lowered. `name` is the dotted constant path (`"Foo"`, `"Foo::Bar"`), kept
+    /// so a `X.new` call can resolve `X` to a class name WITHOUT typing the bare
+    /// constant read itself (which stays `Dynamic[top]` — no class-object typing,
+    /// the zero-FP-safe choice). Empty for an un-namable dynamic constant.
     // TODO(spec): constant resolution (ADR-0019).
-    ConstantRead { span: Span },
+    ConstantRead { name: String, span: Span },
     /// A constant write (`FOO = v`). The value is lowered. Not a value itself.
     ConstantWrite { value: NodeId, span: Span },
     /// `self`. Typed `Dynamic[top]` — the enclosing-class type is not tracked in
@@ -181,6 +209,8 @@ impl Node {
             | Node::FalseLit { span }
             | Node::Call { span, .. }
             | Node::Definition { span, .. }
+            | Node::ClassDef { span, .. }
+            | Node::ModuleDef { span, .. }
             | Node::If { span, .. }
             | Node::Case { span, .. }
             | Node::Loop { span, .. }
@@ -191,7 +221,7 @@ impl Node {
             | Node::Range { span }
             | Node::VariableRead { span }
             | Node::VariableWrite { span, .. }
-            | Node::ConstantRead { span }
+            | Node::ConstantRead { span, .. }
             | Node::ConstantWrite { span, .. }
             | Node::SelfExpr { span }
             | Node::Other { span } => *span,
@@ -414,16 +444,41 @@ impl Builder {
         }
 
         if let Some(class) = node.as_class_node() {
+            // The constant-path name (`Point`, `Foo::Bar`). The superclass name,
+            // if a `< Bar` clause is written (a bare const or a const path; its
+            // last component is what the source-chain walk keys on). The instance
+            // methods are the `def` names defined directly in the body — read
+            // from Prism BEFORE lowering, since lowering erases a def's name.
+            let name = constant_path_string(&class.constant_path());
+            let superclass = class
+                .superclass()
+                .and_then(|s| constant_node_name(&s));
+            let methods = class
+                .body()
+                .as_ref()
+                .map(direct_method_names)
+                .unwrap_or_default();
             let body = self.lower_optional_body(class.body().as_ref());
-            return self.push(Node::Definition {
+            return self.push(Node::ClassDef {
+                name,
+                superclass,
+                methods,
                 body,
                 span: span_of(&class.location()),
             });
         }
 
         if let Some(module) = node.as_module_node() {
+            let name = constant_path_string(&module.constant_path());
+            let methods = module
+                .body()
+                .as_ref()
+                .map(direct_method_names)
+                .unwrap_or_default();
             let body = self.lower_optional_body(module.body().as_ref());
-            return self.push(Node::Definition {
+            return self.push(Node::ModuleDef {
+                name,
+                methods,
                 body,
                 span: span_of(&module.location()),
             });
@@ -731,6 +786,7 @@ impl Builder {
         }
         if let Some(cr) = node.as_constant_read_node() {
             return self.push(Node::ConstantRead {
+                name: constant_string(cr.name().as_slice()),
                 span: span_of(&cr.location()),
             });
         }
@@ -740,6 +796,7 @@ impl Builder {
                 self.lower_node(&parent);
             }
             return self.push(Node::ConstantRead {
+                name: constant_path_string(node),
                 span: span_of(&cp.location()),
             });
         }
@@ -816,6 +873,81 @@ impl Builder {
 /// total on exotic encodings.
 fn constant_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The dotted constant-path name of a `class`/`module` declaration's path node:
+/// `Point` -> `"Point"`, `Foo::Bar` -> `"Foo::Bar"`. A `ConstantReadNode` is the
+/// bare-name case; a `ConstantPathNode` is the `A::B` case (recurse on parent).
+/// Any other node (an unusual dynamic-constant form) yields an empty string,
+/// which the SourceIndex treats as un-namable (no instance typing for it).
+fn constant_path_string(node: &PrismNode<'_>) -> String {
+    if let Some(cr) = node.as_constant_read_node() {
+        return constant_string(cr.name().as_slice());
+    }
+    if let Some(cp) = node.as_constant_path_node() {
+        // `name()` is the last component (`Bar` in `Foo::Bar`); the parent is the
+        // scope. `::Foo` has no parent (top-level) — render just the name.
+        let last = cp
+            .name()
+            .map(|n| constant_string(n.as_slice()))
+            .unwrap_or_default();
+        match cp.parent() {
+            Some(parent) => {
+                let head = constant_path_string(&parent);
+                if head.is_empty() {
+                    last
+                } else {
+                    format!("{head}::{last}")
+                }
+            }
+            None => last,
+        }
+    } else {
+        String::new()
+    }
+}
+
+/// The name of a constant *reference* used as a superclass (`< Bar`,
+/// `< Foo::Bar`): the **last** path component, since that is what the
+/// source-superclass chain walk resolves against the SourceIndex / RBS by simple
+/// name. Returns `None` for a non-constant superclass expression (e.g.
+/// `< Struct.new(...)`), which leaves the chain deliberately open (unknown
+/// ancestor ⇒ the conservative gate stays silent).
+fn constant_node_name(node: &PrismNode<'_>) -> Option<String> {
+    if let Some(cr) = node.as_constant_read_node() {
+        return Some(constant_string(cr.name().as_slice()));
+    }
+    if let Some(cp) = node.as_constant_path_node() {
+        return cp.name().map(|n| constant_string(n.as_slice()));
+    }
+    None
+}
+
+/// The instance-method names defined *directly* in a class/module body via
+/// `def name`. Reads the Prism body before lowering (lowering drops a def's
+/// name). Only direct, top-of-body defs are collected — methods inside nested
+/// classes/conditionals are out of scope for this slice (and would be unsound to
+/// attribute to the outer class). A singleton/`self.` def is excluded: it is not
+/// an instance method, so it must not count toward instance-method existence.
+fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    let collect = |stmt: &PrismNode<'_>, names: &mut Vec<String>| {
+        if let Some(def) = stmt.as_def_node() {
+            // A def with a receiver (`def self.foo` / `def obj.foo`) is a
+            // singleton method, NOT an instance method — exclude it.
+            if def.receiver().is_none() {
+                names.push(constant_string(def.name().as_slice()));
+            }
+        }
+    };
+    if let Some(stmts) = body.as_statements_node() {
+        for stmt in stmts.body().iter() {
+            collect(&stmt, &mut names);
+        }
+    } else {
+        collect(body, &mut names);
+    }
+    names
 }
 
 /// Convert a Prism `Location` to a byte-offset [`Span`].
@@ -1015,5 +1147,90 @@ mod tests {
         let src = b"x = \"hi #{a.foo}\"\n";
         let ast = lower(&crate::parse(src));
         assert!(has_call(&ast, "foo"), "interpolated call must be lowered");
+    }
+
+    /// Locate the single `ClassDef` and return its (name, superclass, methods).
+    fn class_def(ast: &LoweredAst) -> (String, Option<String>, Vec<String>) {
+        ast.iter()
+            .find_map(|(_, n)| match n {
+                Node::ClassDef { name, superclass, methods, .. } => {
+                    Some((name.clone(), superclass.clone(), methods.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a ClassDef node")
+    }
+
+    #[test]
+    fn lowers_class_def_name_super_and_methods() {
+        // `class Point; def x; end; def y; end; end` — name "Point", no super,
+        // instance methods [x, y]. The body's calls still reach the arena.
+        let src = b"class Point\n  def x\n    1\n  end\n  def y\n    @a.foo\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (name, sup, methods) = class_def(&ast);
+        assert_eq!(name, "Point");
+        assert_eq!(sup, None);
+        assert_eq!(methods, vec!["x".to_string(), "y".to_string()]);
+        // A call inside a method body is still lowered (reachability preserved).
+        assert!(has_call(&ast, "foo"), "call inside def body must be lowered");
+    }
+
+    #[test]
+    fn lowers_class_def_superclass_name() {
+        // `class User < ApplicationRecord; end` — superclass recorded as the
+        // simple last-component name.
+        let ast = lower(&crate::parse(b"class User < ApplicationRecord\nend\n"));
+        let (name, sup, _) = class_def(&ast);
+        assert_eq!(name, "User");
+        assert_eq!(sup.as_deref(), Some("ApplicationRecord"));
+    }
+
+    #[test]
+    fn lowers_namespaced_class_name_and_super_path() {
+        // `class Foo::Bar < Base::Thing; end` — dotted name, super last comp.
+        let ast = lower(&crate::parse(b"class Foo::Bar < Base::Thing\nend\n"));
+        let (name, sup, _) = class_def(&ast);
+        assert_eq!(name, "Foo::Bar");
+        assert_eq!(sup.as_deref(), Some("Thing"));
+    }
+
+    #[test]
+    fn singleton_def_is_not_an_instance_method() {
+        // `def self.make` is a singleton method — it must NOT be collected as an
+        // instance method (else `X.new.make` would wrongly look defined).
+        let ast = lower(&crate::parse(b"class C\n  def self.make\n  end\n  def go\n  end\nend\n"));
+        let (_, _, methods) = class_def(&ast);
+        assert_eq!(methods, vec!["go".to_string()]);
+    }
+
+    #[test]
+    fn reopened_class_lowers_two_class_defs() {
+        // Two `class C` bodies lower to two ClassDef nodes; the SourceIndex
+        // unions them (tested in rigor-infer). Here we just assert both appear.
+        let ast = lower(&crate::parse(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\n"));
+        let defs: Vec<_> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::ClassDef { name, methods, .. } => Some((name.clone(), methods.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0], ("C".to_string(), vec!["a".to_string()]));
+        assert_eq!(defs[1], ("C".to_string(), vec!["b".to_string()]));
+    }
+
+    #[test]
+    fn lowers_module_def_name_and_methods() {
+        let ast = lower(&crate::parse(b"module M\n  def helper\n  end\nend\n"));
+        let (name, methods) = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::ModuleDef { name, methods, .. } => Some((name.clone(), methods.clone())),
+                _ => None,
+            })
+            .expect("expected a ModuleDef node");
+        assert_eq!(name, "M");
+        assert_eq!(methods, vec!["helper".to_string()]);
     }
 }

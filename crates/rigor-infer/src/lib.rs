@@ -18,12 +18,24 @@
 #![allow(dead_code)]
 
 pub mod folding;
+pub mod source_index;
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type, TypeId};
+
+pub use source_index::{SourceIndex, SOURCE_CLASS_BASE};
+
+/// A process-wide empty [`SourceIndex`], used as the default `source` for a
+/// [`Typer`] built via [`Typer::new`] (callers that predate in-source typing).
+/// Sharing one empty index keeps `Typer::new` allocation-free and infallible.
+fn empty_source() -> &'static SourceIndex {
+    static EMPTY: OnceLock<SourceIndex> = OnceLock::new();
+    EMPTY.get_or_init(SourceIndex::default)
+}
 
 /// A flat name -> type binding environment, populated by `LocalVariableWrite`
 /// as the statement sequence is walked in order. Intentionally not
@@ -42,12 +54,33 @@ pub type TypeEnv = HashMap<String, TypeId>;
 /// want chained-call result typing construct a [`Typer`] with the real index.
 pub struct Typer<'i> {
     index: &'i CoreIndex,
+    /// The per-run in-source class index (ADR-0023 tier-4). Empty for a
+    /// [`Typer::new`] caller; real for [`Typer::with_source`]. Lets `X.new` type
+    /// to an instance of a project-defined class and a typo on it be witnessed.
+    source: &'i SourceIndex,
 }
 
 impl<'i> Typer<'i> {
-    /// Build a typer over a borrowed core index.
+    /// Build a typer over a borrowed core index, with an EMPTY source index
+    /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index }
+        Typer { index, source: empty_source() }
+    }
+
+    /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
+    /// enabling `X.new` instance typing and in-source method resolution.
+    pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
+        Typer { index, source }
+    }
+
+    /// The borrowed source index (for the rules layer's method-resolution gate).
+    pub fn source(&self) -> &SourceIndex {
+        self.source
+    }
+
+    /// The borrowed core index.
+    pub fn core(&self) -> &CoreIndex {
+        self.index
     }
 
     /// Type an owned-AST node against the current `env`, interning carriers into
@@ -138,6 +171,31 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
+        // Tier 4 (in-source / RBS `.new`): `X.new` where `X` is a constant
+        // naming a class known to the RBS index OR the SourceIndex types to a
+        // Nominal INSTANCE of `X`, so a chained `X.new.method` can be checked.
+        // We resolve the receiver constant's NAME directly (the bare constant
+        // read itself stays Dynamic — we never type a class object). A core
+        // (RBS) class wins its core ClassId; a source-only class gets a
+        // source-range ClassId from the SourceIndex.
+        if method == "new" {
+            if let Node::ConstantRead { name, .. } = ast.get(receiver) {
+                if !name.is_empty() {
+                    // Prefer a core (CORE_CLASSES) nominal id when the name maps
+                    // to one — its method existence resolves via the core path.
+                    if let Some(class_id) = self.index.class_id(name) {
+                        return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                    }
+                    // Else a source class OR a registered RBS-only instance class
+                    // (e.g. Pathname) carries a registry id in the high range.
+                    if let Some(class_id) = self.source.class_id(name) {
+                        return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                    }
+                    // Unknown constant ⇒ fall through to Dynamic (never guess).
+                }
+            }
+        }
+
         let recv_ty = self.type_of(ast, receiver, env, interner);
 
         // Tier 1: constant folding on a value-pinned receiver. Fold only when
@@ -552,5 +610,111 @@ mod tests {
         let call = find_call(&ast, "sample");
         let ty = typer.type_of(&ast, call, &env, &mut i);
         assert_eq!(ty, i.untyped());
+    }
+
+    // --- in-source class typing (ADR-0023 tier-4) ---------------------------
+
+    #[test]
+    fn source_class_new_types_to_source_instance() {
+        // `class Point; def x; end; end; p = Point.new` — `Point.new` types to a
+        // Nominal instance whose ClassId resolves back to "Point" via the source
+        // index, and the source index witnesses `y` absent (chain complete:
+        // implicit Object super, fully RBS-loaded).
+        let ast = lower_src(b"class Point\n  def x\n  end\nend\np = Point.new\np.y\n");
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        let typer = Typer::with_source(&idx, &source);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        // `p` binds to the Point.new instance.
+        let p_ty = *env.get("p").expect("p should be bound");
+        let class = match i.get(p_ty) {
+            Type::Nominal { class, .. } => *class,
+            other => panic!("expected Nominal instance, got {other:?}"),
+        };
+        assert_eq!(source.class_name_for_id(class), Some("Point"));
+        // `x` is defined, `y` is not — and the chain is complete.
+        assert!(source.class_has_method(&idx, "Point", "x"));
+        assert!(!source.class_has_method(&idx, "Point", "y"));
+        // Inherited Object method is present (no false absence).
+        assert!(source.class_has_method(&idx, "Point", "frozen?"));
+    }
+
+    #[test]
+    fn unknown_superclass_makes_chain_incomplete_and_silent() {
+        // `class User < ApplicationRecord; end` — ApplicationRecord is neither
+        // source nor RBS ⇒ chain INCOMPLETE ⇒ any method is assumed present.
+        let ast = lower_src(b"class User < ApplicationRecord\nend\nu = User.new\nu.anything\n");
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        assert!(source.knows_class("User"));
+        // Even a clearly-bogus method is assumed present (zero-FP keystone).
+        assert!(source.class_has_method(&idx, "User", "totally_made_up_xyz"));
+        assert!(source.class_has_method(&idx, "User", "anything"));
+    }
+
+    #[test]
+    fn reopened_source_class_unions_methods() {
+        // Two `class C` bodies: the SourceIndex unions their methods.
+        let ast = lower_src(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\n");
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        assert!(source.class_has_method(&idx, "C", "a"));
+        assert!(source.class_has_method(&idx, "C", "b"));
+        // A method on neither reopen is witnessed absent (complete chain).
+        assert!(!source.class_has_method(&idx, "C", "c"));
+    }
+
+    #[test]
+    fn source_superclass_chain_resolves_inherited_method() {
+        // `class Animal; def speak; end; end; class Dog < Animal; end` —
+        // Dog.new.speak is inherited (present); Dog.new.fly is absent (the whole
+        // chain Dog -> Animal -> Object is known).
+        let ast = lower_src(
+            b"class Animal\n  def speak\n  end\nend\nclass Dog < Animal\nend\n",
+        );
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        assert!(source.class_has_method(&idx, "Dog", "speak"));
+        assert!(!source.class_has_method(&idx, "Dog", "fly"));
+    }
+
+    #[test]
+    fn rbs_class_new_types_to_rbs_instance() {
+        // `Pathname.new("a")` — Pathname is RBS-known (with the stdlib tree) but
+        // outside CORE_CLASSES; the source registry carries its instance id and
+        // method existence defers to RBS. Under the stub fallback Pathname is not
+        // registered, so this test only asserts the registry/typing wiring when
+        // Pathname is actually loaded.
+        let ast = lower_src(b"p = Pathname.new(\"a\")\np.foo\n");
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        if idx.knows_class("Pathname") {
+            let typer = Typer::with_source(&idx, &source);
+            let mut i = Interner::new();
+            let env = typer.build_toplevel_env(&ast, &mut i);
+            let p_ty = *env.get("p").expect("p should be bound");
+            let class = match i.get(p_ty) {
+                Type::Nominal { class, .. } => *class,
+                other => panic!("expected Nominal instance, got {other:?}"),
+            };
+            assert_eq!(source.class_name_for_id(class), Some("Pathname"));
+            // A real Pathname method is present; a typo is absent (via RBS).
+            assert!(source.class_has_method(&idx, "Pathname", "basename"));
+            assert!(!source.class_has_method(&idx, "Pathname", "nonexist"));
+        }
+    }
+
+    #[test]
+    fn unknown_constant_new_is_dynamic() {
+        // `Widget.new` where Widget is neither source nor RBS ⇒ Dynamic (silent).
+        let ast = lower_src(b"w = Widget.new\nw.foo\n");
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        let typer = Typer::with_source(&idx, &source);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let w_ty = *env.get("w").expect("w should be bound");
+        assert_eq!(w_ty, i.untyped(), "unknown-constant .new must be Dynamic[top]");
     }
 }

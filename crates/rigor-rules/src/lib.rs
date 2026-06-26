@@ -137,9 +137,12 @@ pub const CALL_POSSIBLE_NIL_RECEIVER: &str = "call.possible-nil-receiver";
 /// in the SAME pass. At most one diagnostic is emitted per call site, matching
 /// the reference's one-diagnostic-per-offending-call discipline.
 pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> Vec<Diagnostic> {
-    // Build a typer over the real index so non-folded nominal returns
-    // (e.g. `Integer#to_s -> String`) resolve for chained-call typing.
-    let typer = Typer::new(index);
+    // Build the per-run in-source class index (ADR-0023 tier-4), then a typer
+    // over the real RBS index AND that source index, so `X.new` types to an
+    // instance of a project-defined (or RBS-known) class and non-folded nominal
+    // returns (e.g. `Integer#to_s -> String`) resolve for chained-call typing.
+    let source = rigor_infer::SourceIndex::build(ast, index);
+    let typer = Typer::with_source(index, &source);
     let env = typer.build_toplevel_env(ast, interner);
     let mut out = Vec::new();
 
@@ -203,21 +206,43 @@ fn check_call(
 ) -> Option<Diagnostic> {
     let recv_ty = typer.type_of(ast, receiver, env, interner);
 
-    // Resolve the receiver's class name; `None` => Dynamic/unknown => silent.
-    let class_name = index.class_name_of(interner, recv_ty)?;
+    // Resolve the receiver's class name from EITHER the core (RBS/CORE_CLASSES)
+    // surface OR the per-run source registry (in-source classes + registered
+    // RBS-only instance classes like Pathname). `None` => Dynamic/unknown =>
+    // silent.
+    let source = typer.source();
+    if let Some(class_name) = index.class_name_of(interner, recv_ty) {
+        // Core/RBS-modeled receiver: witness absence only over a known class.
+        if !index.knows_class(class_name) {
+            return None;
+        }
+        if index.class_has_method(class_name, method) {
+            return None;
+        }
+    } else if let Some(class_name) = source_class_name(source, interner, recv_ty) {
+        // In-source / registered-instance receiver. The source index applies the
+        // conservative completeness gate (unknown ancestor ⇒ assume present); a
+        // `false` here means the entire chain is known and lacks the method.
+        if source.class_has_method(index, &class_name, method) {
+            return None;
+        }
+    } else {
+        // Neither surface resolves the receiver ⇒ Dynamic/unknown ⇒ silent.
+        return None;
+    }
 
-    // Only a class the index actually models can witness method *absence*.
-    if !index.knows_class(class_name) {
-        return None;
-    }
-    if index.class_has_method(class_name, method) {
-        return None;
-    }
+    // We have witnessed absence. Resolve the class name again for rendering
+    // (core takes precedence; else the source registry).
+    let class_name: String = index
+        .class_name_of(interner, recv_ty)
+        .map(|s| s.to_string())
+        .or_else(|| source_class_name(source, interner, recv_ty))
+        .unwrap_or_default();
 
     // Render the receiver in the reference's value-in-message style: the bare
     // value for a `Constant` (`"Hello"`, `3`), else the class name. The
     // `message` field is presentation, not contract (ADR-0030).
-    let receiver_render = render_receiver(interner, recv_ty, class_name);
+    let receiver_render = render_receiver(interner, recv_ty, &class_name);
     let message = format!("undefined method `{method}' for {receiver_render}");
 
     let severity = catalog(CALL_UNDEFINED_METHOD)
@@ -349,6 +374,20 @@ fn check_nil_receiver(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve a receiver [`TypeId`] to its per-run source-registry class name, when
+/// it is a `Type::Nominal` whose `ClassId` is in the source range. `None` for any
+/// other carrier (the core path or Dynamic owns those).
+fn source_class_name(
+    source: &rigor_infer::SourceIndex,
+    interner: &Interner,
+    ty: rigor_types::TypeId,
+) -> Option<String> {
+    match interner.get(ty) {
+        Type::Nominal { class, .. } => source.class_name_for_id(*class).map(|s| s.to_string()),
+        _ => None,
+    }
+}
 
 /// Render the receiver for the diagnostic message: the bare literal value for a
 /// value-pinned `Constant`, else the resolved class name.
@@ -502,6 +541,101 @@ mod tests {
         // concrete envelope for nearly every method; a variadic one is the case
         // where many args are still legal.)
         let diags = run(b"s = \"x\"\ns.concat(\"a\", \"b\")\n");
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    // --- in-source class typing (ADR-0023 tier-4) end-to-end ----------------
+
+    #[test]
+    fn flags_typo_on_in_source_instance_with_complete_chain() {
+        // `class Point; def x; end; end; p = Point.new; p.y` — `y` is undefined
+        // on Point and its full chain (implicit Object) is known ⇒ flag.
+        let src = b"class Point\n  def x\n  end\nend\np = Point.new\np.y\n";
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(d.severity, Severity::Error);
+        assert_eq!(d.message, "undefined method `y' for Point");
+        assert_eq!(d.receiver_type.as_deref(), Some("Point"));
+        assert_eq!(d.method_name.as_deref(), Some("y"));
+        assert_eq!(&src[d.start_offset..d.end_offset], b"y");
+    }
+
+    #[test]
+    fn defined_in_source_method_is_silent() {
+        // `p.x` where Point defines `x` ⇒ no diagnostic.
+        let diags = run(b"class Point\n  def x\n  end\nend\np = Point.new\np.x\n");
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn inherited_object_method_on_source_instance_is_silent() {
+        // `p.frozen?` — inherited from Object via the source class's implicit
+        // super; must not be a false positive.
+        let diags = run(b"class Point\n  def x\n  end\nend\np = Point.new\np.frozen?\n");
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn unknown_superclass_keeps_source_instance_silent() {
+        // `class User < ApplicationRecord; end; u = User.new; u.anything` — the
+        // super is unknown ⇒ chain incomplete ⇒ assume present ⇒ SILENT. This is
+        // the zero-FP keystone for Rails models.
+        let diags = run(
+            b"class User < ApplicationRecord\nend\nu = User.new\nu.totally_made_up_xyz\n",
+        );
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn inherited_source_method_is_silent_and_typo_flagged() {
+        // `class Animal; def speak; end; end; class Dog < Animal; end` —
+        // Dog.new.speak inherited (silent); Dog.new.fly absent over a fully known
+        // chain (flag).
+        let ok = run(b"class Animal\n  def speak\n  end\nend\nclass Dog < Animal\nend\nd = Dog.new\nd.speak\n");
+        assert!(ok.is_empty(), "inherited method must be silent, got {ok:?}");
+        let bad = run(b"class Animal\n  def speak\n  end\nend\nclass Dog < Animal\nend\nd = Dog.new\nd.fly\n");
+        assert_eq!(bad.len(), 1, "expected typo flagged, got {bad:?}");
+        assert_eq!(bad[0].message, "undefined method `fly' for Dog");
+    }
+
+    #[test]
+    fn reopened_source_class_unions_methods_no_fp() {
+        // Methods from both reopens are visible; a genuine typo still flags.
+        assert!(run(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\nc = C.new\nc.a\n").is_empty());
+        assert!(run(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\nc = C.new\nc.b\n").is_empty());
+        let typo = run(b"class C\n  def a\n  end\nend\nclass C\n  def b\n  end\nend\nc = C.new\nc.zzz\n");
+        assert_eq!(typo.len(), 1, "expected typo flagged, got {typo:?}");
+    }
+
+    #[test]
+    fn rbs_class_new_typo_flags() {
+        // `Pathname.new("a").nonexist` — Pathname is RBS-known (needs the stdlib
+        // tree). When loaded, the typo flags; under the stub fallback Pathname is
+        // absent so the receiver is Dynamic and it stays (correctly) silent.
+        let idx = CoreIndex::new();
+        let diags = run(b"p = Pathname.new(\"a\")\np.nonexist\n");
+        if idx.knows_class("Pathname") {
+            assert_eq!(diags.len(), 1, "expected Pathname typo flagged, got {diags:?}");
+            assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+            assert_eq!(diags[0].method_name.as_deref(), Some("nonexist"));
+        } else {
+            assert!(diags.is_empty(), "stub fallback: Pathname unknown ⇒ silent");
+        }
+    }
+
+    #[test]
+    fn real_rbs_method_on_rbs_instance_is_silent() {
+        // `Pathname.new("a").basename` — a real method, never a false positive.
+        let diags = run(b"p = Pathname.new(\"a\")\np.basename\n");
+        assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn dynamic_unknown_constant_new_is_silent() {
+        // `Widget.new.foo` where Widget is unknown ⇒ Dynamic ⇒ silent.
+        let diags = run(b"w = Widget.new\nw.foo\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 
