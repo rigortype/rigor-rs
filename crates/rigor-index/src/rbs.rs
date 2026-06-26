@@ -1,10 +1,19 @@
-//! Real RBS-backed core data: parse a curated set of Ruby `core/*.rbs` with the
+//! Real RBS-backed core data: parse the Ruby `core/*.rbs` set with the
 //! `ruby-rbs` crate (parser only — ADR-0004), extract per-class method tables
 //! (return class + arity envelope) and the super/include graph, then flatten an
 //! ancestor chain so method existence is decided over the full linearization.
 //!
-//! Falls back to a hardcoded stub when the core RBS directory is absent, so the
-//! crate works without a Ruby install (CI, other machines) and never panics.
+//! The signature set is **vendored and embedded at build time** (ADR-0007): the
+//! whole `core/` ⊕ the `DEFAULT_LIBRARIES` stdlib closure is copied under
+//! `vendor/rbs/`, `build.rs` emits `$OUT_DIR/embedded_rbs.rs` (the
+//! [`EMBEDDED_RBS`] `(path, contents)` table), and [`CoreData::load`] ingests
+//! those bytes by default — no runtime filesystem dependency on a local rbs gem.
+//! `RIGOR_RBS_CORE_DIR` remains an override seam (ADR-0007 / audit-R2): when set,
+//! the loader reads from that directory at runtime exactly as before, for
+//! out-of-band stdlib-RBS refreshes.
+//!
+//! Falls back to a hardcoded stub only in the degenerate case (embedded set
+//! empty / override dir absent or unparsable), so the crate never panics.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,6 +21,13 @@ use std::path::PathBuf;
 use ruby_rbs::node::{
     parse, AliasKind, ClassNode, MethodDefinitionKind, ModuleNode, Node,
 };
+
+// The build-time-embedded RBS signature set: `EMBEDDED_RBS: &[(&str, &str)]`,
+// one `(relative-path, file-contents)` entry per vendored `.rbs`, in
+// deterministic sorted-by-path order (see `build.rs`). The ingest is
+// order-independent for class membership, so any total order yields the same
+// index; sorted is chosen for reproducibility.
+include!(concat!(env!("OUT_DIR"), "/embedded_rbs.rs"));
 
 /// The stdlib libraries loaded on top of `core/` — the reference's
 /// `DEFAULT_LIBRARIES` (`Rigor::Environment::DEFAULT_LIBRARIES`). Each name maps
@@ -34,9 +50,12 @@ const DEFAULT_LIBRARIES: &[&str] = &[
     "prism", "rbs",
 ];
 
-/// The default core-RBS directory (rbs gem under mise) used when
-/// `RIGOR_RBS_CORE_DIR` is unset. ADR-0007 will replace this runtime path with
-/// vendored, build-time-embedded RBS.
+/// The original runtime core-RBS directory (rbs-4.0.3 gem under mise). ADR-0007
+/// replaced this default with the vendored, build-time-[`EMBEDDED_RBS`] set, so
+/// it is no longer on the default load path — kept only as documentation of the
+/// source the vendored tree was generated from. `RIGOR_RBS_CORE_DIR` (any dir)
+/// is the live override seam; this constant is not read at runtime.
+#[allow(dead_code)]
 const DEFAULT_CORE_DIR: &str = "/Users/megurine/.local/share/mise/installs/ruby/4.0.5/\
 lib/ruby/gems/4.0.0/gems/rbs-4.0.3/core";
 
@@ -118,15 +137,47 @@ pub struct CoreData {
 
 impl CoreData {
     /// Build from the real RBS universe (the reference's default: ALL of
-    /// `core/*.rbs` ⊕ the `DEFAULT_LIBRARIES` stdlib set) if the core directory
-    /// exists, else from the hardcoded stub. Never panics: any per-file parse
-    /// error is skipped, and stdlib reopens of core classes (`class Hash ...`)
-    /// merge into the existing entry (see [`Builder::merge`]).
+    /// `core/*.rbs` ⊕ the `DEFAULT_LIBRARIES` stdlib set). Never panics: any
+    /// per-file parse error is skipped, and stdlib reopens of core classes
+    /// (`class Hash ...`) merge into the existing entry (see [`Builder::merge`]).
+    ///
+    /// **Default:** ingest the build-time-[`EMBEDDED_RBS`] vendored set — no
+    /// runtime filesystem dependency (ADR-0007). **Override:** if
+    /// `RIGOR_RBS_CORE_DIR` is set, read from that directory at runtime exactly
+    /// as before (the out-of-band stdlib-RBS refresh seam, audit-R2): the WHOLE
+    /// dir plus the `DEFAULT_LIBRARIES` stdlib closure rooted at `<dir>/../stdlib`.
+    /// The embedded path feeds the SAME bytes to the SAME parser as the override
+    /// path ([`ingest_rbs_source`]), so the resulting index is byte-identical to
+    /// what the override dir produced when it holds the same signatures.
     pub fn load() -> Self {
-        let dir = std::env::var("RIGOR_RBS_CORE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(DEFAULT_CORE_DIR));
+        // Override seam: a runtime RBS dir (ADR-0007 / audit-R2). KEEP this path
+        // exactly as before — when present it fully replaces the embedded set.
+        if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
+            let dir = PathBuf::from(dir);
+            if let Some(index) = Self::load_from_dir(&dir) {
+                return index;
+            }
+            // Override set but unusable (absent / nothing parsed): fall through
+            // to the embedded default rather than failing.
+        }
 
+        // Default: the vendored, build-time-embedded set.
+        let mut builder = Builder::default();
+        ingest_embedded(&mut builder);
+        let (classes, toplevel_classes) = builder.finish();
+        if !classes.is_empty() {
+            return Self { classes, toplevel_classes };
+        }
+        // Fallback: embedded empty (shouldn't happen) ⇒ hardcoded stub.
+        Self::stub()
+    }
+
+    /// The runtime-filesystem ingest path (the `RIGOR_RBS_CORE_DIR` override):
+    /// ingest the WHOLE `dir` plus the `DEFAULT_LIBRARIES` stdlib closure rooted
+    /// at `<dir>/../stdlib`. Returns `None` when the dir is absent or nothing
+    /// parsed (caller then falls back to the embedded default / stub). This is
+    /// the same logic the default previously ran against the hardcoded path.
+    fn load_from_dir(dir: &std::path::Path) -> Option<Self> {
         if dir.is_dir() {
             let mut builder = Builder::default();
 
@@ -165,11 +216,10 @@ impl CoreData {
 
             let (classes, toplevel_classes) = builder.finish();
             if !classes.is_empty() {
-                return Self { classes, toplevel_classes };
+                return Some(Self { classes, toplevel_classes });
             }
         }
-        // Fallback: no RBS dir (or nothing parsed) ⇒ hardcoded stub.
-        Self::stub()
+        None
     }
 
     /// Whether the class is in the loaded set.
@@ -991,9 +1041,32 @@ fn ingest_rbs_dir(builder: &mut Builder, dir: &std::path::Path) {
             ingest_rbs_dir(builder, &path);
         } else if path.extension().is_some_and(|e| e == "rbs") {
             if let Ok(code) = std::fs::read_to_string(&path) {
-                builder.ingest(&code);
+                ingest_rbs_source(builder, &path.to_string_lossy(), &code);
             }
         }
+    }
+}
+
+/// Fold one RBS source's declarations into `builder`. The single per-file ingest
+/// point shared by BOTH the filesystem path ([`ingest_rbs_dir`], the
+/// `RIGOR_RBS_CORE_DIR` override) and the embedded path ([`ingest_embedded`]):
+/// both feed the SAME bytes to the SAME [`Builder::ingest`] / `ruby-rbs` parser,
+/// which is what makes the embedded default byte-identical to the runtime path.
+/// `name` is informational only (the path or embedded key) — the parser keys off
+/// `contents` alone, so it never affects the resulting index.
+fn ingest_rbs_source(builder: &mut Builder, _name: &str, contents: &str) {
+    builder.ingest(contents);
+}
+
+/// Ingest the build-time-embedded vendored RBS set ([`EMBEDDED_RBS`]) — the
+/// default (no `RIGOR_RBS_CORE_DIR`) load path. Each `(relative-path, contents)`
+/// entry is fed to the SAME [`ingest_rbs_source`] the filesystem path uses, so
+/// the index is identical to ingesting the vendored tree from disk. The embedded
+/// set is the whole `core/` ⊕ the `DEFAULT_LIBRARIES` stdlib closure already
+/// resolved at vendoring time, so no `manifest.yaml` walk is needed here.
+fn ingest_embedded(builder: &mut Builder) {
+    for (name, contents) in EMBEDDED_RBS {
+        ingest_rbs_source(builder, name, contents);
     }
 }
 
@@ -1175,4 +1248,49 @@ fn intern(s: &str) -> &'static str {
     let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
     guard.insert(leaked);
     leaked
+}
+
+#[cfg(test)]
+mod embedded_tests {
+    use super::*;
+
+    /// The build-time-embedded set is present and carries the core classes.
+    #[test]
+    fn embedded_rbs_non_empty_with_core_files() {
+        assert!(!EMBEDDED_RBS.is_empty(), "EMBEDDED_RBS must not be empty");
+        let has = |needle: &str| EMBEDDED_RBS.iter().any(|(p, _)| p.ends_with(needle));
+        assert!(has("core/array.rbs"), "missing core/array.rbs");
+        assert!(has("core/string.rbs"), "missing core/string.rbs");
+        // A stdlib closure member.
+        assert!(
+            EMBEDDED_RBS.iter().any(|(p, _)| p.contains("stdlib/pathname/")),
+            "missing stdlib/pathname"
+        );
+        // Entries are non-empty file contents.
+        assert!(EMBEDDED_RBS.iter().all(|(_, c)| !c.is_empty()));
+    }
+
+    /// `CoreData::load()` with `RIGOR_RBS_CORE_DIR` UNSET ingests the embedded
+    /// set (NOT a stub): it knows the core roots and stdlib-closure classes, and
+    /// resolves instance methods with the same parity the runtime path gives.
+    ///
+    /// NB: this asserts on the global `load()` and so must not clobber the env
+    /// var (other code/tests share the process). It relies on the harness/CI
+    /// running with the var unset; if it happens to be set, the override path is
+    /// equally valid for these assertions (same signatures), so we don't gate.
+    #[test]
+    fn embedded_load_is_non_stub_and_method_parity() {
+        let idx = CoreData::load();
+        // Core classes from the embedded core/ tree.
+        assert!(idx.knows_class("String"));
+        assert!(idx.knows_class("Array"));
+        assert!(idx.knows_class("Hash"));
+        // Stdlib-closure classes (proves the stdlib set embedded, not just core
+        // / the small stub): `Pathname` (pathname) and `Set` (in core builtin).
+        assert!(idx.knows_class("Pathname"));
+        assert!(idx.knows_class("Set"));
+        // Method existence parity for a known method, and absence for a typo.
+        assert!(idx.class_has_method("String", "upcase"));
+        assert!(!idx.class_has_method("String", "lenght"));
+    }
 }
