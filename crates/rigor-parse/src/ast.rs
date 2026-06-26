@@ -56,6 +56,12 @@ pub enum Node {
     LocalVariableRead { name: String, span: Span },
     /// A string literal (`"Hello"`); `value` is the unescaped contents.
     StringLit { value: String, span: Span },
+    /// An interpolated string or heredoc (`"a#{x}b"`, `<<~SQL ... #{t} ... SQL`).
+    /// Types as a `String` *instance* (a `Nominal { String }`): an interpolated
+    /// string literal is always a `String` regardless of the interpolated
+    /// values. `parts` carries the lowered interpolation segments so calls
+    /// inside `#{ … }` stay reachable for the walk.
+    InterpolatedString { parts: Vec<NodeId>, span: Span },
     /// An integer literal (`42`).
     IntegerLit { value: i64, span: Span },
     /// A float literal (`3.14`); `value` is the parsed `f64`.
@@ -201,6 +207,7 @@ impl Node {
             | Node::LocalVariableWrite { span, .. }
             | Node::LocalVariableRead { span, .. }
             | Node::StringLit { span, .. }
+            | Node::InterpolatedString { span, .. }
             | Node::IntegerLit { span, .. }
             | Node::FloatLit { span, .. }
             | Node::SymbolLit { span, .. }
@@ -839,13 +846,16 @@ impl Builder {
         }
 
         if let Some(interp) = node.as_interpolated_string_node() {
-            // Lower every interpolation part (`#{call}`) so its calls are walked.
-            let _parts: Vec<NodeId> = interp
+            // Lower every interpolation part (`#{call}`) so its calls are walked,
+            // and keep the ids: the node types as a `String` instance, with the
+            // parts as the reachability carrier.
+            let parts: Vec<NodeId> = interp
                 .parts()
                 .iter()
                 .map(|p| self.lower_node(&p))
                 .collect();
-            return self.push(Node::Other {
+            return self.push(Node::InterpolatedString {
+                parts,
                 span: span_of(&interp.location()),
             });
         }
@@ -1026,6 +1036,24 @@ mod tests {
         });
         assert!(has_write, "expected a LocalVariableWrite for `s`");
         assert!(has_str, "expected a StringLit \"Hello\"");
+    }
+
+    #[test]
+    fn lowers_interpolated_string_to_node() {
+        // `"a#{x}b"` lowers to an InterpolatedString whose parts are non-empty
+        // (the `#{x}` segment is lowered, keeping its calls reachable).
+        let src = b"\"a#{x}b\"\n";
+        let result = crate::parse(src);
+        let ast = lower(&result);
+
+        let parts = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::InterpolatedString { parts, .. } => Some(parts.clone()),
+                _ => None,
+            })
+            .expect("expected an InterpolatedString node");
+        assert!(!parts.is_empty(), "expected non-empty interpolation parts");
     }
 
     #[test]

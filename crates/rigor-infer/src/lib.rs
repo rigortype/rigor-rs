@@ -109,6 +109,12 @@ impl<'i> Typer<'i> {
             Node::StringLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Str(value.clone())))
             }
+            // An interpolated string / heredoc (`"a#{x}b"`) is always a `String`
+            // instance regardless of the interpolated values, so type it as a
+            // bare `String` Nominal — a typo'd / non-core method on it (e.g.
+            // `.squish`, `.constantize`) then resolves against the real String
+            // RBS and is witnessed, matching the reference.
+            Node::InterpolatedString { .. } => self.nominal_or_untyped("String", interner),
             Node::IntegerLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Int(*value)))
             }
@@ -552,6 +558,23 @@ mod tests {
         let ty = typer.type_of(&ast, arr, &env, &mut i);
         assert_eq!(idx.class_name_of(&i, ty), Some("Array"));
         assert!(!idx.class_has_method("Array", "frist"));
+    }
+
+    #[test]
+    fn interpolated_string_types_to_string_nominal() {
+        // `"a#{x}b"` types to a bare String Nominal (a String *instance*), so a
+        // typo'd / non-core method on it resolves against the real String RBS.
+        let ast = lower_src(b"\"a#{x}b\"\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let interp = ast
+            .iter()
+            .find_map(|(id, n)| matches!(n, Node::InterpolatedString { .. }).then_some(id))
+            .unwrap();
+        let ty = typer.type_of(&ast, interp, &env, &mut i);
+        assert_eq!(idx.class_name_of(&i, ty), Some("String"));
     }
 
     #[test]
