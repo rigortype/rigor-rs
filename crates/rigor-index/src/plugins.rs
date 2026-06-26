@@ -47,6 +47,12 @@ pub const ACTIVESUPPORT_CORE_EXT: BundledPlugin = BundledPlugin {
 /// All bundled plugins, for iteration in tests / future dispatch.
 const ALL: &[&BundledPlugin] = &[&ACTIVESUPPORT_CORE_EXT];
 
+/// The bundled plugins shipped with rigor-rs, for enumeration (e.g. `rigor
+/// doctor` reports their availability + config-gated enabled state).
+pub fn bundled_plugins() -> &'static [&'static BundledPlugin] {
+    ALL
+}
+
 /// Resolve a plugin id from `.rigor.yml` to its bundled payload, or `None` for an
 /// unknown / unbundled id (NEVER an error — the reference likewise can't load a
 /// gem it doesn't have, so an unknown id is simply inert).

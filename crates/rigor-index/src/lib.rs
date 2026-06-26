@@ -31,6 +31,8 @@ use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 pub mod plugins;
 mod rbs;
 
+pub use rbs::RbsSource;
+
 /// The core classes this index registers, in a fixed order. The slice index of
 /// a name in this array IS its [`ClassId`] (see [`CoreIndex::class_id`]), so the
 /// mapping is stable and reversible (ADR-0019: a `Type::Nominal { class }` can
@@ -98,6 +100,20 @@ impl CoreIndex {
         Self {
             data: rbs::CoreData::load_with_plugins(&resolved),
         }
+    }
+
+    /// Which RBS signature source backs this index (embedded vendored set, the
+    /// `RIGOR_RBS_CORE_DIR` override, or the conservative stub). Surfaced by
+    /// `rigor doctor` so the standalone-vs-override coverage state is observable
+    /// (audit-R1 / ADR-0007).
+    pub fn rbs_source(&self) -> &rbs::RbsSource {
+        self.data.source()
+    }
+
+    /// How many distinct classes the loaded RBS surface registered — a coarse
+    /// coverage signal reported by `rigor doctor`.
+    pub fn class_count(&self) -> usize {
+        self.data.class_count()
     }
 
     /// Whether `class_name` is one this index models at all. The rule must stay

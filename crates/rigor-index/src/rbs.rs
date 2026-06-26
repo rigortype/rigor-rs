@@ -127,9 +127,31 @@ struct ClassEntry {
     extends: Vec<&'static str>,
 }
 
+/// Which signature source the loaded [`CoreData`] was built from. Surfaced by
+/// `rigor doctor` so the embedded-vs-override coverage state is observable
+/// (audit-R1 / ADR-0007): the standalone default is [`Embedded`](RbsSource::Embedded),
+/// the out-of-band refresh seam is [`Override`](RbsSource::Override), and
+/// [`Stub`](RbsSource::Stub) is the degenerate "nothing parsed" fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RbsSource {
+    /// The build-time-embedded vendored RBS set (the standalone default — no
+    /// runtime filesystem dependency).
+    Embedded,
+    /// The `RIGOR_RBS_CORE_DIR` override directory was set AND usable; the path
+    /// carried is the dir that was ingested.
+    Override(String),
+    /// Neither the override nor the embedded set yielded any classes — the
+    /// hardcoded conservative stub.
+    Stub,
+}
+
 /// The loaded core data backing [`crate::CoreIndex`] and the free
 /// `method_return` / `method_arity` functions.
 pub struct CoreData {
+    /// Which signature source this data was built from (embedded / override /
+    /// stub). Informational only — used by `rigor doctor` to report the active
+    /// RBS coverage source.
+    source: RbsSource,
     /// `class name -> entry`. Keys are `&'static str` (leaked once at load) so
     /// resolved return-class names can flow out as `&'static str`.
     classes: HashMap<&'static str, ClassEntry>,
@@ -178,16 +200,16 @@ impl CoreData {
         // 1) Resolve the core source (override dir, else embedded), folding into a
         //    fresh builder — the SAME logic [`Self::load`] previously inlined.
         let mut builder = Builder::default();
-        let mut used_override = false;
+        let mut source = RbsSource::Embedded;
         if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
             let dir = PathBuf::from(dir);
             if Self::ingest_dir_into(&mut builder, &dir) {
-                used_override = true;
+                source = RbsSource::Override(dir.display().to_string());
             }
             // Override set but unusable (absent / nothing parsed): fall through
             // to the embedded default rather than failing.
         }
-        if !used_override {
+        if source == RbsSource::Embedded {
             ingest_embedded(&mut builder);
         }
 
@@ -201,7 +223,7 @@ impl CoreData {
 
         let (classes, toplevel_classes) = builder.finish();
         if !classes.is_empty() {
-            return Self { classes, toplevel_classes };
+            return Self { source, classes, toplevel_classes };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
         // carries no plugin selectors, which stays conservative (zero-FP).
@@ -865,7 +887,19 @@ impl CoreData {
         // whole key set is the top-level set (defect 2: `knows_toplevel_class`
         // of a curated class is `true`, of an unknown name is `false`).
         let toplevel_classes: HashSet<&'static str> = classes.keys().copied().collect();
-        Self { classes, toplevel_classes }
+        Self { source: RbsSource::Stub, classes, toplevel_classes }
+    }
+
+    /// The signature source this data was built from (embedded / override /
+    /// stub) — surfaced by `rigor doctor` (audit-R1).
+    pub fn source(&self) -> &RbsSource {
+        &self.source
+    }
+
+    /// How many distinct classes the loaded RBS surface registered. A coarse
+    /// coverage signal for `rigor doctor`.
+    pub fn class_count(&self) -> usize {
+        self.classes.len()
     }
 }
 

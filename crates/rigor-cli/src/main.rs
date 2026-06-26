@@ -25,14 +25,16 @@ mod diagnostic_formats;
 use diagnostic_formats::Rendered;
 mod baseline;
 use baseline::{Baseline, MatchMode, DEFAULT_BASELINE_PATH};
+mod doctor;
 mod explain;
+mod init;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).
 const COMMANDS: &[&str] = &[
     "check", "annotate", "type-of", "trace", "type-scan", "explain", "diff",
     "sig-gen", "baseline", "triage", "coverage", "plugins", "plugin", "lsp",
-    "mcp", "skill", "docs", "init",
+    "mcp", "skill", "docs", "init", "doctor",
 ];
 
 fn main() -> ExitCode {
@@ -42,6 +44,8 @@ fn main() -> ExitCode {
         Some("baseline") => cmd_baseline(&args[1..]),
         Some("type-of") => type_of::cmd_type_of(&args[1..]),
         Some("explain") => explain::cmd_explain(&args[1..]),
+        Some("init") => init::cmd_init(&args[1..]),
+        Some("doctor") => doctor::cmd_doctor(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => {
             eprintln!("rigor-rs: `{cmd}` is recognized but not yet implemented in this phase");
             ExitCode::from(2)

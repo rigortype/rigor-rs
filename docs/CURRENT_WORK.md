@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 316 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 321 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 316 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 321 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -484,13 +484,28 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   **byte-identical** to the reference for every canonical id, alias, family, and the
   no-arg index; unknown rule → the reference's two-line stderr + exit 64. (json key
   order is hand-built to match `JSON.pretty_generate`, which serde would alphabetize.)
-- ⬜ `init` — the reference HAS it (writes `.rigor.dist.yml`, a ~60-line template
-  serialising full `Configuration::DEFAULTS` + a next-steps block); left as-is here
-  because a faithful port needs the full config-defaults model, out of scope for this
-  type-of/explain slice.
+- ✅ `init` — writes `.rigor.dist.yml` (default; `--path PATH` retargets, `--force`
+  overwrites, refuses an existing file without `--force` → exit 1, matching the
+  reference's surface + "already exists; use --force to overwrite it" message + the
+  "Created … / Next steps:" stdout shape). **Intentional difference:** the reference
+  serialises its full `Configuration::DEFAULTS` (~30 keys, mostly preview surface);
+  rigor-rs's template documents ONLY the four keys its loader honors (`disable:` /
+  `exclude:` / `plugins:` / `baseline:`) so it never advertises keys rigor-rs silently
+  drops — truthful to the standalone sound subset. The file round-trips through
+  `Config::load`.
+- 🟡 `doctor` — environment/setup diagnostic. Reports: config discovery (found+parsed /
+  malformed→WARN / absent), the **active RBS source** (embedded vendored set vs
+  `RIGOR_RBS_CORE_DIR` override vs stub→FAIL) **+ class count** (audit-R1), the bundled
+  plugins + which the discovered config enables (config-gated), and the implemented
+  (sound-subset) rule set. `[PASS]`/`[WARN]`/`[FAIL]` line shape + exit 0/1 borrowed
+  from the reference (ADR-77). **Deferred** (no `configuration.paths` model in rigor-rs's
+  CLI yet): the reference's scoped-`check` baseline-drift + Rails-unconfigured checks, and
+  a `--format json` (the reference has one; human format first). Intentionally divergent:
+  the reference's doctor is a findings classifier over a real analysis pass; rigor-rs's
+  surfaces the standalone/embedded setup state instead.
 - ⬜ `annotate` · `diff` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugins`/`plugin` · `docs` ·
-  `sig-gen` (ref ADR-14) · `skill`/`describe` · `doctor` (ref ADR-77) · `lsp` · `mcp` ·
+  `sig-gen` (ref ADR-14) · `skill`/`describe` · `lsp` · `mcp` ·
   `trace` · `type-scan`.
 
 ### 12. Editor / agent servers (ADR-0029)
@@ -523,8 +538,12 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 
 `…/ruby/rigor/docs/notes/20260626-rigor-rs-design-audit.md` (verdict: structurally avoids the
 Pzoom/artichoke/pylyzer traps).
-- ✅ **R1** ADR-0008: positioning (standalone = sound subset; full parity needs the sidecar);
-  ⬜ remaining: surface "sidecar absent ⇒ reduced coverage" in `rigor doctor` when it lands.
+- ✅ **R1** ADR-0008: positioning (standalone = sound subset; full parity needs the sidecar).
+  `rigor doctor` now surfaces the standalone/embedded coverage state: the active RBS source
+  (embedded vendored set vs `RIGOR_RBS_CORE_DIR` override vs stub) + class count, and the
+  implemented rule set as an explicit "sound subset of the reference" line. (The
+  "sidecar absent ⇒ reduced coverage" framing is the rule-set line; the deferred sidecar
+  itself is still out of scope.)
 - ✅ **R2** ADR-0007: RBS now **vendored + embedded at build time** (standalone binary, no runtime
   rbs gem); `RIGOR_RBS_CORE_DIR` retained as the out-of-band stdlib-RBS refresh/override seam.
 - ✅ **R3** ADR-0001: positioning stated — rigor-rs is a performance prototype that COEXISTS

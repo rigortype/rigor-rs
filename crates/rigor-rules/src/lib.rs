@@ -1208,6 +1208,13 @@ const IMPLEMENTED_RULES: &[&str] = &[
     DEF_OVERRIDE_VISIBILITY_REDUCED,
 ];
 
+/// The canonical rule ids rigor-rs can actually emit — the implemented coverage
+/// scope, a SOUND SUBSET of the reference's catalogue (ADR-0008). Reported by
+/// `rigor doctor` so users know which rules are live.
+pub fn implemented_rules() -> &'static [&'static str] {
+    IMPLEMENTED_RULES
+}
+
 /// Maps a legacy short alias to its canonical id (reference `LEGACY_RULE_ALIASES`).
 /// Only the three implemented ids can ever match a real diagnostic; the remaining
 /// aliases are included for forward-compat (they expand to ids no rigor-rs
