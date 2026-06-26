@@ -62,6 +62,12 @@ struct ClassEntry {
     /// `old_name`'s existence / return type / arity (the old name may live on
     /// the same class or anywhere up the ancestor chain).
     aliases: HashMap<&'static str, &'static str>,
+    /// Singleton (class-method) aliases `new -> old` (RBS `alias self.pwd
+    /// self.getwd`, `alias self.escape self.shellescape`). Resolved at singleton
+    /// lookup time over the singleton chain. These are COMMON in core/stdlib
+    /// (File/Dir/Shellwords/…); omitting them makes the singleton surface look
+    /// complete-but-missing-`new` and witnesses a real class method as absent.
+    singleton_aliases: HashMap<&'static str, &'static str>,
     /// Direct superclass name, if any (`None` ⇒ implicit `Object`, except the
     /// roots which are seeded explicitly).
     superclass: Option<&'static str>,
@@ -251,44 +257,75 @@ impl CoreData {
     /// `Random::Formatter` (extended by `SecureRandom`) is not loaded, the
     /// surface is unknown ⇒ caller stays silent.
     fn singleton_lookup(&self, class_name: &str, method: &str) -> (bool, bool) {
+        // Gather the singleton superclass chain (the singleton class inherits
+        // down `superclass`), tracking completeness: a referenced superclass or
+        // `extend`ed module that isn't loaded truncates the surface.
+        let mut chain: Vec<&'static str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut complete = true;
         let mut cur = Some(class_name);
         while let Some(name) = cur {
             let Some((&key, entry)) = self.classes.get_key_value(name) else {
-                // Referenced superclass not loaded ⇒ chain incomplete.
-                return (false, false);
+                complete = false; // referenced superclass not loaded.
+                break;
             };
             if !seen.insert(key) {
                 break; // Defensive: cycle guard.
             }
-            if entry.singleton_methods.contains_key(method) {
-                return (true, true);
-            }
-            // An `extend M` directive folds M's INSTANCE methods into this
-            // class object's singleton surface. Consult each extended module's
-            // own ancestor chain (instance dispatch). If a module is unknown the
-            // surface is incomplete; record that but keep scanning the rest of
-            // the chain so a definite hit elsewhere can still short-circuit.
+            chain.push(key);
             for &module in &entry.extends {
                 if !self.classes.contains_key(module) {
-                    complete = false;
-                    continue;
-                }
-                let (mod_chain, mod_complete) = self.ancestors(module);
-                if self.lookup_on_chain(&mod_chain, method).is_some() {
-                    return (true, true);
-                }
-                if !mod_complete {
                     complete = false;
                 }
             }
             cur = entry.superclass;
         }
-        // Walked the whole superclass chain to a root (no super) without a hit.
-        // `complete` is `true` unless some extended module was unknown along the
-        // way (a truncated singleton surface ⇒ caller stays silent).
-        (false, complete)
+        let found = self.singleton_on_chain(&chain, method, 0);
+        (found, complete)
+    }
+
+    /// Whether `method` is on the class object's surface across the singleton
+    /// `chain`: a direct `def self.x` on any class, an INSTANCE method of any
+    /// `extend`ed module, or a singleton ALIAS resolving (bounded) to one of
+    /// those. Existence-only; completeness is computed by the caller.
+    fn singleton_on_chain(&self, chain: &[&'static str], method: &str, depth: usize) -> bool {
+        // (1) A direct singleton method on any class in the chain.
+        for &anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if entry.singleton_methods.contains_key(method) {
+                    return true;
+                }
+            }
+        }
+        // (2) An `extend`ed module's INSTANCE method (extend folds M's instance
+        //     methods into the class object's singleton surface).
+        for &anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                for &module in &entry.extends {
+                    if self.classes.contains_key(module) {
+                        let (mod_chain, _) = self.ancestors(module);
+                        if self.lookup_on_chain(&mod_chain, method).is_some() {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        // (3) A singleton alias `method -> old`, resolved over the same chain.
+        //     Bounded to defend against a pathological alias cycle.
+        if depth >= 16 {
+            return false;
+        }
+        for &anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(&old) = entry.singleton_aliases.get(method) {
+                    if self.singleton_on_chain(chain, old, depth + 1) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// Resolve a method's return class over the ancestor chain (first defining
@@ -417,6 +454,7 @@ impl CoreData {
                     // conservative because the five base classes' singleton
                     // surface is incomplete here ⇒ always silent.
                     singleton_methods: HashMap::new(),
+                    singleton_aliases: HashMap::new(),
                     superclass,
                     includes,
                     // The stub models no `extend` directives (no class-method
@@ -760,15 +798,20 @@ impl Builder {
                     }
                 }
                 Node::Alias(a) => {
-                    // `alias new old` makes `new` an instance method equivalent
-                    // to `old` (RBS `alias size length`). Record only instance
-                    // aliases — the existence check is instance dispatch.
-                    if a.kind() != AliasKind::Instance {
-                        continue;
-                    }
+                    // `alias new old` aliases a method to another. An INSTANCE
+                    // alias (`alias size length`) feeds instance dispatch; a
+                    // SINGLETON alias (`alias self.pwd self.getwd`) feeds the
+                    // class-object surface. Record each into its own map.
                     let new_name = intern(a.new_name().as_str());
                     let old_name = intern(a.old_name().as_str());
-                    entry.aliases.entry(new_name).or_insert(old_name);
+                    match a.kind() {
+                        AliasKind::Instance => {
+                            entry.aliases.entry(new_name).or_insert(old_name);
+                        }
+                        AliasKind::Singleton => {
+                            entry.singleton_aliases.entry(new_name).or_insert(old_name);
+                        }
+                    }
                 }
                 // A NESTED class/module declaration (e.g. `module PP; module
                 // ObjectMixin; end; end`) must be registered too, by its simple
@@ -802,6 +845,9 @@ impl Builder {
         }
         for (new_name, old_name) in entry.aliases {
             slot.aliases.entry(new_name).or_insert(old_name);
+        }
+        for (new_name, old_name) in entry.singleton_aliases {
+            slot.singleton_aliases.entry(new_name).or_insert(old_name);
         }
         for inc in entry.includes {
             if !slot.includes.contains(&inc) {

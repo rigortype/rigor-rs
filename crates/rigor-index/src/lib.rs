@@ -474,6 +474,30 @@ mod tests {
     }
 
     #[test]
+    fn singleton_aliases_resolve() {
+        // A class method defined as a SINGLETON alias must not be witnessed
+        // absent: `alias self.pwd self.getwd` (Dir), `alias self.fnmatch?
+        // self.fnmatch` (File), `alias self.escape self.shellescape` (Shellwords).
+        // These were a 23-FP family. Guarded on real RBS.
+        let idx = CoreIndex::new();
+        if idx.knows_class("Dir") {
+            assert!(idx.class_has_singleton_method("Dir", "pwd"), "Dir.pwd is an alias of getwd");
+            assert!(idx.class_has_singleton_method("Dir", "getwd"), "Dir.getwd is the alias target");
+        }
+        if idx.knows_class("File") {
+            assert!(idx.class_has_singleton_method("File", "fnmatch?"), "File.fnmatch? aliases fnmatch");
+        }
+        if idx.knows_class("Shellwords") {
+            for m in ["escape", "split", "join"] {
+                assert!(
+                    idx.class_has_singleton_method("Shellwords", m),
+                    "Shellwords.{m} is a singleton alias of shell{m}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn knows_toplevel_class_distinguishes_namespaced() {
         // Defect 2: a short name that only ever appears NAMESPACED (e.g.
         // `class Process::Status`, registered by short key "Status") must NOT be
