@@ -88,9 +88,30 @@ impl<'i> Typer<'i> {
                 let (r, method, args) = (*r, method.clone(), args.clone());
                 self.type_call(ast, r, &method, &args, env, interner)
             }
-            // A call with no receiver (implicit self) or any other carrier is
-            // unknown -> Dynamic[top] (never guess).
+            // An array/hash literal types to its bare nominal class so a typo'd
+            // method on it (`[1,2].frist`, `{}.fetchh`) flags via the real
+            // Array/Hash RBS — matching the reference. Element/shape precision is
+            // deferred (TODO(spec): Tuple / HashShape per ADR-0023).
+            Node::ArrayLit { .. } => self.nominal_or_untyped("Array", interner),
+            Node::HashLit { .. } => self.nominal_or_untyped("Hash", interner),
+            // A call with no receiver (implicit self) or any other carrier
+            // (`@ivar`, constant, `self`, `if`/`case`-as-expression, index,
+            // range, logical, variable read) is not precisely typed in this
+            // slice -> Dynamic[top] (never guess; keeps the call rule silent).
+            // TODO(spec): ivar typing (ADR-0022), constant resolution,
+            // branch-union typing, container-element typing.
             _ => interner.untyped(),
+        }
+    }
+
+    /// Intern a bare `Nominal { class }` for a registered core class name, or
+    /// `Dynamic[top]` if the index doesn't register it. Used to type a literal
+    /// container (array/hash) so a typo'd method on it resolves against the real
+    /// RBS for that class, while staying silent if the class is somehow unknown.
+    fn nominal_or_untyped(&self, class_name: &str, interner: &mut Interner) -> TypeId {
+        match self.index.class_id(class_name) {
+            Some(class) => interner.intern(Type::Nominal { class, args: vec![] }),
+            None => interner.untyped(),
         }
     }
 
@@ -441,6 +462,81 @@ mod tests {
         // Not folded (receiver isn't a Constant), so we get the Nominal return.
         assert_eq!(i.get(ty), &Type::Nominal { class: string_id, args: vec![] });
         assert_eq!(idx.class_name_of(&i, ty), Some("String"));
+    }
+
+    #[test]
+    fn array_literal_types_to_array_nominal() {
+        // `[1, 2]` types to a bare Array Nominal so a typo (`.frist`) is
+        // checkable against the real Array RBS.
+        let ast = lower_src(b"[1, 2]\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let arr = ast
+            .iter()
+            .find_map(|(id, n)| matches!(n, Node::ArrayLit { .. }).then_some(id))
+            .unwrap();
+        let ty = typer.type_of(&ast, arr, &env, &mut i);
+        assert_eq!(idx.class_name_of(&i, ty), Some("Array"));
+        assert!(!idx.class_has_method("Array", "frist"));
+    }
+
+    #[test]
+    fn hash_literal_types_to_hash_nominal() {
+        let ast = lower_src(b"{ a: 1 }\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let hash = ast
+            .iter()
+            .find_map(|(id, n)| matches!(n, Node::HashLit { .. }).then_some(id))
+            .unwrap();
+        let ty = typer.type_of(&ast, hash, &env, &mut i);
+        assert_eq!(idx.class_name_of(&i, ty), Some("Hash"));
+    }
+
+    #[test]
+    fn method_param_read_is_dynamic_top() {
+        // Inside `def foo(x); x.bar; end`, the receiver `x` is a param read with
+        // no top-level binding -> Dynamic[top] -> the call rule stays silent.
+        // This is the zero-FP keystone for lowering def bodies.
+        let ast = lower_src(b"def foo(x)\n  x.bar\nend\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let recv = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::Call { receiver: Some(r), method, .. } if method == "bar" => Some(*r),
+                _ => None,
+            })
+            .unwrap();
+        let ty = typer.type_of(&ast, recv, &env, &mut i);
+        assert_eq!(ty, i.untyped());
+    }
+
+    #[test]
+    fn ivar_and_self_and_const_reads_are_dynamic_top() {
+        // `@x`, `self`, and a constant read all type to Dynamic[top] (silent).
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        for src in [b"@x.foo\n".as_slice(), b"self.foo\n".as_slice(), b"Foo.foo\n".as_slice()] {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = typer.build_toplevel_env(&ast, &mut i);
+            let recv = ast
+                .iter()
+                .find_map(|(_, n)| match n {
+                    Node::Call { receiver: Some(r), method, .. } if method == "foo" => Some(*r),
+                    _ => None,
+                })
+                .unwrap();
+            let ty = typer.type_of(&ast, recv, &env, &mut i);
+            assert_eq!(ty, i.untyped(), "receiver of {src:?} must be Dynamic[top]");
+        }
     }
 
     #[test]
