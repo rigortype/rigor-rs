@@ -150,76 +150,107 @@ impl CoreData {
     /// path ([`ingest_rbs_source`]), so the resulting index is byte-identical to
     /// what the override dir produced when it holds the same signatures.
     pub fn load() -> Self {
-        // Override seam: a runtime RBS dir (ADR-0007 / audit-R2). KEEP this path
-        // exactly as before — when present it fully replaces the embedded set.
+        Self::load_with_plugins(&[])
+    }
+
+    /// Build the core data, THEN ingest each bundled plugin's RBS on top
+    /// (ADR-25, config-gated). With `plugins` empty this is byte-identical to
+    /// [`Self::load`] — the default no-config path is unchanged.
+    ///
+    /// The core source is resolved exactly as [`Self::load`] does (the
+    /// `RIGOR_RBS_CORE_DIR` override if set, else the embedded vendored set),
+    /// and each plugin's `(name, contents)` entries are then fed to the SAME
+    /// [`ingest_rbs_source`] / `ruby-rbs` parser. The existing [`Builder::merge`]
+    /// reopen-union folds each plugin's reopened `class String ... def squish`
+    /// into the EXISTING `String` entry, so the plugin selectors join the core
+    /// surface — byte-identical to feeding the reference's bundled RBS through
+    /// the core path (the zero-FP keystone). Unknown plugin ids are filtered out
+    /// by the caller ([`crate::CoreIndex::with_plugins`]); here every entry is a
+    /// real bundled payload.
+    pub fn load_with_plugins(plugins: &[&crate::plugins::BundledPlugin]) -> Self {
+        // 1) Resolve the core source (override dir, else embedded), folding into a
+        //    fresh builder — the SAME logic [`Self::load`] previously inlined.
+        let mut builder = Builder::default();
+        let mut used_override = false;
         if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
             let dir = PathBuf::from(dir);
-            if let Some(index) = Self::load_from_dir(&dir) {
-                return index;
+            if Self::ingest_dir_into(&mut builder, &dir) {
+                used_override = true;
             }
             // Override set but unusable (absent / nothing parsed): fall through
             // to the embedded default rather than failing.
         }
+        if !used_override {
+            ingest_embedded(&mut builder);
+        }
 
-        // Default: the vendored, build-time-embedded set.
-        let mut builder = Builder::default();
-        ingest_embedded(&mut builder);
+        // 2) Ingest each bundled plugin's RBS on top of whichever core source was
+        //    used. The reopen-union merge handles classes already present.
+        for plugin in plugins {
+            for (name, contents) in plugin.rbs {
+                ingest_rbs_source(&mut builder, name, contents);
+            }
+        }
+
         let (classes, toplevel_classes) = builder.finish();
         if !classes.is_empty() {
             return Self { classes, toplevel_classes };
         }
-        // Fallback: embedded empty (shouldn't happen) ⇒ hardcoded stub.
+        // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
+        // carries no plugin selectors, which stays conservative (zero-FP).
         Self::stub()
     }
 
     /// The runtime-filesystem ingest path (the `RIGOR_RBS_CORE_DIR` override):
-    /// ingest the WHOLE `dir` plus the `DEFAULT_LIBRARIES` stdlib closure rooted
-    /// at `<dir>/../stdlib`. Returns `None` when the dir is absent or nothing
-    /// parsed (caller then falls back to the embedded default / stub). This is
-    /// the same logic the default previously ran against the hardcoded path.
-    fn load_from_dir(dir: &std::path::Path) -> Option<Self> {
-        if dir.is_dir() {
-            let mut builder = Builder::default();
+    /// fold the WHOLE `dir` plus the `DEFAULT_LIBRARIES` stdlib closure rooted at
+    /// `<dir>/../stdlib` INTO `builder`. Returns `true` when the dir exists and
+    /// something parsed (so the caller knows the override is usable), `false` when
+    /// the dir is absent or nothing parsed (caller then falls back to the embedded
+    /// default). Folding into a passed-in builder (rather than building `Self`)
+    /// lets [`Self::load_with_plugins`] ingest plugin RBS on top of the SAME
+    /// builder. This is the same core/stdlib logic the default previously ran.
+    fn ingest_dir_into(builder: &mut Builder, dir: &std::path::Path) -> bool {
+        if !dir.is_dir() {
+            return false;
+        }
 
-            // 1) The WHOLE core dir (~62 files), not a curated subset — so every
-            //    core class + its full ancestor chain is loaded.
-            ingest_rbs_dir(&mut builder, &dir);
+        // 1) The WHOLE core dir (~62 files), not a curated subset — so every
+        //    core class + its full ancestor chain is loaded.
+        ingest_rbs_dir(builder, dir);
 
-            // 2) The DEFAULT_LIBRARIES stdlib set, rooted at `<core>/../stdlib`,
-            //    transitively closed over each lib's `manifest.yaml` deps (the
-            //    reference resolves these — e.g. `yaml` ⇒ `psych` ships the
-            //    `Object#to_yaml` reopen, `csv` ⇒ `stringio`). Each lib is
-            //    `stdlib/<lib>/0/*.rbs`; an absent lib (e.g. `prism`/`rbs`, or a
-            //    dep like `socket` not in this tree) is skipped silently.
-            if let Some(root) = dir.parent() {
-                let stdlib = root.join("stdlib");
-                let mut loaded: HashSet<String> = HashSet::new();
-                let mut queue: Vec<String> =
-                    DEFAULT_LIBRARIES.iter().map(|s| s.to_string()).collect();
-                while let Some(lib) = queue.pop() {
-                    if !loaded.insert(lib.clone()) {
-                        continue;
-                    }
-                    let lib_dir = stdlib.join(&lib).join("0");
-                    if !lib_dir.is_dir() {
-                        continue; // ships RBS elsewhere / not in this tree ⇒ skip.
-                    }
-                    ingest_rbs_dir(&mut builder, &lib_dir);
-                    // Enqueue manifest dependencies (transitive closure).
-                    for dep in manifest_deps(&lib_dir.join("manifest.yaml")) {
-                        if !loaded.contains(&dep) {
-                            queue.push(dep);
-                        }
+        // 2) The DEFAULT_LIBRARIES stdlib set, rooted at `<core>/../stdlib`,
+        //    transitively closed over each lib's `manifest.yaml` deps (the
+        //    reference resolves these — e.g. `yaml` ⇒ `psych` ships the
+        //    `Object#to_yaml` reopen, `csv` ⇒ `stringio`). Each lib is
+        //    `stdlib/<lib>/0/*.rbs`; an absent lib (e.g. `prism`/`rbs`, or a
+        //    dep like `socket` not in this tree) is skipped silently.
+        if let Some(root) = dir.parent() {
+            let stdlib = root.join("stdlib");
+            let mut loaded: HashSet<String> = HashSet::new();
+            let mut queue: Vec<String> =
+                DEFAULT_LIBRARIES.iter().map(|s| s.to_string()).collect();
+            while let Some(lib) = queue.pop() {
+                if !loaded.insert(lib.clone()) {
+                    continue;
+                }
+                let lib_dir = stdlib.join(&lib).join("0");
+                if !lib_dir.is_dir() {
+                    continue; // ships RBS elsewhere / not in this tree ⇒ skip.
+                }
+                ingest_rbs_dir(builder, &lib_dir);
+                // Enqueue manifest dependencies (transitive closure).
+                for dep in manifest_deps(&lib_dir.join("manifest.yaml")) {
+                    if !loaded.contains(&dep) {
+                        queue.push(dep);
                     }
                 }
             }
-
-            let (classes, toplevel_classes) = builder.finish();
-            if !classes.is_empty() {
-                return Some(Self { classes, toplevel_classes });
-            }
         }
-        None
+
+        // "Usable" means the core dir yielded at least one class. The builder may
+        // already hold classes from a prior fold, but the override is only ever
+        // ingested into a FRESH builder, so non-empty ⇒ this dir parsed.
+        !builder.classes.is_empty()
     }
 
     /// Whether the class is in the loaded set.

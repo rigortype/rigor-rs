@@ -28,6 +28,7 @@ use std::sync::OnceLock;
 
 use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 
+pub mod plugins;
 mod rbs;
 
 /// The core classes this index registers, in a fixed order. The slice index of
@@ -75,6 +76,27 @@ impl CoreIndex {
     pub fn new() -> Self {
         Self {
             data: rbs::CoreData::load(),
+        }
+    }
+
+    /// Build the index with the named config-gated plugins applied (ADR-25, the
+    /// first plugin slice). Each id in `enabled` (from `.rigor.yml`'s `plugins:`)
+    /// is resolved to a bundled RBS payload via [`plugins::bundled_plugin`]; an
+    /// UNKNOWN / unbundled id is silently ignored (never an error), matching the
+    /// reference, which simply can't load a gem it doesn't have. Resolved plugins'
+    /// RBS is ingested on top of the core surface (see
+    /// [`rbs::CoreData::load_with_plugins`]).
+    ///
+    /// **Gating:** `with_plugins(&[])` is byte-identical to [`Self::new`], so the
+    /// default no-config path stays unchanged. The plugin selectors (and the new
+    /// chained witnesses they enable) appear ONLY when a plugin is named in config.
+    pub fn with_plugins(enabled: &[String]) -> Self {
+        let resolved: Vec<&'static plugins::BundledPlugin> = enabled
+            .iter()
+            .filter_map(|id| plugins::bundled_plugin(id))
+            .collect();
+        Self {
+            data: rbs::CoreData::load_with_plugins(&resolved),
         }
     }
 
@@ -131,6 +153,31 @@ impl CoreIndex {
     /// extension absent from core `Time`'s singleton surface).
     pub fn class_has_singleton_method(&self, class_name: &str, method: &str) -> bool {
         self.data.class_has_singleton_method(class_name, method)
+    }
+
+    /// The RETURN class name of a core method, resolved over the receiver class's
+    /// flattened ancestor chain — the **instance** counterpart of the free
+    /// [`method_return`], reading THIS index's data so a config-gated plugin's
+    /// reopened return (e.g. `String#squish -> String` from
+    /// `activesupport-core-ext`) is visible. The free function reads the
+    /// plugin-unaware process-global; the analysis pipeline must use this method
+    /// so chained typing on a plugin selector witnesses correctly (ADR-25).
+    pub fn method_return(&self, class: &str, method: &str) -> Option<&'static str> {
+        self.data.method_return(class, method)
+    }
+
+    /// The RETURN class of a core method **called WITH a block**, over THIS
+    /// index's data — the instance counterpart of [`method_return_with_block`],
+    /// plugin-aware for the same reason as [`Self::method_return`].
+    pub fn method_return_with_block(&self, class: &str, method: &str) -> Option<&'static str> {
+        self.data.method_return_with_block(class, method)
+    }
+
+    /// The arity envelope `(min, max)` of a core method over THIS index's data —
+    /// the instance counterpart of [`method_arity`], plugin-aware so a config-
+    /// gated plugin's reopened method has its arity checked (ADR-25).
+    pub fn method_arity(&self, class: &str, method: &str) -> Option<(usize, Option<usize>)> {
+        self.data.method_arity(class, method)
     }
 
     // --- class registry (name <-> ClassId) -----------------------------------
@@ -242,6 +289,72 @@ fn scalar_class(scalar: &Scalar) -> &'static str {
 mod tests {
     use super::*;
     use rigor_types::Type;
+
+    #[test]
+    fn with_plugins_activesupport_core_ext_reopens_core_classes() {
+        // ADR-25 — config-gated plugin ingest. With the plugin enabled, the
+        // ActiveSupport core-extension selectors join the core surface, and their
+        // RBS return types drive chained typing. Guarded on the real RBS being
+        // loaded (the plugin reopens core classes that must already exist); under
+        // the stub fallback the plugin merge is conservative (still zero-FP).
+        let idx = CoreIndex::with_plugins(&["activesupport-core-ext".to_string()]);
+        if !idx.knows_class("String") {
+            return; // stub fallback — nothing to assert.
+        }
+
+        // Methods returning a concrete CORE class ⇒ chained witness enabled.
+        assert!(idx.class_has_method("String", "squish"));
+        assert_eq!(idx.method_return("String", "squish"), Some("String"));
+        assert!(idx.class_has_method("String", "underscore"));
+        assert_eq!(idx.method_return("String", "underscore"), Some("String"));
+        assert!(idx.class_has_method("Hash", "symbolize_keys"));
+        assert_eq!(idx.method_return("Hash", "symbolize_keys"), Some("Hash"));
+
+        // Methods returning `untyped` (Duration) ⇒ known (no direct FP) but no
+        // concrete return ⇒ chained call stays Dynamic/silent (matches reference).
+        assert!(idx.class_has_method("Integer", "minutes"));
+        assert_eq!(idx.method_return("Integer", "minutes"), None);
+
+        // Singleton (class-method) extension: `Time.current` becomes known.
+        assert!(idx.class_has_singleton_method("Time", "current"));
+
+        // Gem-name alias resolves identically.
+        let by_gem = CoreIndex::with_plugins(&["rigor-activesupport-core-ext".to_string()]);
+        assert!(by_gem.class_has_method("String", "squish"));
+        assert_eq!(by_gem.method_return("String", "squish"), Some("String"));
+        assert!(by_gem.class_has_singleton_method("Time", "current"));
+    }
+
+    #[test]
+    fn without_plugins_baseline_unchanged() {
+        // Gating: `with_plugins(&[])` AND `new()` are byte-identical — the
+        // plugin selectors are ABSENT, so the direct calls still witness (the
+        // reference, plugin-less, agrees). This is the no-regression keystone.
+        let empty = CoreIndex::with_plugins(&[]);
+        let plain = CoreIndex::new();
+        if !plain.knows_class("String") {
+            return; // stub fallback.
+        }
+        for idx in [&empty, &plain] {
+            assert!(!idx.class_has_method("String", "squish"));
+            assert_eq!(idx.method_return("String", "squish"), None);
+            assert!(!idx.class_has_method("Integer", "minutes"));
+            assert!(!idx.class_has_method("Hash", "symbolize_keys"));
+            // `Time.current` (AS extension) must be witnessed absent (no plugin).
+            assert!(!idx.class_has_singleton_method("Time", "current"));
+        }
+    }
+
+    #[test]
+    fn unknown_plugin_id_is_ignored_not_error() {
+        // An unbundled / misspelled plugin id resolves to nothing and is silently
+        // dropped — the index is the plain baseline, never an error.
+        let idx = CoreIndex::with_plugins(&["not-a-real-plugin".to_string()]);
+        if !idx.knows_class("String") {
+            return;
+        }
+        assert!(!idx.class_has_method("String", "squish"));
+    }
 
     #[test]
     fn known_string_methods_resolve() {

@@ -66,6 +66,56 @@ REFERENCE_EXE = File.join(REFERENCE_RIGOR_DIR, "exe", "rigor")
 PARITY_SEVERITIES = %w[error warning].freeze
 
 # ---------------------------------------------------------------------------
+# Plugin-enabled fixtures (ADR-25)
+# ---------------------------------------------------------------------------
+#
+# A fixture `corpus/NN_name.rb` may declare a SIDECAR config
+# `corpus/NN_name.rigor.yml`. When present, the harness runs BOTH tools with
+# that config (`--config <sidecar>`) so a config-gated plugin is exercised on
+# BOTH sides — the reference loads the plugin from the sidecar's `plugins:`
+# list, and rigor-rs ingests the matching bundled RBS. The reference also needs
+# the plugin gem's `lib/` on its `-I` load path (it `require`s the gem); the
+# rigor-rs binary has the plugin RBS vendored, so it needs only `--config`.
+#
+# Fixtures WITHOUT a sidecar (the existing 16) are unchanged: no `--config`, no
+# extra `-I` — byte-identical to before this slice.
+#
+# `PLUGIN_LIB_DIRS` maps a plugin id (as it appears in a sidecar's `plugins:`)
+# to the gem `lib/` the reference must load. NOTE: the reference `require`s the
+# id verbatim, so a sidecar MUST use the GEM-NAME spelling
+# (`rigor-activesupport-core-ext`) — the manifest-id spelling
+# (`activesupport-core-ext`) is not require-able by the reference. rigor-rs
+# normalises both, so the gem-name works for both tools. Add an entry here when
+# vendoring a new plugin's parity fixture.
+PLUGIN_LIB_DIRS = {
+  "rigor-activesupport-core-ext" =>
+    File.join(REFERENCE_RIGOR_DIR, "plugins", "rigor-activesupport-core-ext", "lib")
+}.freeze
+
+# The sidecar config path for a fixture, or `nil` if it has none. Convention:
+# `corpus/NN_name.rb` ⇒ `corpus/NN_name.rigor.yml`.
+def sidecar_config(fixture_path)
+  cfg = fixture_path.sub(/\.rb\z/, ".rigor.yml")
+  File.exist?(cfg) ? cfg : nil
+end
+
+# The `-I <lib>` flags the reference needs to `require` every plugin named in a
+# sidecar config's `plugins:` list. Returns a flat array (possibly empty).
+def reference_plugin_includes(sidecar)
+  return [] if sidecar.nil?
+
+  data = begin
+    YAML.safe_load_file(sidecar) || {}
+  rescue StandardError
+    {}
+  end
+  Array(data["plugins"]).flat_map do |id|
+    lib = PLUGIN_LIB_DIRS[id.to_s]
+    lib ? ["-I", lib] : []
+  end
+end
+
+# ---------------------------------------------------------------------------
 # Build rigor-rs if binary is absent
 # ---------------------------------------------------------------------------
 
@@ -99,13 +149,22 @@ def run_reference(fixture_path)
     # Absolute path for unambiguous matching
     abs_fixture = File.expand_path(fixture_path)
 
+    # A plugin-enabled fixture carries a sidecar `.rigor.yml`; pass it via
+    # `--config` and add each named plugin's gem `lib/` to the reference's `-I`
+    # load path so it can `require` and load the plugin. No sidecar ⇒ no extra
+    # flags ⇒ the existing fixtures run exactly as before.
+    sidecar = sidecar_config(fixture_path)
+    config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
+
     cmd = [
       "ruby",
       "-I", REFERENCE_LIB,
+      *reference_plugin_includes(sidecar),
       REFERENCE_EXE,
       "check",
       abs_fixture,
-      "--format", "json"
+      "--format", "json",
+      *config_flags
     ]
 
     stdout, _stderr, _status = Open3.capture3(*cmd, chdir: tmpdir)
@@ -135,8 +194,14 @@ end
 def run_rigor_rs(fixture_path)
   abs_fixture = File.expand_path(fixture_path)
 
+  # Mirror the reference: a sidecar `.rigor.yml` is passed via `--config` so a
+  # config-gated plugin is exercised. rigor-rs has the plugin RBS vendored, so it
+  # needs only the config (no `-I`). No sidecar ⇒ no `--config` ⇒ unchanged.
+  sidecar = sidecar_config(fixture_path)
+  config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
+
   stdout, stderr, status = Open3.capture3(
-    RIGOR_RS_BIN, "check", abs_fixture, "--format", "json"
+    RIGOR_RS_BIN, "check", abs_fixture, "--format", "json", *config_flags
   )
 
   # rigor-rs outputs the JSON array to stderr (exit 1) or stdout

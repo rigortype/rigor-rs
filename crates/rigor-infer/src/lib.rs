@@ -279,7 +279,7 @@ impl<'i> Typer<'i> {
 
         // Tier 3 (-ish): resolve receiver class -> method return class.
         if let Some(class_name) = self.index.class_name_of(interner, recv_ty) {
-            if let Some(ret_class) = rigor_index::method_return(class_name, method) {
+            if let Some(ret_class) = self.index.method_return(class_name, method) {
                 if let Some(class_id) = self.index.class_id(ret_class) {
                     return interner.intern(Type::Nominal {
                         class: class_id,
@@ -337,7 +337,7 @@ impl<'i> Typer<'i> {
         };
         // The block-overload return for `class_name#method`. `None` ⇒ the block
         // form isn't precisely modeled ⇒ decline to Dynamic (silent).
-        let Some(ret_class) = rigor_index::method_return_with_block(class_name, method) else {
+        let Some(ret_class) = self.index.method_return_with_block(class_name, method) else {
             return interner.untyped();
         };
         match self.index.class_id(ret_class) {

@@ -138,8 +138,11 @@ project-RBS / plugins):
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 211. **Parity:** `run.rb` PASS (16 fixtures), 0 FP; `run_corpus.rb` validated to **3829 real
-  files, 0 FP, 542/542 matched** (100% precision; embedded RBS == runtime path, byte-identical).
+- **Tests:** 252. **Parity:** `run.rb` PASS (18 fixtures incl. the plugin-enabled +
+  gate-guard pair), 0 FP; `run_corpus.rb` validated to **3829 real files, 0 FP, 542/542
+  matched** (100% precision; embedded RBS == runtime path, byte-identical) — and the
+  default (no-config) corpus is **byte-unchanged with the first plugin slice landed**,
+  proving config-gating doesn't regress the default path.
 - **Works today:** `rigor check [--format text|json] <file…>` →
   `call.undefined-method` (literals, chained calls, post-fold, **core `X.new`
   instances** like `Array.new`, **interpolated strings/heredocs**, and **class-method
@@ -337,9 +340,37 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   severity re-stamp post-pool; workers precedence. (Salsa deferred — empirical trigger only.)
 
 ### 10. Plugins — `lib/rigor/plugin/` + `plugins/` (31) → (ADR-0013/0027)
-- ⬜ Plugin trait (`node_rule`/`dynamic_return`/`type_specifier` + NodeContext + FactStore topo-sort
-  + manifest fields); sidecar-hosted Ruby plugin runner (strangler default) + IoBoundary/TrustPolicy;
-  native-Rust ports, hottest-first (Rails family). **This is where most real-code coverage lives.**
+- ✅ **First plugin slice landed — `rigor-activesupport-core-ext` (PURE-RBS via
+  `signature_paths:` ingest, config-gated; ADR-25).** The highest-leverage Rails plugin
+  ships NO analyzer code: its whole contribution is a bundled `core_ext.rbs` that reopens
+  core classes (Object/String/Integer/Float/Time/Date/DateTime/Array/Hash/Enumerable/Nil/
+  True/FalseClass) with ~40 of the most-flagged ActiveSupport selectors (`blank?`/`squish`/
+  `underscore`/`pluralize`/`minutes`/`days`/`current`/`symbolize_keys`/`second`/…). The
+  reference's RBS is **vendored byte-for-byte** (`crates/rigor-index/vendor/plugins/`, see
+  its `PROVENANCE.md`), embedded via `include_str!` (`rigor-index/src/plugins.rs`), and
+  ingested on top of the embedded core via the SAME `ruby-rbs` parser + `Builder::merge`
+  reopen-union seam (`CoreData::load_with_plugins`). **Config-gated end-to-end:**
+  `.rigor.yml`'s `plugins:` → `Config::plugins` → `CoreIndex::with_plugins(&cfg.plugins)`
+  (only at `main.rs`'s `check` index build). Gem-name ↔ manifest-id normalised in
+  `bundled_plugin()` (`rigor-activesupport-core-ext` and `activesupport-core-ext` both
+  resolve); unknown ids are silently ignored. The instance `CoreIndex::method_return /
+  _with_block / method_arity` (routed through `self.index` in `rigor-infer`/`rigor-rules`,
+  replacing the plugin-unaware process-global free fns) carry the plugin returns into
+  chained typing, so `"x".squish.foo` witnesses `foo' for String` — byte-identical to the
+  reference with the plugin loaded. **Zero-FP & gating proven:** the default (no-config)
+  corpus stays **3829 files / 542 matched / 0 FP** (byte-unchanged), and the 16 existing
+  fixtures are untouched; the win shows only on the plugin-enabled fixture pair (A: chained
+  witness with config; B: gate guard — the 3 direct calls still flag with no config). The
+  harness gained a minimal sidecar mechanism: a fixture `NN.rb` with a sibling `NN.rigor.yml`
+  passes `--config` to BOTH tools (reference also gets `-I <plugin lib>`; sidecar uses the
+  **gem-name** spelling, the only form the reference can `require`).
+- ⬜ **Deferred** (this slice needed NONE of it): the Plugin trait
+  (`node_rule`/`dynamic_return`/`type_specifier` + NodeContext + FactStore topo-sort +
+  `open_receivers` + manifest fields beyond `signature_paths:`); the sidecar-hosted Ruby
+  plugin runner (strangler default) + IoBoundary/TrustPolicy; the other ~30 plugins;
+  native-Rust analyzer ports, hottest-first (Rails family). **This is where most remaining
+  real-code coverage lives.** Next pure-RBS candidates by survey frequency: the rest of the
+  Rails family (`rigor-rails-*`), then the analyzer-bearing plugins once the trait lands.
 
 ### 11. CLI commands — `lib/rigor/cli.rb` → `rigor-cli` (ADR-0015)
 - ✅ Full surface presented; unimplemented commands report clearly. ✅ `check`
@@ -386,7 +417,8 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   auto-detection.
 
 ### 14. Parity harness & QA (ADR-0002/0011)
-- ✅ `harness/run.rb` (fixture gate, 12 fixtures incl. alias regression) + divergence-registry.
+- ✅ `harness/run.rb` (fixture gate, 18 fixtures incl. alias regression + the ADR-25
+  plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars) + divergence-registry.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
 - ⬜ Continuous corpus growth (new fixtures per rule/feature); snapshot mode (pin reference,
   commit expected JSON) for CI without a Ruby runtime (ADR-0002).

@@ -176,7 +176,13 @@ fn analyze_files(
     verb: &str,
 ) -> (Vec<(usize, String, String, Diagnostic)>, bool) {
     let disable_matcher = cfg.disable_matcher();
-    let index = CoreIndex::new();
+    // ADR-25 — config-gated plugins. With no `plugins:` in `.rigor.yml` this is
+    // byte-identical to `CoreIndex::new()` (empty list ⇒ default no-config path),
+    // so the differential harness + default corpus run are unaffected. A named,
+    // bundled plugin (e.g. `activesupport-core-ext`) reopens core classes with
+    // its RBS selectors, suppressing the direct calls and enabling chained
+    // witnesses — matching the reference, which loads plugins only from config.
+    let index = CoreIndex::with_plugins(&cfg.plugins);
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).
     let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();
     let mut had_io_error = false;

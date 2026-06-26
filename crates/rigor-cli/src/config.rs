@@ -33,6 +33,14 @@ pub struct Config {
     pub disable: Vec<String>,
     /// Path glob patterns whose matching files are skipped entirely.
     pub exclude: Vec<String>,
+    /// Config-gated plugins to activate (ADR-25), as listed under `.rigor.yml`'s
+    /// `plugins:`. Each entry is a plugin id — either the gem name
+    /// (`rigor-activesupport-core-ext`) or the manifest id
+    /// (`activesupport-core-ext`); `rigor_index::CoreIndex::with_plugins`
+    /// normalises and resolves them, ignoring any that aren't bundled. The
+    /// reference discovers plugins ONLY from this list (no Gemfile auto-detect),
+    /// so the default (no-config) corpus run is unaffected.
+    pub plugins: Vec<String>,
     /// ADR-22 baseline path. `baseline: <path>` activates a baseline for
     /// `check`; `baseline: false` is the explicit-disable form. Absent / `null`
     /// means no baseline. Deserialized as an untyped value so both the string
@@ -138,6 +146,26 @@ mod tests {
         let cfg: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(cfg.disable, vec!["undefined-method"]);
         assert!(cfg.exclude.is_empty());
+    }
+
+    #[test]
+    fn parses_plugins_list() {
+        // ADR-25: `plugins:` is a typed list of plugin ids. Both the gem-name
+        // and manifest-id spellings are accepted at the config layer (the
+        // index's `with_plugins` normalises gem-name ↔ manifest-id).
+        let yaml = "plugins:\n  - rigor-activesupport-core-ext\n  - activesupport-core-ext\n";
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.plugins,
+            vec!["rigor-activesupport-core-ext", "activesupport-core-ext"]
+        );
+    }
+
+    #[test]
+    fn absent_plugins_is_empty() {
+        // No `plugins:` key ⇒ empty list ⇒ the default no-config path (gating).
+        let cfg: Config = serde_yaml::from_str("disable: []\n").unwrap();
+        assert!(cfg.plugins.is_empty());
     }
 
     #[test]

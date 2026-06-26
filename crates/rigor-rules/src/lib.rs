@@ -376,7 +376,7 @@ fn check_wrong_arity(
     }
 
     // A known arity envelope is required — never guess on an unmodeled method.
-    let (min, max) = rigor_index::method_arity(class_name, method)?;
+    let (min, max) = index.method_arity(class_name, method)?;
 
     let given = args.len();
     let too_few = given < min;
