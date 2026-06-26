@@ -40,7 +40,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
-use rigor_parse::{LoweredAst, MethodBody, Node};
+use rigor_parse::{LoweredAst, MethodBody, Node, NodeId, Visibility};
 use rigor_types::{ClassId, Interner};
 
 /// The first [`ClassId`] handed out by the per-run registry. Chosen well above
@@ -48,6 +48,12 @@ use rigor_types::{ClassId, Interner};
 /// registered instance's nominal id can never be mistaken for a core class by
 /// `CoreIndex::class_name_for_id`. A million-id gap is ample headroom.
 pub const SOURCE_CLASS_BASE: u32 = 1_000_000;
+
+/// ADR-35 slice 1: the visited-node cap on the override-visibility ancestor
+/// walk ([`SourceIndex::nearest_ancestor_defining`]). Matches the reference's
+/// `OVERRIDE_ANCESTOR_WALK_LIMIT`. Past it the walk declines (a missed witness,
+/// never a false positive) rather than risk a runaway on a pathological graph.
+pub const OVERRIDE_ANCESTOR_WALK_LIMIT: usize = 100;
 
 /// Per-class structure harvested from source: own instance methods + superclass.
 #[derive(Default, Clone)]
@@ -59,6 +65,30 @@ struct SourceClass {
     /// no `< X` clause was written ⇒ the implicit super is `Object` (a fully
     /// loaded RBS root), so a no-super source class HAS a complete chain.
     superclass: Option<String>,
+}
+
+/// ADR-35 slice 1: per-class override data keyed by FULLY LEXICALLY-QUALIFIED
+/// name (`IssuableFinder::Params`, not the collapsed `Params` the bare
+/// [`SourceClass`] map uses). Lexical qualification is the zero-FP keystone for
+/// `def.override-visibility-reduced`: distinct namespaced classes/modules that
+/// share a last component (`Groups::Params`, `Integrations::Params`,
+/// `IssuableFinder::Params`) must NOT merge into one ancestor — collapsing them
+/// invented phantom overrides (the gitlab-foss FP cluster). The ancestor walk
+/// resolves `include` / `superclass` names against the subclass's lexical
+/// nesting and matches ONLY a precisely-qualified project class.
+#[derive(Default, Clone)]
+struct OverrideClass {
+    /// Fully-qualified superclass NAME as WRITTEN (`< Foo::Bar` keeps `Foo::Bar`;
+    /// `< Bar` keeps `Bar`), resolved against lexical nesting at walk time.
+    superclass: Option<String>,
+    /// `include` / `prepend` names as WRITTEN, in source order.
+    includes: Vec<String>,
+    /// The discovered instance-method VISIBILITY table. First-write-wins on
+    /// reopen (mirrors the reference accumulator's stable cross-file view).
+    method_visibilities: HashMap<String, Visibility>,
+    /// Instance-method names defined directly (any visibility) — the existence
+    /// set the walk stops on. Mirrors `SourceClass::methods` but lexically keyed.
+    methods: HashSet<String>,
 }
 
 /// The per-run source-class index + instance-class registry. Built once per file.
@@ -94,6 +124,10 @@ pub struct SourceIndex {
     /// two (a tail is either param-rooted or not). Same cross-file NAME keying and
     /// the same reopen-disagreement decline apply.
     param_bound_returns: HashMap<(String, String), ParamBoundReturn>,
+    /// ADR-35 slice 1: the lexically-qualified override index for
+    /// `def.override-visibility-reduced` (see [`OverrideClass`]). Keyed by FULL
+    /// qualified name to avoid the last-component name-collision merge.
+    override_classes: HashMap<String, OverrideClass>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
@@ -158,6 +192,16 @@ impl SourceIndex {
                     _ => {}
                 }
             }
+        }
+
+        // Pass 1b (ADR-35 slice 1): build the LEXICALLY-QUALIFIED override index
+        // by a recursive walk of each file's AST with a nesting stack, so a
+        // nested `module Params` is keyed `Outer::Params` (not the collapsed
+        // `Params`). This is what keeps the override-visibility rule free of the
+        // name-collision false positives. Kept entirely separate from the
+        // collapsed `classes` map above — no other rule is affected.
+        for ast in asts {
+            idx.collect_override_classes(ast, ast.root(), &[]);
         }
 
         // Pass 2: register an instance-class id for every `ConstantRead` whose
@@ -274,6 +318,223 @@ impl SourceIndex {
         match interner.get(ty) {
             rigor_types::Type::Nominal { class, .. } => self.class_name_for_id(*class),
             _ => None,
+        }
+    }
+
+    /// ADR-35 slice 1: the discovered instance-method VISIBILITY of `method` on
+    /// the QUALIFIED project class `class` (its OWN table only — not inherited).
+    /// `None` when `class` is not in the override index or does not record
+    /// `method`.
+    pub fn method_visibility(&self, class: &str, method: &str) -> Option<Visibility> {
+        self.override_classes
+            .get(class)
+            .and_then(|c| c.method_visibilities.get(method).copied())
+    }
+
+    /// ADR-35 slice 1: the NEAREST project ancestor of the QUALIFIED class
+    /// `class` that DEFINES the instance method `method`, paired with that
+    /// ancestor's discovered visibility for `method` (`None` when the ancestor
+    /// defines the method but its visibility is UNKNOWN — e.g. `private def` /
+    /// dynamic form).
+    ///
+    /// MRO-ordered breadth-first walk over the LEXICALLY-QUALIFIED override index:
+    /// included / prepended modules FIRST, then the superclass (Ruby's MRO
+    /// ordering). Each ancestor name is resolved against the subclass's lexical
+    /// nesting (the reference's `resolve_override_ancestor_name`) and dropped if
+    /// it names no PROJECT class (RBS / third-party ancestors are NOT walked —
+    /// slice-1 carve-out). Cycle-guarded and capped at
+    /// [`OVERRIDE_ANCESTOR_WALK_LIMIT`] visited nodes (returns `None` past the cap
+    /// — a missed witness, never an FP).
+    ///
+    /// An ancestor DEFINES `method` when it appears in that ancestor's own
+    /// `methods` set OR its `method_visibilities` table; the walk STOPS at the
+    /// first such ancestor.
+    ///
+    /// ## The zero-FP keystones (do NOT weaken)
+    ///
+    /// 1. **Lexical qualification.** The index is keyed by FULL qualified name, so
+    ///    a nested `module Params` in `IssuableFinder` is `IssuableFinder::Params`
+    ///    — it never merges with `Groups::Params`. Collapsing them invented
+    ///    phantom ancestors / methods (the gitlab-foss FP cluster).
+    /// 2. **Never synthesize Public.** The returned visibility is the ancestor's
+    ///    RECORDED entry or `None`. The caller must treat `None` as "cannot prove
+    ///    a reduction" and STAY SILENT — never fabricate `Public` from a missing
+    ///    entry (the reference's Mastodon 160 → 35 cluster).
+    pub fn nearest_ancestor_defining(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<(String, Option<Visibility>)> {
+        let mut queue: Vec<String> = self.override_ancestor_names(class);
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(class.to_string());
+        let mut visited = 0usize;
+
+        while !queue.is_empty() {
+            let current = queue.remove(0);
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            visited += 1;
+            if visited > OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return None; // cap exceeded ⇒ decline (never an FP).
+            }
+            if let Some(entry) = self.override_classes.get(&current) {
+                let defines = entry.methods.contains(method)
+                    || entry.method_visibilities.contains_key(method);
+                if defines {
+                    // Stop at the nearest defining ancestor; its visibility may be
+                    // None (unknown) — the caller treats unknown as "cannot prove".
+                    return Some((current.clone(), entry.method_visibilities.get(method).copied()));
+                }
+                // Not defined here ⇒ enqueue this ancestor's own ancestors.
+                for next in self.override_ancestor_names(&current) {
+                    queue.push(next);
+                }
+            }
+        }
+        None
+    }
+
+    /// The direct PROJECT ancestors of the QUALIFIED `class`, resolved + ordered:
+    /// each `include` / `prepend` (in source order) FIRST, then the `superclass`
+    /// — Ruby's MRO ordering. Names that resolve to no project class (RBS /
+    /// third-party) are dropped (slice-1 carve-out).
+    fn override_ancestor_names(&self, class: &str) -> Vec<String> {
+        let Some(entry) = self.override_classes.get(class) else {
+            return Vec::new();
+        };
+        let mut names = Vec::new();
+        for inc in &entry.includes {
+            if let Some(resolved) = self.resolve_override_ancestor(class, inc) {
+                names.push(resolved);
+            }
+        }
+        if let Some(sup) = &entry.superclass {
+            if let Some(resolved) = self.resolve_override_ancestor(class, sup) {
+                names.push(resolved);
+            }
+        }
+        names
+    }
+
+    /// Resolve an as-written ancestor name against the subclass's lexical
+    /// nesting, returning the QUALIFIED project class name it names, or `None` if
+    /// it names no project class. Mirrors the reference's
+    /// `resolve_override_ancestor_name`: try `<prefix>::<raw>` for each enclosing
+    /// scope of the subclass, longest-prefix first, falling back to the bare name.
+    /// A leading `::` on the raw name is stripped (a top-level absolute path).
+    fn resolve_override_ancestor(&self, subclass: &str, raw: &str) -> Option<String> {
+        let raw = raw.strip_prefix("::").unwrap_or(raw);
+        let segments: Vec<&str> = subclass.split("::").collect();
+        // Drop the subclass's own last segment; try its enclosing scopes
+        // longest-first, then the top level (bare `raw`).
+        for i in (0..segments.len()).rev() {
+            let candidate = if i == 0 {
+                raw.to_string()
+            } else {
+                format!("{}::{}", segments[..i].join("::"), raw)
+            };
+            if self.override_classes.contains_key(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+
+    /// ADR-35 slice 1: recursively collect the LEXICALLY-QUALIFIED override
+    /// classes from `ast`, starting at `node` under the lexical `prefix` (the
+    /// enclosing class/module name segments). A `ClassDef`/`ModuleDef` contributes
+    /// an [`OverrideClass`] keyed by `prefix + name`, then recurses into its body
+    /// with the extended prefix so a nested class/module is fully qualified. Other
+    /// nodes recurse over their direct children only enough to reach nested
+    /// class/module bodies (handled via the explicit body lists below).
+    ///
+    /// First-write-wins on reopen / cross-file for visibilities + superclass
+    /// (mirrors the reference's stable accumulator); methods + includes accumulate.
+    fn collect_override_classes(&mut self, ast: &LoweredAst, node: NodeId, prefix: &[String]) {
+        match ast.get(node) {
+            Node::Program { body, .. } | Node::Statements { body, .. } => {
+                for &child in body {
+                    self.collect_override_classes(ast, child, prefix);
+                }
+            }
+            Node::ClassDef {
+                name,
+                superclass_path,
+                methods,
+                method_visibilities,
+                includes,
+                body,
+                ..
+            } => {
+                if name.is_empty() {
+                    return;
+                }
+                let qualified = qualify(prefix, name);
+                self.ingest_override_class(
+                    &qualified,
+                    superclass_path.clone(),
+                    methods,
+                    method_visibilities,
+                    includes,
+                );
+                let child_prefix = split_qualified(&qualified);
+                for &child in body {
+                    self.collect_override_classes(ast, child, &child_prefix);
+                }
+            }
+            Node::ModuleDef {
+                name,
+                methods,
+                method_visibilities,
+                includes,
+                body,
+                ..
+            } => {
+                if name.is_empty() {
+                    return;
+                }
+                let qualified = qualify(prefix, name);
+                self.ingest_override_class(&qualified, None, methods, method_visibilities, includes);
+                let child_prefix = split_qualified(&qualified);
+                for &child in body {
+                    self.collect_override_classes(ast, child, &child_prefix);
+                }
+            }
+            // Any other node: a nested class/module only appears as a DIRECT body
+            // statement of a class/module/program (mirroring the reference's
+            // `record_def_visibility`/qualification, which only qualifies through
+            // class/module bodies). We deliberately do NOT descend into method
+            // bodies / control flow — a def-nested class is out of slice-1 scope.
+            _ => {}
+        }
+    }
+
+    /// Fold one (re)definition of a QUALIFIED override class into the index.
+    fn ingest_override_class(
+        &mut self,
+        qualified: &str,
+        superclass: Option<String>,
+        methods: &[String],
+        method_visibilities: &[(String, Visibility)],
+        includes: &[String],
+    ) {
+        let entry = self.override_classes.entry(qualified.to_string()).or_default();
+        if entry.superclass.is_none() {
+            entry.superclass = superclass;
+        }
+        for m in methods {
+            entry.methods.insert(m.clone());
+        }
+        // First-write-wins per method name (stable cross-file view).
+        for (m, vis) in method_visibilities {
+            entry.method_visibilities.entry(m.clone()).or_insert(*vis);
+        }
+        for inc in includes {
+            if !entry.includes.contains(inc) {
+                entry.includes.push(inc.clone());
+            }
         }
     }
 
@@ -559,6 +820,24 @@ fn infer_one_param_bound(ast: &LoweredAst, mb: &MethodBody) -> Option<ParamBound
     }
 }
 
+/// ADR-35 slice 1: join a lexical `prefix` and a (possibly already-namespaced)
+/// declaration `name` into a fully-qualified name. A `name` that is itself a
+/// path (`Foo::Bar` declared inside `Outer`) qualifies to `Outer::Foo::Bar`,
+/// matching Ruby's lexical constant resolution for the declaration head.
+fn qualify(prefix: &[String], name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{}", prefix.join("::"), name)
+    }
+}
+
+/// Split a qualified name into its segment vector (`"A::B" -> ["A", "B"]`), used
+/// as the child lexical prefix when recursing into a class/module body.
+fn split_qualified(qualified: &str) -> Vec<String> {
+    qualified.split("::").map(|s| s.to_string()).collect()
+}
+
 /// Whether a tail node is a branch/loop carrier whose type is not a single
 /// concrete class (gate 4). `BeginRescue` also covers a lowered parenthesized
 /// expression and an inline `rescue` body — both decline conservatively.
@@ -822,6 +1101,168 @@ mod tests {
         let a1 = lower_src(b"class C\n  def m(a, b)\n    b\n  end\nend\n");
         let idx = SourceIndex::build_project(&[&a0, &a1], &core);
         assert_eq!(idx.param_bound_return("C", "m"), None);
+    }
+
+    // --- ADR-35 slice 1: override-visibility ancestor walk -------------------
+
+    #[test]
+    fn method_visibility_reads_own_table() {
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class C\n  def a\n  end\n  private\n  def b\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.method_visibility("C", "a"), Some(Visibility::Public));
+        assert_eq!(idx.method_visibility("C", "b"), Some(Visibility::Private));
+        assert_eq!(idx.method_visibility("C", "missing"), None);
+    }
+
+    #[test]
+    fn nearest_ancestor_walks_superclass() {
+        // B < A; A defines `foo` (public). The nearest ancestor of B defining
+        // `foo` is A with Public.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class A\n  def foo\n  end\nend\nclass B < A\n  private\n  def foo\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(
+            idx.nearest_ancestor_defining("B", "foo"),
+            Some(("A".to_string(), Some(Visibility::Public)))
+        );
+    }
+
+    #[test]
+    fn nearest_ancestor_prefers_included_module_over_superclass() {
+        // B includes M and is < A; both define `foo`. MRO ⇒ the included module
+        // M is the nearest ancestor.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module M\n  def foo\n  end\nend\nclass A\n  def foo\n  end\nend\nclass B < A\n  include M\n  def bar\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(
+            idx.nearest_ancestor_defining("B", "foo"),
+            Some(("M".to_string(), Some(Visibility::Public)))
+        );
+    }
+
+    #[test]
+    fn nearest_ancestor_none_when_no_project_ancestor_defines() {
+        // B < A but A does not define `foo` ⇒ no defining ancestor.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class A\n  def other\n  end\nend\nclass B < A\n  def foo\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.nearest_ancestor_defining("B", "foo"), None);
+    }
+
+    #[test]
+    fn nearest_ancestor_skips_rbs_third_party_super() {
+        // `class B < ApplicationRecord` — the super is not a project source class
+        // ⇒ dropped ⇒ no defining ancestor (RBS-ancestor carve-out).
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"class B < ApplicationRecord\n  private\n  def foo\n  end\nend\n", &core);
+        assert_eq!(idx.nearest_ancestor_defining("B", "foo"), None);
+    }
+
+    #[test]
+    fn nearest_ancestor_returns_unknown_visibility_for_methods_only_entry() {
+        // The keystone path: an ancestor that DEFINES the method (in `methods`)
+        // but has NO visibility-table entry returns `(ancestor, None)` — the rule
+        // layer must NOT synthesize Public from this. We construct a methods-only
+        // entry directly (the public lowering keeps the two tables in lockstep, so
+        // this exercises the data path that the "never synthesize Public" gate
+        // guards against).
+        let core = CoreIndex::new();
+        let mut idx = SourceIndex::build(&lower_src(b"class B < A\n  def foo\n  end\nend\n"), &core);
+        // Seed override class `A` with `foo` in `methods` only (no vis entry).
+        idx.override_classes.insert(
+            "A".to_string(),
+            OverrideClass {
+                superclass: None,
+                includes: Vec::new(),
+                method_visibilities: HashMap::new(),
+                methods: ["foo".to_string()].into_iter().collect(),
+            },
+        );
+        assert_eq!(
+            idx.nearest_ancestor_defining("B", "foo"),
+            Some(("A".to_string(), None))
+        );
+    }
+
+    #[test]
+    fn nearest_ancestor_does_not_merge_namespace_collisions() {
+        // The gitlab-foss FP root cause: a controller includes `Groups::Params`
+        // (which defines `group_params`, not `group`), while a DIFFERENT
+        // `IssuableFinder::Params` defines a private `group`. With lexical
+        // qualification the include resolves to `Groups::Params` ONLY, so `group`
+        // has no project ancestor here ⇒ None (no phantom override).
+        let core = CoreIndex::new();
+        let groups_params = lower_src(
+            b"module Groups\n  module Params\n    def group_params\n    end\n  end\nend\n",
+        );
+        let finder_params = lower_src(
+            b"module IssuableFinder\n  module Params\n    private\n    def group\n    end\n  end\nend\n",
+        );
+        let controller = lower_src(
+            b"module Organizations\n  class GroupsController\n    include Groups::Params\n    private\n    def group\n    end\n  end\nend\n",
+        );
+        let idx = SourceIndex::build_project(
+            &[&groups_params, &finder_params, &controller],
+            &core,
+        );
+        // The controller's `group` has NO project ancestor defining it (the
+        // included `Groups::Params` lacks `group`; `IssuableFinder::Params` is not
+        // an ancestor) ⇒ silent. This is the precise zero-FP guarantee.
+        assert_eq!(
+            idx.nearest_ancestor_defining("Organizations::GroupsController", "group"),
+            None
+        );
+    }
+
+    #[test]
+    fn nearest_ancestor_resolves_namespaced_include_path() {
+        // `include Groups::Params` from a class in a different namespace resolves
+        // to the fully-qualified `Groups::Params` (which DOES define the method).
+        let core = CoreIndex::new();
+        let m = lower_src(b"module Groups\n  module Params\n    def gp\n    end\n  end\nend\n");
+        let c = lower_src(
+            b"module Organizations\n  class Ctrl\n    include Groups::Params\n    private\n    def gp\n    end\n  end\nend\n",
+        );
+        let idx = SourceIndex::build_project(&[&m, &c], &core);
+        assert_eq!(
+            idx.nearest_ancestor_defining("Organizations::Ctrl", "gp"),
+            Some(("Groups::Params".to_string(), Some(Visibility::Public)))
+        );
+    }
+
+    #[test]
+    fn nearest_ancestor_cross_file_via_build_project() {
+        // Parent A in file 0, subclass B in file 1 — the project build seeds both,
+        // so the walk resolves A across files.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"class A\n  def foo\n  end\nend\n");
+        let a1 = lower_src(b"class B < A\n  private\n  def foo\n  end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert_eq!(
+            idx.nearest_ancestor_defining("B", "foo"),
+            Some(("A".to_string(), Some(Visibility::Public)))
+        );
+    }
+
+    #[test]
+    fn nearest_ancestor_cycle_guarded() {
+        // A < B and B < A (pathological cycle) — the walk terminates (None, no
+        // panic/loop) when neither defines the method.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"class A < B\n  def x\n  end\nend\n");
+        let a1 = lower_src(b"class B < A\n  def y\n  end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert_eq!(idx.nearest_ancestor_defining("A", "foo"), None);
     }
 
     #[test]

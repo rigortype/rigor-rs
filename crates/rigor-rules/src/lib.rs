@@ -109,6 +109,13 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "medium",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-dead-assignment",
         }),
+        DEF_OVERRIDE_VISIBILITY_REDUCED => Some(&RuleEntry {
+            default_severity: Severity::Warning,
+            // The oracle stamps this rule `high` (a purely structural Liskov
+            // signature check over the project ancestor chain); mirror exactly.
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-override-visibility-reduced",
+        }),
         _ => None,
     }
 }
@@ -135,6 +142,16 @@ pub const CALL_POSSIBLE_NIL_RECEIVER: &str = "call.possible-nil-receiver";
 /// check (no flow-sensitive scopes, no typer/folding), mirroring the reference's
 /// `DeadAssignmentCollector` exactly.
 pub const FLOW_DEAD_ASSIGNMENT: &str = "flow.dead-assignment";
+
+/// `def.override-visibility-reduced` (ADR-35 slice 1): an instance-method
+/// override whose visibility is STRICTLY MORE RESTRICTIVE than the nearest
+/// project-source ancestor method it overrides (public→protected/private or
+/// protected→private), breaking substitutability. A purely STRUCTURAL def-family
+/// check (no typer, no flow scopes, no unions): the override visibility is read
+/// from the source-discovered table and the parent is resolved over the
+/// project-source ancestor chain (RBS / third-party ancestors are a deferred
+/// follow-on). Mirrors the reference's `override_visibility_diagnostic` exactly.
+pub const DEF_OVERRIDE_VISIBILITY_REDUCED: &str = "def.override-visibility-reduced";
 
 // ---------------------------------------------------------------------------
 // analyze()
@@ -243,7 +260,189 @@ pub fn analyze_with_source(
         }
     }
 
+    // Third pass — `def.override-visibility-reduced` (ADR-35 slice 1). A purely
+    // STRUCTURAL def-family check: iterate every `ClassDef`/`ModuleDef`, and for
+    // each instance method in its discovered visibility table, fire iff the
+    // override strictly REDUCES the visibility of the nearest project ancestor
+    // method it overrides. The override span is the method-NAME token of the
+    // matching `Definition` in the class body. The OVERRIDING class is identified
+    // by its FULLY LEXICALLY-QUALIFIED name (so the project-wide qualified
+    // override index resolves its ancestors precisely — the zero-FP keystone).
+    // See `check_override_visibility` for the full gate.
+    let qualified_names = qualified_class_names(ast);
+    for (class_id, node) in ast.iter() {
+        let (body, method_visibilities) = match node {
+            Node::ClassDef { name, body, method_visibilities, .. }
+            | Node::ModuleDef { name, body, method_visibilities, .. }
+                if !name.is_empty() =>
+            {
+                (body, method_visibilities)
+            }
+            _ => continue,
+        };
+        let Some(qualified) = qualified_names.get(&class_id) else {
+            continue; // un-namable ⇒ skip.
+        };
+        // Iterate the class body's DIRECT named `Definition` children (the
+        // overriding defs), anchoring on each one's name token. A def's recorded
+        // visibility comes from the per-node table (by name); a method-name with
+        // no direct Definition child (e.g. the untracked `private def foo` form,
+        // whose def is a call argument, not a body statement) is simply not seen
+        // here — which is correct (that form is silent anyway).
+        for &child_id in body {
+            let Node::Definition {
+                name: Some(method),
+                name_span: Some(name_span),
+                ..
+            } = ast.get(child_id)
+            else {
+                continue;
+            };
+            let Some(override_vis) = method_visibilities
+                .iter()
+                .find(|(m, _)| m == method)
+                .map(|(_, v)| *v)
+            else {
+                continue; // not in the table (singleton / untracked) ⇒ silent.
+            };
+            if let Some(diag) =
+                check_override_visibility(source, qualified, method, override_vis, *name_span)
+            {
+                out.push(diag);
+            }
+        }
+    }
+
     out
+}
+
+/// ADR-35 slice 1: map every `ClassDef`/`ModuleDef` arena id to its FULLY
+/// LEXICALLY-QUALIFIED name (`module Outer; module Inner` -> `Inner` maps to
+/// `Outer::Inner`), by a recursive walk from the program root tracking the
+/// enclosing class/module prefix. This is the SAME qualification the source
+/// index's override walk uses, so a subclass and its ancestors key consistently
+/// — the zero-FP keystone against last-component name collisions. A declaration
+/// whose name is itself a path (`class Foo::Bar`) qualifies head-first.
+fn qualified_class_names(ast: &LoweredAst) -> std::collections::HashMap<rigor_parse::NodeId, String> {
+    let mut map = std::collections::HashMap::new();
+    walk_qualified(ast, ast.root(), &[], &mut map);
+    map
+}
+
+fn walk_qualified(
+    ast: &LoweredAst,
+    node: rigor_parse::NodeId,
+    prefix: &[String],
+    map: &mut std::collections::HashMap<rigor_parse::NodeId, String>,
+) {
+    match ast.get(node) {
+        Node::Program { body, .. } | Node::Statements { body, .. } => {
+            for &child in body {
+                walk_qualified(ast, child, prefix, map);
+            }
+        }
+        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+            if name.is_empty() {
+                return;
+            }
+            let qualified = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{}::{}", prefix.join("::"), name)
+            };
+            let child_prefix: Vec<String> =
+                qualified.split("::").map(|s| s.to_string()).collect();
+            map.insert(node, qualified);
+            for &child in body {
+                walk_qualified(ast, child, &child_prefix, map);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The numeric rank of a visibility under the `public > protected > private`
+/// ordering (ADR-35 slice 1). A STRICTLY lower override rank than the parent's
+/// is a reduction. Mirrors the reference's `VISIBILITY_RANK`.
+fn visibility_rank(v: rigor_parse::Visibility) -> u8 {
+    match v {
+        rigor_parse::Visibility::Public => 2,
+        rigor_parse::Visibility::Protected => 1,
+        rigor_parse::Visibility::Private => 0,
+    }
+}
+
+/// Render a visibility as the reference spells it in the diagnostic message
+/// (lowercase, NO colon): `public` / `protected` / `private`.
+fn visibility_word(v: rigor_parse::Visibility) -> &'static str {
+    match v {
+        rigor_parse::Visibility::Public => "public",
+        rigor_parse::Visibility::Protected => "protected",
+        rigor_parse::Visibility::Private => "private",
+    }
+}
+
+/// Apply `def.override-visibility-reduced` to one overriding instance method.
+///
+/// Fires (returns `Some`) iff ALL of these hold — each `None` is a DECLINE (a
+/// missed witness, NEVER a false positive):
+///
+///   1. The override is an instance method present in the visibility table
+///      (`override_vis` — singleton defs are excluded upstream by lowering).
+///   2. [`SourceIndex::nearest_ancestor_defining`] finds a PROJECT-source
+///      ancestor that defines `method` (RBS / third-party ancestors are not
+///      walked — slice-1 carve-out; an unresolvable / absent ancestor declines).
+///   3. **The parent visibility is KNOWN (`Some`).** We NEVER synthesize `Public`
+///      from a missing/absent ancestor visibility entry — this is THE documented
+///      false-positive cluster in the reference (Mastodon 160 → 35). Only compare
+///      when the nearest defining ancestor genuinely records the method in its
+///      visibility table.
+///   4. The override's rank is STRICTLY LOWER than the parent's
+///      (`rank(override) < rank(parent)`). Same-or-wider (a widening
+///      `private→protected`, `protected→public`) declines.
+///
+/// The diagnostic anchors on the overriding def's name token (`name_span`) and
+/// reproduces the reference's byte-exact message:
+/// `` visibility of `m' reduced from <parent> to <override> (overrides
+/// Parent#m); breaks substitutability ``.
+fn check_override_visibility(
+    source: &rigor_infer::SourceIndex,
+    // The FULLY LEXICALLY-QUALIFIED name of the overriding class (e.g.
+    // `Organizations::GroupsController`), so the ancestor walk resolves against
+    // the project-wide qualified override index precisely.
+    qualified_class: &str,
+    method: &str,
+    override_vis: rigor_parse::Visibility,
+    name_span: (usize, usize),
+) -> Option<Diagnostic> {
+    // Gate 2: a project ancestor must DEFINE the method.
+    let (parent_class, parent_vis) = source.nearest_ancestor_defining(qualified_class, method)?;
+    // Gate 3 (the keystone): the parent visibility must be KNOWN — NEVER
+    // synthesize Public from a missing entry.
+    let parent_vis = parent_vis?;
+    // Gate 4: strict reduction only.
+    if visibility_rank(override_vis) >= visibility_rank(parent_vis) {
+        return None;
+    }
+
+    let severity = catalog(DEF_OVERRIDE_VISIBILITY_REDUCED)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Warning);
+    let message = format!(
+        "visibility of `{method}' reduced from {} to {} (overrides {parent_class}#{method}); breaks substitutability",
+        visibility_word(parent_vis),
+        visibility_word(override_vis),
+    );
+    Some(Diagnostic {
+        rule_id: DEF_OVERRIDE_VISIBILITY_REDUCED,
+        start_offset: name_span.0,
+        end_offset: name_span.1,
+        message,
+        severity,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: Some(method.to_string()),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -710,6 +909,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     CALL_WRONG_ARITY,
     CALL_POSSIBLE_NIL_RECEIVER,
     FLOW_DEAD_ASSIGNMENT,
+    DEF_OVERRIDE_VISIBILITY_REDUCED,
 ];
 
 /// Maps a legacy short alias to its canonical id (reference `LEGACY_RULE_ALIASES`).
@@ -1666,5 +1866,137 @@ mod tests {
         let set = SuppressSet::from_tokens(&["not-a-real-rule"]);
         assert!(!set.suppresses(CALL_UNDEFINED_METHOD));
         assert!(!set.suppresses(CALL_WRONG_ARITY));
+    }
+
+    // --- ADR-35 slice 1: def.override-visibility-reduced ----------------------
+
+    /// The override-visibility diagnostics in one source string (single-file).
+    fn override_vis(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == DEF_OVERRIDE_VISIBILITY_REDUCED)
+            .collect()
+    }
+
+    /// Cross-file: analyze `files[focus]` against a PROJECT source built over all
+    /// `files`, returning only the override-visibility diagnostics.
+    fn override_vis_project(files: &[&[u8]], focus: usize) -> Vec<Diagnostic> {
+        let asts: Vec<_> = files.iter().map(|s| lower(&parse(s))).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        let index = CoreIndex::new();
+        let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+        let mut interner = Interner::new();
+        analyze_with_source(&asts[focus], &mut interner, &index, &source)
+            .into_iter()
+            .filter(|d| d.rule_id == DEF_OVERRIDE_VISIBILITY_REDUCED)
+            .collect()
+    }
+
+    #[test]
+    fn override_vis_fires_public_to_private_across_superclass() {
+        // The oracle fixture: B < A, A#foo public, B#foo private ⇒ fires.
+        let src = b"class A\n  def foo; end\nend\nclass B < A\n  private\n  def foo; end\nend\n";
+        let diags = override_vis(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.rule_id, DEF_OVERRIDE_VISIBILITY_REDUCED);
+        assert_eq!(d.severity, Severity::Warning);
+        assert_eq!(d.source_family, "builtin");
+        assert_eq!(d.method_name.as_deref(), Some("foo"));
+        assert_eq!(
+            d.message,
+            "visibility of `foo' reduced from public to private (overrides A#foo); breaks substitutability"
+        );
+        // Anchored on the overriding def's name token.
+        assert_eq!(&src[d.start_offset..d.end_offset], b"foo");
+    }
+
+    #[test]
+    fn override_vis_fires_public_to_protected() {
+        let src = b"class A\n  def foo; end\nend\nclass B < A\n  protected\n  def foo; end\nend\n";
+        let diags = override_vis(src);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].message,
+            "visibility of `foo' reduced from public to protected (overrides A#foo); breaks substitutability"
+        );
+    }
+
+    #[test]
+    fn override_vis_silent_on_widening() {
+        // private parent ⇒ public override is a WIDENING (not a reduction) ⇒ silent.
+        let src = b"class A\n  private\n  def foo; end\nend\nclass B < A\n  def foo; end\nend\n";
+        assert!(override_vis(src).is_empty());
+        // protected ⇒ public widening too.
+        let src2 = b"class A\n  protected\n  def foo; end\nend\nclass B < A\n  def foo; end\nend\n";
+        assert!(override_vis(src2).is_empty());
+    }
+
+    #[test]
+    fn override_vis_silent_when_ancestor_is_rbs_or_unknown() {
+        // `class B < ApplicationRecord` — the super is not a project source class
+        // ⇒ no project ancestor defines the method ⇒ silent (RBS carve-out).
+        let src = b"class B < ApplicationRecord\n  private\n  def foo; end\nend\n";
+        assert!(override_vis(src).is_empty());
+    }
+
+    #[test]
+    fn override_vis_silent_when_no_ancestor_defines() {
+        // B < A but A does not define `foo` ⇒ silent.
+        let src = b"class A\n  def other; end\nend\nclass B < A\n  private\n  def foo; end\nend\n";
+        assert!(override_vis(src).is_empty());
+    }
+
+    #[test]
+    fn override_vis_silent_on_singleton_def() {
+        // `def self.foo` is a singleton method — never in the visibility table ⇒
+        // silent even under a bare `private`.
+        let src = b"class A\n  def foo; end\nend\nclass B < A\n  private\n  def self.foo; end\nend\n";
+        assert!(override_vis(src).is_empty());
+    }
+
+    #[test]
+    fn override_vis_silent_on_private_def_form() {
+        // `private def foo` records `foo` at the running default (Public),
+        // mirroring the reference gap ⇒ Public-vs-Public is no reduction ⇒ silent.
+        let src = b"class A\n  def foo; end\nend\nclass B < A\n  private def foo; end\nend\n";
+        assert!(override_vis(src).is_empty());
+    }
+
+    #[test]
+    fn override_vis_fires_across_included_module() {
+        // M#foo public (included into B); B#foo private ⇒ fires, overrides M#foo.
+        let src = b"module M\n  def foo; end\nend\nclass B\n  include M\n  private\n  def foo; end\nend\n";
+        let diags = override_vis(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            "visibility of `foo' reduced from public to private (overrides M#foo); breaks substitutability"
+        );
+    }
+
+    #[test]
+    fn override_vis_fires_cross_file() {
+        // Parent A in file 0, subclass B (private override) in file 1 — built via
+        // `build_project`, the walk resolves A across files and fires.
+        let a = b"class A\n  def foo; end\nend\n" as &[u8];
+        let b = b"class B < A\n  private\n  def foo; end\nend\n" as &[u8];
+        let diags = override_vis_project(&[a, b], 1);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            "visibility of `foo' reduced from public to private (overrides A#foo); breaks substitutability"
+        );
+    }
+
+    #[test]
+    fn override_vis_catalog_entry_matches_oracle() {
+        let e = catalog(DEF_OVERRIDE_VISIBILITY_REDUCED).expect("catalog entry must exist");
+        assert_eq!(e.default_severity, Severity::Warning);
+        assert_eq!(e.evidence_tier, "high");
+        assert_eq!(
+            e.documentation_url,
+            "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-override-visibility-reduced"
+        );
     }
 }

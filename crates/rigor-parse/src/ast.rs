@@ -67,6 +67,31 @@ pub struct MethodBody {
     pub params: Option<Vec<String>>,
 }
 
+/// Instance-method visibility as discovered at lowering time (ADR-35 slice 1,
+/// the `def.override-visibility-reduced` rule). Mirrors the reference's
+/// `scope_indexer.rb` visibility table semantics exactly:
+///   * a class/module body is walked left-to-right with a running default that
+///     starts [`Visibility::Public`];
+///   * a bare `private` / `protected` / `public` call (no args) FLIPS the
+///     running default for subsequent `def`s;
+///   * `private :foo, :bar` / `private "foo"` (literal symbol/string args)
+///     BACK-PATCHES those named methods to that visibility;
+///   * a plain `def foo` records `foo` at the current running default;
+///   * `private def foo` (the modifier-wrapping-a-def form) is NOT tracked — it
+///     records as the running default — matching the reference gap exactly so
+///     the witness set stays ⊆ the reference's;
+///   * dynamic forms (`send(:private, …)`, `private(*names)`) are NOT recognised;
+///   * singleton defs (`def self.x`, inside `class << self`) are EXCLUDED.
+///
+/// The `Ord`-by-rank comparison (public > protected > private) lives in the rule
+/// layer; this enum only carries the discovered atom.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Visibility {
+    Public,
+    Protected,
+    Private,
+}
+
 /// One owned node. Mirrors a minimal Prism subset (ADR-0012); every variant
 /// carries the byte [`Span`] needed to key a diagnostic (ADR-0030).
 #[derive(Clone, Debug)]
@@ -159,6 +184,11 @@ pub enum Node {
         /// decline tier-4b param binding (splat/post/kwargs/block/optional
         /// present). See [`MethodBody::params`].
         params: Option<Vec<String>>,
+        /// Precise span of the method-NAME token (Prism `name_loc`), or `None`
+        /// for a name-less `class << self` body. The
+        /// `def.override-visibility-reduced` rule anchors its diagnostic here
+        /// (matching the reference's `Diagnostic.from_name_loc`).
+        name_span: Option<Span>,
         body: Vec<NodeId>,
         span: Span,
     },
@@ -173,6 +203,12 @@ pub enum Node {
     ClassDef {
         name: String,
         superclass: Option<String>,
+        /// ADR-35 slice 1: the FULL written superclass path (`< Foo::Bar` ->
+        /// `Some("Foo::Bar")`), distinct from `superclass` (which keeps only the
+        /// last component for the existing chain-walk). Used by the
+        /// override-visibility ancestor walk to resolve against lexical nesting
+        /// WITHOUT the last-component name-collision merge.
+        superclass_path: Option<String>,
         methods: Vec<String>,
         /// Per direct instance method: `(name, lowered body node ids,
         /// has_explicit_return)`. Parallel to `methods` (same inclusion rule —
@@ -181,6 +217,16 @@ pub enum Node {
         /// the method's RETURN expression. Kept SEPARATE from `methods` so the
         /// existing `SourceIndex::add_source` signature and tests are untouched.
         method_bodies: Vec<MethodBody>,
+        /// ADR-35 slice 1: the discovered instance-method visibility table, in
+        /// source order — `(method name, visibility)` per the
+        /// [`Visibility`] semantics. Singleton defs excluded; `private def foo`
+        /// records as the running default (untracked, mirroring the reference).
+        method_visibilities: Vec<(String, Visibility)>,
+        /// ADR-35 slice 1: the `include X` / `prepend X` constant names (last
+        /// path component, mirroring how `superclass` is captured) in source
+        /// order. The override-visibility ancestor walk resolves these FIRST,
+        /// then the superclass (Ruby MRO ordering).
+        includes: Vec<String>,
         body: Vec<NodeId>,
         span: Span,
     },
@@ -194,6 +240,10 @@ pub enum Node {
         /// Per direct instance method `(name, body ids, has_explicit_return)`.
         /// See [`Node::ClassDef::method_bodies`].
         method_bodies: Vec<MethodBody>,
+        /// ADR-35 slice 1 visibility table. See [`Node::ClassDef::method_visibilities`].
+        method_visibilities: Vec<(String, Visibility)>,
+        /// ADR-35 slice 1 include/prepend names. See [`Node::ClassDef::includes`].
+        includes: Vec<String>,
         body: Vec<NodeId>,
         span: Span,
     },
@@ -571,10 +621,18 @@ impl Builder {
             // or `None` to decline when the signature has anything that breaks
             // positional index<->arg alignment (splat/post/kwargs/block/optional).
             let params = plain_positional_params(def.parameters().as_ref());
+            // The method-NAME token span (for the override-visibility rule's
+            // diagnostic anchor); `None` for a receiver-bearing singleton def
+            // (kept parallel to `name`, which is also `None` there).
+            let name_span = def
+                .receiver()
+                .is_none()
+                .then(|| span_of(&def.name_loc()));
             return self.push(Node::Definition {
                 name,
                 has_explicit_return,
                 params,
+                name_span,
                 body,
                 span: span_of(&def.location()),
             });
@@ -590,6 +648,8 @@ impl Builder {
             let superclass = class
                 .superclass()
                 .and_then(|s| constant_node_name(&s));
+            // The FULL written superclass path (for the override-visibility walk).
+            let superclass_path = class.superclass().map(|s| constant_path_string(&s)).filter(|s| !s.is_empty());
             let methods = class
                 .body()
                 .as_ref()
@@ -604,11 +664,23 @@ impl Builder {
             // lowers to a name-less Definition and is skipped; a def nested in a
             // conditional/inner class is not a direct child and is skipped).
             let method_bodies = self.harvest_method_bodies(&body);
+            // ADR-35 slice 1: the source-discovered instance-method visibility
+            // table + include/prepend names, read from the Prism body BEFORE
+            // lowering (lowering erases the modifier-call/`def`-name structure
+            // the discovery needs). Mirrors `scope_indexer.rb` exactly.
+            let (method_visibilities, includes) = class
+                .body()
+                .as_ref()
+                .map(discover_visibilities_and_includes)
+                .unwrap_or_default();
             return self.push(Node::ClassDef {
                 name,
                 superclass,
+                superclass_path,
                 methods,
                 method_bodies,
+                method_visibilities,
+                includes,
                 body,
                 span: span_of(&class.location()),
             });
@@ -623,10 +695,17 @@ impl Builder {
                 .unwrap_or_default();
             let body = self.lower_optional_body(module.body().as_ref());
             let method_bodies = self.harvest_method_bodies(&body);
+            let (method_visibilities, includes) = module
+                .body()
+                .as_ref()
+                .map(discover_visibilities_and_includes)
+                .unwrap_or_default();
             return self.push(Node::ModuleDef {
                 name,
                 methods,
                 method_bodies,
+                method_visibilities,
+                includes,
                 body,
                 span: span_of(&module.location()),
             });
@@ -637,7 +716,8 @@ impl Builder {
             return self.push(Node::Definition {
                 name: None, // `class << self` has no single method name.
                 has_explicit_return: false,
-                params: None, // no single method ⇒ no param binding.
+                params: None,    // no single method ⇒ no param binding.
+                name_span: None, // no single name ⇒ no name span.
                 body,
                 span: span_of(&sclass.location()),
             });
@@ -1190,6 +1270,162 @@ fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
         collect(body, &mut names);
     }
     names
+}
+
+/// ADR-35 slice 1 (`def.override-visibility-reduced`): discover a class/module
+/// body's instance-method VISIBILITY table + its `include`/`prepend` ancestor
+/// names, reading the Prism body BEFORE lowering. Mirrors
+/// `scope_indexer.rb#build_discovered_method_visibilities` /
+/// `collect_includes` EXACTLY (the witness set must stay ⊆ the reference's):
+///
+///   * the body is walked left-to-right with a running default that starts
+///     [`Visibility::Public`];
+///   * a bare `private` / `protected` / `public` call (receiver-less, NO args)
+///     FLIPS the running default for subsequent `def`s;
+///   * `private :foo, :bar` / `private "foo"` (literal symbol/string args ONLY)
+///     BACK-PATCHES those named methods to that visibility WITHOUT changing the
+///     running default; a non-literal arg in the list is ignored;
+///   * a plain `def foo` (receiver-less) records `foo` at the running default;
+///   * a `def foo` nested as an ARGUMENT to a modifier call (`private def foo`)
+///     is recorded at the (unchanged) running default — NOT at the modifier's
+///     visibility — exactly mirroring the reference's tracking gap;
+///   * `include X` / `prepend X` collect `X`'s last path component (mirroring how
+///     `superclass` is captured) for the MRO ancestor walk;
+///   * a singleton def (`def self.x`) is EXCLUDED from the visibility table.
+///
+/// Back-patches are applied to the LAST recorded entry for a name (a reopened
+/// `def` then `private :name` re-marks it), matching the reference's
+/// last-write-wins accumulator.
+fn discover_visibilities_and_includes(
+    body: &PrismNode<'_>,
+) -> (Vec<(String, Visibility)>, Vec<String>) {
+    let mut vis: Vec<(String, Visibility)> = Vec::new();
+    let mut includes: Vec<String> = Vec::new();
+    let mut current = Visibility::Public;
+
+    // A class/module body is a `StatementsNode` (or absent). Walk its direct
+    // statements left-to-right; the order is what makes the running-default flow
+    // correct. A bare (non-Statements) single-statement body is handled as one.
+    if let Some(stmts) = body.as_statements_node() {
+        for stmt in stmts.body().iter() {
+            process_visibility_stmt(&stmt, &mut current, &mut vis, &mut includes);
+        }
+    } else {
+        process_visibility_stmt(body, &mut current, &mut vis, &mut includes);
+    }
+    (vis, includes)
+}
+
+/// Apply one direct body statement to the running visibility default + the
+/// discovered tables. See [`discover_visibilities_and_includes`] for the rules.
+fn process_visibility_stmt(
+    stmt: &PrismNode<'_>,
+    current: &mut Visibility,
+    vis: &mut Vec<(String, Visibility)>,
+    includes: &mut Vec<String>,
+) {
+    // A receiver-less `def name` records at the running default.
+    if let Some(def) = stmt.as_def_node() {
+        if def.receiver().is_none() {
+            vis.push((constant_string(def.name().as_slice()), *current));
+        }
+        return;
+    }
+    let Some(call) = stmt.as_call_node() else {
+        return;
+    };
+    // Modifier / mixin calls only ever have an implicit-self receiver.
+    if call.receiver().is_some() {
+        return;
+    }
+    let name = constant_string(call.name().as_slice());
+    if let Some(modifier) = visibility_of_modifier(&name) {
+        let args = collect_call_args(&call);
+        if args.is_empty() {
+            // Bare modifier ⇒ flip the running default.
+            *current = modifier;
+        } else {
+            // `private :foo, …` ⇒ back-patch the named methods (running default
+            // unchanged for this form).
+            for arg in &args {
+                if let Some(target) = literal_symbol_or_string_name(arg) {
+                    back_patch_visibility(vis, &target, modifier);
+                }
+            }
+            // A `private def foo` arg records the nested def at the UNCHANGED
+            // running default (the reference's tracking gap).
+            record_nested_defs(&args, *current, vis);
+        }
+        return;
+    }
+    if name == "include" || name == "prepend" {
+        for arg in &collect_call_args(&call) {
+            // Capture the FULL written constant path (`Foo::Bar`, not just `Bar`)
+            // so the override-visibility ancestor walk can resolve it against the
+            // subclass's lexical nesting WITHOUT the name-collision merge that a
+            // last-component-only name would cause (the gitlab-foss FP cluster).
+            // A non-constant include arg yields an empty string ⇒ skipped.
+            let path = constant_path_string(arg);
+            if !path.is_empty() {
+                includes.push(path);
+            }
+        }
+    }
+}
+
+/// Map a receiver-less call name to its visibility, or `None` if it is not one
+/// of the three modifiers.
+fn visibility_of_modifier(name: &str) -> Option<Visibility> {
+    match name {
+        "public" => Some(Visibility::Public),
+        "protected" => Some(Visibility::Protected),
+        "private" => Some(Visibility::Private),
+        _ => None,
+    }
+}
+
+/// The positional arguments of a call as Prism nodes (empty if none).
+fn collect_call_args<'pr>(call: &ruby_prism::CallNode<'pr>) -> Vec<PrismNode<'pr>> {
+    call.arguments()
+        .map(|a| a.arguments().iter().collect())
+        .unwrap_or_default()
+}
+
+/// The literal method name a `private :foo` / `private "foo"` argument names, or
+/// `None` for any non-literal (dynamic) argument — which the reference ignores.
+fn literal_symbol_or_string_name(arg: &PrismNode<'_>) -> Option<String> {
+    if let Some(sym) = arg.as_symbol_node() {
+        return Some(String::from_utf8_lossy(sym.unescaped()).into_owned());
+    }
+    if let Some(s) = arg.as_string_node() {
+        return Some(String::from_utf8_lossy(s.unescaped()).into_owned());
+    }
+    None
+}
+
+/// Re-mark the LAST recorded entry for `name` to `visibility` (last-write-wins,
+/// matching the reference accumulator). No-op if the name was never recorded.
+fn back_patch_visibility(vis: &mut [(String, Visibility)], name: &str, visibility: Visibility) {
+    if let Some(slot) = vis.iter_mut().rev().find(|(n, _)| n == name) {
+        slot.1 = visibility;
+    }
+}
+
+/// Record any `def`s nested directly inside a modifier call's argument list
+/// (`private def foo`) at the supplied running default. Mirrors the reference's
+/// full-subtree recursion landing the inner def at the unchanged default.
+fn record_nested_defs(
+    args: &[PrismNode<'_>],
+    current: Visibility,
+    vis: &mut Vec<(String, Visibility)>,
+) {
+    for arg in args {
+        if let Some(def) = arg.as_def_node() {
+            if def.receiver().is_none() {
+                vis.push((constant_string(def.name().as_slice()), current));
+            }
+        }
+    }
 }
 
 /// The PLAIN-POSITIONAL parameter names of a `def` for ADR-0023 tier-4b
@@ -1751,5 +1987,135 @@ mod tests {
             .expect("expected a ModuleDef node");
         assert_eq!(name, "M");
         assert_eq!(methods, vec!["helper".to_string()]);
+    }
+
+    // --- ADR-35 slice 1: visibility-table + include discovery ----------------
+
+    /// The `(method_visibilities, includes)` of the single ClassDef in `ast`.
+    fn class_vis_includes(
+        ast: &LoweredAst,
+    ) -> (Vec<(String, Visibility)>, Vec<String>) {
+        ast.iter()
+            .find_map(|(_, n)| match n {
+                Node::ClassDef { method_visibilities, includes, .. } => {
+                    Some((method_visibilities.clone(), includes.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a ClassDef node")
+    }
+
+    #[test]
+    fn discovers_bare_modifier_flips_running_default() {
+        // `def a` is public; after a bare `private`, `def b` is private; a
+        // subsequent bare `public` makes `def c` public again.
+        let src = b"class C\n  def a\n  end\n  private\n  def b\n  end\n  public\n  def c\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (vis, _) = class_vis_includes(&ast);
+        assert_eq!(
+            vis,
+            vec![
+                ("a".to_string(), Visibility::Public),
+                ("b".to_string(), Visibility::Private),
+                ("c".to_string(), Visibility::Public),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovers_named_arg_back_patch() {
+        // `private :foo` back-patches an already-recorded `foo` to private,
+        // leaving the running default (and `bar`) public.
+        let src = b"class C\n  def foo\n  end\n  def bar\n  end\n  private :foo\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (vis, _) = class_vis_includes(&ast);
+        assert_eq!(
+            vis,
+            vec![
+                ("foo".to_string(), Visibility::Private),
+                ("bar".to_string(), Visibility::Public),
+            ]
+        );
+    }
+
+    #[test]
+    fn discovers_string_arg_back_patch() {
+        // `protected "foo"` (a string literal arg) marks `foo` protected.
+        let src = b"class C\n  def foo\n  end\n  protected \"foo\"\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (vis, _) = class_vis_includes(&ast);
+        assert_eq!(vis, vec![("foo".to_string(), Visibility::Protected)]);
+    }
+
+    #[test]
+    fn private_def_modifier_records_at_default_not_private() {
+        // `private def foo; end` — the wrap-around form is NOT tracked as a
+        // visibility change: `foo` records at the running default (Public),
+        // mirroring the reference gap (keeps the witness set ⊆ reference's).
+        let src = b"class C\n  private def foo\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (vis, _) = class_vis_includes(&ast);
+        assert_eq!(vis, vec![("foo".to_string(), Visibility::Public)]);
+    }
+
+    #[test]
+    fn discovers_include_and_prepend_full_path() {
+        // `include Foo::Bar` / `prepend Baz` collect the FULL written constant
+        // path (so the override walk can resolve against lexical nesting).
+        let src = b"class C\n  include Foo::Bar\n  prepend Baz\n  def a\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (_, includes) = class_vis_includes(&ast);
+        assert_eq!(includes, vec!["Foo::Bar".to_string(), "Baz".to_string()]);
+    }
+
+    #[test]
+    fn singleton_def_excluded_from_visibility_table() {
+        // `def self.x` is a singleton method — never in the visibility table.
+        let src = b"class C\n  private\n  def self.x\n  end\n  def y\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (vis, _) = class_vis_includes(&ast);
+        // Only the instance method `y` (at the running private default) appears.
+        assert_eq!(vis, vec![("y".to_string(), Visibility::Private)]);
+    }
+
+    #[test]
+    fn module_discovers_visibility_and_includes() {
+        // The ModuleDef carries the same tables.
+        let src = b"module M\n  include Helper\n  def a\n  end\n  private\n  def b\n  end\nend\n";
+        let ast = lower(&crate::parse(src));
+        let (vis, includes) = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::ModuleDef { method_visibilities, includes, .. } => {
+                    Some((method_visibilities.clone(), includes.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a ModuleDef node");
+        assert_eq!(
+            vis,
+            vec![
+                ("a".to_string(), Visibility::Public),
+                ("b".to_string(), Visibility::Private),
+            ]
+        );
+        assert_eq!(includes, vec!["Helper".to_string()]);
+    }
+
+    #[test]
+    fn definition_records_name_span_on_name_token() {
+        // The `Definition` node anchors `name_span` on the method-NAME token.
+        let src = b"def foo\nend\n";
+        let ast = lower(&crate::parse(src));
+        let name_span = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::Definition { name: Some(nm), name_span: Some(sp), .. } if nm == "foo" => {
+                    Some(*sp)
+                }
+                _ => None,
+            })
+            .expect("expected a named Definition");
+        assert_eq!(&src[name_span.0..name_span.1], b"foo");
     }
 }

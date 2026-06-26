@@ -168,12 +168,15 @@ Ranked next levers:
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 266. **Parity:** `run.rb` PASS (20 fixtures incl. the plugin-enabled +
-  gate-guard pair and the tier-4b param-binding witness/decline pair), 0 FP; `run_corpus.rb`
-  validated to **3829 real files, 0 FP, 542/542 matched** (param-binding slice held matched at
-  542 — 0 new real-corpus witnesses, the pattern is rare; still 100% precision) (100% precision; embedded RBS == runtime path, byte-identical) — and the
-  default (no-config) corpus is **byte-unchanged with the first plugin slice landed**,
-  proving config-gating doesn't regress the default path.
+- **Tests:** 308. **Parity:** `run.rb` PASS (26 fixtures incl. the plugin-enabled +
+  gate-guard pair, the tier-4b param-binding witness/decline pair, and the four
+  `def.override-visibility-reduced` fixtures — superclass + module-include positives, the
+  reopened-class split, and the adversarial negatives bundle), 0 FP; `run_corpus.rb`
+  validated to **3829 real files, 0 FP, 637/637 matched** (`def.override-visibility-reduced`
+  added **+79 matched net**, of which **+44 are override-visibility witnesses on
+  mastodon+gitlab, 44/44 reference-equal**; 100% precision; embedded RBS == runtime path,
+  byte-identical) — and the default (no-config) corpus is **byte-unchanged with the first
+  plugin slice landed**, proving config-gating doesn't regress the default path.
 - **Works today:** `rigor check [--format text|json] <file…>` →
   `call.undefined-method` (literals, chained calls, post-fold, **core `X.new`
   instances** like `Array.new`, **interpolated strings/heredocs**, and **class-method
@@ -314,7 +317,23 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ⬜ `flow.always-raises` · `flow.unreachable-branch` · `flow.unreachable-clause` (ref ADR-47) ·
   `flow.always-truthy-condition` (deferred — needs the ADR-0022 flow-scope substrate, i.e.
   flow-sensitive scopes + narrowing in §4, which `dead-assignment` deliberately does NOT use).
-- ⬜ `def.return-type-mismatch` · `def.method-visibility-mismatch` · `def.override-*` (ref ADR-35) ·
+- ✅ `def.override-visibility-reduced` (ref ADR-35 slice 1) — a purely **STRUCTURAL** def-family
+  check (no typer, no flow scopes, no unions): an instance-method override whose visibility is
+  STRICTLY MORE RESTRICTIVE than the nearest **project-source** ancestor method it overrides
+  (public→protected/private, protected→private) fires `warning` (`visibility of \`m' reduced from
+  <parent> to <override> (overrides Parent#m); breaks substitutability`), anchored on the
+  overriding def's name token. The override visibility is read from a source-discovered table
+  (bare-modifier flip / `private :sym` back-patch; `def self.x` excluded; `private def foo` records
+  at the running default and is therefore untracked — both deferrals match the reference gap).
+  Ancestors are walked MRO-ordered (includes/prepends FIRST, then superclass) over a **lexically-
+  qualified** override index — `module Params` nested in `IssuableFinder` keys `IssuableFinder::Params`,
+  never merging with `Groups::Params` (last-component collapse was the gitlab-foss FP cluster).
+  **Two zero-FP keystones**: (1) RBS / third-party ancestors are NOT walked (project-source ancestors
+  only); (2) the rule NEVER synthesizes `Public` from a missing ancestor-visibility entry — absent
+  visibility ⇒ silent. **Corpus: +44 override witnesses on mastodon+gitlab (44/44 = reference-
+  equal), 0 FP**; grand corpus **558 → 637 matched / 0 FP** across 3829 files. RBS-ancestor
+  comparison, the singleton/`private def` forms, and `def.override-return-widened` are deferred.
+- ⬜ `def.return-type-mismatch` · `def.method-visibility-mismatch` · `def.override-return-widened` (ref ADR-35) ·
   `def.ivar-write-mismatch` (ref ADR-58).
 - ⬜ `dump.type` / `assert.type-mismatch`; discriminated-union narrowing (ref ADR-66);
   `rbs.coverage.missing-gem` + config/coverage diagnostics.
