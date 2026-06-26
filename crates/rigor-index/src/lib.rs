@@ -205,6 +205,18 @@ mod tests {
     }
 
     #[test]
+    fn aliased_methods_resolve() {
+        // `alias size length` in string.rbs: `String#size` must be known and
+        // inherit `length`'s return type + arity (no false positive on s.size).
+        let idx = CoreIndex::new();
+        assert!(idx.class_has_method("String", "size"));
+        assert_eq!(method_return("String", "size"), Some("Integer"));
+        assert_eq!(method_arity("String", "size"), method_arity("String", "length"));
+        // A genuine typo of the alias is still witnessed absent.
+        assert!(!idx.class_has_method("String", "sizee"));
+    }
+
+    #[test]
     fn inherited_methods_resolve() {
         // The keystone: methods inherited from Kernel/Object must count as
         // present (no false positive on `s.frozen?`, `s.tap`, `s.class`).

@@ -1,6 +1,9 @@
 /target
 **/target
 
+# Analysis cache (ADR-0017; also written by the reference when run here).
+/.rigor/
+
 # Cargo.lock IS committed: rigor-rs ships a binary, so a committed lockfile
 # gives reproducible, supply-chain-pinned builds (see ADR-0010 distribution).
 # The spike/ probe is a throwaway, standalone crate — its lockfile stays out.

@@ -120,7 +120,12 @@ fn cmd_check(args: &[String]) -> ExitCode {
                         start_offset: 0,
                         end_offset: 0,
                         message: format!("internal error while analysing file: {msg}"),
-                        severity: Severity::Error,
+                        // `:info`, never `:error` (audit R5): `internal-error` is a
+                        // deliberate rigor-rs-specific out-of-band signal with no
+                        // reference counterpart. Keeping it info-severity excludes it
+                        // from the differential harness's error/warning parity gate, so
+                        // a crashed file never counts as a false positive (ADR-0016).
+                        severity: Severity::Info,
                         source_family: "builtin",
                         receiver_type: None,
                         method_name: None,

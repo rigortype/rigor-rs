@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ruby_rbs::node::{
-    parse, ClassNode, MethodDefinitionKind, ModuleNode, Node,
+    parse, AliasKind, ClassNode, MethodDefinitionKind, ModuleNode, Node,
 };
 
 /// The curated set of core RBS files to parse. Chosen so that String / Integer
@@ -52,6 +52,11 @@ type Arity = (usize, Option<usize>);
 struct ClassEntry {
     /// `method name -> (return class name if resolvable, arity envelope)`.
     methods: HashMap<&'static str, (Option<&'static str>, Arity)>,
+    /// Instance-method aliases `new_name -> old_name` (RBS `alias size length`).
+    /// The alias target is resolved at lookup time so `new_name` inherits
+    /// `old_name`'s existence / return type / arity (the old name may live on
+    /// the same class or anywhere up the ancestor chain).
+    aliases: HashMap<&'static str, &'static str>,
     /// Direct superclass name, if any (`None` ⇒ implicit `Object`, except the
     /// roots which are seeded explicitly).
     superclass: Option<&'static str>,
@@ -100,21 +105,18 @@ impl CoreData {
     }
 
     /// Walk the full flattened ancestor chain; a method is present if ANY
-    /// ancestor defines it. Conservative gate: if the chain is not fully loaded
-    /// (an ancestor missing from the set), return `true` ("assume present") so
-    /// absence is never falsely witnessed. Absence (`false`) is only returned
-    /// when every ancestor is loaded and none defines the method.
+    /// ancestor defines it directly OR via an instance `alias`. Conservative
+    /// gate: if the chain is not fully loaded (an ancestor missing from the
+    /// set), return `true` ("assume present") so absence is never falsely
+    /// witnessed. Absence (`false`) is only returned when every ancestor is
+    /// loaded and none defines (or aliases) the method.
     pub fn class_has_method(&self, class_name: &str, method: &str) -> bool {
         if !self.classes.contains_key(class_name) {
             return false;
         }
         let (chain, complete) = self.ancestors(class_name);
-        for anc in &chain {
-            if let Some(entry) = self.classes.get(anc) {
-                if entry.methods.contains_key(method) {
-                    return true;
-                }
-            }
+        if self.lookup_on_chain(&chain, method).is_some() {
+            return true;
         }
         // Not found across the chain. Only witness absence if the chain is
         // fully loaded; otherwise assume present (zero false positive).
@@ -122,27 +124,60 @@ impl CoreData {
     }
 
     /// Resolve a method's return class over the ancestor chain (first defining
-    /// ancestor wins). `None` if the return is not a known concrete class.
+    /// ancestor wins), resolving through `alias` definitions. `None` if the
+    /// return is not a known concrete class (or the method is unknown).
     pub fn method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
         let (chain, _) = self.ancestors(class_name);
-        for anc in &chain {
-            if let Some(entry) = self.classes.get(anc) {
-                if let Some((ret, _)) = entry.methods.get(method) {
-                    return *ret;
-                }
-            }
-        }
-        None
+        self.lookup_on_chain(&chain, method).and_then(|(ret, _)| ret)
     }
 
     /// Resolve a method's arity envelope over the ancestor chain (first defining
-    /// ancestor wins). `None` if the method is unknown on the chain.
+    /// ancestor wins), resolving through `alias` definitions. `None` if the
+    /// method is unknown on the chain.
     pub fn method_arity(&self, class_name: &str, method: &str) -> Option<Arity> {
         let (chain, _) = self.ancestors(class_name);
-        for anc in &chain {
+        self.lookup_on_chain(&chain, method).map(|(_, arity)| arity)
+    }
+
+    /// Find `method`'s `(return, arity)` on the flattened ancestor chain,
+    /// resolving instance `alias`es. The first ancestor that defines `method`
+    /// directly wins; otherwise, if some ancestor aliases `method -> old`, the
+    /// lookup re-runs on the **same chain** for `old` (which may itself be an
+    /// alias or live on a different ancestor — `String#size -> length`, both on
+    /// `String`; an inherited alias resolves to an inherited target too).
+    fn lookup_on_chain(
+        &self,
+        chain: &[&'static str],
+        method: &str,
+    ) -> Option<(Option<&'static str>, Arity)> {
+        self.lookup_on_chain_depth(chain, method, 0)
+    }
+
+    fn lookup_on_chain_depth(
+        &self,
+        chain: &[&'static str],
+        method: &str,
+        depth: usize,
+    ) -> Option<(Option<&'static str>, Arity)> {
+        // A direct definition anywhere on the chain wins.
+        for anc in chain {
             if let Some(entry) = self.classes.get(anc) {
-                if let Some((_, arity)) = entry.methods.get(method) {
-                    return Some(*arity);
+                if let Some(&def) = entry.methods.get(method) {
+                    return Some(def);
+                }
+            }
+        }
+        // Else: follow the first alias for `method` found on the chain. Bound
+        // the recursion to defend against a pathological alias cycle in RBS.
+        if depth >= 16 {
+            return None;
+        }
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(&old) = entry.aliases.get(method) {
+                    if let Some(found) = self.lookup_on_chain_depth(chain, old, depth + 1) {
+                        return Some(found);
+                    }
                 }
             }
         }
@@ -206,6 +241,9 @@ impl CoreData {
                 name,
                 ClassEntry {
                     methods: m,
+                    // The stub lists `size` directly alongside `length`, so it
+                    // needs no alias table; real RBS uses `alias size length`.
+                    aliases: HashMap::new(),
                     superclass,
                     includes,
                 },
@@ -311,6 +349,9 @@ impl CoreData {
                 ("start_with?", Some("TrueClass"), (0, None)),
                 ("end_with?", Some("TrueClass"), (0, None)),
                 ("empty?", Some("TrueClass"), (0, Some(0))),
+                ("rjust", Some("String"), (1, Some(2))),
+                ("ljust", Some("String"), (1, Some(2))),
+                ("center", Some("String"), (1, Some(2))),
                 ("+", Some("String"), (1, Some(1))),
                 ("*", Some("String"), (1, Some(1))),
             ],
@@ -489,6 +530,17 @@ impl Builder {
                         }
                     }
                 }
+                Node::Alias(a) => {
+                    // `alias new old` makes `new` an instance method equivalent
+                    // to `old` (RBS `alias size length`). Record only instance
+                    // aliases — the existence check is instance dispatch.
+                    if a.kind() != AliasKind::Instance {
+                        continue;
+                    }
+                    let new_name = intern(a.new_name().as_str());
+                    let old_name = intern(a.old_name().as_str());
+                    entry.aliases.entry(new_name).or_insert(old_name);
+                }
                 _ => {}
             }
         }
@@ -504,6 +556,9 @@ impl Builder {
         }
         for (k, v) in entry.methods {
             slot.methods.entry(k).or_insert(v);
+        }
+        for (new_name, old_name) in entry.aliases {
+            slot.aliases.entry(new_name).or_insert(old_name);
         }
         for inc in entry.includes {
             if !slot.includes.contains(&inc) {
