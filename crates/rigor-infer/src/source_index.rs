@@ -81,42 +81,61 @@ impl SourceIndex {
     /// each `X.new` receiver constant whose `X` is RBS-known (so a `Pathname.new`
     /// instance carries identity even though `Pathname` is outside `CORE_CLASSES`).
     pub fn build(ast: &LoweredAst, core: &CoreIndex) -> Self {
+        Self::build_project(&[ast], core)
+    }
+
+    /// Build a PROJECT-WIDE index from EVERY analyzed file's lowered AST. Class /
+    /// module names are harvested from all `asts`, so [`knows_class`] answers
+    /// project-wide — this is what lets the rules layer refuse to singleton-type a
+    /// bare constant that the project itself defines elsewhere (e.g. a Rails model
+    /// `Group`/`Report`), keeping cross-file constant typing false-positive-free.
+    ///
+    /// Constant registration is also project-wide and generalized: EVERY
+    /// `Node::ConstantRead { name }` whose `name` is RBS-known (and not already a
+    /// source class) gets a registry id, so `Time`/`Array`/... round-trip via
+    /// [`class_id`]/[`class_name_for_id`] for singleton rendering. The original
+    /// `X.new` registration is subsumed by this (its receiver is a `ConstantRead`).
+    ///
+    /// [`knows_class`]: SourceIndex::knows_class
+    /// [`class_id`]: SourceIndex::class_id
+    /// [`class_name_for_id`]: SourceIndex::class_name_for_id
+    pub fn build_project(asts: &[&LoweredAst], core: &CoreIndex) -> Self {
         let mut idx = SourceIndex::default();
 
-        // Pass 1: source class/module structure.
-        for (_, node) in ast.iter() {
-            match node {
-                Node::ClassDef { name, superclass, methods, .. } => {
-                    if name.is_empty() {
-                        continue; // un-namable (dynamic constant) ⇒ skip.
+        // Pass 1: source class/module structure, harvested across ALL files.
+        for ast in asts {
+            for (_, node) in ast.iter() {
+                match node {
+                    Node::ClassDef { name, superclass, methods, .. } => {
+                        if name.is_empty() {
+                            continue; // un-namable (dynamic constant) ⇒ skip.
+                        }
+                        idx.add_source(name, superclass.clone(), methods);
                     }
-                    idx.add_source(name, superclass.clone(), methods);
-                }
-                Node::ModuleDef { name, methods, .. } => {
-                    if name.is_empty() {
-                        continue;
+                    Node::ModuleDef { name, methods, .. } => {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        idx.add_source(name, None, methods); // a module has no super.
                     }
-                    idx.add_source(name, None, methods); // a module has no super.
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
-        // Pass 2: register an instance-class id for every `X.new` receiver whose
-        // `X` is RBS-known but not a source class (source classes are already
-        // registered). This lets `Pathname.new(...)` carry a Nominal identity
-        // whose method existence resolves via RBS.
-        for (_, node) in ast.iter() {
-            if let Node::Call { receiver: Some(r), method, .. } = node {
-                if method == "new" {
-                    if let Node::ConstantRead { name, .. } = ast.get(*r) {
-                        if !name.is_empty()
-                            && !idx.classes.contains_key(name)
-                            && core.knows_class(name)
-                            && core.class_id(name).is_none()
-                        {
-                            idx.register(name);
-                        }
+        // Pass 2: register an instance-class id for every `ConstantRead` whose
+        // `name` is RBS-known but not a source class (source classes are already
+        // registered). This lets both `Pathname.new(...)` instances AND bare
+        // singleton constants (`Time`, `Array`, ...) carry a registry identity
+        // that round-trips for rendering. Harvested across ALL files.
+        for ast in asts {
+            for (_, node) in ast.iter() {
+                if let Node::ConstantRead { name, .. } = node {
+                    if !name.is_empty()
+                        && !idx.classes.contains_key(name)
+                        && core.knows_class(name)
+                    {
+                        idx.register(name);
                     }
                 }
             }

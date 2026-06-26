@@ -234,6 +234,7 @@ name = "rigor-cli"
 version = "0.0.0"
 dependencies = [
  "rigor-index",
+ "rigor-infer",
  "rigor-parse",
  "rigor-rules",
  "rigor-types",

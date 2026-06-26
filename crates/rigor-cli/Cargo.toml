@@ -11,4 +11,5 @@ path = "src/main.rs"
 rigor-parse = { path = "../rigor-parse" }
 rigor-rules = { path = "../rigor-rules" }
 rigor-index = { path = "../rigor-index" }
+rigor-infer = { path = "../rigor-infer" }
 rigor-types = { path = "../rigor-types" }

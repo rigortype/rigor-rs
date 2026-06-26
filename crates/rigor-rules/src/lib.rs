@@ -137,14 +137,30 @@ pub const CALL_POSSIBLE_NIL_RECEIVER: &str = "call.possible-nil-receiver";
 /// in the SAME pass. At most one diagnostic is emitted per call site, matching
 /// the reference's one-diagnostic-per-offending-call discipline.
 pub fn analyze(ast: &LoweredAst, interner: &mut Interner, index: &CoreIndex) -> Vec<Diagnostic> {
-    // Build the per-run in-source class index (ADR-0023 tier-4), then a typer
-    // over the real RBS index AND that source index, so `X.new` types to an
-    // instance of a project-defined (or RBS-known) class and non-folded nominal
-    // returns (e.g. `Integer#to_s -> String`) resolve for chained-call typing.
-    // The source index drives RETURN-TYPE inference for chaining only; it is NOT
-    // a witnessing surface for the undefined-method rule (see `check_call`).
+    // Single-file API: build a per-file source index then delegate. Preserves the
+    // existing signature + tests. The project pass (the CLI) builds ONE
+    // project-wide source over all files and calls `analyze_with_source` directly.
     let source = rigor_infer::SourceIndex::build(ast, index);
-    let typer = Typer::with_source(index, &source);
+    analyze_with_source(ast, interner, index, &source)
+}
+
+/// Analyze a lowered AST against an EXTERNALLY-built [`SourceIndex`] — the
+/// project-wide variant the CLI builds once over every file. Splitting this out
+/// lets the bare-constant singleton gate (`!source.knows_class(name)`) see class
+/// names defined in OTHER files, so a project model referenced in a file that
+/// does not define it (`Group.where(...)`) is never singleton-typed and stays
+/// silent (the cross-file zero-FP keystone).
+pub fn analyze_with_source(
+    ast: &LoweredAst,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Vec<Diagnostic> {
+    // A typer over the real RBS index AND the (project-wide) source index, so
+    // `X.new` types to an instance and a bare constant `X` types to its class
+    // object (`Singleton(X)`) for class-method witnessing. The source index also
+    // drives RETURN-TYPE inference for chaining.
+    let typer = Typer::with_source(index, source);
     let env = typer.build_toplevel_env(ast, interner);
     let mut out = Vec::new();
 
@@ -231,6 +247,39 @@ fn check_call(
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
     let recv_ty = typer.type_of(ast, receiver, env, interner);
+
+    // Singleton (class-object) receiver: a bare constant `C` typed to
+    // `Type::Singleton(class)` (see the typer's `ConstantRead` arm + its zero-FP
+    // gate). Witness a CLASS-method typo (`Time.current`) against the RBS
+    // class-method surface. This branch MUST come first: `class_name_of` returns
+    // `None` for a Singleton carrier, so the instance path below would skip it.
+    if let Type::Singleton(class) = interner.get(recv_ty) {
+        let class = *class;
+        let Some(name) = typer.source().class_name_for_id(class) else {
+            return None; // not round-trippable ⇒ silent (never guess).
+        };
+        // `class_has_singleton_method` is conservative: `false` only when the
+        // class-method surface is fully known and lacks the method (handles
+        // `extend`ed modules; incomplete/unknown ⇒ `true` ⇒ silent).
+        if index.class_has_singleton_method(name, method) {
+            return None;
+        }
+        let receiver_render = format!("singleton({name})");
+        let message = format!("undefined method `{method}' for {receiver_render}");
+        let severity = catalog(CALL_UNDEFINED_METHOD)
+            .map(|e| e.default_severity)
+            .unwrap_or(Severity::Error);
+        return Some(Diagnostic {
+            rule_id: CALL_UNDEFINED_METHOD,
+            start_offset: message_span.0,
+            end_offset: message_span.1,
+            message,
+            severity,
+            source_family: "builtin",
+            receiver_type: Some(receiver_render),
+            method_name: Some(method.to_string()),
+        });
+    }
 
     // Witness ONLY over a class the core (RBS/CORE_CLASSES) surface models and
     // round-trips by id. A receiver that resolves only through the in-source /
@@ -666,6 +715,72 @@ mod tests {
         // `Widget.new.foo` where Widget is unknown ⇒ Dynamic ⇒ silent.
         let diags = run(b"w = Widget.new\nw.foo\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    // --- singleton (class-method) witnessing on bare constants ---------------
+    //
+    // A bare top-level RBS constant (`Time`, `Array`) types to `Singleton(C)`;
+    // a class-method typo on it is witnessed (`Time.current`), while real class
+    // methods, instance-only names, `.new`, and project-class collisions stay
+    // silent. All guarded on real RBS being loaded (stub ⇒ assert silent).
+
+    #[test]
+    fn time_current_flags_singleton() {
+        let idx = CoreIndex::new();
+        let diags = run(b"Time.current\n");
+        if idx.knows_class("Time") {
+            assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+            let d = &diags[0];
+            assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
+            assert_eq!(d.severity, Severity::Error);
+            assert_eq!(d.message, "undefined method `current' for singleton(Time)");
+            assert_eq!(d.receiver_type.as_deref(), Some("singleton(Time)"));
+            assert_eq!(d.method_name.as_deref(), Some("current"));
+        } else {
+            assert!(diags.is_empty(), "stub fallback must be silent, got {diags:?}");
+        }
+    }
+
+    #[test]
+    fn time_real_class_methods_and_new_are_silent() {
+        // `Time.now` / `Time.name` are real class methods; `Time.new` constructs
+        // an instance (intercepted before singleton typing). All silent.
+        assert!(run(b"Time.now\n").is_empty(), "Time.now must be silent");
+        assert!(run(b"Time.name\n").is_empty(), "Time.name must be silent");
+        assert!(run(b"Time.new\n").is_empty(), "Time.new must be silent");
+    }
+
+    #[test]
+    fn array_wrap_flags_singleton_but_new_is_silent() {
+        let idx = CoreIndex::new();
+        // `Array.wrap` is an ActiveSupport extension, not core ⇒ flagged absent.
+        let diags = run(b"Array.wrap(x)\n");
+        if idx.knows_class("Array") {
+            assert_eq!(diags.len(), 1, "expected Array.wrap flagged, got {diags:?}");
+            assert_eq!(diags[0].message, "undefined method `wrap' for singleton(Array)");
+            assert_eq!(diags[0].receiver_type.as_deref(), Some("singleton(Array)"));
+        } else {
+            assert!(diags.is_empty(), "stub fallback must be silent, got {diags:?}");
+        }
+        // `Array.new` constructs an instance ⇒ silent (not singleton-typed).
+        assert!(run(b"Array.new\n").is_empty(), "Array.new must be silent");
+    }
+
+    #[test]
+    fn project_class_collision_is_silent() {
+        // A file that DEFINES `class Group` and also calls `Group.where(1)`: even
+        // though `Group` may be a top-level RBS class, the project defines it, so
+        // the gate refuses to singleton-type it ⇒ silent (cross-file zero-FP).
+        let diags = run(b"class Group\nend\nGroup.where(1)\n");
+        assert!(diags.is_empty(), "project-class collision must be silent, got {diags:?}");
+    }
+
+    #[test]
+    fn secure_random_hex_is_silent_extend_surface() {
+        // `SecureRandom.hex` — its class methods come via an `extend`ed module, so
+        // the class-method surface is incomplete ⇒ conservative ⇒ silent.
+        let diags = run(b"SecureRandom.hex\n");
+        assert!(diags.is_empty(), "SecureRandom.hex must be silent, got {diags:?}");
     }
 
     #[test]

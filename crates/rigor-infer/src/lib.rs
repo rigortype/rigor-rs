@@ -145,6 +145,30 @@ impl<'i> Typer<'i> {
                     self.type_call(ast, r, &method, &args, env, interner)
                 }
             }
+            // A bare constant read (`Time`, `Array`) types to the CLASS OBJECT
+            // itself — `Type::Singleton(class)` — so a class-method typo on it
+            // (`Time.current`) can be witnessed. The zero-FP gate (ADR-0023):
+            //   * `name` is a GENUINE top-level RBS class (`knows_toplevel_class`)
+            //     — excludes namespaced-only names (`Status`/`Instance`/`List`);
+            //   * the PROJECT does NOT define `name` (`!source.knows_class`) —
+            //     excludes top-level RBS classes that are ALSO project models
+            //     (`Group`/`Report`), which the reference resolves to the project
+            //     class and stays silent on; AND
+            //   * `name` is registered so its id round-trips for rendering.
+            // Any miss ⇒ fall through to Dynamic[top] (silent). Note: a `Foo.new`
+            // receiver is intercepted earlier in `type_call` (before the constant
+            // is typed), so `Time.new` still yields a Time INSTANCE, not Singleton.
+            Node::ConstantRead { name, .. } => {
+                if !name.is_empty()
+                    && self.index.knows_toplevel_class(name)
+                    && !self.source.knows_class(name)
+                {
+                    if let Some(class) = self.source.class_id(name) {
+                        return interner.intern(Type::Singleton(class));
+                    }
+                }
+                interner.untyped()
+            }
             // An array/hash literal types to its bare nominal class so a typo'd
             // method on it (`[1,2].frist`, `{}.fetchh`) flags via the real
             // Array/Hash RBS — matching the reference. Element/shape precision is

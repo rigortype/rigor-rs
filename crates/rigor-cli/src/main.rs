@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
 use rigor_parse::{lower, parse};
-use rigor_rules::{analyze, catalog, Diagnostic, Severity};
+use rigor_rules::{analyze_with_source, catalog, Diagnostic, Severity};
 use rigor_types::Interner;
 
 /// The reference's full subcommand surface (ADR-0015).
@@ -72,13 +72,38 @@ fn cmd_check(args: &[String]) -> ExitCode {
     }
 
     let index = CoreIndex::new();
-    // Each entry: (path, source_or_empty, diagnostic).
-    // `source` is empty string for internal-error diagnostics (no source to
+    // Each entry: (input_order_key, path, source_or_empty, diagnostic).
+    // The order key is the file's index in `files`, used to keep diagnostics
+    // grouped per file in INPUT order even though the project pass emits
+    // parse/lower-panic diagnostics (stage 1) before analyze diagnostics (stage
+    // 3). `source` is empty string for internal-error diagnostics (no source to
     // compute line/col from — the offset is 0).
-    let mut findings: Vec<(String, String, Diagnostic)> = Vec::new();
+    let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();
     let mut had_io_error = false;
 
-    for path in &files {
+    // PROJECT PASS (ADR-0023 cross-file): the bare-constant singleton gate must
+    // know every class the PROJECT defines (across ALL files) so a model
+    // referenced where it is not defined (`Group.where(...)`) is never
+    // singleton-typed and stays silent. So we parse+lower EVERY file first,
+    // collect their owned ASTs, build ONE project-wide SourceIndex, then analyze
+    // each file against it.
+    //
+    // Per-file panic isolation (ADR-0016) is preserved at BOTH stages: a file
+    // that panics in parse/lower is dropped from the project set with a synthetic
+    // internal-error diagnostic (and never contributes class names); a file that
+    // panics in analyze likewise yields the synthetic diagnostic.
+
+    // Stage 1: read + parse + lower every file (panic-isolated). Keep the per-file
+    // source text and owned AST for files that lowered cleanly, in input order.
+    struct Prepared {
+        order: usize,
+        path: String,
+        source: String,
+        ast: rigor_parse::LoweredAst,
+    }
+    let mut prepared: Vec<Prepared> = Vec::new();
+
+    for (order, path) in files.iter().enumerate() {
         let source = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) => {
@@ -88,52 +113,55 @@ fn cmd_check(args: &[String]) -> ExitCode {
             }
         };
 
-        // ADR-0016 never-crash: wrap parse+lower+analyze in catch_unwind.
-        // On a panic we emit a synthetic internal-error diagnostic and continue.
-        // `AssertUnwindSafe` is sound here: we discard all borrowed state from
-        // the closure on unwind; `index` and `source` are not mutated inside.
         let path_owned = path.to_string();
         let source_bytes = source.as_bytes().to_vec();
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
             let result = parse(&source_bytes);
-            let ast = lower(&result);
+            lower(&result)
+        }));
+
+        match lowered {
+            Ok(ast) => prepared.push(Prepared { order, path: path_owned, source, ast }),
+            Err(panic_val) => {
+                let msg = panic_message(&panic_val);
+                eprintln!("rigor check: internal panic on {path}: {msg}");
+                findings.push((order, path_owned, String::new(), internal_error_diag(msg)));
+            }
+        }
+    }
+
+    // Stage 2: build ONE project-wide source index from all cleanly-lowered ASTs.
+    let asts: Vec<&rigor_parse::LoweredAst> = prepared.iter().map(|p| &p.ast).collect();
+    let project_source = rigor_infer::SourceIndex::build_project(&asts, &index);
+
+    // Stage 3: analyze each file against the shared project source (panic-isolated),
+    // emitting diagnostics grouped per file in input order.
+    for p in &prepared {
+        let Prepared { order, path, source, ast } = p;
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
             let mut interner = Interner::new();
-            analyze(&ast, &mut interner, &index)
+            analyze_with_source(ast, &mut interner, &index, &project_source)
         }));
 
         match result {
             Ok(diags) => {
                 for diag in diags {
-                    findings.push((path_owned.clone(), source.clone(), diag));
+                    findings.push((*order, path.clone(), source.clone(), diag));
                 }
             }
             Err(panic_val) => {
-                // Convert the panic into a synthetic internal-error diagnostic
-                // so the run continues and the caller can see which file failed.
                 let msg = panic_message(&panic_val);
                 eprintln!("rigor check: internal panic on {path}: {msg}");
-                findings.push((
-                    path_owned.clone(),
-                    String::new(), // no source — offset 0 maps to line 1, col 1
-                    Diagnostic {
-                        rule_id: "internal-error",
-                        start_offset: 0,
-                        end_offset: 0,
-                        message: format!("internal error while analysing file: {msg}"),
-                        // `:info`, never `:error` (audit R5): `internal-error` is a
-                        // deliberate rigor-rs-specific out-of-band signal with no
-                        // reference counterpart. Keeping it info-severity excludes it
-                        // from the differential harness's error/warning parity gate, so
-                        // a crashed file never counts as a false positive (ADR-0016).
-                        severity: Severity::Info,
-                        source_family: "builtin",
-                        receiver_type: None,
-                        method_name: None,
-                    },
-                ));
+                findings.push((*order, path.clone(), String::new(), internal_error_diag(msg)));
             }
         }
     }
+
+    // Restore input order: stage 1 (parse/lower panics) and stage 3 (analyze)
+    // push interleaved, so stable-sort by the file's input-order key to recover
+    // the per-file grouping in input order. Stable keeps a file's own diagnostics
+    // in source order.
+    findings.sort_by_key(|(order, _, _, _)| *order);
 
     match format {
         OutputFormat::Text => print_text(&findings),
@@ -156,8 +184,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
 /// Human format: `path:line:col: <severity>: <message>` (1-based line/col).
 /// Severity is rendered from the diagnostic's actual severity field — not
 /// hardcoded — so warning/info diagnostics render correctly.
-fn print_text(findings: &[(String, String, Diagnostic)]) {
-    for (path, source, diag) in findings {
+fn print_text(findings: &[(usize, String, String, Diagnostic)]) {
+    for (_order, path, source, diag) in findings {
         let (line, col) = line_col(source, diag.start_offset);
         println!("{path}:{line}:{col}: {}: {}", diag.severity.as_str(), diag.message);
     }
@@ -172,9 +200,9 @@ fn print_text(findings: &[(String, String, Diagnostic)]) {
 ///
 /// `path/line/column/rule` are always present; the harness reads these.
 /// Hand-rolled (no serde dependency) — the field set is small and fixed.
-fn print_json(findings: &[(String, String, Diagnostic)]) {
+fn print_json(findings: &[(usize, String, String, Diagnostic)]) {
     let mut buf = String::from("[");
-    for (idx, (path, source, diag)) in findings.iter().enumerate() {
+    for (idx, (_order, path, source, diag)) in findings.iter().enumerate() {
         if idx > 0 {
             buf.push(',');
         }
@@ -260,6 +288,24 @@ fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     // Column = char count between the line start and the offset, plus 1.
     let col = source[line_start..clamped].chars().count() + 1;
     (line, col)
+}
+
+/// Build the synthetic `internal-error` diagnostic emitted when a file panics
+/// during parse/lower/analyze (ADR-0016 never-crash). `:info`, never `:error`:
+/// it is a rigor-rs-specific out-of-band signal with no reference counterpart, so
+/// info-severity excludes it from the differential harness's error/warning parity
+/// gate — a crashed file never counts as a false positive.
+fn internal_error_diag(msg: String) -> Diagnostic {
+    Diagnostic {
+        rule_id: "internal-error",
+        start_offset: 0,
+        end_offset: 0,
+        message: format!("internal error while analysing file: {msg}"),
+        severity: Severity::Info,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: None,
+    }
 }
 
 /// Extract a human-readable description from a panic payload.

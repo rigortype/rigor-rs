@@ -657,24 +657,31 @@ impl Builder {
             return;
         };
         for decl in sig.declarations().iter() {
+            // `false` = top-level (file-level) declaration: only these may enter
+            // the `toplevel_classes` set.
             match decl {
-                Node::Class(c) => self.ingest_class(&c),
-                Node::Module(m) => self.ingest_module(&m),
+                Node::Class(c) => self.ingest_class(&c, false),
+                Node::Module(m) => self.ingest_module(&m, false),
                 _ => {}
             }
         }
     }
 
-    fn ingest_class(&mut self, c: &ClassNode) {
+    fn ingest_class(&mut self, c: &ClassNode, nested: bool) {
         let tn = c.name();
         let Some(name) = type_name_str(&tn) else {
             return;
         };
-        // A top-level decl (`class Time`) has an EMPTY namespace; a namespaced
-        // one (`class Process::Status`) does not. Record only genuine top-level
-        // names (defect 2). Nested decls (collect_members re-entry) carry their
-        // own namespace, so a `class Status` nested in `Process` is non-empty.
-        if is_toplevel_name(&tn) {
+        // A genuine top-level decl (`class Time`) is a FILE-LEVEL declaration with
+        // an EMPTY namespace. A LEXICALLY NESTED decl (`class Group` written
+        // inside `class PrettyPrint`) ALSO has an empty namespace on its own node
+        // (nesting is lexical, not embedded in the inner TypeName), so the
+        // namespace check alone is insufficient — we must additionally know the
+        // decl is file-level (`!nested`). Without this, `PrettyPrint::Group`,
+        // `Benchmark::Report`, `Etc::Group` etc. would leak into the top-level set
+        // and be wrongly singleton-witnessable (false positives on a project model
+        // named `Group`/`Report`). Record only file-level, empty-namespace names.
+        if !nested && is_toplevel_name(&tn) {
             self.toplevel_classes.insert(name);
         }
         let superclass = c
@@ -688,12 +695,12 @@ impl Builder {
         self.merge(name, entry);
     }
 
-    fn ingest_module(&mut self, m: &ModuleNode) {
+    fn ingest_module(&mut self, m: &ModuleNode, nested: bool) {
         let tn = m.name();
         let Some(name) = type_name_str(&tn) else {
             return;
         };
-        if is_toplevel_name(&tn) {
+        if !nested && is_toplevel_name(&tn) {
             self.toplevel_classes.insert(name);
         }
         let mut entry = ClassEntry::default();
@@ -772,8 +779,8 @@ impl Builder {
                 // ⇒ all typo detection silently disabled). Registering nested
                 // types by simple name keeps chains complete. (Simple-name
                 // collisions only ever ADD methods, never witness false absence.)
-                Node::Class(nested) => self.ingest_class(&nested),
-                Node::Module(nested) => self.ingest_module(&nested),
+                Node::Class(inner) => self.ingest_class(&inner, true),
+                Node::Module(inner) => self.ingest_module(&inner, true),
                 _ => {}
             }
         }
