@@ -895,12 +895,46 @@ mod tests {
     }
 
     #[test]
-    fn in_source_param_dependent_return_is_silent() {
-        // A param-dependent method types Dynamic ⇒ no return entry ⇒ the chained
-        // call stays silent (the zero-FP keystone for tier-4b).
+    fn in_source_passthrough_param_return_is_witnessed() {
+        // ADR-0023 tier-4b call-site PARAMETER BINDING: `def echo(x); x; end`
+        // returns its arg's type, so `c.echo("a")` binds String and `.lenght`
+        // witnesses against String — the reference witnesses the same call
+        // (`undefined method 'lenght' for "a"`, same class, value-render aside).
         let src = b"class C\n  def echo(x)\n    x\n  end\nend\nc = C.new\nc.echo(\"a\").lenght\n";
         let diags = run(src);
-        assert!(diags.is_empty(), "param-dependent return must not be witnessed, got {diags:?}");
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        assert_eq!(diags[0].method_name.as_deref(), Some("lenght"));
+        assert_eq!(diags[0].receiver_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn in_source_core_transform_param_return_is_witnessed() {
+        // Core-transform via the param: `def up(x); x.upcase; end` returns the
+        // core return of `String#upcase` (String) when the arg is a String, so
+        // `.frob` on the result witnesses against String.
+        let src = b"class C\n  def up(x)\n    x.upcase\n  end\nend\nc = C.new\nc.up(\"a\").frob\n";
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        assert_eq!(diags[0].method_name.as_deref(), Some("frob"));
+        assert_eq!(diags[0].receiver_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn in_source_param_bound_unknown_arg_is_silent() {
+        // The decline side: a param-bound method whose ARG types Dynamic (an
+        // unknown receiver's result) ⇒ no core class to bind ⇒ silent.
+        let src = b"class C\n  def echo(x)\n    x\n  end\nend\nc = C.new\nc.echo(whatever).lenght\n";
+        let diags = run(src);
+        assert!(diags.is_empty(), "param bound to an unknown-typed arg must stay silent, got {diags:?}");
+    }
+
+    #[test]
+    fn in_source_splat_param_method_is_silent() {
+        // A splat signature declines param binding entirely (no 1:1 index map),
+        // so even a String arg does not witness — a missed witness, never an FP.
+        let src = b"class C\n  def echo(*xs)\n    xs\n  end\nend\nc = C.new\nc.echo(\"a\").lenght\n";
+        let diags = run(src);
+        assert!(diags.is_empty(), "splat-param method must decline param binding, got {diags:?}");
     }
 
     #[test]

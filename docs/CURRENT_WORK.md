@@ -58,7 +58,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 542 at this size, 100%
-precision). 242 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 266 tests. The design (ADR 0001–0031) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -69,7 +69,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 242 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 266 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -101,16 +101,34 @@ is **96%** of error/warning diagnostics — so coverage comes from *typing more 
 precisely, not new rules. The remaining gap is mostly **Rails** receivers needing
 project-RBS / plugins):
 1. 🟡 **Cross-file in-source RETURN-TYPE inference** (ADR-0023 tier-4 body inference) —
-   **minimal slice LANDED** (this session): `SourceIndex` Pass-3 `infer_method_returns`
+   **two slices LANDED** (this session): `SourceIndex` Pass-3 `infer_method_returns`
    types a project method's TAIL expression under an EMPTY `TypeEnv` and, when it yields a
    concrete **core/RBS** class, interns that core nominal so a chained typo witnesses
    (`user.full_name.lenght` where `full_name : String`). Zero-FP by strict
    under-approximation (witness set ⊆ reference): declines on explicit `return`, branch/loop
    tail, param/ivar/self dependence (empty env ⇒ Dynamic), in-source method-call tail, and
-   reopen disagreement. **Deferred (next increments):** call-site param binding (`def n(x); x; end`),
-   cross-method-call return inference + fixpoint (ref ADR-55/56), branch/explicit-return
-   UNION (needs a union-consuming witness site), ivar/self typing (ADR-0022 flow), singleton
-   (`def self.x`) return inference. These are the remaining in-source coverage levers.
+   reopen disagreement. **Slice 2 — call-site PARAMETER BINDING (LANDED).** A method whose
+   tail is a bare positional-param read (`def full(x); x; end`) or a no-arg core-method CHAIN
+   rooted at one (`def up(x); x.upcase; end`) now records a param-bound descriptor
+   (`{ param_index, chain }`, Pass-3b `infer_one_param_bound`); the tier-4b call hook
+   (`resolve_param_bound`) binds the positional ARGUMENT's type and re-derives the core
+   return through the SAME `method_return` table tier 3 uses, so `g.full("hi").lenght`
+   witnesses against String. The descriptor is self-contained (param index + no-arg core
+   chain — no AST/node-id), so it is fully cross-file safe and never re-enters the build pass
+   (no recursion/fixpoint). **Gate (decline ⇒ Dynamic, never an FP):** plain-positional
+   params ONLY (lowering returns `params: None` ⇒ decline on splat/post/kwargs/block/optional/
+   destructuring); the tail root must be a declared positional param; every chain step must be
+   a no-arg, no-block call; arg count must cover `param_index`; the bound arg AND every chain
+   step must land on a concrete CORE class; plus the inherited gates (explicit `return`,
+   branch/loop tail, reopen disagreement). **Corpus: matched UNCHANGED at 542 (0 new
+   real-corpus witnesses), 0 FP** — the pattern (a project pass-through/transform of a
+   positional arg, then a typo chained on the result with a literal/core argument) is rare in
+   real code; the increment is a correct, zero-FP closure of the param-binding deferral, not a
+   coverage lever. **Deferred (next increments):** multi-param / value-unrolling binding (the
+   reference binds args more richly — we decline), cross-method-call return inference +
+   fixpoint (ref ADR-55/56), branch/explicit-return UNION (needs a union-consuming witness
+   site), ivar/self typing (ADR-0022 flow), singleton (`def self.x`) return inference. These
+   are the remaining in-source coverage levers.
 2. ✅ **Drop-in readiness landed** (this session): inline `# rigor:disable` suppression,
    minimal `.rigor.yml` (disable/exclude), `github` + `sarif` + `gitlab` + `checkstyle` +
    `junit` + `teamcity` output (all four new formats byte-identical to the reference) and
@@ -138,9 +156,10 @@ project-RBS / plugins):
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 252. **Parity:** `run.rb` PASS (18 fixtures incl. the plugin-enabled +
-  gate-guard pair), 0 FP; `run_corpus.rb` validated to **3829 real files, 0 FP, 542/542
-  matched** (100% precision; embedded RBS == runtime path, byte-identical) — and the
+- **Tests:** 266. **Parity:** `run.rb` PASS (20 fixtures incl. the plugin-enabled +
+  gate-guard pair and the tier-4b param-binding witness/decline pair), 0 FP; `run_corpus.rb`
+  validated to **3829 real files, 0 FP, 542/542 matched** (param-binding slice held matched at
+  542 — 0 new real-corpus witnesses, the pattern is rare; still 100% precision) (100% precision; embedded RBS == runtime path, byte-identical) — and the
   default (no-config) corpus is **byte-unchanged with the first plugin slice landed**,
   proving config-gating doesn't regress the default path.
 - **Works today:** `rigor check [--format text|json] <file…>` →
@@ -417,8 +436,9 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   auto-detection.
 
 ### 14. Parity harness & QA (ADR-0002/0011)
-- ✅ `harness/run.rb` (fixture gate, 18 fixtures incl. alias regression + the ADR-25
-  plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars) + divergence-registry.
+- ✅ `harness/run.rb` (fixture gate, 20 fixtures incl. alias regression, the ADR-25
+  plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars, and the tier-4b
+  param-binding witness/decline pair) + divergence-registry.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
 - ⬜ Continuous corpus growth (new fixtures per rule/feature); snapshot mode (pin reference,
   commit expected JSON) for CI without a Ruby runtime (ADR-0002).

@@ -46,11 +46,25 @@ pub type Span = (usize, usize);
 /// expression can be typed), and `has_explicit_return` (any `return` in the
 /// Prism body ⇒ the inference declines). Carried on [`Node::ClassDef`] /
 /// [`Node::ModuleDef`] alongside the method-name list.
+///
+/// `params` records the method's PLAIN-POSITIONAL parameter names in order
+/// (`def full(x, y)` -> `Some(["x", "y"])`), enabling ADR-0023 tier-4b call-site
+/// PARAMETER BINDING: a method whose tail reads / chains off a bare positional
+/// param can have its return re-derived from the ARGUMENT type at the call site.
+/// It is `None` — meaning "decline this method for param binding" — whenever the
+/// signature has ANYTHING that breaks positional index<->arg alignment: a splat
+/// (`*args`), a post-splat positional, a keyword / double-splat (`**`), a block
+/// param (`&blk`), or a default-valued (optional) param (`def f(x = 1)`). The
+/// param-INDEPENDENT inference (a tail that types to a concrete core class under
+/// an empty env) is unaffected by `params` — it never reads a param.
 #[derive(Clone, Debug)]
 pub struct MethodBody {
     pub name: String,
     pub body: Vec<NodeId>,
     pub has_explicit_return: bool,
+    /// `Some(plain positional param names in order)`, or `None` to DECLINE
+    /// param binding for this method (splat/post/kwargs/block/optional present).
+    pub params: Option<Vec<String>>,
 }
 
 /// One owned node. Mirrors a minimal Prism subset (ADR-0012); every variant
@@ -122,6 +136,10 @@ pub enum Node {
     Definition {
         name: Option<String>,
         has_explicit_return: bool,
+        /// The method's PLAIN-POSITIONAL param names in order, or `None` to
+        /// decline tier-4b param binding (splat/post/kwargs/block/optional
+        /// present). See [`MethodBody::params`].
+        params: Option<Vec<String>>,
         body: Vec<NodeId>,
         span: Span,
     },
@@ -494,9 +512,14 @@ impl Builder {
                 .as_ref()
                 .map(body_has_explicit_return)
                 .unwrap_or(false);
+            // The plain-positional param names (for tier-4b call-site binding),
+            // or `None` to decline when the signature has anything that breaks
+            // positional index<->arg alignment (splat/post/kwargs/block/optional).
+            let params = plain_positional_params(def.parameters().as_ref());
             return self.push(Node::Definition {
                 name,
                 has_explicit_return,
+                params,
                 body,
                 span: span_of(&def.location()),
             });
@@ -559,6 +582,7 @@ impl Builder {
             return self.push(Node::Definition {
                 name: None, // `class << self` has no single method name.
                 has_explicit_return: false,
+                params: None, // no single method ⇒ no param binding.
                 body,
                 span: span_of(&sclass.location()),
             });
@@ -986,12 +1010,14 @@ impl Builder {
                 Node::Definition {
                     name: Some(name),
                     has_explicit_return,
+                    params,
                     body,
                     ..
                 } => Some(MethodBody {
                     name: name.clone(),
                     body: body.clone(),
                     has_explicit_return: *has_explicit_return,
+                    params: params.clone(),
                 }),
                 _ => None,
             })
@@ -1079,6 +1105,55 @@ fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
         collect(body, &mut names);
     }
     names
+}
+
+/// The PLAIN-POSITIONAL parameter names of a `def` for ADR-0023 tier-4b
+/// call-site PARAMETER BINDING, or `None` to DECLINE the method when its
+/// signature has anything that breaks positional index<->argument alignment.
+///
+/// A method with NO parameters (`def f; ...; end`, Prism `parameters() == None`)
+/// returns `Some([])` — there is nothing to bind, and the param-INDEPENDENT
+/// inference still applies; the call-site binder just never reads an arg.
+///
+/// We accept ONLY `requireds` (the leading `x, y` positionals). Any of the
+/// following makes the method decline (return `None`), because the call-site
+/// binder maps positional ARG index -> positional PARAM index 1:1 and these
+/// break that alignment:
+///   * `optionals` — `def f(x = 1)`: a defaulted param may be filled by the
+///     default (no arg) so arg index N need not be param N.
+///   * `rest` — `*args`: a splat absorbs a variable arg count.
+///   * `posts` — a positional AFTER a splat (`def f(*a, z)`): its arg index
+///     depends on the splat length.
+///   * `keywords` / `keyword_rest` — `k:`, `**opts`: keyword args are not
+///     positional.
+///   * `block` — `&blk`: a block param is not a positional arg.
+fn plain_positional_params(params: Option<&ruby_prism::ParametersNode<'_>>) -> Option<Vec<String>> {
+    let Some(params) = params else {
+        // No parameter list at all ⇒ zero plain positionals (bindable, no-op).
+        return Some(Vec::new());
+    };
+    // Decline on ANY non-plain-positional construct (conservative; a decline is
+    // never a false positive — only a missed witness).
+    if params.optionals().iter().next().is_some()
+        || params.rest().is_some()
+        || params.posts().iter().next().is_some()
+        || params.keywords().iter().next().is_some()
+        || params.keyword_rest().is_some()
+        || params.block().is_some()
+    {
+        return None;
+    }
+    // Every required must be a simple named `RequiredParameterNode`. A
+    // destructuring positional (`def f((a, b))`) is a `MultiTargetNode`, which
+    // has no single name and breaks the 1:1 mapping ⇒ decline.
+    let mut names = Vec::new();
+    for req in params.requireds().iter() {
+        let Some(rp) = req.as_required_parameter_node() else {
+            return None;
+        };
+        names.push(constant_string(rp.name().as_slice()));
+    }
+    Some(names)
 }
 
 /// Whether a Prism `def` body contains an explicit `return` statement ANYWHERE

@@ -80,6 +80,35 @@ pub struct SourceIndex {
     /// at the call site via [`CoreIndex::class_id`]. A method that fails ANY gate
     /// has NO entry ⇒ the call types Dynamic (silent).
     method_returns: HashMap<(String, String), String>,
+    /// ADR-0023 tier-4b call-site PARAMETER BINDING: `(class NAME, method NAME)
+    /// -> ParamBoundReturn`. This is the param-DEPENDENT companion to
+    /// `method_returns` (which is param-INDEPENDENT). A method qualifies when its
+    /// tail is a bare positional-param read, or a no-arg core-method CHAIN whose
+    /// root receiver is a bare positional-param read (`def up(x); x.upcase; end`).
+    /// The descriptor defers the param's type to the call site: it records WHICH
+    /// positional param the chain roots at, and the chain of no-arg core methods
+    /// to apply. The call site binds the ARGUMENT's type and re-derives the core
+    /// return (see [`SourceIndex::param_bound_return`] + the tier-4b call hook).
+    /// Kept SEPARATE from `method_returns`: the param-independent map always wins
+    /// when present (it needs no args), and a method may have at most one of the
+    /// two (a tail is either param-rooted or not). Same cross-file NAME keying and
+    /// the same reopen-disagreement decline apply.
+    param_bound_returns: HashMap<(String, String), ParamBoundReturn>,
+}
+
+/// ADR-0023 tier-4b call-site param-binding descriptor (see
+/// [`SourceIndex::param_bound_returns`]). The method's tail is the
+/// `chain.len() == 0` bare read of positional param `param_index`, or that param
+/// read followed by the no-arg core-method `chain` (`x.upcase.strip` ->
+/// `param_index = <x>, chain = ["upcase", "strip"]`). The call site types the
+/// ARGUMENT at `param_index`, then walks the chain through the core return table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParamBoundReturn {
+    /// The positional index of the param the tail's root receiver reads.
+    pub param_index: usize,
+    /// No-arg core methods applied to the param, in source order (possibly empty
+    /// for a bare passthrough `def full(x); x; end`).
+    pub chain: Vec<String>,
 }
 
 impl SourceIndex {
@@ -154,7 +183,9 @@ impl SourceIndex {
         // project class), and produces a fresh map that is then assigned — we must
         // NOT mutate `idx.method_returns` while `&idx` is immutably borrowed for
         // typing, so the inference returns a value.
-        idx.method_returns = infer_method_returns(&idx, core, asts);
+        let (returns, param_bound) = infer_method_returns(&idx, core, asts);
+        idx.method_returns = returns;
+        idx.param_bound_returns = param_bound;
 
         idx
     }
@@ -217,6 +248,16 @@ impl SourceIndex {
         self.method_returns
             .get(&(class.to_string(), method.to_string()))
             .map(|s| s.as_str())
+    }
+
+    /// The ADR-0023 tier-4b call-site PARAMETER-BINDING descriptor for a project
+    /// method `(class, method)`, if its tail roots on a positional param. `None`
+    /// ⇒ no param-bound entry ⇒ the call site falls through (Dynamic, silent).
+    /// The param-INDEPENDENT [`method_return`] takes precedence at the call site
+    /// (a method has at most one of the two). See [`ParamBoundReturn`].
+    pub fn param_bound_return(&self, class: &str, method: &str) -> Option<&ParamBoundReturn> {
+        self.param_bound_returns
+            .get(&(class.to_string(), method.to_string()))
     }
 
     /// The SOURCE class name behind a `Nominal { class }` whose `ClassId` is in
@@ -331,17 +372,43 @@ impl SourceIndex {
 ///    non-foldable-call — all already Dynamic under the empty env.
 /// 6. Reopen disagreement: the same `(C, m)` inferred twice with DIFFERENT core
 ///    returns ⇒ remove the entry (decline). Same return twice ⇒ keep.
+///
+/// ## Pass 3b — call-site PARAMETER BINDING (the param-DEPENDENT companion)
+///
+/// A method whose tail is a bare positional-PARAM read, or a no-arg core-method
+/// CHAIN rooted at one (`def up(x); x.upcase; end`), is param-DEPENDENT, so it
+/// yields no entry above (gate 5: a param read is Dynamic under the empty env).
+/// We additionally record a [`ParamBoundReturn`] for it so the call site can bind
+/// the ARGUMENT's type to the param and re-derive the core return. The extra
+/// gates (any failure ⇒ NO param-bound entry, see [`infer_one_param_bound`]):
+///   * the method must declare PLAIN POSITIONAL params only (`mb.params ==
+///     Some(_)` — splat/post/kwargs/block/optional ⇒ `None` ⇒ decline);
+///   * the tail's ROOT receiver must be a bare read of one of those params;
+///   * every step of the chain must be a no-arg call (an arg would itself need
+///     binding, which we don't model) ⇒ decline otherwise.
+/// The same gates 2/3/4 (empty body / explicit return / branch tail) and the
+/// reopen-disagreement rule apply, tracked independently from the param-
+/// independent map. A method never appears in BOTH maps (its tail is either a
+/// concrete core class under the empty env, or param-rooted — never both).
 fn infer_method_returns(
     idx: &SourceIndex,
     core: &CoreIndex,
     asts: &[&LoweredAst],
-) -> HashMap<(String, String), String> {
+) -> (
+    HashMap<(String, String), String>,
+    HashMap<(String, String), ParamBoundReturn>,
+) {
     let typer = crate::Typer::with_source(core, idx);
     let empty_env = crate::TypeEnv::new();
 
     let mut returns: HashMap<(String, String), String> = HashMap::new();
     // Track keys seen with a DISAGREEING reopen so they are never re-added.
     let mut disagreed: HashSet<(String, String)> = HashSet::new();
+
+    // Param-bound (call-site-binding) descriptors, with their own disagreement
+    // blacklist (a reopen with a DIFFERENT param-bound shape ⇒ decline).
+    let mut param_bound: HashMap<(String, String), ParamBoundReturn> = HashMap::new();
+    let mut pb_disagreed: HashSet<(String, String)> = HashSet::new();
 
     for ast in asts {
         for (_, node) in ast.iter() {
@@ -355,29 +422,40 @@ fn infer_method_returns(
                 _ => continue,
             };
             for mb in method_bodies {
-                let Some(core_name) =
-                    infer_one_return(ast, &typer, core, &empty_env, mb)
-                else {
-                    continue;
-                };
                 let key = (class_name.to_string(), mb.name.clone());
-                if disagreed.contains(&key) {
-                    continue; // a prior reopen disagreed ⇒ stay declined.
-                }
-                match returns.get(&key) {
-                    Some(prev) if prev != &core_name => {
-                        // Gate 6: disagreeing reopens ⇒ remove + blacklist.
-                        returns.remove(&key);
-                        disagreed.insert(key);
+                if let Some(core_name) = infer_one_return(ast, &typer, core, &empty_env, mb) {
+                    if disagreed.contains(&key) {
+                        continue; // a prior reopen disagreed ⇒ stay declined.
                     }
-                    _ => {
-                        returns.insert(key, core_name);
+                    match returns.get(&key) {
+                        Some(prev) if prev != &core_name => {
+                            // Gate 6: disagreeing reopens ⇒ remove + blacklist.
+                            returns.remove(&key);
+                            disagreed.insert(key);
+                        }
+                        _ => {
+                            returns.insert(key, core_name);
+                        }
+                    }
+                } else if let Some(pb) = infer_one_param_bound(ast, mb) {
+                    // Pass 3b: a param-rooted tail. Same reopen-disagreement rule.
+                    if pb_disagreed.contains(&key) {
+                        continue;
+                    }
+                    match param_bound.get(&key) {
+                        Some(prev) if prev != &pb => {
+                            param_bound.remove(&key);
+                            pb_disagreed.insert(key);
+                        }
+                        _ => {
+                            param_bound.insert(key, pb);
+                        }
                     }
                 }
             }
         }
     }
-    returns
+    (returns, param_bound)
 }
 
 /// Run gates 2–5 for one method body and return the inferred CORE class NAME, or
@@ -413,6 +491,71 @@ fn infer_one_return(
         Some(core_name.to_string())
     } else {
         None
+    }
+}
+
+/// Run the call-site PARAMETER-BINDING gates for one method body and return a
+/// [`ParamBoundReturn`] descriptor, or `None` to decline. Called ONLY when the
+/// param-independent [`infer_one_return`] already declined (the tail is not a
+/// concrete core class under the empty env) — so this never double-records.
+///
+/// The accepted tail shapes (anything else ⇒ `None`):
+///   * a bare positional-param read (`def full(x); x; end`) ⇒
+///     `ParamBoundReturn { param_index, chain: [] }`;
+///   * a no-arg core-method CHAIN whose ROOT receiver is a bare positional-param
+///     read (`def up(x); x.upcase.strip; end`) ⇒ `{ param_index, chain:
+///     ["upcase", "strip"] }`.
+///
+/// Gates (any failure ⇒ `None`; a decline is never a false positive):
+///   * `has_explicit_return` ⇒ decline (gate 3 — we read only the tail);
+///   * empty body ⇒ decline (gate 2);
+///   * `params == None` (splat/post/kwargs/block/optional) ⇒ decline — the
+///     call-site positional binder needs a clean 1:1 index mapping;
+///   * the tail's root isn't a bare read of a declared positional param ⇒
+///     decline (an ivar/self/local-not-a-param/another-param-combination root is
+///     not bindable here);
+///   * any chain step carries ARGUMENTS ⇒ decline (we bind only the root param;
+///     a step arg would itself need binding, which this slice doesn't model);
+///   * any chain step carries a BLOCK ⇒ decline (the block-overload return is a
+///     separate model; keep this purely the no-arg/no-block core path).
+fn infer_one_param_bound(ast: &LoweredAst, mb: &MethodBody) -> Option<ParamBoundReturn> {
+    // Gate 3: any explicit `return` ⇒ decline.
+    if mb.has_explicit_return {
+        return None;
+    }
+    // Only plain-positional signatures bind (None ⇒ splat/kwargs/etc. ⇒ decline).
+    let params = mb.params.as_ref()?;
+    // Gate 2: empty/absent body ⇒ decline.
+    let &ret_id = mb.body.last()?;
+
+    // Peel the no-arg/no-block core-method chain off the tail, innermost-last:
+    // `x.upcase.strip` walks `strip`'s receiver `x.upcase`, then `upcase`'s
+    // receiver `x`, collecting method names; the innermost receiver must be a
+    // bare param read. We push outer-first then reverse to source (apply) order.
+    let mut chain: Vec<String> = Vec::new();
+    let mut cursor = ret_id;
+    loop {
+        match ast.get(cursor) {
+            // A bare local read: the chain root. It must name a declared
+            // positional param (its index is the binding slot).
+            Node::LocalVariableRead { name, .. } => {
+                let param_index = params.iter().position(|p| p == name)?;
+                chain.reverse(); // collected outer-first ⇒ flip to apply order.
+                return Some(ParamBoundReturn { param_index, chain });
+            }
+            // A call on a receiver: a chain step. It must be a NO-ARG, NO-BLOCK
+            // call (an arg/block would need its own binding we don't model).
+            Node::Call { receiver: Some(r), method, args, block_body, .. } => {
+                if !args.is_empty() || !block_body.is_empty() {
+                    return None;
+                }
+                chain.push(method.clone());
+                cursor = *r;
+            }
+            // Anything else as the root (ivar/self/literal/another carrier) ⇒
+            // not a bindable param tail.
+            _ => return None,
+        }
     }
 }
 
@@ -559,6 +702,126 @@ mod tests {
         let a1 = lower_src(b"class C\n  def m\n    \"t\"\n  end\nend\n");
         let idx = SourceIndex::build_project(&[&a0, &a1], &core);
         assert_eq!(idx.method_return("C", "m"), Some("String"));
+    }
+
+    // --- tier-4b call-site PARAMETER BINDING descriptors ---------------------
+
+    #[test]
+    fn passthrough_param_records_bound_return() {
+        // `def full(x); x; end` — the tail is a bare read of positional param 0,
+        // so it records a param-bound descriptor (index 0, empty chain) and NO
+        // param-independent return (the param is Dynamic under the empty env).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def full(x)\n    x\n  end\nend\n", &core);
+        assert_eq!(idx.method_return("C", "full"), None);
+        assert_eq!(
+            idx.param_bound_return("C", "full"),
+            Some(&ParamBoundReturn { param_index: 0, chain: vec![] })
+        );
+    }
+
+    #[test]
+    fn second_param_records_correct_index() {
+        // `def pick(a, b); b; end` — the tail reads the SECOND positional param,
+        // so the descriptor binds index 1.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def pick(a, b)\n    b\n  end\nend\n", &core);
+        assert_eq!(
+            idx.param_bound_return("C", "pick"),
+            Some(&ParamBoundReturn { param_index: 1, chain: vec![] })
+        );
+    }
+
+    #[test]
+    fn core_transform_param_records_chain() {
+        // `def up(x); x.upcase.strip; end` — a no-arg core chain rooted at param
+        // 0 records `{ index: 0, chain: ["upcase", "strip"] }` (apply order).
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"class C\n  def up(x)\n    x.upcase.strip\n  end\nend\n", &core);
+        assert_eq!(
+            idx.param_bound_return("C", "up"),
+            Some(&ParamBoundReturn {
+                param_index: 0,
+                chain: vec!["upcase".into(), "strip".into()]
+            })
+        );
+    }
+
+    #[test]
+    fn splat_param_declines_binding() {
+        // `def f(*xs); xs; end` — a splat breaks the positional index map ⇒ no
+        // param-bound entry (and `xs` is param-rooted, so no independent entry).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def f(*xs)\n    xs\n  end\nend\n", &core);
+        assert_eq!(idx.param_bound_return("C", "f"), None);
+        assert_eq!(idx.method_return("C", "f"), None);
+    }
+
+    #[test]
+    fn kwarg_param_declines_binding() {
+        // `def f(x, k:); x; end` — a keyword param ⇒ decline (params == None).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def f(x, k:)\n    x\n  end\nend\n", &core);
+        assert_eq!(idx.param_bound_return("C", "f"), None);
+    }
+
+    #[test]
+    fn default_param_declines_binding() {
+        // `def f(x = 1); x; end` — an optional (defaulted) param ⇒ decline.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def f(x = 1)\n    x\n  end\nend\n", &core);
+        assert_eq!(idx.param_bound_return("C", "f"), None);
+    }
+
+    #[test]
+    fn block_param_declines_binding() {
+        // `def f(x, &blk); x; end` — a block param ⇒ decline.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class C\n  def f(x, &blk)\n    x\n  end\nend\n", &core);
+        assert_eq!(idx.param_bound_return("C", "f"), None);
+    }
+
+    #[test]
+    fn chain_with_args_declines_binding() {
+        // `def f(x); x.fetch(0); end` — a chain step that carries an argument is
+        // not a no-arg core call ⇒ decline (we bind only the root param).
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"class C\n  def f(x)\n    x.fetch(0)\n  end\nend\n", &core);
+        assert_eq!(idx.param_bound_return("C", "f"), None);
+    }
+
+    #[test]
+    fn non_param_root_tail_declines_binding() {
+        // `def f(x); @y.upcase; end` — the chain root is an ivar, not a param ⇒
+        // no param-bound entry.
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"class C\n  def f(x)\n    @y.upcase\n  end\nend\n", &core);
+        assert_eq!(idx.param_bound_return("C", "f"), None);
+    }
+
+    #[test]
+    fn explicit_return_declines_param_binding() {
+        // An explicit `return` ⇒ decline even for a param-rooted tail.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class C\n  def f(x)\n    return x if x\n    x\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.param_bound_return("C", "f"), None);
+    }
+
+    #[test]
+    fn disagreeing_reopened_param_bound_declines() {
+        // `def m(x); x; end` reopened with `def m(a, b); b; end` — index 0 vs 1
+        // disagree ⇒ the param-bound entry is removed.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"class C\n  def m(x)\n    x\n  end\nend\n");
+        let a1 = lower_src(b"class C\n  def m(a, b)\n    b\n  end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert_eq!(idx.param_bound_return("C", "m"), None);
     }
 
     #[test]

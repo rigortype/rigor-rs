@@ -27,7 +27,7 @@ use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type, TypeId};
 
-pub use source_index::{SourceIndex, SOURCE_CLASS_BASE};
+pub use source_index::{ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
 
 /// A process-wide empty [`SourceIndex`], used as the default `source` for a
 /// [`Typer`] built via [`Typer::new`] (callers that predate in-source typing).
@@ -299,15 +299,82 @@ impl<'i> Typer<'i> {
         // Any miss — no source receiver, no inferred return, or an unregistered
         // core name — falls through to Dynamic (silent; zero-FP).
         if let Some(src_name) = self.source.class_name_for_id_of(interner, recv_ty) {
-            if let Some(ret_core) = self.source.method_return(src_name, method) {
+            let src_name = src_name.to_string();
+            if let Some(ret_core) = self.source.method_return(&src_name, method) {
                 if let Some(class_id) = self.index.class_id(ret_core) {
                     return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                }
+            }
+            // Tier 4b call-site PARAMETER BINDING (ADR-0023): a source method
+            // whose return DEFERS to a positional argument. We bind the ARG's
+            // type to the rooted param, then re-derive the core return — the
+            // param-independent path above never fired for it (its tail is param-
+            // rooted, hence Dynamic under the empty build-time env). The whole
+            // safety argument is a STRICT under-approximation: we resolve only
+            // when the bound arg AND every chain step land on a concrete CORE
+            // class via the same `method_return` table tier 3 uses; any miss
+            // (arg out of range, non-core arg, a chain step with no core return)
+            // ⇒ Dynamic (silent). No AST/node-id is needed — the descriptor
+            // carries the param index + the no-arg core chain, so this is fully
+            // cross-file safe. No re-entry into `infer_method_returns` (the
+            // chain walks the core return table only, never an in-source body),
+            // so there is no recursion into the build pass.
+            if let Some(pb) = self.source.param_bound_return(&src_name, method) {
+                if let Some(core_class) =
+                    self.resolve_param_bound(ast, pb, args, env, interner)
+                {
+                    if let Some(class_id) = self.index.class_id(&core_class) {
+                        return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                    }
                 }
             }
         }
 
         // Tier 5: unknown -> Dynamic[top].
         interner.untyped()
+    }
+
+    /// Resolve a tier-4b call-site PARAMETER-BINDING descriptor against the
+    /// actual call arguments, returning the concrete CORE class NAME the method
+    /// returns for THIS call, or `None` to decline (Dynamic, silent).
+    ///
+    /// 1. The arg at `pb.param_index` must exist (arg count > index) — fewer args
+    ///    than required positional params ⇒ decline.
+    /// 2. Type that arg under the CURRENT call-site `env` and resolve its CORE
+    ///    class; a Dynamic / non-core / source-only arg ⇒ decline (we can only
+    ///    witness against core/RBS classes, the existing witness gate).
+    /// 3. Walk `pb.chain` through the SAME `method_return` table tier 3 uses: each
+    ///    no-arg core method must yield a registered core return; any miss ⇒
+    ///    decline. The chain is core-only and uses the already-built index — it
+    ///    cannot re-enter the in-source return inference, so there is no recursion
+    ///    into the build pass and no fixpoint in this slice.
+    fn resolve_param_bound(
+        &self,
+        ast: &LoweredAst,
+        pb: &ParamBoundReturn,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<String> {
+        // Gate 1: the bound positional arg must be present.
+        let &arg_id = args.get(pb.param_index)?;
+        // Gate 2: type the arg under the call-site env; keep only a concrete CORE
+        // class (a Dynamic / Constant-of-unknown / source-only carrier ⇒ None).
+        let arg_ty = self.type_of(ast, arg_id, env, interner);
+        let mut class_name = self.index.class_name_of(interner, arg_ty)?.to_string();
+        if !self.index.knows_class(&class_name) {
+            return None;
+        }
+        // Gate 3: walk the no-arg core chain. Each step must yield a registered
+        // core return; otherwise decline.
+        for step in &pb.chain {
+            let ret = self.index.method_return(&class_name, step)?;
+            if !self.index.knows_class(ret) {
+                return None;
+            }
+            class_name = ret.to_string();
+        }
+        Some(class_name)
     }
 
     /// Type a method call that carries a BLOCK (`recv.method { ... }`), modeling
