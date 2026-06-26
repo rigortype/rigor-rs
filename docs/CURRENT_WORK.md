@@ -57,7 +57,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 2458 real files** (mastodon, gitlab-foss, conference-app,
-the reference's own source), **367/367 matched** (100% precision). 167 tests. The
+the reference's own source), **367/367 matched** (100% precision). 190 tests. The
 design (ADR 0001–0031) is audited and stable. The 2026-06-26 session (a) aligned the
 undefined-method rule with the reference's leniency, (b) closed lowering-traversal +
 interpolated-string gaps, (c) landed **class-method (singleton) witnessing** with a
@@ -66,7 +66,7 @@ note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 167 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 190 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -98,8 +98,9 @@ project-RBS / plugins):
    `full_name : String`). The project-wide `SourceIndex::build_project` substrate now
    EXISTS (landed for the singleton gate) — extend it with per-method body inference.
 2. ✅ **Drop-in readiness landed** (this session): inline `# rigor:disable` suppression,
-   minimal `.rigor.yml` (disable/exclude), `github` + `sarif` output. Remaining §6/§7:
-   GitLab/Checkstyle/JUnit formats, CI auto-detect, full config schema + baseline.
+   minimal `.rigor.yml` (disable/exclude), `github` + `sarif` + `gitlab` + `checkstyle` +
+   `junit` + `teamcity` output (all four new formats byte-identical to the reference) and
+   **CI auto-detection** (ADR-51, full provider table). Remaining §6/§7: full config schema + baseline.
 3. **Plugin phase** (§10, ADR-0013) — the real Rails-coverage unlock (sidecar-hosted Ruby
    plugins). Biggest phase; **the bulk of remaining undefined-method coverage lives here**
    (the gap analysis confirms most misses are Rails receivers needing project-RBS/plugins).
@@ -119,7 +120,7 @@ project-RBS / plugins):
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 167. **Parity:** `run.rb` PASS (14 fixtures), 0 FP; `run_corpus.rb` validated to **2458 real
+- **Tests:** 190. **Parity:** `run.rb` PASS (14 fixtures), 0 FP; `run_corpus.rb` validated to **2458 real
   files, 0 FP, 367/367 matched** (100% precision).
 - **Works today:** `rigor check [--format text|json] <file…>` →
   `call.undefined-method` (literals, chained calls, post-fold, **core `X.new`
@@ -254,7 +255,21 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ✅ text + JSON (hand-rolled; field-identical to the reference for the call rules — the
   harness depends on this, keep byte-stable). ✅ **`github`** (Actions annotations) + **`sarif`**
   (SARIF 2.1.0, serde_json) — additive, CI-consumable, NOT harness-gated.
-- ⬜ GitLab · Checkstyle · JUnit · TeamCity (ref ADR-51); CI auto-detection (ref ADR-51).
+- ✅ **`gitlab`** (GitLab Code Quality JSON; serde-derived structs for exact key order; SHA-256
+  `fingerprint` over `[path, qualified_rule, line, column, message].join("\0")` — the NUL
+  separator is load-bearing, dependency-free SHA-256 in `diagnostic_formats.rs`) ·
+  ✅ **`checkstyle`** (hand-rolled XML, 5-entity escaping, grouped by file in first-appearance
+  order) · ✅ **`junit`** (hand-rolled XML; one `testcase`/diagnostic, clean run = one passing
+  case) · ✅ **`teamcity`** (`##teamcity[…]` service messages, `|`-escaping; empty on a clean
+  run). All four are **byte-identical to the reference** (parity-checked with + without
+  diagnostics, single + multi-file). Additive, NOT harness-gated.
+- ✅ **CI auto-detection** (ref ADR-51 WD7, `ci_detector.rs`): the reference's full 14-row
+  `PROVIDERS` table (most-specific first, `CI` catch-all last), tiers
+  `NativeStdout`/`NativeArtifact`/`Reviewdog`, `RIGOR_CI_DETECT=0|false|no|off` disable seam.
+  Triggered ONLY for `--format text` (an explicit format means the caller is in control):
+  GitHub Actions/TeamCity auto-emit their native format on stdout on top of the human output;
+  GitLab/reviewdog-routed CIs print a one-line hint to stderr when there are diagnostics. The
+  harness (no CI env) is never augmented.
 
 ### 7. Config & baseline — `configuration.rb`, `analysis/baseline.rb` → (ADR-0009/0031)
 - ✅ **In-source suppression** (`# rigor:disable <rules>` line, `# rigor:disable-file <rules>`/`all`)
@@ -285,7 +300,8 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 
 ### 11. CLI commands — `lib/rigor/cli.rb` → `rigor-cli` (ADR-0015)
 - ✅ Full surface presented; unimplemented commands report clearly. ✅ `check`
-  (`--format text|json|github|sarif`, `--config <path>`, project two-phase pass, inline + config suppression).
+  (`--format text|json|github|sarif|gitlab|checkstyle|junit|teamcity`, `--config <path>`,
+  project two-phase pass, inline + config suppression, CI auto-detection on `--format text`).
 - ⬜ `annotate` · `type-of` · `explain` · `init` · `diff` · `baseline` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugins`/`plugin` · `docs` ·
   `sig-gen` (ref ADR-14) · `skill`/`describe` · `doctor` (ref ADR-77) · `lsp` · `mcp` ·

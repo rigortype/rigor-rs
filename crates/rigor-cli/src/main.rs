@@ -20,6 +20,9 @@ use rigor_types::Interner;
 
 mod config;
 use config::Config;
+mod ci_detector;
+mod diagnostic_formats;
+use diagnostic_formats::Rendered;
 
 /// The reference's full subcommand surface (ADR-0015).
 const COMMANDS: &[&str] = &[
@@ -64,9 +67,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 Some("json") => format = OutputFormat::Json,
                 Some("github") => format = OutputFormat::Github,
                 Some("sarif") => format = OutputFormat::Sarif,
+                Some("gitlab") => format = OutputFormat::Gitlab,
+                Some("checkstyle") => format = OutputFormat::Checkstyle,
+                Some("junit") => format = OutputFormat::Junit,
+                Some("teamcity") => format = OutputFormat::Teamcity,
                 other => {
                     eprintln!(
-                        "rigor check: --format expects `text`, `json`, `github`, or `sarif`, got {other:?}"
+                        "rigor check: --format expects `text`, `json`, `github`, `sarif`, \
+                         `gitlab`, `checkstyle`, `junit`, or `teamcity`, got {other:?}"
                     );
                     return ExitCode::from(64);
                 }
@@ -220,6 +228,22 @@ fn cmd_check(args: &[String]) -> ExitCode {
         OutputFormat::Json => print_json(&findings),
         OutputFormat::Github => print_github(&findings),
         OutputFormat::Sarif => print_sarif(&findings),
+        OutputFormat::Gitlab => print_rendered(&findings, diagnostic_formats::render_gitlab),
+        OutputFormat::Checkstyle => print_rendered(&findings, diagnostic_formats::render_checkstyle),
+        OutputFormat::Junit => print_rendered(&findings, diagnostic_formats::render_junit),
+        OutputFormat::Teamcity => print_rendered(&findings, diagnostic_formats::render_teamcity),
+    }
+
+    // CI auto-detection (ADR-51 WD7): only augments the default human (`text`)
+    // output — an explicit `--format` means the caller is in control and is left
+    // untouched. For a first-class stdout-native CI (GitHub Actions / TeamCity)
+    // the platform's annotations are emitted on top of the text output; for
+    // GitLab (native but artifact-based) and the reviewdog-routed CIs a one-line
+    // hint goes to stderr, but only when there are diagnostics so a clean run
+    // stays quiet. `RIGOR_CI_DETECT=0`/`false`/`no`/`off` disables it (and so the
+    // differential harness, which runs without those CI vars, is never affected).
+    if matches!(format, OutputFormat::Text) {
+        emit_ci_detected_output(&findings);
     }
 
     if had_io_error {
@@ -383,6 +407,113 @@ fn print_sarif(findings: &[(usize, String, String, Diagnostic)]) {
     println!("{}", serde_json::to_string_pretty(&log).unwrap());
 }
 
+/// Flatten findings into `Rendered` rows (resolve each byte offset to a 1-based
+/// line/column) for the CI formatters, then print the rendered document. Mirrors
+/// the reference's `write_result` for the `DiagnosticFormats` cases: an empty
+/// render (teamcity with no diagnostics) prints nothing; otherwise the document
+/// is printed with a trailing newline. ADDITIVE — does not touch text/json.
+fn print_rendered(
+    findings: &[(usize, String, String, Diagnostic)],
+    render: fn(&[Rendered]) -> String,
+) {
+    let rows = to_rendered(findings);
+    let output = render(&rows);
+    if !output.is_empty() {
+        println!("{output}");
+    }
+}
+
+/// Resolve each finding's byte offset to a 1-based (line, column) and project
+/// the fields the CI formatters read. `rule_id` is rigor-rs's qualified rule
+/// (the `builtin` family is kept bare in `rule_id`).
+fn to_rendered(findings: &[(usize, String, String, Diagnostic)]) -> Vec<Rendered<'_>> {
+    findings
+        .iter()
+        .map(|(_order, path, source, diag)| {
+            let (line, column) = line_col(source, diag.start_offset);
+            Rendered {
+                path,
+                line,
+                column,
+                severity: diag.severity,
+                rule_id: diag.rule_id,
+                message: &diag.message,
+            }
+        })
+        .collect()
+}
+
+/// CI auto-detection augmentation (ADR-51 WD7), called only for `--format text`.
+/// For a stdout-native CI (GitHub Actions → `github`, TeamCity → `teamcity`) the
+/// platform's annotations are emitted on top of the human output; for GitLab
+/// (artifact-based) and reviewdog-routed CIs a one-line hint goes to stderr when
+/// there are diagnostics. No-op when no CI is detected or detection is disabled.
+fn emit_ci_detected_output(findings: &[(usize, String, String, Diagnostic)]) {
+    let Some(platform) = ci_detector::detect() else {
+        return;
+    };
+    match platform.tier {
+        ci_detector::Tier::NativeStdout => {
+            // Render in the platform's native stdout format on top of the text.
+            let rows = to_rendered(findings);
+            let output = match platform.format {
+                Some("github") => render_github_string(&rows),
+                Some("teamcity") => diagnostic_formats::render_teamcity(&rows),
+                _ => String::new(),
+            };
+            if !output.is_empty() {
+                println!("{output}");
+            }
+        }
+        ci_detector::Tier::NativeArtifact | ci_detector::Tier::Reviewdog => {
+            if !findings.is_empty() {
+                eprintln!("{}", ci_detected_hint(&platform));
+            }
+        }
+    }
+}
+
+/// The stderr hint for a CI rigor can't auto-emit to stdout (GitLab artifact /
+/// reviewdog-routed), mirroring the reference's `ci_detected_hint`.
+fn ci_detected_hint(platform: &ci_detector::Platform) -> String {
+    let tail = "see `rigor skill rigor-ci-setup`";
+    match platform.tier {
+        ci_detector::Tier::NativeArtifact => format!(
+            "rigor: {} detected — for the inline report run \
+             `rigor check --format {}` and publish it as the platform's report artifact ({tail}).",
+            platform.name,
+            platform.format.unwrap_or("gitlab"),
+        ),
+        _ => format!(
+            "rigor: {} detected — Rigor has no native format for it; pipe \
+             `rigor check --format checkstyle` through reviewdog, or use `--format junit` ({tail}).",
+            platform.name,
+        ),
+    }
+}
+
+/// Build the GitHub Actions annotation block as a string (the same lines
+/// `print_github` prints), so CI auto-detection can emit it on top of text.
+fn render_github_string(rows: &[Rendered]) -> String {
+    rows.iter()
+        .map(|r| {
+            let level = match r.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "notice",
+            };
+            format!(
+                "::{level} file={},line={},col={}::{}",
+                gh_escape_prop(r.path),
+                r.line,
+                r.column,
+                gh_escape_data(r.message),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 // ---------------------------------------------------------------------------
 // JSON helpers
 // ---------------------------------------------------------------------------
@@ -484,13 +615,19 @@ fn json_string(s: &str) -> String {
 }
 
 /// Output format for `rigor check` (ADR-0014; text default, json nice-to-have).
-/// `Github`/`Sarif` are ADDITIVE CI-oriented formats — they do not affect the
-/// text/json output the differential harness depends on.
+/// `Github`/`Sarif`/`Gitlab`/`Checkstyle`/`Junit`/`Teamcity` are ADDITIVE
+/// CI-oriented formats (reference ADR-51) — they do not affect the text/json
+/// output the differential harness depends on.
+#[derive(Clone, Copy)]
 enum OutputFormat {
     Text,
     Json,
     Github,
     Sarif,
+    Gitlab,
+    Checkstyle,
+    Junit,
+    Teamcity,
 }
 
 // ---------------------------------------------------------------------------
