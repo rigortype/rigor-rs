@@ -206,12 +206,14 @@ structurally avoids the Pzoom/artichoke/pylyzer traps). Tracked actions:
 - ✅ **R3** ADR-0001: positioning stated — rigor-rs is a performance prototype that COEXISTS
   with the Ruby mainstream (Ruby leads; no planned retirement / single-implementation; full
   parity + eventual sync are possibilities, not commitments).
-- 🟡 **R4 (urgent, in progress)** scaled corpus harness landed (`harness/run_corpus.rb`):
-  ran 115 real files (rigor examples + lib/rigor/type + mastodon/app/models), coverage
-  67%, and surfaced exactly **1 false positive** — `Hash#to_json` (index loaded core
-  RBS only, not the `json` stdlib that reopens Hash). Fix in flight: load core +
-  the reference's `DEFAULT_LIBRARIES` stdlib set. Next: rescan + bigger corpora,
-  iterate scan→fix→rescan.
+- ✅ **R4 — graded at scale, zero false positives.** `harness/run_corpus.rb` ran the
+  scan→fix→rescan loop over **~850 real files** (mastodon app/{models,services,
+  controllers}, gitlab-foss app/{models,services}, the reference's own lib/rigor/*,
+  rigor examples). It surfaced one latent FP (`Hash#to_json` — index loaded core RBS
+  only) and a deeper gate bug (nested-decl registration silently disabling detection);
+  both fixed by loading core + the reference's `DEFAULT_LIBRARIES` stdlib. **Result:
+  0 false positives across all ~850 files**, ~85 reference diagnostics matched.
+  The harness stays for ongoing regression as rules/inference grow.
 
 ## Network — RESTORED (2026-06-26)
 
