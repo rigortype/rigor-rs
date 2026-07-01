@@ -13,6 +13,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::process::ExitCode;
 
+use rayon::prelude::*;
 use rigor_index::CoreIndex;
 use rigor_parse::{lower, parse};
 use rigor_rules::{analyze_with_source, catalog, Diagnostic, Severity};
@@ -206,8 +207,18 @@ fn analyze_files(
     let mut had_io_error = false;
 
     // PROJECT PASS (ADR-0023 cross-file): parse+lower EVERY file first, build
-    // ONE project-wide SourceIndex, then analyze each file against it.
-    // Per-file panic isolation (ADR-0016) is preserved at BOTH stages.
+    // ONE project-wide SourceIndex, then analyze each file against it. Stages 1
+    // (parse+lower) and 3 (analyze) are file-INDEPENDENT and run on a rayon pool
+    // (§9, ADR-0006/0028); stage 2 (the project-index build) is the serial
+    // barrier between them. Per-file panic isolation (ADR-0016) is preserved at
+    // both parallel stages — each closure `catch_unwind`s its own file.
+    //
+    // Determinism (the parity keystone): each parallel stage collects its
+    // outcomes IN INPUT ORDER (`par_iter().map().collect()` preserves the source
+    // order into the result Vec), and side effects — the stderr lines and the
+    // findings pushes — are replayed by a SEQUENTIAL drain of that ordered Vec.
+    // So the stderr stream, the findings order, and the final `sort_by_key` are
+    // all byte-identical to the old serial loop; the pool is invisible in output.
     struct Prepared {
         order: usize,
         path: String,
@@ -215,79 +226,128 @@ fn analyze_files(
         ast: rigor_parse::LoweredAst,
         comments: Vec<(usize, String)>,
     }
+
+    // STAGE 1 (file-parallel): read + parse + lower. A closure never mutates
+    // shared state — it returns a self-contained outcome that the serial drain
+    // below turns into the same eprintln / push the serial loop did.
+    enum Stage1 {
+        Excluded,
+        Prepared(Prepared),
+        IoError { path: String, msg: String },
+        Panic { order: usize, path: String, msg: String },
+    }
+    let stage1: Vec<Stage1> = files
+        .par_iter()
+        .enumerate()
+        .map(|(order, path)| {
+            // Config `exclude:` — skip the file entirely before reading it.
+            if cfg.is_excluded(path) {
+                return Stage1::Excluded;
+            }
+            let source = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    return Stage1::IoError { path: path.to_string(), msg: e.to_string() };
+                }
+            };
+            let source_bytes = source.as_bytes().to_vec();
+            let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
+                let result = parse(&source_bytes);
+                let comments = rigor_parse::comment_lines(&result, &source_bytes);
+                (lower(&result), comments)
+            }));
+            match lowered {
+                Ok((ast, comments)) => Stage1::Prepared(Prepared {
+                    order,
+                    path: path.to_string(),
+                    source,
+                    ast,
+                    comments,
+                }),
+                Err(panic_val) => Stage1::Panic {
+                    order,
+                    path: path.to_string(),
+                    msg: panic_message(&panic_val),
+                },
+            }
+        })
+        .collect();
+
+    // Drain stage-1 outcomes in input order: deterministic stderr + findings.
     let mut prepared: Vec<Prepared> = Vec::new();
-
-    for (order, path) in files.iter().enumerate() {
-        // Config `exclude:` — skip the file entirely before reading/analyzing it.
-        if cfg.is_excluded(path) {
-            continue;
-        }
-
-        let source = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("rigor {verb}: cannot read {path}: {e}");
+    for outcome in stage1 {
+        match outcome {
+            Stage1::Excluded => {}
+            Stage1::Prepared(p) => prepared.push(p),
+            Stage1::IoError { path, msg } => {
+                eprintln!("rigor {verb}: cannot read {path}: {msg}");
                 had_io_error = true;
-                continue;
             }
-        };
-
-        let path_owned = path.to_string();
-        let source_bytes = source.as_bytes().to_vec();
-        let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
-            let result = parse(&source_bytes);
-            let comments = rigor_parse::comment_lines(&result, &source_bytes);
-            (lower(&result), comments)
-        }));
-
-        match lowered {
-            Ok((ast, comments)) => {
-                prepared.push(Prepared { order, path: path_owned, source, ast, comments });
-            }
-            Err(panic_val) => {
-                let msg = panic_message(&panic_val);
+            Stage1::Panic { order, path, msg } => {
                 eprintln!("rigor {verb}: internal panic on {path}: {msg}");
-                findings.push((order, path_owned, String::new(), internal_error_diag(msg)));
+                findings.push((order, path, String::new(), internal_error_diag(msg)));
             }
         }
     }
 
-    // Stage 2: build ONE project-wide source index from all cleanly-lowered ASTs.
+    // STAGE 2 (serial barrier): build ONE project-wide source index from all
+    // cleanly-lowered ASTs. This is the cross-file join — it must see every AST.
     let asts: Vec<&rigor_parse::LoweredAst> = prepared.iter().map(|p| &p.ast).collect();
     let project_source = rigor_infer::SourceIndex::build_project(&asts, &index);
 
-    // Stage 3: analyze each file against the shared project source (panic-isolated).
-    for p in &prepared {
-        let Prepared { order, path, source, ast, comments } = p;
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut interner = Interner::new();
-            analyze_with_source(ast, &mut interner, &index, &project_source)
-        }));
-
-        match result {
-            Ok(diags) => {
-                let with_lines: Vec<(usize, Diagnostic)> = diags
-                    .into_iter()
-                    .map(|diag| (line_col(source, diag.start_offset).0, diag))
-                    .collect();
-                for (_line, diag) in rigor_rules::filter_suppressed(with_lines, comments) {
-                    // Config `disable:` — drop diagnostics whose rule matches the
-                    // expanded disable set (the internal-error sentinel is never matched).
-                    if disable_matcher.suppresses(diag.rule_id) {
-                        continue;
+    // STAGE 3 (file-parallel): analyze each file against the shared, now-frozen
+    // `index` + `project_source` (read-only, `Sync`) with a FRESH per-file
+    // `Interner`. Each closure produces its file's post-suppression findings —
+    // and, on a panic, the synthetic internal-error finding plus a DEFERRED
+    // stderr line — all order-keyed, so the serial drain replays them in order.
+    struct Stage3 {
+        findings: Vec<(usize, String, String, Diagnostic)>,
+        /// `(path, msg)` for a panic's deferred (in-order) stderr line.
+        panic: Option<(String, String)>,
+    }
+    let stage3: Vec<Stage3> = prepared
+        .par_iter()
+        .map(|p| {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut interner = Interner::new();
+                analyze_with_source(&p.ast, &mut interner, &index, &project_source)
+            }));
+            match result {
+                Ok(diags) => {
+                    let with_lines: Vec<(usize, Diagnostic)> = diags
+                        .into_iter()
+                        .map(|diag| (line_col(&p.source, diag.start_offset).0, diag))
+                        .collect();
+                    let mut local = Vec::new();
+                    for (_line, diag) in rigor_rules::filter_suppressed(with_lines, &p.comments) {
+                        // Config `disable:` — drop diagnostics whose rule matches the
+                        // expanded disable set (the internal-error sentinel never matches).
+                        if disable_matcher.suppresses(diag.rule_id) {
+                            continue;
+                        }
+                        local.push((p.order, p.path.clone(), p.source.clone(), diag));
                     }
-                    findings.push((*order, path.clone(), source.clone(), diag));
+                    Stage3 { findings: local, panic: None }
+                }
+                Err(panic_val) => {
+                    let msg = panic_message(&panic_val);
+                    let finding =
+                        (p.order, p.path.clone(), String::new(), internal_error_diag(msg.clone()));
+                    Stage3 { findings: vec![finding], panic: Some((p.path.clone(), msg)) }
                 }
             }
-            Err(panic_val) => {
-                let msg = panic_message(&panic_val);
-                eprintln!("rigor {verb}: internal panic on {path}: {msg}");
-                findings.push((*order, path.clone(), String::new(), internal_error_diag(msg)));
-            }
+        })
+        .collect();
+
+    // Drain stage-3 outcomes in input order: deterministic stderr + findings.
+    for s3 in stage3 {
+        if let Some((path, msg)) = &s3.panic {
+            eprintln!("rigor {verb}: internal panic on {path}: {msg}");
         }
+        findings.extend(s3.findings);
     }
 
-    // Restore input order (stage 1 and stage 3 push interleaved).
+    // Restore input order (stage-1 panics and stage-3 findings interleave by order).
     findings.sort_by_key(|(order, _, _, _)| *order);
     (findings, had_io_error)
 }

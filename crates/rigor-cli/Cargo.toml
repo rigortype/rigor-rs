@@ -54,3 +54,11 @@ serde_json = "1"
 # regexes (reference ADR-22). `regex` 1.12.3 is already in Cargo.lock as a
 # transitive dep and cached in ~/.cargo/registry, so this is offline-safe.
 regex = "1"
+# File-level parallelism for the `check` pipeline (§9, ADR-0006/0028). rayon's
+# work-stealing pool drives the two embarrassingly-parallel stages (parse+lower,
+# analyze); the project-index build stays a serial barrier between them. Output
+# is collected in input order + stably sorted, so parallelism is invisible in
+# the result (byte-identical to serial). rayon 1.12 + its crossbeam/either deps
+# are already unpacked in ~/.cargo/registry, so the build stays offline.
+# `RAYON_NUM_THREADS` (rayon-native) caps the pool; =1 forces serial execution.
+rayon = "1"

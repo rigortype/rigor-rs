@@ -6,7 +6,11 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 — **5 commits pushed to origin/master (@ `2d0add3`)**: rustfmt policy
+Last updated: 2026-07-01 — **UNCOMMITTED working-tree change: §9 rayon file-level parallelism**
+(`analyze_files` parse+lower + analyze on a rayon pool, `build_project` the serial barrier;
+byte-identical to serial, 0 FP preserved, ~2.4× warm speedup on 7749 real files; 369 tests +
+run.rb + run_snapshot.rb + run_corpus.rb all green; see §9). First Productization-track (lever A)
+increment. Prior: **5 commits pushed to origin/master (@ `2d0add3`)**: rustfmt policy
 (ADR-0032) · `flow.always-truthy-condition` + first ADR-0022 flow substrate · **upstream pinned to
 `v0.2.6`** as a `reference/rigor` git submodule + harness re-baselined ([`UPSTREAM.md`](../UPSTREAM.md)) ·
 **`call.unresolved-toplevel`** (the highest-frequency unimplemented rule per a v0.2.6 corpus tally, 0 FP) ·
@@ -162,13 +166,21 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 > 369 tests, run.rb + run_snapshot.rb PASS (36 fixtures, 0 FP), corpus 0 FP (clean v0.2.6 ref run),
 > clippy `-D warnings` clean.
 >
+> **▶▶ DONE (2026-07-01, next session) — §9 rayon file-level parallelism.** The `check` pipeline
+> (`analyze_files`) now runs parse+lower and analyze on a rayon pool with `build_project` as the
+> serial barrier ("pre-pass tables frozen before workers"); output is byte-identical to serial
+> (order-keyed collect + sequential side-effect drain), **0 FP preserved**, **~2.4× warm speedup**
+> (12 cores, 7749 real files: 0.91s → 0.37s). See §9 for the full write-up + verification. This is
+> the first Productization-track (lever A) increment; `RAYON_NUM_THREADS=1` forces serial.
+>
 > **▶▶ NEXT SESSION — START HERE.** Net-new-rule coverage is EXHAUSTED (the v0.2.6 rule-tally proved
 > every unimplemented rule fires ~0 on the clean Rails corpus). The next levers are a different kind
 > of value; ranked by EV:
-> - **A. Productization (RECOMMENDED — highest EV, coverage-independent).** §12 **LSP server**
->   (`rigor lsp --transport=stdio`, hover/completion — the single-binary strength shows here) or an
->   MCP server; §9 **performance** (rayon file-level parallelism + frozen pre-pass tables — matches
->   the "performance prototype" positioning, benchmarkable); §11 CLI completion
+> - **A. Productization (RECOMMENDED — highest EV, coverage-independent).** ✅ §9 **performance**
+>   (rayon file-level parallelism) LANDED 2026-07-01 (see above / §9) — a further win is
+>   parallelizing stage-2 `build_project` if it becomes the bottleneck at scale. Still open: §12
+>   **LSP server** (`rigor lsp --transport=stdio`, hover/completion — the single-binary strength
+>   shows here) or an MCP server; §11 CLI completion
 >   (`annotate`/`diff`/`triage`/`coverage --protection`/`sig-gen`).
 > - **B. Plugin phase (§10, ADR-0013/0027)** — the Plugin trait (`dynamic_return`/`narrowing_facts`/
 >   `node_rule`) + Rails plugins. The BIGGEST remaining undefined-method coverage pool ("most
@@ -665,8 +677,30 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   two store paths; incremental cross-file dep graph + `--verify-incremental` (ref ADR-46).
 
 ### 9. Concurrency — `worker-session`, ractor → (ADR-0006/0028)
-- ⬜ rayon file-level parallelism; pre-pass tables frozen before workers; per-worker merge;
-  severity re-stamp post-pool; workers precedence. (Salsa deferred — empirical trigger only.)
+- ✅ **rayon file-level parallelism landed (2026-07-01).** `analyze_files`
+  (`rigor-cli/main.rs`, the shared `check`/`baseline generate` pipeline) now runs its two
+  file-INDEPENDENT stages on a rayon work-stealing pool: **stage 1** (read + parse + lower each
+  file) and **stage 3** (analyze each file against the shared index). **Stage 2** — the
+  project-wide `SourceIndex::build_project` — stays the **serial barrier** between them (this IS
+  the "pre-pass tables frozen before workers": `index` + `project_source` are immutable/`Sync`
+  and shared read-only across the stage-3 pool; each worker mints a FRESH per-file `Interner`).
+  **Byte-identical output is the parity keystone:** each parallel stage `par_iter().map().collect()`s
+  its outcomes IN INPUT ORDER, and all side effects — the stderr lines AND the findings pushes —
+  are replayed by a SEQUENTIAL drain of that ordered Vec, then the existing `sort_by_key(order)`
+  restores global input order. So stdout, stderr, and exit code are byte-for-byte the serial
+  result; the pool is invisible. Per-file panic isolation (ADR-0016) is preserved — each closure
+  `catch_unwind`s its own file; a panic's stderr line is DEFERRED to the ordered drain.
+  **Verified:** 8-thread ≡ 1-thread (`RAYON_NUM_THREADS`) byte-identical stdout+stderr+exit on
+  the 36 corpus fixtures (52 real diagnostics) AND on 400 real corpus files; 10 repeated parallel
+  runs → one identical md5; 369 tests + `run.rb` (36 fixtures, 0 FP) + `run_snapshot.rb` +
+  `run_corpus.rb` (1200 real files, 0 FP) all green; clippy bin-clean. **Speedup: ~2.4× warm**
+  (12 cores, 7749 mastodon+gitlab `.rb`: serial ~0.91s → parallel ~0.37s; the ~0.02s RBS-load
+  floor is negligible, so this is ~2.5× on the parallelizable work). Sublinear vs core count
+  because stage 2 + output collection stay serial (by design — §9's "pre-pass frozen" model).
+  rayon 1.12 + crossbeam/either added to `Cargo.lock` (offline-cached); `RAYON_NUM_THREADS=1`
+  forces serial. **Deferred** (not needed for this slice): per-worker incremental merge, severity
+  re-stamp post-pool, `workers:` config precedence, parallelizing stage 2's `build_project`.
+  (Salsa deferred — empirical trigger only.)
 
 ### 10. Plugins — `lib/rigor/plugin/` + `plugins/` (31) → (ADR-0013/0027)
 - ✅ **First plugin slice landed — `rigor-activesupport-core-ext` (PURE-RBS via
