@@ -318,6 +318,71 @@ impl CoreData {
         !complete
     }
 
+    /// Enumerate every INSTANCE method name callable on `class_name` — its own
+    /// methods plus those inherited over the flattened ancestor chain (superclass
+    /// and included modules), plus instance `alias` names. Sorted and deduped.
+    /// Empty when the class is unknown. Used by LSP completion (§12); unlike the
+    /// diagnostic predicates this is advisory, so it enumerates the full known
+    /// surface without a completeness gate.
+    pub fn instance_method_names(&self, class_name: &str) -> Vec<&'static str> {
+        if !self.classes.contains_key(class_name) {
+            return Vec::new();
+        }
+        let (chain, _complete) = self.ancestors(class_name);
+        let mut set: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+        for &anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                set.extend(entry.methods.keys().copied());
+                set.extend(entry.aliases.keys().copied());
+            }
+        }
+        set.into_iter().collect()
+    }
+
+    /// Enumerate every SINGLETON (class-object) method name callable on the class
+    /// object `class_name`: the `def self.x` methods up its superclass chain, the
+    /// instance methods of every `extend`ed module, singleton aliases, and the
+    /// instance methods of the base classes the class object is itself an instance
+    /// of (`Class`/`Module`/`Object`/`Kernel`/`BasicObject`). Sorted + deduped.
+    /// Mirrors the surface of [`Self::class_has_singleton_method`]; advisory
+    /// (no completeness gate), for LSP completion on a `Singleton` receiver.
+    pub fn singleton_method_names(&self, class_name: &str) -> Vec<&'static str> {
+        if !self.classes.contains_key(class_name) {
+            return Vec::new();
+        }
+        let mut set: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
+
+        // The singleton superclass chain (the singleton class inherits down
+        // `superclass`); on each, own `def self.x` + singleton aliases + the
+        // instance methods of every `extend`ed module.
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let Some((&key, entry)) = self.classes.get_key_value(name) else { break };
+            if !seen.insert(key) {
+                break; // cycle guard.
+            }
+            set.extend(entry.singleton_methods.keys().copied());
+            set.extend(entry.singleton_aliases.keys().copied());
+            for &module in &entry.extends {
+                for m in self.instance_method_names(module) {
+                    set.insert(m);
+                }
+            }
+            cur = entry.superclass;
+        }
+
+        // The class object is itself an instance of `Class` (→ `Module` →
+        // `Object` → `Kernel`/`BasicObject`), so those instance methods respond
+        // on it (`.new`, `.name`, `.tap`, …).
+        for base in ["Class", "Module", "Object", "Kernel", "BasicObject"] {
+            for m in self.instance_method_names(base) {
+                set.insert(m);
+            }
+        }
+        set.into_iter().collect()
+    }
+
     /// Whether the class OBJECT `class_name` responds to a singleton (class)
     /// method `method`. Conservative (zero false positive): returns `true`
     /// ("present ⇒ stay silent") unless the full singleton surface is known to

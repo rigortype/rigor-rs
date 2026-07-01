@@ -9,9 +9,11 @@ fix a sequence.
 Last updated: 2026-07-01 — **Productization track (lever A): 2 commits pushed (@ `10e78e1`) +
 UNCOMMITTED LSP v1.** (1) §9 **rayon file-level parallelism** (`analyze_files` on a rayon pool,
 byte-identical to serial, 0 FP, ~2.4× warm speedup) + `RIGOR_TIMING` observability [committed].
-(2) §12 **LSP server v1** — `rigor lsp --transport=stdio` (sync `lsp-server`/`lsp-types`, no
-async runtime): live diagnostics + hover, reusing the exact `check`/`type-of` path; 376 tests +
-end-to-end stdio smoke green [uncommitted, ready]. Prior: **5 commits pushed (@ `2d0add3`)**: rustfmt policy
+(2) §12 **LSP server v1 + v2** — `rigor lsp --transport=stdio` (sync `lsp-server`/`lsp-types`, no
+async runtime): live diagnostics + hover [v1, committed `2e291a5`] + **member-access completion**
+(new `CoreIndex` method-enumeration API + placeholder-injection receiver typing) [v2, uncommitted,
+ready]. 384 tests + end-to-end stdio smoke (diagnostics/hover/completion) green; v2 proven
+byte-identical `check` output vs v1. Prior: **5 commits pushed (@ `2d0add3`)**: rustfmt policy
 (ADR-0032) · `flow.always-truthy-condition` + first ADR-0022 flow substrate · **upstream pinned to
 `v0.2.6`** as a `reference/rigor` git submodule + harness re-baselined ([`UPSTREAM.md`](../UPSTREAM.md)) ·
 **`call.unresolved-toplevel`** (the highest-frequency unimplemented rule per a v0.2.6 corpus tally, 0 FP) ·
@@ -178,12 +180,13 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 > every unimplemented rule fires ~0 on the clean Rails corpus). The next levers are a different kind
 > of value; ranked by EV:
 > - **A. Productization (RECOMMENDED — highest EV, coverage-independent).** ✅ §9 **performance**
->   (rayon file-level parallelism) LANDED 2026-07-01 (see §9). ✅ §12 **LSP server v1** LANDED
->   2026-07-01 (`rigor lsp --transport=stdio`: live diagnostics + hover; see §12). **Next LSP
->   slice = `textDocument/completion`** (needs a `CoreIndex` method-enumeration API + a
->   receiver-before-trigger parser — the one headline LSP feature still deferred). Also open: an
->   MCP server (§12); §11 CLI completion (`annotate`/`diff`/`triage`/`coverage --protection`/
->   `sig-gen`); parallelizing stage-2 `build_project` if it becomes the bottleneck at scale.
+>   (rayon file-level parallelism) LANDED 2026-07-01 (see §9). ✅ §12 **LSP server v1 + v2** LANDED
+>   2026-07-01 (`rigor lsp --transport=stdio`: live diagnostics + hover + member-access
+>   **completion**; see §12) — the three headline LSP features are now all in. **Next LSP slice**
+>   = `::` constant/namespace completion + Union-intersection + private-method visibility filter,
+>   or the full two-tier `ProjectContext` (watched-files invalidation, debounce, worker pool).
+>   Also open: an **MCP server** (§12); §11 CLI completion (`annotate`/`diff`/`triage`/
+>   `coverage --protection`/`sig-gen`); parallelizing stage-2 `build_project` at scale.
 > - **B. Plugin phase (§10, ADR-0013/0027)** — the Plugin trait (`dynamic_return`/`narrowing_facts`/
 >   `node_rule`) + Rails plugins. The BIGGEST remaining undefined-method coverage pool ("most
 >   remaining real-code coverage lives here"), but a large phase.
@@ -853,13 +856,38 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   shutdown/exit 0) and a didChange/didClose lifecycle (open-clean→0, change-typo→1, close→0).
   376 tests total, run.rb + run_snapshot.rb PASS (0 FP), clippy bin-clean. Deps fetched into the
   offline cache (`lsp-server` 0.8, `lsp-types` 0.97 + crossbeam-channel/fluent-uri/serde_repr).
-- ⬜ **Deferred (LSP v2+):** `textDocument/completion` (the last headline LSP feature — needs a
-  NEW `CoreIndex` method-ENUMERATION API, `class_methods` over the ancestor chain, + a
-  receiver-before-`.`/`::` parser + Union-intersection + visibility filter); the full two-tier
-  `ProjectContext` (generation counter, `didChangeWatchedFiles`/`didChangeConfiguration`
-  invalidation), cross-file project context for open buffers, a pre-warmed worker pool, 200ms
-  `didChange` debounce, temp-file `BufferBinding`, incremental UTF-16 `didChange` sync, `--log`
-  wiring, and TCP/socket transport. **MCP server** (read-only tools over stdio).
+- ✅ **LSP v2 — `textDocument/completion` landed (2026-07-01).** Member-access method completion,
+  triggered on `.` and `:` (advertised `completionProvider`). **New index enumeration API**
+  (`rigor-index`): `CoreIndex::instance_method_names` (own + inherited over the flattened ancestor
+  chain + `alias` names) and `singleton_method_names` (own/inherited `def self.x` + extended-module
+  instance methods + singleton aliases + the `Class`/`Module`/`Object`/`Kernel`/`BasicObject`
+  instance surface); sorted/deduped, advisory (no completeness gate — completion isn't a witness).
+  **Receiver resolution is robust to incomplete input via placeholder injection:** a stub method
+  name is spliced in at the cursor (dropping any half-typed prefix — the client filters the full
+  set), so the parser yields a `Call { receiver, method: <stub> }` regardless of what's typed; the
+  receiver node is typed with the SAME `Typer` hover/check use, and its class drives instance-
+  (`class_name_of`) vs singleton- (`Type::Singleton` → `class_name_for_id`) enumeration. A
+  `Dynamic`/project/unknown receiver ⇒ empty (no guess). **Verified:** +6 LSP completion tests
+  (String/Integer instance methods, half-typed-prefix, `Time.` singleton `now`/`new`, non-member
+  and Dynamic-receiver empties) + 2 index enumeration tests; an e2e stdio completion session (269
+  String methods incl. `upcase`/`length`). **The v2 index+completion code is DEAD CODE for the
+  diagnostic path — proven byte-identical `check` output on 1236 real mastodon files vs committed
+  v1 (both 397 diags).** 384 tests, run.rb + run_snapshot.rb PASS (0 FP), clippy index-lib +
+  cli-bin clean.
+- ⬜ **Deferred (LSP v3+):** `::` constant/namespace completion (currently `::` yields singleton
+  methods, not nested constants); Union-receiver method intersection + private-method visibility
+  filter; the full two-tier `ProjectContext` (generation counter,
+  `didChangeWatchedFiles`/`didChangeConfiguration` invalidation), cross-file project context for
+  open buffers, a pre-warmed worker pool, 200ms `didChange` debounce, temp-file `BufferBinding`,
+  incremental UTF-16 `didChange` sync, `--log` wiring, and TCP/socket transport. **MCP server**
+  (read-only tools over stdio).
+- **NOTE (reference-harness flakiness, observed 2026-07-01):** `run_corpus.rb` (the LIVE
+  differential harness) gave swinging FP counts (70/0/2/0) on a DETERMINISTIC file set
+  (`Dir[...].sort.first(limit)`) with a provably-deterministic rigor-rs binary — i.e. the Ruby
+  v0.2.6 reference oracle is itself nondeterministic across runs (transient per-file
+  under-emission). The reference-free **`run_snapshot.rb`** (pinned snapshots) is the reliable
+  0-FP gate and stays green; treat live-corpus FP counts as advisory, and confirm any apparent
+  regression by diffing rigor-rs's OWN output across builds (as done for v2 above).
 
 ### 13. Distribution (ADR-0010)
 > **Version is now `0.0.1`** — the v0.0.1 first-release target (see "▶▶ v0.0.1 RELEASE PREP"

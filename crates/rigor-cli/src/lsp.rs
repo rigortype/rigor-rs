@@ -23,6 +23,7 @@ use std::process::ExitCode;
 
 use lsp_server::{Connection, Message, Response};
 use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, Hover, HoverContents, HoverParams, HoverProviderCapability,
     MarkupContent, MarkupKind, NumberOrString, Position, PublishDiagnosticsParams, Range,
@@ -31,9 +32,9 @@ use lsp_types::{
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, Typer};
-use rigor_parse::{comment_lines, lower, parse};
+use rigor_parse::{comment_lines, lower, parse, Node};
 use rigor_rules::{analyze_with_source, filter_suppressed, Severity, SuppressSet};
-use rigor_types::Interner;
+use rigor_types::{Interner, Type, TypeId};
 
 use crate::config::Config;
 
@@ -88,6 +89,13 @@ fn run_stdio() -> Result<(), String> {
         // bandwidth is irrelevant; UTF-16 incremental diffing is a later slice).
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        // Member-access method completion, triggered on `.` and `:` (the second
+        // `:` of `::`). The server returns the full unfiltered candidate set;
+        // client-side fuzzy matching narrows it (ADR-0029).
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     let caps_value = serde_json::to_value(capabilities).map_err(|e| e.to_string())?;
@@ -157,6 +165,19 @@ fn main_loop(
                             .sender
                             .send(Message::Response(resp))
                             .map_err(|e| e.to_string())?;
+                    }
+                    "textDocument/completion" => {
+                        match req.extract::<CompletionParams>("textDocument/completion") {
+                            Ok((id, params)) => {
+                                let items = completion(ctx, buffers, &params);
+                                let resp = Response::new_ok(id, items);
+                                connection
+                                    .sender
+                                    .send(Message::Response(resp))
+                                    .map_err(|e| e.to_string())?;
+                            }
+                            Err(e) => eprintln!("rigor lsp: bad completion params: {e:?}"),
+                        }
                     }
                     // Unknown request: reply with a MethodNotFound-ish null result
                     // so the client doesn't hang (we advertise a small surface).
@@ -342,6 +363,114 @@ fn hover(
 }
 
 // ---------------------------------------------------------------------------
+// Completion (member-access method completion on `.` / `::`)
+// ---------------------------------------------------------------------------
+
+/// A stub method name injected at the cursor so a possibly-incomplete buffer
+/// (`x.`, `x.up`) parses cleanly into a `Call` whose receiver we can type. Chosen
+/// to be a valid, collision-unlikely lowercase identifier.
+const COMPLETION_STUB: &str = "rigorCompletionHole";
+
+/// Answer `textDocument/completion`: if the cursor sits after a `.`/`::` member
+/// access, resolve the receiver's type and return its callable methods. Returns
+/// `None` (a null completion) when the cursor isn't in a member-access context,
+/// the buffer is unknown, or the receiver type is unresolved.
+///
+/// Robust to incomplete input via **placeholder injection**: a stub method name
+/// is spliced in right after the separator (replacing any half-typed name), so
+/// the parser yields a `Call { receiver, method: <stub> }` regardless of what the
+/// user has typed. The receiver node is typed with the same `Typer` `hover`/`check`
+/// use; its class drives instance- vs singleton-method enumeration. The half-typed
+/// prefix is intentionally dropped — the client filters the full set by it.
+fn completion(
+    ctx: &ServerContext,
+    buffers: &HashMap<String, String>,
+    params: &CompletionParams,
+) -> Option<CompletionResponse> {
+    let tdp = &params.text_document_position;
+    let text = buffers.get(&uri_key(&tdp.text_document.uri))?;
+    let offset = position_to_offset(text, tdp.position)?;
+    let bytes = text.as_bytes();
+
+    // Scan back over any half-typed identifier to find where it starts.
+    let mut ident_start = offset;
+    while ident_start > 0 && is_ident_byte(bytes[ident_start - 1]) {
+        ident_start -= 1;
+    }
+    // The separator must sit immediately before the (possibly empty) identifier:
+    // `::` (constant/class scope) or a plain `.` (not part of a `..`/`...` range).
+    let is_member_access = (ident_start >= 2 && &text[ident_start - 2..ident_start] == "::")
+        || (ident_start >= 1
+            && bytes[ident_start - 1] == b'.'
+            && !(ident_start >= 2 && bytes[ident_start - 2] == b'.'));
+    if !is_member_access {
+        return None; // not a member-access completion context.
+    }
+    let stub_at = ident_start; // where the stub name begins (right after the sep).
+
+    // Splice the stub in after the separator, dropping any half-typed name.
+    let synth = format!("{}{}{}", &text[..ident_start], COMPLETION_STUB, &text[offset..]);
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let ast = lower(&parse(synth.as_bytes()));
+        // Our injected call is the unique `Call` whose method-name token starts
+        // exactly at `stub_at`.
+        let receiver = ast.iter().find_map(|(_, n)| match n {
+            Node::Call { receiver, message_span, .. } if message_span.0 == stub_at => Some(*receiver),
+            _ => None,
+        })??;
+        let source = SourceIndex::build(&ast, &ctx.index);
+        let typer = Typer::with_source(&ctx.index, &source);
+        let mut interner = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut interner);
+        let ty = typer.type_of(&ast, receiver, &env, &mut interner);
+        Some(method_names_for(&ctx.index, &typer, &interner, ty))
+    }));
+
+    let names = result.ok().flatten()?;
+    if names.is_empty() {
+        return None;
+    }
+    let items: Vec<CompletionItem> = names
+        .into_iter()
+        .map(|m| CompletionItem {
+            label: m.to_string(),
+            kind: Some(CompletionItemKind::METHOD),
+            ..Default::default()
+        })
+        .collect();
+    Some(CompletionResponse::Array(items))
+}
+
+/// Resolve the receiver type to the set of callable method names: singleton
+/// (class-object) methods for a `Type::Singleton` receiver (a bare class
+/// constant), else instance methods on the receiver's concrete core class. Empty
+/// when the class isn't resolvable (a `Dynamic`/project/unknown receiver ⇒ no
+/// completion, never a guess).
+fn method_names_for(
+    index: &CoreIndex,
+    typer: &Typer<'_>,
+    interner: &Interner,
+    ty: TypeId,
+) -> Vec<&'static str> {
+    if let Type::Singleton(class) = interner.get(ty) {
+        return match typer.source().class_name_for_id(*class) {
+            Some(name) => index.singleton_method_names(name),
+            None => Vec::new(),
+        };
+    }
+    match index.class_name_of(interner, ty) {
+        Some(name) => index.instance_method_names(name),
+        None => Vec::new(),
+    }
+}
+
+/// An ASCII identifier byte (`[A-Za-z0-9_]`) — used to scan a half-typed name.
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+// ---------------------------------------------------------------------------
 // Position <-> byte-offset (LSP: 0-based line, 0-based UTF-16 `character`)
 // ---------------------------------------------------------------------------
 
@@ -477,6 +606,69 @@ mod tests {
             HoverContents::Markup(m) => assert!(m.value.contains("42"), "{}", m.value),
             _ => panic!("expected markup hover"),
         }
+    }
+
+    /// Run completion at a 0-based (line, character) over a single buffer,
+    /// returning the candidate labels (empty when None).
+    fn complete(text: &str, line: u32, character: u32) -> Vec<String> {
+        let mut buffers = HashMap::new();
+        let uri: Uri = "file:///c.rb".parse().unwrap();
+        buffers.insert(uri_key(&uri), text.to_string());
+        let params = CompletionParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        match completion(&ctx(), &buffers, &params) {
+            Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn completion_instance_methods_on_a_string() {
+        // `s = "hi"\ns.` — cursor right after the dot on line 2 (char 2).
+        let labels = complete("s = \"hi\"\ns.\n", 1, 2);
+        assert!(labels.contains(&"upcase".to_string()), "has upcase: {labels:?}");
+        assert!(labels.contains(&"length".to_string()), "has length: {labels:?}");
+    }
+
+    #[test]
+    fn completion_with_partial_prefix_still_lists_full_set() {
+        // `s = "hi"\ns.up` — cursor after `up`; the half-typed prefix is dropped,
+        // the FULL instance-method set is returned (client filters by `up`).
+        let labels = complete("s = \"hi\"\ns.up\n", 1, 4);
+        assert!(labels.contains(&"upcase".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn completion_integer_methods() {
+        let labels = complete("n = 3\nn.\n", 1, 2);
+        assert!(labels.contains(&"times".to_string()), "has times: {labels:?}");
+    }
+
+    #[test]
+    fn completion_singleton_methods_on_a_class_constant() {
+        // `Time.` — a bare toplevel RBS class constant types to Singleton(Time),
+        // so completion offers class (singleton) methods like `now`.
+        let labels = complete("Time.\n", 0, 5);
+        assert!(labels.contains(&"now".to_string()), "has Time.now: {labels:?}");
+    }
+
+    #[test]
+    fn completion_not_in_member_access_is_empty() {
+        // A bare local write, cursor after `1` — no `.`/`::` before it.
+        assert!(complete("x = 1\n", 0, 5).is_empty());
+    }
+
+    #[test]
+    fn completion_on_dynamic_receiver_is_empty() {
+        // `foo.` where `foo` is unbound ⇒ Dynamic receiver ⇒ no completion (no guess).
+        assert!(complete("foo.\n", 0, 4).is_empty());
     }
 
     #[test]

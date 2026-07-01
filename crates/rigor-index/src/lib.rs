@@ -171,6 +171,22 @@ impl CoreIndex {
         self.data.class_has_singleton_method(class_name, method)
     }
 
+    /// Enumerate every INSTANCE method callable on `class_name` over its ancestor
+    /// chain (own + inherited + module + aliases), sorted + deduped. Empty for an
+    /// unknown class. Advisory (no completeness gate) — for LSP completion (§12).
+    pub fn instance_method_names(&self, class_name: &str) -> Vec<&'static str> {
+        self.data.instance_method_names(class_name)
+    }
+
+    /// Enumerate every SINGLETON (class-object) method callable on `class_name`
+    /// (own/inherited `def self.x`, extended-module instance methods, singleton
+    /// aliases, and the `Class`/`Module`/`Object`/`Kernel`/`BasicObject` instance
+    /// surface). Sorted + deduped, empty for an unknown class. Advisory — for LSP
+    /// completion on a `Singleton` receiver (§12).
+    pub fn singleton_method_names(&self, class_name: &str) -> Vec<&'static str> {
+        self.data.singleton_method_names(class_name)
+    }
+
     /// The RETURN class name of a core method, resolved over the receiver class's
     /// flattened ancestor chain — the **instance** counterpart of the free
     /// [`method_return`], reading THIS index's data so a config-gated plugin's
@@ -453,6 +469,30 @@ mod tests {
         assert!(!idx.knows_class("MyWidget"));
         // Even a plausible method on an unmodeled class returns false.
         assert!(!idx.class_has_method("MyWidget", "call"));
+    }
+
+    #[test]
+    fn instance_method_names_enumerate_over_ancestors() {
+        let idx = CoreIndex::new();
+        let m = idx.instance_method_names("String");
+        // Own + inherited + alias names are all present.
+        assert!(m.contains(&"upcase"), "own String method");
+        assert!(m.contains(&"length"), "String method");
+        assert!(m.contains(&"tap"), "inherited from Kernel/Object");
+        // Sorted + deduped.
+        assert!(m.windows(2).all(|w| w[0] <= w[1]), "sorted");
+        assert!(idx.instance_method_names("Integer").contains(&"times"));
+        // Unknown class ⇒ empty.
+        assert!(idx.instance_method_names("MyWidget").is_empty());
+    }
+
+    #[test]
+    fn singleton_method_names_include_class_methods_and_object_surface() {
+        let idx = CoreIndex::new();
+        let m = idx.singleton_method_names("Time");
+        assert!(m.contains(&"now"), "Time.now class method");
+        assert!(m.contains(&"new"), "Time.new via Class instance surface");
+        assert!(idx.singleton_method_names("MyWidget").is_empty());
     }
 
     #[test]
