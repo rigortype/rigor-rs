@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/35_unresolved_toplevel.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 15,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `undefined_toplevel_thing`. If a project file defines `undefined_toplevel_thing` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 16,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `another_missing_call`. If a project file defines `another_missing_call` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 22,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `still_missing`. If a project file defines `still_missing` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

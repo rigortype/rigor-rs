@@ -108,6 +108,15 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "medium",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-possible-nil-receiver",
         }),
+        CALL_UNRESOLVED_TOPLEVEL => Some(&RuleEntry {
+            // Authored `:warning` (balanced), `:off` in lenient. Evidence tier
+            // `low`: a firing is frequently a resolution gap (the defining file
+            // is outside the analyzed set, or the method is metaprogrammed) that
+            // routes to the `pre_eval:` review path, not a definite typo.
+            default_severity: Severity::Warning,
+            evidence_tier: "low",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-unresolved-toplevel",
+        }),
         FLOW_DEAD_ASSIGNMENT => Some(&RuleEntry {
             default_severity: Severity::Warning,
             evidence_tier: "medium",
@@ -163,6 +172,15 @@ pub const CALL_WRONG_ARITY: &str = "call.wrong-arity";
 /// literal-`nil` case is owned by `call.undefined-method` (matching the
 /// reference, which routes `nil.foo` to undefined-method).
 pub const CALL_POSSIBLE_NIL_RECEIVER: &str = "call.possible-nil-receiver";
+
+/// `call.unresolved-toplevel` (ref ADR-34): an implicit-self call (no explicit
+/// receiver) at TOPLEVEL scope — outside any `def`/`class`/`module` body — whose
+/// method name resolves against NONE of: a toplevel `def` in the same file, the
+/// `Object`/`Kernel` instance surface (`puts`/`require`/`raise`/`loop`/… all
+/// declared `def self?.x` in the core RBS, so recorded as instance methods), or
+/// an ADR-17 `pre_eval:` monkey-patch. Deliberately does NOT fire on implicit-self
+/// calls inside `def`/`class`/`module` bodies (ADR-24 leniency stays there).
+pub const CALL_UNRESOLVED_TOPLEVEL: &str = "call.unresolved-toplevel";
 
 /// `flow.dead-assignment`: a local assigned in a method body but never read in
 /// that body (ADR-0030 taxonomy). The FIRST `flow.*` rule — a pure AST/structural
@@ -453,7 +471,92 @@ pub fn analyze_with_source(
         }
     }
 
+    // Sixth pass — `call.unresolved-toplevel` (ref ADR-34). An implicit-self call
+    // (`receiver: None`) at TOPLEVEL scope whose name resolves against NEITHER the
+    // `Object`/`Kernel` instance surface NOR a same-file toplevel `def`. Toplevel
+    // = the call's span is not contained in any `def`/`class`/`module` span
+    // (span-containment, orphan-proof; ADR-24 leniency keeps in-body implicit-self
+    // calls silent). See `check_unresolved_toplevel` for the gate.
+    unresolved_toplevel_diagnostics(ast, index, source, &mut out);
+
     out
+}
+
+/// Emit `call.unresolved-toplevel` for every toplevel implicit-self call whose
+/// name is unresolved. Zero-FP gate (fires ⊆ the reference): suppress on the
+/// `Object` RBS surface (`class_has_method("Object", …)` — witnessed-absent only
+/// when Object's full core chain is loaded, so a miss there stays silent) AND on
+/// same-file toplevel `def` names AND on in-source `Object`/`Kernel`/`BasicObject`
+/// reopen methods (the reference's `source_declared_method?` path). `pre_eval:`
+/// monkey-patches are not modeled (rigor-rs has no `pre_eval`), so a project that
+/// injects toplevel methods that way would see a firing — the reference routes the
+/// same case to `pre_eval:` in the message; on the config-less corpus/harness the
+/// two agree exactly.
+fn unresolved_toplevel_diagnostics(
+    ast: &LoweredAst,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Spans of every CLASS/MODULE body — the NON-toplevel regions. `def` spans are
+    // deliberately EXCLUDED: the reference's `scope.toplevel?` means "outside any
+    // class/module body", so a TOPLEVEL `def`'s body is still toplevel (the rule
+    // fires on an unresolved implicit-self call there) — only a `def` nested in a
+    // class/module (a method) is non-toplevel, and its calls fall inside the
+    // enclosing class/module span.
+    let scope_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::ClassDef { .. } | Node::ModuleDef { .. } => Some(n.span()),
+            _ => None,
+        })
+        .collect();
+
+    for (_, n) in ast.iter() {
+        if let Node::Call { receiver: None, method, message_span, .. } = n {
+            // Not at toplevel (nested in a class/module) ⇒ silent (ADR-24).
+            if span_contained_in_any(n.span(), &scope_spans) {
+                continue;
+            }
+            // Resolves against a PROJECT-WIDE toplevel `def` / Object-reopen ⇒
+            // silent. Cross-file (not just same-file) matches the reference's
+            // project-mode resolution — a `def` in a required file resolves the
+            // call — which is what keeps the multi-file corpus zero-FP.
+            if source.is_toplevel_def(method) {
+                continue;
+            }
+            // Present on the Object/Kernel instance surface ⇒ silent. (`false`
+            // is witnessed-absent only when Object's whole core chain is loaded;
+            // an incomplete chain returns `true` ⇒ we stay silent — never an FP.)
+            if index.class_has_method("Object", method) {
+                continue;
+            }
+            let severity = catalog(CALL_UNRESOLVED_TOPLEVEL)
+                .map(|e| e.default_severity)
+                .unwrap_or(Severity::Warning);
+            out.push(Diagnostic {
+                rule_id: CALL_UNRESOLVED_TOPLEVEL,
+                start_offset: message_span.0,
+                end_offset: message_span.1,
+                message: format!(
+                    "unresolved toplevel call to `{method}`. If a project file defines \
+                     `{method}` via a toplevel `def` or a monkey-patch on Object/Kernel, list \
+                     that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+                ),
+                severity,
+                source_family: "builtin",
+                receiver_type: None,
+                method_name: Some(method.clone()),
+            });
+        }
+    }
+}
+
+/// Whether `span` is contained in ANY of `spans` (non-strict). Used to decide a
+/// call is inside some def/class/module body (a call span never equals a scope
+/// span, so no self-match).
+fn span_contained_in_any(span: rigor_parse::Span, spans: &[rigor_parse::Span]) -> bool {
+    spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
 }
 
 /// The defensive predicate selectors the reference's
@@ -1842,8 +1945,9 @@ mod tests {
 
     #[test]
     fn dynamic_receiver_is_silent() {
-        // `x` is never assigned => Dynamic[top] => never guess.
-        let diags = run(b"x.foo\n");
+        // `@x` is an untyped ivar => Dynamic[top] => never guess. (An ivar, not a
+        // bare `x`, so `call.unresolved-toplevel` — a separate rule — stays out.)
+        let diags = run(b"@x.foo\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
     }
 
@@ -2021,8 +2125,8 @@ mod tests {
         assert!(run(b"s = \"x\"\ns.upcase\n").is_empty());
         assert!(run(b"n = 1\nn.abs\n").is_empty());
         assert!(run(b"s = \"hi\"\ns.gsub(\"a\", \"b\")\n").is_empty());
-        // Dynamic receiver with any arity stays silent (never guess).
-        assert!(run(b"x.foo(1, 2, 3)\n").is_empty());
+        // Dynamic (ivar) receiver with any arity stays silent (never guess).
+        assert!(run(b"@x.foo(1, 2, 3)\n").is_empty());
         // A nullary call in its valid form stays silent.
         assert!(run(b"s = \"x\"\ns.chars\n").is_empty());
     }
@@ -2145,7 +2249,7 @@ mod tests {
     fn in_source_param_bound_unknown_arg_is_silent() {
         // The decline side: a param-bound method whose ARG types Dynamic (an
         // unknown receiver's result) ⇒ no core class to bind ⇒ silent.
-        let src = b"class C\n  def echo(x)\n    x\n  end\nend\nc = C.new\nc.echo(whatever).lenght\n";
+        let src = b"class C\n  def echo(x)\n    x\n  end\nend\nc = C.new\nc.echo(@whatever).lenght\n";
         let diags = run(src);
         assert!(diags.is_empty(), "param bound to an unknown-typed arg must stay silent, got {diags:?}");
     }
@@ -2323,7 +2427,8 @@ mod tests {
     fn array_wrap_flags_singleton_but_new_is_silent() {
         let idx = CoreIndex::new();
         // `Array.wrap` is an ActiveSupport extension, not core ⇒ flagged absent.
-        let diags = run(b"Array.wrap(x)\n");
+        // (`@x` ivar arg, not a bare `x`, so unresolved-toplevel stays out.)
+        let diags = run(b"Array.wrap(@x)\n");
         if idx.knows_class("Array") {
             assert_eq!(diags.len(), 1, "expected Array.wrap flagged, got {diags:?}");
             assert_eq!(diags[0].message, "undefined method `wrap' for singleton(Array)");
@@ -2747,6 +2852,79 @@ mod tests {
         );
     }
 
+    // -- call.unresolved-toplevel -----------------------------------------
+    //
+    // An implicit-self call at TOPLEVEL (outside any class/module) whose name
+    // resolves against neither the Object/Kernel surface nor a same-file toplevel
+    // def. Each case verified byte-exact (rule, line, column) against the oracle.
+
+    /// The `call.unresolved-toplevel` diagnostics in `src`, in source order.
+    fn unresolved(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNRESOLVED_TOPLEVEL)
+            .collect()
+    }
+
+    #[test]
+    fn unresolved_toplevel_fires_on_undefined_call() {
+        // A bare implicit-self call to an undefined method at toplevel. Oracle:
+        // 1:1, method `undefined_xyz`.
+        let src = b"undefined_xyz\n";
+        let d = unresolved(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert!(d[0].message.starts_with("unresolved toplevel call to `undefined_xyz`"));
+        assert_eq!(line_col(src, d[0].start_offset), (1, 1));
+    }
+
+    #[test]
+    fn unresolved_toplevel_kernel_method_resolves_silent() {
+        // Kernel methods (`def self?.x` in core RBS ⇒ instance methods on Kernel,
+        // included by Object) resolve ⇒ silent.
+        for src in [
+            b"puts \"x\"\n".as_slice(),
+            b"require \"set\"\n".as_slice(),
+            b"loop { break }\n".as_slice(),
+            b"raise \"e\"\n".as_slice(),
+        ] {
+            assert!(
+                unresolved(src).is_empty(),
+                "Kernel call must resolve silently: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_toplevel_same_file_def_silent() {
+        // A same-file toplevel `def` resolves a later toplevel call to it.
+        assert!(
+            unresolved(b"def helper\n  42\nend\nhelper\n").is_empty(),
+            "a same-file toplevel def must resolve the call"
+        );
+    }
+
+    #[test]
+    fn unresolved_toplevel_inside_class_body_silent() {
+        // An implicit-self call inside a class/module body is NOT toplevel
+        // (ADR-24 leniency) ⇒ silent even when unresolved.
+        assert!(
+            unresolved(b"class Widget\n  some_macro\n  def run\n    also_missing\n  end\nend\n")
+                .is_empty(),
+            "in-class implicit-self calls are not toplevel"
+        );
+    }
+
+    #[test]
+    fn unresolved_toplevel_fires_inside_toplevel_def_body() {
+        // A toplevel `def`'s BODY is still toplevel (scope.toplevel? = outside any
+        // class/module) ⇒ an unresolved implicit-self call there FIRES. Oracle: 2:3.
+        let src = b"def m\n  still_missing\nend\n";
+        let d = unresolved(src);
+        assert_eq!(d.len(), 1, "toplevel def body is toplevel, got {d:?}");
+        assert_eq!(line_col(src, d[0].start_offset), (2, 3));
+    }
+
     #[test]
     fn catalog_entries_are_correct() {
         let entry = catalog(CALL_UNDEFINED_METHOD).expect("catalog entry must exist");
@@ -2777,6 +2955,11 @@ mod tests {
         assert_eq!(entry.default_severity, Severity::Warning);
         assert_eq!(entry.evidence_tier, "medium");
         assert!(entry.documentation_url.contains("flow-always-truthy-condition"));
+
+        let entry = catalog(CALL_UNRESOLVED_TOPLEVEL).expect("catalog entry must exist");
+        assert_eq!(entry.default_severity, Severity::Warning);
+        assert_eq!(entry.evidence_tier, "low");
+        assert!(entry.documentation_url.contains("call-unresolved-toplevel"));
 
         assert!(catalog("unknown.rule").is_none());
     }

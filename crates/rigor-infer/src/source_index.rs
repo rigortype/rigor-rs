@@ -128,6 +128,15 @@ pub struct SourceIndex {
     /// `def.override-visibility-reduced` (see [`OverrideClass`]). Keyed by FULL
     /// qualified name to avoid the last-component name-collision merge.
     override_classes: HashMap<String, OverrideClass>,
+    /// PROJECT-WIDE toplevel method names, for `call.unresolved-toplevel` (ref
+    /// ADR-34). A name is here iff SOME analyzed file declares it OUTSIDE any
+    /// class/module — a toplevel `def foo` (Object private method), or an
+    /// in-source reopen of `Object`/`Kernel`/`BasicObject`. The reference resolves
+    /// a toplevel call against toplevel defs PROJECT-WIDE in a directory run (a
+    /// `def` in file A satisfies a call in file B that `require`s it), so the rule
+    /// suppresses on this cross-file set — matching the reference's project-mode
+    /// resolution and staying zero-FP on the multi-file corpus.
+    toplevel_defs: HashSet<String>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
@@ -204,6 +213,38 @@ impl SourceIndex {
             idx.collect_override_classes(ast, ast.root(), &[]);
         }
 
+        // Pass 1c (ADR-34): PROJECT-WIDE toplevel method names for
+        // `call.unresolved-toplevel`. A `def` OUTSIDE any class/module body is a
+        // toplevel def (an Object private method); an in-source reopen of
+        // Object/Kernel/BasicObject injects toplevel-callable methods too. Toplevel
+        // detection is span-containment against the file's class/module spans
+        // (orphan-proof). Harvested across ALL files so a `def` in one file
+        // resolves a call in another (the reference's project-mode resolution).
+        for ast in asts {
+            let scope_spans: Vec<rigor_parse::Span> = ast
+                .iter()
+                .filter_map(|(_, n)| match n {
+                    Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => Some(*span),
+                    _ => None,
+                })
+                .collect();
+            for (_, node) in ast.iter() {
+                match node {
+                    Node::Definition { name: Some(nm), span, .. }
+                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
+                    {
+                        idx.toplevel_defs.insert(nm.clone());
+                    }
+                    Node::ClassDef { name, methods, .. } | Node::ModuleDef { name, methods, .. }
+                        if matches!(name.as_str(), "Object" | "Kernel" | "BasicObject") =>
+                    {
+                        idx.toplevel_defs.extend(methods.iter().cloned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         // Pass 2: register an instance-class id for every `ConstantRead` whose
         // `name` is RBS-known but not a source class (source classes are already
         // registered). This lets both `Pathname.new(...)` instances AND bare
@@ -232,6 +273,13 @@ impl SourceIndex {
         idx.param_bound_returns = param_bound;
 
         idx
+    }
+
+    /// Whether `name` is a PROJECT-WIDE toplevel method (a toplevel `def` in any
+    /// analyzed file, or an in-source Object/Kernel/BasicObject reopen method) —
+    /// the `call.unresolved-toplevel` cross-file suppression surface.
+    pub fn is_toplevel_def(&self, name: &str) -> bool {
+        self.toplevel_defs.contains(name)
     }
 
     /// Register a name in the id registry (idempotent), returning nothing.

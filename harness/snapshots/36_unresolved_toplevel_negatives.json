@@ -1,0 +1,4 @@
+{
+  "fixture": "harness/corpus/36_unresolved_toplevel_negatives.rb",
+  "diagnostics": []
+}

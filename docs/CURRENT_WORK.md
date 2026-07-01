@@ -6,10 +6,11 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 (**upstream pinned to `v0.2.6`** as a `reference/rigor` git submodule +
-harness re-baselined, see [`UPSTREAM.md`](../UPSTREAM.md); earlier: `flow.always-truthy-condition`
-+ first ADR-0022 flow-constant substrate; 363 tests, corpus 0 FP). Prior: 2026-06-30 (rustfmt
-stance recorded — ADR-0032). 2026-06-27 (v0.0.1 release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix).
+Last updated: 2026-07-01 (**`call.unresolved-toplevel` landed** against pinned v0.2.6 — the
+highest-frequency unimplemented rule per a corpus rule-tally, 0 FP; **upstream pinned to `v0.2.6`**
+as a `reference/rigor` git submodule + harness re-baselined, see [`UPSTREAM.md`](../UPSTREAM.md);
+`flow.always-truthy-condition` + first ADR-0022 flow-constant substrate; 368 tests, corpus 0 FP).
+Prior: 2026-06-30 (rustfmt stance recorded — ADR-0032). 2026-06-27 (v0.0.1 release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix).
 See "▶ Resume here" for the release-tag steps + the recorded next work (musl/Windows targets; quality management).
 
 > **2026-06-26 correctness finding (this session).** The reference does **not**
@@ -110,7 +111,7 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >    and a strengthened `ci.yml` header comment pointing at the ADR. No source/code change; clippy
 >    stays the blocking style gate. (c) ✅ DONE (2026-06-27) —
 >    **Snapshot-mode CI parity** (ADR-0002, §14). Shared harness logic extracted to `harness/lib.rb`;
->    `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (34 fixtures) from the live
+>    `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (36 fixtures) from the live
 >    reference — the reference's pinned `(rule,line,column,severity,message)` set, sorted/pretty so
 >    regeneration is a no-op. `harness/run_snapshot.rb` is the reference-FREE gate: it loads the
 >    snapshots, runs the binary, and applies the IDENTICAL `(rule,line,column)` comparison (FP fail,
@@ -134,16 +135,32 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 > reusable substrate). +11 tests (363 total), live + snapshot harness PASS (34 fixtures), corpus 0 FP.
 > This is the **first ADR-0022 increment** — the seam later flow rules build on.
 >
-> Beyond it, the big remaining levers (now partially unblocked): **extend the ADR-0022 substrate**
-> from constant-propagation to NARROWING + negative facts (the `possible-nil` source expansion in §5
-> — `T | nil` params, `@ivar = nil` seeds, project-method nilable returns — and `flow.unreachable-clause`,
-> ref ADR-47); the plugin trait + the other ~30 plugins (§10, where most remaining undefined-method
-> coverage lives); §12 LSP/MCP.
+> **▶▶ DONE (2026-07-01) — `call.unresolved-toplevel` (ref ADR-34).** A corpus rule-tally against
+> the pinned v0.2.6 oracle (mastodon+gitlab: 762 undefined-method, 27 possible-nil, **14
+> unresolved-toplevel**, 8 always-truthy, 6 override-visibility) named unresolved-toplevel the
+> highest-frequency UNIMPLEMENTED rule with corpus signal — everything else (def.override-return/
+> param, ivar-write, argument-type, unreachable-clause) fires **0** on the clean Rails corpus. It
+> landed **0-FP** (§5): the presumed Object/Kernel-private-method blocker doesn't exist (core RBS
+> declares `puts`/`require`/… `def self?.x`, already recorded as Kernel instance methods), so no
+> index change; the real work was PROJECT-WIDE toplevel-def resolution (`SourceIndex::is_toplevel_def`,
+> §3) to match the reference's directory-mode cross-file resolution (cleared 19 example-corpus FPs).
+> 5 unit tests + 2 fixtures; 5 stale bare-`x` tests updated to `@x` (their `x` now correctly fires).
+> The remaining unimplemented rules are effectively 0-on-corpus — **coverage via net-new rules is
+> now exhausted** (confirms the [[undefined-method-lever-exhausted]] memory with fresh v0.2.6 data).
+>
+> Beyond it, the big remaining levers: **extend the ADR-0022 substrate** from constant-propagation to
+> NARROWING + negative facts (the `possible-nil` source expansion in §5 — `T | nil` params,
+> `@ivar = nil` seeds, project-method nilable returns — and `flow.unreachable-clause`, ref ADR-47),
+> which needs ivar typing and has UNCERTAIN corpus payoff (guard-dominated); the plugin trait + the
+> other ~30 plugins (§10, the biggest real-code coverage pool); §12 LSP/MCP; or a pivot to
+> productization (distribution/perf/LSP) as the higher-EV corpus-visible direction. Also: a
+> **pre-existing `flow.dead-assignment` FP** surfaced (a `while x = …; f(&x)` block-pass read isn't
+> counted) — spawned as its own task; small, unrelated to this work.
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 363 tests. The design (ADR 0001–0032) is audited and stable. The
+precision). 368 tests. The design (ADR 0001–0032) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -154,7 +171,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 363 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 368 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -258,17 +275,20 @@ Ranked next levers:
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 363 (verified `cargo test --offline`; the `flow.always-truthy-condition` slice added
-  +11 — 9 rule tests in `rigor-rules` + 2 flow-substrate tests in `rigor-infer`). **Parity:**
-  `run.rb` PASS (34 fixtures incl. the plugin-enabled +
+- **Tests:** 368 (verified `cargo test --offline`; `flow.always-truthy-condition` added +11,
+  `call.unresolved-toplevel` added +5 rule tests and updated 5 stale tests whose bare-`x` toplevel
+  stand-ins now correctly fire the new rule — switched to `@x` ivar receivers). **Parity:**
+  `run.rb` PASS (36 fixtures incl. the plugin-enabled +
   gate-guard pair, the tier-4b param-binding witness/decline pair, the four
   `def.override-visibility-reduced` fixtures — superclass + module-include positives, the
   reopened-class split, and the adversarial negatives bundle — the two
   `call.possible-nil-receiver` fixtures: a byte-exact true positive + a guarded-negatives
-  bundle — and the two `flow.always-truthy-condition` fixtures: a 4-case witness fixture
+  bundle — the two `flow.always-truthy-condition` fixtures: a 4-case witness fixture
   (literal-assigned / nil / inferred-fold / unless-false, all byte-exact vs the oracle) + an
-  adversarial-negatives bundle that proves the branch-reassignment / defensive / loop-nested /
-  param declines), 0 FP; `run_corpus.rb`
+  adversarial-negatives bundle — and the two `call.unresolved-toplevel` fixtures: a witness fixture
+  (undefined toplevel calls + a fire inside a toplevel `def` body, byte-exact vs the oracle) + a
+  pure-negatives bundle proving ~25 Kernel/Object methods + a toplevel def + in-class calls stay
+  silent), 0 FP; `run_corpus.rb`
   validated to **3829 real files, 0 FP, 637/637 matched** (`def.override-visibility-reduced`
   added **+79 matched net**, of which **+44 are override-visibility witnesses on
   mastodon+gitlab, 44/44 reference-equal**; 100% precision; embedded RBS == runtime path,
@@ -345,8 +365,12 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
   new deps, offline). `load()` ingests the embedded set by default via the shared
   `ingest_rbs_source` (same bytes → same `ruby-rbs` parser as the filesystem path ⇒ byte-identical).
   `RIGOR_RBS_CORE_DIR` retained as the runtime override; hardcoded-stub only on the degenerate path.
-- ✅ **Cross-file** project class index (`build_project`) for the singleton FP gate; ⬜ cross-file
-  CONSTANT index + cross-file in-source method RETURN inference (the next real coverage lever).
+- ✅ **Cross-file** project class index (`build_project`) for the singleton FP gate + the
+  PROJECT-WIDE **toplevel-def set** (`SourceIndex::is_toplevel_def`, ADR-34): every `def` outside a
+  class/module (across all files) + in-source Object/Kernel/BasicObject reopens, so
+  `call.unresolved-toplevel` resolves a call against a `def` in a `require`d file (matching the
+  reference's project-mode resolution — the cross-file zero-FP keystone). ⬜ cross-file CONSTANT
+  index + cross-file in-source method RETURN inference (the next real coverage lever).
 - ⬜ Project `sig/` + gem RBS (bundler / rbs_collection) + `target_ruby` overlays (ADR-0007).
 - ⬜ Method visibility, `prepend` order, generics/refinement resolution.
 - ⬜ Constant resolution (in-source > RBS precedence, `# TYPE:`); `pre_eval` monkey-patch pass
@@ -433,8 +457,27 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ✅ **Metaclass-constructor guard** (`CLASS_RETURNING_NEW` in `rigor-infer`): `Struct.new(...)`,
   `Data.define(...)`, `Class.new` return a CLASS, not an instance — never typed as an instance
   of the receiver (was a chained-`.new` FP).
-- ⬜ `call.self-undefined-method` (ships `:off`; needs subclass-aware gate) · `call.unresolved-toplevel`
-  (ref ADR-34) · `call.argument-type-mismatch` (ref ADR-64).
+- ✅ `call.unresolved-toplevel` (ref ADR-34) — an implicit-self call (`receiver: None`) at
+  TOPLEVEL scope (outside any class/module body — a toplevel `def`'s BODY IS still toplevel; only a
+  method inside a class/module is not) whose name resolves against NEITHER the `Object`/`Kernel`
+  instance surface NOR a toplevel `def`. Fires `warning` (evidence `low`; the reference message +
+  `pre_eval:` routing, verbatim), anchored on the method-name token. **The Object/Kernel surface was
+  the presumed blocker (private methods) — but it does NOT exist:** `puts`/`require`/`raise`/`loop`/
+  `format`/… are declared `def self?.x` in core RBS, so rigor-rs already records them as instance
+  methods on Kernel (which Object includes), and `class_has_method("Object", …)` resolves them
+  (verified `"x".puts`/`.require`/`.loop` all silent). Zero-FP gate: suppress on the Object surface
+  (witnessed-absent only when Object's whole core chain is loaded ⇒ a miss stays silent), on
+  PROJECT-WIDE toplevel `def` names (`SourceIndex::is_toplevel_def`, §3 — cross-file so a `def` in a
+  `require`d file resolves the call, matching the reference's project-mode resolution; this is the
+  zero-FP keystone that cleared 19 example-corpus FPs where `route_helpers.rb` defines the toplevel
+  defs `demo.rb` calls), and on in-source `Object`/`Kernel`/`BasicObject` reopens. Toplevel detection
+  is span-containment against class/module spans (orphan-proof). `pre_eval:` monkey-patches are not
+  modeled (rigor-rs has no `pre_eval`), a documented limitation — on the config-less corpus/harness
+  the tools agree exactly. **Corpus (pinned v0.2.6): 0 FP** across mastodon+gitlab+conference (the
+  one residual corpus FP is a PRE-EXISTING `flow.dead-assignment` bug on `while x = …; f(&x)` — the
+  `&x` block-pass read isn't counted — unrelated to this rule; see the spawned task).
+- ⬜ `call.self-undefined-method` (ships `:off`; needs subclass-aware gate) ·
+  `call.argument-type-mismatch` (ref ADR-64).
 - ✅ `flow.dead-assignment` — **the first `flow.* rule`**. A pure AST/structural check (no
   flow-sensitive scopes, no typer/folding): a local assigned in a NAMED method body but never
   read in that body fires `warning` (`local \`x' assigned in \`m' but never read`), anchored on
@@ -852,11 +895,12 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
     zig/cross/cargo-zigbuild + no Linux/Windows cross-toolchain on this host).
 
 ### 14. Parity harness & QA (ADR-0002/0011)
-- ✅ `harness/run.rb` (fixture gate, 34 fixtures incl. alias regression, the
+- ✅ `harness/run.rb` (fixture gate, 36 fixtures incl. alias regression, the
   `call.possible-nil-receiver` TP + guarded-negatives pair, the ADR-25
   plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars, the tier-4b
-  param-binding witness/decline pair, and the `flow.always-truthy-condition`
-  witness/adversarial-negatives pair) + divergence-registry.
+  param-binding witness/decline pair, the `flow.always-truthy-condition`
+  witness/adversarial-negatives pair, and the `call.unresolved-toplevel`
+  witness/pure-negatives pair) + divergence-registry.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
 - ✅ **CI workflow** (`.github/workflows/ci.yml`): `cargo build` + `cargo test` (the
   Ruby-free gates) on push/PR over ubuntu+macos, toolchain pinned to the **1.88** build MSRV
@@ -868,7 +912,7 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   round-trips the hand style). The differential harnesses stay a LOCAL gate (they need the
   reference checkout + real corpora).
 - ✅ **Snapshot-mode CI parity** (ADR-0002, §14 track c): shared harness logic in `harness/lib.rb`;
-  `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (34 fixtures) from the live
+  `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (36 fixtures) from the live
   reference (sorted/pretty → deterministic, `--check` flags drift); `harness/run_snapshot.rb` is the
   reference-FREE gate (loads snapshots + runs the binary + IDENTICAL `(rule,line,column)` comparison);
   a separate `parity` job in `ci.yml` runs it on every PR (setup-ruby, no reference checkout). Snapshot

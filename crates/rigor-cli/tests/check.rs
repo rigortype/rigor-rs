@@ -36,8 +36,11 @@ fn known_method_yields_zero_diagnostics() {
 
 #[test]
 fn dynamic_receiver_yields_zero_diagnostics() {
-    // `x` is never assigned, so it types as Dynamic[top]; the rule must stay
-    // silent rather than guess (zero-false-positive, ADR-0023).
-    let diags = check(b"x.foo\n");
+    // `@x` is an untyped ivar (Dynamic[top]); `foo` on it must stay silent rather
+    // than guess (zero-false-positive, ADR-0023). An ivar receiver (not a bare
+    // implicit-self call) also keeps `call.unresolved-toplevel` out of the way —
+    // a bare `x.foo` would (correctly) fire unresolved-toplevel on the receiver
+    // `x`, which is a separate rule with its own coverage.
+    let diags = check(b"@x.foo\n");
     assert!(diags.is_empty(), "expected zero diagnostics: {diags:?}");
 }
