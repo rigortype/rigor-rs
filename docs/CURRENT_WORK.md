@@ -6,10 +6,12 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 (**`call.unresolved-toplevel` landed** against pinned v0.2.6 — the
-highest-frequency unimplemented rule per a corpus rule-tally, 0 FP; **upstream pinned to `v0.2.6`**
-as a `reference/rigor` git submodule + harness re-baselined, see [`UPSTREAM.md`](../UPSTREAM.md);
-`flow.always-truthy-condition` + first ADR-0022 flow-constant substrate; 368 tests, corpus 0 FP).
+Last updated: 2026-07-01 — **5 commits pushed to origin/master (@ `2d0add3`)**: rustfmt policy
+(ADR-0032) · `flow.always-truthy-condition` + first ADR-0022 flow substrate · **upstream pinned to
+`v0.2.6`** as a `reference/rigor` git submodule + harness re-baselined ([`UPSTREAM.md`](../UPSTREAM.md)) ·
+**`call.unresolved-toplevel`** (the highest-frequency unimplemented rule per a v0.2.6 corpus tally, 0 FP) ·
+a `flow.dead-assignment` block-pass (`&x`) FP fix. 369 tests, corpus 0 FP. **Net-new-rule coverage is
+now exhausted** — see "▶▶ NEXT SESSION — START HERE" for the ranked next levers.
 Prior: 2026-06-30 (rustfmt stance recorded — ADR-0032). 2026-06-27 (v0.0.1 release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix).
 See "▶ Resume here" for the release-tag steps + the recorded next work (musl/Windows targets; quality management).
 
@@ -148,19 +150,43 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 > The remaining unimplemented rules are effectively 0-on-corpus — **coverage via net-new rules is
 > now exhausted** (confirms the [[undefined-method-lever-exhausted]] memory with fresh v0.2.6 data).
 >
-> Beyond it, the big remaining levers: **extend the ADR-0022 substrate** from constant-propagation to
-> NARROWING + negative facts (the `possible-nil` source expansion in §5 — `T | nil` params,
-> `@ivar = nil` seeds, project-method nilable returns — and `flow.unreachable-clause`, ref ADR-47),
-> which needs ivar typing and has UNCERTAIN corpus payoff (guard-dominated); the plugin trait + the
-> other ~30 plugins (§10, the biggest real-code coverage pool); §12 LSP/MCP; or a pivot to
-> productization (distribution/perf/LSP) as the higher-EV corpus-visible direction. Also: a
-> **pre-existing `flow.dead-assignment` FP** surfaced (a `while x = …; f(&x)` block-pass read isn't
-> counted) — spawned as its own task; small, unrelated to this work.
+> Also fixed (2026-07-01) a **`flow.dead-assignment` FP** surfaced during the above: a `while x = …;
+> f(&x); end` block-pass read wasn't counted, because the `&expr` block-pass (a `BlockArgumentNode`)
+> lowered to nothing so the `x` read never entered the arena. The Call lowering now lowers the
+> block-pass expression into `block_body` (also fixes `has_block` for `&block` calls); matched vs the
+> v0.2.6 oracle on gitlab-foss `after_commit_queue.rb`.
+>
+> **▶▶ ALL THIS SESSION'S WORK IS COMMITTED + PUSHED (2026-07-01, origin/master @ `2d0add3`):**
+> 5 commits — rustfmt policy (ADR-0032) · `flow.always-truthy-condition` + ADR-0022 flow substrate ·
+> upstream v0.2.6 submodule pin · `call.unresolved-toplevel` · dead-assignment block-pass fix.
+> 369 tests, run.rb + run_snapshot.rb PASS (36 fixtures, 0 FP), corpus 0 FP (clean v0.2.6 ref run),
+> clippy `-D warnings` clean.
+>
+> **▶▶ NEXT SESSION — START HERE.** Net-new-rule coverage is EXHAUSTED (the v0.2.6 rule-tally proved
+> every unimplemented rule fires ~0 on the clean Rails corpus). The next levers are a different kind
+> of value; ranked by EV:
+> - **A. Productization (RECOMMENDED — highest EV, coverage-independent).** §12 **LSP server**
+>   (`rigor lsp --transport=stdio`, hover/completion — the single-binary strength shows here) or an
+>   MCP server; §9 **performance** (rayon file-level parallelism + frozen pre-pass tables — matches
+>   the "performance prototype" positioning, benchmarkable); §11 CLI completion
+>   (`annotate`/`diff`/`triage`/`coverage --protection`/`sig-gen`).
+> - **B. Plugin phase (§10, ADR-0013/0027)** — the Plugin trait (`dynamic_return`/`narrowing_facts`/
+>   `node_rule`) + Rails plugins. The BIGGEST remaining undefined-method coverage pool ("most
+>   remaining real-code coverage lives here"), but a large phase.
+> - **C. ADR-0022 narrowing extension** — constant-prop → narrowing + negative facts + **ivar typing**,
+>   unlocking `possible-nil` source expansion (`T | nil` params, `@ivar = nil` seeds, project-method
+>   nilable returns) + `flow.unreachable-clause` (ADR-47). Strategic, but UNCERTAIN corpus payoff
+>   (Rails is guard-dominated → live possible-nil ≈ 0).
+> - **D. Small closures.** `pre_eval:` support (the one production caveat on `call.unresolved-toplevel`);
+>   block-call ARITY recovery (§4 deferred); full config schema; baseline `regenerate`/`drift`/`prune`.
+>
+> (Independent of all the above: the two pre-v0.0.1 tracks still stand — the musl/Windows release
+> targets need a real CI tag run (maintainer infra), and the v0.0.1 tag itself.)
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 368 tests. The design (ADR 0001–0032) is audited and stable. The
+precision). 369 tests. The design (ADR 0001–0032) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -171,7 +197,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 368 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 369 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
