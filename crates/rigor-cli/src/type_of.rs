@@ -237,7 +237,7 @@ fn position_to_offset(source: &str, line: usize, column: usize) -> Result<usize,
 /// every node, so this is a single linear scan. The root `Program`/`Statements`
 /// wrappers always cover the offset but lose the smallest-span contest to any
 /// real expression beneath them.
-fn locate_node(ast: &LoweredAst, offset: usize) -> Option<NodeId> {
+pub(crate) fn locate_node(ast: &LoweredAst, offset: usize) -> Option<NodeId> {
     let mut best: Option<(NodeId, usize)> = None; // (id, span width)
     for (id, node) in ast.iter() {
         let (start, end) = node.span();
@@ -264,7 +264,7 @@ fn locate_node(ast: &LoweredAst, offset: usize) -> Option<NodeId> {
 /// A rigor-rs-native node-variant label for the `node:` line. The reference
 /// prints the Prism node class (`Prism::StringNode`); rigor-rs walks an owned
 /// arena, so we name the owned variant.
-fn node_kind(node: &Node) -> &'static str {
+pub(crate) fn node_kind(node: &Node) -> &'static str {
     match node {
         Node::Program { .. } => "Program",
         Node::Statements { .. } => "Statements",
@@ -305,7 +305,7 @@ fn node_kind(node: &Node) -> &'static str {
 /// `:foo`, `nil`); a carrier with a known class name renders that name
 /// (`String`, `singleton(Time)`); anything else falls back to rigor-rs's
 /// [`rigor_types::describe`] (`Dynamic[top]`, unions, …).
-fn render_type(interner: &Interner, index: &CoreIndex, ty: TypeId) -> String {
+pub(crate) fn render_type(interner: &Interner, index: &CoreIndex, ty: TypeId) -> String {
     if let Type::Constant(scalar) = interner.get(ty) {
         return render_scalar(scalar);
     }

@@ -62,3 +62,12 @@ regex = "1"
 # are already unpacked in ~/.cargo/registry, so the build stays offline.
 # `RAYON_NUM_THREADS` (rayon-native) caps the pool; =1 forces serial execution.
 rayon = "1"
+# LSP server (§12, ADR-0029): `rigor lsp --transport=stdio`. The rust-analyzer
+# family sync crates — `lsp-server` is the stdio JSON-RPC framing + message loop
+# (no async runtime / tokio; uses crossbeam-channel), `lsp-types` the protocol
+# structs. Chosen over tower-lsp precisely to keep the single self-contained
+# binary free of an async runtime. Fetched into ~/.cargo/registry so `--offline`
+# keeps working. LSP is a NEW surface (no Ruby-reference byte-parity harness) — it
+# reuses the exact `check`/`type-of` analysis path so diagnostics stay consistent.
+lsp-server = "0.8.0"
+lsp-types = "0.97.0"

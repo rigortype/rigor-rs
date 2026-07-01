@@ -6,11 +6,12 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 — **UNCOMMITTED working-tree change: §9 rayon file-level parallelism**
-(`analyze_files` parse+lower + analyze on a rayon pool, `build_project` the serial barrier;
-byte-identical to serial, 0 FP preserved, ~2.4× warm speedup on 7749 real files; 369 tests +
-run.rb + run_snapshot.rb + run_corpus.rb all green; see §9). First Productization-track (lever A)
-increment. Prior: **5 commits pushed to origin/master (@ `2d0add3`)**: rustfmt policy
+Last updated: 2026-07-01 — **Productization track (lever A): 2 commits pushed (@ `10e78e1`) +
+UNCOMMITTED LSP v1.** (1) §9 **rayon file-level parallelism** (`analyze_files` on a rayon pool,
+byte-identical to serial, 0 FP, ~2.4× warm speedup) + `RIGOR_TIMING` observability [committed].
+(2) §12 **LSP server v1** — `rigor lsp --transport=stdio` (sync `lsp-server`/`lsp-types`, no
+async runtime): live diagnostics + hover, reusing the exact `check`/`type-of` path; 376 tests +
+end-to-end stdio smoke green [uncommitted, ready]. Prior: **5 commits pushed (@ `2d0add3`)**: rustfmt policy
 (ADR-0032) · `flow.always-truthy-condition` + first ADR-0022 flow substrate · **upstream pinned to
 `v0.2.6`** as a `reference/rigor` git submodule + harness re-baselined ([`UPSTREAM.md`](../UPSTREAM.md)) ·
 **`call.unresolved-toplevel`** (the highest-frequency unimplemented rule per a v0.2.6 corpus tally, 0 FP) ·
@@ -177,11 +178,12 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 > every unimplemented rule fires ~0 on the clean Rails corpus). The next levers are a different kind
 > of value; ranked by EV:
 > - **A. Productization (RECOMMENDED — highest EV, coverage-independent).** ✅ §9 **performance**
->   (rayon file-level parallelism) LANDED 2026-07-01 (see above / §9) — a further win is
->   parallelizing stage-2 `build_project` if it becomes the bottleneck at scale. Still open: §12
->   **LSP server** (`rigor lsp --transport=stdio`, hover/completion — the single-binary strength
->   shows here) or an MCP server; §11 CLI completion
->   (`annotate`/`diff`/`triage`/`coverage --protection`/`sig-gen`).
+>   (rayon file-level parallelism) LANDED 2026-07-01 (see §9). ✅ §12 **LSP server v1** LANDED
+>   2026-07-01 (`rigor lsp --transport=stdio`: live diagnostics + hover; see §12). **Next LSP
+>   slice = `textDocument/completion`** (needs a `CoreIndex` method-enumeration API + a
+>   receiver-before-trigger parser — the one headline LSP feature still deferred). Also open: an
+>   MCP server (§12); §11 CLI completion (`annotate`/`diff`/`triage`/`coverage --protection`/
+>   `sig-gen`); parallelizing stage-2 `build_project` if it becomes the bottleneck at scale.
 > - **B. Plugin phase (§10, ADR-0013/0027)** — the Plugin trait (`dynamic_return`/`narrowing_facts`/
 >   `node_rule`) + Rails plugins. The BIGGEST remaining undefined-method coverage pool ("most
 >   remaining real-code coverage lives here"), but a large phase.
@@ -821,14 +823,43 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   handbook / install pages, the `llms.txt` index, and the `--list`/`--path` flags that
   address them; `docs` prints a note pointing at the web manual instead (no fabricated
   content).
+- ✅ `lsp` — `rigor lsp [--transport=stdio] [--log=PATH]` (see §12).
 - ⬜ `annotate` · `diff` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugin` ·
-  `sig-gen` (ref ADR-14) · `skill`/`describe` · `lsp` · `mcp` ·
+  `sig-gen` (ref ADR-14) · `skill`/`describe` · `mcp` ·
   `trace` · `type-scan`.
 
 ### 12. Editor / agent servers (ADR-0029)
-- ⬜ LSP (`rigor lsp --transport=stdio`, two-tier ProjectContext, BufferBinding, hover/completion);
-  MCP server (read-only tools over stdio).
+- ✅ **LSP server v1 landed (2026-07-01) — `rigor lsp --transport=stdio`.** An in-process
+  Language Server built on the sync **`lsp-server`** scaffold (stdio JSON-RPC framing + message
+  loop; NO async runtime / tokio — chosen precisely to keep the single self-contained binary
+  runtime-free) + **`lsp-types`** 0.97 protocol structs (`crates/rigor-cli/src/lsp.rs`, wired at
+  `main.rs`'s `Some("lsp")`). **Capabilities advertised:** `textDocumentSync = FULL` +
+  `hoverProvider`. **Features:** (1) live **diagnostics** — `didOpen`/`didChange` run the EXACT
+  `check` single-file path (parse → lower → single-file `SourceIndex` → `analyze_with_source`) +
+  inline `# rigor:disable` + config `disable:` suppression, mapped to LSP `Diagnostic`s
+  (`source="rigor"`, `code=<rule id>`, severity error→Error/warning→Warning/info→Information per
+  ADR-0029); `didClose` publishes an empty set to clear markers. (2) **hover** — reuses the
+  `type-of` node-locator + type renderer (deepest node at the cursor → `Typer::type_of` → a
+  markdown card with the inferred type + node kind + hover range). **Two-tier essence:** the RBS
+  environment (`CoreIndex::with_plugins`) + config-derived suppression set are built ONCE at
+  startup and reused across every request, so the per-keystroke cost is a single-file
+  parse+lower+analyze, never the RBS-load floor. Panic-isolated (ADR-0016): a malformed buffer
+  yields no diagnostics/hover, never a crash. LSP is a NEW surface (no Ruby-reference byte-parity
+  harness) — correctness comes from reusing the `check`/`type-of` path verbatim. **Verified:** +7
+  unit tests (UTF-16 position round-trip incl. multibyte `é`/`𐐷`, diagnostics + inline
+  suppression + severity/source/code mapping, hover type report, unknown-buffer null); an
+  end-to-end stdio smoke session (initialize handshake → didOpen diagnostics → hover → clean
+  shutdown/exit 0) and a didChange/didClose lifecycle (open-clean→0, change-typo→1, close→0).
+  376 tests total, run.rb + run_snapshot.rb PASS (0 FP), clippy bin-clean. Deps fetched into the
+  offline cache (`lsp-server` 0.8, `lsp-types` 0.97 + crossbeam-channel/fluent-uri/serde_repr).
+- ⬜ **Deferred (LSP v2+):** `textDocument/completion` (the last headline LSP feature — needs a
+  NEW `CoreIndex` method-ENUMERATION API, `class_methods` over the ancestor chain, + a
+  receiver-before-`.`/`::` parser + Union-intersection + visibility filter); the full two-tier
+  `ProjectContext` (generation counter, `didChangeWatchedFiles`/`didChangeConfiguration`
+  invalidation), cross-file project context for open buffers, a pre-warmed worker pool, 200ms
+  `didChange` debounce, temp-file `BufferBinding`, incremental UTF-16 `didChange` sync, `--log`
+  wiring, and TCP/socket transport. **MCP server** (read-only tools over stdio).
 
 ### 13. Distribution (ADR-0010)
 > **Version is now `0.0.1`** — the v0.0.1 first-release target (see "▶▶ v0.0.1 RELEASE PREP"
