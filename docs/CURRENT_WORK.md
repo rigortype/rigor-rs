@@ -6,9 +6,10 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 (`flow.always-truthy-condition` + first ADR-0022 flow-constant substrate;
-363 tests, corpus 0 FP). Prior: 2026-06-30 (rustfmt stance recorded — ADR-0032). 2026-06-27 (v0.0.1
-release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix).
+Last updated: 2026-07-01 (**upstream pinned to `v0.2.6`** as a `reference/rigor` git submodule +
+harness re-baselined, see [`UPSTREAM.md`](../UPSTREAM.md); earlier: `flow.always-truthy-condition`
++ first ADR-0022 flow-constant substrate; 363 tests, corpus 0 FP). Prior: 2026-06-30 (rustfmt
+stance recorded — ADR-0032). 2026-06-27 (v0.0.1 release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix).
 See "▶ Resume here" for the release-tag steps + the recorded next work (musl/Windows targets; quality management).
 
 > **2026-06-26 correctness finding (this session).** The reference does **not**
@@ -159,11 +160,15 @@ ruby harness/run.rb                                  # fixture differential gate
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
 ```
 
-**Reference oracle (for the harness / manual checks):**
+**Reference oracle (for the harness / manual checks):** the reference is **PINNED as a
+git submodule** at `reference/rigor`, checked out at upstream tag **`v0.2.6`** (see
+[`UPSTREAM.md`](../UPSTREAM.md) for the pin + bump procedure). Init once with
+`git submodule update --init reference/rigor`.
 ```sh
-ruby -I/Users/megurine/repo/ruby/rigor/lib /Users/megurine/repo/ruby/rigor/exe/rigor check <path> --format json
+ruby -I reference/rigor/lib reference/rigor/exe/rigor check <path> --format json
 # JSON on STDOUT; preamble + racc warning on STDERR. Run with cwd = a clean temp dir to
 # avoid picking up a project .rigor.yml. It accepts a directory (analyzes all .rb, RBS loaded once).
+# The harness defaults REFERENCE_RIGOR_DIR to this submodule; set it to override.
 ```
 
 **Key facts/paths:**
@@ -733,7 +738,8 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
     gemspec (`gem/rigortype-rs.gemspec`, platform-neutral); the Rakefile sets `spec.platform` per
     build. Each platform gem bundles the matching native binary at `libexec/rigor`; the fallback
     bundles none. Module name **`RigortypeRs`** (consistent across `lib/`, gemspec, sig, tests).
-  - **Name `rigortype-rs`** (NOT `rigortype` — a 0.1.0 over the reference's 0.2.5 would be a
+  - **Name `rigortype-rs`** (NOT `rigortype` — a 0.1.0 over the reference's 0.2.x (pinned v0.2.6)
+    would be a
     downgrade; and per ADR-0001 rigor-rs COEXISTS with the Ruby mainstream — there is NO planned
     `rigortype` name takeover, so the distinct name is permanent). Both gems install a `rigor`
     exe → README warns not to install both in one env.

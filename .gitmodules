@@ -1,0 +1,3 @@
+[submodule "reference/rigor"]
+	path = reference/rigor
+	url = git@github.com:rigortype/rigor.git

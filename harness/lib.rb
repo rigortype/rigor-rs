@@ -33,9 +33,15 @@ module RigorHarness
 
   REPO_ROOT = File.expand_path("..", __dir__)
 
-  REFERENCE_RIGOR_DIR = ENV.fetch(
-    "REFERENCE_RIGOR_DIR",
-    "/Users/megurine/repo/ruby/rigor"
+  # The reference oracle is PINNED as a git submodule at `reference/rigor`,
+  # checked out at the upstream `v0.2.6` tag (see UPSTREAM.md). Running the
+  # differential against the pinned tag — not a drifting local checkout — makes
+  # parity reproducible. `REFERENCE_RIGOR_DIR` still overrides for ad-hoc runs
+  # against another checkout. Init the submodule with:
+  #   git submodule update --init reference/rigor
+  REFERENCE_RIGOR_DIR = File.expand_path(
+    ENV.fetch("REFERENCE_RIGOR_DIR", "reference/rigor"),
+    REPO_ROOT
   )
 
   RIGOR_RS_BIN = File.expand_path(
