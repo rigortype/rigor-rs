@@ -698,9 +698,27 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   floor is negligible, so this is ~2.5× on the parallelizable work). Sublinear vs core count
   because stage 2 + output collection stay serial (by design — §9's "pre-pass frozen" model).
   rayon 1.12 + crossbeam/either added to `Cargo.lock` (offline-cached); `RAYON_NUM_THREADS=1`
-  forces serial. **Deferred** (not needed for this slice): per-worker incremental merge, severity
-  re-stamp post-pool, `workers:` config precedence, parallelizing stage 2's `build_project`.
-  (Salsa deferred — empirical trigger only.)
+  forces serial.
+- ✅ **`RIGOR_TIMING` stage-breakdown observability (2026-07-01).** `analyze_files` emits a
+  one-line per-stage breakdown to stderr under the `RIGOR_TIMING` env gate (invisible by default —
+  the harness never sets it, so byte-exact output + 0-FP are unaffected): `index-load` /
+  `stage1(parse+lower)` / `stage2(build_project)` / `stage3(analyze)` / `sort` / `total` / file +
+  thread count. Fits the "performance prototype" positioning (benchmarkable). **Profiling finding
+  (7749 mastodon+gitlab `.rb`, 12 cores, warm, ~296ms total):** stage1 ~152ms/51% (parallel, 3.3×
+  — I/O + libprism-FFI bound, the scaling ceiling), **stage2 ~77ms/26% (SERIAL — the next
+  bottleneck)**, stage3 ~46ms/16% (parallel, 5.3× — pure-Rust analysis scales best), index ~17ms,
+  sort ~2µs.
+- **Stage-2 parallelization assessed + DEFERRED (low EV / high risk).** `build_project`'s heavy
+  cost is NOT the one parallelizable pass: Pass 3 (`infer_method_returns`, the only Typer-running
+  pass, and order-INDEPENDENT in outcome so it's safely map-reducible) measures only **~20ms of
+  the ~77ms** (~7% of total) — parallelizing it buys ≤1.1× for real risk. The remaining ~55ms is
+  Passes 1/1b/1c/2 (4 structural AST walks) which ASSIGN `ClassId`s by `names`-Vec insertion order
+  (`add_source`/`register`) — order-SENSITIVE, so parallelizing them would need a deterministic
+  serial ID-assignment merge to stay byte-identical, a large risk to the zero-FP cross-file
+  keystone for a ~1.2× ceiling. **Verdict: the headline file-level parallelism (2.4×) is the
+  high-value win; stage-2 is deferred.** **Deferred** (not needed for this slice): per-worker
+  incremental merge, severity re-stamp post-pool, `workers:` config precedence, stage-2
+  parallelization. (Salsa deferred — empirical trigger only.)
 
 ### 10. Plugins — `lib/rigor/plugin/` + `plugins/` (31) → (ADR-0013/0027)
 - ✅ **First plugin slice landed — `rigor-activesupport-core-ext` (PURE-RBS via

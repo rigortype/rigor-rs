@@ -201,7 +201,16 @@ fn analyze_files(
     // bundled plugin (e.g. `activesupport-core-ext`) reopens core classes with
     // its RBS selectors, suppressing the direct calls and enabling chained
     // witnesses — matching the reference, which loads plugins only from config.
+    // Optional stage-timing breakdown (§9, "performance prototype" positioning).
+    // `RIGOR_TIMING` (any value) prints a one-line per-stage breakdown to stderr
+    // — invisible by default, so the differential harness (which never sets it)
+    // and the byte-exact output are unaffected. `Instant::now()` is cheap; the
+    // markers are unconditional but only formatted/emitted under the env gate.
+    let timing = std::env::var_os("RIGOR_TIMING").is_some();
+    let t_start = std::time::Instant::now();
+
     let index = CoreIndex::with_plugins(&cfg.plugins);
+    let t_index = std::time::Instant::now();
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).
     let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();
     let mut had_io_error = false;
@@ -290,10 +299,13 @@ fn analyze_files(
         }
     }
 
+    let t_stage1 = std::time::Instant::now();
+
     // STAGE 2 (serial barrier): build ONE project-wide source index from all
     // cleanly-lowered ASTs. This is the cross-file join — it must see every AST.
     let asts: Vec<&rigor_parse::LoweredAst> = prepared.iter().map(|p| &p.ast).collect();
     let project_source = rigor_infer::SourceIndex::build_project(&asts, &index);
+    let t_stage2 = std::time::Instant::now();
 
     // STAGE 3 (file-parallel): analyze each file against the shared, now-frozen
     // `index` + `project_source` (read-only, `Sync`) with a FRESH per-file
@@ -347,8 +359,27 @@ fn analyze_files(
         findings.extend(s3.findings);
     }
 
+    let t_stage3 = std::time::Instant::now();
+
     // Restore input order (stage-1 panics and stage-3 findings interleave by order).
     findings.sort_by_key(|(order, _, _, _)| *order);
+
+    if timing {
+        let t_end = std::time::Instant::now();
+        eprintln!(
+            "rigor timing: index-load={:.3?} stage1(parse+lower)={:.3?} \
+             stage2(build_project)={:.3?} stage3(analyze)={:.3?} sort={:.3?} \
+             total={:.3?} files={} threads={}",
+            t_index - t_start,
+            t_stage1 - t_index,
+            t_stage2 - t_stage1,
+            t_stage3 - t_stage2,
+            t_end - t_stage3,
+            t_end - t_start,
+            prepared.len(),
+            rayon::current_num_threads(),
+        );
+    }
     (findings, had_io_error)
 }
 
