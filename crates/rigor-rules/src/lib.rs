@@ -2527,6 +2527,22 @@ mod tests {
     }
 
     #[test]
+    fn dead_assignment_block_pass_read_is_silent() {
+        // A read inside a `&expr` block-pass argument counts as a read ⇒ silent.
+        // Regression: a `&action` block-pass previously lowered to nothing, so the
+        // `action` read never surfaced in the arena and the loop-condition write
+        // was falsely flagged (gitlab-foss after_commit_queue.rb, matched vs the
+        // v0.2.6 oracle which stays silent).
+        let src = b"def f\n  while x = q.pop\n    g(&x)\n  end\nend\n";
+        assert!(dead(src).is_empty(), "block-pass `&x` read must suppress, got {:?}", dead(src));
+        // The direct form too: `foo(&blk)` after `blk = ...`.
+        assert!(
+            dead(b"def f\n  blk = make\n  run(&blk)\nend\n").is_empty(),
+            "a `&blk` read must count"
+        );
+    }
+
+    #[test]
     fn dead_assignment_nested_def_isolation() {
         // An OUTER write read only by an INNER def is a closure capture? No — a
         // nested `def` is a fresh scope, but the reference gathers READS with no

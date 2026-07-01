@@ -592,15 +592,29 @@ impl Builder {
                 .arguments()
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
-            // Lower an attached block's body so calls inside it reach the walk.
-            // The block is a BlockNode (`{ … }` / `do…end`); a `&block`-arg form
-            // is a BlockArgumentNode with no inline body, which lowers to nothing
-            // here (its calls, if any, are in the referenced symbol/proc).
-            let block_body = call
-                .block()
-                .and_then(|b| b.as_block_node())
-                .map(|b| self.lower_optional_body(b.body().as_ref()))
-                .unwrap_or_default();
+            // Lower an attached block so calls/reads inside it reach the walk.
+            //   * a BlockNode (`{ … }` / `do…end`) — lower its body statements.
+            //   * a `&expr` block-pass (BlockArgumentNode) — lower the passed
+            //     EXPRESSION. A `foo(&blk)` genuinely passes a block, and its `blk`
+            //     read MUST surface in the arena: `flow.dead-assignment` gathers
+            //     reads by arena span-scan, so an unlowered `&action` would leave
+            //     `while action = q.pop; f(&action); end` with no read of `action`
+            //     and FALSELY flag the write. `&` alone (argument forwarding) has
+            //     no expression and lowers to nothing.
+            let block_body = match call.block() {
+                None => Vec::new(),
+                Some(b) => {
+                    if let Some(bn) = b.as_block_node() {
+                        self.lower_optional_body(bn.body().as_ref())
+                    } else if let Some(ba) = b.as_block_argument_node() {
+                        ba.expression()
+                            .map(|e| vec![self.lower_node(&e)])
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
             // The message_loc is the method-name token; fall back to the whole
             // call span if Prism elides it (e.g. operator-ish forms).
             let message_span = call

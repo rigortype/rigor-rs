@@ -67,3 +67,14 @@ def read_after_write
   computed.to_s
   :trailer
 end
+
+# 10. A loop-condition write read via a `&block-pass` argument counts as a read
+#     -> silent. (Regression: `&task` previously lowered to nothing, orphaning the
+#     `task` read.) Receivers are literals/locals so no unresolved-toplevel fires.
+def block_pass_read
+  queue = ["a", "b"]
+  while task = queue.pop
+    "".instance_eval(&task)
+  end
+  :done
+end

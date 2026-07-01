@@ -488,7 +488,11 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   `super`, `*splat` — lower lossily; a structural child-walk would miss reads underneath and
   FALSE-flag). Closing that gap required a lowering fix: a new `Node::LocalVariableOpWrite`
   variant (op/and/or-writes) + recovering reads/calls buried under unhandled wrapper nodes
-  (the catch-all now lowers descendant reads/calls instead of dropping the subtree).
+  (the catch-all now lowers descendant reads/calls instead of dropping the subtree) + **lowering
+  the `&expr` block-pass argument** (a `BlockArgumentNode`, previously dropped — so `while x = q.pop;
+  f(&x); end` orphaned the `x` read and FALSE-flagged the loop-condition write; the passed
+  expression now lowers into `block_body`, which also makes `has_block` correct for `&block` calls;
+  fixed 2026-07-01, matched vs the v0.2.6 oracle on gitlab-foss `after_commit_queue.rb`).
   **+0 net corpus fires** in this unusually-clean corpus (accepted — the value is the net-new
   `flow.*` family + the adversarial-fixture FP guarantee); 0 FP across 3829 corpus files.
 - ✅ `flow.always-raises` — a provable Integer `ZeroDivisionError`. Fires `error`
