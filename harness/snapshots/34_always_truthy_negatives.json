@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/34_always_truthy_negatives.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 13,
+      "column": 4,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `guard`. If a project file defines `guard` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 14,
+      "column": 8,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `recompute`. If a project file defines `recompute` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 31,
+      "column": 7,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `guard`. If a project file defines `guard` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

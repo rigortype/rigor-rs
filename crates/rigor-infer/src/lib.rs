@@ -496,6 +496,146 @@ impl<'i> Typer<'i> {
         env
     }
 
+    /// Flow-sensitive local CONSTANT propagation (ADR-0022 first substrate
+    /// slice). For every `if`/`unless`/ternary predicate NOT lexically inside a
+    /// loop / block, record the [`TypeId`] the predicate folds to under the
+    /// branch-joined flow environment that dominates it. The companion rule
+    /// `flow.always-truthy-condition` fires only when that recorded type is a
+    /// `Type::Constant`, so this query is the zero-FP keystone: it must be a
+    /// strict UNDER-approximation of the reference's flow folder (witness set ⊆
+    /// reference), achieved by **widening on any doubt**.
+    ///
+    /// Soundness model (why a constant here can never be a false positive):
+    /// - **Straight-line writes** bind the local to the RHS type, exactly as the
+    ///   flat env does.
+    /// - **`if`/`unless` branches** are evaluated independently and JOINED: a
+    ///   local keeps a binding only when both branches agree on the IDENTICAL
+    ///   `TypeId`; any disagreement (or a local written in only one branch)
+    ///   widens it to `Dynamic`. This is what stops `x = 5; if c; x = f; end;
+    ///   if x` from folding `x` to `5` — the flat env's central unsoundness.
+    /// - **Loops / blocks / `case` / `begin`-`rescue` / `&&`-`||` / any other
+    ///   node** widen EVERY local written anywhere in their span (a loop iterates
+    ///   0..n times; a closure may write a captured local; a `case`/`begin` arm
+    ///   is conditional) and are NOT descended for predicate snapshots. Skipping
+    ///   loop/block predicates matches the reference's own envelope; declining
+    ///   the others is an extra conservative miss (never an FP).
+    /// - **`def` / `class` / `module` bodies** are independent scopes: they are
+    ///   descended with a FRESH local env (Ruby method/class bodies do not see
+    ///   the enclosing locals) but INHERIT the loop/block suppression flag, so a
+    ///   `def` nested in a block keeps its predicates suppressed (reference parity)
+    ///   while a top-level `def`'s predicates are recorded. A nested scope never
+    ///   perturbs the enclosing env.
+    ///
+    /// Writes are collected once (span-keyed) and widening filters that list by
+    /// span-containment — orphan-proof, the same discipline as
+    /// [`Self::build_method_body_env`] and the dead-assignment collector.
+    pub fn always_truthy_snapshots(
+        &self,
+        ast: &LoweredAst,
+        interner: &mut Interner,
+    ) -> HashMap<NodeId, TypeId> {
+        let mut out = HashMap::new();
+        let writes = collect_flow_writes(ast);
+        let body = match ast.get(ast.root()) {
+            Node::Program { body, .. } => body.clone(),
+            _ => return out,
+        };
+        let mut env = TypeEnv::new();
+        self.flow_eval_scope(ast, &body, &mut env, false, &writes, interner, &mut out);
+        out
+    }
+
+    /// Thread `env` through a scope's statements in source order.
+    #[allow(clippy::too_many_arguments)]
+    fn flow_eval_scope(
+        &self,
+        ast: &LoweredAst,
+        stmts: &[NodeId],
+        env: &mut TypeEnv,
+        in_loop_or_block: bool,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, TypeId>,
+    ) {
+        for &s in stmts {
+            self.flow_eval_stmt(ast, s, env, in_loop_or_block, writes, interner, out);
+        }
+    }
+
+    /// Evaluate one statement's effect on `env`, recording predicate snapshots.
+    #[allow(clippy::too_many_arguments)]
+    fn flow_eval_stmt(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &mut TypeEnv,
+        in_loop_or_block: bool,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, TypeId>,
+    ) {
+        match ast.get(id) {
+            Node::Statements { body, .. } => {
+                let body = body.clone();
+                self.flow_eval_scope(ast, &body, env, in_loop_or_block, writes, interner, out);
+            }
+            Node::LocalVariableWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                // A value expression may itself write OTHER locals (`x = (y = 5)`)
+                // or capture-write via a block — widen those first, then bind.
+                let vspan = ast.get(value).span();
+                widen_flow_writes(writes, vspan, env, interner);
+                let ty = self.type_of(ast, value, env, interner);
+                env.insert(name, ty);
+            }
+            Node::LocalVariableOpWrite { name, .. } => {
+                // `x += 1` / `x ||= 5` reads-then-writes; the result is not a
+                // tracked constant in this slice — widen.
+                let name = name.clone();
+                let u = interner.untyped();
+                env.insert(name, u);
+            }
+            Node::If { predicate, then_body, else_body, .. } => {
+                let (predicate, then_body, else_body) =
+                    (*predicate, then_body.clone(), else_body.clone());
+                if !in_loop_or_block {
+                    let pty = self.type_of(ast, predicate, env, interner);
+                    out.insert(id, pty);
+                }
+                // Independently evaluate each branch from the dominating env, then
+                // join: a binding survives only if both branches agree exactly.
+                let mut then_env = env.clone();
+                self.flow_eval_scope(
+                    ast, &then_body, &mut then_env, in_loop_or_block, writes, interner, out,
+                );
+                let mut else_env = env.clone();
+                self.flow_eval_scope(
+                    ast, &else_body, &mut else_env, in_loop_or_block, writes, interner, out,
+                );
+                *env = join_flow_envs(&then_env, &else_env, interner);
+                // A predicate may contain a write (`if (x = f)`); widen post-join.
+                let pspan = ast.get(predicate).span();
+                widen_flow_writes(writes, pspan, env, interner);
+            }
+            Node::Definition { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => {
+                // Independent scope: fresh local env, inherited suppression flag,
+                // no effect on the enclosing env.
+                let body = body.clone();
+                let mut fresh = TypeEnv::new();
+                self.flow_eval_scope(
+                    ast, &body, &mut fresh, in_loop_or_block, writes, interner, out,
+                );
+            }
+            // Loop / case / begin-rescue / logical / call(+block) / any other node:
+            // widen every local written in the span, do not descend for snapshots.
+            other => {
+                widen_flow_writes(writes, other.span(), env, interner);
+            }
+        }
+    }
+
     /// Bind a single statement into `env` if it is a local write; recurse
     /// through a `Statements` wrapper. Other statements have no binding effect.
     fn bind_statement(&self, ast: &LoweredAst, id: NodeId, env: &mut TypeEnv, interner: &mut Interner) {
@@ -513,6 +653,57 @@ impl<'i> Typer<'i> {
             _ => {}
         }
     }
+}
+
+/// Collect every local-write `(span, name)` in the arena (plain and op-writes),
+/// once, for span-containment widening in the flow-constant pass. Orphan-proof:
+/// a write under a lossily-lowered wrapper is still found by its span.
+fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    ast.iter()
+        .filter_map(|(_, n)| match n {
+            Node::LocalVariableWrite { name, span, .. }
+            | Node::LocalVariableOpWrite { name, span, .. } => Some((*span, name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Widen (to `Dynamic`) every tracked local whose write span is contained in
+/// `span` — the conservative invalidation a control-flow construct applies.
+fn widen_flow_writes(
+    writes: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+    env: &mut TypeEnv,
+    interner: &mut Interner,
+) {
+    let u = interner.untyped();
+    for (wspan, name) in writes {
+        if span.0 <= wspan.0 && wspan.1 <= span.1 {
+            env.insert(name.clone(), u);
+        }
+    }
+}
+
+/// Join two branch environments: a binding survives only when both sides map it
+/// to the IDENTICAL `TypeId`; every disagreement, and every local bound in only
+/// one branch, widens to `Dynamic`. This is the branch-merge that makes a
+/// surviving `Type::Constant` sound to witness as always-truthy/falsey.
+fn join_flow_envs(a: &TypeEnv, b: &TypeEnv, interner: &mut Interner) -> TypeEnv {
+    let u = interner.untyped();
+    let mut out = TypeEnv::with_capacity(a.len());
+    for (k, av) in a {
+        let v = match b.get(k) {
+            Some(bv) if bv == av => *av,
+            _ => u,
+        };
+        out.insert(k.clone(), v);
+    }
+    for k in b.keys() {
+        if !a.contains_key(k) {
+            out.insert(k.clone(), u);
+        }
+    }
+    out
 }
 
 /// Type an owned-AST node against the current `env`. Free-function wrapper kept
@@ -566,6 +757,45 @@ mod tests {
         assert_eq!(i.get(str_ty), &Type::Constant(Scalar::Str("Hello".into())));
         let int_ty = type_of(&ast, int_id, &env, &mut i);
         assert_eq!(i.get(int_ty), &Type::Constant(Scalar::Int(42)));
+    }
+
+    /// The flow-constant substrate (ADR-0022) records a straight-line dominating
+    /// constant for an `if` predicate.
+    #[test]
+    fn flow_snapshot_folds_straight_line_constant() {
+        let ast = lower_src(b"x = 5\nif x\n  noop\nend\n");
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+        let if_id = ast
+            .iter()
+            .find_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+            .unwrap();
+        let ty = snaps.get(&if_id).copied().expect("predicate snapshot recorded");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(5)));
+    }
+
+    /// The branch-join keystone: a conditionally reassigned local is widened, so
+    /// a later predicate reading it is NOT a constant (the zero-FP guarantee the
+    /// flat env cannot provide).
+    #[test]
+    fn flow_snapshot_widens_conditional_reassignment() {
+        let ast = lower_src(b"x = 5\nif g\n  x = f\nend\nif x\n  noop\nend\n");
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+        let ifs: Vec<_> = ast
+            .iter()
+            .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+            .collect();
+        assert_eq!(ifs.len(), 2, "expected two if nodes");
+        let ty2 = snaps.get(&ifs[1]).copied().expect("second if recorded");
+        assert!(
+            !matches!(i.get(ty2), Type::Constant(_)),
+            "x must be widened to non-constant after a conditional reassignment"
+        );
     }
 
     #[test]

@@ -6,8 +6,10 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-06-27 (v0.0.1 release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix). See "▶ Resume here" for the
-release-tag steps + the recorded next work (musl/Windows targets; quality management).
+Last updated: 2026-07-01 (`flow.always-truthy-condition` + first ADR-0022 flow-constant substrate;
+363 tests, corpus 0 FP). Prior: 2026-06-30 (rustfmt stance recorded — ADR-0032). 2026-06-27 (v0.0.1
+release prep; AGPL-3.0 relicense; MSRV→1.88 CI fix).
+See "▶ Resume here" for the release-tag steps + the recorded next work (musl/Windows targets; quality management).
 
 > **2026-06-26 correctness finding (this session).** The reference does **not**
 > witness `call.undefined-method` on a **project-defined (in-source) class
@@ -95,12 +97,19 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >    `rust-version` + the CI toolchain pins are 1.88; clippy's suggestion-MSRV stays 1.85 for OUR
 >    code. CI failed once on this mismatch — `ruby-rbs` cannot compile on 1.85 — and was fixed by
 >    raising the pins to 1.88.)
->    All 352 tests + harness (0 FP) + corpus (0 FP) stay green. (b) Decide the **rustfmt**
->    stance — the codebase is hand-formatted (239 diffs across 25 files vs `cargo fmt`); either
->    adopt `cargo fmt` repo-wide + enforce `fmt --check` in CI, or add a `rustfmt.toml`/`#[rustfmt::skip]`
->    policy that matches the maintainer's hand-formatting and document it. (c) ✅ DONE (2026-06-27) —
+>    All 352 tests + harness (0 FP) + corpus (0 FP) stay green. (b) ✅ DONE (2026-06-30) —
+>    the **rustfmt** stance is now a recorded decision (ADR-0032): the codebase stays
+>    **hand-formatted** and `cargo fmt --check` is NOT a CI gate. Adopting `cargo fmt` was
+>    rejected (it rewrites 239 hunks across 25 files, erasing the compact hand style for no
+>    parity/correctness gain); tuning `rustfmt.toml` to PRESERVE the style was found infeasible
+>    (`use_small_heuristics = "Max"` only moved 239 → 222 and introduced opposite-direction
+>    diffs — the hand style round-trips through no single stable config; some deviations need
+>    unstable nightly options). Artifacts: `docs/adr/0032-source-formatting-policy.md`, a
+>    documenting `rustfmt.toml` (loud "do not run cargo fmt" header + `edition`/`max_width` pin),
+>    and a strengthened `ci.yml` header comment pointing at the ADR. No source/code change; clippy
+>    stays the blocking style gate. (c) ✅ DONE (2026-06-27) —
 >    **Snapshot-mode CI parity** (ADR-0002, §14). Shared harness logic extracted to `harness/lib.rb`;
->    `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (32 fixtures) from the live
+>    `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (34 fixtures) from the live
 >    reference — the reference's pinned `(rule,line,column,severity,message)` set, sorted/pretty so
 >    regeneration is a no-op. `harness/run_snapshot.rb` is the reference-FREE gate: it loads the
 >    snapshots, runs the binary, and applies the IDENTICAL `(rule,line,column)` comparison (FP fail,
@@ -110,14 +119,30 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >    per-fixture) and reference-independence (passes with `REFERENCE_RIGOR_DIR` pointed at a nonexistent
 >    path). The live `harness/run.rb` stays the local source-of-truth that regenerates the snapshots.
 >
-> Both are independent of each other and of the release; pull either next. Beyond them, the big
-> remaining levers are unchanged (the ADR-0022 flow-scope substrate for `flow.always-truthy`/the
-> deferred `possible-nil` sources; the plugin trait + the other ~30 plugins; §12 LSP/MCP).
+> Both are independent of each other and of the release; pull either next.
+>
+> **▶▶ DONE (2026-07-01) — `flow.always-truthy-condition` + the first ADR-0022 flow substrate.**
+> The `flow.*` family's inferred-constant rule landed (§5), built on a NEW minimal flow-sensitive
+> **local constant-propagation** pass (`Typer::always_truthy_snapshots`, `rigor-infer`): straight-line
+> binds + real `if`/`unless` branch JOINS + loop/block/`case`/`begin`/`&&`-`||` widening
+> (span-containment, orphan-proof). The join is the zero-FP keystone — `x=5; if c; x=f; end; if x`
+> widens `x` and does NOT fire (the flat env's central unsoundness). A strict under-approximation of
+> the reference folder (witness ⊆ reference). Verified byte-exact vs the oracle on the positives;
+> **0 always-truthy fires across the full ~3800-file corpus** (like `unreachable-branch`, the
+> inferred-constant pattern is vanishingly rare in real code — the value is the complete rule + the
+> reusable substrate). +11 tests (363 total), live + snapshot harness PASS (34 fixtures), corpus 0 FP.
+> This is the **first ADR-0022 increment** — the seam later flow rules build on.
+>
+> Beyond it, the big remaining levers (now partially unblocked): **extend the ADR-0022 substrate**
+> from constant-propagation to NARROWING + negative facts (the `possible-nil` source expansion in §5
+> — `T | nil` params, `@ivar = nil` seeds, project-method nilable returns — and `flow.unreachable-clause`,
+> ref ADR-47); the plugin trait + the other ~30 plugins (§10, where most remaining undefined-method
+> coverage lives); §12 LSP/MCP.
 
 **State:** a working, parity-validated analyzer. `rigor check` runs end to end;
 **0 false positives across 3829 real files** (mastodon, gitlab-foss, conference-app,
 the reference's own source; matched scales with the sweep — 558 at this size, 100%
-precision). 352 tests. The design (ADR 0001–0031) is audited and stable. The
+precision). 363 tests. The design (ADR 0001–0032) is audited and stable. The
 2026-06-26 session (a) aligned the undefined-method rule with the reference's leniency,
 (b) closed lowering-traversal + interpolated-string gaps, (c) landed **class-method
 (singleton) witnessing** with a cross-file project index, (d) fixed a pre-existing
@@ -128,7 +153,7 @@ inference** (ADR-0023 tier-4 minimal slice). See the note below.
 
 **Build / test / run (from the repo root):**
 ```sh
-cargo build --offline && cargo test --offline       # 352 tests; ruby-prism + ruby-rbs are cached
+cargo build --offline && cargo test --offline       # 363 tests; ruby-prism + ruby-rbs are cached
 cargo run -p rigor-cli -- check <file.rb> --format json
 ruby harness/run.rb                                  # fixture differential gate (must PASS, 0 FP)
 ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate (CORPUS_LIMIT env)
@@ -220,7 +245,7 @@ Ranked next levers:
 
 ## Status snapshot
 
-- **Design:** ADRs 0001–0031 (`docs/adr/`) + glossary (`CONTEXT.md`), audited
+- **Design:** ADRs 0001–0032 (`docs/adr/`) + glossary (`CONTEXT.md`), audited
   (`…/ruby/rigor/docs/notes/20260626-rigor-rs-design-audit.md`; verdict positive, R1–R5 done).
 - **Build:** Cargo workspace, edition 2024, **MSRV 1.88** (forced by the `ruby-rbs` dep's
   let-chains; CI pins 1.88; clippy's suggestion-MSRV stays 1.85 for our own crates),
@@ -228,13 +253,17 @@ Ranked next levers:
 - **Crates:** `rigor-types` (lattice) · `rigor-parse` (Prism + owned AST) ·
   `rigor-index` (real RBS index) · `rigor-infer` (typer + folding + source index) ·
   `rigor-rules` · `rigor-cli` (`rigor check`).
-- **Tests:** 352 (verified `cargo test --offline`; this distribution slice added no new Rust
-  tests — version command is exercised via the CLI binary). **Parity:** `run.rb` PASS (28 fixtures incl. the plugin-enabled +
+- **Tests:** 363 (verified `cargo test --offline`; the `flow.always-truthy-condition` slice added
+  +11 — 9 rule tests in `rigor-rules` + 2 flow-substrate tests in `rigor-infer`). **Parity:**
+  `run.rb` PASS (34 fixtures incl. the plugin-enabled +
   gate-guard pair, the tier-4b param-binding witness/decline pair, the four
   `def.override-visibility-reduced` fixtures — superclass + module-include positives, the
-  reopened-class split, and the adversarial negatives bundle — and the two
+  reopened-class split, and the adversarial negatives bundle — the two
   `call.possible-nil-receiver` fixtures: a byte-exact true positive + a guarded-negatives
-  bundle), 0 FP; `run_corpus.rb`
+  bundle — and the two `flow.always-truthy-condition` fixtures: a 4-case witness fixture
+  (literal-assigned / nil / inferred-fold / unless-false, all byte-exact vs the oracle) + an
+  adversarial-negatives bundle that proves the branch-reassignment / defensive / loop-nested /
+  param declines), 0 FP; `run_corpus.rb`
   validated to **3829 real files, 0 FP, 637/637 matched** (`def.override-visibility-reduced`
   added **+79 matched net**, of which **+44 are override-visibility witnesses on
   mastodon+gitlab, 44/44 reference-equal**; 100% precision; embedded RBS == runtime path,
@@ -327,7 +356,14 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
   { } -> x`; declines to Dynamic when the block form isn't modeled — zero-FP).
 - ✅ Rust-native constant folding (`folding.rs`) — deterministic Integer/Float/Bool/Nil/Symbol/
   ASCII-String; declines (→ None) on any doubt; arg-dependent folds (`1 + 2 → 3`).
-- 🟡 Environment is flat / top-level (no flow sensitivity yet); params/ivars/non-class-constants → Dynamic.
+- 🟡 The general typer environment is flat / top-level (the call/chaining/arity rules consume it);
+  params/ivars/non-class-constants → Dynamic. **A first flow-sensitive substrate landed** alongside
+  it (ADR-0022, used ONLY by `flow.always-truthy-condition`, §5): `Typer::always_truthy_snapshots`
+  runs a SEPARATE local **constant-propagation** pass with real `if`/`unless` branch JOINS +
+  loop/block/`case`/`begin`/`&&`-`||` widening, so a predicate's constant-ness is sound across
+  conditional reassignment. It is scoped to that rule (does not perturb the flat env the other
+  rules use) and is a strict under-approximation (widen on any doubt). Full narrowing / negative
+  facts / 5-edge scopes / fact buckets remain deferred.
 - ✅ **RECOVERED (2026-06-26): block-call result typing.** A block-bearing call now types to its
   **block-overload RBS return**, not Dynamic — exactly the reference's `block_required: true`
   overload selection (`method_dispatcher/rbs_dispatch.rb` → `overload_selector.rb`). It is
@@ -350,8 +386,12 @@ Reference paths are under `/Users/megurine/repo/ruby/rigor/`.
   single arity envelope collapsed over all overloads and cannot isolate the block overload's
   count — staying silent there is a missed witness, never an FP. Per-block-overload arity is the
   follow-up to recover those.
-- ⬜ **Flow-sensitive scopes** + 5 edges + fact buckets + invalidation (ADR-0022); narrowing
-  (guards, `is_a?`, truthy/falsey, equality trust, negative facts domain-relative).
+- 🟡 **Flow-sensitive scopes** (ADR-0022) — a FIRST slice landed: `Typer::always_truthy_snapshots`
+  is a flow-sensitive local **constant-propagation** pass with real `if`/`unless` branch JOINS +
+  loop/block/`case`/`begin`/`&&`-`||` widening (used by `flow.always-truthy-condition`, §5). Still
+  ⬜: the full 5 edges + fact buckets + invalidation, and narrowing (guards, `is_a?`, truthy/falsey,
+  equality trust, negative facts domain-relative) — the substrate the `possible-nil` source
+  expansion + `flow.unreachable-clause` need next.
 - ⬜ Full dispatch tier cascade (tier-2 shape, tier-4 in-source bodies); cross-file implicit-self
   (ref ADR-24/57); inference budgets (wired guards + table, ADR-0024); block/loop fixpoint +
   break-sink (ref ADR-56); recursive-return precision (ref ADR-55); reflexive-send fold guard
@@ -436,9 +476,34 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   (literal-predicate conditionals are vanishingly rare in production) — accepted; the value is a
   complete, correct rule plus the `is_unless` AST-correctness fix. 0 FP across 3829 corpus files,
   grand matched UNCHANGED at **637**.
-- ⬜ `flow.unreachable-clause` (ref ADR-47) · `flow.always-truthy-condition` (deferred — needs the
-  ADR-0022 flow-scope substrate, i.e. flow-sensitive scopes + narrowing in §4, which
-  `dead-assignment` and `unreachable-branch` deliberately do NOT use).
+- ✅ `flow.always-truthy-condition` (ADR-0022 first flow slice) — the **inferred-constant**
+  counterpart to the syntactic-literal `unreachable-branch`. Fires `warning` (`condition is always
+  <truthy|falsey> (the surrounding flow proves it folds to a constant)`, anchored on the predicate
+  node) when an `if`/`unless`/ternary predicate folds to a `Type::Constant` under the dominating
+  flow scope. Polarity mirrors the reference exactly: a `nil`/`false` constant ⇒ `falsey`, every
+  other constant ⇒ `truthy`. Skip envelope ported verbatim from the reference's
+  `AlwaysTruthyConditionCollector`: a SYNTACTIC literal predicate (owned by `unreachable-branch`,
+  so no double-fire), a defensive predicate call (`nil?`/`empty?`/`zero?`/`any?`/`none?`/`all?`/
+  `respond_to?`), and a predicate lexically inside a loop/block are all declined.
+  **The zero-FP keystone is a NEW minimal flow substrate** — `Typer::always_truthy_snapshots`
+  (`rigor-infer`): ONE flow-sensitive local **constant-propagation** pass that threads a per-scope
+  env, **forks `if`/`unless` branches and JOINS them** (a binding survives only when both branches
+  agree on the identical `TypeId`, else widens), and widens every local written under a loop /
+  block / `case` / `begin` / `&&`-`||` / any other node (span-containment, orphan-proof). This is
+  what makes a surviving constant SOUND: `x = 5; if c; x = f; end; if x` widens `x` and does NOT
+  fire (the flat env's central unsoundness — it would falsely retain `x = 5`). `def`/`class`/
+  `module` bodies are independent scopes (fresh env, inherited loop/block suppression). A strict
+  UNDER-approximation of the reference folder (witness ⊆ reference): it never folds ivars,
+  method-call returns, or params to constants, so the dangerous FP families (ivar/overridable-method
+  folding) simply never arise. Verified byte-exact against the oracle on the positive cases
+  (`x=5;if x` ⇒ 2:4 truthy; `y=nil` ⇒ falsey; `1+1` inferred fold; `unless false`). Like
+  `unreachable-branch`, fires ~0 times on the real corpus (inferred-constant predicates are
+  vanishingly rare in production) — ACCEPTED; the value is a complete `flow.*` rule plus the
+  reusable flow-constant substrate (the first ADR-0022 increment, the seam later flow rules build
+  on). **Deferred:** full narrowing / negative facts / 5-edge scopes / fact buckets (the rest of
+  ADR-0022); predicates nested in non-loop `case`/`begin`/`&&` are conservatively declined here
+  (the reference records them).
+- ⬜ `flow.unreachable-clause` (ref ADR-47).
 - ✅ `def.override-visibility-reduced` (ref ADR-35 slice 1) — a purely **STRUCTURAL** def-family
   check (no typer, no flow scopes, no unions): an instance-method override whose visibility is
   STRICTLY MORE RESTRICTIVE than the nearest **project-source** ancestor method it overrides
@@ -781,20 +846,23 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
     zig/cross/cargo-zigbuild + no Linux/Windows cross-toolchain on this host).
 
 ### 14. Parity harness & QA (ADR-0002/0011)
-- ✅ `harness/run.rb` (fixture gate, 28 fixtures incl. alias regression, the
+- ✅ `harness/run.rb` (fixture gate, 34 fixtures incl. alias regression, the
   `call.possible-nil-receiver` TP + guarded-negatives pair, the ADR-25
-  plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars, and the tier-4b
-  param-binding witness/decline pair) + divergence-registry.
+  plugin-enabled / gate-guard pair via sibling-`.rigor.yml` sidecars, the tier-4b
+  param-binding witness/decline pair, and the `flow.always-truthy-condition`
+  witness/adversarial-negatives pair) + divergence-registry.
 - ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
 - ✅ **CI workflow** (`.github/workflows/ci.yml`): `cargo build` + `cargo test` (the
   Ruby-free gates) on push/PR over ubuntu+macos, toolchain pinned to the **1.88** build MSRV
   (forced by the `ruby-rbs` dep's let-chains), `--locked`, libclang for
   bindgen, rust-cache; clippy BLOCKING (`-D warnings`; workspace is clippy-clean, `clippy.toml`
   holds the suggestion-`msrv = "1.85"` for OUR code, below the 1.88 build floor); rustfmt NOT
-  enforced (hand-formatted codebase). The differential harnesses stay a LOCAL gate (they need the
+  enforced (hand-formatted codebase — a recorded decision, **ADR-0032**, with a documenting
+  `rustfmt.toml`; `cargo fmt` rejected as a 239-hunk/25-file reformat, and no stable config
+  round-trips the hand style). The differential harnesses stay a LOCAL gate (they need the
   reference checkout + real corpora).
 - ✅ **Snapshot-mode CI parity** (ADR-0002, §14 track c): shared harness logic in `harness/lib.rb`;
-  `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (32 fixtures) from the live
+  `harness/snapshot.rb` regenerates `harness/snapshots/NN_name.json` (34 fixtures) from the live
   reference (sorted/pretty → deterministic, `--check` flags drift); `harness/run_snapshot.rb` is the
   reference-FREE gate (loads snapshots + runs the binary + IDENTICAL `(rule,line,column)` comparison);
   a separate `parity` job in `ci.yml` runs it on every PR (setup-ruby, no reference checkout). Snapshot

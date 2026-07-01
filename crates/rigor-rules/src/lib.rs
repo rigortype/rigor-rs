@@ -135,6 +135,14 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-raises",
         }),
+        FLOW_ALWAYS_TRUTHY_CONDITION => Some(&RuleEntry {
+            // The oracle stamps this `warning` / medium (an inferred-constant
+            // predicate; the inferred counterpart to the high-evidence syntactic
+            // `unreachable-branch`).
+            default_severity: Severity::Warning,
+            evidence_tier: "medium",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-truthy-condition",
+        }),
         _ => None,
     }
 }
@@ -201,6 +209,25 @@ pub const FLOW_ALWAYS_RAISES: &str = "flow.always-raises";
 /// conditionals are vanishingly rare in production); that is ACCEPTED — the value
 /// is a complete, correct rule plus the `is_unless` AST-correctness fix.
 pub const FLOW_UNREACHABLE_BRANCH: &str = "flow.unreachable-branch";
+
+/// `flow.always-truthy-condition`: an `if`/`unless`/ternary predicate whose
+/// INFERRED type folds to a `Type::Constant` under the dominating flow scope —
+/// the inferred-constant counterpart to the syntactic-literal `unreachable-branch`
+/// (ADR-0022 first flow slice). Fired only when the predicate is NOT a syntactic
+/// literal (owned by `unreachable-branch`), NOT a defensive predicate call
+/// (`nil?`/`empty?`/`zero?`/`any?`/`none?`/`all?`/`respond_to?` — the user reading
+/// like an explicit runtime check the types disagree with), and NOT lexically
+/// inside a loop / block (incomplete loop-mutation modelling makes an in-loop
+/// constant suspect). Mirrors the reference's `AlwaysTruthyConditionCollector`
+/// skip envelope; the folded type comes from
+/// [`rigor_infer::Typer::always_truthy_snapshots`], a strict UNDER-approximation
+/// of the reference flow folder, so a surviving constant is zero-FP.
+///
+/// Like `unreachable-branch`, fires ~0 times on the real corpus (inferred-constant
+/// predicates are vanishingly rare in production); ACCEPTED — the value is a
+/// complete, correct `flow.*` rule plus the reusable flow-constant substrate it
+/// is the first consumer of.
+pub const FLOW_ALWAYS_TRUTHY_CONDITION: &str = "flow.always-truthy-condition";
 
 /// The Integer division/modulo operators that raise `ZeroDivisionError` on a
 /// zero Integer divisor — verbatim the reference's `INTEGER_RAISING_OPERATORS`
@@ -404,7 +431,97 @@ pub fn analyze_with_source(
         }
     }
 
+    // Fifth pass — `flow.always-truthy-condition` (ADR-0022 first flow slice). The
+    // inferred-constant counterpart to the syntactic `unreachable-branch`: a
+    // predicate that the dominating flow scope folds to a `Type::Constant` (e.g.
+    // `x = 5; if x`). `always_truthy_snapshots` runs ONE flow-sensitive
+    // constant-propagation pass over the file and records, per non-loop/block
+    // `if`/`unless`, the predicate's folded type under branch-joined bindings —
+    // a strict under-approximation of the reference folder (zero-FP keystone).
+    // The rule then applies the reference's remaining skip envelope (syntactic
+    // literal → owned by unreachable-branch; defensive predicate call) and fires
+    // when the snapshot is a constant. Loop/block suppression is already baked in
+    // (those predicates are absent from the snapshot map).
+    let truthy_snapshots = typer.always_truthy_snapshots(ast, interner);
+    for (id, node) in ast.iter() {
+        if let Node::If { predicate, .. } = node {
+            if let Some(diag) =
+                check_always_truthy(ast, id, *predicate, &truthy_snapshots, interner)
+            {
+                out.push(diag);
+            }
+        }
+    }
+
     out
+}
+
+/// The defensive predicate selectors the reference's
+/// `AlwaysTruthyConditionCollector` skips: a predicate call to one of these reads
+/// like an explicit runtime check the (strict-on-returns) type system disagrees
+/// with — skipping them keeps the rule on genuine logic errors, not defensive
+/// code. Verbatim the reference's `DEFENSIVE_PREDICATES`.
+const DEFENSIVE_PREDICATES: &[&str] =
+    &["nil?", "empty?", "zero?", "any?", "none?", "all?", "respond_to?"];
+
+/// Build the `flow.always-truthy-condition` diagnostic for one `Node::If`, or
+/// `None` (a DECLINE — never a false positive). Fires iff the predicate folds to
+/// a `Type::Constant` in the recorded flow snapshot AND is not in the reference's
+/// skip envelope:
+///   - a SYNTACTIC literal predicate (owned by `flow.unreachable-branch`) →
+///     declined here so the two rules never double-fire;
+///   - a defensive predicate call (`nil?`/`empty?`/…) → declined;
+///   - a loop/block-nested predicate → already absent from `snapshots`.
+///
+/// The diagnostic anchors on the predicate node span (the reference's
+/// `Diagnostic.from_node(predicate_node)`).
+fn check_always_truthy(
+    ast: &LoweredAst,
+    if_id: rigor_parse::NodeId,
+    predicate: rigor_parse::NodeId,
+    snapshots: &std::collections::HashMap<rigor_parse::NodeId, rigor_types::TypeId>,
+    interner: &Interner,
+) -> Option<Diagnostic> {
+    // Skip syntactic literals (unreachable-branch's domain) and defensive calls.
+    if literal_predicate_truthy(ast, predicate).is_some() {
+        return None;
+    }
+    if matches!(ast.get(predicate), Node::Call { method, .. } if DEFENSIVE_PREDICATES.contains(&method.as_str()))
+    {
+        return None;
+    }
+    let ty = *snapshots.get(&if_id)?;
+    let polarity = constant_polarity(interner, ty)?;
+
+    let span = ast.get(predicate).span();
+    let severity = catalog(FLOW_ALWAYS_TRUTHY_CONDITION)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Warning);
+
+    Some(Diagnostic {
+        rule_id: FLOW_ALWAYS_TRUTHY_CONDITION,
+        start_offset: span.0,
+        end_offset: span.1,
+        message: format!(
+            "condition is always {polarity} (the surrounding flow proves it folds to a constant)"
+        ),
+        severity,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: None,
+    })
+}
+
+/// The polarity word for a constant predicate, or `None` if `ty` is not a
+/// `Type::Constant`. Mirrors the reference exactly: a `nil` or `false` constant
+/// is `falsey`, every other constant (Integer/Float/String/Symbol/`true`) is
+/// `truthy` (in Ruby only `nil`/`false` are falsey).
+fn constant_polarity(interner: &Interner, ty: rigor_types::TypeId) -> Option<&'static str> {
+    match interner.get(ty) {
+        Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => Some("falsey"),
+        Type::Constant(_) => Some("truthy"),
+        _ => None,
+    }
 }
 
 /// `:truthy` / `:falsey` polarity of a SYNTACTICALLY-LITERAL predicate, or `None`
@@ -2522,6 +2639,114 @@ mod tests {
         assert_eq!(d[0].message, "unreachable branch: literal predicate is always falsey");
     }
 
+    // -- flow.always-truthy-condition -------------------------------------
+    //
+    // The inferred-constant counterpart to unreachable-branch (ADR-0022 first
+    // flow slice). Fires only when the dominating flow scope folds the predicate
+    // to a `Type::Constant`; the branch-join is the zero-FP keystone. Each
+    // positive was verified byte-exact (rule, line, column) against the oracle.
+
+    /// The `flow.always-truthy-condition` diagnostics in `src`, in source order.
+    fn always_truthy(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == FLOW_ALWAYS_TRUTHY_CONDITION)
+            .collect()
+    }
+
+    #[test]
+    fn always_truthy_literal_assigned_constant_fires() {
+        // `ca = 5; if ca` — `ca` folds to `5` (dominating straight-line write) ⇒
+        // always truthy. Oracle: 2:4 (the predicate node), "always truthy".
+        let src = b"ca = 5\nif ca\n  puts ca\nend\n";
+        let d = always_truthy(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(
+            d[0].message,
+            "condition is always truthy (the surrounding flow proves it folds to a constant)"
+        );
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(line_col(src, d[0].start_offset), (2, 4));
+    }
+
+    #[test]
+    fn always_truthy_nil_constant_is_falsey() {
+        // `cb = nil; if cb` — only nil/false are falsey ⇒ "always falsey".
+        let src = b"cb = nil\nif cb\n  noop\nend\n";
+        let d = always_truthy(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(
+            d[0].message,
+            "condition is always falsey (the surrounding flow proves it folds to a constant)"
+        );
+        assert_eq!(line_col(src, d[0].start_offset), (2, 4));
+    }
+
+    #[test]
+    fn always_truthy_inferred_fold_fires() {
+        // `cc = 1 + 1; if cc` — an INFERRED constant (folded arithmetic, not a
+        // syntactic literal). This is the case unreachable-branch cannot reach.
+        let d = always_truthy(b"cc = 1 + 1\nif cc\n  noop\nend\n");
+        assert_eq!(d.len(), 1, "inferred-constant predicate must fire, got {d:?}");
+        assert!(d[0].message.contains("always truthy"));
+    }
+
+    #[test]
+    fn always_truthy_unless_false_is_falsey() {
+        // The `unless` keyword: predicate `cd` folds to `false` ⇒ "always falsey"
+        // (polarity is the predicate VALUE, independent of which branch runs).
+        let d = always_truthy(b"cd = false\nunless cd\n  noop\nend\n");
+        assert_eq!(d.len(), 1, "unless-false predicate must fire, got {d:?}");
+        assert!(d[0].message.contains("always falsey"));
+    }
+
+    #[test]
+    fn always_truthy_branch_reassignment_widens_silent() {
+        // THE KEYSTONE. `na = 5`, then a CONDITIONAL reassignment ⇒ `na` is
+        // `5 | <recompute>` at the second `if` — the flow join widens it, so NO
+        // fire. The flat (non-flow) env would keep `na = 5` and falsely fire.
+        let src = b"na = 5\nif guard\n  na = recompute\nend\nif na\n  noop\nend\n";
+        assert!(
+            always_truthy(src).is_empty(),
+            "a conditionally-reassigned local must NOT fold to a constant"
+        );
+    }
+
+    #[test]
+    fn always_truthy_defensive_predicate_silent() {
+        // A defensive predicate call (`nil?`/`empty?`/…) reads as an explicit
+        // runtime check; the reference skips it ⇒ silent.
+        assert!(
+            always_truthy(b"nb = 5\nif nb.nil?\n  noop\nend\n").is_empty(),
+            "defensive `.nil?` predicate must be silent"
+        );
+    }
+
+    #[test]
+    fn always_truthy_loop_nested_silent() {
+        // A predicate inside a loop/block body is suppressed (loop-mutation
+        // modelling is incomplete) ⇒ silent, matching the reference envelope.
+        let src = b"nc = 7\nwhile guard\n  if nc\n    noop\n  end\nend\n";
+        assert!(always_truthy(src).is_empty(), "loop-nested predicate must be silent");
+    }
+
+    #[test]
+    fn always_truthy_param_never_folds_silent() {
+        // A method parameter is `Dynamic[top]`, never a constant ⇒ silent.
+        let src = b"def m(flag)\n  if flag\n    noop\n  end\nend\n";
+        assert!(always_truthy(src).is_empty(), "a param predicate must never fold");
+    }
+
+    #[test]
+    fn always_truthy_skips_syntactic_literal() {
+        // A SYNTACTIC literal predicate is owned by unreachable-branch; always-
+        // truthy must NOT double-fire on it (the reference skips literals here).
+        assert!(
+            always_truthy(b"if true\n  live\nend\n").is_empty(),
+            "literal predicate is unreachable-branch's domain, not always-truthy's"
+        );
+    }
+
     #[test]
     fn catalog_entries_are_correct() {
         let entry = catalog(CALL_UNDEFINED_METHOD).expect("catalog entry must exist");
@@ -2547,6 +2772,11 @@ mod tests {
         assert_eq!(entry.default_severity, Severity::Warning);
         assert_eq!(entry.evidence_tier, "high");
         assert!(entry.documentation_url.contains("flow-unreachable-branch"));
+
+        let entry = catalog(FLOW_ALWAYS_TRUTHY_CONDITION).expect("catalog entry must exist");
+        assert_eq!(entry.default_severity, Severity::Warning);
+        assert_eq!(entry.evidence_tier, "medium");
+        assert!(entry.documentation_url.contains("flow-always-truthy-condition"));
 
         assert!(catalog("unknown.rule").is_none());
     }
