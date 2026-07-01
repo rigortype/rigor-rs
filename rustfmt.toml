@@ -1,0 +1,14 @@
+# rigor-rs is HAND-FORMATTED. Do NOT run `cargo fmt` over this tree.
+#
+# `cargo fmt --check` is intentionally NOT a CI gate, and `cargo fmt` will
+# REWRITE ~239 hunks across ~25 files — erasing the deliberately compact hand
+# style (one-line struct literals, packed match arms, inline chains) for no
+# correctness or parity benefit. The blocking style gate is clippy
+# (`-D warnings`), not rustfmt. See docs/adr/0032-source-formatting-policy.md.
+#
+# This file exists ONLY to document that policy and to pin the basic intent
+# (edition + line width) for any tool that insists on a rustfmt config. No stable
+# rustfmt configuration round-trips the existing code, so these settings do NOT
+# make `fmt --check` pass — they are not an invitation to format.
+edition = "2024"
+max_width = 100

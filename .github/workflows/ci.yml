@@ -5,7 +5,9 @@
 # (`harness/run.rb`, `harness/run_corpus.rb`) need the reference checkout and
 # real corpora and so stay a LOCAL pre-merge gate, not a CI job.
 #
-# rustfmt is intentionally not enforced (the codebase is hand-formatted);
+# rustfmt is intentionally not enforced (the codebase is hand-formatted; a
+# recorded decision — see docs/adr/0032-source-formatting-policy.md and the
+# documenting rustfmt.toml — NOT an oversight);
 # clippy is BLOCKING (`-D warnings`): the workspace is clippy-clean (deliberate
 # exceptions carry surgical per-item `#[allow]`s with rationale; `clippy.toml`
 # holds clippy's suggestion-MSRV at 1.85 — below the 1.88 build floor that the
