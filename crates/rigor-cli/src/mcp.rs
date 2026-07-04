@@ -161,6 +161,20 @@ fn tool_catalog() -> Value {
                 },
                 "required": ["source", "line", "column"]
             }
+        },
+        {
+            "name": "explain",
+            "description": "Look up rigor's rule catalogue. With no `rule`, returns the id + \
+                            summary of every rule. With a `rule` (canonical id, legacy alias, or \
+                            family token like `flow`), returns that rule's full metadata (summary, \
+                            fires-when, suppression, severity, docs URL).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rule": { "type": "string", "description": "Rule id / alias / family token (optional)." }
+                },
+                "required": []
+            }
         }
     ])
 }
@@ -174,6 +188,7 @@ fn tools_call(ctx: &ServerContext, params: &Value) -> Value {
     let outcome = match name {
         "check" => tool_check(ctx, &args),
         "type_of" => tool_type_of(ctx, &args),
+        "explain" => tool_explain(&args),
         other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
@@ -261,6 +276,14 @@ fn tool_type_of(ctx: &ServerContext, args: &Value) -> Result<String, String> {
     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
 }
 
+/// The `explain` tool: look up the rule catalogue (all rules, or one rule's full
+/// metadata by id / alias / family token). Reuses the `explain` command's table.
+fn tool_explain(args: &Value) -> Result<String, String> {
+    let query = args.get("rule").and_then(Value::as_str);
+    let v = crate::explain::explain_json(query)?;
+    serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+}
+
 /// 1-based `(line, column)` from a byte offset (columns in Unicode scalars), the
 /// same mapping the text/json reporters use.
 fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
@@ -308,16 +331,22 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_advertises_check_and_type_of() {
+    fn tools_list_advertises_the_tools() {
         let tools = tool_catalog();
         let names: Vec<&str> =
             tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"check"));
         assert!(names.contains(&"type_of"));
-        // Each tool declares an object inputSchema with a `source` property.
+        assert!(names.contains(&"explain"));
+        // Every tool declares an object inputSchema.
         for t in tools.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object");
-            assert!(t["inputSchema"]["properties"]["source"].is_object());
+        }
+        // The source-consuming tools declare a `source` property.
+        for t in tools.as_array().unwrap() {
+            if matches!(t["name"].as_str(), Some("check") | Some("type_of")) {
+                assert!(t["inputSchema"]["properties"]["source"].is_object());
+            }
         }
     }
 
@@ -357,6 +386,40 @@ mod tests {
         let parsed: Value = serde_json::from_str(text).unwrap();
         assert_eq!(parsed["type"], "42");
         assert_eq!(parsed["node"], "IntegerLit");
+    }
+
+    #[test]
+    fn explain_tool_lists_all_rules_with_no_arg() {
+        let out = tools_call(&ctx(), &json!({ "name": "explain", "arguments": {} }));
+        assert_eq!(out["isError"], false);
+        let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(parsed["count"].as_u64().unwrap() > 5);
+        let ids: Vec<&str> =
+            parsed["rules"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"call.undefined-method"));
+    }
+
+    #[test]
+    fn explain_tool_returns_full_metadata_for_a_rule() {
+        // A legacy alias resolves to the canonical rule with full fields.
+        let out = tools_call(&ctx(), &json!({
+            "name": "explain", "arguments": { "rule": "undefined-method" }
+        }));
+        assert_eq!(out["isError"], false);
+        let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["count"], 1);
+        let r = &parsed["rules"][0];
+        assert_eq!(r["id"], "call.undefined-method");
+        assert!(r["fires_when"].is_array());
+        assert!(r["documentation_url"].as_str().unwrap().contains("call-undefined-method"));
+    }
+
+    #[test]
+    fn explain_tool_unknown_rule_is_an_error() {
+        let out = tools_call(&ctx(), &json!({
+            "name": "explain", "arguments": { "rule": "no-such-rule" }
+        }));
+        assert_eq!(out["isError"], true);
     }
 
     #[test]

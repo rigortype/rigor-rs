@@ -516,6 +516,51 @@ pub fn render_rule_doc(token: &str) -> bool {
     true
 }
 
+/// Structured rule-catalogue JSON for the MCP `explain` tool (§12). `None` query
+/// → an id-sorted index (`{id, summary}` per rule). `Some(token)` → the full
+/// metadata for every matching entry (canonical id / legacy alias / family token,
+/// the SAME resolution `explain` uses), or `Err` when nothing resolves. Reuses
+/// the single `ENTRIES` table — no duplication of catalogue content.
+pub(crate) fn explain_json(query: Option<&str>) -> Result<serde_json::Value, String> {
+    use serde_json::json;
+    let entries = match query {
+        None => all(),
+        Some(token) => {
+            let hits = resolve(token);
+            if hits.is_empty() {
+                return Err(format!("unknown rule, alias, or family: {token}"));
+            }
+            hits
+        }
+    };
+    let full = query.is_some(); // index view (id+summary) vs full metadata.
+    let rules: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|e| {
+            if !full {
+                return json!({ "id": e.id, "summary": e.summary });
+            }
+            json!({
+                "id": e.id,
+                "summary": e.summary,
+                "fires_when": e.fires_when,
+                "does_not_fire_when": e.does_not_fire_when,
+                "suppression": e.suppression,
+                "severity_authored": e.severity_authored,
+                "severity_by_profile": e.severity_by_profile
+                    .iter()
+                    .map(|(p, s)| json!({ "profile": p, "severity": s }))
+                    .collect::<Vec<_>>(),
+                "evidence_tier": e.evidence_tier,
+                "since": e.since,
+                "documentation_url": e.documentation_url(),
+                "aliases": e.aliases(),
+            })
+        })
+        .collect();
+    Ok(json!({ "rules": rules, "count": rules.len() }))
+}
+
 /// `rigor explain [--format text|json] [<rule>]` — print rule metadata.
 /// Exit 0 on success, 64 on an unknown rule or a usage error.
 pub fn cmd_explain(args: &[String]) -> ExitCode {
