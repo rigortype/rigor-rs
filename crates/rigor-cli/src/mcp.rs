@@ -175,6 +175,18 @@ fn tool_catalog() -> Value {
                 },
                 "required": []
             }
+        },
+        {
+            "name": "outline",
+            "description": "Return the structural outline of Ruby source — a nested tree of its \
+                            classes, modules, and methods with 1-based line ranges.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "The Ruby source code." }
+                },
+                "required": ["source"]
+            }
         }
     ])
 }
@@ -189,6 +201,7 @@ fn tools_call(ctx: &ServerContext, params: &Value) -> Value {
         "check" => tool_check(ctx, &args),
         "type_of" => tool_type_of(ctx, &args),
         "explain" => tool_explain(&args),
+        "outline" => tool_outline(&args),
         other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
@@ -282,6 +295,38 @@ fn tool_explain(args: &Value) -> Result<String, String> {
     let query = args.get("rule").and_then(Value::as_str);
     let v = crate::explain::explain_json(query)?;
     serde_json::to_string_pretty(&v).map_err(|e| e.to_string())
+}
+
+/// The `outline` tool: the nested class/module/method structure of the source,
+/// with 1-based line ranges. Reuses the shared outline builder (the same one the
+/// LSP `documentSymbol` handler uses).
+fn tool_outline(args: &Value) -> Result<String, String> {
+    let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
+    let syms = panic::catch_unwind(AssertUnwindSafe(|| {
+        let ast = lower(&parse(source.as_bytes()));
+        crate::outline::build(&ast)
+    }))
+    .map_err(|_| "internal error: parsing panicked on this source".to_string())?;
+
+    let tree: Vec<Value> = syms.iter().map(|s| outline_json(s, source)).collect();
+    let report = json!({ "outline": tree, "count": syms.len() });
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+/// Adapt a shared outline node into JSON with 1-based line ranges.
+fn outline_json(s: &crate::outline::SymNode, source: &str) -> Value {
+    let (start_line, _) = line_col(source, s.full.0);
+    let (end_line, _) = line_col(source, s.full.1.min(source.len()));
+    let mut obj = json!({
+        "name": s.name,
+        "kind": s.kind.label(),
+        "startLine": start_line,
+        "endLine": end_line,
+    });
+    if !s.children.is_empty() {
+        obj["children"] = Value::Array(s.children.iter().map(|c| outline_json(c, source)).collect());
+    }
+    obj
 }
 
 /// 1-based `(line, column)` from a byte offset (columns in Unicode scalars), the
@@ -420,6 +465,25 @@ mod tests {
             "name": "explain", "arguments": { "rule": "no-such-rule" }
         }));
         assert_eq!(out["isError"], true);
+    }
+
+    #[test]
+    fn outline_tool_returns_nested_structure() {
+        let src = "class Foo\n  def bar\n  end\nend\nmodule M\nend\n";
+        let out = tools_call(&ctx(), &json!({ "name": "outline", "arguments": { "source": src } }));
+        assert_eq!(out["isError"], false);
+        let parsed: Value = serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed["count"], 2);
+        let foo = parsed["outline"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "Foo")
+            .unwrap();
+        assert_eq!(foo["kind"], "class");
+        assert_eq!(foo["startLine"], 1);
+        assert_eq!(foo["children"][0]["name"], "bar");
+        assert_eq!(foo["children"][0]["kind"], "method");
     }
 
     #[test]

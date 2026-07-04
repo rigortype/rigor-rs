@@ -550,7 +550,7 @@ fn document_symbols(
     let text = buffers.get(&uri_key(&params.text_document.uri))?;
     let syms = panic::catch_unwind(AssertUnwindSafe(|| {
         let ast = lower(&parse(text.as_bytes()));
-        build_symbol_tree(&ast, text)
+        crate::outline::build(&ast).iter().map(|s| to_document_symbol(s, text)).collect::<Vec<_>>()
     }))
     .ok()?;
     if syms.is_empty() {
@@ -559,99 +559,29 @@ fn document_symbols(
     Some(DocumentSymbolResponse::Nested(syms))
 }
 
-/// A pre-tree symbol row harvested from one AST node.
-struct RawSymbol {
-    name: String,
-    kind: SymbolKind,
-    full: (usize, usize),
-    sel: (usize, usize),
-}
-
-/// Build the nested `DocumentSymbol` tree from the arena: each `ClassDef` /
-/// `ModuleDef` / named `Definition` becomes a symbol, nested by BYTE-SPAN
-/// CONTAINMENT (a method inside a class becomes its child; a nested class nests
-/// too). The arena is flat, so nesting is reconstructed structurally — the same
-/// span-containment approach the toplevel-def / override rules use.
-fn build_symbol_tree(ast: &rigor_parse::LoweredAst, text: &str) -> Vec<DocumentSymbol> {
-    let mut raws: Vec<RawSymbol> = Vec::new();
-    for (_, node) in ast.iter() {
-        match node {
-            Node::ClassDef { name, span, .. } if !name.is_empty() => raws.push(RawSymbol {
-                name: name.clone(),
-                kind: SymbolKind::CLASS,
-                full: *span,
-                sel: *span,
-            }),
-            Node::ModuleDef { name, span, .. } if !name.is_empty() => raws.push(RawSymbol {
-                name: name.clone(),
-                kind: SymbolKind::MODULE,
-                full: *span,
-                sel: *span,
-            }),
-            Node::Definition { name: Some(n), name_span, span, .. } => raws.push(RawSymbol {
-                name: n.clone(),
-                kind: SymbolKind::METHOD,
-                full: *span,
-                sel: name_span.unwrap_or(*span),
-            }),
-            _ => {}
-        }
-    }
-
-    // Sort by start ascending, then by end DESCENDING so a container always
-    // precedes the symbols it contains (equal start ⇒ the wider one first).
-    raws.sort_by(|a, b| a.full.0.cmp(&b.full.0).then(b.full.1.cmp(&a.full.1)));
-
-    // Parent index via a containment stack: pop while the top doesn't fully
-    // contain the current span (start is already ≤ by the sort, so test end).
-    let mut parent: Vec<Option<usize>> = vec![None; raws.len()];
-    let mut stack: Vec<usize> = Vec::new();
-    for i in 0..raws.len() {
-        while let Some(&top) = stack.last() {
-            if raws[top].full.1 >= raws[i].full.1 {
-                break; // top contains i.
-            }
-            stack.pop();
-        }
-        parent[i] = stack.last().copied();
-        stack.push(i);
-    }
-
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); raws.len()];
-    let mut roots: Vec<usize> = Vec::new();
-    for (i, p) in parent.iter().enumerate() {
-        match p {
-            Some(p) => children[*p].push(i),
-            None => roots.push(i),
-        }
-    }
-
-    roots.iter().map(|&i| assemble_symbol(i, &raws, &children, text)).collect()
-}
-
-/// Recursively materialise the `DocumentSymbol` at raw-index `i` and its children.
-fn assemble_symbol(
-    i: usize,
-    raws: &[RawSymbol],
-    children: &[Vec<usize>],
-    text: &str,
-) -> DocumentSymbol {
-    let r = &raws[i];
-    let kids: Vec<DocumentSymbol> =
-        children[i].iter().map(|&c| assemble_symbol(c, raws, children, text)).collect();
-    let to_range = |(s, e): (usize, usize)| Range {
-        start: offset_to_position(text, s),
-        end: offset_to_position(text, e),
+/// Adapt a shared [`crate::outline::SymNode`] into an LSP `DocumentSymbol`
+/// (byte-offset spans → 0-based UTF-16 ranges; kind → `SymbolKind`).
+fn to_document_symbol(s: &crate::outline::SymNode, text: &str) -> DocumentSymbol {
+    use crate::outline::SymKind;
+    let kids: Vec<DocumentSymbol> = s.children.iter().map(|c| to_document_symbol(c, text)).collect();
+    let to_range = |(a, b): (usize, usize)| Range {
+        start: offset_to_position(text, a),
+        end: offset_to_position(text, b),
+    };
+    let kind = match s.kind {
+        SymKind::Class => SymbolKind::CLASS,
+        SymKind::Module => SymbolKind::MODULE,
+        SymKind::Method => SymbolKind::METHOD,
     };
     #[allow(deprecated)] // `deprecated` field is required by the struct literal.
     DocumentSymbol {
-        name: r.name.clone(),
+        name: s.name.clone(),
         detail: None,
-        kind: r.kind,
+        kind,
         tags: None,
         deprecated: None,
-        range: to_range(r.full),
-        selection_range: to_range(r.sel),
+        range: to_range(s.full),
+        selection_range: to_range(s.sel),
         children: if kids.is_empty() { None } else { Some(kids) },
     }
 }

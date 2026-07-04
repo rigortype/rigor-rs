@@ -905,9 +905,13 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   call) and panic isolation. **Verified:** +9 unit tests (initialize echo/default, tools/list
   schema, check-typo + inline-suppression, type_of, unknown-tool/missing-arg isError, unknown-method
   JSON-RPC error) + an e2e stdio session (initialize → tools/list → `check` 1 diagnostic → `type_of`
-  `"HI"` → unknown-tool error). 395 tests, run.rb + run_snapshot.rb PASS (0 FP), clippy-clean; MCP
-  is a purely additive subcommand (no `check` impact). Deferred: more tools (`explain`/`documentSymbol`
-  analogue), resources/prompts capabilities.
+  `"HI"` → unknown-tool error). MCP is a purely additive subcommand (no `check` impact).
+  **Tools added (2026-07-01):** `explain` (rule-catalogue lookup — no arg → the 19-rule index, or a
+  rule/alias/family token → full metadata; reuses `explain`'s `ENTRIES` via `explain::explain_json`)
+  and `outline` (nested class/module/method structure with 1-based line ranges; reuses the shared
+  `outline::build` — the SAME nesting builder the LSP `documentSymbol` handler now uses, so the
+  span-containment logic lives in one place: `crates/rigor-cli/src/outline.rs`). 400 tests, run.rb +
+  run_snapshot.rb PASS (0 FP), clippy-clean. Deferred: resources/prompts capabilities.
 - **NOTE (reference-harness flakiness, observed 2026-07-01):** `run_corpus.rb` (the LIVE
   differential harness) gave swinging FP counts (70/0/2/0) on a DETERMINISTIC file set
   (`Dir[...].sort.first(limit)`) with a provably-deterministic rigor-rs binary — i.e. the Ruby

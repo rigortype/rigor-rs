@@ -32,6 +32,7 @@ mod explain;
 mod init;
 mod lsp;
 mod mcp;
+mod outline;
 mod plugins_cmd;
 mod type_of;
 
