@@ -238,23 +238,32 @@ pub(crate) fn position_to_offset(source: &str, line: usize, column: usize) -> Re
 /// wrappers always cover the offset but lose the smallest-span contest to any
 /// real expression beneath them.
 pub(crate) fn locate_node(ast: &LoweredAst, offset: usize) -> Option<NodeId> {
-    let mut best: Option<(NodeId, usize)> = None; // (id, span width)
+    let mut best: Option<(NodeId, usize, bool)> = None; // (id, span width, is_wrapper)
     for (id, node) in ast.iter() {
         let (start, end) = node.span();
         if start <= offset && offset < end {
             let width = end - start;
+            // A `Program`/`Statements` container often shares its span with its
+            // sole child (e.g. a file that is one `def`), so it must never win a
+            // tie against a real node — otherwise "the expression here" resolves
+            // to the whole program. It is only a candidate when nothing else covers.
+            let is_wrapper = matches!(node, Node::Program { .. } | Node::Statements { .. });
             match best {
-                // Strictly-narrower span wins; on an equal width prefer the later
-                // id (deeper / more specific node lowered after its container).
-                Some((_, best_w)) if width <= best_w => {
-                    best = Some((id, width));
+                None => best = Some((id, width, is_wrapper)),
+                Some((_, best_w, best_wrapper)) => {
+                    // Strictly-narrower wins. On an equal width: a non-wrapper beats
+                    // a wrapper; otherwise prefer the later id (deeper / more
+                    // specific node lowered after its container).
+                    let better = width < best_w
+                        || (width == best_w && (best_wrapper || !is_wrapper));
+                    if better {
+                        best = Some((id, width, is_wrapper));
+                    }
                 }
-                None => best = Some((id, width)),
-                _ => {}
             }
         }
     }
-    best.map(|(id, _)| id)
+    best.map(|(id, _, _)| id)
 }
 
 // ---------------------------------------------------------------------------

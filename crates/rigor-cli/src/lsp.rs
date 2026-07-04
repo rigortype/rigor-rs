@@ -372,6 +372,20 @@ fn hover(
             Node::ConstantRead { name, .. } if !name.is_empty() => Some(name.clone()),
             _ => None,
         };
+        // Definition-site hover (hovering on a `class`/`module`/`def` name): a
+        // signature line built from the node, no typing needed.
+        let def_sig = match ast.get(node_id) {
+            Node::ClassDef { name, superclass_path, .. } if !name.is_empty() => Some(match superclass_path {
+                Some(sup) => format!("class {name} < {sup}"),
+                None => format!("class {name}"),
+            }),
+            Node::ModuleDef { name, .. } if !name.is_empty() => Some(format!("module {name}")),
+            Node::Definition { name: Some(n), params, .. } => Some(match params {
+                Some(ps) if !ps.is_empty() => format!("def {n}({})", ps.join(", ")),
+                _ => format!("def {n}"),
+            }),
+            _ => None,
+        };
         let kind = crate::type_of::node_kind(ast.get(node_id));
 
         let body = if let Some((receiver, method)) = call_bits {
@@ -387,6 +401,8 @@ fn hover(
                 }
             }
             format!("```ruby\n{sig}\n```\n\n*rigor: Call*")
+        } else if let Some(sig) = def_sig {
+            format!("```ruby\n{sig}\n```\n\n*rigor: definition*")
         } else if let Some(name) = const_name {
             format!("```ruby\n{name} : {type_render}\n```\n\n*rigor: Constant*")
         } else {
@@ -849,6 +865,39 @@ mod tests {
         assert!(m.value.contains("String#upcase"), "signature: {}", m.value);
         assert!(m.value.contains("arity"), "arity shown: {}", m.value);
         assert!(m.value.contains("*rigor: Call*"), "{}", m.value);
+    }
+
+    /// Hover value at a 0-based (line, char) over a single buffer (or empty).
+    fn hover_value(text: &str, line: u32, character: u32) -> String {
+        let mut buffers = HashMap::new();
+        let uri: Uri = "file:///h.rb".parse().unwrap();
+        buffers.insert(uri_key(&uri), text.to_string());
+        let params = HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+        };
+        match hover(&ctx(), &buffers, &params) {
+            Some(Hover { contents: HoverContents::Markup(m), .. }) => m.value,
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn hover_on_a_def_shows_its_signature() {
+        // `def greet(name)` — hover on the method name (line 1, char 4).
+        let v = hover_value("def greet(name)\n  name\nend\n", 0, 4);
+        assert!(v.contains("def greet(name)"), "{v}");
+        assert!(v.contains("*rigor: definition*"), "{v}");
+    }
+
+    #[test]
+    fn hover_on_a_class_shows_its_header() {
+        // `class Foo < Bar` — hover on the class name (line 1, char 6).
+        let v = hover_value("class Foo < Bar\nend\n", 0, 6);
+        assert!(v.contains("class Foo < Bar"), "{v}");
     }
 
     #[test]
