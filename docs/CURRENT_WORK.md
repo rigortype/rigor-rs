@@ -6,14 +6,15 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 — **Productization track (lever A): 5 local commits (@ `f7cc99f`) +
-UNCOMMITTED MCP server.** (1) §9 **rayon file-level parallelism** (byte-identical to serial, 0 FP,
-~2.4× warm) + `RIGOR_TIMING` observability. (2) §12 **LSP server v1/v2/v3** — `rigor lsp
---transport=stdio` (sync `lsp-server`/`lsp-types`, no async runtime): live diagnostics + hover +
-member-access **completion** + **documentSymbol** outline. (3) §12 **MCP server** — `rigor mcp`
-(hand-rolled newline-delimited JSON-RPC, no new dep): read-only `check` + `type_of` tools
-[uncommitted, ready]. 395 tests + end-to-end stdio smokes green. Prior: **5 commits pushed (@
-`2d0add3`)**: rustfmt policy
+Last updated: 2026-07-01 — **Productization track (lever A): 6 commits pushed (@ `8c3dbee`) + 4
+uncommitted polish commits (@ `28592fb`).** (1) §9 **rayon file-level parallelism** (byte-identical
+to serial, 0 FP, ~2.4× warm) + `RIGOR_TIMING` observability. (2) §12 **LSP server** — `rigor lsp
+--transport=stdio` (sync `lsp-server`/`lsp-types`, no async runtime): live diagnostics +
+**node-aware hover** (Call signature / def header / constant) + member-access **completion** +
+**documentSymbol** outline. (3) §12 **MCP server** — `rigor mcp` (hand-rolled newline-delimited
+JSON-RPC, no new dep): read-only `check` / `type_of` / `explain` / `outline` tools. The
+LSP `documentSymbol` + MCP `outline` share one `outline::build` nesting builder. 402 tests +
+end-to-end stdio smokes green. Prior: **5 commits pushed (@ `2d0add3`)**: rustfmt policy
 (ADR-0032) · `flow.always-truthy-condition` + first ADR-0022 flow substrate · **upstream pinned to
 `v0.2.6`** as a `reference/rigor` git submodule + harness re-baselined ([`UPSTREAM.md`](../UPSTREAM.md)) ·
 **`call.unresolved-toplevel`** (the highest-frequency unimplemented rule per a v0.2.6 corpus tally, 0 FP) ·
@@ -845,9 +846,13 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   `check` single-file path (parse → lower → single-file `SourceIndex` → `analyze_with_source`) +
   inline `# rigor:disable` + config `disable:` suppression, mapped to LSP `Diagnostic`s
   (`source="rigor"`, `code=<rule id>`, severity error→Error/warning→Warning/info→Information per
-  ADR-0029); `didClose` publishes an empty set to clear markers. (2) **hover** — reuses the
-  `type-of` node-locator + type renderer (deepest node at the cursor → `Typer::type_of` → a
-  markdown card with the inferred type + node kind + hover range). **Two-tier essence:** the RBS
+  ADR-0029); `didClose` publishes an empty set to clear markers. (2) **hover** — NODE-AWARE
+  markdown cards (enriched 2026-07-01): a `Call` shows `receiver#method → return` + the RBS arity
+  envelope, a `class`/`module`/`def` name shows its header/signature (`class Foo < Bar` /
+  `def name(params)`), a constant shows `Name : type`, else the inferred type + node kind + hover
+  range. Reuses the `type-of` node-locator + `Typer` + `CoreIndex` (`class_name_of`/`method_arity`).
+  (The def-hover work also fixed a latent `locate_node` wrapper tie-break: a `Program`/`Statements`
+  container sharing its span with a sole child no longer wins — improves `type-of` too.) **Two-tier essence:** the RBS
   environment (`CoreIndex::with_plugins`) + config-derived suppression set are built ONCE at
   startup and reused across every request, so the per-keystroke cost is a single-file
   parse+lower+analyze, never the RBS-load floor. Panic-isolated (ADR-0016): a malformed buffer
