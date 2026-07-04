@@ -874,7 +874,15 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   diagnostic path — proven byte-identical `check` output on 1236 real mastodon files vs committed
   v1 (both 397 diags).** 384 tests, run.rb + run_snapshot.rb PASS (0 FP), clippy index-lib +
   cli-bin clean.
-- ⬜ **Deferred (LSP v3+):** `::` constant/namespace completion (currently `::` yields singleton
+- ✅ **LSP v3 — `textDocument/documentSymbol` landed (2026-07-01).** A nested outline
+  (classes/modules/methods) built from the lowered AST: every `ClassDef`/`ModuleDef`/named
+  `Definition` becomes a `DocumentSymbol` (`Class`/`Module`/`Method` kind), nested by BYTE-SPAN
+  CONTAINMENT (a method nests under its class; nested classes nest too) — the same span-containment
+  approach the toplevel-def/override rules use, since the arena is flat. `range` = the whole def
+  span, `selectionRange` = the name token (`name_span` for methods). Advertised
+  `documentSymbolProvider`. +2 tests (nested class→methods + module; empty for a script-ish file)
+  and an e2e stdio session. 386 tests, harnesses PASS (0 FP), clippy-clean.
+- ⬜ **Deferred (LSP v4+):** `::` constant/namespace completion (currently `::` yields singleton
   methods, not nested constants); Union-receiver method intersection + private-method visibility
   filter; the full two-tier `ProjectContext` (generation counter,
   `didChangeWatchedFiles`/`didChangeConfiguration` invalidation), cross-file project context for
