@@ -337,8 +337,10 @@ fn to_lsp_diagnostic(text: &str, d: &rigor_rules::Diagnostic) -> Diagnostic {
 }
 
 /// Answer `textDocument/hover`: locate the deepest node under the cursor, type it,
-/// and render a small markdown card (node kind + inferred type). Reuses the
-/// `type-of` node-locator + type renderer. Returns `None` when the buffer is
+/// and render a node-aware markdown card. A `Call` shows `receiver#method →
+/// return` (plus the RBS arity when the receiver class is core-known); a constant
+/// shows `Name : type`; anything else shows the inferred type + node kind. Reuses
+/// the `type-of` node-locator + type renderer. Returns `None` when the buffer is
 /// unknown, the position is out of range, or no node covers it — a null hover.
 fn hover(
     ctx: &ServerContext,
@@ -357,15 +359,43 @@ fn hover(
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, node_id, &env, &mut interner);
-        let node = ast.get(node_id);
-        let (start, end) = node.span();
-        let kind = crate::type_of::node_kind(node);
-        let rendered = crate::type_of::render_type(&interner, &ctx.index, ty);
-        Some((kind, rendered, start, end))
+        let (start, end) = ast.get(node_id).span();
+        let type_render = crate::type_of::render_type(&interner, &ctx.index, ty);
+
+        // Extract owned node bits so later `&mut interner` calls don't clash with
+        // the `&ast` borrow of `node`.
+        let call_bits = match ast.get(node_id) {
+            Node::Call { receiver, method, .. } => Some((*receiver, method.clone())),
+            _ => None,
+        };
+        let const_name = match ast.get(node_id) {
+            Node::ConstantRead { name, .. } if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        };
+        let kind = crate::type_of::node_kind(ast.get(node_id));
+
+        let body = if let Some((receiver, method)) = call_bits {
+            let recv_ty = receiver.map(|r| typer.type_of(&ast, r, &env, &mut interner));
+            let recv_disp = recv_ty
+                .map(|rt| receiver_display(&ctx.index, &typer, &interner, rt))
+                .unwrap_or_else(|| "self".to_string());
+            let mut sig = format!("{recv_disp}#{method} → {type_render}");
+            if let Some(cls) = recv_ty.and_then(|rt| ctx.index.class_name_of(&interner, rt)) {
+                if let Some((min, max)) = ctx.index.method_arity(cls, &method) {
+                    let max_s = max.map_or_else(|| "∞".to_string(), |m| m.to_string());
+                    sig.push_str(&format!("  (arity {min}..{max_s})"));
+                }
+            }
+            format!("```ruby\n{sig}\n```\n\n*rigor: Call*")
+        } else if let Some(name) = const_name {
+            format!("```ruby\n{name} : {type_render}\n```\n\n*rigor: Constant*")
+        } else {
+            format!("```ruby\n{type_render}\n```\n\n*rigor: {kind}*")
+        };
+        Some((body, start, end))
     }));
 
-    let (kind, rendered, start, end) = result.ok().flatten()?;
-    let value = format!("```ruby\n{rendered}\n```\n\n*rigor: {kind}*");
+    let (value, start, end) = result.ok().flatten()?;
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -484,6 +514,26 @@ fn method_names_for(
 /// An ASCII identifier byte (`[A-Za-z0-9_]`) — used to scan a half-typed name.
 fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Display a receiver's type as a class name for a hover signature: a bare class
+/// constant renders `singleton(Name)`, a concrete core instance its class name,
+/// and anything else falls back to the general type render (e.g. `Dynamic[top]`).
+fn receiver_display(
+    index: &CoreIndex,
+    typer: &Typer<'_>,
+    interner: &Interner,
+    ty: TypeId,
+) -> String {
+    if let Type::Singleton(class) = interner.get(ty) {
+        return typer
+            .source()
+            .class_name_for_id(*class)
+            .map_or_else(|| "singleton(?)".to_string(), |n| format!("singleton({n})"));
+    }
+    index
+        .class_name_of(interner, ty)
+        .map_or_else(|| crate::type_of::render_type(interner, index, ty), |n| n.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +898,27 @@ mod tests {
             partial_result_params: Default::default(),
         };
         assert!(document_symbols(&buffers, &params).is_none());
+    }
+
+    #[test]
+    fn hover_call_shows_receiver_method_signature() {
+        // `s = "hi"\ns.upcase` — hover on `upcase` (line 2, char 3) shows a
+        // `String#upcase → …` signature with the RBS arity.
+        let mut buffers = HashMap::new();
+        let uri: Uri = "file:///t.rb".parse().unwrap();
+        buffers.insert(uri_key(&uri), "s = \"hi\"\ns.upcase\n".to_string());
+        let params = HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: Position { line: 1, character: 2 },
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let h = hover(&ctx(), &buffers, &params).expect("a hover");
+        let HoverContents::Markup(m) = h.contents else { panic!("markup") };
+        assert!(m.value.contains("String#upcase"), "signature: {}", m.value);
+        assert!(m.value.contains("arity"), "arity shown: {}", m.value);
+        assert!(m.value.contains("*rigor: Call*"), "{}", m.value);
     }
 
     #[test]
