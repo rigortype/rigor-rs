@@ -1,0 +1,380 @@
+//! `rigor mcp` (§12, ADR-0029) — a read-only Model Context Protocol server over
+//! stdio, so an AI agent can analyse Ruby with rigor as a tool.
+//!
+//! Transport: MCP stdio = newline-delimited JSON-RPC 2.0 (one message per line,
+//! no embedded newlines) — simpler than LSP's `Content-Length` framing, so this
+//! is hand-rolled on `serde_json` (already a dep) with no async runtime and no
+//! new dependency, keeping the single binary self-contained + offline.
+//!
+//! Tools (all READ-ONLY, all operating on source passed in the call — the server
+//! never reads or writes the filesystem):
+//! - `check`   — analyse Ruby source, return the diagnostics (the `check` path).
+//! - `type_of` — the inferred type of the expression at a 1-based line/column.
+//!
+//! Like the LSP server, the RBS environment + config are built ONCE at startup
+//! and reused; every tool call is a single-file parse+lower+analyze. Panic
+//! isolation (ADR-0016): a tool that trips the parser returns an `isError` result,
+//! never crashing the server.
+
+use std::io::{self, BufRead, Write};
+use std::panic::{self, AssertUnwindSafe};
+use std::process::ExitCode;
+
+use serde_json::{json, Value};
+
+use rigor_index::CoreIndex;
+use rigor_infer::{SourceIndex, Typer};
+use rigor_parse::{comment_lines, lower, parse};
+use rigor_rules::{analyze_with_source, catalog, filter_suppressed, Diagnostic, SuppressSet};
+use rigor_types::Interner;
+
+use crate::config::Config;
+
+/// The protocol version advertised when the client sends none (a recent stable
+/// MCP revision). When the client sends one, the server echoes it back (the most
+/// compatible response — the client then decides whether to proceed).
+const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// `rigor mcp` — run the stdio MCP server. Accepts (and ignores, reserved) a
+/// `--transport=stdio` flag for symmetry with `lsp`. Returns exit 0 on a clean
+/// EOF shutdown, 1 on an IO error, 64 on a usage error.
+pub fn cmd_mcp(args: &[String]) -> ExitCode {
+    for arg in args {
+        match arg.as_str() {
+            "--transport=stdio" | "--transport" | "stdio" => {}
+            other => {
+                eprintln!("rigor mcp: unexpected argument {other:?} (only stdio transport)");
+                return ExitCode::from(64);
+            }
+        }
+    }
+    match run_stdio() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("rigor mcp: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// The session-stable context: the RBS index + config-derived suppression set,
+/// built once at startup and reused for every tool call.
+struct ServerContext {
+    index: CoreIndex,
+    disable: SuppressSet,
+}
+
+/// The stdio read/dispatch/respond loop. Reads one JSON-RPC message per line;
+/// responds to requests (those with an `id`), silently accepts notifications.
+fn run_stdio() -> Result<(), String> {
+    let cfg = Config::load(None);
+    let ctx = ServerContext {
+        index: CoreIndex::with_plugins(&cfg.plugins),
+        disable: cfg.disable_matcher(),
+    };
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let msg: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue, // ignore an unparseable line (robustness).
+        };
+        // A notification (no `id`) gets no response.
+        let Some(id) = msg.get("id").cloned() else { continue };
+        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        let params = msg.get("params").cloned().unwrap_or(Value::Null);
+
+        let response = match dispatch(&ctx, method, &params) {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err((code, message)) => {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+            }
+        };
+        let line = serde_json::to_string(&response).map_err(|e| e.to_string())?;
+        writeln!(stdout, "{line}").map_err(|e| e.to_string())?;
+        stdout.flush().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Dispatch a request method to its handler. `Ok(result)` becomes a JSON-RPC
+/// `result`; `Err((code, message))` a JSON-RPC `error` (protocol-level).
+fn dispatch(ctx: &ServerContext, method: &str, params: &Value) -> Result<Value, (i64, String)> {
+    match method {
+        "initialize" => Ok(initialize_result(params)),
+        // Handshake completion + keepalive — succeed with an empty result.
+        "notifications/initialized" | "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tool_catalog() })),
+        "tools/call" => Ok(tools_call(ctx, params)),
+        // JSON-RPC "method not found".
+        _ => Err((-32601, format!("method not found: {method}"))),
+    }
+}
+
+/// The `initialize` result: echo the client's protocol version (most compatible),
+/// advertise the `tools` capability, and identify the server.
+fn initialize_result(params: &Value) -> Value {
+    let version = params
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+    json!({
+        "protocolVersion": version,
+        "capabilities": { "tools": { "listChanged": false } },
+        "serverInfo": { "name": "rigor-rs", "version": env!("CARGO_PKG_VERSION") },
+    })
+}
+
+/// The tool catalogue (name + description + JSON-Schema input) returned by
+/// `tools/list`.
+fn tool_catalog() -> Value {
+    json!([
+        {
+            "name": "check",
+            "description": "Analyze Ruby source with rigor's inference-first static analysis and \
+                            return the diagnostics (undefined methods, wrong arity, flow issues, …). \
+                            Sound-subset: it never reports a diagnostic it cannot prove.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "The Ruby source code to analyze." },
+                    "path": { "type": "string", "description": "Optional filename for the report (display only)." }
+                },
+                "required": ["source"]
+            }
+        },
+        {
+            "name": "type_of",
+            "description": "Report rigor's inferred type of the Ruby expression at a 1-based \
+                            line/column in the given source.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "The Ruby source code." },
+                    "line": { "type": "integer", "description": "1-based line number." },
+                    "column": { "type": "integer", "description": "1-based column number." }
+                },
+                "required": ["source", "line", "column"]
+            }
+        }
+    ])
+}
+
+/// Handle `tools/call`: route to the named tool. A tool-level failure (bad args,
+/// unknown tool, analysis panic) is reported as an `isError` result — visible to
+/// the model — rather than a protocol error, per the MCP convention.
+fn tools_call(ctx: &ServerContext, params: &Value) -> Value {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or(Value::Null);
+    let outcome = match name {
+        "check" => tool_check(ctx, &args),
+        "type_of" => tool_type_of(ctx, &args),
+        other => Err(format!("unknown tool: {other}")),
+    };
+    match outcome {
+        Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+        Err(msg) => json!({ "content": [{ "type": "text", "text": msg }], "isError": true }),
+    }
+}
+
+/// The `check` tool: run the analysis pipeline on the source and return the
+/// diagnostics as a pretty JSON array (the same field set as `rigor check
+/// --format json`, keyed for agent consumption).
+fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
+    let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
+    let path = args.get("path").and_then(Value::as_str).unwrap_or("<mcp>");
+
+    let bytes = source.as_bytes().to_vec();
+    let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = parse(&bytes);
+        let comments = comment_lines(&result, &bytes);
+        let ast = lower(&result);
+        let src = SourceIndex::build(&ast, &ctx.index);
+        let mut interner = Interner::new();
+        let diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
+        (diags, comments)
+    }))
+    .map_err(|_| "internal error: analysis panicked on this source".to_string())?;
+
+    let (diags, comments) = analysed;
+    let with_lines: Vec<(usize, Diagnostic)> =
+        diags.into_iter().map(|d| (line_col(source, d.start_offset).0, d)).collect();
+    let kept = filter_suppressed(with_lines, &comments);
+
+    let items: Vec<Value> = kept
+        .into_iter()
+        .filter(|(_, d)| !ctx.disable.suppresses(d.rule_id))
+        .map(|(_, d)| {
+            let (line, column) = line_col(source, d.start_offset);
+            let mut obj = json!({
+                "path": path,
+                "line": line,
+                "column": column,
+                "severity": d.severity.as_str(),
+                "rule": d.rule_id,
+                "message": d.message,
+            });
+            if let Some(entry) = catalog(d.rule_id) {
+                obj["documentation_url"] = json!(entry.documentation_url);
+            }
+            obj
+        })
+        .collect();
+
+    let report = json!({ "diagnostics": items, "count": items.len() });
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+/// The `type_of` tool: type the deepest expression at a 1-based (line, column).
+fn tool_type_of(ctx: &ServerContext, args: &Value) -> Result<String, String> {
+    let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
+    let line = args.get("line").and_then(Value::as_u64).ok_or("missing `line` integer")? as usize;
+    let column =
+        args.get("column").and_then(Value::as_u64).ok_or("missing `column` integer")? as usize;
+
+    let offset = crate::type_of::position_to_offset(source, line, column)?;
+    let rendered = panic::catch_unwind(AssertUnwindSafe(|| {
+        let ast = lower(&parse(source.as_bytes()));
+        let node_id = crate::type_of::locate_node(&ast, offset)?;
+        let src = SourceIndex::build(&ast, &ctx.index);
+        let typer = Typer::with_source(&ctx.index, &src);
+        let mut interner = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut interner);
+        let ty = typer.type_of(&ast, node_id, &env, &mut interner);
+        let node = ast.get(node_id);
+        Some((
+            crate::type_of::node_kind(node).to_string(),
+            crate::type_of::render_type(&interner, &ctx.index, ty),
+        ))
+    }))
+    .map_err(|_| "internal error: typing panicked on this source".to_string())?;
+
+    let (node, ty) = rendered.ok_or_else(|| {
+        format!("no expression found at line {line}, column {column}")
+    })?;
+    let report = json!({ "line": line, "column": column, "node": node, "type": ty });
+    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+/// 1-based `(line, column)` from a byte offset (columns in Unicode scalars), the
+/// same mapping the text/json reporters use.
+fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
+    if source.is_empty() {
+        return (1, 1);
+    }
+    let clamped = byte_offset.min(source.len());
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    for (i, b) in source.as_bytes().iter().enumerate() {
+        if i >= clamped {
+            break;
+        }
+        if *b == b'\n' {
+            line += 1;
+            line_start = i + 1;
+        }
+    }
+    (line, source[line_start..clamped].chars().count() + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx() -> ServerContext {
+        ServerContext {
+            index: CoreIndex::new(),
+            disable: Config::default().disable_matcher(),
+        }
+    }
+
+    #[test]
+    fn initialize_echoes_protocol_and_names_server() {
+        let r = initialize_result(&json!({ "protocolVersion": "2024-11-05" }));
+        assert_eq!(r["protocolVersion"], "2024-11-05");
+        assert_eq!(r["serverInfo"]["name"], "rigor-rs");
+        assert!(r["capabilities"]["tools"].is_object());
+    }
+
+    #[test]
+    fn initialize_defaults_protocol_when_absent() {
+        let r = initialize_result(&json!({}));
+        assert_eq!(r["protocolVersion"], DEFAULT_PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn tools_list_advertises_check_and_type_of() {
+        let tools = tool_catalog();
+        let names: Vec<&str> =
+            tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"check"));
+        assert!(names.contains(&"type_of"));
+        // Each tool declares an object inputSchema with a `source` property.
+        for t in tools.as_array().unwrap() {
+            assert_eq!(t["inputSchema"]["type"], "object");
+            assert!(t["inputSchema"]["properties"]["source"].is_object());
+        }
+    }
+
+    #[test]
+    fn check_tool_reports_a_typo() {
+        let out = tools_call(&ctx(), &json!({
+            "name": "check",
+            "arguments": { "source": "x = \"hi\"\nx.lenght\n" }
+        }));
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["count"], 1);
+        assert_eq!(parsed["diagnostics"][0]["rule"], "call.undefined-method");
+        assert_eq!(parsed["diagnostics"][0]["line"], 2);
+    }
+
+    #[test]
+    fn check_tool_respects_inline_suppression() {
+        let out = tools_call(&ctx(), &json!({
+            "name": "check",
+            "arguments": { "source": "x = \"hi\"\nx.lenght # rigor:disable undefined-method\n" }
+        }));
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["count"], 0);
+    }
+
+    #[test]
+    fn type_of_tool_reports_type() {
+        let out = tools_call(&ctx(), &json!({
+            "name": "type_of",
+            "arguments": { "source": "n = 42\n", "line": 1, "column": 5 }
+        }));
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let parsed: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed["type"], "42");
+        assert_eq!(parsed["node"], "IntegerLit");
+    }
+
+    #[test]
+    fn unknown_tool_is_an_error_result() {
+        let out = tools_call(&ctx(), &json!({ "name": "nope", "arguments": {} }));
+        assert_eq!(out["isError"], true);
+        assert!(out["content"][0]["text"].as_str().unwrap().contains("unknown tool"));
+    }
+
+    #[test]
+    fn check_tool_missing_source_is_an_error() {
+        let out = tools_call(&ctx(), &json!({ "name": "check", "arguments": {} }));
+        assert_eq!(out["isError"], true);
+    }
+
+    #[test]
+    fn dispatch_unknown_method_is_jsonrpc_error() {
+        let e = dispatch(&ctx(), "frobnicate", &Value::Null).unwrap_err();
+        assert_eq!(e.0, -32601);
+    }
+}

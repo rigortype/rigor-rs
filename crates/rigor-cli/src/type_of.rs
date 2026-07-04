@@ -179,7 +179,7 @@ fn decode_position<'a>(file: &'a str, line: &str, column: &str) -> Option<(&'a s
 /// The column is 1-based and counted in Unicode scalar values, the inverse of
 /// the presenter's [`crate::line_col`]-style mapping. An out-of-range line or
 /// column yields an `Err` with the reference's wording.
-fn position_to_offset(source: &str, line: usize, column: usize) -> Result<usize, String> {
+pub(crate) fn position_to_offset(source: &str, line: usize, column: usize) -> Result<usize, String> {
     if line == 0 || column == 0 {
         return Err("line and column are 1-based".to_string());
     }

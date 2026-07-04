@@ -31,6 +31,7 @@ mod doctor;
 mod explain;
 mod init;
 mod lsp;
+mod mcp;
 mod plugins_cmd;
 mod type_of;
 
@@ -63,6 +64,7 @@ fn main() -> ExitCode {
         Some("plugins") => plugins_cmd::cmd_plugins(&args[1..]),
         Some("docs") => docs::cmd_docs(&args[1..]),
         Some("lsp") => lsp::cmd_lsp(&args[1..]),
+        Some("mcp") => mcp::cmd_mcp(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => {
             eprintln!("rigor-rs: `{cmd}` is recognized but not yet implemented in this phase");
             ExitCode::from(2)

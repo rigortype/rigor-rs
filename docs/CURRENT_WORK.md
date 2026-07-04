@@ -6,14 +6,14 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 — **Productization track (lever A): 2 commits pushed (@ `10e78e1`) +
-UNCOMMITTED LSP v1.** (1) §9 **rayon file-level parallelism** (`analyze_files` on a rayon pool,
-byte-identical to serial, 0 FP, ~2.4× warm speedup) + `RIGOR_TIMING` observability [committed].
-(2) §12 **LSP server v1 + v2** — `rigor lsp --transport=stdio` (sync `lsp-server`/`lsp-types`, no
-async runtime): live diagnostics + hover [v1, committed `2e291a5`] + **member-access completion**
-(new `CoreIndex` method-enumeration API + placeholder-injection receiver typing) [v2, uncommitted,
-ready]. 384 tests + end-to-end stdio smoke (diagnostics/hover/completion) green; v2 proven
-byte-identical `check` output vs v1. Prior: **5 commits pushed (@ `2d0add3`)**: rustfmt policy
+Last updated: 2026-07-01 — **Productization track (lever A): 5 local commits (@ `f7cc99f`) +
+UNCOMMITTED MCP server.** (1) §9 **rayon file-level parallelism** (byte-identical to serial, 0 FP,
+~2.4× warm) + `RIGOR_TIMING` observability. (2) §12 **LSP server v1/v2/v3** — `rigor lsp
+--transport=stdio` (sync `lsp-server`/`lsp-types`, no async runtime): live diagnostics + hover +
+member-access **completion** + **documentSymbol** outline. (3) §12 **MCP server** — `rigor mcp`
+(hand-rolled newline-delimited JSON-RPC, no new dep): read-only `check` + `type_of` tools
+[uncommitted, ready]. 395 tests + end-to-end stdio smokes green. Prior: **5 commits pushed (@
+`2d0add3`)**: rustfmt policy
 (ADR-0032) · `flow.always-truthy-condition` + first ADR-0022 flow substrate · **upstream pinned to
 `v0.2.6`** as a `reference/rigor` git submodule + harness re-baselined ([`UPSTREAM.md`](../UPSTREAM.md)) ·
 **`call.unresolved-toplevel`** (the highest-frequency unimplemented rule per a v0.2.6 corpus tally, 0 FP) ·
@@ -185,8 +185,10 @@ diagnostic the reference does not. Coverage grows; it never regresses into guess
 >   **completion**; see §12) — the three headline LSP features are now all in. **Next LSP slice**
 >   = `::` constant/namespace completion + Union-intersection + private-method visibility filter,
 >   or the full two-tier `ProjectContext` (watched-files invalidation, debounce, worker pool).
->   Also open: an **MCP server** (§12); §11 CLI completion (`annotate`/`diff`/`triage`/
->   `coverage --protection`/`sig-gen`); parallelizing stage-2 `build_project` at scale.
+>   ✅ **MCP server** (§12) LANDED 2026-07-01 (`rigor mcp`: read-only `check` + `type_of` tools) —
+>   next MCP slice = more tools (`explain`, an outline tool) or resources/prompts. Also open: §11
+>   CLI completion (`annotate`/`diff`/`triage`/`coverage --protection`/`sig-gen`); parallelizing
+>   stage-2 `build_project` at scale.
 > - **B. Plugin phase (§10, ADR-0013/0027)** — the Plugin trait (`dynamic_return`/`narrowing_facts`/
 >   `node_rule`) + Rails plugins. The BIGGEST remaining undefined-method coverage pool ("most
 >   remaining real-code coverage lives here"), but a large phase.
@@ -827,9 +829,10 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   address them; `docs` prints a note pointing at the web manual instead (no fabricated
   content).
 - ✅ `lsp` — `rigor lsp [--transport=stdio] [--log=PATH]` (see §12).
+- ✅ `mcp` — `rigor mcp` read-only MCP server over stdio (`check` + `type_of` tools; see §12).
 - ⬜ `annotate` · `diff` · `triage` ·
   `coverage` (incl. `--protection`, ref ADR-63/70) · `plugin` ·
-  `sig-gen` (ref ADR-14) · `skill`/`describe` · `mcp` ·
+  `sig-gen` (ref ADR-14) · `skill`/`describe` ·
   `trace` · `type-scan`.
 
 ### 12. Editor / agent servers (ADR-0029)
@@ -887,8 +890,24 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   filter; the full two-tier `ProjectContext` (generation counter,
   `didChangeWatchedFiles`/`didChangeConfiguration` invalidation), cross-file project context for
   open buffers, a pre-warmed worker pool, 200ms `didChange` debounce, temp-file `BufferBinding`,
-  incremental UTF-16 `didChange` sync, `--log` wiring, and TCP/socket transport. **MCP server**
-  (read-only tools over stdio).
+  incremental UTF-16 `didChange` sync, `--log` wiring, and TCP/socket transport.
+- ✅ **MCP server landed (2026-07-01) — `rigor mcp`.** A read-only Model Context Protocol server
+  over stdio so an AI agent can analyse Ruby with rigor as a tool. **Transport hand-rolled on
+  `serde_json`** (MCP stdio = newline-delimited JSON-RPC 2.0, one message per line — simpler than
+  LSP's `Content-Length`) — no async runtime, no new dependency, offline-safe. **Tools (read-only,
+  operate on source passed in the call — the server never touches the filesystem):** `check`
+  (analyse Ruby source → diagnostics JSON, the exact `check` path incl. inline `# rigor:disable` +
+  config suppression) and `type_of` (inferred type at a 1-based line/column, reusing the `type-of`
+  probe). Protocol: `initialize` (echoes the client's `protocolVersion`, advertises `tools`,
+  identifies `rigor-rs`), `notifications/initialized`, `ping`, `tools/list`, `tools/call`; unknown
+  method → JSON-RPC `-32601`, a tool-level failure → an `isError` result (visible to the model, MCP
+  convention). Same two-tier essence as the LSP server (RBS index + config built once, reused per
+  call) and panic isolation. **Verified:** +9 unit tests (initialize echo/default, tools/list
+  schema, check-typo + inline-suppression, type_of, unknown-tool/missing-arg isError, unknown-method
+  JSON-RPC error) + an e2e stdio session (initialize → tools/list → `check` 1 diagnostic → `type_of`
+  `"HI"` → unknown-tool error). 395 tests, run.rb + run_snapshot.rb PASS (0 FP), clippy-clean; MCP
+  is a purely additive subcommand (no `check` impact). Deferred: more tools (`explain`/`documentSymbol`
+  analogue), resources/prompts capabilities.
 - **NOTE (reference-harness flakiness, observed 2026-07-01):** `run_corpus.rb` (the LIVE
   differential harness) gave swinging FP counts (70/0/2/0) on a DETERMINISTIC file set
   (`Dir[...].sort.first(limit)`) with a provably-deterministic rigor-rs binary — i.e. the Ruby
