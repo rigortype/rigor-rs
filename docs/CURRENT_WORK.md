@@ -6,7 +6,17 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **FP-audit sweep completed (branch `fp-audit-sweep`).** Extended the audit to
+Last updated: 2026-07-06 — **Coverage-gap track opened (branch `coverage-gaps`).** Added `fp_audit.py --gaps`
+(aggregates reference-only diagnostics by rule = the coverage-effort map). Landscape across the survey:
+`call.undefined-method` (~109), `call.possible-nil-receiver` (~118), `flow.always-truthy-condition` (~117)
+dominate — the top two need the ADR-0022 nil/flow substrate, and `call.argument-type-mismatch` (~30) is an
+unimplemented rule; these are feature-scale, not easy. The tractable win taken: **parenthesized receivers**
+— `(15).frobnicate` was silent because `(e)` lowered to a Dynamic block wrapper; a single-statement parens
+now UNWRAPS to its inner node (`(e)` ≡ `e`), so the receiver types precisely. Closed ~13 undefined-method
+gaps, 0 FP, harness 53/53. Commit `b98c658`. **Remaining coverage frontier is substantial** (flow/nil
+substrate for the ~235 always-truthy+possible-nil gaps; the argument-type-mismatch rule; the plugin engine).
+
+Prior: 2026-07-06 — **FP-audit sweep completed (branch `fp-audit-sweep`).** Extended the audit to
 the full `rigor-survey` library set (redmine, concurrent-ruby, parser, haml/hamlit, ox, pycall, rbnacl,
 mangrove, jbuilder, dependabot-core/common, erubi, … + the earlier 12). One new FP class fixed:
 **ERB-template `.rb` files** (Rails generator `templates/*.rb` using `<%= … %>`) — Prism error-recovery

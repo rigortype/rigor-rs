@@ -14,7 +14,9 @@ Both run core+stdlib only for a fair comparison: the reference from a clean cwd
 (so it auto-loads no project config / bundle), rigor-rs from the repo (which
 ships no `sig/` or `rbs_collection`). Parity severities only (error/warning).
 
-Usage:  python3 harness/fp_audit.py <dir-of-.rb> [<dir> ...]
+Usage:  python3 harness/fp_audit.py [--gaps] <dir-of-.rb> [<dir> ...]
+        --gaps also aggregates coverage gaps (reference-only) by rule — the map
+        of where to spend coverage effort.
 Env:    RIGOR_RS_BIN (default target/release/rigor), REFERENCE_RIGOR_DIR
         (default reference/rigor).
 """
@@ -74,7 +76,7 @@ def keys(diags):
     }
 
 
-def audit(tgt, show=12):
+def audit(tgt, show=12, show_gaps=False, gap_rules=None):
     files = rb_files(tgt)
     if not files:
         print(f"{tgt}: no .rb files")
@@ -96,13 +98,25 @@ def audit(tgt, show=12):
         print("  FP by rule:", dict(Counter(k[3] for k in fp).most_common()))
         for k in sorted(fp)[:show]:
             print(f"    FP: {k[3]} @ {os.path.basename(k[0])}:{k[1]}:{k[2]}")
+    if gap_rules is not None:
+        for k in gap:
+            gap_rules[k[3]] += 1
+    if show_gaps and gap:
+        print("  gaps by rule:", dict(Counter(k[3] for k in gap).most_common()))
     return len(fp)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    args = [a for a in sys.argv[1:] if a != "--gaps"]
+    show_gaps = "--gaps" in sys.argv  # also report coverage-gap breakdown by rule
+    if not args:
         print(__doc__)
         sys.exit(2)
-    total = sum(audit(t) for t in sys.argv[1:])
+    gap_rules = Counter() if show_gaps else None
+    total = sum(audit(t, show_gaps=show_gaps, gap_rules=gap_rules) for t in args)
     print(f"\nTOTAL FP candidates: {total}")
+    if show_gaps:
+        print("TOTAL coverage gaps by rule (where to spend coverage effort):")
+        for rule, n in gap_rules.most_common():
+            print(f"  {n:6}  {rule}")
     sys.exit(1 if total else 0)
