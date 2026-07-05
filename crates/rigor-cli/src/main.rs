@@ -343,6 +343,13 @@ fn analyze_files(
                     return Stage1::IoError { path: path.to_string(), msg: e.to_string() };
                 }
             };
+            // Skip ERB templates (`.rb` generator templates using `<%= … %>`):
+            // Prism's error recovery yields a garbage AST the structural rules
+            // over-fire on. Matches the reference's ErbTemplateDetector (real-
+            // corpus FP audit: jbuilder/redmine generator templates).
+            if rigor_parse::looks_like_erb_template(source.as_bytes()) {
+                return Stage1::Excluded;
+            }
             let source_bytes = source.as_bytes().to_vec();
             let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
                 let result = parse(&source_bytes);
