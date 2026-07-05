@@ -6,50 +6,40 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **nil/flow substrate DESIGNED ([ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md), merged).**
-Grill-decided strategy to close the two biggest coverage-gap clusters (possible-nil ~118, always-truthy ~117):
-complete ADR-0022's edge-aware model as a faithful reference port (goal = no divergence), on the threaded
-`flow_eval`, with an **"unmodeled construct ⇒ decline" backstop** (every partial state is a sound subset /
-0-FP; growing the modeled-construct set monotonically closes gaps to 100%). Every slice gated to 0-FP
-across the survey (`fp_audit.py`) + harness 53/53 + measured gap reduction.
+Last updated: 2026-07-06 — **flow substrate SLICE 1 LANDED as an FP-safe foundation (0 gaps)
+([ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md), branch `flow-substrate-slice1`).**
+The threaded flow-eval nil-receiver substrate (`Typer::nilable_receiver_snapshots`) REPLACES the
+`enclosing_def` span-scan: it threads a type env (inherited into blocks) + a nilability fact map
+(fresh per block, same-block-body locality) straight-line with block descent, declining on any
+unmodeled construct. `check_nil_receiver` fires from the snapshot map. Also a shared `type_dot_new`
+so block-bearing `X.new{}` types as an `X` instance. Harness 53/53 / 0 FP; 430 tests; clippy-clean
+(no new warnings). **It closes ZERO survey gaps** — and was landed anyway, as a deliberate one-time
+re-interpretation of the §5 gap-gate (maintainer decision), because it retires the span-scan and is
+the FP-safe foundation later slices build on. See ADR-0038 "Slice 1 outcome".
 
-**▶▶ NEXT SESSION — START HERE: Slice 1 (foundation + possible-nil in block scopes).** Goal: close the
-unguarded block-scope possible-nil cluster (the treemaps class — `x = arr[0..n]; x.size` inside
-`RBench.run do … report do … end`). Concrete steps (all in `crates/rigor-infer` + `crates/rigor-rules`):
-1. **flow_eval must descend into block bodies — under ADR-0038 §3's normative block semantics**
-   (revised 2026-07-06 after the [slice-1 audit](notes/20260706-adr0038-slice1-audit.md)): entry-widen
-   the block's capture-writes BEFORE descending (exit-only widening is unsound under re-entrancy);
-   fact source+use must sit in the SAME block body (block-crossing facts decline); clear block-param
-   names on descent (incl. `_1`/`it` — shadow leak = guaranteed FP); a descended Call must NOT also
-   hit the `other`-arm span-widen; nilability gets its OWN state/flags (don't overload
-   `in_loop_or_block`). Today `flow_eval_stmt` (rigor-infer/src/lib.rs) puts `Call`-with-block in the
-   `other` arm (widen, no descent).
-2. **Thread a nilability fact** (a `HashMap<String, &'static str>` local→non-nil-core-arm) alongside the
-   constant env through `flow_eval`. Source = the existing `nilable_local_core_arm` logic
-   (`method_return_nilable`) PLUS: (a) arg-aware collection slice `arr[Range]`/`str[Range]` → nilable self
-   (Array#[]'s overloads disagree so `method_return_nilable` collapses to None — recognise the single-Range-arg
-   form; ONLY on a confirmed core Array/String receiver, `arr[i, len]`/endless-range/`str[Regexp]` decline —
-   recorded debt vs the reference's real overload selection), (b) block-bearing `X.new(…){…}` typed as an `X`
-   instance (extract a shared `type_dot_new` used by both `type_call` and `type_block_call` — the plain path
-   already does this inline; the non-core-`.new`-never-witnessed leniency gate MUST move with the extraction).
-3. Clear a local's nilability on ANY not-yet-modeled construct between source and use (branch/loop/case/
-   logical/op-write/guard/reassignment) — the decline backstop (Slice 1 = straight-line only).
-4. Record a per-call-node `nilable_receiver_snapshot` (parallel to `always_truthy_snapshots`), and **rewire
-   `check_nil_receiver`** to fire from it (keep the exact firing conditions: safe-nav skip, method absent on
-   NilClass, present on the non-nil arm) instead of the `enclosing_def` span-scan. Retire the span-scan for
-   this rule. The rewire drops the `enclosing_def` gate ⇒ top-level receivers become fireable — E2E-confirm
-   the reference fires at top level BEFORE enabling it there.
-- **Gate (ADR-0038 §5, all four):** `fp_audit.py` 0-FP across the survey (CRITICAL — narrowing/nilability
-  bugs surface as FPs here), harness 53/53, a measured possible-nil gap reduction on algorithms (treemaps)
-  + others, AND **matched non-regression** (the existing possible-nil fixtures + corpus matched count must
-  not drop when the span-scan path is replaced). A slice that closes no gaps is NOT shipped (recon lesson —
-  [docs/notes/20260706-nil-flow-substrate-recon.md](notes/20260706-nil-flow-substrate-recon.md)).
-- **Reverted prior probe** (the source-resolution slice) closed 0 real gaps alone because it lacked block
-  scope — that's exactly what Slice 1 adds (block-descent). The `type_dot_new` + slice-nilability pieces
-  are correct and to be re-introduced as part of Slice 1.
-- **Then Slice 2+:** truthy/falsey narrowing per construct (if/unless → &&/|| → nil?/early-return guard →
-  case → loop), each 0-FP-gated; **later:** always-truthy onto the substrate, then ivar value-flow (deque
-  `@size == 1` class; likely its own ADR).
+**▶▶ KEY FINDING — the treemaps gap is fold-gated, not just scope-gated
+([array-fold blocker note](notes/20260706-slice1-array-fold-blocker.md)).** treemaps needs
+`Array#[](Range) -> Array?`, but the reference constant-folds `Array.new(n ≤ 16)` and every array
+literal to a concrete array (hiding the `Array?`), firing only on `Array.new(n ≥ 17)`. rigor-rs types
+arrays as `Nominal[Array]` (no fold), so an Array-slice source over-fires on the folded cases
+(confirmed FPs, threshold 16 measured). So the Array-slice source was DROPPED; **String** slices are
+FP-safe (rigor-rs's Constant/Nominal split for String aligns with the reference's fold/nominal split,
+verified 6/6) but no String-slice gap exists in the survey. The recon's "block scope is the paying
+piece" was half-right: block scope is necessary but not sufficient — treemaps also needs array-folding.
+
+**▶▶ NEXT — the paying possible-nil work is one of (Slice 1's source model reaches neither):**
+1. **Array constant-folding** — fold `Array.new(≤threshold)` + array literals + pure array methods to
+   `Constant` arrays, so an Array-slice source becomes FP-safe (the shared Constant-decline in
+   `nilable_source_class` then handles the folded cases; large/nominal arrays fire). Unblocks treemaps.
+   Cost: a real folding feature; the threshold must match the reference (fragile).
+2. **Tier B/C possible-nil** — project-method nilable-return inference + `@ivar` typing + loop
+   narrowing. The sampled remaining survey gaps live here (`t.left`/`t.right` in `splay_tree_map.rb`,
+   heap `.key` — nilable project-attr receivers with `break unless …` guards), i.e. the BULK of the
+   possible-nil cluster. Larger, likely its own ADR(s).
+3. **always-truthy onto this substrate** — truthy/falsey narrowing per construct (if/unless → &&/|| →
+   nil?/early-return guard → case → loop), each 0-FP-gated + gap-measured; reuses the threaded
+   flow-eval directly, sidestepping the possible-nil source problem. Then ivar value-flow (deque
+   `@size == 1` class; likely its own ADR).
 
 Prior: 2026-07-06 — **Coverage-gap track opened (branch `coverage-gaps`).** Added `fp_audit.py --gaps`
 (aggregates reference-only diagnostics by rule = the coverage-effort map). Landscape across the survey:

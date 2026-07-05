@@ -1,7 +1,8 @@
 # Completing the ADR-0022 flow substrate: FP-safe incremental narrowing
 
 Status: accepted (revised 2026-07-06 — block-scope semantics made normative +
-gate hardened, absorbing the [slice-1 audit](../notes/20260706-adr0038-slice1-audit.md))
+gate hardened, absorbing the [slice-1 audit](../notes/20260706-adr0038-slice1-audit.md);
+Slice 1 landed as an FP-safe SUBSTRATE, see "Slice 1 outcome" below)
 
 [ADR-0022](0022-control-flow-scopes-and-facts.md) accepts the edge-aware scope /
 fact-bucket model as a **faithful port** of the reference's control-flow analysis
@@ -149,6 +150,46 @@ FP-safety is not argued — it is measured against the oracle.
   rejected: it ignores 0-/many-/deferred-execution and param shadowing, the
   exact FP classes the recon flagged. §3 exists because "straight-line within
   the block" is only sound under entry-widen + locality + shadow-clearing.
+
+## Slice 1 outcome (2026-07-06) — landed as an FP-safe substrate; §5-gap-gate re-interpreted
+
+Slice 1 was implemented and is **FP-safe and harness-clean (53/53, 0 FP)** but
+closes **zero measured survey gaps**. Recorded here because it revises the plan.
+
+**Landed (kept, merged):** the shared `type_dot_new` (block-bearing `X.new{}` types
+as an `X` instance) and `Typer::nilable_receiver_snapshots` — the threaded
+flow-eval (type env inherited into blocks, nilability facts fresh per block,
+straight-line + block descent, decline-all on any unmodeled construct) that
+REPLACES the `enclosing_def` span-scan. `check_nil_receiver` now fires from the
+snapshot map. The def-scope fixtures (27 fire / 28 negatives) still pass.
+
+**The gap that didn't close — treemaps is fold-gated, not just scope-gated.** The
+one Slice-1-reachable survey gap (treemaps `select_subset = random_array[0..n];
+select_subset.size`) needs `Array#[](Range) -> Array?`. Measuring against the
+oracle showed the reference gates that entirely on its **constant-folding**: it
+folds `Array.new(n ≤ 16)` and every array literal to a concrete array (hiding the
+`Array?`), firing only on `Array.new(n ≥ 17)`. rigor-rs types arrays as
+`Nominal[Array]` (it does not fold them), so an Array-slice source **over-fires**
+on the folded cases (confirmed FPs). The fold threshold (16) is a
+reference-implementation constant. So the Array-slice source is dropped;
+**String** slices are FP-safe (rigor-rs's `Constant`/`Nominal` split for String
+aligns with the reference's fold/nominal split, verified 6/6) but no
+String-slice-in-scope gap exists in the survey. Full analysis:
+[the array-fold blocker note](../notes/20260706-slice1-array-fold-blocker.md).
+
+This refines the [recon](../notes/20260706-nil-flow-substrate-recon.md)'s "block
+scope is the paying piece": block scope is necessary but not sufficient — treemaps
+also needs array-folding, and the rest of the survey possible-nil cluster is
+Tier B/C (project nilable-return inference + ivar typing + loop narrowing), which
+Slice 1's source model does not reach.
+
+**Gate re-interpretation (maintainer decision, 2026-07-06).** §5's "a slice that
+closes no gaps is not shipped" is relaxed ONCE, deliberately, for this substrate
+landing: retiring the span-scan and threading block-aware flow-eval is the FP-safe
+foundation every later slice builds on, and it is worth landing even though it
+closes 0 gaps today. Future slices remain gap-gated by §5 as written. The next
+paying possible-nil work is array constant-folding (unblocks treemaps) OR Tier B/C
+(the bulk of the cluster) — not more of Slice 1's source model.
 
 ## Revisiting
 
