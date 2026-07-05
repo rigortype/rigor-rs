@@ -6,7 +6,23 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-05 — **[ADR-0036](adr/0036-ruby-sidecar-default-reversal.md) — DESIGN ACCEPTED (grill
+Last updated: 2026-07-05 — **Real-corpus FP audit (branch `sidecar-perf`).** New tool `harness/fp_audit.py`
+diffs rigor-rs vs the reference on real projects (`rigor-survey`), reporting rigor-rs-only diagnostics
+(zero-FP-bar violations). Validated **0 FP on mastodon/app/models** (248 files) at the outset, then the
+audit across the wider corpus surfaced and fixed **four real FP clusters**: (1) `call.unresolved-toplevel`
+inside `class << X` singleton-class bodies (added an `is_singleton_class` AST discriminator; those bodies
+are class scopes) — net-ssh/algorithms; (2) `call.unresolved-toplevel` on RubyGems' `Kernel#gem` (a
+runtime-injected method the vendored RBS omits; small FP-safe allowlist mirroring the reference's runtime
+reflection) — net-ssh; (3) `call.undefined-method` on `Regexp.compile` (a singleton alias whose target
+`new` is `Class#new`, a base method the alias resolver didn't consult) — algorithms; (4)
+`flow.dead-assignment` on a `def local.m` singleton-def receiver (the receiver was dropped in lowering, so
+the local's read was invisible) — textbringer. **Comprehensive audit now: 0 FP across 12 validly-comparable
+corpora (~1750 files)** (erubi skipped — the reference aborts its 142-file batch; the tool was hardened to
+detect reference failure and skip rather than report false FPs). Each fix guarded by a unit test / corpus
+fixture; harness 53/53; cargo test + CI clippy clean. Also on this branch: [ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)
+(perf slices retired by measurement). Commits `6654cb1`(ADR-0037) `34957a8` `6ad8225` `a543289` `040c5d5`.
+
+Prior: 2026-07-05 — **[ADR-0036](adr/0036-ruby-sidecar-default-reversal.md) — DESIGN ACCEPTED (grill
 session), implementation phased.** Reverses ADR-0008's polarity **before any production-ready
 announcement** (BC-free window): **full fidelity (Ruby sidecar) is the default and product identity; the
 Ruby-free sound subset is an explicit opt-in.** Coverage-posture axis: `--ruby=require|auto|off|<path>`
