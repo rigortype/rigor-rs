@@ -37,7 +37,7 @@ unguarded block-scope possible-nil cluster (the treemaps class — `x = arr[0..n
 - **Reverted prior probe** (the source-resolution slice) closed 0 real gaps alone because it lacked block
   scope — that's exactly what Slice 1 adds (block-descent). The `type_dot_new` + slice-nilability pieces
   are correct and to be re-introduced as part of Slice 1.
-- **Then Slice 2+:** truthy/falsey narrowing per construct (if/unless → &&/‖ → nil?/early-return guard →
+- **Then Slice 2+:** truthy/falsey narrowing per construct (if/unless → &&/|| → nil?/early-return guard →
   case → loop), each 0-FP-gated; **later:** always-truthy onto the substrate, then ivar value-flow (deque
   `@size == 1` class; likely its own ADR).
 
