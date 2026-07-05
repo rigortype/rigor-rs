@@ -934,15 +934,21 @@ impl<'i> Typer<'i> {
     /// (not a modeled nil source ⇒ the local is treated non-nilable).
     ///
     /// Two sources (both zero-FP by construction):
-    /// (a) **Collection slice** `arr[Range]` / `str[Range]` — the single-`Range`-
-    ///     arg `#[]` form on a CONFIRMED core `Array`/`String` receiver. RBS types
-    ///     it `Array?` / `String?`, so the non-nil arm is the receiver's own class.
-    ///     Two-arg `arr[i, len]`, an integer / `Regexp` arg, or a non-core
-    ///     receiver ⇒ decline (a different overload / unknown class).
+    /// (a) **String slice** `str[Range]` — the single-`Range`-arg `#[]` form on a
+    ///     non-`Constant` `String` receiver. RBS types it `String?`, so the
+    ///     non-nil arm is `String`. A `Constant` receiver is declined: the
+    ///     reference constant-folds a string LITERAL slice to a concrete non-nil
+    ///     value (`"hello"[0..2]` ⇒ `"hel"`), so it never sees `String | nil`;
+    ///     rigor-rs types a string literal as `Constant` and declines, matching.
+    ///     A `String.new` / interpolated / method-return String is `Nominal` in
+    ///     both (unfolded) and fires. **`Array` slices are deliberately NOT a
+    ///     source** — the reference folds `Array.new(n≤16)` and every array
+    ///     literal to a concrete array (hiding the `Array?`), while rigor-rs types
+    ///     them `Nominal[Array]`; that fold-divergence would over-fire, so array
+    ///     slices are gated behind array constant-folding (a separate feature).
     /// (b) **Certain nilable RBS return** on a KNOWN core receiver
-    ///     (`String#byteslice -> String?`). A `Constant` receiver is declined (the
-    ///     reference constant-folds it to a concrete non-nil value, never seeing
-    ///     `C | nil`) — the folding-parity keystone.
+    ///     (`String#byteslice -> String?`). A `Constant` receiver is declined for
+    ///     the same folding-parity reason — the keystone.
     fn nilable_source_class(
         &self,
         ast: &LoweredAst,
@@ -960,18 +966,9 @@ impl<'i> Typer<'i> {
         let recv = *recv;
         let method = method.clone();
         let args = args.clone();
-        // (a) collection slice.
-        if method == "[]" && args.len() == 1 && matches!(ast.get(args[0]), Node::Range { .. }) {
-            let rty = self.type_of(ast, recv, tenv, interner);
-            if let Some(cls) = self.index.class_name_of(interner, rty) {
-                if cls == "Array" || cls == "String" {
-                    return Some(cls);
-                }
-            }
-            return None;
-        }
-        // (b) certain nilable RBS return.
         let rty = self.type_of(ast, recv, tenv, interner);
+        // Folding-parity keystone (shared by both sources): a `Constant` receiver
+        // is folded by the reference to a concrete non-nil value ⇒ decline.
         if matches!(interner.get(rty), Type::Constant(_)) {
             return None;
         }
@@ -979,6 +976,15 @@ impl<'i> Typer<'i> {
         if !self.index.knows_class(cls) {
             return None;
         }
+        // (a) String slice — `str[Range]` ⇒ `String?`. String only (see doc).
+        if method == "[]"
+            && cls == "String"
+            && args.len() == 1
+            && matches!(ast.get(args[0]), Node::Range { .. })
+        {
+            return Some("String");
+        }
+        // (b) certain nilable RBS return.
         match self.index.method_return_nilable(cls, &method) {
             Some((core, true)) if self.index.knows_class(core) => Some(core),
             _ => None,
@@ -1126,6 +1132,91 @@ mod tests {
         assert!(
             !matches!(i.get(ty2), Type::Constant(_)),
             "x must be widened to non-constant after a conditional reassignment"
+        );
+    }
+
+    /// ADR-0038 Slice 1: a nilable String slice bound in a NESTED block, with its
+    /// receiver typed by a `String.new` in an OUTER block, fires possible-nil on
+    /// the same-block use. The block-scope shape the substrate unlocks.
+    #[test]
+    fn nil_snapshot_fires_on_block_scope_string_slice() {
+        let ast = lower_src(
+            b"outer do\n  s = String.new(\"hello\")\n  inner do\n    sub = s[0..2]\n    n = sub.size\n  end\nend\n",
+        );
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+        // The `sub.size` call is the nilable-receiver use; its arm is String.
+        let use_id = ast
+            .iter()
+            .find_map(|(id, n)| match n {
+                Node::Call { receiver: Some(r), method, .. }
+                    if method == "size"
+                        && matches!(ast.get(*r), Node::LocalVariableRead { name, .. } if name == "sub") =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .expect("sub.size call present");
+        assert_eq!(snaps.get(&use_id).copied(), Some("String"));
+    }
+
+    /// An `Array` slice is NOT a source (the reference folds small/literal arrays,
+    /// so `Array?` would over-fire) — the snapshot stays empty.
+    #[test]
+    fn nil_snapshot_array_slice_is_not_a_source() {
+        let ast = lower_src(
+            b"s = String.new(\"hi\")\narr = Array.new(300000) { |i| i }\nsub = arr[0..5]\nn = sub.size\n",
+        );
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+        assert!(snaps.is_empty(), "array slices must not mint a nilable fact");
+    }
+
+    /// The decline backstop: a guard (`if`) between the slice source and the use
+    /// clears the fact, so no snapshot is recorded (zero-FP over recall).
+    #[test]
+    fn nil_snapshot_declines_on_guard_between_source_and_use() {
+        let ast = lower_src(
+            b"s = String.new(\"abc\")\nsub = s[0..1]\nif sub\n  noop\nend\nn = sub.size\n",
+        );
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+        let use_id = ast
+            .iter()
+            .find_map(|(id, n)| match n {
+                Node::Call { receiver: Some(r), method, .. }
+                    if method == "size"
+                        && matches!(ast.get(*r), Node::LocalVariableRead { name, .. } if name == "sub") =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .expect("sub.size call present");
+        assert_eq!(snaps.get(&use_id), None, "an intervening guard must decline");
+    }
+
+    /// A same-named block parameter must NOT inherit an outer nilable fact — the
+    /// fresh-per-block `nenv` makes the shadowing FP class structurally impossible.
+    #[test]
+    fn nil_snapshot_block_param_shadow_does_not_leak() {
+        let ast = lower_src(b"sub = String.new(\"x\")[0..2]\n[1, 2].each do |sub|\n  n = sub.size\nend\n");
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+        // Even though `sub` is nilable outside, the block's `|sub|` is a different
+        // variable; the fresh block `nenv` means no snapshot leaks in.
+        assert!(
+            snaps.is_empty(),
+            "an outer fact must not leak past a same-named block param"
         );
     }
 
