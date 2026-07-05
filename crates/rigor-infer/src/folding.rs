@@ -100,13 +100,18 @@ pub fn scalar_class(s: &Scalar) -> &'static str {
 /// (the core wins first in the dispatcher).
 #[must_use]
 pub fn sidecar_foldable(receiver_class: &str, method: &str) -> bool {
+    // Every entry has been verified to fold IDENTICALLY in the reference (which
+    // also executes real Ruby), so routing it cannot diverge. All are pure +
+    // deterministic and return a scalar carrier; a non-scalar arg simply fails to
+    // pin (the fold is never attempted) and a non-scalar result declines.
     matches!(
         (receiver_class, method),
-        // Integer#to_s(base) — the Rust core folds only base-10 `to_s`; a base
-        // argument routes here (`255.to_s(16) => "ff"`).
-        ("Integer", "to_s")
-        // String#% (format) — a pure, deterministic long-tail fold.
-        | ("String", "%")
+        // Integer — base-N formatting + number theory (Rust core is base-10 only).
+        ("Integer", "to_s" | "gcd")
+        // Float — rounding family (Rust core has none of these).
+        | ("Float", "round")
+        // String — the format + transform long tail.
+        | ("String", "%" | "center" | "ljust" | "rjust" | "tr" | "sub" | "strip")
     )
 }
 
@@ -397,5 +402,29 @@ mod tests {
         assert!(is_foldable("String", "upcase"));
         assert!(!is_foldable("Array", "sample"));
         assert!(!is_foldable("String", "gsub")); // sidecar territory
+    }
+
+    #[test]
+    fn sidecar_foldable_is_reference_verified_subset() {
+        // Every entry folds identically in the reference (real Ruby both sides).
+        assert!(sidecar_foldable("Integer", "to_s"));
+        assert!(sidecar_foldable("Integer", "gcd"));
+        assert!(sidecar_foldable("Float", "round"));
+        assert!(sidecar_foldable("String", "%"));
+        assert!(sidecar_foldable("String", "center"));
+        assert!(sidecar_foldable("String", "rjust"));
+        // Non-deterministic / unverified stay OUT (never route what could diverge).
+        assert!(!sidecar_foldable("Array", "sample"));
+        assert!(!sidecar_foldable("Integer", "+")); // Rust core owns it
+        assert!(!sidecar_foldable("String", "gsub")); // unverified — not routed
+    }
+
+    #[test]
+    fn scalar_class_maps_carriers() {
+        assert_eq!(scalar_class(&Scalar::Int(1)), "Integer");
+        assert_eq!(scalar_class(&Scalar::Float(1.0)), "Float");
+        assert_eq!(scalar_class(&Scalar::Str("x".into())), "String");
+        assert_eq!(scalar_class(&Scalar::Bool(true)), "TrueClass");
+        assert_eq!(scalar_class(&Scalar::Nil), "NilClass");
     }
 }

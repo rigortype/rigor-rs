@@ -366,6 +366,16 @@ mod tests {
             sc.fold(&Scalar::Str("%05d".into()), "%", &[Scalar::Int(42)]),
             Some(Scalar::Str("00042".into()))
         );
+        // A sampling of the expanded allowlist (all real-Ruby, parity-confirmed).
+        assert_eq!(
+            sc.fold(&Scalar::Float(3.14159), "round", &[Scalar::Int(2)]),
+            Some(Scalar::Float(3.14))
+        );
+        assert_eq!(sc.fold(&Scalar::Int(12), "gcd", &[Scalar::Int(8)]), Some(Scalar::Int(4)));
+        assert_eq!(
+            sc.fold(&Scalar::Str("abc".into()), "rjust", &[Scalar::Int(5), Scalar::Str(".".into())]),
+            Some(Scalar::Str("..abc".into()))
+        );
         // A raising call declines (never crashes the worker).
         assert_eq!(sc.fold(&Scalar::Int(1), "to_s", &[Scalar::Int(99)]), None);
         // The worker is still alive after a decline.
