@@ -28,16 +28,6 @@ pub enum RubyMode {
     Path(String),
 }
 
-impl RubyMode {
-    /// Whether this mode opts OUT of full fidelity deliberately (`off`). Used to
-    /// decide whether the interim "sidecar pending" notice is shown: an explicit
-    /// opt-out chose the subset, so it is not warned about.
-    #[must_use]
-    pub fn is_opt_out(&self) -> bool {
-        matches!(self, RubyMode::Off)
-    }
-}
-
 impl fmt::Display for RubyMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -106,32 +96,6 @@ pub fn resolve(
     Ok(default_mode)
 }
 
-/// The one-time stderr notice emitted (phase a) when a non-opt-out mode runs the
-/// sound subset only because the sidecar is not yet implemented. Converts a
-/// silent posture into a disclosed one.
-pub const INTERIM_PENDING_NOTICE: &str =
-    "rigor: full-fidelity Ruby sidecar not yet implemented — running the sound subset \
-     (coverage posture: subset). Pass --ruby=off (or RIGOR_NO_RUBY=1) to silence this.";
-
-/// A short human posture description for `rigor doctor`, plus whether it is a
-/// *reduced* posture (deliberate opt-out is not reduced; a pending sidecar is).
-#[must_use]
-pub fn interim_posture_line(mode: &RubyMode) -> (String, bool) {
-    if mode.is_opt_out() {
-        (
-            "sound subset (Ruby-free by request: --ruby=off)".to_string(),
-            false,
-        )
-    } else {
-        (
-            format!(
-                "sound subset — full fidelity pending the Ruby sidecar (requested: {mode}; ADR-0036)"
-            ),
-            true,
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,13 +128,5 @@ mod tests {
     fn default_when_nothing_specified() {
         let m = resolve(None, None, RubyMode::Auto).unwrap();
         assert_eq!(m, RubyMode::Auto);
-    }
-
-    #[test]
-    fn opt_out_is_not_a_reduced_posture() {
-        let (_, reduced) = interim_posture_line(&RubyMode::Off);
-        assert!(!reduced);
-        let (_, reduced) = interim_posture_line(&RubyMode::Require);
-        assert!(reduced);
     }
 }

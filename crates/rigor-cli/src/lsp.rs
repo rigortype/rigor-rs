@@ -34,11 +34,12 @@ use lsp_types::{
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, Typer};
 use rigor_parse::{comment_lines, lower, parse, Node};
-use rigor_rules::{analyze_with_source, filter_suppressed, Severity, SuppressSet};
+use rigor_rules::{analyze_with_source_and_folder, filter_suppressed, Severity, SuppressSet};
 use rigor_types::{Interner, Type, TypeId};
 
 use crate::config::Config;
 use crate::ruby_mode;
+use crate::sidecar;
 
 /// `rigor lsp [--transport=stdio] [--log=PATH]`. Only `stdio` transport is
 /// supported in v1 (ADR-0029); `--log` is accepted and reserved (server logs go
@@ -110,20 +111,46 @@ fn run_stdio() -> Result<(), String> {
     // Two-tier essence: the RBS environment + config are built ONCE and reused
     // for the whole session (the per-keystroke path never pays the RBS-load floor).
     let cfg = Config::load(None);
+
+    // ADR-0036 / ADR-0008: `rigor lsp` defaults to `auto` and NEVER hard-errors
+    // (an editor's Ruby env is structurally fragile — GUI apps don't source shell
+    // rc), so an unreachable sidecar degrades to the sound subset here even under
+    // `require`. The posture is always SURFACED via `window/showMessage`, and a
+    // reachable sidecar is wired as the folder so the editor gets full fidelity.
+    let ruby = ruby_mode::resolve(None, cfg.ruby_config_value(), ruby_mode::RubyMode::Auto)
+        .unwrap_or(ruby_mode::RubyMode::Auto);
+    let (folder, posture, typ) = match &ruby {
+        ruby_mode::RubyMode::Off => (
+            None,
+            "sound subset (Ruby-free by request)".to_string(),
+            MessageType::INFO,
+        ),
+        mode => {
+            let bin = sidecar::ruby_bin_for(mode).expect("a non-off mode names a ruby binary");
+            match sidecar::Sidecar::spawn(&bin) {
+                Ok(sc) => {
+                    let v = sc.ruby_version().to_string();
+                    (
+                        Some(sidecar::SidecarFolder::new(sc)),
+                        format!("full fidelity — Ruby sidecar (ruby {v})"),
+                        MessageType::INFO,
+                    )
+                }
+                Err(e) => (
+                    None,
+                    format!("sound subset — Ruby sidecar unavailable ({e})"),
+                    MessageType::WARNING,
+                ),
+            }
+        }
+    };
+    send_show_message(&connection, typ, format!("rigor: coverage posture — {posture}"))?;
+
     let ctx = ServerContext {
         index: CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new("."))),
         disable: cfg.disable_matcher(),
+        folder,
     };
-
-    // ADR-0036: `rigor lsp` defaults to `auto` (never break the editor when Ruby
-    // is unreachable — a structurally fragile case for GUI editors) and always
-    // SURFACES the coverage posture via a `window/showMessage` on startup, so
-    // reduced coverage is disclosed in the editor rather than silent.
-    let ruby = ruby_mode::resolve(None, cfg.ruby_config_value(), ruby_mode::RubyMode::Auto)
-        .unwrap_or(ruby_mode::RubyMode::Auto);
-    let (posture, reduced) = ruby_mode::interim_posture_line(&ruby);
-    let typ = if reduced { MessageType::WARNING } else { MessageType::INFO };
-    send_show_message(&connection, typ, format!("rigor: coverage posture — {posture}"))?;
 
     let mut buffers: HashMap<String, String> = HashMap::new();
 
@@ -142,6 +169,10 @@ fn run_stdio() -> Result<(), String> {
 struct ServerContext {
     index: CoreIndex,
     disable: SuppressSet,
+    /// The ADR-0008 real-Ruby folder for full-fidelity constant folds, when a
+    /// sidecar was reachable at startup. `None` = sound subset. The LSP request
+    /// loop is sequential, so a single worker suffices.
+    folder: Option<sidecar::SidecarFolder>,
 }
 
 /// The synchronous dispatch loop. Requests are answered inline; notifications
@@ -317,7 +348,12 @@ fn compute_diagnostics(ctx: &ServerContext, text: &str) -> Vec<Diagnostic> {
         let ast = lower(&result);
         let source = SourceIndex::build(&ast, &ctx.index);
         let mut interner = Interner::new();
-        let diags = analyze_with_source(&ast, &mut interner, &ctx.index, &source);
+        let folder = ctx
+            .folder
+            .as_ref()
+            .map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
+        let diags =
+            analyze_with_source_and_folder(&ast, &mut interner, &ctx.index, &source, folder);
         (diags, comments)
     }));
 
@@ -694,6 +730,7 @@ mod tests {
         ServerContext {
             index: CoreIndex::new(),
             disable: Config::default().disable_matcher(),
+            folder: None,
         }
     }
 

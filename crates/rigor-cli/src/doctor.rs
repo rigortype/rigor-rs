@@ -86,26 +86,37 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
         }
     }
 
-    // --- Coverage posture (ADR-0036) ----------------------------------------
-    // Which posture a default run resolves to (env + `rigor_rs.ruby`, default
-    // `require`). The sidecar is not yet implemented, so a non-opt-out mode is a
-    // *reduced* posture today (WARN, not FAIL — expected pre-sidecar); an explicit
-    // `--ruby=off` is a deliberate choice (PASS).
+    // --- Coverage posture (ADR-0036 / ADR-0008) -----------------------------
+    // Resolve the posture a default run would use (env + `rigor_rs.ruby`, default
+    // `require`) and probe the sidecar so reduced coverage is never silent. `off`
+    // is a deliberate Ruby-free choice (PASS); a reachable sidecar is full
+    // fidelity (PASS); an unreachable sidecar is the sound subset (WARN), and a
+    // note that `require` would hard-error (exit 69) there.
     match ruby_mode::resolve(None, cfg.ruby_config_value(), ruby_mode::RubyMode::Require) {
-        Ok(ruby) => {
-            let (posture, reduced) = ruby_mode::interim_posture_line(&ruby);
-            let marker = if reduced { "WARN" } else { "PASS" };
-            println!("[{marker}] coverage posture: {posture}");
-            // Slice 1: probe sidecar reachability (unless opted out). Folding is
-            // not yet routed, so a reachable sidecar does not yet raise coverage —
-            // reported honestly as "reachable; folding not yet routed".
-            if let Some(bin) = crate::sidecar::ruby_bin_for(&ruby) {
-                match crate::sidecar::probe(&bin) {
-                    Ok(hs) => println!(
-                        "[PASS] ruby sidecar: reachable — `{bin}` (ruby {}); folding not yet routed (Slice 2)",
-                        hs.ruby_version
-                    ),
-                    Err(e) => println!("[WARN] ruby sidecar: unreachable — {e}"),
+        Ok(ruby_mode::RubyMode::Off) => {
+            println!("[PASS] coverage posture: sound subset (Ruby-free by request: ruby=off)");
+        }
+        Ok(mode) => {
+            let bin = crate::sidecar::ruby_bin_for(&mode)
+                .expect("a non-off mode names a ruby binary");
+            match crate::sidecar::probe(&bin) {
+                Ok(hs) => println!(
+                    "[PASS] coverage posture: full fidelity — Ruby sidecar reachable via `{bin}` (ruby {})",
+                    hs.ruby_version
+                ),
+                Err(e) => {
+                    let hard = matches!(
+                        mode,
+                        ruby_mode::RubyMode::Require | ruby_mode::RubyMode::Path(_)
+                    );
+                    println!(
+                        "[WARN] coverage posture: sound subset — Ruby sidecar unavailable ({e})"
+                    );
+                    if hard {
+                        println!(
+                            "  → `ruby={mode}` would hard-error (exit 69); install Ruby or set ruby=off/auto"
+                        );
+                    }
                 }
             }
         }

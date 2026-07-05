@@ -76,6 +76,51 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
     }
 }
 
+/// The Ruby class name of a scalar literal — the receiver-class key used to gate
+/// [`sidecar_foldable`]. `Bool`/`Nil` map to their singleton classes.
+#[must_use]
+pub fn scalar_class(s: &Scalar) -> &'static str {
+    match s {
+        Scalar::Int(_) => "Integer",
+        Scalar::Float(_) => "Float",
+        Scalar::Str(_) => "String",
+        Scalar::Sym(_) => "Symbol",
+        Scalar::Bool(true) => "TrueClass",
+        Scalar::Bool(false) => "FalseClass",
+        Scalar::Nil => "NilClass",
+    }
+}
+
+/// Whether a `(receiver class, method)` is safe to route to the Ruby sidecar
+/// (ADR-0008): a pure, deterministic long-tail fold the Rust core deliberately
+/// declines, whose result the reference folds identically (so routing it cannot
+/// diverge — parity-safe). Deliberately a SMALL, harness-verified subset; grows
+/// as each method is confirmed against the reference. Note this is disjoint from
+/// the Rust core: a method the Rust core already folds never reaches the sidecar
+/// (the core wins first in the dispatcher).
+#[must_use]
+pub fn sidecar_foldable(receiver_class: &str, method: &str) -> bool {
+    matches!(
+        (receiver_class, method),
+        // Integer#to_s(base) — the Rust core folds only base-10 `to_s`; a base
+        // argument routes here (`255.to_s(16) => "ff"`).
+        ("Integer", "to_s")
+        // String#% (format) — a pure, deterministic long-tail fold.
+        | ("String", "%")
+    )
+}
+
+/// Executes a purity-gated fold the Rust core declined, by running the real Ruby
+/// method (ADR-0008 — the Ruby sidecar). Injected into the [`crate::Typer`] so
+/// the pure `rigor-infer` crate never itself does IO / spawns a process; the
+/// implementor (the CLI's sidecar client) owns that. `None` = declined /
+/// unavailable (the dispatcher then widens to the nominal type — sound subset).
+pub trait RubyFolder {
+    /// Execute `receiver.method(*args)` on scalar literals, returning the result
+    /// scalar or `None`. The caller has already confirmed [`sidecar_foldable`].
+    fn fold(&self, receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar>;
+}
+
 // --- Integer ----------------------------------------------------------------
 
 fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {

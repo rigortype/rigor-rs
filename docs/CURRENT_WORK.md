@@ -41,9 +41,22 @@ ruby). **Sequencing refinement (deliberate):** the exit-69 hard error for `requi
 not wired now — hard-failing (or spawning ruby on) every default `check` before folding is routed would
 be premature blast radius with no fidelity gain yet; the probe is built + tested + surfaced in `doctor`,
 and the teeth flip on in Slice 2 when a reachable sidecar actually delivers full fidelity. `check`/`lsp`
-hot paths unchanged (still the interim notice); harness stays 53/53 / 0 FP. **Next — Slice 2:** route the
-first real fold (a persistent worker + one non-Rust-foldable op → `Constant`), then flip on the exit-69
-teeth.
+hot paths unchanged (still the interim notice); harness stays 53/53 / 0 FP. **Slice 2 LANDED:** persistent worker + fold routing + exit-69 teeth. `sidecar.rb` gains a `fold` op
+(tagged-scalar JSON ⇄ real Ruby value, purity-gated + rescue-guarded); `Sidecar` is now a persistent
+worker (`fold`/`ping`, dead-pipe short-circuit, `Drop` shutdown) + `SidecarFolder` (`Mutex`+memo, `Sync`)
+implementing the new `rigor_infer::RubyFolder` trait. rigor-infer: `folding::sidecar_foldable` allowlist
+(parity-confirmed subset — `Integer#to_s(base)`, `String#%`) + `scalar_class`; `Typer` gains an optional
+folder; `type_call` tier-1 falls back to it when the Rust core declines. rigor-rules:
+`analyze_with_source_and_folder`. CLI: `build_sidecar_folder` (shared by `check` + `baseline`) resolves
+the mode, spawns the sidecar, and **`require`/`<path>` unavailable → exit 69** (`auto` degrades+discloses,
+`off` silent); `lsp` wires the folder too (never hard-errors — always `auto`-degrades); `doctor` reports
+real reachability. The phase-a interim notice is retired (sidecar is real now). **Verified:** E2E vs the
+reference — `255.to_s(16).frobnicate` witnesses on the folded `"ff"` identically (full fidelity);
+`--no-ruby` stays sound-subset; exit 69 on require+no-ruby; harness **53/53 / 0 FP** with folding active
+(default check now spawns a sidecar); a deterministic mock-folder infer test guards the tier-1 wiring;
+real-ruby fold round-trip test; `cargo test` + CI clippy clean. **Next — Slice 3:** batching (one
+round-trip per file) + MessagePack framing; then Slice 4 (on-disk cache), Slice 5 (plugin invocation),
+and expanding the `sidecar_foldable` allowlist.
 
 Prior: 2026-07-05 — **[ADR-0034](adr/0034-rbs-collection-ingestion.md) — IMPLEMENTED.** The gem-RBS
 leg's Ruby-free half now ships: `rbs collection` discovery (`crates/rigor-cli/src/rbs_collection.rs`) — a
