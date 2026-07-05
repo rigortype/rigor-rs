@@ -239,6 +239,46 @@ impl<'i> Typer<'i> {
     ///
     // TODO(spec): tier-2 shape dispatch, tier-4 in-source bodies, argument
     // contracts, the Ruby sidecar for non-Rust-foldable calls (ADR-0008/0023).
+    /// Type a `.new` call's result as an INSTANCE of the named class — shared by
+    /// the plain (`X.new(...)`) and block-bearing (`X.new(...) { ... }`) paths so
+    /// both agree that `X.new` (with or without a block) is an `X` instance.
+    ///
+    /// `Some(Nominal[X])` when `receiver` is a bare constant naming a class the
+    /// core index (preferred) or the source index knows, and `X` is NOT a
+    /// metaclass constructor (`Struct`/`Data`/`Class`, whose `.new`/`.define`
+    /// build an anonymous SUBCLASS we can't model). `None` ⇒ not a typeable
+    /// `.new`; the caller falls through to its normal path (Dynamic / block
+    /// return), silent.
+    ///
+    /// This helper decides only the receiver TYPE. The
+    /// non-core-`.new`-never-witnessed leniency (2026-06-26 correctness finding)
+    /// lives in the RULES layer, which witnesses only receivers whose class is
+    /// RBS-known in the core surface — a source-only `.new` instance types for
+    /// chaining but is never a *witnessing* surface. Identical for both shapes.
+    fn type_dot_new(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let Node::ConstantRead { name, .. } = ast.get(receiver) else {
+            return None;
+        };
+        if name.is_empty() || CLASS_RETURNING_NEW.contains(&name.as_str()) {
+            return None;
+        }
+        // Prefer a core (CORE_CLASSES) nominal id — its method existence resolves
+        // via the core path; else a source class or a registered RBS-only instance
+        // class (e.g. Pathname) carries a registry id in the high range.
+        if let Some(class_id) = self.index.class_id(name) {
+            return Some(interner.intern(Type::Nominal { class: class_id, args: vec![] }));
+        }
+        if let Some(class_id) = self.source.class_id(name) {
+            return Some(interner.intern(Type::Nominal { class: class_id, args: vec![] }));
+        }
+        None
+    }
+
     fn type_call(
         &self,
         ast: &LoweredAst,
@@ -256,27 +296,11 @@ impl<'i> Typer<'i> {
         // (RBS) class wins its core ClassId; a source-only class gets a
         // source-range ClassId from the SourceIndex.
         if method == "new" {
-            if let Node::ConstantRead { name, .. } = ast.get(receiver) {
-                // The metaclass constructors return a CLASS, not a plain instance
-                // of the named class: `Struct.new(...)`/`Data.define(...)` build an
-                // anonymous SUBCLASS, `Class.new` builds a Class. Typing their
-                // result as an instance of `Struct`/`Data`/`Class` would wrongly
-                // witness e.g. the chained `.new` (a class method) absent. We
-                // can't model the anonymous class, so leave it Dynamic (silent).
-                if !name.is_empty() && !CLASS_RETURNING_NEW.contains(&name.as_str()) {
-                    // Prefer a core (CORE_CLASSES) nominal id when the name maps
-                    // to one — its method existence resolves via the core path.
-                    if let Some(class_id) = self.index.class_id(name) {
-                        return interner.intern(Type::Nominal { class: class_id, args: vec![] });
-                    }
-                    // Else a source class OR a registered RBS-only instance class
-                    // (e.g. Pathname) carries a registry id in the high range.
-                    if let Some(class_id) = self.source.class_id(name) {
-                        return interner.intern(Type::Nominal { class: class_id, args: vec![] });
-                    }
-                    // Unknown constant ⇒ fall through to Dynamic (never guess).
-                }
+            if let Some(ty) = self.type_dot_new(ast, receiver, interner) {
+                return ty;
             }
+            // Not a typeable `.new` (metaclass constructor / unknown constant) ⇒
+            // fall through to the folding / RBS-return cascade below.
         }
 
         let recv_ty = self.type_of(ast, receiver, env, interner);
@@ -424,6 +448,14 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
+        // A block-bearing `X.new(...) { ... }` still constructs an `X` instance
+        // (e.g. `Array.new(n) { |i| … } : Array`, `Hash.new { … } : Hash`), so it
+        // types via the SHARED `.new` path — not the block-overload return below.
+        if method == "new" {
+            if let Some(ty) = self.type_dot_new(ast, receiver, interner) {
+                return ty;
+            }
+        }
         let recv_ty = self.type_of(ast, receiver, env, interner);
         // The receiver must resolve to a concrete class the index models; a
         // Dynamic / unknown receiver ⇒ silent (never guess the block return).
@@ -679,6 +711,277 @@ impl<'i> Typer<'i> {
                 }
             }
             _ => {}
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-0038 Slice 1 — `call.possible-nil-receiver` on the threaded flow-eval
+    // -----------------------------------------------------------------------
+
+    /// Compute the per-call-node nil-receiver snapshot map (ADR-0038 Slice 1):
+    /// `call node id -> non-nil core arm C` for every bare-local receiver that is
+    /// certainly `C | nil` and unguarded at the use. The rules layer's
+    /// `check_nil_receiver` fires from this map (applying the method-absent-on-
+    /// NilClass / present-on-C gate). This REPLACES the prior `enclosing_def`
+    /// span-scan, so a nilable local now witnesses in block / top-level scopes,
+    /// not only inside a named `def`.
+    ///
+    /// It threads two facts straight-line through the program, DESCENDING into
+    /// block bodies:
+    /// - `tenv` — a TYPE env, INHERITED (cloned) into block bodies so a slice /
+    ///   `.new` receiver typed in an OUTER scope (`random_array = Array.new(n){…}`)
+    ///   is visible to a source in a NESTED block (`select_subset = random_array[
+    ///   0..n]`). Widened precisely (only written locals) on unmodeled constructs.
+    /// - `nenv` — a NILABILITY fact map, `local -> non-nil core arm C` (the local
+    ///   is currently `C | nil`). It starts EMPTY in every block body.
+    ///
+    /// ## FP-safety (ADR-0038 §2/§3 decline backstop)
+    ///
+    /// - **Same-block-body locality.** `nenv` is FRESH per block, so a fact never
+    ///   crosses INTO a block. Block parameters are not lowered (so cannot be
+    ///   cleared by name); the fresh env makes a param shadowing an outer local
+    ///   unable to leak a stale fact — the shadowing FP class is structurally
+    ///   impossible.
+    /// - **Unmodeled ⇒ clear all.** ANY statement not in the modeled set (control
+    ///   flow, multi-assign, ivar write, …) CLEARS ALL `nenv` facts. Multi-assign
+    ///   targets are invisible in the lowered arena, so a per-name scan could miss
+    ///   a reassignment; the clear-all is the bulletproof choice for the direct
+    ///   fire gate.
+    /// - **Block descent clears outer facts.** After descending a block, ALL outer
+    ///   `nenv` facts are cleared (a block capture may invisibly reassign an outer
+    ///   local).
+    /// - **Guards clear the fact.** A `.nil?`/`present?`/`blank?`/`presence` call
+    ///   or a safe-nav call on the local removes it (narrowed); an `&&`/`||`
+    ///   operand context clears all facts (unmodeled narrowing in Slice 1).
+    ///
+    /// Residual (documented Slice 1 limit): a multi-assign that reassigns a
+    /// SOURCE receiver's TYPE leaves `tenv` stale (targets invisible), which could
+    /// feed a wrong NEW source. Contrived and survey-absent; closed when
+    /// multi-assign is modeled. Every fire is gated by `fp_audit.py` on the survey.
+    pub fn nilable_receiver_snapshots(
+        &self,
+        ast: &LoweredAst,
+        interner: &mut Interner,
+    ) -> HashMap<NodeId, &'static str> {
+        let mut out = HashMap::new();
+        let body = match ast.get(ast.root()) {
+            Node::Program { body, .. } => body.clone(),
+            _ => return out,
+        };
+        let writes = collect_flow_writes(ast);
+        let mut tenv = TypeEnv::new();
+        let mut nenv: HashMap<String, &'static str> = HashMap::new();
+        self.nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &writes, interner, &mut out);
+        out
+    }
+
+    /// Thread `(tenv, nenv)` through a scope's statements in source order.
+    #[allow(clippy::too_many_arguments)]
+    fn nil_flow_scope(
+        &self,
+        ast: &LoweredAst,
+        stmts: &[NodeId],
+        tenv: &mut TypeEnv,
+        nenv: &mut HashMap<String, &'static str>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+    ) {
+        for &s in stmts {
+            self.nil_flow_stmt(ast, s, tenv, nenv, writes, interner, out);
+        }
+    }
+
+    /// Apply one statement's effect on `(tenv, nenv)` and record any nil uses.
+    #[allow(clippy::too_many_arguments)]
+    fn nil_flow_stmt(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        nenv: &mut HashMap<String, &'static str>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+    ) {
+        match ast.get(id) {
+            Node::Statements { body, .. } => {
+                let body = body.clone();
+                self.nil_flow_scope(ast, &body, tenv, nenv, writes, interner, out);
+            }
+            Node::LocalVariableWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                // Record uses in the RHS (and descend any block it carries) BEFORE
+                // rebinding — a use of a currently-nilable local reads the fact.
+                self.nil_flow_expr(ast, value, tenv, nenv, writes, interner, out);
+                let src = self.nilable_source_class(ast, value, tenv, interner);
+                let vty = self.type_of(ast, value, tenv, interner);
+                tenv.insert(name.clone(), vty);
+                match src {
+                    Some(c) => {
+                        nenv.insert(name, c);
+                    }
+                    None => {
+                        nenv.remove(&name);
+                    }
+                }
+            }
+            Node::LocalVariableOpWrite { name, .. } => {
+                // `x += …` / `x ||= …` reads-then-writes ⇒ the nil possibility is
+                // narrowed/replaced; drop the fact and widen the type.
+                let name = name.clone();
+                nenv.remove(&name);
+                let u = interner.untyped();
+                tenv.insert(name, u);
+            }
+            Node::Call { .. } => {
+                self.nil_flow_expr(ast, id, tenv, nenv, writes, interner, out);
+            }
+            Node::Definition { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => {
+                // Independent scope: fresh `tenv` AND `nenv`, no effect on the
+                // enclosing scope.
+                let body = body.clone();
+                let mut t = TypeEnv::new();
+                let mut n: HashMap<String, &'static str> = HashMap::new();
+                self.nil_flow_scope(ast, &body, &mut t, &mut n, writes, interner, out);
+            }
+            // Any other statement (`if`/`unless`/`while`/`case`/logical/begin/
+            // multi-assign/ivar-write/…) is UNMODELED in Slice 1: widen `tenv` for
+            // the locals it writes, and CLEAR ALL `nenv` facts (decline backstop —
+            // no fact survives an unmodeled construct). No descent (straight-line).
+            other => {
+                let span = other.span();
+                widen_flow_writes(writes, span, tenv, interner);
+                nenv.clear();
+            }
+        }
+    }
+
+    /// Evaluate an expression for nil-receiver USES: record `call -> arm` for a
+    /// bare-local receiver in `nenv`, clear the fact on a guard/safe-nav call, and
+    /// descend a block body with a FRESH `nenv` + INHERITED `tenv`.
+    #[allow(clippy::too_many_arguments)]
+    fn nil_flow_expr(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        nenv: &mut HashMap<String, &'static str>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+    ) {
+        match ast.get(id) {
+            Node::Call { receiver, method, args, block_body, safe_nav, .. } => {
+                let receiver = *receiver;
+                let method = method.clone();
+                let args = args.clone();
+                let block_body = block_body.clone();
+                let safe_nav = *safe_nav;
+                // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
+                if let Some(r) = receiver {
+                    self.nil_flow_expr(ast, r, tenv, nenv, writes, interner, out);
+                }
+                if let Some(r) = receiver {
+                    if let Node::LocalVariableRead { name, .. } = ast.get(r) {
+                        let is_guard = matches!(
+                            method.as_str(),
+                            "nil?" | "present?" | "blank?" | "presence"
+                        );
+                        // Record the use: currently-nilable bare local, plain (not
+                        // safe-nav) call, non-guard method. `check_nil_receiver`
+                        // applies the NilClass-absent / arm-present gate.
+                        if !safe_nav && !is_guard {
+                            if let Some(&arm) = nenv.get(name) {
+                                out.insert(id, arm);
+                            }
+                        }
+                        // A guard or safe-nav call on the local narrows nil away
+                        // for SUBSEQUENT uses ⇒ drop the fact.
+                        if safe_nav || is_guard {
+                            nenv.remove(name);
+                        }
+                    }
+                }
+                for a in &args {
+                    self.nil_flow_expr(ast, *a, tenv, nenv, writes, interner, out);
+                }
+                if !block_body.is_empty() {
+                    // Same-block locality: descend with a FRESH `nenv`, inheriting
+                    // (cloning) `tenv`. Afterwards clear ALL outer facts — a block
+                    // capture may invisibly reassign an outer local.
+                    let mut btenv = tenv.clone();
+                    let mut bnenv: HashMap<String, &'static str> = HashMap::new();
+                    self.nil_flow_scope(ast, &block_body, &mut btenv, &mut bnenv, writes, interner, out);
+                    nenv.clear();
+                }
+            }
+            Node::Logical { left, right, .. } => {
+                // `&&`/`||` — unmodeled narrowing in Slice 1. Clear all facts
+                // (decline), then recurse for block/call reachability.
+                let (left, right) = (*left, *right);
+                nenv.clear();
+                self.nil_flow_expr(ast, left, tenv, nenv, writes, interner, out);
+                self.nil_flow_expr(ast, right, tenv, nenv, writes, interner, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// The non-nil core arm `C` of a nilable SOURCE expression `value`, or `None`
+    /// (not a modeled nil source ⇒ the local is treated non-nilable).
+    ///
+    /// Two sources (both zero-FP by construction):
+    /// (a) **Collection slice** `arr[Range]` / `str[Range]` — the single-`Range`-
+    ///     arg `#[]` form on a CONFIRMED core `Array`/`String` receiver. RBS types
+    ///     it `Array?` / `String?`, so the non-nil arm is the receiver's own class.
+    ///     Two-arg `arr[i, len]`, an integer / `Regexp` arg, or a non-core
+    ///     receiver ⇒ decline (a different overload / unknown class).
+    /// (b) **Certain nilable RBS return** on a KNOWN core receiver
+    ///     (`String#byteslice -> String?`). A `Constant` receiver is declined (the
+    ///     reference constant-folds it to a concrete non-nil value, never seeing
+    ///     `C | nil`) — the folding-parity keystone.
+    fn nilable_source_class(
+        &self,
+        ast: &LoweredAst,
+        value_id: NodeId,
+        tenv: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<&'static str> {
+        let Node::Call { receiver: Some(recv), method, args, block_body, .. } = ast.get(value_id)
+        else {
+            return None;
+        };
+        if !block_body.is_empty() {
+            return None;
+        }
+        let recv = *recv;
+        let method = method.clone();
+        let args = args.clone();
+        // (a) collection slice.
+        if method == "[]" && args.len() == 1 && matches!(ast.get(args[0]), Node::Range { .. }) {
+            let rty = self.type_of(ast, recv, tenv, interner);
+            if let Some(cls) = self.index.class_name_of(interner, rty) {
+                if cls == "Array" || cls == "String" {
+                    return Some(cls);
+                }
+            }
+            return None;
+        }
+        // (b) certain nilable RBS return.
+        let rty = self.type_of(ast, recv, tenv, interner);
+        if matches!(interner.get(rty), Type::Constant(_)) {
+            return None;
+        }
+        let cls = self.index.class_name_of(interner, rty)?;
+        if !self.index.knows_class(cls) {
+            return None;
+        }
+        match self.index.method_return_nilable(cls, &method) {
+            Some((core, true)) if self.index.knows_class(core) => Some(core),
+            _ => None,
         }
     }
 }
