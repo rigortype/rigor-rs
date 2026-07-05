@@ -6,7 +6,21 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **flow substrate SLICE 1 LANDED as an FP-safe foundation (0 gaps)
+Last updated: 2026-07-06 — **`rigor check <dir>` DIRECTORY SUPPORT LANDED
+([ADR-0040](adr/0040-directory-path-argument-support.md), branch `shape-tier-slice1`).** `rigor check`
+now recursively analyzes a directory's `**/*.rb` (was: `cannot read <dir>: Is a directory`, analyzed
+NOTHING — `rigor check .`, the first command a real user runs, was broken). Faithful port of the
+reference's `expand_paths` (recursive, skip hidden/symlinks, ignore `.gitignore`, config `exclude:`,
+sorted; bad-path diagnostics with warn-if-any-else-error severity + synthetic rule ids; **exit code now
+ERROR-severity-driven** — a warning-only run exits 0, matching the reference). Dir arg == explicit file
+list (redmine 65=65, algorithms 1553=1553, mastodon 109=109). 437 tests, harness 54/54, clippy clean.
+**CORRECTION this session:** an earlier "Rails/ActiveSupport reopened-core-class over-leniency" finding
+was an ARTIFACT of this very bug — `rigor check <dir>` analyzed nothing, so all "dir-mode" rigor-rs
+numbers were bogus. The reference's `expand_paths` was verified REASONABLE (no upstream fix); the valid
+coverage gate is `fp_audit.py` (explicit file lists), whose landscape (undefined-method / possible-nil /
+always-truthy — Rails-plugin + Tier B/C dominated) stands.
+
+Prior: 2026-07-06 — **flow substrate SLICE 1 LANDED as an FP-safe foundation (0 gaps)
 ([ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md), branch `flow-substrate-slice1`).**
 The threaded flow-eval nil-receiver substrate (`Typer::nilable_receiver_snapshots`) REPLACES the
 `enclosing_def` span-scan: it threads a type env (inherited into blocks) + a nilability fact map
