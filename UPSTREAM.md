@@ -54,4 +54,10 @@ ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.2
    candidate coverage to port (new rules / behaviours in `vX.Y.Z`); any that
    rigor-rs now emits but the reference dropped is a regression to fix or a
    divergence to register ([ADR-0011](docs/adr/0011-reference-oracle-exceptions.md)).
-5. Update the tag/commit in this file and note the bump in `docs/CURRENT_WORK.md`.
+5. **Re-measure the ported reference-implementation constants** — they can move
+   silently across releases. Currently: the shape-tier thresholds
+   ([ADR-0039](docs/adr/0039-shape-typing-tier.md)) — `ARRAY_NEW_TUPLE_LIMIT`
+   (grep `method_dispatcher.rb`, empirically probe `Array.new(n)`-slice
+   possible-nil around the boundary) and, once ported, the other
+   `constant_folding.rb` / `shape_dispatch.rb` limits.
+6. Update the tag/commit in this file and note the bump in `docs/CURRENT_WORK.md`.

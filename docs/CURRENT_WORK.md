@@ -32,24 +32,30 @@ runtime-hot + low-risk logic to Rust; reserve the sidecar for what genuinely nee
 folding was rejected (diverges from the reference's static model, full-fidelity-only, per-literal cost).
 New glossary: `Shape type` / `Tuple` / `HashShape` / `Shape-typing tier` (CONTEXT.md).
 
-**▶▶ NEXT SESSION — START HERE: shape-tier Slice 1 (ADR-0039 §3, all in `crates/rigor-types` +
-`crates/rigor-infer` + `crates/rigor-rules`).** Static, no sidecar:
-1. Add `Type::Tuple` (fixed-length vector of element `TypeId`s) to the lattice + interner.
-2. Type array literals + `Array.new(n ≤ 16)` as `Tuple` (faithful `ARRAY_NEW_TUPLE_LIMIT = 16`; oversize /
-   non-constant ⇒ `Nominal[Array]`).
-3. Shape dispatch: `Tuple#[]` (const index → element; static Range → sub-Tuple; out-of-range →
-   `Constant[nil]`), `Tuple#size` → `Constant[len]`. Unmodeled Tuple op ⇒ fall back to `Nominal[Array]`.
-4. Re-enable the possible-nil array-slice source, firing ONLY on the FP-safe provenance the §2 invariant
-   permits in Slice 1: a receiver bound directly to `Array.new(size > 16 or non-constant)`. `.map`/… Tuple
-   propagation is a LATER slice (until then those receivers decline — recall gap, safe).
-5. **Invariant (binds every shape slice):** `{arrays rigor-rs types Nominal[Array]} ⊆ {arrays the reference
-   types Nominal[Array]}` — else the slice source over-fires (the `.map` FP). Never fire on an array whose
-   provenance isn't proven reference-Nominal.
-6. **Gate:** `fp_audit.py` 0-FP (synthetic literals / small `Array.new` / `.map` slices all silent),
-   harness 53/53, treemaps line 45 matches, matched non-regression. **Then MEASURE the tier's EV** before
-   committing to further shape slices (honest caveat: `Tuple` shares `Array`'s method set, so this adds NO
-   undefined-method coverage; gains = element-type precision + possible-nil FP-avoidance + shape-method
-   results — measurement-gated).
+**▶▶ NEXT SESSION — START HERE: shape-tier Slice 1 (ADR-0039 §3 as revised after the
+[shape-tier audit](notes/20260706-adr0039-shape-tier-audit.md); `crates/rigor-types` +
+`crates/rigor-infer` + `crates/rigor-rules`).** Static, no sidecar, internally ordered so the lattice
+change never holds the gap hostage:
+- **Slice 1a — the provenance fire (closes treemaps, needs NO `Type::Tuple`):** the possible-nil
+  array-slice source fires ONLY on a **syntactic** provenance — the receiver's binding RHS is literally
+  `Array.new(constant > 16 | non-constant | ZERO args)` (all probe-confirmed reference-Nominal; type-based
+  firing on env `Nominal[Array]` is FORBIDDEN — the `.map`-fallback FP, ADR-0039 §2). The provenance marker
+  travels on the **tenv side** of the ADR-0038 substrate (inherited into blocks; nenv is per-block fresh),
+  invalidated by tenv's widen rules.
+- **Slice 1b — Tuple groundwork:** `Type::Tuple` in the lattice + interner with
+  **`class_name_of(Tuple) = "Array"`** (else today's literal-array matched regresses); literals +
+  `Array.new(n ≤ 16, [fill])` → Tuple (zero-arg stays Nominal; block form: READ the reference's block path
+  first, mint Dynamic elements); `Tuple#[]` const-index → element, static Range → sub-Tuple for
+  **non-negative literal in-bounds forms ONLY** (negative/beginless/endless/boundary ⇒ decline),
+  out-of-range → `Constant[nil]` (pays little until nil-receiver undefined-method lands — fixture-08 gap);
+  `Tuple#size` → `Constant[len]`; unmodeled op ⇒ `Nominal[Array]` fallback (safe: never feeds the source).
+- **Gate (hardened):** fp_audit 0-FP + harness green + matched non-regression + **committed negative
+  fixtures** (the ADR-0038 Array FP was INVISIBLE to the survey audit — only synthetics catch this class:
+  literal / small / two-arg / `.map` slices silent, treemaps positive) + **cross-rule always-truthy
+  differentials** for every Constant-minting shape op (probe-confirmed: the reference fires always-truthy
+  on `if [1,2].size` AND `if [1,2].size > 0` — a parity gain if matched, an error-severity FP if not).
+  **Pre-declared expectation:** algorithms possible-nil 50→49, matched +1 (line 45 ONLY; 46–48 stay
+  declined by same-block locality). Then MEASURE the tier's EV before further shape slices.
 
 **Deferred behind Slice 1's measurement:** `HashShape`; shape-preserving method propagation (widens the
 possible-nil fire set monotonically); argument-type-mismatch on shapes. **Separate possible-nil track (still

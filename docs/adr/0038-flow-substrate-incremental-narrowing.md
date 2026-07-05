@@ -17,6 +17,11 @@ breaching the zero-false-positive bar ([ADR-0002](0002-diagnostic-set-parity.md)
 
 ## Context — why the goal forces the full model
 
+> **Goal refined (2026-07-06, [ADR-0039](0039-shape-typing-tier.md)):** full 100%
+> divergence-freedom is negotiable; the operative goal is to **minimize practical
+> mismatches**, resolving Ruby-free whatever is resolvable Ruby-free. The
+> paragraph below predates that refinement.
+
 The end goal is **no divergence from the reference** (100% parity), not merely
 zero-FP-with-gaps. That disqualifies extending the structural under-approximation
 (decline-on-any-guard): it leaves permanent gaps by construction AND its span-scan

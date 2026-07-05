@@ -1,12 +1,16 @@
 # Port the reference's static shape-typing tier (Tuple/HashShape) to Rust, not Ruby folding
 
-Status: accepted
+Status: accepted (revised 2026-07-06 — syntactic-provenance fire rule, internal
+ordering, cross-rule gate and probe-derived spec corrections made normative,
+absorbing the [shape-tier audit](../notes/20260706-adr0039-shape-tier-audit.md))
 
 The container-precision the reference gets from **static shape types** (Tuple /
 HashShape) is ported to Rust as a native tier, NOT reproduced by executing Ruby in
 the sidecar. This is the concrete resolution of the [Slice 1 array-fold blocker](../notes/20260706-slice1-array-fold-blocker.md):
 the treemaps `call.possible-nil-receiver` gap is not a folding gap — it is a
-**shape-typing** gap.
+**shape-typing** gap. It also refines [ADR-0038](0038-flow-substrate-incremental-narrowing.md)'s
+parity goal: full 100% divergence-freedom is negotiable; **practical mismatches
+are minimized**, and what is resolvable Ruby-free gets resolved Ruby-free.
 
 ## Context — the finding that forces this
 
@@ -18,7 +22,9 @@ reference was silent). Tracing the reference showed WHY, and it is not what the
 - The reference types array literals and `Array.new(n)` (small constant `n`) as a
   **`Tuple`** — a static, per-position shape — via `expression_typer.rb`
   (`tuple_of(*elements…)`) and `method_dispatcher.rb`'s `array_new_lift`, capped at
-  `ARRAY_NEW_TUPLE_LIMIT = 16`. Oversize / non-constant sizes stay `Nominal[Array]`.
+  `ARRAY_NEW_TUPLE_LIMIT = 16`. Oversize / non-constant sizes stay `Nominal[Array]`
+  — and so does **zero-arg `Array.new`** (`array_new_lift` declines empty
+  `arg_types`; probe-confirmed: the reference fires possible-nil on its slice).
 - Shape-preserving methods (`map`/`select`/`reject`/`flatten`/…) **propagate the
   Tuple** (`expression_typer.rb:2853…`), which is why `[1,2,3].map{…}[0..1]` is
   silent too.
@@ -51,56 +57,106 @@ entirely, and literals are too common for that), and it pays a Ruby round-trip p
 literal. A native shape tier converges with the reference by construction and
 keeps the diagnostic in the **sound subset**.
 
-### 2. The FP-safety invariant (binds every shape slice)
+### 2. FP-safety: the set invariant AND the syntactic-provenance fire rule
 
 Re-enabling the possible-nil array-slice source is sound only while
 
 > **{arrays rigor-rs types `Nominal[Array]` (non-shape)} ⊆ {arrays the reference
 > types `Nominal[Array]`}.**
 
-If rigor-rs leaves an array `Nominal` that the reference made a `Tuple`, the slice
-source fires where the reference is silent — an FP (the `.map` case above). So a
-partial shape port must NEVER let the possible-nil source fire on an array whose
-provenance it has not proven the reference also keeps `Nominal`.
+A partial shape port CANNOT satisfy this invariant type-wise: until Tuple
+propagation is complete, an unmodeled Tuple op (`[1,2,3].map{}`) falls back to
+`Nominal[Array]` in rigor-rs while the reference keeps a Tuple — so **firing the
+slice source off the type env would FP** on `[1,2,3].map{}[0..n].size`. The two
+halves are reconciled by making the fire rule **syntactic, not type-based**:
 
-### 3. Slice 1 scope (static, gated by ADR-0038 §5)
+- **Mint the nilable fact ONLY when the receiver's binding RHS is literally
+  `Array.new(constant > 16 | non-constant | zero args)`** — the provenances
+  probe-confirmed to stay `Nominal[Array]` in the reference.
+- **The provenance travels on the tenv side** (the layer the ADR-0038 substrate
+  inherits into block bodies — treemaps binds `Array.new` in an OUTER block and
+  slices in an inner one), invalidated by exactly tenv's widen rules. The
+  per-block-fresh `nenv` cannot carry it.
+- The `Nominal[Array]` fallback for unmodeled Tuple ops is then safe: it serves
+  undefined-method (a Tuple's method set equals Array's) and never feeds the
+  possible-nil source. Type-based firing arrives only when propagation coverage
+  makes the set invariant hold type-wise (a later, measured slice).
 
-1. Add `Type::Tuple` (a fixed-length vector of element `TypeId`s) to the lattice +
-   interner.
-2. Type array literals and `Array.new(n ≤ 16)` as `Tuple` (port
-   `ARRAY_NEW_TUPLE_LIMIT = 16` faithfully; oversize / non-constant ⇒
-   `Nominal[Array]`).
-3. Shape dispatch: `Tuple#[]` (constant index → element type; static Range →
-   sub-`Tuple`; out-of-range → `Constant[nil]`), `Tuple#size` → `Constant[len]`.
-   Any unmodeled Tuple op falls back to `Nominal[Array]` (decline).
-4. Re-enable the possible-nil array-slice source, but fire it ONLY on the
-   provenance the invariant permits in Slice 1: a receiver bound directly to
-   `Array.new(size > 16 or non-constant)`. `.map`/`select`/… propagation is a
-   LATER slice; until it lands, those receivers stay declined (recall gap, safe).
-5. Gate: `fp_audit.py` 0-FP across the survey (synthetic literals / small
-   `Array.new` / `.map` slices all silent), harness 53/53, treemaps line 45
-   matches the reference, matched non-regression. **Then MEASURE** the tier's EV
-   before committing to further shape slices.
+### 3. Slice 1 scope (static, internally ordered, gated)
+
+Corollary of §2: **closing treemaps does not require `Type::Tuple` at all** — the
+gap payload is the provenance rule; Tuple is element-precision groundwork. Slice 1
+is therefore ordered internally so the lattice change never holds the gap hostage:
+
+**Slice 1a — the provenance fire (closes treemaps):**
+1. Thread the `Array.new`-provenance marker on the tenv side of the ADR-0038
+   substrate (§2); re-enable the possible-nil array-slice source firing ONLY on
+   it. `.map`/… receivers stay declined (recall gap, safe) until propagation.
+
+**Slice 1b — Tuple groundwork (element precision):**
+2. Add `Type::Tuple` (a fixed-length vector of element `TypeId`s) to the lattice +
+   interner. **`class_name_of(Tuple) = "Array"`** — method-existence resolution
+   delegates to Array, or every literal-array witness in today's matched set
+   regresses the moment literals type as Tuple.
+3. Type array literals and `Array.new(n ≤ 16, [fill])` as `Tuple` (port
+   `ARRAY_NEW_TUPLE_LIMIT = 16` faithfully; oversize / non-constant / zero-arg ⇒
+   `Nominal[Array]`). For the block-bearing form `Array.new(n){…}`, READ the
+   reference's actual block path first (the audited `array_new_lift` excerpt does
+   not mention blocks, though the 16-threshold was measured WITH blocks); mint
+   elements as Dynamic rather than inferring the block return — the safe side.
+4. Shape dispatch: `Tuple#[]` with a constant index → element type; with a static
+   Range → sub-`Tuple` for **non-negative literal in-bounds ranges ONLY** —
+   negative / beginless / endless / boundary (`start == size`) forms ⇒ decline
+   (Ruby's slice semantics are subtle; a wrong element type is an
+   undefined-method mis-witness). Statically out-of-range → `Constant[nil]`
+   (parity note: the reference then fires nil-receiver undefined-method, which
+   rigor-rs does not yet witness — fixture 08 gap — so this sub-feature pays
+   little until that lands). `Tuple#size` → `Constant[len]`. Any unmodeled Tuple
+   op falls back to `Nominal[Array]`.
+
+**Gate (both sub-slices):**
+- `fp_audit.py` 0-FP across the survey, harness green, matched non-regression —
+  AND, because the ADR-0038 Slice 1 FP was **invisible to the survey audit**
+  (real code rarely has the pattern; only a synthetic fixture caught it),
+  **committed harness negative fixtures**, not session-local checks: literal /
+  small-`Array.new` / two-arg / `.map`-result slices all silent; the positive
+  treemaps shape firing.
+- **Cross-rule differentials for every Constant-minting shape op** (probe-
+  confirmed: the reference fires `flow.always-truthy-condition` on
+  `if [1,2].size` and `if [1,2].size > 0`): `Tuple#size`/`#[]` feed the
+  flow-constant snapshots, so Slice 1b must gate always-truthy behavior against
+  the oracle on these shapes — an error-severity FP channel if conditions
+  diverge, a parity gain if they match.
+- **Pre-declared expectation** (so the measurement is not misread): algorithms
+  possible-nil 50 → 49 and matched +1 — treemaps line 45 ONLY; lines 46–48
+  remain declined by the substrate's same-block locality.
+- **Then MEASURE** the tier's EV before committing to further shape slices.
 
 ## Considered options
 
 - **Ruby-sidecar array folding** — rejected (§1): diverges from the reference's
   static model, full-fidelity-only, per-literal cost.
-- **Tactical `Array.new`-provenance rule only, no Tuple type** — closes treemaps
-  cheaply but is ad-hoc and gives none of the shape tier's element-precision; the
-  §3 slice subsumes it (the provenance fire IS Slice 1's possible-nil rule) while
-  laying the real lattice groundwork.
+- **Tactical `Array.new`-provenance rule only, no Tuple type** — this IS Slice 1a,
+  and it closes treemaps alone; the difference from "tactical only" is that the
+  Tuple groundwork (1b) is planned, measurement-gated, and ordered second rather
+  than abandoned.
+- **Type-based provenance (fire on `Nominal[Array]` in the env)** — rejected (§2):
+  under a partial port it violates the set invariant (`.map` fallback FP).
 - **Accept as a permanent sound-subset decline** — rejected: it is resolvable
   Ruby-free, and the goal is to minimize practical mismatches, not to bank them.
 
 ## Consequences
 
 - Honest EV note: a `Tuple` shares `Array`'s method set, so this does NOT add
-  `call.undefined-method` coverage over `Nominal[Array]`. Its gains are
-  element-type precision (`[1,"a"][0].typo` witnesses against the element), the
-  possible-nil FP-avoidance above, and shape-method result types. Slice 1 is
-  therefore measurement-gated — if the EV is thin, the tier stays at Slice 1
-  (treemaps closed) rather than expanding speculatively.
+  `call.undefined-method` coverage over `Nominal[Array]` (probe P6's element-type
+  witness — `[1,"a"][0].frobnicate` against Integer — is the exception where the
+  ELEMENT type is what pays). Gains are element-type precision, the possible-nil
+  FP-avoidance above, shape-method result types, and a measured always-truthy
+  channel. Slice 1 is measurement-gated — if the EV is thin, the tier stays at
+  Slice 1 (treemaps closed) rather than expanding speculatively.
 - `HashShape` and shape-preserving method propagation are later slices, each
-  0-FP-gated and each widening the invariant-permitted possible-nil fire set
-  monotonically.
+  0-FP-gated and each widening the type-wise invariant coverage monotonically
+  (eventually retiring the syntactic-provenance restriction).
+- `ARRAY_NEW_TUPLE_LIMIT` is a reference-implementation constant that can move
+  silently on an upstream bump — UPSTREAM.md's bump procedure re-measures the
+  shape thresholds.
