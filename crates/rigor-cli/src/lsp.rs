@@ -26,9 +26,9 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Hover,
-    HoverContents, HoverParams, HoverProviderCapability, MarkupContent, MarkupKind, NumberOrString,
-    OneOf, Position, PublishDiagnosticsParams, Range, ServerCapabilities, SymbolKind,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
+    HoverContents, HoverParams, HoverProviderCapability, MarkupContent, MarkupKind, MessageType,
+    NumberOrString, OneOf, Position, PublishDiagnosticsParams, Range, ServerCapabilities,
+    ShowMessageParams, SymbolKind, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 
 use rigor_index::CoreIndex;
@@ -38,6 +38,7 @@ use rigor_rules::{analyze_with_source, filter_suppressed, Severity, SuppressSet}
 use rigor_types::{Interner, Type, TypeId};
 
 use crate::config::Config;
+use crate::ruby_mode;
 
 /// `rigor lsp [--transport=stdio] [--log=PATH]`. Only `stdio` transport is
 /// supported in v1 (ADR-0029); `--log` is accepted and reserved (server logs go
@@ -113,6 +114,17 @@ fn run_stdio() -> Result<(), String> {
         index: CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new("."))),
         disable: cfg.disable_matcher(),
     };
+
+    // ADR-0036: `rigor lsp` defaults to `auto` (never break the editor when Ruby
+    // is unreachable — a structurally fragile case for GUI editors) and always
+    // SURFACES the coverage posture via a `window/showMessage` on startup, so
+    // reduced coverage is disclosed in the editor rather than silent.
+    let ruby = ruby_mode::resolve(None, cfg.ruby_config_value(), ruby_mode::RubyMode::Auto)
+        .unwrap_or(ruby_mode::RubyMode::Auto);
+    let (posture, reduced) = ruby_mode::interim_posture_line(&ruby);
+    let typ = if reduced { MessageType::WARNING } else { MessageType::INFO };
+    send_show_message(&connection, typ, format!("rigor: coverage posture — {posture}"))?;
+
     let mut buffers: HashMap<String, String> = HashMap::new();
 
     main_loop(&connection, &ctx, &mut buffers)?;
@@ -258,6 +270,20 @@ fn publish(
 ) -> Result<(), String> {
     let diags = compute_diagnostics(ctx, text);
     send_diagnostics(connection, uri, diags)
+}
+
+/// Send a `window/showMessage` notification (ADR-0036 posture disclosure).
+fn send_show_message(
+    connection: &Connection,
+    typ: MessageType,
+    message: String,
+) -> Result<(), String> {
+    let params = ShowMessageParams { typ, message };
+    let not = lsp_server::Notification::new("window/showMessage".to_string(), params);
+    connection
+        .sender
+        .send(Message::Notification(not))
+        .map_err(|e| e.to_string())
 }
 
 /// Send a `textDocument/publishDiagnostics` notification.

@@ -35,6 +35,7 @@ mod mcp;
 mod outline;
 mod plugins_cmd;
 mod rbs_collection;
+mod ruby_mode;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).
@@ -94,6 +95,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `apply_baseline_filter`): `--no-baseline` (Off) > `--baseline PATH`
     // (Path) > `.rigor.yml`'s `baseline:` (Unset → config).
     let mut baseline_arg = BaselineArg::Unset;
+    // ADR-0036 coverage-posture axis (CLI layer). `--ruby` and `--no-ruby` are
+    // mutually exclusive; the effective mode is resolved (CLI > env > config >
+    // default `require`) after config load.
+    let mut ruby_cli: Option<ruby_mode::RubyMode> = None;
+    let mut no_ruby_flag = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -130,6 +136,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 }
             },
             "--no-baseline" => baseline_arg = BaselineArg::Off,
+            "--ruby" => match it.next() {
+                Some(v) => ruby_cli = Some(ruby_mode::parse_value(v)),
+                None => {
+                    eprintln!("rigor check: --ruby expects require|auto|off|<path>");
+                    return ExitCode::from(64);
+                }
+            },
+            "--no-ruby" => no_ruby_flag = true,
+            other if other.starts_with("--ruby=") => {
+                ruby_cli = Some(ruby_mode::parse_value(&other["--ruby=".len()..]));
+            }
             other => files.push(other),
         }
     }
@@ -139,11 +156,35 @@ fn cmd_check(args: &[String]) -> ExitCode {
         return ExitCode::from(64);
     }
 
+    // ADR-0036 same-layer mutual exclusion: `--ruby` and `--no-ruby` together is
+    // a usage error, redundant or not.
+    if ruby_cli.is_some() && no_ruby_flag {
+        eprintln!("rigor check: --ruby and --no-ruby are mutually exclusive (specify at most one)");
+        return ExitCode::from(64);
+    }
+    let ruby_cli = ruby_cli.or(no_ruby_flag.then_some(ruby_mode::RubyMode::Off));
+
     // Load `.rigor.yml` (explicit `--config` path, else cwd auto-discovery).
     // Config ONLY suppresses/scopes diagnostics; it never changes analysis.
     // Degrades to default (= inert) on any error, so the differential harness —
     // which runs from a directory with no `.rigor.yml` — is unaffected.
     let cfg = Config::load(explicit_config.map(Path::new));
+
+    // ADR-0036 phase a: resolve the coverage-posture mode and disclose the interim
+    // posture. The sidecar is not yet implemented, so every mode runs the sound
+    // subset today; a non-opt-out mode gets a one-time stderr notice so the subset
+    // is DISCLOSED rather than silent. `off` chose the subset, so it stays quiet.
+    // The exit-69 hard error for `require` lands with the sidecar (phase b).
+    let ruby = match ruby_mode::resolve(ruby_cli, cfg.ruby_config_value(), ruby_mode::RubyMode::Require) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("rigor check: {e}");
+            return ExitCode::from(64);
+        }
+    };
+    if !ruby.is_opt_out() {
+        eprintln!("{}", ruby_mode::INTERIM_PENDING_NOTICE);
+    }
 
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
     // `# rigor:disable` applied). Shared with `baseline generate`.

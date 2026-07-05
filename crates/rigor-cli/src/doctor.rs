@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use rigor_index::{CoreIndex, RbsSource};
 
 use crate::config::Config;
+use crate::ruby_mode;
 
 /// `rigor doctor [--config PATH]` — report the environment/setup diagnostic.
 /// Exit 0 when healthy, 1 if a check fails (a malformed explicit config).
@@ -83,6 +84,20 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
             );
             println!("  → coverage is severely reduced; report this (the embedded set should always load).");
         }
+    }
+
+    // --- Coverage posture (ADR-0036) ----------------------------------------
+    // Which posture a default run resolves to (env + `rigor_rs.ruby`, default
+    // `require`). The sidecar is not yet implemented, so a non-opt-out mode is a
+    // *reduced* posture today (WARN, not FAIL — expected pre-sidecar); an explicit
+    // `--ruby=off` is a deliberate choice (PASS).
+    match ruby_mode::resolve(None, cfg.ruby_config_value(), ruby_mode::RubyMode::Require) {
+        Ok(ruby) => {
+            let (posture, reduced) = ruby_mode::interim_posture_line(&ruby);
+            let marker = if reduced { "WARN" } else { "PASS" };
+            println!("[{marker}] coverage posture: {posture}");
+        }
+        Err(e) => println!("[WARN] coverage posture: unresolved — {e}"),
     }
 
     // --- Plugins ------------------------------------------------------------

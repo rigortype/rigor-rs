@@ -63,6 +63,22 @@ pub struct Config {
     /// `rbs_collection:` config block (`auto_detect` default `true`, optional
     /// `lockfile` override).
     pub rbs_collection: RbsCollectionConfig,
+    /// ADR-0036: rigor-rs-SPECIFIC config, namespaced so it stays transparent to
+    /// the pure-Ruby reference (which ignores unknown keys) — the same `.rigor.yml`
+    /// feeds both. Reference-schema keys stay top-level; rigor-rs-only knobs live
+    /// here.
+    pub rigor_rs: RigorRsConfig,
+}
+
+/// ADR-0036: the `rigor_rs:` namespace for rigor-rs-specific config keys — those
+/// with no equivalent in the pure-Ruby reference's schema (the Ruby-sidecar
+/// coverage-posture mode is the first).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct RigorRsConfig {
+    /// The coverage-posture mode: `require` | `auto` | `off` | a ruby binary path
+    /// (ADR-0036, same grammar as `--ruby`). `None` ⇒ the context default.
+    pub ruby: Option<String>,
 }
 
 /// ADR-0034: the `rbs_collection:` config block. `auto_detect` (default `true`,
@@ -90,6 +106,7 @@ impl Default for Config {
             baseline: serde_yaml::Value::Null,
             signature_paths: default_signature_paths(),
             rbs_collection: RbsCollectionConfig::default(),
+            rigor_rs: RigorRsConfig::default(),
         }
     }
 }
@@ -189,6 +206,14 @@ impl Config {
             self.rbs_collection.auto_detect,
         ));
         dirs
+    }
+
+    /// The `.rigor.yml` `rigor_rs.ruby` value (ADR-0036), if set — the config
+    /// layer of the coverage-posture axis. `None` falls through to the context
+    /// default during [`crate::ruby_mode::resolve`].
+    #[must_use]
+    pub fn ruby_config_value(&self) -> Option<&str> {
+        self.rigor_rs.ruby.as_deref()
     }
 
     /// Whether `path` (as given on the command line) matches any `exclude:`
@@ -321,6 +346,21 @@ mod tests {
         let none: Config = serde_yaml::from_str("signature_paths: []\n").unwrap();
         assert!(none.signature_paths.is_empty());
         assert!(none.signature_dirs().is_empty());
+    }
+
+    #[test]
+    fn rigor_rs_ruby_namespaced_config() {
+        // ADR-0036: the coverage-posture mode lives under the `rigor_rs:` group.
+        let cfg: Config = serde_yaml::from_str("rigor_rs:\n  ruby: auto\n").unwrap();
+        assert_eq!(cfg.ruby_config_value(), Some("auto"));
+        // A path value round-trips verbatim.
+        let p: Config = serde_yaml::from_str("rigor_rs:\n  ruby: /opt/ruby/bin/ruby\n").unwrap();
+        assert_eq!(p.ruby_config_value(), Some("/opt/ruby/bin/ruby"));
+        // Absent group ⇒ None (context default applies).
+        assert_eq!(Config::default().ruby_config_value(), None);
+        // A stray top-level `ruby:` is NOT the rigor_rs one (must be namespaced).
+        let top: Config = serde_yaml::from_str("ruby: auto\n").unwrap();
+        assert_eq!(top.ruby_config_value(), None);
     }
 
     #[test]

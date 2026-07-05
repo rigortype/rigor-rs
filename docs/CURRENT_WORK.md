@@ -20,8 +20,15 @@ glossary terms in CONTEXT.md: **sound subset / full fidelity / coverage posture*
 redefined optional→default. **Phasing (a):** ship the flag/env/config surface + an interim "sidecar not
 yet implemented — running sound subset" posture notice NOW (converts today's *silent* subset into a
 *disclosed* one, freezes the vocabulary); the exit-69 hard-error teeth + real full fidelity land WITH the
-sidecar (still unimplemented). **Next:** implement the interim surface (flag parse + doctor posture line +
-one-time notice) — no sidecar needed. See [ADR-0036](adr/0036-ruby-sidecar-default-reversal.md).
+sidecar (still unimplemented). **Phase-a surface IMPLEMENTED** (`crates/rigor-cli/src/ruby_mode.rs`):
+`--ruby=require|auto|off|<path>` + `--no-ruby` + `RIGOR_RUBY`/`RIGOR_NO_RUBY` + `.rigor.yml` `rigor_rs.ruby`,
+layered resolution (CLI>env>file>default) with same-layer mutual-exclusion → exit 64; `check` emits the
+one-time interim "sidecar not yet implemented → sound subset" stderr notice (silent under `off`); `doctor`
+prints a coverage-posture line (WARN when reduced / PASS when opted out); `rigor lsp` defaults `auto` and
+surfaces posture via `window/showMessage`. Diagnostic stdout is byte-identical (notice is stderr-only) —
+harness stays 53/53 / 0 FP; `cargo test` + CI clippy clean. **Remaining (phase b, with the sidecar):** the
+exit-69 hard error, the handshake probe, real full fidelity, and a `--format json` posture field.
+See [ADR-0036](adr/0036-ruby-sidecar-default-reversal.md).
 
 Prior: 2026-07-05 — **[ADR-0034](adr/0034-rbs-collection-ingestion.md) — IMPLEMENTED.** The gem-RBS
 leg's Ruby-free half now ships: `rbs collection` discovery (`crates/rigor-cli/src/rbs_collection.rs`) — a
