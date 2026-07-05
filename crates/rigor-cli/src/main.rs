@@ -36,6 +36,7 @@ mod outline;
 mod plugins_cmd;
 mod rbs_collection;
 mod ruby_mode;
+mod sidecar;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).

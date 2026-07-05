@@ -30,6 +30,21 @@ harness stays 53/53 / 0 FP; `cargo test` + CI clippy clean. **Remaining (phase b
 exit-69 hard error, the handshake probe, real full fidelity, and a `--format json` posture field.
 See [ADR-0036](adr/0036-ruby-sidecar-default-reversal.md).
 
+**Phase b / sidecar — Slice 1 LANDED (branch `ruby-sidecar`).** transport + handshake + availability
+probe. `crates/rigor-cli/src/sidecar.rb` (embedded via `include_str!`, newline-delimited JSON — ADR-0008
+v1 transport, MessagePack deferred to the batching slice) + `sidecar.rs` client: spawn the ruby, read the
+`{rigor_sidecar,ruby_version}` handshake, exchange one `ping`, timeout-guarded (5s, worker-thread), child
+always killed. `ruby_bin_for(mode)` selects the binary (`ruby` on PATH / `<path>`; project-Ruby/bundler
+detection is a later slice). Wired into `rigor doctor` only: reports sidecar reachability + ruby version
+(a real ADR-0036 first-class posture check). Tests incl. a real-ruby handshake+ping (skipped when no
+ruby). **Sequencing refinement (deliberate):** the exit-69 hard error for `require` is HELD to Slice 2,
+not wired now — hard-failing (or spawning ruby on) every default `check` before folding is routed would
+be premature blast radius with no fidelity gain yet; the probe is built + tested + surfaced in `doctor`,
+and the teeth flip on in Slice 2 when a reachable sidecar actually delivers full fidelity. `check`/`lsp`
+hot paths unchanged (still the interim notice); harness stays 53/53 / 0 FP. **Next — Slice 2:** route the
+first real fold (a persistent worker + one non-Rust-foldable op → `Constant`), then flip on the exit-69
+teeth.
+
 Prior: 2026-07-05 — **[ADR-0034](adr/0034-rbs-collection-ingestion.md) — IMPLEMENTED.** The gem-RBS
 leg's Ruby-free half now ships: `rbs collection` discovery (`crates/rigor-cli/src/rbs_collection.rs`) — a
 pure filesystem+YAML port of the reference's `RbsCollectionDiscovery` (native `serde_yaml`, no bundler,

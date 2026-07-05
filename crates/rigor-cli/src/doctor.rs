@@ -96,6 +96,18 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
             let (posture, reduced) = ruby_mode::interim_posture_line(&ruby);
             let marker = if reduced { "WARN" } else { "PASS" };
             println!("[{marker}] coverage posture: {posture}");
+            // Slice 1: probe sidecar reachability (unless opted out). Folding is
+            // not yet routed, so a reachable sidecar does not yet raise coverage —
+            // reported honestly as "reachable; folding not yet routed".
+            if let Some(bin) = crate::sidecar::ruby_bin_for(&ruby) {
+                match crate::sidecar::probe(&bin) {
+                    Ok(hs) => println!(
+                        "[PASS] ruby sidecar: reachable — `{bin}` (ruby {}); folding not yet routed (Slice 2)",
+                        hs.ruby_version
+                    ),
+                    Err(e) => println!("[WARN] ruby sidecar: unreachable — {e}"),
+                }
+            }
         }
         Err(e) => println!("[WARN] coverage posture: unresolved — {e}"),
     }
