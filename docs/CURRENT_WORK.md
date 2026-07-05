@@ -54,9 +54,16 @@ real reachability. The phase-a interim notice is retired (sidecar is real now). 
 reference — `255.to_s(16).frobnicate` witnesses on the folded `"ff"` identically (full fidelity);
 `--no-ruby` stays sound-subset; exit 69 on require+no-ruby; harness **53/53 / 0 FP** with folding active
 (default check now spawns a sidecar); a deterministic mock-folder infer test guards the tier-1 wiring;
-real-ruby fold round-trip test; `cargo test` + CI clippy clean. **Next — Slice 3:** batching (one
-round-trip per file) + MessagePack framing; then Slice 4 (on-disk cache), Slice 5 (plugin invocation),
-and expanding the `sidecar_foldable` allowlist.
+real-ruby fold round-trip test; `cargo test` + CI clippy clean. **Allowlist expanded** (`53f652d`): +`Integer#gcd`, `Float#round`, `String#center/ljust/rjust/tr/sub/strip`
+— each reference-verified (real Ruby both sides ⇒ parity-safe by construction). **Sidecar is now
+FUNCTIONALLY COMPLETE** (spawn · fold routing · exit-69 teeth · posture disclosure · growing fidelity),
+all gated (harness 53/53, cargo test + CI clippy clean). **Remaining ADR-0008 work is enhancement, not
+core** and each wants its own focused effort: **Slice 3** batching (one round-trip/file) + MessagePack —
+a two-pass inference refactor OR per-rayon-thread workers; **perf, needs `make bench-perf`-style
+measurement to justify**, not correctness. **Slice 4** on-disk content-addressed cache (cross-run perf).
+**Slice 5** plugin target-library invocation — a large separate subsystem. Ongoing: grow the allowlist as
+real-project signal appears. Branch `ruby-sidecar`; commits `5420419` (S1) · `9b5bb64` (S2) · `53f652d`
+(allowlist).
 
 Prior: 2026-07-05 — **[ADR-0034](adr/0034-rbs-collection-ingestion.md) — IMPLEMENTED.** The gem-RBS
 leg's Ruby-free half now ships: `rbs collection` discovery (`crates/rigor-cli/src/rbs_collection.rs`) — a
