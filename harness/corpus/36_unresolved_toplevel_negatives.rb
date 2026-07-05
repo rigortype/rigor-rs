@@ -26,6 +26,9 @@ at_exit { 0 }
 catch(:done) { throw :done }
 freeze
 gets
+# RubyGems' `Kernel#gem` — runtime-injected, absent from the vendored RBS but
+# resolved by the reference via runtime reflection ⇒ silent (real-corpus FP audit).
+gem "some_dependency"
 
 # A same-file toplevel `def` resolves a toplevel call to it ⇒ silent.
 def local_helper
