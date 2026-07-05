@@ -185,6 +185,13 @@ pub enum Node {
     /// different type (the reference unions both; we conservatively decline).
     Definition {
         name: Option<String>,
+        /// `true` when this name-less Definition is a singleton-class body
+        /// (`class << X`), NOT a method `def`. A `class << X` is a CLASS scope —
+        /// non-toplevel, so `call.unresolved-toplevel` must NOT fire inside it —
+        /// whereas a `def self.x` / `def x` body is a method scope (a *toplevel*
+        /// `def` body still counts as toplevel and DOES fire). Both are name-less,
+        /// so this flag is the only reliable discriminator.
+        is_singleton_class: bool,
         has_explicit_return: bool,
         /// The method's PLAIN-POSITIONAL param names in order, or `None` to
         /// decline tier-4b param binding (splat/post/kwargs/block/optional
@@ -664,8 +671,17 @@ impl Builder {
                 .receiver()
                 .is_none()
                 .then(|| span_of(&def.name_loc()));
+            // A receiver-bearing def (`def recv.x`) evaluates `recv` in the
+            // ENCLOSING scope. Lower it so its reads are visible — otherwise a
+            // `def local.m` looks like `local` is assigned-but-never-read
+            // (flow.dead-assignment FP, real-corpus audit: textbringer). The node
+            // lives in the arena; the span-scan analyses find it (orphan-proof).
+            if let Some(recv) = def.receiver() {
+                let _ = self.lower_node(&recv);
+            }
             return self.push(Node::Definition {
                 name,
+                is_singleton_class: false,
                 has_explicit_return,
                 params,
                 name_span,
@@ -751,6 +767,7 @@ impl Builder {
             let body = self.lower_optional_body(sclass.body().as_ref());
             return self.push(Node::Definition {
                 name: None, // `class << self` has no single method name.
+                is_singleton_class: true, // a CLASS scope, not a method def.
                 has_explicit_return: false,
                 params: None,    // no single method ⇒ no param binding.
                 name_span: None, // no single name ⇒ no name span.

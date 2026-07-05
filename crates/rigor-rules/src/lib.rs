@@ -507,6 +507,14 @@ pub fn analyze_with_source_and_folder(
 /// injects toplevel methods that way would see a firing — the reference routes the
 /// same case to `pre_eval:` in the message; on the config-less corpus/harness the
 /// two agree exactly.
+/// Toplevel `Kernel` methods that the RUNTIME Ruby injects but the vendored
+/// RBS does not model, so `class_has_method("Object", …)` misses them. The
+/// reference resolves these via runtime reflection on `Object`; rigor-rs mirrors
+/// that result with this small, FP-safe allowlist. `gem` is RubyGems' `Kernel#gem`
+/// (the only core-only case the corpus FP audit surfaced). Extend as real signal
+/// appears — never a false positive, only a missed witness if wrong.
+const RUNTIME_KERNEL_TOPLEVEL: &[&str] = &["gem"];
+
 fn unresolved_toplevel_diagnostics(
     ast: &LoweredAst,
     index: &CoreIndex,
@@ -522,7 +530,12 @@ fn unresolved_toplevel_diagnostics(
     let scope_spans: Vec<rigor_parse::Span> = ast
         .iter()
         .filter_map(|(_, n)| match n {
+            // A `class << X` singleton-class body is a CLASS scope too — the
+            // reference stays silent on implicit-self calls inside it (FP audit:
+            // net-ssh/algorithms fired here). A method `def` (name-less or not) is
+            // NOT a class scope: a toplevel `def` body still fires.
             Node::ClassDef { .. } | Node::ModuleDef { .. } => Some(n.span()),
+            Node::Definition { is_singleton_class: true, .. } => Some(n.span()),
             _ => None,
         })
         .collect();
@@ -544,6 +557,14 @@ fn unresolved_toplevel_diagnostics(
             // is witnessed-absent only when Object's whole core chain is loaded;
             // an incomplete chain returns `true` ⇒ we stay silent — never an FP.)
             if index.class_has_method("Object", method) {
+                continue;
+            }
+            // Runtime-injected Kernel toplevel methods the vendored RBS doesn't
+            // model, but the live Ruby does — so the reference (which resolves via
+            // runtime reflection on `Object`, `check_rules.rb`) stays silent. `gem`
+            // (RubyGems' `Kernel#gem`) is the core-only case the net-ssh FP audit
+            // surfaced. FP-safe: this only ever silences.
+            if RUNTIME_KERNEL_TOPLEVEL.contains(&method.as_str()) {
                 continue;
             }
             let severity = catalog(CALL_UNRESOLVED_TOPLEVEL)
@@ -2572,6 +2593,16 @@ mod tests {
         // A read inside string interpolation counts as a read ⇒ silent.
         let diags = dead(b"def f\n  x = 1\n  \"v=#{x}\"\n  77\nend\n");
         assert!(diags.is_empty(), "interpolation read must suppress, got {diags:?}");
+    }
+
+    #[test]
+    fn dead_assignment_def_receiver_read_is_silent() {
+        // A local used as a singleton-def RECEIVER (`def x.m`) IS read — the
+        // receiver is evaluated in the enclosing scope. Real-corpus FP audit
+        // (textbringer): before lowering the receiver, `x` looked assigned-but-
+        // never-read here.
+        let diags = dead(b"def f\n  x = Object.new\n  def x.m\n    1\n  end\n  77\nend\n");
+        assert!(diags.is_empty(), "def-receiver read must suppress, got {diags:?}");
     }
 
     #[test]

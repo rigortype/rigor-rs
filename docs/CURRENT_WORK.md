@@ -6,7 +6,23 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-05 — **[ADR-0036](adr/0036-ruby-sidecar-default-reversal.md) — DESIGN ACCEPTED (grill
+Last updated: 2026-07-05 — **Real-corpus FP audit (branch `sidecar-perf`).** New tool `harness/fp_audit.py`
+diffs rigor-rs vs the reference on real projects (`rigor-survey`), reporting rigor-rs-only diagnostics
+(zero-FP-bar violations). Validated **0 FP on mastodon/app/models** (248 files) at the outset, then the
+audit across the wider corpus surfaced and fixed **four real FP clusters**: (1) `call.unresolved-toplevel`
+inside `class << X` singleton-class bodies (added an `is_singleton_class` AST discriminator; those bodies
+are class scopes) — net-ssh/algorithms; (2) `call.unresolved-toplevel` on RubyGems' `Kernel#gem` (a
+runtime-injected method the vendored RBS omits; small FP-safe allowlist mirroring the reference's runtime
+reflection) — net-ssh; (3) `call.undefined-method` on `Regexp.compile` (a singleton alias whose target
+`new` is `Class#new`, a base method the alias resolver didn't consult) — algorithms; (4)
+`flow.dead-assignment` on a `def local.m` singleton-def receiver (the receiver was dropped in lowering, so
+the local's read was invisible) — textbringer. **Comprehensive audit now: 0 FP across 12 validly-comparable
+corpora (~1750 files)** (erubi skipped — the reference aborts its 142-file batch; the tool was hardened to
+detect reference failure and skip rather than report false FPs). Each fix guarded by a unit test / corpus
+fixture; harness 53/53; cargo test + CI clippy clean. Also on this branch: [ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)
+(perf slices retired by measurement). Commits `6654cb1`(ADR-0037) `34957a8` `6ad8225` `a543289` `040c5d5`.
+
+Prior: 2026-07-05 — **[ADR-0036](adr/0036-ruby-sidecar-default-reversal.md) — DESIGN ACCEPTED (grill
 session), implementation phased.** Reverses ADR-0008's polarity **before any production-ready
 announcement** (BC-free window): **full fidelity (Ruby sidecar) is the default and product identity; the
 Ruby-free sound subset is an explicit opt-in.** Coverage-posture axis: `--ruby=require|auto|off|<path>`
@@ -57,13 +73,18 @@ reference — `255.to_s(16).frobnicate` witnesses on the folded `"ff"` identical
 real-ruby fold round-trip test; `cargo test` + CI clippy clean. **Allowlist expanded** (`53f652d`): +`Integer#gcd`, `Float#round`, `String#center/ljust/rjust/tr/sub/strip`
 — each reference-verified (real Ruby both sides ⇒ parity-safe by construction). **Sidecar is now
 FUNCTIONALLY COMPLETE** (spawn · fold routing · exit-69 teeth · posture disclosure · growing fidelity),
-all gated (harness 53/53, cargo test + CI clippy clean). **Remaining ADR-0008 work is enhancement, not
-core** and each wants its own focused effort: **Slice 3** batching (one round-trip/file) + MessagePack —
-a two-pass inference refactor OR per-rayon-thread workers; **perf, needs `make bench-perf`-style
-measurement to justify**, not correctness. **Slice 4** on-disk content-addressed cache (cross-run perf).
-**Slice 5** plugin target-library invocation — a large separate subsystem. Ongoing: grow the allowlist as
-real-project signal appears. Branch `ruby-sidecar`; commits `5420419` (S1) · `9b5bb64` (S2) · `53f652d`
-(allowlist).
+all gated. **MEASURED on `rigor-survey` (branch `sidecar-perf`, [ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)):**
+full-vs-`--no-ruby` delta is FLAT ~0.06s across 55→548 files (fixed spawn cost, NOT per-call IPC — folds
+fire only on rare pinned literals), and the diagnostic set is IDENTICAL full vs subset on every corpus
+(mastodon 109=109, algorithms 1561=1561, kramdown/liquid 0=0). **⇒ Slice 3 (batching+MessagePack) + Slice
+4 (on-disk cache) RETIRED** (optimize a non-bottleneck). **Slice 5 (plugin invocation) is NOT a sidecar
+slice:** rigor-rs's plugin model is RBS-bundles-only today — the code-contribution surface
+(`node_rule`/`dynamic_return`/`type_specifier`, ADR-0013/0027) + sidecar-hosted plugins are UNBUILT, so it
+is gated on building rigor-rs's whole plugin ENGINE (a major separate track). **Net: the Ruby sidecar is
+at a natural completion** (spawn · fold · exit-69 teeth · posture, all gated); constant folding is
+precision-additive on rare literal constructs + the substrate a future plugin engine reuses. Next real
+frontier = the plugin engine OR real-scale FP validation vs the reference on the corpora — both larger,
+separate tracks. `ruby-sidecar` merged (`2aa5ce6`); perf finding on `sidecar-perf`.
 
 Prior: 2026-07-05 — **[ADR-0034](adr/0034-rbs-collection-ingestion.md) — IMPLEMENTED.** The gem-RBS
 leg's Ruby-free half now ships: `rbs collection` discovery (`crates/rigor-cli/src/rbs_collection.rs`) — a
