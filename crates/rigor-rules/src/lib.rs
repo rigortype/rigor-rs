@@ -2007,6 +2007,19 @@ mod tests {
     }
 
     #[test]
+    fn parenthesized_receiver_types_through_the_parens() {
+        // `(15).frobnicate` — a parenthesized literal receiver types as its inner
+        // Constant (parens are pure grouping), so undefined-method witnesses.
+        // Real-corpus coverage-gap audit: closed ~13 undefined-method gaps.
+        let diags = run(b"(15).frobnicate\n");
+        assert_eq!(diags.len(), 1, "expected undefined-method, got {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(diags[0].receiver_type.as_deref(), Some("15"));
+        // A valid method through the parens stays silent.
+        assert!(run(b"(15).succ\n").is_empty(), "valid method must be silent");
+    }
+
+    #[test]
     fn known_method_is_silent() {
         let diags = run(b"s = \"Hello\"\ns.length\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");

@@ -1046,10 +1046,17 @@ impl Builder {
         }
 
         if let Some(parens) = node.as_parentheses_node() {
-            // A parenthesized expression — `(30.seconds)`, used as range endpoints
-            // and grouped operands. Lower the inner body for reachability; the node
-            // itself types Dynamic (precision is unnecessary for this fix).
+            // A parenthesized expression — `(30.seconds)`, `(15)`, grouped
+            // operands, range endpoints. `(e)` is pure grouping (`(e)` ≡ `e`), so
+            // a single-statement parens is UNWRAPPED to its inner node: a
+            // parenthesized receiver then types precisely (`(15).foo` witnesses on
+            // Integer — real-corpus coverage-gap audit). Multi-statement / empty
+            // parens keep the block wrapper (their value is the last statement,
+            // which the wrapper types as Dynamic — unchanged).
             let body = self.lower_optional_body(parens.body().as_ref());
+            if let [only] = body[..] {
+                return only;
+            }
             return self.push(Node::BeginRescue {
                 body,
                 span: span_of(&parens.location()),
