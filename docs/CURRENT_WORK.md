@@ -21,6 +21,17 @@ reference-free gates now **53/53 / 0 FP**; `cargo test` + CI clippy clean; disco
 **Deferred (parity-safe — coverage-gap only, never FP):** the bundler-installed-gem `sig/` leg (needs
 gem-path discovery, Ruby-free tension) and inline RBS (ADR-0007's fourth leg).
 
+**[ADR-0035](adr/0035-inline-rbs-deferred.md) — inline RBS DEFERRED (decision recorded).** The fourth
+ADR-0007 leg is opt-in in the reference (the `rigor-rbs-inline` plugin, ADR-32 / `--treat-all-as-inline-rbs`),
+not the default env — so deferring is parity-safe (the corpus never enables it; coverage-gap only). No
+Ruby-free parse path exists: the reference plugin delegates to the `rbs-inline` gem's
+`RBS::Inline::Parser`, and `ruby-rbs` parses `.rbs` files, not the rbs-inline comment sub-language — a
+faithful port means reimplementing that grammar in Rust (large, standalone), and rigor-rs has no
+source-parsing plugin surface (its plugin model is bundled-RBS only). Staged plan in the ADR (WD1
+contribution mechanism → WD2 minimal `#:` method-sig slice → WD3 `# @rbs` long tail), demand-gated.
+**With this, every ADR-0007 leg is resolved:** embedded stdlib + project `sig/` + `rbs_collection`
+IMPLEMENTED; bundler-installed-gem `sig/` (ADR-0034) + inline RBS (ADR-0035) deferred with rationale.
+
 Prior: 2026-07-05 — **Upstream pin bumped `v0.2.6` → `v0.2.7`** (`reference/rigor` @ `47c1c7d3`,
 [`UPSTREAM.md`](../UPSTREAM.md)). Re-baselined: live differential 50/50 (0 FP), snapshots byte-identical
 (0 written), reference-free gate PASS — no observable parity drift on the current corpus. v0.2.7's
