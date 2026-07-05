@@ -110,6 +110,16 @@ current rigor-rs support status. Fixtures are numbered:
 - `07`-`09`: coverage-gap cases (rules not yet implemented in rigor-rs) that
   exercise the `missing` path without causing failures
 
+### Fixture conventions
+
+- **Sidecar config** — `corpus/NN_name.rb` may ship `corpus/NN_name.rigor.yml`;
+  both tools then run with `--config <sidecar>` (used for plugin fixtures, ADR-25).
+- **Project sig/** (ADR-0033) — `corpus/NN_name.rb` may ship a sibling directory
+  `corpus/NN_name.sig/` of `.rbs` files. The harness stages a copy as `sig/` in
+  each tool's cwd, so the default `signature_paths: ["sig"]` ingests it — the two
+  implementations run symmetrically over the real project-signature path (e.g.
+  `37_project_sig_new`, `38_project_sig_negatives`).
+
 ## Divergence registry
 
 `harness/divergence-registry.yml` lists excused `extra` entries per ADR-0011.

@@ -1,0 +1,3 @@
+class Widget
+  def spin: () -> Integer
+end

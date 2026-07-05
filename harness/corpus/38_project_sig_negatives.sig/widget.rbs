@@ -1,0 +1,4 @@
+class Widget
+  def spin: () -> Integer
+  def describe: () -> String
+end

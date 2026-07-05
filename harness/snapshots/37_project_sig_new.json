@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/37_project_sig_new.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 14,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `spni' for Widget"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `spni' for Widget"
+    }
+  ]
+}

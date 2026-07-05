@@ -33,11 +33,13 @@ project-sig class (`Widget.new.spni`) exactly as the reference does, while a bun
 apart. Bare-constant/singleton witnessing (`Widget.spni`) fell out of the ingestion slice alone.
 **Verified:** E2E differential vs the reference across 7 receiver shapes (core / stdlib / project-sig ×
 direct/var/valid/singleton) — full parity; `cargo test` + CI clippy clean; the corpus differential
-harness stays 50/50 / 0 FP (the corpus ships no `sig/`, so the leg is inert there). **Follow-up:** the
-harness has no per-fixture `sig/` support, so the project-sig parity is guarded by unit tests
-(`rigor-index` + `rigor-rules`) + the manual E2E differential, not the automated corpus gate — adding
-sig-fixture support to `harness/` is the remaining infra task. Not yet ported: gem RBS /
-`rbs_collection` / inline RBS (separate ADR-0007 legs).
+harness now covers it: a per-fixture `corpus/NN_name.sig/` convention stages a `sig/` copy into each
+tool's cwd so the default `signature_paths: ["sig"]` ingests it symmetrically (`harness/lib.rb`
+`sig_dir`/`stage_sig_into`). Two fixtures added — `37_project_sig_new` (witnesses the `.new` typo, +2
+matched) and `38_project_sig_negatives` (valid calls + `Pathname` leniency, 0 diags). Live + reference-
+free gates now **52/52 / 0 FP**; snapshots committed. So project-sig parity is guarded by the automated
+corpus gate AND unit tests (`rigor-index` + `rigor-rules`). Not yet ported: gem RBS / `rbs_collection` /
+inline RBS (separate ADR-0007 legs).
 
 Prior: 2026-07-01 — **Productization track (lever A): 6 commits pushed (@ `8c3dbee`) + 4
 uncommitted polish commits (@ `28592fb`).** (1) §9 **rayon file-level parallelism** (byte-identical

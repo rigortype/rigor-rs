@@ -93,6 +93,24 @@ module RigorHarness
     File.exist?(cfg) ? cfg : nil
   end
 
+  # The per-fixture project `sig/` directory, or `nil` if it has none (ADR-0033).
+  # Convention: `corpus/NN_name.rb` ⇒ `corpus/NN_name.sig/` (a dir of `.rbs`).
+  # When present, BOTH tools run with a cwd whose `sig/` is a copy of it, so the
+  # DEFAULT `signature_paths: ["sig"]` picks it up — exercising the real project-
+  # signature ingestion path with no per-tool config divergence.
+  def sig_dir(fixture_path)
+    dir = fixture_path.sub(/\.rb\z/, ".sig")
+    File.directory?(dir) ? dir : nil
+  end
+
+  # Copy a fixture's `sig/` dir (if any) into `tmpdir` as `sig/`, so a tool run
+  # with `chdir: tmpdir` and default config resolves `signature_paths: ["sig"]`
+  # to it. No-op when the fixture ships no sig dir.
+  def stage_sig_into(fixture_path, tmpdir)
+    sig = sig_dir(fixture_path)
+    FileUtils.cp_r(sig, File.join(tmpdir, "sig")) if sig
+  end
+
   # The `-I <lib>` flags the reference needs to `require` every plugin named in
   # a sidecar config's `plugins:` list. Returns a flat array (possibly empty).
   def reference_plugin_includes(sidecar)
@@ -142,6 +160,10 @@ module RigorHarness
     Dir.mktmpdir("rigor-harness-ref") do |tmpdir|
       abs_fixture = File.expand_path(fixture_path)
 
+      # ADR-0033: stage the fixture's project sig/ so the reference's default
+      # `signature_paths: ["sig"]` (resolved against cwd = tmpdir) ingests it.
+      stage_sig_into(fixture_path, tmpdir)
+
       sidecar = sidecar_config(fixture_path)
       config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
 
@@ -183,13 +205,30 @@ module RigorHarness
 
     sidecar = sidecar_config(fixture_path)
     config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
+    cmd = [RIGOR_RS_BIN, "check", abs_fixture, "--format", "json", *config_flags]
 
-    stdout, stderr, _status = Open3.capture3(
-      RIGOR_RS_BIN, "check", abs_fixture, "--format", "json", *config_flags
-    )
+    # ADR-0033: a sig-bearing fixture runs in a clean tmpdir whose `sig/` is a
+    # copy of the fixture's, so the default `signature_paths: ["sig"]` ingests it
+    # — the SAME staging the reference gets, keeping the two implementations
+    # symmetric. A fixture without a sig dir runs as before (no chdir).
+    if sig_dir(fixture_path)
+      Dir.mktmpdir("rigor-harness-rs") do |tmpdir|
+        stage_sig_into(fixture_path, tmpdir)
+        stdout, stderr, _status = Open3.capture3(*cmd, chdir: tmpdir)
+        parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
+      end
+    else
+      stdout, stderr, _status = Open3.capture3(*cmd)
+      parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
+    end
+  end
 
+  # Parse rigor-rs's JSON stdout (falling back to stderr) into the normalized
+  # diagnostic array shared by both run paths. rigor-rs omits `severity`, so it
+  # defaults to `"error"`; diagnostics are filtered to parity severities and the
+  # fixture file.
+  def parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
     output = stdout.strip.empty? ? stderr.strip : stdout.strip
-
     return [] if output.strip.empty?
 
     parsed = JSON.parse(output)
