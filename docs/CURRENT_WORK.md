@@ -6,7 +6,19 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-05 — **Real-corpus FP audit (branch `sidecar-perf`).** New tool `harness/fp_audit.py`
+Last updated: 2026-07-06 — **FP-audit sweep completed (branch `fp-audit-sweep`).** Extended the audit to
+the full `rigor-survey` library set (redmine, concurrent-ruby, parser, haml/hamlit, ox, pycall, rbnacl,
+mangrove, jbuilder, dependabot-core/common, erubi, … + the earlier 12). One new FP class fixed:
+**ERB-template `.rb` files** (Rails generator `templates/*.rb` using `<%= … %>`) — Prism error-recovery
+over the non-Ruby source yielded a garbage AST that over-fired `unresolved-toplevel`/`undefined-method`
+(~58 FPs in jbuilder + redmine templates). `rigor_parse::looks_like_erb_template` (byte-level `%>`,
+mirroring the reference's `ErbTemplateDetector` EXACTLY) now skips such files in the check + LSP paths.
+**Result: 0 FP across the entire surveyed library corpus** (~4000+ files, 20+ libs). Remaining non-zero
+audits were artifacts, not rigor-rs bugs: the reference batch-aborts on some test/ dirs (erubi/test) →
+the tool SKIPs (comparison invalid); auditing lib/ dirs is clean. Guarded by a rigor-parse unit test +
+corpus fixture 41. harness 53/53 (41 fixtures); cargo test + CI clippy clean. Commit `00c8734`.
+
+Prior: 2026-07-05 — **Real-corpus FP audit (branch `sidecar-perf`).** New tool `harness/fp_audit.py`
 diffs rigor-rs vs the reference on real projects (`rigor-survey`), reporting rigor-rs-only diagnostics
 (zero-FP-bar violations). Validated **0 FP on mastodon/app/models** (248 files) at the outset, then the
 audit across the wider corpus surfaced and fixed **four real FP clusters**: (1) `call.unresolved-toplevel`

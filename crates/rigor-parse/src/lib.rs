@@ -18,6 +18,21 @@ pub fn parse(source: &[u8]) -> ruby_prism::ParseResult<'_> {
     ruby_prism::parse(source)
 }
 
+/// Whether `source` is actually an ERB template (a Rails generator
+/// `templates/foo.rb` using `<%= … %>`), not Ruby — in which case Prism's
+/// error recovery yields a garbage AST that the structural rules over-fire on.
+/// The analysis pipeline skips such files entirely, matching the reference's
+/// `ErbTemplateDetector`.
+///
+/// Detection mirrors the reference EXACTLY (byte-level): any `%>` closing marker
+/// proves it. `%>` cannot occur in valid Ruby — `%` is a binary operator that
+/// needs a right operand, never `>`. Mirroring the exact heuristic keeps parity
+/// even on its imperfections (a `%>` inside a string makes BOTH tools skip).
+#[must_use]
+pub fn looks_like_erb_template(source: &[u8]) -> bool {
+    source.windows(2).any(|w| w == b"%>")
+}
+
 /// Collect each comment as `(start_line /* 1-based */, comment_text)`.
 ///
 /// Used by in-source diagnostic suppression (`# rigor:disable` /
@@ -61,4 +76,20 @@ pub fn comment_lines(result: &ruby_prism::ParseResult<'_>, source: &[u8]) -> Vec
         out.push((line, text));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_erb_template;
+
+    #[test]
+    fn erb_template_detected_by_closing_marker() {
+        // A `%>` closing marker proves an ERB template (cannot occur in Ruby).
+        assert!(looks_like_erb_template(b"class <%= @name %> < Base\nend\n"));
+        assert!(looks_like_erb_template(b"<% if x -%>\nrequire 'y'\n<% end -%>\n"));
+        // Plain Ruby (including a lone `%` modulo op) is not a template.
+        assert!(!looks_like_erb_template(b"x = 5 % 2\nputs x\n"));
+        assert!(!looks_like_erb_template(b"class Foo\n  def bar; end\nend\n"));
+        assert!(!looks_like_erb_template(b""));
+    }
 }

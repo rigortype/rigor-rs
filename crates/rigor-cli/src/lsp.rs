@@ -342,6 +342,11 @@ fn send_diagnostics(
 /// malformed buffer that trips the parser yields no diagnostics, never a crash.
 fn compute_diagnostics(ctx: &ServerContext, text: &str) -> Vec<Diagnostic> {
     let bytes = text.as_bytes().to_vec();
+    // Skip ERB templates (matches `check` + the reference's ErbTemplateDetector):
+    // Prism's error recovery over a `<%= … %>` template yields a garbage AST.
+    if rigor_parse::looks_like_erb_template(&bytes) {
+        return Vec::new();
+    }
     let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
         let result = parse(&bytes);
         let comments = comment_lines(&result, &bytes);
