@@ -6,7 +6,42 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **Coverage-gap track opened (branch `coverage-gaps`).** Added `fp_audit.py --gaps`
+Last updated: 2026-07-06 — **nil/flow substrate DESIGNED ([ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md), merged).**
+Grill-decided strategy to close the two biggest coverage-gap clusters (possible-nil ~118, always-truthy ~117):
+complete ADR-0022's edge-aware model as a faithful reference port (goal = no divergence), on the threaded
+`flow_eval`, with an **"unmodeled construct ⇒ decline" backstop** (every partial state is a sound subset /
+0-FP; growing the modeled-construct set monotonically closes gaps to 100%). Every slice gated to 0-FP
+across the survey (`fp_audit.py`) + harness 53/53 + measured gap reduction.
+
+**▶▶ NEXT SESSION — START HERE: Slice 1 (foundation + possible-nil in block scopes).** Goal: close the
+unguarded block-scope possible-nil cluster (the treemaps class — `x = arr[0..n]; x.size` inside
+`RBench.run do … report do … end`). Concrete steps (all in `crates/rigor-infer` + `crates/rigor-rules`):
+1. **flow_eval must descend into block bodies.** Today `flow_eval_stmt` (rigor-infer/src/lib.rs) puts
+   `Call`-with-block in the `other` arm (widen, no descent). Thread the scope into the Call's `block_body`
+   (straight-line within the block; widen block-captured writes on exit).
+2. **Thread a nilability fact** (a `HashMap<String, &'static str>` local→non-nil-core-arm) alongside the
+   constant env through `flow_eval`. Source = the existing `nilable_local_core_arm` logic
+   (`method_return_nilable`) PLUS: (a) arg-aware collection slice `arr[Range]`/`str[Range]` → nilable self
+   (Array#[]'s overloads disagree so `method_return_nilable` collapses to None — recognise the single-Range-arg
+   form), (b) block-bearing `X.new(…){…}` typed as an `X` instance (extract a shared `type_dot_new` used by
+   both `type_call` and `type_block_call` — the plain path already does this inline).
+3. Clear a local's nilability on ANY not-yet-modeled construct between source and use (branch/loop/case/
+   logical/op-write/guard/reassignment) — the decline backstop (Slice 1 = straight-line only).
+4. Record a per-call-node `nilable_receiver_snapshot` (parallel to `always_truthy_snapshots`), and **rewire
+   `check_nil_receiver`** to fire from it (keep the exact firing conditions: safe-nav skip, method absent on
+   NilClass, present on the non-nil arm) instead of the `enclosing_def` span-scan. Retire the span-scan for
+   this rule.
+- **Gate:** `fp_audit.py` 0-FP across the survey (CRITICAL — narrowing/nilability bugs surface as FPs here),
+  harness 53/53, and a measured possible-nil gap reduction on algorithms (treemaps) + others. A slice that
+  closes no gaps is NOT shipped (recon lesson — [docs/notes/20260706-nil-flow-substrate-recon.md](notes/20260706-nil-flow-substrate-recon.md)).
+- **Reverted prior probe** (the source-resolution slice) closed 0 real gaps alone because it lacked block
+  scope — that's exactly what Slice 1 adds (block-descent). The `type_dot_new` + slice-nilability pieces
+  are correct and to be re-introduced as part of Slice 1.
+- **Then Slice 2+:** truthy/falsey narrowing per construct (if/unless → &&/‖ → nil?/early-return guard →
+  case → loop), each 0-FP-gated; **later:** always-truthy onto the substrate, then ivar value-flow (deque
+  `@size == 1` class; likely its own ADR).
+
+Prior: 2026-07-06 — **Coverage-gap track opened (branch `coverage-gaps`).** Added `fp_audit.py --gaps`
 (aggregates reference-only diagnostics by rule = the coverage-effort map). Landscape across the survey:
 `call.undefined-method` (~109), `call.possible-nil-receiver` (~118), `flow.always-truthy-condition` (~117)
 dominate — the top two need the ADR-0022 nil/flow substrate, and `call.argument-type-mismatch` (~30) is an
