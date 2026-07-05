@@ -85,9 +85,10 @@ fn main() -> ExitCode {
     }
 }
 
-/// `rigor check [--format text|json] <file...>` — analyze each file and print
-/// its diagnostics. Exit 1 if any diagnostic is found, 0 if none, 64 on a usage
-/// error (ADR-0030 exit codes).
+/// `rigor check [--format text|json] <path...>` — analyze each file or directory
+/// (a directory expands to its `**/*.rb`, ADR-0040) and print
+/// its diagnostics. Exit 1 if any ERROR-severity diagnostic is found (a
+/// warning-only run exits 0, ADR-0040), 64 on a usage error (ADR-0030 exit codes).
 fn cmd_check(args: &[String]) -> ExitCode {
     let mut format = OutputFormat::Text;
     let mut files: Vec<&str> = Vec::new();
@@ -153,7 +154,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     }
 
     if files.is_empty() {
-        eprintln!("rigor check: expected at least one file");
+        eprintln!("rigor check: expected at least one file or directory");
         return ExitCode::from(64);
     }
 
@@ -184,9 +185,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let folder_ref =
         sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
 
+    // ADR-0040 — expand directory args into their `**/*.rb` files and collect
+    // bad-path errors, matching the reference's `expand_paths`.
+    let (expanded_owned, path_errors) = expand_check_paths(&files);
+    let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
+
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
     // `# rigor:disable` applied). Shared with `baseline generate`.
-    let (mut findings, had_io_error) = analyze_files(&files, &cfg, "check", folder_ref);
+    let (mut findings, had_io_error) = analyze_files(&expanded, &cfg, "check", folder_ref);
 
     // ADR-22 — baseline filter, applied LAST (after inline `# rigor:disable`
     // and config `disable:`, per reference WD6). With no resolved baseline this
@@ -194,6 +200,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     if let Some(path) = resolve_baseline_path(&baseline_arg, &cfg) {
         findings = apply_baseline(findings, &path);
     }
+
+    // ADR-0040 — inject bad-path diagnostics AFTER the baseline filter (they are
+    // not code findings and must never be baseline-suppressed). Severity follows
+    // the reference: warn-and-skip when SOME files were analyzed, else error.
+    prepend_path_errors(&mut findings, &path_errors, !expanded_owned.is_empty());
 
     match format {
         OutputFormat::Text => print_text(&findings),
@@ -218,12 +229,13 @@ fn cmd_check(args: &[String]) -> ExitCode {
         emit_ci_detected_output(&findings);
     }
 
-    if had_io_error {
+    // ADR-0040 — exit 1 iff there is a genuine read I/O error OR any ERROR-severity
+    // finding (matching the reference's `error_count > 0`); a warning-only run —
+    // including a warn-and-skip bad path alongside analyzed files — exits 0.
+    if had_io_error || findings.iter().any(|(_, _, _, d)| d.severity == Severity::Error) {
         ExitCode::from(1)
-    } else if findings.is_empty() {
-        ExitCode::SUCCESS
     } else {
-        ExitCode::from(1)
+        ExitCode::SUCCESS
     }
 }
 
@@ -270,6 +282,115 @@ fn build_sidecar_folder(
             }
         }
     }
+}
+
+/// A CLI path argument that could not be turned into an analyzable `.rb` file.
+struct PathError {
+    path: String,
+    /// `true` — the path does not exist; `false` — it exists but is not a `.rb`
+    /// file (a directory is expanded, never a `PathError`).
+    not_found: bool,
+}
+
+/// Expand raw `check`/`baseline` path arguments into the concrete `.rb` files to
+/// analyze plus any bad-path errors — a faithful port of the reference's
+/// `Runner#expand_paths` (ADR-0040):
+/// - a DIRECTORY → its `**/*.rb` (recursive; hidden dirs and symlinks skipped;
+///   `.gitignore` ignored — only config `exclude:` prunes, via the per-file gate
+///   in [`analyze_files`]); each directory's files sorted, concatenated in arg
+///   order.
+/// - a FILE ending in `.rb` → kept as-is.
+/// - an existing non-`.rb` file → a `PathError { not_found: false }`.
+/// - a missing path → a `PathError { not_found: true }`.
+fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    for &p in raw {
+        let path = Path::new(p);
+        if path.is_dir() {
+            let mut in_dir = Vec::new();
+            collect_rb_files(path, &mut in_dir);
+            in_dir.sort();
+            files.extend(in_dir);
+        } else if path.is_file() && p.ends_with(".rb") {
+            files.push(p.to_string());
+        } else if path.exists() {
+            errors.push(PathError { path: p.to_string(), not_found: false });
+        } else {
+            errors.push(PathError { path: p.to_string(), not_found: true });
+        }
+    }
+    (files, errors)
+}
+
+/// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
+/// `Dir.glob("**/*.rb")`: SKIP hidden entries (name starting with `.`) and do NOT
+/// traverse or include symlinks (Ruby's `**` does not follow symlinked dirs; we
+/// skip symlinked files too — a vanishingly rare case, and skipping only loses
+/// coverage, never soundness). Unreadable directories are silently skipped.
+fn collect_rb_files(dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
+        let child = entry.path();
+        if ft.is_dir() {
+            collect_rb_files(&child, out);
+        } else if ft.is_file() && name.ends_with(".rb") {
+            out.push(child.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// Prepend bad-path diagnostics to `findings` (ADR-0040): severity is `warning`
+/// (` (skipped)`) when SOME files were found, else `error` — the reference's
+/// "a bad path among valid ones warns; a bad path leaving nothing to do errors,
+/// so a lone typo is not silently masked". Emitted with a synthetic `rule_id`
+/// (rigor-rs's `Diagnostic.rule_id` is non-optional; the reference uses `null`).
+fn prepend_path_errors(
+    findings: &mut Vec<(usize, String, String, Diagnostic)>,
+    errors: &[PathError],
+    any_files: bool,
+) {
+    if errors.is_empty() {
+        return;
+    }
+    let severity = if any_files { Severity::Warning } else { Severity::Error };
+    let suffix = if any_files { " (skipped)" } else { "" };
+    let mut injected: Vec<(usize, String, String, Diagnostic)> = errors
+        .iter()
+        .map(|e| {
+            let (rule, base): (&'static str, &str) = if e.not_found {
+                ("path.not-found", "no such file or directory")
+            } else {
+                ("path.not-ruby", "not a Ruby file (expected `.rb` or a directory)")
+            };
+            let diag = Diagnostic {
+                rule_id: rule,
+                start_offset: 0,
+                end_offset: 0,
+                message: format!("{base}{suffix}"),
+                severity,
+                source_family: "builtin",
+                receiver_type: None,
+                method_name: None,
+            };
+            (0usize, e.path.clone(), String::new(), diag)
+        })
+        .collect();
+    injected.append(findings);
+    *findings = injected;
 }
 
 fn analyze_files(
@@ -589,7 +710,11 @@ fn baseline_generate(args: &[String]) -> ExitCode {
     // IMPORTANT (reference parity): generate must record the UNFILTERED set —
     // it never applies an existing baseline (`analyze_files` does not), so the
     // new file records the live diagnostics, not the post-baseline (empty) surface.
-    let (findings, _had_io_error) = analyze_files(&files, &cfg, "baseline", folder_ref);
+    // ADR-0040 — expand directory args like `check` (a baseline is generated over
+    // a project tree); bad paths are simply skipped here (no diagnostic surface).
+    let (expanded_owned, _path_errors) = expand_check_paths(&files);
+    let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
+    let (findings, _had_io_error) = analyze_files(&expanded, &cfg, "baseline", folder_ref);
 
     // Key on project-root-relative paths, like the reference's `Dir.pwd`.
     let cwd = std::env::current_dir().ok();
@@ -1311,5 +1436,69 @@ mod tests {
         assert_eq!(v["version"], "2.1.0");
         assert_eq!(v["runs"][0]["results"].as_array().unwrap().len(), 0);
         assert_eq!(v["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap().len(), 0);
+    }
+
+    /// ADR-0040 — a directory arg expands to its `**/*.rb` (recursive), skipping
+    /// hidden dirs and non-`.rb` files; a missing path and an existing non-`.rb`
+    /// file become the two `PathError` kinds.
+    #[test]
+    fn expand_check_paths_dir_recursion_and_errors() {
+        let root = std::env::temp_dir().join(format!("rigor_expand_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join(".hidden")).unwrap();
+        std::fs::write(root.join("a.rb"), b"x = 1\n").unwrap();
+        std::fs::write(root.join("sub/b.rb"), b"y = 2\n").unwrap();
+        std::fs::write(root.join(".hidden/h.rb"), b"z = 3\n").unwrap();
+        std::fs::write(root.join("n.txt"), b"nope\n").unwrap();
+
+        let root_s = root.to_string_lossy().into_owned();
+        let (files, errs) = expand_check_paths(&[root_s.as_str()]);
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| Path::new(f).file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"a.rb".to_string()), "top-level .rb included");
+        assert!(names.contains(&"b.rb".to_string()), "nested .rb included");
+        assert!(!names.iter().any(|n| n == "h.rb"), "hidden dir skipped");
+        assert!(!names.iter().any(|n| n == "n.txt"), "non-.rb skipped in dir walk");
+        assert!(errs.is_empty(), "a valid dir yields no path errors");
+
+        // A missing path and an existing non-.rb file → the two PathError kinds.
+        let txt = root.join("n.txt").to_string_lossy().into_owned();
+        let missing = root.join("gone.rb").to_string_lossy().into_owned();
+        let (f2, e2) = expand_check_paths(&[missing.as_str(), txt.as_str()]);
+        assert!(f2.is_empty());
+        assert_eq!(e2.len(), 2);
+        assert!(e2[0].not_found, "missing path is not_found");
+        assert!(!e2[1].not_found, "existing non-.rb is not_found=false");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ADR-0040 — bad-path severity: `warning`+`(skipped)` when files were found,
+    /// else `error`; synthetic rule ids; injected ahead of the code findings.
+    #[test]
+    fn prepend_path_errors_severity_and_placement() {
+        let errs = vec![
+            PathError { path: "gone.rb".into(), not_found: true },
+            PathError { path: "x.txt".into(), not_found: false },
+        ];
+        // any_files = true ⇒ warnings, "(skipped)" suffix.
+        let mut findings = vec![(0usize, "a.rb".to_string(), "x = 1\n".to_string(),
+            diag("call.undefined-method", Severity::Error, "boom"))];
+        prepend_path_errors(&mut findings, &errs, true);
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].3.rule_id, "path.not-found");
+        assert_eq!(findings[0].3.severity, Severity::Warning);
+        assert!(findings[0].3.message.ends_with("(skipped)"));
+        assert_eq!(findings[1].3.rule_id, "path.not-ruby");
+        assert_eq!(findings[2].3.rule_id, "call.undefined-method", "code finding kept, after errors");
+
+        // any_files = false ⇒ errors, no suffix.
+        let mut empty = Vec::new();
+        prepend_path_errors(&mut empty, &errs, false);
+        assert_eq!(empty[0].3.severity, Severity::Error);
+        assert!(!empty[0].3.message.ends_with("(skipped)"));
     }
 }
