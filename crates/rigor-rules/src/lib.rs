@@ -912,6 +912,39 @@ fn check_call(
         });
     }
 
+    // Project-`sig/`-declared class instance (ADR-0033): `Widget.new` types to a
+    // source-registry `Nominal` that `class_name_of` (core-id only) will not
+    // resolve, so recover the name from the source registry. Witness a typo ONLY
+    // when the class was INTRODUCED by the project's OWN signatures
+    // (`is_project_sig_class`) — the reference treats project sig as
+    // authoritative, unlike a bundled stdlib/gem RBS class (`Pathname.new.typo`),
+    // which stays lenient, and unlike an in-source-only class (not sig-declared),
+    // which also stays lenient. `class_has_method` keeps its conservative gate
+    // (an incomplete ancestor chain ⇒ `true` ⇒ silent), so this never fires on a
+    // sig class whose charted super is unknown.
+    if index.class_name_of(interner, recv_ty).is_none() {
+        if let Some(name) = typer.source().class_name_for_id_of(interner, recv_ty) {
+            if index.is_project_sig_class(name) && !index.class_has_method(name, method) {
+                let name = name.to_string();
+                let receiver_render = render_receiver(interner, recv_ty, &name);
+                let message = format!("undefined method `{method}' for {receiver_render}");
+                let severity = catalog(CALL_UNDEFINED_METHOD)
+                    .map(|e| e.default_severity)
+                    .unwrap_or(Severity::Error);
+                return Some(Diagnostic {
+                    rule_id: CALL_UNDEFINED_METHOD,
+                    start_offset: message_span.0,
+                    end_offset: message_span.1,
+                    message,
+                    severity,
+                    source_family: "builtin",
+                    receiver_type: Some(receiver_render),
+                    method_name: Some(method.to_string()),
+                });
+            }
+        }
+    }
+
     // Witness ONLY over a class the core (RBS/CORE_CLASSES) surface models and
     // round-trips by id. A receiver that resolves only through the in-source /
     // registry surface (a project class, or a non-core `X.new` like Pathname)
@@ -3405,5 +3438,66 @@ mod tests {
             e.documentation_url,
             "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-raises"
         );
+    }
+
+    // --- ADR-0033: project `sig/`-declared class instance witnessing ----------
+
+    /// Analyze `src` against a CoreIndex built WITH a project `sig/` dir holding
+    /// `class Widget; def spin: () -> Integer; end`. Uses a real temp dir (sig
+    /// ingestion is filesystem-driven). Returns undefined-method diagnostics.
+    fn run_with_widget_sig(label: &str, src: &[u8]) -> Vec<Diagnostic> {
+        // `label` makes the dir unique per test — tests run in parallel threads
+        // sharing one process id, so a shared path would let one test's cleanup
+        // wipe another's sig file mid-run.
+        let dir = std::env::temp_dir()
+            .join(format!("rigor-rules-sig-{}-{label}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp sig dir");
+        std::fs::write(dir.join("widget.rbs"), "class Widget\n  def spin: () -> Integer\nend\n")
+            .expect("write sig");
+        let index = CoreIndex::for_project(&[], std::slice::from_ref(&dir));
+        let ast = lower(&parse(src));
+        let refs = [&ast];
+        let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+        let mut interner = Interner::new();
+        let diags = analyze_with_source(&ast, &mut interner, &index, &source)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        diags
+    }
+
+    #[test]
+    fn project_sig_new_instance_typo_is_witnessed() {
+        // `Widget.new.spni` — Widget is declared in project sig/, so the reference
+        // (and now rigor-rs) witnesses the typo on the `.new` instance.
+        let diags = run_with_widget_sig("typo", b"Widget.new.spni\n");
+        assert_eq!(diags.len(), 1, "expected witness, got {diags:?}");
+        assert_eq!(diags[0].receiver_type.as_deref(), Some("Widget"));
+        assert_eq!(diags[0].method_name.as_deref(), Some("spni"));
+        assert_eq!(diags[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn project_sig_new_instance_valid_method_is_silent() {
+        // `spin` IS declared ⇒ no diagnostic (the sig is authoritative both ways).
+        assert!(run_with_widget_sig("valid", b"Widget.new.spin\n").is_empty());
+    }
+
+    #[test]
+    fn project_sig_new_instance_through_variable_is_witnessed() {
+        // The instance type survives the local binding (`w = Widget.new; w.spni`).
+        let diags = run_with_widget_sig("var", b"w = Widget.new\nw.spin\nw.spni\n");
+        assert_eq!(diags.len(), 1, "expected one witness, got {diags:?}");
+        assert_eq!(diags[0].receiver_type.as_deref(), Some("Widget"));
+    }
+
+    #[test]
+    fn bundled_stdlib_new_instance_stays_lenient_with_sig_loaded() {
+        // Provenance gate: even with a project sig/ present, a bundled stdlib
+        // class (`Pathname`, NOT project-sig) keeps the reference's `.new`
+        // leniency — its typo must NOT be witnessed.
+        assert!(run_with_widget_sig("pathname", b"Pathname.new(\"a\").spni\n").is_empty());
     }
 }

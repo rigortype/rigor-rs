@@ -110,7 +110,7 @@ fn run_stdio() -> Result<(), String> {
     // for the whole session (the per-keystroke path never pays the RBS-load floor).
     let cfg = Config::load(None);
     let ctx = ServerContext {
-        index: CoreIndex::with_plugins(&cfg.plugins),
+        index: CoreIndex::for_project(&cfg.plugins, &cfg.signature_dirs()),
         disable: cfg.disable_matcher(),
     };
     let mut buffers: HashMap<String, String> = HashMap::new();

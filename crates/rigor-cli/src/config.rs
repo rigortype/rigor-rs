@@ -26,7 +26,12 @@ use serde::Deserialize;
 
 /// The parsed `.rigor.yml`. Unknown keys are ignored (no `deny_unknown_fields`),
 /// and every field defaults so a partial or empty file is valid.
-#[derive(Debug, Default, Deserialize)]
+///
+/// [`Default`] is hand-written (not derived) so `signature_paths` defaults to
+/// `["sig"]` — the reference's default — for both an absent key (container
+/// `#[serde(default)]` fills it from here) and a missing/malformed config file
+/// (`Config::load` returns `Config::default()`).
+#[derive(Debug, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Rule tokens to disable globally (e.g. `undefined-method`, `call`, `all`).
@@ -47,6 +52,31 @@ pub struct Config {
     /// and `false` spellings are accepted, then coerced by [`Config::baseline_path`].
     #[serde(default)]
     pub baseline: serde_yaml::Value,
+    /// ADR-0033: the project's own RBS signature directories, resolved relative
+    /// to the process cwd (the project-root convention config discovery uses).
+    /// Defaults to `["sig"]`, matching the reference. Each existing directory's
+    /// `*.rbs` are ingested into the type environment on top of core + plugin
+    /// RBS, so a project's hand-written types join the known-class surface the
+    /// dispatch rules witness against. A named dir that doesn't exist is inert.
+    pub signature_paths: Vec<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            disable: Vec::new(),
+            exclude: Vec::new(),
+            plugins: Vec::new(),
+            baseline: serde_yaml::Value::Null,
+            signature_paths: default_signature_paths(),
+        }
+    }
+}
+
+/// The reference's default `signature_paths`. A standalone fn so it seeds both
+/// the [`Default`] impl and serde's per-field container default.
+fn default_signature_paths() -> Vec<String> {
+    vec!["sig".to_string()]
 }
 
 impl Config {
@@ -109,6 +139,19 @@ impl Config {
             serde_yaml::Value::String(s) => Some(s.clone()),
             _ => None, // null / false / absent / non-string → no baseline
         }
+    }
+
+    /// The project RBS signature directories to ingest (ADR-0033), as paths
+    /// resolved relative to the process cwd (the same project-root convention as
+    /// config discovery). An entry naming a non-existent directory is inert —
+    /// ingestion skips it — so the default `["sig"]` costs nothing when a project
+    /// ships no signatures.
+    #[must_use]
+    pub fn signature_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.signature_paths
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect()
     }
 
     /// Whether `path` (as given on the command line) matches any `exclude:`
@@ -210,6 +253,37 @@ mod tests {
     fn disable_never_suppresses_internal_error() {
         let cfg = Config { disable: vec!["all".into()], exclude: vec![], ..Default::default() };
         assert!(!cfg.disable_matcher().suppresses("internal-error"));
+    }
+
+    #[test]
+    fn signature_paths_defaults_to_sig() {
+        // ADR-0033: an absent key defaults to ["sig"] (reference default), via
+        // both the container `#[serde(default)]` and `Config::default()`.
+        let present: Config = serde_yaml::from_str("disable: []\n").unwrap();
+        assert_eq!(present.signature_paths, vec!["sig".to_string()]);
+        assert_eq!(Config::default().signature_paths, vec!["sig".to_string()]);
+        assert_eq!(
+            Config::default().signature_dirs(),
+            vec![std::path::PathBuf::from("sig")]
+        );
+    }
+
+    #[test]
+    fn signature_paths_explicit_list() {
+        let cfg: Config =
+            serde_yaml::from_str("signature_paths:\n  - sig\n  - vendor/rbs\n").unwrap();
+        assert_eq!(cfg.signature_paths, vec!["sig", "vendor/rbs"]);
+        assert_eq!(
+            cfg.signature_dirs(),
+            vec![
+                std::path::PathBuf::from("sig"),
+                std::path::PathBuf::from("vendor/rbs")
+            ]
+        );
+        // An explicit empty list disables project-sig ingestion entirely.
+        let none: Config = serde_yaml::from_str("signature_paths: []\n").unwrap();
+        assert!(none.signature_paths.is_empty());
+        assert!(none.signature_dirs().is_empty());
     }
 
     #[test]

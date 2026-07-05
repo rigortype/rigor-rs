@@ -93,12 +93,27 @@ impl CoreIndex {
     /// default no-config path stays unchanged. The plugin selectors (and the new
     /// chained witnesses they enable) appear ONLY when a plugin is named in config.
     pub fn with_plugins(enabled: &[String]) -> Self {
+        Self::for_project(enabled, &[])
+    }
+
+    /// Build the index with config-gated plugins AND the project's own `sig/`
+    /// RBS ingested on top (ADR-0033, the ADR-0007 project-signature leg). Each
+    /// dir in `sig_dirs` (from `.rigor.yml`'s `signature_paths:`, default
+    /// `["sig"]`) is folded through the SAME native parser + reopen-union merge
+    /// as core + plugin RBS — no Ruby runtime. A project's own classes thereby
+    /// join [`Self::knows_class`], so the dispatch rules witness them exactly as
+    /// the reference's `rbs_class_known?` gate does.
+    ///
+    /// **Gating:** `for_project(enabled, &[])` is byte-identical to
+    /// [`Self::with_plugins`], and with no `sig/` on disk the ingestion is inert,
+    /// so the default no-config path stays unchanged.
+    pub fn for_project(enabled: &[String], sig_dirs: &[std::path::PathBuf]) -> Self {
         let resolved: Vec<&'static plugins::BundledPlugin> = enabled
             .iter()
             .filter_map(|id| plugins::bundled_plugin(id))
             .collect();
         Self {
-            data: rbs::CoreData::load_with_plugins(&resolved),
+            data: rbs::CoreData::load_for_project(&resolved, sig_dirs),
         }
     }
 
@@ -120,6 +135,16 @@ impl CoreIndex {
     /// silent on classes outside the loaded set (ADR-0023: never guess).
     pub fn knows_class(&self, class_name: &str) -> bool {
         self.data.knows_class(class_name)
+    }
+
+    /// Whether `class_name` was INTRODUCED by project-`sig/` ingestion (ADR-0033)
+    /// rather than carried by a bundled (core/stdlib/plugin) RBS. The dispatch
+    /// rules witness an `X.new` instance-method typo on such a project-authored
+    /// class (the reference treats project sig as authoritative) while staying
+    /// lenient on a bundled stdlib/gem class (`Pathname.new.typo`). Always
+    /// `false` when no `sig/` was ingested, so the default path is unchanged.
+    pub fn is_project_sig_class(&self, class_name: &str) -> bool {
+        self.data.is_project_sig_class(class_name)
     }
 
     /// Whether `class_name` was declared at GENUINE top level (empty namespace)

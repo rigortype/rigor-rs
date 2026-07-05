@@ -22,12 +22,22 @@ construction — unknown class ⇒ Dynamic — so nothing re-declares a name); (
 (`crates/rigor-index/src/rbs.rs`) unions by name key with NO class/module kind concept and raises no
 error, and there is no `resolve_type_names`-style global validation that could collapse the env to nil
 (per-file parse failures are isolated, ADR-0016). This is exactly the deliberate divergence ADR-79
-records. **Next work opened:** [ADR-0033](adr/0033-project-sig-ingestion.md) commits the ADR-0007
-project-`sig/` ingestion leg (still unimplemented) — add a `signature_paths:` config key + feed the
-resolved dirs through the existing `ingest_rbs_dir`, Ruby-free (native `ruby-rbs`). It is primarily a
-coverage lever: `knows_class` widens to project-sig'd classes to match the reference's `rbs_class_known?`
-gate, closing missed `call.undefined-method` witnesses. Landing gate = differential harness on a
-`sig/`-shipping corpus project (coverage delta + 0 unregistered FP).
+records. **[ADR-0033](adr/0033-project-sig-ingestion.md) — IMPLEMENTED (2026-07-05).** The ADR-0007
+project-`sig/` ingestion leg now ships, Ruby-free (native `ruby-rbs`), in two cohesive slices: (1)
+**ingestion** — a `signature_paths:` config key (default `["sig"]`) whose dirs feed the existing
+`ingest_rbs_dir` into the same reopen-union `Builder`; all four production callers use
+`CoreIndex::for_project`. (2) **witnessing** — project-sig classes carry provenance
+(`CoreData::is_project_sig_class`), so `call.undefined-method` witnesses an `X.new` instance typo on a
+project-sig class (`Widget.new.spni`) exactly as the reference does, while a bundled stdlib/gem class
+(`Pathname.new.typo`) and an in-source-only class stay lenient — the provenance gate keeps the two
+apart. Bare-constant/singleton witnessing (`Widget.spni`) fell out of the ingestion slice alone.
+**Verified:** E2E differential vs the reference across 7 receiver shapes (core / stdlib / project-sig ×
+direct/var/valid/singleton) — full parity; `cargo test` + CI clippy clean; the corpus differential
+harness stays 50/50 / 0 FP (the corpus ships no `sig/`, so the leg is inert there). **Follow-up:** the
+harness has no per-fixture `sig/` support, so the project-sig parity is guarded by unit tests
+(`rigor-index` + `rigor-rules`) + the manual E2E differential, not the automated corpus gate — adding
+sig-fixture support to `harness/` is the remaining infra task. Not yet ported: gem RBS /
+`rbs_collection` / inline RBS (separate ADR-0007 legs).
 
 Prior: 2026-07-01 — **Productization track (lever A): 6 commits pushed (@ `8c3dbee`) + 4
 uncommitted polish commits (@ `28592fb`).** (1) §9 **rayon file-level parallelism** (byte-identical

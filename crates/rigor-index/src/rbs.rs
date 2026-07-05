@@ -162,6 +162,14 @@ pub struct CoreData {
     /// project class and a namespaced stdlib class is not falsely treated as a
     /// known top-level core class (defect 2).
     toplevel_classes: HashSet<&'static str>,
+    /// Class names INTRODUCED by project-`sig/` ingestion (ADR-0033) — those the
+    /// project's own signatures declared that no bundled (core/stdlib/plugin) RBS
+    /// already carried. The dispatch rules treat these as AUTHORITATIVE for
+    /// witnessing an `X.new` instance method typo (the reference witnesses a
+    /// project-sig class but stays lenient on a bundled stdlib/gem class like
+    /// `Pathname`), so this set is the provenance gate that keeps the two apart.
+    /// Empty when no `sig/` was ingested.
+    project_sig_classes: HashSet<&'static str>,
 }
 
 impl CoreData {
@@ -197,6 +205,28 @@ impl CoreData {
     /// by the caller ([`crate::CoreIndex::with_plugins`]); here every entry is a
     /// real bundled payload.
     pub fn load_with_plugins(plugins: &[&crate::plugins::BundledPlugin]) -> Self {
+        Self::load_for_project(plugins, &[])
+    }
+
+    /// Build the core data + bundled plugins (as [`Self::load_with_plugins`]),
+    /// THEN ingest each project signature directory's `*.rbs` on top (ADR-0033).
+    /// With `sig_dirs` empty this is byte-identical to [`Self::load_with_plugins`],
+    /// so the no-config / no-`sig/` path is unchanged.
+    ///
+    /// The project sig is folded through the SAME native `ruby-rbs` parser and
+    /// the SAME reopen-union [`Builder::merge`] as core + plugin RBS — no Ruby
+    /// runtime, no new format (the ADR-0007 project-signature leg). A project's
+    /// own classes thereby join the loaded set, so [`Self::knows_class`] (the
+    /// dispatch-rule gate, the analogue of the reference's `rbs_class_known?`)
+    /// witnesses them. A `sig_dir` that doesn't exist on disk is inert
+    /// ([`ingest_rbs_dir`] skips a non-directory). User-authored RBS degrades
+    /// soundly: a per-file parse failure drops only that file's declarations
+    /// (ADR-0016), and there is no global resolve pass that a malformed file
+    /// could collapse (ADR-0033).
+    pub fn load_for_project(
+        plugins: &[&crate::plugins::BundledPlugin],
+        sig_dirs: &[PathBuf],
+    ) -> Self {
         // 1) Resolve the core source (override dir, else embedded), folding into a
         //    fresh builder — the SAME logic [`Self::load`] previously inlined.
         let mut builder = Builder::default();
@@ -221,9 +251,25 @@ impl CoreData {
             }
         }
 
+        // 3) Ingest the project's own `sig/` RBS on top of core + plugin
+        //    (ADR-0033). Same parser, same reopen-union merge. Snapshot the
+        //    class keyset first so the names the project sig INTRODUCES (vs
+        //    reopens of an already-bundled class) are recorded as project-sig
+        //    provenance — the witnessing gate for `X.new` typos.
+        let pre_sig: HashSet<&'static str> = builder.classes.keys().copied().collect();
+        for dir in sig_dirs {
+            ingest_rbs_dir(&mut builder, dir);
+        }
+        let project_sig_classes: HashSet<&'static str> = builder
+            .classes
+            .keys()
+            .copied()
+            .filter(|k| !pre_sig.contains(k))
+            .collect();
+
         let (classes, toplevel_classes) = builder.finish();
         if !classes.is_empty() {
-            return Self { source, classes, toplevel_classes };
+            return Self { source, classes, toplevel_classes, project_sig_classes };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
         // carries no plugin selectors, which stays conservative (zero-FP).
@@ -952,13 +998,28 @@ impl CoreData {
         // whole key set is the top-level set (defect 2: `knows_toplevel_class`
         // of a curated class is `true`, of an unknown name is `false`).
         let toplevel_classes: HashSet<&'static str> = classes.keys().copied().collect();
-        Self { source: RbsSource::Stub, classes, toplevel_classes }
+        Self {
+            source: RbsSource::Stub,
+            classes,
+            toplevel_classes,
+            project_sig_classes: HashSet::new(),
+        }
     }
 
     /// The signature source this data was built from (embedded / override /
     /// stub) — surfaced by `rigor doctor` (audit-R1).
     pub fn source(&self) -> &RbsSource {
         &self.source
+    }
+
+    /// Whether `class_name` was INTRODUCED by project-`sig/` ingestion (ADR-0033)
+    /// — declared in the project's own signatures and not already carried by a
+    /// bundled (core/stdlib/plugin) RBS. The dispatch rules use this to witness an
+    /// `X.new` instance-method typo on a project-authored class while staying
+    /// lenient on a bundled stdlib/gem class. Always `false` when no `sig/` was
+    /// ingested.
+    pub fn is_project_sig_class(&self, class_name: &str) -> bool {
+        self.project_sig_classes.contains(class_name)
     }
 
     /// How many distinct classes the loaded RBS surface registered. A coarse
@@ -1508,5 +1569,51 @@ mod embedded_tests {
         // The existing non-nil accessors are unchanged by the new bit.
         assert_eq!(idx.method_return("String", "upcase"), Some("String"));
         assert_eq!(idx.method_return("String", "byteslice"), Some("String"));
+    }
+
+    /// ADR-0033: an empty `sig_dirs` is byte-identical to `load_with_plugins`
+    /// (the gating contract) — the no-`sig/` path must be unchanged.
+    #[test]
+    fn empty_project_sig_is_unchanged() {
+        let base = CoreData::load_with_plugins(&[]);
+        let with_sig = CoreData::load_for_project(&[], &[]);
+        assert_eq!(base.class_count(), with_sig.class_count());
+        // A named-but-absent dir is inert too (ingestion skips a non-directory).
+        let absent = CoreData::load_for_project(
+            &[],
+            &[std::path::PathBuf::from("this-dir-does-not-exist-xyzzy")],
+        );
+        assert_eq!(base.class_count(), absent.class_count());
+    }
+
+    /// ADR-0033: a project `sig/` dir's classes join the known set (so the
+    /// dispatch rules can witness them) and their methods resolve, while a typo
+    /// on such a class is witnessed-absent — exactly the reference's
+    /// `rbs_class_known?` behaviour. Uses a real temp dir since ingestion is
+    /// filesystem-driven (`ingest_rbs_dir`).
+    #[test]
+    fn project_sig_widens_known_classes() {
+        let base = std::env::temp_dir()
+            .join(format!("rigor-sig-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp sig dir");
+        std::fs::write(
+            base.join("widget.rbs"),
+            "class Widget\n  def spin: () -> Integer\nend\n",
+        )
+        .expect("write sig");
+
+        let data = CoreData::load_for_project(&[], std::slice::from_ref(&base));
+        assert!(data.knows_class("Widget"), "project class joins knows_class");
+        assert!(data.knows_toplevel_class("Widget"), "declared at top level");
+        assert!(data.class_has_method("Widget", "spin"), "declared method resolves");
+        // A typo is witnessed-absent (the whole ancestor chain — Widget + Object
+        // — is loaded, so absence is decidable), the coverage this leg unlocks.
+        assert!(!data.class_has_method("Widget", "spni"));
+        // Core classes are unaffected by the project ingest.
+        assert!(data.knows_class("String"));
+        assert!(data.class_has_method("String", "upcase"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
