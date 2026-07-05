@@ -149,8 +149,12 @@ is therefore ordered internally so the lattice change never holds the gap hostag
 
 **Slice 1a shipped** (the syntactic-provenance possible-nil fire, no `Type::Tuple`):
 closes the treemaps gap (algorithms possible-nil 50→49, matched +1 — line 45
-only), 0 FP across ~1800 survey files, harness 54/54 with committed positive +
-shape-negative fixtures (42/43), 435 tests. The FP-safe fire is gated on the
+only), harness 54/54 with committed positive + shape-negative fixtures (42/43),
+435 tests. **0 FP verified across the FULL survey — 26 corpora, ~2300 files**
+(the only non-zero audit is tdiary-core's 9 pre-existing `unresolved-toplevel`
+FPs, baseline-identical, unrelated to this work). A new source on a ubiquitous
+type (arrays) is the maximal FP surface, so the whole-survey audit — not just the
+sampled corpora — is the bar; it holds. The FP-safe fire is gated on the
 `penv` provenance set (`Array.new` zero-arg / constant size > 16), threaded on the
 tenv side of the ADR-0038 substrate.
 
