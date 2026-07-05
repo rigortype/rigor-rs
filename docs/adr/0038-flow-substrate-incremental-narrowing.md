@@ -1,6 +1,7 @@
 # Completing the ADR-0022 flow substrate: FP-safe incremental narrowing
 
-Status: accepted
+Status: accepted (revised 2026-07-06 — block-scope semantics made normative +
+gate hardened, absorbing the [slice-1 audit](../notes/20260706-adr0038-slice1-audit.md))
 
 [ADR-0022](0022-control-flow-scopes-and-facts.md) accepts the edge-aware scope /
 fact-bucket model as a **faithful port** of the reference's control-flow analysis
@@ -23,6 +24,12 @@ recon confirmed this empirically: a bounded structural source-resolution slice w
 0-FP but closed ZERO real gaps (every real occurrence is in a block/top-level
 scope the span-scan defers on). So the substrate must be the real edge-aware
 model, built on the threaded `flow_eval` (not the span-scan).
+
+The recon also names WHERE the FP risk concentrates: **possible-nil across block /
+top-level scopes**, where capture and re-entrancy make narrowing delicate. A
+pre-implementation audit ([2026-07-06](../notes/20260706-adr0038-slice1-audit.md))
+confirmed the original slice plan was thin exactly there; §3 below makes those
+semantics normative rather than leaving them to implementation judgment.
 
 ## The decision
 
@@ -48,17 +55,58 @@ generalizes the established completeness discipline (`class_has_method` witnesse
 absence only when the ancestor chain is fully loaded; the current possible-nil
 declines on any guard).
 
-### 3. Slice sequence
+### 3. Block-scope semantics (normative — the FP-delicate core)
+
+Descending `flow_eval` into block bodies is where the real gaps live AND where
+the FP risk concentrates. A block is not straight-line code that happens to be
+indented: it may run **zero times** (`[].each`), **many times** (loop-shaped
+re-entrancy — a read lexically *before* the block's own capture-write observes
+the post-write value on iteration 2), or **later / elsewhere** (a stored
+callback, where lexical position carries no fact at all). These rules are
+therefore part of the decision, not implementation detail:
+
+- **Entry-widen.** Before descending into a block body, widen every
+  capture-write whose span falls inside that block (the same
+  `widen_flow_writes` discipline, applied to the block span *on entry* — exit
+  widening alone is unsound under re-entrancy).
+- **Fact locality (until narrowing justifies more).** A fact may only support a
+  fire when its source and its use sit in the **same block body** (or the same
+  non-block scope). A fact crossing a block boundary in either direction is
+  `unknown` ⇒ decline. Later slices may relax this per construct, each
+  relaxation individually 0-FP-gated.
+- **Shadow-clearing.** On descent, clear every name bound by the block's
+  parameters — including destructured, numbered (`_1`…) and `it` params. A
+  same-named block param is a different variable; a leaked outer fact is a
+  guaranteed FP class. `def`/`class`/`module` bodies keep their existing
+  fresh-state treatment for every fact kind threaded through `flow_eval`.
+- **Descend XOR widen.** A Call-with-block that is descended must NOT also pass
+  through the `other`-arm span-widen (else every descended fact is immediately
+  destroyed — a silent no-op, which the "no gap closed ⇒ not shipped" gate
+  would catch late and expensively).
+- **Per-rule flow state.** Each rule threads its own fact map and its own
+  record/suppress flags. The existing `in_loop_or_block` flag (always-truthy
+  suppression) is NOT overloaded to govern nilability — one flag serving two
+  rules with opposite in-block behavior is how a suppression bug ships.
+
+### 4. Slice sequence
 
 - **Slice 1 — scope foundation + nilability + possible-nil.** Thread a local
-  `nilable` fact through `flow_eval`, INCLUDING block bodies (the real gaps are in
-  blocks). Sources: `method_return_nilable` + the arg-aware collection slice
+  `nilable` fact through `flow_eval`, INCLUDING block bodies under the §3 rules.
+  Sources: `method_return_nilable` + the arg-aware collection slice
   (`arr[Range]`/`str[Range]` → nilable self-collection, which the multi-overload
-  `method_return_nilable` collapses to None). Also type block-bearing `X.new(…){…}`
-  as an `X` instance (shared `.new` typing). Fire possible-nil on a straight-line,
-  unguarded, certainly-nilable local receiver; **decline** if any branch / guard /
-  reassignment lies between source and use. Closes the unguarded block-scope
-  cluster (treemaps class).
+  `method_return_nilable` collapses to None) — applied ONLY when the receiver is
+  a confirmed core `Array`/`String` (user-defined `[]` ⇒ decline), with the
+  two-arg `arr[i, len]`, endless-range and `str[Regexp]` forms explicitly out of
+  scope (⇒ decline). Also type block-bearing `X.new(…){…}` as an `X` instance
+  via a shared `type_dot_new` — which MUST carry the 2026-06-26 leniency
+  invariant with it (**non-core `.new` instances are typed but never
+  witnessed**; the witnessing gate moves with the extraction, or the
+  `Struct.new(...).new` FP class returns). Fire possible-nil on a straight-line,
+  unguarded, certainly-nilable local receiver; **decline** if any branch /
+  guard / reassignment lies between source and use. Rewiring retires the
+  `enclosing_def` gate, so top-level receivers become fireable — confirm E2E
+  that the reference fires at top level BEFORE enabling it there. Closes the
+  unguarded block-scope cluster (treemaps class).
 - **Slice 2+ — truthy/falsey narrowing, one construct at a time**: `if`/`unless`
   → `&&`/`||` → `.nil?` / early-return guard → `case` → loops. Each admits more
   guarded flows (growing recall); each gated to 0-FP + measured gap reduction.
@@ -66,12 +114,24 @@ declines on any guard).
   truthy/falsey), then ivar value-flow (the deque `@size == 1` class,
   ADR-58-adjacent — the deepest, deferred).
 
-### 4. Gate
+**Recorded debt:** the hand-recognized `arr[Range]` form is a bounded stand-in
+for the reference's real overload selection (which picks the `Range` overload by
+argument shape). The "no divergence" goal ultimately wants that selection logic
+ported; the special case is acceptable only while its guards above hold.
 
-Every slice: the differential harness (53/53, 0 unregistered FP) AND
-`harness/fp_audit.py` at **0 FP across the survey corpora**, plus a measured gap
-reduction (`--gaps`). A slice that closes no gaps is not shipped (the recon
-lesson). FP-safety is not argued — it is measured against the oracle.
+### 5. Gate
+
+Every slice, all four:
+1. the differential harness (53/53, 0 unregistered FP);
+2. `harness/fp_audit.py` at **0 FP across the survey corpora**;
+3. a measured gap reduction (`--gaps`) — a slice that closes no gaps is not
+   shipped (the recon lesson);
+4. **matched non-regression** — the existing possible-nil fixtures AND the
+   corpus matched count do not drop. Migrating a rule off the span-scan replaces
+   its firing path; a stricter new path silently dropping a currently-firing
+   def-scope case is a regression the gap metric alone does not see.
+
+FP-safety is not argued — it is measured against the oracle.
 
 ## Considered options
 
@@ -85,9 +145,16 @@ lesson). FP-safety is not argued — it is measured against the oracle.
 - **Full 5-edge/6-bucket model from Slice 1** — deferred within slices: Slice 1
   needs only the normal edge + local-nilability; the truthy/falsey edges and the
   other buckets arrive as narrowing constructs are added.
+- **Treat block descent as plain straight-line descent (the pre-audit plan)** —
+  rejected: it ignores 0-/many-/deferred-execution and param shadowing, the
+  exact FP classes the recon flagged. §3 exists because "straight-line within
+  the block" is only sound under entry-widen + locality + shadow-clearing.
 
 ## Revisiting
 
 Supersede if a construct proves un-portable FP-safely under the backstop, or if
 the ivar value-flow tier (Slice “later”) needs its own ADR (likely — it is
-ADR-58-scale on the reference side).
+ADR-58-scale on the reference side). Note also that the monotonic-gap-closure
+claim holds against the **pinned** oracle ([UPSTREAM.md](../../UPSTREAM.md)); an
+upstream bump can move the flow semantics themselves, so re-measure the gap
+landscape after every pin bump before trusting the trend line.
