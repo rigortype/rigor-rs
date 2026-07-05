@@ -22,7 +22,12 @@ construction — unknown class ⇒ Dynamic — so nothing re-declares a name); (
 (`crates/rigor-index/src/rbs.rs`) unions by name key with NO class/module kind concept and raises no
 error, and there is no `resolve_type_names`-style global validation that could collapse the env to nil
 (per-file parse failures are isolated, ADR-0016). This is exactly the deliberate divergence ADR-79
-records.
+records. **Next work opened:** [ADR-0033](adr/0033-project-sig-ingestion.md) commits the ADR-0007
+project-`sig/` ingestion leg (still unimplemented) — add a `signature_paths:` config key + feed the
+resolved dirs through the existing `ingest_rbs_dir`, Ruby-free (native `ruby-rbs`). It is primarily a
+coverage lever: `knows_class` widens to project-sig'd classes to match the reference's `rbs_class_known?`
+gate, closing missed `call.undefined-method` witnesses. Landing gate = differential harness on a
+`sig/`-shipping corpus project (coverage delta + 0 unregistered FP).
 
 Prior: 2026-07-01 — **Productization track (lever A): 6 commits pushed (@ `8c3dbee`) + 4
 uncommitted polish commits (@ `28592fb`).** (1) §9 **rayon file-level parallelism** (byte-identical
