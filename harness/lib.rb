@@ -103,12 +103,34 @@ module RigorHarness
     File.directory?(dir) ? dir : nil
   end
 
-  # Copy a fixture's `sig/` dir (if any) into `tmpdir` as `sig/`, so a tool run
-  # with `chdir: tmpdir` and default config resolves `signature_paths: ["sig"]`
-  # to it. No-op when the fixture ships no sig dir.
-  def stage_sig_into(fixture_path, tmpdir)
-    sig = sig_dir(fixture_path)
-    FileUtils.cp_r(sig, File.join(tmpdir, "sig")) if sig
+  # The per-fixture `rbs collection` env dir, or `nil` (ADR-0034). Convention:
+  # `corpus/NN_name.rb` ⇒ `corpus/NN_name.collection/`, whose CONTENTS (an
+  # `rbs_collection.lock.yaml` + a `.gem_rbs_collection/` tree) are copied into
+  # the tool's cwd so the default `rbs_collection.auto_detect` discovers them.
+  def collection_dir(fixture_path)
+    dir = fixture_path.sub(/\.rb\z/, ".collection")
+    File.directory?(dir) ? dir : nil
+  end
+
+  # Whether a fixture needs a staged cwd (it ships a project sig/ or an rbs
+  # collection). Both tools then run with `chdir: <staged tmpdir>`.
+  def staged_fixture?(fixture_path)
+    !sig_dir(fixture_path).nil? || !collection_dir(fixture_path).nil?
+  end
+
+  # Stage a fixture's project-signature env into `tmpdir` so a tool run with
+  # `chdir: tmpdir` and default config picks it up: the `sig/` dir (ADR-0033,
+  # staged as `sig/`) and the rbs-collection dir (ADR-0034, its contents copied
+  # to the cwd root, dotfiles included). No-op for a fixture that ships neither.
+  def stage_fixture_env(fixture_path, tmpdir)
+    if (sig = sig_dir(fixture_path))
+      FileUtils.cp_r(sig, File.join(tmpdir, "sig"))
+    end
+    if (coll = collection_dir(fixture_path))
+      Dir.each_child(coll) do |child|
+        FileUtils.cp_r(File.join(coll, child), File.join(tmpdir, child))
+      end
+    end
   end
 
   # The `-I <lib>` flags the reference needs to `require` every plugin named in
@@ -160,9 +182,9 @@ module RigorHarness
     Dir.mktmpdir("rigor-harness-ref") do |tmpdir|
       abs_fixture = File.expand_path(fixture_path)
 
-      # ADR-0033: stage the fixture's project sig/ so the reference's default
-      # `signature_paths: ["sig"]` (resolved against cwd = tmpdir) ingests it.
-      stage_sig_into(fixture_path, tmpdir)
+      # ADR-0033/0034: stage the fixture's project sig/ and/or rbs collection so
+      # the reference's defaults (resolved against cwd = tmpdir) ingest them.
+      stage_fixture_env(fixture_path, tmpdir)
 
       sidecar = sidecar_config(fixture_path)
       config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
@@ -207,13 +229,14 @@ module RigorHarness
     config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
     cmd = [RIGOR_RS_BIN, "check", abs_fixture, "--format", "json", *config_flags]
 
-    # ADR-0033: a sig-bearing fixture runs in a clean tmpdir whose `sig/` is a
-    # copy of the fixture's, so the default `signature_paths: ["sig"]` ingests it
-    # — the SAME staging the reference gets, keeping the two implementations
-    # symmetric. A fixture without a sig dir runs as before (no chdir).
-    if sig_dir(fixture_path)
+    # ADR-0033/0034: a fixture shipping a project sig/ or an rbs collection runs
+    # in a clean tmpdir staged with a copy of that env, so rigor-rs's defaults
+    # (`signature_paths: ["sig"]`, `rbs_collection.auto_detect`) ingest it — the
+    # SAME staging the reference gets, keeping the two implementations symmetric.
+    # A fixture without either runs as before (no chdir).
+    if staged_fixture?(fixture_path)
       Dir.mktmpdir("rigor-harness-rs") do |tmpdir|
-        stage_sig_into(fixture_path, tmpdir)
+        stage_fixture_env(fixture_path, tmpdir)
         stdout, stderr, _status = Open3.capture3(*cmd, chdir: tmpdir)
         parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
       end

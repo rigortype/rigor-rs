@@ -119,6 +119,15 @@ current rigor-rs support status. Fixtures are numbered:
   each tool's cwd, so the default `signature_paths: ["sig"]` ingests it — the two
   implementations run symmetrically over the real project-signature path (e.g.
   `37_project_sig_new`, `38_project_sig_negatives`).
+- **rbs collection** (ADR-0034) — `corpus/NN_name.rb` may ship a sibling
+  `corpus/NN_name.collection/` whose CONTENTS (an `rbs_collection.lock.yaml` +
+  a `.gem_rbs_collection/` tree) are copied into each tool's cwd root, so the
+  default `rbs_collection.auto_detect` discovers and ingests the gem RBS (e.g.
+  `39_rbs_collection_new`).
+
+A staged fixture (sig/ or collection) runs BOTH tools with `chdir` into the
+staged tmpdir, so they see an identical project layout — no per-tool config
+divergence.
 
 ## Divergence registry
 

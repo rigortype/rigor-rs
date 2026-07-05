@@ -6,7 +6,22 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-05 — **Upstream pin bumped `v0.2.6` → `v0.2.7`** (`reference/rigor` @ `47c1c7d3`,
+Last updated: 2026-07-05 — **[ADR-0034](adr/0034-rbs-collection-ingestion.md) — IMPLEMENTED.** The gem-RBS
+leg's Ruby-free half now ships: `rbs collection` discovery (`crates/rigor-cli/src/rbs_collection.rs`) — a
+pure filesystem+YAML port of the reference's `RbsCollectionDiscovery` (native `serde_yaml`, no bundler,
+no network) resolves `rbs_collection.lock.yaml` (config `rbs_collection.auto_detect` default `true` +
+optional `lockfile`), walks `.gem_rbs_collection/<name>/<version>/`, skips `stdlib`-source entries, and
+feeds the dirs through the SAME ADR-0033 ingestion so collection gem classes gain project-sig provenance
+and are WITNESSED — matching the reference (empirically: it attributes a collection gem to the
+signature-path tier and fires `call.undefined-method` on `Mygem.new.typo`). `Config::all_signature_dirs`
+concatenates `signature_paths:` + discovered collection dirs; all four index builders use it. **Verified:**
+E2E differential vs the reference (collection `.new` typo witnessed identically) + a new corpus fixture
+`39_rbs_collection_new` (harness `.collection/` staging, ADR-0033 fixture-env pattern) — live +
+reference-free gates now **53/53 / 0 FP**; `cargo test` + CI clippy clean; discovery internals unit-tested.
+**Deferred (parity-safe — coverage-gap only, never FP):** the bundler-installed-gem `sig/` leg (needs
+gem-path discovery, Ruby-free tension) and inline RBS (ADR-0007's fourth leg).
+
+Prior: 2026-07-05 — **Upstream pin bumped `v0.2.6` → `v0.2.7`** (`reference/rigor` @ `47c1c7d3`,
 [`UPSTREAM.md`](../UPSTREAM.md)). Re-baselined: live differential 50/50 (0 FP), snapshots byte-identical
 (0 written), reference-free gate PASS — no observable parity drift on the current corpus. v0.2.7's
 parity-relevant core change is the RBS-loader stability fix (a malformed project `.rbs` no longer

@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/39_rbs_collection_new.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `delvier' for Mailer"
+    }
+  ]
+}

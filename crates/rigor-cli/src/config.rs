@@ -59,6 +59,26 @@ pub struct Config {
     /// RBS, so a project's hand-written types join the known-class surface the
     /// dispatch rules witness against. A named dir that doesn't exist is inert.
     pub signature_paths: Vec<String>,
+    /// ADR-0034: `rbs collection` awareness. Mirrors the reference's
+    /// `rbs_collection:` config block (`auto_detect` default `true`, optional
+    /// `lockfile` override).
+    pub rbs_collection: RbsCollectionConfig,
+}
+
+/// ADR-0034: the `rbs_collection:` config block. `auto_detect` (default `true`,
+/// matching the reference) enables auto-discovery of `rbs_collection.lock.yaml`
+/// at the project root; `lockfile` names an explicit lockfile path instead.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct RbsCollectionConfig {
+    pub auto_detect: bool,
+    pub lockfile: Option<String>,
+}
+
+impl Default for RbsCollectionConfig {
+    fn default() -> Self {
+        RbsCollectionConfig { auto_detect: true, lockfile: None }
+    }
 }
 
 impl Default for Config {
@@ -69,6 +89,7 @@ impl Default for Config {
             plugins: Vec::new(),
             baseline: serde_yaml::Value::Null,
             signature_paths: default_signature_paths(),
+            rbs_collection: RbsCollectionConfig::default(),
         }
     }
 }
@@ -141,17 +162,33 @@ impl Config {
         }
     }
 
-    /// The project RBS signature directories to ingest (ADR-0033), as paths
-    /// resolved relative to the process cwd (the same project-root convention as
-    /// config discovery). An entry naming a non-existent directory is inert —
-    /// ingestion skips it — so the default `["sig"]` costs nothing when a project
-    /// ships no signatures.
+    /// The project's own RBS signature directories from `signature_paths:`
+    /// (ADR-0033), as paths resolved relative to the process cwd. An entry naming
+    /// a non-existent directory is inert — ingestion skips it — so the default
+    /// `["sig"]` costs nothing when a project ships no signatures.
     #[must_use]
     pub fn signature_dirs(&self) -> Vec<std::path::PathBuf> {
         self.signature_paths
             .iter()
             .map(std::path::PathBuf::from)
             .collect()
+    }
+
+    /// Every RBS signature directory to ingest for a project rooted at
+    /// `project_root`: the `signature_paths:` dirs (ADR-0033) followed by the
+    /// `rbs collection` gem dirs discovered under `rbs_collection.lock.yaml`
+    /// (ADR-0034). Both tiers flow through the same authoritative ingestion path,
+    /// so their classes are witnessed alike. Pass the process cwd (`"."`) as
+    /// `project_root` — the same base config discovery uses.
+    #[must_use]
+    pub fn all_signature_dirs(&self, project_root: &Path) -> Vec<std::path::PathBuf> {
+        let mut dirs = self.signature_dirs();
+        dirs.extend(crate::rbs_collection::discover(
+            self.rbs_collection.lockfile.as_deref().map(Path::new),
+            project_root,
+            self.rbs_collection.auto_detect,
+        ));
+        dirs
     }
 
     /// Whether `path` (as given on the command line) matches any `exclude:`

@@ -34,6 +34,7 @@ mod lsp;
 mod mcp;
 mod outline;
 mod plugins_cmd;
+mod rbs_collection;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).
@@ -214,7 +215,7 @@ fn analyze_files(
     let timing = std::env::var_os("RIGOR_TIMING").is_some();
     let t_start = std::time::Instant::now();
 
-    let index = CoreIndex::for_project(&cfg.plugins, &cfg.signature_dirs());
+    let index = CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new(".")));
     let t_index = std::time::Instant::now();
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).
     let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();

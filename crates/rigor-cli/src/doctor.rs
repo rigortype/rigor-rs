@@ -63,7 +63,7 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
     // --- RBS source (audit-R1) ----------------------------------------------
     // The keystone: surface whether coverage comes from the embedded vendored
     // set (the standalone default), a RIGOR_RBS_CORE_DIR override, or the stub.
-    let index = CoreIndex::for_project(&cfg.plugins, &cfg.signature_dirs());
+    let index = CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new(".")));
     let count = index.class_count();
     match index.rbs_source() {
         RbsSource::Embedded => {

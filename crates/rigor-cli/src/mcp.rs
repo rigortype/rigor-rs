@@ -69,7 +69,7 @@ struct ServerContext {
 fn run_stdio() -> Result<(), String> {
     let cfg = Config::load(None);
     let ctx = ServerContext {
-        index: CoreIndex::for_project(&cfg.plugins, &cfg.signature_dirs()),
+        index: CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new("."))),
         disable: cfg.disable_matcher(),
     };
 
