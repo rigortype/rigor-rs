@@ -743,6 +743,15 @@ mod tests {
                 );
             }
         }
+        // Real-corpus FP audit (algorithms `Regexp.compile`): a singleton alias
+        // whose TARGET is a base-class method (`alias self.compile self.new`,
+        // where `new` is `Class#new`, not an own `def self.new`) must resolve.
+        if idx.knows_class("Regexp") {
+            assert!(
+                idx.class_has_singleton_method("Regexp", "compile"),
+                "Regexp.compile aliases self.new (a Class#new base method)"
+            );
+        }
     }
 
     #[test]

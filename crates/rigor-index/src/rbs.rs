@@ -461,24 +461,11 @@ impl CoreData {
             return true;
         }
         // (b) Instance methods of the class object's own ancestry (it is a
-        //     `Class`). Reuse the conservative `class_has_method` over the five
-        //     base classes. Their presence is also a completeness precondition:
-        //     if any of the five is missing the surface is unknown ⇒ silent.
-        const BASES: [&str; 5] =
-            ["Class", "Module", "Object", "Kernel", "BasicObject"];
-        let mut bases_loaded = true;
-        for base in BASES {
-            if !self.classes.contains_key(base) {
-                bases_loaded = false;
-                continue;
-            }
-            // `class_has_method` walks the base's own ancestor chain; a hit on
-            // any of the five means the class object responds. We test each
-            // base directly so a hit short-circuits to PRESENT.
-            let (chain, _) = self.ancestors(base);
-            if self.lookup_on_chain(&chain, method).is_some() {
-                return true;
-            }
+        //     `Class`) — `new`, `name`, etc. from Class/Module/Object/Kernel/
+        //     BasicObject. Their presence is also a completeness precondition.
+        let (bases_found, bases_loaded) = self.singleton_bases_lookup(method);
+        if bases_found {
+            return true;
         }
         // Not found anywhere. Witness absence ONLY when the whole surface is
         // known: the singleton superclass chain is complete AND all five base
@@ -487,6 +474,29 @@ impl CoreData {
             return false;
         }
         true
+    }
+
+    /// Whether `method` is an instance method of the class object's own ancestry
+    /// — the five base classes a class object is/inherits (Class, Module, Object,
+    /// Kernel, BasicObject) — plus whether all five are loaded (a completeness
+    /// precondition). Shared by [`Self::class_has_singleton_method`] and the
+    /// singleton-alias resolution, so an alias whose TARGET is a base method
+    /// (`alias self.compile self.new`, where `new` is `Class#new`) resolves.
+    fn singleton_bases_lookup(&self, method: &str) -> (bool, bool) {
+        const BASES: [&str; 5] = ["Class", "Module", "Object", "Kernel", "BasicObject"];
+        let mut loaded = true;
+        let mut found = false;
+        for base in BASES {
+            if !self.classes.contains_key(base) {
+                loaded = false;
+                continue;
+            }
+            let (chain, _) = self.ancestors(base);
+            if self.lookup_on_chain(&chain, method).is_some() {
+                found = true;
+            }
+        }
+        (found, loaded)
     }
 
     /// Walk `class_name` and its superclass chain collecting OWN singleton
@@ -561,7 +571,12 @@ impl CoreData {
         for &anc in chain {
             if let Some(entry) = self.classes.get(anc) {
                 if let Some(&old) = entry.singleton_aliases.get(method) {
-                    if self.singleton_on_chain(chain, old, depth + 1) {
+                    // The alias target may live on the singleton chain OR on the
+                    // base-class surface (`alias self.compile self.new`, where
+                    // `new` is `Class#new`), so check both.
+                    if self.singleton_on_chain(chain, old, depth + 1)
+                        || self.singleton_bases_lookup(old).0
+                    {
                         return true;
                     }
                 }
