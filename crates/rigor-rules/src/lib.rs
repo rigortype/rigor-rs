@@ -284,11 +284,26 @@ pub fn analyze_with_source(
     index: &CoreIndex,
     source: &rigor_infer::SourceIndex,
 ) -> Vec<Diagnostic> {
+    analyze_with_source_and_folder(ast, interner, index, source, None)
+}
+
+/// As [`analyze_with_source`], plus the optional ADR-0008 real-Ruby folder for
+/// sidecar-routed constant folds (full-fidelity mode). `folder = None` is
+/// byte-identical to [`analyze_with_source`] (the sound subset). The folder must
+/// be `Sync` — one instance is shared across the file-parallel analysis.
+pub fn analyze_with_source_and_folder(
+    ast: &LoweredAst,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
+) -> Vec<Diagnostic> {
     // A typer over the real RBS index AND the (project-wide) source index, so
     // `X.new` types to an instance and a bare constant `X` types to its class
     // object (`Singleton(X)`) for class-method witnessing. The source index also
-    // drives RETURN-TYPE inference for chaining.
-    let typer = Typer::with_source(index, source);
+    // drives RETURN-TYPE inference for chaining. The folder (if wired) lets a
+    // sidecar-foldable literal call the Rust core declined resolve to a `Constant`.
+    let typer = Typer::with_source_and_folder(index, source, folder);
     let env = typer.build_toplevel_env(ast, interner);
     let mut out = Vec::new();
 

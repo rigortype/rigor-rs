@@ -27,6 +27,7 @@ use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type, TypeId};
 
+pub use folding::RubyFolder;
 pub use source_index::{ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
 
 /// A process-wide empty [`SourceIndex`], used as the default `source` for a
@@ -66,19 +67,35 @@ pub struct Typer<'i> {
     /// [`Typer::new`] caller; real for [`Typer::with_source`]. Lets `X.new` type
     /// to an instance of a project-defined class and a typo on it be witnessed.
     source: &'i SourceIndex,
+    /// The optional real-Ruby folder (ADR-0008 sidecar). `None` keeps folding to
+    /// the conservative Rust core (the sound subset); `Some` lets the dispatcher
+    /// route a [`folding::sidecar_foldable`] call the Rust core declined to real
+    /// Ruby. Must be `Sync` so one folder is shared across the file-parallel walk.
+    folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
 }
 
 impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source() }
+        Typer { index, source: empty_source(), folder: None }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source }
+        Typer { index, source, folder: None }
+    }
+
+    /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
+    /// sidecar-routed constant folds. `None` is byte-identical to
+    /// [`Typer::with_source`] (the sound subset).
+    pub fn with_source_and_folder(
+        index: &'i CoreIndex,
+        source: &'i SourceIndex,
+        folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
+    ) -> Self {
+        Typer { index, source, folder }
     }
 
     /// The borrowed source index (for the rules layer's method-resolution gate).
@@ -273,6 +290,17 @@ impl<'i> Typer<'i> {
             if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
                 if let Some(folded) = folding::fold(&scalar, method, &arg_scalars) {
                     return interner.intern(Type::Constant(folded));
+                }
+                // ADR-0008 sidecar fallback: the Rust core declined, but if this
+                // is a `sidecar_foldable` pure call and a real-Ruby folder is
+                // wired (full-fidelity mode), execute it there. A declined /
+                // absent folder leaves the value widened (sound subset).
+                if let Some(folder) = self.folder {
+                    if folding::sidecar_foldable(folding::scalar_class(&scalar), method) {
+                        if let Some(folded) = folder.fold(&scalar, method, &arg_scalars) {
+                            return interner.intern(Type::Constant(folded));
+                        }
+                    }
                 }
             }
         }
@@ -1241,5 +1269,42 @@ mod tests {
         let env = typer.build_toplevel_env(&ast, &mut i);
         let w_ty = *env.get("w").expect("w should be bound");
         assert_eq!(w_ty, i.untyped(), "unknown-constant .new must be Dynamic[top]");
+    }
+
+    /// ADR-0008: the tier-1 sidecar fallback. A `sidecar_foldable` call the Rust
+    /// core declines (`255.to_s(16)`) routes to a wired [`folding::RubyFolder`]
+    /// and interns its result as a `Constant`; with no folder it stays the nominal
+    /// RBS return (the sound subset). Deterministic — no real Ruby.
+    #[test]
+    fn type_call_routes_sidecar_foldable_to_folder() {
+        struct MockFolder(Scalar);
+        impl folding::RubyFolder for MockFolder {
+            fn fold(&self, _r: &Scalar, _m: &str, _a: &[Scalar]) -> Option<Scalar> {
+                Some(self.0.clone())
+            }
+        }
+
+        let ast = lower_src(b"255.to_s(16)\n");
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let call_id = ast
+            .iter()
+            .find_map(|(id, n)| matches!(n, Node::Call { .. }).then_some(id))
+            .expect("a call node");
+
+        // With a folder: the declined-by-Rust base-arg `to_s` folds to the
+        // folder's result.
+        let mock = MockFolder(Scalar::Str("ff".into()));
+        let typer = Typer::with_source_and_folder(&index, &source, Some(&mock));
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let ty = typer.type_of(&ast, call_id, &env, &mut i);
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Str("ff".into())));
+
+        // Without a folder: the nominal `Integer#to_s -> String`, not a Constant
+        // (the sound subset — no false constant).
+        let typer2 = Typer::with_source(&index, &source);
+        let ty2 = typer2.type_of(&ast, call_id, &env, &mut i);
+        assert!(!matches!(i.get(ty2), Type::Constant(_)), "no folder ⇒ no constant");
     }
 }

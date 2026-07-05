@@ -30,7 +30,7 @@ rigor-rs executes real Ruby through an optional, cached **[Ruby sidecar](../../C
 ### Sidecar architecture (mirrors the reference's ADR-39 `process` strategy)
 
 - A **persistent Ruby worker**, spawned **lazily** (only on the first non-Rust-foldable or plugin call) under the **project's Ruby + bundle**, so plugin target gems resolve at the project's versions. Pure-Rust analyses spawn no Ruby.
-- **Length-prefixed MessagePack IPC, batched** — one round-trip per file's worth of foldable calls, to amortize IPC.
+- **Length-prefixed MessagePack IPC, batched** — one round-trip per file's worth of foldable calls, to amortize IPC. *(Implementation phasing: v1 (Slice 1, the handshake + liveness probe) uses **newline-delimited JSON** — no new dependency, low-volume, correctness-first; the MessagePack framing arrives with batching (Slice 3), where the per-call hot path makes it pay.)*
 - **Crash containment** — a worker crash (e.g. a target-gem segfault) is caught as EOF; the call declines (widen/silence) and the worker respawns.
 
 ### Caching (two-level, persistent)

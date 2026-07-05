@@ -76,6 +76,56 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
     }
 }
 
+/// The Ruby class name of a scalar literal — the receiver-class key used to gate
+/// [`sidecar_foldable`]. `Bool`/`Nil` map to their singleton classes.
+#[must_use]
+pub fn scalar_class(s: &Scalar) -> &'static str {
+    match s {
+        Scalar::Int(_) => "Integer",
+        Scalar::Float(_) => "Float",
+        Scalar::Str(_) => "String",
+        Scalar::Sym(_) => "Symbol",
+        Scalar::Bool(true) => "TrueClass",
+        Scalar::Bool(false) => "FalseClass",
+        Scalar::Nil => "NilClass",
+    }
+}
+
+/// Whether a `(receiver class, method)` is safe to route to the Ruby sidecar
+/// (ADR-0008): a pure, deterministic long-tail fold the Rust core deliberately
+/// declines, whose result the reference folds identically (so routing it cannot
+/// diverge — parity-safe). Deliberately a SMALL, harness-verified subset; grows
+/// as each method is confirmed against the reference. Note this is disjoint from
+/// the Rust core: a method the Rust core already folds never reaches the sidecar
+/// (the core wins first in the dispatcher).
+#[must_use]
+pub fn sidecar_foldable(receiver_class: &str, method: &str) -> bool {
+    // Every entry has been verified to fold IDENTICALLY in the reference (which
+    // also executes real Ruby), so routing it cannot diverge. All are pure +
+    // deterministic and return a scalar carrier; a non-scalar arg simply fails to
+    // pin (the fold is never attempted) and a non-scalar result declines.
+    matches!(
+        (receiver_class, method),
+        // Integer — base-N formatting + number theory (Rust core is base-10 only).
+        ("Integer", "to_s" | "gcd")
+        // Float — rounding family (Rust core has none of these).
+        | ("Float", "round")
+        // String — the format + transform long tail.
+        | ("String", "%" | "center" | "ljust" | "rjust" | "tr" | "sub" | "strip")
+    )
+}
+
+/// Executes a purity-gated fold the Rust core declined, by running the real Ruby
+/// method (ADR-0008 — the Ruby sidecar). Injected into the [`crate::Typer`] so
+/// the pure `rigor-infer` crate never itself does IO / spawns a process; the
+/// implementor (the CLI's sidecar client) owns that. `None` = declined /
+/// unavailable (the dispatcher then widens to the nominal type — sound subset).
+pub trait RubyFolder {
+    /// Execute `receiver.method(*args)` on scalar literals, returning the result
+    /// scalar or `None`. The caller has already confirmed [`sidecar_foldable`].
+    fn fold(&self, receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar>;
+}
+
 // --- Integer ----------------------------------------------------------------
 
 fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
@@ -352,5 +402,29 @@ mod tests {
         assert!(is_foldable("String", "upcase"));
         assert!(!is_foldable("Array", "sample"));
         assert!(!is_foldable("String", "gsub")); // sidecar territory
+    }
+
+    #[test]
+    fn sidecar_foldable_is_reference_verified_subset() {
+        // Every entry folds identically in the reference (real Ruby both sides).
+        assert!(sidecar_foldable("Integer", "to_s"));
+        assert!(sidecar_foldable("Integer", "gcd"));
+        assert!(sidecar_foldable("Float", "round"));
+        assert!(sidecar_foldable("String", "%"));
+        assert!(sidecar_foldable("String", "center"));
+        assert!(sidecar_foldable("String", "rjust"));
+        // Non-deterministic / unverified stay OUT (never route what could diverge).
+        assert!(!sidecar_foldable("Array", "sample"));
+        assert!(!sidecar_foldable("Integer", "+")); // Rust core owns it
+        assert!(!sidecar_foldable("String", "gsub")); // unverified — not routed
+    }
+
+    #[test]
+    fn scalar_class_maps_carriers() {
+        assert_eq!(scalar_class(&Scalar::Int(1)), "Integer");
+        assert_eq!(scalar_class(&Scalar::Float(1.0)), "Float");
+        assert_eq!(scalar_class(&Scalar::Str("x".into())), "String");
+        assert_eq!(scalar_class(&Scalar::Bool(true)), "TrueClass");
+        assert_eq!(scalar_class(&Scalar::Nil), "NilClass");
     }
 }

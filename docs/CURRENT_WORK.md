@@ -20,8 +20,50 @@ glossary terms in CONTEXT.md: **sound subset / full fidelity / coverage posture*
 redefined optional→default. **Phasing (a):** ship the flag/env/config surface + an interim "sidecar not
 yet implemented — running sound subset" posture notice NOW (converts today's *silent* subset into a
 *disclosed* one, freezes the vocabulary); the exit-69 hard-error teeth + real full fidelity land WITH the
-sidecar (still unimplemented). **Next:** implement the interim surface (flag parse + doctor posture line +
-one-time notice) — no sidecar needed. See [ADR-0036](adr/0036-ruby-sidecar-default-reversal.md).
+sidecar (still unimplemented). **Phase-a surface IMPLEMENTED** (`crates/rigor-cli/src/ruby_mode.rs`):
+`--ruby=require|auto|off|<path>` + `--no-ruby` + `RIGOR_RUBY`/`RIGOR_NO_RUBY` + `.rigor.yml` `rigor_rs.ruby`,
+layered resolution (CLI>env>file>default) with same-layer mutual-exclusion → exit 64; `check` emits the
+one-time interim "sidecar not yet implemented → sound subset" stderr notice (silent under `off`); `doctor`
+prints a coverage-posture line (WARN when reduced / PASS when opted out); `rigor lsp` defaults `auto` and
+surfaces posture via `window/showMessage`. Diagnostic stdout is byte-identical (notice is stderr-only) —
+harness stays 53/53 / 0 FP; `cargo test` + CI clippy clean. **Remaining (phase b, with the sidecar):** the
+exit-69 hard error, the handshake probe, real full fidelity, and a `--format json` posture field.
+See [ADR-0036](adr/0036-ruby-sidecar-default-reversal.md).
+
+**Phase b / sidecar — Slice 1 LANDED (branch `ruby-sidecar`).** transport + handshake + availability
+probe. `crates/rigor-cli/src/sidecar.rb` (embedded via `include_str!`, newline-delimited JSON — ADR-0008
+v1 transport, MessagePack deferred to the batching slice) + `sidecar.rs` client: spawn the ruby, read the
+`{rigor_sidecar,ruby_version}` handshake, exchange one `ping`, timeout-guarded (5s, worker-thread), child
+always killed. `ruby_bin_for(mode)` selects the binary (`ruby` on PATH / `<path>`; project-Ruby/bundler
+detection is a later slice). Wired into `rigor doctor` only: reports sidecar reachability + ruby version
+(a real ADR-0036 first-class posture check). Tests incl. a real-ruby handshake+ping (skipped when no
+ruby). **Sequencing refinement (deliberate):** the exit-69 hard error for `require` is HELD to Slice 2,
+not wired now — hard-failing (or spawning ruby on) every default `check` before folding is routed would
+be premature blast radius with no fidelity gain yet; the probe is built + tested + surfaced in `doctor`,
+and the teeth flip on in Slice 2 when a reachable sidecar actually delivers full fidelity. `check`/`lsp`
+hot paths unchanged (still the interim notice); harness stays 53/53 / 0 FP. **Slice 2 LANDED:** persistent worker + fold routing + exit-69 teeth. `sidecar.rb` gains a `fold` op
+(tagged-scalar JSON ⇄ real Ruby value, purity-gated + rescue-guarded); `Sidecar` is now a persistent
+worker (`fold`/`ping`, dead-pipe short-circuit, `Drop` shutdown) + `SidecarFolder` (`Mutex`+memo, `Sync`)
+implementing the new `rigor_infer::RubyFolder` trait. rigor-infer: `folding::sidecar_foldable` allowlist
+(parity-confirmed subset — `Integer#to_s(base)`, `String#%`) + `scalar_class`; `Typer` gains an optional
+folder; `type_call` tier-1 falls back to it when the Rust core declines. rigor-rules:
+`analyze_with_source_and_folder`. CLI: `build_sidecar_folder` (shared by `check` + `baseline`) resolves
+the mode, spawns the sidecar, and **`require`/`<path>` unavailable → exit 69** (`auto` degrades+discloses,
+`off` silent); `lsp` wires the folder too (never hard-errors — always `auto`-degrades); `doctor` reports
+real reachability. The phase-a interim notice is retired (sidecar is real now). **Verified:** E2E vs the
+reference — `255.to_s(16).frobnicate` witnesses on the folded `"ff"` identically (full fidelity);
+`--no-ruby` stays sound-subset; exit 69 on require+no-ruby; harness **53/53 / 0 FP** with folding active
+(default check now spawns a sidecar); a deterministic mock-folder infer test guards the tier-1 wiring;
+real-ruby fold round-trip test; `cargo test` + CI clippy clean. **Allowlist expanded** (`53f652d`): +`Integer#gcd`, `Float#round`, `String#center/ljust/rjust/tr/sub/strip`
+— each reference-verified (real Ruby both sides ⇒ parity-safe by construction). **Sidecar is now
+FUNCTIONALLY COMPLETE** (spawn · fold routing · exit-69 teeth · posture disclosure · growing fidelity),
+all gated (harness 53/53, cargo test + CI clippy clean). **Remaining ADR-0008 work is enhancement, not
+core** and each wants its own focused effort: **Slice 3** batching (one round-trip/file) + MessagePack —
+a two-pass inference refactor OR per-rayon-thread workers; **perf, needs `make bench-perf`-style
+measurement to justify**, not correctness. **Slice 4** on-disk content-addressed cache (cross-run perf).
+**Slice 5** plugin target-library invocation — a large separate subsystem. Ongoing: grow the allowlist as
+real-project signal appears. Branch `ruby-sidecar`; commits `5420419` (S1) · `9b5bb64` (S2) · `53f652d`
+(allowlist).
 
 Prior: 2026-07-05 — **[ADR-0034](adr/0034-rbs-collection-ingestion.md) — IMPLEMENTED.** The gem-RBS
 leg's Ruby-free half now ships: `rbs collection` discovery (`crates/rigor-cli/src/rbs_collection.rs`) — a

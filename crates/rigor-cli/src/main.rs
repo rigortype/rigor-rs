@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use rayon::prelude::*;
 use rigor_index::CoreIndex;
 use rigor_parse::{lower, parse};
-use rigor_rules::{analyze_with_source, catalog, Diagnostic, Severity};
+use rigor_rules::{analyze_with_source_and_folder, catalog, Diagnostic, Severity};
 use rigor_types::Interner;
 
 mod config;
@@ -35,6 +35,8 @@ mod mcp;
 mod outline;
 mod plugins_cmd;
 mod rbs_collection;
+mod ruby_mode;
+mod sidecar;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).
@@ -94,6 +96,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `apply_baseline_filter`): `--no-baseline` (Off) > `--baseline PATH`
     // (Path) > `.rigor.yml`'s `baseline:` (Unset → config).
     let mut baseline_arg = BaselineArg::Unset;
+    // ADR-0036 coverage-posture axis (CLI layer). `--ruby` and `--no-ruby` are
+    // mutually exclusive; the effective mode is resolved (CLI > env > config >
+    // default `require`) after config load.
+    let mut ruby_cli: Option<ruby_mode::RubyMode> = None;
+    let mut no_ruby_flag = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -130,6 +137,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 }
             },
             "--no-baseline" => baseline_arg = BaselineArg::Off,
+            "--ruby" => match it.next() {
+                Some(v) => ruby_cli = Some(ruby_mode::parse_value(v)),
+                None => {
+                    eprintln!("rigor check: --ruby expects require|auto|off|<path>");
+                    return ExitCode::from(64);
+                }
+            },
+            "--no-ruby" => no_ruby_flag = true,
+            other if other.starts_with("--ruby=") => {
+                ruby_cli = Some(ruby_mode::parse_value(&other["--ruby=".len()..]));
+            }
             other => files.push(other),
         }
     }
@@ -139,15 +157,36 @@ fn cmd_check(args: &[String]) -> ExitCode {
         return ExitCode::from(64);
     }
 
+    // ADR-0036 same-layer mutual exclusion: `--ruby` and `--no-ruby` together is
+    // a usage error, redundant or not.
+    if ruby_cli.is_some() && no_ruby_flag {
+        eprintln!("rigor check: --ruby and --no-ruby are mutually exclusive (specify at most one)");
+        return ExitCode::from(64);
+    }
+    let ruby_cli = ruby_cli.or(no_ruby_flag.then_some(ruby_mode::RubyMode::Off));
+
     // Load `.rigor.yml` (explicit `--config` path, else cwd auto-discovery).
     // Config ONLY suppresses/scopes diagnostics; it never changes analysis.
     // Degrades to default (= inert) on any error, so the differential harness —
     // which runs from a directory with no `.rigor.yml` — is unaffected.
     let cfg = Config::load(explicit_config.map(Path::new));
 
+    // ADR-0036 coverage posture (ADR-0008 sidecar). Resolve the mode, then bring
+    // up the Ruby sidecar accordingly: `require`/`<path>` MUST have it (exit 69 on
+    // failure — full fidelity was demanded and cannot be delivered); `auto` uses
+    // it when reachable and otherwise discloses + degrades to the sound subset;
+    // `off` never spawns it. A wired folder lets `sidecar_foldable` literal calls
+    // resolve to `Constant` (full fidelity); its absence is the sound subset.
+    let sidecar_folder = match build_sidecar_folder(&cfg, ruby_cli) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    let folder_ref =
+        sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
+
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
     // `# rigor:disable` applied). Shared with `baseline generate`.
-    let (mut findings, had_io_error) = analyze_files(&files, &cfg, "check");
+    let (mut findings, had_io_error) = analyze_files(&files, &cfg, "check", folder_ref);
 
     // ADR-22 — baseline filter, applied LAST (after inline `# rigor:disable`
     // and config `disable:`, per reference WD6). With no resolved baseline this
@@ -195,10 +234,49 @@ fn cmd_check(args: &[String]) -> ExitCode {
 /// findings in input order. The baseline filter is NOT applied here — that is
 /// the LAST stage, applied only by `check` (reference WD6). `verb` labels the
 /// command in error messages (`check` / `baseline`).
+/// Resolve the coverage-posture mode (ADR-0036) and bring up the Ruby sidecar
+/// folder (ADR-0008) accordingly. `Ok(Some)` = full fidelity; `Ok(None)` = the
+/// sound subset (`off`, or `auto` with no reachable sidecar); `Err(code)` = a
+/// usage error (64, conflicting env) or the require-but-unavailable hard error
+/// (69) — the caller returns it as its exit code. Shared by `check` and
+/// `baseline generate` so a baseline records exactly what `check` witnesses.
+fn build_sidecar_folder(
+    cfg: &Config,
+    cli_ruby: Option<ruby_mode::RubyMode>,
+) -> Result<Option<sidecar::SidecarFolder>, ExitCode> {
+    let ruby = ruby_mode::resolve(cli_ruby, cfg.ruby_config_value(), ruby_mode::RubyMode::Require)
+        .map_err(|e| {
+            eprintln!("rigor: {e}");
+            ExitCode::from(64)
+        })?;
+    match &ruby {
+        ruby_mode::RubyMode::Off => Ok(None),
+        mode => {
+            let bin = sidecar::ruby_bin_for(mode).expect("a non-off mode names a ruby binary");
+            match sidecar::Sidecar::spawn(&bin) {
+                Ok(sc) => Ok(Some(sidecar::SidecarFolder::new(sc))),
+                Err(e) => {
+                    if matches!(mode, ruby_mode::RubyMode::Require | ruby_mode::RubyMode::Path(_)) {
+                        eprintln!("rigor: full-fidelity Ruby sidecar required but unavailable — {e}.");
+                        eprintln!("  Pass --ruby=off (or set RIGOR_NO_RUBY=1) to run the Ruby-free sound subset.");
+                        return Err(ExitCode::from(69));
+                    }
+                    // `auto`: disclose the reduced posture and run the sound subset.
+                    eprintln!(
+                        "rigor: Ruby sidecar unavailable ({e}) — running the sound subset (coverage posture: subset)."
+                    );
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
 fn analyze_files(
     files: &[&str],
     cfg: &Config,
     verb: &str,
+    folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
 ) -> (Vec<(usize, String, String, Diagnostic)>, bool) {
     let disable_matcher = cfg.disable_matcher();
     // ADR-25 — config-gated plugins. With no `plugins:` in `.rigor.yml` this is
@@ -328,7 +406,7 @@ fn analyze_files(
         .map(|p| {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let mut interner = Interner::new();
-                analyze_with_source(&p.ast, &mut interner, &index, &project_source)
+                analyze_with_source_and_folder(&p.ast, &mut interner, &index, &project_source, folder)
             }));
             match result {
                 Ok(diags) => {
@@ -491,10 +569,20 @@ fn baseline_generate(args: &[String]) -> ExitCode {
     }
 
     let cfg = Config::load(explicit_config.map(Path::new));
+    // Same coverage posture as `check` (ADR-0008/0036) so the baseline records
+    // exactly what `check` witnesses — a subset-generated baseline would fail to
+    // suppress full-fidelity findings. `baseline` has no `--ruby` flag, so the
+    // mode comes from env / `.rigor.yml` / default.
+    let sidecar_folder = match build_sidecar_folder(&cfg, None) {
+        Ok(f) => f,
+        Err(code) => return code,
+    };
+    let folder_ref =
+        sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
     // IMPORTANT (reference parity): generate must record the UNFILTERED set —
     // it never applies an existing baseline (`analyze_files` does not), so the
     // new file records the live diagnostics, not the post-baseline (empty) surface.
-    let (findings, _had_io_error) = analyze_files(&files, &cfg, "baseline");
+    let (findings, _had_io_error) = analyze_files(&files, &cfg, "baseline", folder_ref);
 
     // Key on project-root-relative paths, like the reference's `Dir.pwd`.
     let cwd = std::env::current_dir().ok();

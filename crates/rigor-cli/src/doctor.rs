@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use rigor_index::{CoreIndex, RbsSource};
 
 use crate::config::Config;
+use crate::ruby_mode;
 
 /// `rigor doctor [--config PATH]` — report the environment/setup diagnostic.
 /// Exit 0 when healthy, 1 if a check fails (a malformed explicit config).
@@ -83,6 +84,43 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
             );
             println!("  → coverage is severely reduced; report this (the embedded set should always load).");
         }
+    }
+
+    // --- Coverage posture (ADR-0036 / ADR-0008) -----------------------------
+    // Resolve the posture a default run would use (env + `rigor_rs.ruby`, default
+    // `require`) and probe the sidecar so reduced coverage is never silent. `off`
+    // is a deliberate Ruby-free choice (PASS); a reachable sidecar is full
+    // fidelity (PASS); an unreachable sidecar is the sound subset (WARN), and a
+    // note that `require` would hard-error (exit 69) there.
+    match ruby_mode::resolve(None, cfg.ruby_config_value(), ruby_mode::RubyMode::Require) {
+        Ok(ruby_mode::RubyMode::Off) => {
+            println!("[PASS] coverage posture: sound subset (Ruby-free by request: ruby=off)");
+        }
+        Ok(mode) => {
+            let bin = crate::sidecar::ruby_bin_for(&mode)
+                .expect("a non-off mode names a ruby binary");
+            match crate::sidecar::probe(&bin) {
+                Ok(hs) => println!(
+                    "[PASS] coverage posture: full fidelity — Ruby sidecar reachable via `{bin}` (ruby {})",
+                    hs.ruby_version
+                ),
+                Err(e) => {
+                    let hard = matches!(
+                        mode,
+                        ruby_mode::RubyMode::Require | ruby_mode::RubyMode::Path(_)
+                    );
+                    println!(
+                        "[WARN] coverage posture: sound subset — Ruby sidecar unavailable ({e})"
+                    );
+                    if hard {
+                        println!(
+                            "  → `ruby={mode}` would hard-error (exit 69); install Ruby or set ruby=off/auto"
+                        );
+                    }
+                }
+            }
+        }
+        Err(e) => println!("[WARN] coverage posture: unresolved — {e}"),
     }
 
     // --- Plugins ------------------------------------------------------------
