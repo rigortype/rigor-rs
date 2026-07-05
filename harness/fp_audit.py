@@ -50,15 +50,20 @@ def run_rs(files):
 def run_ref(files):
     # Clean cwd: no project .rigor.yml / Gemfile / sig auto-load, so the
     # reference analyses on core+stdlib only — comparable to rigor-rs's default.
+    # Returns None (NOT []) when the reference produced no parseable JSON — a
+    # batch failure (one poison file aborting the whole run) would otherwise look
+    # like "reference found nothing", turning all of rigor-rs's output into false
+    # FP candidates. A None result means the comparison is invalid, not FP-free.
     r = subprocess.run(["ruby", "-I", REF_LIB, REF_EXE, "check", "--format", "json"] + files,
                        capture_output=True, text=True, cwd="/tmp")
     i = r.stdout.find("{")
     if i < 0:
-        return []
+        return None
     try:
-        return json.loads(r.stdout[i:]).get("diagnostics", [])
+        obj = json.loads(r.stdout[i:])
     except Exception:
-        return []
+        return None
+    return obj.get("diagnostics", []) if "diagnostics" in obj else None
 
 
 def keys(diags):
@@ -75,7 +80,13 @@ def audit(tgt, show=12):
         print(f"{tgt}: no .rb files")
         return 0
     t = time.time()
-    rs, ref = keys(run_rs(files)), keys(run_ref(files))
+    ref_diags = run_ref(files)
+    if ref_diags is None:
+        print(f"\n=== {tgt} ({len(files)} files) ===")
+        print("  SKIPPED: reference produced no parseable output on this batch "
+              "(likely one file aborts its run) — comparison invalid, not FP-free.")
+        return 0
+    rs, ref = keys(run_rs(files)), keys(ref_diags)
     fp, gap = rs - ref, ref - rs
     print(f"\n=== {tgt} ({len(files)} files, {time.time() - t:.1f}s) ===")
     print(f"  reference={len(ref)}  rigor-rs={len(rs)}  matched={len(rs & ref)}")

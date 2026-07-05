@@ -671,6 +671,14 @@ impl Builder {
                 .receiver()
                 .is_none()
                 .then(|| span_of(&def.name_loc()));
+            // A receiver-bearing def (`def recv.x`) evaluates `recv` in the
+            // ENCLOSING scope. Lower it so its reads are visible — otherwise a
+            // `def local.m` looks like `local` is assigned-but-never-read
+            // (flow.dead-assignment FP, real-corpus audit: textbringer). The node
+            // lives in the arena; the span-scan analyses find it (orphan-proof).
+            if let Some(recv) = def.receiver() {
+                let _ = self.lower_node(&recv);
+            }
             return self.push(Node::Definition {
                 name,
                 is_singleton_class: false,

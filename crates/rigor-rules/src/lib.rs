@@ -2596,6 +2596,16 @@ mod tests {
     }
 
     #[test]
+    fn dead_assignment_def_receiver_read_is_silent() {
+        // A local used as a singleton-def RECEIVER (`def x.m`) IS read — the
+        // receiver is evaluated in the enclosing scope. Real-corpus FP audit
+        // (textbringer): before lowering the receiver, `x` looked assigned-but-
+        // never-read here.
+        let diags = dead(b"def f\n  x = Object.new\n  def x.m\n    1\n  end\n  77\nend\n");
+        assert!(diags.is_empty(), "def-receiver read must suppress, got {diags:?}");
+    }
+
+    #[test]
     fn dead_assignment_block_pass_read_is_silent() {
         // A read inside a `&expr` block-pass argument counts as a read ⇒ silent.
         // Regression: a `&action` block-pass previously lowered to nothing, so the
