@@ -17,29 +17,46 @@ so block-bearing `X.new{}` types as an `X` instance. Harness 53/53 / 0 FP; 430 t
 re-interpretation of the §5 gap-gate (maintainer decision), because it retires the span-scan and is
 the FP-safe foundation later slices build on. See ADR-0038 "Slice 1 outcome".
 
-**▶▶ KEY FINDING — the treemaps gap is fold-gated, not just scope-gated
-([array-fold blocker note](notes/20260706-slice1-array-fold-blocker.md)).** treemaps needs
-`Array#[](Range) -> Array?`, but the reference constant-folds `Array.new(n ≤ 16)` and every array
-literal to a concrete array (hiding the `Array?`), firing only on `Array.new(n ≥ 17)`. rigor-rs types
-arrays as `Nominal[Array]` (no fold), so an Array-slice source over-fires on the folded cases
-(confirmed FPs, threshold 16 measured). So the Array-slice source was DROPPED; **String** slices are
-FP-safe (rigor-rs's Constant/Nominal split for String aligns with the reference's fold/nominal split,
-verified 6/6) but no String-slice gap exists in the survey. The recon's "block scope is the paying
-piece" was half-right: block scope is necessary but not sufficient — treemaps also needs array-folding.
+**▶▶ KEY FINDING (refined by a grilling session) — the treemaps gap is a SHAPE-TYPING gap, not a
+folding gap ([ADR-0039](adr/0039-shape-typing-tier.md), [blocker note](notes/20260706-slice1-array-fold-blocker.md)).**
+The reference does NOT execute Ruby to hide `Array#[](Range)`'s `Array?` — it types array literals and
+`Array.new(n ≤ 16)` as a static **`Tuple`** (`ARRAY_NEW_TUPLE_LIMIT = 16`), propagates the Tuple through
+`map`/`select`/…, and a `Tuple#[](Range)` returns a NON-nil sub-Tuple. Only `Nominal[Array]#[](Range)`
+(e.g. `Array.new(300000)` — treemaps) fires. This is the reference's static shape tier ("Slice 5 phase 2"),
+which rigor-rs deferred at ADR-0023. Strings already align (a string is a value `Constant` in both tools,
+which the possible-nil source declines) — no shape type needed for them.
 
-**▶▶ NEXT — the paying possible-nil work is one of (Slice 1's source model reaches neither):**
-1. **Array constant-folding** — fold `Array.new(≤threshold)` + array literals + pure array methods to
-   `Constant` arrays, so an Array-slice source becomes FP-safe (the shared Constant-decline in
-   `nilable_source_class` then handles the folded cases; large/nominal arrays fire). Unblocks treemaps.
-   Cost: a real folding feature; the threshold must match the reference (fragile).
-2. **Tier B/C possible-nil** — project-method nilable-return inference + `@ivar` typing + loop
-   narrowing. The sampled remaining survey gaps live here (`t.left`/`t.right` in `splay_tree_map.rb`,
-   heap `.key` — nilable project-attr receivers with `break unless …` guards), i.e. the BULK of the
-   possible-nil cluster. Larger, likely its own ADR(s).
-3. **always-truthy onto this substrate** — truthy/falsey narrowing per construct (if/unless → &&/|| →
-   nil?/early-return guard → case → loop), each 0-FP-gated + gap-measured; reuses the threaded
-   flow-eval directly, sidestepping the possible-nil source problem. Then ivar value-flow (deque
-   `@size == 1` class; likely its own ADR).
+**▶▶ DECISION (grill-with-docs, 2026-07-06) — port the static shape-typing tier to Rust, NOT sidecar
+folding ([ADR-0039](adr/0039-shape-typing-tier.md)).** General boundary rule recorded: *port Ruby-free +
+runtime-hot + low-risk logic to Rust; reserve the sidecar for what genuinely needs Ruby.* Sidecar array
+folding was rejected (diverges from the reference's static model, full-fidelity-only, per-literal cost).
+New glossary: `Shape type` / `Tuple` / `HashShape` / `Shape-typing tier` (CONTEXT.md).
+
+**▶▶ NEXT SESSION — START HERE: shape-tier Slice 1 (ADR-0039 §3, all in `crates/rigor-types` +
+`crates/rigor-infer` + `crates/rigor-rules`).** Static, no sidecar:
+1. Add `Type::Tuple` (fixed-length vector of element `TypeId`s) to the lattice + interner.
+2. Type array literals + `Array.new(n ≤ 16)` as `Tuple` (faithful `ARRAY_NEW_TUPLE_LIMIT = 16`; oversize /
+   non-constant ⇒ `Nominal[Array]`).
+3. Shape dispatch: `Tuple#[]` (const index → element; static Range → sub-Tuple; out-of-range →
+   `Constant[nil]`), `Tuple#size` → `Constant[len]`. Unmodeled Tuple op ⇒ fall back to `Nominal[Array]`.
+4. Re-enable the possible-nil array-slice source, firing ONLY on the FP-safe provenance the §2 invariant
+   permits in Slice 1: a receiver bound directly to `Array.new(size > 16 or non-constant)`. `.map`/… Tuple
+   propagation is a LATER slice (until then those receivers decline — recall gap, safe).
+5. **Invariant (binds every shape slice):** `{arrays rigor-rs types Nominal[Array]} ⊆ {arrays the reference
+   types Nominal[Array]}` — else the slice source over-fires (the `.map` FP). Never fire on an array whose
+   provenance isn't proven reference-Nominal.
+6. **Gate:** `fp_audit.py` 0-FP (synthetic literals / small `Array.new` / `.map` slices all silent),
+   harness 53/53, treemaps line 45 matches, matched non-regression. **Then MEASURE the tier's EV** before
+   committing to further shape slices (honest caveat: `Tuple` shares `Array`'s method set, so this adds NO
+   undefined-method coverage; gains = element-type precision + possible-nil FP-avoidance + shape-method
+   results — measurement-gated).
+
+**Deferred behind Slice 1's measurement:** `HashShape`; shape-preserving method propagation (widens the
+possible-nil fire set monotonically); argument-type-mismatch on shapes. **Separate possible-nil track (still
+open, unrelated to shapes):** Tier B/C — project-method nilable-return inference + `@ivar` typing + loop
+narrowing (the BULK of the survey possible-nil cluster: `t.left`/`t.right` in `splay_tree_map.rb`, heap
+`.key` — nilable project-attr receivers with `break unless …` guards; larger, its own ADR(s)). **Also open:**
+`flow.always-truthy-condition` onto the ADR-0038 substrate (reuses the threaded flow-eval, needs no shapes).
 
 Prior: 2026-07-06 — **Coverage-gap track opened (branch `coverage-gaps`).** Added `fp_audit.py --gaps`
 (aggregates reference-only diagnostics by rule = the coverage-effort map). Landscape across the survey:

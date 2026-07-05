@@ -84,6 +84,22 @@ _Avoid_: compatibility, assignable (name it; it is not `<:`)
 The deterministic canonical form of a type. Equivalent inputs must produce identical output; because diagnostics render normalized types, it is a bit-for-bit parity surface (e.g. `1 | Integer` does not collapse; `true | false` reads as `bool` for display only).
 _Avoid_: simplification, canonicalization (use "normalization")
 
+**Shape type**:
+A structurally-typed container carrier that records its element/entry types and (for a tuple) its exact length, so a read returns a precise member type instead of a bare `Array`/`Hash` nominal. Built STATICALLY from literals and constructors (no Ruby execution) — the reference's differentiated container precision. Two forms: **Tuple** and **HashShape**.
+_Avoid_: literal type, refined type (name the structural nature)
+
+**Tuple**:
+The shape type for a fixed-length array: an ordered vector of element types (`[1, "a"]` → `Tuple[Integer, String]`). Minted from array literals and `Array.new(n)` with a small constant `n` (the reference caps this at `ARRAY_NEW_TUPLE_LIMIT = 16`; oversize or non-constant sizes stay `Nominal[Array]`). A `Tuple#[]` with a static index/range returns the member type / a sub-`Tuple` / `Constant[nil]` for a statically-out-of-range slice — so `tuple[Range]` is NON-nil, unlike `Nominal[Array]#[](Range) : Array?`.
+_Avoid_: array literal type (a literal is one *source*; a `.map` result is also a Tuple)
+
+**HashShape**:
+The shape type for a hash with statically-known keys: a map from constant keys to value types, so `h[:k]` / `h.dig(:k)` / `h.fetch(:k)` return the precise value type. The hash counterpart of Tuple.
+_Avoid_: hash literal type (same reason as Tuple)
+
+**Shape-typing tier**:
+The dispatch tier that mints and consumes shape types — literal/constructor → shape, and shape-preserving methods (`map`/`select`/`flatten`/slice/`dig`/`fetch`) → shape. It sits between constant folding and RBS-nominal dispatch. Ported to Rust STATICALLY (no sidecar), because it is Ruby-process-free, runtime-hot (literals are everywhere), and low-risk ([ADR-0039](docs/adr/0039-shape-typing-tier.md)).
+_Avoid_: shape dispatch (that is one half — consuming; the tier also mints)
+
 **Fact bucket**:
 A named partition of a scope snapshot (local-binding, captured-local, object-content, global-storage, dynamic-origin, relational) with bucket-specific invalidation — e.g. an unknown call sweeps object-content but leaves local-binding intact.
 _Avoid_: fact store (that is the cross-plugin channel — a different thing)
