@@ -145,6 +145,36 @@ is therefore ordered internally so the lattice change never holds the gap hostag
 - **Accept as a permanent sound-subset decline** — rejected: it is resolvable
   Ruby-free, and the goal is to minimize practical mismatches, not to bank them.
 
+## Slice 1a outcome + the measurement gate result (2026-07-06)
+
+**Slice 1a shipped** (the syntactic-provenance possible-nil fire, no `Type::Tuple`):
+closes the treemaps gap (algorithms possible-nil 50→49, matched +1 — line 45
+only), 0 FP across ~1800 survey files, harness 54/54 with committed positive +
+shape-negative fixtures (42/43), 435 tests. The FP-safe fire is gated on the
+`penv` provenance set (`Array.new` zero-arg / constant size > 16), threaded on the
+tenv side of the ADR-0038 substrate.
+
+**Slice 1b (`Type::Tuple`) is DEFERRED by the measurement gate — thin EV.** Before
+building the lattice change, the tier's would-be gains were measured against the
+oracle in project (directory) mode:
+
+- **always-truthy**: the real project-mode count is tiny (algorithms 3, rubocop-ast
+  2, parser 4 — the "~117" figure was a per-file-isolation artifact), and every one
+  is a `flow proves it truthy/falsey` case = **ivar value-flow / loop narrowing
+  (Tier B/C)**, none a shape `if [1,2].size`.
+- **undefined-method**: the gaps are dominated by **Rails/ActiveSupport plugin
+  methods** on core types (`html_safe`/`blank?`/`present?`/`constantize`/`pluck`/
+  `megabytes`/… — redmine alone had ~66, almost all this) plus project-class
+  methods (`AST::Node#type?`) and Tier-B/C nil receivers. **Zero** need Tuple
+  ELEMENT precision (`[1,"a"][0].typo` does not occur in real gaps; a Tuple shares
+  Array's method set, so container typos already witness via `Nominal[Array]`).
+
+Per §3's own rule ("if the EV is thin, the tier stays at Slice 1"), the shape tier
+**stops at Slice 1a**. `Type::Tuple` / `HashShape` / propagation are not built. The
+higher-EV frontiers the measurement surfaced instead: the **Rails/ActiveSupport
+plugin** phase (the dominant undefined-method pool) and **Tier B/C possible-nil /
+always-truthy** (ivar + loop flow — the dominant flow pool).
+
 ## Consequences
 
 - Honest EV note: a `Tuple` shares `Array`'s method set, so this does NOT add

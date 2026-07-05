@@ -97,7 +97,7 @@ The shape type for a hash with statically-known keys: a map from constant keys t
 _Avoid_: hash literal type (same reason as Tuple)
 
 **Shape-typing tier**:
-The dispatch tier that mints and consumes shape types — literal/constructor → shape, and shape-preserving methods (`map`/`select`/`flatten`/slice/`dig`/`fetch`) → shape. It sits between constant folding and RBS-nominal dispatch. Ported to Rust STATICALLY (no sidecar), because it is Ruby-process-free, runtime-hot (literals are everywhere), and low-risk ([ADR-0039](docs/adr/0039-shape-typing-tier.md)).
+The reference's dispatch tier that mints and consumes shape types — literal/constructor → shape, and shape-preserving methods (`map`/`select`/`flatten`/slice/`dig`/`fetch`) → shape. It sits between constant folding and RBS-nominal dispatch. rigor-rs ports it STATICALLY (no sidecar) when a slice pays; only the `Array.new`-provenance possible-nil fire (Slice 1a) is ported so far — the full `Type::Tuple` was measurement-deferred (thin EV) ([ADR-0039](docs/adr/0039-shape-typing-tier.md)).
 _Avoid_: shape dispatch (that is one half — consuming; the tier also mints)
 
 **Fact bucket**:

@@ -32,7 +32,20 @@ runtime-hot + low-risk logic to Rust; reserve the sidecar for what genuinely nee
 folding was rejected (diverges from the reference's static model, full-fidelity-only, per-literal cost).
 New glossary: `Shape type` / `Tuple` / `HashShape` / `Shape-typing tier` (CONTEXT.md).
 
-**▶▶ NEXT SESSION — START HERE: shape-tier Slice 1 (ADR-0039 §3 as revised after the
+**▶▶ shape-tier Slice 1a LANDED; Slice 1b DEFERRED by measurement ([ADR-0039](adr/0039-shape-typing-tier.md)
+"Slice 1a outcome").** Slice 1a (the `Array.new`-provenance possible-nil fire, NO `Type::Tuple`) closed the
+treemaps gap FP-safely: algorithms possible-nil 50→49, matched +1 (line 45 only), 0 FP across ~1800 survey
+files, harness 54/54 (fixtures 42 positive + 43 shape-negatives), 435 tests. **Slice 1b (`Type::Tuple`) was
+NOT built** — the measurement gate found ~0 survey EV: undefined-method gaps are Rails/ActiveSupport plugin
+methods + project-class + Tier B/C nil (none need Tuple element precision — a Tuple shares Array's method
+set); always-truthy gaps (project-mode: single digits, the ~117 was a per-file artifact) are all ivar /
+loop flow narrowing (Tier B/C). **The higher-EV frontiers this surfaced:** the **Rails/ActiveSupport plugin
+phase** (dominant undefined-method pool — the CURRENT_WORK §10 plugin engine) and **Tier B/C possible-nil /
+always-truthy** (ivar value-flow + loop narrowing on the ADR-0038 substrate). Shape tier is parked at 1a.
+
+<details><summary>(superseded) shape-tier Slice 1 plan — kept for provenance</summary>
+
+**shape-tier Slice 1 (ADR-0039 §3 as revised after the
 [shape-tier audit](notes/20260706-adr0039-shape-tier-audit.md); `crates/rigor-types` +
 `crates/rigor-infer` + `crates/rigor-rules`).** Static, no sidecar, internally ordered so the lattice
 change never holds the gap hostage:
@@ -57,12 +70,14 @@ change never holds the gap hostage:
   **Pre-declared expectation:** algorithms possible-nil 50→49, matched +1 (line 45 ONLY; 46–48 stay
   declined by same-block locality). Then MEASURE the tier's EV before further shape slices.
 
-**Deferred behind Slice 1's measurement:** `HashShape`; shape-preserving method propagation (widens the
-possible-nil fire set monotonically); argument-type-mismatch on shapes. **Separate possible-nil track (still
-open, unrelated to shapes):** Tier B/C — project-method nilable-return inference + `@ivar` typing + loop
-narrowing (the BULK of the survey possible-nil cluster: `t.left`/`t.right` in `splay_tree_map.rb`, heap
-`.key` — nilable project-attr receivers with `break unless …` guards; larger, its own ADR(s)). **Also open:**
-`flow.always-truthy-condition` onto the ADR-0038 substrate (reuses the threaded flow-eval, needs no shapes).
+</details>
+
+**Separate possible-nil track (still open, unrelated to shapes):** Tier B/C — project-method nilable-return
+inference + `@ivar` typing + loop narrowing (the BULK of the survey possible-nil cluster: `t.left`/`t.right`
+in `splay_tree_map.rb`, heap `.key` — nilable project-attr receivers with `break unless …` guards; larger,
+its own ADR(s)). **Also open:** `flow.always-truthy-condition` onto the ADR-0038 substrate (reuses the
+threaded flow-eval, needs no shapes). **And (measurement-surfaced highest EV):** the Rails/ActiveSupport
+plugin phase (§10) — the dominant undefined-method coverage pool.
 
 Prior: 2026-07-06 — **Coverage-gap track opened (branch `coverage-gaps`).** Added `fp_audit.py --gaps`
 (aggregates reference-only diagnostics by rule = the coverage-effort map). Landscape across the survey:
