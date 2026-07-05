@@ -15,8 +15,8 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned tag** | **`v0.2.6`** |
-| Commit | `6c433a91d0c1a08d1bcbf6becb4c4bb95d2ffa63` |
+| **Pinned tag** | **`v0.2.7`** |
+| Commit | `47c1c7d35efbce222a6a888268b263808b49796c` |
 
 The differential harness (`harness/run.rb`, `harness/snapshot.rb`) defaults
 `REFERENCE_RIGOR_DIR` to this submodule (`harness/lib.rb`). The reference-free
@@ -25,16 +25,16 @@ it replays the pinned snapshots under `harness/snapshots/`, which were generated
 from this exact reference version.
 
 Note: the vendored RBS (`crates/rigor-index/vendor/rbs`, **rbs-4.0.3**) is pinned
-**independently** of the reference tag — see its `PROVENANCE.md`. At `v0.2.6` the
-reference bundled rbs-4.0.2; the bump to 4.0.3 landed just after the tag and does
-not change diagnostic output, so the two pins stay consistent.
+**independently** of the reference tag — see its `PROVENANCE.md`. As of `v0.2.7`
+the reference bundles rbs-4.0.3 as well (it bundled 4.0.2 at `v0.2.6`), so the two
+pins now match exactly.
 
 ## First-time setup
 
 ```sh
 git submodule update --init reference/rigor
 # The reference is plain Ruby run in place — no build step:
-ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.2.6
+ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.2.7
 ```
 
 ## Bumping the pin (following upstream)

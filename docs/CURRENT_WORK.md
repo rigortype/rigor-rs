@@ -6,7 +6,25 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-01 — **Productization track (lever A): 6 commits pushed (@ `8c3dbee`) + 4
+Last updated: 2026-07-05 — **Upstream pin bumped `v0.2.6` → `v0.2.7`** (`reference/rigor` @ `47c1c7d3`,
+[`UPSTREAM.md`](../UPSTREAM.md)). Re-baselined: live differential 50/50 (0 FP), snapshots byte-identical
+(0 written), reference-free gate PASS — no observable parity drift on the current corpus. v0.2.7's
+parity-relevant core change is the RBS-loader stability fix (a malformed project `.rbs` no longer
+collapses the whole env to `Dynamic[Top]` via `DuplicatedDeclarationError`); the rest of the release is
+skills/docs/plugins (out of port scope) plus a dead-method removal in `statement_evaluator`. v0.2.7 now
+bundles rbs-4.0.3, matching our vendored pin exactly. **Follow-up investigated → nothing to port:** the
+loader's "skip already-declared namespaces when stubbing missing types" guard has no rigor-rs analogue.
+The hazard is structurally absent on three independent grounds — (1) rigor-rs never ingests project
+`sig/*.rbs` (the index is vendored core+stdlib+plugin RBS only, all well-formed; no config key or code
+path reads a project `sig/`), so the malformed-project-.rbs trigger never occurs; (2) there is no
+stub-missing-referenced-types / synthesize-missing-namespaces path at all (dispatch is lenient by
+construction — unknown class ⇒ Dynamic — so nothing re-declares a name); (3) `Builder::merge`
+(`crates/rigor-index/src/rbs.rs`) unions by name key with NO class/module kind concept and raises no
+error, and there is no `resolve_type_names`-style global validation that could collapse the env to nil
+(per-file parse failures are isolated, ADR-0016). This is exactly the deliberate divergence ADR-79
+records.
+
+Prior: 2026-07-01 — **Productization track (lever A): 6 commits pushed (@ `8c3dbee`) + 4
 uncommitted polish commits (@ `28592fb`).** (1) §9 **rayon file-level parallelism** (byte-identical
 to serial, 0 FP, ~2.4× warm) + `RIGOR_TIMING` observability. (2) §12 **LSP server** — `rigor lsp
 --transport=stdio` (sync `lsp-server`/`lsp-types`, no async runtime): live diagnostics +
