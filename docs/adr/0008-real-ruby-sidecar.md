@@ -1,6 +1,14 @@
 # Real-Ruby execution via a cached sidecar for constant folding and plugin invocation
 
-Status: accepted
+Status: accepted (default polarity amended by [ADR-0036](0036-ruby-sidecar-default-reversal.md))
+
+> **Amended by [ADR-0036](0036-ruby-sidecar-default-reversal.md).** The § Degradation
+> default and § Product positioning below describe the sidecar as *optional* with
+> silent graceful-degrade as the default. ADR-0036 **reverses that polarity**: full
+> fidelity (sidecar) is the default and the product identity, the Ruby-free sound
+> subset is an explicit opt-in (`--ruby=off`), and coverage posture is never silent.
+> Everything else here — the sidecar architecture, the hybrid Rust/Ruby folding
+> boundary, caching, and the decline-to-silence discipline — still stands.
 
 ## Background
 

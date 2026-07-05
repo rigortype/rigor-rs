@@ -45,8 +45,20 @@ Computing a literal/refined type for a constant expression by executing the real
 _Avoid_: constant propagation (that is the static-dataflow notion; folding here executes real Ruby)
 
 **Ruby sidecar**:
-The optional, cached helper process — the project's Ruby + bundle running a rigor-rs request loop — that executes the real Ruby calls rigor-rs does not reimplement natively (the long tail of constant folding and all plugin target-library invocations). Spawned lazily; its absence degrades to widening, preserving zero false positives.
-_Avoid_: the Ruby process, the worker (name it)
+The cached helper process — the project's Ruby + bundle running a rigor-rs request loop — that executes the real Ruby calls rigor-rs does not reimplement natively (the long tail of constant folding and all plugin target-library invocations). Spawned lazily; its absence degrades to widening, preserving zero false positives. **Used by default** (the reversed policy): a run defaults to full fidelity and falls back to the sound subset only when Ruby is explicitly opted out or genuinely unavailable — see coverage posture.
+_Avoid_: the Ruby process, the worker (name it); optional (it is the default, not opt-in)
+
+**Sound subset**:
+The diagnostic set rigor-rs emits WITHOUT the Ruby sidecar — a strict subset of full fidelity that is sound (never a wrong diagnostic, the zero-false-positive bar holds) but incomplete (omits findings that require executing real Ruby, which widen to `Dynamic` instead). What a `--no-ruby` run produces.
+_Avoid_: degraded mode, reduced mode (name the guarantee: it is a *sound* subset, not merely lesser)
+
+**Full fidelity**:
+The diagnostic set rigor-rs emits WITH the Ruby sidecar available — equal to the reference's set (the diagnostic-set-parity target) and a strict superset of the sound subset. The default coverage posture.
+_Avoid_: full parity (that names the correctness bar; this names the achieved diagnostic set of a sidecar-enabled run)
+
+**Coverage posture**:
+Which diagnostic set a given run is operating at — full fidelity (sidecar in use) or sound subset (no sidecar) — surfaced to the user so incompleteness is never silent (`rigor doctor`, a startup notice, and structured output metadata report it).
+_Avoid_: mode, level (too generic; it names the completeness posture specifically)
 
 **Divergence registry**:
 The tracked ledger of intentional rigor-rs/reference differences excused from parity — each entry records the corrected behaviour and links an upstream report of a reference defect. The differential harness treats registered divergences as expected and every other divergence as a regression.
