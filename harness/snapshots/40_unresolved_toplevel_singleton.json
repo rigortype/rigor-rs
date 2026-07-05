@@ -1,0 +1,4 @@
+{
+  "fixture": "harness/corpus/40_unresolved_toplevel_singleton.rb",
+  "diagnostics": []
+}

@@ -522,7 +522,12 @@ fn unresolved_toplevel_diagnostics(
     let scope_spans: Vec<rigor_parse::Span> = ast
         .iter()
         .filter_map(|(_, n)| match n {
+            // A `class << X` singleton-class body is a CLASS scope too — the
+            // reference stays silent on implicit-self calls inside it (FP audit:
+            // net-ssh/algorithms fired here). A method `def` (name-less or not) is
+            // NOT a class scope: a toplevel `def` body still fires.
             Node::ClassDef { .. } | Node::ModuleDef { .. } => Some(n.span()),
+            Node::Definition { is_singleton_class: true, .. } => Some(n.span()),
             _ => None,
         })
         .collect();
