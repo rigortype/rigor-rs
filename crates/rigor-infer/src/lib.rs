@@ -20,7 +20,7 @@
 pub mod folding;
 pub mod source_index;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use rigor_index::CoreIndex;
@@ -50,6 +50,12 @@ pub type TypeEnv = HashMap<String, TypeId>;
 /// (e.g. the second `.new` in `Struct.new(:a).new(1)`) falsely absent. We can't
 /// model the anonymous class, so the result stays Dynamic (silent).
 const CLASS_RETURNING_NEW: &[&str] = &["Struct", "Data", "Class"];
+
+/// The reference's `Array.new(n)` tuple-lift cap (`ARRAY_NEW_TUPLE_LIMIT`,
+/// `method_dispatcher.rb`): a constant size `n ≤ 16` lifts to a `Tuple`; a size
+/// `> 16` (or a non-constant / zero-arg call) stays `Nominal[Array]`. Ported
+/// faithfully (ADR-0039); re-measured on every upstream bump (UPSTREAM.md).
+const ARRAY_NEW_TUPLE_LIMIT: i64 = 16;
 
 /// The expression typer (ADR-0023: the reference's `ExpressionTyper` /
 /// `MethodDispatcher` split). Holds a borrow of the [`CoreIndex`] so it can
@@ -771,11 +777,16 @@ impl<'i> Typer<'i> {
         let writes = collect_flow_writes(ast);
         let mut tenv = TypeEnv::new();
         let mut nenv: HashMap<String, &'static str> = HashMap::new();
-        self.nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &writes, interner, &mut out);
+        let mut penv: HashSet<String> = HashSet::new();
+        self.nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, interner, &mut out);
         out
     }
 
-    /// Thread `(tenv, nenv)` through a scope's statements in source order.
+    /// Thread `(tenv, nenv, penv)` through a scope's statements in source order.
+    /// `penv` is the `Array.new`-Nominal-provenance set (ADR-0039 §2) — the locals
+    /// currently bound to an array the reference keeps `Nominal[Array]` (not a
+    /// `Tuple`), the only receivers the array-slice possible-nil source may fire on.
+    /// It travels on the tenv side (inherited into blocks; widened by tenv's rules).
     #[allow(clippy::too_many_arguments)]
     fn nil_flow_scope(
         &self,
@@ -783,16 +794,17 @@ impl<'i> Typer<'i> {
         stmts: &[NodeId],
         tenv: &mut TypeEnv,
         nenv: &mut HashMap<String, &'static str>,
+        penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         for &s in stmts {
-            self.nil_flow_stmt(ast, s, tenv, nenv, writes, interner, out);
+            self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, interner, out);
         }
     }
 
-    /// Apply one statement's effect on `(tenv, nenv)` and record any nil uses.
+    /// Apply one statement's effect on `(tenv, nenv, penv)` and record any nil uses.
     #[allow(clippy::too_many_arguments)]
     fn nil_flow_stmt(
         &self,
@@ -800,6 +812,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         tenv: &mut TypeEnv,
         nenv: &mut HashMap<String, &'static str>,
+        penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
@@ -807,16 +820,24 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::Statements { body, .. } => {
                 let body = body.clone();
-                self.nil_flow_scope(ast, &body, tenv, nenv, writes, interner, out);
+                self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
                 // Record uses in the RHS (and descend any block it carries) BEFORE
                 // rebinding — a use of a currently-nilable local reads the fact.
-                self.nil_flow_expr(ast, value, tenv, nenv, writes, interner, out);
-                let src = self.nilable_source_class(ast, value, tenv, interner);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                let src = self.nilable_source_class(ast, value, tenv, penv, interner);
+                let prov = self.array_new_nominal_provenance(ast, value, tenv, interner);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
+                // Rebinding always refreshes the provenance (any non-`Array.new`
+                // RHS clears it).
+                if prov {
+                    penv.insert(name.clone());
+                } else {
+                    penv.remove(&name);
+                }
                 match src {
                     Some(c) => {
                         nenv.insert(name, c);
@@ -828,32 +849,35 @@ impl<'i> Typer<'i> {
             }
             Node::LocalVariableOpWrite { name, .. } => {
                 // `x += …` / `x ||= …` reads-then-writes ⇒ the nil possibility is
-                // narrowed/replaced; drop the fact and widen the type.
+                // narrowed/replaced; drop every fact and widen the type.
                 let name = name.clone();
                 nenv.remove(&name);
+                penv.remove(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
             Node::Call { .. } => {
-                self.nil_flow_expr(ast, id, tenv, nenv, writes, interner, out);
+                self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
             }
             Node::Definition { body, .. }
             | Node::ClassDef { body, .. }
             | Node::ModuleDef { body, .. } => {
-                // Independent scope: fresh `tenv` AND `nenv`, no effect on the
+                // Independent scope: fresh `tenv`/`nenv`/`penv`, no effect on the
                 // enclosing scope.
                 let body = body.clone();
                 let mut t = TypeEnv::new();
                 let mut n: HashMap<String, &'static str> = HashMap::new();
-                self.nil_flow_scope(ast, &body, &mut t, &mut n, writes, interner, out);
+                let mut p: HashSet<String> = HashSet::new();
+                self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, writes, interner, out);
             }
             // Any other statement (`if`/`unless`/`while`/`case`/logical/begin/
-            // multi-assign/ivar-write/…) is UNMODELED in Slice 1: widen `tenv` for
-            // the locals it writes, and CLEAR ALL `nenv` facts (decline backstop —
-            // no fact survives an unmodeled construct). No descent (straight-line).
+            // multi-assign/ivar-write/…) is UNMODELED in Slice 1: widen `tenv` and
+            // `penv` for the locals it writes, and CLEAR ALL `nenv` facts (decline
+            // backstop — no fact survives an unmodeled construct). No descent.
             other => {
                 let span = other.span();
                 widen_flow_writes(writes, span, tenv, interner);
+                widen_penv_writes(writes, span, penv);
                 nenv.clear();
             }
         }
@@ -861,7 +885,7 @@ impl<'i> Typer<'i> {
 
     /// Evaluate an expression for nil-receiver USES: record `call -> arm` for a
     /// bare-local receiver in `nenv`, clear the fact on a guard/safe-nav call, and
-    /// descend a block body with a FRESH `nenv` + INHERITED `tenv`.
+    /// descend a block body with a FRESH `nenv` + INHERITED `(tenv, penv)`.
     #[allow(clippy::too_many_arguments)]
     fn nil_flow_expr(
         &self,
@@ -869,20 +893,22 @@ impl<'i> Typer<'i> {
         id: NodeId,
         tenv: &mut TypeEnv,
         nenv: &mut HashMap<String, &'static str>,
+        penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         match ast.get(id) {
-            Node::Call { receiver, method, args, block_body, safe_nav, .. } => {
+            Node::Call { receiver, method, args, block_body, safe_nav, span, .. } => {
                 let receiver = *receiver;
                 let method = method.clone();
                 let args = args.clone();
                 let block_body = block_body.clone();
                 let safe_nav = *safe_nav;
+                let call_span = *span;
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
                 if let Some(r) = receiver {
-                    self.nil_flow_expr(ast, r, tenv, nenv, writes, interner, out);
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
                 }
                 if let Some(r) = receiver {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
@@ -906,16 +932,23 @@ impl<'i> Typer<'i> {
                     }
                 }
                 for a in &args {
-                    self.nil_flow_expr(ast, *a, tenv, nenv, writes, interner, out);
+                    self.nil_flow_expr(ast, *a, tenv, nenv, penv, writes, interner, out);
                 }
                 if !block_body.is_empty() {
                     // Same-block locality: descend with a FRESH `nenv`, inheriting
-                    // (cloning) `tenv`. Afterwards clear ALL outer facts — a block
-                    // capture may invisibly reassign an outer local.
+                    // (cloning) `(tenv, penv)`. Afterwards CLEAR ALL outer `nenv`
+                    // (a block capture may invisibly reassign an outer local), and
+                    // widen `tenv`/`penv` for locals the block visibly writes (a
+                    // capture-write must not leave a stale type/provenance behind).
                     let mut btenv = tenv.clone();
                     let mut bnenv: HashMap<String, &'static str> = HashMap::new();
-                    self.nil_flow_scope(ast, &block_body, &mut btenv, &mut bnenv, writes, interner, out);
+                    let mut bpenv = penv.clone();
+                    self.nil_flow_scope(
+                        ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, interner, out,
+                    );
                     nenv.clear();
+                    widen_flow_writes(writes, call_span, tenv, interner);
+                    widen_penv_writes(writes, call_span, penv);
                 }
             }
             Node::Logical { left, right, .. } => {
@@ -923,11 +956,50 @@ impl<'i> Typer<'i> {
                 // (decline), then recurse for block/call reachability.
                 let (left, right) = (*left, *right);
                 nenv.clear();
-                self.nil_flow_expr(ast, left, tenv, nenv, writes, interner, out);
-                self.nil_flow_expr(ast, right, tenv, nenv, writes, interner, out);
+                self.nil_flow_expr(ast, left, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, right, tenv, nenv, penv, writes, interner, out);
             }
             _ => {}
         }
+    }
+
+    /// Whether `rhs_id` is an `Array.new(...)` the REFERENCE keeps `Nominal[Array]`
+    /// (not a `Tuple`) — the FP-safe provenance for the possible-nil array-slice
+    /// source (ADR-0039 §2). True iff `Array.new` with ZERO args, or a first arg
+    /// that types to `Constant(Int(n))` with `n > ARRAY_NEW_TUPLE_LIMIT`. A small /
+    /// non-constant / non-integer size ⇒ false: the reference MIGHT `Tuple` it
+    /// (it may fold a constant rigor-rs leaves `Dynamic`), so claiming Nominal
+    /// would over-fire. Syntactic on the `Array` constant + a Constant size arg;
+    /// never a bare `Nominal[Array]` (which a `.map` result the reference Tuples
+    /// also carries).
+    fn array_new_nominal_provenance(
+        &self,
+        ast: &LoweredAst,
+        rhs_id: NodeId,
+        tenv: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        let Node::Call { receiver: Some(recv), method, args, .. } = ast.get(rhs_id) else {
+            return false;
+        };
+        if method != "new" {
+            return false;
+        }
+        let Node::ConstantRead { name, .. } = ast.get(*recv) else {
+            return false;
+        };
+        if name != "Array" {
+            return false;
+        }
+        // Zero-arg `Array.new` ⇒ the reference declines the tuple lift ⇒ Nominal.
+        if args.is_empty() {
+            return true;
+        }
+        // Else the FIRST arg must be a Constant integer strictly above the tuple
+        // limit (small / non-constant / non-integer size ⇒ decline, FP-safe).
+        let first = args[0];
+        let fty = self.type_of(ast, first, tenv, interner);
+        matches!(interner.get(fty), Type::Constant(Scalar::Int(n)) if *n > ARRAY_NEW_TUPLE_LIMIT)
     }
 
     /// The non-nil core arm `C` of a nilable SOURCE expression `value`, or `None`
@@ -941,11 +1013,13 @@ impl<'i> Typer<'i> {
     ///     value (`"hello"[0..2]` ⇒ `"hel"`), so it never sees `String | nil`;
     ///     rigor-rs types a string literal as `Constant` and declines, matching.
     ///     A `String.new` / interpolated / method-return String is `Nominal` in
-    ///     both (unfolded) and fires. **`Array` slices are deliberately NOT a
-    ///     source** — the reference folds `Array.new(n≤16)` and every array
-    ///     literal to a concrete array (hiding the `Array?`), while rigor-rs types
-    ///     them `Nominal[Array]`; that fold-divergence would over-fire, so array
-    ///     slices are gated behind array constant-folding (a separate feature).
+    ///     both (unfolded) and fires.
+    /// (a2) **Array slice** `arr[Range]` ⇒ `Array?` — but ONLY when the receiver is
+    ///     an `Array.new`-Nominal-provenance array (ADR-0039 §2 syntactic
+    ///     provenance): a bare local in `penv`, or a direct `Array.new(nominal)`
+    ///     call. NEVER a bare `Nominal[Array]` — the reference types array literals
+    ///     and `Array.new(n≤16)` (and `.map`/… results) as `Tuple` whose slice is
+    ///     non-nil, so firing off the type env would over-fire on those.
     /// (b) **Certain nilable RBS return** on a KNOWN core receiver
     ///     (`String#byteslice -> String?`). A `Constant` receiver is declined for
     ///     the same folding-parity reason — the keystone.
@@ -954,6 +1028,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         value_id: NodeId,
         tenv: &TypeEnv,
+        penv: &HashSet<String>,
         interner: &mut Interner,
     ) -> Option<&'static str> {
         let Node::Call { receiver: Some(recv), method, args, block_body, .. } = ast.get(value_id)
@@ -976,13 +1051,19 @@ impl<'i> Typer<'i> {
         if !self.index.knows_class(cls) {
             return None;
         }
+        let is_range_slice =
+            method == "[]" && args.len() == 1 && matches!(ast.get(args[0]), Node::Range { .. });
         // (a) String slice — `str[Range]` ⇒ `String?`. String only (see doc).
-        if method == "[]"
-            && cls == "String"
-            && args.len() == 1
-            && matches!(ast.get(args[0]), Node::Range { .. })
-        {
+        if is_range_slice && cls == "String" {
             return Some("String");
+        }
+        // (a2) Array slice — `arr[Range]` ⇒ `Array?`, provenance-gated (§2).
+        if is_range_slice && cls == "Array" {
+            let provenanced = match ast.get(recv) {
+                Node::LocalVariableRead { name, .. } => penv.contains(name),
+                _ => self.array_new_nominal_provenance(ast, recv, tenv, interner),
+            };
+            return provenanced.then_some("Array");
         }
         // (b) certain nilable RBS return.
         match self.index.method_return_nilable(cls, &method) {
@@ -1017,6 +1098,21 @@ fn widen_flow_writes(
     for (wspan, name) in writes {
         if span.0 <= wspan.0 && wspan.1 <= span.1 {
             env.insert(name.clone(), u);
+        }
+    }
+}
+
+/// Drop the `Array.new`-provenance of every local whose write span is contained
+/// in `span` — the `penv` counterpart of [`widen_flow_writes`] (a reassignment
+/// inside `span` invalidates the "still bound to `Array.new(nominal)`" fact).
+fn widen_penv_writes(
+    writes: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+    penv: &mut HashSet<String>,
+) {
+    for (wspan, name) in writes {
+        if span.0 <= wspan.0 && wspan.1 <= span.1 {
+            penv.remove(name);
         }
     }
 }
@@ -1163,18 +1259,51 @@ mod tests {
         assert_eq!(snaps.get(&use_id).copied(), Some("String"));
     }
 
-    /// An `Array` slice is NOT a source (the reference folds small/literal arrays,
-    /// so `Array?` would over-fire) — the snapshot stays empty.
+    /// ADR-0039 §2: an `Array.new(n > 16)` slice IS a source (the reference keeps
+    /// it `Nominal[Array]`, so `arr[Range] : Array?` fires). Provenance-gated.
     #[test]
-    fn nil_snapshot_array_slice_is_not_a_source() {
-        let ast = lower_src(
-            b"s = String.new(\"hi\")\narr = Array.new(300000) { |i| i }\nsub = arr[0..5]\nn = sub.size\n",
-        );
+    fn nil_snapshot_array_new_large_slice_fires() {
+        let ast = lower_src(b"arr = Array.new(300000) { |i| i }\nsub = arr[0..5]\nn = sub.size\n");
         let index = CoreIndex::new();
         let typer = Typer::new(&index);
         let mut i = Interner::new();
         let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
-        assert!(snaps.is_empty(), "array slices must not mint a nilable fact");
+        let use_id = ast
+            .iter()
+            .find_map(|(id, n)| match n {
+                Node::Call { receiver: Some(r), method, .. }
+                    if method == "size"
+                        && matches!(ast.get(*r), Node::LocalVariableRead { name, .. } if name == "sub") =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+            .expect("sub.size call present");
+        assert_eq!(snaps.get(&use_id).copied(), Some("Array"));
+    }
+
+    /// The reference `Tuple`s a small `Array.new(n ≤ 16)` and every array literal
+    /// (their slice is non-nil), so those slices must NOT fire — else an FP. The
+    /// provenance gate (small const / literal ⇒ no provenance) keeps them silent.
+    #[test]
+    fn nil_snapshot_small_array_new_and_literal_slices_decline() {
+        for src in [
+            b"arr = Array.new(10) { |i| i }\nsub = arr[0..5]\nn = sub.size\n".as_slice(),
+            b"arr = [1, 2, 3]\nsub = arr[0..1]\nn = sub.size\n".as_slice(),
+            b"arr = [1, 2, 3].map { |x| x }\nsub = arr[0..1]\nn = sub.size\n".as_slice(),
+        ] {
+            let ast = lower_src(src);
+            let index = CoreIndex::new();
+            let typer = Typer::new(&index);
+            let mut i = Interner::new();
+            let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+            assert!(
+                snaps.is_empty(),
+                "small/literal/.map array slice must not mint a nilable fact: {:?}",
+                std::str::from_utf8(src).unwrap()
+            );
+        }
     }
 
     /// The decline backstop: a guard (`if`) between the slice source and the use

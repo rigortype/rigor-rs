@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/42_nil_array_new_provenance.rb",
+  "diagnostics": [
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 18,
+      "column": 13,
+      "severity": "error",
+      "message": "possible nil receiver: `size' is undefined on NilClass"
+    }
+  ]
+}
