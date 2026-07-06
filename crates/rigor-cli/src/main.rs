@@ -235,14 +235,25 @@ fn cmd_check(args: &[String]) -> ExitCode {
         emit_ci_detected_output(&findings);
     }
 
-    // ADR-0040 — exit 1 iff there is a genuine read I/O error OR any ERROR-severity
-    // finding (matching the reference's `error_count > 0`); a warning-only run —
-    // including a warn-and-skip bad path alongside analyzed files — exits 0.
-    if had_io_error || findings.iter().any(|(_, _, _, d)| d.severity == Severity::Error) {
+    // ADR-0040 — exit 1 iff there is a genuine read I/O error OR any run-failing
+    // finding (see `finding_fails_run`); a warning-only run — including a
+    // warn-and-skip bad path alongside analyzed files — exits 0.
+    if had_io_error || findings.iter().any(|(_, _, _, d)| finding_fails_run(d)) {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// Whether a finding fails the `check` run (exit 1). ERROR severity matches the
+/// reference's `error_count > 0`. The synthetic `internal-error` finding also
+/// fails the run DESPITE being info-severity: its severity is info only to keep
+/// it out of the differential harness's error/warning parity gate (see
+/// [`internal_error_diag`]) — but a run whose analysis PANICKED must never exit 0
+/// (the 2026-07-06 audit's regression: the error-severity-driven exit code would
+/// otherwise silently green-light a crashed file in CI).
+fn finding_fails_run(d: &Diagnostic) -> bool {
+    d.severity == Severity::Error || d.rule_id == "internal-error"
 }
 
 /// The analysis pipeline shared by `check` and `baseline generate`: read +
@@ -330,10 +341,11 @@ fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
 }
 
 /// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
-/// `Dir.glob("**/*.rb")`: SKIP hidden entries (name starting with `.`) and do NOT
-/// traverse or include symlinks (Ruby's `**` does not follow symlinked dirs; we
-/// skip symlinked files too — a vanishingly rare case, and skipping only loses
-/// coverage, never soundness). Unreadable directories are silently skipped.
+/// `Dir.glob("**/*.rb")` exactly (probed): SKIP hidden entries (name starting
+/// with `.`); do NOT traverse symlinked DIRECTORIES (`**` does not follow them);
+/// but DO include symlinked `.rb` FILES (glob matches them — 2026-07-06 audit
+/// correction; a symlink to a dir is skipped, a symlink to a file is a match).
+/// Unreadable directories are silently skipped.
 fn collect_rb_files(dir: &Path, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -347,10 +359,19 @@ fn collect_rb_files(dir: &Path, out: &mut Vec<String>) {
         let Ok(ft) = entry.file_type() else {
             continue;
         };
+        let child = entry.path();
         if ft.is_symlink() {
+            // Follow the link ONE step to classify it: a file target is matched
+            // (like Dir.glob), a dir target is NOT traversed.
+            if name.ends_with(".rb") {
+                if let Ok(md) = std::fs::metadata(&child) {
+                    if md.is_file() {
+                        out.push(child.to_string_lossy().into_owned());
+                    }
+                }
+            }
             continue;
         }
-        let child = entry.path();
         if ft.is_dir() {
             collect_rb_files(&child, out);
         } else if ft.is_file() && name.ends_with(".rb") {
@@ -691,10 +712,6 @@ fn baseline_generate(args: &[String]) -> ExitCode {
         }
     }
 
-    if files.is_empty() {
-        eprintln!("rigor baseline generate: expected at least one file");
-        return ExitCode::from(64);
-    }
     if Path::new(&output).exists() && !force {
         eprintln!(
             "rigor: {output} already exists. Re-run with --force to overwrite."
@@ -716,9 +733,19 @@ fn baseline_generate(args: &[String]) -> ExitCode {
     // IMPORTANT (reference parity): generate must record the UNFILTERED set —
     // it never applies an existing baseline (`analyze_files` does not), so the
     // new file records the live diagnostics, not the post-baseline (empty) surface.
-    // ADR-0040 — expand directory args like `check` (a baseline is generated over
-    // a project tree); bad paths are simply skipped here (no diagnostic surface).
-    let (expanded_owned, _path_errors) = expand_check_paths(&files);
+    // ADR-0040 — bare `baseline generate` (no path args) scans the config
+    // `paths:` like a bare `check` (the reference generated a baseline from
+    // `configuration.paths` — 2026-07-06 audit); explicit args override. Then
+    // expand directory roots; bad paths are simply skipped here (no diagnostic
+    // surface on `generate`).
+    let config_paths: Vec<&str>;
+    let roots: &[&str] = if files.is_empty() {
+        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        &config_paths
+    } else {
+        &files
+    };
+    let (expanded_owned, _path_errors) = expand_check_paths(roots);
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _had_io_error) = analyze_files(&expanded, &cfg, "baseline", folder_ref);
 
@@ -1479,6 +1506,49 @@ mod tests {
         assert!(e2[0].not_found, "missing path is not_found");
         assert!(!e2[1].not_found, "existing non-.rb is not_found=false");
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 2026-07-06 audit #1: an ERROR-severity finding fails the run, a warning /
+    /// info does not — EXCEPT the synthetic `internal-error` (info-severity for
+    /// harness reasons), which must fail the run: a panicked analysis never
+    /// exits 0.
+    #[test]
+    fn finding_fails_run_severity_and_internal_error() {
+        assert!(finding_fails_run(&diag("call.undefined-method", Severity::Error, "boom")));
+        assert!(!finding_fails_run(&diag("call.unresolved-toplevel", Severity::Warning, "w")));
+        assert!(!finding_fails_run(&diag("some.info-rule", Severity::Info, "i")));
+        assert!(finding_fails_run(&internal_error_diag("panicked".to_string())));
+    }
+
+    /// 2026-07-06 audit #3: the dir walk matches Ruby's `Dir.glob("**/*.rb")` on
+    /// symlinks — a symlinked `.rb` FILE is included, a symlinked DIRECTORY is
+    /// not traversed.
+    #[cfg(unix)]
+    #[test]
+    fn collect_rb_files_symlink_semantics() {
+        let root = std::env::temp_dir().join(format!("rigor_symlink_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("real_dir")).unwrap();
+        std::fs::write(root.join("real.rb"), b"x = 1\n").unwrap();
+        std::fs::write(root.join("real_dir/inner.rb"), b"y = 2\n").unwrap();
+        std::os::unix::fs::symlink(root.join("real.rb"), root.join("link.rb")).unwrap();
+        std::os::unix::fs::symlink(root.join("real_dir"), root.join("link_dir")).unwrap();
+
+        let mut out = Vec::new();
+        collect_rb_files(&root, &mut out);
+        let names: Vec<String> = out
+            .iter()
+            .map(|f| Path::new(f).file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"real.rb".to_string()));
+        assert!(names.contains(&"inner.rb".to_string()));
+        assert!(names.contains(&"link.rb".to_string()), "symlinked FILE matched (Dir.glob does)");
+        assert_eq!(
+            names.iter().filter(|n| *n == "inner.rb").count(),
+            1,
+            "symlinked DIR not traversed (no duplicate inner.rb via link_dir)"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

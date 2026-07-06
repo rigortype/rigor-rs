@@ -18,8 +18,10 @@ an earlier probe look buggy):
 
 - **Directory** → `Dir.glob("<dir>/**/*.rb")` then `reject_excluded` — recursive,
   `.rb` only, **skips hidden dirs** (`.git/`…, glob's default dotfile rule),
-  **does not follow symlinked dirs**, **does not read `.gitignore`** (only the
-  config `exclude:` list prunes), results **sorted**.
+  **does not follow symlinked dirs** but **DOES match symlinked `.rb` files**
+  (probed; corrected by the 2026-07-06 audit — the first cut skipped symlinked
+  files too), **does not read `.gitignore`** (only the config `exclude:` list
+  prunes), results **sorted**.
 - **File** → accepted only if it exists and ends with `.rb`.
 - **Existing non-`.rb` file** → error `not a Ruby file (expected `.rb` or a
   directory)`.
@@ -41,7 +43,8 @@ limitation, not a bug — extending it would be a both-sides change, not now.
    dependency; the Rust `glob` crate matches leading dots by default, the
    opposite of Ruby, so a hand-walk is the faithful choice): recurse each
    directory arg, skip entries whose name starts with `.`, do not traverse
-   symlinked directories, collect `*.rb`, sort. Config `exclude:` still prunes via
+   symlinked directories (but include symlinked `.rb` files — glob matches them),
+   collect `*.rb`, sort. Config `exclude:` still prunes via
    the existing per-file `Config::is_excluded` gate in `analyze_files`.
 2. **Path errors matched in SEMANTICS, emitted in rigor-rs's format.** Accurate
    messages and the any-files-else-error severity rule. Bad-path diagnostics use a
@@ -85,8 +88,24 @@ path args still take full precedence (config `paths:` is used ONLY when no args
 are given). This reuses the `expand_check_paths` walk above, so `rigor check` in a
 project root — the most natural invocation — works like the reference (e.g.
 `paths: [lib]` scopes to `lib/`, excluding `spec/`). Verified message-identical to
-the reference. Unblocks the baseline `regenerate`/`drift`/`prune` subcommands,
-which depend on `configuration.paths`.
+the reference (including a missing `lib/`: error + exit 1, both tools). Unblocks
+the baseline `regenerate`/`drift`/`prune` subcommands, which depend on
+`configuration.paths`. **`baseline generate` with no path args does the same**
+(the reference generates from `configuration.paths`; audit #2) — explicit args
+override there too.
+
+**Known limitation (documented divergence):** rigor-rs resolves relative `paths:`
+entries against the process CWD; the reference resolves them against the project
+root (the config file's base). These coincide in the normal case (`.rigor.yml`
+auto-discovered in the CWD) and diverge only under an explicit `--config
+path/to/.rigor.yml` run from elsewhere — revisit if that becomes a real workflow.
+
+**Exit-code amendment (2026-07-06 audit #1):** the error-severity-driven exit
+gained one exception — the synthetic `internal-error` finding (a per-file PANIC,
+ADR-0016 never-crash) fails the run despite its info severity (which exists only
+to keep it out of the harness parity gate). Without this, the severity-driven
+rule would have silently green-lighted a crashed analysis in CI (the original
+"exit 1 on any finding" rule had covered it by accident).
 
 ## Out of scope (pre-existing, separate)
 
