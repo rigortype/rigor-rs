@@ -7,17 +7,19 @@
 //! per-line list. Read-only and advisory; ALWAYS exits 0 (an inspection command,
 //! not a gate — `rigor check` remains the gate).
 //!
-//! ## Scope — the `hints` Catalogue is DEFERRED
+//! ## Scope — the `hints` Catalogue
 //!
-//! The reference's fourth section, `hints`, is a 362-line ecosystem-heuristic
-//! Catalogue (ActiveSupport core-ext, ActiveRecord relations, project
-//! monkey-patch guesses, `gem-without-rbs`) tuned for a full Rails run and partly
-//! keyed on `:info`-severity plugin-recognition diagnostics rigor-rs does not
-//! emit. It is deferred with rationale here; the statistical core (summary /
-//! distribution / selectors / hotspots) is the parity-clean, high-value slice.
-//! Consequently rigor-rs's default sections are `[distribution, selectors,
-//! hotspots]` — i.e. the default output equals the reference's `triage --no-hints`
-//! (the parity gate); `hints` always renders empty.
+//! The fourth section, `hints`, ports the reference Catalogue's COUNT / rule-based
+//! recognisers — H7 (unresolved-toplevel), H5 (systemic single-file cluster), H6
+//! (low-count genuine bugs) — which fire on rigor-rs's diagnostic set and match
+//! the reference byte-for-byte, preserving the recogniser precedence + claiming.
+//! The ECOSYSTEM recognisers are DEFERRED (H1 ActiveSupport core-ext, H2/H2K
+//! project monkey-patch, H3 `gem-without-rbs`, H4 ActiveRecord relation): they key
+//! on ActiveSupport/ActiveRecord method tables, `:info` plugin-recognition
+//! notices, cross-file `project_definition_site` provenance, or `Array[…]`
+//! relation receivers that rigor-rs does not produce — so on a rigor-rs diagnostic
+//! set they never fire, and the reference (fed the same source) does not fire them
+//! either, so the ported subset is parity-faithful for rigor-rs-witnessable code.
 //!
 //! ## Parity notes
 //!
@@ -68,7 +70,8 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
     let mut top = 10usize;
     let mut include_info = false;
     // Default sections: hints deferred, so the default equals `--no-hints`.
-    let mut sections = vec![Section::Distribution, Section::Selectors, Section::Hotspots];
+    let mut sections =
+        vec![Section::Distribution, Section::Selectors, Section::Hotspots, Section::Hints];
     let mut explicit_config: Option<&str> = None;
     let mut paths: Vec<&str> = Vec::new();
 
@@ -139,7 +142,7 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
     let diags: Vec<DiagRef> =
         findings.iter().map(|(_o, path, _src, d)| (path.as_str(), d)).collect();
 
-    let report = analyze(&diags, top, include_info);
+    let report = analyze(&diags, top, sections.contains(&Section::Hints), include_info);
     match format {
         "json" => println!("{}", report_json(&report)),
         _ => print!("{}", render_text(&report, &sections)),
@@ -179,15 +182,25 @@ struct Hotspot {
     by_rule: Vec<(String, usize)>,
 }
 
+/// One heuristic hint (reference `Triage::Hint`).
+struct Hint {
+    id: &'static str,
+    confidence: &'static str,
+    diagnostic_count: usize,
+    summary: String,
+    action: &'static str,
+}
+
 struct Report {
     summary: Summary,
     distribution: Vec<RuleCount>,
     selectors: Vec<Selector>,
     hotspots: Vec<Hotspot>,
+    hints: Vec<Hint>,
     include_info: bool,
 }
 
-fn analyze(diags: &[DiagRef], top: usize, include_info: bool) -> Report {
+fn analyze(diags: &[DiagRef], top: usize, run_hints: bool, include_info: bool) -> Report {
     // The summary reports the FULL stream; the volume views route out `:info`
     // unless `--include-info` (WD6). rigor-rs emits no `:info` today, so routing
     // is inert, but it is ported faithfully.
@@ -201,8 +214,148 @@ fn analyze(diags: &[DiagRef], top: usize, include_info: bool) -> Report {
         distribution: build_distribution(&routed),
         selectors: build_selectors(&routed),
         hotspots: build_hotspots(&routed, top),
+        // Hints see the FULL stream (the per-recogniser info-guard is inside).
+        hints: if run_hints { recognise(diags, include_info) } else { Vec::new() },
         include_info,
     }
+}
+
+const UNRESOLVED_TOPLEVEL_RULE: &str = "call.unresolved-toplevel";
+const SYSTEMIC_THRESHOLD: usize = 8;
+const GENUINE_BUG_MAX_COUNT: usize = 5;
+
+/// Run the heuristic-hint recognisers in precedence order, each claiming the
+/// diagnostics it matches so a later recogniser cannot re-claim them (reference
+/// `Catalogue.recognise`). rigor-rs ports the count / rule-based recognisers that
+/// fire on its diagnostic set — H7 (unresolved-toplevel), H5 (systemic cluster),
+/// H6 (genuine bugs); the ecosystem recognisers (H1 ActiveSupport, H2/H2K
+/// monkey-patch, H3 gem-without-rbs, H4 ActiveRecord relation) are deferred —
+/// they need method tables / `:info` notices / cross-file provenance / `Array[…]`
+/// relation receivers that rigor-rs does not produce, and would never fire here.
+/// The preserved order (H7 before the H5/H6 catch-alls) matches the reference.
+fn recognise(diags: &[DiagRef], include_info: bool) -> Vec<Hint> {
+    let mut claimed = vec![false; diags.len()];
+    let mut hints = Vec::new();
+    // H7 sees the full pool; H5/H6 are `:info`-guarded unless --include-info.
+    for (recogniser, info_guarded) in [
+        (h7_unresolved_toplevel as fn(&[DiagRef], &[usize]) -> Option<(Hint, Vec<usize>)>, false),
+        (h5_systemic_cluster, true),
+        (h6_genuine_bugs, true),
+    ] {
+        let pool: Vec<usize> = (0..diags.len())
+            .filter(|&i| !claimed[i])
+            .filter(|&i| include_info || !info_guarded || diags[i].1.severity != Severity::Info)
+            .collect();
+        if let Some((hint, matched)) = recogniser(diags, &pool) {
+            for i in matched {
+                claimed[i] = true;
+            }
+            hints.push(hint);
+        }
+    }
+    hints
+}
+
+/// H7 — implicit-self toplevel calls that resolve to nothing.
+fn h7_unresolved_toplevel(diags: &[DiagRef], pool: &[usize]) -> Option<(Hint, Vec<usize>)> {
+    let matched: Vec<usize> =
+        pool.iter().copied().filter(|&i| qualified_rule(diags[i].1) == UNRESOLVED_TOPLEVEL_RULE).collect();
+    if matched.is_empty() {
+        return None;
+    }
+    let mut files: Vec<&str> = matched.iter().map(|&i| diags[i].0).collect();
+    files.sort_unstable();
+    files.dedup();
+    let methods = top_methods(matched.iter().map(|&i| diags[i].1.method_name.as_deref()));
+    let summary = format!(
+        "{} toplevel call(s) resolve to nothing visible across {} file(s) ({methods})",
+        matched.len(),
+        files.len()
+    );
+    Some((
+        Hint {
+            id: "unresolved-toplevel",
+            confidence: "possible",
+            diagnostic_count: matched.len(),
+            summary,
+            action: "If a monkey-patch or required helper defines these, list its \
+                     file in `.rigor.yml`'s `pre_eval:` (ADR-17); otherwise they may \
+                     be genuine typos or missing requires.",
+        },
+        matched,
+    ))
+}
+
+/// H5 — a single (file, rule) cluster of at least [`SYSTEMIC_THRESHOLD`]
+/// diagnostics (the largest such cluster wins).
+fn h5_systemic_cluster(diags: &[DiagRef], pool: &[usize]) -> Option<(Hint, Vec<usize>)> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<(&str, String), Vec<usize>> = HashMap::new();
+    for &i in pool {
+        groups.entry((diags[i].0, qualified_rule(diags[i].1))).or_default().push(i);
+    }
+    let (path, rule, matched) = groups
+        .into_iter()
+        .filter(|(_, v)| v.len() >= SYSTEMIC_THRESHOLD)
+        // max by size, then a stable tiebreak on (path, rule) for determinism.
+        .max_by(|a, b| {
+            a.1.len().cmp(&b.1.len()).then_with(|| b.0.cmp(&a.0))
+        })
+        .map(|((p, r), v)| (p, r, v))?;
+    Some((
+        Hint {
+            id: "systemic-file-cluster",
+            confidence: "likely",
+            diagnostic_count: matched.len(),
+            summary: format!("{}× `{rule}` concentrated in {path}", matched.len()),
+            action: "Likely systemic in this file — one fix may clear many; \
+                     or a strong baseline candidate (ADR-22).",
+        },
+        matched,
+    ))
+}
+
+/// H6 — every rule whose total count is low (1..=[`GENUINE_BUG_MAX_COUNT`]) —
+/// the localised bugs, not systemic noise.
+fn h6_genuine_bugs(diags: &[DiagRef], pool: &[usize]) -> Option<(Hint, Vec<usize>)> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    for &i in pool {
+        groups.entry(qualified_rule(diags[i].1)).or_default().push(i);
+    }
+    let mut small: Vec<(String, Vec<usize>)> =
+        groups.into_iter().filter(|(_, v)| (1..=GENUINE_BUG_MAX_COUNT).contains(&v.len())).collect();
+    if small.is_empty() {
+        return None;
+    }
+    // `rules` string is sorted (reference `.sort`); matched is every small diag.
+    small.sort_by(|a, b| a.0.cmp(&b.0));
+    let rules = small.iter().map(|(r, v)| format!("{r}×{}", v.len())).collect::<Vec<_>>().join(", ");
+    let matched: Vec<usize> = small.into_iter().flat_map(|(_, v)| v).collect();
+    Some((
+        Hint {
+            id: "genuine-bugs",
+            confidence: "likely",
+            diagnostic_count: matched.len(),
+            summary: format!("low-count, scattered rules ({rules})"),
+            action: "Review these first — low-count diagnostics are usually the \
+                     localised bugs Rigor caught, not systemic noise.",
+        },
+        matched,
+    ))
+}
+
+/// The `method×count` summary of a diagnostic set's method names, top 5 by
+/// `-count, method` (reference `top_methods`).
+fn top_methods<'a>(names: impl Iterator<Item = Option<&'a str>>) -> String {
+    use std::collections::HashMap;
+    let mut tally: HashMap<&str, usize> = HashMap::new();
+    for n in names.flatten() {
+        *tally.entry(n).or_insert(0) += 1;
+    }
+    let mut rows: Vec<(&str, usize)> = tally.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    rows.into_iter().take(5).map(|(m, c)| format!("{m}×{c}")).collect::<Vec<_>>().join(" ")
 }
 
 fn build_summary(diags: &[DiagRef]) -> Summary {
@@ -390,7 +543,7 @@ fn render_text(report: &Report, sections: &[Section]) -> String {
             Section::Distribution => blocks.push(distribution_block(report)),
             Section::Selectors => blocks.push(selectors_block(report)),
             Section::Hotspots => blocks.push(hotspots_block(report)),
-            Section::Hints => blocks.push("Hints\n  (no heuristic hints)".to_string()),
+            Section::Hints => blocks.push(hints_block(report)),
         }
     }
     format!("{}\n", blocks.join("\n\n"))
@@ -450,6 +603,21 @@ fn hotspots_block(report: &Report) -> String {
     lines.join("\n")
 }
 
+/// The `Hints` text section (reference `TriageRenderer#hints_block`).
+fn hints_block(report: &Report) -> String {
+    if report.hints.is_empty() {
+        return "Hints\n  (no heuristic hints)".to_string();
+    }
+    let mut lines = vec!["Hints — heuristics, verify before acting".to_string()];
+    for h in &report.hints {
+        lines.push(String::new());
+        lines.push(format!("  [{} {}]  {} diagnostic(s)", h.confidence, h.id, h.diagnostic_count));
+        lines.push(format!("    {}", h.summary));
+        lines.push(format!("    → {}", h.action));
+    }
+    lines.join("\n")
+}
+
 fn bar(count: usize, max: usize) -> String {
     let mut filled = (count * BAR_WIDTH).checked_div(max).unwrap_or(0);
     if filled == 0 && count > 0 {
@@ -488,7 +656,13 @@ fn report_json(report: &Report) -> String {
         "hotspots": report.hotspots.iter()
             .map(|h| json!({ "file": h.file, "count": h.count, "by_rule": map(&h.by_rule) }))
             .collect::<Vec<_>>(),
-        "hints": Vec::<serde_json::Value>::new(),
+        "hints": report.hints.iter().map(|h| json!({
+            "id": h.id,
+            "confidence": h.confidence,
+            "diagnostic_count": h.diagnostic_count,
+            "summary": h.summary,
+            "action": h.action,
+        })).collect::<Vec<_>>(),
         "include_info": report.include_info,
     });
     serde_json::to_string_pretty(&payload).unwrap()
@@ -530,12 +704,42 @@ mod tests {
     }
 
     #[test]
+    fn hint_recognisers_claim_in_precedence_order() {
+        let td = diag("call.unresolved-toplevel", Severity::Error, None, Some("helper"));
+        let u1 = diag("call.undefined-method", Severity::Error, Some("\"x\""), Some("a"));
+        let u2 = diag("call.undefined-method", Severity::Error, Some("\"y\""), Some("b"));
+        let diags = vec![("f.rb", &td), ("f.rb", &u1), ("g.rb", &u2)];
+        let hints = recognise(&diags, false);
+        // H7 (unresolved-toplevel) claims the toplevel call; H6 (genuine bugs)
+        // then claims the two remaining undefined-methods. H5 needs >= 8, so no.
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].id, "unresolved-toplevel");
+        assert_eq!(hints[0].diagnostic_count, 1);
+        assert_eq!(hints[1].id, "genuine-bugs");
+        assert_eq!(hints[1].diagnostic_count, 2);
+        assert_eq!(hints[1].summary, "low-count, scattered rules (call.undefined-method×2)");
+    }
+
+    #[test]
+    fn systemic_cluster_fires_at_threshold() {
+        // 8 undefined-methods in one file → H5 (not H6, which claims <= 5).
+        let ds: Vec<Diagnostic> = (0..8)
+            .map(|_| diag("call.undefined-method", Severity::Error, Some("\"x\""), Some("m")))
+            .collect();
+        let diags: Vec<DiagRef> = ds.iter().map(|d| ("big.rb", d)).collect();
+        let hints = recognise(&diags, false);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].id, "systemic-file-cluster");
+        assert_eq!(hints[0].summary, "8× `call.undefined-method` concentrated in big.rb");
+    }
+
+    #[test]
     fn distribution_and_summary() {
         let d1 = diag("call.undefined-method", Severity::Error, Some("\"x\""), Some("frist"));
         let d2 = diag("call.undefined-method", Severity::Error, Some("\"y\""), Some("lenght"));
         let d3 = diag("call.wrong-arity", Severity::Warning, Some("z"), Some("f"));
         let diags = vec![("a.rb", &d1), ("a.rb", &d2), ("b.rb", &d3)];
-        let report = analyze(&diags, 10, false);
+        let report = analyze(&diags, 10, false, false);
         assert_eq!(report.summary.total, 3);
         assert_eq!(report.summary.error, 2);
         assert_eq!(report.summary.warning, 1);
@@ -554,7 +758,7 @@ mod tests {
     fn method_only_selector_has_null_receiver() {
         let d = diag("call.unresolved-toplevel", Severity::Error, None, Some("helper"));
         let diags = vec![("a.rb", &d)];
-        let report = analyze(&diags, 10, false);
+        let report = analyze(&diags, 10, false, false);
         assert_eq!(report.selectors.len(), 1);
         assert!(report.selectors[0].receiver.is_none());
         assert_eq!(report.selectors[0].method, "helper");
@@ -562,7 +766,7 @@ mod tests {
 
     #[test]
     fn empty_stream_renders_none_placeholders() {
-        let report = analyze(&[], 10, false);
+        let report = analyze(&[], 10, false, false);
         let text = render_text(&report, &[Section::Distribution, Section::Selectors, Section::Hotspots]);
         assert!(text.contains("Diagnostic distribution — 0 total (0 error / 0 warning)"));
         assert!(text.contains("Selectors — by class / method\n  (none)"));
