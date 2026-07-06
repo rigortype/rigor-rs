@@ -6,9 +6,26 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 (config-audit merged to master, PR #8 / `173be0d`) — **Baseline feature area
-COMPLETE + productization pivot + flow-frontier exhaustion recorded; `warn_unresolved_config` config-audit
-LANDED.** Read `AGENTS.md` "Working discipline" before continuing.
+Last updated: 2026-07-06 (config-audit PR #8 merged; `rigor diff` on branch `diff-command`) — **Baseline
+feature area COMPLETE + productization pivot + flow-frontier exhaustion recorded; `warn_unresolved_config`
+config-audit LANDED; `rigor diff` ported.** Read `AGENTS.md` "Working discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `diff-command`) — `rigor diff <baseline.json> [paths...]`.** A faithful
+port of the reference's `DiffCommand` (`lib/rigor/cli/diff_command.rb`): compares the current `rigor check`
+diagnostics against a saved `check --format=json` baseline and prints the **new** (regressions) / **fixed**
+(progress) delta, exit **1** iff any new diagnostic appears (a CI regression gate — legacy errors in the
+baseline don't fail, new ones do). A lighter-weight sibling of the ADR-22 baseline system (no
+`.rigor-baseline.yml` — just two JSON snapshots). `crates/rigor-cli/src/diff.rs`: identity tuple
+`(path, line, column, rule, source_family, message)`; `--format text|json`, `--current PATH` (compare a saved
+JSON instead of a live run), `--config PATH`; `load_diagnostics` accepts both a bare array (rigor-rs) and a
+`{diagnostics: […]}` object (reference). The current run reuses `analyze_files` in the Ruby-free SOUND SUBSET
+(folder=None) — diagnostic-identical to full fidelity per ADR-0037, keeping `diff` dependency-free.
+**Verified:** fresh-dir E2E vs the oracle (feeding both tools the same baseline + `--current` JSON to isolate
+format from analyzer-coverage differences) — **text output byte-identical**, exit codes identical (1 new / 0
+clean / 64 missing-file), JSON **content**-identical (only key ORDER differs — serde_json alphabetizes vs the
+reference's insertion order; JSON key order is insignificant, documented). Live end-to-end path confirmed
+(generate baseline → edit source → correct new/fixed split). 462 workspace tests, run.rb + run_snapshot.rb
+54/54, no new clippy lints. **NOT yet merged.**
 
 **▶▶ LANDED THIS SESSION (merged to master, PR #8) — `warn_unresolved_config` / `ConfigAudit`.**
 A faithful port of the reference's config audit (`lib/rigor/config_audit.rb` + `check_command.rb`'s
@@ -36,8 +53,9 @@ reference + probes the oracle; Opus implements on a branch; main byte-audits bef
   Follow-ons if pursued: the deferred JSON `config_warnings` payload (needs a JSON top-level shape decision,
   since rigor-rs emits a bare array). NOTE: the reference does NOT warn on unknown keys — it ignores them
   silently, exactly as rigor-rs already does — so there is no "unknown-key" pass to add.
-- **reference CLI commands not yet ported**: `explain` (why a diagnostic fired), `diff` (only-new-vs-base),
-  `annotate`, `type_of`, `triage` — each a faithful port; pick by likely user value.
+- **reference CLI commands** — `explain`, `type-of`, `diff` (this session) DONE. Remaining unported:
+  `annotate` (inline `#=> <type>` xmpfilter-style annotations), `triage` (ADR-23 distribution/selectors/
+  hotspots — larger), `trace`, `type-scan`, `sig-gen`, `coverage` — each a faithful port; pick by user value.
 - **§12 LSP two-tier / MCP tool expansion** — larger; watched-files invalidation, debounce, worker pool;
   or more MCP tools.
 Always: predict value with a valid-mode probe first, port faithfully (read reference + oracle),
