@@ -11,6 +11,17 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `case-union`) — (a) inference precision slice 3: case-expression union (completes if/case).**
+A `Node::Case` arm in `Typer::type_of` (reference `type_of_case_simple_union`): a `case`/`when` (or `case`/`in`)
+as an expression types to the union of its branch VALUES + the `else` value (or `nil` when no `else` - a
+non-exhaustive case returns nil). Each `when`/`in` branch lowers to a `BeginRescue` carrier whose tail is the
+branch value (resolved by the recursive `stmt_value_type`). A sound over-approximation of the reference's
+`===`-certainty-narrowed variant (which only DROPS statically-impossible branches). Also: `describe_named`'s
+union rendering now floats `nil` LAST (`10 | 20 | nil`, the reference's `T | … | nil` convention) in the
+non-optional case. Byte-identical to the reference on case/when in `annotate`/`type-of`. **Gated:** 482 tests,
+run.rb + run_snapshot.rb 54/54, corpus 400 files 0 FP. **(a) is now COMPLETE**: Tuple projection folds (#15),
+if/unless/ternary unions (#16), case unions (this). NOT yet merged.
+
 **▶▶ LANDED THIS SESSION (branch `ifcase-union`) — (a) inference precision slice 2: if/unless/ternary value typing.**
 A new `Node::If` arm in `Typer::type_of` (reference `type_of_if`): an `if`/`unless`/ternary AS AN EXPRESSION
 types to the union of its branch VALUES (each branch's tail; a missing `else` contributes `nil`) - `if c then 1
