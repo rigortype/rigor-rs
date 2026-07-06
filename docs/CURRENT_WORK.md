@@ -6,7 +6,23 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **PRODUCTIZATION: bare `rigor check` scans config `paths:` (default `[lib]`)
+Last updated: 2026-07-06 — **PRODUCTIZATION: baseline `regenerate`/`drift`/`prune` LANDED (ADR-22
+completion; merge `95564d4`).** The three remaining baseline subcommands are a faithful port, built by a
+delegated implementation agent from a TWO-WAY-verified oracle spec (two independent reference
+investigations agreed on all overlapping facts) and audited before merge: `regenerate` = `generate
+--force` with the `regenerated baseline` verb (no `--force` flag, no existence guard); `drift` audits
+every bucket (message-before-rule claiming) into over/cleared/reducible/within + Δ (default filter
+Δ≠0, `--only` bypasses it, fixed group order, exact unicode row format, exit 0 informational / 64
+missing-or-malformed baseline); `prune` removes cleared buckets by full-tuple equality (`--dry-run`
+announce-only; stdout announce + stderr summary channel contract). Two spec deviations were resolved
+TOWARD THE ORACLE by the implementer and independently re-verified (positionals silently ignored on
+drift/prune; optparse-native error wording). `Baseline::{audit,without}` + `DriftStatus`/`DriftRow` are
+reusable for a future `check --baseline-strict` (not implemented). Also removed stale
+accidentally-committed `.rigor/cache` files. **445 tests, clippy clean, both harness gates PASS, 22/22
+E2E parity scenarios byte-identical (stdout+stderr+exit).** §7's baseline item is now COMPLETE
+(generate/dump/regenerate/drift/prune); remaining §7: full config schema, `--baseline-strict`.
+
+Prior: 2026-07-06 — **PRODUCTIZATION: bare `rigor check` scans config `paths:` (default `[lib]`)
 landed** ([ADR-0040](adr/0040-directory-path-argument-support.md) follow-on) — `rigor check` in a project
 root now works like the reference (was: `expected at least one file`); explicit args still override.
 Verified reference-message-identical; unblocks baseline `regenerate`/`drift`/`prune` (which need
