@@ -21,6 +21,7 @@ use rigor_types::Interner;
 
 mod config;
 use config::Config;
+mod config_audit;
 mod ci_detector;
 mod diagnostic_formats;
 use diagnostic_formats::Rendered;
@@ -172,6 +173,15 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // Degrades to default (= inert) on any error, so the differential harness —
     // which runs from a directory with no `.rigor.yml` — is unaffected.
     let cfg = Config::load(explicit_config.map(Path::new));
+
+    // Config audit (reference `warn_unresolved_config`): surface configured
+    // values that silently resolve to nothing — a typo'd `signature_paths:` dir
+    // (which would manufacture hundreds of false `undefined-method`s), an inert
+    // `disable:` rule token, a missing explicit `rbs_collection.lockfile`. Emitted
+    // to stderr as `rigor: <message>` before analysis; the stdout diagnostic
+    // stream is untouched (0-FP / harness-safe — the harness runs configless).
+    // `project_root` is the process cwd, the base config discovery resolves against.
+    config_audit::emit(&cfg, Path::new("."));
 
     // ADR-0036 coverage posture (ADR-0008 sidecar). Resolve the mode, then bring
     // up the Ruby sidecar accordingly: `require`/`<path>` MUST have it (exit 69 on

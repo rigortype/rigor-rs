@@ -6,16 +6,36 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 (multi-arc session, all merged to master) — **Baseline feature area COMPLETE
-+ productization pivot + flow-frontier exhaustion recorded.** Read `AGENTS.md` "Working discipline"
-before continuing.
+Last updated: 2026-07-06 (config-audit slice on branch `config-audit`) — **Baseline feature area COMPLETE
++ productization pivot + flow-frontier exhaustion recorded; `warn_unresolved_config` config-audit ported.**
+Read `AGENTS.md` "Working discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `config-audit`, NOT yet merged) — `warn_unresolved_config` / `ConfigAudit`.**
+A faithful port of the reference's config audit (`lib/rigor/config_audit.rb` + `check_command.rb`'s
+`warn_unresolved_config`), surfacing configured values that silently resolve to nothing — the class of
+mistake whose only symptom is downstream and confusing (a typo'd `signature_paths:` dir manufactures
+hundreds of false `undefined-method`s; an inert `disable:` token leaves the rule firing as if unwritten).
+`crates/rigor-cli/src/config_audit.rs` ports the applicable subset (rigor-rs's config lacks
+`libraries:`/`bundler.*`/`severity_overrides:`): (1) **`signature_paths:`** entries resolving to nothing
+(`:missing`/`:not_directory`/`:empty`), audited ONLY when explicitly configured (new `Config::present_keys` +
+`explicit_signature_paths()` gate mirrors the reference's nil-when-unset — the implicit `["sig"]` default
+never warns); (2) **`disable:`** inert built-in-family tokens via new `rigor_rules::is_inert_builtin_token`
+(validated against the reference's FULL 19-id `ALL_CANONICAL_RULES`, not the narrower `IMPLEMENTED_RULES`, so
+a recognized-but-unemitted rule is never mis-flagged); (3) explicit **`rbs_collection.lockfile`** that does
+not exist. Emitted to STDERR as `rigor: <message>` before analysis (all formats); the JSON-payload
+`config_warnings` half is DEFERRED (rigor-rs's JSON is a bare diagnostics *array*, an established shape
+divergence). **Verified:** fresh-dir E2E vs the oracle — all message forms byte-identical EXCEPT
+`signature_paths:` prints the RELATIVE configured string vs the reference's absolutized path (deliberate,
+documented — rigor-rs's house style resolves/prints paths relative to cwd). 0-FP / harness-safe (stderr-only,
+harness runs configless): run.rb + run_snapshot.rb 54/54, workspace tests green, clippy adds no new lints.
 
 **▶▶ NEXT SESSION — START HERE: continue PRODUCTIZATION (the measurement-proven high-ROI track).**
 Candidates, any of which suits the delegation model (main designs/audits; Sonnet investigates the
 reference + probes the oracle; Opus implements on a branch; main byte-audits before merge):
-- **full `.rigor.yml` config-schema validation** — warn on malformed/unknown keys like the reference
-  (`warn_unresolved_config`); the config surface exists (`crates/rigor-cli/src/config.rs`), this adds the
-  validation/warnings pass.
+- ✅ **`.rigor.yml` config-audit** (`warn_unresolved_config`) — LANDED on `config-audit` (see above).
+  Follow-ons if pursued: the deferred JSON `config_warnings` payload (needs a JSON top-level shape decision,
+  since rigor-rs emits a bare array). NOTE: the reference does NOT warn on unknown keys — it ignores them
+  silently, exactly as rigor-rs already does — so there is no "unknown-key" pass to add.
 - **reference CLI commands not yet ported**: `explain` (why a diagnostic fired), `diff` (only-new-vs-base),
   `annotate`, `type_of`, `triage` — each a faithful port; pick by likely user value.
 - **§12 LSP two-tier / MCP tool expansion** — larger; watched-files invalidation, debounce, worker pool;
