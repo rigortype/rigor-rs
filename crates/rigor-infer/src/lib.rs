@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 
 use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, Node, NodeId};
-use rigor_types::{Interner, Scalar, Type, TypeId};
+use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
 pub use source_index::{ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
@@ -228,11 +228,22 @@ impl<'i> Typer<'i> {
                     interner.intern(Type::Tuple(elems))
                 }
             }
-            // A hash literal types to its bare `Hash` nominal so a typo'd method
-            // (`{}.fetchh`) flags via the real Hash RBS. HashShape (value-pinned
-            // key/value) precision is deferred — the reference produces it, but
-            // typing it needs the key/value pairing + openness model (ADR-0023).
-            Node::HashLit { .. } => self.nominal_or_untyped("Hash", interner),
+            // A hash literal types to a value-pinned `HashShape` (reference
+            // `type_of_hash` / `static_hash_shape_for`) when every element is an
+            // assoc with a static Symbol/String key: `{ a: 1 }` → `{ a: 1 }`,
+            // `{}` → the empty `HashShape{}`. `class_name_of(HashShape)` erases to
+            // `Hash`, so a typo'd method (`{ a: 1 }.fetchh`) still flags via the
+            // real Hash RBS — the shape only sharpens the DISPLAY. A `**`splat, a
+            // non-static (dynamic / integer) key, or a duplicate key degrades to
+            // the bare `Hash` nominal (`all_assoc == false` short-circuits it).
+            Node::HashLit { elements, all_assoc, .. } => {
+                if *all_assoc {
+                    let elem_ids = elements.clone();
+                    self.hash_shape_or_hash(ast, &elem_ids, env, interner)
+                } else {
+                    self.nominal_or_untyped("Hash", interner)
+                }
+            }
             // A call with no receiver (implicit self) or any other carrier
             // (`@ivar`, constant, `self`, `if`/`case`-as-expression, index,
             // range, logical, variable read) is not precisely typed in this
@@ -252,6 +263,39 @@ impl<'i> Typer<'i> {
             Some(class) => interner.intern(Type::Nominal { class, args: vec![] }),
             None => interner.untyped(),
         }
+    }
+
+    /// Build a value-pinned [`Type::HashShape`] from an all-assoc hash literal's
+    /// flat `[k, v, k, v, …]` element list (guaranteed even by `all_assoc`), or
+    /// fall back to the bare `Hash` nominal. A faithful port of the reference's
+    /// `static_hash_shape_for`: every key must be a static Symbol/String literal
+    /// and no key may repeat; a non-static or duplicate key degrades to `Hash`.
+    /// The empty list yields the empty `HashShape{}` (`{}`).
+    fn hash_shape_or_hash(
+        &self,
+        ast: &LoweredAst,
+        elem_ids: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let mut members: Vec<ShapeMember> = Vec::with_capacity(elem_ids.len() / 2);
+        let mut seen: std::collections::HashSet<ShapeKey> = std::collections::HashSet::new();
+        let mut i = 0;
+        while i + 1 < elem_ids.len() {
+            let key = match ast.get(elem_ids[i]) {
+                Node::SymbolLit { value, .. } => ShapeKey::Sym(value.clone()),
+                Node::StringLit { value, .. } => ShapeKey::Str(value.clone()),
+                // A dynamic / non-Symbol-or-String key can't pin a shape slot.
+                _ => return self.nominal_or_untyped("Hash", interner),
+            };
+            if !seen.insert(key.clone()) {
+                return self.nominal_or_untyped("Hash", interner);
+            }
+            let value = self.type_of(ast, elem_ids[i + 1], env, interner);
+            members.push(ShapeMember { key, value, optional: false });
+            i += 2;
+        }
+        interner.intern(Type::HashShape(members))
     }
 
     /// Type a method call with a receiver, running the conservative head of the
