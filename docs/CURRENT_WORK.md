@@ -11,6 +11,15 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `tuple-projection`) — (a) inference precision slice 1: Tuple projection folds.**
+`Typer::fold_tuple_projection` (new Tier 2 in `type_call`, reference `ShapeDispatch`): a no-arg accessor or
+constant-index read on a value-pinned `Tuple` folds to the pinned element/arity — `[1,2,3].first`->`1`,
+`.last`->`3`, `.size`/`.length`/`.count`->`3`, `.empty?`->`false`, `[1,2][0]`->`1` (Ruby negative index; OOB->`nil`;
+`[].first`->`nil`). Only block-free no-arg / single-constant-index forms fold (an arg-form `first(2)` declines to
+the RBS `Array[Elem]` overload; `type_call` never sees block calls). Sharpens `type-of`/`annotate` and chained
+witnessing (`[1,2].first.frist` flags on `1`) - byte-identical to the reference on the projection cases.
+**Gated:** 480 tests, run.rb + run_snapshot.rb 54/54, corpus 400 files 0 FP (hot-path). Merged as PR (below).
+
 **▶▶ LANDED THIS SESSION (branch `annotate`) — `rigor annotate FILE`.** A port of the reference's
 `AnnotateCommand` + `LineTypeCollector`: appends a `#=> <type>` comment to each source line (xmpfilter
 convention), rendering the type via the shared `describe_named` layer — the payoff of the type-display arc.
