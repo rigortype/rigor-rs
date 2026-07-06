@@ -11,6 +11,18 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `ifcase-union`) — (a) inference precision slice 2: if/unless/ternary value typing.**
+A new `Node::If` arm in `Typer::type_of` (reference `type_of_if`): an `if`/`unless`/ternary AS AN EXPRESSION
+types to the union of its branch VALUES (each branch's tail; a missing `else` contributes `nil`) - `if c then 1
+else 2 end`->`1 | 2`, `if e then 1 end`->`1?`. A KNOWN-polarity predicate elides the dead branch via
+`predicate_polarity` (nil/false->falsey, any Nominal/shape/non-nil-non-false Constant->truthy, else->keep both;
+never MORE aggressive than the reference, so it can only cost a witness, never add one): `if "x".upcase then a
+end`->`a` (not `a | nil`). `branch_value_type`/`stmt_value_type` resolve a branch's tail through assignment
+(->RHS) and the `BeginRescue`/`Statements` wrappers rigor-rs lowers an `else` into. Union receivers never
+witness (`class_name_of`->None), so FP-safe. Byte-identical to the reference on if/unless/ternary in
+`annotate`/`type-of`. **Gated:** 481 tests, run.rb + run_snapshot.rb 54/54, corpus 560 files 0 FP (matched
+unchanged). `case`-as-expression union is the remaining sibling (deferred - needs per-When-branch descent).
+
 **▶▶ LANDED THIS SESSION (branch `tuple-projection`) — (a) inference precision slice 1: Tuple projection folds.**
 `Typer::fold_tuple_projection` (new Tier 2 in `type_call`, reference `ShapeDispatch`): a no-arg accessor or
 constant-index read on a value-pinned `Tuple` folds to the pinned element/arity — `[1,2,3].first`->`1`,

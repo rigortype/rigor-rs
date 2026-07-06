@@ -244,13 +244,109 @@ impl<'i> Typer<'i> {
                     self.nominal_or_untyped("Hash", interner)
                 }
             }
+            // An `if`/`unless`/ternary AS AN EXPRESSION evaluates to the union of
+            // its branch values (reference `type_of_if`): each branch's tail
+            // value, with a missing `else` contributing `nil`. A KNOWN-polarity
+            // predicate elides the dead branch (`if str_value; a; end` → `a`, not
+            // `a | nil`, since a Nominal/non-nil-Constant is always truthy). An
+            // unknown predicate keeps both. Sharpens `type-of`/`annotate`; a
+            // union receiver never witnesses (`class_name_of` ⇒ None), so this
+            // adds no undefined-method firings and is FP-safe.
+            Node::If { predicate, then_body, else_body, is_unless, .. } => {
+                let then_ty = self.branch_value_type(ast, then_body, env, interner);
+                let else_ty = if else_body.is_empty() {
+                    interner.intern(Type::Constant(Scalar::Nil))
+                } else {
+                    self.branch_value_type(ast, else_body, env, interner)
+                };
+                // The union is symmetric, but ELISION on a known predicate must
+                // pick the live branch by the keyword's polarity: an `unless`
+                // runs its body when the predicate is FALSEY, so a truthy
+                // predicate selects the else branch (inverted vs `if`).
+                let (truthy_ty, falsey_ty) =
+                    if *is_unless { (else_ty, then_ty) } else { (then_ty, else_ty) };
+                let pred_ty = self.type_of(ast, *predicate, env, interner);
+                match self.predicate_polarity(interner, pred_ty) {
+                    Some(true) => truthy_ty,
+                    Some(false) => falsey_ty,
+                    None => rigor_types::Algebra::join(interner, then_ty, else_ty),
+                }
+            }
             // A call with no receiver (implicit self) or any other carrier
-            // (`@ivar`, constant, `self`, `if`/`case`-as-expression, index,
+            // (`@ivar`, constant, `self`, `case`-as-expression, index,
             // range, logical, variable read) is not precisely typed in this
             // slice -> Dynamic[top] (never guess; keeps the call rule silent).
             // TODO(spec): ivar typing (ADR-0022), constant resolution,
-            // branch-union typing, container-element typing.
+            // container-element typing.
             _ => interner.untyped(),
+        }
+    }
+
+    /// The value a branch body evaluates to (reference `statements_or_nil`): its
+    /// tail statement's value, or `Constant[nil]` for an empty body.
+    fn branch_value_type(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match body.last() {
+            Some(&tail) => self.stmt_value_type(ast, tail, env, interner),
+            None => interner.intern(Type::Constant(Scalar::Nil)),
+        }
+    }
+
+    /// The value a single statement evaluates to: an assignment → its RHS value;
+    /// a statements / `else`-clause wrapper (rigor-rs lowers an `else` body to a
+    /// `BeginRescue` carrier) → its own tail statement's value; otherwise the
+    /// node's type. Recursive over wrappers so a branch's tail resolves to the
+    /// real value expression.
+    fn stmt_value_type(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match ast.get(id) {
+            Node::Statements { body, .. } | Node::BeginRescue { body, .. } => {
+                match body.clone().last() {
+                    Some(&tail) => self.stmt_value_type(ast, tail, env, interner),
+                    None => interner.intern(Type::Constant(Scalar::Nil)),
+                }
+            }
+            Node::LocalVariableWrite { value, .. }
+            | Node::LocalVariableOpWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. } => {
+                let value = *value;
+                self.type_of(ast, value, env, interner)
+            }
+            _ => self.type_of(ast, id, env, interner),
+        }
+    }
+
+    /// Three-valued truthiness of a predicate's type for branch elision
+    /// (reference `Narrowing.predicate_certainty`): `Some(false)` for the only
+    /// falsey values (`nil` / `false`), `Some(true)` for a value that is always
+    /// truthy in Ruby (any Nominal / shape / non-nil-non-false Constant), and
+    /// `None` (keep both branches) for anything whose truthiness is not statically
+    /// decided (`Dynamic` / `Top` / a union / `bool`). Deliberately no more
+    /// aggressive than the reference: a union is always `None`, so rigor-rs never
+    /// elides a branch the reference keeps (which could only cost a witness, never
+    /// add a false one).
+    fn predicate_polarity(&self, interner: &Interner, ty: TypeId) -> Option<bool> {
+        match interner.get(ty) {
+            Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => Some(false),
+            Type::Constant(_)
+            | Type::Nominal { .. }
+            | Type::Tuple(_)
+            | Type::HashShape(_)
+            | Type::IntegerRange { .. }
+            | Type::Singleton(_)
+            | Type::DataInstance { .. } => Some(true),
+            _ => None,
         }
     }
 
@@ -1347,6 +1443,34 @@ mod tests {
         case(b"[1, 2].empty?\n", Type::Constant(Scalar::Bool(false)));
         case(b"[].first\n", Type::Constant(Scalar::Nil));
         case(b"[1, 2][9]\n", Type::Constant(Scalar::Nil)); // out of bounds → nil
+    }
+
+    /// An `if`/`unless`/ternary as an expression types to the union of its
+    /// branch values, with a known-polarity predicate eliding the dead branch.
+    #[test]
+    fn if_expression_unions_and_elides_branches() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let describe = |src: &[u8]| -> String {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let if_id = ast
+                .iter()
+                .find_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+                .unwrap();
+            let ty = typer.type_of(&ast, if_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+        // The internal `describe` spells constants `Constant[n]`; the point here
+        // is the union/elision structure, not the user-facing rendering.
+        // Unknown predicate → union of both branches (a missing else ⇒ nil).
+        assert_eq!(describe(b"if c then 1 else 2 end\n"), "Constant[1] | Constant[2]");
+        assert_eq!(describe(b"if c then 1 end\n"), "Constant[1] | nil");
+        // Truthy constant predicate → then branch only (elided).
+        assert_eq!(describe(b"if true then 1 else 2 end\n"), "Constant[1]");
+        // Falsey predicate → else branch only.
+        assert_eq!(describe(b"if nil then 1 else 2 end\n"), "Constant[2]");
     }
 
     /// The flow-constant substrate (ADR-0022) records a straight-line dominating
