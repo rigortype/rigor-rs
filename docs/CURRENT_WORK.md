@@ -6,9 +6,30 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 (config-audit PR #8 merged; `rigor diff` on branch `diff-command`) — **Baseline
-feature area COMPLETE + productization pivot + flow-frontier exhaustion recorded; `warn_unresolved_config`
-config-audit LANDED; `rigor diff` ported.** Read `AGENTS.md` "Working discipline" before continuing.
+Last updated: 2026-07-06 (config-audit PR #8 + diff PR #10 merged; `rigor triage` on branch
+`triage-command`) — **Baseline feature area COMPLETE + productization pivot + flow-frontier exhaustion
+recorded; `warn_unresolved_config` config-audit + `rigor diff` LANDED; `rigor triage` statistical core
+ported.** Read `AGENTS.md` "Working discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `triage-command`) — `rigor triage [paths]` statistical core (ADR-23).**
+A faithful port of the reference's `Triage`/`TriageRenderer`/`TriageCommand`, SCOPED to the statistical
+core: runs the same analysis as `check`, then summarises the stream — rule-id **distribution**, class/method
+**selectors** (ADR-61 agent stats), per-file **hotspots**, + a **summary** — text or `--format json`, with
+`--top N`/`--include-info`/`--no-hints`/`--selectors-only`/`--hints-only`/`--config`. Read-only, always
+exits 0. `crates/rigor-cli/src/triage.rs` reuses `analyze_files` (sound subset) and ports
+`normalize_receiver`/`qualified_rule`/the renderer verbatim. **DEFERRED: the `hints` Catalogue** (362-line
+ecosystem heuristic — AS core-ext / AR relations / project monkey-patch / `gem-without-rbs` — tuned for a
+full Rails run and partly keyed on `:info` plugin-recognition diagnostics rigor-rs doesn't emit); so
+rigor-rs's default sections = `[distribution, selectors, hotspots]`, i.e. default output == reference
+`triage --no-hints` (the parity gate), `hints` always empty. **Verified:** fresh-dir E2E vs the oracle —
+default text **byte-identical** to `triage --no-hints` for all-scalar receivers (incl. `--selectors-only`,
+`--top`); the ONE systematic divergence is that rigor-rs types an array/hash literal receiver as its nominal
+class (`Array`/`Hash`) where the reference keeps the value-pinned tuple display (`[1, 2, 3]`) — rigor-rs's
+tool-wide `receiver_type` spelling, not a triage defect (same convention `type-of` documents). JSON is
+content-identical (serde_json alphabetizes keys — documented, diff precedent). 467 workspace tests, run.rb +
+run_snapshot.rb 54/54, no new clippy lints. **NOT yet merged.** (Follow-on if pursued: the deferred hints
+Catalogue; a `describe`/`erase_to_rbs` type-display layer would let the selector receiver match the
+reference's tuple spelling AND unblock `annotate`/`sig-gen`.)
 
 **▶▶ LANDED THIS SESSION (branch `diff-command`) — `rigor diff <baseline.json> [paths...]`.** A faithful
 port of the reference's `DiffCommand` (`lib/rigor/cli/diff_command.rb`): compares the current `rigor check`
@@ -53,9 +74,14 @@ reference + probes the oracle; Opus implements on a branch; main byte-audits bef
   Follow-ons if pursued: the deferred JSON `config_warnings` payload (needs a JSON top-level shape decision,
   since rigor-rs emits a bare array). NOTE: the reference does NOT warn on unknown keys — it ignores them
   silently, exactly as rigor-rs already does — so there is no "unknown-key" pass to add.
-- **reference CLI commands** — `explain`, `type-of`, `diff` (this session) DONE. Remaining unported:
-  `annotate` (inline `#=> <type>` xmpfilter-style annotations), `triage` (ADR-23 distribution/selectors/
-  hotspots — larger), `trace`, `type-scan`, `sig-gen`, `coverage` — each a faithful port; pick by user value.
+- **reference CLI commands** — `explain`, `type-of`, `diff`, `triage` (statistical core) DONE. The
+  remaining ones are BLOCKED ON SUBSTRATE rigor-rs lacks, not quick ports: `annotate` + `sig-gen` need a
+  `describe(:short)`/`erase_to_rbs` type-display layer (rigor-rs uses its own `render_type`, deliberately
+  divergent — see `type-of`); `trace` needs a FallbackTracer; `type-scan` reports Prism node-class names
+  (rigor-rs has owned node variants); `coverage` is ADR-63 protection (large, mutation). The single
+  highest-leverage unlock is a **type-display layer** (`describe`/`erase_to_rbs`) — it would make the
+  `triage` selector receivers match the reference's tuple spelling AND unblock `annotate`/`sig-gen`.
+  Also open: the deferred `triage` **hints Catalogue** (ecosystem heuristics).
 - **§12 LSP two-tier / MCP tool expansion** — larger; watched-files invalidation, debounce, worker pool;
   or more MCP tools.
 Always: predict value with a valid-mode probe first, port faithfully (read reference + oracle),

@@ -23,6 +23,7 @@ mod config;
 use config::Config;
 mod config_audit;
 mod diff;
+mod triage;
 mod ci_detector;
 mod diagnostic_formats;
 use diagnostic_formats::Rendered;
@@ -65,6 +66,7 @@ fn main() -> ExitCode {
         Some("baseline") => cmd_baseline(&args[1..]),
         Some("type-of") => type_of::cmd_type_of(&args[1..]),
         Some("diff") => diff::cmd_diff(&args[1..]),
+        Some("triage") => triage::cmd_triage(&args[1..]),
         Some("explain") => explain::cmd_explain(&args[1..]),
         Some("init") => init::cmd_init(&args[1..]),
         Some("doctor") => doctor::cmd_doctor(&args[1..]),
