@@ -272,12 +272,40 @@ impl<'i> Typer<'i> {
                     None => rigor_types::Algebra::join(interner, then_ty, else_ty),
                 }
             }
+            // A `case`/`when` (or `case`/`in`) AS AN EXPRESSION types to the
+            // union of its branch values + the `else` value (or `nil` when there
+            // is no `else` — a non-exhaustive `case` returns nil). This is the
+            // reference `type_of_case_simple_union` (a sound over-approximation of
+            // the `===`-certainty-narrowed variant, which only ever DROPS
+            // statically-impossible branches). Each branch lowers to a
+            // `BeginRescue` carrier whose tail is the branch's value, resolved by
+            // `stmt_value_type`. A union receiver never witnesses, so FP-safe.
+            Node::Case { branches, else_body, .. } => {
+                let branch_ids = branches.clone();
+                let else_ids = else_body.clone();
+                let mut acc: Option<TypeId> = None;
+                for br in branch_ids {
+                    let v = self.stmt_value_type(ast, br, env, interner);
+                    acc = Some(match acc {
+                        None => v,
+                        Some(a) => rigor_types::Algebra::join(interner, a, v),
+                    });
+                }
+                let else_ty = if else_ids.is_empty() {
+                    interner.intern(Type::Constant(Scalar::Nil))
+                } else {
+                    self.branch_value_type(ast, &else_ids, env, interner)
+                };
+                match acc {
+                    Some(a) => rigor_types::Algebra::join(interner, a, else_ty),
+                    None => else_ty,
+                }
+            }
             // A call with no receiver (implicit self) or any other carrier
-            // (`@ivar`, constant, `self`, `case`-as-expression, index,
-            // range, logical, variable read) is not precisely typed in this
-            // slice -> Dynamic[top] (never guess; keeps the call rule silent).
-            // TODO(spec): ivar typing (ADR-0022), constant resolution,
-            // container-element typing.
+            // (`@ivar`, constant, `self`, index, range, logical, variable read)
+            // is not precisely typed in this slice -> Dynamic[top] (never guess;
+            // keeps the call rule silent). TODO(spec): ivar typing (ADR-0022),
+            // constant resolution, container-element typing.
             _ => interner.untyped(),
         }
     }
@@ -1471,6 +1499,34 @@ mod tests {
         assert_eq!(describe(b"if true then 1 else 2 end\n"), "Constant[1]");
         // Falsey predicate → else branch only.
         assert_eq!(describe(b"if nil then 1 else 2 end\n"), "Constant[2]");
+    }
+
+    /// A `case`/`when` expression types to the union of its branch values + the
+    /// `else` value (nil when no `else`).
+    #[test]
+    fn case_expression_unions_branch_values() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let describe = |src: &[u8]| -> String {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let case_id = ast
+                .iter()
+                .find_map(|(id, n)| matches!(n, Node::Case { .. }).then_some(id))
+                .unwrap();
+            let ty = typer.type_of(&ast, case_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+        assert_eq!(
+            describe(b"case x\nwhen 1 then 10\nwhen 2 then 20\nelse 30\nend\n"),
+            "Constant[10] | Constant[20] | Constant[30]"
+        );
+        // No else → nil joins the union (a non-exhaustive case returns nil).
+        assert_eq!(
+            describe(b"case x\nwhen 1 then 10\nend\n"),
+            "Constant[10] | nil"
+        );
     }
 
     /// The flow-constant substrate (ADR-0022) records a straight-line dominating

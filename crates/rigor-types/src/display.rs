@@ -206,7 +206,12 @@ fn named_union(
         return std::iter::once("bool".to_string()).chain(rest).collect::<Vec<_>>().join(" | ");
     }
 
-    members.iter().map(|&m| describe_named(i, m, resolve)).collect::<Vec<_>>().join(" | ")
+    // Float `nil` to the end (the common `T | … | nil` reading), keeping every
+    // other member in its canonical order — matching the reference's union order.
+    let mut rendered: Vec<(bool, String)> =
+        members.iter().map(|&m| (is_nil(m), describe_named(i, m, resolve))).collect();
+    rendered.sort_by_key(|(nil, _)| *nil);
+    rendered.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(" | ")
 }
 
 /// Render `id` as a human-readable string.
