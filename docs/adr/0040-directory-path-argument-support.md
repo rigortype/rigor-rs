@@ -76,6 +76,18 @@ limitation, not a bug — extending it would be a both-sides change, not now.
   If the JSON envelope is later aligned to the reference as its own slice, the
   path-error `rule` can become `null` there in one place.
 
+## Follow-on — bare `rigor check` uses config `paths:` (2026-07-06)
+
+A bare `rigor check` (no path args) now scans the config `paths:` (`.rigor.yml`,
+default `["lib"]`) instead of erroring `expected at least one file` — matching the
+reference's `runner.run(@argv.empty? ? configuration.paths : @argv)`. Explicit
+path args still take full precedence (config `paths:` is used ONLY when no args
+are given). This reuses the `expand_check_paths` walk above, so `rigor check` in a
+project root — the most natural invocation — works like the reference (e.g.
+`paths: [lib]` scopes to `lib/`, excluding `spec/`). Verified message-identical to
+the reference. Unblocks the baseline `regenerate`/`drift`/`prune` subcommands,
+which depend on `configuration.paths`.
+
 ## Out of scope (pre-existing, separate)
 
 The JSON output shape: rigor-rs emits a bare `[{…}]` array; the reference emits a

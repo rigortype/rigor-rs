@@ -38,6 +38,11 @@ pub struct Config {
     pub disable: Vec<String>,
     /// Path glob patterns whose matching files are skipped entirely.
     pub exclude: Vec<String>,
+    /// ADR-0040 — the default scan roots for a bare `rigor check` (no path
+    /// args): `paths:` in `.rigor.yml`, defaulting to `["lib"]` (the reference's
+    /// `Configuration` default). Each is expanded to its `**/*.rb` like an
+    /// explicit directory arg. Ignored when the CLI is given explicit path args.
+    pub paths: Vec<String>,
     /// Config-gated plugins to activate (ADR-25), as listed under `.rigor.yml`'s
     /// `plugins:`. Each entry is a plugin id — either the gem name
     /// (`rigor-activesupport-core-ext`) or the manifest id
@@ -102,6 +107,7 @@ impl Default for Config {
         Config {
             disable: Vec::new(),
             exclude: Vec::new(),
+            paths: default_paths(),
             plugins: Vec::new(),
             baseline: serde_yaml::Value::Null,
             signature_paths: default_signature_paths(),
@@ -115,6 +121,12 @@ impl Default for Config {
 /// the [`Default`] impl and serde's per-field container default.
 fn default_signature_paths() -> Vec<String> {
     vec!["sig".to_string()]
+}
+
+/// The reference's default `paths` (`Configuration`'s `"paths" => ["lib"]`) — the
+/// scan roots for a bare `rigor check` with no path args.
+fn default_paths() -> Vec<String> {
+    vec!["lib".to_string()]
 }
 
 impl Config {
@@ -242,6 +254,16 @@ mod tests {
         let m = cfg.disable_matcher();
         assert!(m.suppresses("call.undefined-method"));
         assert!(m.suppresses("call.wrong-arity"));
+    }
+
+    #[test]
+    fn paths_defaults_to_lib_and_parses() {
+        // ADR-0040: `paths:` is the bare-`check` scan roots; default `["lib"]`.
+        let empty: Config = serde_yaml::from_str("disable: []\n").unwrap();
+        assert_eq!(empty.paths, vec!["lib"], "absent paths: ⇒ [\"lib\"]");
+        assert_eq!(Config::default().paths, vec!["lib"]);
+        let cfg: Config = serde_yaml::from_str("paths:\n  - app\n  - lib\n").unwrap();
+        assert_eq!(cfg.paths, vec!["app", "lib"]);
     }
 
     #[test]

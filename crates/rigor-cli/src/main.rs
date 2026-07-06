@@ -153,11 +153,6 @@ fn cmd_check(args: &[String]) -> ExitCode {
         }
     }
 
-    if files.is_empty() {
-        eprintln!("rigor check: expected at least one file or directory");
-        return ExitCode::from(64);
-    }
-
     // ADR-0036 same-layer mutual exclusion: `--ruby` and `--no-ruby` together is
     // a usage error, redundant or not.
     if ruby_cli.is_some() && no_ruby_flag {
@@ -185,9 +180,20 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let folder_ref =
         sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
 
-    // ADR-0040 — expand directory args into their `**/*.rb` files and collect
-    // bad-path errors, matching the reference's `expand_paths`.
-    let (expanded_owned, path_errors) = expand_check_paths(&files);
+    // ADR-0040 — the scan roots: explicit path args when given, else the config
+    // `paths:` (default `["lib"]`), matching the reference's
+    // `@argv.empty? ? configuration.paths : @argv`.
+    let config_paths: Vec<&str>;
+    let roots: &[&str] = if files.is_empty() {
+        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        &config_paths
+    } else {
+        &files
+    };
+
+    // Expand directory roots into their `**/*.rb` files and collect bad-path
+    // errors, matching the reference's `expand_paths`.
+    let (expanded_owned, path_errors) = expand_check_paths(roots);
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
 
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
