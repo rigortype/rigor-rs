@@ -352,6 +352,58 @@ impl<'i> Typer<'i> {
         None
     }
 
+    /// Fold a no-arg accessor / constant-index read on a value-pinned `Tuple`
+    /// receiver to the pinned element or arity — a faithful port of the reference
+    /// `ShapeDispatch` Tuple folds. `None` declines (leaves the RBS tier to widen
+    /// to `Array[..]`). Only the no-arg / single-constant-index forms fold; an
+    /// arg-form (`first(2)`) declines so the documented `Array[Elem]` RBS overload
+    /// still applies.
+    fn fold_tuple_projection(
+        &self,
+        recv_ty: TypeId,
+        method: &str,
+        ast: &LoweredAst,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let elems = match interner.get(recv_ty) {
+            Type::Tuple(e) => e.clone(),
+            _ => return None,
+        };
+        let nil = |interner: &mut Interner| interner.intern(Type::Constant(Scalar::Nil));
+        match method {
+            "first" if args.is_empty() => {
+                Some(elems.first().copied().unwrap_or_else(|| nil(interner)))
+            }
+            "last" if args.is_empty() => {
+                Some(elems.last().copied().unwrap_or_else(|| nil(interner)))
+            }
+            "size" | "length" | "count" if args.is_empty() => {
+                Some(interner.intern(Type::Constant(Scalar::Int(elems.len() as i64))))
+            }
+            "empty?" if args.is_empty() => {
+                Some(interner.intern(Type::Constant(Scalar::Bool(elems.is_empty()))))
+            }
+            // `t[n]` — a constant integer index (Ruby negative-from-end);
+            // out-of-bounds folds to `nil`. A non-constant index declines.
+            "[]" if args.len() == 1 => {
+                let idx_ty = self.type_of(ast, args[0], env, interner);
+                let Type::Constant(Scalar::Int(i)) = interner.get(idx_ty) else {
+                    return None;
+                };
+                let (i, len) = (*i, elems.len() as i64);
+                let real = if i < 0 { len + i } else { i };
+                if (0..len).contains(&real) {
+                    Some(elems[real as usize])
+                } else {
+                    Some(nil(interner))
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn type_call(
         &self,
         ast: &LoweredAst,
@@ -400,6 +452,17 @@ impl<'i> Typer<'i> {
                     }
                 }
             }
+        }
+
+        // Tier 2: value-pinned shape projection on a `Tuple` receiver (reference
+        // ShapeDispatch). A no-arg accessor / constant-index read on a
+        // value-pinned Tuple folds to the pinned element or arity — `[1, 2].first`
+        // → `1`, `[1, 2].size` → `2`, `[1, 2][0]` → `1` — sharpening `type-of` /
+        // `annotate` and chained witnessing (`[1, 2].first.frist` flags on `1`).
+        // Only reached for BLOCK-FREE calls (the Call arm routes block calls to
+        // `type_block_call`), so a block form never mis-folds here.
+        if let Some(folded) = self.fold_tuple_projection(recv_ty, method, ast, args, env, interner) {
+            return folded;
         }
 
         // Tier 3 (-ish): resolve receiver class -> method return class.
@@ -1257,6 +1320,33 @@ mod tests {
         assert_eq!(i.get(str_ty), &Type::Constant(Scalar::Str("Hello".into())));
         let int_ty = type_of(&ast, int_id, &env, &mut i);
         assert_eq!(i.get(int_ty), &Type::Constant(Scalar::Int(42)));
+    }
+
+    /// Value-pinned Tuple projection folds: a no-arg accessor / constant index
+    /// on an array literal folds to the pinned element or arity.
+    #[test]
+    fn tuple_projection_folds() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let case = |src: &[u8], expect: Type| {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let call_id = ast
+                .iter()
+                .find_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+                .unwrap();
+            let ty = typer.type_of(&ast, call_id, &env, &mut i);
+            assert_eq!(i.get(ty), &expect, "src={}", String::from_utf8_lossy(src));
+        };
+        case(b"[1, 2, 3].first\n", Type::Constant(Scalar::Int(1)));
+        case(b"[1, 2, 3].last\n", Type::Constant(Scalar::Int(3)));
+        case(b"[1, 2, 3].size\n", Type::Constant(Scalar::Int(3)));
+        case(b"[10, 20][1]\n", Type::Constant(Scalar::Int(20)));
+        case(b"[10, 20][-1]\n", Type::Constant(Scalar::Int(20)));
+        case(b"[1, 2].empty?\n", Type::Constant(Scalar::Bool(false)));
+        case(b"[].first\n", Type::Constant(Scalar::Nil));
+        case(b"[1, 2][9]\n", Type::Constant(Scalar::Nil)); // out of bounds → nil
     }
 
     /// The flow-constant substrate (ADR-0022) records a straight-line dominating
