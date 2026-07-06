@@ -6,7 +6,13 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **FLOW FRONTIER: no cheap FP-safe wins left — pivot to productization
+Last updated: 2026-07-06 — **PRODUCTIZATION: bare `rigor check` scans config `paths:` (default `[lib]`)
+landed** ([ADR-0040](adr/0040-directory-path-argument-support.md) follow-on) — `rigor check` in a project
+root now works like the reference (was: `expected at least one file`); explicit args still override.
+Verified reference-message-identical; unblocks baseline `regenerate`/`drift`/`prune` (which need
+`configuration.paths`). 438 tests, harness 54/54, clippy clean. First item of the productization pivot below.
+
+Prior: 2026-07-06 — **FLOW FRONTIER: no cheap FP-safe wins left — pivot to productization
 ([flow-frontier note](notes/20260706-flow-frontier-exhausted.md), [ADR-0041](adr/0041-project-method-nilable-return.md)).**
 Three consecutive FP-safe flow slices closed 0 measured survey gaps: shape `Type::Tuple` (1b, deferred
 pre-build) and project-method nilable-return with a clean core arm (piece A — built, FP-safe, fires the
