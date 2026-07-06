@@ -11,6 +11,19 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ (c) REMAINING-COMMANDS ASSESSMENT (2026-07-06, investigated — DEFERRED as substrate-blocked).** The four
+unported CLI commands each depend on substrate rigor-rs lacks or diverge structurally, so none is a clean
+faithful port right now: **sig-gen** needs `erase_to_rbs` (conservative value-pin->nominal RBS erasure — a
+sizeable substrate, distinct from the landed `describe_named`); **trace** needs a FallbackTracer (rigor-rs has
+no dynamic-fallback-origin tracking — cf. the `type-of` note that omits `--trace`); **coverage** is ADR-63
+protection coverage (large, mutation-engine-backed); **type-scan** reports per-node-class precision over the
+AST, but rigor-rs's OWNED lowered AST differs structurally from Prism (different node counts AND names), so its
+`visits`/coverage-% and node-class labels cannot byte-match the reference (it could ship as a rigor-rs-NATIVE
+precision metric under the same documented divergence `type-of`'s node_kind carries, but not as a parity port).
+NEXT high-value tracks instead (deeper inference / coverage, not more thin CLI ports): possible-nil source
+expansion + the ivar/flow substrate (ADR-0022/58), or the Rails plugin engine (ADR-0013/0027) — the biggest
+remaining undefined-method coverage pool.
+
 **▶▶ LANDED THIS SESSION (branch `triage-hints`) — (b) triage hints Catalogue (portable subset).**
 `rigor triage` now emits the reference `hints` section: the COUNT/rule-based recognisers H7 (unresolved-toplevel),
 H5 (systemic single-file cluster, >=8 of one (file,rule)), H6 (low-count genuine bugs, rule total 1..=5) - in the
