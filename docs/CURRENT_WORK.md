@@ -6,7 +6,21 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **`rigor check <dir>` DIRECTORY SUPPORT LANDED
+Last updated: 2026-07-06 — **FLOW FRONTIER: no cheap FP-safe wins left — pivot to productization
+([flow-frontier note](notes/20260706-flow-frontier-exhausted.md), [ADR-0041](adr/0041-project-method-nilable-return.md)).**
+Three consecutive FP-safe flow slices closed 0 measured survey gaps: shape `Type::Tuple` (1b, deferred
+pre-build) and project-method nilable-return with a clean core arm (piece A — built, FP-safe, fires the
+synthetic clean pattern, 0 FP survey-wide, but 0 real gaps; **not shipped**, code kept on branch
+`tier-bc-nilable-return`). Valid-mode classification shows the residual possible-nil/always-truthy gaps are
+ALL deep clusters — param-dependent return arm (`return_type_heuristic`), AS-method-on-arm (plugin),
+**project-class arm** (parser 25 + textbringer 11, the largest single cluster), ivar whole-class flow, loop
+narrowing — each a deep per-cluster effort for a handful of gaps. **Recommendation (maintainer-approved):
+default next work to PRODUCTIZATION** (lever A — §11 CLI completion, §12 LSP two-tier / MCP tools, config
+schema, baseline subcommands), which has demonstrably higher ROI (directory support paid off + corrected
+two measurement artifacts). Treat the deep flow clusters as opt-in, ADR-backed, one-at-a-time efforts —
+never build another speculative flow slice without a valid-mode gap count predicting it pays.
+
+Prior: 2026-07-06 — **`rigor check <dir>` DIRECTORY SUPPORT LANDED
 ([ADR-0040](adr/0040-directory-path-argument-support.md), branch `shape-tier-slice1`).** `rigor check`
 now recursively analyzes a directory's `**/*.rb` (was: `cannot read <dir>: Is a directory`, analyzed
 NOTHING — `rigor check .`, the first command a real user runs, was broken). Faithful port of the

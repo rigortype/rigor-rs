@@ -65,6 +65,14 @@ pub struct MethodBody {
     /// `Some(plain positional param names in order)`, or `None` to DECLINE
     /// param binding for this method (splat/post/kwargs/block/optional present).
     pub params: Option<Vec<String>>,
+    /// ADR-0041 nilable-return signal: the body has a `return` point that yields
+    /// `nil` — a bare `return` (Ruby `return` ≡ `return nil`) or a `return nil`.
+    pub returns_nil: bool,
+    /// ADR-0041: the body has an explicit `return <non-nil expr>` (a single
+    /// non-`nil` arg, or multiple args = an array). When true the tail is NOT the
+    /// sole non-nil return, so the nilable-return arm cannot be read off the tail
+    /// alone ⇒ decline (see `infer_one_nilable_return`).
+    pub has_nonnil_explicit_return: bool,
 }
 
 /// Instance-method visibility as discovered at lowering time (ADR-35 slice 1,
@@ -193,6 +201,9 @@ pub enum Node {
         /// so this flag is the only reliable discriminator.
         is_singleton_class: bool,
         has_explicit_return: bool,
+        /// ADR-0041 nilable-return signals (see [`MethodBody::returns_nil`]).
+        returns_nil: bool,
+        has_nonnil_explicit_return: bool,
         /// The method's PLAIN-POSITIONAL param names in order, or `None` to
         /// decline tier-4b param binding (splat/post/kwargs/block/optional
         /// present). See [`MethodBody::params`].
@@ -660,6 +671,13 @@ impl Builder {
                 .as_ref()
                 .map(body_has_explicit_return)
                 .unwrap_or(false);
+            // ADR-0041 nilable-return signals (nil return present / non-nil
+            // explicit return present), computed from the same Prism body.
+            let (returns_nil, has_nonnil_explicit_return) = def
+                .body()
+                .as_ref()
+                .map(body_return_signals)
+                .unwrap_or((false, false));
             // The plain-positional param names (for tier-4b call-site binding),
             // or `None` to decline when the signature has anything that breaks
             // positional index<->arg alignment (splat/post/kwargs/block/optional).
@@ -683,6 +701,8 @@ impl Builder {
                 name,
                 is_singleton_class: false,
                 has_explicit_return,
+                returns_nil,
+                has_nonnil_explicit_return,
                 params,
                 name_span,
                 body,
@@ -769,6 +789,8 @@ impl Builder {
                 name: None, // `class << self` has no single method name.
                 is_singleton_class: true, // a CLASS scope, not a method def.
                 has_explicit_return: false,
+                returns_nil: false,
+                has_nonnil_explicit_return: false,
                 params: None,    // no single method ⇒ no param binding.
                 name_span: None, // no single name ⇒ no name span.
                 body,
@@ -1237,6 +1259,8 @@ impl Builder {
                 Node::Definition {
                     name: Some(name),
                     has_explicit_return,
+                    returns_nil,
+                    has_nonnil_explicit_return,
                     params,
                     body,
                     ..
@@ -1245,6 +1269,8 @@ impl Builder {
                     body: body.clone(),
                     has_explicit_return: *has_explicit_return,
                     params: params.clone(),
+                    returns_nil: *returns_nil,
+                    has_nonnil_explicit_return: *has_nonnil_explicit_return,
                 }),
                 _ => None,
             })
@@ -1559,6 +1585,50 @@ fn body_has_explicit_return(body: &PrismNode<'_>) -> bool {
     let mut v = ReturnVisitor { found: false };
     v.visit(body);
     v.found
+}
+
+/// ADR-0041 — classify a method body's explicit `return`s into
+/// `(returns_nil, has_nonnil_explicit_return)`:
+/// - `returns_nil` — some `return` yields `nil`: a bare `return` (Ruby `return` ≡
+///   `return nil`) or a single `nil`-literal arg.
+/// - `has_nonnil_explicit_return` — some `return` yields a non-`nil` value (a
+///   single non-`nil` arg, or multiple args = an array).
+///
+/// A `return` inside a NESTED `def` belongs to that inner method, not this one,
+/// so nested defs are not descended (their `return`s would otherwise pollute the
+/// aggressively-firing `returns_nil` signal). Blocks/lambdas ARE descended (a
+/// `return` in a block is a non-local return from THIS method).
+fn body_return_signals(body: &PrismNode<'_>) -> (bool, bool) {
+    use ruby_prism::Visit;
+    struct V {
+        returns_nil: bool,
+        nonnil: bool,
+    }
+    impl<'pr> Visit<'pr> for V {
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {
+            // Do NOT recurse: a nested def's `return` is not this method's.
+        }
+        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+            match node.arguments() {
+                None => self.returns_nil = true, // bare `return`
+                Some(args) => {
+                    let items: Vec<_> = args.arguments().iter().collect();
+                    if items.len() == 1 && items[0].as_nil_node().is_some() {
+                        self.returns_nil = true; // `return nil`
+                    } else {
+                        self.nonnil = true; // `return <expr>` / `return a, b`
+                    }
+                    // Recurse into the args (a nested `return` could hide there).
+                    for a in args.arguments().iter() {
+                        self.visit(&a);
+                    }
+                }
+            }
+        }
+    }
+    let mut v = V { returns_nil: false, nonnil: false };
+    v.visit(body);
+    (v.returns_nil, v.nonnil)
 }
 
 /// Convert a Prism `Location` to a byte-offset [`Span`].

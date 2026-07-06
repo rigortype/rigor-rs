@@ -124,6 +124,14 @@ pub struct SourceIndex {
     /// two (a tail is either param-rooted or not). Same cross-file NAME keying and
     /// the same reopen-disagreement decline apply.
     param_bound_returns: HashMap<(String, String), ParamBoundReturn>,
+    /// ADR-0041: `(class NAME, method NAME) -> non-nil core arm C`, meaning the
+    /// method returns `C | nil`. Populated in the same Pass 3 for methods with a
+    /// `nil` return signal, no non-nil explicit return, and a tail typing (empty
+    /// env) to a concrete core class. Feeds `call.possible-nil-receiver`: a local
+    /// bound to such a call is `C | nil`. DISJOINT from `method_returns` (that map
+    /// is the certain, non-nil return). Same cross-file NAME keying + reopen
+    /// decline.
+    nilable_returns: HashMap<(String, String), String>,
     /// ADR-35 slice 1: the lexically-qualified override index for
     /// `def.override-visibility-reduced` (see [`OverrideClass`]). Keyed by FULL
     /// qualified name to avoid the last-component name-collision merge.
@@ -268,9 +276,10 @@ impl SourceIndex {
         // project class), and produces a fresh map that is then assigned — we must
         // NOT mutate `idx.method_returns` while `&idx` is immutably borrowed for
         // typing, so the inference returns a value.
-        let (returns, param_bound) = infer_method_returns(&idx, core, asts);
+        let (returns, param_bound, nilable_returns) = infer_method_returns(&idx, core, asts);
         idx.method_returns = returns;
         idx.param_bound_returns = param_bound;
+        idx.nilable_returns = nilable_returns;
 
         idx
     }
@@ -350,6 +359,16 @@ impl SourceIndex {
     pub fn param_bound_return(&self, class: &str, method: &str) -> Option<&ParamBoundReturn> {
         self.param_bound_returns
             .get(&(class.to_string(), method.to_string()))
+    }
+
+    /// ADR-0041: the non-nil core arm `C` of a project method's `C | nil` return,
+    /// or `None` when the method has no nilable-return entry. Feeds the
+    /// `call.possible-nil-receiver` source (a local bound to `obj.m(...)` /
+    /// `m(...)` is `C | nil`).
+    pub fn nilable_return(&self, class: &str, method: &str) -> Option<&str> {
+        self.nilable_returns
+            .get(&(class.to_string(), method.to_string()))
+            .map(String::as_str)
     }
 
     /// The SOURCE class name behind a `Nominal { class }` whose `ClassId` is in
@@ -710,6 +729,7 @@ fn infer_method_returns(
 ) -> (
     HashMap<(String, String), String>,
     HashMap<(String, String), ParamBoundReturn>,
+    HashMap<(String, String), String>,
 ) {
     let typer = crate::Typer::with_source(core, idx);
     let empty_env = crate::TypeEnv::new();
@@ -722,6 +742,11 @@ fn infer_method_returns(
     // blacklist (a reopen with a DIFFERENT param-bound shape ⇒ decline).
     let mut param_bound: HashMap<(String, String), ParamBoundReturn> = HashMap::new();
     let mut pb_disagreed: HashSet<(String, String)> = HashSet::new();
+
+    // ADR-0041 nilable-return arms (`(class, method) -> non-nil core arm C`,
+    // meaning the method returns `C | nil`), with their own disagreement list.
+    let mut nilable_returns: HashMap<(String, String), String> = HashMap::new();
+    let mut nil_disagreed: HashSet<(String, String)> = HashSet::new();
 
     for ast in asts {
         for (_, node) in ast.iter() {
@@ -736,6 +761,22 @@ fn infer_method_returns(
             };
             for mb in method_bodies {
                 let key = (class_name.to_string(), mb.name.clone());
+                // ADR-0041: nilable-return (DISJOINT from the two below — it
+                // REQUIRES an explicit nil return, which `infer_one_return`
+                // declines on via gate 3). Same reopen-disagreement discipline.
+                if let Some(arm) = infer_one_nilable_return(ast, &typer, core, &empty_env, mb) {
+                    if !nil_disagreed.contains(&key) {
+                        match nilable_returns.get(&key) {
+                            Some(prev) if prev != &arm => {
+                                nilable_returns.remove(&key);
+                                nil_disagreed.insert(key.clone());
+                            }
+                            _ => {
+                                nilable_returns.insert(key.clone(), arm);
+                            }
+                        }
+                    }
+                }
                 if let Some(core_name) = infer_one_return(ast, &typer, core, &empty_env, mb) {
                     if disagreed.contains(&key) {
                         continue; // a prior reopen disagreed ⇒ stay declined.
@@ -768,7 +809,42 @@ fn infer_method_returns(
             }
         }
     }
-    (returns, param_bound)
+    (returns, param_bound, nilable_returns)
+}
+
+/// ADR-0041 — infer a method's NILABLE-return non-nil arm `C` (the method returns
+/// `C | nil`), or `None` to decline. FP-safe by requiring the tail to be the SOLE
+/// non-nil return:
+/// - Gate N1: the body has a `nil` return signal (`mb.returns_nil`) — else not
+///   nilable.
+/// - Gate N2: NO explicit non-nil return (`mb.has_nonnil_explicit_return`) — else
+///   the tail is not the only non-nil path, so its type is not the whole arm ⇒
+///   decline (avoids an unsound single-arm read of a multi-type return).
+/// - Gates 2/4/5 (reused): a non-empty body, a non-branch-carrier tail, and the
+///   tail types (empty env) to a concrete core class `C` with `knows_class(C)`.
+///
+/// So the ONLY non-nil return is the tail, typed exactly as tier-4; the nil comes
+/// from the guard `return`(s). A param/ivar/self/in-source/AS-chained tail is
+/// `Dynamic` under the empty env ⇒ decline — matching the reference, which is also
+/// silent when the non-nil arm is not a single concrete class.
+fn infer_one_nilable_return(
+    ast: &LoweredAst,
+    typer: &crate::Typer<'_>,
+    core: &CoreIndex,
+    empty_env: &crate::TypeEnv,
+    mb: &MethodBody,
+) -> Option<String> {
+    if !mb.returns_nil || mb.has_nonnil_explicit_return {
+        return None;
+    }
+    let &ret_id = mb.body.last()?;
+    if is_branch_carrier(ast.get(ret_id)) {
+        return None;
+    }
+    let mut scratch = Interner::new();
+    let ty = typer.type_of(ast, ret_id, empty_env, &mut scratch);
+    let core_name = core.class_name_of(&scratch, ty)?;
+    core.knows_class(core_name).then(|| core_name.to_string())
 }
 
 /// Run gates 2–5 for one method body and return the inferred CORE class NAME, or

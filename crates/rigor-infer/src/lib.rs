@@ -778,7 +778,7 @@ impl<'i> Typer<'i> {
         let mut tenv = TypeEnv::new();
         let mut nenv: HashMap<String, &'static str> = HashMap::new();
         let mut penv: HashSet<String> = HashSet::new();
-        self.nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, interner, &mut out);
+        self.nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &mut penv, None, &writes, interner, &mut out);
         out
     }
 
@@ -795,12 +795,13 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
+        enc: Option<&str>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         for &s in stmts {
-            self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, interner, out);
+            self.nil_flow_stmt(ast, s, tenv, nenv, penv, enc, writes, interner, out);
         }
     }
 
@@ -813,6 +814,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
+        enc: Option<&str>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
@@ -820,14 +822,14 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::Statements { body, .. } => {
                 let body = body.clone();
-                self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_scope(ast, &body, tenv, nenv, penv, enc, writes, interner, out);
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
                 // Record uses in the RHS (and descend any block it carries) BEFORE
                 // rebinding — a use of a currently-nilable local reads the fact.
-                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
-                let src = self.nilable_source_class(ast, value, tenv, penv, interner);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, enc, writes, interner, out);
+                let src = self.nilable_source_class(ast, value, tenv, penv, enc, interner);
                 let prov = self.array_new_nominal_provenance(ast, value, tenv, interner);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
@@ -857,18 +859,28 @@ impl<'i> Typer<'i> {
                 tenv.insert(name, u);
             }
             Node::Call { .. } => {
-                self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, id, tenv, nenv, penv, enc, writes, interner, out);
             }
-            Node::Definition { body, .. }
-            | Node::ClassDef { body, .. }
-            | Node::ModuleDef { body, .. } => {
-                // Independent scope: fresh `tenv`/`nenv`/`penv`, no effect on the
-                // enclosing scope.
+            Node::ClassDef { body, name, .. } | Node::ModuleDef { body, name, .. } => {
+                // Independent scope: fresh `tenv`/`nenv`/`penv`. Set the ENCLOSING
+                // CLASS (ADR-0041) so an implicit-self call inside a method resolves
+                // its project nilable-return. `name` borrows the arena (immutable
+                // for the whole walk).
+                let body = body.clone();
+                let inner_enc = (!name.is_empty()).then_some(name.as_str());
+                let mut t = TypeEnv::new();
+                let mut n: HashMap<String, &'static str> = HashMap::new();
+                let mut p: HashSet<String> = HashSet::new();
+                self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, inner_enc, writes, interner, out);
+            }
+            Node::Definition { body, .. } => {
+                // A method body: fresh facts, but KEEP the enclosing class (a `def`
+                // is lexically inside its class).
                 let body = body.clone();
                 let mut t = TypeEnv::new();
                 let mut n: HashMap<String, &'static str> = HashMap::new();
                 let mut p: HashSet<String> = HashSet::new();
-                self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, writes, interner, out);
+                self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, enc, writes, interner, out);
             }
             // Any other statement (`if`/`unless`/`while`/`case`/logical/begin/
             // multi-assign/ivar-write/…) is UNMODELED in Slice 1: widen `tenv` and
@@ -894,6 +906,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
+        enc: Option<&str>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
@@ -908,7 +921,7 @@ impl<'i> Typer<'i> {
                 let call_span = *span;
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
                 if let Some(r) = receiver {
-                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, enc, writes, interner, out);
                 }
                 if let Some(r) = receiver {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
@@ -932,7 +945,7 @@ impl<'i> Typer<'i> {
                     }
                 }
                 for a in &args {
-                    self.nil_flow_expr(ast, *a, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, *a, tenv, nenv, penv, enc, writes, interner, out);
                 }
                 if !block_body.is_empty() {
                     // Same-block locality: descend with a FRESH `nenv`, inheriting
@@ -944,7 +957,7 @@ impl<'i> Typer<'i> {
                     let mut bnenv: HashMap<String, &'static str> = HashMap::new();
                     let mut bpenv = penv.clone();
                     self.nil_flow_scope(
-                        ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, interner, out,
+                        ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, enc, writes, interner, out,
                     );
                     nenv.clear();
                     widen_flow_writes(writes, call_span, tenv, interner);
@@ -956,8 +969,8 @@ impl<'i> Typer<'i> {
                 // (decline), then recurse for block/call reachability.
                 let (left, right) = (*left, *right);
                 nenv.clear();
-                self.nil_flow_expr(ast, left, tenv, nenv, penv, writes, interner, out);
-                self.nil_flow_expr(ast, right, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, left, tenv, nenv, penv, enc, writes, interner, out);
+                self.nil_flow_expr(ast, right, tenv, nenv, penv, enc, writes, interner, out);
             }
             _ => {}
         }
@@ -1023,24 +1036,51 @@ impl<'i> Typer<'i> {
     /// (b) **Certain nilable RBS return** on a KNOWN core receiver
     ///     (`String#byteslice -> String?`). A `Constant` receiver is declined for
     ///     the same folding-parity reason — the keystone.
+    /// (c) **Project-method nilable return** (ADR-0041) — `x = obj.m(...)` /
+    ///     `x = m(...)` where `m` is a project method inferred to return `C | nil`
+    ///     (a `nil` guard-return + a clean core-class tail). The class is the
+    ///     enclosing class `enc` (implicit self) or `obj`'s resolved project class.
     fn nilable_source_class(
         &self,
         ast: &LoweredAst,
         value_id: NodeId,
         tenv: &TypeEnv,
         penv: &HashSet<String>,
+        enc: Option<&str>,
         interner: &mut Interner,
     ) -> Option<&'static str> {
-        let Node::Call { receiver: Some(recv), method, args, block_body, .. } = ast.get(value_id)
-        else {
+        let Node::Call { receiver, method, args, block_body, .. } = ast.get(value_id) else {
             return None;
         };
         if !block_body.is_empty() {
             return None;
         }
-        let recv = *recv;
+        let receiver = *receiver;
         let method = method.clone();
         let args = args.clone();
+
+        // (c) Project-method nilable return. Resolve the defining project class:
+        // implicit self ⇒ the enclosing class `enc`; a receiver ⇒ the receiver's
+        // resolved SOURCE class. Re-intern the (core) arm to a `'static` name.
+        let proj_class: Option<String> = match receiver {
+            None => enc.map(str::to_string),
+            Some(r) => {
+                let rty = self.type_of(ast, r, tenv, interner);
+                self.source.class_name_for_id_of(interner, rty).map(str::to_string)
+            }
+        };
+        if let Some(k) = proj_class {
+            if let Some(arm) = self.source.nilable_return(&k, &method) {
+                if let Some(cid) = self.index.class_id(arm) {
+                    if let Some(static_name) = self.index.class_name_for_id(cid) {
+                        return Some(static_name);
+                    }
+                }
+            }
+        }
+
+        // (a/a2/b) require a receiver (a slice / core-RBS-return source).
+        let recv = receiver?;
         let rty = self.type_of(ast, recv, tenv, interner);
         // Folding-parity keystone (shared by both sources): a `Constant` receiver
         // is folded by the reference to a concrete non-nil value ⇒ decline.
