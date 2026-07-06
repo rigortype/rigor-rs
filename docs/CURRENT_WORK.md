@@ -6,141 +6,49 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **PRODUCTIZATION: `check --baseline-strict` CI gate LANDED (ADR-22 slice 5;
-merge `ac4744f`).** Faithful port of the reference's strict gate, delegated-implemented from a 10-scenario
-oracle spec and independently byte-audited before merge: audits the UNSUPPRESSED findings via
-`Baseline::audit`; ANY non-`Within` drift (over/cleared/reducible — deficit drift counts too) fails the run
-(exit 1, flat OR); two distinct no-baseline behaviors (nil path → `nothing to gate.`; resolved-but-absent →
-silent); malformed baseline emits BOTH `(continuing without baseline)` and `(--baseline-strict gate
-skipped)`; report on stderr last, `(Δ{delta}, {status})` row format. 450 tests, clippy clean, both harness
-PASS. **The ADR-22 baseline feature area is now COMPLETE** (generate/dump/regenerate/drift/prune +
-`--baseline-strict`). Audit note: an audit-harness shell-quoting bug (`$(pwd)` evaluated inside a `cd`
-subshell → reference ran from the wrong dir, LoadError, empty output) initially masked the reference side —
-corrected and re-verified byte-identical. Remaining productization: full config schema validation, §12
-LSP two-tier / MCP tool expansion, reference CLI commands (`explain`/`diff`/`annotate`/`type_of`).
+Last updated: 2026-07-06 (multi-arc session, all merged to master) — **Baseline feature area COMPLETE
++ productization pivot + flow-frontier exhaustion recorded.** Read `AGENTS.md` "Working discipline"
+before continuing.
 
-Prior: 2026-07-06 — **PRODUCTIZATION: baseline `regenerate`/`drift`/`prune` LANDED (ADR-22
-completion; merge `95564d4`).** The three remaining baseline subcommands are a faithful port, built by a
-delegated implementation agent from a TWO-WAY-verified oracle spec (two independent reference
-investigations agreed on all overlapping facts) and audited before merge: `regenerate` = `generate
---force` with the `regenerated baseline` verb (no `--force` flag, no existence guard); `drift` audits
-every bucket (message-before-rule claiming) into over/cleared/reducible/within + Δ (default filter
-Δ≠0, `--only` bypasses it, fixed group order, exact unicode row format, exit 0 informational / 64
-missing-or-malformed baseline); `prune` removes cleared buckets by full-tuple equality (`--dry-run`
-announce-only; stdout announce + stderr summary channel contract). Two spec deviations were resolved
-TOWARD THE ORACLE by the implementer and independently re-verified (positionals silently ignored on
-drift/prune; optparse-native error wording). `Baseline::{audit,without}` + `DriftStatus`/`DriftRow` are
-reusable for a future `check --baseline-strict` (not implemented). Also removed stale
-accidentally-committed `.rigor/cache` files. **445 tests, clippy clean, both harness gates PASS, 22/22
-E2E parity scenarios byte-identical (stdout+stderr+exit).** §7's baseline item is now COMPLETE
-(generate/dump/regenerate/drift/prune); remaining §7: full config schema, `--baseline-strict`.
+**▶▶ NEXT SESSION — START HERE: continue PRODUCTIZATION (the measurement-proven high-ROI track).**
+Candidates, any of which suits the delegation model (main designs/audits; Sonnet investigates the
+reference + probes the oracle; Opus implements on a branch; main byte-audits before merge):
+- **full `.rigor.yml` config-schema validation** — warn on malformed/unknown keys like the reference
+  (`warn_unresolved_config`); the config surface exists (`crates/rigor-cli/src/config.rs`), this adds the
+  validation/warnings pass.
+- **reference CLI commands not yet ported**: `explain` (why a diagnostic fired), `diff` (only-new-vs-base),
+  `annotate`, `type_of`, `triage` — each a faithful port; pick by likely user value.
+- **§12 LSP two-tier / MCP tool expansion** — larger; watched-files invalidation, debounce, worker pool;
+  or more MCP tools.
+Always: predict value with a valid-mode probe first, port faithfully (read reference + oracle),
+gate with fresh-dir E2E parity.
 
-Prior: 2026-07-06 — **PRODUCTIZATION: bare `rigor check` scans config `paths:` (default `[lib]`)
-landed** ([ADR-0040](adr/0040-directory-path-argument-support.md) follow-on) — `rigor check` in a project
-root now works like the reference (was: `expected at least one file`); explicit args still override.
-Verified reference-message-identical; unblocks baseline `regenerate`/`drift`/`prune` (which need
-`configuration.paths`). 438 tests, harness 54/54, clippy clean. First item of the productization pivot below.
+**This session landed (master), newest first — detail in the linked ADRs/notes:**
+- **ADR-22 baseline area COMPLETE** (merges `95564d4`, `ac4744f`): `regenerate`/`drift`/`prune` +
+  `check --baseline-strict`, faithful ports built by delegated agents from two-way-verified oracle specs,
+  each byte-audited before merge (22/22 then 9/9 E2E parity). Reusable `Baseline::{audit,without}` +
+  `DriftStatus`/`DriftRow`.
+- **`rigor check <dir>` directory support + config `paths:`** ([ADR-0040](adr/0040-directory-path-argument-support.md),
+  merges through `9b61513`; audit fixes in `983e6ef`): recursive `**/*.rb` (skip hidden, symlinked FILES
+  matched, no `.gitignore`, config `exclude:`), path-error diagnostics + warn-if-any-else-error severity,
+  **error-severity-driven exit code** (a warning-only run exits 0; the synthetic `internal-error` still
+  fails the run — audit #1), bare `check`/`baseline generate` scan config `paths:` (default `[lib]`).
+- **flow substrate (possible-nil)**: [ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md) threaded
+  flow-eval (Slice 1a fires treemaps via the block-descent substrate); [ADR-0039](adr/0039-shape-typing-tier.md)
+  shape-tier Slice 1a (`Array.new`-provenance) landed, `Type::Tuple` (1b) DEFERRED by measurement;
+  [ADR-0041](adr/0041-project-method-nilable-return.md) project-method nilable-return DEFERRED by
+  measurement (FP-safe, 0 survey gaps; code on branch `tier-bc-nilable-return`).
+- **KEY STRATEGIC FINDING** ([flow-frontier note](notes/20260706-flow-frontier-exhausted.md), [[possible-nil-fold-gated]]):
+  three consecutive FP-safe flow slices closed 0 survey gaps → the possible-nil/always-truthy frontier has
+  **no cheap FP-safe wins left** (residual = param-dependent return typing, AS RBS, project-class arms, ivar
+  whole-class flow, loop narrowing — deep, opt-in, ADR-backed). Productization is the default.
+- Audit notes this session: [adr0038-slice1-audit](notes/20260706-adr0038-slice1-audit.md),
+  [adr0039-shape-tier-audit](notes/20260706-adr0039-shape-tier-audit.md),
+  [slice1-array-fold-blocker](notes/20260706-slice1-array-fold-blocker.md),
+  [productization-audit](notes/20260706-productization-audit.md).
 
-Prior: 2026-07-06 — **FLOW FRONTIER: no cheap FP-safe wins left — pivot to productization
-([flow-frontier note](notes/20260706-flow-frontier-exhausted.md), [ADR-0041](adr/0041-project-method-nilable-return.md)).**
-Three consecutive FP-safe flow slices closed 0 measured survey gaps: shape `Type::Tuple` (1b, deferred
-pre-build) and project-method nilable-return with a clean core arm (piece A — built, FP-safe, fires the
-synthetic clean pattern, 0 FP survey-wide, but 0 real gaps; **not shipped**, code kept on branch
-`tier-bc-nilable-return`). Valid-mode classification shows the residual possible-nil/always-truthy gaps are
-ALL deep clusters — param-dependent return arm (`return_type_heuristic`), AS-method-on-arm (plugin),
-**project-class arm** (parser 25 + textbringer 11, the largest single cluster), ivar whole-class flow, loop
-narrowing — each a deep per-cluster effort for a handful of gaps. **Recommendation (maintainer-approved):
-default next work to PRODUCTIZATION** (lever A — §11 CLI completion, §12 LSP two-tier / MCP tools, config
-schema, baseline subcommands), which has demonstrably higher ROI (directory support paid off + corrected
-two measurement artifacts). Treat the deep flow clusters as opt-in, ADR-backed, one-at-a-time efforts —
-never build another speculative flow slice without a valid-mode gap count predicting it pays.
-
-Prior: 2026-07-06 — **`rigor check <dir>` DIRECTORY SUPPORT LANDED
-([ADR-0040](adr/0040-directory-path-argument-support.md), branch `shape-tier-slice1`).** `rigor check`
-now recursively analyzes a directory's `**/*.rb` (was: `cannot read <dir>: Is a directory`, analyzed
-NOTHING — `rigor check .`, the first command a real user runs, was broken). Faithful port of the
-reference's `expand_paths` (recursive, skip hidden/symlinks, ignore `.gitignore`, config `exclude:`,
-sorted; bad-path diagnostics with warn-if-any-else-error severity + synthetic rule ids; **exit code now
-ERROR-severity-driven** — a warning-only run exits 0, matching the reference). Dir arg == explicit file
-list (redmine 65=65, algorithms 1553=1553, mastodon 109=109). 437 tests, harness 54/54, clippy clean.
-**CORRECTION this session:** an earlier "Rails/ActiveSupport reopened-core-class over-leniency" finding
-was an ARTIFACT of this very bug — `rigor check <dir>` analyzed nothing, so all "dir-mode" rigor-rs
-numbers were bogus. The reference's `expand_paths` was verified REASONABLE (no upstream fix); the valid
-coverage gate is `fp_audit.py` (explicit file lists), whose landscape (undefined-method / possible-nil /
-always-truthy — Rails-plugin + Tier B/C dominated) stands.
-
-Prior: 2026-07-06 — **flow substrate SLICE 1 LANDED as an FP-safe foundation (0 gaps)
-([ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md), branch `flow-substrate-slice1`).**
-The threaded flow-eval nil-receiver substrate (`Typer::nilable_receiver_snapshots`) REPLACES the
-`enclosing_def` span-scan: it threads a type env (inherited into blocks) + a nilability fact map
-(fresh per block, same-block-body locality) straight-line with block descent, declining on any
-unmodeled construct. `check_nil_receiver` fires from the snapshot map. Also a shared `type_dot_new`
-so block-bearing `X.new{}` types as an `X` instance. Harness 53/53 / 0 FP; 430 tests; clippy-clean
-(no new warnings). **It closes ZERO survey gaps** — and was landed anyway, as a deliberate one-time
-re-interpretation of the §5 gap-gate (maintainer decision), because it retires the span-scan and is
-the FP-safe foundation later slices build on. See ADR-0038 "Slice 1 outcome".
-
-**▶▶ KEY FINDING (refined by a grilling session) — the treemaps gap is a SHAPE-TYPING gap, not a
-folding gap ([ADR-0039](adr/0039-shape-typing-tier.md), [blocker note](notes/20260706-slice1-array-fold-blocker.md)).**
-The reference does NOT execute Ruby to hide `Array#[](Range)`'s `Array?` — it types array literals and
-`Array.new(n ≤ 16)` as a static **`Tuple`** (`ARRAY_NEW_TUPLE_LIMIT = 16`), propagates the Tuple through
-`map`/`select`/…, and a `Tuple#[](Range)` returns a NON-nil sub-Tuple. Only `Nominal[Array]#[](Range)`
-(e.g. `Array.new(300000)` — treemaps) fires. This is the reference's static shape tier ("Slice 5 phase 2"),
-which rigor-rs deferred at ADR-0023. Strings already align (a string is a value `Constant` in both tools,
-which the possible-nil source declines) — no shape type needed for them.
-
-**▶▶ DECISION (grill-with-docs, 2026-07-06) — port the static shape-typing tier to Rust, NOT sidecar
-folding ([ADR-0039](adr/0039-shape-typing-tier.md)).** General boundary rule recorded: *port Ruby-free +
-runtime-hot + low-risk logic to Rust; reserve the sidecar for what genuinely needs Ruby.* Sidecar array
-folding was rejected (diverges from the reference's static model, full-fidelity-only, per-literal cost).
-New glossary: `Shape type` / `Tuple` / `HashShape` / `Shape-typing tier` (CONTEXT.md).
-
-**▶▶ shape-tier Slice 1a LANDED; Slice 1b DEFERRED by measurement ([ADR-0039](adr/0039-shape-typing-tier.md)
-"Slice 1a outcome").** Slice 1a (the `Array.new`-provenance possible-nil fire, NO `Type::Tuple`) closed the
-treemaps gap FP-safely: algorithms possible-nil 50→49, matched +1 (line 45 only), 0 FP across ~1800 survey
-files, harness 54/54 (fixtures 42 positive + 43 shape-negatives), 435 tests. **Slice 1b (`Type::Tuple`) was
-NOT built** — the measurement gate found ~0 survey EV: undefined-method gaps are Rails/ActiveSupport plugin
-methods + project-class + Tier B/C nil (none need Tuple element precision — a Tuple shares Array's method
-set); always-truthy gaps (project-mode: single digits, the ~117 was a per-file artifact) are all ivar /
-loop flow narrowing (Tier B/C). **The higher-EV frontiers this surfaced:** the **Rails/ActiveSupport plugin
-phase** (dominant undefined-method pool — the CURRENT_WORK §10 plugin engine) and **Tier B/C possible-nil /
-always-truthy** (ivar value-flow + loop narrowing on the ADR-0038 substrate). Shape tier is parked at 1a.
-
-<details><summary>(superseded) shape-tier Slice 1 plan — kept for provenance</summary>
-
-**shape-tier Slice 1 (ADR-0039 §3 as revised after the
-[shape-tier audit](notes/20260706-adr0039-shape-tier-audit.md); `crates/rigor-types` +
-`crates/rigor-infer` + `crates/rigor-rules`).** Static, no sidecar, internally ordered so the lattice
-change never holds the gap hostage:
-- **Slice 1a — the provenance fire (closes treemaps, needs NO `Type::Tuple`):** the possible-nil
-  array-slice source fires ONLY on a **syntactic** provenance — the receiver's binding RHS is literally
-  `Array.new(constant > 16 | non-constant | ZERO args)` (all probe-confirmed reference-Nominal; type-based
-  firing on env `Nominal[Array]` is FORBIDDEN — the `.map`-fallback FP, ADR-0039 §2). The provenance marker
-  travels on the **tenv side** of the ADR-0038 substrate (inherited into blocks; nenv is per-block fresh),
-  invalidated by tenv's widen rules.
-- **Slice 1b — Tuple groundwork:** `Type::Tuple` in the lattice + interner with
-  **`class_name_of(Tuple) = "Array"`** (else today's literal-array matched regresses); literals +
-  `Array.new(n ≤ 16, [fill])` → Tuple (zero-arg stays Nominal; block form: READ the reference's block path
-  first, mint Dynamic elements); `Tuple#[]` const-index → element, static Range → sub-Tuple for
-  **non-negative literal in-bounds forms ONLY** (negative/beginless/endless/boundary ⇒ decline),
-  out-of-range → `Constant[nil]` (pays little until nil-receiver undefined-method lands — fixture-08 gap);
-  `Tuple#size` → `Constant[len]`; unmodeled op ⇒ `Nominal[Array]` fallback (safe: never feeds the source).
-- **Gate (hardened):** fp_audit 0-FP + harness green + matched non-regression + **committed negative
-  fixtures** (the ADR-0038 Array FP was INVISIBLE to the survey audit — only synthetics catch this class:
-  literal / small / two-arg / `.map` slices silent, treemaps positive) + **cross-rule always-truthy
-  differentials** for every Constant-minting shape op (probe-confirmed: the reference fires always-truthy
-  on `if [1,2].size` AND `if [1,2].size > 0` — a parity gain if matched, an error-severity FP if not).
-  **Pre-declared expectation:** algorithms possible-nil 50→49, matched +1 (line 45 ONLY; 46–48 stay
-  declined by same-block locality). Then MEASURE the tier's EV before further shape slices.
-
-</details>
-
-**Separate possible-nil track (still open, unrelated to shapes):** Tier B/C — project-method nilable-return
-inference + `@ivar` typing + loop narrowing (the BULK of the survey possible-nil cluster: `t.left`/`t.right`
-in `splay_tree_map.rb`, heap `.key` — nilable project-attr receivers with `break unless …` guards; larger,
-its own ADR(s)). **Also open:** `flow.always-truthy-condition` onto the ADR-0038 substrate (reuses the
-threaded flow-eval, needs no shapes). **And (measurement-surfaced highest EV):** the Rails/ActiveSupport
-plugin phase (§10) — the dominant undefined-method coverage pool.
+(Deep flow clusters — Tier B/C possible-nil, always-truthy on the substrate, Rails/AS plugin — are
+enumerated in the flow-frontier note above; each is opt-in and ADR-backed, NOT the default next work.)
 
 Prior: 2026-07-06 — **Coverage-gap track opened (branch `coverage-gaps`).** Added `fp_audit.py --gaps`
 (aggregates reference-only diagnostics by rule = the coverage-effort map). Landscape across the survey:
