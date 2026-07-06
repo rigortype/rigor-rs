@@ -6,10 +6,30 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display #12 merged; HASH-shape
-typing on branch `hash-shape`) — **Baseline area COMPLETE + productization pivot; `warn_unresolved_config` +
-`rigor diff` + `rigor triage` + reference-faithful type-display layer LANDED; value-pinned ARRAY **and HASH**
-typing ported.** Read `AGENTS.md` "Working discipline" before continuing.
+Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display #12 + hash-shape #13 merged;
+`rigor annotate` on branch `annotate`) — **Baseline area COMPLETE + productization pivot; config-audit +
+`diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
+Read `AGENTS.md` "Working discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `annotate`) — `rigor annotate FILE`.** A port of the reference's
+`AnnotateCommand` + `LineTypeCollector`: appends a `#=> <type>` comment to each source line (xmpfilter
+convention), rendering the type via the shared `describe_named` layer — the payoff of the type-display arc.
+`crates/rigor-cli/src/annotate.rs`: per-line selection ported faithfully — every STATEMENT (a child of a
+`Statements`/`Program` body OR a branch/loop/def/class body, which rigor-rs stores as flat `Vec<NodeId>`
+fields — collected via `push_statement_children`) sets `by_line[end_line]`, processed in ascending `NodeId`
+order so the outermost/last statement closing a line wins (the arena is lowered bottom-up ⇒ NodeId order ==
+post-order); an assignment evaluates to its RHS value, a `def` to its `:name` symbol with a header-line
+return-type override; a line no statement closes falls back to the widest expression ending there. Text
+(column-aligned, idempotent re-annotation via `#=>` strip) + `--format json` (`{ line: type }` map).
+**Verified:** fresh-dir E2E vs the oracle — **byte-identical (text AND json) on straight-line top-level code**
+(literals, arrays, hashes, `def` return/symbol). On complex code the residual divergences are all rigor-rs
+**inference-precision gaps, not annotate defects** (and sound — `Dynamic[top]` over-approximates): an
+`if`-expression types `Dynamic` where the reference folds to its branch value, and `[1,2].first` is
+`Dynamic` where the reference folds the Tuple projection to `1`. **DEFERRALS (documented):** per-scope local
+typing inside method bodies (no `ScopeIndexer` — a def-LOCAL literal binding types `Dynamic` where the
+reference's scope pins it; top-level is exact); colour output (`bat`/IRB highlighting — flags accepted,
+plain output). **Gated:** 479 tests (5 new), run.rb 54/54, clippy clean; check path untouched (new command).
+**NOT yet merged.**
 
 **▶▶ LANDED THIS SESSION (branch `hash-shape`) — value-pinned HASH → HashShape typing (completes the
 type-display arc).** The previous slice deferred hashes because rigor-rs's lowering flattens hash assocs to
