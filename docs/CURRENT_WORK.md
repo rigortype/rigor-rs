@@ -6,7 +6,20 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 — **PRODUCTIZATION: baseline `regenerate`/`drift`/`prune` LANDED (ADR-22
+Last updated: 2026-07-06 — **PRODUCTIZATION: `check --baseline-strict` CI gate LANDED (ADR-22 slice 5;
+merge `ac4744f`).** Faithful port of the reference's strict gate, delegated-implemented from a 10-scenario
+oracle spec and independently byte-audited before merge: audits the UNSUPPRESSED findings via
+`Baseline::audit`; ANY non-`Within` drift (over/cleared/reducible — deficit drift counts too) fails the run
+(exit 1, flat OR); two distinct no-baseline behaviors (nil path → `nothing to gate.`; resolved-but-absent →
+silent); malformed baseline emits BOTH `(continuing without baseline)` and `(--baseline-strict gate
+skipped)`; report on stderr last, `(Δ{delta}, {status})` row format. 450 tests, clippy clean, both harness
+PASS. **The ADR-22 baseline feature area is now COMPLETE** (generate/dump/regenerate/drift/prune +
+`--baseline-strict`). Audit note: an audit-harness shell-quoting bug (`$(pwd)` evaluated inside a `cd`
+subshell → reference ran from the wrong dir, LoadError, empty output) initially masked the reference side —
+corrected and re-verified byte-identical. Remaining productization: full config schema validation, §12
+LSP two-tier / MCP tool expansion, reference CLI commands (`explain`/`diff`/`annotate`/`type_of`).
+
+Prior: 2026-07-06 — **PRODUCTIZATION: baseline `regenerate`/`drift`/`prune` LANDED (ADR-22
 completion; merge `95564d4`).** The three remaining baseline subcommands are a faithful port, built by a
 delegated implementation agent from a TWO-WAY-verified oracle spec (two independent reference
 investigations agreed on all overlapping facts) and audited before merge: `regenerate` = `generate
