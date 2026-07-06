@@ -25,7 +25,7 @@ use std::process::ExitCode;
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, Typer};
 use rigor_parse::{lower, parse, LoweredAst, Node, NodeId};
-use rigor_types::{Interner, Scalar, Type, TypeId};
+use rigor_types::{Interner, TypeId};
 
 /// A located, typed result, ready to render (mirrors the reference's `Result`).
 struct Probe {
@@ -114,7 +114,7 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
         line,
         column,
         node_kind: node_kind(ast.get(node_id)),
-        type_render: render_type(&interner, &index, ty),
+        type_render: render_type(&interner, &index, &source_index, ty),
     };
 
     match format {
@@ -314,29 +314,21 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
 /// `:foo`, `nil`); a carrier with a known class name renders that name
 /// (`String`, `singleton(Time)`); anything else falls back to rigor-rs's
 /// [`rigor_types::describe`] (`Dynamic[top]`, unions, …).
-pub(crate) fn render_type(interner: &Interner, index: &CoreIndex, ty: TypeId) -> String {
-    if let Type::Constant(scalar) = interner.get(ty) {
-        return render_scalar(scalar);
-    }
-    if let Some(name) = index.class_name_of(interner, ty) {
-        return name.to_string();
-    }
-    rigor_types::describe(interner, ty)
+pub(crate) fn render_type(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &SourceIndex,
+    ty: TypeId,
+) -> String {
+    // The reference-faithful display layer (`type_display::describe` →
+    // `rigor_types::describe_named`), resolving a class id through the core RBS
+    // index first, then the project `sig/` registry. This replaces the old ad-hoc
+    // `Constant → scalar / Nominal → name / else low-level describe` cascade,
+    // which leaked `Class<id>` for any composite carrier (union / range / hash
+    // shape) because the low-level describe cannot resolve names.
+    crate::type_display::describe(interner, index, source, ty)
 }
 
-/// Render a scalar literal as it appears in `check`'s output: strings quoted
-/// (`"hello"`), symbols colon-prefixed (`:foo`), everything else by its natural
-/// spelling. Mirrors `rigor_rules`'s `render_scalar`.
-fn render_scalar(scalar: &Scalar) -> String {
-    match scalar {
-        Scalar::Str(s) => format!("{s:?}"),
-        Scalar::Sym(s) => format!(":{s}"),
-        Scalar::Int(n) => n.to_string(),
-        Scalar::Float(f) => f.to_string(),
-        Scalar::Bool(b) => b.to_string(),
-        Scalar::Nil => "nil".to_string(),
-    }
-}
 
 /// Text rendering (mirrors the reference's `render_text` layout).
 fn render_text(probe: &Probe) {
@@ -374,7 +366,7 @@ mod tests {
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, id, &env, &mut interner);
-        (node_kind(ast.get(id)), render_type(&interner, &index, ty))
+        (node_kind(ast.get(id)), render_type(&interner, &index, &source_index, ty))
     }
 
     #[test]

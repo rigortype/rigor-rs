@@ -277,7 +277,7 @@ fn tool_type_of(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let node = ast.get(node_id);
         Some((
             crate::type_of::node_kind(node).to_string(),
-            crate::type_of::render_type(&interner, &ctx.index, ty),
+            crate::type_of::render_type(&interner, &ctx.index, &src, ty),
         ))
     }))
     .map_err(|_| "internal error: typing panicked on this source".to_string())?;

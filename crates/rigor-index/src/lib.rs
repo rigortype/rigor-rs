@@ -281,9 +281,16 @@ impl CoreIndex {
         match interner.get(ty) {
             Type::Constant(scalar) => Some(scalar_class(scalar)),
             Type::Nominal { class, .. } => self.class_name_for_id(*class),
-            // TODO(spec): resolve refined / shaped carriers (Tuple -> Array,
-            // HashShape -> Hash, IntegerRange -> Integer) once the RBS-backed
-            // index lands; the current slice resolves literals + nominals.
+            // Shaped carriers erase to their nominal container for DISPATCH /
+            // witnessing (the reference's RBS erasure): a value-pinned `Tuple`
+            // dispatches as `Array`, a `HashShape` as `Hash`, an `IntegerRange`
+            // as `Integer`. This keeps `[1, 2].frist` witnessing on Array while
+            // the carrier's value-pinned DISPLAY (`[1, 2]`) rides through
+            // `describe_named`. Any core-modeled Array/Hash/Integer method stays
+            // silent, so this only ever witnesses a genuinely-absent method.
+            Type::Tuple(_) => Some("Array"),
+            Type::HashShape(_) => Some("Hash"),
+            Type::IntegerRange { .. } => Some("Integer"),
             _ => None,
         }
     }
