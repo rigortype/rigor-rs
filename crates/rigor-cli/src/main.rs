@@ -25,7 +25,7 @@ mod ci_detector;
 mod diagnostic_formats;
 use diagnostic_formats::Rendered;
 mod baseline;
-use baseline::{Baseline, MatchMode, DEFAULT_BASELINE_PATH};
+use baseline::{Baseline, Bucket, DriftStatus, MatchMode, DEFAULT_BASELINE_PATH};
 mod docs;
 mod doctor;
 mod explain;
@@ -643,13 +643,10 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("generate") => baseline_generate(&args[1..]),
+        Some("regenerate") => baseline_regenerate(&args[1..]),
         Some("dump") => baseline_dump(&args[1..]),
-        Some(sub @ ("regenerate" | "drift" | "prune")) => {
-            eprintln!(
-                "rigor baseline: `{sub}` is recognized but not yet implemented in this phase"
-            );
-            ExitCode::from(2)
-        }
+        Some("drift") => baseline_drift(&args[1..]),
+        Some("prune") => baseline_prune(&args[1..]),
         Some(other) => {
             eprintln!("rigor baseline: unknown subcommand `{other}`");
             print_baseline_help();
@@ -662,14 +659,164 @@ fn print_baseline_help() {
     eprintln!(
         "Usage: rigor baseline <subcommand> [options]\n\n\
          Subcommands:\n\
-         \x20 generate   Write a fresh baseline from a check run over the given files.\n\
-         \x20 dump       Print the contents of an existing baseline.\n\n\
-         generate options:\n\
+         \x20 generate    Write a fresh baseline from a check run over the given files.\n\
+         \x20 regenerate  Rewrite the baseline unconditionally (post-fix refresh).\n\
+         \x20 dump        Print the contents of an existing baseline.\n\
+         \x20 drift       Compare baseline vs current diagnostics (reduction / regression hints).\n\
+         \x20 prune       Drop cleared buckets (actual == 0) from the baseline.\n\n\
+         generate/regenerate options:\n\
          \x20 --match-mode rule|message   Row form: rule (default) or message\n\
          \x20 --output PATH               Write baseline to PATH (default: {DEFAULT_BASELINE_PATH})\n\
-         \x20 --force                     Overwrite an existing baseline file\n\
+         \x20 --force                     Overwrite an existing baseline file (generate only)\n\
+         \x20 --config PATH               Path to .rigor.yml\n\n\
+         drift options:\n\
+         \x20 --baseline PATH             Path to the baseline file (default: {DEFAULT_BASELINE_PATH})\n\
+         \x20 --only STATUS               Show only within|over|cleared|reducible buckets\n\
+         \x20 --config PATH               Path to .rigor.yml\n\n\
+         prune options:\n\
+         \x20 --baseline PATH             Path to the baseline file (default: {DEFAULT_BASELINE_PATH})\n\
+         \x20 --dry-run                   Show what would be dropped without writing\n\
          \x20 --config PATH               Path to .rigor.yml"
     );
+}
+
+/// A run's findings: `(input-order, path, source, diagnostic)` tuples.
+type Findings = Vec<(usize, String, String, Diagnostic)>;
+
+/// A minimal `OptionParser`-compatible flag parser for the baseline
+/// subcommands, reproducing the reference Ruby's `optparse` error surface so
+/// stderr + exit codes match byte-for-byte:
+/// - `--flag value` and `--flag=value` both accepted for value flags.
+/// - missing value → `missing argument: <flag>` (exit 64).
+/// - unknown `--flag` → `invalid option: <flag>` (exit 64).
+/// - a value-flag validator rejecting a value → `invalid argument: <token>`
+///   where `<token>` is the ORIGINAL argv token (`--only bogus` vs
+///   `--only=bogus`), matching optparse (exit 64).
+/// - positional (non-`--`) args are collected and returned; the baseline
+///   subcommands ignore them (optparse `parse!` leaves them in argv unused).
+struct OptParse<'a> {
+    args: &'a [String],
+    idx: usize,
+}
+
+/// One parsed flag occurrence.
+enum OptEvent<'a> {
+    /// A value flag: canonical name (`--only`), its value, and the original
+    /// token for error rendering.
+    Value { name: &'a str, value: String, token: String },
+    /// A boolean flag (e.g. `--dry-run`).
+    Bool { name: String },
+    /// A positional argument (the raw token).
+    Positional { token: &'a str },
+}
+
+impl<'a> OptParse<'a> {
+    fn new(args: &'a [String]) -> Self {
+        OptParse { args, idx: 0 }
+    }
+
+    /// Advance to the next token, classifying it. `value_flags` names the flags
+    /// that consume a value. Returns `Err(msg)` for missing-argument on a
+    /// value flag whose value is absent.
+    fn next(&mut self, value_flags: &[&'a str]) -> Option<Result<OptEvent<'a>, String>> {
+        if self.idx >= self.args.len() {
+            return None;
+        }
+        let raw = &self.args[self.idx];
+        self.idx += 1;
+        if let Some(rest) = raw.strip_prefix("--") {
+            let _ = rest;
+            // Split `--flag=value`.
+            let (name, inline) = match raw.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_string())),
+                None => (raw.as_str(), None),
+            };
+            if let Some(canon) = value_flags.iter().find(|f| **f == name).copied() {
+                match inline {
+                    Some(v) => {
+                        Some(Ok(OptEvent::Value { name: canon, value: v, token: raw.clone() }))
+                    }
+                    None => {
+                        // Consume the following token as the value.
+                        if self.idx < self.args.len() {
+                            let v = self.args[self.idx].clone();
+                            let token = format!("{name} {v}");
+                            self.idx += 1;
+                            Some(Ok(OptEvent::Value { name: canon, value: v, token }))
+                        } else {
+                            Some(Err(format!("missing argument: {name}")))
+                        }
+                    }
+                }
+            } else {
+                // A `--flag` that is not a value flag: caller decides whether
+                // it is a known boolean or an unknown option.
+                Some(Ok(OptEvent::Bool { name: name.to_string() }))
+            }
+        } else {
+            Some(Ok(OptEvent::Positional { token: raw.as_str() }))
+        }
+    }
+}
+
+/// Shared analysis path for generate/regenerate/drift/prune: load config,
+/// build the sidecar folder, resolve roots, analyze, and return the findings
+/// paired with their project-root-relative path (the baseline matcher key).
+///
+/// `roots`: positional path args (empty → config `paths:`). drift/prune pass an
+/// empty slice (they never take positionals); generate/regenerate pass their
+/// positionals — a deliberate rigor-rs extension over the reference, which
+/// always analyzes config `paths:`.
+///
+/// Returns `Err(code)` if the sidecar folder fails to build.
+fn baseline_analysis(
+    explicit_config: Option<&str>,
+    roots: &[&str],
+    verb: &'static str,
+) -> Result<(Config, Findings), ExitCode> {
+    let cfg = Config::load(explicit_config.map(Path::new));
+    let sidecar_folder = build_sidecar_folder(&cfg, None)?;
+    let folder_ref =
+        sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
+
+    let config_paths: Vec<&str>;
+    let roots: &[&str] = if roots.is_empty() {
+        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        &config_paths
+    } else {
+        roots
+    };
+    let (expanded_owned, _path_errors) = expand_check_paths(roots);
+    let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
+    let (findings, _had_io_error) = analyze_files(&expanded, &cfg, verb, folder_ref);
+    Ok((cfg, findings))
+}
+
+/// Relativize findings against cwd, as the baseline matcher keys on
+/// project-root-relative paths (the reference's `Dir.pwd`).
+fn baseline_entries(
+    findings: &[(usize, String, String, Diagnostic)],
+) -> Vec<(String, &Diagnostic)> {
+    let cwd = std::env::current_dir().ok();
+    findings
+        .iter()
+        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
+        .collect()
+}
+
+/// Load a baseline for drift/prune, enforcing the reference's strict existence
+/// + parse contract (unlike `Baseline::load`, a missing file is an error here).
+///
+/// `Err(ExitCode::from(64))` on missing/malformed; the message is on stderr.
+fn load_baseline_strict(path: &str) -> Result<Baseline, ExitCode> {
+    if !Path::new(path).exists() {
+        eprintln!("rigor: baseline file not found: {path}");
+        return Err(ExitCode::from(64));
+    }
+    Baseline::load(Path::new(path)).map_err(|e| {
+        eprintln!("rigor: baseline load failed: {e}");
+        ExitCode::from(64)
+    })
 }
 
 /// `rigor baseline generate` — run `check` over the files and write a baseline.
@@ -678,87 +825,117 @@ fn baseline_generate(args: &[String]) -> ExitCode {
     let mut output = DEFAULT_BASELINE_PATH.to_string();
     let mut mode = MatchMode::Rule;
     let mut force = false;
-    let mut explicit_config: Option<&str> = None;
+    let mut explicit_config: Option<String> = None;
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--output" => match it.next() {
-                Some(p) => output = p.clone(),
-                None => {
-                    eprintln!("rigor baseline generate: --output expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            "--match-mode" => match it.next().map(String::as_str) {
-                Some("rule") => mode = MatchMode::Rule,
-                Some("message") => mode = MatchMode::Message,
-                other => {
-                    eprintln!(
-                        "rigor baseline generate: --match-mode expects `rule` or `message`, got {other:?}"
-                    );
-                    return ExitCode::from(64);
-                }
-            },
-            "--config" => match it.next() {
-                Some(p) => explicit_config = Some(p),
-                None => {
-                    eprintln!("rigor baseline generate: --config expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            "--force" => force = true,
-            other => files.push(other),
+    let mut p = OptParse::new(args);
+    while let Some(ev) = p.next(&["--output", "--match-mode", "--config"]) {
+        match ev {
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::from(64);
+            }
+            Ok(OptEvent::Value { name: "--output", value, .. }) => output = value,
+            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
+            Ok(OptEvent::Value { name: "--match-mode", value, token }) => {
+                mode = match value.as_str() {
+                    "rule" => MatchMode::Rule,
+                    "message" => MatchMode::Message,
+                    _ => {
+                        eprintln!("invalid argument: {token}");
+                        return ExitCode::from(64);
+                    }
+                };
+            }
+            Ok(OptEvent::Value { .. }) => unreachable!(),
+            Ok(OptEvent::Bool { name }) if name == "--force" => force = true,
+            Ok(OptEvent::Bool { name }) => {
+                eprintln!("invalid option: {name}");
+                return ExitCode::from(64);
+            }
+            // A rigor-rs generate-parity extension: positional roots override
+            // config `paths:`. The reference accepts no positionals here.
+            Ok(OptEvent::Positional { token }) => files.push(token),
         }
     }
+    let explicit_config = explicit_config.as_deref();
 
     if Path::new(&output).exists() && !force {
         eprintln!(
-            "rigor: {output} already exists. Re-run with --force to overwrite."
+            "rigor: {output} already exists. Re-run with --force to overwrite, \
+             or use `rigor baseline regenerate`."
         );
         return ExitCode::from(64);
     }
 
-    let cfg = Config::load(explicit_config.map(Path::new));
+    write_baseline(explicit_config, &files, &output, mode, "wrote baseline to")
+}
+
+/// `rigor baseline regenerate` — `generate --force` with a different success
+/// verb: unconditional overwrite (no existence check, no `--force` flag). Roots
+/// follow the same rigor-rs generate-parity extension (positionals-if-given
+/// else config `paths:`); the reference always analyzes config `paths:`.
+fn baseline_regenerate(args: &[String]) -> ExitCode {
+    let mut files: Vec<&str> = Vec::new();
+    let mut output = DEFAULT_BASELINE_PATH.to_string();
+    let mut mode = MatchMode::Rule;
+    let mut explicit_config: Option<String> = None;
+
+    let mut p = OptParse::new(args);
+    // No `--force` here: regenerate always overwrites, and passing `--force`
+    // must fail as `invalid option: --force` (reference optparse parity).
+    while let Some(ev) = p.next(&["--output", "--match-mode", "--config"]) {
+        match ev {
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::from(64);
+            }
+            Ok(OptEvent::Value { name: "--output", value, .. }) => output = value,
+            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
+            Ok(OptEvent::Value { name: "--match-mode", value, token }) => {
+                mode = match value.as_str() {
+                    "rule" => MatchMode::Rule,
+                    "message" => MatchMode::Message,
+                    _ => {
+                        eprintln!("invalid argument: {token}");
+                        return ExitCode::from(64);
+                    }
+                };
+            }
+            Ok(OptEvent::Value { .. }) => unreachable!(),
+            Ok(OptEvent::Bool { name }) => {
+                eprintln!("invalid option: {name}");
+                return ExitCode::from(64);
+            }
+            Ok(OptEvent::Positional { token }) => files.push(token),
+        }
+    }
+
+    write_baseline(explicit_config.as_deref(), &files, &output, mode, "regenerated baseline")
+}
+
+/// Shared generate/regenerate writer: analyze, build the baseline, write it, and
+/// emit the stderr summary + the `note` line when `.rigor.yml` lacks
+/// `baseline:`. `verb` differs (`wrote baseline to` vs `regenerated baseline`).
+fn write_baseline(
+    explicit_config: Option<&str>,
+    files: &[&str],
+    output: &str,
+    mode: MatchMode,
+    verb: &str,
+) -> ExitCode {
     // Same coverage posture as `check` (ADR-0008/0036) so the baseline records
-    // exactly what `check` witnesses — a subset-generated baseline would fail to
-    // suppress full-fidelity findings. `baseline` has no `--ruby` flag, so the
-    // mode comes from env / `.rigor.yml` / default.
-    let sidecar_folder = match build_sidecar_folder(&cfg, None) {
-        Ok(f) => f,
+    // exactly what `check` witnesses. IMPORTANT (reference parity): the baseline
+    // records the UNFILTERED set — `analyze_files` never applies an existing
+    // baseline, so the new file records live diagnostics, not the post-baseline
+    // (empty) surface.
+    let (cfg, findings) = match baseline_analysis(explicit_config, files, "baseline") {
+        Ok(v) => v,
         Err(code) => return code,
     };
-    let folder_ref =
-        sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
-    // IMPORTANT (reference parity): generate must record the UNFILTERED set —
-    // it never applies an existing baseline (`analyze_files` does not), so the
-    // new file records the live diagnostics, not the post-baseline (empty) surface.
-    // ADR-0040 — bare `baseline generate` (no path args) scans the config
-    // `paths:` like a bare `check` (the reference generated a baseline from
-    // `configuration.paths` — 2026-07-06 audit); explicit args override. Then
-    // expand directory roots; bad paths are simply skipped here (no diagnostic
-    // surface on `generate`).
-    let config_paths: Vec<&str>;
-    let roots: &[&str] = if files.is_empty() {
-        config_paths = cfg.paths.iter().map(String::as_str).collect();
-        &config_paths
-    } else {
-        &files
-    };
-    let (expanded_owned, _path_errors) = expand_check_paths(roots);
-    let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
-    let (findings, _had_io_error) = analyze_files(&expanded, &cfg, "baseline", folder_ref);
-
-    // Key on project-root-relative paths, like the reference's `Dir.pwd`.
-    let cwd = std::env::current_dir().ok();
-    let entries: Vec<(String, &Diagnostic)> = findings
-        .iter()
-        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
-        .collect();
-
+    let entries = baseline_entries(&findings);
     let baseline = Baseline::from_diagnostics(&entries, mode);
-    if let Err(e) = std::fs::write(&output, baseline.to_yaml()) {
-        eprintln!("rigor baseline generate: cannot write {output}: {e}");
+    if let Err(e) = std::fs::write(output, baseline.to_yaml()) {
+        eprintln!("rigor baseline: cannot write {output}: {e}");
         return ExitCode::from(1);
     }
     let mode_str = match mode {
@@ -766,10 +943,16 @@ fn baseline_generate(args: &[String]) -> ExitCode {
         MatchMode::Message => "message",
     };
     eprintln!(
-        "rigor: wrote baseline to {output} ({} bucket(s) covering {} diagnostic(s); match-mode: {mode_str})",
+        "rigor: {verb} {output} ({} bucket(s) covering {} diagnostic(s); match-mode: {mode_str})",
         baseline.size(),
         entries.len()
     );
+    if cfg.baseline_path().is_none() {
+        eprintln!(
+            "rigor: note — `.rigor.yml` does not declare `baseline:`; \
+             add `baseline: {output}` to activate the suppression."
+        );
+    }
     ExitCode::SUCCESS
 }
 
@@ -812,6 +995,176 @@ fn baseline_dump(args: &[String]) -> ExitCode {
         }
     }
     println!("Total: {} bucket(s), {total} occurrence(s)", baseline.size());
+    ExitCode::SUCCESS
+}
+
+/// `rigor baseline drift` — audit current diagnostics against the baseline and
+/// report per-bucket drift. Informational: exit 0 whether or not drift is
+/// found; exit 64 only for usage / missing / malformed baseline.
+fn baseline_drift(args: &[String]) -> ExitCode {
+    let mut path = DEFAULT_BASELINE_PATH.to_string();
+    let mut only: Option<DriftStatus> = None;
+    let mut explicit_config: Option<String> = None;
+
+    let mut p = OptParse::new(args);
+    while let Some(ev) = p.next(&["--baseline", "--only", "--config"]) {
+        match ev {
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::from(64);
+            }
+            Ok(OptEvent::Value { name: "--baseline", value, .. }) => path = value,
+            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
+            Ok(OptEvent::Value { name: "--only", value, token }) => {
+                only = Some(match value.as_str() {
+                    "within" => DriftStatus::Within,
+                    "over" => DriftStatus::Over,
+                    "cleared" => DriftStatus::Cleared,
+                    "reducible" => DriftStatus::Reducible,
+                    _ => {
+                        eprintln!("invalid argument: {token}");
+                        return ExitCode::from(64);
+                    }
+                });
+            }
+            Ok(OptEvent::Value { .. }) => unreachable!(),
+            Ok(OptEvent::Bool { name }) => {
+                eprintln!("invalid option: {name}");
+                return ExitCode::from(64);
+            }
+            // Positionals are ignored (optparse `parse!` leaves them unused).
+            Ok(OptEvent::Positional { .. }) => {}
+        }
+    }
+    let explicit_config = explicit_config.as_deref();
+
+    let baseline = match load_baseline_strict(&path) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
+    // drift/prune never take positional roots — always config `paths:`.
+    let findings = match baseline_analysis(explicit_config, &[], "baseline") {
+        Ok((_cfg, f)) => f,
+        Err(code) => return code,
+    };
+    let entries = baseline_entries(&findings);
+    let rows = baseline.audit(&entries);
+
+    // Display filter: default = delta != 0; --only = status == S.
+    let shown: Vec<&baseline::DriftRow> = match only {
+        None => rows.iter().filter(|r| r.delta != 0).collect(),
+        Some(s) => rows.iter().filter(|r| r.status == s).collect(),
+    };
+
+    if shown.is_empty() {
+        println!("No drift detected.");
+        return ExitCode::SUCCESS;
+    }
+
+    println!("Drift report against {path}:");
+    println!();
+    for status in [DriftStatus::Over, DriftStatus::Cleared, DriftStatus::Reducible, DriftStatus::Within] {
+        let mut group: Vec<&&baseline::DriftRow> =
+            shown.iter().filter(|r| r.status == status).collect();
+        if group.is_empty() {
+            continue;
+        }
+        group.sort_by(|a, b| (&a.bucket.file, &a.bucket.rule).cmp(&(&b.bucket.file, &b.bucket.rule)));
+        let n = group.len();
+        println!("{}", drift_section_header(status, n));
+        for row in group {
+            let delta_str = match row.delta.cmp(&0) {
+                std::cmp::Ordering::Greater => format!("+{}", row.delta),
+                _ => row.delta.to_string(),
+            };
+            println!(
+                "  {}  [{}]  {} → {}  (Δ{delta_str})",
+                row.bucket.file, row.bucket.rule, row.bucket.count, row.actual
+            );
+        }
+        println!();
+    }
+    ExitCode::SUCCESS
+}
+
+fn drift_section_header(status: DriftStatus, n: usize) -> String {
+    match status {
+        DriftStatus::Over => {
+            format!("## Over threshold ({n}) — bucket exceeded; check the regular diagnostic output.")
+        }
+        DriftStatus::Cleared => {
+            format!("## Cleared ({n}) — `rigor baseline prune` can drop these.")
+        }
+        DriftStatus::Reducible => {
+            format!("## Reducible ({n}) — tightening opportunity; run `rigor baseline regenerate`.")
+        }
+        DriftStatus::Within => format!("## Within threshold ({n})"),
+    }
+}
+
+/// `rigor baseline prune` — drop cleared buckets (`actual == 0`) from the
+/// baseline. Same missing/malformed handling as drift (exit 64).
+fn baseline_prune(args: &[String]) -> ExitCode {
+    let mut path = DEFAULT_BASELINE_PATH.to_string();
+    let mut dry_run = false;
+    let mut explicit_config: Option<String> = None;
+
+    let mut p = OptParse::new(args);
+    while let Some(ev) = p.next(&["--baseline", "--config"]) {
+        match ev {
+            Err(msg) => {
+                eprintln!("{msg}");
+                return ExitCode::from(64);
+            }
+            Ok(OptEvent::Value { name: "--baseline", value, .. }) => path = value,
+            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
+            Ok(OptEvent::Value { .. }) => unreachable!(),
+            Ok(OptEvent::Bool { name }) if name == "--dry-run" => dry_run = true,
+            Ok(OptEvent::Bool { name }) => {
+                eprintln!("invalid option: {name}");
+                return ExitCode::from(64);
+            }
+            Ok(OptEvent::Positional { .. }) => {}
+        }
+    }
+    let explicit_config = explicit_config.as_deref();
+
+    let baseline = match load_baseline_strict(&path) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
+    let findings = match baseline_analysis(explicit_config, &[], "baseline") {
+        Ok((_cfg, f)) => f,
+        Err(code) => return code,
+    };
+    let entries = baseline_entries(&findings);
+    let rows = baseline.audit(&entries);
+
+    let mut cleared: Vec<&baseline::DriftRow> =
+        rows.iter().filter(|r| r.status == DriftStatus::Cleared).collect();
+    if cleared.is_empty() {
+        println!("No cleared buckets to prune.");
+        return ExitCode::SUCCESS;
+    }
+    cleared.sort_by(|a, b| (&a.bucket.file, &a.bucket.rule).cmp(&(&b.bucket.file, &b.bucket.rule)));
+
+    println!("{} bucket(s) to prune from {path}:", cleared.len());
+    for row in &cleared {
+        println!("  - {}  [{}]  (was: {})", row.bucket.file, row.bucket.rule, row.bucket.count);
+    }
+
+    if dry_run {
+        return ExitCode::SUCCESS;
+    }
+
+    let remove: Vec<&Bucket> = cleared.iter().map(|r| r.bucket).collect();
+    let n = remove.len();
+    let pruned = baseline.without(&remove);
+    if let Err(e) = std::fs::write(&path, pruned.to_yaml()) {
+        eprintln!("rigor baseline prune: cannot write {path}: {e}");
+        return ExitCode::from(1);
+    }
+    eprintln!("rigor: pruned {n} bucket(s); baseline now has {} entries.", pruned.size());
     ExitCode::SUCCESS
 }
 
