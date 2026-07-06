@@ -102,6 +102,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // default `require`) after config load.
     let mut ruby_cli: Option<ruby_mode::RubyMode> = None;
     let mut no_ruby_flag = false;
+    // ADR-22 slice 5 — the `--baseline-strict` CI gate. When set, ANY baseline
+    // drift (over, cleared, or reducible) fails the run; a no-op with a stderr
+    // note when no baseline is active (WD2 — the flag never loads a baseline the
+    // config did not name).
+    let mut baseline_strict = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -138,6 +143,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 }
             },
             "--no-baseline" => baseline_arg = BaselineArg::Off,
+            "--baseline-strict" => baseline_strict = true,
             "--ruby" => match it.next() {
                 Some(v) => ruby_cli = Some(ruby_mode::parse_value(v)),
                 None => {
@@ -200,6 +206,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `# rigor:disable` applied). Shared with `baseline generate`.
     let (mut findings, had_io_error) = analyze_files(&expanded, &cfg, "check", folder_ref);
 
+    // ADR-22 slice 5 — snapshot the RAW (pre-baseline-filter) findings for the
+    // `--baseline-strict` audit. The reference audits `raw_result.diagnostics`
+    // (BEFORE `apply_baseline_filter`), so the gate sees deficit drift a bucket
+    // would otherwise silence. Only snapshot when the flag is set; a clone
+    // avoids threading a borrow through the mutate-in-place filter below.
+    let raw_findings: Vec<(usize, String, String, Diagnostic)> =
+        if baseline_strict { findings.clone() } else { Vec::new() };
+
     // ADR-22 — baseline filter, applied LAST (after inline `# rigor:disable`
     // and config `disable:`, per reference WD6). With no resolved baseline this
     // is a no-op, so the no-baseline path stays byte-identical (harness-gated).
@@ -238,10 +252,133 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // ADR-0040 — exit 1 iff there is a genuine read I/O error OR any run-failing
     // finding (see `finding_fails_run`); a warning-only run — including a
     // warn-and-skip bad path alongside analyzed files — exits 0.
-    if had_io_error || findings.iter().any(|(_, _, _, d)| finding_fails_run(d)) {
+    let normal_fail =
+        had_io_error || findings.iter().any(|(_, _, _, d)| finding_fails_run(d));
+
+    // ADR-22 slice 5 — the `--baseline-strict` gate runs LAST (after all normal
+    // stdout diagnostics + stderr stats/silenced lines) so its report is the
+    // final thing emitted, and OR's onto the exit code. It must run and print
+    // even when `normal_fail` is already true (informational output + a flat OR;
+    // no distinct exit code).
+    let strict_violation =
+        baseline_strict && baseline_strict_violation(&raw_findings, &cfg, &baseline_arg);
+
+    if normal_fail || strict_violation {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// ADR-22 slice 5 — the `--baseline-strict` CI gate predicate. Audits the RAW
+/// (pre-baseline-filter) findings against the resolved baseline and, on ANY
+/// drift (`status != Within` — over, cleared, OR reducible), prints a report to
+/// stderr and returns `true` (fail the run). Returns `false` (with an
+/// appropriate stderr note, or silently) in every "nothing to gate" case. The
+/// caller guards on the flag; this is only invoked when `--baseline-strict` is
+/// set.
+///
+/// Faithful to the reference `baseline_strict_violation?`:
+/// - no resolved baseline path → `... nothing to gate.` note, `false`.
+/// - an ABSENT file → `Baseline::load` yields an empty baseline → `false`
+///   SILENTLY (no message).
+/// - a malformed file (`LoadError`) → `... gate skipped` note, `false`. This is
+///   a SECOND, independent load — `apply_baseline` already loaded+warned
+///   `... (continuing without baseline)`, and BOTH messages must appear in a run
+///   with a malformed file, so we deliberately do not dedupe.
+fn baseline_strict_violation(
+    raw_findings: &[(usize, String, String, Diagnostic)],
+    cfg: &Config,
+    baseline_arg: &BaselineArg,
+) -> bool {
+    let Some(path) = resolve_baseline_path(baseline_arg, cfg) else {
+        eprintln!("rigor: --baseline-strict given but no baseline is active; nothing to gate.");
+        return false;
+    };
+
+    let baseline = match Baseline::load(Path::new(&path)) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("rigor: baseline load failed: {e} (--baseline-strict gate skipped)");
+            return false;
+        }
+    };
+    // An absent file loads as empty → nothing to gate, silently.
+    if baseline.is_empty() {
+        return false;
+    }
+
+    let cwd = std::env::current_dir().ok();
+    let entries: Vec<(String, &Diagnostic)> = raw_findings
+        .iter()
+        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
+        .collect();
+
+    let rows = baseline.audit(&entries);
+    let drifted: Vec<&baseline::DriftRow> =
+        rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
+    if drifted.is_empty() {
+        return false;
+    }
+
+    report_strict_drift(&drifted, &path);
+    true
+}
+
+/// Print the `--baseline-strict` drift report to stderr (reference
+/// `report_strict_drift`). Rows are sorted by `(bucket.file, bucket.rule)`; the
+/// row format matches `baseline drift`'s EXCEPT for the trailing `, {status}`
+/// inside the parens (verified byte-for-byte against the oracle). `delta_str`
+/// is `+N` for positive delta, else Ruby's `Integer#to_s` (`0`, `-N`);
+/// `status` renders as the lowercase status word (`over`/`cleared`/`reducible`).
+fn report_strict_drift(drifted: &[&baseline::DriftRow], path: &str) {
+    eprint!("{}", format_strict_drift(drifted, path));
+}
+
+/// Render the strict-drift report as one trailing-newline-terminated block, so
+/// the exact bytes are unit-testable. `eprint!`ed verbatim by
+/// `report_strict_drift`.
+fn format_strict_drift(drifted: &[&baseline::DriftRow], path: &str) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "rigor: --baseline-strict — {} bucket(s) drifted from {path}:\n",
+        drifted.len()
+    ));
+    let mut rows: Vec<&&baseline::DriftRow> = drifted.iter().collect();
+    rows.sort_by(|a, b| (&a.bucket.file, &a.bucket.rule).cmp(&(&b.bucket.file, &b.bucket.rule)));
+    for row in rows {
+        out.push_str(&format!(
+            "  {}  [{}]  {} → {}  (Δ{}, {})\n",
+            row.bucket.file,
+            row.bucket.rule,
+            row.bucket.count,
+            row.actual,
+            strict_delta_str(row.delta),
+            drift_status_word(row.status),
+        ));
+    }
+    out.push_str("rigor: run `rigor baseline regenerate` to refresh the baseline.\n");
+    out
+}
+
+/// Ruby's `delta.positive? ? "+#{delta}" : delta.to_s` — `+N` for positive,
+/// else the bare integer (`0`, `-N`).
+fn strict_delta_str(delta: i64) -> String {
+    match delta.cmp(&0) {
+        std::cmp::Ordering::Greater => format!("+{delta}"),
+        _ => delta.to_string(),
+    }
+}
+
+/// The lowercase status word the strict report prints — the Ruby symbol's `to_s`
+/// (`:over` → `over`). `Within` never reaches the report (drifted-only), but is
+/// mapped for totality.
+fn drift_status_word(status: DriftStatus) -> &'static str {
+    match status {
+        DriftStatus::Over => "over",
+        DriftStatus::Cleared => "cleared",
+        DriftStatus::Reducible => "reducible",
+        DriftStatus::Within => "within",
     }
 }
 
@@ -1929,5 +2066,84 @@ mod tests {
         prepend_path_errors(&mut empty, &errs, false);
         assert_eq!(empty[0].3.severity, Severity::Error);
         assert!(!empty[0].3.message.ends_with("(skipped)"));
+    }
+
+    // --- ADR-22 slice 5 `--baseline-strict` -------------------------------
+
+    #[test]
+    fn strict_delta_str_matches_ruby_to_s() {
+        // Ruby: delta.positive? ? "+#{delta}" : delta.to_s
+        assert_eq!(strict_delta_str(1), "+1");
+        assert_eq!(strict_delta_str(5), "+5");
+        assert_eq!(strict_delta_str(0), "0"); // not positive → bare 0
+        assert_eq!(strict_delta_str(-1), "-1");
+        assert_eq!(strict_delta_str(-3), "-3");
+    }
+
+    #[test]
+    fn drift_status_word_lowercase() {
+        assert_eq!(drift_status_word(DriftStatus::Over), "over");
+        assert_eq!(drift_status_word(DriftStatus::Cleared), "cleared");
+        assert_eq!(drift_status_word(DriftStatus::Reducible), "reducible");
+        assert_eq!(drift_status_word(DriftStatus::Within), "within");
+    }
+
+    #[test]
+    fn strict_report_byte_format_over_and_sorted() {
+        // A baseline with two buckets; audit against findings that push c.rb
+        // over (count 1, actual 2 → Δ+1 over) and leave a.rb reducible (count 3,
+        // actual 1 → Δ-2 reducible). Assert exact bytes AND the (file, rule) sort.
+        let text = "---\nversion: 1\nignored:\n\
+                    - file: c.rb\n  rule: r2\n  count: 1\n\
+                    - file: a.rb\n  rule: r1\n  count: 3\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        let d_a = diag("r1", Severity::Error, "m");
+        let d_c = diag("r2", Severity::Error, "m");
+        let entries = vec![
+            ("a.rb".to_string(), &d_a),
+            ("c.rb".to_string(), &d_c),
+            ("c.rb".to_string(), &d_c),
+        ];
+        let rows = b.audit(&entries);
+        let drifted: Vec<&baseline::DriftRow> =
+            rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
+        assert_eq!(drifted.len(), 2);
+        let out = format_strict_drift(&drifted, ".rigor-baseline.yml");
+        assert_eq!(
+            out,
+            "rigor: --baseline-strict — 2 bucket(s) drifted from .rigor-baseline.yml:\n\
+             \x20 a.rb  [r1]  3 → 1  (Δ-2, reducible)\n\
+             \x20 c.rb  [r2]  1 → 2  (Δ+1, over)\n\
+             rigor: run `rigor baseline regenerate` to refresh the baseline.\n"
+        );
+    }
+
+    #[test]
+    fn strict_report_cleared_bucket() {
+        // A bucket with no live diagnostics → cleared, Δ-N.
+        let text = "---\nversion: 1\nignored:\n- file: a.rb\n  rule: r1\n  count: 2\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        let rows = b.audit(&[]);
+        let drifted: Vec<&baseline::DriftRow> =
+            rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
+        let out = format_strict_drift(&drifted, "bl.yml");
+        assert_eq!(
+            out,
+            "rigor: --baseline-strict — 1 bucket(s) drifted from bl.yml:\n\
+             \x20 a.rb  [r1]  2 → 0  (Δ-2, cleared)\n\
+             rigor: run `rigor baseline regenerate` to refresh the baseline.\n"
+        );
+    }
+
+    #[test]
+    fn strict_within_bucket_is_not_a_violation() {
+        // actual == count → Within → not in the drifted set → no violation.
+        let text = "---\nversion: 1\nignored:\n- file: a.rb\n  rule: r1\n  count: 1\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        let d = diag("r1", Severity::Error, "m");
+        let rows = b.audit(&[("a.rb".to_string(), &d)]);
+        let drifted: Vec<&baseline::DriftRow> =
+            rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
+        assert!(drifted.is_empty());
     }
 }
