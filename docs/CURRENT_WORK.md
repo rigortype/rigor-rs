@@ -11,6 +11,17 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `triage-hints`) — (b) triage hints Catalogue (portable subset).**
+`rigor triage` now emits the reference `hints` section: the COUNT/rule-based recognisers H7 (unresolved-toplevel),
+H5 (systemic single-file cluster, >=8 of one (file,rule)), H6 (low-count genuine bugs, rule total 1..=5) - in the
+reference precedence order with per-diagnostic claiming (`recognise` in `triage.rs`). Default sections now include
+`hints`. The ECOSYSTEM recognisers stay DEFERRED (H1 ActiveSupport, H2/H2K monkey-patch, H3 gem-without-rbs, H4
+ActiveRecord relation) - they key on AS/AR method tables / `:info` notices / cross-file provenance / `Array[...]`
+receivers rigor-rs doesn't produce, so they never fire on a rigor-rs diagnostic set (nor does the reference on the
+same source), keeping the ported subset parity-faithful. **Verified:** fresh-dir E2E vs the oracle - default hints
+BYTE-IDENTICAL (H7 claims toplevel calls + H6 the undefined-methods; H5 systemic at threshold). **Gated:** tests
+(2 new), run.rb + run_snapshot.rb 54/54, clippy clean; check path untouched. NOT yet merged.
+
 **▶▶ LANDED THIS SESSION (branch `case-union`) — (a) inference precision slice 3: case-expression union (completes if/case).**
 A `Node::Case` arm in `Typer::type_of` (reference `type_of_case_simple_union`): a `case`/`when` (or `case`/`in`)
 as an expression types to the union of its branch VALUES + the `else` value (or `nil` when no `else` - a
