@@ -963,8 +963,7 @@ fn check_call(
     if index.class_name_of(interner, recv_ty).is_none() {
         if let Some(name) = typer.source().class_name_for_id_of(interner, recv_ty) {
             if index.is_project_sig_class(name) && !index.class_has_method(name, method) {
-                let name = name.to_string();
-                let receiver_render = render_receiver(interner, recv_ty, &name);
+                let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
                 let severity = catalog(CALL_UNDEFINED_METHOD)
                     .map(|e| e.default_severity)
@@ -995,13 +994,10 @@ fn check_call(
         return None;
     }
 
-    // We have witnessed absence over a core/RBS class.
-    let class_name = class_name.to_string();
-
-    // Render the receiver in the reference's value-in-message style: the bare
-    // value for a `Constant` (`"Hello"`, `3`), else the class name. The
-    // `message` field is presentation, not contract (ADR-0030).
-    let receiver_render = render_receiver(interner, recv_ty, &class_name);
+    // We have witnessed absence over a core/RBS class. Render the receiver in the
+    // reference's spelling (value-pinned for a Constant/Tuple, else the class
+    // name) via the shared display layer.
+    let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
     let message = format!("undefined method `{method}' for {receiver_render}");
 
     let severity = catalog(CALL_UNDEFINED_METHOD)
@@ -1462,11 +1458,26 @@ fn descend_trailing(ast: &LoweredAst, id: rigor_parse::NodeId) -> Option<rigor_p
 
 /// Render the receiver for the diagnostic message: the bare literal value for a
 /// value-pinned `Constant`, else the resolved class name.
-fn render_receiver(interner: &Interner, ty: rigor_types::TypeId, class_name: &str) -> String {
-    match interner.get(ty) {
-        Type::Constant(scalar) => render_scalar(scalar),
-        _ => class_name.to_string(),
-    }
+/// Render a receiver for a diagnostic's `message` / `receiver_type` field in the
+/// reference's spelling, via the shared `describe_named` display layer: a
+/// `Constant` renders its value (`"Hello"`, `3`), a `Tuple` value-pinned
+/// (`[1, 2, 3]`), a `Nominal` its class name — resolving class ids through the
+/// core RBS index then the project `sig/` registry. Presentation, not contract
+/// (ADR-0030); the harness keys diagnostics on `(rule, line, column)`, so the
+/// spelling never affects the zero-FP invariant.
+fn render_receiver(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    ty: rigor_types::TypeId,
+) -> String {
+    let resolve = |class: rigor_types::ClassId| -> Option<String> {
+        index
+            .class_name_for_id(class)
+            .map(str::to_string)
+            .or_else(|| source.class_name_for_id(class).map(str::to_string))
+    };
+    rigor_types::describe_named(interner, ty, &resolve)
 }
 
 /// Render a scalar literal as it appears in the reference's message: strings

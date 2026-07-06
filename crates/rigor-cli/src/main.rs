@@ -24,6 +24,7 @@ use config::Config;
 mod config_audit;
 mod diff;
 mod triage;
+mod type_display;
 mod ci_detector;
 mod diagnostic_formats;
 use diagnostic_formats::Rendered;

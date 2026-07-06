@@ -204,11 +204,34 @@ impl<'i> Typer<'i> {
                 }
                 interner.untyped()
             }
-            // An array/hash literal types to its bare nominal class so a typo'd
-            // method on it (`[1,2].frist`, `{}.fetchh`) flags via the real
-            // Array/Hash RBS — matching the reference. Element/shape precision is
-            // deferred (TODO(spec): Tuple / HashShape per ADR-0023).
-            Node::ArrayLit { .. } => self.nominal_or_untyped("Array", interner),
+            // An array literal types to a value-pinned `Tuple` of its element
+            // types (reference `array_type_for`): `[]` → the empty `Tuple[]`, a
+            // non-splat literal → `Tuple[t1, .., tn]`. `class_name_of(Tuple)`
+            // erases to `Array`, so a typo'd method (`[1,2].frist`) still flags
+            // via the real Array RBS exactly as before — the Tuple only sharpens
+            // the DISPLAY (`[1, 2]`, not `Array`) to match the reference. A splat
+            // (or any element with no owned AST variant, lowered to
+            // `Statements`/`Other`) makes the arity unknown, so it degrades to the
+            // bare `Array` nominal (the reference's `Nominal[Array, [union]]`).
+            Node::ArrayLit { elements, .. } => {
+                if elements.is_empty() {
+                    interner.intern(Type::Tuple(vec![]))
+                } else if elements
+                    .iter()
+                    .any(|&e| matches!(ast.get(e), Node::Statements { .. } | Node::Other { .. }))
+                {
+                    self.nominal_or_untyped("Array", interner)
+                } else {
+                    let elem_ids: Vec<NodeId> = elements.clone();
+                    let elems: Vec<TypeId> =
+                        elem_ids.iter().map(|&e| self.type_of(ast, e, env, interner)).collect();
+                    interner.intern(Type::Tuple(elems))
+                }
+            }
+            // A hash literal types to its bare `Hash` nominal so a typo'd method
+            // (`{}.fetchh`) flags via the real Hash RBS. HashShape (value-pinned
+            // key/value) precision is deferred — the reference produces it, but
+            // typing it needs the key/value pairing + openness model (ADR-0023).
             Node::HashLit { .. } => self.nominal_or_untyped("Hash", interner),
             // A call with no receiver (implicit self) or any other carrier
             // (`@ivar`, constant, `self`, `if`/`case`-as-expression, index,

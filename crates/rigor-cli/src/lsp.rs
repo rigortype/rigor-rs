@@ -427,7 +427,7 @@ fn hover(
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, node_id, &env, &mut interner);
         let (start, end) = ast.get(node_id).span();
-        let type_render = crate::type_of::render_type(&interner, &ctx.index, ty);
+        let type_render = crate::type_of::render_type(&interner, &ctx.index, &source, ty);
 
         // Extract owned node bits so later `&mut interner` calls don't clash with
         // the `&ast` borrow of `node`.
@@ -616,7 +616,7 @@ fn receiver_display(
     }
     index
         .class_name_of(interner, ty)
-        .map_or_else(|| crate::type_of::render_type(interner, index, ty), |n| n.to_string())
+        .map_or_else(|| crate::type_of::render_type(interner, index, typer.source(), ty), |n| n.to_string())
 }
 
 // ---------------------------------------------------------------------------

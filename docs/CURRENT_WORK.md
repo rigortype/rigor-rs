@@ -6,10 +6,29 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 (config-audit PR #8 + diff PR #10 merged; `rigor triage` on branch
-`triage-command`) — **Baseline feature area COMPLETE + productization pivot + flow-frontier exhaustion
-recorded; `warn_unresolved_config` config-audit + `rigor diff` LANDED; `rigor triage` statistical core
+Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 merged; type-display layer on branch
+`type-display`) — **Baseline area COMPLETE + productization pivot; `warn_unresolved_config` +
+`rigor diff` + `rigor triage` LANDED; reference-faithful type-display layer + value-pinned ARRAY typing
 ported.** Read `AGENTS.md` "Working discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `type-display`) — reference-faithful type-display layer + value-pinned
+array typing.** Builds `rigor_types::describe_named` — a faithful port of the reference's
+`Type#describe(:short)` (`lib/rigor/type/*.rb`) with class-name resolution (a `&dyn Fn(ClassId)->Option<String>`
+resolver over core RBS + project `sig/`): `Nominal`→name (`Array[Integer]`), `Constant`→Ruby inspect
+(`3`/`"hi"`/`:sym`), `Tuple`→value-pinned (`[1, 2, 3]`), optional `Union`→`T?`, `IntegerRange`→`int<…>`/alias,
+HashShape→`{ k: v }`. **Routed both `type-of`'s `render_type` AND the check path's `render_receiver` through
+it** — one shared reference-faithful vocabulary; this fixes `type-of` leaking `Class<id>` for composite
+carriers (union/range/shape) that the low-level `describe` cannot name. **Value-pinned ARRAY typing**
+(`crates/rigor-infer`): `[1,2,3]` now types as a `Tuple` (was `Nominal{Array}`; splat/`[]`/unsupported
+degrade per the reference `array_type_for`), with a new `class_name_of` fallback (`Tuple`→Array,
+`HashShape`→Hash, `IntegerRange`→Integer) that PRESERVES witnessing/dispatch (a typo still flags via the
+real Array RBS). **Result:** an array receiver now renders `[1, 2, 3]` — byte-identical to the reference —
+in the check message, `type-of`, AND `triage` selectors (the original triage-array divergence CLOSED).
+**Gated HARD:** 474 tests, run.rb + run_snapshot.rb 54/54, **corpus 560 real files 0 FP** (hot-path change),
+type-of E2E matches the reference on scalars/nominals/nested arrays. **DEFERRED: HASH → HashShape typing** —
+rigor-rs's lowering FLATTENS hash assocs to `[k,v,k,v]`, so faithful re-pairing needs a lowering change to
+preserve pair structure (a hash receiver still shows `Hash`, not `{ a: 1 }`); this is the clean next slice
+and, with it, `annotate` (which renders each line's type via `describe_named`) is unblocked. **NOT yet merged.**
 
 **▶▶ LANDED THIS SESSION (branch `triage-command`) — `rigor triage [paths]` statistical core (ADR-23).**
 A faithful port of the reference's `Triage`/`TriageRenderer`/`TriageCommand`, SCOPED to the statistical
