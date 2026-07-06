@@ -360,6 +360,98 @@ impl Baseline {
     }
 }
 
+/// A bucket's audited status against the current diagnostic stream
+/// (reference `status_for`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriftStatus {
+    /// `actual > count` — the bucket exceeded its recorded threshold.
+    Over,
+    /// `actual == 0` — the bucket no longer matches any diagnostic.
+    Cleared,
+    /// `0 < actual < count` — the count can be tightened.
+    Reducible,
+    /// `actual == count` — the bucket exactly matches.
+    Within,
+}
+
+/// One audited baseline bucket: the bucket, its live count, and status
+/// (reference `DriftRow`). `delta = actual - count`.
+#[derive(Debug)]
+pub struct DriftRow<'a> {
+    /// The audited bucket (borrowed from the baseline).
+    pub bucket: &'a Bucket,
+    /// How many current diagnostics this bucket claims.
+    pub actual: usize,
+    /// The bucket's drift status.
+    pub status: DriftStatus,
+    /// `actual - count` (may be negative).
+    pub delta: i64,
+}
+
+impl Baseline {
+    /// Audit the current diagnostic stream against every baseline bucket, in
+    /// file order (reference `audit`). Each bucket claims diagnostics via the
+    /// same message-pattern-before-rule-ID logic as `filter`; a bucket's
+    /// `actual` is how many diagnostics it claims. Message-source-keyed counts
+    /// are shared among buckets with the same `(file, rule, message-source)`
+    /// key, matching the reference's `bucket_key`.
+    #[must_use]
+    pub fn audit<'a>(&'a self, entries: &[(String, &Diagnostic)]) -> Vec<DriftRow<'a>> {
+        // Count diagnostics per claimed-bucket key.
+        let mut counts: BTreeMap<(String, String, Option<String>), usize> = BTreeMap::new();
+        for (rel, diag) in entries {
+            if let Some(bi) = self.claim_bucket(rel, diag) {
+                let b = &self.buckets[bi];
+                let key = (b.file.clone(), b.rule.clone(), b.message.clone());
+                *counts.entry(key).or_insert(0) += 1;
+            }
+        }
+
+        self.buckets
+            .iter()
+            .map(|b| {
+                let key = (b.file.clone(), b.rule.clone(), b.message.clone());
+                let actual = counts.get(&key).copied().unwrap_or(0);
+                let status = status_for(actual, b.count);
+                let delta = actual as i64 - b.count as i64;
+                DriftRow { bucket: b, actual, status, delta }
+            })
+            .collect()
+    }
+
+    /// A new baseline with the given buckets dropped, compared by FULL tuple
+    /// `(file, rule, message-source, count)` — not by `(file, rule)` key
+    /// (reference `without`, backed by Struct equality). Message is compared
+    /// by its stored source string, not the compiled regex.
+    #[must_use]
+    pub fn without(&self, remove: &[&Bucket]) -> Baseline {
+        let buckets = self
+            .buckets
+            .iter()
+            .filter(|b| !remove.iter().any(|r| bucket_eq(b, r)))
+            .cloned()
+            .collect();
+        Baseline { buckets }
+    }
+}
+
+/// Full-tuple bucket equality: `(file, rule, message-source, count)`.
+fn bucket_eq(a: &Bucket, b: &Bucket) -> bool {
+    a.file == b.file && a.rule == b.rule && a.message == b.message && a.count == b.count
+}
+
+fn status_for(actual: usize, count: usize) -> DriftStatus {
+    if actual == 0 {
+        DriftStatus::Cleared
+    } else if actual > count {
+        DriftStatus::Over
+    } else if actual == count {
+        DriftStatus::Within
+    } else {
+        DriftStatus::Reducible
+    }
+}
+
 /// Total ordering wrapper for bin keys (BTreeMap gives a deterministic walk).
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 enum BinKeyOrd {
@@ -682,6 +774,100 @@ mod tests {
     fn parses_empty_inline_ignored_array() {
         let b = Baseline::parse("---\nversion: 1\nignored: []\n", "t").unwrap();
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn audit_computes_all_four_statuses_and_deltas() {
+        // Baseline: a.rb/r1 count 2 (→ within), b.rb/r2 count 3 (→ reducible),
+        // c.rb/r3 count 1 (→ over), d.rb/r4 count 1 (→ cleared).
+        let text = "---\nversion: 1\nignored:\n\
+                    - file: a.rb\n  rule: r1\n  count: 2\n\
+                    - file: b.rb\n  rule: r2\n  count: 3\n\
+                    - file: c.rb\n  rule: r3\n  count: 1\n\
+                    - file: d.rb\n  rule: r4\n  count: 1\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        let d_a = diag("r1", "m");
+        let d_b = diag("r2", "m");
+        let d_c = diag("r3", "m");
+        let entries = vec![
+            ("a.rb".to_string(), &d_a),
+            ("a.rb".to_string(), &d_a), // within: 2 == 2
+            ("b.rb".to_string(), &d_b), // reducible: 1 < 3
+            ("c.rb".to_string(), &d_c),
+            ("c.rb".to_string(), &d_c), // over: 2 > 1
+            // d.rb has no diagnostics → cleared
+        ];
+        let rows = b.audit(&entries);
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].status, DriftStatus::Within);
+        assert_eq!(rows[0].actual, 2);
+        assert_eq!(rows[0].delta, 0);
+        assert_eq!(rows[1].status, DriftStatus::Reducible);
+        assert_eq!(rows[1].actual, 1);
+        assert_eq!(rows[1].delta, -2);
+        assert_eq!(rows[2].status, DriftStatus::Over);
+        assert_eq!(rows[2].actual, 2);
+        assert_eq!(rows[2].delta, 1);
+        assert_eq!(rows[3].status, DriftStatus::Cleared);
+        assert_eq!(rows[3].actual, 0);
+        assert_eq!(rows[3].delta, -1);
+    }
+
+    #[test]
+    fn audit_respects_message_bucket_before_rule_bucket() {
+        // A message bucket (count 1) claims the matching diagnostic before the
+        // rule bucket (count 5) for the same (file, rule).
+        let text = "---\nversion: 1\nignored:\n\
+                    - file: a.rb\n  rule: r\n  message: foo\n  count: 1\n\
+                    - file: a.rb\n  rule: r\n  count: 5\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        let matches_msg = diag("r", "foo bar");
+        let other = diag("r", "zzz");
+        let entries = vec![("a.rb".to_string(), &matches_msg), ("a.rb".to_string(), &other)];
+        let rows = b.audit(&entries);
+        // Message bucket: actual 1 == count 1 → within.
+        assert_eq!(rows[0].status, DriftStatus::Within);
+        assert_eq!(rows[0].actual, 1);
+        // Rule bucket: actual 1 (the non-matching one) < count 5 → reducible.
+        assert_eq!(rows[1].status, DriftStatus::Reducible);
+        assert_eq!(rows[1].actual, 1);
+    }
+
+    #[test]
+    fn without_removes_by_full_tuple() {
+        // Two rows sharing (a.rb, r): one message row, one rule row. Removing
+        // the message row keeps the rule row.
+        let text = "---\nversion: 1\nignored:\n\
+                    - file: a.rb\n  rule: r\n  message: foo\n  count: 1\n\
+                    - file: a.rb\n  rule: r\n  count: 5\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        let to_remove: Vec<&Bucket> = vec![&b.buckets()[0]];
+        let pruned = b.without(&to_remove);
+        assert_eq!(pruned.size(), 1);
+        assert_eq!(pruned.buckets()[0].rule, "r");
+        assert!(pruned.buckets()[0].message.is_none());
+        assert_eq!(pruned.buckets()[0].count, 5);
+    }
+
+    #[test]
+    fn without_full_tuple_distinguishes_count() {
+        // A remove-candidate that differs only in count must NOT match.
+        let text = "---\nversion: 1\nignored:\n- file: a.rb\n  rule: r\n  count: 5\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        let ghost = Bucket::rule_row("a.rb".to_string(), "r".to_string(), 3);
+        let pruned = b.without(&[&ghost]);
+        assert_eq!(pruned.size(), 1); // count 3 != count 5 → not removed
+    }
+
+    #[test]
+    fn drift_default_filter_hides_zero_delta() {
+        let rows = vec![
+            (DriftStatus::Within, 0i64),
+            (DriftStatus::Over, 1i64),
+            (DriftStatus::Cleared, -1i64),
+        ];
+        let shown: Vec<_> = rows.iter().filter(|(_, d)| *d != 0).collect();
+        assert_eq!(shown.len(), 2);
     }
 
     #[test]
