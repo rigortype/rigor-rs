@@ -310,10 +310,13 @@ pub enum Node {
     /// so a typo'd method on an array literal flags via the real Array RBS.
     // TODO(spec): Tuple precision (element types) per ADR-0023.
     ArrayLit { elements: Vec<NodeId>, span: Span },
-    /// A hash literal (`{ k => v }`). Key/value children are lowered. Typed
-    /// `Nominal Hash` so a typo'd method flags via the real Hash RBS.
-    // TODO(spec): HashShape precision per ADR-0023.
-    HashLit { elements: Vec<NodeId>, span: Span },
+    /// A hash literal (`{ k => v }`). Each assoc lowers its key then its value
+    /// into `elements` (a flat `[k, v, k, v, …]` list), so a call hiding in
+    /// either is still walked for reachability. `all_assoc` is `true` only for a
+    /// real `HashNode` whose every element was an `AssocNode` (no `**` splat),
+    /// which lets the typer re-pair `elements` into a value-pinned `HashShape`;
+    /// a splat, or a bare keyword-hash argument, sets it `false` (types `Hash`).
+    HashLit { elements: Vec<NodeId>, all_assoc: bool, span: Span },
     /// A range (`a..b` / `a...b`). Both bounds (when present) lowered. Typed
     /// `Dynamic[top]`. Note: an index read `a[i]` is a Prism `CallNode` named
     /// `[]`, so it lowers as a [`Node::Call`] (receiver + index args) and needs
@@ -997,17 +1000,23 @@ impl Builder {
 
         if let Some(hash) = node.as_hash_node() {
             // Lower each assoc's key + value (a call can hide in either).
+            // `all_assoc` stays true only if every element is a proper assoc — a
+            // `**splat` (non-assoc) makes the arity/keys unknown, so the typer
+            // must fall back to the bare `Hash` nominal.
             let mut elements = Vec::new();
+            let mut all_assoc = true;
             for el in hash.elements().iter() {
                 if let Some(assoc) = el.as_assoc_node() {
                     elements.push(self.lower_node(&assoc.key()));
                     elements.push(self.lower_node(&assoc.value()));
                 } else {
+                    all_assoc = false;
                     elements.push(self.lower_node(&el));
                 }
             }
             return self.push(Node::HashLit {
                 elements,
+                all_assoc,
                 span: span_of(&hash.location()),
             });
         }
@@ -1039,8 +1048,11 @@ impl Builder {
                     elements.push(self.lower_node(&el));
                 }
             }
+            // A bare keyword-hash argument is not a precise value carrier — keep
+            // `all_assoc: false` so the typer leaves it the bare `Hash` nominal.
             return self.push(Node::HashLit {
                 elements,
+                all_assoc: false,
                 span: span_of(&khash.location()),
             });
         }
