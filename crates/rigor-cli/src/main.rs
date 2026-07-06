@@ -21,6 +21,7 @@ use rigor_types::Interner;
 
 mod config;
 use config::Config;
+mod annotate;
 mod config_audit;
 mod diff;
 mod triage;
@@ -68,6 +69,7 @@ fn main() -> ExitCode {
         Some("type-of") => type_of::cmd_type_of(&args[1..]),
         Some("diff") => diff::cmd_diff(&args[1..]),
         Some("triage") => triage::cmd_triage(&args[1..]),
+        Some("annotate") => annotate::cmd_annotate(&args[1..]),
         Some("explain") => explain::cmd_explain(&args[1..]),
         Some("init") => init::cmd_init(&args[1..]),
         Some("doctor") => doctor::cmd_doctor(&args[1..]),
