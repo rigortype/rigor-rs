@@ -1522,6 +1522,55 @@ pub fn implemented_rules() -> &'static [&'static str] {
     IMPLEMENTED_RULES
 }
 
+/// The reference's FULL `ALL_RULES` canonical catalogue (all 19 built-in ids,
+/// `check_rules.rb` lines 58–76). Deliberately BROADER than [`IMPLEMENTED_RULES`]:
+/// the config audit ([`is_inert_builtin_token`]) uses it to decide whether a
+/// `disable:`/`severity_overrides:` token names a real rule, so it must never
+/// flag an id the reference recognizes — even one rigor-rs does not yet emit.
+const ALL_CANONICAL_RULES: &[&str] = &[
+    "call.undefined-method",
+    "call.self-undefined-method",
+    "call.unresolved-toplevel",
+    "call.wrong-arity",
+    "call.argument-type-mismatch",
+    "call.possible-nil-receiver",
+    "dump.type",
+    "assert.type-mismatch",
+    "flow.always-raises",
+    "flow.unreachable-branch",
+    "def.return-type-mismatch",
+    "def.method-visibility-mismatch",
+    "def.override-visibility-reduced",
+    "def.override-return-widened",
+    "def.override-param-narrowed",
+    "def.ivar-write-mismatch",
+    "flow.dead-assignment",
+    "flow.always-truthy-condition",
+    "flow.unreachable-clause",
+];
+
+/// True when `token` looks like a built-in-family rule id but matches none — its
+/// first `.`-segment is a built-in family (`call`/`flow`/`assert`/`dump`/`def`)
+/// yet it is neither the bare family wildcard nor a known canonical id, so it is
+/// a likely typo whose `disable:`/`severity_overrides:` entry has no effect.
+///
+/// A faithful port of `ConfigAudit#inert_builtin_token?`. A token whose family is
+/// NOT built-in (a plugin / `rbs_extended.*` rule, or a bare legacy alias like
+/// `undefined-method`) is deliberately never flagged — it may resolve at run
+/// time, so under-warning is the FP-safe choice. Validated against the full
+/// reference [`ALL_CANONICAL_RULES`], not the narrower [`IMPLEMENTED_RULES`].
+#[must_use]
+pub fn is_inert_builtin_token(token: &str) -> bool {
+    let family = token.split('.').next().unwrap_or(token);
+    if !RULE_FAMILIES.contains(&family) {
+        return false;
+    }
+    if token == family {
+        return false;
+    }
+    !ALL_CANONICAL_RULES.contains(&token)
+}
+
 /// Maps a legacy short alias to its canonical id (reference `LEGACY_RULE_ALIASES`).
 /// Only the three implemented ids can ever match a real diagnostic; the remaining
 /// aliases are included for forward-compat (they expand to ids no rigor-rs
@@ -2980,6 +3029,30 @@ mod tests {
         let set = SuppressSet::from_tokens(&["not-a-real-rule"]);
         assert!(!set.suppresses(CALL_UNDEFINED_METHOD));
         assert!(!set.suppresses(CALL_WRONG_ARITY));
+    }
+
+    #[test]
+    fn inert_builtin_token_flags_only_typos_under_a_builtin_family() {
+        // A built-in-family id that names no real rule → inert (a likely typo).
+        assert!(is_inert_builtin_token("call.undefiend-method"));
+        assert!(is_inert_builtin_token("flow.dead-assingment"));
+        assert!(is_inert_builtin_token("def.override-visibility"));
+        // A known canonical id → NOT flagged (recognized).
+        assert!(!is_inert_builtin_token("call.undefined-method"));
+        assert!(!is_inert_builtin_token("flow.always-truthy-condition"));
+        // Even a canonical id rigor-rs doesn't yet emit → NOT flagged (the audit
+        // uses the reference's FULL catalogue, not IMPLEMENTED_RULES).
+        assert!(!is_inert_builtin_token("def.return-type-mismatch"));
+        assert!(!is_inert_builtin_token("call.argument-type-mismatch"));
+        // A bare family wildcard → NOT flagged (a valid `disable: [call]`).
+        assert!(!is_inert_builtin_token("call"));
+        assert!(!is_inert_builtin_token("flow"));
+        // A non-built-in family (plugin / legacy alias / arbitrary) → NOT flagged
+        // (may resolve at run time; under-warning is FP-safe).
+        assert!(!is_inert_builtin_token("undefined-method")); // legacy alias
+        assert!(!is_inert_builtin_token("rails.something")); // plugin family
+        assert!(!is_inert_builtin_token("all"));
+        assert!(!is_inert_builtin_token("not-a-real-rule"));
     }
 
     // --- ADR-35 slice 1: def.override-visibility-reduced ----------------------

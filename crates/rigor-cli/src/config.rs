@@ -73,6 +73,15 @@ pub struct Config {
     /// feeds both. Reference-schema keys stay top-level; rigor-rs-only knobs live
     /// here.
     pub rigor_rs: RigorRsConfig,
+    /// The set of top-level keys that were EXPLICITLY present in the parsed file
+    /// (empty for `Config::default` and for direct `serde_yaml::from_str`). The
+    /// config audit ([`crate::config_audit`]) uses it to distinguish an
+    /// explicitly-configured `signature_paths:` (audited) from the implicit
+    /// `["sig"]` default (not audited) — mirroring the reference, whose
+    /// `Configuration#signature_paths` is `nil` when unset. Populated only by
+    /// [`Config::load`]; never (de)serialized.
+    #[serde(skip)]
+    present_keys: std::collections::BTreeSet<String>,
 }
 
 /// ADR-0036: the `rigor_rs:` namespace for rigor-rs-specific config keys — those
@@ -113,6 +122,7 @@ impl Default for Config {
             signature_paths: default_signature_paths(),
             rbs_collection: RbsCollectionConfig::default(),
             rigor_rs: RigorRsConfig::default(),
+            present_keys: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -127,6 +137,20 @@ fn default_signature_paths() -> Vec<String> {
 /// scan roots for a bare `rigor check` with no path args.
 fn default_paths() -> Vec<String> {
     vec!["lib".to_string()]
+}
+
+/// The top-level mapping keys present in a `.rigor.yml` document. Used to record
+/// which keys were explicitly configured (vs defaulted). A non-mapping / broken
+/// document yields an empty set — treated as "nothing explicit", which is the
+/// FP-safe direction for the audit.
+fn top_level_keys(text: &str) -> std::collections::BTreeSet<String> {
+    match serde_yaml::from_str::<serde_yaml::Value>(text) {
+        Ok(serde_yaml::Value::Mapping(map)) => map
+            .keys()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect(),
+        _ => std::collections::BTreeSet::new(),
+    }
 }
 
 impl Config {
@@ -162,14 +186,44 @@ impl Config {
     }
 
     /// Parse YAML text, warning and falling back to default on a parse error.
+    /// Records the file's top-level keys ([`Config::present_keys`]) so the config
+    /// audit can tell an explicitly-configured key from a defaulted one.
     fn parse_or_warn(text: &str, label: &str) -> Config {
         match serde_yaml::from_str::<Config>(text) {
-            Ok(cfg) => cfg,
+            Ok(mut cfg) => {
+                cfg.present_keys = top_level_keys(text);
+                cfg
+            }
             Err(e) => {
                 eprintln!("rigor: ignoring malformed config {label}: {e}");
                 Config::default()
             }
         }
+    }
+
+    /// The `signature_paths:` entries when the key was EXPLICITLY configured, or
+    /// `None` when it was left to the `["sig"]` default. The config audit only
+    /// warns on explicit paths — an absent (auto-detected) `sig/` is a normal
+    /// setup, not a misconfiguration — mirroring the reference, whose
+    /// `Configuration#signature_paths` is `nil` when unset.
+    #[must_use]
+    pub fn explicit_signature_paths(&self) -> Option<&[String]> {
+        self.present_keys
+            .contains("signature_paths")
+            .then_some(self.signature_paths.as_slice())
+    }
+
+    /// The explicitly-configured `rbs_collection.lockfile` path, if any. `None`
+    /// means auto-detection (finding nothing is normal, so it is not audited).
+    #[must_use]
+    pub fn rbs_collection_lockfile(&self) -> Option<&str> {
+        self.rbs_collection.lockfile.as_deref()
+    }
+
+    /// The `disable:` tokens, for the config audit's inert-rule-token check.
+    #[must_use]
+    pub fn disable_tokens(&self) -> &[String] {
+        &self.disable
     }
 
     /// The expanded `disable:` matcher, reusing the SAME rule-token expansion as
