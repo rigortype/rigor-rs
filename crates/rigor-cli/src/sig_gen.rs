@@ -9,30 +9,27 @@
 //! class. Return types render through the shared reference-faithful
 //! [`crate::type_display::erase`] layer ([`rigor_types::erase_to_rbs_named`]).
 //!
-//! ## Parity model — byte-identical on the agreeing subset
+//! ## Parity model — byte-identical on the agreeing subset, sound-superset overall
 //!
-//! The reference SKIPS a def whose inferred return is `untyped` / `Dynamic[top]`
-//! (`sig.skipped.untyped-return`) or one with a non-simple parameter shape
-//! (`sig.skipped.complex-shape`); neither is printed. rigor-rs applies the SAME
-//! skips PLUS a set of FP-safe guards (below) so that on the METHODS BOTH EMIT
-//! the output is byte-identical (`type:` + `rbs` verified against the oracle).
-//!
-//! The two tools' return inference is NOT identical, so the emitted SETS differ:
+//! The one HARD guarantee is byte-identity on the methods BOTH tools emit
+//! (`rbs` verified against the oracle). The emitted SETS differ by inference
+//! precision, and that is BY DESIGN — see AGENTS.md "Generative-tool parity":
 //! - rigor-rs types a method body against the top-level env (no per-method
 //!   `ScopeIndexer`), so a def-LOCAL binding types `Dynamic` and is SKIPPED where
 //!   the reference's scope pins it — rigor-rs emits FEWER (a coverage gap).
-//! - conversely, rigor-rs's inference is more ROBUST on a few shapes the
-//!   reference degrades to `untyped`/nil (a string-interpolation return, a `%i[]`
-//!   word array, a project-class `.new`) — there rigor-rs would emit a SOUND
-//!   signature the reference skips.
+//! - conversely, rigor-rs's inference is more ROBUST on shapes the reference
+//!   degrades to `untyped`/nil (a string-interpolation return, a `%i[]` word
+//!   array, a project-class `.new` → its instance, a partially-`untyped` shape).
+//!   There rigor-rs emits a SOUND signature the reference skips — that excess is
+//!   coverage, NOT a false bug report, and we TRACK it (the reference converges as
+//!   it gains precision) rather than suppress it with anti-convergence guards.
 //!
-//! To keep the emitted set a clean subset (and because sig-gen is generative, an
-//! extra SOUND signature is coverage, not a false bug report), the guards below
-//! suppress the divergent-precision cases that are either UNSOUND (a constructor
-//! `initialize` typed as its body) or low-value (a partially-`untyped` shape, a
-//! project-class instance the reference leaves `Dynamic`). A residual handful of
-//! sound string/tuple returns on intricate self-typed code may still exceed the
-//! reference; those are documented coverage EXCESS, never wrong emissions.
+//! The only guards are the three AGENTS.md sanctions: fix a rigor-rs UNSOUND emit
+//! (`initialize` typed as its body → skip; the reference's `-> void` stub is a
+//! later slice), match a reference PERMANENT skip (`dynamic_top?`'s whole-`untyped`
+//! return), or avoid a WRONG emit from an unported rigor-rs LIMITATION (a bare
+//! generic nominal the reference *elaborates* to `Array[untyped]`, and an explicit
+//! `return` whose union rigor-rs cannot yet reconstruct from the AST).
 //!
 //! ## Deferred (later slices, each its own gate)
 //!
@@ -53,7 +50,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
-use rigor_infer::{SourceIndex, TypeEnv, Typer, SOURCE_CLASS_BASE};
+use rigor_infer::{SourceIndex, TypeEnv, Typer};
 use rigor_parse::{lower, parse, LoweredAst, MethodBody, Node, NodeId, Visibility};
 use rigor_types::{Interner, Type, TypeId};
 
@@ -292,21 +289,13 @@ fn method_candidate(
     let ret_ty = def_return_type(ast, typer, &method.body, env, interner)?;
     let erased = crate::type_display::erase(interner, index, typer.source(), ret_ty);
 
-    // Skip a return that mentions `untyped` ANYWHERE (reference `dynamic_top?`
-    // catches the whole-`untyped` case; rigor-rs additionally over-precises a
-    // partially-dynamic shape — `Hash[String, untyped]`, `{ k: untyped }`,
-    // `[untyped, …]` — where the reference degrades the whole inference to
-    // `untyped` and skips). Skipping any `untyped`-bearing return is FP-safe (a
-    // coverage gap) and matches the reference's skip on these complex bodies.
-    if erased.contains("untyped") || matches!(interner.get(ret_ty), Type::Top) {
-        return None;
-    }
-    // A return typed as a PROJECT (in-source) class instance: rigor-rs types a
-    // `ProjectClass.new(...)` as that instance (ADR-0023 tier-4 SourceIndex),
-    // where the reference types a project-class `.new` as `Dynamic` and SKIPS the
-    // method. Match the reference — skip a source-class nominal (its `ClassId` is
-    // in the `SOURCE_CLASS_BASE` range) — FP-safe.
-    if is_source_class_return(interner, ret_ty) {
+    // Skip a WHOLE-`untyped` / `Top` / `Dynamic` return (reference `dynamic_top?`,
+    // a PERMANENT design skip): emitting `-> untyped` obscures rather than helps.
+    // A PARTIALLY-`untyped` shape (`Hash[String, untyped]`, `{ k: untyped }`) is a
+    // SOUND signature — rigor-rs emits it even though the reference degrades that
+    // body to whole-`untyped` and skips (a reference inference GAP we track, not
+    // encode; AGENTS.md "Generative-tool parity").
+    if erased == "untyped" || matches!(interner.get(ret_ty), Type::Top | Type::Dynamic(_)) {
         return None;
     }
     // A bare GENERIC nominal (`Array` / `Hash` / …) would be `Array[untyped]`
@@ -356,16 +345,6 @@ fn def_return_type(
         _ => tail,
     };
     Some(typer.type_of(ast, target, env, interner))
-}
-
-/// Whether `ty` is a nominal (bare or generic) of a PROJECT (in-source) class —
-/// its `ClassId` lives in the [`SOURCE_CLASS_BASE`] range that
-/// [`SourceIndex`](rigor_infer::SourceIndex) allocates. rigor-rs types a
-/// `ProjectClass.new(...)` as such an instance; the reference leaves a
-/// project-class `.new` as `Dynamic` and skips the method, so this match drives
-/// the same skip.
-fn is_source_class_return(interner: &Interner, ty: TypeId) -> bool {
-    matches!(interner.get(ty), Type::Nominal { class, .. } if class.0 >= SOURCE_CLASS_BASE)
 }
 
 /// Whether an erased return is a bare (no type-args) core GENERIC class name —
@@ -552,12 +531,16 @@ mod tests {
     }
 
     #[test]
-    fn skips_project_class_instance_return() {
-        // `Bar.new` types as a source-class `Bar` instance in rigor-rs; the
-        // reference leaves a project-class `.new` as `Dynamic` and skips — match it.
+    fn emits_sound_project_class_instance_return() {
+        // `Bar.new` types as a source-class `Bar` instance (ADR-0023 tier-4). The
+        // reference degrades a project-class `.new` to `Dynamic` and skips, but
+        // rigor-rs emits the SOUND `-> Bar` — coverage excess we track, not encode
+        // (AGENTS.md "Generative-tool parity"; the reference converges as it gains
+        // project-instance return typing).
         let src = "class Bar\nend\n\nclass Foo\n  def make\n    Bar.new\n  end\nend\n";
         let cs = candidates_tagged("srccls", src, false);
-        assert!(cs.iter().all(|c| c.method_name != "make"), "make should be skipped, got {cs:?}");
+        let make = cs.iter().find(|c| c.method_name == "make").expect("make emitted");
+        assert_eq!(make.rbs, "def make: () -> Bar");
     }
 
     #[test]
