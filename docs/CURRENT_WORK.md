@@ -6,12 +6,23 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display #12 + hash-shape #13 merged;
-`rigor annotate` on branch `annotate`) — **Baseline area COMPLETE + productization pivot; config-audit +
-`diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
-Read `AGENTS.md` "Working discipline" before continuing.
+Last updated: 2026-07-10 (mcp-triage-annotate + gemfile-lock-overlay MERGED to master; plugin track CLOSED
+by measurement) — **Baseline + parity-port productization arc COMPLETE; the entire PLUGIN track is now
+assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
+frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `mcp-triage-annotate`) — (2) MCP tool expansion: `triage` + `annotate`.**
+**▶▶ INVESTIGATED THIS SESSION (2026-07-10) — PURE-RBS BUNDLE TRACK CLOSED.** The plugin-engine design slice
+recommended pure-RBS bundle expansion as the productization plugin path; a full enumeration of the reference's
+31 plugins CLOSES that track: **`activesupport-core-ext` is the ONLY pure-RBS plugin** (all others contribute
+code — ADR-16 macros / ADR-13 FactStore producers — the code engine already deferred as thin/interdependent),
+and the vendored AS bundle is **byte-identical to the current reference** (`d31d19b0…`, so no refresh either).
+The Gemfile.lock auto-overlay map already matches the reference's `GEM_OVERLAY_PLUGIN_IDS` exactly (only
+`activesupport`). ⇒ No cheap FP-safe faithful-port plugin work remains. Fourth "big track, thin/absent value"
+finding of the session. Detail: [pure-rbs-bundle-track-closed note](notes/20260710-pure-rbs-bundle-track-closed.md).
+**Next real frontier is a substantial ADR-backed track (substrate for sig-gen/trace/coverage, the code engine
+on a measured Rails gap, or §12 LSP two-tier infra) — none a cheap slice; the parity-port arc has bottomed out.**
+
+**▶▶ LANDED (branch `mcp-triage-annotate`, MERGED `c6c1094`) — (2) MCP tool expansion: `triage` + `annotate`.**
 `rigor mcp` gains two read-only tools reusing this session's landed commands: **`triage`** (analyse a source
 string → the structured diagnostic triage JSON: distribution / selectors / hotspots / summary / hints, ADR-23
 — the aggregate stats an agent uses to prioritise) and **`annotate`** (the `{ line => type }` map, xmpfilter
@@ -21,7 +32,7 @@ source). The MCP surface is now check / type_of / explain / outline / triage / a
 rigor-cli tests (3 new), end-to-end stdio smoke (initialize → tools/list → triage + annotate), harness 54/54,
 clippy clean; the check path is untouched. NOT yet merged.
 
-**▶▶ LANDED THIS SESSION (branch `gemfile-lock-overlay`) — ADR-72 Gemfile.lock-gated auto-overlay (the
+**▶▶ LANDED (branch `gemfile-lock-overlay`, MERGED `96d7f47`) — ADR-72 Gemfile.lock-gated auto-overlay (the
 productization win the plugin investigation pointed to).** rigor-rs now AUTO-APPLIES the bundled
 `activesupport-core-ext` RBS overlay when a project's `Gemfile.lock` locks `activesupport` (which ships no
 RBS), so a Rails project "just works" WITHOUT a `plugins:` config entry — closing the systematic AS-method
