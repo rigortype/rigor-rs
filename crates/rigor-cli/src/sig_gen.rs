@@ -98,6 +98,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let mut format = "text";
     let mut include_private = false;
     let mut write = false;
+    let mut diff = false;
     let mut explicit_config: Option<&str> = None;
     let mut positional: Vec<&str> = Vec::new();
 
@@ -106,6 +107,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         match arg.as_str() {
             "--print" => {} // the default mode
             "--write" => write = true,
+            "--diff" => diff = true,
             "--include-private" => include_private = true,
             "--format" => match it.next().map(String::as_str) {
                 Some(f @ ("text" | "json")) => format = f,
@@ -122,7 +124,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 }
             },
             // Recognised reference flags whose machinery is a later slice.
-            "--diff" | "--overwrite" => {
+            "--overwrite" => {
                 eprintln!("sig-gen: `{arg}` is not yet implemented in this slice");
                 return ExitCode::from(2);
             }
@@ -157,9 +159,12 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let candidates: Vec<Candidate> =
         files.iter().flat_map(|p| generate_file(p, include_private)).collect();
 
-    match format {
-        "json" => render_json(&candidates),
-        _ => render_text(&candidates),
+    // `--format json` renders the candidate table regardless of print/diff mode
+    // (reference `Renderer#render`); text picks the diff or print layout.
+    match (format, diff) {
+        ("json", _) => render_json(&candidates),
+        (_, true) => render_diff(&candidates),
+        (_, false) => render_text(&candidates),
     }
     ExitCode::SUCCESS
 }
@@ -817,6 +822,27 @@ fn render_text(candidates: &[Candidate]) {
     }
 }
 
+/// `--diff` text: per candidate `--- <path>: <class>#<method>` / `+ <rbs>` /
+/// blank line (reference `render_diff`). rigor-rs emits only NEW methods (no
+/// existing-RBS comparison), so there is never a `- def …` declared line — the
+/// same shape the reference produces for a `new_method`.
+fn render_diff(candidates: &[Candidate]) {
+    if candidates.is_empty() {
+        println!("No candidates");
+        return;
+    }
+    print!("{}", diff_string(candidates));
+}
+
+/// Build the `--diff` text body (extracted from [`render_diff`] for testability).
+fn diff_string(candidates: &[Candidate]) -> String {
+    let mut out = String::new();
+    for c in candidates {
+        out.push_str(&format!("--- {}: {}#{}\n+ {}\n\n", c.file, c.class_name, c.method_name, c.rbs));
+    }
+    out
+}
+
 /// `--print --format json`: `{ "candidates": [ … ] }` with the reference's
 /// per-candidate key set (`file`/`class`/`method`/`kind`/`classification`/`rbs`/
 /// `inferred_return`). serde alphabetizes keys (the established insignificant-
@@ -1268,6 +1294,27 @@ mod tests {
         // reference reads differently (sweep-proven mismatch source) → skip.
         let src = "class A\n  def m(x)\n    [x, 0]\n  end\nend\n";
         assert!(candidates_tagged("untycomp", src, false).is_empty());
+    }
+
+    #[test]
+    fn diff_string_emits_header_and_plus_line_per_candidate() {
+        let c = |cls: &str, m: &str, rbs: &str| Candidate {
+            file: "lib/f.rb".into(),
+            class_name: cls.into(),
+            method_name: m.into(),
+            kind: "instance",
+            rbs: rbs.into(),
+            inferred_return: String::new(),
+        };
+        let cands = [
+            c("Foo", "greeting", "def greeting: () -> \"h\""),
+            c("Foo", "build", "def self.build: () -> 42"),
+        ];
+        assert_eq!(
+            diff_string(&cands),
+            "--- lib/f.rb: Foo#greeting\n+ def greeting: () -> \"h\"\n\n\
+             --- lib/f.rb: Foo#build\n+ def self.build: () -> 42\n\n"
+        );
     }
 
     #[test]
