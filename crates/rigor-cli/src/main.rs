@@ -43,6 +43,7 @@ mod plugins_cmd;
 mod rbs_collection;
 mod ruby_mode;
 mod sidecar;
+mod sig_gen;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).
@@ -71,6 +72,7 @@ fn main() -> ExitCode {
         Some("diff") => diff::cmd_diff(&args[1..]),
         Some("triage") => triage::cmd_triage(&args[1..]),
         Some("annotate") => annotate::cmd_annotate(&args[1..]),
+        Some("sig-gen") => sig_gen::cmd_sig_gen(&args[1..]),
         Some("explain") => explain::cmd_explain(&args[1..]),
         Some("init") => init::cmd_init(&args[1..]),
         Some("doctor") => doctor::cmd_doctor(&args[1..]),
@@ -501,7 +503,7 @@ fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
 /// but DO include symlinked `.rb` FILES (glob matches them — 2026-07-06 audit
 /// correction; a symlink to a dir is skipped, a symlink to a file is a match).
 /// Unreadable directories are silently skipped.
-fn collect_rb_files(dir: &Path, out: &mut Vec<String>) {
+pub(crate) fn collect_rb_files(dir: &Path, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
