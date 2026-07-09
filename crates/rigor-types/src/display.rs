@@ -8,7 +8,7 @@
 
 use crate::algebra::is_bool_pair;
 use crate::interner::Interner;
-use crate::ty::{ClassId, Scalar, ShapeKey, Type, TypeId};
+use crate::ty::{ClassId, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 /// The user-facing type display — a faithful port of the reference's
 /// `Type#describe(:short)` (`lib/rigor/type/*.rb`).
@@ -115,6 +115,193 @@ pub fn describe_named(
 /// A class id's name, or the `Class<id>` fallback when `resolve` cannot name it.
 fn named_class(class: ClassId, resolve: &dyn Fn(ClassId) -> Option<String>) -> String {
     resolve(class).unwrap_or_else(|| format!("Class<{}>", class.0))
+}
+
+/// The reference's `Type#erase_to_rbs` — a **valid-RBS erasure** of a carrier.
+///
+/// Distinct from [`describe_named`] (the human-facing display): erasure
+/// generalizes the value-pins RBS cannot spell so the output is always
+/// well-formed RBS — a non-primitive `Constant` erases to its class name
+/// (`3.5` → `Float`), an `IntegerRange` to `Integer`, an open / non-symbol-keyed
+/// `HashShape` to `Hash[K, V]`, and a `Dynamic` to `untyped`. Primitive
+/// value-pins are PRESERVED (`3`, `"hi"`, `:sym`, `[1, 2, 3]`, `{ a: 1 }`) — the
+/// erasure keeps the tuple / record spelling RBS *does* support. Unions dedup and
+/// short-circuit to `untyped`, with NO `bool` / `T?` collapse (that is
+/// display-only in `describe_named`).
+///
+/// This is the substrate `rigor sig-gen` will consume; it is surfaced today
+/// through `type-of`'s `erased:` field. `resolve` maps a [`ClassId`] to its name
+/// exactly as [`describe_named`] uses it (core RBS + project `sig/`).
+pub fn erase_to_rbs_named(
+    i: &Interner,
+    id: TypeId,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> String {
+    match i.get(id) {
+        Type::Top => "top".to_string(),
+        Type::Bottom => "bot".to_string(),
+        // Any dynamic-origin value erases to `untyped` (its class name is unknown).
+        Type::Dynamic(_) => "untyped".to_string(),
+
+        Type::Nominal { class, args } => {
+            let name = named_class(*class, resolve);
+            if args.is_empty() {
+                name
+            } else {
+                let inner: Vec<String> =
+                    args.iter().map(|&a| erase_to_rbs_named(i, a, resolve)).collect();
+                format!("{name}[{}]", inner.join(", "))
+            }
+        }
+        Type::Singleton(class) => format!("singleton({})", named_class(*class, resolve)),
+
+        Type::Constant(s) => scalar_erase(s),
+
+        Type::Tuple(elems) => {
+            if elems.is_empty() {
+                "[]".to_string()
+            } else {
+                let inner: Vec<String> =
+                    elems.iter().map(|&e| erase_to_rbs_named(i, e, resolve)).collect();
+                format!("[{}]", inner.join(", "))
+            }
+        }
+
+        Type::HashShape(members) => erase_hash_shape(i, members, resolve),
+
+        // A refined integer range generalizes to the nominal `Integer` (the RBS
+        // has no `int<lo, hi>` spelling).
+        Type::IntegerRange { .. } => "Integer".to_string(),
+
+        Type::Union(members) => erase_union(i, members, resolve),
+
+        // A difference erases through its base; an intersection through its first
+        // member (reference `Difference` / `Intersection#erase_to_rbs`).
+        Type::Difference { base, .. } => erase_to_rbs_named(i, *base, resolve),
+        Type::Intersection(members) => members
+            .first()
+            .map(|&m| erase_to_rbs_named(i, m, resolve))
+            .unwrap_or_else(|| "untyped".to_string()),
+        Type::Refined { base, .. } => erase_to_rbs_named(i, *base, resolve),
+
+        // Carriers with no faithful RBS spelling in this port erase conservatively
+        // to `untyped` — always sound (it widens, never narrows).
+        Type::Complement(_) | Type::App { .. } => "untyped".to_string(),
+
+        // reference `DataInstance#erase_to_rbs` → the class name, or `Data` when
+        // the class is anonymous / unresolved.
+        Type::DataInstance { class, .. } => {
+            resolve(*class).unwrap_or_else(|| "Data".to_string())
+        }
+
+        // Valid RBS keyword carriers render literally.
+        Type::Void => "void".to_string(),
+        Type::SelfType => "self".to_string(),
+        Type::Instance => "instance".to_string(),
+        Type::ClassType => "class".to_string(),
+    }
+}
+
+/// A `Constant` scalar erased to valid RBS (reference `Constant#erase_to_rbs`):
+/// `true`/`false`/`nil` and integers keep their literal spelling; a symbol / string
+/// keeps its `inspect` form; every OTHER constant (here, only a `Float`)
+/// generalizes to its class name — the reference's `else value.class.name` branch.
+fn scalar_erase(s: &Scalar) -> String {
+    match s {
+        Scalar::Bool(true) => "true".to_string(),
+        Scalar::Bool(false) => "false".to_string(),
+        Scalar::Nil => "nil".to_string(),
+        Scalar::Int(n) => n.to_string(),
+        Scalar::Str(v) => format!("{v:?}"),
+        Scalar::Sym(v) => format!(":{v}"),
+        Scalar::Float(_) => "Float".to_string(),
+    }
+}
+
+/// A union erased (reference `Union#erase_to_rbs`): each member erased, the whole
+/// short-circuiting to `untyped` if any member is `untyped`, else the members
+/// deduped (first-occurrence order, Ruby `Array#uniq`) and joined with ` | `.
+/// No `bool` / `T?` collapse — those are display-only.
+fn erase_union(
+    i: &Interner,
+    members: &[TypeId],
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> String {
+    let erased: Vec<String> =
+        members.iter().map(|&m| erase_to_rbs_named(i, m, resolve)).collect();
+    if erased.iter().any(|e| e == "untyped") {
+        return "untyped".to_string();
+    }
+    uniq_join(erased)
+}
+
+/// A `HashShape` erased (reference `HashShape#erase_to_rbs`). rigor-rs only ever
+/// builds a value-pinned `HashShape` from static keys (an open / splat hash
+/// degrades to the `Hash` nominal upstream), so it is always effectively
+/// *closed*: an empty shape erases to `{}`; a shape with any non-symbol key
+/// generalizes to `Hash[K, V]` (RBS record keys must be symbols); an all-symbol
+/// shape keeps the record spelling `{ key: T, ?opt: T }`.
+fn erase_hash_shape(
+    i: &Interner,
+    members: &[ShapeMember],
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> String {
+    if members.is_empty() {
+        return "{}".to_string();
+    }
+    if !members.iter().all(|m| matches!(m.key, ShapeKey::Sym(_))) {
+        return hash_erasure(i, members, resolve);
+    }
+    let rendered: Vec<String> = members
+        .iter()
+        .map(|m| {
+            let ShapeKey::Sym(name) = &m.key else { unreachable!() };
+            let key = if m.optional { format!("?{name}") } else { name.clone() };
+            format!("{key}: {}", erase_to_rbs_named(i, m.value, resolve))
+        })
+        .collect();
+    format!("{{ {} }}", rendered.join(", "))
+}
+
+/// Generalize a non-symbol-keyed (or otherwise non-record) shape to a
+/// `Hash[K, V]` bound: the key type is the union of each key's class, the value
+/// type the union of the member values (reference `HashShape#hash_erasure`).
+fn hash_erasure(
+    i: &Interner,
+    members: &[ShapeMember],
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> String {
+    let key_type = uniq_join(members.iter().map(|m| shape_key_class_name(&m.key)).collect());
+    let val_erased: Vec<String> =
+        members.iter().map(|m| erase_to_rbs_named(i, m.value, resolve)).collect();
+    let value_type = if val_erased.iter().any(|e| e == "untyped") {
+        "untyped".to_string()
+    } else {
+        uniq_join(val_erased)
+    };
+    format!("Hash[{key_type}, {value_type}]")
+}
+
+/// The RBS class name a shape key's value belongs to (reference
+/// `hash_erasure_key_type`'s `nominal_of(key.class)`).
+fn shape_key_class_name(k: &ShapeKey) -> String {
+    match k {
+        ShapeKey::Sym(_) => "Symbol".to_string(),
+        ShapeKey::Str(_) => "String".to_string(),
+        ShapeKey::Int(_) => "Integer".to_string(),
+        ShapeKey::Other => "untyped".to_string(),
+    }
+}
+
+/// Join strings with ` | `, deduping in first-occurrence order (Ruby
+/// `Array#uniq` semantics) — the shared spelling of an erased union.
+fn uniq_join(items: Vec<String>) -> String {
+    let mut seen = std::collections::HashSet::new();
+    items
+        .into_iter()
+        .filter(|e| seen.insert(e.clone()))
+        .collect::<Vec<_>>()
+        .join(" | ")
 }
 
 /// A `Constant` scalar as Ruby's `inspect` renders it (reference
@@ -447,6 +634,131 @@ mod named_tests {
             ShapeMember { key: ShapeKey::Sym("age".to_string()), value: int, optional: true },
         ]));
         assert_eq!(describe_named(&i, shape, &resolver), "{ name: Integer, ?age: Integer }");
+    }
+}
+
+#[cfg(test)]
+mod erase_tests {
+    //! Tests for the reference-faithful [`erase_to_rbs_named`] valid-RBS erasure,
+    //! on CONSTRUCTED carriers (independent of inference) so the substrate's
+    //! per-variant behaviour is pinned directly.
+    use super::*;
+    use crate::algebra::Algebra;
+    use crate::ty::ShapeMember;
+
+    fn resolver(class: ClassId) -> Option<String> {
+        match class.0 {
+            1 => Some("Integer".to_string()),
+            2 => Some("String".to_string()),
+            3 => Some("Array".to_string()),
+            7 => Some("Time".to_string()),
+            _ => None,
+        }
+    }
+
+    fn nominal(i: &mut Interner, id: u32, args: Vec<TypeId>) -> TypeId {
+        i.intern(Type::Nominal { class: ClassId(id), args })
+    }
+
+    #[test]
+    fn nominal_generic_and_singleton() {
+        let mut i = Interner::new();
+        let int = nominal(&mut i, 1, vec![]);
+        assert_eq!(erase_to_rbs_named(&i, int, &resolver), "Integer");
+        let arr = nominal(&mut i, 3, vec![int]);
+        assert_eq!(erase_to_rbs_named(&i, arr, &resolver), "Array[Integer]");
+        let s = i.intern(Type::Singleton(ClassId(7)));
+        assert_eq!(erase_to_rbs_named(&i, s, &resolver), "singleton(Time)");
+    }
+
+    #[test]
+    fn constants_keep_primitives_but_generalize_float() {
+        let mut i = Interner::new();
+        let three = i.int(3);
+        assert_eq!(erase_to_rbs_named(&i, three, &resolver), "3");
+        let s = i.intern(Type::Constant(Scalar::Str("hi".to_string())));
+        assert_eq!(erase_to_rbs_named(&i, s, &resolver), "\"hi\"");
+        let sym = i.intern(Type::Constant(Scalar::Sym("foo".to_string())));
+        assert_eq!(erase_to_rbs_named(&i, sym, &resolver), ":foo");
+        // A Float value-pin has no RBS literal → generalizes to its class name.
+        let f = i.intern(Type::Constant(Scalar::Float(3.5)));
+        assert_eq!(erase_to_rbs_named(&i, f, &resolver), "Float");
+        assert_eq!(erase_to_rbs_named(&i, i.true_(), &resolver), "true");
+        assert_eq!(erase_to_rbs_named(&i, i.nil(), &resolver), "nil");
+    }
+
+    #[test]
+    fn dynamic_and_integer_range_generalize() {
+        let mut i = Interner::new();
+        let dyn_top = i.untyped();
+        assert_eq!(erase_to_rbs_named(&i, dyn_top, &resolver), "untyped");
+        // An integer range has no `int<lo, hi>` RBS spelling → `Integer`.
+        let r = i.intern(Type::IntegerRange { min: Some(1), max: Some(10) });
+        assert_eq!(erase_to_rbs_named(&i, r, &resolver), "Integer");
+        let open = i.intern(Type::IntegerRange { min: Some(1), max: None });
+        assert_eq!(erase_to_rbs_named(&i, open, &resolver), "Integer");
+    }
+
+    #[test]
+    fn union_dedups_without_bool_or_optional_collapse() {
+        let mut i = Interner::new();
+        // `true | false` erases to the two literals joined by ` | ` (no `bool`
+        // collapse — that is display-only). Order follows rigor-rs's canonical
+        // union order (`false` sorts before `true`), not a reordering by erase.
+        let (t, f) = (i.true_(), i.false_());
+        let b = Algebra::join(&mut i, t, f);
+        let bool_erased = erase_to_rbs_named(&i, b, &resolver);
+        assert!(bool_erased.contains("true") && bool_erased.contains("false"));
+        assert!(bool_erased.contains(" | ") && !bool_erased.contains("bool"));
+        // `String | nil` keeps `nil` inline (no `T?` collapse).
+        let string = nominal(&mut i, 2, vec![]);
+        let nil = i.nil();
+        let opt = Algebra::join(&mut i, string, nil);
+        let erased = erase_to_rbs_named(&i, opt, &resolver);
+        assert!(erased.contains("String") && erased.contains("nil") && erased.contains(" | "));
+        assert!(!erased.contains('?'));
+    }
+
+    #[test]
+    fn union_short_circuits_to_untyped() {
+        let mut i = Interner::new();
+        let string = nominal(&mut i, 2, vec![]);
+        let dyn_ = i.untyped();
+        let u = Algebra::join(&mut i, string, dyn_);
+        // Any `untyped` member collapses the whole union (reference `Union#erase`).
+        assert_eq!(erase_to_rbs_named(&i, u, &resolver), "untyped");
+    }
+
+    #[test]
+    fn tuple_and_symbol_record_verbatim() {
+        let mut i = Interner::new();
+        let (a, b, c) = (i.int(1), i.int(2), i.int(3));
+        let tup = i.intern(Type::Tuple(vec![a, b, c]));
+        assert_eq!(erase_to_rbs_named(&i, tup, &resolver), "[1, 2, 3]");
+        let empty_tup = i.intern(Type::Tuple(vec![]));
+        assert_eq!(erase_to_rbs_named(&i, empty_tup, &resolver), "[]");
+
+        let int = nominal(&mut i, 1, vec![]);
+        let rec = i.intern(Type::HashShape(vec![
+            ShapeMember { key: ShapeKey::Sym("name".to_string()), value: int, optional: false },
+            ShapeMember { key: ShapeKey::Sym("age".to_string()), value: int, optional: true },
+        ]));
+        assert_eq!(erase_to_rbs_named(&i, rec, &resolver), "{ name: Integer, ?age: Integer }");
+        let empty_hash = i.intern(Type::HashShape(vec![]));
+        assert_eq!(erase_to_rbs_named(&i, empty_hash, &resolver), "{}");
+    }
+
+    #[test]
+    fn non_symbol_keyed_shape_generalizes_to_hash_bound() {
+        let mut i = Interner::new();
+        let two = i.int(2);
+        // A string key cannot be an RBS record key → `Hash[String, 2]`.
+        let str_keyed = i.intern(Type::HashShape(vec![ShapeMember {
+            key: ShapeKey::Str("k".to_string()),
+            value: two,
+            optional: false,
+        }]));
+        assert_eq!(erase_to_rbs_named(&i, str_keyed, &resolver), "Hash[String, 2]");
     }
 }
 

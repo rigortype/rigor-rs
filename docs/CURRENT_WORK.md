@@ -11,6 +11,22 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `sig-gen-erase-substrate`) — sig-gen substrate slice 1: `erase_to_rbs`.**
+The valid-RBS type-erasure layer `sig-gen` needs, built as a reusable substrate (mirroring how `describe_named`
+landed before `annotate` consumed it). `rigor_types::erase_to_rbs_named` ports the reference's
+`Type#erase_to_rbs` (`lib/rigor/type/*.rb`): distinct from `describe_named` (human display) — erasure
+GENERALIZES the value-pins RBS cannot spell so output is always well-formed RBS: a non-primitive `Constant`→its
+class name (`3.5`→`Float`), an `IntegerRange`→`Integer`, an open / non-symbol-keyed `HashShape`→`Hash[K, V]`, a
+`Dynamic`→`untyped`; primitive pins are PRESERVED (`3`, `"hi"`, `:sym`, `[1, 2, 3]`, `{ a: 1 }`); unions dedup +
+short-circuit to `untyped` with NO `bool`/`T?` collapse (that's display-only). Surfaced today through
+**`type-of`'s `erased:` line** (text + json, previously omitted — the smallest gateable consumer) via the shared
+`type_display::erase` seam. **Gated:** 502 workspace tests (11 new), run.rb + run_snapshot.rb 54/54 0 FP (check
+path untouched), clippy clean on touched files; **fresh-dir E2E vs the oracle — `type:` + `erased:`
+BYTE-IDENTICAL** across the scalar/tuple/record/hash-bound/float/dynamic matrix (incl. `Float`→`Float` and
+`{ "k" => 2 }`→`Hash[String, 2]`). **NOT yet merged.** NEXT sig-gen slices (deferred, ~3000 LOC): the
+`ObservationCollector` (per-def observed-call gathering) → `Generator`/`Writer` (RBS emission) — the heavy
+machinery `erase_to_rbs` feeds; each a separate slice.
+
 **▶▶ INVESTIGATED THIS SESSION (2026-07-10) — PURE-RBS BUNDLE TRACK CLOSED.** The plugin-engine design slice
 recommended pure-RBS bundle expansion as the productization plugin path; a full enumeration of the reference's
 31 plugins CLOSES that track: **`activesupport-core-ext` is the ONLY pure-RBS plugin** (all others contribute

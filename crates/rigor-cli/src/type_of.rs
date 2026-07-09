@@ -14,10 +14,14 @@
 //! display, so the `node:` line names the rigor-rs node variant and the `type:`
 //! line uses rigor-rs's [`render_type`] — the SAME spelling `check`'s
 //! `receiver_type` field uses (a Constant renders its value, e.g. `"hello"`; a
-//! nominal renders its class name, e.g. `String`). The layout (`file:line:col`,
-//! `node:`, `type:` for text; the same keys for json) mirrors the reference; the
-//! `erased`/`fallbacks`/`--trace` fields the reference carries are rigor-rs-specific
-//! follow-ons (no `erase_to_rbs` / FallbackTracer in this port yet) and are omitted.
+//! nominal renders its class name, e.g. `String`). The `erased:` line renders the
+//! reference-faithful `Type#erase_to_rbs` (valid-RBS erasure: `3` stays `3`, a
+//! `Float` constant generalizes to `Float`, an integer range to `Integer`, a
+//! non-symbol-keyed hash shape to `Hash[K, V]`) via the shared
+//! [`crate::type_display::erase`] layer. The layout (`file:line:col`, `node:`,
+//! `type:`, `erased:` for text; the same keys for json) mirrors the reference; the
+//! `fallbacks`/`--trace` fields the reference carries need a FallbackTracer this
+//! port lacks and are still omitted.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -34,6 +38,7 @@ struct Probe {
     column: usize,
     node_kind: &'static str,
     type_render: String,
+    erased: String,
 }
 
 /// `rigor type-of [--format text|json] FILE:LINE:COL` (or `FILE LINE COL`).
@@ -115,6 +120,7 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
         column,
         node_kind: node_kind(ast.get(node_id)),
         type_render: render_type(&interner, &index, &source_index, ty),
+        erased: crate::type_display::erase(&interner, &index, &source_index, ty),
     };
 
     match format {
@@ -335,9 +341,11 @@ fn render_text(probe: &Probe) {
     println!("{}:{}:{}", probe.file, probe.line, probe.column);
     println!("node:    {}", probe.node_kind);
     println!("type:    {}", probe.type_render);
+    println!("erased:  {}", probe.erased);
 }
 
-/// JSON rendering (the reference's `render_json` key set, minus `erased`).
+/// JSON rendering (the reference's `render_json` key set — `erased` included;
+/// serde alphabetizes keys, an established insignificant-order divergence).
 fn render_json(probe: &Probe) {
     use serde_json::json;
     let payload = json!({
@@ -346,6 +354,7 @@ fn render_json(probe: &Probe) {
         "column": probe.column,
         "node": probe.node_kind,
         "type": probe.type_render,
+        "erased": probe.erased,
     });
     println!("{}", serde_json::to_string_pretty(&payload).unwrap());
 }
@@ -357,6 +366,12 @@ mod tests {
     /// Type the node located at a 1-based (line, column) in `src`, returning
     /// `(node_kind, type_render)` — the two fields `type-of` prints.
     fn probe(src: &str, line: usize, column: usize) -> (&'static str, String) {
+        let (kind, ty, _erased) = probe_full(src, line, column);
+        (kind, ty)
+    }
+
+    /// Like [`probe`] but also returns the `erased:` (`erase_to_rbs`) rendering.
+    fn probe_full(src: &str, line: usize, column: usize) -> (&'static str, String, String) {
         let offset = position_to_offset(src, line, column).expect("in range");
         let ast = lower(&parse(src.as_bytes()));
         let id = locate_node(&ast, offset).expect("a node at position");
@@ -366,7 +381,11 @@ mod tests {
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, id, &env, &mut interner);
-        (node_kind(ast.get(id)), render_type(&interner, &index, &source_index, ty))
+        (
+            node_kind(ast.get(id)),
+            render_type(&interner, &index, &source_index, ty),
+            crate::type_display::erase(&interner, &index, &source_index, ty),
+        )
     }
 
     #[test]
@@ -401,6 +420,45 @@ mod tests {
         let (kind, ty) = probe("s = \"hi\"\ns.upcase\n", 2, 3);
         assert_eq!(kind, "Call");
         assert_eq!(ty, "\"HI\"");
+    }
+
+    #[test]
+    fn erases_primitive_constants_verbatim() {
+        // Integer / string / symbol / true / nil value-pins survive erasure
+        // unchanged (they are valid RBS literals), matching the oracle.
+        assert_eq!(probe_full("a = 3\n", 1, 5).2, "3");
+        assert_eq!(probe_full("b = \"hi\"\n", 1, 5).2, "\"hi\"");
+        assert_eq!(probe_full("c = :foo\n", 1, 5).2, ":foo");
+        assert_eq!(probe_full("e = true\n", 1, 5).2, "true");
+        assert_eq!(probe_full("f = nil\n", 1, 5).2, "nil");
+    }
+
+    #[test]
+    fn erases_float_constant_to_its_class() {
+        // A Float value-pin has no RBS literal, so erasure generalizes to the
+        // class name `Float` (reference `Constant#erase_to_rbs` else-branch),
+        // while `type:` keeps the value-pinned `3.5`.
+        let (_kind, ty, erased) = probe_full("d = 3.5\n", 1, 5);
+        assert_eq!(ty, "3.5");
+        assert_eq!(erased, "Float");
+    }
+
+    #[test]
+    fn erases_tuple_and_symbol_record_verbatim() {
+        // A tuple and an all-symbol-key hash shape keep the RBS-supported
+        // spelling under erasure.
+        assert_eq!(probe_full("g = [1, 2, 3]\n", 1, 5).2, "[1, 2, 3]");
+        assert_eq!(probe_full("h = { name: 1, age: 2 }\n", 1, 5).2, "{ name: 1, age: 2 }");
+    }
+
+    #[test]
+    fn erases_string_keyed_hash_shape_to_hash_bound() {
+        // A non-symbol (string) key cannot be an RBS record key, so the shape
+        // generalizes to `Hash[String, V]` (reference `hash_erasure`), while
+        // `type:` keeps the value-pinned `{ "k": 2 }`.
+        let (_kind, ty, erased) = probe_full("i = { \"k\" => 2 }\n", 1, 5);
+        assert_eq!(ty, "{ \"k\": 2 }");
+        assert_eq!(erased, "Hash[String, 2]");
     }
 
     #[test]
