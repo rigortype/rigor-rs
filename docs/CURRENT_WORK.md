@@ -11,7 +11,7 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-erase-substrate`) — sig-gen substrate slice 1: `erase_to_rbs`.**
+**▶▶ LANDED (branch `sig-gen-erase-substrate`, MERGED `ee60d41`) — sig-gen substrate slice 1: `erase_to_rbs`.**
 The valid-RBS type-erasure layer `sig-gen` needs, built as a reusable substrate (mirroring how `describe_named`
 landed before `annotate` consumed it). `rigor_types::erase_to_rbs_named` ports the reference's
 `Type#erase_to_rbs` (`lib/rigor/type/*.rb`): distinct from `describe_named` (human display) — erasure
@@ -23,7 +23,7 @@ short-circuit to `untyped` with NO `bool`/`T?` collapse (that's display-only). S
 `type_display::erase` seam. **Gated:** 502 workspace tests (11 new), run.rb + run_snapshot.rb 54/54 0 FP (check
 path untouched), clippy clean on touched files; **fresh-dir E2E vs the oracle — `type:` + `erased:`
 BYTE-IDENTICAL** across the scalar/tuple/record/hash-bound/float/dynamic matrix (incl. `Float`→`Float` and
-`{ "k" => 2 }`→`Hash[String, 2]`). **NOT yet merged.** NEXT sig-gen slices (deferred, ~3000 LOC): the
+`{ "k" => 2 }`→`Hash[String, 2]`). NEXT sig-gen slices (deferred, ~3000 LOC): the
 `ObservationCollector` (per-def observed-call gathering) → `Generator`/`Writer` (RBS emission) — the heavy
 machinery `erase_to_rbs` feeds; each a separate slice.
 
