@@ -11,7 +11,21 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-write`) — sig-gen slice 5: `--write` (create-only).** The user-facing
+**▶▶ LANDED THIS SESSION (branch `sig-gen-initialize`) — sig-gen slice 6: `initialize -> void` stub.** A big
+convergence win — nearly every class has a constructor; shared-method count on `reference/lib` jumped ~33 → 102
+(70 of them `initialize`), **0 mismatch**. **rigor-parse**: a new `ParamShape` (required/optional counts, rest,
+keyword `(name, optional)` list, kwrest, block) captured at lowering onto `Node::Definition` via `param_shape_of`
+— additive, check path unaffected. **sig-gen**: `initialize` (instance) renders the reference `-> void` stub with
+the FULL param shape as `untyped` in `render_initialize_param_list` order (`untyped, ?untyped, *untyped, name:
+untyped, ?opt: untyped, **untyped, ?{ (?) -> void }`; posts omitted as the reference does); a trivial all-empty
+`initialize` is EXCLUDED; checked BEFORE the `simple_parameter_shape` gate so kwargs/optional/splat constructors
+emit; `def self.initialize` stays an ordinary singleton. **Gated:** 527 tests (4 new + matrix), run.rb +
+run_snapshot.rb 54/54 0 FP, clippy clean, check-path smoke 0 FP (initialize-heavy), initialize param-matrix
+BYTE-IDENTICAL vs the oracle, intersection sweep 140 files: 102 shared / 0 mismatch. NEXT: Writer UPDATE/merge +
+`LayoutIndex` (consolidated-sig projects); `--params=observed` (ObservationCollector); qualified source-class
+naming; `module_function` `self?.` spelling.
+
+**▶▶ LANDED (branch `sig-gen-write`, MERGED `af4f42f`) — sig-gen slice 5: `--write` (create-only).** The user-facing
 payoff — `--print` is advisory, `--write` actually generates the `sig/` tree. Ports the reference `Writer`'s
 CREATE path: **PathMapper** (`lib/foo.rb` → `sig/foo.rbs`; strip `config.paths.first` basename, swap ext, place
 under `config.signature_paths.first`) + **namespace-tree render** (group candidates by target, split `class_name`
