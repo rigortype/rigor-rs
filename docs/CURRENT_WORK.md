@@ -11,7 +11,24 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-singletons`) — sig-gen slice 4: singleton methods + module_function
+**▶▶ LANDED THIS SESSION (branch `sig-gen-write`) — sig-gen slice 5: `--write` (create-only).** The user-facing
+payoff — `--print` is advisory, `--write` actually generates the `sig/` tree. Ports the reference `Writer`'s
+CREATE path: **PathMapper** (`lib/foo.rb` → `sig/foo.rbs`; strip `config.paths.first` basename, swap ext, place
+under `config.signature_paths.first`) + **namespace-tree render** (group candidates by target, split `class_name`
+on `::`, render `<keyword> <name><super?>` / body / `end` with `node_keyword` = recorded class/module kind else
+leaf-with-methods→class else module, + superclass suffix — a new `NamespaceInfo` from a lightweight walk carries
+per-segment kind + plain-constant superclass). **CREATE-ONLY, safe by construction**: writes only when the mirror
+target is ABSENT; an existing target is `skipped_exists` (the Writer's merge / user-authored preservation +
+`LayoutIndex` consolidated-file re-routing are deferred — **never corrupts or duplicates**). Verified rigor-rs
+never over-writes a file the reference doesn't, never touches an existing file; on files both write the shared
+method lines are byte-identical (rigor-rs may write a valid RBS SUBSET — `initialize` stub + less-precise
+inference — the sound-superset model at FILE level). **Gated:** 525 tests (5 new), run.rb + run_snapshot.rb
+54/54 0 FP, clippy clean; fresh-dir E2E vs the oracle — written sig TREE + text + JSON BYTE-IDENTICAL (flat
+class+module, nested `module::class < super`, multi-file). NEXT: `initialize -> void` stub (needs full-param
+lowering); the Writer's UPDATE/merge path + `LayoutIndex` (unlocks consolidated-sig projects); `--params=observed`
+(ObservationCollector); qualified source-class naming; `module_function` `self?.` spelling.
+
+**▶▶ LANDED (branch `sig-gen-singletons`, MERGED `8db1bed`) — sig-gen slice 4: singleton methods + module_function
 safety.** Roughly DOUBLES emitted coverage on real code (the reference emits a large share of `def self.` /
 `self?.`). **rigor-parse**: `Node::Definition` gains `singleton_name` — `Some(name)` for a `def self.x` SELF
 receiver (whose name was otherwise LOST, only receiver-less defs kept a name); additive (all matches use `..`),
