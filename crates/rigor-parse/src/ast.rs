@@ -67,6 +67,42 @@ pub struct MethodBody {
     pub params: Option<Vec<String>>,
 }
 
+/// The RBS-relevant STRUCTURE of a method's parameter list — the counts + flags
+/// `sig-gen`'s `initialize` stub renders (`(untyped, ?untyped, *untyped, name:
+/// untyped, ?opt: untyped, **untyped, ?{ (?) -> void })`). Distinct from
+/// [`MethodBody::params`], which captures only plain-positional NAMES and
+/// declines any complex shape. Posts (`def f(a, *rest, b)`'s `b`) are
+/// deliberately omitted — the reference's stub renderer drops them too.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ParamShape {
+    /// Number of required positionals (each → `untyped`).
+    pub required: usize,
+    /// Number of optional positionals (each → `?untyped`).
+    pub optional: usize,
+    /// A rest param `*args` is present (→ `*untyped`).
+    pub has_rest: bool,
+    /// Keyword params in source order: `(name, is_optional)` (→ `name: untyped`
+    /// / `?name: untyped`).
+    pub keywords: Vec<(String, bool)>,
+    /// A keyword-rest `**opts` is present (→ `**untyped`).
+    pub has_kwrest: bool,
+    /// A block param `&blk` is present (→ `?{ (?) -> void }`).
+    pub has_block: bool,
+}
+
+impl ParamShape {
+    /// A trivial parameter list (all-empty) — the reference EXCLUDES a trivial
+    /// `initialize` from the stub (the `Object#initialize` RBS covers it).
+    pub fn is_trivial(&self) -> bool {
+        self.required == 0
+            && self.optional == 0
+            && !self.has_rest
+            && self.keywords.is_empty()
+            && !self.has_kwrest
+            && !self.has_block
+    }
+}
+
 /// Instance-method visibility as discovered at lowering time (ADR-35 slice 1,
 /// the `def.override-visibility-reduced` rule). Mirrors the reference's
 /// `scope_indexer.rb` visibility table semantics exactly:
@@ -205,6 +241,9 @@ pub enum Node {
         /// decline tier-4b param binding (splat/post/kwargs/block/optional
         /// present). See [`MethodBody::params`].
         params: Option<Vec<String>>,
+        /// The full RBS-relevant parameter STRUCTURE (counts + flags), for
+        /// `sig-gen`'s `initialize` stub. See [`ParamShape`].
+        param_shape: ParamShape,
         /// Precise span of the method-NAME token (Prism `name_loc`), or `None`
         /// for a name-less `class << self` body. The
         /// `def.override-visibility-reduced` rule anchors its diagnostic here
@@ -686,6 +725,8 @@ impl Builder {
             // or `None` to decline when the signature has anything that breaks
             // positional index<->arg alignment (splat/post/kwargs/block/optional).
             let params = plain_positional_params(def.parameters().as_ref());
+            // The full RBS-relevant param structure (for sig-gen's initialize stub).
+            let param_shape = param_shape_of(def.parameters().as_ref());
             // The method-NAME token span (for the override-visibility rule's
             // diagnostic anchor); `None` for a receiver-bearing singleton def
             // (kept parallel to `name`, which is also `None` there).
@@ -715,6 +756,7 @@ impl Builder {
                 singleton_name,
                 has_explicit_return,
                 params,
+                param_shape,
                 name_span,
                 body,
                 span: span_of(&def.location()),
@@ -802,6 +844,7 @@ impl Builder {
                 singleton_name: None, // the BODY's inner defs are the singletons.
                 has_explicit_return: false,
                 params: None,    // no single method ⇒ no param binding.
+                param_shape: ParamShape::default(),
                 name_span: None, // no single name ⇒ no name span.
                 body,
                 span: span_of(&sclass.location()),
@@ -1592,6 +1635,33 @@ fn plain_positional_params(params: Option<&ruby_prism::ParametersNode<'_>>) -> O
         names.push(constant_string(rp.name().as_slice()));
     }
     Some(names)
+}
+
+/// Capture the full RBS-relevant [`ParamShape`] from a Prism `ParametersNode`
+/// (for `sig-gen`'s `initialize` stub). Mirrors the inputs the reference's
+/// `render_initialize_param_list` reads — requireds/optionals counts, rest,
+/// keyword `(name, optional)` in order, keyword-rest, block. POSTS are omitted
+/// because the reference's renderer drops them.
+fn param_shape_of(params: Option<&ruby_prism::ParametersNode<'_>>) -> ParamShape {
+    let Some(p) = params else {
+        return ParamShape::default();
+    };
+    let mut keywords = Vec::new();
+    for kw in p.keywords().iter() {
+        if let Some(req) = kw.as_required_keyword_parameter_node() {
+            keywords.push((constant_string(req.name().as_slice()), false));
+        } else if let Some(opt) = kw.as_optional_keyword_parameter_node() {
+            keywords.push((constant_string(opt.name().as_slice()), true));
+        }
+    }
+    ParamShape {
+        required: p.requireds().iter().count(),
+        optional: p.optionals().iter().count(),
+        has_rest: p.rest().is_some(),
+        keywords,
+        has_kwrest: p.keyword_rest().is_some(),
+        has_block: p.block().is_some(),
+    }
 }
 
 /// Whether a Prism `def` body contains an explicit `return` statement ANYWHERE

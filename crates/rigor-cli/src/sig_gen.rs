@@ -58,7 +58,7 @@ use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, TypeEnv, Typer};
-use rigor_parse::{lower, parse, LoweredAst, Node, NodeId, Visibility};
+use rigor_parse::{lower, parse, LoweredAst, Node, NodeId, ParamShape, Visibility};
 use rigor_types::{Interner, Type, TypeId};
 
 /// A collected method to consider (instance or singleton) — the fields
@@ -68,6 +68,8 @@ struct MethodSig<'a> {
     name: &'a str,
     body: &'a [NodeId],
     params: &'a Option<Vec<String>>,
+    /// The full parameter structure — only consumed by the `initialize` stub.
+    param_shape: &'a ParamShape,
     has_explicit_return: bool,
     /// `true` for a `def self.x` / `class << self` def — rendered `def self.name`,
     /// kind `"singleton"`, and NOT subject to the visibility / `initialize` skips
@@ -355,23 +357,27 @@ fn walk_namespace(
     for &child in body {
         match ast.get(child) {
             Node::Definition {
-                name: Some(n), body: b, params, has_explicit_return, span, ..
+                name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } if !module_function_active => {
                 let vis = visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v);
-                sigs.push((sig_of(n, b, params, *has_explicit_return, false), vis, span.0));
+                sigs.push((sig_of(n, b, params, param_shape, *has_explicit_return, false), vis, span.0));
             }
             Node::Definition {
-                singleton_name: Some(n), body: b, params, has_explicit_return, span, ..
+                singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
-                sigs.push((sig_of(n, b, params, *has_explicit_return, true), None, span.0));
+                sigs.push((sig_of(n, b, params, param_shape, *has_explicit_return, true), None, span.0));
             }
             Node::Definition { is_singleton_class: true, body: sbody, .. } => {
                 for &inner in sbody {
                     if let Node::Definition {
-                        name: Some(n), body: b, params, has_explicit_return, span, ..
+                        name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
                     } = ast.get(inner)
                     {
-                        sigs.push((sig_of(n, b, params, *has_explicit_return, true), None, span.0));
+                        sigs.push((
+                            sig_of(n, b, params, param_shape, *has_explicit_return, true),
+                            None,
+                            span.0,
+                        ));
                     }
                 }
             }
@@ -423,10 +429,11 @@ fn sig_of<'a>(
     name: &'a str,
     body: &'a [NodeId],
     params: &'a Option<Vec<String>>,
+    param_shape: &'a ParamShape,
     has_explicit_return: bool,
     singleton: bool,
 ) -> MethodSig<'a> {
-    MethodSig { name, body, params, has_explicit_return, singleton }
+    MethodSig { name, body, params, param_shape, has_explicit_return, singleton }
 }
 
 /// Classify + render one method (instance or singleton), or `None` when skipped
@@ -456,19 +463,33 @@ fn method_candidate(
         return None;
     }
 
+    // `initialize` (instance only) is special: the reference emits a `-> void`
+    // constructor STUB with the FULL param shape rendered as `untyped`, never the
+    // inferred body type — and EXCLUDES a trivial (all-empty) initialize (the
+    // `Object#initialize` RBS covers it). Checked BEFORE the `simple_parameter_shape`
+    // gate below, since the stub renders any param shape (kwargs/optionals/splat).
+    // A `def self.initialize` is an ordinary singleton method, not a constructor.
+    if !sig.singleton && sig.name == "initialize" {
+        if sig.param_shape.is_trivial() {
+            return None;
+        }
+        let params = render_initialize_params(sig.param_shape);
+        return Some(Candidate {
+            file: path.to_string(),
+            class_name: class_name.to_string(),
+            method_name: "initialize".to_string(),
+            kind: "instance",
+            rbs: format!("def initialize: ({params}) -> void"),
+            // The reference stub's `inferred_return` is `untyped` (the rbs is
+            // `-> void`, but the candidate carries the fallback type).
+            inferred_return: "untyped".to_string(),
+        });
+    }
+
     // Simple parameter shape: rigor-rs sets `params = None` for exactly the
     // splat/post/kwargs/block/optional forms the reference's
     // `simple_parameter_shape?` rejects. Only plain requireds qualify.
     let arity = sig.params.as_ref()?.len();
-
-    // `initialize` (instance only) is special: the reference emits it as a
-    // `-> void` constructor STUB, never the inferred body type. rigor-rs types
-    // the body tail (`@m = Mutex.new` → `Mutex`), WRONG for a constructor — skip
-    // it (the void-stub is a later slice). A `def self.initialize` is an ordinary
-    // singleton method, not a constructor, so the skip is instance-only.
-    if !sig.singleton && sig.name == "initialize" {
-        return None;
-    }
 
     // Explicit-return union (reference `DefReturnTyper#union_with_explicit_returns`,
     // oracle-probed 2026-07-10): the return type is `union(tail, every collectible
@@ -702,6 +723,36 @@ fn is_bare_generic_name(erased: &str) -> bool {
     const GENERIC: &[&str] =
         &["Array", "Hash", "Set", "Range", "Enumerator", "Enumerator::Lazy"];
     GENERIC.contains(&erased)
+}
+
+/// Render an `initialize` stub's parameter list — every param `untyped`
+/// (params-observed typing is a later slice), in the reference's
+/// `render_initialize_param_list` order: requireds → optionals (`?untyped`) →
+/// rest (`*untyped`) → keywords (`name: untyped` / `?name: untyped`) → keyword-
+/// rest (`**untyped`) → block (`?{ (?) -> void }`). Posts are omitted (as the
+/// reference does).
+fn render_initialize_params(shape: &ParamShape) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for _ in 0..shape.required {
+        parts.push("untyped".to_string());
+    }
+    for _ in 0..shape.optional {
+        parts.push("?untyped".to_string());
+    }
+    if shape.has_rest {
+        parts.push("*untyped".to_string());
+    }
+    for (name, optional) in &shape.keywords {
+        let marker = if *optional { "?" } else { "" };
+        parts.push(format!("{marker}{name}: untyped"));
+    }
+    if shape.has_kwrest {
+        parts.push("**untyped".to_string());
+    }
+    if shape.has_block {
+        parts.push("?{ (?) -> void }".to_string());
+    }
+    parts.join(", ")
 }
 
 /// Wrap a rendered return in parens iff it is a TOP-LEVEL union (a ` | ` at
@@ -1274,12 +1325,37 @@ mod tests {
     }
 
     #[test]
-    fn skips_initialize_constructor() {
-        // `initialize` types to its body tail (`@m = X.new` → `X`), which is
-        // WRONG for a constructor; the reference emits a `-> void` stub instead.
-        // Skip it — FP-safe.
+    fn trivial_initialize_is_excluded() {
+        // An all-empty-param initialize is EXCLUDED (Object#initialize covers it).
         let src = "class Foo\n  def initialize\n    @x = 1\n  end\nend\n";
-        assert!(candidates_tagged("init", src, false).is_empty());
+        assert!(candidates_tagged("init0", src, false).is_empty());
+    }
+
+    #[test]
+    fn initialize_stub_renders_full_param_shape_as_void() {
+        // Oracle-probed matrix: requireds/optionals/rest/keywords/kwrest/block →
+        // the reference's `render_initialize_param_list` spelling, `-> void`.
+        let cases = [
+            ("class B\n  def initialize(a, b)\n    @a = a\n  end\nend\n", "def initialize: (untyped, untyped) -> void"),
+            ("class C\n  def initialize(a, b = 1)\n    @a = a\n  end\nend\n", "def initialize: (untyped, ?untyped) -> void"),
+            ("class D\n  def initialize(name:, age: 0)\n    @n = name\n  end\nend\n", "def initialize: (name: untyped, ?age: untyped) -> void"),
+            ("class E\n  def initialize(*a, **o, &b)\n    @a = a\n  end\nend\n", "def initialize: (*untyped, **untyped, ?{ (?) -> void }) -> void"),
+            ("class F\n  def initialize(a, b = 1, *r, c:, d: 2)\n    @a = a\n  end\nend\n", "def initialize: (untyped, ?untyped, *untyped, c: untyped, ?d: untyped) -> void"),
+        ];
+        for (i, (src, want)) in cases.iter().enumerate() {
+            let cs = candidates_tagged(&format!("initm{i}"), src, false);
+            assert_eq!(cs.len(), 1, "case {i}: {cs:?}");
+            assert_eq!(&cs[0].rbs, want, "case {i}");
+            assert_eq!(cs[0].kind, "instance");
+        }
+    }
+
+    #[test]
+    fn def_self_initialize_is_an_ordinary_singleton() {
+        // `def self.initialize` is NOT a constructor — a normal singleton method.
+        let src = "class Foo\n  def self.initialize(a)\n    \"x\"\n  end\nend\n";
+        let cs = candidates_tagged("initsing", src, false);
+        assert_eq!(cs[0].rbs, "def self.initialize: (untyped) -> \"x\"");
     }
 
     #[test]
