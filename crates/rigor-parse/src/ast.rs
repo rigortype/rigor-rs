@@ -192,6 +192,14 @@ pub enum Node {
         /// `def` body still counts as toplevel and DOES fire). Both are name-less,
         /// so this flag is the only reliable discriminator.
         is_singleton_class: bool,
+        /// The method name for a SELF-singleton `def self.x` (`Some("x")`), else
+        /// `None`. Kept SEPARATE from `name` (which stays `None` for a
+        /// receiver-bearing def so it is never harvested as an instance method):
+        /// this lets `sig-gen` collect `def self.x` singletons (their name is
+        /// otherwise lost) WITHOUT touching the tier-4b instance-method harvest.
+        /// A non-self receiver (`def obj.x`) leaves this `None` (a per-object
+        /// singleton, out of scope).
+        singleton_name: Option<String>,
         has_explicit_return: bool,
         /// The method's PLAIN-POSITIONAL param names in order, or `None` to
         /// decline tier-4b param binding (splat/post/kwargs/block/optional
@@ -693,9 +701,18 @@ impl Builder {
             if let Some(recv) = def.receiver() {
                 let _ = self.lower_node(&recv);
             }
+            // A `def self.x` (SELF receiver) captures its method name here so
+            // `sig-gen` can collect the singleton; `name` stays `None` so the
+            // instance-method harvest still skips it. A non-self receiver
+            // (`def obj.x`) is left `None`.
+            let singleton_name = def
+                .receiver()
+                .filter(|r| r.as_self_node().is_some())
+                .map(|_| constant_string(def.name().as_slice()));
             return self.push(Node::Definition {
                 name,
                 is_singleton_class: false,
+                singleton_name,
                 has_explicit_return,
                 params,
                 name_span,
@@ -782,6 +799,7 @@ impl Builder {
             return self.push(Node::Definition {
                 name: None, // `class << self` has no single method name.
                 is_singleton_class: true, // a CLASS scope, not a method def.
+                singleton_name: None, // the BODY's inner defs are the singletons.
                 has_explicit_return: false,
                 params: None,    // no single method ⇒ no param binding.
                 name_span: None, // no single name ⇒ no name span.

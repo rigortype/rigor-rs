@@ -58,8 +58,22 @@ use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, TypeEnv, Typer};
-use rigor_parse::{lower, parse, LoweredAst, MethodBody, Node, NodeId, Visibility};
+use rigor_parse::{lower, parse, LoweredAst, Node, NodeId, Visibility};
 use rigor_types::{Interner, Type, TypeId};
+
+/// A collected method to consider (instance or singleton) — the fields
+/// `method_candidate` needs, unifying the instance-harvest (`MethodBody`) and the
+/// singleton walk (`Node::Definition` fields) into one shape.
+struct MethodSig<'a> {
+    name: &'a str,
+    body: &'a [NodeId],
+    params: &'a Option<Vec<String>>,
+    has_explicit_return: bool,
+    /// `true` for a `def self.x` / `class << self` def — rendered `def self.name`,
+    /// kind `"singleton"`, and NOT subject to the visibility / `initialize` skips
+    /// (both instance-only in the reference).
+    singleton: bool,
+}
 
 /// One printable RBS skeleton row (the reference's emittable `MethodCandidate`,
 /// always `NEW_METHOD` in the `--print` path — `NEW_FILE` is a `--write` concept).
@@ -68,7 +82,7 @@ struct Candidate {
     file: String,
     class_name: String,
     method_name: String,
-    /// `"instance"` — singleton methods are a deferred slice.
+    /// `"instance"` or `"singleton"`.
     kind: &'static str,
     /// The rendered one-liner, e.g. `def greeting: () -> "hello"`.
     rbs: String,
@@ -254,12 +268,12 @@ fn walk_namespace(
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
 ) {
-    let (name, method_bodies, visibilities, body, is_module) = match ast.get(id) {
+    let (name, method_bodies, visibilities, body) = match ast.get(id) {
         Node::ClassDef { name, method_bodies, method_visibilities, body, .. } => {
-            (name, method_bodies, method_visibilities, body, false)
+            (name, method_bodies, method_visibilities, body)
         }
         Node::ModuleDef { name, method_bodies, method_visibilities, body, .. } => {
-            (name, method_bodies, method_visibilities, body, true)
+            (name, method_bodies, method_visibilities, body)
         }
         _ => return,
     };
@@ -268,35 +282,71 @@ fn walk_namespace(
     qualified.push(name.clone());
     let class_name = qualified.join("::");
 
-    // A module with a bare `module_function` call: the reference emits its
-    // methods as `def self?.name` (the dual instance+singleton RBS spelling —
+    // A bare `module_function` call (in a MODULE *or* a CLASS — rule_catalog.rb
+    // uses it in a class): the reference emits every subsequent instance method
+    // as `def self?.name` (the dual instance+singleton spelling —
     // `@module_function_methods` in the reference walker). rigor-rs's lowering
     // does not track module_function state, so emitting `def name` here would
-    // byte-diverge on a shared method — skip the whole module's methods until
-    // the `self?.` spelling is ported (FP-safe under-emit; nested namespaces
-    // still descend).
-    let module_function_active = is_module
-        && body.iter().any(|&c| {
-            matches!(ast.get(c), Node::Call { method, receiver: None, .. } if method == "module_function")
-        });
+    // byte-DIVERGE on a shared method (probed: `class C; module_function; def
+    // helper` → ref `def self?.helper` vs rs `def helper`). Skip this body's
+    // instance methods until the `self?.` spelling is ported (FP-safe under-emit;
+    // singletons still emit, nested namespaces still descend).
+    let module_function_active = body.iter().any(|&c| {
+        matches!(ast.get(c), Node::Call { method, receiver: None, .. } if method == "module_function")
+    });
 
-    if !module_function_active {
-        for method in method_bodies {
-            if let Some(candidate) = method_candidate(
-                ast,
-                method,
-                visibilities,
-                &class_name,
-                path,
-                include_private,
-                index,
-                typer,
-                env,
-                nested_classes,
-                interner,
-            ) {
-                out.push(candidate);
+    // Collect instance + singleton methods in ONE pass over the class body so
+    // they emit in SOURCE ORDER (the reference walks the AST top-to-bottom): a
+    // direct instance `def x` (unless module_function suppresses it), a
+    // `def self.x`, and the receiver-less inner defs of a `class << self`.
+    // `method_bodies` harvests exactly the direct `Definition{name:Some}` set, so
+    // walking the body for them is equivalent AND recovers each def's span for the
+    // ordering. Each entry carries `span.start` as the sort key.
+    let _ = (method_bodies, visibilities); // superseded by the body walk below
+    let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
+    for &child in body {
+        match ast.get(child) {
+            Node::Definition {
+                name: Some(n), body: b, params, has_explicit_return, span, ..
+            } if !module_function_active => {
+                let vis = visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v);
+                sigs.push((sig_of(n, b, params, *has_explicit_return, false), vis, span.0));
             }
+            Node::Definition {
+                singleton_name: Some(n), body: b, params, has_explicit_return, span, ..
+            } => {
+                sigs.push((sig_of(n, b, params, *has_explicit_return, true), None, span.0));
+            }
+            Node::Definition { is_singleton_class: true, body: sbody, .. } => {
+                for &inner in sbody {
+                    if let Node::Definition {
+                        name: Some(n), body: b, params, has_explicit_return, span, ..
+                    } = ast.get(inner)
+                    {
+                        sigs.push((sig_of(n, b, params, *has_explicit_return, true), None, span.0));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sigs.sort_by_key(|&(_, _, start)| start);
+
+    for (sig, vis, _) in &sigs {
+        if let Some(candidate) = method_candidate(
+            ast,
+            sig,
+            *vis,
+            &class_name,
+            path,
+            include_private,
+            index,
+            typer,
+            env,
+            nested_classes,
+            interner,
+        ) {
+            out.push(candidate);
         }
     }
 
@@ -320,14 +370,25 @@ fn walk_namespace(
     }
 }
 
-/// Classify + render one instance method, or `None` when it is skipped
+/// Build a [`MethodSig`] borrowing the def's arena fields.
+fn sig_of<'a>(
+    name: &'a str,
+    body: &'a [NodeId],
+    params: &'a Option<Vec<String>>,
+    has_explicit_return: bool,
+    singleton: bool,
+) -> MethodSig<'a> {
+    MethodSig { name, body, params, has_explicit_return, singleton }
+}
+
+/// Classify + render one method (instance or singleton), or `None` when skipped
 /// (private/protected without `--include-private`, a non-simple parameter shape,
-/// or an `untyped` / `Dynamic[top]` inferred return).
+/// `initialize`, or an `untyped` / `Dynamic[top]` / low-confidence return).
 #[allow(clippy::too_many_arguments)]
 fn method_candidate(
     ast: &LoweredAst,
-    method: &MethodBody,
-    visibilities: &[(String, Visibility)],
+    sig: &MethodSig,
+    visibility: Option<Visibility>,
     class_name: &str,
     path: &str,
     include_private: bool,
@@ -337,27 +398,27 @@ fn method_candidate(
     nested_classes: &std::collections::HashSet<String>,
     interner: &mut Interner,
 ) -> Option<Candidate> {
-    // Visibility: skip private / protected unless `--include-private`
-    // (reference `visibility_excludes?`; instance methods only in this slice).
-    if !include_private {
-        if let Some((_, vis)) = visibilities.iter().find(|(n, _)| n == &method.name) {
-            if matches!(vis, Visibility::Private | Visibility::Protected) {
-                return None;
-            }
-        }
+    // Visibility: skip private / protected unless `--include-private` (reference
+    // `visibility_excludes?` — returns false for a singleton, so singletons are
+    // never visibility-skipped).
+    if !include_private
+        && !sig.singleton
+        && matches!(visibility, Some(Visibility::Private | Visibility::Protected))
+    {
+        return None;
     }
 
     // Simple parameter shape: rigor-rs sets `params = None` for exactly the
     // splat/post/kwargs/block/optional forms the reference's
     // `simple_parameter_shape?` rejects. Only plain requireds qualify.
-    let arity = method.params.as_ref()?.len();
+    let arity = sig.params.as_ref()?.len();
 
-    // `initialize` is special: the reference emits it (when it has non-trivial
-    // params) as a `-> void` constructor STUB, never the inferred body type, and
-    // excludes the trivial no-arg form. rigor-rs types the body tail (e.g. an
-    // `@m = Mutex.new` → `Mutex`), which is WRONG for a constructor. Skip it here
-    // (the void-stub is a later slice) — FP-safe.
-    if method.name == "initialize" {
+    // `initialize` (instance only) is special: the reference emits it as a
+    // `-> void` constructor STUB, never the inferred body type. rigor-rs types
+    // the body tail (`@m = Mutex.new` → `Mutex`), WRONG for a constructor — skip
+    // it (the void-stub is a later slice). A `def self.initialize` is an ordinary
+    // singleton method, not a constructor, so the skip is instance-only.
+    if !sig.singleton && sig.name == "initialize" {
         return None;
     }
 
@@ -371,12 +432,12 @@ fn method_candidate(
     // their `describe(:short)` string (reference `Combinator#sort_members`) and
     // dedup; any `untyped`-erasing member skips the method (`dynamic_top?` on the
     // erased union).
-    let returns = collect_explicit_returns(ast, method)?;
+    let returns = collect_explicit_returns(ast, sig)?;
 
     // Tail type (reference `body_last_expression` + `safe_type_of`): the last
     // statement's type; an assignment tail evaluates to its RHS; a `return E`
     // tail evaluates to its value (`nil` when bare).
-    let tail_ty = def_return_type(ast, typer, &method.body, env, interner)?;
+    let tail_ty = def_return_type(ast, typer, sig.body, env, interner)?;
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -453,13 +514,16 @@ fn method_candidate(
         format!("({})", vec!["untyped"; arity].join(", "))
     };
     let ret = paren_wrap_union(&erased);
-    let rbs = format!("def {}: {head} -> {ret}", method.name);
+    // `def self.name` for a singleton (reference `method_def_prefix`), `def name`
+    // for an instance method.
+    let prefix = if sig.singleton { "def self." } else { "def " };
+    let rbs = format!("{prefix}{}: {head} -> {ret}", sig.name);
 
     Some(Candidate {
         file: path.to_string(),
         class_name: class_name.to_string(),
-        method_name: method.name.clone(),
-        kind: "instance",
+        method_name: sig.name.to_string(),
+        kind: if sig.singleton { "singleton" } else { "instance" },
         rbs,
         inferred_return: erased,
     })
@@ -488,13 +552,13 @@ fn method_candidate(
 /// Membership is by span containment against the def's body-statement spans
 /// (the arena is flat; spans nest strictly), mirroring how outline/flow walks
 /// resolve nesting.
-fn collect_explicit_returns(ast: &LoweredAst, method: &MethodBody) -> Option<Vec<Option<NodeId>>> {
-    if !method.has_explicit_return {
+fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Option<NodeId>>> {
+    if !sig.has_explicit_return {
         return Some(Vec::new());
     }
 
     let regions: Vec<(usize, usize)> =
-        method.body.iter().map(|&id| ast.get(id).span()).collect();
+        sig.body.iter().map(|&id| ast.get(id).span()).collect();
     let within = |s: (usize, usize), regions: &[(usize, usize)]| {
         regions.iter().any(|&(rs, re)| rs <= s.0 && s.1 <= re)
     };
@@ -789,11 +853,38 @@ mod tests {
     }
 
     #[test]
-    fn module_function_module_skips_methods() {
-        // The reference spells a module_function module's methods `def self?.m`;
-        // rigor-rs doesn't track module_function yet → skip the module's methods.
-        let src = "module Util\n  module_function\n\n  def helper\n    1\n  end\nend\n";
-        assert!(candidates_tagged("modfunc", src, false).is_empty());
+    fn module_function_skips_methods_in_module_and_class() {
+        // The reference spells module_function methods `def self?.m`; rigor-rs
+        // doesn't track that yet → skip. `module_function` in a CLASS
+        // (rule_catalog.rb) must skip too — else `def helper` byte-diverges from
+        // the reference's `def self?.helper`.
+        let modsrc = "module Util\n  module_function\n\n  def helper\n    1\n  end\nend\n";
+        assert!(candidates_tagged("modfunc", modsrc, false).is_empty());
+        let clssrc = "class C\n  module_function\n\n  def helper\n    1\n  end\nend\n";
+        assert!(candidates_tagged("modfuncls", clssrc, false).is_empty());
+    }
+
+    #[test]
+    fn emits_singleton_methods_both_forms() {
+        // `def self.x` and a `class << self` inner def both render `def self.NAME`.
+        let src = "class A\n  def self.build\n    \"b\"\n  end\n  class << self\n    def via\n      :s\n    end\n  end\nend\n";
+        let cs = candidates_tagged("sing", src, false);
+        let rbs: Vec<&str> = cs.iter().map(|c| c.rbs.as_str()).collect();
+        assert!(rbs.contains(&"def self.build: () -> \"b\""), "{rbs:?}");
+        assert!(rbs.contains(&"def self.via: () -> :s"), "{rbs:?}");
+        assert!(cs.iter().all(|c| c.kind == "singleton"));
+    }
+
+    #[test]
+    fn instance_and_singleton_emit_in_source_order() {
+        // `def self.build` (line 2) precedes `def inst` (line 5): source order,
+        // not instance-then-singleton.
+        let src = "class A\n  def self.build\n    1\n  end\n  def inst\n    2\n  end\nend\n";
+        let cs = candidates_tagged("order", src, false);
+        assert_eq!(
+            cs.iter().map(|c| c.method_name.as_str()).collect::<Vec<_>>(),
+            vec!["build", "inst"]
+        );
     }
 
     #[test]
