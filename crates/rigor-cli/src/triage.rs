@@ -200,6 +200,13 @@ struct Report {
     include_info: bool,
 }
 
+/// The full triage report (all sections incl. hints) as JSON, for the `triage`
+/// MCP tool. `diags` is the `(path, diagnostic)` set from an analysis.
+#[must_use]
+pub fn report_json_for(diags: &[(&str, &Diagnostic)], top: usize, include_info: bool) -> String {
+    report_json(&analyze(diags, top, true, include_info))
+}
+
 fn analyze(diags: &[DiagRef], top: usize, run_hints: bool, include_info: bool) -> Report {
     // The summary reports the FULL stream; the volume views route out `:info`
     // unless `--include-info` (WD6). rigor-rs emits no `:info` today, so routing

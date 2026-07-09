@@ -11,6 +11,16 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `mcp-triage-annotate`) — (2) MCP tool expansion: `triage` + `annotate`.**
+`rigor mcp` gains two read-only tools reusing this session's landed commands: **`triage`** (analyse a source
+string → the structured diagnostic triage JSON: distribution / selectors / hotspots / summary / hints, ADR-23
+— the aggregate stats an agent uses to prioritise) and **`annotate`** (the `{ line => type }` map, xmpfilter
+`#=> <type>` view). Exposed `triage::report_json_for` + `annotate::annotations_json` as the reusable seams;
+both MCP handlers run the SAME suppression + disable filter as `check`, panic-isolated (`isError` on a bad
+source). The MCP surface is now check / type_of / explain / outline / triage / annotate. **Gated:** 177
+rigor-cli tests (3 new), end-to-end stdio smoke (initialize → tools/list → triage + annotate), harness 54/54,
+clippy clean; the check path is untouched. NOT yet merged.
+
 **▶▶ LANDED THIS SESSION (branch `gemfile-lock-overlay`) — ADR-72 Gemfile.lock-gated auto-overlay (the
 productization win the plugin investigation pointed to).** rigor-rs now AUTO-APPLIES the bundled
 `activesupport-core-ext` RBS overlay when a project's `Gemfile.lock` locks `activesupport` (which ships no
