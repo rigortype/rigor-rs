@@ -53,7 +53,7 @@
 //! - QUALIFIED source-class naming (`Rigor::Plugin::ProtocolContract`) — unlocks
 //!   the nested source-class returns skipped above.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
@@ -95,13 +95,15 @@ struct Candidate {
 pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let mut format = "text";
     let mut include_private = false;
+    let mut write = false;
     let mut explicit_config: Option<&str> = None;
     let mut positional: Vec<&str> = Vec::new();
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--print" => {} // the only supported mode (default)
+            "--print" => {} // the default mode
+            "--write" => write = true,
             "--include-private" => include_private = true,
             "--format" => match it.next().map(String::as_str) {
                 Some(f @ ("text" | "json")) => format = f,
@@ -118,10 +120,8 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 }
             },
             // Recognised reference flags whose machinery is a later slice.
-            "--diff" | "--write" | "--overwrite" => {
-                eprintln!(
-                    "sig-gen: `{arg}` is not yet implemented in this slice (only --print)"
-                );
+            "--diff" | "--overwrite" => {
+                eprintln!("sig-gen: `{arg}` is not yet implemented in this slice");
                 return ExitCode::from(2);
             }
             other if other.starts_with("--params") || other.starts_with("--observe") => {
@@ -147,6 +147,10 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         &positional
     };
     let files = resolve_paths(raw);
+
+    if write {
+        return cmd_write(&files, include_private, format, &cfg);
+    }
 
     let candidates: Vec<Candidate> =
         files.iter().flat_map(|p| generate_file(p, include_private)).collect();
@@ -179,11 +183,53 @@ fn resolve_paths(raw: &[&str]) -> Vec<String> {
     out
 }
 
-/// Produce the printable candidates for one source file. A parse/read failure
-/// (or a file with no reachable named class body) yields no candidates.
+/// Per-namespace metadata the `--write` tree renderer needs (unused by `--print`):
+/// the declaration keyword and any plain-constant superclass, keyed by the fully-
+/// qualified name.
+#[derive(Default)]
+struct NamespaceInfo {
+    /// qualified name → `"class"` / `"module"` (reference `node_keyword`).
+    kinds: std::collections::HashMap<String, &'static str>,
+    /// qualified name → written superclass path (reference `superclass_suffix`).
+    supers: std::collections::HashMap<String, String>,
+}
+
+/// Record each class/module declaration's keyword + superclass into `info`,
+/// keyed by qualified name (reference `build_namespace_kinds` /
+/// `build_superclasses`).
+fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
+    let (name, body, kind, superclass): (&String, &[NodeId], &'static str, Option<&String>) =
+        match ast.get(id) {
+            Node::ClassDef { name, body, superclass_path, .. } => {
+                (name, body, "class", superclass_path.as_ref())
+            }
+            Node::ModuleDef { name, body, .. } => (name, body, "module", None),
+            _ => return,
+        };
+    let mut qualified = prefix.to_vec();
+    qualified.push(name.clone());
+    let q = qualified.join("::");
+    info.kinds.insert(q.clone(), kind);
+    if let Some(sp) = superclass {
+        info.supers.insert(q, sp.clone());
+    }
+    for &child in body {
+        collect_namespace_info(ast, child, &qualified, info);
+    }
+}
+
+/// Produce the printable candidates for one source file (drops the write-only
+/// [`NamespaceInfo`]).
 fn generate_file(path: &str, include_private: bool) -> Vec<Candidate> {
+    generate_file_with_info(path, include_private).0
+}
+
+/// Produce candidates + the `--write` namespace metadata for one source file. A
+/// parse/read failure (or a file with no reachable named class body) yields no
+/// candidates.
+fn generate_file_with_info(path: &str, include_private: bool) -> (Vec<Candidate>, NamespaceInfo) {
     let Ok(source) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return (Vec::new(), NamespaceInfo::default());
     };
     let ast = lower(&parse(source.as_bytes()));
     // Core-only env: the existing-project-RBS comparison (tighter/equivalent) is
@@ -210,6 +256,7 @@ fn generate_file(path: &str, include_private: bool) -> Vec<Candidate> {
     }
 
     let mut out = Vec::new();
+    let mut info = NamespaceInfo::default();
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
             walk_namespace(
@@ -225,9 +272,10 @@ fn generate_file(path: &str, include_private: bool) -> Vec<Candidate> {
                 &mut interner,
                 &mut out,
             );
+            collect_namespace_info(&ast, child, &[], &mut info);
         }
     }
-    out
+    (out, info)
 }
 
 /// Collect the written names of class/module declarations that are lexically
@@ -741,6 +789,282 @@ fn render_json(candidates: &[Candidate]) {
     println!("{}", serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap());
 }
 
+// ---------------------------------------------------------------------------
+// `--write` (reference `Writer`) — CREATE-ONLY slice
+// ---------------------------------------------------------------------------
+
+/// The outcome of writing one target `.rbs` file.
+struct WriteResult {
+    source: String,
+    target: String,
+    action: &'static str, // "created" | "skipped_exists" | "skipped_outside_sig_root"
+    applied: Vec<Candidate>,
+}
+
+/// `rigor sig-gen --write [paths]` — CREATE-ONLY: writes `sig/<path>.rbs` for
+/// each source file whose target does NOT yet exist (reference `create_new`).
+///
+/// DEFERRED (each FP-safe — never corrupts an existing file): updating an
+/// EXISTING target (the `Writer`'s merge / user-authored preservation) is
+/// reported `skipped_exists` and left untouched; the `LayoutIndex` re-routing to
+/// a consolidated sig file is not ported, so `--write` targets a fresh / 1:1
+/// `sig/` layout (a consolidated layout could otherwise create a duplicate
+/// declaration — guarded by only writing when the mirror target is ABSENT).
+fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate::Config) -> ExitCode {
+    let project_root = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let source_root = cfg
+        .paths
+        .first()
+        .and_then(|p| Path::new(p).file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "lib".to_string());
+    let sig_root = cfg
+        .signature_paths
+        .first()
+        .and_then(|p| Path::new(p).file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "sig".to_string());
+
+    // Generate candidates + namespace metadata per source file, tagging each
+    // candidate with its target path (reference `write_all` groups by target).
+    let mut merged = NamespaceInfo::default();
+    let mut tagged: Vec<(PathBuf, Candidate)> = Vec::new();
+    for f in files {
+        let (candidates, info) = generate_file_with_info(f, include_private);
+        merged.kinds.extend(info.kinds);
+        merged.supers.extend(info.supers);
+        for c in candidates {
+            let target = target_for(&c.file, &source_root, &sig_root, &project_root);
+            tagged.push((target, c));
+        }
+    }
+
+    // Group by target, preserving first-seen order (reference groups by target).
+    let mut targets: Vec<PathBuf> = Vec::new();
+    for (t, _) in &tagged {
+        if !targets.contains(t) {
+            targets.push(t.clone());
+        }
+    }
+
+    let sig_root_dir = project_root.join(&sig_root);
+    let mut results: Vec<WriteResult> = Vec::new();
+    for target in targets {
+        let group: Vec<Candidate> =
+            tagged.iter().filter(|(t, _)| *t == target).map(|(_, c)| clone_candidate(c)).collect();
+        let source = group.first().map(|c| c.file.clone()).unwrap_or_default();
+        let target_str = target.to_string_lossy().into_owned();
+
+        if !target.starts_with(&sig_root_dir) {
+            results.push(WriteResult {
+                source,
+                target: target_str,
+                action: "skipped_outside_sig_root",
+                applied: Vec::new(),
+            });
+            continue;
+        }
+        if target.exists() {
+            // Update is a later slice — never touch an existing sig file.
+            results.push(WriteResult {
+                source,
+                target: target_str,
+                action: "skipped_exists",
+                applied: Vec::new(),
+            });
+            continue;
+        }
+        let content = render_new_file(&group, &merged);
+        if let Some(parent) = target.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&target, content).is_err() {
+            eprintln!("sig-gen: failed to write {target_str}");
+            return ExitCode::from(1);
+        }
+        results.push(WriteResult { source, target: target_str, action: "created", applied: group });
+    }
+
+    match format {
+        "json" => render_write_json(&results),
+        _ => render_write_text(&results),
+    }
+    ExitCode::SUCCESS
+}
+
+/// A shallow copy of a candidate (its `kind` is `&'static str`).
+fn clone_candidate(c: &Candidate) -> Candidate {
+    Candidate {
+        file: c.file.clone(),
+        class_name: c.class_name.clone(),
+        method_name: c.method_name.clone(),
+        kind: c.kind,
+        rbs: c.rbs.clone(),
+        inferred_return: c.inferred_return.clone(),
+    }
+}
+
+/// Map a source `.rb` path to its target `.rbs` (reference `PathMapper`): strip
+/// the source-root first component, swap the extension, place under the sig root.
+fn target_for(source: &str, source_root: &str, sig_root: &str, project_root: &Path) -> PathBuf {
+    let sp = Path::new(source);
+    let rel: PathBuf = if sp.is_absolute() {
+        let canon = sp.canonicalize().unwrap_or_else(|_| sp.to_path_buf());
+        canon.strip_prefix(project_root).map(Path::to_path_buf).unwrap_or(canon)
+    } else {
+        sp.to_path_buf()
+    };
+    // Strip the leading source-root component (`lib/` → ``) when present.
+    let stripped: PathBuf = {
+        let mut comps = rel.components();
+        match comps.clone().next() {
+            Some(first) if first.as_os_str() == std::ffi::OsStr::new(source_root) => {
+                comps.next();
+                comps.as_path().to_path_buf()
+            }
+            _ => rel.clone(),
+        }
+    };
+    let mut target = project_root.join(sig_root).join(stripped);
+    target.set_extension("rbs");
+    target
+}
+
+/// The 2-space RBS indent (reference `Writer::INDENT`).
+const INDENT: &str = "  ";
+
+/// Render a NEW sig file's content (reference `render_new_file` /
+/// `render_tree_nodes`): build a namespace tree from the candidates, then render
+/// each top-level node, joined by a blank line.
+fn render_new_file(candidates: &[Candidate], info: &NamespaceInfo) -> String {
+    let mut roots: Vec<TreeNode> = Vec::new();
+    for c in candidates {
+        let segs: Vec<&str> = c.class_name.split("::").collect();
+        insert_into_tree(&mut roots, &segs, &c.rbs);
+    }
+    roots
+        .iter()
+        .map(|n| render_tree_node(n, info, 0, &[]))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A namespace-tree node: a name segment, ordered children, and the method RBS
+/// lines declared directly at this level.
+struct TreeNode {
+    name: String,
+    children: Vec<TreeNode>,
+    methods: Vec<String>,
+}
+
+/// Insert a method's RBS under the class-name path `segs` (creating intermediate
+/// nodes), preserving first-seen order (reference `insert_into_tree`).
+fn insert_into_tree(nodes: &mut Vec<TreeNode>, segs: &[&str], rbs: &str) {
+    let Some((head, rest)) = segs.split_first() else { return };
+    let idx = match nodes.iter().position(|n| n.name == *head) {
+        Some(i) => i,
+        None => {
+            nodes.push(TreeNode { name: head.to_string(), children: Vec::new(), methods: Vec::new() });
+            nodes.len() - 1
+        }
+    };
+    if rest.is_empty() {
+        nodes[idx].methods.push(rbs.to_string());
+    } else {
+        insert_into_tree(&mut nodes[idx].children, rest, rbs);
+    }
+}
+
+/// Render one tree node (reference `render_tree_node`): `<indent><keyword> <name>
+/// <super?>\n<body><indent>end\n`, body = method lines then child blocks.
+fn render_tree_node(node: &TreeNode, info: &NamespaceInfo, depth: usize, prefix: &[String]) -> String {
+    let indent = INDENT.repeat(depth);
+    let mut qual = prefix.to_vec();
+    qual.push(node.name.clone());
+    let qualified = qual.join("::");
+    let keyword = node_keyword(node, info, &qualified);
+    let superclass = if keyword == "class" {
+        info.supers.get(&qualified).map(|s| format!(" < {s}")).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let inner = INDENT.repeat(depth + 1);
+    let mut body = String::new();
+    for m in &node.methods {
+        body.push_str(&format!("{inner}{m}\n"));
+    }
+    for child in &node.children {
+        body.push_str(&render_tree_node(child, info, depth + 1, &qual));
+    }
+    format!("{indent}{keyword} {}{superclass}\n{body}{indent}end\n", node.name)
+}
+
+/// The declaration keyword for a node (reference `node_keyword`): the recorded
+/// kind, else `class` for a leaf-with-methods, else `module`.
+fn node_keyword(node: &TreeNode, info: &NamespaceInfo, qualified: &str) -> &'static str {
+    if let Some(k) = info.kinds.get(qualified) {
+        return k;
+    }
+    if !node.methods.is_empty() && node.children.is_empty() {
+        "class"
+    } else {
+        "module"
+    }
+}
+
+/// `--write` text report (reference `render_write_text`): `No changes` when
+/// nothing was created (all targets already existed / none in scope), else one
+/// line per created / outside-sig-root target. An `skipped_exists` (update
+/// deferred) prints a note only alongside a real action, else it reads as `No
+/// changes`.
+fn render_write_text(results: &[WriteResult]) {
+    let acted = results.iter().any(|r| r.action == "created" || r.action == "skipped_outside_sig_root");
+    if !acted {
+        println!("No changes");
+        return;
+    }
+    for r in results {
+        match r.action {
+            "created" => println!("created {} ({} method(s))", r.target, r.applied.len()),
+            "skipped_exists" => {
+                println!("skipped {} (already exists; update is a later slice)", r.target)
+            }
+            "skipped_outside_sig_root" => {
+                println!("skipped {} -> {} (outside sig root)", r.source, r.target)
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `--write --format json` report (reference `render_write_json`).
+fn render_write_json(results: &[WriteResult]) {
+    use serde_json::json;
+    let rows: Vec<_> = results
+        .iter()
+        .map(|r| {
+            let applied: Vec<_> = r
+                .applied
+                .iter()
+                .map(|c| {
+                    json!({
+                        "file": c.file, "class": c.class_name, "method": c.method_name,
+                        "kind": c.kind, "classification": "new_method", "rbs": c.rbs,
+                        "inferred_return": c.inferred_return,
+                    })
+                })
+                .collect();
+            json!({
+                "source": r.source, "target": r.target, "action": r.action,
+                "applied": applied, "skipped": [],
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&json!({ "results": rows })).unwrap());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,6 +1217,51 @@ mod tests {
         // reference reads differently (sweep-proven mismatch source) → skip.
         let src = "class A\n  def m(x)\n    [x, 0]\n  end\nend\n";
         assert!(candidates_tagged("untycomp", src, false).is_empty());
+    }
+
+    #[test]
+    fn target_for_maps_lib_to_sig() {
+        let root = Path::new("/proj");
+        assert_eq!(target_for("lib/foo.rb", "lib", "sig", root), PathBuf::from("/proj/sig/foo.rbs"));
+        assert_eq!(
+            target_for("lib/a/b.rb", "lib", "sig", root),
+            PathBuf::from("/proj/sig/a/b.rbs")
+        );
+        // A path not under the source root keeps its full relative path.
+        assert_eq!(target_for("app/x.rb", "lib", "sig", root), PathBuf::from("/proj/sig/app/x.rbs"));
+    }
+
+    #[test]
+    fn render_new_file_wraps_nested_namespaces_with_kinds_and_super() {
+        let cand = |class: &str, rbs: &str| Candidate {
+            file: "lib/x.rb".into(),
+            class_name: class.into(),
+            method_name: "m".into(),
+            kind: "instance",
+            rbs: rbs.into(),
+            inferred_return: String::new(),
+        };
+        let mut info = NamespaceInfo::default();
+        info.kinds.insert("Outer".into(), "module");
+        info.kinds.insert("Outer::Inner".into(), "class");
+        info.supers.insert("Outer::Inner".into(), "Base".into());
+        let out = render_new_file(&[cand("Outer::Inner", "def m: () -> :s")], &info);
+        assert_eq!(out, "module Outer\n  class Inner < Base\n    def m: () -> :s\n  end\nend\n");
+    }
+
+    #[test]
+    fn render_new_file_leaf_class_defaults_to_class_keyword() {
+        let cand = Candidate {
+            file: "lib/x.rb".into(),
+            class_name: "Foo".into(),
+            method_name: "g".into(),
+            kind: "instance",
+            rbs: "def g: () -> \"h\"".into(),
+            inferred_return: String::new(),
+        };
+        // No kinds recorded → a leaf with methods defaults to `class`.
+        let out = render_new_file(&[cand], &NamespaceInfo::default());
+        assert_eq!(out, "class Foo\n  def g: () -> \"h\"\nend\n");
     }
 
     #[test]
