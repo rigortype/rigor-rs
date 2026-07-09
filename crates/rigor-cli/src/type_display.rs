@@ -18,3 +18,16 @@ pub fn describe(interner: &Interner, index: &CoreIndex, source: &SourceIndex, ty
     };
     rigor_types::describe_named(interner, ty, &resolve)
 }
+
+/// Erase `ty` to valid RBS as the reference's `Type#erase_to_rbs` would, resolving
+/// class ids through the core RBS index then the project `sig/` registry. The
+/// substrate `sig-gen` reuses; surfaced today via `type-of`'s `erased:` field.
+pub fn erase(interner: &Interner, index: &CoreIndex, source: &SourceIndex, ty: TypeId) -> String {
+    let resolve = |class: ClassId| -> Option<String> {
+        index
+            .class_name_for_id(class)
+            .map(str::to_string)
+            .or_else(|| source.class_name_for_id(class).map(str::to_string))
+    };
+    rigor_types::erase_to_rbs_named(interner, ty, &resolve)
+}
