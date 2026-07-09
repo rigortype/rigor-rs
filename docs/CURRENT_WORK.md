@@ -11,6 +11,23 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `sig-gen-print-slice`) — sig-gen slice 2: `rigor sig-gen --print`.**
+The `--print` RBS-skeleton path over instance methods in a named `class`/`module` body, atop the landed
+`erase_to_rbs` substrate. Walks each file, infers each qualifying method's RETURN via the shared `Typer`, and
+prints `def name: (untyped, …) -> <erased>` grouped by file+class (reference `Generator`/`Renderer`). Reuses
+`ClassDef`/`ModuleDef` `method_bodies`+`method_visibilities` and `MethodBody.params` (`None` == the reference's
+non-simple param shape). **Parity model — byte-identical on the methods BOTH emit** (verified vs the oracle:
+scalar/tuple/record/nested/private/arity). FP-safe guards suppress the divergent-precision cases (constructor
+`initialize`; explicit-return union rigor-rs can't reconstruct; partially-`untyped` shapes; project-class `.new`
+the reference leaves `Dynamic`; bare generic nominals). **KNOWN FORK (needs a call):** the emitted SETS differ
+by inference precision — a broad subset gate over `reference/rigor/lib` shows **4 over-emits in 130 files**, all
+**SOUND** signatures (string-interp / `%i[]` / more-robust inference) the reference's inference degrades on. For
+a generative tool these are coverage EXCESS not false bug reports, but they break strict subset-parity; matching
+the reference's skips exactly would mean replicating its inference gaps (open-ended, fragile). **Gated:** 513
+tests (12 new), run.rb + run_snapshot.rb 54/54 0 FP (check untouched), clippy clean. **NOT yet merged — pending
+the strict-parity-vs-sound-superset decision.** Deferred slices: `--diff`/`--write` (Writer),
+`--params=observed` (ObservationCollector), singleton/attr/`Data.define`, tighter-return classification.
+
 **▶▶ LANDED (branch `sig-gen-erase-substrate`, MERGED `ee60d41`) — sig-gen substrate slice 1: `erase_to_rbs`.**
 The valid-RBS type-erasure layer `sig-gen` needs, built as a reusable substrate (mirroring how `describe_named`
 landed before `annotate` consumed it). `rigor_types::erase_to_rbs_named` ports the reference's
