@@ -53,6 +53,41 @@ the harness reproduces it:
    the reference path wrong (LoadError → empty output → false "identical"). Fix
    the harness, re-run, before believing a diff.
 
+### Generative-tool parity: track the reference's endpoint, don't encode its gaps
+
+`check` is a DIAGNOSTIC tool → strict zero-FP subset (never emit a diagnostic the
+reference doesn't). `sig-gen` (and future GENERATIVE tools that produce code/RBS,
+not bug reports) obey a DIFFERENT bar, decided 2026-07-10 on the
+minimize-long-term-divergence criterion:
+
+- **Emit wherever rigor-rs's SOUND inference yields a concrete type. The one hard
+  guarantee is byte-identity on the methods BOTH tools emit** (verified vs the
+  oracle). The emitted SETS may differ by inference precision.
+- Where rigor-rs is LESS precise (Dynamic where the reference pins) it emits fewer
+  (a coverage gap). Where rigor-rs is MORE precise/robust (the reference's
+  inference degrades to `untyped`/nil — `%i[]`, string-interpolation returns,
+  project-class `.new`, recursion) it emits a SOUND signature the reference skips.
+  **That excess is coverage, NOT a false positive** — a generative tool's extra
+  *correct* output is not a false bug report.
+- **Do NOT add guards that suppress rigor-rs's sound extra precision just to match
+  the reference's CURRENT inference gaps.** Those gaps are transient — the
+  reference trends toward MORE precision (its own ADR-48/55/56/57), so it will
+  CONVERGE toward rigor-rs's output. Encoding a gap as a guard is anti-convergence:
+  when the reference improves, rigor-rs lags and the guard must be removed. That
+  MAXIMIZES eventual divergence — the opposite of the goal — and the gap set is
+  open-ended (unenumerable), so the guards are fragile whack-a-mole.
+- Add a guard ONLY to (1) fix rigor-rs UNSOUNDNESS (a wrong signature — a
+  constructor `initialize` typed as its body); (2) match a reference PERMANENT
+  design decision, not a gap (`initialize -> void`, `dynamic_top?`'s `untyped`
+  skip); or (3) avoid a WRONG emit from a rigor-rs LIMITATION not yet ported (a
+  bare generic nominal the reference *elaborates* to `Array[untyped]` — skip until
+  `TypeElaborator` lands, else the emit byte-diverges on a shared method).
+- **The deepest divergence reducer is porting the reference's inference faithfully
+  at the source** (e.g. `DefReturnTyper`'s explicit-`return` union) so the SETS
+  converge — prefer that over per-case output guards.
+- **Keep divergence VISIBLE**: a differential audit surfaces over-emissions for
+  human adjudication (sound-extra = accept, unsound = fix at the root).
+
 ### Faithful port: read the reference, don't guess
 
 - rigor-rs is a faithful Rust port of the Ruby reference (`reference/rigor`,

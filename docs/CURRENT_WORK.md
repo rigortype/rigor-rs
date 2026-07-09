@@ -11,6 +11,27 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `sig-gen-print-slice`) — sig-gen slice 2: `rigor sig-gen --print`.**
+The `--print` RBS-skeleton path over instance methods in a named `class`/`module` body, atop the landed
+`erase_to_rbs` substrate. Walks each file, infers each qualifying method's RETURN via the shared `Typer`, and
+prints `def name: (untyped, …) -> <erased>` grouped by file+class (reference `Generator`/`Renderer`). Reuses
+`ClassDef`/`ModuleDef` `method_bodies`+`method_visibilities` and `MethodBody.params` (`None` == the reference's
+non-simple param shape). **PARITY MODEL DECIDED (2026-07-10) — sound-superset**, chosen on the
+minimize-long-term-divergence criterion (now a standing principle in **AGENTS.md "Generative-tool parity"**):
+the HARD guarantee is byte-identity on the methods BOTH tools emit (gate: **0 rbs-mismatch across shared methods
+on `reference/rigor/lib`**); the emitted SETS may differ by inference precision, and where rigor-rs is MORE
+robust (string-interp / `%i[]` / project-class `.new` → its instance / partial-`untyped` shape) it emits a SOUND
+signature the reference degrades-and-skips — that excess is COVERAGE we TRACK (the reference converges as it
+gains precision), NOT encode with anti-convergence guards. The ONLY guards are the three sanctioned kinds: fix a
+rigor-rs UNSOUND emit (`initialize`-as-body → skip), match a reference PERMANENT skip (`dynamic_top?`
+whole-`untyped`), or avoid a WRONG emit from an unported rigor-rs LIMITATION (bare-generic → needs
+`TypeElaborator`; explicit-`return` union → needs return exprs in the AST). **Gated:** 513 tests (12 new),
+run.rb + run_snapshot.rb 54/54 0 FP (check untouched), clippy clean; extras spot-checked SOUND. **NEXT (most
+divergence-reducing, per the principle): port `DefReturnTyper`'s explicit-`return` union at the source** (needs
+rigor-parse to preserve `return E` exprs) so the SETS converge; then a sig-gen differential audit
+(`fp_audit`-style) to keep over-emits visible + adjudicated. Deferred: `--diff`/`--write` (Writer),
+`--params=observed` (ObservationCollector), singleton/attr/`Data.define`, tighter-return classification.
+
 **▶▶ LANDED (branch `sig-gen-erase-substrate`, MERGED `ee60d41`) — sig-gen substrate slice 1: `erase_to_rbs`.**
 The valid-RBS type-erasure layer `sig-gen` needs, built as a reusable substrate (mirroring how `describe_named`
 landed before `annotate` consumed it). `rigor_types::erase_to_rbs_named` ports the reference's
