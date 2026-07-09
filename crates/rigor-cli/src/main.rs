@@ -22,6 +22,7 @@ use rigor_types::Interner;
 mod config;
 use config::Config;
 mod annotate;
+mod bundler;
 mod config_audit;
 mod diff;
 mod triage;
@@ -595,7 +596,12 @@ fn analyze_files(
     let timing = std::env::var_os("RIGOR_TIMING").is_some();
     let t_start = std::time::Instant::now();
 
-    let index = CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new(".")));
+    // ADR-72: the effective plugin set = config `plugins:` + `Gemfile.lock`-gated
+    // auto-detected overlays (bundler.auto_detect). Empty-Gemfile.lock projects
+    // (incl. the config-less differential harness) get exactly `cfg.plugins`.
+    let root = std::path::Path::new(".");
+    let effective_plugins = cfg.effective_plugins(root);
+    let index = CoreIndex::for_project(&effective_plugins, &cfg.all_signature_dirs(root));
     let t_index = std::time::Instant::now();
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).
     let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();

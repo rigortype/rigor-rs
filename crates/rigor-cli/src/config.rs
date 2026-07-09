@@ -68,6 +68,11 @@ pub struct Config {
     /// `rbs_collection:` config block (`auto_detect` default `true`, optional
     /// `lockfile` override).
     pub rbs_collection: RbsCollectionConfig,
+    /// ADR-72: `Gemfile.lock`-gated bundled RBS overlays. `bundler.auto_detect`
+    /// (default `true`) auto-applies a bundled overlay plugin for each locked gem
+    /// that ships no RBS (currently `activesupport` → `activesupport-core-ext`),
+    /// so a Rails project "just works" without naming the plugin in `plugins:`.
+    pub bundler: BundlerConfig,
     /// ADR-0036: rigor-rs-SPECIFIC config, namespaced so it stays transparent to
     /// the pure-Ruby reference (which ignores unknown keys) — the same `.rigor.yml`
     /// feeds both. Reference-schema keys stay top-level; rigor-rs-only knobs live
@@ -111,6 +116,21 @@ impl Default for RbsCollectionConfig {
     }
 }
 
+/// ADR-72: the `bundler:` config block. `auto_detect` (default `true`, matching
+/// the reference) enables `Gemfile.lock`-gated auto-application of bundled RBS
+/// overlays.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct BundlerConfig {
+    pub auto_detect: bool,
+}
+
+impl Default for BundlerConfig {
+    fn default() -> Self {
+        BundlerConfig { auto_detect: true }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -121,6 +141,7 @@ impl Default for Config {
             baseline: serde_yaml::Value::Null,
             signature_paths: default_signature_paths(),
             rbs_collection: RbsCollectionConfig::default(),
+            bundler: BundlerConfig::default(),
             rigor_rs: RigorRsConfig::default(),
             present_keys: std::collections::BTreeSet::new(),
         }
@@ -272,6 +293,25 @@ impl Config {
             self.rbs_collection.auto_detect,
         ));
         dirs
+    }
+
+    /// The effective plugin id set for a project rooted at `project_root`: the
+    /// explicit `plugins:` list, plus (when `bundler.auto_detect`, ADR-72) a
+    /// bundled overlay for each `Gemfile.lock`-locked gem that ships no RBS,
+    /// de-duplicated (an explicit entry is never double-added). With no
+    /// `Gemfile.lock` this equals `plugins:`, so the config-less differential
+    /// harness is unaffected.
+    #[must_use]
+    pub fn effective_plugins(&self, project_root: &Path) -> Vec<String> {
+        let mut plugins = self.plugins.clone();
+        if self.bundler.auto_detect {
+            for overlay in crate::bundler::auto_detected_overlays(project_root) {
+                if !plugins.iter().any(|p| p == &overlay) {
+                    plugins.push(overlay);
+                }
+            }
+        }
+        plugins
     }
 
     /// The `.rigor.yml` `rigor_rs.ruby` value (ADR-0036), if set — the config
@@ -437,6 +477,27 @@ mod tests {
         // A stray top-level `ruby:` is NOT the rigor_rs one (must be namespaced).
         let top: Config = serde_yaml::from_str("ruby: auto\n").unwrap();
         assert_eq!(top.ruby_config_value(), None);
+    }
+
+    #[test]
+    fn effective_plugins_auto_detects_and_dedups() {
+        let dir = std::env::temp_dir().join(format!("rigor_eff_plugins_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Gemfile.lock"),
+            "GEM\n  specs:\n    activesupport (7.1.3)\n\nDEPENDENCIES\n  activesupport\n",
+        )
+        .unwrap();
+        // Default (auto_detect on): the overlay is auto-added.
+        let cfg = Config::default();
+        assert_eq!(cfg.effective_plugins(&dir), vec!["activesupport-core-ext".to_string()]);
+        // An explicit entry is not double-added.
+        let explicit = Config { plugins: vec!["activesupport-core-ext".into()], ..Default::default() };
+        assert_eq!(explicit.effective_plugins(&dir), vec!["activesupport-core-ext".to_string()]);
+        // auto_detect off → only the explicit list.
+        let off = Config { bundler: BundlerConfig { auto_detect: false }, ..Default::default() };
+        assert!(off.effective_plugins(&dir).is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
