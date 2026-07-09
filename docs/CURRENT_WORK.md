@@ -11,7 +11,16 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-initialize`) — sig-gen slice 6: `initialize -> void` stub.** A big
+**▶▶ LANDED THIS SESSION (branch `sig-gen-diff`) — sig-gen slice 7: `--diff` mode.** The cheapest remaining
+slice — a thin renderer over the SAME candidates `--print` produces, completing the reference's three output
+modes (`--print` / `--diff` / `--write`). Per candidate: `--- <path>: <class>#<method>` / `+ <rbs>` / blank line
+(reference `render_diff`); rigor-rs emits only NEW methods so never a `- def` declared line (the reference's
+`new_method` shape). `--format json` renders the candidate table regardless of print/diff mode. **Gated:** 528
+tests (1 new), harness 54/54 0 FP, clippy clean; fresh-dir E2E — `--diff` text BYTE-IDENTICAL, `--diff` json ==
+`--print` json. NEXT: Writer UPDATE/merge + `LayoutIndex` (existing-sig projects — the heavy remaining piece);
+`--params=observed` (ObservationCollector); qualified source-class naming; `module_function` `self?.` spelling.
+
+**▶▶ LANDED (branch `sig-gen-initialize`, MERGED `25d82eb`) — sig-gen slice 6: `initialize -> void` stub.** A big
 convergence win — nearly every class has a constructor; shared-method count on `reference/lib` jumped ~33 → 102
 (70 of them `initialize`), **0 mismatch**. **rigor-parse**: a new `ParamShape` (required/optional counts, rest,
 keyword `(name, optional)` list, kwrest, block) captured at lowering onto `Node::Definition` via `param_shape_of`
