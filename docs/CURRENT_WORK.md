@@ -11,6 +11,21 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ LANDED THIS SESSION (branch `gemfile-lock-overlay`) — ADR-72 Gemfile.lock-gated auto-overlay (the
+productization win the plugin investigation pointed to).** rigor-rs now AUTO-APPLIES the bundled
+`activesupport-core-ext` RBS overlay when a project's `Gemfile.lock` locks `activesupport` (which ships no
+RBS), so a Rails project "just works" WITHOUT a `plugins:` config entry — closing the systematic AS-method
+`undefined-method` FP wall (`3.minutes`, `"x".squish`, `Object#blank?`). `crates/rigor-cli/src/bundler.rs`:
+a line-oriented `Gemfile.lock` `GEM/specs:` parser (`locked_gems`, 4-space spec indent) + the
+`GEM_OVERLAY_PLUGIN_IDS` map (`activesupport`->`activesupport-core-ext`, reference
+`Environment::GEM_OVERLAY_PLUGIN_IDS`); `Config::effective_plugins(root)` unions `plugins:` + auto-detected
+overlays (deduped), gated on the new `bundler.auto_detect` (default true). **FP-SAFE by construction** — the
+overlay only ADDS signatures for a locked gem, so a real typo (`5.minuets`) still fires. **Verified:** E2E vs
+the oracle on a Rails-like dir (activesupport in Gemfile.lock) — undefined-method stream BYTE-IDENTICAL (both
+suppress AS methods, both fire the typo); real mastodon root (its actual Gemfile.lock) auto-suppresses the
+AS-method FP wall. **Gated:** 490 tests, run.rb + run_snapshot.rb 54/54, corpus 320 files 0 FP (unchanged -
+the harness/corpus have no Gemfile.lock, so `effective_plugins == plugins:`). NOT yet merged.
+
 **▶▶ (1) POSSIBLE-NIL / IVAR EXPANSION — INVESTIGATED, CONFIRMED NET-NEGATIVE/ZERO-EV (2026-07-06).** Chased the
 possible-nil source-expansion track and found rigor-rs is ALREADY at the FP-safe optimum; the residual is not a
 gap to close. Evidence: (1) the existing nilable-local flow substrate is faithful — a live parity test shows
