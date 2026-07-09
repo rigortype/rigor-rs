@@ -11,7 +11,23 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-return-union`) — sig-gen slice 3: `DefReturnTyper` explicit-return
+**▶▶ LANDED THIS SESSION (branch `sig-gen-singletons`) — sig-gen slice 4: singleton methods + module_function
+safety.** Roughly DOUBLES emitted coverage on real code (the reference emits a large share of `def self.` /
+`self?.`). **rigor-parse**: `Node::Definition` gains `singleton_name` — `Some(name)` for a `def self.x` SELF
+receiver (whose name was otherwise LOST, only receiver-less defs kept a name); additive (all matches use `..`),
+the instance harvest still skips singleton defs so check is unaffected. **sig-gen** collects instance + singleton
+sigs in ONE source-ordered pass over the class body (`def self.x` via `singleton_name`; `class << self` inner
+receiver-less defs), sorted by span so the two interleave in the reference's walk order; singletons render
+`def self.NAME`, kind `singleton`, exempt from the visibility + `initialize` skips (both instance-only in the
+reference). `module_function` now skips a CLASS body too (rule_catalog.rb uses it in a class → reference emits
+`def self?.helper`; rs must not emit `def helper` — probed mismatch, fixed). **Gated:** 522 tests (5 new),
+run.rb + run_snapshot.rb 54/54 0 FP, check-path smoke 0 FP over 20 singleton/module_function files, singleton
+E2E byte-identical (incl. source-order interleaving), **class-aware intersection sweep ~210 reference/lib files:
+0 rbs-mismatch on shared methods**. NEXT (still-skipped coverage): `module_function` `self?.` spelling, qualified
+source-class naming, `TypeElaborator` generic fill, `initialize -> void` stub (needs full-param lowering); then
+`--diff`/`--write` (Writer) → `--params=observed` (ObservationCollector).
+
+**▶▶ LANDED (branch `sig-gen-return-union`, MERGED `929ff74`) — sig-gen slice 3: `DefReturnTyper` explicit-return
 union + `Node::Return`.** The divergence-reducing slice the sound-superset decision named: port the reference's
 return inference at the SOURCE. **rigor-parse gains a real `Node::Return` variant** (values fully lowered as
 children) replacing the recovered-children fallthrough carrier — the typer's catch-all types it `Dynamic[top]`
