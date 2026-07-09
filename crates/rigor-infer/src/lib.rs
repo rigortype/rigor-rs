@@ -216,10 +216,12 @@ impl<'i> Typer<'i> {
             Node::ArrayLit { elements, .. } => {
                 if elements.is_empty() {
                     interner.intern(Type::Tuple(vec![]))
-                } else if elements
-                    .iter()
-                    .any(|&e| matches!(ast.get(e), Node::Statements { .. } | Node::Other { .. }))
-                {
+                } else if elements.iter().any(|&e| {
+                    matches!(
+                        ast.get(e),
+                        Node::Statements { .. } | Node::Other { .. } | Node::Return { .. }
+                    )
+                }) {
                     self.nominal_or_untyped("Array", interner)
                 } else {
                     let elem_ids: Vec<NodeId> = elements.clone();
