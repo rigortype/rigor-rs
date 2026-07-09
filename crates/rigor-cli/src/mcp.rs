@@ -8,8 +8,13 @@
 //!
 //! Tools (all READ-ONLY, all operating on source passed in the call — the server
 //! never reads or writes the filesystem):
-//! - `check`   — analyse Ruby source, return the diagnostics (the `check` path).
-//! - `type_of` — the inferred type of the expression at a 1-based line/column.
+//! - `check`    — analyse Ruby source, return the diagnostics (the `check` path).
+//! - `type_of`  — the inferred type of the expression at a 1-based line/column.
+//! - `explain`  — look up the rule catalogue.
+//! - `outline`  — the structural outline (classes / modules / methods).
+//! - `triage`   — the structured diagnostic triage (distribution / selectors /
+//!   hotspots / summary / hints) of the source (ADR-23).
+//! - `annotate` — rigor's inferred type for every source line (`{ line => type }`).
 //!
 //! Like the LSP server, the RBS environment + config are built ONCE at startup
 //! and reused; every tool call is a single-file parse+lower+analyze. Panic
@@ -187,6 +192,34 @@ fn tool_catalog() -> Value {
                 },
                 "required": ["source"]
             }
+        },
+        {
+            "name": "triage",
+            "description": "Analyze Ruby source and return a structured triage of the diagnostics \
+                            (ADR-23): a rule-id distribution, a class/method selectors axis, per-file \
+                            hotspots, a severity summary, and heuristic hints — the aggregate stats an \
+                            agent uses to prioritise instead of reading the raw per-line list.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "The Ruby source code to analyze." },
+                    "path": { "type": "string", "description": "Optional filename for the report (display only)." }
+                },
+                "required": ["source"]
+            }
+        },
+        {
+            "name": "annotate",
+            "description": "Return rigor's inferred type for every source line as a `{ line => type }` \
+                            map (the xmpfilter `#=> <type>` view) — a quick way to see what the engine \
+                            infers throughout a file.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "The Ruby source code." }
+                },
+                "required": ["source"]
+            }
         }
     ])
 }
@@ -202,6 +235,8 @@ fn tools_call(ctx: &ServerContext, params: &Value) -> Value {
         "type_of" => tool_type_of(ctx, &args),
         "explain" => tool_explain(&args),
         "outline" => tool_outline(&args),
+        "triage" => tool_triage(ctx, &args),
+        "annotate" => tool_annotate(ctx, &args),
         other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
@@ -256,6 +291,44 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
 
     let report = json!({ "diagnostics": items, "count": items.len() });
     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
+}
+
+/// The `triage` tool: analyze the source, then return the structured triage
+/// report (distribution / selectors / hotspots / summary / hints) as JSON. Runs
+/// the SAME suppression + disable filter as `check` before aggregating.
+fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
+    let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
+    let path = args.get("path").and_then(Value::as_str).unwrap_or("<mcp>");
+
+    let bytes = source.as_bytes().to_vec();
+    let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = parse(&bytes);
+        let comments = comment_lines(&result, &bytes);
+        let ast = lower(&result);
+        let src = SourceIndex::build(&ast, &ctx.index);
+        let mut interner = Interner::new();
+        let diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
+        (diags, comments)
+    }))
+    .map_err(|_| "internal error: analysis panicked on this source".to_string())?;
+
+    let (diags, comments) = analysed;
+    let with_lines: Vec<(usize, Diagnostic)> =
+        diags.into_iter().map(|d| (line_col(source, d.start_offset).0, d)).collect();
+    let kept: Vec<Diagnostic> = filter_suppressed(with_lines, &comments)
+        .into_iter()
+        .filter(|(_, d)| !ctx.disable.suppresses(d.rule_id))
+        .map(|(_, d)| d)
+        .collect();
+    let pairs: Vec<(&str, &Diagnostic)> = kept.iter().map(|d| (path, d)).collect();
+    Ok(crate::triage::report_json_for(&pairs, 10, false))
+}
+
+/// The `annotate` tool: return the `{ line => type }` map for the source.
+fn tool_annotate(ctx: &ServerContext, args: &Value) -> Result<String, String> {
+    let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
+    panic::catch_unwind(AssertUnwindSafe(|| crate::annotate::annotations_json(&ctx.index, source)))
+        .map_err(|_| "internal error: annotation panicked on this source".to_string())
 }
 
 /// The `type_of` tool: type the deepest expression at a 1-based (line, column).
@@ -383,6 +456,8 @@ mod tests {
         assert!(names.contains(&"check"));
         assert!(names.contains(&"type_of"));
         assert!(names.contains(&"explain"));
+        assert!(names.contains(&"triage"));
+        assert!(names.contains(&"annotate"));
         // Every tool declares an object inputSchema.
         for t in tools.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object");
@@ -407,6 +482,33 @@ mod tests {
         assert_eq!(parsed["count"], 1);
         assert_eq!(parsed["diagnostics"][0]["rule"], "call.undefined-method");
         assert_eq!(parsed["diagnostics"][0]["line"], 2);
+    }
+
+    #[test]
+    fn triage_tool_returns_structured_report() {
+        let out = tools_call(&ctx(), &json!({
+            "name": "triage",
+            "arguments": { "source": "\"x\".frist\n", "path": "t.rb" }
+        }));
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let report: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["summary"]["total"], 1);
+        assert_eq!(report["selectors"][0]["receiver"], "String");
+        assert_eq!(report["selectors"][0]["method"], "frist");
+    }
+
+    #[test]
+    fn annotate_tool_returns_line_types() {
+        let out = tools_call(&ctx(), &json!({
+            "name": "annotate",
+            "arguments": { "source": "x = [1, 2].first\n" }
+        }));
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let ann: Value = serde_json::from_str(text).unwrap();
+        // The Tuple-projection fold gives `[1, 2].first` → `1`.
+        assert_eq!(ann["annotations"]["1"], "1");
     }
 
     #[test]

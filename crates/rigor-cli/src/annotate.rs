@@ -313,11 +313,30 @@ fn annotate_text(source: &str, line_types: &BTreeMap<usize, String>) -> String {
 /// `--format json` — the `{ "annotations": { "<line>": "<type>" } }` map
 /// (reference `emit_json`), 1-based string line keys in ascending order.
 fn emit_json(line_types: &BTreeMap<usize, String>) {
+    println!("{}", annotations_json_string(line_types));
+}
+
+fn annotations_json_string(line_types: &BTreeMap<usize, String>) -> String {
     let entries: Vec<String> = line_types
         .iter()
         .map(|(line, ty)| format!("{}:{}", serde_json::to_string(&line.to_string()).unwrap(), serde_json::to_string(ty).unwrap()))
         .collect();
-    println!("{{\"annotations\":{{{}}}}}", entries.join(","));
+    format!("{{\"annotations\":{{{}}}}}", entries.join(","))
+}
+
+/// The `{ line => type }` annotations JSON for `source`, typed against `index`
+/// (reused by the `annotate` MCP tool). Types are inferred against the top-level
+/// env, exactly as `rigor annotate --format json`.
+#[must_use]
+pub fn annotations_json(index: &CoreIndex, source: &str) -> String {
+    let ast = lower(&parse(source.as_bytes()));
+    let source_index = SourceIndex::build(&ast, index);
+    let typer = Typer::with_source(index, &source_index);
+    let mut interner = Interner::new();
+    let env = typer.build_toplevel_env(&ast, &mut interner);
+    let line_types =
+        collect_line_types(&ast, &typer, &source_index, index, &env, &mut interner, source);
+    annotations_json_string(&line_types)
 }
 
 #[cfg(test)]
