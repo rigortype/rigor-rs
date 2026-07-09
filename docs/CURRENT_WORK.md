@@ -11,7 +11,28 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-print-slice`) — sig-gen slice 2: `rigor sig-gen --print`.**
+**▶▶ LANDED THIS SESSION (branch `sig-gen-return-union`) — sig-gen slice 3: `DefReturnTyper` explicit-return
+union + `Node::Return`.** The divergence-reducing slice the sound-superset decision named: port the reference's
+return inference at the SOURCE. **rigor-parse gains a real `Node::Return` variant** (values fully lowered as
+children) replacing the recovered-children fallthrough carrier — the typer's catch-all types it `Dynamic[top]`
+exactly like the old carrier so the check path is behavior-preserving BY CONSTRUCTION, with one deliberate
+improvement: `flow.dead-assignment` now fires on `return (x = 5)` byte-identically to the reference
+(oracle-probed; the write now exists in the arena). **sig-gen unions `(tail, every collectible return)`** per
+`DefReturnTyper` (oracle-probed matrix): bare `return`→`nil`; block/nested-def returns BARRIERED (reference
+`RETURN_BARRIER_NODES`; span-containment over `Call::block_body` — the lambda barrier holds structurally, a
+lambda never lowers a `Node::Return`); multi-value `return a, b` SKIPS the method (the reference silently drops
+its type — an unsound emit not adopted); members sort by `describe(:short)` (reference
+`Combinator#sort_members` — `("a" | 1 | :sym)` ordering byte-verified). Sweep adjudication added three
+sanctioned guards: **module_function modules skip** (reference spells `def self?.name`), **any `untyped` inside
+a member skips** (confidence rule — sweep-proven shared-method mismatch source, `Baseline#filter`), **nested
+source-class instances skip** (reference emits fully-qualified names; TOP-LEVEL classes byte-match and emit).
+**Gated:** 520 tests (7 new), run.rb + run_snapshot.rb 54/54 0 FP, check-path smoke 0 FP over 25 return-heavy
+reference/lib files, return-matrix byte-identical, **class-aware intersection sweep: 0 rbs-mismatch on shared
+methods**. NEXT sig-gen follow-ups (each unlocks skipped coverage): qualified source-class naming
+(`Rigor::Plugin::ProtocolContract`), `module_function` `self?.` spelling, `TypeElaborator` generic fill,
+`initialize -> void` stub, singleton methods; then `--diff`/`--write` (Writer) + `--params=observed`.
+
+**▶▶ LANDED (branch `sig-gen-print-slice`, MERGED `7f01322`) — sig-gen slice 2: `rigor sig-gen --print`.**
 The `--print` RBS-skeleton path over instance methods in a named `class`/`module` body, atop the landed
 `erase_to_rbs` substrate. Walks each file, infers each qualifying method's RETURN via the shared `Typer`, and
 prints `def name: (untyped, …) -> <erased>` grouped by file+class (reference `Generator`/`Renderer`). Reuses

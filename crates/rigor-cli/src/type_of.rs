@@ -311,6 +311,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::ConstantRead { .. } => "ConstantRead",
         Node::ConstantWrite { .. } => "ConstantWrite",
         Node::SelfExpr { .. } => "SelfExpr",
+        Node::Return { .. } => "Return",
         Node::Other { .. } => "Other",
     }
 }

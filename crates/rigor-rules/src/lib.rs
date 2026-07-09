@@ -1452,6 +1452,11 @@ fn descend_trailing(ast: &LoweredAst, id: rigor_parse::NodeId) -> Option<rigor_p
             Some(&inner) => descend_trailing(ast, inner),
             None => Some(id),
         },
+        // An explicit `return E` is NOT descended: the reference FIRES
+        // `flow.dead-assignment` on `return (x = 5)` (the local binding is
+        // pointless even though its value is returned — oracle-probed
+        // 2026-07-10), so a write inside a return must NOT get the
+        // implicit-return trailing-write skip.
         _ => Some(id),
     }
 }

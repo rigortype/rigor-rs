@@ -345,6 +345,16 @@ pub enum Node {
     /// lowering walk is total. Carries the original span for completeness.
     ///
     // TODO(spec): grow the owned-node set toward full Prism coverage, and add
+    /// An explicit `return` statement. `values` are the lowered argument
+    /// expressions in source order — empty for a bare `return`, one for
+    /// `return e`, several for `return a, b`. A STATEMENT, not a value: the
+    /// typer's catch-all types it `Dynamic[top]` (exactly like the recovered-
+    /// children `Statements` carrier it replaced), so the check path is
+    /// behavior-preserving; sig-gen's `DefReturnTyper` port reads `values` to
+    /// union a def's explicit returns into its return type. The children live
+    /// in the arena so calls / local reads inside a return stay visible to the
+    /// rule walk (`flow.dead-assignment`, the call rules).
+    Return { values: Vec<NodeId>, span: Span },
     // synthetic-node variants (plugin/macro-generated definitions with no
     // source text) per ADR-0012 / ADR-0013. No plugins yet, so no synthetic
     // variant is materialized in this slice.
@@ -385,6 +395,7 @@ impl Node {
             | Node::ConstantRead { span, .. }
             | Node::ConstantWrite { span, .. }
             | Node::SelfExpr { span }
+            | Node::Return { span, .. }
             | Node::Other { span } => *span,
         }
     }
@@ -1191,10 +1202,26 @@ impl Builder {
             });
         }
 
+        if let Some(ret) = node.as_return_node() {
+            // An explicit `return` — a real owned variant (sig-gen's
+            // `DefReturnTyper` port needs the VALUE expressions to union a def's
+            // explicit returns). The value exprs are FULLY lowered as children,
+            // a strict superset of the old recovered-children carrier (reads /
+            // op-writes / calls inside a return stay visible to `flow.dead-
+            // assignment` + the call rules, plus literals now exist too). The
+            // node itself stays a STATEMENT: the typer's catch-all types it
+            // `Dynamic[top]` exactly like the `Statements` carrier it replaces.
+            let values = ret
+                .arguments()
+                .map(|a| self.lower_body(&a.arguments()))
+                .unwrap_or_default();
+            return self.push(Node::Return { values, span });
+        }
+
         // Anything outside the handled subset: RECOVER any meaningful descendant
         // nodes (local reads / op-writes / calls) so structural walks see them.
         //
-        // The long tail of Prism nodes (`return`, `super`, `yield`, a `*splat`
+        // The long tail of Prism nodes (`super`, `yield`, a `*splat`
         // arg, a block-arg, an assoc-splat, …) has no owned variant. Lowering them
         // to a bare span-only `Other` would DROP their subtree — and with it any
         // `LocalVariableRead` underneath. For `flow.dead-assignment` that is a

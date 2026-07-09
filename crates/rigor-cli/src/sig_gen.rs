@@ -19,32 +19,39 @@
 //!   the reference's scope pins it — rigor-rs emits FEWER (a coverage gap).
 //! - conversely, rigor-rs's inference is more ROBUST on shapes the reference
 //!   degrades to `untyped`/nil (a string-interpolation return, a `%i[]` word
-//!   array, a project-class `.new` → its instance, a partially-`untyped` shape).
-//!   There rigor-rs emits a SOUND signature the reference skips — that excess is
-//!   coverage, NOT a false bug report, and we TRACK it (the reference converges as
-//!   it gains precision) rather than suppress it with anti-convergence guards.
+//!   array, a top-level project-class `.new` → its instance). There rigor-rs
+//!   emits a SOUND signature the reference skips — that excess is coverage, NOT
+//!   a false bug report, and we TRACK it (the reference converges as it gains
+//!   precision) rather than suppress it with anti-convergence guards.
 //!
-//! The only guards are the three AGENTS.md sanctions: fix a rigor-rs UNSOUND emit
-//! (`initialize` typed as its body → skip; the reference's `-> void` stub is a
-//! later slice), match a reference PERMANENT skip (`dynamic_top?`'s whole-`untyped`
-//! return), or avoid a WRONG emit from an unported rigor-rs LIMITATION (a bare
-//! generic nominal the reference *elaborates* to `Array[untyped]`, and an explicit
-//! `return` whose union rigor-rs cannot yet reconstruct from the AST).
+//! **Confidence rule** (sweep-proven refinement): the sound-superset excess
+//! applies only to CONFIDENT types — any `untyped` inside a member (whole or
+//! buried in a composite, `[untyped, 0]`) marks a precision hole where the
+//! reference reads the same code differently, a shared-method mismatch source
+//! (`Baseline#filter`), so such members skip the method.
+//!
+//! The remaining guards are the three AGENTS.md sanctions: fix a rigor-rs UNSOUND
+//! emit (`initialize` typed as its body → skip; a `module_function` module's
+//! methods — the reference spells them `def self?.name` — skip until that
+//! spelling is ported), match a reference PERMANENT skip (`dynamic_top?`,
+//! the block/lambda/def return barrier, multi-value-return methods are skipped
+//! rather than adopt the reference's silent type drop), or avoid a WRONG emit
+//! from an unported rigor-rs LIMITATION (a bare generic nominal the reference
+//! *elaborates* to `Array[untyped]`; a NESTED source-class instance the
+//! reference names fully-qualified — rigor-rs has only the written short name).
 //!
 //! ## Deferred (later slices, each its own gate)
 //!
 //! - `--diff` / `--write` (the `Writer`), `--format json` write-report;
 //! - `--params=observed` (the `ObservationCollector`) — params stay `untyped`;
-//! - singleton (`def self.x` / `class << self`), `module_function`,
-//!   `Const = Data.define(...)` class shells, `attr_*` reader candidates;
+//! - singleton (`def self.x` / `class << self`), `module_function` `self?.`
+//!   spelling, `Const = Data.define(...)` class shells, `attr_*` readers;
 //! - `TIGHTER_RETURN` / `EQUIVALENT` classification against existing project RBS
 //!   (a method that already resolves to an RBS declaration is OMITTED — the
 //!   reference emits `tighter-return`; omitting it is FP-safe, a coverage gap);
-//! - `TypeElaborator`'s generic-arity fill (`Array` → `Array[untyped]`): a bare
-//!   GENERIC nominal return is skipped rather than under-elaborated (FP-safe);
-//! - the explicit-`return` union (`DefReturnTyper#union_with_explicit_returns`):
-//!   a method with any `return E` is skipped (rigor-rs's AST keeps only the
-//!   `has_explicit_return` flag, not the return expressions) — FP-safe.
+//! - `TypeElaborator`'s generic-arity fill (`Array` → `Array[untyped]`);
+//! - QUALIFIED source-class naming (`Rigor::Plugin::ProtocolContract`) — unlocks
+//!   the nested source-class returns skipped above.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -173,16 +180,61 @@ fn generate_file(path: &str, include_private: bool) -> Vec<Candidate> {
     let mut interner = Interner::new();
     let env = typer.build_toplevel_env(&ast, &mut interner);
 
-    let mut out = Vec::new();
+    // Written names of NESTED class/module declarations (non-empty lexical
+    // prefix). rigor-rs's SourceIndex types a project `X.new` under the WRITTEN
+    // short name, but the reference emits the FULLY-QUALIFIED name
+    // (`Rigor::Plugin::ProtocolContract`) — so a nested source-class member
+    // would byte-diverge on a shared method. Top-level classes' written name IS
+    // the qualified name (oracle-probed byte-identical), so only nested ones
+    // must skip until qualified source-class naming is ported.
+    let mut nested_classes: std::collections::HashSet<String> = std::collections::HashSet::new();
     let root = ast.root();
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
+            collect_nested_class_names(&ast, child, false, &mut nested_classes);
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Node::Program { body, .. } = ast.get(root) {
+        for &child in body {
             walk_namespace(
-                &ast, child, &[], path, include_private, &index, &typer, &env, &mut interner, &mut out,
+                &ast,
+                child,
+                &[],
+                path,
+                include_private,
+                &index,
+                &typer,
+                &env,
+                &nested_classes,
+                &mut interner,
+                &mut out,
             );
         }
     }
     out
+}
+
+/// Collect the written names of class/module declarations that are lexically
+/// NESTED (inside another class/module). `inside` is true once we are within any
+/// namespace body.
+fn collect_nested_class_names(
+    ast: &LoweredAst,
+    id: NodeId,
+    inside: bool,
+    out: &mut std::collections::HashSet<String>,
+) {
+    let (name, body) = match ast.get(id) {
+        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => (name, body),
+        _ => return,
+    };
+    if inside {
+        out.insert(name.clone());
+    }
+    for &child in body {
+        collect_nested_class_names(ast, child, true, out);
+    }
 }
 
 /// Recurse a `class` / `module` node, emitting a candidate per qualifying direct
@@ -198,15 +250,16 @@ fn walk_namespace(
     index: &CoreIndex,
     typer: &Typer,
     env: &TypeEnv,
+    nested_classes: &std::collections::HashSet<String>,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
 ) {
-    let (name, method_bodies, visibilities, body) = match ast.get(id) {
+    let (name, method_bodies, visibilities, body, is_module) = match ast.get(id) {
         Node::ClassDef { name, method_bodies, method_visibilities, body, .. } => {
-            (name, method_bodies, method_visibilities, body)
+            (name, method_bodies, method_visibilities, body, false)
         }
         Node::ModuleDef { name, method_bodies, method_visibilities, body, .. } => {
-            (name, method_bodies, method_visibilities, body)
+            (name, method_bodies, method_visibilities, body, true)
         }
         _ => return,
     };
@@ -215,18 +268,54 @@ fn walk_namespace(
     qualified.push(name.clone());
     let class_name = qualified.join("::");
 
-    for method in method_bodies {
-        if let Some(candidate) = method_candidate(
-            ast, method, visibilities, &class_name, path, include_private, index, typer, env, interner,
-        ) {
-            out.push(candidate);
+    // A module with a bare `module_function` call: the reference emits its
+    // methods as `def self?.name` (the dual instance+singleton RBS spelling —
+    // `@module_function_methods` in the reference walker). rigor-rs's lowering
+    // does not track module_function state, so emitting `def name` here would
+    // byte-diverge on a shared method — skip the whole module's methods until
+    // the `self?.` spelling is ported (FP-safe under-emit; nested namespaces
+    // still descend).
+    let module_function_active = is_module
+        && body.iter().any(|&c| {
+            matches!(ast.get(c), Node::Call { method, receiver: None, .. } if method == "module_function")
+        });
+
+    if !module_function_active {
+        for method in method_bodies {
+            if let Some(candidate) = method_candidate(
+                ast,
+                method,
+                visibilities,
+                &class_name,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                nested_classes,
+                interner,
+            ) {
+                out.push(candidate);
+            }
         }
     }
 
     // Descend into nested class/module declarations in this body.
     for &child in body {
         if matches!(ast.get(child), Node::ClassDef { .. } | Node::ModuleDef { .. }) {
-            walk_namespace(ast, child, &qualified, path, include_private, index, typer, env, interner, out);
+            walk_namespace(
+                ast,
+                child,
+                &qualified,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                nested_classes,
+                interner,
+                out,
+            );
         }
     }
 }
@@ -245,6 +334,7 @@ fn method_candidate(
     index: &CoreIndex,
     typer: &Typer,
     env: &TypeEnv,
+    nested_classes: &std::collections::HashSet<String>,
     interner: &mut Interner,
 ) -> Option<Candidate> {
     // Visibility: skip private / protected unless `--include-private`
@@ -271,41 +361,91 @@ fn method_candidate(
         return None;
     }
 
-    // Explicit-return union (reference `DefReturnTyper#union_with_explicit_returns`):
-    // the return type is `union(tail, every `return E` type)`. rigor-rs's lowering
-    // records only the FLAG `has_explicit_return`, not the return EXPRESSIONS, so
-    // it cannot reconstruct that union — and a `return E` whose `E` is Dynamic (an
-    // ivar/param read) would make the reference's union erase to `untyped` and be
-    // SKIPPED. Since rigor-rs would otherwise see only the concrete tail and
-    // over-emit (the `Nominal#erase_to_rbs` / `DiffCommand#run` cases), any method
-    // with an explicit return is skipped here — FP-safe (a coverage gap). Typing
-    // the return expressions is a later slice (needs them preserved in the AST).
-    if method.has_explicit_return {
+    // Explicit-return union (reference `DefReturnTyper#union_with_explicit_returns`,
+    // oracle-probed 2026-07-10): the return type is `union(tail, every collectible
+    // `return E` type)` — a bare `return` contributes `nil`; a `return` inside a
+    // BLOCK or a nested def is BARRIERED (reference `RETURN_BARRIER_NODES` —
+    // block/lambda/def — a deliberate design, matched here); a MULTI-value
+    // `return a, b` makes the method SKIP (the reference silently drops its type,
+    // an unsound emit we do not adopt — under-emit is FP-safe); members sort by
+    // their `describe(:short)` string (reference `Combinator#sort_members`) and
+    // dedup; any `untyped`-erasing member skips the method (`dynamic_top?` on the
+    // erased union).
+    let returns = collect_explicit_returns(ast, method)?;
+
+    // Tail type (reference `body_last_expression` + `safe_type_of`): the last
+    // statement's type; an assignment tail evaluates to its RHS; a `return E`
+    // tail evaluates to its value (`nil` when bare).
+    let tail_ty = def_return_type(ast, typer, &method.body, env, interner)?;
+
+    // Assemble the member list: flatten(tail) + each return's type (bare → nil),
+    // dedup by TypeId (structural identity via the hash-consing interner).
+    let mut members: Vec<TypeId> = Vec::new();
+    let push_flat = |interner: &mut Interner, members: &mut Vec<TypeId>, ty: TypeId| {
+        let flat: Vec<TypeId> = match interner.get(ty) {
+            Type::Union(ms) => ms.clone(),
+            _ => vec![ty],
+        };
+        for m in flat {
+            if !members.contains(&m) {
+                members.push(m);
+            }
+        }
+    };
+    push_flat(interner, &mut members, tail_ty);
+    for ret in &returns {
+        let ty = match ret {
+            Some(v) => typer.type_of(ast, *v, env, interner),
+            None => interner.nil(),
+        };
+        push_flat(interner, &mut members, ty);
+    }
+
+    // `dynamic_top?` (a reference PERMANENT skip): any Top/Dynamic member — or any
+    // member erasing to `untyped` — collapses the erased union to `untyped`; the
+    // method is skipped rather than emitted as `-> untyped`.
+    if members
+        .iter()
+        .any(|&m| matches!(interner.get(m), Type::Top | Type::Dynamic(_)))
+    {
         return None;
     }
 
-    // Return inference (reference `DefReturnTyper` — the shared `annotate` logic):
-    // the last statement's type, an assignment tail evaluating to its RHS.
-    let ret_ty = def_return_type(ast, typer, &method.body, env, interner)?;
-    let erased = crate::type_display::erase(interner, index, typer.source(), ret_ty);
-
-    // Skip a WHOLE-`untyped` / `Top` / `Dynamic` return (reference `dynamic_top?`,
-    // a PERMANENT design skip): emitting `-> untyped` obscures rather than helps.
-    // A PARTIALLY-`untyped` shape (`Hash[String, untyped]`, `{ k: untyped }`) is a
-    // SOUND signature — rigor-rs emits it even though the reference degrades that
-    // body to whole-`untyped` and skips (a reference inference GAP we track, not
-    // encode; AGENTS.md "Generative-tool parity").
-    if erased == "untyped" || matches!(interner.get(ret_ty), Type::Top | Type::Dynamic(_)) {
-        return None;
+    // Sort by the DESCRIBE string (reference `sort_members` — `describe(:short)`,
+    // NOT the erased form), then erase each member.
+    members.sort_by_key(|&m| crate::type_display::describe(interner, index, typer.source(), m));
+    let mut erased_members: Vec<String> = Vec::new();
+    for &m in &members {
+        let e = crate::type_display::erase(interner, index, typer.source(), m);
+        // Any `untyped` ANYWHERE in a member (whole `untyped`, or buried inside a
+        // composite — `[untyped, 0]`, `Hash[String, untyped]`) skips the method:
+        // an untyped hole marks a point where rigor-rs's inference lost precision,
+        // and the reference's inference reads the SAME code differently there
+        // (sweep-proven: `Baseline#filter` emitted `[untyped, untyped]` vs the
+        // reference's `[Array[untyped], 0 | Integer]` — a shared-method byte
+        // mismatch). The sound-superset excess applies only to CONFIDENT types.
+        if e.contains("untyped") {
+            return None;
+        }
+        // A bare GENERIC nominal member (`Array` / `Hash` / …) would be
+        // `Array[untyped]` after the reference's `TypeElaborator` fill (deferred
+        // here), so its presence skips the method rather than emit an
+        // under-elaborated form that would byte-diverge on a shared method.
+        if is_bare_generic_name(&e) {
+            return None;
+        }
+        // A NESTED source-class instance renders its WRITTEN short name here but
+        // the reference emits the fully-qualified name — skip until qualified
+        // source-class naming is ported (top-level classes match byte-for-byte
+        // and still emit).
+        if nested_classes.contains(&e) {
+            return None;
+        }
+        if !erased_members.contains(&e) {
+            erased_members.push(e);
+        }
     }
-    // A bare GENERIC nominal (`Array` / `Hash` / …) would be `Array[untyped]`
-    // after the reference's `TypeElaborator` fill (deferred here), so skip it
-    // rather than emit an under-elaborated form (FP-safe coverage gap). Checked on
-    // the ERASED string (a value-pinned `Array[Integer]` / `[1, 2]` carries a
-    // bracket and is NOT bare, so it still emits).
-    if is_bare_generic_name(&erased) {
-        return None;
-    }
+    let erased = erased_members.join(" | ");
 
     let head = if arity == 0 {
         "()".to_string()
@@ -325,10 +465,96 @@ fn method_candidate(
     })
 }
 
+/// Collect the def's collectible explicit-return value expressions, or `None`
+/// when the method must be SKIPPED. Each element is `Some(value NodeId)` for a
+/// single-value `return e` / `None` for a bare `return` (→ `nil`). Ports the
+/// reference `DefReturnTyper#collect_return_types` semantics over the lowered
+/// arena:
+///
+/// - **Barriers** (reference `RETURN_BARRIER_NODES` = block / lambda / def): a
+///   `return` inside a `Call`'s `block_body` or a nested def/class/module is NOT
+///   collected. A lambda's `return` never lowers to [`Node::Return`] at all (the
+///   lambda routes through the recovered-children fallthrough), so the lambda
+///   barrier holds structurally.
+/// - **Multi-value** `return a, b`: the reference silently contributes NOTHING
+///   (emitting a signature that misses the tuple — an unsound emit); rigor-rs
+///   SKIPS the method instead (under-emit, FP-safe, no shared-method mismatch).
+/// - **Residual ambiguity**: `has_explicit_return` trips on returns inside
+///   lambdas AND inside unhandled wrappers; the former the reference barriers
+///   (safe to emit) but the latter it collects. When the flag is set yet NO
+///   [`Node::Return`] exists anywhere in the def, the two are indistinguishable
+///   → skip (rare, FP-safe).
+///
+/// Membership is by span containment against the def's body-statement spans
+/// (the arena is flat; spans nest strictly), mirroring how outline/flow walks
+/// resolve nesting.
+fn collect_explicit_returns(ast: &LoweredAst, method: &MethodBody) -> Option<Vec<Option<NodeId>>> {
+    if !method.has_explicit_return {
+        return Some(Vec::new());
+    }
+
+    let regions: Vec<(usize, usize)> =
+        method.body.iter().map(|&id| ast.get(id).span()).collect();
+    let within = |s: (usize, usize), regions: &[(usize, usize)]| {
+        regions.iter().any(|&(rs, re)| rs <= s.0 && s.1 <= re)
+    };
+
+    // Barrier regions inside this def: block bodies + nested class-like scopes.
+    // (The def's own body statements are the regions, so any Definition matched
+    // within them is a NESTED def, never the def itself.)
+    let mut barriers: Vec<(usize, usize)> = Vec::new();
+    for (_, node) in ast.iter() {
+        match node {
+            Node::Call { block_body, span, .. } if !block_body.is_empty() => {
+                if within(*span, &regions) {
+                    for &b in block_body {
+                        barriers.push(ast.get(b).span());
+                    }
+                }
+            }
+            Node::Definition { span, .. }
+            | Node::ClassDef { span, .. }
+            | Node::ModuleDef { span, .. }
+                if within(*span, &regions) =>
+            {
+                barriers.push(*span);
+            }
+            _ => {}
+        }
+    }
+
+    let mut found_any = false;
+    let mut collected: Vec<Option<NodeId>> = Vec::new();
+    for (_, node) in ast.iter() {
+        if let Node::Return { values, span } = node {
+            if !within(*span, &regions) {
+                continue;
+            }
+            found_any = true;
+            if within(*span, &barriers) {
+                continue; // block / nested-def barrier (reference design)
+            }
+            match values.len() {
+                0 => collected.push(None),
+                1 => collected.push(Some(values[0])),
+                _ => return None, // multi-value return → skip (see above)
+            }
+        }
+    }
+
+    // Flag set but no Return lowered → lambda-or-unhandled ambiguity → skip.
+    if !found_any {
+        return None;
+    }
+    Some(collected)
+}
+
 /// A method's inferred return type, or `None` for an empty body (reference
 /// `DefReturnTyper`): the last statement's type, an assignment tail evaluating to
-/// its RHS value. Typed against the top-level env — a def-LOCAL binding types
-/// `Dynamic` (the documented `annotate` deferral) and is then skipped upstream.
+/// its RHS value, a `return E` tail to its value (`nil` when bare — the oracle
+/// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
+/// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
+/// `annotate` deferral) and is then skipped upstream.
 fn def_return_type(
     ast: &LoweredAst,
     typer: &Typer,
@@ -342,6 +568,11 @@ fn def_return_type(
         | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => *value,
+        Node::Return { values, .. } => match values.len() {
+            0 => return Some(interner.nil()),
+            1 => values[0],
+            _ => return None,
+        },
         _ => tail,
     };
     Some(typer.type_of(ast, target, env, interner))
@@ -512,13 +743,74 @@ mod tests {
     }
 
     #[test]
-    fn skips_methods_with_explicit_return() {
-        // An explicit `return` means the true return type is a union rigor-rs
-        // cannot reconstruct (the return expressions are not in the AST), so the
-        // method is skipped — matching the reference skipping `Nominal#erase_to_rbs`
-        // (which has `return class_name`).
-        let src = "class Foo\n  def m\n    return bar if cond\n    \"tail\"\n  end\nend\n";
-        assert!(candidates_tagged("expret", src, false).is_empty());
+    fn unions_explicit_returns_with_tail_in_describe_order() {
+        // Oracle-probed matrix (2026-07-10): members sort by describe(:short) —
+        // `"s"` < `1` — and the union paren-wraps in method position.
+        let src = "class A\n  def m(x)\n    return 1 if x\n    \"s\"\n  end\nend\n";
+        let cs = candidates_tagged("union", src, false);
+        assert_eq!(cs[0].rbs, "def m: (untyped) -> (\"s\" | 1)");
+    }
+
+    #[test]
+    fn bare_return_contributes_nil() {
+        let src = "class A\n  def m(x)\n    return if x\n    \"s\"\n  end\nend\n";
+        let cs = candidates_tagged("bareret", src, false);
+        assert_eq!(cs[0].rbs, "def m: (untyped) -> (\"s\" | nil)");
+    }
+
+    #[test]
+    fn tail_return_types_as_its_value_and_dedups() {
+        // A tail `return 42` types 42 (oracle) and dedups against the collected
+        // return; a same-value return collapses to the single member.
+        let src = "class A\n  def t\n    return 42\n  end\n  def s(x)\n    return 1 if x\n    1\n  end\nend\n";
+        let cs = candidates_tagged("tailret", src, false);
+        assert_eq!(cs[0].rbs, "def t: () -> 42");
+        assert_eq!(cs[1].rbs, "def s: (untyped) -> 1");
+    }
+
+    #[test]
+    fn block_return_is_barriered_and_multi_return_skips() {
+        // A return inside a block is barriered (reference RETURN_BARRIER_NODES —
+        // union is tail-only); a multi-value return skips the method (the
+        // reference silently drops its type, an unsound emit we do not adopt).
+        let src = "class A\n  def b(x)\n    [1].each { return 5 }\n    \"s\"\n  end\n  def m(x)\n    return 1, 2 if x\n    \"s\"\n  end\nend\n";
+        let cs = candidates_tagged("blockret", src, false);
+        assert_eq!(cs.len(), 1, "only the block-barriered method emits: {cs:?}");
+        assert_eq!(cs[0].rbs, "def b: (untyped) -> \"s\"");
+    }
+
+    #[test]
+    fn nested_source_class_instance_skips_but_top_level_emits() {
+        // A NESTED class's instance renders its written short name (`Inner`) but
+        // the reference emits the qualified `Outer::Inner` — skip. A TOP-LEVEL
+        // class's written name IS qualified — emit (oracle byte-identical).
+        let src = "module Outer\n  class Inner\n  end\n  class Maker\n    def make\n      Inner.new\n    end\n  end\nend\n";
+        assert!(candidates_tagged("nestcls", src, false).is_empty());
+    }
+
+    #[test]
+    fn module_function_module_skips_methods() {
+        // The reference spells a module_function module's methods `def self?.m`;
+        // rigor-rs doesn't track module_function yet → skip the module's methods.
+        let src = "module Util\n  module_function\n\n  def helper\n    1\n  end\nend\n";
+        assert!(candidates_tagged("modfunc", src, false).is_empty());
+    }
+
+    #[test]
+    fn untyped_inside_composite_member_skips() {
+        // `[x, 0]` with x untyped erases `[untyped, 0]` — an inference hole the
+        // reference reads differently (sweep-proven mismatch source) → skip.
+        let src = "class A\n  def m(x)\n    [x, 0]\n  end\nend\n";
+        assert!(candidates_tagged("untycomp", src, false).is_empty());
+    }
+
+    #[test]
+    fn dynamic_return_member_skips_method() {
+        // `return bar` (an unresolved call → Dynamic) poisons the union →
+        // dynamic_top? → skip, matching the reference's untyped-return skip
+        // (the Nominal#erase_to_rbs / DiffCommand#run over-emit fix).
+        let src = "class A\n  def m(c)\n    return bar if c\n    \"tail\"\n  end\nend\n";
+        assert!(candidates_tagged("dynret", src, false).is_empty());
     }
 
     #[test]
