@@ -11,6 +11,22 @@ Last updated: 2026-07-06 (config-audit #8 + diff #10 + triage #11 + type-display
 `diff` + `triage` + type-display layer + value-pinned ARRAY/HASH typing LANDED; `rigor annotate` ported.**
 Read `AGENTS.md` "Working discipline" before continuing.
 
+**▶▶ (1) POSSIBLE-NIL / IVAR EXPANSION — INVESTIGATED, CONFIRMED NET-NEGATIVE/ZERO-EV (2026-07-06).** Chased the
+possible-nil source-expansion track and found rigor-rs is ALREADY at the FP-safe optimum; the residual is not a
+gap to close. Evidence: (1) the existing nilable-local flow substrate is faithful — a live parity test shows
+BOTH tools fire on the local nilable form (`x = s.byteslice(r); x.upcase`) and NEITHER on the direct chain, and
+BOTH fire **0** possible-nil on the idiomatic node-field traversal (`current = current.next until
+current.next.nil?`). (2) The reference's OWN ADR-58 tells the story: its ScopeIndexer ivar index types a node
+field `Node | nil`, which MANUFACTURES 109 invariant-guarded FPs across the algorithm corpora, and ADR-58's
+DECISION is a FP-SUPPRESSION policy (WD1: declaration-sourced nil is not diagnostic fuel) — WD2 (the precision
+half) is recorded "corpus yield ~zero". rigor-rs reaches the identical FP-safe state for FREE by not typing
+ivars, so ADDING ivar typing would re-introduce the 109 FPs unless the WD1 suppression is also ported, for ~zero
+net coverage. Every other possible-nil source is likewise done-or-measured-zero: string/array slice + nilable-RBS
+return LANDED; project-method nilable return is ADR-0041 (0 survey gaps, deferred); `T | nil` params need param
+typing (ADR-5 keeps params lenient). ⇒ The possible-nil frontier is thoroughly tapped (confirming both the
+flow-frontier note AND ADR-58's own measurement). **The genuine high-value remaining track is the Rails PLUGIN
+ENGINE (ADR-0013/0027) — the biggest remaining undefined-method coverage pool.**
+
 **▶▶ (c) REMAINING-COMMANDS ASSESSMENT (2026-07-06, investigated — DEFERRED as substrate-blocked).** The four
 unported CLI commands each depend on substrate rigor-rs lacks or diverge structurally, so none is a clean
 faithful port right now: **sig-gen** needs `erase_to_rbs` (conservative value-pin->nominal RBS erasure — a
