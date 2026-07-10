@@ -1115,6 +1115,76 @@ impl<'i> Typer<'i> {
             Node::Call { .. } => {
                 self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
             }
+            Node::If { predicate, then_body, else_body, .. } => {
+                let (predicate, then_body, else_body) =
+                    (*predicate, then_body.clone(), else_body.clone());
+                // Constant-fold suppression parity (ADR-0038 Slice 2, spec §7): the
+                // reference folds a literal / constant-typed predicate to a provably
+                // live branch, so the branch-merge injects NO nil (a one-branch
+                // assign becomes unconditional, or the dead branch is pruned).
+                // rigor-rs does NOT fold, so minting nilability here would over-fire.
+                // Fall back to the conservative `other` treatment (widen the whole
+                // If span, clear every nenv fact) — byte-identical to master's arm.
+                let pty = self.type_of(ast, predicate, tenv, interner);
+                if matches!(interner.get(pty), Type::Constant(_)) {
+                    let span = ast.get(id).span();
+                    widen_flow_writes(writes, span, tenv, interner);
+                    widen_penv_writes(writes, span, penv);
+                    nenv.clear();
+                    return;
+                }
+                // Record possible-nil USES inside the predicate itself, applying the
+                // existing guard / safe-nav / logical narrowing to `nenv`.
+                self.nil_flow_expr(ast, predicate, tenv, nenv, penv, writes, interner, out);
+                // MANDATORY truthy-narrowing + conservative over-narrowing (spec
+                // pitfall b): clear EVERY local MENTIONED in the predicate. A bare
+                // `if x` narrows x truthy in the then-branch, which `nil_flow_expr`
+                // (Call/Logical only) does not catch; more generally any predicate
+                // mention (`x`, `x.nil?`, `is_a?`, `&&`, safe-nav, `respond_to?`, an
+                // early-return guard's predicate) is a place the reference MAY narrow
+                // — clearing here guarantees FIRE ⊆ reference (FP-safe), at the cost
+                // of under-emitting the reference's non-narrowing guards (`present?`),
+                // an accepted coverage gap.
+                let pspan = ast.get(predicate).span();
+                let pnames = locals_read_in_span(ast, pspan);
+                for name in &pnames {
+                    nenv.remove(name);
+                }
+                // Descend each branch independently from the (post-predicate)
+                // dominating state, then JOIN — the nenv/penv counterpart of the
+                // tenv-only join in `flow_eval_stmt`'s If arm.
+                let mut then_tenv = tenv.clone();
+                let mut then_nenv = nenv.clone();
+                let mut then_penv = penv.clone();
+                self.nil_flow_scope(
+                    ast, &then_body, &mut then_tenv, &mut then_nenv, &mut then_penv, writes,
+                    interner, out,
+                );
+                let mut else_tenv = tenv.clone();
+                let mut else_nenv = nenv.clone();
+                let mut else_penv = penv.clone();
+                self.nil_flow_scope(
+                    ast, &else_body, &mut else_tenv, &mut else_nenv, &mut else_penv, writes,
+                    interner, out,
+                );
+                // tenv join: a binding survives only when both branches agree (else
+                // Dynamic); a name bound in only one branch widens to Dynamic but is
+                // PRESENT (so a later If sees it as pre-bound, not a fresh NilPath).
+                *tenv = join_flow_envs(&then_tenv, &else_tenv, interner);
+                // penv join: keep the `Array.new`-Nominal provenance only where BOTH
+                // branches agree — a provenance on only one path is uncertain and
+                // over-claiming it could over-fire the array-slice source.
+                *penv = then_penv.intersection(&else_penv).cloned().collect();
+                // nenv join: mint / preserve the certain `C | nil` facts from the
+                // branch-merge nil-injection (the conditional-assignment source
+                // emerges HERE).
+                *nenv = self.join_nil_envs(&then_tenv, &then_nenv, &else_tenv, &else_nenv, interner);
+                // Re-clear predicate-mentioned locals: a mint could re-introduce a
+                // name the predicate narrows (`x = f if x`) — keep FIRE ⊆ reference.
+                for name in &pnames {
+                    nenv.remove(name);
+                }
+            }
             Node::Definition { body, .. }
             | Node::ClassDef { body, .. }
             | Node::ModuleDef { body, .. } => {
@@ -1126,10 +1196,12 @@ impl<'i> Typer<'i> {
                 let mut p: HashSet<String> = HashSet::new();
                 self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, writes, interner, out);
             }
-            // Any other statement (`if`/`unless`/`while`/`case`/logical/begin/
-            // multi-assign/ivar-write/…) is UNMODELED in Slice 1: widen `tenv` and
-            // `penv` for the locals it writes, and CLEAR ALL `nenv` facts (decline
-            // backstop — no fact survives an unmodeled construct). No descent.
+            // Any other statement (`while`/`case`/logical/begin/multi-assign/
+            // ivar-write/…) remains UNMODELED (Slice 2 covers only `if`/`unless`):
+            // widen `tenv` and `penv` for the locals it writes, and CLEAR ALL `nenv`
+            // facts (decline backstop — no fact survives an unmodeled construct). No
+            // descent. `case`/loop branch-merges are DEFERRED here — FP-safe under-
+            // emit until a later slice ports their join.
             other => {
                 let span = other.span();
                 widen_flow_writes(writes, span, tenv, interner);
@@ -1327,6 +1399,78 @@ impl<'i> Typer<'i> {
             _ => None,
         }
     }
+
+    /// Join the nilability facts of two `if`/`unless` branches into the
+    /// continuation `nenv` (ADR-0038 Slice 2 — the branch-merge nil-injection,
+    /// reference `join_with_nil_injection`). A name is minted / kept as a certain
+    /// `C | nil` iff, unioning both branch states, **nil is possible** AND
+    /// **exactly one known non-nil core class `C`** contributes AND **no branch
+    /// binds it to an unknown/ambiguous class**. Everything else is dropped
+    /// (non-nil, or decline) — an under-emit, which is FP-safe.
+    ///
+    /// Per branch a name is one of:
+    /// - **Nilable(C)** — in that branch's `nenv`: already-proven `C | nil`
+    ///   (contributes nil + class `C`).
+    /// - **Bound(T)** — in `tenv`, not `nenv`: bound non-nil; contributes class
+    ///   `class_of(T)` if a `knows_class` nominal, else marks the join AMBIGUOUS
+    ///   (a `Dynamic`/unmodeled bind ⇒ we cannot name the non-nil arm).
+    /// - **NilPath** — absent from `tenv`: unbound on this path ⇒ reads as `nil`
+    ///   (Ruby's implicit-nil for a local assigned only on the sibling path).
+    ///   Contributes nil, no class. Because `tenv` is CLONED into each branch and
+    ///   never shrinks, a NilPath means the name was neither pre-bound nor
+    ///   assigned here — exactly the reference's "assigned in only one branch,
+    ///   undefined before" nil-injection trigger. This is what MINTS
+    ///   `x = expr if c` ⇒ `x : typeof(expr) | nil`.
+    fn join_nil_envs(
+        &self,
+        then_tenv: &TypeEnv,
+        then_nenv: &HashMap<String, &'static str>,
+        else_tenv: &TypeEnv,
+        else_nenv: &HashMap<String, &'static str>,
+        interner: &mut Interner,
+    ) -> HashMap<String, &'static str> {
+        // (nil_seen, known_class, ambiguous) for one branch's view of `n`.
+        let contrib = |n: &str,
+                       tenv: &TypeEnv,
+                       nenv: &HashMap<String, &'static str>,
+                       interner: &Interner|
+         -> (bool, Option<&'static str>, bool) {
+            if let Some(&arm) = nenv.get(n) {
+                return (true, Some(arm), false); // certain C | nil
+            }
+            if let Some(&ty) = tenv.get(n) {
+                return match self.index.class_name_of(interner, ty) {
+                    Some(c) if self.index.knows_class(c) => (false, Some(c), false),
+                    _ => (false, None, true), // bound to an unmodeled class ⇒ ambiguous
+                };
+            }
+            (true, None, false) // NilPath: unbound ⇒ nil, no class
+        };
+        let names: HashSet<&String> = then_tenv.keys().chain(else_tenv.keys()).collect();
+        let mut out = HashMap::new();
+        for n in names {
+            let (t_nil, t_class, t_amb) = contrib(n, then_tenv, then_nenv, interner);
+            let (e_nil, e_class, e_amb) = contrib(n, else_tenv, else_nenv, interner);
+            let nil_seen = t_nil || e_nil;
+            let ambiguous = t_amb || e_amb;
+            // Fold the (≤ 2) known-class contributions; `multi` marks disagreement.
+            let mut cls: Option<&'static str> = None;
+            let mut multi = false;
+            for c in [t_class, e_class].into_iter().flatten() {
+                match cls {
+                    None => cls = Some(c),
+                    Some(existing) if existing == c => {}
+                    Some(_) => multi = true,
+                }
+            }
+            if nil_seen && !ambiguous && !multi {
+                if let Some(c) = cls {
+                    out.insert(n.clone(), c);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Collect every local-write `(span, name)` in the arena (plain and op-writes),
@@ -1337,6 +1481,23 @@ fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
         .filter_map(|(_, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
             | Node::LocalVariableOpWrite { name, span, .. } => Some((*span, name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every local-variable NAME read anywhere in `span` (orphan-proof span-scan,
+/// same rationale as `dead_assignments_in_def`'s read gather: a lossily-lowered
+/// wrapper may orphan a read's parent link, but the read node still lands in the
+/// flat arena with its byte span inside the enclosing construct). Used to clear
+/// the nilability fact of every local MENTIONED in an `if`/`unless` predicate —
+/// the conservative over-narrowing that keeps `possible-nil` FIRE ⊆ reference.
+fn locals_read_in_span(ast: &LoweredAst, span: rigor_parse::Span) -> Vec<String> {
+    ast.iter()
+        .filter_map(|(_, n)| match n {
+            Node::LocalVariableRead { name, span: s } if span.0 <= s.0 && s.1 <= span.1 => {
+                Some(name.clone())
+            }
             _ => None,
         })
         .collect()
@@ -1686,6 +1847,57 @@ mod tests {
             snaps.is_empty(),
             "an outer fact must not leak past a same-named block param"
         );
+    }
+
+    /// Helper: the recorded arm for the `x.<method>` use in `src` (None = silent).
+    fn nil_arm_for(src: &[u8], method: &str) -> Option<&'static str> {
+        let ast = lower_src(src);
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+        let use_id = ast.iter().find_map(|(id, n)| match n {
+            Node::Call { receiver: Some(r), method: m, .. }
+                if m == method
+                    && matches!(ast.get(*r), Node::LocalVariableRead { name, .. } if name == "x") =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })?;
+        snaps.get(&use_id).copied()
+    }
+
+    /// ADR-0038 Slice 2: `x = expr if c` mints `typeof(expr) | nil` from the
+    /// branch-merge nil-injection — the else path leaves `x` unbound (nil). An
+    /// unguarded use fires on the non-nil arm.
+    #[test]
+    fn nil_snapshot_conditional_assign_mints_nilable() {
+        // String RHS ⇒ arm String; `unless` polarity mints identically; an Integer
+        // RHS mints Integer; a second CONDITIONAL reassignment keeps it nilable.
+        assert_eq!(nil_arm_for(b"x = String.new(\"a\") if c\nx.upcase\n", "upcase"), Some("String"));
+        assert_eq!(nil_arm_for(b"x = String.new(\"a\") unless c\nx.upcase\n", "upcase"), Some("String"));
+        assert_eq!(nil_arm_for(b"x = 5 if c\nx.times\n", "times"), Some("Integer"));
+        assert_eq!(
+            nil_arm_for(b"x = String.new(\"a\") if c\nx = String.new(\"b\") if d\nx.upcase\n", "upcase"),
+            Some("String"),
+            "a second conditional reassignment re-unions the stale-nil path"
+        );
+    }
+
+    /// The mint is suppressed by every narrowing the reference applies AND by an
+    /// unconditional reassignment (which removes the nil possibility).
+    #[test]
+    fn nil_snapshot_conditional_assign_narrowing_declines() {
+        // Truthy `if x` predicate narrows the then-branch (the self-FP tripwire).
+        assert_eq!(nil_arm_for(b"x = String.new(\"a\") if c\nif x then x.upcase end\n", "upcase"), None);
+        // Unconditional reassignment clears nil.
+        assert_eq!(nil_arm_for(b"x = String.new(\"a\") if c\nx = String.new(\"b\")\nx.upcase\n", "upcase"), None);
+        // Constant-fold parity: a literal-boolean predicate is folded by the
+        // reference (branch provably live ⇒ no nil injected) ⇒ decline.
+        assert_eq!(nil_arm_for(b"x = String.new(\"a\") if true\nx.upcase\n", "upcase"), None);
+        // Straight-line non-nil bind never mints.
+        assert_eq!(nil_arm_for(b"x = String.new(\"a\")\nx.upcase\n", "upcase"), None);
     }
 
     #[test]
