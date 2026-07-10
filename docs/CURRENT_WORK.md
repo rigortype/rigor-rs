@@ -6,10 +6,33 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-11 (sig-gen arc: TEN slices merged — erase_to_rbs substrate → --print →
+Last updated: 2026-07-11 (sig-gen arc: ELEVEN slices merged — erase_to_rbs substrate → --print →
 return-union/Node::Return → singletons → --write create → initialize stub → --diff → module_function self?. →
-Writer UPDATE/merge + LayoutIndex → generation-time env classification; sound-superset parity model recorded in
-**AGENTS.md "Generative-tool parity"**). Read `AGENTS.md` "Working discipline" before continuing.
+Writer UPDATE/merge + LayoutIndex → generation-time env classification → --overwrite replace path; sound-superset
+parity model recorded in **AGENTS.md "Generative-tool parity"**). Read `AGENTS.md` "Working discipline" before
+continuing.
+
+**▶▶ LANDED THIS SESSION (branch `sig-gen-overwrite`, MERGED `9e85e07`) — sig-gen slice 11: `--write
+--overwrite` replace path.** The payoff slice 10 unlocked — a bounded main-session port (built + oracle-audited
+directly on the merge code I'd just line-audited, no delegation round-trip). Ports the reference Writer's
+`replace_eligible_conflicts` / `apply_replacement`: with `--overwrite`, a `tighter_return` conflict (the
+classifier already proved a strict subtype) has its EXISTING RBS declaration spliced out and replaced by the new
+one-liner, moving from `skipped user-authored` → `applied` (`updated (+N, skipped 0)`); without the flag the
+same candidate is preserved byte-untouched. A `NEW_METHOD` conflict is replaced ONLY when its RBS has strictly
+fewer bare `untyped` tokens than the existing decl (reference `tightens_untyped?`, word-boundary `count_untyped`)
+— that path is ported FAITHFULLY but is **dead for BOTH tools until `--params=observed` lands** (an `initialize`
+stub stays `(untyped) -> void`), so its absence is parity-safe. Replacements apply **highest-byte-offset-first**
+so earlier member spans stay valid; new-method insertion runs first (at `end_start`, after every member) exactly
+as the reference orders `insert_into_class` before replace. `--print`/`--diff` ignore the flag (it lives on the
+Writer); the exit-2 stub is removed. **Substrate:** `MemberInfo` gains the member's byte span + raw text; a new
+`Conflict` struct carries them into `merge_into_existing`; the skip-conflict logic is factored into a helper
+shared by both branches. **Verified byte-identical vs the oracle (fresh dirs):** single/multi tighter (offset
+ordering), mix (new + tighter + a wider-DROPPED-at-classification `count` — the existing decl stays untouched),
+singleton, consolidated multi-class routing (Alpha replaced, Beta untouched), idempotent re-run (`No changes`),
+`--print --overwrite` inert, `--write --overwrite` text + JSON. **Gated:** 563 tests (+5), harness run.rb +
+run_snapshot.rb 54/54 0 FP, clippy clean. **Remaining sig-gen frontier:** `--params=observed`
+(ObservationCollector — the last big machinery, also lights up the overwrite untyped-tightening path), qualified
+source-class naming (the `Data.define` nested-constant `-> Selector` vs `-> Rigor::Triage::Selector` gap).
 
 **▶▶ LANDED THIS SESSION (branch `sig-gen-env-classification`, MERGED `a268a6c`) — sig-gen slice 10:
 generation-time env classification.** Ports the reference generator's classify-against-existing-RBS
