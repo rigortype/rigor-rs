@@ -42,13 +42,12 @@
 //!
 //! ## Deferred (later slices, each its own gate)
 //!
-//! - `--diff` / `--write` (the `Writer`), `--format json` write-report;
-//! - `--params=observed` (the `ObservationCollector`) — params stay `untyped`;
-//! - singleton (`def self.x` / `class << self`), `module_function` `self?.`
-//!   spelling, `Const = Data.define(...)` class shells, `attr_*` readers;
-//! - `TIGHTER_RETURN` / `EQUIVALENT` classification against existing project RBS
-//!   (a method that already resolves to an RBS declaration is OMITTED — the
-//!   reference emits `tighter-return`; omitting it is FP-safe, a coverage gap);
+//! - `--params=observed` (the `ObservationCollector`) — params stay `untyped`.
+//!   NOTE: this is what makes the `--overwrite` `NEW_METHOD`-tightens-`untyped`
+//!   replacement path (ported faithfully) actually fire — until it lands, that
+//!   path is dead for BOTH tools (an initialize stub stays `(untyped) -> void`),
+//!   so its absence is parity-safe;
+//! - `Const = Data.define(...)` class shells, `attr_*` reader generation;
 //! - `TypeElaborator`'s generic-arity fill (`Array` → `Array[untyped]`);
 //! - QUALIFIED source-class naming (`Rigor::Plugin::ProtocolContract`) — unlocks
 //!   the nested source-class returns skipped above.
@@ -118,6 +117,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let mut include_private = false;
     let mut write = false;
     let mut diff = false;
+    let mut overwrite = false;
     let mut explicit_config: Option<&str> = None;
     let mut positional: Vec<&str> = Vec::new();
 
@@ -127,6 +127,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
             "--print" => {} // the default mode
             "--write" => write = true,
             "--diff" => diff = true,
+            "--overwrite" => overwrite = true,
             "--include-private" => include_private = true,
             "--format" => match it.next().map(String::as_str) {
                 Some(f @ ("text" | "json")) => format = f,
@@ -142,11 +143,6 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                     return ExitCode::from(64);
                 }
             },
-            // Recognised reference flags whose machinery is a later slice.
-            "--overwrite" => {
-                eprintln!("sig-gen: `{arg}` is not yet implemented in this slice");
-                return ExitCode::from(2);
-            }
             other if other.starts_with("--params") || other.starts_with("--observe") => {
                 eprintln!("sig-gen: `{other}` is not yet implemented in this slice (params stay untyped)");
                 return ExitCode::from(2);
@@ -181,8 +177,12 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
 
     if write {
-        return cmd_write(&files, include_private, format, &cfg, &sig_env);
+        return cmd_write(&files, include_private, format, overwrite, &cfg, &sig_env);
     }
+
+    // `--overwrite` only affects the write path (it governs replacing an existing
+    // declaration during merge); on a print/diff run it is inert, exactly like the
+    // reference (the flag lives on the Writer).
 
     let candidates: Vec<Candidate> =
         files.iter().flat_map(|p| generate_file(p, include_private, &sig_env)).collect();
@@ -1102,6 +1102,7 @@ fn cmd_write(
     files: &[String],
     include_private: bool,
     format: &str,
+    overwrite: bool,
     cfg: &crate::Config,
     sig_env: &SigEnv,
 ) -> ExitCode {
@@ -1167,7 +1168,14 @@ fn cmd_write(
             continue;
         }
         if target.exists() {
-            results.push(update_existing(source, &target, target_str, group, &merged.supers));
+            results.push(update_existing(
+                source,
+                &target,
+                target_str,
+                group,
+                &merged.supers,
+                overwrite,
+            ));
             continue;
         }
         let content = render_new_file(&group, &merged);
@@ -1514,6 +1522,26 @@ struct MemberInfo {
     /// The member's declared return text (after the last depth-0 `->` for a
     /// method; the declared type for an attr), or `None` when unextractable.
     return_text: Option<String>,
+    /// The member declaration's byte range in the source `[start, end)` — the
+    /// splice window for `--overwrite` replacement (reference `member.location`).
+    /// `None` for an attr member (attrs are never replacement targets here — the
+    /// generator emits attr candidates as `initialize`/method rows, and the
+    /// reference's `find_method_member` only matches `MethodDefinition`s).
+    span: Option<(usize, usize)>,
+    /// The member declaration's raw source text — consumed by `count_untyped` in
+    /// the `--overwrite` `NEW_METHOD` tightening test (reference `tightens_untyped?`).
+    text: String,
+}
+
+/// A candidate whose `(name, kind)` collides with an existing member, paired
+/// with that member's replacement metadata (reference `conflicting` tuple).
+struct Conflict {
+    /// The existing member's declared return text (equivalence check / skip tag).
+    return_text: Option<String>,
+    /// The existing member declaration's byte span, for `--overwrite` replacement.
+    span: Option<(usize, usize)>,
+    /// The existing member declaration's raw text, for `count_untyped`.
+    text: String,
 }
 
 /// Owned snapshot of a found class decl: the byte offset of its closing `end`
@@ -1536,6 +1564,7 @@ fn update_existing(
     target_str: String,
     candidates: Vec<Candidate>,
     supers: &HashMap<String, String>,
+    overwrite: bool,
 ) -> WriteResult {
     let Ok(source) = std::fs::read_to_string(target) else {
         return WriteResult {
@@ -1548,7 +1577,7 @@ fn update_existing(
     };
 
     let MergeOutcome { source: merged, action, applied, skipped } =
-        apply_merge(source, candidates, supers);
+        apply_merge(source, candidates, supers, overwrite);
     if action == "updated" {
         let _ = std::fs::write(target, &merged);
     }
@@ -1572,6 +1601,7 @@ fn apply_merge(
     mut source: String,
     candidates: Vec<Candidate>,
     supers: &HashMap<String, String>,
+    overwrite: bool,
 ) -> MergeOutcome {
     // Parse-failure gate: a malformed target is left byte-untouched (reference
     // `parse_signature` → nil → `:noop`).
@@ -1581,7 +1611,7 @@ fn apply_merge(
     let mut applied: Vec<Candidate> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
-        merge_class(&mut source, &class_name, group, supers, &mut applied, &mut skipped);
+        merge_class(&mut source, &class_name, group, supers, overwrite, &mut applied, &mut skipped);
     }
     let action = if applied.is_empty() { "noop" } else { "updated" };
     MergeOutcome { source, action, applied, skipped }
@@ -1609,6 +1639,7 @@ fn merge_class(
     class_name: &str,
     candidates: Vec<Candidate>,
     supers: &HashMap<String, String>,
+    overwrite: bool,
     applied: &mut Vec<Candidate>,
     skipped: &mut Vec<SkipEntry>,
 ) {
@@ -1618,7 +1649,7 @@ fn merge_class(
         Err(_) => None,
     };
     match found {
-        Some(info) => merge_into_existing(source, &info, candidates, applied, skipped),
+        Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, skipped),
         None => append_new_class(source, class_name, candidates, supers.get(class_name), applied),
     }
 }
@@ -1675,8 +1706,18 @@ fn collect_member_pairs<'a>(
                     MethodDefinitionKind::Singleton => "singleton",
                     MethodDefinitionKind::SingletonInstance => "singleton_instance",
                 };
-                let return_text = extract_method_return_text(slice_of(source, md.location()));
-                out.push(MemberInfo { name: md.name().as_str().to_string(), kind, return_text });
+                let loc = md.location();
+                let start = clamp_offset(loc.start(), source.len());
+                let end = clamp_offset(loc.end(), source.len());
+                let text = slice_of(source, loc);
+                let return_text = extract_method_return_text(text);
+                out.push(MemberInfo {
+                    name: md.name().as_str().to_string(),
+                    kind,
+                    return_text,
+                    span: Some((start, end)),
+                    text: text.to_string(),
+                });
             }
             RbsNode::AttrReader(a) => {
                 let rt = attr_type_text(source, &a.type_());
@@ -1684,6 +1725,8 @@ fn collect_member_pairs<'a>(
                     name: a.name().as_str().to_string(),
                     kind: "instance",
                     return_text: rt,
+                    span: None,
+                    text: String::new(),
                 });
             }
             RbsNode::AttrWriter(a) => {
@@ -1692,6 +1735,8 @@ fn collect_member_pairs<'a>(
                     name: format!("{}=", a.name().as_str()),
                     kind: "instance",
                     return_text: rt,
+                    span: None,
+                    text: String::new(),
                 });
             }
             RbsNode::AttrAccessor(a) => {
@@ -1701,8 +1746,16 @@ fn collect_member_pairs<'a>(
                     name: name.clone(),
                     kind: "instance",
                     return_text: rt.clone(),
+                    span: None,
+                    text: String::new(),
                 });
-                out.push(MemberInfo { name: format!("{name}="), kind: "instance", return_text: rt });
+                out.push(MemberInfo {
+                    name: format!("{name}="),
+                    kind: "instance",
+                    return_text: rt,
+                    span: None,
+                    text: String::new(),
+                });
             }
             _ => {}
         }
@@ -1722,28 +1775,38 @@ fn attr_type_text(source: &str, type_node: &RbsNode) -> Option<String> {
 }
 
 /// Merge a candidate group into a found existing class (reference
-/// `merge_into_existing_class`): partition into NEW (spliced) vs CONFLICTING
-/// (equivalence-checked — dropped when the return matches, else skipped).
+/// `merge_into_existing_class`): partition into NEW (spliced) vs CONFLICTING.
+/// Under `--overwrite`, eligible conflicts (a `tighter_return`, or a
+/// `new_method` that strictly removes an `untyped` slot) have their existing
+/// declaration REPLACED in place and move to `applied`; every other conflict is
+/// equivalence-checked — dropped when the return matches, else skipped.
 fn merge_into_existing(
     source: &mut String,
     info: &ClassDeclInfo,
     candidates: Vec<Candidate>,
+    overwrite: bool,
     applied: &mut Vec<Candidate>,
     skipped: &mut Vec<SkipEntry>,
 ) {
     let mut new_methods: Vec<Candidate> = Vec::new();
-    let mut conflicting: Vec<(Candidate, Option<String>)> = Vec::new();
+    let mut conflicting: Vec<(Candidate, Conflict)> = Vec::new();
     for c in candidates {
         match info.members.iter().find(|m| m.name == c.method_name && m.kind == c.kind) {
             None => new_methods.push(c),
-            Some(m) => conflicting.push((c, m.return_text.clone())),
+            Some(m) => conflicting.push((
+                c,
+                Conflict { return_text: m.return_text.clone(), span: m.span, text: m.text.clone() },
+            )),
         }
     }
 
     // Splice NEW members before the class's closing `end` token (fixed 2-space
     // indent, one `"  {rbs}\n"` per method, concatenated — reference
     // `insert_into_class`). The token-start splice + fixed indent reproduces the
-    // oracle's nested-case bytes with no special-casing.
+    // oracle's nested-case bytes with no special-casing. This runs BEFORE any
+    // replacement: it inserts at `end_start`, after every existing member, so the
+    // captured member spans (all below `end_start`) stay valid (reference order:
+    // `insert_into_class` then `replace_eligible_conflicts`).
     if !new_methods.is_empty() {
         let addition: String =
             new_methods.iter().map(|c| format!("{INDENT}{}\n", c.rbs)).collect();
@@ -1752,41 +1815,108 @@ fn merge_into_existing(
         applied.extend(new_methods);
     }
 
-    // CONFLICTING → skipped as user-authored (design-note refinement 2, ADR-14
-    // slice 10 reconciliation).
-    for (c, existing_rt) in conflicting {
-        // A candidate GENERATION already classified `tighter_return` carries its
-        // own `declared_return_rbs` resolved from the [`SigEnv`] — trust it, do
-        // NOT re-derive from the target text (amendment: no double-divergence).
-        // Only a `new_method` conflict (the class escaped env classification —
-        // e.g. a consolidated target whose class the generation env didn't see)
-        // falls back to the write-time extraction the previous slice used.
-        if c.classification == "tighter_return" {
-            let declared_return_rbs = c.declared_return_rbs.clone();
-            skipped.push(SkipEntry {
-                candidate: c,
-                classification: "tighter_return",
-                declared_return_rbs,
-            });
-            continue;
-        }
-        let cand_rt = extract_method_return_text(&c.rbs);
-        match (existing_rt, cand_rt) {
-            (Some(er), Some(cr)) if er.trim() == cr.trim() => {
-                // Equivalent → drop silently (not applied, not skipped).
+    if overwrite {
+        // Split conflicts into REPLACEABLE (reference `eligible_for_replacement?`)
+        // and the rest. Eligible = a `tighter_return` (the classifier already
+        // proved a strict subtype), OR a `new_method` whose new RBS has strictly
+        // fewer `untyped` tokens than the existing declaration (reference
+        // `tightens_untyped?` — the `--params=observed` initialize-tightening
+        // case). An attr member has no method span and is never replaced.
+        let mut eligible: Vec<(Candidate, (usize, usize))> = Vec::new();
+        let mut rest: Vec<(Candidate, Option<String>)> = Vec::new();
+        for (c, m) in conflicting {
+            let ok = match m.span {
+                Some(sp) if c.classification == "tighter_return" => Some(sp),
+                Some(sp)
+                    if c.classification == "new_method"
+                        && count_untyped(&c.rbs) < count_untyped(&m.text) =>
+                {
+                    Some(sp)
+                }
+                _ => None,
+            };
+            match ok {
+                Some(sp) => eligible.push((c, sp)),
+                None => rest.push((c, m.return_text)),
             }
-            (Some(er), Some(_)) => skipped.push(SkipEntry {
-                candidate: c,
-                classification: "tighter_return",
-                declared_return_rbs: Some(er.trim().to_string()),
-            }),
-            _ => skipped.push(SkipEntry {
-                candidate: c,
-                classification: "new_method",
-                declared_return_rbs: None,
-            }),
         }
+        // Apply replacements from the HIGHEST byte offset downward so each splice
+        // leaves earlier offsets valid (reference sorts by `-member_position`).
+        eligible.sort_by_key(|(_, (start, _))| std::cmp::Reverse(*start));
+        for (c, (start, end)) in eligible {
+            source.replace_range(start..end, &c.rbs);
+            applied.push(c);
+        }
+        for (c, existing_rt) in rest {
+            skip_conflict(c, existing_rt, skipped);
+        }
+        return;
     }
+
+    // No `--overwrite`: every conflict is preserved as user-authored.
+    for (c, m) in conflicting {
+        let existing_rt = m.return_text;
+        skip_conflict(c, existing_rt, skipped);
+    }
+}
+
+/// Record one preserved (user-authored) conflict as a [`SkipEntry`] (reference
+/// `merge_into_existing_class`'s `skipped` accumulator). A candidate GENERATION
+/// already classified `tighter_return` carries its own `declared_return_rbs`
+/// resolved from the [`SigEnv`] — trust it, do NOT re-derive from the target text
+/// (amendment: no double-divergence). Only a `new_method` conflict (the class
+/// escaped env classification — e.g. a consolidated target whose class the
+/// generation env did not see) falls back to the write-time return extraction:
+/// an equal return drops silently, a differing one skips as `tighter_return`,
+/// an unextractable one as `new_method`.
+fn skip_conflict(c: Candidate, existing_rt: Option<String>, skipped: &mut Vec<SkipEntry>) {
+    if c.classification == "tighter_return" {
+        let declared_return_rbs = c.declared_return_rbs.clone();
+        skipped.push(SkipEntry { candidate: c, classification: "tighter_return", declared_return_rbs });
+        return;
+    }
+    let cand_rt = extract_method_return_text(&c.rbs);
+    match (existing_rt, cand_rt) {
+        (Some(er), Some(cr)) if er.trim() == cr.trim() => {
+            // Equivalent → drop silently (not applied, not skipped).
+        }
+        (Some(er), Some(_)) => skipped.push(SkipEntry {
+            candidate: c,
+            classification: "tighter_return",
+            declared_return_rbs: Some(er.trim().to_string()),
+        }),
+        _ => skipped.push(SkipEntry {
+            candidate: c,
+            classification: "new_method",
+            declared_return_rbs: None,
+        }),
+    }
+}
+
+/// Count bare `untyped` type tokens in an RBS fragment (reference
+/// `count_untyped` — word-boundary matched so it is not counted inside an
+/// identifier). Used by the `--overwrite` `NEW_METHOD` tightening test.
+fn count_untyped(rbs: &str) -> usize {
+    let bytes = rbs.as_bytes();
+    let mut count = 0;
+    let mut i = 0;
+    while let Some(pos) = rbs[i..].find("untyped") {
+        let start = i + pos;
+        let end = start + "untyped".len();
+        let before_ok = start == 0 || !is_word_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_word_byte(bytes[end]);
+        if before_ok && after_ok {
+            count += 1;
+        }
+        i = end;
+    }
+    count
+}
+
+/// Whether a byte is part of a Ruby/RBS identifier word (`\w`: alphanumeric or
+/// underscore) — the word-boundary test for [`count_untyped`].
+fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Append a NEW class block for a class not declared in the file (reference
@@ -2395,6 +2525,21 @@ mod tests {
         }
     }
 
+    /// A `tighter_return` candidate (the classifier proved a strict subtype), the
+    /// only kind `--overwrite` replaces from generation classification.
+    fn mc_tighter(
+        class: &str,
+        method: &str,
+        kind: &'static str,
+        rbs: &str,
+        declared: &str,
+    ) -> Candidate {
+        let mut c = mc(class, method, kind, rbs);
+        c.classification = "tighter_return";
+        c.declared_return_rbs = Some(declared.into());
+        c
+    }
+
     #[test]
     fn member_pairs_cover_attr_writer_accessor_and_kind_rules_but_not_alias() {
         // attr_writer → `name=`; attr_accessor → both; alias never counts;
@@ -2450,7 +2595,8 @@ mod tests {
     #[test]
     fn merge_inserts_new_method_flat_before_end() {
         let src = "class Foo\n  def existing: () -> String\nend\n".to_string();
-        let out = apply_merge(src, vec![mc("Foo", "newm", "instance", "def newm: () -> 1")], &HashMap::new());
+        let out =
+            apply_merge(src, vec![mc("Foo", "newm", "instance", "def newm: () -> 1")], &HashMap::new(), false);
         assert_eq!(out.action, "updated");
         assert_eq!(out.applied.len(), 1);
         assert_eq!(
@@ -2469,6 +2615,7 @@ mod tests {
             src,
             vec![mc("Outer::Inner", "newm", "instance", "def newm: () -> 5")],
             &HashMap::new(),
+            false,
         );
         assert_eq!(
             out.source,
@@ -2484,6 +2631,7 @@ mod tests {
             src.clone(),
             vec![mc("Foo", "greeting", "instance", "def greeting: () -> \"hi\"")],
             &HashMap::new(),
+            false,
         );
         assert_eq!(out.action, "noop");
         assert!(out.applied.is_empty() && out.skipped.is_empty());
@@ -2497,12 +2645,103 @@ mod tests {
             src.clone(),
             vec![mc("Foo", "greeting", "instance", "def greeting: () -> \"hi\"")],
             &HashMap::new(),
+            false,
         );
         assert_eq!(out.action, "noop"); // nothing applied
         assert_eq!(out.skipped.len(), 1);
         assert_eq!(out.skipped[0].classification, "tighter_return");
         assert_eq!(out.skipped[0].declared_return_rbs.as_deref(), Some("String"));
         assert_eq!(out.source, src);
+    }
+
+    #[test]
+    fn overwrite_replaces_tighter_conflict_in_place_and_applies_it() {
+        // Under --overwrite a tighter_return conflict REPLACES the declared line,
+        // moves to `applied`, and leaves 0 skipped (reference `apply_replacement`).
+        let src = "class Foo\n  def greeting: () -> String\nend\n".to_string();
+        let out = apply_merge(
+            src,
+            vec![mc_tighter("Foo", "greeting", "instance", "def greeting: () -> \"hi\"", "String")],
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(out.action, "updated");
+        assert_eq!(out.applied.len(), 1);
+        assert!(out.skipped.is_empty());
+        assert_eq!(out.source, "class Foo\n  def greeting: () -> \"hi\"\nend\n");
+    }
+
+    #[test]
+    fn overwrite_replaces_multiple_tighter_conflicts_offsets_stay_valid() {
+        // Replacements apply highest-offset-first so earlier spans stay valid even
+        // as line lengths change; all three land byte-correctly.
+        let src =
+            "class Foo\n  def a: () -> String\n  def b: () -> String\n  def c: () -> String\nend\n"
+                .to_string();
+        let out = apply_merge(
+            src,
+            vec![
+                mc_tighter("Foo", "a", "instance", "def a: () -> \"aa\"", "String"),
+                mc_tighter("Foo", "b", "instance", "def b: () -> \"bb\"", "String"),
+                mc_tighter("Foo", "c", "instance", "def c: () -> \"cc\"", "String"),
+            ],
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(out.applied.len(), 3);
+        assert_eq!(
+            out.source,
+            "class Foo\n  def a: () -> \"aa\"\n  def b: () -> \"bb\"\n  def c: () -> \"cc\"\nend\n"
+        );
+    }
+
+    #[test]
+    fn overwrite_off_still_preserves_tighter_conflict_as_skipped() {
+        // Without --overwrite the same candidate is preserved (byte-untouched).
+        let src = "class Foo\n  def greeting: () -> String\nend\n".to_string();
+        let out = apply_merge(
+            src.clone(),
+            vec![mc_tighter("Foo", "greeting", "instance", "def greeting: () -> \"hi\"", "String")],
+            &HashMap::new(),
+            false,
+        );
+        assert_eq!(out.action, "noop");
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.source, src);
+    }
+
+    #[test]
+    fn overwrite_new_method_only_replaces_when_it_removes_an_untyped_slot() {
+        // A new_method conflict is eligible ONLY when its RBS has strictly fewer
+        // `untyped` tokens than the existing decl (reference `tightens_untyped?`).
+        // Tightening: existing `(untyped) -> void`, candidate `(String) -> void`.
+        let src = "class Foo\n  def initialize: (untyped) -> void\nend\n".to_string();
+        let tighten = apply_merge(
+            src.clone(),
+            vec![mc("Foo", "initialize", "instance", "def initialize: (String) -> void")],
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(tighten.applied.len(), 1, "removes one untyped ⇒ replaced");
+        assert_eq!(tighten.source, "class Foo\n  def initialize: (String) -> void\nend\n");
+
+        // Not tightening: same untyped count ⇒ preserved, not replaced.
+        let same = apply_merge(
+            src.clone(),
+            vec![mc("Foo", "initialize", "instance", "def initialize: (untyped) -> void")],
+            &HashMap::new(),
+            true,
+        );
+        assert_eq!(same.action, "noop", "equal untyped count + equal return ⇒ drop");
+        assert_eq!(same.source, src);
+    }
+
+    #[test]
+    fn count_untyped_is_word_boundary_matched() {
+        assert_eq!(count_untyped("(untyped, untyped) -> void"), 2);
+        assert_eq!(count_untyped("() -> void"), 0);
+        // `untyped` inside an identifier is not a type token.
+        assert_eq!(count_untyped("(my_untyped_thing) -> untyped"), 1);
     }
 
     #[test]
@@ -2513,6 +2752,7 @@ mod tests {
             src,
             vec![mc("Foo", "build", "singleton", "def self.build: () -> 1")],
             &HashMap::new(),
+            false,
         );
         assert_eq!(out.action, "updated");
         assert_eq!(
@@ -2528,6 +2768,7 @@ mod tests {
             src.clone(),
             vec![mc("Foo", "name", "instance", "def name: () -> \"n\"")],
             &HashMap::new(),
+            false,
         );
         // attr_reader name: String vs candidate "n" → different → skipped.
         assert_eq!(out.skipped.len(), 1);
@@ -2544,6 +2785,7 @@ mod tests {
             src,
             vec![mc("Bar", "added", "instance", "def added: () -> 7")],
             &supers,
+            false,
         );
         assert_eq!(out.action, "updated");
         assert_eq!(
@@ -2561,6 +2803,7 @@ mod tests {
             src,
             vec![mc("A::B", "m", "instance", "def m: () -> 1")],
             &HashMap::new(),
+            false,
         );
         assert_eq!(out.source, "class Foo\nend\n\nclass A::B\n  def m: () -> 1\nend\n");
     }
@@ -2572,6 +2815,7 @@ mod tests {
             src,
             vec![mc("Bar", "m", "instance", "def m: () -> 1")],
             &HashMap::new(),
+            false,
         );
         assert_eq!(out.source, "class Foo\nend\n\nclass Bar\n  def m: () -> 1\nend\n");
     }
@@ -2583,6 +2827,7 @@ mod tests {
             src.clone(),
             vec![mc("Foo", "newm", "instance", "def newm: () -> 1")],
             &HashMap::new(),
+            false,
         );
         assert_eq!(out.action, "noop");
         assert!(out.applied.is_empty() && out.skipped.is_empty());
