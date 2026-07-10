@@ -1198,9 +1198,42 @@ fn diff_string(candidates: &[Candidate]) -> String {
 /// `inferred_return`). serde alphabetizes keys (the established insignificant-
 /// order divergence).
 fn render_json(candidates: &[Candidate]) {
+    println!("{}", candidates_json_string(candidates));
+}
+
+/// The `--print --format json` payload as a pretty `String` — `{ "candidates":
+/// [...] }` (reference `Renderer#render_json`). Extracted so the MCP `sig_gen`
+/// tool can reuse it without going through stdout.
+fn candidates_json_string(candidates: &[Candidate]) -> String {
     use serde_json::json;
     let rows: Vec<_> = candidates.iter().map(candidate_json).collect();
-    println!("{}", serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap());
+    serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap()
+}
+
+/// MCP `sig_gen` tool seam (reference `rigor_sig_gen`, a READ-ONLY
+/// `sig-gen --print --format=json`): resolve `raw_paths` (or the config `paths:`
+/// when empty) to `.rb` files, build the sig-gen-local [`SigEnv`] from the
+/// project signature dirs, generate candidates, and return the `{ "candidates":
+/// [...] }` JSON. `--params=observed` is NOT exposed — it is substrate-blocked
+/// (see `docs/notes/20260711-siggen-params-observed-substrate-blocked.md`); this
+/// seam is always the `untyped` param policy.
+pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> String {
+    let cfg = crate::Config::load(explicit_config);
+    let config_paths: Vec<&str>;
+    let raw: &[&str] = if raw_paths.is_empty() {
+        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        &config_paths
+    } else {
+        raw_paths
+    };
+    let files = resolve_paths(raw);
+    let project_root = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
+    let candidates: Vec<Candidate> =
+        files.iter().flat_map(|p| generate_file(p, false, &sig_env)).collect();
+    candidates_json_string(&candidates)
 }
 
 /// One candidate's JSON object (reference `MethodCandidate#to_h`): the per-
