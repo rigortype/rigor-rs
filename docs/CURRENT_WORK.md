@@ -33,6 +33,19 @@ now a DIFFERENT direction — the ScopeIndexer substrate (unblocks --params=obse
 clusters, ADR-0022), more productization (LSP §12 two-tier / watched-files / more MCP tools), or a measured
 coverage rule.** The parity-port arc has fully bottomed out; productization + deep-substrate are the frontier.
 
+**▶▶ COVERAGE FRONTIER RE-MEASURED (2026-07-11) — bounded wins EXHAUSTED, next is deep-substrate.** Ran
+`fp_audit.py --gaps` on mastodon (0 FP throughout): `app/models` 108/115 matched, 7 gaps; `app` 397/459, 62 gaps
+(undefined-method 33 tapped-out, possible-nil 26, always-truthy 2, arg-type-mismatch 1). **Characterized the
+possible-nil gaps** = conditional-assignment nilability (`local = expr if cond` ⇒ `local` is nil on the false
+path; the reference flags every call on it, even the nil-safe `.present?`, and does NOT narrow via `present?`) —
+a flow-substrate feature with real FP risk, NOT a bounded cheap win. Full detail + the decision table:
+[notes/20260711-coverage-frontier-remeasured.md](notes/20260711-coverage-frontier-remeasured.md). ⇒ No cheap
+FP-safe coverage slice remains; the three real next tracks are (1) flow/ScopeIndexer substrate — highest
+leverage, multi-session, unblocks possible-nil + always-truthy + --params=observed; (2) more productization (LSP
+§12, coverage command); (3) a single FP-risky flow slice (conditional-assignment nilability, closes the 26
+possible-nil dominant cause) via the full delegation protocol. **AWAITING DIRECTION on which — all are large or
+FP-risky, so none is a speculative slice to start unprompted.**
+
 **▶▶ LANDED THIS SESSION (branch `sig-gen-data-shells`, MERGED `33f9436`) — sig-gen slice 13: Data.define/Struct
 class shells on `--write`.** Completes slice 12: qualified naming made `--write` emit `-> Rigor::Triage::Selector`
 but never declared `class Selector`, leaving a DANGLING reference in the generated RBS (Steep can't resolve it —
