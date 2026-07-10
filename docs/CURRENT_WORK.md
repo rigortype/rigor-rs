@@ -6,31 +6,38 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-10 (sig-gen arc: NINE slices merged this session — erase_to_rbs substrate → --print →
+Last updated: 2026-07-11 (sig-gen arc: TEN slices merged — erase_to_rbs substrate → --print →
 return-union/Node::Return → singletons → --write create → initialize stub → --diff → module_function self?. →
-Writer UPDATE/merge + LayoutIndex; sound-superset parity model recorded in **AGENTS.md "Generative-tool
-parity"**). Read `AGENTS.md` "Working discipline" before continuing.
+Writer UPDATE/merge + LayoutIndex → generation-time env classification; sound-superset parity model recorded in
+**AGENTS.md "Generative-tool parity"**). Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ NEXT SESSION — START HERE: sig-gen slice 10, generation-time env classification (DESIGN COMPLETE,
-implementation NOT started).** The binding spec is
-[notes/20260710-siggen-env-classification-design.md](notes/20260710-siggen-env-classification-design.md) —
-investigated via the full delegation protocol (Sonnet×2: full `classify_def`/`lookup_existing_method`/
-`compare_against_declared`/`tighter?` source trace + 13-scenario byte-exact oracle probes) PLUS three decisive
-main-session probes (N/O/P) that settled a DISAGREEMENT between the two investigations — the true rule:
-**ancestor resolution IS performed but gated on the receiver class ITSELF being declared in the RBS env**
-(`env.class_decls.key?`); with no sig at all everything is `new_method` (probe A), with even an EMPTY
-`class Foo\nend` in sig, `def hash; 1; end` → `# [tighter, was: Integer]` (probe N) and `[1].size` →
-equivalent-drop (probe P). Both agents' single-sided interpretations were WRONG (methodology note in the spec).
-This slice closes: the `ObservedCall#hash` writer excess, the sig-project `--print`/`--diff` byte mismatches
-(`[tighter, was: X]` tag + `- def` line), JSON `declared_return_rbs` at generation time, and unlocks
-`--overwrite`. KEY ALIGNMENT: rigor-rs's conservative `CoreIndex::method_return` (None on literal/union/
-untyped/multi-overload) maps almost exactly onto the reference's DROP set — the spec has the decision table +
-sketch + documented FP-safe deviations. **Next session: dispatch the Opus implementer on branch
-`sig-gen-env-classification` per the spec's delegation plan (pitfalls enumerated there), then audit with
-independent probes (N/O/P + the reference/lib intersection sweep — the reference repo HAS a sig/, so the sweep
-now exercises classification on real code and the `def hash` excess must disappear).** After slice 10, the
-remaining sig-gen frontier: `--overwrite`, `--params=observed` (ObservationCollector), qualified source-class
-naming.
+**▶▶ LANDED THIS SESSION (branch `sig-gen-env-classification`, MERGED `a268a6c`) — sig-gen slice 10:
+generation-time env classification.** Ports the reference generator's classify-against-existing-RBS
+(`new_method` / `tighter_return` / equivalent-drop) so sig-gen on a project WITH a `sig/` now prints
+`# [tighter, was: X]` (not `# [new]`), the `--diff` `- def name: () -> X` declared line, and JSON
+`classification`/`declared_return_rbs` at GENERATION time — closing the shared-method byte/tag mismatch that was
+the hard-guarantee break, and unlocking `--overwrite`. **The design note's original "rigor-rs mapping" was
+FALSIFIED by main-session probes before implementation** (amendment appended to the spec, commit `1506c59`):
+(1) `CoreIndex` is short-name keyed and MERGES same-short-name classes, so `knows_class("M::Foo")` is always
+false — the sketched gate would leave every nested (real-world) class as `new_method`; (2) `ClassEntry` had no
+singleton return; (3) the conservative `class_has_method` "assume present" conflates not-declared (emit) with
+declared-unresolvable (drop); (4) the gated `ObservedCall#hash` excess never existed (that class is absent from
+`reference/rigor/sig`). **Built instead:** a sig-gen-local **FQN-keyed `SigEnv`** (`crates/rigor-cli/src/
+sig_gen/sig_env.rs`) over the project `.rbs` + three **additive, precise, sig-gen-ONLY** accessors on
+rigor-index (`declared_instance_return`/`declared_singleton_return`/`chain_complete`, three-valued
+`Option<Option<&str>>`, never "assume present"); `ClassEntry::singleton_methods` widened to carry the return
+(check path inert — diagnostic predicates read only the key set). classify ports the full `classify_def` tail:
+equivalent-drop, wider-drop, `narrows_collection_to_shape?` (GENERIC_COLLECTION_CLASSES read verbatim),
+`computed_literal_tightening?` on the RAW `sig.body.last()` (no assignment unwrap). **Independently audited
+before merge:** 558 tests, harness run.rb + run_snapshot.rb 54/54 0 FP, clippy clean on both touched crates;
+main-session fresh-dir oracle re-probe 13 scenarios × 3 modes = 39/39 byte-identical (incl. probe O
+superclass-project-sig, and the assign-tail / computed-literal DROP cases); `reference/rigor/lib` sweep 239
+shared def lines, 0 tag mismatch. **Under-emits (FP-safe, documented):** incomplete ancestor chain → DROP (not
+`# [new]`); non-single-overload/union/optional/untyped/generic-arg declared → DROP; per-file parse isolation
+instead of the reference's whole-env collapse (ADR-0016/79). **Remaining sig-gen frontier:** `--overwrite`
+(now unlocked — tighter-return replacement in the Writer), `--params=observed` (ObservationCollector),
+qualified source-class naming (the pre-existing `Data.define` nested-constant `-> Selector` vs
+`-> Rigor::Triage::Selector` naming gap — the sweep's only rbs-line mismatch, unchanged by this slice).
 
 **▶▶ LANDED THIS SESSION (branch `sig-gen-writer-update`, MERGED `c02dcdc`) — sig-gen slice 9: Writer
 UPDATE/merge + LayoutIndex.**
