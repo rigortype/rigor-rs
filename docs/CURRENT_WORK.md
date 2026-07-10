@@ -6,11 +6,37 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-11 (sig-gen arc: ELEVEN slices merged — erase_to_rbs substrate → --print →
+Last updated: 2026-07-11 (sig-gen arc: TWELVE slices merged — erase_to_rbs substrate → --print →
 return-union/Node::Return → singletons → --write create → initialize stub → --diff → module_function self?. →
-Writer UPDATE/merge + LayoutIndex → generation-time env classification → --overwrite replace path; sound-superset
-parity model recorded in **AGENTS.md "Generative-tool parity"**). Read `AGENTS.md` "Working discipline" before
-continuing.
+Writer UPDATE/merge + LayoutIndex → generation-time env classification → --overwrite replace path → qualified
+source-class naming; sound-superset parity model recorded in **AGENTS.md "Generative-tool parity"**). Read
+`AGENTS.md` "Working discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `sig-gen-qualified-naming`, MERGED `0f122b6`) — sig-gen slice 12: qualified
+source-class naming + source-order class emission.** Closes the LAST known shared-method byte mismatch in the
+`reference/rigor/lib` sweep: a source-class instance return (the `Selector = Data.define(...)` constant in
+triage.rb, nested `class Inner`) rendered its WRITTEN short name (`-> Selector`) where the reference emits the
+fully-qualified `-> Rigor::Triage::Selector`. **rigor-parse:** `Node::ConstantWrite` gains the written constant
+`name` (additive — every existing match uses `{ value, .. }`, zero blast radius) so sig-gen can map the file's
+`Data.define`/`Struct.new` constant FQNs. **sig-gen:** `collect_source_fqns` builds the file's declared
+class/module + class-defining-constant FQN set; `erase_qualified`/`describe_qualified` wrap the base resolver so
+a SOURCE class short name is qualified via Ruby constant lookup from the method's enclosing scope
+(`qualify_source_name`, longest-enclosing-prefix) while CORE names pass through unqualified — sound because the
+sig-gen `SourceIndex` is per-file (every typed source class is defined in the file, FQN always resolvable). The
+old `nested_classes` skip is REMOVED (those returns now emit qualified — a coverage gain). **Also fixed a
+pre-existing class-group ORDER divergence:** candidates now emit + descend into nested classes in ONE
+source-order (span) pass, so a nested class declared before the outer's own methods groups ahead of its parent
+(reference walk + `group_by`). **Verified:** sweep 250 shared methods / **0 rbs-mismatch** (Selector CLOSED);
+whole-file byte-identical **162 → 166** (net gain, no regression; master-vs-branch measured); 565 tests (+2),
+harness run.rb + run_snapshot.rb 54/54 0 FP (arena change inert on the check path), clippy clean. **Remaining
+under-emits (documented, sound-superset):** `Data.define`/`Struct.new` empty CLASS SHELLS on `--write` (reference
+writes `class Selector\nend`; rigor-rs qualifies RETURNS of it but doesn't generate the shell — a valid subset),
+and non-core-named `Data.define`/`Struct` RECEIVER typing (a `Const.new` types to a source class only when
+`Const` collides with a core RBS name; else `Dynamic` → skip — a pre-existing inference gap, not a naming defect).
+**⇒ The sig-gen arc's byte-mismatch surface is now CLOSED (0 shared-method mismatch on the full sweep). Remaining
+sig-gen items are pure COVERAGE under-emits (Data.define shells, Struct/attr generation, --params=observed
+substrate-blocked) — no known correctness gap left. The arc is at a clean stopping point; next work is a
+different track (deeper ScopeIndexer substrate, productization, or §12 LSP).**
 
 **▶▶ INVESTIGATED THIS SESSION (2026-07-11) — `--params=observed` SUBSTRATE-BLOCKED, deferred (NOT built).**
 Investigated as the next slice after `--overwrite` via the full protocol (value probe + two Sonnet
