@@ -10,7 +10,28 @@ Last updated: 2026-07-11 (sig-gen arc: THIRTEEN slices merged — erase_to_rbs s
 return-union/Node::Return → singletons → --write create → initialize stub → --diff → module_function self?. →
 Writer UPDATE/merge + LayoutIndex → generation-time env classification → --overwrite replace path → qualified
 source-class naming → Data.define/Struct class shells; sound-superset parity model recorded in **AGENTS.md
-"Generative-tool parity"**). Read `AGENTS.md` "Working discipline" before continuing.
+"Generative-tool parity"**). Then PIVOTED to productization (MCP `sig_gen` tool). Read `AGENTS.md` "Working
+discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `mcp-sig-gen`, MERGED `e7ae83e`) — productization: `sig_gen` MCP tool.** The
+clean pivot after the sig-gen arc closed: surfaces the sig-gen work through the MCP tool surface an agent calls
+(reference `rigor_sig_gen`). Read-only — runs `sig-gen --print --format=json` over FILE `paths` (+ optional
+`config`), returns the `{ candidates: [...] }` JSON, panic-isolated. `--params=observed` is NOT exposed
+(substrate-blocked). `sig_gen.rs` gained `candidates_json_string` + the `mcp_report_json` seam; `mcp.rs` the tool
+declaration + `tool_sig_gen` handler. The MCP surface is now check / type_of / explain / outline / triage /
+annotate / sig_gen. **Verified:** stdio smoke (initialize → tools/list has `sig_gen` → call returns candidates)
+byte-identical to the CLI `--print --format json`; rigor-cli 246 tests, harness 54/54 0 FP, clippy clean; check
+path untouched. The reference's other missing MCP tool, `rigor_coverage`, needs the large mutation-backed
+coverage command (unavailable) — deferred.
+
+**▶▶ sig-gen arc RETROSPECTIVE (13 slices, this + prior sessions): byte-mismatch surface CLOSED, `--write` SOUND.**
+0 shared-method rbs-mismatch on the full `reference/rigor/lib` sweep; no dangling refs in written RBS. Remaining
+sig-gen items are thin coverage-only (attr_* readers — needs an ivar-typing pass, measured ~40 attrs mostly from
+computed ivars, byte-risky; merge-path shell injection; non-core-named Data.define/Struct receiver typing — a
+pre-existing rigor-infer gap; `--params=observed` — substrate-blocked). **NEXT: the higher-leverage tracks are
+now a DIFFERENT direction — the ScopeIndexer substrate (unblocks --params=observed AND the flow/possible-nil
+clusters, ADR-0022), more productization (LSP §12 two-tier / watched-files / more MCP tools), or a measured
+coverage rule.** The parity-port arc has fully bottomed out; productization + deep-substrate are the frontier.
 
 **▶▶ LANDED THIS SESSION (branch `sig-gen-data-shells`, MERGED `33f9436`) — sig-gen slice 13: Data.define/Struct
 class shells on `--write`.** Completes slice 12: qualified naming made `--write` emit `-> Rigor::Triage::Selector`
