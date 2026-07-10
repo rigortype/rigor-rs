@@ -6,11 +6,30 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-11 (sig-gen arc: TWELVE slices merged — erase_to_rbs substrate → --print →
+Last updated: 2026-07-11 (sig-gen arc: THIRTEEN slices merged — erase_to_rbs substrate → --print →
 return-union/Node::Return → singletons → --write create → initialize stub → --diff → module_function self?. →
 Writer UPDATE/merge + LayoutIndex → generation-time env classification → --overwrite replace path → qualified
-source-class naming; sound-superset parity model recorded in **AGENTS.md "Generative-tool parity"**). Read
-`AGENTS.md` "Working discipline" before continuing.
+source-class naming → Data.define/Struct class shells; sound-superset parity model recorded in **AGENTS.md
+"Generative-tool parity"**). Read `AGENTS.md` "Working discipline" before continuing.
+
+**▶▶ LANDED THIS SESSION (branch `sig-gen-data-shells`, MERGED `33f9436`) — sig-gen slice 13: Data.define/Struct
+class shells on `--write`.** Completes slice 12: qualified naming made `--write` emit `-> Rigor::Triage::Selector`
+but never declared `class Selector`, leaving a DANGLING reference in the generated RBS (Steep can't resolve it —
+a soundness gap slice 12 introduced). Ports the reference's `@class_shells`: a `Const = Data.define(...)` /
+`Struct.new(...)` constant now writes an empty `class Const\nend` shell. `collect_namespace_info` records each
+shell FQN (source order) + kind `class`; `cmd_write` routes each shell to its ENCLOSING class's target (rides
+beside its class in a consolidated layout) + adds shell-only targets; `render_new_file` appends empty shell class
+nodes AFTER the method + real-nested children (reference tree order) via `insert_shell_into_tree`. Shells appear
+ONLY in `--write` (never `--print` — no candidate). **Scope: the CREATE path;** merge-path shell injection is
+deferred (a `--write` re-run is idempotent since the shell was written on create — only merging into a
+USER-authored sig lacking the shell is uncovered, documented). **Verified byte-identical vs the oracle:** mixed
+(methods/real-nested/shells order, Data + Struct, top-level + nested shells) + the real triage.rb (5 shells now
+declared, dangling refs resolved) + idempotent re-run (`No changes`, matches reference). 567 tests (+4), harness
+run.rb + run_snapshot.rb 54/54 0 FP, clippy clean.
+**⇒ sig-gen `--write` output is now SOUND (no dangling refs) as well as byte-mismatch-free.** The remaining
+sig-gen surface is thin coverage-only: `attr_*` reader generation, merge-path shell injection, non-core-named
+Data.define/Struct RECEIVER typing (pre-existing rigor-infer gap), and `--params=observed` (substrate-blocked).
+The arc is at a clean stopping point — next is a DIFFERENT track (ScopeIndexer substrate, productization, §12 LSP).
 
 **▶▶ LANDED THIS SESSION (branch `sig-gen-qualified-naming`, MERGED `0f122b6`) — sig-gen slice 12: qualified
 source-class naming + source-order class emission.** Closes the LAST known shared-method byte mismatch in the
