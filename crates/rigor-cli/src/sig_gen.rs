@@ -37,8 +37,17 @@
 //! the block/lambda/def return barrier, multi-value-return methods are skipped
 //! rather than adopt the reference's silent type drop), or avoid a WRONG emit
 //! from an unported rigor-rs LIMITATION (a bare generic nominal the reference
-//! *elaborates* to `Array[untyped]`; a NESTED source-class instance the
-//! reference names fully-qualified — rigor-rs has only the written short name).
+//! *elaborates* to `Array[untyped]`).
+//!
+//! A source-class instance return is rendered FULLY-QUALIFIED
+//! (`Rigor::Triage::Selector`, `Outer::Inner`) by [`erase_qualified`]: the file's
+//! declared class/module + `Data.define`/`Struct.new` constant FQNs
+//! ([`collect_source_fqns`]) resolved from the method's enclosing scope via Ruby
+//! constant lookup ([`qualify_source_name`]). Because the sig-gen `SourceIndex`
+//! is per-file, every source class that types to a Nominal is defined HERE, so
+//! its FQN is always in the set. Candidates emit + descend in ONE source-order
+//! (span) pass so a nested class declared before the outer's own methods groups
+//! ahead of its parent (reference walk order).
 //!
 //! ## Deferred (later slices, each its own gate)
 //!
@@ -47,10 +56,15 @@
 //!   replacement path (ported faithfully) actually fire — until it lands, that
 //!   path is dead for BOTH tools (an initialize stub stays `(untyped) -> void`),
 //!   so its absence is parity-safe;
-//! - `Const = Data.define(...)` class shells, `attr_*` reader generation;
+//! - `Const = Data.define(...)` / `Struct.new(...)` empty CLASS SHELLS (the
+//!   reference `--write`s a `class Selector\nend` decl for the constant; rigor-rs
+//!   qualifies RETURNS of it but does not yet generate the shell — an under-emit,
+//!   a valid RBS subset), `attr_*` reader generation;
 //! - `TypeElaborator`'s generic-arity fill (`Array` → `Array[untyped]`);
-//! - QUALIFIED source-class naming (`Rigor::Plugin::ProtocolContract`) — unlocks
-//!   the nested source-class returns skipped above.
+//! - `Struct.new` / non-core-named `Data.define` constant RECEIVER typing — a
+//!   `Const.new` types to a source class (⇒ qualified) only when `Const` collides
+//!   with a core RBS name; otherwise it stays `Dynamic` and the method is skipped
+//!   (an under-emit — a pre-existing inference gap, not a naming defect).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -61,7 +75,7 @@ use ruby_rbs::node::{MethodDefinitionKind, Node as RbsNode, RBSLocationRange};
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, TypeEnv, Typer};
 use rigor_parse::{lower, parse, LoweredAst, Node, NodeId, ParamShape, Visibility};
-use rigor_types::{Interner, Type, TypeId};
+use rigor_types::{ClassId, Interner, Type, TypeId};
 
 mod sig_env;
 use sig_env::{Lookup, SigEnv};
@@ -279,18 +293,19 @@ fn generate_file_with_info(
     let mut interner = Interner::new();
     let env = typer.build_toplevel_env(&ast, &mut interner);
 
-    // Written names of NESTED class/module declarations (non-empty lexical
-    // prefix). rigor-rs's SourceIndex types a project `X.new` under the WRITTEN
-    // short name, but the reference emits the FULLY-QUALIFIED name
-    // (`Rigor::Plugin::ProtocolContract`) — so a nested source-class member
-    // would byte-diverge on a shared method. Top-level classes' written name IS
-    // the qualified name (oracle-probed byte-identical), so only nested ones
-    // must skip until qualified source-class naming is ported.
-    let mut nested_classes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // The file's declared source-class FQN set: every `class`/`module` and every
+    // `Const = Data.define(...)` / `Struct.new(...)`, keyed by fully-qualified
+    // name. rigor-rs's per-file SourceIndex types a project `X.new` under the
+    // WRITTEN short name, but the reference emits the FULLY-QUALIFIED name
+    // (`Rigor::Triage::Selector`) — so a source-class member is qualified at emit
+    // time via Ruby constant resolution (longest-enclosing-prefix) against this
+    // set. Because the SourceIndex is per-file, every source class that resolves
+    // to a Nominal is defined HERE, so its FQN is always in this set.
+    let mut fqns: std::collections::HashSet<String> = std::collections::HashSet::new();
     let root = ast.root();
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
-            collect_nested_class_names(&ast, child, false, &mut nested_classes);
+            collect_source_fqns(&ast, child, &[], &mut fqns);
         }
     }
 
@@ -307,7 +322,7 @@ fn generate_file_with_info(
                 &index,
                 &typer,
                 &env,
-                &nested_classes,
+                &fqns,
                 sig_env,
                 &mut interner,
                 &mut out,
@@ -318,25 +333,146 @@ fn generate_file_with_info(
     (out, info)
 }
 
-/// Collect the written names of class/module declarations that are lexically
-/// NESTED (inside another class/module). `inside` is true once we are within any
-/// namespace body.
-fn collect_nested_class_names(
+/// Collect every declared source-class FULLY-QUALIFIED name in the file: each
+/// `class`/`module` (its written `name` may itself be a `A::B` path — joined
+/// onto the lexical `prefix`), and each `Const = Data.define(...)` /
+/// `Struct.new(...)` constant. `prefix` is the enclosing lexical namespace.
+/// Feeds [`qualify_source_name`] so a source-class return renders the reference's
+/// fully-qualified spelling (`Rigor::Triage::Selector`).
+fn collect_source_fqns(
     ast: &LoweredAst,
     id: NodeId,
-    inside: bool,
+    prefix: &[String],
     out: &mut std::collections::HashSet<String>,
 ) {
-    let (name, body) = match ast.get(id) {
-        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => (name, body),
-        _ => return,
+    match ast.get(id) {
+        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+            let fqn = qualify_join(prefix, name);
+            out.insert(fqn.clone());
+            // The child prefix is the full path split (`A::B` nested under `M`
+            // becomes prefix `["M", "A", "B"]` for its own body).
+            let child_prefix: Vec<String> = fqn.split("::").map(str::to_string).collect();
+            for &child in body {
+                collect_source_fqns(ast, child, &child_prefix, out);
+            }
+        }
+        // A `Const = Data.define(...)` / `Struct.new(...)` defines a class-valued
+        // constant whose `.new` types to a `DataInstance`/Nominal the reference
+        // names fully-qualified. Record its FQN so returns of it qualify.
+        Node::ConstantWrite { name, value, .. }
+            if !name.is_empty() && is_class_defining_call(ast, *value) =>
+        {
+            out.insert(qualify_join(prefix, name));
+        }
+        _ => {}
+    }
+}
+
+/// Whether a constant-write's value is a `Data.define(...)` or `Struct.new(...)`
+/// call — the class-defining constant forms whose instances the reference names
+/// with the constant's fully-qualified name.
+fn is_class_defining_call(ast: &LoweredAst, value: NodeId) -> bool {
+    let Node::Call { receiver: Some(recv), method, .. } = ast.get(value) else {
+        return false;
     };
-    if inside {
-        out.insert(name.clone());
+    let Node::ConstantRead { name: recv_name, .. } = ast.get(*recv) else {
+        return false;
+    };
+    matches!(
+        (recv_name.as_str(), method.as_str()),
+        ("Data", "define") | ("Struct", "new")
+    )
+}
+
+/// Join a lexical `prefix` and a (possibly already-namespaced) `name` with `::`.
+fn qualify_join(prefix: &[String], name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{}", prefix.join("::"), name)
     }
-    for &child in body {
-        collect_nested_class_names(ast, child, true, out);
+}
+
+/// Resolve a source-class SHORT name to its fully-qualified name via Ruby
+/// constant lookup from the `enclosing` scope: try `<enclosing>::<short>`, then
+/// walk one namespace level outward at a time, first hit in `fqns` wins; falls
+/// back to `short` unchanged when nothing matches (an external / already-bare
+/// name — byte-identical to the old behavior). Mirrors the reference's
+/// longest-enclosing-prefix constant resolution (`resolve_override_ancestor_name`).
+fn qualify_source_name(
+    short: &str,
+    enclosing: &str,
+    fqns: &std::collections::HashSet<String>,
+) -> String {
+    // An already-qualified short (contains `::`) is used as written.
+    let mut scope: Vec<&str> = if enclosing.is_empty() {
+        Vec::new()
+    } else {
+        enclosing.split("::").collect()
+    };
+    loop {
+        let candidate = if scope.is_empty() {
+            short.to_string()
+        } else {
+            format!("{}::{}", scope.join("::"), short)
+        };
+        if fqns.contains(&candidate) {
+            return candidate;
+        }
+        if scope.pop().is_none() {
+            return short.to_string();
+        }
     }
+}
+
+/// Erase `ty` to RBS like [`crate::type_display::erase`], but QUALIFY every
+/// source-class name to its fully-qualified spelling from the `enclosing` scope
+/// (reference behavior). The resolver tries the CORE index first — a core class
+/// (`String`, `Integer`) is never qualified — then the source registry, whose
+/// short name is run through [`qualify_source_name`]. Composite carriers
+/// (unions, tuples) qualify member-by-member because the resolver is invoked per
+/// class id during erasure. Sig-gen-local: the `check` path's shared
+/// `type_display::erase` is untouched.
+fn erase_qualified(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &SourceIndex,
+    ty: TypeId,
+    enclosing: &str,
+    fqns: &std::collections::HashSet<String>,
+) -> String {
+    let resolve = |class: ClassId| -> Option<String> {
+        if let Some(core) = index.class_name_for_id(class) {
+            return Some(core.to_string());
+        }
+        source
+            .class_name_for_id(class)
+            .map(|short| qualify_source_name(short, enclosing, fqns))
+    };
+    rigor_types::erase_to_rbs_named(interner, ty, &resolve)
+}
+
+/// The `describe(:short)` sort key with source-class names QUALIFIED — the twin
+/// of [`erase_qualified`] for the member-sort key, so a union containing a
+/// source-class member orders identically to the reference (whose `describe`
+/// resolves a source nominal to its FQN).
+fn describe_qualified(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &SourceIndex,
+    ty: TypeId,
+    enclosing: &str,
+    fqns: &std::collections::HashSet<String>,
+) -> String {
+    let resolve = |class: ClassId| -> Option<String> {
+        if let Some(core) = index.class_name_for_id(class) {
+            return Some(core.to_string());
+        }
+        source
+            .class_name_for_id(class)
+            .map(|short| qualify_source_name(short, enclosing, fqns))
+    };
+    rigor_types::describe_named(interner, ty, &resolve)
 }
 
 /// Recurse a `class` / `module` node, emitting a candidate per qualifying direct
@@ -352,7 +488,7 @@ fn walk_namespace(
     index: &CoreIndex,
     typer: &Typer,
     env: &TypeEnv,
-    nested_classes: &std::collections::HashSet<String>,
+    fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
@@ -431,31 +567,47 @@ fn walk_namespace(
             _ => {}
         }
     }
-    sigs.sort_by_key(|&(_, _, start)| start);
-
-    for (sig, vis, _) in &sigs {
-        if let Some(candidate) = method_candidate(
-            ast,
-            sig,
-            *vis,
-            &class_name,
-            path,
-            include_private,
-            index,
-            typer,
-            env,
-            nested_classes,
-            sig_env,
-            interner,
-        ) {
-            out.push(candidate);
-        }
+    // Emit own methods AND descend into nested classes in ONE source-order
+    // (span) pass, so a nested class declared BEFORE the outer class's own
+    // methods is FIRST-SEEN first — matching the reference's single top-to-bottom
+    // walk + `group_by(&:class_name)` (a nested class's group then sorts ahead of
+    // its parent's). Two separate loops (methods-then-nested) mis-ordered the
+    // class groups for that shape.
+    enum Emit<'a> {
+        Method(&'a MethodSig<'a>, Option<Visibility>),
+        Nested(NodeId),
     }
-
-    // Descend into nested class/module declarations in this body.
+    let mut items: Vec<(usize, Emit)> = Vec::new();
+    for (sig, vis, span) in &sigs {
+        items.push((*span, Emit::Method(sig, *vis)));
+    }
     for &child in body {
         if matches!(ast.get(child), Node::ClassDef { .. } | Node::ModuleDef { .. }) {
-            walk_namespace(
+            items.push((ast.get(child).span().0, Emit::Nested(child)));
+        }
+    }
+    items.sort_by_key(|(span, _)| *span);
+    for (_, item) in items {
+        match item {
+            Emit::Method(sig, vis) => {
+                if let Some(candidate) = method_candidate(
+                    ast,
+                    sig,
+                    vis,
+                    &class_name,
+                    path,
+                    include_private,
+                    index,
+                    typer,
+                    env,
+                    fqns,
+                    sig_env,
+                    interner,
+                ) {
+                    out.push(candidate);
+                }
+            }
+            Emit::Nested(child) => walk_namespace(
                 ast,
                 child,
                 &qualified,
@@ -464,11 +616,11 @@ fn walk_namespace(
                 index,
                 typer,
                 env,
-                nested_classes,
+                fqns,
                 sig_env,
                 interner,
                 out,
-            );
+            ),
         }
     }
 }
@@ -501,7 +653,7 @@ fn method_candidate(
     index: &CoreIndex,
     typer: &Typer,
     env: &TypeEnv,
-    nested_classes: &std::collections::HashSet<String>,
+    fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
     interner: &mut Interner,
 ) -> Option<Candidate> {
@@ -599,11 +751,14 @@ fn method_candidate(
     }
 
     // Sort by the DESCRIBE string (reference `sort_members` — `describe(:short)`,
-    // NOT the erased form), then erase each member.
-    members.sort_by_key(|&m| crate::type_display::describe(interner, index, typer.source(), m));
+    // NOT the erased form), qualifying source-class names so a union's member
+    // ORDER matches the reference (which describes a source nominal by its FQN).
+    members.sort_by_key(|&m| describe_qualified(interner, index, typer.source(), m, class_name, fqns));
     let mut erased_members: Vec<String> = Vec::new();
     for &m in &members {
-        let e = crate::type_display::erase(interner, index, typer.source(), m);
+        // Erase with QUALIFIED source-class names (reference emits the FQN
+        // `Rigor::Triage::Selector`, not the written short `Selector`).
+        let e = erase_qualified(interner, index, typer.source(), m, class_name, fqns);
         // Any `untyped` ANYWHERE in a member (whole `untyped`, or buried inside a
         // composite — `[untyped, 0]`, `Hash[String, untyped]`) skips the method:
         // an untyped hole marks a point where rigor-rs's inference lost precision,
@@ -619,13 +774,6 @@ fn method_candidate(
         // here), so its presence skips the method rather than emit an
         // under-elaborated form that would byte-diverge on a shared method.
         if is_bare_generic_name(&e) {
-            return None;
-        }
-        // A NESTED source-class instance renders its WRITTEN short name here but
-        // the reference emits the fully-qualified name — skip until qualified
-        // source-class naming is ported (top-level classes match byte-for-byte
-        // and still emit).
-        if nested_classes.contains(&e) {
             return None;
         }
         if !erased_members.contains(&e) {
@@ -2266,12 +2414,44 @@ mod tests {
     }
 
     #[test]
-    fn nested_source_class_instance_skips_but_top_level_emits() {
-        // A NESTED class's instance renders its written short name (`Inner`) but
-        // the reference emits the qualified `Outer::Inner` — skip. A TOP-LEVEL
-        // class's written name IS qualified — emit (oracle byte-identical).
+    fn nested_source_class_instance_renders_fully_qualified() {
+        // A NESTED class's instance return is QUALIFIED to its FQN via Ruby
+        // constant resolution from the enclosing scope (`Inner` written in
+        // `Outer::Maker` resolves to `Outer::Inner`) — byte-identical to the
+        // reference, which names a source nominal fully-qualified.
         let src = "module Outer\n  class Inner\n  end\n  class Maker\n    def make\n      Inner.new\n    end\n  end\nend\n";
-        assert!(candidates_tagged("nestcls", src, false).is_empty());
+        let cs = candidates_tagged("nestcls", src, false);
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].rbs, "def make: () -> Outer::Inner");
+    }
+
+    #[test]
+    fn data_define_constant_return_is_fully_qualified() {
+        // `Const = Data.define(...)` typed to a source nominal renders the
+        // reference's fully-qualified constant name (`Rigor::Triage::Selector`),
+        // NOT the written short `Selector`. `Selector` resolves as a source class
+        // here only because it collides with a core RBS name; the qualification
+        // logic is what this asserts.
+        let src = "module Rigor\n  class Triage\n    Selector = Data.define(:a)\n    def make\n      Selector.new(a: 1)\n    end\n  end\nend\n";
+        let cs = candidates_tagged("datadef", src, false);
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].rbs, "def make: () -> Rigor::Triage::Selector");
+    }
+
+    #[test]
+    fn qualify_source_name_walks_enclosing_scope_outward() {
+        let mut fqns = std::collections::HashSet::new();
+        fqns.insert("Rigor::Triage".to_string());
+        fqns.insert("Rigor::Triage::Selector".to_string());
+        fqns.insert("Top".to_string());
+        // same-scope constant
+        assert_eq!(qualify_source_name("Selector", "Rigor::Triage", &fqns), "Rigor::Triage::Selector");
+        // outer sibling: `Triage` referenced from `Rigor::Sibling` → `Rigor::Triage`
+        assert_eq!(qualify_source_name("Triage", "Rigor::Sibling", &fqns), "Rigor::Triage");
+        // top-level self-reference
+        assert_eq!(qualify_source_name("Top", "Top", &fqns), "Top");
+        // unknown name is left bare (external / not in file)
+        assert_eq!(qualify_source_name("Unknown", "Rigor::Triage", &fqns), "Unknown");
     }
 
     #[test]

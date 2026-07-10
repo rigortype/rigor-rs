@@ -384,7 +384,11 @@ pub enum Node {
     // TODO(spec): constant resolution (ADR-0019).
     ConstantRead { name: String, span: Span },
     /// A constant write (`FOO = v`). The value is lowered. Not a value itself.
-    ConstantWrite { value: NodeId, span: Span },
+    /// `name` is the WRITTEN constant name (`"FOO"`; the last component for a
+    /// `Foo::Bar = v` path-write, else empty for an un-namable dynamic form) —
+    /// used by sig-gen to build the file's `Data.define`/`Struct.new` constant
+    /// FQN map for qualified source-class naming.
+    ConstantWrite { name: String, value: NodeId, span: Span },
     /// `self`. Typed `Dynamic[top]` — the enclosing-class type is not tracked in
     /// this slice.
     SelfExpr { span: Span },
@@ -1186,8 +1190,10 @@ impl Builder {
         }
 
         if let Some(cw) = node.as_constant_write_node() {
+            let name = constant_string(cw.name().as_slice());
             let value = self.lower_node(&cw.value());
             return self.push(Node::ConstantWrite {
+                name,
                 value,
                 span: span_of(&cw.location()),
             });
