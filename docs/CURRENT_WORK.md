@@ -12,6 +12,30 @@ Writer UPDATE/merge + LayoutIndex → generation-time env classification → --o
 parity model recorded in **AGENTS.md "Generative-tool parity"**). Read `AGENTS.md` "Working discipline" before
 continuing.
 
+**▶▶ INVESTIGATED THIS SESSION (2026-07-11) — `--params=observed` SUBSTRATE-BLOCKED, deferred (NOT built).**
+Investigated as the next slice after `--overwrite` via the full protocol (value probe + two Sonnet
+investigations — reference `ObservationCollector` + rigor-rs substrate — + a main-session literal-vs-nominal
+measurement). **A faithful byte-safe port is BLOCKED on the ScopeIndexer rigor-rs lacks** (the same per-scope
+typing substrate ADR-0022 / the flow frontier need). The reference types observed call-args with the FULL
+`scope.type_of` (locals / `let` / self-call returns), and real specs overwhelmingly use those, not inline
+literals; rigor-rs can type ONLY literal args (scope-independent) and types block-local reads `Dynamic`. The
+parity KILLER: any `Dynamic` member collapses an observed union to bare `untyped`, and the `initialize` stub is
+ALWAYS emitted by both tools — so a class whose observe tree has even one scope-dependent caller yields
+reference `def initialize: ("hi" | String) -> void` vs rigor-rs `(untyped) -> void`: a **shared-method byte
+mismatch**, NOT a safe under-emit. A literal-only partial port is therefore a NET REGRESSION (converts an honest
+exit-2 into a mismatching partial impl) and additionally needs an arena keyword-hash discriminator (the matchable
+value is ~all keyword args). Kept at exit-2. Full detail + the value numbers:
+[notes/20260711-siggen-params-observed-substrate-blocked.md](notes/20260711-siggen-params-observed-substrate-blocked.md).
+**⇒ The honestly-portable sig-gen surface is now essentially EXHAUSTED.** The one known SHARED-METHOD byte
+mismatch left in the `reference/rigor/lib` sweep is **qualified source-class naming**: a `Const = Data.define(...)`
+(or nested `class`) instance return emits its WRITTEN short name (`-> Selector`) where the reference emits the
+fully-qualified `-> Rigor::Triage::Selector` (`lib/rigor/triage.rb:28,139`; probe-confirmed current). A real,
+bounded, byte-safe-to-close fix — but NON-trivial (needs a SourceIndex investigation: how `Data.define`
+constants register + how a nested-scope constant receiver resolves to an FQN-named Nominal), so it wants its own
+investigation before implementation. That, or a pivot: the parity-port arc has bottomed out (this is the fifth
+"big track, thin/blocked value" finding across the arc) — the deeper frontiers are the ScopeIndexer substrate
+(unblocks --params=observed AND the flow/possible-nil clusters) or productization / §12 LSP infra.
+
 **▶▶ LANDED THIS SESSION (branch `sig-gen-overwrite`, MERGED `9e85e07`) — sig-gen slice 11: `--write
 --overwrite` replace path.** The payoff slice 10 unlocked — a bounded main-session port (built + oracle-audited
 directly on the merge code I'd just line-audited, no delegation round-trip). Ports the reference Writer's
