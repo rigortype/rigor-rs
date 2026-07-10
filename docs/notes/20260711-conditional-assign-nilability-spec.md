@@ -1,5 +1,37 @@
 # Conditional-assignment nilability — binding spec (2026-07-11)
 
+> **OUTCOME (2026-07-11): BUILT, CORRECT, FP-SAFE, but closes 0 SURVEY GAPS —
+> NOT merged, preserved on branch `flow-cond-assign-nilability` (commit
+> `7b7fe3d`).** Opus implemented the full ADR-0038 Slice 2 substrate (`Node::If`
+> descend + `join_nil_envs` + conservative predicate-mention narrowing +
+> constant-fold parity guard). Main-session audit CONFIRMED: the mechanism is
+> byte-identical to the reference on the whole self-probe matrix (`x = "s" if c;
+> x.upcase` FIRES at the same location, `unless`/int-RHS/double-conditional fire,
+> truthy-`if`/return-guard/safe-nav/NilClass-`to_s` all silent, 7/7 + the agent's
+> 13/13); FP-safe on mastodon/app (1236) + gitlab-foss/app (6513) + conference-app
+> (98) — **0 FP candidates, matched count UNCHANGED (397/459 mastodon)**; harness
+> 54/54; corpus 27 fires / 28 silent. But `fp_audit --gaps`: mastodon possible-nil
+> gap 26→26, gitlab 95→95 — **0 closed**. Every one of the 26 mastodon gaps is
+> either (a) a `present?`/`blank?` guard-method call (the accepted conservative
+> under-emit) or (b) sourced from a PROJECT-METHOD / IVAR nilable return
+> (`scope = scope_for(...)`, `@signature.created_time`) — **Tier B/C inference
+> rigor-rs lacks, so the local is never minted nilable regardless of the flow
+> substrate**. NONE is the unguarded core-typed `x = expr if c; x.foo` this slice
+> closes; that pattern does not occur in the surveyed corpora.
+>
+> **This is the 4th consecutive FP-safe flow slice to close 0 survey gaps**
+> ([[possible-nil-fold-gated]] + [flow-frontier note](20260706-flow-frontier-exhausted.md)):
+> the possible-nil frontier is Tier B/C (project-method nilable return, ADR-0041 —
+> code on branch `tier-bc-nilable-return`; ivar whole-class flow, ADR-58), full
+> stop. The If-descent/join substrate here is a genuine, reusable ADR-0038 Slice 2
+> prerequisite (future Tier B/C uses in `if`-branches need it), preserved on its
+> branch per the ADR-0041 precedent — merge it WHEN a measured gap needs it, not
+> speculatively. **Per AGENTS.md "never ship a speculative slice", the discipline
+> call is: do not merge a 0-gap slice.** The durable value is this finding + the
+> preserved branch.
+
+---
+
 Port `call.possible-nil-receiver` for the **conditional-assignment nilable
 local** (`x = expr if cond` ⇒ `x : T | nil`). Investigated via the full protocol:
 two independent Sonnet investigations (reference semantics; rigor-rs substrate) +

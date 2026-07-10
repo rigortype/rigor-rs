@@ -33,6 +33,25 @@ now a DIFFERENT direction — the ScopeIndexer substrate (unblocks --params=obse
 clusters, ADR-0022), more productization (LSP §12 two-tier / watched-files / more MCP tools), or a measured
 coverage rule.** The parity-port arc has fully bottomed out; productization + deep-substrate are the frontier.
 
+**▶▶ CONDITIONAL-ASSIGNMENT NILABILITY — BUILT + FP-SAFE but 0 SURVEY GAPS, NOT merged (branch
+`flow-cond-assign-nilability`, `7b7fe3d`).** The user-chosen flow slice, done via the full delegation protocol
+(2 Sonnet investigations + oracle self-probes → binding spec → Opus impl → main audit). Turned out to be
+materially ADR-0038 Slice 2 (the `Node::If` descend + `nenv`/`penv` join + mandatory truthy-`if` narrowing
+substrate; the conditional-assignment nil emerges from the join). **Correct + FP-safe** (self-probe matrix
+byte-identical to the reference — `x = "s" if c; x.upcase` fires, guards/reassign/safe-nav silent; 0 FP on
+mastodon 1236 + gitlab-foss 6513 + conference-app 98, matched count UNCHANGED; harness 54/54; corpus 27/28
+non-regression). **But `fp_audit --gaps` closes 0** (mastodon possible-nil 26→26): the 26 gaps are all
+`present?`-guarded (accepted under-emit) or PROJECT-METHOD/IVAR nilable returns (Tier B/C, which rigor-rs lacks —
+the local is never minted nilable), NONE the unguarded core-typed pattern this closes; that pattern is absent
+from the corpora. **The 4th consecutive FP-safe flow slice to close 0 survey gaps** — confirming (again) the
+possible-nil frontier is Tier B/C ([ADR-0041](adr/0041-project-method-nilable-return.md), code on
+`tier-bc-nilable-return`) + ivar whole-class flow (ADR-58), full stop. **Per AGENTS.md "never ship a speculative
+slice", NOT merged**; the If-descent/join is reusable ADR-0038 Slice 2 substrate preserved on its branch (merge
+WHEN a measured gap needs it). Detail:
+[notes/20260711-conditional-assign-nilability-spec.md](notes/20260711-conditional-assign-nilability-spec.md).
+**⇒ The possible-nil sub-tracks are now exhausted at the flow-substrate level; the ONLY remaining lever is Tier
+B/C RHS-return inference (a deeper, separate substrate).**
+
 **▶▶ COVERAGE FRONTIER RE-MEASURED (2026-07-11) — bounded wins EXHAUSTED, next is deep-substrate.** Ran
 `fp_audit.py --gaps` on mastodon (0 FP throughout): `app/models` 108/115 matched, 7 gaps; `app` 397/459, 62 gaps
 (undefined-method 33 tapped-out, possible-nil 26, always-truthy 2, arg-type-mismatch 1). **Characterized the
