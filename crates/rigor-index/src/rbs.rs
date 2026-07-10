@@ -99,11 +99,14 @@ struct ClassEntry {
     /// shape, are simply absent here (⇒ the block call stays Dynamic / silent).
     block_returns: HashMap<&'static str, &'static str>,
     /// Singleton (class-level) methods `def self.x` (and the singleton half of
-    /// `def self?.x`). Keyed by name -> arity envelope. The singleton class
-    /// inherits down the SUPERCLASS chain, so resolving a class method walks
-    /// these maps up `superclass`. Return types are not modeled here (the
-    /// existence check is all the singleton surface needs).
-    singleton_methods: HashMap<&'static str, Arity>,
+    /// `def self?.x`). Keyed by name -> `(resolved return class, arity envelope)`.
+    /// The singleton class inherits down the SUPERCLASS chain, so resolving a
+    /// class method walks these maps up `superclass`. The return-class slot
+    /// mirrors the instance `methods` table's resolution discipline (a single
+    /// bare concrete `ClassInstanceType` ⇒ `Some(name)`, else `None`) and is read
+    /// ONLY by the sig-gen-only [`Self::declared_singleton_return`]; the existence
+    /// check ([`Self::class_has_singleton_method`]) uses just the key set.
+    singleton_methods: HashMap<&'static str, (Option<&'static str>, Arity)>,
     /// Instance-method aliases `new_name -> old_name` (RBS `alias size length`).
     /// The alias target is resolved at lookup time so `new_name` inherits
     /// `old_name`'s existence / return type / arity (the old name may live on
@@ -676,6 +679,161 @@ impl CoreData {
         self.lookup_on_chain(&chain, method).map(|(_, arity, _)| arity)
     }
 
+    // -- Sig-gen-only precise declared-return accessors (ADR-14 slice 10) ------
+    //
+    // These are NOT diagnostic predicates. `class_has_method` /
+    // `class_has_singleton_method` deliberately "assume present" on an incomplete
+    // ancestor chain (a diagnostic must never witness false absence), which
+    // conflates *not declared* with *declared, return unresolvable*. sig-gen's
+    // generation-time classification needs those apart: NotDeclared ⇒ emit
+    // `# [new]`, Declared(unresolvable) ⇒ silently DROP. The three-valued
+    // `Option<Option<&str>>` encoding carries that distinction, and these
+    // accessors NEVER assume-present — an incomplete chain with the method absent
+    // yields `Some(None)` (the conservative DROP), never `None`.
+
+    /// Whether the flattened ancestor chain of `class` is fully loaded (every
+    /// referenced ancestor is in the RBS set). **Sig-gen only.**
+    pub fn chain_complete(&self, class: &str) -> bool {
+        self.ancestors(class).1
+    }
+
+    /// **Sig-gen only — NOT a diagnostic predicate.** Precise three-valued
+    /// declared INSTANCE-return lookup over the ancestor chain:
+    /// - `None` ⇒ the method is not declared anywhere on a COMPLETE chain
+    ///   (⇒ sig-gen emits `# [new]`);
+    /// - `Some(None)` ⇒ declared (or the chain is incomplete, so a declaration
+    ///   may exist upstream) but the return is not a single bare concrete class
+    ///   (⇒ sig-gen DROPs, conservatively);
+    /// - `Some(Some(c))` ⇒ declared, resolvable return class `c`.
+    ///
+    /// The return-class resolution is exactly [`Self::method_return`]'s (a single
+    /// bare concrete `ClassInstanceType` across all overloads, else `None`).
+    pub fn declared_instance_return(&self, class: &str, method: &str) -> Option<Option<&'static str>> {
+        if !self.classes.contains_key(class) {
+            return None;
+        }
+        let (chain, complete) = self.ancestors(class);
+        match self.lookup_on_chain(&chain, method) {
+            Some((ret, _, _)) => Some(ret),
+            None if complete => None,
+            None => Some(None),
+        }
+    }
+
+    /// **Sig-gen only — NOT a diagnostic predicate.** The singleton counterpart
+    /// of [`Self::declared_instance_return`], over the same surface
+    /// [`Self::class_has_singleton_method`] checks: own `def self.x` up the
+    /// superclass chain, every `extend`ed module's INSTANCE methods, and the
+    /// INSTANCE methods of the five base classes (`Class`/`Module`/`Object`/
+    /// `Kernel`/`BasicObject`) the class object is itself an instance of. A
+    /// singleton ALIAS resolves as `Some(None)` (declared, return unresolved ⇒
+    /// DROP) rather than being missed.
+    pub fn declared_singleton_return(&self, class: &str, method: &str) -> Option<Option<&'static str>> {
+        if !self.classes.contains_key(class) {
+            return None;
+        }
+        // (a) own singleton methods up the superclass chain + extends' instance.
+        let (ret_a, found_a, complete_a) = self.singleton_return_lookup(class, method);
+        if found_a {
+            return Some(ret_a);
+        }
+        // (b) the class object's own ancestry (it is a `Class`): the instance
+        //     surface of the five base classes.
+        let (ret_b, found_b, bases_loaded) = self.singleton_bases_return(method);
+        if found_b {
+            return Some(ret_b);
+        }
+        // Not found anywhere: a precise NotDeclared only when the whole surface
+        // is known; otherwise the conservative DROP.
+        if complete_a && bases_loaded {
+            None
+        } else {
+            Some(None)
+        }
+    }
+
+    /// Walk `class_name`'s singleton superclass chain resolving the return of the
+    /// first `def self.x` / extended-module-instance / singleton-alias match.
+    /// Returns `(return, found, complete)`; `complete` is `false` when a
+    /// referenced superclass or extended module is not loaded. An alias match
+    /// yields `(None, true, _)` (declared, unresolved ⇒ DROP).
+    fn singleton_return_lookup(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> (Option<&'static str>, bool, bool) {
+        let mut chain: Vec<&'static str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut complete = true;
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let Some((&key, entry)) = self.classes.get_key_value(name) else {
+                complete = false;
+                break;
+            };
+            if !seen.insert(key) {
+                break;
+            }
+            chain.push(key);
+            for &module in &entry.extends {
+                if !self.classes.contains_key(module) {
+                    complete = false;
+                }
+            }
+            cur = entry.superclass;
+        }
+        // (1) direct `def self.x` on any class in the chain.
+        for &anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(&(ret, _)) = entry.singleton_methods.get(method) {
+                    return (ret, true, complete);
+                }
+            }
+        }
+        // (2) an `extend`ed module's INSTANCE method's return.
+        for &anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                for &module in &entry.extends {
+                    if self.classes.contains_key(module) {
+                        let (mod_chain, _) = self.ancestors(module);
+                        if let Some((ret, _, _)) = self.lookup_on_chain(&mod_chain, method) {
+                            return (ret, true, complete);
+                        }
+                    }
+                }
+            }
+        }
+        // (3) a singleton alias ⇒ declared, but the return is not resolved here
+        //     ⇒ DROP (safer than mis-emitting `# [new]`).
+        for &anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if entry.singleton_aliases.contains_key(method) {
+                    return (None, true, complete);
+                }
+            }
+        }
+        (None, false, complete)
+    }
+
+    /// The INSTANCE-method return of `method` on the class object's own ancestry
+    /// (the five base classes), plus whether all five are loaded — the
+    /// return-resolving twin of [`Self::singleton_bases_lookup`].
+    fn singleton_bases_return(&self, method: &str) -> (Option<&'static str>, bool, bool) {
+        const BASES: [&str; 5] = ["Class", "Module", "Object", "Kernel", "BasicObject"];
+        let mut loaded = true;
+        for base in BASES {
+            if !self.classes.contains_key(base) {
+                loaded = false;
+                continue;
+            }
+            let (chain, _) = self.ancestors(base);
+            if let Some((ret, _, _)) = self.lookup_on_chain(&chain, method) {
+                return (ret, true, loaded);
+            }
+        }
+        (None, false, loaded)
+    }
+
     /// Find `method`'s `(return, arity)` on the flattened ancestor chain,
     /// resolving instance `alias`es. The first ancestor that defines `method`
     /// directly wins; otherwise, if some ancestor aliases `method -> old`, the
@@ -1145,7 +1303,7 @@ impl Builder {
                         MethodDefinitionKind::Singleton
                             | MethodDefinitionKind::SingletonInstance
                     ) {
-                        entry.singleton_methods.entry(mname).or_insert(arity);
+                        entry.singleton_methods.entry(mname).or_insert((ret, arity));
                     }
                 }
                 Node::Include(inc) => {
@@ -1599,6 +1757,36 @@ mod embedded_tests {
             &[std::path::PathBuf::from("this-dir-does-not-exist-xyzzy")],
         );
         assert_eq!(base.class_count(), absent.class_count());
+    }
+
+    /// ADR-14 slice 10: the sig-gen-only precise declared-return accessors are
+    /// three-valued and never "assume present". `Object#hash → Integer` resolves
+    /// through the ancestor chain (instance AND — via the class object's own
+    /// ancestry — singleton), an absent method on a complete chain is `None`
+    /// (NotDeclared), and an unresolvable-return method is `Some(None)`.
+    #[test]
+    fn sig_gen_declared_return_accessors_are_three_valued() {
+        let idx = CoreData::load();
+        // Instance: declared, concrete return.
+        assert_eq!(idx.declared_instance_return("String", "upcase"), Some(Some("String")));
+        assert_eq!(idx.declared_instance_return("Object", "hash"), Some(Some("Integer")));
+        // Instance: declared, but the return is not a single bare concrete class
+        // (`Integer#times` returns an Enumerator/self union) ⇒ Some(None).
+        assert_eq!(idx.declared_instance_return("Integer", "times"), Some(None));
+        // Instance: not declared on a fully-loaded chain ⇒ None (NotDeclared).
+        assert_eq!(idx.declared_instance_return("String", "definitely_absent_zzz"), None);
+        // An unknown class ⇒ None (the SigEnv gates on presence first).
+        assert_eq!(idx.declared_instance_return("NoSuchClassZzz", "foo"), None);
+
+        // Singleton: the class object inherits `Object#hash` (Integer) through
+        // its `Class`/`Module`/`Object` ancestry.
+        assert_eq!(idx.declared_singleton_return("String", "hash"), Some(Some("Integer")));
+        // Singleton: an absent class method on a complete surface ⇒ None.
+        assert_eq!(idx.declared_singleton_return("String", "definitely_absent_zzz"), None);
+
+        // Chain completeness: a fully-loaded core class is complete.
+        assert!(idx.chain_complete("String"));
+        assert!(!idx.chain_complete("NoSuchClassZzz"));
     }
 
     /// ADR-0033: a project `sig/` dir's classes join the known set (so the

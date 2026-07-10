@@ -64,6 +64,9 @@ use rigor_infer::{SourceIndex, TypeEnv, Typer};
 use rigor_parse::{lower, parse, LoweredAst, Node, NodeId, ParamShape, Visibility};
 use rigor_types::{Interner, Type, TypeId};
 
+mod sig_env;
+use sig_env::{Lookup, SigEnv};
+
 /// A collected method to consider (instance or singleton) — the fields
 /// `method_candidate` needs, unifying the instance-harvest (`MethodBody`) and the
 /// singleton walk (`Node::Definition` fields) into one shape.
@@ -97,6 +100,15 @@ struct Candidate {
     rbs: String,
     /// The raw inferred return erased to RBS (the JSON `inferred_return` field).
     inferred_return: String,
+    /// The generation-time classification (`"new_method"` or `"tighter_return"`)
+    /// decided against the project's own RBS via [`SigEnv`] (ADR-14 slice 10).
+    /// `"equivalent"` candidates are never constructed (dropped, as the reference
+    /// filters them out) so the field is one of exactly these two.
+    classification: &'static str,
+    /// For a `tighter_return`, the declared return's erased RBS string (the
+    /// `# [tighter, was: X]` tag / `- def …` diff line / JSON `declared_return_rbs`);
+    /// `None` for a `new_method`.
+    declared_return_rbs: Option<String>,
 }
 
 /// `rigor sig-gen [--print] [--format text|json] [--include-private] [--config PATH] [paths]`.
@@ -159,12 +171,21 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     };
     let files = resolve_paths(raw);
 
+    // The sig-gen-local, FQN-keyed declaration env, built ONCE from the project's
+    // own `.rbs` under the configured signature dirs (ADR-14 slice 10). Drives
+    // generation-time `new_method` / `tighter_return` classification. Sig-gen-local
+    // by construction — the `check` path never sees it.
+    let project_root = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
+
     if write {
-        return cmd_write(&files, include_private, format, &cfg);
+        return cmd_write(&files, include_private, format, &cfg, &sig_env);
     }
 
     let candidates: Vec<Candidate> =
-        files.iter().flat_map(|p| generate_file(p, include_private)).collect();
+        files.iter().flat_map(|p| generate_file(p, include_private, &sig_env)).collect();
 
     // `--format json` renders the candidate table regardless of print/diff mode
     // (reference `Renderer#render`); text picks the diff or print layout.
@@ -234,20 +255,24 @@ fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info:
 
 /// Produce the printable candidates for one source file (drops the write-only
 /// [`NamespaceInfo`]).
-fn generate_file(path: &str, include_private: bool) -> Vec<Candidate> {
-    generate_file_with_info(path, include_private).0
+fn generate_file(path: &str, include_private: bool, sig_env: &SigEnv) -> Vec<Candidate> {
+    generate_file_with_info(path, include_private, sig_env).0
 }
 
 /// Produce candidates + the `--write` namespace metadata for one source file. A
 /// parse/read failure (or a file with no reachable named class body) yields no
 /// candidates.
-fn generate_file_with_info(path: &str, include_private: bool) -> (Vec<Candidate>, NamespaceInfo) {
+fn generate_file_with_info(
+    path: &str,
+    include_private: bool,
+    sig_env: &SigEnv,
+) -> (Vec<Candidate>, NamespaceInfo) {
     let Ok(source) = std::fs::read_to_string(path) else {
         return (Vec::new(), NamespaceInfo::default());
     };
     let ast = lower(&parse(source.as_bytes()));
-    // Core-only env: the existing-project-RBS comparison (tighter/equivalent) is
-    // a deferred slice, so every qualifying def is a fresh `NEW_METHOD`.
+    // Core index for typing / erasure AND the declared-return ancestor tail the
+    // [`SigEnv`] delegates to (`declared_instance_return` / `_singleton_return`).
     let index = CoreIndex::new();
     let source_index = SourceIndex::build(&ast, &index);
     let typer = Typer::with_source(&index, &source_index);
@@ -283,6 +308,7 @@ fn generate_file_with_info(path: &str, include_private: bool) -> (Vec<Candidate>
                 &typer,
                 &env,
                 &nested_classes,
+                sig_env,
                 &mut interner,
                 &mut out,
             );
@@ -327,6 +353,7 @@ fn walk_namespace(
     typer: &Typer,
     env: &TypeEnv,
     nested_classes: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
 ) {
@@ -418,6 +445,7 @@ fn walk_namespace(
             typer,
             env,
             nested_classes,
+            sig_env,
             interner,
         ) {
             out.push(candidate);
@@ -437,6 +465,7 @@ fn walk_namespace(
                 typer,
                 env,
                 nested_classes,
+                sig_env,
                 interner,
                 out,
             );
@@ -473,6 +502,7 @@ fn method_candidate(
     typer: &Typer,
     env: &TypeEnv,
     nested_classes: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
     interner: &mut Interner,
 ) -> Option<Candidate> {
     // Visibility: skip private / protected unless `--include-private` (reference
@@ -505,6 +535,11 @@ fn method_candidate(
             // The reference stub's `inferred_return` is `untyped` (the rbs is
             // `-> void`, but the candidate carries the fallback type).
             inferred_return: "untyped".to_string(),
+            // `initialize` BYPASSES env lookup entirely (probe K: an identical
+            // declared `initialize` is still emitted `new_method`) — keep the stub
+            // path exactly as-is, before any classification.
+            classification: "new_method",
+            declared_return_rbs: None,
         });
     }
 
@@ -617,6 +652,14 @@ fn method_candidate(
     };
     let rbs = format!("{prefix}{}: {head} -> {ret}", sig.name);
 
+    // Generation-time env classification (ADR-14 slice 10). `None` ⇒ the method
+    // is DROPPED (equivalent to an already-declared return, or a conservative
+    // drop against an unresolvable / incomplete-chain declaration) — the same
+    // observable output as the reference building an EQUIVALENT candidate and the
+    // renderer's `EMITTABLE` filter discarding it.
+    let (classification, declared_return_rbs) =
+        classify(sig, class_name, &erased, &members, ast, index, sig_env, interner)?;
+
     Some(Candidate {
         file: path.to_string(),
         class_name: class_name.to_string(),
@@ -624,7 +667,108 @@ fn method_candidate(
         kind: if sig.singleton { "singleton" } else { "instance" },
         rbs,
         inferred_return: erased,
+        classification,
+        declared_return_rbs,
     })
+}
+
+/// Classify one already-inferred candidate against the project's own RBS
+/// ([`SigEnv`]), ported from the reference `classify_def`'s
+/// `lookup_existing_method` → `compare_against_declared` tail (probes A/N/O/P,
+/// oracle-confirmed). Returns `(classification, declared_return_rbs)`, or `None`
+/// to DROP the candidate (an EQUIVALENT declaration, or a conservative drop).
+///
+/// `inferred_erased` is the inferred return's erased RBS string (the equivalence
+/// key); `members` is the deduped inferred member set — a single member is a bare
+/// carrier eligible for tightening, more than one is a union that never tightens
+/// a bare declared class (an FP-safe under-emit).
+#[allow(clippy::too_many_arguments)]
+fn classify(
+    sig: &MethodSig,
+    class_name: &str,
+    inferred_erased: &str,
+    members: &[TypeId],
+    ast: &LoweredAst,
+    index: &CoreIndex,
+    sig_env: &SigEnv,
+    interner: &Interner,
+) -> Option<(&'static str, Option<String>)> {
+    match sig_env.lookup(index, class_name, sig.name, sig.singleton) {
+        // NotDeclared ⇒ a fresh method (emit `# [new]`).
+        Lookup::NotDeclared => Some(("new_method", None)),
+        // Declared but the return is unresolvable, or the ancestor chain is
+        // incomplete ⇒ conservative DROP (never a wrong `# [new]` tag).
+        Lookup::Declared(None) => None,
+        Lookup::Declared(Some(decl)) => {
+            // Equivalent: the inferred erases to the declared string (probe C/P).
+            if inferred_erased == decl {
+                return None;
+            }
+            // A tightening must be a SINGLE bare carrier whose nominal-of is
+            // exactly the declared class. A union (`> 1` member) never bare-tightens
+            // a single declared class (FP-safe under-emit; e.g. declared union member
+            // loss, `Integer | Float` narrowing `Numeric`).
+            let inferred_ty = match members {
+                [single] => *single,
+                _ => return None,
+            };
+            // Wider / unrelated: the inferred's nominal is not the declared class
+            // (probe F — declared `Integer`, inferred `"hi"` → `String`).
+            if index.class_name_of(interner, inferred_ty) != Some(decl.as_str()) {
+                return None;
+            }
+            // Collection→shape lenience loss: declared bare `Array`/`Hash`/… vs an
+            // inferred `Tuple`/`HashShape` (`narrows_collection_to_shape?`).
+            if narrows_collection_to_shape(&decl, interner, inferred_ty) {
+                return None;
+            }
+            // `computed_literal_tightening?`: an inferred `Constant` whose def's RAW
+            // tail statement is NOT a directly-authored literal node — the precision
+            // came from inference over an internal computation, not the author's
+            // contract (probe P: `def hash; [1].size; end` folds `1` but the tail
+            // `[1].size` is a Call). NB: the RAW `sig.body.last()` node, NOT the
+            // assignment-unwrapped typing tail.
+            let raw_tail = ast.get(*sig.body.last()?);
+            if computed_literal_tightening(interner, inferred_ty, raw_tail) {
+                return None;
+            }
+            Some(("tighter_return", Some(decl)))
+        }
+    }
+}
+
+/// The reference `narrows_collection_to_shape?`: a declared generic-collection
+/// nominal whose inferred form collapsed to a fixed `Tuple` / `HashShape`. The
+/// member list is the reference's `GENERIC_COLLECTION_CLASSES` constant
+/// (`generator.rb`), read verbatim — NOT guessed.
+fn narrows_collection_to_shape(declared: &str, interner: &Interner, inferred: TypeId) -> bool {
+    const GENERIC_COLLECTION_CLASSES: &[&str] =
+        &["Array", "Hash", "Set", "Range", "Enumerable", "Enumerator", "Enumerator::Lazy"];
+    if !GENERIC_COLLECTION_CLASSES.contains(&declared) {
+        return false;
+    }
+    matches!(interner.get(inferred), Type::Tuple(_) | Type::HashShape(_))
+}
+
+/// The reference `computed_literal_tightening?`: the inferred type is a
+/// `Type::Constant` AND the def's RAW last statement is not a directly-authored
+/// literal node. The reference's `body_last_expression` does NOT unwrap an
+/// assignment, so `def m; x = 1; end` DROPS (the raw tail is a `LocalVariableWrite`,
+/// not an `IntegerLit`) even though its typing tail unwraps to `Constant<1>`.
+fn computed_literal_tightening(interner: &Interner, inferred: TypeId, raw_tail: &Node) -> bool {
+    if !matches!(interner.get(inferred), Type::Constant(_)) {
+        return false;
+    }
+    !matches!(
+        raw_tail,
+        Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::StringLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::TrueLit { .. }
+            | Node::FalseLit { .. }
+            | Node::NilLit { .. }
+    )
 }
 
 /// Collect the def's collectible explicit-return value expressions, or `None`
@@ -837,7 +981,7 @@ fn render_text(candidates: &[Candidate]) {
         for class in classes {
             println!("class {class}");
             for c in items.iter().filter(|c| c.class_name == class) {
-                println!("  # [new]");
+                println!("  # {}", candidate_tag(c));
                 println!("  {}", c.rbs);
             }
             println!("end");
@@ -858,11 +1002,29 @@ fn render_diff(candidates: &[Candidate]) {
     print!("{}", diff_string(candidates));
 }
 
+/// The `--print` comment tag for a candidate (reference `render_classes`):
+/// `[new]` for a `new_method`, `[tighter, was: <declared>]` for a
+/// `tighter_return`.
+fn candidate_tag(c: &Candidate) -> String {
+    match &c.declared_return_rbs {
+        Some(declared) => format!("[tighter, was: {declared}]"),
+        None => "[new]".to_string(),
+    }
+}
+
 /// Build the `--diff` text body (extracted from [`render_diff`] for testability).
+/// A `tighter_return` prints its declared line `- def <name>: () -> <declared>`
+/// before the `+` line (reference `render_diff`): the `()` param list and the
+/// BARE method name are HARDCODED even for a singleton (`- def build: …` sits
+/// above `+ def self.build: …`), and the header stays `Class#method`.
 fn diff_string(candidates: &[Candidate]) -> String {
     let mut out = String::new();
     for c in candidates {
-        out.push_str(&format!("--- {}: {}#{}\n+ {}\n\n", c.file, c.class_name, c.method_name, c.rbs));
+        out.push_str(&format!("--- {}: {}#{}\n", c.file, c.class_name, c.method_name));
+        if let Some(declared) = &c.declared_return_rbs {
+            out.push_str(&format!("- def {}: () -> {declared}\n", c.method_name));
+        }
+        out.push_str(&format!("+ {}\n\n", c.rbs));
     }
     out
 }
@@ -873,21 +1035,28 @@ fn diff_string(candidates: &[Candidate]) -> String {
 /// order divergence).
 fn render_json(candidates: &[Candidate]) {
     use serde_json::json;
-    let rows: Vec<_> = candidates
-        .iter()
-        .map(|c| {
-            json!({
-                "file": c.file,
-                "class": c.class_name,
-                "method": c.method_name,
-                "kind": c.kind,
-                "classification": "new_method",
-                "rbs": c.rbs,
-                "inferred_return": c.inferred_return,
-            })
-        })
-        .collect();
+    let rows: Vec<_> = candidates.iter().map(candidate_json).collect();
     println!("{}", serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap());
+}
+
+/// One candidate's JSON object (reference `MethodCandidate#to_h`): the per-
+/// candidate key set with the real `classification`, and `declared_return_rbs`
+/// present ONLY on a `tighter_return` (the reference `.compact`s the nil).
+fn candidate_json(c: &Candidate) -> serde_json::Value {
+    use serde_json::json;
+    let mut obj = json!({
+        "file": c.file,
+        "class": c.class_name,
+        "method": c.method_name,
+        "kind": c.kind,
+        "classification": c.classification,
+        "rbs": c.rbs,
+        "inferred_return": c.inferred_return,
+    });
+    if let Some(dr) = &c.declared_return_rbs {
+        obj.as_object_mut().unwrap().insert("declared_return_rbs".to_string(), json!(dr));
+    }
+    obj
 }
 
 // ---------------------------------------------------------------------------
@@ -929,7 +1098,13 @@ struct SkipEntry {
 /// through [`update_existing`] — new members spliced before the class's `end`,
 /// user-authored conflicts preserved. A file's candidates may split across a
 /// consolidated target and a mirror target (per-candidate grouping).
-fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate::Config) -> ExitCode {
+fn cmd_write(
+    files: &[String],
+    include_private: bool,
+    format: &str,
+    cfg: &crate::Config,
+    sig_env: &SigEnv,
+) -> ExitCode {
     let project_root = std::env::current_dir()
         .and_then(|d| d.canonicalize())
         .unwrap_or_else(|_| PathBuf::from("."));
@@ -955,7 +1130,7 @@ fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate:
     let mut merged = NamespaceInfo::default();
     let mut tagged: Vec<(PathBuf, Candidate)> = Vec::new();
     for f in files {
-        let (candidates, info) = generate_file_with_info(f, include_private);
+        let (candidates, info) = generate_file_with_info(f, include_private, sig_env);
         merged.kinds.extend(info.kinds);
         merged.supers.extend(info.supers);
         for c in candidates {
@@ -1028,6 +1203,8 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         kind: c.kind,
         rbs: c.rbs.clone(),
         inferred_return: c.inferred_return.clone(),
+        classification: c.classification,
+        declared_return_rbs: c.declared_return_rbs.clone(),
     }
 }
 
@@ -1191,17 +1368,7 @@ fn render_write_json(results: &[WriteResult]) {
     let rows: Vec<_> = results
         .iter()
         .map(|r| {
-            let applied: Vec<_> = r
-                .applied
-                .iter()
-                .map(|c| {
-                    json!({
-                        "file": c.file, "class": c.class_name, "method": c.method_name,
-                        "kind": c.kind, "classification": "new_method", "rbs": c.rbs,
-                        "inferred_return": c.inferred_return,
-                    })
-                })
-                .collect();
+            let applied: Vec<_> = r.applied.iter().map(candidate_json).collect();
             let skipped: Vec<_> = r
                 .skipped
                 .iter()
@@ -1585,8 +1752,24 @@ fn merge_into_existing(
         applied.extend(new_methods);
     }
 
-    // CONFLICTING → equivalence check (design-note refinement 2).
+    // CONFLICTING → skipped as user-authored (design-note refinement 2, ADR-14
+    // slice 10 reconciliation).
     for (c, existing_rt) in conflicting {
+        // A candidate GENERATION already classified `tighter_return` carries its
+        // own `declared_return_rbs` resolved from the [`SigEnv`] — trust it, do
+        // NOT re-derive from the target text (amendment: no double-divergence).
+        // Only a `new_method` conflict (the class escaped env classification —
+        // e.g. a consolidated target whose class the generation env didn't see)
+        // falls back to the write-time extraction the previous slice used.
+        if c.classification == "tighter_return" {
+            let declared_return_rbs = c.declared_return_rbs.clone();
+            skipped.push(SkipEntry {
+                candidate: c,
+                classification: "tighter_return",
+                declared_return_rbs,
+            });
+            continue;
+        }
         let cand_rt = extract_method_return_text(&c.rbs);
         match (existing_rt, cand_rt) {
             (Some(er), Some(cr)) if er.trim() == cr.trim() => {
@@ -1691,9 +1874,179 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("t.rb");
         std::fs::write(&file, src).unwrap();
-        let out = generate_file(file.to_str().unwrap(), include_private);
+        // An EMPTY sig env: no project RBS ⇒ every candidate is `new_method`
+        // (these tests exercise inference/rendering, not env classification —
+        // that has its own `sig_env` unit tests + the oracle E2E gate).
+        let env = SigEnv::build(&[]);
+        let out = generate_file(file.to_str().unwrap(), include_private, &env);
         let _ = std::fs::remove_file(&file);
         out
+    }
+
+    /// Generate candidates for `rb_src` with a project sig env built from
+    /// `rbs_src` (the sig-gen-local [`SigEnv`]) — the env-classification unit
+    /// harness. A fresh unique dir per tag isolates parallel runs.
+    fn candidates_with_sig(tag: &str, rb_src: &str, rbs_src: &str) -> Vec<Candidate> {
+        let dir = std::env::temp_dir().join(format!("rigor_siggen_env_{tag}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        std::fs::create_dir_all(dir.join("sig")).unwrap();
+        let rb = dir.join("lib/foo.rb");
+        std::fs::write(&rb, rb_src).unwrap();
+        std::fs::write(dir.join("sig/foo.rbs"), rbs_src).unwrap();
+        let env = SigEnv::build(&[dir.join("sig")]);
+        let out = generate_file(rb.to_str().unwrap(), false, &env);
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    #[test]
+    fn env_no_sig_class_is_new_method() {
+        // Probe A: the class is absent from the env ⇒ NEW_METHOD (`# [new]`).
+        let cs = candidates_with_sig("no_env", "class Foo\n  def hash\n    1\n  end\nend\n", "class Bar\nend\n");
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].classification, "new_method");
+        assert_eq!(cs[0].declared_return_rbs, None);
+        assert_eq!(cs[0].rbs, "def hash: () -> 1");
+    }
+
+    #[test]
+    fn env_empty_decl_resolves_inherited_tighter() {
+        // Probe N: an EMPTY `class Foo` in sig ⇒ `hash` resolves through Object ⇒
+        // tighter, was: Integer.
+        let cs = candidates_with_sig("empty_decl", "class Foo\n  def hash\n    1\n  end\nend\n", "class Foo\nend\n");
+        assert_eq!(cs[0].classification, "tighter_return");
+        assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("Integer"));
+    }
+
+    #[test]
+    fn env_fqn_gate_resolves_nested_class() {
+        // Probe Q1: the gate is FQN-keyed — a nested `M::Foo` resolves (rigor-index
+        // short-name folding cannot; this is why SigEnv exists).
+        let cs = candidates_with_sig(
+            "fqn",
+            "module M\n  class Foo\n    def hash\n      1\n    end\n  end\nend\n",
+            "module M\n  class Foo\n  end\nend\n",
+        );
+        assert_eq!(cs[0].class_name, "M::Foo");
+        assert_eq!(cs[0].classification, "tighter_return");
+        assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("Integer"));
+    }
+
+    #[test]
+    fn env_project_superclass_resolves_tighter() {
+        // Probe O: `class Foo < Base`, Base declares `greeting: () -> String`.
+        let cs = candidates_with_sig(
+            "super",
+            "class Foo\n  def greeting\n    \"hi\"\n  end\nend\n",
+            "class Base\n  def greeting: () -> String\nend\n\nclass Foo < Base\nend\n",
+        );
+        assert_eq!(cs[0].classification, "tighter_return");
+        assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn env_inherited_equivalent_drops() {
+        // Probe P: `def hash; [1].size; end` folds `1` but the raw tail `[1].size`
+        // is not a literal ⇒ computed_literal_tightening ⇒ DROP (No candidates).
+        let cs = candidates_with_sig("equiv", "class Foo\n  def hash\n    [1].size\n  end\nend\n", "class Foo\nend\n");
+        assert!(cs.is_empty(), "computed-literal drop: {cs:?}");
+    }
+
+    #[test]
+    fn env_initialize_bypasses_classification() {
+        // Probe K: an identical declared `initialize` still emits `# [new]`.
+        let cs = candidates_with_sig(
+            "init",
+            "class Foo\n  def initialize(a)\n    @a = a\n  end\nend\n",
+            "class Foo\n  def initialize: (untyped) -> void\nend\n",
+        );
+        assert_eq!(cs[0].classification, "new_method");
+        assert_eq!(cs[0].rbs, "def initialize: (untyped) -> void");
+    }
+
+    #[test]
+    fn env_attr_reader_classifies_like_method() {
+        // Probe I: `attr_reader name: String` ⇒ `def name` tighter, was: String.
+        let cs = candidates_with_sig("attr", "class Foo\n  def name\n    \"n\"\n  end\nend\n", "class Foo\n  attr_reader name: String\nend\n");
+        assert_eq!(cs[0].classification, "tighter_return");
+        assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn env_singleton_own_and_inherited() {
+        // Probe Q2: own `def self.build: () -> Integer` ⇒ tighter.
+        let own = candidates_with_sig(
+            "sing_own",
+            "class Foo\n  def self.build\n    1\n  end\nend\n",
+            "class Foo\n  def self.build: () -> Integer\nend\n",
+        );
+        assert_eq!(own[0].classification, "tighter_return");
+        assert_eq!(own[0].kind, "singleton");
+        assert_eq!(own[0].declared_return_rbs.as_deref(), Some("Integer"));
+
+        // Probe Q3: `def self.hash` on an empty `class Foo` inherits `Object#hash`
+        // through the class object's `Class`/`Module`/`Object` ancestry.
+        let inh = candidates_with_sig(
+            "sing_inh",
+            "class Foo\n  def self.hash\n    1\n  end\nend\n",
+            "class Foo\nend\n",
+        );
+        assert_eq!(inh[0].classification, "tighter_return");
+        assert_eq!(inh[0].declared_return_rbs.as_deref(), Some("Integer"));
+    }
+
+    #[test]
+    fn env_literal_tightening_emits_but_computed_drops() {
+        // A directly-authored literal tail tightens; a computed constant drops.
+        let lit = candidates_with_sig("lit", "class Foo\n  def m\n    1\n  end\nend\n", "class Foo\n  def m: () -> Integer\nend\n");
+        assert_eq!(lit[0].classification, "tighter_return");
+        // Assignment tail: `x = 1` types Constant<1> but the RAW tail is a write,
+        // NOT a literal ⇒ computed_literal_tightening ⇒ DROP (no assignment unwrap).
+        let asn = candidates_with_sig("asn", "class Foo\n  def m\n    x = 1\n  end\nend\n", "class Foo\n  def m: () -> Integer\nend\n");
+        assert!(asn.is_empty(), "assignment tail is not a direct literal: {asn:?}");
+    }
+
+    #[test]
+    fn env_collection_to_shape_drops() {
+        // Declared bare `Array`, inferred `[1, 2]` (Tuple) ⇒
+        // narrows_collection_to_shape ⇒ DROP.
+        let cs = candidates_with_sig("coll", "class Foo\n  def m\n    [1, 2]\n  end\nend\n", "class Foo\n  def m: () -> Array\nend\n");
+        assert!(cs.is_empty(), "collection→shape drop: {cs:?}");
+    }
+
+    #[test]
+    fn env_unresolvable_declared_returns_drop() {
+        // optional / union / untyped / multi-overload / generic-args declared ⇒
+        // Declared(None) or not-tighter ⇒ DROP (No candidates).
+        for (tag, decl) in [
+            ("opt", "def m: () -> String?"),
+            ("uni", "def m: () -> (String | Integer)"),
+            ("unt", "def m: () -> untyped"),
+            ("gen", "def m: () -> Array[Integer]"),
+            ("wid", "def m: () -> Integer"), // wider: inferred "hi" is String
+        ] {
+            let rbs = format!("class Foo\n  {decl}\nend\n");
+            let cs = candidates_with_sig(tag, "class Foo\n  def m\n    \"hi\"\n  end\nend\n", &rbs);
+            assert!(cs.is_empty(), "{tag}: expected DROP, got {cs:?}");
+        }
+        // A genuine tightening still emits (declared String, inferred "hi").
+        let ok = candidates_with_sig("tight", "class Foo\n  def m\n    \"hi\"\n  end\nend\n", "class Foo\n  def m: () -> String\nend\n");
+        assert_eq!(ok[0].classification, "tighter_return");
+        assert_eq!(ok[0].declared_return_rbs.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn env_incomplete_chain_drops_not_new() {
+        // Pitfall g: an unknown superclass (`< Unknown`, no sig) makes the chain
+        // incomplete ⇒ DROP (conservative), NOT `# [new]` — a wrong `# [new]` on a
+        // method the reference tags `# [tighter]` would be the hard-guarantee break.
+        let cs = candidates_with_sig(
+            "incomplete",
+            "class Foo\n  def zzz\n    \"hi\"\n  end\nend\n",
+            "class Foo < Unknown\nend\n",
+        );
+        assert!(cs.is_empty(), "incomplete-chain drop: {cs:?}");
     }
 
     #[test]
@@ -1870,6 +2223,8 @@ mod tests {
             kind: "instance",
             rbs: rbs.into(),
             inferred_return: String::new(),
+            classification: "new_method",
+            declared_return_rbs: None,
         };
         let cands = [
             c("Foo", "greeting", "def greeting: () -> \"h\""),
@@ -1920,6 +2275,8 @@ mod tests {
             kind: "instance",
             rbs: rbs.into(),
             inferred_return: String::new(),
+            classification: "new_method",
+            declared_return_rbs: None,
         };
         let mut info = NamespaceInfo::default();
         info.kinds.insert("Outer".into(), "module");
@@ -1938,6 +2295,8 @@ mod tests {
             kind: "instance",
             rbs: "def g: () -> \"h\"".into(),
             inferred_return: String::new(),
+            classification: "new_method",
+            declared_return_rbs: None,
         };
         // No kinds recorded → a leaf with methods defaults to `class`.
         let out = render_new_file(&[cand], &NamespaceInfo::default());
@@ -2031,6 +2390,8 @@ mod tests {
             kind,
             rbs: rbs.into(),
             inferred_return: String::new(),
+            classification: "new_method",
+            declared_return_rbs: None,
         }
     }
 

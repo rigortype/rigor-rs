@@ -196,6 +196,29 @@ impl CoreIndex {
         self.data.class_has_singleton_method(class_name, method)
     }
 
+    /// **Sig-gen only — NOT a diagnostic predicate.** Whether the flattened
+    /// ancestor chain of `class` is fully loaded. See
+    /// [`rbs::CoreData::chain_complete`].
+    pub fn chain_complete(&self, class: &str) -> bool {
+        self.data.chain_complete(class)
+    }
+
+    /// **Sig-gen only — NOT a diagnostic predicate.** Precise three-valued
+    /// declared instance-return lookup (`None` = not declared on a complete
+    /// chain; `Some(None)` = declared/incomplete-chain but return unresolvable;
+    /// `Some(Some(c))` = declared, returns `c`). See
+    /// [`rbs::CoreData::declared_instance_return`].
+    pub fn declared_instance_return(&self, class: &str, method: &str) -> Option<Option<&'static str>> {
+        self.data.declared_instance_return(class, method)
+    }
+
+    /// **Sig-gen only — NOT a diagnostic predicate.** The singleton counterpart
+    /// of [`Self::declared_instance_return`]. See
+    /// [`rbs::CoreData::declared_singleton_return`].
+    pub fn declared_singleton_return(&self, class: &str, method: &str) -> Option<Option<&'static str>> {
+        self.data.declared_singleton_return(class, method)
+    }
+
     /// Enumerate every INSTANCE method callable on `class_name` over its ancestor
     /// chain (own + inherited + module + aliases), sorted + deduped. Empty for an
     /// unknown class. Advisory (no completeness gate) — for LSP completion (§12).
