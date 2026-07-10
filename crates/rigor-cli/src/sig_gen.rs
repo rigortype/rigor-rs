@@ -75,6 +75,10 @@ struct MethodSig<'a> {
     /// kind `"singleton"`, and NOT subject to the visibility / `initialize` skips
     /// (both instance-only in the reference).
     singleton: bool,
+    /// `true` for an instance def that a bare `module_function` earlier in the
+    /// same body made dual — rendered `def self?.name` (reference
+    /// `method_def_prefix` / `@module_function_methods`). Kind stays `instance`.
+    module_function: bool,
 }
 
 /// One printable RBS skeleton row (the reference's emittable `MethodCandidate`,
@@ -337,40 +341,48 @@ fn walk_namespace(
     qualified.push(name.clone());
     let class_name = qualified.join("::");
 
-    // A bare `module_function` call (in a MODULE *or* a CLASS — rule_catalog.rb
-    // uses it in a class): the reference emits every subsequent instance method
-    // as `def self?.name` (the dual instance+singleton spelling —
-    // `@module_function_methods` in the reference walker). rigor-rs's lowering
-    // does not track module_function state, so emitting `def name` here would
-    // byte-DIVERGE on a shared method (probed: `class C; module_function; def
-    // helper` → ref `def self?.helper` vs rs `def helper`). Skip this body's
-    // instance methods until the `self?.` spelling is ported (FP-safe under-emit;
-    // singletons still emit, nested namespaces still descend).
-    let module_function_active = body.iter().any(|&c| {
-        matches!(ast.get(c), Node::Call { method, receiver: None, .. } if method == "module_function")
-    });
-
     // Collect instance + singleton methods in ONE pass over the class body so
     // they emit in SOURCE ORDER (the reference walks the AST top-to-bottom): a
-    // direct instance `def x` (unless module_function suppresses it), a
-    // `def self.x`, and the receiver-less inner defs of a `class << self`.
-    // `method_bodies` harvests exactly the direct `Definition{name:Some}` set, so
-    // walking the body for them is equivalent AND recovers each def's span for the
-    // ordering. Each entry carries `span.start` as the sort key.
+    // direct instance `def x`, a `def self.x`, and the receiver-less inner defs
+    // of a `class << self`. `method_bodies` harvests exactly the direct
+    // `Definition{name:Some}` set, so walking the body for them is equivalent AND
+    // recovers each def's span for the ordering (the sort key).
+    //
+    // `mf_active` tracks a bare `module_function` (no args) seen EARLIER in this
+    // body — it makes every SUBSEQUENT instance def dual, rendered `def self?.name`
+    // (reference `@module_function_methods`). Position matters: a def BEFORE the
+    // call stays a plain instance method. The `module_function :sym` ARGS form does
+    // NOT flip the mode (oracle-probed) and is ignored. It applies in a CLASS body
+    // too (rule_catalog.rb), not just a module.
     let _ = (method_bodies, visibilities); // superseded by the body walk below
+    let mut mf_active = false;
     let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
     for &child in body {
         match ast.get(child) {
+            // A BARE `module_function` (no args) flips the mode for later defs.
+            Node::Call { method, receiver: None, args, .. }
+                if method == "module_function" && args.is_empty() =>
+            {
+                mf_active = true;
+            }
             Node::Definition {
                 name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
-            } if !module_function_active => {
+            } => {
                 let vis = visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v);
-                sigs.push((sig_of(n, b, params, param_shape, *has_explicit_return, false), vis, span.0));
+                sigs.push((
+                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf_active),
+                    vis,
+                    span.0,
+                ));
             }
             Node::Definition {
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
-                sigs.push((sig_of(n, b, params, param_shape, *has_explicit_return, true), None, span.0));
+                sigs.push((
+                    sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
+                    None,
+                    span.0,
+                ));
             }
             Node::Definition { is_singleton_class: true, body: sbody, .. } => {
                 for &inner in sbody {
@@ -379,7 +391,7 @@ fn walk_namespace(
                     } = ast.get(inner)
                     {
                         sigs.push((
-                            sig_of(n, b, params, param_shape, *has_explicit_return, true),
+                            sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
                             None,
                             span.0,
                         ));
@@ -430,6 +442,7 @@ fn walk_namespace(
 }
 
 /// Build a [`MethodSig`] borrowing the def's arena fields.
+#[allow(clippy::too_many_arguments)]
 fn sig_of<'a>(
     name: &'a str,
     body: &'a [NodeId],
@@ -437,8 +450,9 @@ fn sig_of<'a>(
     param_shape: &'a ParamShape,
     has_explicit_return: bool,
     singleton: bool,
+    module_function: bool,
 ) -> MethodSig<'a> {
-    MethodSig { name, body, params, param_shape, has_explicit_return, singleton }
+    MethodSig { name, body, params, param_shape, has_explicit_return, singleton, module_function }
 }
 
 /// Classify + render one method (instance or singleton), or `None` when skipped
@@ -588,9 +602,16 @@ fn method_candidate(
         format!("({})", vec!["untyped"; arity].join(", "))
     };
     let ret = paren_wrap_union(&erased);
-    // `def self.name` for a singleton (reference `method_def_prefix`), `def name`
-    // for an instance method.
-    let prefix = if sig.singleton { "def self." } else { "def " };
+    // reference `method_def_prefix`, in that precedence: a singleton is
+    // `def self.`, a bare-`module_function`-governed instance def is the DUAL
+    // `def self?.`, everything else `def `.
+    let prefix = if sig.singleton {
+        "def self."
+    } else if sig.module_function {
+        "def self?."
+    } else {
+        "def "
+    };
     let rbs = format!("{prefix}{}: {head} -> {ret}", sig.name);
 
     Some(Candidate {
@@ -1254,15 +1275,42 @@ mod tests {
     }
 
     #[test]
-    fn module_function_skips_methods_in_module_and_class() {
-        // The reference spells module_function methods `def self?.m`; rigor-rs
-        // doesn't track that yet → skip. `module_function` in a CLASS
-        // (rule_catalog.rb) must skip too — else `def helper` byte-diverges from
-        // the reference's `def self?.helper`.
-        let modsrc = "module Util\n  module_function\n\n  def helper\n    1\n  end\nend\n";
-        assert!(candidates_tagged("modfunc", modsrc, false).is_empty());
-        let clssrc = "class C\n  module_function\n\n  def helper\n    1\n  end\nend\n";
-        assert!(candidates_tagged("modfuncls", clssrc, false).is_empty());
+    fn bare_module_function_makes_subsequent_defs_dual() {
+        // Position matters: a def BEFORE the bare call stays instance; after it,
+        // the def is dual (`def self?.`). Applies in a CLASS body too.
+        let src = "module U\n  def before\n    1\n  end\n  module_function\n  def after\n    2\n  end\nend\n";
+        let cs = candidates_tagged("mfpos", src, false);
+        assert_eq!(
+            cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+            vec!["def before: () -> 1", "def self?.after: () -> 2"]
+        );
+        // Kind stays `instance` — only the rbs prefix changes.
+        assert!(cs.iter().all(|c| c.kind == "instance"));
+
+        let clssrc = "class C\n  module_function\n  def helper\n    1\n  end\nend\n";
+        let cc = candidates_tagged("mfcls", clssrc, false);
+        assert_eq!(cc[0].rbs, "def self?.helper: () -> 1");
+    }
+
+    #[test]
+    fn module_function_with_args_does_not_flip_mode() {
+        // `module_function :sym` (args form) neither flips the mode nor marks the
+        // method (oracle-probed) — both defs stay plain instance methods.
+        let src = "module N\n  def a\n    4\n  end\n  module_function :a\n  def b\n    5\n  end\nend\n";
+        let cs = candidates_tagged("mfargs", src, false);
+        assert_eq!(
+            cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+            vec!["def a: () -> 4", "def b: () -> 5"]
+        );
+    }
+
+    #[test]
+    fn singleton_prefix_wins_over_module_function() {
+        // reference `method_def_prefix` checks singleton FIRST.
+        let src = "class C\n  module_function\n  def self.s\n    7\n  end\nend\n";
+        let cs = candidates_tagged("mfsing", src, false);
+        assert_eq!(cs[0].rbs, "def self.s: () -> 7");
+        assert_eq!(cs[0].kind, "singleton");
     }
 
     #[test]

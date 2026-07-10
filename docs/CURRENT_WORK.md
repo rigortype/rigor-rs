@@ -11,7 +11,22 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-diff`) — sig-gen slice 7: `--diff` mode.** The cheapest remaining
+**▶▶ LANDED THIS SESSION (branch `sig-gen-module-function`) — sig-gen slice 8: `module_function` `self?.`
+spelling.** Replaces the conservative whole-body skip with the reference's real semantics, turning
+previously-SKIPPED methods into byte-identical emits: shared methods on `reference/lib` **102 → 108** (6 new
+`self?.`), **0 mismatch**. Semantics (oracle-probed): a BARE `module_function` (no args) flips a running flag for
+every SUBSEQUENT instance def in that body → `def self?.name` (reference `method_def_prefix` /
+`@module_function_methods`); **position matters** (a def BEFORE the call stays plain instance); the ARGS form
+(`module_function :sym`) does NOT flip the mode nor mark the method; it applies in a CLASS body too
+(rule_catalog.rb). Kind stays `instance` — only the rbs prefix changes. Singleton prefix WINS over
+module_function. Implemented by tracking `mf_active` in the existing ordered body walk (no new pass); lowering is
+module_function-agnostic so post-mf defs stay Public and are not visibility-skipped. **Gated:** 530 tests (3
+new), run.rb + run_snapshot.rb 54/54 0 FP, clippy clean; E2E BYTE-IDENTICAL on the full matrix (before/after,
+args form, class body, singleton precedence) for `--print` AND `--write`; sweep 140 files: 108 shared / 0
+mismatch. NEXT: Writer UPDATE/merge + `LayoutIndex` (existing-sig projects — the heavy remaining piece);
+`--params=observed` (ObservationCollector); qualified source-class naming.
+
+**▶▶ LANDED (branch `sig-gen-diff`, MERGED `968c10c`) — sig-gen slice 7: `--diff` mode.** The cheapest remaining
 slice — a thin renderer over the SAME candidates `--print` produces, completing the reference's three output
 modes (`--print` / `--diff` / `--write`). Per candidate: `--- <path>: <class>#<method>` / `+ <rbs>` / blank line
 (reference `render_diff`); rigor-rs emits only NEW methods so never a `- def` declared line (the reference's
