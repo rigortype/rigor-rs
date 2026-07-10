@@ -241,11 +241,16 @@ struct NamespaceInfo {
     kinds: std::collections::HashMap<String, &'static str>,
     /// qualified name → written superclass path (reference `superclass_suffix`).
     supers: std::collections::HashMap<String, String>,
+    /// FQNs of `Const = Data.define(...)` / `Struct.new(...)` constants, in source
+    /// order — the reference `--write`s an empty `class Const\nend` SHELL for each
+    /// so a qualified return type of it resolves (reference `@class_shells`).
+    shells: Vec<String>,
 }
 
 /// Record each class/module declaration's keyword + superclass into `info`,
 /// keyed by qualified name (reference `build_namespace_kinds` /
-/// `build_superclasses`).
+/// `build_superclasses`), and each `Data.define`/`Struct.new` constant as a
+/// class SHELL (reference `register_data_struct_shell`).
 fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
     let (name, body, kind, superclass): (&String, &[NodeId], &'static str, Option<&String>) =
         match ast.get(id) {
@@ -253,6 +258,17 @@ fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info:
                 (name, body, "class", superclass_path.as_ref())
             }
             Node::ModuleDef { name, body, .. } => (name, body, "module", None),
+            // A `Const = Data.define(...)` / `Struct.new(...)` at this level is a
+            // shell: record its FQN + mark its kind `class` (so the leaf renders
+            // `class`, not the intermediate-segment `module` default).
+            Node::ConstantWrite { name, value, .. }
+                if !name.is_empty() && is_class_defining_call(ast, *value) =>
+            {
+                let q = qualify_join(prefix, name);
+                info.kinds.insert(q.clone(), "class");
+                info.shells.push(q);
+                return;
+            }
             _ => return,
         };
     let mut qualified = prefix.to_vec();
@@ -1278,20 +1294,42 @@ fn cmd_write(
     // candidate to its target via the layout index (reference `write_all`).
     let mut merged = NamespaceInfo::default();
     let mut tagged: Vec<(PathBuf, Candidate)> = Vec::new();
+    // Each `Data.define`/`Struct.new` shell FQN routed to its target — the same
+    // target as its enclosing class (a shell lives in the source file with its
+    // constant). Preserves source order per file for stable shell rendering.
+    let mut tagged_shells: Vec<(PathBuf, String)> = Vec::new();
     for f in files {
         let (candidates, info) = generate_file_with_info(f, include_private, sig_env);
-        merged.kinds.extend(info.kinds);
-        merged.supers.extend(info.supers);
         for c in candidates {
             let target =
                 target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout);
             tagged.push((target, c));
         }
+        for shell in &info.shells {
+            // Route a shell to its ENCLOSING class's target (a shell rides in the
+            // same file as the class it is nested in — e.g. `Rigor::Triage::Selector`
+            // routes with `Rigor::Triage`), so a consolidated layout keeps the
+            // shell beside its class. A top-level shell (no `::`) routes by itself.
+            let route_name = shell.rsplit_once("::").map(|(head, _)| head).unwrap_or(shell);
+            let target =
+                target_for(f, route_name, &source_root, &sig_root, &project_root, &layout);
+            tagged_shells.push((target, shell.clone()));
+        }
+        merged.kinds.extend(info.kinds);
+        merged.supers.extend(info.supers);
+        merged.shells.extend(info.shells);
     }
 
     // Group by target, preserving first-seen order (reference groups by target).
+    // A shell-only target (a file with a `Data.define` but no methods) still gets
+    // a file so the shell declaration exists.
     let mut targets: Vec<PathBuf> = Vec::new();
     for (t, _) in &tagged {
+        if !targets.contains(t) {
+            targets.push(t.clone());
+        }
+    }
+    for (t, _) in &tagged_shells {
         if !targets.contains(t) {
             targets.push(t.clone());
         }
@@ -1302,7 +1340,19 @@ fn cmd_write(
     for target in targets {
         let group: Vec<Candidate> =
             tagged.iter().filter(|(t, _)| *t == target).map(|(_, c)| clone_candidate(c)).collect();
-        let source = group.first().map(|c| c.file.clone()).unwrap_or_default();
+        let shells: Vec<String> = tagged_shells
+            .iter()
+            .filter(|(t, _)| *t == target)
+            .map(|(_, s)| s.clone())
+            .collect();
+        let source = group
+            .first()
+            .map(|c| c.file.clone())
+            .or_else(|| {
+                // A shell-only target has no candidate: recover the source file.
+                tagged_shells.iter().find(|(t, _)| *t == target).map(|_| String::new())
+            })
+            .unwrap_or_default();
         let target_str = target.to_string_lossy().into_owned();
 
         if !target.starts_with(&sig_root_dir) {
@@ -1321,12 +1371,13 @@ fn cmd_write(
                 &target,
                 target_str,
                 group,
+                &shells,
                 &merged.supers,
                 overwrite,
             ));
             continue;
         }
-        let content = render_new_file(&group, &merged);
+        let content = render_new_file(&group, &shells, &merged);
         if let Some(parent) = target.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -1412,19 +1463,44 @@ fn mirror_target(source: &str, source_root: &str, sig_root: &str, project_root: 
 const INDENT: &str = "  ";
 
 /// Render a NEW sig file's content (reference `render_new_file` /
-/// `render_tree_nodes`): build a namespace tree from the candidates, then render
-/// each top-level node, joined by a blank line.
-fn render_new_file(candidates: &[Candidate], info: &NamespaceInfo) -> String {
+/// `render_tree_nodes`): build a namespace tree from the candidates, APPEND the
+/// `Data.define`/`Struct.new` shells (empty class nodes, after the method/nested
+/// children so a class body renders methods → real nested classes → shells, the
+/// reference order), then render each top-level node joined by a blank line.
+fn render_new_file(candidates: &[Candidate], shells: &[String], info: &NamespaceInfo) -> String {
     let mut roots: Vec<TreeNode> = Vec::new();
     for c in candidates {
         let segs: Vec<&str> = c.class_name.split("::").collect();
         insert_into_tree(&mut roots, &segs, &c.rbs);
+    }
+    for shell in shells {
+        let segs: Vec<&str> = shell.split("::").collect();
+        insert_shell_into_tree(&mut roots, &segs);
     }
     roots
         .iter()
         .map(|n| render_tree_node(n, info, 0, &[]))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Ensure an EMPTY tree node exists at the shell's class-name path `segs`,
+/// creating intermediate nodes as needed (reference `@class_shells` tree nodes).
+/// A leaf that already exists (the constant is ALSO referenced elsewhere) is left
+/// untouched — never duplicated.
+fn insert_shell_into_tree(nodes: &mut Vec<TreeNode>, segs: &[&str]) {
+    let Some((head, rest)) = segs.split_first() else { return };
+    let idx = match nodes.iter().position(|n| n.name == *head) {
+        Some(i) => i,
+        None => {
+            nodes.push(TreeNode { name: head.to_string(), children: Vec::new(), methods: Vec::new() });
+            nodes.len() - 1
+        }
+    };
+    if !rest.is_empty() {
+        insert_shell_into_tree(&mut nodes[idx].children, rest);
+    }
+    // rest empty ⇒ the leaf node now exists (empty) — nothing more to add.
 }
 
 /// A namespace-tree node: a name segment, ordered children, and the method RBS
@@ -1711,6 +1787,7 @@ fn update_existing(
     target: &Path,
     target_str: String,
     candidates: Vec<Candidate>,
+    shells: &[String],
     supers: &HashMap<String, String>,
     overwrite: bool,
 ) -> WriteResult {
@@ -1724,6 +1801,12 @@ fn update_existing(
         };
     };
 
+    // Shell injection on the MERGE path is deferred: when a file already exists,
+    // any shell it needs was written on the CREATE run (`render_new_file`), so a
+    // `--write` re-run stays idempotent (the shell is present, no conflict). The
+    // only uncovered case is merging into a USER-authored sig that lacks a shell
+    // for a `Data.define` return — a documented follow-up, not a regression.
+    let _ = shells;
     let MergeOutcome { source: merged, action, applied, skipped } =
         apply_merge(source, candidates, supers, overwrite);
     if action == "updated" {
@@ -2592,8 +2675,47 @@ mod tests {
         info.kinds.insert("Outer".into(), "module");
         info.kinds.insert("Outer::Inner".into(), "class");
         info.supers.insert("Outer::Inner".into(), "Base".into());
-        let out = render_new_file(&[cand("Outer::Inner", "def m: () -> :s")], &info);
+        let out = render_new_file(&[cand("Outer::Inner", "def m: () -> :s")], &[], &info);
         assert_eq!(out, "module Outer\n  class Inner < Base\n    def m: () -> :s\n  end\nend\n");
+    }
+
+    #[test]
+    fn render_new_file_appends_data_struct_shells_after_real_children() {
+        // Shells (empty `class`) append AFTER methods + real nested classes, in
+        // the given (source) order — the reference `@class_shells` tree order.
+        let cand = Candidate {
+            file: "lib/x.rb".into(),
+            class_name: "Host".into(),
+            method_name: "m".into(),
+            kind: "instance",
+            rbs: "def m: () -> Host::A".into(),
+            inferred_return: String::new(),
+            classification: "new_method",
+            declared_return_rbs: None,
+        };
+        let mut info = NamespaceInfo::default();
+        info.kinds.insert("Host".into(), "class");
+        info.kinds.insert("Host::A".into(), "class");
+        info.kinds.insert("Host::B".into(), "class");
+        let out = render_new_file(
+            &[cand],
+            &["Host::A".to_string(), "Host::B".to_string()],
+            &info,
+        );
+        assert_eq!(
+            out,
+            "class Host\n  def m: () -> Host::A\n  class A\n  end\n  class B\n  end\nend\n"
+        );
+    }
+
+    #[test]
+    fn render_new_file_shell_only_target_creates_the_class() {
+        // A file whose only sig-worthy content is a `Data.define` still gets a
+        // shell class (a shell-only target).
+        let mut info = NamespaceInfo::default();
+        info.kinds.insert("Standalone".into(), "class");
+        let out = render_new_file(&[], &["Standalone".to_string()], &info);
+        assert_eq!(out, "class Standalone\nend\n");
     }
 
     #[test]
@@ -2609,7 +2731,7 @@ mod tests {
             declared_return_rbs: None,
         };
         // No kinds recorded → a leaf with methods defaults to `class`.
-        let out = render_new_file(&[cand], &NamespaceInfo::default());
+        let out = render_new_file(&[cand], &[], &NamespaceInfo::default());
         assert_eq!(out, "class Foo\n  def g: () -> \"h\"\nend\n");
     }
 
