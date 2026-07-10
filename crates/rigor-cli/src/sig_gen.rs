@@ -53,8 +53,11 @@
 //! - QUALIFIED source-class naming (`Rigor::Plugin::ProtocolContract`) — unlocks
 //!   the nested source-class returns skipped above.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use ruby_rbs::node::{MethodDefinitionKind, Node as RbsNode, RBSLocationRange};
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, TypeEnv, Typer};
@@ -888,26 +891,44 @@ fn render_json(candidates: &[Candidate]) {
 }
 
 // ---------------------------------------------------------------------------
-// `--write` (reference `Writer`) — CREATE-ONLY slice
+// `--write` (reference `Writer`) — CREATE + UPDATE/merge
 // ---------------------------------------------------------------------------
 
-/// The outcome of writing one target `.rbs` file.
+/// The outcome of writing one target `.rbs` file (reference `WriteResult`).
 struct WriteResult {
     source: String,
     target: String,
-    action: &'static str, // "created" | "skipped_exists" | "skipped_outside_sig_root"
+    /// `"created"` | `"updated"` | `"noop"` | `"skipped_outside_sig_root"`.
+    action: &'static str,
     applied: Vec<Candidate>,
+    /// Candidates the merge declined because a user-authored member of the same
+    /// `(name, kind)` already exists with a DIFFERENT declared return (reference
+    /// `merge_into_existing_class`'s `skipped` accumulator). Empty on create.
+    skipped: Vec<SkipEntry>,
 }
 
-/// `rigor sig-gen --write [paths]` — CREATE-ONLY: writes `sig/<path>.rbs` for
-/// each source file whose target does NOT yet exist (reference `create_new`).
+/// One skipped (user-authored-conflict) candidate + the classification metadata
+/// the JSON report surfaces (design-note refinement 2). `reason` is always
+/// `user_authored` so it is hardcoded in the renderer.
+struct SkipEntry {
+    candidate: Candidate,
+    /// `"tighter_return"` when the existing return text was extractable and
+    /// differs; `"new_method"` when extraction failed (residual — see the note).
+    classification: &'static str,
+    /// The existing member's extracted return text (trimmed), present only for
+    /// `tighter_return`.
+    declared_return_rbs: Option<String>,
+}
+
+/// `rigor sig-gen --write [paths]` — CREATE + UPDATE (reference `Writer`).
 ///
-/// DEFERRED (each FP-safe — never corrupts an existing file): updating an
-/// EXISTING target (the `Writer`'s merge / user-authored preservation) is
-/// reported `skipped_exists` and left untouched; the `LayoutIndex` re-routing to
-/// a consolidated sig file is not ported, so `--write` targets a fresh / 1:1
-/// `sig/` layout (a consolidated layout could otherwise create a duplicate
-/// declaration — guarded by only writing when the mirror target is ABSENT).
+/// Each candidate is routed to its target `.rbs` (reference `PathMapper`): the
+/// [`LayoutIndex`] maps its `class_name` to an existing sig file (consolidated
+/// layout) FIRST, falling back to the 1:1 mirror. Candidates are then grouped by
+/// target; a MISSING target is created (`create_new`), an EXISTING one is merged
+/// through [`update_existing`] — new members spliced before the class's `end`,
+/// user-authored conflicts preserved. A file's candidates may split across a
+/// consolidated target and a mirror target (per-candidate grouping).
 fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate::Config) -> ExitCode {
     let project_root = std::env::current_dir()
         .and_then(|d| d.canonicalize())
@@ -925,8 +946,12 @@ fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate:
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "sig".to_string());
 
-    // Generate candidates + namespace metadata per source file, tagging each
-    // candidate with its target path (reference `write_all` groups by target).
+    // Pre-scan the configured signature dirs so a candidate whose class already
+    // lives in a consolidated `.rbs` routes there (reference `LayoutIndex`).
+    let layout = LayoutIndex::build(&cfg.signature_paths, &project_root);
+
+    // Generate candidates + namespace metadata per source file, routing each
+    // candidate to its target via the layout index (reference `write_all`).
     let mut merged = NamespaceInfo::default();
     let mut tagged: Vec<(PathBuf, Candidate)> = Vec::new();
     for f in files {
@@ -934,7 +959,8 @@ fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate:
         merged.kinds.extend(info.kinds);
         merged.supers.extend(info.supers);
         for c in candidates {
-            let target = target_for(&c.file, &source_root, &sig_root, &project_root);
+            let target =
+                target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout);
             tagged.push((target, c));
         }
     }
@@ -961,17 +987,12 @@ fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate:
                 target: target_str,
                 action: "skipped_outside_sig_root",
                 applied: Vec::new(),
+                skipped: Vec::new(),
             });
             continue;
         }
         if target.exists() {
-            // Update is a later slice — never touch an existing sig file.
-            results.push(WriteResult {
-                source,
-                target: target_str,
-                action: "skipped_exists",
-                applied: Vec::new(),
-            });
+            results.push(update_existing(source, &target, target_str, group, &merged.supers));
             continue;
         }
         let content = render_new_file(&group, &merged);
@@ -982,7 +1003,13 @@ fn cmd_write(files: &[String], include_private: bool, format: &str, cfg: &crate:
             eprintln!("sig-gen: failed to write {target_str}");
             return ExitCode::from(1);
         }
-        results.push(WriteResult { source, target: target_str, action: "created", applied: group });
+        results.push(WriteResult {
+            source,
+            target: target_str,
+            action: "created",
+            applied: group,
+            skipped: Vec::new(),
+        });
     }
 
     match format {
@@ -1004,9 +1031,27 @@ fn clone_candidate(c: &Candidate) -> Candidate {
     }
 }
 
-/// Map a source `.rb` path to its target `.rbs` (reference `PathMapper`): strip
-/// the source-root first component, swap the extension, place under the sig root.
-fn target_for(source: &str, source_root: &str, sig_root: &str, project_root: &Path) -> PathBuf {
+/// Map a candidate to its target `.rbs` (reference `PathMapper#target_for`):
+/// consult the [`LayoutIndex`] by `class_name` FIRST (a class already declared in
+/// a consolidated sig file routes there), and only on a miss fall back to the 1:1
+/// mirror mapping (strip the source-root first component, swap the extension,
+/// place under the sig root).
+fn target_for(
+    source: &str,
+    class_name: &str,
+    source_root: &str,
+    sig_root: &str,
+    project_root: &Path,
+    layout: &LayoutIndex,
+) -> PathBuf {
+    if let Some(existing) = layout.file_for(class_name) {
+        return existing.clone();
+    }
+    mirror_target(source, source_root, sig_root, project_root)
+}
+
+/// The 1:1 mirror `.rb` → `.rbs` mapping (the reference `PathMapper` fallback).
+fn mirror_target(source: &str, source_root: &str, sig_root: &str, project_root: &Path) -> PathBuf {
     let sp = Path::new(source);
     let rel: PathBuf = if sp.is_absolute() {
         let canon = sp.canonicalize().unwrap_or_else(|_| sp.to_path_buf());
@@ -1113,22 +1158,22 @@ fn node_keyword(node: &TreeNode, info: &NamespaceInfo, qualified: &str) -> &'sta
 }
 
 /// `--write` text report (reference `render_write_text`): `No changes` when
-/// nothing was created (all targets already existed / none in scope), else one
-/// line per created / outside-sig-root target. An `skipped_exists` (update
-/// deferred) prints a note only alongside a real action, else it reads as `No
-/// changes`.
+/// EVERY result is `noop`, else one line per created / updated / outside-sig-root
+/// target (a `noop` result prints nothing).
 fn render_write_text(results: &[WriteResult]) {
-    let acted = results.iter().any(|r| r.action == "created" || r.action == "skipped_outside_sig_root");
-    if !acted {
+    if results.iter().all(|r| r.action == "noop") {
         println!("No changes");
         return;
     }
     for r in results {
         match r.action {
             "created" => println!("created {} ({} method(s))", r.target, r.applied.len()),
-            "skipped_exists" => {
-                println!("skipped {} (already exists; update is a later slice)", r.target)
-            }
+            "updated" => println!(
+                "updated {} (+{}, skipped {} user-authored)",
+                r.target,
+                r.applied.len(),
+                r.skipped.len()
+            ),
             "skipped_outside_sig_root" => {
                 println!("skipped {} -> {} (outside sig root)", r.source, r.target)
             }
@@ -1137,7 +1182,10 @@ fn render_write_text(results: &[WriteResult]) {
     }
 }
 
-/// `--write --format json` report (reference `render_write_json`).
+/// `--write --format json` report (reference `render_write_json` / `to_h`).
+/// Each applied candidate carries the reference's per-candidate key set; each
+/// skipped entry is the candidate's fields (with an overridden `classification`
+/// and optional `declared_return_rbs`) plus `write_skip_reason: "user_authored"`.
 fn render_write_json(results: &[WriteResult]) {
     use serde_json::json;
     let rows: Vec<_> = results
@@ -1154,13 +1202,482 @@ fn render_write_json(results: &[WriteResult]) {
                     })
                 })
                 .collect();
+            let skipped: Vec<_> = r
+                .skipped
+                .iter()
+                .map(|s| {
+                    let c = &s.candidate;
+                    let mut obj = json!({
+                        "file": c.file, "class": c.class_name, "method": c.method_name,
+                        "kind": c.kind, "classification": s.classification, "rbs": c.rbs,
+                        "inferred_return": c.inferred_return, "write_skip_reason": "user_authored",
+                    });
+                    if let Some(dr) = &s.declared_return_rbs {
+                        obj.as_object_mut()
+                            .unwrap()
+                            .insert("declared_return_rbs".to_string(), json!(dr));
+                    }
+                    obj
+                })
+                .collect();
             json!({
                 "source": r.source, "target": r.target, "action": r.action,
-                "applied": applied, "skipped": [],
+                "applied": applied, "skipped": skipped,
             })
         })
         .collect();
     println!("{}", serde_json::to_string_pretty(&json!({ "results": rows })).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// LayoutIndex (reference `LayoutIndex`) — qualified-class-name → sig-file map
+// ---------------------------------------------------------------------------
+
+/// Pre-scans every configured signature directory's `.rbs` files to build a
+/// `FQN → sig-file path` map so a candidate whose class is already declared in a
+/// consolidated file routes there (reference `LayoutIndex`). First-found wins on
+/// duplicate declarations; an unparseable file is skipped silently.
+struct LayoutIndex {
+    map: HashMap<String, PathBuf>,
+}
+
+impl LayoutIndex {
+    /// Build from the configured signature dirs (each resolved under
+    /// `project_root` when relative). A SORTED recursive `**/*.rbs` walk parses
+    /// every file and records each class/module FQN → file (first-found-wins);
+    /// any per-file read/parse failure drops just that file.
+    fn build(signature_paths: &[String], project_root: &Path) -> Self {
+        let mut map: HashMap<String, PathBuf> = HashMap::new();
+        for sp in signature_paths {
+            if sp.is_empty() {
+                continue;
+            }
+            let dir = {
+                let p = Path::new(sp);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    project_root.join(p)
+                }
+            };
+            if !dir.is_dir() {
+                continue;
+            }
+            let mut files: Vec<PathBuf> = Vec::new();
+            collect_rbs_files(&dir, &mut files);
+            files.sort();
+            for f in files {
+                let Ok(src) = std::fs::read_to_string(&f) else { continue };
+                let Ok(sig) = ruby_rbs::node::parse(&src) else { continue };
+                record_layout_decls(sig.declarations().iter(), &[], &f, &mut map);
+            }
+        }
+        LayoutIndex { map }
+    }
+
+    /// The sig file already declaring `class_name`, or `None`.
+    fn file_for(&self, class_name: &str) -> Option<&PathBuf> {
+        self.map.get(class_name)
+    }
+}
+
+/// Recursively collect `**/*.rbs` files under `dir` (unsorted; the caller sorts).
+fn collect_rbs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rbs_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rbs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Record each class/module declaration's FQN → `path` (first-found-wins),
+/// recursing into nested decls (reference `record_decl`).
+fn record_layout_decls<'a>(
+    decls: impl Iterator<Item = RbsNode<'a>>,
+    prefix: &[String],
+    path: &Path,
+    map: &mut HashMap<String, PathBuf>,
+) {
+    for decl in decls {
+        let (local, members): (String, ruby_rbs::node::NodeList<'a>) = match decl {
+            RbsNode::Class(c) => (decl_full_name(&c.name()), c.members()),
+            RbsNode::Module(m) => (decl_full_name(&m.name()), m.members()),
+            _ => continue,
+        };
+        let full = if prefix.is_empty() {
+            local.clone()
+        } else {
+            format!("{}::{}", prefix.join("::"), local)
+        };
+        map.entry(full).or_insert_with(|| path.to_path_buf());
+        let mut child_prefix = prefix.to_vec();
+        child_prefix.push(local);
+        record_layout_decls(members.iter(), &child_prefix, path, map);
+    }
+}
+
+/// The full written name of a class/module decl: its namespace path segments
+/// joined with `::` then the trailing name (reference `decl.name.to_s`, leading
+/// `::` stripped). A compact `class Foo::Bar` yields `"Foo::Bar"`.
+fn decl_full_name(tn: &ruby_rbs::node::TypeNameNode) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for seg in tn.namespace().path().iter() {
+        if let RbsNode::Symbol(s) = seg {
+            parts.push(s.as_str().to_string());
+        }
+    }
+    parts.push(tn.name().as_str().to_string());
+    parts.join("::")
+}
+
+// ---------------------------------------------------------------------------
+// update_existing (reference `Writer#update_existing`) — merge into a target
+// ---------------------------------------------------------------------------
+
+/// A member of an existing class decl, collected for the partition + equivalence
+/// check (reference `collect_member_pairs` + the return-text extraction).
+struct MemberInfo {
+    name: String,
+    /// `"instance"` | `"singleton"` | `"singleton_instance"` (attrs → instance).
+    kind: &'static str,
+    /// The member's declared return text (after the last depth-0 `->` for a
+    /// method; the declared type for an attr), or `None` when unextractable.
+    return_text: Option<String>,
+}
+
+/// Owned snapshot of a found class decl: the byte offset of its closing `end`
+/// token's start, plus its member pairs. Extracted BEFORE any mutation so the
+/// borrow of the parsed tree ends before the source string is spliced.
+struct ClassDeclInfo {
+    end_start: usize,
+    members: Vec<MemberInfo>,
+}
+
+/// Merge a per-target candidate group into an EXISTING `.rbs` (reference
+/// `Writer#update_existing`). Parse the target for splice locations; a parse
+/// failure yields `noop` with the file untouched. Per class group (first-seen
+/// order) the class is found (→ merge) or not (→ append), re-parsing fresh from
+/// the current source before each so byte offsets are never stale. The file is
+/// written only when at least one method was applied (`updated`).
+fn update_existing(
+    source_path: String,
+    target: &Path,
+    target_str: String,
+    candidates: Vec<Candidate>,
+    supers: &HashMap<String, String>,
+) -> WriteResult {
+    let Ok(source) = std::fs::read_to_string(target) else {
+        return WriteResult {
+            source: source_path,
+            target: target_str,
+            action: "noop",
+            applied: Vec::new(),
+            skipped: Vec::new(),
+        };
+    };
+
+    let MergeOutcome { source: merged, action, applied, skipped } =
+        apply_merge(source, candidates, supers);
+    if action == "updated" {
+        let _ = std::fs::write(target, &merged);
+    }
+    WriteResult { source: source_path, target: target_str, action, applied, skipped }
+}
+
+/// The pure result of merging a candidate group into an existing `.rbs` source
+/// string — the file-I/O-free core of [`update_existing`], shared with tests.
+struct MergeOutcome {
+    source: String,
+    action: &'static str,
+    applied: Vec<Candidate>,
+    skipped: Vec<SkipEntry>,
+}
+
+/// Merge a candidate group into `source` (reference `Writer#update_existing`
+/// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
+/// `action: "noop"`; otherwise each class group (first-seen order) is merged or
+/// appended, re-parsing fresh before each so offsets are never stale.
+fn apply_merge(
+    mut source: String,
+    candidates: Vec<Candidate>,
+    supers: &HashMap<String, String>,
+) -> MergeOutcome {
+    // Parse-failure gate: a malformed target is left byte-untouched (reference
+    // `parse_signature` → nil → `:noop`).
+    if ruby_rbs::node::parse(&source).is_err() {
+        return MergeOutcome { source, action: "noop", applied: Vec::new(), skipped: Vec::new() };
+    }
+    let mut applied: Vec<Candidate> = Vec::new();
+    let mut skipped: Vec<SkipEntry> = Vec::new();
+    for (class_name, group) in group_by_class(candidates) {
+        merge_class(&mut source, &class_name, group, supers, &mut applied, &mut skipped);
+    }
+    let action = if applied.is_empty() { "noop" } else { "updated" };
+    MergeOutcome { source, action, applied, skipped }
+}
+
+/// Group candidates by `class_name`, preserving first-seen class order
+/// (reference `candidates.group_by(&:class_name)`).
+fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<Candidate>> = HashMap::new();
+    for c in candidates {
+        if !groups.contains_key(&c.class_name) {
+            order.push(c.class_name.clone());
+        }
+        groups.entry(c.class_name.clone()).or_default().push(c);
+    }
+    order.into_iter().map(|k| (k.clone(), groups.remove(&k).unwrap())).collect()
+}
+
+/// Merge one class group: find the class by FQN (re-parsing fresh so offsets are
+/// current), then merge into it or append a new class block (reference
+/// `merge_class`).
+fn merge_class(
+    source: &mut String,
+    class_name: &str,
+    candidates: Vec<Candidate>,
+    supers: &HashMap<String, String>,
+    applied: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkipEntry>,
+) {
+    // Extract owned decl info before mutating (the parsed tree borrows `source`).
+    let found: Option<ClassDeclInfo> = match ruby_rbs::node::parse(source) {
+        Ok(sig) => find_and_extract(source, sig.declarations().iter(), &[], class_name),
+        Err(_) => None,
+    };
+    match found {
+        Some(info) => merge_into_existing(source, &info, candidates, applied, skipped),
+        None => append_new_class(source, class_name, candidates, supers.get(class_name), applied),
+    }
+}
+
+/// Recursively find the decl whose FQN matches `target` and extract its owned
+/// [`ClassDeclInfo`] (reference `find_class_decl_in`).
+fn find_and_extract<'a>(
+    source: &str,
+    decls: impl Iterator<Item = RbsNode<'a>>,
+    prefix: &[String],
+    target: &str,
+) -> Option<ClassDeclInfo> {
+    for decl in decls {
+        let (local, members, end_loc): (String, ruby_rbs::node::NodeList<'a>, RBSLocationRange) =
+            match &decl {
+                RbsNode::Class(c) => (decl_full_name(&c.name()), c.members(), c.end_location()),
+                RbsNode::Module(m) => (decl_full_name(&m.name()), m.members(), m.end_location()),
+                _ => continue,
+            };
+        let full = if prefix.is_empty() {
+            local.clone()
+        } else {
+            format!("{}::{}", prefix.join("::"), local)
+        };
+        if full == target {
+            return Some(ClassDeclInfo {
+                end_start: clamp_offset(end_loc.start(), source.len()),
+                members: collect_member_pairs(source, members.iter()),
+            });
+        }
+        let mut child_prefix = prefix.to_vec();
+        child_prefix.push(local);
+        if let Some(found) = find_and_extract(source, members.iter(), &child_prefix, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Collect `(name, kind, return_text)` for every method-like member of a class
+/// (reference `collect_member_pairs` / `collect_pairs_for_member`). `alias` does
+/// NOT count; `attr_writer` contributes `name=`; `attr_accessor` contributes
+/// both `name` and `name=`.
+fn collect_member_pairs<'a>(
+    source: &str,
+    members: impl Iterator<Item = RbsNode<'a>>,
+) -> Vec<MemberInfo> {
+    let mut out: Vec<MemberInfo> = Vec::new();
+    for member in members {
+        match member {
+            RbsNode::MethodDefinition(md) => {
+                let kind = match md.kind() {
+                    MethodDefinitionKind::Instance => "instance",
+                    MethodDefinitionKind::Singleton => "singleton",
+                    MethodDefinitionKind::SingletonInstance => "singleton_instance",
+                };
+                let return_text = extract_method_return_text(slice_of(source, md.location()));
+                out.push(MemberInfo { name: md.name().as_str().to_string(), kind, return_text });
+            }
+            RbsNode::AttrReader(a) => {
+                let rt = attr_type_text(source, &a.type_());
+                out.push(MemberInfo {
+                    name: a.name().as_str().to_string(),
+                    kind: "instance",
+                    return_text: rt,
+                });
+            }
+            RbsNode::AttrWriter(a) => {
+                let rt = attr_type_text(source, &a.type_());
+                out.push(MemberInfo {
+                    name: format!("{}=", a.name().as_str()),
+                    kind: "instance",
+                    return_text: rt,
+                });
+            }
+            RbsNode::AttrAccessor(a) => {
+                let rt = attr_type_text(source, &a.type_());
+                let name = a.name().as_str().to_string();
+                out.push(MemberInfo {
+                    name: name.clone(),
+                    kind: "instance",
+                    return_text: rt.clone(),
+                });
+                out.push(MemberInfo { name: format!("{name}="), kind: "instance", return_text: rt });
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The declared type text of an attr member — its `type` node's source slice
+/// (reference "the type text after `:` via location"), trimmed.
+fn attr_type_text(source: &str, type_node: &RbsNode) -> Option<String> {
+    let s = slice_of(source, type_node.location()).trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Merge a candidate group into a found existing class (reference
+/// `merge_into_existing_class`): partition into NEW (spliced) vs CONFLICTING
+/// (equivalence-checked — dropped when the return matches, else skipped).
+fn merge_into_existing(
+    source: &mut String,
+    info: &ClassDeclInfo,
+    candidates: Vec<Candidate>,
+    applied: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkipEntry>,
+) {
+    let mut new_methods: Vec<Candidate> = Vec::new();
+    let mut conflicting: Vec<(Candidate, Option<String>)> = Vec::new();
+    for c in candidates {
+        match info.members.iter().find(|m| m.name == c.method_name && m.kind == c.kind) {
+            None => new_methods.push(c),
+            Some(m) => conflicting.push((c, m.return_text.clone())),
+        }
+    }
+
+    // Splice NEW members before the class's closing `end` token (fixed 2-space
+    // indent, one `"  {rbs}\n"` per method, concatenated — reference
+    // `insert_into_class`). The token-start splice + fixed indent reproduces the
+    // oracle's nested-case bytes with no special-casing.
+    if !new_methods.is_empty() {
+        let addition: String =
+            new_methods.iter().map(|c| format!("{INDENT}{}\n", c.rbs)).collect();
+        let at = info.end_start.min(source.len());
+        source.insert_str(at, &addition);
+        applied.extend(new_methods);
+    }
+
+    // CONFLICTING → equivalence check (design-note refinement 2).
+    for (c, existing_rt) in conflicting {
+        let cand_rt = extract_method_return_text(&c.rbs);
+        match (existing_rt, cand_rt) {
+            (Some(er), Some(cr)) if er.trim() == cr.trim() => {
+                // Equivalent → drop silently (not applied, not skipped).
+            }
+            (Some(er), Some(_)) => skipped.push(SkipEntry {
+                candidate: c,
+                classification: "tighter_return",
+                declared_return_rbs: Some(er.trim().to_string()),
+            }),
+            _ => skipped.push(SkipEntry {
+                candidate: c,
+                classification: "new_method",
+                declared_return_rbs: None,
+            }),
+        }
+    }
+}
+
+/// Append a NEW class block for a class not declared in the file (reference
+/// `append_new_class`): a COMPACT qualified header + `< Super` when known, body
+/// lines at 2-space indent, ONE leading blank line, and a trailing-newline
+/// repair on the original file first. All methods are applied.
+fn append_new_class(
+    source: &mut String,
+    class_name: &str,
+    candidates: Vec<Candidate>,
+    superclass: Option<&String>,
+    applied: &mut Vec<Candidate>,
+) {
+    let body = candidates
+        .iter()
+        .map(|c| format!("{INDENT}{}", c.rbs))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let header = match superclass {
+        Some(s) => format!("class {class_name} < {s}"),
+        None => format!("class {class_name}"),
+    };
+    if !source.ends_with('\n') {
+        source.push('\n');
+    }
+    source.push_str(&format!("\n{header}\n{body}\nend\n"));
+    applied.extend(candidates);
+}
+
+/// Extract a method's RETURN TEXT: the substring after the LAST `->` at bracket
+/// depth 0 within `text`, trimmed. `None` when no depth-0 `->` is found
+/// (extraction failure — design-note refinement 2).
+fn extract_method_return_text(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    let mut last: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b'-' if depth == 0 && bytes.get(i + 1) == Some(&b'>') => {
+                last = Some(i + 2);
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let start = last?;
+    let s = text.get(start..)?.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
+}
+
+/// Slice `source` by an [`RBSLocationRange`], bounds-checking the i32 offsets.
+fn slice_of(source: &str, loc: RBSLocationRange) -> &str {
+    let len = source.len();
+    let start = clamp_offset(loc.start(), len);
+    let end = clamp_offset(loc.end(), len).max(start);
+    source.get(start..end).unwrap_or("")
+}
+
+/// Clamp an i32 RBS byte offset into `0..=len` (pitfall 8: validate before use).
+fn clamp_offset(v: i32, len: usize) -> usize {
+    if v < 0 {
+        0
+    } else {
+        (v as usize).min(len)
+    }
 }
 
 #[cfg(test)]
@@ -1366,15 +1883,32 @@ mod tests {
     }
 
     #[test]
-    fn target_for_maps_lib_to_sig() {
+    fn mirror_target_maps_lib_to_sig() {
         let root = Path::new("/proj");
-        assert_eq!(target_for("lib/foo.rb", "lib", "sig", root), PathBuf::from("/proj/sig/foo.rbs"));
+        assert_eq!(mirror_target("lib/foo.rb", "lib", "sig", root), PathBuf::from("/proj/sig/foo.rbs"));
         assert_eq!(
-            target_for("lib/a/b.rb", "lib", "sig", root),
+            mirror_target("lib/a/b.rb", "lib", "sig", root),
             PathBuf::from("/proj/sig/a/b.rbs")
         );
         // A path not under the source root keeps its full relative path.
-        assert_eq!(target_for("app/x.rb", "lib", "sig", root), PathBuf::from("/proj/sig/app/x.rbs"));
+        assert_eq!(mirror_target("app/x.rb", "lib", "sig", root), PathBuf::from("/proj/sig/app/x.rbs"));
+    }
+
+    #[test]
+    fn target_for_consults_layout_index_before_mirror() {
+        let root = Path::new("/proj");
+        let mut layout = LayoutIndex { map: HashMap::new() };
+        layout.map.insert("Foo".to_string(), PathBuf::from("/proj/sig/consolidated.rbs"));
+        // Class in the index → routed to the consolidated file.
+        assert_eq!(
+            target_for("lib/foo.rb", "Foo", "lib", "sig", root, &layout),
+            PathBuf::from("/proj/sig/consolidated.rbs")
+        );
+        // Class NOT in the index → 1:1 mirror.
+        assert_eq!(
+            target_for("lib/bar.rb", "Bar", "lib", "sig", root, &layout),
+            PathBuf::from("/proj/sig/bar.rbs")
+        );
     }
 
     #[test]
@@ -1484,5 +2018,235 @@ mod tests {
         assert!(!is_bare_generic_name("[1, 2]"));
         assert!(!is_bare_generic_name("String"));
         assert!(!is_bare_generic_name("42"));
+    }
+
+    // -- UPDATE/merge + LayoutIndex ------------------------------------------
+
+    /// A merge-candidate factory for the `apply_merge` tests.
+    fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
+        Candidate {
+            file: "lib/f.rb".into(),
+            class_name: class.into(),
+            method_name: method.into(),
+            kind,
+            rbs: rbs.into(),
+            inferred_return: String::new(),
+        }
+    }
+
+    #[test]
+    fn member_pairs_cover_attr_writer_accessor_and_kind_rules_but_not_alias() {
+        // attr_writer → `name=`; attr_accessor → both; alias never counts;
+        // def kinds map instance / singleton / singleton_instance.
+        let rbs = "class Foo\n  def a: () -> Integer\n  def self.s: () -> String\n  def self?.d: () -> bool\n  attr_reader r: String\n  attr_writer w: Integer\n  attr_accessor acc: String\n  alias al a\nend\n";
+        let sig = ruby_rbs::node::parse(rbs).unwrap();
+        let RbsNode::Class(c) = sig.declarations().iter().next().unwrap() else { panic!() };
+        let pairs = collect_member_pairs(rbs, c.members().iter());
+        let got: Vec<(String, &str)> =
+            pairs.iter().map(|m| (m.name.clone(), m.kind)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("a".into(), "instance"),
+                ("s".into(), "singleton"),
+                ("d".into(), "singleton_instance"),
+                ("r".into(), "instance"),
+                ("w=".into(), "instance"),
+                ("acc".into(), "instance"),
+                ("acc=".into(), "instance"),
+            ],
+            "alias `al` must not appear; attr rules applied"
+        );
+    }
+
+    #[test]
+    fn return_text_extraction_takes_last_depth_zero_arrow() {
+        assert_eq!(extract_method_return_text("def m: () -> String"), Some("String".into()));
+        // A block-typed param carries an inner `->` at depth > 0 — ignored.
+        assert_eq!(
+            extract_method_return_text("def m: () ?{ () -> void } -> Integer"),
+            Some("Integer".into())
+        );
+        // Union return, wrapped.
+        assert_eq!(
+            extract_method_return_text("def m: (untyped) -> (\"s\" | 1)"),
+            Some("(\"s\" | 1)".into())
+        );
+        // No arrow → extraction failure.
+        assert_eq!(extract_method_return_text("attr_reader name: String"), None);
+    }
+
+    #[test]
+    fn member_pair_return_text_for_method_and_attr() {
+        let rbs = "class Foo\n  def m: (untyped) -> Integer\n  attr_reader r: String?\nend\n";
+        let sig = ruby_rbs::node::parse(rbs).unwrap();
+        let RbsNode::Class(c) = sig.declarations().iter().next().unwrap() else { panic!() };
+        let pairs = collect_member_pairs(rbs, c.members().iter());
+        assert_eq!(pairs[0].return_text.as_deref(), Some("Integer"));
+        assert_eq!(pairs[1].return_text.as_deref(), Some("String?"));
+    }
+
+    #[test]
+    fn merge_inserts_new_method_flat_before_end() {
+        let src = "class Foo\n  def existing: () -> String\nend\n".to_string();
+        let out = apply_merge(src, vec![mc("Foo", "newm", "instance", "def newm: () -> 1")], &HashMap::new());
+        assert_eq!(out.action, "updated");
+        assert_eq!(out.applied.len(), 1);
+        assert_eq!(
+            out.source,
+            "class Foo\n  def existing: () -> String\n  def newm: () -> 1\nend\n"
+        );
+    }
+
+    #[test]
+    fn merge_inserts_new_method_nested_reproduces_indent_quirk() {
+        // The token-start splice + fixed 2-space indent: the inserted line renders
+        // 4-space and the inner `end` drops to column 0 (oracle-verified).
+        let src = "module Outer\n  class Inner\n    def existing: () -> String\n  end\nend\n"
+            .to_string();
+        let out = apply_merge(
+            src,
+            vec![mc("Outer::Inner", "newm", "instance", "def newm: () -> 5")],
+            &HashMap::new(),
+        );
+        assert_eq!(
+            out.source,
+            "module Outer\n  class Inner\n    def existing: () -> String\n    def newm: () -> 5\nend\nend\n"
+        );
+    }
+
+    #[test]
+    fn merge_equivalent_conflict_drops_silently() {
+        // Same declared return → dropped: not applied, not skipped → noop.
+        let src = "class Foo\n  def greeting: () -> \"hi\"\nend\n".to_string();
+        let out = apply_merge(
+            src.clone(),
+            vec![mc("Foo", "greeting", "instance", "def greeting: () -> \"hi\"")],
+            &HashMap::new(),
+        );
+        assert_eq!(out.action, "noop");
+        assert!(out.applied.is_empty() && out.skipped.is_empty());
+        assert_eq!(out.source, src, "byte-untouched when everything drops");
+    }
+
+    #[test]
+    fn merge_different_conflict_skips_user_authored_with_declared_return() {
+        let src = "class Foo\n  def greeting: () -> String\nend\n".to_string();
+        let out = apply_merge(
+            src.clone(),
+            vec![mc("Foo", "greeting", "instance", "def greeting: () -> \"hi\"")],
+            &HashMap::new(),
+        );
+        assert_eq!(out.action, "noop"); // nothing applied
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].classification, "tighter_return");
+        assert_eq!(out.skipped[0].declared_return_rbs.as_deref(), Some("String"));
+        assert_eq!(out.source, src);
+    }
+
+    #[test]
+    fn merge_instance_and_singleton_are_distinct_identities() {
+        // An existing INSTANCE `def build` does NOT block a SINGLETON candidate.
+        let src = "class Foo\n  def build: () -> String\nend\n".to_string();
+        let out = apply_merge(
+            src,
+            vec![mc("Foo", "build", "singleton", "def self.build: () -> 1")],
+            &HashMap::new(),
+        );
+        assert_eq!(out.action, "updated");
+        assert_eq!(
+            out.source,
+            "class Foo\n  def build: () -> String\n  def self.build: () -> 1\nend\n"
+        );
+    }
+
+    #[test]
+    fn merge_attr_reader_blocks_matching_method_candidate() {
+        let src = "class Foo\n  attr_reader name: String\nend\n".to_string();
+        let out = apply_merge(
+            src.clone(),
+            vec![mc("Foo", "name", "instance", "def name: () -> \"n\"")],
+            &HashMap::new(),
+        );
+        // attr_reader name: String vs candidate "n" → different → skipped.
+        assert_eq!(out.skipped.len(), 1);
+        assert_eq!(out.skipped[0].declared_return_rbs.as_deref(), Some("String"));
+        assert_eq!(out.source, src);
+    }
+
+    #[test]
+    fn append_new_class_compact_header_and_leading_blank() {
+        let src = "class Foo\n  def existing: () -> String\nend\n".to_string();
+        let mut supers = HashMap::new();
+        supers.insert("Bar".to_string(), "Base".to_string());
+        let out = apply_merge(
+            src,
+            vec![mc("Bar", "added", "instance", "def added: () -> 7")],
+            &supers,
+        );
+        assert_eq!(out.action, "updated");
+        assert_eq!(
+            out.source,
+            "class Foo\n  def existing: () -> String\nend\n\nclass Bar < Base\n  def added: () -> 7\nend\n"
+        );
+    }
+
+    #[test]
+    fn append_new_class_qualified_name_stays_compact() {
+        // A class not in the file with a qualified name uses `class A::B`, NOT
+        // nested modules.
+        let src = "class Foo\nend\n".to_string();
+        let out = apply_merge(
+            src,
+            vec![mc("A::B", "m", "instance", "def m: () -> 1")],
+            &HashMap::new(),
+        );
+        assert_eq!(out.source, "class Foo\nend\n\nclass A::B\n  def m: () -> 1\nend\n");
+    }
+
+    #[test]
+    fn append_repairs_missing_trailing_newline() {
+        let src = "class Foo\nend".to_string(); // no trailing newline
+        let out = apply_merge(
+            src,
+            vec![mc("Bar", "m", "instance", "def m: () -> 1")],
+            &HashMap::new(),
+        );
+        assert_eq!(out.source, "class Foo\nend\n\nclass Bar\n  def m: () -> 1\nend\n");
+    }
+
+    #[test]
+    fn malformed_target_is_noop_and_untouched() {
+        let src = "class Foo\n  def existing: (( -> \nend\n".to_string();
+        let out = apply_merge(
+            src.clone(),
+            vec![mc("Foo", "newm", "instance", "def newm: () -> 1")],
+            &HashMap::new(),
+        );
+        assert_eq!(out.action, "noop");
+        assert!(out.applied.is_empty() && out.skipped.is_empty());
+        assert_eq!(out.source, src);
+    }
+
+    #[test]
+    fn layout_index_first_found_wins_and_skips_parse_failures() {
+        let dir = std::env::temp_dir().join(format!("rigor_layout_{}", std::process::id()));
+        let sig = dir.join("sig");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(sig.join("nested")).unwrap();
+        // Two files declare Foo; sorted walk means `a.rbs` (< `z.rbs`) wins.
+        std::fs::write(sig.join("a.rbs"), "class Foo\nend\n").unwrap();
+        std::fs::write(sig.join("z.rbs"), "class Foo\nend\nclass Bar\nend\n").unwrap();
+        // A nested, consolidated declaration is indexed by its FQN.
+        std::fs::write(sig.join("nested/x.rbs"), "module M\n  class Inner\n  end\nend\n").unwrap();
+        // A malformed file is skipped silently (its Baz never appears).
+        std::fs::write(sig.join("broken.rbs"), "class Baz (( bad\n").unwrap();
+
+        let layout = LayoutIndex::build(&["sig".to_string()], &dir);
+        assert_eq!(layout.file_for("Foo"), Some(&sig.join("a.rbs")));
+        assert_eq!(layout.file_for("Bar"), Some(&sig.join("z.rbs")));
+        assert_eq!(layout.file_for("M::Inner"), Some(&sig.join("nested/x.rbs")));
+        assert_eq!(layout.file_for("Baz"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -11,7 +11,28 @@ by measurement) — **Baseline + parity-port productization arc COMPLETE; the en
 assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
 frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-module-function`) — sig-gen slice 8: `module_function` `self?.`
+**▶▶ LANDED THIS SESSION (branch `sig-gen-writer-update`) — sig-gen slice 9: Writer UPDATE/merge + LayoutIndex.**
+The heavy remaining piece, built via the full delegation protocol (Sonnet×2 independent investigations — source
+report + 9-scenario byte-exact oracle probes — → binding design note → Opus implementation → main-session
+independent audit). `--write` now MERGES into existing `.rbs` files: **parse-for-location, splice-as-text,
+reparse after every mutation** (ruby-rbs `end_location()` byte offsets; parse-failure → `noop`, file untouched);
+member conflicts by `(name, kind)` (attr_reader/`writer name=`/accessor count, alias doesn't; instance never
+blocks singleton); conflicting members skip as `user_authored` with `classification: tighter_return` +
+`declared_return_rbs` (write-time return-text extraction); **equivalence-drop** (same return → silent, so re-runs
+are idempotent `No changes`); class-not-in-file → compact `class A::B < Super` append; the scenario-4 nested
+"indent quirk" reproduces EMERGENTLY from token-start splicing (replicated, not special-cased). **LayoutIndex**:
+sorted `**/*.rbs` scan of signature dirs, FQN→file first-found-wins, per-candidate routing (consolidated file
+first, 1:1 mirror fallback — one source's candidates can split). **Audited independently:** 545 tests (13 new),
+harness 54/54 0 FP, clippy clean, **9/9 fresh-dir E2E scenarios byte-identical (stdout + written trees)**,
+idempotence (`No changes` + byte-stable), JSON content-identical incl. skipped-entry fields, reversed-arg result
+order. Documented divergences: JSON key order; malformed-scenario STDERR env warning (needs project-sig env at
+generation — deferred); sound-superset re-insert of inherited methods (`Object#hash`) the reference's env-based
+EQUIVALENT classification drops — the deferred generator slice. Design note:
+[siggen-writer-update-design](notes/20260710-siggen-writer-update-design.md). NEXT: `--params=observed`
+(ObservationCollector); generation-time env classification (closes the inherited-method excess + malformed
+stderr); qualified source-class naming; `--overwrite` tighter-return replacement.
+
+**▶▶ LANDED (branch `sig-gen-module-function`, MERGED `95f490d`) — sig-gen slice 8: `module_function` `self?.`
 spelling.** Replaces the conservative whole-body skip with the reference's real semantics, turning
 previously-SKIPPED methods into byte-identical emits: shared methods on `reference/lib` **102 → 108** (6 new
 `self?.`), **0 mismatch**. Semantics (oracle-probed): a BARE `module_function` (no args) flips a running flag for

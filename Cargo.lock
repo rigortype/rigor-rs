@@ -338,6 +338,7 @@ dependencies = [
  "rigor-parse",
  "rigor-rules",
  "rigor-types",
+ "ruby-rbs",
  "serde",
  "serde_json",
  "serde_yaml",
