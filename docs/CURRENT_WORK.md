@@ -6,12 +6,34 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-10 (mcp-triage-annotate + gemfile-lock-overlay MERGED to master; plugin track CLOSED
-by measurement) — **Baseline + parity-port productization arc COMPLETE; the entire PLUGIN track is now
-assessed done-or-deferred (see finding below). Cheap FP-safe faithful-port wins are exhausted; remaining
-frontier is the substantial ADR-backed tracks.** Read `AGENTS.md` "Working discipline" before continuing.
+Last updated: 2026-07-10 (sig-gen arc: NINE slices merged this session — erase_to_rbs substrate → --print →
+return-union/Node::Return → singletons → --write create → initialize stub → --diff → module_function self?. →
+Writer UPDATE/merge + LayoutIndex; sound-superset parity model recorded in **AGENTS.md "Generative-tool
+parity"**). Read `AGENTS.md` "Working discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `sig-gen-writer-update`) — sig-gen slice 9: Writer UPDATE/merge + LayoutIndex.**
+**▶▶ NEXT SESSION — START HERE: sig-gen slice 10, generation-time env classification (DESIGN COMPLETE,
+implementation NOT started).** The binding spec is
+[notes/20260710-siggen-env-classification-design.md](notes/20260710-siggen-env-classification-design.md) —
+investigated via the full delegation protocol (Sonnet×2: full `classify_def`/`lookup_existing_method`/
+`compare_against_declared`/`tighter?` source trace + 13-scenario byte-exact oracle probes) PLUS three decisive
+main-session probes (N/O/P) that settled a DISAGREEMENT between the two investigations — the true rule:
+**ancestor resolution IS performed but gated on the receiver class ITSELF being declared in the RBS env**
+(`env.class_decls.key?`); with no sig at all everything is `new_method` (probe A), with even an EMPTY
+`class Foo\nend` in sig, `def hash; 1; end` → `# [tighter, was: Integer]` (probe N) and `[1].size` →
+equivalent-drop (probe P). Both agents' single-sided interpretations were WRONG (methodology note in the spec).
+This slice closes: the `ObservedCall#hash` writer excess, the sig-project `--print`/`--diff` byte mismatches
+(`[tighter, was: X]` tag + `- def` line), JSON `declared_return_rbs` at generation time, and unlocks
+`--overwrite`. KEY ALIGNMENT: rigor-rs's conservative `CoreIndex::method_return` (None on literal/union/
+untyped/multi-overload) maps almost exactly onto the reference's DROP set — the spec has the decision table +
+sketch + documented FP-safe deviations. **Next session: dispatch the Opus implementer on branch
+`sig-gen-env-classification` per the spec's delegation plan (pitfalls enumerated there), then audit with
+independent probes (N/O/P + the reference/lib intersection sweep — the reference repo HAS a sig/, so the sweep
+now exercises classification on real code and the `def hash` excess must disappear).** After slice 10, the
+remaining sig-gen frontier: `--overwrite`, `--params=observed` (ObservationCollector), qualified source-class
+naming.
+
+**▶▶ LANDED THIS SESSION (branch `sig-gen-writer-update`, MERGED `c02dcdc`) — sig-gen slice 9: Writer
+UPDATE/merge + LayoutIndex.**
 The heavy remaining piece, built via the full delegation protocol (Sonnet×2 independent investigations — source
 report + 9-scenario byte-exact oracle probes — → binding design note → Opus implementation → main-session
 independent audit). `--write` now MERGES into existing `.rbs` files: **parse-for-location, splice-as-text,
