@@ -220,6 +220,26 @@ fn tool_catalog() -> Value {
                 },
                 "required": ["source"]
             }
+        },
+        {
+            "name": "sig_gen",
+            "description": "Generate RBS skeleton signatures inferred from Ruby source FILES (read-only, \
+                            like `sig-gen --print --format=json`). Returns a JSON report of candidates \
+                            with their classification (new-method / tighter-return) and inferred return \
+                            type. Takes file/dir PATHS (not inline source), resolved on the server's \
+                            filesystem.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Files or directories to generate signatures for (defaults to the \
+                                        configured `paths:`)."
+                    },
+                    "config": { "type": "string", "description": "Path to .rigor.yml (optional)." }
+                }
+            }
         }
     ])
 }
@@ -237,6 +257,7 @@ fn tools_call(ctx: &ServerContext, params: &Value) -> Value {
         "outline" => tool_outline(&args),
         "triage" => tool_triage(ctx, &args),
         "annotate" => tool_annotate(ctx, &args),
+        "sig_gen" => tool_sig_gen(&args),
         other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
@@ -329,6 +350,22 @@ fn tool_annotate(ctx: &ServerContext, args: &Value) -> Result<String, String> {
     let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
     panic::catch_unwind(AssertUnwindSafe(|| crate::annotate::annotations_json(&ctx.index, source)))
         .map_err(|_| "internal error: annotation panicked on this source".to_string())
+}
+
+/// The `sig_gen` tool: generate RBS-skeleton candidates for the given FILE paths
+/// (read-only, `sig-gen --print --format=json`), returning the `{ "candidates":
+/// [...] }` JSON. Unlike the source-string tools this reads files from the
+/// server's filesystem (reference `rigor_sig_gen` takes `paths`). Panic-isolated.
+fn tool_sig_gen(args: &Value) -> Result<String, String> {
+    let paths: Vec<String> = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    let config = args.get("config").and_then(Value::as_str).map(std::path::Path::new);
+    panic::catch_unwind(AssertUnwindSafe(|| crate::sig_gen::mcp_report_json(&path_refs, config)))
+        .map_err(|_| "internal error: sig-gen panicked".to_string())
 }
 
 /// The `type_of` tool: type the deepest expression at a 1-based (line, column).
@@ -458,6 +495,7 @@ mod tests {
         assert!(names.contains(&"explain"));
         assert!(names.contains(&"triage"));
         assert!(names.contains(&"annotate"));
+        assert!(names.contains(&"sig_gen"));
         // Every tool declares an object inputSchema.
         for t in tools.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object");
@@ -509,6 +547,26 @@ mod tests {
         let ann: Value = serde_json::from_str(text).unwrap();
         // The Tuple-projection fold gives `[1, 2].first` → `1`.
         assert_eq!(ann["annotations"]["1"], "1");
+    }
+
+    #[test]
+    fn sig_gen_tool_returns_candidates_for_a_file() {
+        let dir = std::env::temp_dir().join(format!("rigor_mcp_siggen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("g.rb");
+        std::fs::write(&file, "class Greeter\n  def greeting\n    \"hi\"\n  end\nend\n").unwrap();
+        let out = tools_call(&ctx(), &json!({
+            "name": "sig_gen",
+            "arguments": { "paths": [file.to_str().unwrap()] }
+        }));
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let report: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["candidates"][0]["class"], "Greeter");
+        assert_eq!(report["candidates"][0]["method"], "greeting");
+        assert_eq!(report["candidates"][0]["rbs"], "def greeting: () -> \"hi\"");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
