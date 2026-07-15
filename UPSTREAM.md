@@ -15,8 +15,13 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned tag** | **`v0.2.7`** |
-| Commit | `47c1c7d35efbce222a6a888268b263808b49796c` |
+| **Pinned ref** | **v0.3.0 release candidate** (post-`v0.2.9` master; `--version` still prints 0.2.9) |
+| Commit | `47ec8625` (Merge PR #109) |
+
+> The pin is a **commit, not a tag**, for the first time: upstream is at the
+> v0.3.0 release-candidate stage and the port is closing the RC's gap set
+> (five new rules + inference changes) ahead of the tag. Re-pin to the real
+> `v0.3.0` tag when it lands (expected to be the same or a nearby commit).
 
 The differential harness (`harness/run.rb`, `harness/snapshot.rb`) defaults
 `REFERENCE_RIGOR_DIR` to this submodule (`harness/lib.rb`). The reference-free
@@ -25,16 +30,16 @@ it replays the pinned snapshots under `harness/snapshots/`, which were generated
 from this exact reference version.
 
 Note: the vendored RBS (`crates/rigor-index/vendor/rbs`, **rbs-4.0.3**) is pinned
-**independently** of the reference tag — see its `PROVENANCE.md`. As of `v0.2.7`
-the reference bundles rbs-4.0.3 as well (it bundled 4.0.2 at `v0.2.6`), so the two
-pins now match exactly.
+**independently** of the reference tag — see its `PROVENANCE.md`. The reference
+bundles rbs-4.0.3 from `v0.2.7` through the current v0.3.0-RC pin, so the two
+pins match exactly.
 
 ## First-time setup
 
 ```sh
 git submodule update --init reference/rigor
 # The reference is plain Ruby run in place — no build step:
-ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.2.7
+ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.2.9 (v0.3.0 RC)
 ```
 
 ## Bumping the pin (following upstream)
