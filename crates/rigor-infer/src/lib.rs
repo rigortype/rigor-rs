@@ -1329,14 +1329,52 @@ impl<'i> Typer<'i> {
     }
 }
 
-/// Collect every local-write `(span, name)` in the arena (plain and op-writes),
-/// once, for span-containment widening in the flow-constant pass. Orphan-proof:
-/// a write under a lossily-lowered wrapper is still found by its span.
+/// In-place mutator methods that invalidate a value-pinned literal-shape carrier
+/// (`Tuple` / `HashShape`) bound to a local — the union of the reference's
+/// `MutationWidening::ARRAY_MUTATORS` and `HASH_MUTATORS`
+/// (`reference/rigor/lib/rigor/inference/mutation_widening.rb:70-87`), minus the
+/// `PURE_SELF_RETURNERS` (`freeze`/`dup`/`clone`/`itself`), which never appear
+/// here. A call `local.<m>(…)` for `m` in this set mutates `local`'s content, so
+/// the literal arity/pair-set the shape carrier tracked is no longer justified —
+/// the binding must widen (see [`collect_flow_writes`]).
+const MUTATOR_METHODS: &[&str] = &[
+    // ARRAY mutators
+    "<<", "push", "append", "prepend", "unshift", "concat", "insert", "pop", "shift", "delete",
+    "delete_at", "delete_if", "reject!", "clear", "compact!", "replace", "fill", "[]=", "map!",
+    "collect!", "select!", "filter!", "keep_if", "uniq!", "flatten!", "sort!", "sort_by!",
+    "reverse!", "rotate!", "shuffle!", "slice!",
+    // HASH mutators not already listed above
+    "store", "merge!", "update", "transform_keys!", "transform_values!",
+];
+
+/// Collect every flow-write `(span, name)` in the arena, once, for
+/// span-containment widening in the flow passes. Orphan-proof: a write under a
+/// lossily-lowered wrapper is still found by its span. Records two kinds:
+///
+/// - local-variable rebinds (`LocalVariableWrite`/`LocalVariableOpWrite`) — the
+///   assignment invalidates the prior binding;
+/// - **in-place content mutations** — a call `local.<mutator>(…)` whose receiver
+///   is a bare local read and whose method is in [`MUTATOR_METHODS`], keyed by the
+///   whole-call span. This is the port of the reference's `MutationWidening`
+///   (`widen_after_call` + `widen_after_block`): the mutator forgets the literal
+///   shape, so the containing flow construct widens `local` the same way a rebind
+///   inside it would. `ast.iter()` already descends nested block/case bodies, so a
+///   mutation deep inside an `each`/`case` is found and its span is contained by
+///   the enclosing construct; a straight-line mutation is its own containing span
+///   and widens through the catch-all/`If` arms.
 fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     ast.iter()
         .filter_map(|(_, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
             | Node::LocalVariableOpWrite { name, span, .. } => Some((*span, name.clone())),
+            Node::Call { receiver: Some(r), method, span, .. }
+                if MUTATOR_METHODS.contains(&method.as_str()) =>
+            {
+                match ast.get(*r) {
+                    Node::LocalVariableRead { name, .. } => Some((*span, name.clone())),
+                    _ => None,
+                }
+            }
             _ => None,
         })
         .collect()
@@ -1568,6 +1606,101 @@ mod tests {
             !matches!(i.get(ty2), Type::Constant(_)),
             "x must be widened to non-constant after a conditional reassignment"
         );
+    }
+
+    /// MutationWidening (parser.rb FP): a value-pinned collection local that is
+    /// content-mutated by an in-place mutator call must widen, so a later
+    /// `local.count`/`.size` predicate is NOT a folded constant. `true` means the
+    /// predicate folds to a `Type::Constant` (the always-truthy rule WOULD fire);
+    /// `false` means it was widened (declined). The predicate reads the LAST `if`.
+    fn last_if_predicate_is_constant(src: &[u8]) -> bool {
+        let ast = lower_src(src);
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+        let last_if = ast
+            .iter()
+            .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+            .last()
+            .expect("at least one if node");
+        let ty = snaps
+            .get(&last_if)
+            .copied()
+            .expect("predicate snapshot recorded for a top-level if");
+        matches!(i.get(ty), Type::Constant(_))
+    }
+
+    /// P2 rail: NO mutation ⇒ the `[]`-pinned `results.count > 1` still folds and
+    /// the always-truthy rule must KEEP firing. This is the load-bearing negative
+    /// control — the fix must not widen an unmutated local.
+    #[test]
+    fn mutation_widening_p2_no_mutation_keeps_firing() {
+        assert!(last_if_predicate_is_constant(
+            b"results = []\nif results.count > 1\n  noop\nend\n"
+        ));
+        // Both count directions fold (parser.rb fires on `> 1` and `< 1`).
+        assert!(last_if_predicate_is_constant(
+            b"results = []\nif results.count < 1\n  noop\nend\n"
+        ));
+    }
+
+    /// A NON-mutator call on the local (`map`, a pure sibling) must NOT widen — a
+    /// guard that the extension keys on the mutator set, not on any call.
+    #[test]
+    fn mutation_widening_non_mutator_call_keeps_firing() {
+        assert!(last_if_predicate_is_constant(
+            b"results = []\nresults.map { |x| x }\nif results.count > 1\n  noop\nend\n"
+        ));
+    }
+
+    /// P3: a straight-line `results.push(1)` (no block) widens the local — its own
+    /// call span is the containing span, resolved through the catch-all arm.
+    #[test]
+    fn mutation_widening_p3_straight_line_push_stops_firing() {
+        assert!(!last_if_predicate_is_constant(
+            b"results = []\nresults.push(1)\nif results.count > 1\n  noop\nend\n"
+        ));
+    }
+
+    /// P4: a `push` under an `if` modifier widens (the then-branch mutation
+    /// disagrees with the untaken else at the join).
+    #[test]
+    fn mutation_widening_p4_push_under_if_modifier_stops_firing() {
+        assert!(!last_if_predicate_is_constant(
+            b"results = []\nresults.push(1) if cond\nif results.count > 1\n  noop\nend\n"
+        ));
+    }
+
+    /// P1: the parser.rb shape — `push`/`pop` inside a nested `case` in an `each`
+    /// block. `ast.iter()` finds the mutation spans; the enclosing `each` call span
+    /// contains them, so the catch-all arm widens `results`.
+    #[test]
+    fn mutation_widening_p1_block_nested_case_stops_firing() {
+        let src = b"results = []\nxs.each do |t|\n  case t\n  when 1\n    results.push(t)\n  when 2\n    results.pop\n  end\nend\nif results.count > 1\n  noop\nend\n";
+        assert!(!last_if_predicate_is_constant(src));
+        // Same shape, `< 1` direction.
+        let src_lt = b"results = []\nxs.each do |t|\n  case t\n  when 1\n    results.push(t)\n  end\nend\nif results.count < 1\n  noop\nend\n";
+        assert!(!last_if_predicate_is_constant(src_lt));
+    }
+
+    /// P5: a rebind (`results = results + [x]`) inside the block widens through the
+    /// pre-existing `LocalVariableWrite` arm — correct on both sides already, and
+    /// still correct after the mutator extension.
+    #[test]
+    fn mutation_widening_p5_rebind_in_block_stops_firing() {
+        assert!(!last_if_predicate_is_constant(
+            b"results = []\nxs.each do |t|\n  results = results + [t]\nend\nif results.count > 1\n  noop\nend\n"
+        ));
+    }
+
+    /// P7: `results << t` inside a block — `<<` is a mutator, widened via the
+    /// block-containing span.
+    #[test]
+    fn mutation_widening_p7_shovel_in_block_stops_firing() {
+        assert!(!last_if_predicate_is_constant(
+            b"results = []\nxs.each do |t|\n  results << t\nend\nif results.count > 1\n  noop\nend\n"
+        ));
     }
 
     /// ADR-0038 Slice 1: a nilable String slice bound in a NESTED block, with its
