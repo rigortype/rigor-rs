@@ -627,7 +627,7 @@ fn analyze_files(
         path: String,
         source: String,
         ast: rigor_parse::LoweredAst,
-        comments: Vec<(usize, String)>,
+        comments: Vec<(usize, usize, String)>,
     }
 
     // STAGE 1 (file-parallel): read + parse + lower. A closure never mutates
@@ -726,7 +726,11 @@ fn analyze_files(
                 analyze_with_source_and_folder(&p.ast, &mut interner, &index, &project_source, folder)
             }));
             match result {
-                Ok(diags) => {
+                Ok(mut diags) => {
+                    // Suppression-marker surveillance (`suppression.unknown-rule` /
+                    // `suppression.empty`) is produced into the SAME list BEFORE
+                    // `filter_suppressed`, so a marker can suppress its own complaint.
+                    diags.extend(rigor_rules::suppression_marker_diagnostics(&p.comments));
                     let with_lines: Vec<(usize, Diagnostic)> = diags
                         .into_iter()
                         .map(|diag| (line_col(&p.source, diag.start_offset).0, diag))

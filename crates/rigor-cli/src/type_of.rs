@@ -302,6 +302,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::Case { .. } => "Case",
         Node::Loop { .. } => "Loop",
         Node::BeginRescue { .. } => "BeginRescue",
+        Node::Lambda { .. } => "Lambda",
         Node::Logical { .. } => "Logical",
         Node::ArrayLit { .. } => "ArrayLit",
         Node::HashLit { .. } => "HashLit",

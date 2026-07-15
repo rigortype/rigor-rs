@@ -6,7 +6,7 @@
 
 use rigor_index::CoreIndex;
 use rigor_infer::Typer;
-use rigor_parse::{LoweredAst, Node};
+use rigor_parse::{HashKeyTag, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type};
 
 // ---------------------------------------------------------------------------
@@ -152,6 +152,34 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "medium",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-truthy-condition",
         }),
+        FLOW_DUPLICATE_HASH_KEY => Some(&RuleEntry {
+            // Oracle: warning (balanced) / high — a purely syntactic value-pinned
+            // comparison with no metaprogramming escape (Ruby itself warns under `-w`).
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-duplicate-hash-key",
+        }),
+        FLOW_RETURN_IN_ENSURE => Some(&RuleEntry {
+            // Oracle: warning (balanced) / high — a syntactic proof with a
+            // frame-aware envelope; Ruby's `ensure` semantics make every firing real.
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-return-in-ensure",
+        }),
+        SUPPRESSION_UNKNOWN_RULE => Some(&RuleEntry {
+            // Oracle: warning across ALL profiles / high — pure token-table
+            // membership over the same tables the suppression matcher uses.
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-unknown-rule",
+        }),
+        SUPPRESSION_EMPTY => Some(&RuleEntry {
+            // Oracle: warning across ALL profiles / high — the marker word is
+            // present and the token list is provably empty.
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-empty",
+        }),
         _ => None,
     }
 }
@@ -246,6 +274,31 @@ pub const FLOW_UNREACHABLE_BRANCH: &str = "flow.unreachable-branch";
 /// complete, correct `flow.*` rule plus the reusable flow-constant substrate it
 /// is the first consumer of.
 pub const FLOW_ALWAYS_TRUTHY_CONDITION: &str = "flow.always-truthy-condition";
+
+/// `flow.duplicate-hash-key` (v0.3.0): two entries of one Hash literal (braced or
+/// bare keyword args) carry the same value-pinned literal key — Ruby keeps the
+/// LAST entry silently at runtime, so the earlier value is dead. Purely syntactic
+/// (the [`rigor_parse::HashKey`] envelope: symbols / plain strings / integers /
+/// floats / `true` / `false` / `nil`, never cross-kind, never interpolation /
+/// constants / calls / splats). Mirrors the reference's `DuplicateHashKeyCollector`.
+pub const FLOW_DUPLICATE_HASH_KEY: &str = "flow.duplicate-hash-key";
+
+/// `flow.return-in-ensure` (v0.3.0): an explicit `return` lexically inside an
+/// `ensure` clause body — it silently discards the method's in-flight return
+/// value AND swallows any in-flight exception. Purely syntactic with a frame-aware
+/// envelope (nested `def` / lambda / `define_method` blocks are barriers; plain
+/// blocks and `proc { }` are not). Mirrors the reference's `ReturnInEnsureCollector`.
+pub const FLOW_RETURN_IN_ENSURE: &str = "flow.return-in-ensure";
+
+/// `suppression.unknown-rule` (v0.3.0): a `# rigor:disable[-file]` marker names a
+/// token that resolves to no known rule id, alias, family, or engine diagnostic —
+/// the suppression silently no-ops (usually a typo). Surveillance over the markers
+/// themselves; produced BEFORE `filter_suppressed`, so it is itself suppressible.
+pub const SUPPRESSION_UNKNOWN_RULE: &str = "suppression.unknown-rule";
+
+/// `suppression.empty` (v0.3.0): a bare `# rigor:disable[-file]` marker with no
+/// rule tokens (only whitespace/commas after it) — it suppresses nothing.
+pub const SUPPRESSION_EMPTY: &str = "suppression.empty";
 
 /// The Integer division/modulo operators that raise `ZeroDivisionError` on a
 /// zero Integer divisor — verbatim the reference's `INTEGER_RAISING_OPERATORS`
@@ -495,6 +548,14 @@ pub fn analyze_with_source_and_folder(
     // (span-containment, orphan-proof; ADR-24 leniency keeps in-body implicit-self
     // calls silent). See `check_unresolved_toplevel` for the gate.
     unresolved_toplevel_diagnostics(ast, index, source, &mut out);
+
+    // Seventh pass — `flow.duplicate-hash-key` (v0.3.0). Purely syntactic: walk
+    // every Hash literal's precomputed value-pinned key list and fire on a repeat.
+    duplicate_hash_key_diagnostics(ast, &mut out);
+
+    // Eighth pass — `flow.return-in-ensure` (v0.3.0). Purely syntactic with a
+    // frame-aware envelope: walk every `begin/ensure`'s ensure body for `return`s.
+    return_in_ensure_diagnostics(ast, &mut out);
 
     out
 }
@@ -1500,6 +1561,313 @@ fn render_scalar(scalar: &Scalar) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// flow.duplicate-hash-key (v0.3.0) — reference `DuplicateHashKeyCollector`
+// ---------------------------------------------------------------------------
+
+/// Emit `flow.duplicate-hash-key` for every LATER occurrence of a repeated
+/// value-pinned literal key within one Hash literal (braced or bare kwargs). Walks
+/// each `HashLit`'s precomputed `dup_keys` (source order); a `seen` map keyed by
+/// the collision tag records the FIRST occurrence, and each later hit fires
+/// pointing at the repeat, naming the first's line. The `seen` entry is NOT
+/// updated on a hit, so with N≥2 duplicates every later occurrence references the
+/// SAME original first occurrence (reference semantics). Each literal is its own
+/// scope — nested literals never cross-compare (they are distinct arena nodes).
+fn duplicate_hash_key_diagnostics(ast: &LoweredAst, out: &mut Vec<Diagnostic>) {
+    for (_id, node) in ast.iter() {
+        let Node::HashLit { dup_keys, .. } = node else {
+            continue;
+        };
+        if dup_keys.len() < 2 {
+            continue;
+        }
+        let mut seen: HashMap<&HashKeyTag, u32> = HashMap::new();
+        for key in dup_keys {
+            match seen.get(&key.tag) {
+                Some(&first_line) => out.push(Diagnostic {
+                    rule_id: FLOW_DUPLICATE_HASH_KEY,
+                    start_offset: key.anchor.0,
+                    end_offset: key.anchor.1,
+                    message: format!(
+                        "duplicate hash key `{}' in the same literal; this entry \
+                         overwrites the value first set at line {first_line}",
+                        key.label
+                    ),
+                    severity: Severity::Warning,
+                    source_family: "builtin",
+                    receiver_type: None,
+                    method_name: None,
+                }),
+                None => {
+                    seen.insert(&key.tag, key.line);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// flow.return-in-ensure (v0.3.0) — reference `ReturnInEnsureCollector`
+// ---------------------------------------------------------------------------
+
+/// Receiver-less calls whose attached BLOCK opens a new return frame: a `return`
+/// inside their block exits the lambda / defined method, not the method whose
+/// `ensure` is scanned. `proc` is deliberately ABSENT — `return` inside a `Proc`
+/// block returns from the enclosing method, so it stays in scope. Reference
+/// `FRAME_BARRIER_CALL_NAMES`.
+const FRAME_BARRIER_CALL_NAMES: &[&str] = &["lambda", "define_method"];
+
+/// Emit `flow.return-in-ensure` for every explicit `return` lexically inside an
+/// `ensure` clause body. Dispatches on every `BeginRescue` carrying a non-empty
+/// `ensure_body` and gathers returns from it with a frame-aware envelope.
+fn return_in_ensure_diagnostics(ast: &LoweredAst, out: &mut Vec<Diagnostic>) {
+    for (_id, node) in ast.iter() {
+        let Node::BeginRescue { ensure_body, .. } = node else {
+            continue;
+        };
+        for &stmt in ensure_body {
+            gather_returns_in_ensure(ast, stmt, out);
+        }
+    }
+}
+
+/// Recursively collect offending `return`s under `id`, stopping at frame
+/// barriers. Port of the reference `gather_returns` + `gather_returns_around_barrier_block`.
+fn gather_returns_in_ensure(ast: &LoweredAst, id: NodeId, out: &mut Vec<Diagnostic>) {
+    match ast.get(id) {
+        Node::Return { values, span } => {
+            out.push(Diagnostic {
+                rule_id: FLOW_RETURN_IN_ENSURE,
+                start_offset: span.0,
+                end_offset: span.1,
+                message: "`return' inside `ensure' discards the method's in-flight \
+                          return value and swallows any in-flight exception"
+                    .to_string(),
+                severity: Severity::Warning,
+                source_family: "builtin",
+                receiver_type: None,
+                method_name: None,
+            });
+            // The reference falls through to descend the return's children.
+            for &v in values {
+                gather_returns_in_ensure(ast, v, out);
+            }
+        }
+        // A nested `def` / lambda opens a new return frame — a `return` below it
+        // exits that inner frame, not the one whose `ensure` we scan.
+        Node::Definition { .. } | Node::Lambda { .. } => {}
+        // A nested `begin/ensure`: descend the protected/rescue/else statements
+        // but NOT its own `ensure` clause — that inner ensure is scanned when its
+        // OWN `BeginRescue` is dispatched, so descending here would double-count.
+        // The ensure statements also live (duplicated) in `body`, so exclude them.
+        Node::BeginRescue { body, ensure_body, .. } => {
+            for &child in body {
+                if !ensure_body.contains(&child) {
+                    gather_returns_in_ensure(ast, child, out);
+                }
+            }
+        }
+        // A receiver-less `lambda`/`define_method` call with a block is a barrier:
+        // its receiver + args stay in the current frame (and are descended), only
+        // the block opens a new one. Every other call (incl. `proc`, plain blocks)
+        // is fully descended.
+        Node::Call { receiver, method, args, block_body, .. } => {
+            let is_barrier = receiver.is_none()
+                && FRAME_BARRIER_CALL_NAMES.contains(&method.as_str())
+                && !block_body.is_empty();
+            if let Some(r) = receiver {
+                gather_returns_in_ensure(ast, *r, out);
+            }
+            for &a in args {
+                gather_returns_in_ensure(ast, a, out);
+            }
+            if !is_barrier {
+                for &b in block_body {
+                    gather_returns_in_ensure(ast, b, out);
+                }
+            }
+        }
+        other => {
+            for child in node_children(other) {
+                gather_returns_in_ensure(ast, child, out);
+            }
+        }
+    }
+}
+
+/// The child node ids of a node (for the generic descent in the return-in-ensure
+/// walk). Covers every variant carrying child ids; the barrier/special variants
+/// (`Call`/`BeginRescue`/`Return`/`Definition`/`Lambda`) are handled by the caller
+/// and never routed here.
+fn node_children(node: &Node) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    match node {
+        Node::Program { body, .. }
+        | Node::Statements { body, .. }
+        | Node::ClassDef { body, .. }
+        | Node::ModuleDef { body, .. }
+        | Node::Definition { body, .. }
+        | Node::Lambda { body, .. }
+        | Node::BeginRescue { body, .. } => out.extend(body.iter().copied()),
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => out.push(*value),
+        Node::InterpolatedString { parts, .. } => out.extend(parts.iter().copied()),
+        Node::Call { receiver, args, block_body, .. } => {
+            if let Some(r) = receiver {
+                out.push(*r);
+            }
+            out.extend(args.iter().copied());
+            out.extend(block_body.iter().copied());
+        }
+        Node::If { predicate, then_body, else_body, .. } => {
+            out.push(*predicate);
+            out.extend(then_body.iter().copied());
+            out.extend(else_body.iter().copied());
+        }
+        Node::Case { predicate, branches, else_body, .. } => {
+            if let Some(p) = predicate {
+                out.push(*p);
+            }
+            out.extend(branches.iter().copied());
+            out.extend(else_body.iter().copied());
+        }
+        Node::Loop { predicate, body, .. } => {
+            if let Some(p) = predicate {
+                out.push(*p);
+            }
+            out.extend(body.iter().copied());
+        }
+        Node::Logical { left, right, .. } => {
+            out.push(*left);
+            out.push(*right);
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            out.extend(elements.iter().copied());
+        }
+        Node::Return { values, .. } => out.extend(values.iter().copied()),
+        _ => {}
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// suppression.unknown-rule / suppression.empty (v0.3.0)
+// ---------------------------------------------------------------------------
+
+/// Produce the `suppression.unknown-rule` / `suppression.empty` surveillance
+/// diagnostics for a file's comments (reference `suppression_marker_diagnostics`).
+/// MUST be emitted into the same diagnostic list BEFORE `filter_suppressed`, so a
+/// marker can suppress its own complaint (`# rigor:disable suppression.unknown-rule`).
+/// `comments` is the `(line, start_offset, text)` list from `comment_lines`; every
+/// diagnostic anchors at the comment's `#` (`start_offset`), which the CLI resolves
+/// to `(line, start_column+1)` exactly like the reference.
+#[must_use]
+pub fn suppression_marker_diagnostics(comments: &[(usize, usize, String)]) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for (_line, offset, text) in comments {
+        if let Some(rules) = match_directive(text, "rigor:disable-file") {
+            validate_suppression_tokens(rules, "rigor:disable-file", *offset, &mut out);
+        } else if let Some(rules) = match_directive(text, "rigor:disable") {
+            validate_suppression_tokens(rules, "rigor:disable", *offset, &mut out);
+        } else {
+            diagnose_bare_suppression_marker(text, *offset, &mut out);
+        }
+    }
+    out
+}
+
+/// Validate a matched marker's rule tokens: an empty token list fires
+/// `suppression.empty`; each token that is not a known identifier fires
+/// `suppression.unknown-rule` (reference `validate_suppression_tokens`).
+fn validate_suppression_tokens(raw: &str, marker: &str, offset: usize, out: &mut Vec<Diagnostic>) {
+    let tokens: Vec<&str> = raw.split([' ', '\t', ',']).filter(|t| !t.is_empty()).collect();
+    if tokens.is_empty() {
+        out.push(empty_suppression_diagnostic(marker, offset));
+        return;
+    }
+    for token in tokens {
+        if !known_suppression_token(token) {
+            out.push(unknown_suppression_rule_diagnostic(marker, token, offset));
+        }
+    }
+}
+
+/// A comment carrying the bare marker word but not the token-bearing grammar. A
+/// remainder of nothing but whitespace/commas is a genuinely empty marker
+/// (`# rigor:disable`); anything else (documentation prose) is left alone.
+/// Mirrors `BARE_SUPPRESSION_MARKER` = `/#\s*rigor:disable(-file)?(?![\w-])(?<rest>.*)/`
+/// with `rest ~ /\A[\s,]*\z/`. The anchor is the comment start (offset), matching
+/// the reference's `comment.location.start_column + 1`.
+fn diagnose_bare_suppression_marker(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
+    let bytes = text.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'#' {
+            continue;
+        }
+        // `#\s*`
+        let mut j = i + 1;
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        let Some(after_kw) = text[j..].strip_prefix("rigor:disable") else {
+            continue;
+        };
+        // Optional `-file`, then `(?![\w-])` and an all-whitespace/comma remainder.
+        let (is_file, after) = match after_kw.strip_prefix("-file") {
+            Some(a) => (true, a),
+            None => (false, after_kw),
+        };
+        if let Some(c) = after.chars().next() {
+            if c == '-' || c == '_' || c.is_alphanumeric() {
+                return; // `rigor:disable-next-line`, `rigor:disablexyz` — not a marker.
+            }
+        }
+        if after
+            .chars()
+            .all(|c| matches!(c, ' ' | '\t' | ',' | '\r' | '\n'))
+        {
+            let marker = if is_file { "rigor:disable-file" } else { "rigor:disable" };
+            out.push(empty_suppression_diagnostic(marker, offset));
+        }
+        return;
+    }
+}
+
+fn unknown_suppression_rule_diagnostic(marker: &str, token: &str, offset: usize) -> Diagnostic {
+    Diagnostic {
+        rule_id: SUPPRESSION_UNKNOWN_RULE,
+        start_offset: offset,
+        end_offset: offset,
+        message: format!(
+            "unknown rule `{token}` in `# {marker}` — the token matches no known rule, \
+             alias, or family, so this suppression has no effect. Likely a typo; \
+             `rigor explain <rule>` lists the canonical ids."
+        ),
+        severity: Severity::Warning,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: None,
+    }
+}
+
+fn empty_suppression_diagnostic(marker: &str, offset: usize) -> Diagnostic {
+    Diagnostic {
+        rule_id: SUPPRESSION_EMPTY,
+        start_offset: offset,
+        end_offset: offset,
+        message: format!(
+            "`# {marker}` lists no rules, so this suppression has no effect. Name the \
+             rules to suppress (`# {marker} call.undefined-method`) or use `# {marker} all`."
+        ),
+        severity: Severity::Warning,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-source diagnostic suppression (reference `filter_suppressed`)
 // ---------------------------------------------------------------------------
 
@@ -1515,7 +1883,7 @@ const INTERNAL_ERROR_RULE: &str = "internal-error";
 /// every canonical rule whose id starts with `<token>.` (reference
 /// `RULE_FAMILIES`). Only `call` can match an implemented rule today; the rest
 /// are carried for forward-compat with the reference's catalogue.
-const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def"];
+const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppression"];
 
 /// The canonical rule ids rigor-rs can actually emit. Family expansion and the
 /// `disable all` wildcard are checked against this set, so a `call` family token
@@ -1529,6 +1897,11 @@ const IMPLEMENTED_RULES: &[&str] = &[
     DEF_OVERRIDE_VISIBILITY_REDUCED,
     FLOW_ALWAYS_RAISES,
     FLOW_UNREACHABLE_BRANCH,
+    FLOW_ALWAYS_TRUTHY_CONDITION,
+    FLOW_DUPLICATE_HASH_KEY,
+    FLOW_RETURN_IN_ENSURE,
+    SUPPRESSION_UNKNOWN_RULE,
+    SUPPRESSION_EMPTY,
 ];
 
 /// The canonical rule ids rigor-rs can actually emit — the implemented coverage
@@ -1550,6 +1923,7 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "call.wrong-arity",
     "call.argument-type-mismatch",
     "call.possible-nil-receiver",
+    "call.raise-non-exception",
     "dump.type",
     "assert.type-mismatch",
     "flow.always-raises",
@@ -1563,6 +1937,17 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "flow.dead-assignment",
     "flow.always-truthy-condition",
     "flow.unreachable-clause",
+    // v0.3.0 ids. `flow.duplicate-hash-key` / `flow.return-in-ensure` /
+    // `suppression.unknown-rule` / `suppression.empty` are implemented in this
+    // slice; `call.raise-non-exception` / `flow.shadowed-rescue-clause` are NOT
+    // yet emitted by rigor-rs but MUST still be "known" suppression tokens (so a
+    // `# rigor:disable flow.shadowed-rescue-clause` never fires unknown-rule and
+    // `is_inert_builtin_token` treats it as a real id).
+    "flow.duplicate-hash-key",
+    "flow.return-in-ensure",
+    "flow.shadowed-rescue-clause",
+    "suppression.unknown-rule",
+    "suppression.empty",
 ];
 
 /// True when `token` looks like a built-in-family rule id but matches none — its
@@ -1607,8 +1992,55 @@ fn legacy_alias(token: &str) -> Option<&'static str> {
         "dead-assignment" => Some("flow.dead-assignment"),
         "always-truthy-condition" => Some("flow.always-truthy-condition"),
         "unreachable-clause" => Some("flow.unreachable-clause"),
+        "raise-non-exception" => Some("call.raise-non-exception"),
+        "duplicate-hash-key" => Some(FLOW_DUPLICATE_HASH_KEY),
+        "return-in-ensure" => Some(FLOW_RETURN_IN_ENSURE),
+        "shadowed-rescue-clause" => Some("flow.shadowed-rescue-clause"),
         _ => None,
     }
+}
+
+/// Families of diagnostics the engine emits OUTSIDE the check-rule catalogue
+/// (aggregator/reporter-level: `rbs_extended.*`, `dynamic.*`, `rbs.*`,
+/// `pre-eval.*`), plus the `plugin.` prefix reserved for plugin-produced ids. A
+/// suppression token whose first `.`-segment is one of these is treated as KNOWN
+/// (under-warning is the FP-safe direction — these ids load dynamically / live in
+/// the engine-heavy runner and cannot be enumerated here). Reference
+/// `NON_CHECK_DIAGNOSTIC_FAMILIES`.
+const NON_CHECK_DIAGNOSTIC_FAMILIES: &[&str] =
+    &["rbs_extended", "dynamic", "rbs", "pre-eval", "plugin"];
+
+/// Bare (dot-less) diagnostic ids the engine emits outside the catalogue. A token
+/// equal to one of these is KNOWN even without a family prefix. Reference
+/// `NON_CHECK_DIAGNOSTIC_IDS`.
+const NON_CHECK_DIAGNOSTIC_IDS: &[&str] = &[
+    "configuration-error",
+    "load-error",
+    "pool-degraded",
+    "runtime-error",
+    "source-rbs-synthesis-failed",
+];
+
+/// True when a suppression token resolves to a diagnostic identifier some producer
+/// can emit: the `all` wildcard, a canonical check-rule id (the FULL
+/// [`ALL_CANONICAL_RULES`], not just the emitted subset), a legacy alias, a family
+/// wildcard, a bare non-catalogue engine id, or a dotted id under a known
+/// non-check family (`plugin.*` is always known). A faithful port of the
+/// reference's `known_suppression_token?`. Used by `suppression.unknown-rule`.
+#[must_use]
+pub fn known_suppression_token(token: &str) -> bool {
+    if token == "all" {
+        return true;
+    }
+    if ALL_CANONICAL_RULES.contains(&token)
+        || legacy_alias(token).is_some()
+        || RULE_FAMILIES.contains(&token)
+        || NON_CHECK_DIAGNOSTIC_IDS.contains(&token)
+    {
+        return true;
+    }
+    // A dotted id whose family is a known non-check family (`plugin.foo`, …).
+    matches!(token.split_once('.'), Some((family, _)) if NON_CHECK_DIAGNOSTIC_FAMILIES.contains(&family))
 }
 
 /// A parsed suppression set: a flag for the `all` wildcard plus the explicit
@@ -1692,7 +2124,7 @@ impl SuppressSet {
 #[must_use]
 pub fn filter_suppressed(
     diagnostics: Vec<(usize, Diagnostic)>,
-    comments: &[(usize, String)],
+    comments: &[(usize, usize, String)],
 ) -> Vec<(usize, Diagnostic)> {
     let (line_suppressions, file_suppressions) = parse_suppression_comments(comments);
 
@@ -1721,12 +2153,12 @@ pub fn filter_suppressed(
 /// `-file` form is checked FIRST so a `disable-file` comment is not also read as
 /// a line-level `disable` (the reference's `(?!-file)` negative lookahead).
 fn parse_suppression_comments(
-    comments: &[(usize, String)],
+    comments: &[(usize, usize, String)],
 ) -> (HashMap<usize, SuppressSet>, SuppressSet) {
     let mut line_suppressions: HashMap<usize, SuppressSet> = HashMap::new();
     let mut file_suppressions = SuppressSet::default();
 
-    for (line, text) in comments {
+    for (line, _offset, text) in comments {
         if let Some(rules) = match_directive(text, "rigor:disable-file") {
             absorb_tokens(rules, &mut file_suppressions);
         } else if let Some(rules) = match_directive(text, "rigor:disable") {
@@ -2892,7 +3324,7 @@ mod tests {
 
     fn surviving_rules(
         diags: Vec<(usize, Diagnostic)>,
-        comments: &[(usize, String)],
+        comments: &[(usize, usize, String)],
     ) -> Vec<(usize, &'static str)> {
         filter_suppressed(diags, comments)
             .into_iter()
@@ -2906,7 +3338,7 @@ mod tests {
             (2, diag(CALL_UNDEFINED_METHOD)),
             (4, diag(CALL_UNDEFINED_METHOD)),
         ];
-        let comments = vec![(4, "# rigor:disable call.undefined-method".to_string())];
+        let comments = vec![(4, 0, "# rigor:disable call.undefined-method".to_string())];
         // Only the L4 diagnostic is suppressed; L2 survives.
         assert_eq!(surviving_rules(diags, &comments), vec![(2, CALL_UNDEFINED_METHOD)]);
     }
@@ -2918,7 +3350,7 @@ mod tests {
             (3, diag(CALL_WRONG_ARITY)),
             (5, diag(CALL_WRONG_ARITY)),
         ];
-        let comments = vec![(3, "# rigor:disable all".to_string())];
+        let comments = vec![(3, 0, "# rigor:disable all".to_string())];
         assert_eq!(surviving_rules(diags, &comments), vec![(5, CALL_WRONG_ARITY)]);
     }
 
@@ -2930,7 +3362,7 @@ mod tests {
             (9, diag(CALL_WRONG_ARITY)),
         ];
         // The directive sits on line 1 but scopes the whole file.
-        let comments = vec![(1, "# rigor:disable-file undefined-method".to_string())];
+        let comments = vec![(1, 0, "# rigor:disable-file undefined-method".to_string())];
         assert_eq!(surviving_rules(diags, &comments), vec![(9, CALL_WRONG_ARITY)]);
     }
 
@@ -2941,7 +3373,7 @@ mod tests {
             (4, diag(CALL_WRONG_ARITY)),
             (6, diag(CALL_POSSIBLE_NIL_RECEIVER)),
         ];
-        let comments = vec![(1, "# rigor:disable-file all".to_string())];
+        let comments = vec![(1, 0, "# rigor:disable-file all".to_string())];
         assert!(filter_suppressed(diags, &comments).is_empty());
     }
 
@@ -2952,14 +3384,14 @@ mod tests {
             (2, diag(CALL_WRONG_ARITY)),
             (2, diag(CALL_POSSIBLE_NIL_RECEIVER)),
         ];
-        let comments = vec![(2, "# rigor:disable call".to_string())];
+        let comments = vec![(2, 0, "# rigor:disable call".to_string())];
         assert!(filter_suppressed(diags, &comments).is_empty());
     }
 
     #[test]
     fn legacy_alias_resolves_to_canonical_id() {
         let diags = vec![(4, diag(CALL_UNDEFINED_METHOD))];
-        let comments = vec![(4, "# rigor:disable undefined-method".to_string())];
+        let comments = vec![(4, 0, "# rigor:disable undefined-method".to_string())];
         assert!(filter_suppressed(diags, &comments).is_empty());
     }
 
@@ -2969,7 +3401,7 @@ mod tests {
             (2, diag(CALL_UNDEFINED_METHOD)),
             (2, diag(CALL_WRONG_ARITY)),
         ];
-        let comments = vec![(2, "# rigor:disable undefined-method, wrong-arity".to_string())];
+        let comments = vec![(2, 0, "# rigor:disable undefined-method, wrong-arity".to_string())];
         assert!(filter_suppressed(diags, &comments).is_empty());
     }
 
@@ -2978,14 +3410,14 @@ mod tests {
         // A disable for a DIFFERENT rule on the same line must not drop it.
         let same_line = filter_suppressed(
             vec![(4, diag(CALL_UNDEFINED_METHOD))],
-            &[(4, "# rigor:disable wrong-arity".to_string())],
+            &[(4, 0, "# rigor:disable wrong-arity".to_string())],
         );
         assert_eq!(same_line.len(), 1);
 
         // A disable on a DIFFERENT line must not drop it.
         let other_line = filter_suppressed(
             vec![(4, diag(CALL_UNDEFINED_METHOD))],
-            &[(7, "# rigor:disable undefined-method".to_string())],
+            &[(7, 0, "# rigor:disable undefined-method".to_string())],
         );
         assert_eq!(other_line.len(), 1);
     }
@@ -2995,15 +3427,15 @@ mod tests {
         // `disable-file` must NOT also register as a line-level `disable` for the
         // comment's own line (reference `(?!-file)`).
         let line_set =
-            parse_suppression_comments(&[(3, "# rigor:disable-file undefined-method".to_string())]);
-        assert!(line_set.0.get(&3).is_none());
+            parse_suppression_comments(&[(3, 0, "# rigor:disable-file undefined-method".to_string())]);
+        assert!(!line_set.0.contains_key(&3));
         assert!(line_set.1.suppresses(CALL_UNDEFINED_METHOD));
     }
 
     #[test]
     fn internal_error_is_never_suppressed() {
         let diags = vec![(2, diag(INTERNAL_ERROR_RULE))];
-        let comments = vec![(2, "# rigor:disable all".to_string())];
+        let comments = vec![(2, 0, "# rigor:disable all".to_string())];
         // Even `disable all` cannot silence an internal-error diagnostic.
         assert_eq!(filter_suppressed(diags, &comments).len(), 1);
     }
@@ -3385,5 +3817,227 @@ mod tests {
         // class (`Pathname`, NOT project-sig) keeps the reference's `.new`
         // leniency — its typo must NOT be witnessed.
         assert!(run_with_widget_sig("pathname", b"Pathname.new(\"a\").spni\n").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // flow.duplicate-hash-key (v0.3.0)
+    // -----------------------------------------------------------------------
+
+    /// The diagnostics of one rule, in emit order.
+    fn of_rule(src: &[u8], rule: &str) -> Vec<Diagnostic> {
+        run(src).into_iter().filter(|d| d.rule_id == rule).collect()
+    }
+
+    #[test]
+    fn dup_hash_key_symbol_shorthand_fires_once() {
+        let d = of_rule(b"h = { a: 1, a: 2 }\n", FLOW_DUPLICATE_HASH_KEY);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(d[0].source_family, "builtin");
+        assert_eq!(
+            d[0].message,
+            "duplicate hash key `:a' in the same literal; this entry overwrites the value first set at line 1"
+        );
+        // Anchored at the REPEAT key (`a` on the second entry, col 13 in the oracle).
+        assert_eq!(d[0].start_offset, 12);
+    }
+
+    #[test]
+    fn dup_hash_key_string_uses_ruby_inspect_label() {
+        let d = of_rule(b"h = { \"a\" => 1, \"a\" => 2 }\n", FLOW_DUPLICATE_HASH_KEY);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].message.starts_with("duplicate hash key `\"a\"' "), "{}", d[0].message);
+    }
+
+    #[test]
+    fn dup_hash_key_integer_and_float_are_distinct_kinds() {
+        // `1` and `1.0` are different keys (`1.eql?(1.0)` is false) ⇒ SILENT.
+        assert!(of_rule(b"h = { 1 => 'x', 1.0 => 'y' }\n", FLOW_DUPLICATE_HASH_KEY).is_empty());
+        // Same integer fires.
+        assert_eq!(of_rule(b"h = { 1 => 'x', 1 => 'y' }\n", FLOW_DUPLICATE_HASH_KEY).len(), 1);
+        // Same float fires.
+        assert_eq!(of_rule(b"h = { 1.0 => 'x', 1.0 => 'y' }\n", FLOW_DUPLICATE_HASH_KEY).len(), 1);
+    }
+
+    #[test]
+    fn dup_hash_key_float_label_is_verbatim_slice() {
+        // `1.0` and `1.00` are the same f64 ⇒ collide; the label is the VERBATIM
+        // slice of the repeat (`1.00`), not a re-rendered value.
+        let d = of_rule(b"h = { 1.0 => 'x', 1.00 => 'y' }\n", FLOW_DUPLICATE_HASH_KEY);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].message.starts_with("duplicate hash key `1.00' "), "{}", d[0].message);
+    }
+
+    #[test]
+    fn dup_hash_key_string_vs_symbol_never_collide() {
+        assert!(of_rule(b"h = { \"a\" => 1, a: 2 }\n", FLOW_DUPLICATE_HASH_KEY).is_empty());
+    }
+
+    #[test]
+    fn dup_hash_key_computed_and_interpolated_keys_silent() {
+        assert!(of_rule(b"h = { foo => 1, foo => 2 }\n", FLOW_DUPLICATE_HASH_KEY).is_empty());
+        assert!(of_rule(b"h = { \"#{x}\" => 1, \"#{x}\" => 2 }\n", FLOW_DUPLICATE_HASH_KEY).is_empty());
+    }
+
+    #[test]
+    fn dup_hash_key_splat_is_inert_pair_still_fires() {
+        let d = of_rule(b"h = { **other, a: 1, a: 2 }\n", FLOW_DUPLICATE_HASH_KEY);
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn dup_hash_key_true_false_nil() {
+        assert_eq!(of_rule(b"h = { nil => 1, nil => 2 }\n", FLOW_DUPLICATE_HASH_KEY).len(), 1);
+        assert_eq!(of_rule(b"h = { true => 1, true => 2 }\n", FLOW_DUPLICATE_HASH_KEY).len(), 1);
+    }
+
+    #[test]
+    fn dup_hash_key_bare_keyword_args_fire() {
+        let d = of_rule(b"def m(**o); end\nm(a: 1, a: 2)\n", FLOW_DUPLICATE_HASH_KEY);
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn dup_hash_key_nested_literal_is_own_scope() {
+        // Only the NESTED `a:` pair fires; the outer `a:`/`b:` never cross-compare.
+        let d = of_rule(b"h = { a: 1, b: { a: 2, a: 3 } }\n", FLOW_DUPLICATE_HASH_KEY);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert!(d[0].message.contains("first set at line 1"), "{}", d[0].message);
+    }
+
+    #[test]
+    fn dup_hash_key_triple_all_reference_original() {
+        // `{ a: 1, a: 2, a: 3 }` fires TWICE, both naming the ORIGINAL first line.
+        let d = of_rule(b"h = { a: 1, a: 2, a: 3 }\n", FLOW_DUPLICATE_HASH_KEY);
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d.iter().all(|x| x.message.contains("first set at line 1")));
+    }
+
+    // -----------------------------------------------------------------------
+    // flow.return-in-ensure (v0.3.0)
+    // -----------------------------------------------------------------------
+
+    fn ret(src: &[u8]) -> Vec<Diagnostic> {
+        of_rule(src, FLOW_RETURN_IN_ENSURE)
+    }
+
+    #[test]
+    fn return_in_ensure_fires_with_static_message() {
+        let d = ret(b"def m\n  work\nensure\n  return 1\nend\n");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(
+            d[0].message,
+            "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+        );
+    }
+
+    #[test]
+    fn return_in_ensure_plain_block_fires_lambda_and_define_method_are_barriers() {
+        assert_eq!(ret(b"def m\n  work\nensure\n  [1].each { return }\nend\n").len(), 1);
+        assert!(ret(b"def m\n  work\nensure\n  lambda { return 1 }\nend\n").is_empty());
+        assert!(ret(b"def m\n  work\nensure\n  -> { return 1 }\nend\n").is_empty());
+        assert!(ret(b"def m\n  work\nensure\n  define_method(:f) { return 1 }\nend\n").is_empty());
+        assert!(ret(b"def m\n  work\nensure\n  def nested; return 1; end\nend\n").is_empty());
+    }
+
+    #[test]
+    fn return_in_ensure_proc_block_is_not_a_barrier() {
+        assert_eq!(ret(b"def m\n  work\nensure\n  proc { return 1 }\nend\n").len(), 1);
+    }
+
+    #[test]
+    fn return_in_ensure_two_returns_fire_twice() {
+        assert_eq!(ret(b"def m\n  work\nensure\n  return 1\n  return 2\nend\n").len(), 2);
+    }
+
+    #[test]
+    fn return_in_ensure_toplevel_begin() {
+        assert_eq!(ret(b"begin\n  work\nensure\n  return\nend\n").len(), 1);
+    }
+
+    #[test]
+    fn return_in_ensure_nested_begin_fires_once() {
+        // The inner `return 3` is collected exactly once (when the inner
+        // BeginRescue is dispatched), NOT double-counted by the outer walk.
+        let d = ret(b"def outer\n  work\nensure\n  begin\n    inner\n  ensure\n    return 3\n  end\nend\n");
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn return_in_ensure_no_return_is_silent() {
+        assert!(ret(b"def m\n  work\nensure\n  cleanup\nend\n").is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // suppression.unknown-rule / suppression.empty (v0.3.0)
+    // -----------------------------------------------------------------------
+
+    /// Run the suppression surveillance over a single comment.
+    fn sup(comment: &str) -> Vec<Diagnostic> {
+        suppression_marker_diagnostics(&[(1, 0, comment.to_string())])
+    }
+
+    #[test]
+    fn suppression_unknown_rule_fires_with_exact_message() {
+        let d = sup("# rigor:disable call.no-such-rule");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].rule_id, SUPPRESSION_UNKNOWN_RULE);
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(
+            d[0].message,
+            "unknown rule `call.no-such-rule` in `# rigor:disable` — the token matches no known rule, alias, or family, so this suppression has no effect. Likely a typo; `rigor explain <rule>` lists the canonical ids."
+        );
+    }
+
+    #[test]
+    fn suppression_empty_bare_marker_fires() {
+        let line = sup("# rigor:disable");
+        assert_eq!(line.len(), 1);
+        assert_eq!(line[0].rule_id, SUPPRESSION_EMPTY);
+        assert_eq!(
+            line[0].message,
+            "`# rigor:disable` lists no rules, so this suppression has no effect. Name the rules to suppress (`# rigor:disable call.undefined-method`) or use `# rigor:disable all`."
+        );
+        let file = sup("# rigor:disable-file");
+        assert_eq!(file.len(), 1);
+        assert_eq!(file[0].rule_id, SUPPRESSION_EMPTY);
+        assert!(file[0].message.contains("`# rigor:disable-file`"));
+    }
+
+    #[test]
+    fn suppression_multiple_unknown_tokens_share_anchor() {
+        let d = sup("# rigor:disable call.undefined-method,call.bogus-one, call.bogus-two");
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d.iter().all(|x| x.rule_id == SUPPRESSION_UNKNOWN_RULE));
+        assert!(d.iter().all(|x| x.start_offset == d[0].start_offset));
+    }
+
+    #[test]
+    fn suppression_known_tokens_stay_silent() {
+        assert!(sup("# rigor:disable call").is_empty()); // family
+        assert!(sup("# rigor:disable all").is_empty()); // wildcard
+        assert!(sup("# rigor:disable undefined-method").is_empty()); // legacy alias
+        assert!(sup("# rigor:disable rbs_extended.something").is_empty()); // non-check family
+        assert!(sup("# rigor:disable flow.duplicate-hash-key").is_empty()); // new canonical id
+        assert!(sup("# rigor:disable flow.shadowed-rescue-clause").is_empty()); // known-but-unimplemented
+        assert!(sup("# rigor:disable suppression.unknown-rule").is_empty()); // self
+    }
+
+    #[test]
+    fn suppression_next_line_and_prose_are_ignored() {
+        assert!(sup("# rigor:disable-next-line call.undefined-method").is_empty());
+        assert!(sup("# this documents `# rigor:disable <rule>` usage").is_empty());
+    }
+
+    #[test]
+    fn suppression_self_suppression_via_filter() {
+        // The surveillance diagnostic flows through filter_suppressed and is
+        // suppressed by its own line when acknowledged alongside the bogus token.
+        let comment = "# rigor:disable call.bogus suppression.unknown-rule";
+        let diags = suppression_marker_diagnostics(&[(1, 0, comment.to_string())]);
+        let with_lines: Vec<(usize, Diagnostic)> = diags.into_iter().map(|d| (1, d)).collect();
+        let kept = filter_suppressed(with_lines, &[(1, 0, comment.to_string())]);
+        assert!(kept.is_empty(), "self-suppression must silence the complaint: {kept:?}");
     }
 }

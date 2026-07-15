@@ -362,10 +362,12 @@ fn compute_diagnostics(ctx: &ServerContext, text: &str) -> Vec<Diagnostic> {
         (diags, comments)
     }));
 
-    let (diags, comments) = match analysed {
+    let (mut diags, comments) = match analysed {
         Ok(pair) => pair,
         Err(_) => return Vec::new(),
     };
+    // Suppression-marker surveillance, before `filter_suppressed` (self-suppressible).
+    diags.extend(rigor_rules::suppression_marker_diagnostics(&comments));
 
     // Inline `# rigor:disable` suppression (same as `check`): key each diag on its
     // 1-based line, filter, then drop config-`disable:`d rules.
