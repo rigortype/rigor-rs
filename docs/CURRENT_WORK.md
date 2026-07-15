@@ -6,14 +6,52 @@ port list keyed to the reference's subsystems. **Order is not binding** — pull
 whatever is highest-leverage next; this file exists so nothing is lost, not to
 fix a sequence.
 
-Last updated: 2026-07-11 (sig-gen arc: THIRTEEN slices merged — erase_to_rbs substrate → --print →
+Last updated: 2026-07-16 (v0.3.0-RC upstream-tracking arc: pin bump + SEVEN slices merged in one
+session — see the entry below). Previous: 2026-07-11 (sig-gen arc: THIRTEEN slices merged — erase_to_rbs substrate → --print →
 return-union/Node::Return → singletons → --write create → initialize stub → --diff → module_function self?. →
 Writer UPDATE/merge + LayoutIndex → generation-time env classification → --overwrite replace path → qualified
 source-class naming → Data.define/Struct class shells; sound-superset parity model recorded in **AGENTS.md
 "Generative-tool parity"**). Then PIVOTED to productization (MCP `sig_gen` tool). Read `AGENTS.md` "Working
 discipline" before continuing.
 
-**▶▶ LANDED THIS SESSION (branch `mcp-sig-gen`, MERGED `e7ae83e`) — productization: `sig_gen` MCP tool.** The
+**▶▶ LANDED THIS SESSION (2026-07-16) — v0.3.0-RC UPSTREAM-TRACKING ARC: pin bump + 7 slices, ALL MERGED.**
+Upstream reached the v0.3.0 release-candidate stage; this arc measured the RC gap set and closed it. Full
+survey + binding specs: `docs/notes/20260716-v030-*.md` (4 specs) + `20260716-mutation-widening-fp-spec.md`.
+Protocol: 5 Sonnet investigations (changelog inventory, three rule-cluster specs, FP root-cause) → binding
+specs committed → 6 Opus implementation slices → main-session independent adversarial audit per slice.
+Merges (in order): **(1) `pin-v030-rc`** — submodule pin `v0.2.7` → RC commit `47ec8625` (a COMMIT pin, first
+time; re-pin when the tag lands); snapshots 0 changed/43 unchanged, RC is behavior-identical on the old corpus.
+**(2) `v030-syntactic-rules`** — `flow.duplicate-hash-key`, `flow.return-in-ensure`,
+`suppression.unknown-rule`/`suppression.empty` + substrate (HashLit dup-key capture, BeginRescue
+`ensure_body`, `Node::Lambda` lowering — closed a general `-> {}` invisibility soundness gap, comment
+column). **(3) `mutation-widening-fp`** — ported the reference's MutationWidening as a `collect_flow_writes`
+extension, killing 2 MEASURED always-truthy FPs on gitlab-foss `lib` (a long-standing never-ported subsystem
+surfaced by the first gitlab-lib sweep, NOT RC-new — v0.2.7 already suppressed; the interprocedural
+callee-mutates-arg floor `af3efef3` IS RC-new, 0 live instances, deferred). **(4) `v030-p-pp-identity`** —
+the NEW implicit-self dispatch entry (`type_implicit_self_call`; receiver-None calls previously fell to the
+Dynamic catch-all untyped) + Kernel `p`/`pp` identity typing (0→nil, 1→identity, N→Tuple; shadow/splat
+guards). **(5) `v030-scalar-hashshape`** — Integer/Float/bool/nil hash keys value-pin (ShapeKey Float/Bool/
+Nil), duplicate keys last-wins (first position, last value; also fixed the pre-existing all-Symbol dup-key
+degradation), hashrocket rendering for non-Sym/Str keys, degraded-erasure union sorted by describe, + the NEW
+`fold_hash_shape_projection` tier ([]/fetch/dig/has_key?/slice/except/values_at/invert). **(6)
+`v030-kernel-folding`** — `format`/`sprintf` (hand-written Ruby-sprintf interpreter, 4096-byte cap,
+decline-on-uncertainty; float directives/positional/named forms decline), `String()`, `Hash()`, `Integer()`
+(radix/underscore/base-arg grammar), `Float()`. **(7) `v030-raise-non-exception`** — `call.raise-non-exception`
+(error severity) + NEW public `CoreIndex::class_ordering` (Equal/Subclass/Superclass/Disjoint/Unknown) +
+`is_module` bit; asymmetric singleton/instance verdict paths, project-class unconditional bail, duck
+`#exception`, redefinition gates, `first_arg_nonplain` on Call (kwargs-vs-braced-hash distinction — FP
+load-bearing). **(8) `v030-shadowed-rescue`** — `flow.shadowed-rescue-clause` + `RescueClause` per-clause
+lowering (flat `body` byte-preserved) + a ROOT FIX in rbs.rs (nested `Psych::Exception` was overwriting
+top-level `Exception`'s superclass in the short-name index, manufacturing a cycle and a probe-caught FP).
+**Final state:** harness 57 fixtures / 149 matched / 0 FP (live + snapshot); fp_audit 0 FP on mastodon app
+(matched 397, unchanged), gitlab-foss lib + app/models, conference-app; 665 workspace tests; explain catalog
+25 rules. **The v0.3.0 diagnostic-rule surface is fully ported.** Remaining RC deltas (documented, deferred):
+interprocedural mutation floor (P6), `Kernel.format` explicit-receiver folds, float sprintf directives,
+literal-string lift carrier on failed folds, plugin-only changes (no plugin engine), new CLI surface
+(`--bleeding-edge`, coverage `--workers`, plugins inflection probe — productization candidates). When
+upstream tags v0.3.0: re-pin per UPSTREAM.md (expect snapshots unchanged), re-run fp_audit.
+
+**▶▶ LANDED (2026-07-11, branch `mcp-sig-gen`, MERGED `e7ae83e`) — productization: `sig_gen` MCP tool.** The
 clean pivot after the sig-gen arc closed: surfaces the sig-gen work through the MCP tool surface an agent calls
 (reference `rigor_sig_gen`). Read-only — runs `sig-gen --print --format=json` over FILE `paths` (+ optional
 `config`), returns the `{ candidates: [...] }` JSON, panic-isolated. `--params=observed` is NOT exposed
