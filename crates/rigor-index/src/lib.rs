@@ -31,7 +31,7 @@ use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 pub mod plugins;
 mod rbs;
 
-pub use rbs::RbsSource;
+pub use rbs::{ClassOrdering, RbsSource};
 
 /// The core classes this index registers, in a fixed order. The slice index of
 /// a name in this array IS its [`ClassId`] (see [`CoreIndex::class_id`]), so the
@@ -194,6 +194,20 @@ impl CoreIndex {
     /// extension absent from core `Time`'s singleton surface).
     pub fn class_has_singleton_method(&self, class_name: &str, method: &str) -> bool {
         self.data.class_has_singleton_method(class_name, method)
+    }
+
+    /// The subtyping relation of two RBS-known class names — a faithful port of
+    /// the reference `Environment#class_ordering`. See
+    /// [`rbs::CoreData::class_ordering`]. Read by `call.raise-non-exception`.
+    pub fn class_ordering(&self, lhs: &str, rhs: &str) -> ClassOrdering {
+        self.data.class_ordering(lhs, rhs)
+    }
+
+    /// Whether `class_name` was declared as an RBS `module` (not a `class`) — the
+    /// analogue of the reference `Environment#rbs_module?`. See
+    /// [`rbs::CoreData::is_module`]. Read by `call.raise-non-exception`.
+    pub fn is_module(&self, class_name: &str) -> bool {
+        self.data.is_module(class_name)
     }
 
     /// **Sig-gen only — NOT a diagnostic predicate.** Whether the flattened
@@ -817,6 +831,34 @@ mod tests {
                 idx.knows_toplevel_class("Status"),
             );
         }
+    }
+
+    #[test]
+    fn class_ordering_and_is_module_over_real_rbs() {
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Exception") {
+            return; // stub fallback — Exception/String absent.
+        }
+        use ClassOrdering::*;
+        // Reflexive equality.
+        assert_eq!(idx.class_ordering("String", "String"), Equal);
+        // Exception descendants order as subclass.
+        assert_eq!(idx.class_ordering("ArgumentError", "Exception"), Subclass);
+        assert_eq!(idx.class_ordering("RuntimeError", "Exception"), Subclass);
+        // Unrelated fully-known classes are disjoint.
+        assert_eq!(idx.class_ordering("Integer", "Exception"), Disjoint);
+        assert_eq!(idx.class_ordering("Symbol", "String"), Disjoint);
+        // An unloaded class is unknown.
+        assert_eq!(idx.class_ordering("NotAClass_xyz", "Exception"), Unknown);
+        // The `::` prefix is stripped before comparison.
+        assert_eq!(idx.class_ordering("::String", "String"), Equal);
+        // Module bit: modules true, classes false.
+        assert!(idx.is_module("Comparable"));
+        assert!(idx.is_module("Kernel"));
+        assert!(!idx.is_module("Class"));
+        assert!(!idx.is_module("Object"));
+        assert!(!idx.is_module("Exception"));
+        assert!(!idx.is_module("NotAClass_xyz"));
     }
 
     #[test]

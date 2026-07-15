@@ -247,6 +247,16 @@ pub enum Node {
         /// safe-nav suppression clause): a `&.` call short-circuits on a nil
         /// receiver at runtime, so a nil-bearing receiver is not a bug there.
         safe_nav: bool,
+        /// `true` when the FIRST positional argument is a non-plain shape — a
+        /// splat (`*a`), a bare keyword-hash (`a: 1`, Prism's `KeywordHashNode`),
+        /// or forwarded arguments (`...`). The lowered arg subtree does not
+        /// otherwise preserve this (a `KeywordHashNode` and a braced `HashNode`
+        /// both lower to `Node::HashLit`), so `call.raise-non-exception` reads
+        /// this flag to bail exactly as the reference's
+        /// `first_positional_raise_operand` does (`raise(a: 1)` is silent; a
+        /// positional `raise({a: 1})` fires). `false` when there is no first
+        /// argument or it is an ordinary expression.
+        first_arg_nonplain: bool,
         /// Span of the whole call expression.
         span: Span,
     },
@@ -811,6 +821,20 @@ impl<'src> Builder<'src> {
                 .arguments()
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
+            // Whether the FIRST positional argument is a non-plain shape
+            // (splat / bare keyword-hash / forwarded args) — recorded here
+            // because the lowered subtree does not preserve the distinction
+            // (a `KeywordHashNode` and a braced `HashNode` both become
+            // `Node::HashLit`). `call.raise-non-exception` bails on it, mirroring
+            // the reference's `first_positional_raise_operand`.
+            let first_arg_nonplain = call
+                .arguments()
+                .and_then(|a| a.arguments().iter().next().map(|first| {
+                    first.as_splat_node().is_some()
+                        || first.as_keyword_hash_node().is_some()
+                        || first.as_forwarding_arguments_node().is_some()
+                }))
+                .unwrap_or(false);
             // Lower an attached block so calls/reads inside it reach the walk.
             //   * a BlockNode (`{ … }` / `do…end`) — lower its body statements.
             //   * a `&expr` block-pass (BlockArgumentNode) — lower the passed
@@ -849,6 +873,7 @@ impl<'src> Builder<'src> {
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
                 safe_nav: call.is_safe_navigation(),
+                first_arg_nonplain,
                 span: span_of(&call.location()),
             });
         }

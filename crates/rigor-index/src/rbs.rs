@@ -64,6 +64,23 @@ lib/ruby/gems/4.0.0/gems/rbs-4.0.3/core";
 /// positional rest, else the largest required+optional count.
 type Arity = (usize, Option<usize>);
 
+/// The subtyping relation of two class names, mirroring the reference's
+/// `class_ordering` result atoms (`:equal` / `:subclass` / `:superclass` /
+/// `:disjoint` / `:unknown`). See [`CoreData::class_ordering`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClassOrdering {
+    /// The two names denote the same class.
+    Equal,
+    /// `lhs` is a proper descendant of `rhs` (its ancestry includes `rhs`).
+    Subclass,
+    /// `lhs` is a proper ancestor of `rhs` (`rhs`'s ancestry includes `lhs`).
+    Superclass,
+    /// Neither is an ancestor of the other (both chains fully known).
+    Disjoint,
+    /// The relation cannot be proven (an unloaded class or an incomplete chain).
+    Unknown,
+}
+
 /// Sentinel stored in [`ClassEntry::block_returns`] for a block overload whose
 /// RBS return type is `self` (e.g. `Array#each { } -> self`, `Kernel#tap { } ->
 /// self`). At lookup time it resolves to the RECEIVER's own class name (the
@@ -121,6 +138,12 @@ struct ClassEntry {
     /// Direct superclass name, if any (`None` ⇒ implicit `Object`, except the
     /// roots which are seeded explicitly).
     superclass: Option<&'static str>,
+    /// `true` when this name was declared as a `module` (not a `class`) in RBS —
+    /// the analogue of the reference's `Environment#rbs_module?`. Read ONLY by
+    /// `call.raise-non-exception`'s instance path (a value typed as a module
+    /// includer could be an Exception at runtime, so it must stay silent). Set on
+    /// the module ingest, OR-merged across reopens.
+    is_module: bool,
     /// Included module names (in source order).
     includes: Vec<&'static str>,
     /// `extend`ed module names (in source order). An `extend M` directive folds
@@ -365,6 +388,53 @@ impl CoreData {
         // Not found across the chain. Only witness absence if the chain is
         // fully loaded; otherwise assume present (zero false positive).
         !complete
+    }
+
+    /// Whether `name` was declared as a `module` in RBS (the analogue of the
+    /// reference `Environment#rbs_module?`). `false` for a class or an unknown
+    /// name. Read only by `call.raise-non-exception`'s instance path.
+    pub fn is_module(&self, name: &str) -> bool {
+        self.classes.get(name).is_some_and(|e| e.is_module)
+    }
+
+    /// The subtyping relation of two RBS-known class names, a faithful port of
+    /// the reference `Environment::RbsHierarchy#class_ordering`
+    /// (`environment/rbs_hierarchy.rb`): `Equal` when the (namespace-stripped)
+    /// names match; `Unknown` when either class is unloaded; else `Subclass` when
+    /// `lhs`'s ancestry includes `rhs`, `Superclass` when `rhs`'s ancestry
+    /// includes `lhs`, else `Disjoint`.
+    ///
+    /// One conservative deviation from the reference (whose RBS `ancestors`
+    /// always yields the COMPLETE linearization): rigor-rs's ancestor walk can be
+    /// incomplete when some referenced ancestor is not loaded. When the two
+    /// classes are UNRELATED (neither contains the other) but a chain is
+    /// incomplete, this returns `Unknown` rather than `Disjoint`, so the caller
+    /// never proves disjointness from a partial chain. A positive
+    /// `Subclass`/`Superclass` witness stands regardless of completeness (finding
+    /// the target IS the proof). For the raise rule's Exception/String targets the
+    /// vendored chains are complete, so this matches the reference exactly.
+    pub fn class_ordering(&self, lhs: &str, rhs: &str) -> ClassOrdering {
+        let lhs = lhs.strip_prefix("::").unwrap_or(lhs);
+        let rhs = rhs.strip_prefix("::").unwrap_or(rhs);
+        if lhs == rhs {
+            return ClassOrdering::Equal;
+        }
+        if !self.classes.contains_key(lhs) || !self.classes.contains_key(rhs) {
+            return ClassOrdering::Unknown;
+        }
+        let (lhs_anc, lhs_complete) = self.ancestors(lhs);
+        let (rhs_anc, rhs_complete) = self.ancestors(rhs);
+        if lhs_anc.contains(&rhs) {
+            return ClassOrdering::Subclass;
+        }
+        if rhs_anc.contains(&lhs) {
+            return ClassOrdering::Superclass;
+        }
+        if lhs_complete && rhs_complete {
+            ClassOrdering::Disjoint
+        } else {
+            ClassOrdering::Unknown
+        }
     }
 
     /// Enumerate every INSTANCE method name callable on `class_name` — its own
@@ -953,6 +1023,11 @@ impl CoreData {
                     singleton_methods: HashMap::new(),
                     singleton_aliases: HashMap::new(),
                     superclass,
+                    // The stub does not distinguish modules from classes; the
+                    // raise-non-exception module gate needs the real embedded RBS
+                    // (Exception is absent under the stub, so the rule is silent
+                    // regardless). `false` keeps it inert.
+                    is_module: false,
                     includes,
                     // The stub models no `extend` directives (no class-method
                     // surface under the fallback); empty keeps it conservative.
@@ -1265,7 +1340,10 @@ impl Builder {
         if !nested && is_toplevel_name(&tn) {
             self.toplevel_classes.insert(name);
         }
-        let mut entry = ClassEntry::default();
+        let mut entry = ClassEntry {
+            is_module: true,
+            ..Default::default()
+        };
         self.collect_members(m.members().iter(), &mut entry);
         self.merge(name, entry);
     }
@@ -1365,6 +1443,7 @@ impl Builder {
         if slot.superclass.is_none() {
             slot.superclass = entry.superclass;
         }
+        slot.is_module |= entry.is_module;
         for (k, v) in entry.methods {
             slot.methods.entry(k).or_insert(v);
         }

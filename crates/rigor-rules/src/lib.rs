@@ -166,6 +166,15 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-return-in-ensure",
         }),
+        CALL_RAISE_NON_EXCEPTION => Some(&RuleEntry {
+            // Oracle: error across all profiles / high — the operand's
+            // statically-inferred type is provably not a legal `raise` operand,
+            // gated behind the same zero-FP envelope (project-class bail, module
+            // bail, duck `#exception`, redefinition, unknown-type decline).
+            default_severity: Severity::Error,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-raise-non-exception",
+        }),
         SUPPRESSION_UNKNOWN_RULE => Some(&RuleEntry {
             // Oracle: warning across ALL profiles / high — pure token-table
             // membership over the same tables the suppression matcher uses.
@@ -299,6 +308,26 @@ pub const SUPPRESSION_UNKNOWN_RULE: &str = "suppression.unknown-rule";
 /// `suppression.empty` (v0.3.0): a bare `# rigor:disable[-file]` marker with no
 /// rule tokens (only whitespace/commas after it) — it suppresses nothing.
 pub const SUPPRESSION_EMPTY: &str = "suppression.empty";
+
+/// `call.raise-non-exception` (v0.3.0): an implicit-self `raise` / `fail` whose
+/// first positional argument's statically-inferred type is provably NOT a legal
+/// raise operand — an Exception class object, an Exception instance, a String
+/// (raises RuntimeError), or any object whose class defines `#exception` (the
+/// duck protocol `raise` consults at runtime). Anything else (`raise 42`,
+/// `raise :sym`, `raise nil`, `raise Array`) raises TypeError at runtime. A
+/// faithful port of the reference's `raise_non_exception_diagnostic` +
+/// `raise_operand_verdict` (`check_rules.rb`).
+///
+/// Zero-FP envelope (each gate load-bearing): implicit-self only; `raise`/`fail`
+/// not redefined reachably (toplevel def, Object/Kernel reopen, enclosing-class
+/// instance or singleton def); no block; a plain first positional arg
+/// (splat/kwargs/forwarding bail); a trinary verdict that fires ONLY on a
+/// provable `:illegal` (unknown / Dynamic / mixed union stay silent); ANY
+/// project-discovered class bails; the instance path bails on the generic
+/// carriers (`Class`/`Module`/`Object`/`BasicObject`) and on module-typed values
+/// and treats `:superclass` as unknown (asymmetric with the exact singleton path,
+/// where `:superclass` fires).
+pub const CALL_RAISE_NON_EXCEPTION: &str = "call.raise-non-exception";
 
 /// The Integer division/modulo operators that raise `ZeroDivisionError` on a
 /// zero Integer divisor — verbatim the reference's `INTEGER_RAISING_OPERATORS`
@@ -549,11 +578,19 @@ pub fn analyze_with_source_and_folder(
     // calls silent). See `check_unresolved_toplevel` for the gate.
     unresolved_toplevel_diagnostics(ast, index, source, &mut out);
 
-    // Seventh pass — `flow.duplicate-hash-key` (v0.3.0). Purely syntactic: walk
+    // Seventh pass — `call.raise-non-exception` (v0.3.0). Its OWN walk over
+    // receiver-None `raise`/`fail` calls (the main call walk is receiver-Some
+    // only) — NOT toplevel-restricted, so it fires inside method bodies too. The
+    // operand is typed through the shared typer; the verdict + FP gates
+    // (project-class bail, module bail, duck `#exception`, redefinition, unknown
+    // decline) mirror the reference exactly.
+    raise_non_exception_diagnostics(ast, index, source, &typer, &env, interner, &mut out);
+
+    // Eighth pass — `flow.duplicate-hash-key` (v0.3.0). Purely syntactic: walk
     // every Hash literal's precomputed value-pinned key list and fire on a repeat.
     duplicate_hash_key_diagnostics(ast, &mut out);
 
-    // Eighth pass — `flow.return-in-ensure` (v0.3.0). Purely syntactic with a
+    // Ninth pass — `flow.return-in-ensure` (v0.3.0). Purely syntactic with a
     // frame-aware envelope: walk every `begin/ensure`'s ensure body for `return`s.
     return_in_ensure_diagnostics(ast, &mut out);
 
@@ -1279,6 +1316,328 @@ fn is_integer_rooted(interner: &Interner, index: &CoreIndex, ty: rigor_types::Ty
     }
 }
 
+// ---------------------------------------------------------------------------
+// call.raise-non-exception (v0.3.0) — reference `raise_non_exception_diagnostic`
+// ---------------------------------------------------------------------------
+
+/// The method names that dispatch to `Kernel#raise` (reference
+/// `RAISE_METHOD_NAMES`).
+const RAISE_METHOD_NAMES: &[&str] = &["raise", "fail"];
+
+/// Instance types whose nominal class subsumes exception values / class objects,
+/// so a "disjoint from Exception" ordering proves nothing about the runtime
+/// value (reference `RAISE_UNEXACT_INSTANCE_CLASSES`). Applied ONLY to the
+/// instance path — the exact singleton path fires on `raise Object` / `raise
+/// Class`.
+const RAISE_UNEXACT_INSTANCE_CLASSES: &[&str] = &["Class", "Module", "Object", "BasicObject"];
+
+/// The trinary verdict of the raise-operand check (reference
+/// `raise_operand_verdict`): only [`RaiseVerdict::Illegal`] fires.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RaiseVerdict {
+    Legal,
+    Illegal,
+    Unknown,
+}
+
+/// Emit `call.raise-non-exception` for every implicit-self `raise`/`fail` whose
+/// first positional operand is provably not a legal raise operand. Its OWN walk
+/// over `receiver: None` calls (the main call walk is receiver-Some only), NOT
+/// toplevel-restricted (fires inside method bodies). A faithful port of the
+/// reference `raise_non_exception_diagnostic`.
+fn raise_non_exception_diagnostics(
+    ast: &LoweredAst,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    typer: &Typer,
+    env: &rigor_infer::TypeEnv,
+    interner: &mut Interner,
+    out: &mut Vec<Diagnostic>,
+) {
+    // Collect the candidate calls up front (an owned snapshot) so the immutable
+    // AST borrow does not clash with the `&mut interner` the operand typing needs.
+    let candidates: Vec<(NodeId, String, NodeId, (usize, usize))> = ast
+        .iter()
+        .filter_map(|(id, node)| match node {
+            Node::Call {
+                receiver: None,
+                method,
+                args,
+                block_body,
+                message_span,
+                first_arg_nonplain,
+                ..
+            } if RAISE_METHOD_NAMES.contains(&method.as_str())
+                && block_body.is_empty()
+                && !*first_arg_nonplain =>
+            {
+                // The first positional argument (bare `raise` / `fail` has none).
+                args.first().map(|&arg| (id, method.clone(), arg, *message_span))
+            }
+            _ => None,
+        })
+        .collect();
+
+    for (call_id, method, arg, message_span) in candidates {
+        // Redefinition gate — a reachable project-side `raise`/`fail`.
+        if raise_redefined_in_scope(ast, source, call_id, &method) {
+            continue;
+        }
+        let operand_ty = typer.type_of(ast, arg, env, interner);
+        if raise_operand_verdict(interner, index, source, operand_ty) != RaiseVerdict::Illegal {
+            continue;
+        }
+        let rendered = render_receiver(interner, index, source, operand_ty);
+        let message = format!(
+            "`{method}' operand types as {rendered}, which is not an Exception class, \
+             an Exception instance, a String, or an object defining `#exception' \u{2014} \
+             this raises TypeError at runtime"
+        );
+        let severity = catalog(CALL_RAISE_NON_EXCEPTION)
+            .map(|e| e.default_severity)
+            .unwrap_or(Severity::Error);
+        out.push(Diagnostic {
+            rule_id: CALL_RAISE_NON_EXCEPTION,
+            start_offset: message_span.0,
+            end_offset: message_span.1,
+            message,
+            severity,
+            source_family: "builtin",
+            // JSON carries `method_name` but no `receiver_type` for this rule.
+            receiver_type: None,
+            method_name: Some(method),
+        });
+    }
+}
+
+/// The trinary raise-operand verdict (reference `raise_operand_verdict`): a Union
+/// recurses per member (all-illegal ⇒ illegal, all-legal ⇒ legal, any mixed ⇒
+/// unknown); a `Singleton` takes the exact class path; everything else takes the
+/// instance path.
+fn raise_operand_verdict(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    ty: rigor_types::TypeId,
+) -> RaiseVerdict {
+    match interner.get(ty) {
+        Type::Union(members) => {
+            let verdicts: Vec<RaiseVerdict> = members
+                .clone()
+                .iter()
+                .map(|&m| raise_operand_verdict(interner, index, source, m))
+                .collect();
+            if verdicts.iter().all(|&v| v == RaiseVerdict::Illegal) {
+                RaiseVerdict::Illegal
+            } else if verdicts.iter().all(|&v| v == RaiseVerdict::Legal) {
+                RaiseVerdict::Legal
+            } else {
+                RaiseVerdict::Unknown
+            }
+        }
+        Type::Singleton(class) => {
+            let class = *class;
+            let Some(name) = resolve_class_name(index, source, class) else {
+                return RaiseVerdict::Unknown;
+            };
+            raise_class_operand_verdict(index, source, &name)
+        }
+        _ => raise_instance_operand_verdict(interner, index, source, ty),
+    }
+}
+
+/// The exact class-object (`Type::Singleton`) verdict (reference
+/// `raise_class_operand_verdict`): unknown for a project-discovered class or a
+/// non-RBS-known class; else the ordering vs `Exception` decides — `:equal` /
+/// `:subclass` legal, `:superclass` OR `:disjoint` illegal unless the singleton
+/// defines `#exception` (the duck), `:unknown` silent. NO module exclusion here:
+/// `raise Comparable` / `raise Class` / `raise Object` all fire.
+fn raise_class_operand_verdict(
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    class_name: &str,
+) -> RaiseVerdict {
+    // The most important gate — any project-discovered class bails unconditionally
+    // (its RBS-declared ancestry may omit the real superclass; the typer already
+    // declines to singleton-type a project class, this is belt-and-braces).
+    if source.knows_class(class_name) {
+        return RaiseVerdict::Unknown;
+    }
+    if !index.knows_class(class_name) {
+        return RaiseVerdict::Unknown;
+    }
+    match index.class_ordering(class_name, "Exception") {
+        rigor_index::ClassOrdering::Equal | rigor_index::ClassOrdering::Subclass => {
+            RaiseVerdict::Legal
+        }
+        rigor_index::ClassOrdering::Superclass | rigor_index::ClassOrdering::Disjoint => {
+            if index.class_has_singleton_method(class_name, "exception") {
+                RaiseVerdict::Legal
+            } else {
+                RaiseVerdict::Illegal
+            }
+        }
+        rigor_index::ClassOrdering::Unknown => RaiseVerdict::Unknown,
+    }
+}
+
+/// The instance-operand verdict (reference `raise_instance_operand_verdict`):
+/// legal when the class is String-family or an Exception descendant; illegal only
+/// when the class is fully known, exact enough (not `Class`/`Module`/`Object`/
+/// `BasicObject`, not a module), not project-discovered, provably `:disjoint`
+/// from both String and Exception, and defines no instance `#exception`.
+/// `:superclass` stays UNKNOWN (asymmetric with the singleton path) — a value
+/// typed `Object` may well BE an Exception at runtime.
+fn raise_instance_operand_verdict(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    ty: rigor_types::TypeId,
+) -> RaiseVerdict {
+    let Some(class_name) = concrete_class_name(interner, index, source, ty) else {
+        return RaiseVerdict::Unknown;
+    };
+    if RAISE_UNEXACT_INSTANCE_CLASSES.contains(&class_name.as_str()) {
+        return RaiseVerdict::Unknown;
+    }
+    if source.knows_class(&class_name) {
+        return RaiseVerdict::Unknown;
+    }
+    if !index.knows_class(&class_name) {
+        return RaiseVerdict::Unknown;
+    }
+    if index.is_module(&class_name) {
+        return RaiseVerdict::Unknown;
+    }
+    match index.class_ordering(&class_name, "String") {
+        rigor_index::ClassOrdering::Equal | rigor_index::ClassOrdering::Subclass => {
+            return RaiseVerdict::Legal;
+        }
+        _ => {}
+    }
+    match index.class_ordering(&class_name, "Exception") {
+        rigor_index::ClassOrdering::Equal | rigor_index::ClassOrdering::Subclass => {
+            RaiseVerdict::Legal
+        }
+        rigor_index::ClassOrdering::Disjoint => {
+            if index.class_has_method(&class_name, "exception") {
+                RaiseVerdict::Legal
+            } else {
+                RaiseVerdict::Illegal
+            }
+        }
+        // `:superclass` (asymmetric with the singleton path) and `:unknown` stay
+        // silent.
+        rigor_index::ClassOrdering::Superclass | rigor_index::ClassOrdering::Unknown => {
+            RaiseVerdict::Unknown
+        }
+    }
+}
+
+/// The concrete single-class name a NON-singleton operand type dispatches to
+/// (reference `concrete_class_name`): `Nominal` its class, `Tuple`→Array,
+/// `HashShape`→Hash, `Constant` its value's class, `IntegerRange`→Integer,
+/// `Refined`/`Difference` through their base. Everything else (Dynamic / Top /
+/// Bottom / unresolvable) is `None` ⇒ the caller declines.
+fn concrete_class_name(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    ty: rigor_types::TypeId,
+) -> Option<String> {
+    match interner.get(ty) {
+        Type::Nominal { class, .. } => resolve_class_name(index, source, *class),
+        Type::Tuple(_) => Some("Array".to_string()),
+        Type::HashShape(_) => Some("Hash".to_string()),
+        Type::Constant(scalar) => Some(constant_class_name(scalar).to_string()),
+        Type::IntegerRange { .. } => Some("Integer".to_string()),
+        Type::Refined { base, .. } | Type::Difference { base, .. } => {
+            concrete_class_name(interner, index, source, *base)
+        }
+        _ => None,
+    }
+}
+
+/// The Ruby core class name of a value-pinned scalar (reference
+/// `constant_class_name` / `CONSTANT_CLASSES`).
+fn constant_class_name(scalar: &Scalar) -> &'static str {
+    match scalar {
+        Scalar::Int(_) => "Integer",
+        Scalar::Str(_) => "String",
+        Scalar::Sym(_) => "Symbol",
+        Scalar::Bool(true) => "TrueClass",
+        Scalar::Bool(false) => "FalseClass",
+        Scalar::Nil => "NilClass",
+        Scalar::Float(_) => "Float",
+    }
+}
+
+/// Resolve a [`rigor_types::ClassId`] to its class name through the core RBS
+/// index then the project `sig/` / source registry (same order as
+/// [`render_receiver`]).
+fn resolve_class_name(
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    class: rigor_types::ClassId,
+) -> Option<String> {
+    index
+        .class_name_for_id(class)
+        .map(str::to_string)
+        .or_else(|| source.class_name_for_id(class).map(str::to_string))
+}
+
+/// Whether a project-side definition of `raise`/`fail` could shadow Kernel's at
+/// this call site (reference `raise_redefined_in_scope?`): a toplevel `def` or an
+/// in-source Object/Kernel/BasicObject reopen (both already folded into
+/// [`rigor_infer::SourceIndex::is_toplevel_def`]), OR a `def` on the innermost
+/// enclosing class — instance OR singleton side (implicit self dispatches to
+/// either depending on context; being silent for both is the cheap conservative
+/// answer).
+fn raise_redefined_in_scope(
+    ast: &LoweredAst,
+    source: &rigor_infer::SourceIndex,
+    call_id: NodeId,
+    name: &str,
+) -> bool {
+    // Covers the toplevel `def raise` and the Object/Kernel/BasicObject reopen
+    // (`toplevel_defs` folds both — see `SourceIndex::build_project` pass 1c).
+    if source.is_toplevel_def(name) {
+        return true;
+    }
+    let call_span = ast.get(call_id).span();
+    // The INNERMOST enclosing class/module (smallest span containing the call);
+    // its `self` is what a redefined `raise` would resolve against.
+    let enclosing = ast
+        .iter()
+        .filter(|(_, n)| matches!(n, Node::ClassDef { .. } | Node::ModuleDef { .. }))
+        .filter(|(_, n)| {
+            let s = n.span();
+            s.0 <= call_span.0 && call_span.1 <= s.1
+        })
+        .min_by_key(|(_, n)| {
+            let s = n.span();
+            s.1 - s.0
+        });
+    let Some((_, class_node)) = enclosing else {
+        return false;
+    };
+    let body = match class_node {
+        Node::ClassDef { body, .. } | Node::ModuleDef { body, .. } => body,
+        _ => return false,
+    };
+    // A DIRECT `def raise` (instance) or `def self.raise` (singleton) in that
+    // class body redefines it.
+    body.iter().any(|&child| {
+        matches!(
+            ast.get(child),
+            Node::Definition { name: Some(n), .. } if n == name
+        ) || matches!(
+            ast.get(child),
+            Node::Definition { singleton_name: Some(n), .. } if n == name
+        )
+    })
+}
+
 /// Apply `call.possible-nil-receiver` to a single call, firing from the
 /// precomputed ADR-0038 Slice-1 snapshot map.
 ///
@@ -1900,6 +2259,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     FLOW_ALWAYS_TRUTHY_CONDITION,
     FLOW_DUPLICATE_HASH_KEY,
     FLOW_RETURN_IN_ENSURE,
+    CALL_RAISE_NON_EXCEPTION,
     SUPPRESSION_UNKNOWN_RULE,
     SUPPRESSION_EMPTY,
 ];
@@ -1938,9 +2298,9 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "flow.always-truthy-condition",
     "flow.unreachable-clause",
     // v0.3.0 ids. `flow.duplicate-hash-key` / `flow.return-in-ensure` /
-    // `suppression.unknown-rule` / `suppression.empty` are implemented in this
-    // slice; `call.raise-non-exception` / `flow.shadowed-rescue-clause` are NOT
-    // yet emitted by rigor-rs but MUST still be "known" suppression tokens (so a
+    // `call.raise-non-exception` / `suppression.unknown-rule` /
+    // `suppression.empty` are implemented; `flow.shadowed-rescue-clause` is NOT
+    // yet emitted by rigor-rs but MUST still be a "known" suppression token (so a
     // `# rigor:disable flow.shadowed-rescue-clause` never fires unknown-rule and
     // `is_inert_builtin_token` treats it as a real id).
     "flow.duplicate-hash-key",
@@ -4039,5 +4399,203 @@ mod tests {
         let with_lines: Vec<(usize, Diagnostic)> = diags.into_iter().map(|d| (1, d)).collect();
         let kept = filter_suppressed(with_lines, &[(1, 0, comment.to_string())]);
         assert!(kept.is_empty(), "self-suppression must silence the complaint: {kept:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // call.raise-non-exception (v0.3.0)
+    // -----------------------------------------------------------------------
+
+    /// The `call.raise-non-exception` diagnostics for `src`, in source order.
+    fn raise_diags(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_RAISE_NON_EXCEPTION)
+            .collect()
+    }
+
+    /// The single rendered operand of a lone firing (`<type>` in the message).
+    fn one_raise_operand(src: &[u8]) -> String {
+        let diags = raise_diags(src);
+        assert_eq!(diags.len(), 1, "expected exactly one firing, got {diags:?}");
+        let m = &diags[0].message;
+        let start = m.find("operand types as ").unwrap() + "operand types as ".len();
+        let end = m.find(", which is not").unwrap();
+        m[start..end].to_string()
+    }
+
+    #[test]
+    fn raise_fires_on_scalar_operands() {
+        // Skip when the real Exception/String RBS is unavailable (stub fallback).
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        assert_eq!(one_raise_operand(b"raise 42\n"), "42");
+        assert_eq!(one_raise_operand(b"raise :sym\n"), ":sym");
+        assert_eq!(one_raise_operand(b"raise nil\n"), "nil");
+        assert_eq!(one_raise_operand(b"fail 3.14\n"), "3.14");
+        // The message names the method verbatim.
+        assert_eq!(raise_diags(b"fail 3.14\n")[0].method_name.as_deref(), Some("fail"));
+        assert_eq!(raise_diags(b"raise 42\n")[0].method_name.as_deref(), Some("raise"));
+        assert_eq!(raise_diags(b"raise 42\n")[0].severity, Severity::Error);
+    }
+
+    #[test]
+    fn raise_full_message_is_byte_exact() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        let d = &raise_diags(b"raise 42\n")[0];
+        assert_eq!(
+            d.message,
+            "`raise' operand types as 42, which is not an Exception class, \
+             an Exception instance, a String, or an object defining `#exception' \u{2014} \
+             this raises TypeError at runtime"
+        );
+        // Anchor is the `raise` keyword token.
+        assert_eq!(&b"raise 42\n"[d.start_offset..d.end_offset], b"raise");
+        // No receiver_type for this rule.
+        assert!(d.receiver_type.is_none());
+    }
+
+    #[test]
+    fn raise_singleton_class_operands_fire_including_module_and_generic_carriers() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // A bare class object disjoint from Exception fires with `singleton(X)`.
+        assert_eq!(one_raise_operand(b"raise Array\n"), "singleton(Array)");
+        assert_eq!(one_raise_operand(b"raise Struct\n"), "singleton(Struct)");
+        // The singleton path applies NO module / generic-carrier exclusion —
+        // `raise Comparable` / `Class` / `Object` / `Module` / `BasicObject` fire.
+        assert_eq!(one_raise_operand(b"raise Comparable\n"), "singleton(Comparable)");
+        assert_eq!(one_raise_operand(b"raise Class\n"), "singleton(Class)");
+        assert_eq!(one_raise_operand(b"raise Object\n"), "singleton(Object)");
+        assert_eq!(one_raise_operand(b"raise Module\n"), "singleton(Module)");
+        assert_eq!(one_raise_operand(b"raise BasicObject\n"), "singleton(BasicObject)");
+        assert_eq!(one_raise_operand(b"raise Integer\n"), "singleton(Integer)");
+    }
+
+    #[test]
+    fn raise_instance_and_hash_operands_fire() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // A `Time.new` instance → `Time`.
+        assert_eq!(one_raise_operand(b"raise Time.new\n"), "Time");
+        // A positional (braced) hash literal → value-pinned `{ a: 1 }`.
+        assert_eq!(one_raise_operand(b"raise({a: 1})\n"), "{ a: 1 }");
+    }
+
+    #[test]
+    fn raise_fires_inside_method_and_class_bodies() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // NOT toplevel-restricted.
+        assert_eq!(raise_diags(b"def foo\n  raise 42\nend\n").len(), 1);
+        assert_eq!(
+            raise_diags(b"class W\n  def go\n    raise 7\n  end\nend\n").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn raise_fires_on_third_positional_arg_form() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // Only the first positional argument is checked.
+        assert_eq!(one_raise_operand(b"raise 42, \"msg\", caller\n"), "42");
+    }
+
+    #[test]
+    fn raise_stays_silent_on_legal_operands() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // Exception classes / instances / String are legal.
+        assert!(raise_diags(b"raise StandardError\n").is_empty());
+        assert!(raise_diags(b"raise RuntimeError\n").is_empty());
+        assert!(raise_diags(b"raise KeyError\n").is_empty());
+        assert!(raise_diags(b"raise StandardError, \"m\"\n").is_empty());
+        assert!(raise_diags(b"raise ArgumentError.new\n").is_empty());
+        assert!(raise_diags(b"raise \"plain message\"\n").is_empty());
+        assert!(raise_diags(b"raise \"interp #{1}\"\n").is_empty());
+    }
+
+    #[test]
+    fn raise_stays_silent_on_envelope_bail_cases() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // Bare raise, explicit receiver, splat / bare-kwargs first arg.
+        assert!(raise_diags(b"raise\n").is_empty());
+        assert!(raise_diags(b"obj.raise(42)\n").is_empty());
+        assert!(raise_diags(b"raise *some_ary\n").is_empty());
+        assert!(raise_diags(b"raise(a: 1)\n").is_empty(), "bare keyword-hash bails");
+        // Unresolved constant / dynamic operand.
+        assert!(raise_diags(b"raise NotAThing\n").is_empty());
+        assert!(raise_diags(b"raise err\n").is_empty());
+        assert!(raise_diags(b"raise self.class\n").is_empty());
+        // Qualified constant (unresolved in the source subset).
+        assert!(raise_diags(b"raise Foo::Bar\n").is_empty());
+    }
+
+    #[test]
+    fn raise_stays_silent_on_project_classes_both_paths() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // A project class — even one whose written superclass is StandardError —
+        // bails on BOTH the singleton and the instance path (the project gate).
+        let src = b"class CustomError < StandardError; end\nraise CustomError\nraise CustomError.new\n";
+        assert!(raise_diags(src).is_empty(), "{:?}", raise_diags(src));
+    }
+
+    #[test]
+    fn raise_stays_silent_when_redefined() {
+        if !CoreIndex::new().knows_class("Exception") {
+            return;
+        }
+        // Toplevel def.
+        assert!(raise_diags(b"def raise(x); end\nraise 42\n").is_empty());
+        // Object reopen.
+        assert!(raise_diags(b"class Object\n  def raise(x); end\nend\nraise 42\n").is_empty());
+        // Enclosing-class instance def.
+        assert!(
+            raise_diags(b"class Foo\n  def raise(x); end\n  def go\n    raise 99\n  end\nend\n")
+                .is_empty()
+        );
+        // Enclosing-class singleton def (`def self.raise`).
+        assert!(
+            raise_diags(b"class Bar\n  def self.raise(x); end\n  def go\n    raise 99\n  end\nend\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn raise_union_fires_only_when_every_arm_illegal() {
+        // Constructed directly on the verdict function (rigor-rs types ternaries
+        // Dynamic, so a source-level union operand does not arise through
+        // inference — the verdict logic is what must be exact).
+        let index = CoreIndex::new();
+        if !index.knows_class("Exception") {
+            return;
+        }
+        let source = rigor_infer::SourceIndex::build(&lower(&parse(b"\n")), &index);
+        let mut i = Interner::new();
+        let int = i.int(42);
+        let sym = i.intern(Type::Constant(Scalar::Sym("s".into())));
+        let string = i.intern(Type::Constant(Scalar::Str("x".into())));
+        let all_illegal = rigor_types::Algebra::join(&mut i, int, sym);
+        assert_eq!(
+            raise_operand_verdict(&i, &index, &source, all_illegal),
+            RaiseVerdict::Illegal
+        );
+        let mixed = rigor_types::Algebra::join(&mut i, int, string);
+        assert_eq!(
+            raise_operand_verdict(&i, &index, &source, mixed),
+            RaiseVerdict::Unknown
+        );
     }
 }
