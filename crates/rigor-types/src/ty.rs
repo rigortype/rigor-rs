@@ -113,15 +113,27 @@ impl Ord for Scalar {
     }
 }
 
-/// A key in a hash-shape. Ruby hashes are commonly keyed by symbols or strings;
-/// other constant keys widen to `Other` for now.
+/// A key in a hash-shape. Ruby hash literals pin any value-pinned scalar key —
+/// the reference's `HashShape::ALLOWED_KEY_CLASSES` (Symbol, String, Integer,
+/// Float, true, false, nil). Key identity is Ruby `Hash#eql?`: `1` (an `Int`)
+/// and `1.0` (a `Float`) are DISTINCT keys, while `1.0` and `1.00` collide —
+/// reproduced here because `Float` is stored by its raw `f64` bits (matching
+/// [`Scalar::Float`]'s `to_bits` convention), so the derived `Eq`/`Hash`/`Ord`
+/// give the runtime's collision semantics for free.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub enum ShapeKey {
     Sym(String),
     Str(String),
     Int(i64),
-    /// A non-literal / not-yet-modeled key. // TODO(spec): model arbitrary
-    /// constant keys and open-shape extra-key policy (value-lattice.md, rbs-erasure.md).
+    /// A float key, stored by raw bits (see the type doc): `1.0` == `1.00`,
+    /// distinct from the `Int(1)` key.
+    Float(u64),
+    /// The `true` / `false` singleton keys.
+    Bool(bool),
+    /// The `nil` singleton key.
+    Nil,
+    /// A non-literal / not-yet-modeled key (never built from a hash literal;
+    /// retained as the erase/display fallback).
     Other,
 }
 
