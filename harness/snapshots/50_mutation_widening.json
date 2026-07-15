@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/50_mutation_widening.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 24,
+      "column": 15,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `guard`. If a project file defines `guard` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 32,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `tokens`. If a project file defines `tokens` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 46,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `tokens`. If a project file defines `tokens` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 58,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `items`. If a project file defines `items` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 69,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 75,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}
