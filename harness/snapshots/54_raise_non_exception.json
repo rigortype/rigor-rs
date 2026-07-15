@@ -1,0 +1,124 @@
+{
+  "fixture": "harness/corpus/54_raise_non_exception.rb",
+  "diagnostics": [
+    {
+      "rule": "call.raise-non-exception",
+      "line": 7,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as 42, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 8,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as :sym, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 9,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as nil, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 10,
+      "column": 1,
+      "severity": "error",
+      "message": "`fail' operand types as 3.14, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 15,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(Array), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 16,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(Struct), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 17,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(Integer), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 18,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(Comparable), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 19,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(Class), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 20,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(Object), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 21,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(Module), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 22,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as singleton(BasicObject), which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 25,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as Time, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 28,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as { a: 1 }, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 32,
+      "column": 3,
+      "severity": "error",
+      "message": "`raise' operand types as 7, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 37,
+      "column": 5,
+      "severity": "error",
+      "message": "`raise' operand types as 99, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
+      "rule": "call.raise-non-exception",
+      "line": 42,
+      "column": 1,
+      "severity": "error",
+      "message": "`raise' operand types as 42, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    }
+  ]
+}
