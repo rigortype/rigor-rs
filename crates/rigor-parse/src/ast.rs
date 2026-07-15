@@ -172,6 +172,26 @@ pub struct HashKey {
     pub label: String,
 }
 
+/// One `rescue` clause of a `begin`/`def` rescue chain, in chain order — the
+/// per-clause structure `flow.shadowed-rescue-clause` compares. `exceptions` are
+/// the lowered exception-designator node ids (`rescue A, B` → two ids; a bare
+/// `rescue`/`rescue => e` → empty), referencing the SAME arena ids the flat
+/// [`Node::BeginRescue::body`] already holds (no double-lowering). `body` is the
+/// clause's own lowered statement ids. `span` is the [`Prism::RescueNode`]
+/// location — it starts at the `rescue` keyword, so `span.0` is the anchor the
+/// diagnostic points at (the later dead clause's `rescue`) and the 1-based line
+/// the message names for an earlier clause.
+///
+/// Purely additive: the flat `body` is byte-for-byte what it was before this
+/// field existed (every existing pass is untouched), and only the reused-carrier
+/// `BeginRescue` variants (else/when/in/parens) carry an EMPTY `clauses` list.
+#[derive(Clone, Debug)]
+pub struct RescueClause {
+    pub exceptions: Vec<NodeId>,
+    pub body: Vec<NodeId>,
+    pub span: Span,
+}
+
 /// One owned node. Mirrors a minimal Prism subset (ADR-0012); every variant
 /// carries the byte [`Span`] needed to key a diagnostic (ADR-0030).
 #[derive(Clone, Debug)]
@@ -415,6 +435,11 @@ pub enum Node {
     BeginRescue {
         body: Vec<NodeId>,
         ensure_body: Vec<NodeId>,
+        /// The per-clause rescue-chain structure (empty for the reused carriers —
+        /// `else`/`when`/`in`/parenthesized groups — and for a `begin` with no
+        /// `rescue`). Populated only from a real `BeginNode`'s rescue chain; see
+        /// [`RescueClause`]. Additive — leaves `body`/`ensure_body` untouched.
+        clauses: Vec<RescueClause>,
         span: Span,
     },
     /// A lambda literal (`-> { … }` / `->(x) { … }`). Its `body` statements are
@@ -1076,6 +1101,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body: Vec::new(),
+                clauses: Vec::new(),
                 span: span_of(&else_node.location()),
             });
         }
@@ -1134,6 +1160,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body: Vec::new(),
+                clauses: Vec::new(),
                 span: span_of(&when_node.location()),
             });
         }
@@ -1147,6 +1174,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body: Vec::new(),
+                clauses: Vec::new(),
                 span: span_of(&in_node.location()),
             });
         }
@@ -1198,15 +1226,32 @@ impl<'src> Builder<'src> {
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
-            // Walk the rescue chain (each RescueNode links to the next).
+            // Walk the rescue chain (each RescueNode links to the next). Build the
+            // per-clause `RescueClause` view ALONGSIDE the flat `body`: every
+            // `lower_node`/`lower_body` call happens in the exact same order as
+            // before, and each produced id is pushed to `body` exactly as before,
+            // so `body` is byte-for-byte unchanged — the clause view just records
+            // the SAME ids per clause (no double-lowering).
+            let mut clauses: Vec<RescueClause> = Vec::new();
             let mut rescue = begin_node.rescue_clause();
             while let Some(r) = rescue {
+                let mut exceptions = Vec::new();
                 for exc in r.exceptions().iter() {
-                    body.push(self.lower_node(&exc));
+                    let id = self.lower_node(&exc);
+                    body.push(id);
+                    exceptions.push(id);
                 }
+                let mut clause_body = Vec::new();
                 if let Some(s) = r.statements() {
-                    body.extend(self.lower_body(&s.body()));
+                    let ids = self.lower_body(&s.body());
+                    body.extend(ids.iter().copied());
+                    clause_body = ids;
                 }
+                clauses.push(RescueClause {
+                    exceptions,
+                    body: clause_body,
+                    span: span_of(&r.location()),
+                });
                 rescue = r.subsequent();
             }
             if let Some(e) = begin_node.else_clause().and_then(|e| e.statements()) {
@@ -1225,6 +1270,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body,
+                clauses,
                 span: span_of(&begin_node.location()),
             });
         }
@@ -1337,6 +1383,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body: Vec::new(),
+                clauses: Vec::new(),
                 span: span_of(&parens.location()),
             });
         }

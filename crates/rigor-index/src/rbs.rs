@@ -1285,6 +1285,19 @@ struct Builder {
     /// one declaration. Threaded out via [`Self::finish`] into
     /// [`CoreData::toplevel_classes`] (defect 2).
     toplevel_classes: HashSet<&'static str>,
+    /// Short names whose superclass has been claimed by a GENUINE top-level
+    /// declaration (`!nested && is_toplevel_name`). Because classes are keyed by
+    /// SHORT name, a namespaced/nested class (`Psych::Exception < ::RuntimeError`)
+    /// otherwise collapses onto a same-short-named top-level class (`Exception`)
+    /// and its `< RuntimeError` wins first-write — a superclass CYCLE
+    /// (`Exception → RuntimeError → StandardError → Exception`) that makes
+    /// `class_ordering` return a spurious `Subclass` in BOTH directions. A
+    /// top-level declaration's superclass (even an implicit `Object`, recorded as
+    /// `None` here and defaulted in [`Self::finish`]) is authoritative for its
+    /// short name; once claimed, a nested twin can no longer overwrite it. This
+    /// mirrors the reference's namespace-aware RBS environment without giving up
+    /// the deliberate short-name collapse used for method-existence leniency.
+    super_claimed: HashSet<&'static str>,
 }
 
 impl Builder {
@@ -1318,7 +1331,8 @@ impl Builder {
         // `Benchmark::Report`, `Etc::Group` etc. would leak into the top-level set
         // and be wrongly singleton-witnessable (false positives on a project model
         // named `Group`/`Report`). Record only file-level, empty-namespace names.
-        if !nested && is_toplevel_name(&tn) {
+        let authoritative = !nested && is_toplevel_name(&tn);
+        if authoritative {
             self.toplevel_classes.insert(name);
         }
         let superclass = c
@@ -1329,7 +1343,7 @@ impl Builder {
             ..Default::default()
         };
         self.collect_members(c.members().iter(), &mut entry);
-        self.merge(name, entry);
+        self.merge(name, entry, authoritative);
     }
 
     fn ingest_module(&mut self, m: &ModuleNode, nested: bool) {
@@ -1337,7 +1351,8 @@ impl Builder {
         let Some(name) = type_name_str(&tn) else {
             return;
         };
-        if !nested && is_toplevel_name(&tn) {
+        let authoritative = !nested && is_toplevel_name(&tn);
+        if authoritative {
             self.toplevel_classes.insert(name);
         }
         let mut entry = ClassEntry {
@@ -1345,7 +1360,7 @@ impl Builder {
             ..Default::default()
         };
         self.collect_members(m.members().iter(), &mut entry);
-        self.merge(name, entry);
+        self.merge(name, entry, authoritative);
     }
 
     /// Fold method definitions and `include` directives from a member list into
@@ -1438,9 +1453,26 @@ impl Builder {
     /// Merge an entry into the map (the same class can be reopened across files,
     /// though core mostly isn't). Methods/includes union; an explicit superclass
     /// wins over none.
-    fn merge(&mut self, name: &'static str, entry: ClassEntry) {
+    ///
+    /// `authoritative` is `true` for a GENUINE top-level declaration (empty
+    /// namespace, file-level). Such a declaration owns the short name's superclass
+    /// identity: the FIRST authoritative write wins and, once made, blocks a
+    /// nested/namespaced same-short-name twin from overwriting it — preventing the
+    /// short-name-collapse superclass cycles (see [`Builder::super_claimed`]). A
+    /// non-authoritative (nested) entry may only fill a still-empty, unclaimed
+    /// slot. Methods / includes / singletons still union unconditionally (the
+    /// method-existence surface is deliberately the collapsed union).
+    fn merge(&mut self, name: &'static str, entry: ClassEntry, authoritative: bool) {
+        let claimed = self.super_claimed.contains(name);
         let slot = self.classes.entry(name).or_default();
-        if slot.superclass.is_none() {
+        if authoritative {
+            // The first top-level declaration's superclass (even implicit `Object`,
+            // recorded `None` and defaulted in `finish`) is authoritative and may
+            // overwrite a value a nested twin set earlier.
+            if !claimed {
+                slot.superclass = entry.superclass;
+            }
+        } else if slot.superclass.is_none() && !claimed {
             slot.superclass = entry.superclass;
         }
         slot.is_module |= entry.is_module;
@@ -1468,6 +1500,11 @@ impl Builder {
             if !slot.extends.contains(&ext) {
                 slot.extends.push(ext);
             }
+        }
+        // Record the authoritative superclass claim AFTER the `slot` borrow of
+        // `self.classes` is done (disjoint field).
+        if authoritative {
+            self.super_claimed.insert(name);
         }
     }
 
