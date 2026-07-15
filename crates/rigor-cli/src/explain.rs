@@ -63,7 +63,7 @@ const DOCUMENTATION_BASE: &str =
 
 /// Family wildcard tokens — a bare `<family>` resolves to every rule under
 /// `<family>.` (reference `RULE_FAMILIES`).
-const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def"];
+const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppression"];
 
 /// Legacy unprefixed rule ids → canonical id (reference `LEGACY_RULE_ALIASES`).
 const LEGACY_RULE_ALIASES: &[(&str, &str)] = &[
@@ -72,6 +72,7 @@ const LEGACY_RULE_ALIASES: &[(&str, &str)] = &[
     ("wrong-arity", "call.wrong-arity"),
     ("argument-type-mismatch", "call.argument-type-mismatch"),
     ("possible-nil-receiver", "call.possible-nil-receiver"),
+    ("raise-non-exception", "call.raise-non-exception"),
     ("dump-type", "dump.type"),
     ("assert-type", "assert.type-mismatch"),
     ("always-raises", "flow.always-raises"),
@@ -81,6 +82,9 @@ const LEGACY_RULE_ALIASES: &[(&str, &str)] = &[
     ("dead-assignment", "flow.dead-assignment"),
     ("always-truthy-condition", "flow.always-truthy-condition"),
     ("unreachable-clause", "flow.unreachable-clause"),
+    ("duplicate-hash-key", "flow.duplicate-hash-key"),
+    ("return-in-ensure", "flow.return-in-ensure"),
+    ("shadowed-rescue-clause", "flow.shadowed-rescue-clause"),
 ];
 
 /// The full rule catalogue — content mirrors the reference's
@@ -454,6 +458,96 @@ const ENTRIES: &[Entry] = &[
         evidence_tier: Some("high"),
         since: "0.1.2",
     },
+    Entry {
+        id: "flow.duplicate-hash-key",
+        summary: "Duplicate literal key within a single Hash literal (the last entry wins silently at runtime).",
+        fires_when: &[
+            "Two entries of one Hash literal — braced (`{ a: 1, a: 2 }`) or bare keyword arguments \
+             (`m(a: 1, a: 2)`) — carry the same value-pinned literal key: a symbol (the `key:` shorthand \
+             and `:key =>` spell the same symbol), a plain non-interpolated string, an integer, a float, \
+             or `true` / `false` / `nil`.",
+            "A `**splat` between two identical literal keys does not rescue the pair — the later literal \
+             entry still overwrites the earlier one regardless of what the splat contributes.",
+        ],
+        does_not_fire_when: &[
+            "Either key is not value-pinned at parse time: interpolated strings / symbols, constants, \
+             method calls, locals, and `**splat` entries are never compared.",
+            "The keys live in different literal kinds — `:a` vs `\"a\"`, and `1` vs `1.0` (`1.eql?(1.0)` \
+             is false, so Hash treats them as distinct keys) never collide.",
+            "The repeated keys sit in different Hash literals (nested literals are each their own scope).",
+        ],
+        suppression: "`# rigor:disable duplicate-hash-key` on the later occurrence's line.",
+        severity_authored: "warning",
+        severity_by_profile: [("lenient", "info"), ("balanced", "warning"), ("strict", "error")],
+        evidence_tier: Some("high"),
+        since: "0.3.0",
+    },
+    Entry {
+        id: "flow.return-in-ensure",
+        summary: "Explicit `return` inside an `ensure` clause swallows in-flight exceptions.",
+        fires_when: &[
+            "An explicit `return` sits lexically inside the `ensure` clause of a `begin` / `def` / class \
+             body (`ensure` always runs, so its `return` overrides the method's in-flight return value \
+             AND silently discards any exception being raised).",
+            "The `return` is inside a plain block (`each do ... return ... end`) within the ensure body — \
+             a `return` there still exits the enclosing method.",
+        ],
+        does_not_fire_when: &[
+            "The `return` is inside a nested `def`, a lambda (`->` / `lambda`), or a `define_method` \
+             block within the ensure body — it exits that inner frame, not the one the `ensure` guards.",
+            "The `ensure` body contains no explicit `return` (implicit last-expression values in `ensure` \
+             are discarded harmlessly and do not swallow exceptions).",
+        ],
+        suppression: "`# rigor:disable flow.return-in-ensure` on the `return` line.",
+        severity_authored: "warning",
+        severity_by_profile: [("lenient", "info"), ("balanced", "warning"), ("strict", "error")],
+        evidence_tier: Some("high"),
+        since: "0.3.0",
+    },
+    Entry {
+        id: "suppression.unknown-rule",
+        summary: "A `# rigor:disable[-file]` comment names a rule that does not exist.",
+        fires_when: &[
+            "A `# rigor:disable` / `# rigor:disable-file` marker carries a token that is not a canonical \
+             rule id, a legacy alias, `all`, or a family wildcard (`call` / `flow` / ...).",
+            "The token is also not a known non-catalogue engine diagnostic (`rbs_extended.*`, `dynamic.*`, \
+             `rbs.*`, `pre-eval.*`, or a bare engine id such as `load-error`).",
+            "Typically a typo — `call.undefined-metod` — leaving the suppression silently ineffective.",
+        ],
+        does_not_fire_when: &[
+            "The token resolves (canonical id, legacy alias, `all`, family wildcard, known engine id).",
+            "The token starts with `plugin.` — plugins load dynamically, so their rule vocabulary cannot \
+             be enumerated statically and under-warning is the FP-safe direction.",
+            "The comment merely mentions the marker followed by non-token text (documentation prose \
+             like \"`# rigor:disable <rule>` comments\") — that is not parsed as a suppression either.",
+        ],
+        suppression: "Fix or remove the dead token; `# rigor:disable suppression.unknown-rule` on the \
+                      same line, or `disable: [\"suppression.unknown-rule\"]` in `.rigor.yml`.",
+        severity_authored: "warning",
+        severity_by_profile: [("lenient", "warning"), ("balanced", "warning"), ("strict", "warning")],
+        evidence_tier: Some("high"),
+        since: "0.3.0",
+    },
+    Entry {
+        id: "suppression.empty",
+        summary: "A `# rigor:disable[-file]` comment lists no rules.",
+        fires_when: &[
+            "A comment is exactly the bare marker (`# rigor:disable` / `# rigor:disable-file`) with \
+             nothing but whitespace or commas after it.",
+            "Such a marker suppresses nothing — the author almost certainly meant to name rules or `all`.",
+        ],
+        does_not_fire_when: &[
+            "At least one token follows the marker (each token is then checked by \
+             `suppression.unknown-rule` instead).",
+            "Non-token text follows the marker (documentation prose mentioning the syntax).",
+        ],
+        suppression: "Complete the marker (`# rigor:disable <rule>` / `all`) or delete it; \
+                      `disable: [\"suppression.empty\"]` in `.rigor.yml`.",
+        severity_authored: "warning",
+        severity_by_profile: [("lenient", "warning"), ("balanced", "warning"), ("strict", "warning")],
+        evidence_tier: Some("high"),
+        since: "0.3.0",
+    },
 ];
 
 /// Resolve a token to its catalogue entries (reference `RuleCatalog.resolve`):
@@ -817,8 +911,10 @@ mod tests {
     #[test]
     fn all_is_id_sorted_and_complete() {
         let ids: Vec<&str> = all().iter().map(|e| e.id).collect();
-        // 19 rules, mirroring the reference's ALL_RULES.
-        assert_eq!(ids.len(), 19);
+        // 23 rules: the reference's ALL_RULES minus the two v0.3.0 ids rigor-rs
+        // does not yet emit (`call.raise-non-exception`, `flow.shadowed-rescue-clause`),
+        // which stay known suppression tokens without an explain entry.
+        assert_eq!(ids.len(), 23);
         // Sorted ascending by id.
         let mut sorted = ids.clone();
         sorted.sort_unstable();

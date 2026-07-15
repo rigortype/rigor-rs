@@ -10,7 +10,9 @@ pub use ruby_prism;
 
 pub mod ast;
 
-pub use ast::{lower, LoweredAst, MethodBody, Node, NodeId, ParamShape, Span, Visibility};
+pub use ast::{
+    lower, HashKey, HashKeyTag, LoweredAst, MethodBody, Node, NodeId, ParamShape, Span, Visibility,
+};
 
 /// Parse Ruby source with Prism. The borrowed result is lowered into an owned,
 /// `NodeId`-indexed AST ([`ast::lower`]) before inference (ADR-0012).
@@ -33,12 +35,16 @@ pub fn looks_like_erb_template(source: &[u8]) -> bool {
     source.windows(2).any(|w| w == b"%>")
 }
 
-/// Collect each comment as `(start_line /* 1-based */, comment_text)`.
+/// Collect each comment as `(start_line /* 1-based */, start_offset, comment_text)`.
 ///
 /// Used by in-source diagnostic suppression (`# rigor:disable` /
-/// `# rigor:disable-file`): the rules crate scans the returned text for the
-/// suppression directives and the line number scopes a line-level disable to
-/// its source line.
+/// `# rigor:disable-file`) AND the `suppression.unknown-rule` / `suppression.empty`
+/// surveillance rules: the rules crate scans the returned text for the suppression
+/// directives, the line number scopes a line-level disable to its source line, and
+/// `start_offset` (the absolute byte offset of the comment's `#`) is the anchor a
+/// suppression diagnostic keys on — the CLI resolves it to `(line, column)` the
+/// same way it does every other diagnostic, so the column matches the reference's
+/// `comment.location.start_column + 1` on ASCII.
 ///
 /// Prism's `Location` exposes only a start byte offset (no 1-based line), so the
 /// line is derived by counting newlines in `source` up to that offset. `source`
@@ -50,7 +56,10 @@ pub fn looks_like_erb_template(source: &[u8]) -> bool {
 /// length, and the empty/inverted range that `as_slice` would panic on is
 /// guarded.
 #[must_use]
-pub fn comment_lines(result: &ruby_prism::ParseResult<'_>, source: &[u8]) -> Vec<(usize, String)> {
+pub fn comment_lines(
+    result: &ruby_prism::ParseResult<'_>,
+    source: &[u8],
+) -> Vec<(usize, usize, String)> {
     // Precompute the byte offset of every line start so each comment's line is a
     // binary search instead of a re-scan from the top of the file.
     let mut line_starts: Vec<usize> = vec![0];
@@ -73,7 +82,7 @@ pub fn comment_lines(result: &ruby_prism::ParseResult<'_>, source: &[u8]) -> Vec
         };
         // 1-based line: number of line-starts at or before `start`.
         let line = line_starts.partition_point(|&ls| ls <= start);
-        out.push((line, text));
+        out.push((line, start, text));
     }
     out
 }

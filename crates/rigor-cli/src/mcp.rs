@@ -30,7 +30,10 @@ use serde_json::{json, Value};
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, Typer};
 use rigor_parse::{comment_lines, lower, parse};
-use rigor_rules::{analyze_with_source, catalog, filter_suppressed, Diagnostic, SuppressSet};
+use rigor_rules::{
+    analyze_with_source, catalog, filter_suppressed, suppression_marker_diagnostics, Diagnostic,
+    SuppressSet,
+};
 use rigor_types::Interner;
 
 use crate::config::Config;
@@ -285,7 +288,8 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())?;
 
-    let (diags, comments) = analysed;
+    let (mut diags, comments) = analysed;
+    diags.extend(suppression_marker_diagnostics(&comments));
     let with_lines: Vec<(usize, Diagnostic)> =
         diags.into_iter().map(|d| (line_col(source, d.start_offset).0, d)).collect();
     let kept = filter_suppressed(with_lines, &comments);
@@ -333,7 +337,8 @@ fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())?;
 
-    let (diags, comments) = analysed;
+    let (mut diags, comments) = analysed;
+    diags.extend(suppression_marker_diagnostics(&comments));
     let with_lines: Vec<(usize, Diagnostic)> =
         diags.into_iter().map(|d| (line_col(source, d.start_offset).0, d)).collect();
     let kept: Vec<Diagnostic> = filter_suppressed(with_lines, &comments)

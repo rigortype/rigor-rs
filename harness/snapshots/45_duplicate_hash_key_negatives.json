@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/45_duplicate_hash_key_negatives.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 9,
+      "column": 7,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo`. If a project file defines `foo` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 9,
+      "column": 17,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo`. If a project file defines `foo` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 10,
+      "column": 10,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `prefix`. If a project file defines `prefix` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 10,
+      "column": 28,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `prefix`. If a project file defines `prefix` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 16,
+      "column": 9,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `defaults`. If a project file defines `defaults` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

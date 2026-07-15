@@ -1,0 +1,89 @@
+{
+  "fixture": "harness/corpus/44_duplicate_hash_key.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 22,
+      "column": 9,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `base`. If a project file defines `base` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 25,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `configure`. If a project file defines `configure` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 7,
+      "column": 21,
+      "severity": "warning",
+      "message": "duplicate hash key `:role' in the same literal; this entry overwrites the value first set at line 7"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 10,
+      "column": 24,
+      "severity": "warning",
+      "message": "duplicate hash key `\"env\"' in the same literal; this entry overwrites the value first set at line 10"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 13,
+      "column": 17,
+      "severity": "warning",
+      "message": "duplicate hash key `1' in the same literal; this entry overwrites the value first set at line 13"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 16,
+      "column": 18,
+      "severity": "warning",
+      "message": "duplicate hash key `1.00' in the same literal; this entry overwrites the value first set at line 16"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 19,
+      "column": 17,
+      "severity": "warning",
+      "message": "duplicate hash key `nil' in the same literal; this entry overwrites the value first set at line 19"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 22,
+      "column": 24,
+      "severity": "warning",
+      "message": "duplicate hash key `:size' in the same literal; this entry overwrites the value first set at line 22"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 25,
+      "column": 24,
+      "severity": "warning",
+      "message": "duplicate hash key `:timeout' in the same literal; this entry overwrites the value first set at line 25"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 28,
+      "column": 13,
+      "severity": "warning",
+      "message": "duplicate hash key `:k' in the same literal; this entry overwrites the value first set at line 28"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 28,
+      "column": 19,
+      "severity": "warning",
+      "message": "duplicate hash key `:k' in the same literal; this entry overwrites the value first set at line 28"
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 31,
+      "column": 24,
+      "severity": "warning",
+      "message": "duplicate hash key `:x' in the same literal; this entry overwrites the value first set at line 31"
+    }
+  ]
+}

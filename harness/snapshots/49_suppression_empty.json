@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/49_suppression_empty.rb",
+  "diagnostics": [
+    {
+      "rule": "suppression.empty",
+      "line": 5,
+      "column": 11,
+      "severity": "warning",
+      "message": "`# rigor:disable` lists no rules, so this suppression has no effect. Name the rules to suppress (`# rigor:disable call.undefined-method`) or use `# rigor:disable all`."
+    },
+    {
+      "rule": "suppression.empty",
+      "line": 6,
+      "column": 11,
+      "severity": "warning",
+      "message": "`# rigor:disable-file` lists no rules, so this suppression has no effect. Name the rules to suppress (`# rigor:disable-file call.undefined-method`) or use `# rigor:disable-file all`."
+    }
+  ]
+}
