@@ -357,8 +357,11 @@ fn compute_diagnostics(ctx: &ServerContext, text: &str) -> Vec<Diagnostic> {
             .folder
             .as_ref()
             .map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
-        let diags =
+        let mut diags =
             analyze_with_source_and_folder(&ast, &mut interner, &ctx.index, &source, folder);
+        diags.extend(rigor_rules::shadowed_rescue_diagnostics(
+            &ast, &ctx.index, &source, text,
+        ));
         (diags, comments)
     }));
 

@@ -9,6 +9,9 @@ use rigor_infer::Typer;
 use rigor_parse::{HashKeyTag, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type};
 
+mod shadowed_rescue;
+pub use shadowed_rescue::shadowed_rescue_diagnostics;
+
 // ---------------------------------------------------------------------------
 // Severity enum
 // ---------------------------------------------------------------------------
@@ -175,6 +178,15 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-raise-non-exception",
         }),
+        FLOW_SHADOWED_RESCUE_CLAUSE => Some(&RuleEntry {
+            // Oracle: warning (balanced) / high — a purely syntactic + class-
+            // hierarchy proof with a strict ancestry-certainty envelope (opaque
+            // clauses, module bail, project-superclass gate), no metaprogramming
+            // escape. Lenient info / strict error via the profile.
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-shadowed-rescue-clause",
+        }),
         SUPPRESSION_UNKNOWN_RULE => Some(&RuleEntry {
             // Oracle: warning across ALL profiles / high — pure token-table
             // membership over the same tables the suppression matcher uses.
@@ -328,6 +340,22 @@ pub const SUPPRESSION_EMPTY: &str = "suppression.empty";
 /// and treats `:superclass` as unknown (asymmetric with the exact singleton path,
 /// where `:superclass` fires).
 pub const CALL_RAISE_NON_EXCEPTION: &str = "call.raise-non-exception";
+
+/// `flow.shadowed-rescue-clause` (v0.3.0): a `rescue` clause of a `begin`/`def`
+/// rescue chain that can never run because an EARLIER clause of the SAME chain
+/// already catches a superclass (or the same class) of every exception class the
+/// later clause names (`rescue StandardError => e … rescue ArgumentError` — the
+/// ArgumentError arm is dead). A faithful port of the reference
+/// `ShadowedRescueCollector` (see [`shadowed_rescue`]). Purely syntactic + class
+/// ancestry — no Typer.
+///
+/// Zero-FP envelope (each gate load-bearing): only ConstantRead/ConstantPath
+/// exception designators certify; a clause with any splat / local / call
+/// designator is fully opaque (never covers, never fires). Modules NEVER certify;
+/// a project class certifies ONLY with a discovered `class Foo < Bar` superclass;
+/// a later clause naming a superclass of an earlier one (narrow→wide) stays
+/// silent; comparisons never cross a nested `begin`.
+pub const FLOW_SHADOWED_RESCUE_CLAUSE: &str = "flow.shadowed-rescue-clause";
 
 /// The Integer division/modulo operators that raise `ZeroDivisionError` on a
 /// zero Integer divisor — verbatim the reference's `INTEGER_RAISING_OPERATORS`
@@ -2260,6 +2288,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     FLOW_DUPLICATE_HASH_KEY,
     FLOW_RETURN_IN_ENSURE,
     CALL_RAISE_NON_EXCEPTION,
+    FLOW_SHADOWED_RESCUE_CLAUSE,
     SUPPRESSION_UNKNOWN_RULE,
     SUPPRESSION_EMPTY,
 ];
@@ -2298,11 +2327,8 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "flow.always-truthy-condition",
     "flow.unreachable-clause",
     // v0.3.0 ids. `flow.duplicate-hash-key` / `flow.return-in-ensure` /
-    // `call.raise-non-exception` / `suppression.unknown-rule` /
-    // `suppression.empty` are implemented; `flow.shadowed-rescue-clause` is NOT
-    // yet emitted by rigor-rs but MUST still be a "known" suppression token (so a
-    // `# rigor:disable flow.shadowed-rescue-clause` never fires unknown-rule and
-    // `is_inert_builtin_token` treats it as a real id).
+    // `call.raise-non-exception` / `flow.shadowed-rescue-clause` /
+    // `suppression.unknown-rule` / `suppression.empty` are all implemented.
     "flow.duplicate-hash-key",
     "flow.return-in-ensure",
     "flow.shadowed-rescue-clause",

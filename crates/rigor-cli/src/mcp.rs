@@ -31,7 +31,8 @@ use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, Typer};
 use rigor_parse::{comment_lines, lower, parse};
 use rigor_rules::{
-    analyze_with_source, catalog, filter_suppressed, suppression_marker_diagnostics, Diagnostic,
+    analyze_with_source, catalog, filter_suppressed, shadowed_rescue_diagnostics,
+    suppression_marker_diagnostics, Diagnostic,
     SuppressSet,
 };
 use rigor_types::Interner;
@@ -283,7 +284,8 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let ast = lower(&result);
         let src = SourceIndex::build(&ast, &ctx.index);
         let mut interner = Interner::new();
-        let diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
+        let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
+        diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
         (diags, comments)
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())?;
@@ -332,7 +334,8 @@ fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let ast = lower(&result);
         let src = SourceIndex::build(&ast, &ctx.index);
         let mut interner = Interner::new();
-        let diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
+        let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
+        diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
         (diags, comments)
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())?;

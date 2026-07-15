@@ -1,0 +1,110 @@
+{
+  "fixture": "harness/corpus/56_shadowed_rescue_clause.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 89,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `attempt`. If a project file defines `attempt` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 91,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `recover`. If a project file defines `recover` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 93,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `fallback`. If a project file defines `fallback` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 11,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ArgumentError': every exception class it names is already caught by the earlier `rescue StandardError' (line 9) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 21,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ArgumentError': every exception class it names is already caught by the earlier `rescue' (line 19) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 30,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ArgumentError': every exception class it names is already caught by the earlier `rescue ArgumentError' (line 28) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 40,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ArgumentError, TypeError': every exception class it names is already caught by the earlier `rescue StandardError' (line 38) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 51,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ArgumentError, TypeError': every exception class it names is already caught by the earlier `rescue ArgumentError' (line 47) and `rescue TypeError' (line 49) clauses, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 61,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ArgumentError': every exception class it names is already caught by the earlier `rescue StandardError' (line 59) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 63,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue TypeError': every exception class it names is already caught by the earlier `rescue StandardError' (line 59) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 72,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ::ArgumentError': every exception class it names is already caught by the earlier `rescue ::StandardError' (line 70) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 81,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue StandardError': every exception class it names is already caught by the earlier `rescue Exception' (line 79) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 92,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue ArgumentError': every exception class it names is already caught by the earlier `rescue StandardError' (line 90) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 105,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue CustomError': every exception class it names is already caught by the earlier `rescue StandardError' (line 103) clause, so this clause can never run"
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 120,
+      "column": 1,
+      "severity": "warning",
+      "message": "shadowed `rescue Leaf': every exception class it names is already caught by the earlier `rescue StandardError' (line 118) clause, so this clause can never run"
+    }
+  ]
+}

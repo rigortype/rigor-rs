@@ -309,6 +309,17 @@ impl SourceIndex {
         self.classes.contains_key(name)
     }
 
+    /// The DISCOVERED written superclass (last path component) of a source class,
+    /// or `None` when the name is unknown OR is a source class/module WITHOUT a
+    /// `class Foo < Bar` superclass (a bare `class Foo`/`module Foo` — the two are
+    /// indistinguishable in the collapsed discovery table). This is the rigor-rs
+    /// analogue of the reference's `discovered_superclasses` map: a `Some` result
+    /// both certifies `name` as a project exception-comparable CLASS and gives
+    /// `flow.shadowed-rescue-clause`'s project chain-walk its next parent link.
+    pub fn discovered_superclass(&self, name: &str) -> Option<&str> {
+        self.classes.get(name).and_then(|c| c.superclass.as_deref())
+    }
+
     /// Whether `name` is registered in the instance-class id space (source class
     /// or registered RBS instance class).
     pub fn is_registered(&self, name: &str) -> bool {

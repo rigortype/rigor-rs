@@ -723,7 +723,17 @@ fn analyze_files(
         .map(|p| {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 let mut interner = Interner::new();
-                analyze_with_source_and_folder(&p.ast, &mut interner, &index, &project_source, folder)
+                let mut diags = analyze_with_source_and_folder(
+                    &p.ast, &mut interner, &index, &project_source, folder,
+                );
+                // `flow.shadowed-rescue-clause` (v0.3.0): its own pass over the
+                // begin/rescue clause chains, needing the raw source text (RAW
+                // exception slices + earlier-clause line numbers). Produced BEFORE
+                // suppression / `disable:` filtering, exactly like the call rules.
+                diags.extend(rigor_rules::shadowed_rescue_diagnostics(
+                    &p.ast, &index, &project_source, &p.source,
+                ));
+                diags
             }));
             match result {
                 Ok(mut diags) => {

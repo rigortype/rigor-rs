@@ -529,6 +529,38 @@ const ENTRIES: &[Entry] = &[
         since: "0.3.0",
     },
     Entry {
+        id: "flow.shadowed-rescue-clause",
+        summary: "A `rescue` clause can never run — an earlier clause already catches every class it names.",
+        fires_when: &[
+            "A `begin` / `def` rescue chain has a later `rescue` clause whose EVERY named exception class \
+             is already caught by an earlier clause of the SAME chain (`rescue StandardError => e ... \
+             rescue ArgumentError` — ArgumentError is a subclass, so its arm is dead). A bare `rescue` / \
+             `rescue => e` counts as `StandardError` on either side.",
+            "Every exception reference in BOTH clauses is a constant that resolves (against its lexical \
+             namespace, `::Foo` bypassing the ladder) to a CLASS with known ancestry — an RBS / registry \
+             core class, or a project class whose `class Foo < Bar` superclass chain is discovered.",
+            "A multi-class arm (`rescue A, B`) is shadowed only when EVERY class it names is covered by \
+             some earlier comparable clause — one diagnostic per dead clause, naming the covering earlier \
+             clause(s).",
+        ],
+        does_not_fire_when: &[
+            "The later clause names a SUPERCLASS of an earlier one (the normal narrow-to-wide rescue \
+             order), or the two are disjoint siblings.",
+            "Any exception reference is unresolved, a dynamic expression (`rescue klass`), a splat \
+             (`rescue *ERRORS`), or resolves to a MODULE — the clause is opaque (an opaque earlier clause \
+             covers nothing; an opaque later clause never fires).",
+            "A project constant resolves to a bare `class Foo` / `module Foo` with no discovered \
+             superclass (indistinguishable from a module in the discovery table).",
+            "The two clauses belong to DIFFERENT `begin` chains (a nested `begin` inside a rescue body is \
+             never compared against the outer chain).",
+        ],
+        suppression: "`# rigor:disable flow.shadowed-rescue-clause` on the dead `rescue` line.",
+        severity_authored: "warning",
+        severity_by_profile: [("lenient", "info"), ("balanced", "warning"), ("strict", "error")],
+        evidence_tier: Some("high"),
+        since: "0.3.0",
+    },
+    Entry {
         id: "suppression.unknown-rule",
         summary: "A `# rigor:disable[-file]` comment names a rule that does not exist.",
         fires_when: &[
@@ -936,10 +968,9 @@ mod tests {
     #[test]
     fn all_is_id_sorted_and_complete() {
         let ids: Vec<&str> = all().iter().map(|e| e.id).collect();
-        // 24 rules: the reference's ALL_RULES minus the one v0.3.0 id rigor-rs
-        // does not yet emit (`flow.shadowed-rescue-clause`), which stays a known
-        // suppression token without an explain entry.
-        assert_eq!(ids.len(), 24);
+        // 25 rules: every canonical id rigor-rs recognizes, now including
+        // `flow.shadowed-rescue-clause` (implemented v0.3.0).
+        assert_eq!(ids.len(), 25);
         // Sorted ascending by id.
         let mut sorted = ids.clone();
         sorted.sort_unstable();
