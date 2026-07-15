@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/51_kernel_p_pp_identity.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 12,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 42"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 16,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 42"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for [1, \"a\"]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 24,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 42"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 32,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for { a: 1 }"
+    }
+  ]
+}

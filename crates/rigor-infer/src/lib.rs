@@ -180,6 +180,21 @@ impl<'i> Typer<'i> {
                     self.type_call(ast, r, &method, &args, env, interner)
                 }
             }
+            // An IMPLICIT-SELF call (`p x`, `format(...)`, …) never reaches
+            // `type_call` (that path is `receiver: Some(_)` only). This is the
+            // shared implicit-self dispatch entry (ADR-0038 inference-cluster
+            // spec): keyed strictly off `receiver: None`, it lets receiverless
+            // Kernel folds be typed. This slice implements ONLY Kernel `p`/`pp`
+            // identity; every other implicit-self call declines and falls to
+            // `Dynamic[top]` exactly as the catch-all did before (zero behaviour
+            // change off the `p`/`pp` path). A block does NOT block the fold —
+            // `p(x) { }` still types to `x` — because block reachability is the
+            // rule walk's concern, not this value query.
+            Node::Call { receiver: None, method, args, .. } => {
+                let (method, args) = (method.clone(), args.clone());
+                self.type_implicit_self_call(ast, &method, &args, env, interner)
+                    .unwrap_or_else(|| interner.untyped())
+            }
             // A bare constant read (`Time`, `Array`) types to the CLASS OBJECT
             // itself — `Type::Singleton(class)` — so a class-method typo on it
             // (`Time.current`) can be witnessed. The zero-FP gate (ADR-0023):
@@ -303,11 +318,12 @@ impl<'i> Typer<'i> {
                     None => else_ty,
                 }
             }
-            // A call with no receiver (implicit self) or any other carrier
-            // (`@ivar`, constant, `self`, index, range, logical, variable read)
-            // is not precisely typed in this slice -> Dynamic[top] (never guess;
-            // keeps the call rule silent). TODO(spec): ivar typing (ADR-0022),
-            // constant resolution, container-element typing.
+            // Any other carrier (`@ivar`, constant, `self`, index, range,
+            // logical, variable read) is not precisely typed in this slice ->
+            // Dynamic[top] (never guess; keeps the call rule silent). Implicit-
+            // self calls are handled by the `receiver: None` arm above.
+            // TODO(spec): ivar typing (ADR-0022), constant resolution,
+            // container-element typing.
             _ => interner.untyped(),
         }
     }
@@ -528,6 +544,85 @@ impl<'i> Typer<'i> {
             }
             _ => None,
         }
+    }
+
+    /// Implicit-self (`receiver: None`) dispatch entry — the shared home for
+    /// receiverless Kernel folds (ADR-0038 inference-cluster spec). Returns
+    /// `Some(ty)` when a fold applies, `None` to decline (the caller falls to
+    /// `Dynamic[top]`, silent). This slice folds ONLY Kernel `#p` / `#pp`
+    /// identity; future Kernel folds (`format`/`String()`/`Integer()`/…) extend
+    /// this same entry.
+    ///
+    /// Kernel `#p(x)` / `#pp(x)` mirror the runtime contract (reference
+    /// `KernelDispatch#try_identity_printer`): `p x` returns `x`, `p a, b`
+    /// returns `[a, b]`, bare `p` returns `nil`. So:
+    ///
+    /// | arity  | result                                          |
+    /// |--------|-------------------------------------------------|
+    /// | 0 args | `Constant[nil]`                                 |
+    /// | 1 arg  | the argument's type object UNCHANGED (identity — pins/shapes/`Dynamic` all pass through) |
+    /// | N args | `Tuple[t1, …, tn]`                              |
+    ///
+    /// Note the 0-arg case yields `Constant[nil]` DIRECTLY rather than declining
+    /// (the reference declines because its RBS tier already answers `nil`;
+    /// rigor-rs has no RBS tier on the implicit-self path, so the fold must
+    /// carry the nil itself — probe p03, `for nil`, depends on it).
+    ///
+    /// Guards (decline ⇒ Dynamic, silent), matching the reference's FP envelope:
+    /// - an explicit foreign receiver never reaches here — this path is
+    ///   `receiver: None` only, so `Kernel.p(42)` stays unfolded automatically
+    ///   (probe p05);
+    /// - a user redefinition of the name: rigor-rs has no scope object, so the
+    ///   sanctioned conservative substitute is a FILE-WIDE scan for any
+    ///   `def p` / `def pp` — if found, decline that name across the whole file
+    ///   (under-emit is safe; probe p07);
+    /// - a splat / forwarding argument makes the positional arity (and thus
+    ///   identity-vs-`Tuple`) statically unknown ⇒ decline (probe p08).
+    fn type_implicit_self_call(
+        &self,
+        ast: &LoweredAst,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        // Only `p` / `pp` are folded in this slice; every other implicit-self
+        // call declines (one string compare on the hot path).
+        if method != "p" && method != "pp" {
+            return None;
+        }
+        // User-redefinition guard (conservative file-wide substitute for the
+        // reference's scope-aware check).
+        if self.file_defines_method(ast, method) {
+            return None;
+        }
+        // Splat / forwarding guard: rigor-parse lowers a `*a` splat and a `...`
+        // forwarding arg to `Node::Other` (no owned variant). Any such arg means
+        // the runtime arity is unknown, so we cannot choose identity vs `Tuple`.
+        if args.iter().any(|&a| matches!(ast.get(a), Node::Other { .. })) {
+            return None;
+        }
+        Some(match args {
+            [] => interner.intern(Type::Constant(Scalar::Nil)),
+            [only] => self.type_of(ast, *only, env, interner),
+            many => {
+                let elems: Vec<TypeId> =
+                    many.iter().map(|&a| self.type_of(ast, a, env, interner)).collect();
+                interner.intern(Type::Tuple(elems))
+            }
+        })
+    }
+
+    /// True when the file defines an instance method named `name` anywhere (a
+    /// top-level or in-class `def name`). Used as the conservative file-wide
+    /// user-redefinition guard for the Kernel folds: rigor-rs has no scope
+    /// object, so a single `def p` disables the `p` fold file-wide (under-emit,
+    /// FP-safe). Singleton `def self.p` lowers with `name: None`, so it does not
+    /// trip the guard — matching that it does not shadow the private Kernel
+    /// instance method.
+    fn file_defines_method(&self, ast: &LoweredAst, name: &str) -> bool {
+        ast.iter()
+            .any(|(_, n)| matches!(n, Node::Definition { name: Some(m), .. } if m == name))
     }
 
     fn type_call(
@@ -1511,6 +1606,66 @@ mod tests {
         case(b"[1, 2].empty?\n", Type::Constant(Scalar::Bool(false)));
         case(b"[].first\n", Type::Constant(Scalar::Nil));
         case(b"[1, 2][9]\n", Type::Constant(Scalar::Nil)); // out of bounds → nil
+    }
+
+    /// Kernel `#p` / `#pp` identity typing on the implicit-self (`receiver:
+    /// None`) path — the full p01–p11 probe matrix, both firing (a folded value
+    /// carrier) and silent (`untyped`/Dynamic) directions. Types the LAST call
+    /// in each snippet: for the firing probes that is the `p`/`pp` call whose
+    /// value we assert; for the silent probes it is either the declined `p`/`pp`
+    /// call or an explicit-receiver `Kernel.p` that never reaches our path.
+    #[test]
+    fn kernel_p_pp_identity_typing() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        // Type the p/pp call of interest. `nth_from_end` selects which
+        // implicit-self (receiver-None) call to type, counting from the end
+        // (0 = last) — needed for p07/p11 where a `def p` / method body adds
+        // additional receiver-None calls we must skip past.
+        let describe_ty = |src: &[u8], want_recv_none: bool| -> String {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let call_id = ast
+                .iter()
+                .filter_map(|(id, n)| match n {
+                    Node::Call { receiver, method, .. }
+                        if receiver.is_none() == want_recv_none
+                            && (method == "p" || method == "pp") =>
+                    {
+                        Some(id)
+                    }
+                    _ => None,
+                })
+                .last()
+                .unwrap();
+            let ty = typer.type_of(&ast, call_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+
+        // p01: `p 42` → identity → Constant[42].
+        assert_eq!(describe_ty(b"p 42\n", true), "Constant[42]");
+        // p02: `p(1, "a")` → Tuple of the arg types.
+        assert_eq!(describe_ty(b"p(1, \"a\")\n", true), "Tuple[Constant[1], Constant[\"a\"]]");
+        // p03: bare `p` → nil (NOT declined — rigor-rs has no RBS tier on this
+        // path, so the fold must carry the nil itself).
+        assert_eq!(describe_ty(b"p\n", true), "nil");
+        // p04: `pp 42` → identity → Constant[42].
+        assert_eq!(describe_ty(b"pp 42\n", true), "Constant[42]");
+        // p09: block form still folds (a block does not block the fold).
+        assert_eq!(describe_ty(b"p(42) { 1 }\n", true), "Constant[42]");
+        // p10: HashShape passes through the identity unchanged.
+        assert_eq!(describe_ty(b"p({a: 1})\n", true), "{:a => Constant[1]}");
+
+        // Silent directions — decline to Dynamic[top].
+        // p05: `Kernel.p(42)` — explicit receiver, never on our path.
+        assert_eq!(describe_ty(b"Kernel.p(42)\n", false), "Dynamic[top]");
+        // p07: a file-wide `def p` disables the fold file-wide.
+        assert_eq!(describe_ty(b"def p(*a); nil; end\np 42\n", true), "Dynamic[top]");
+        // p08: a splat arg makes arity unknown → decline.
+        assert_eq!(describe_ty(b"a = [1, 2]\np(*a)\n", true), "Dynamic[top]");
+        // p11: a Dynamic (unknown local) arg passes through identity as Dynamic.
+        assert_eq!(describe_ty(b"p some_unknown_local\n", true), "Dynamic[top]");
     }
 
     /// An `if`/`unless`/ternary as an expression types to the union of its
