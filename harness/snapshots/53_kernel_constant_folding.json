@@ -1,0 +1,110 @@
+{
+  "fixture": "harness/corpus/53_kernel_constant_folding.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"1\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"x-42\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"00042|7    |+3|0xff|hel\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"100%\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 35,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"3.0\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 41,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 44,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for {}"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 26"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 1000"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 54,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 66"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 58,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 1000.0"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 65,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for literal-string"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 69,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 74,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for String"
+    }
+  ]
+}

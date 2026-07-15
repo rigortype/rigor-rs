@@ -356,6 +356,17 @@ fn scalar_inspect(s: &Scalar) -> String {
 /// Ruby `Float#inspect` always shows a decimal point (`3.0.inspect == "3.0"`),
 /// unlike Rust's `3.0_f64.to_string() == "3"`.
 fn named_float(f: f64) -> String {
+    ruby_float_to_s(f)
+}
+
+/// Ruby `Float#to_s` / `Float#inspect` spelling of a finite float: a decimal
+/// point is always present (`3.0.to_s == "3.0"`, `3.14.to_s == "3.14"`), and
+/// non-integral values use Rust's shortest round-trip (which matches Ruby's
+/// `flo_to_s` dtoa for the overwhelming majority of values). Exposed for the
+/// Kernel `String()` / `sprintf` folds (`kernel_fold`), which must reproduce
+/// Ruby's `to_s` byte-for-byte. Non-finite inputs (`NaN`/`±Infinity`) fall to
+/// Rust's spelling; callers that fold must guard those out separately.
+pub fn ruby_float_to_s(f: f64) -> String {
     if f.is_finite() && f == f.trunc() {
         format!("{f:.1}")
     } else {
