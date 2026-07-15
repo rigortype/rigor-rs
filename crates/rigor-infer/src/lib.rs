@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 pub mod folding;
+pub mod kernel_fold;
 pub mod source_index;
 
 use std::collections::{HashMap, HashSet};
@@ -783,9 +784,14 @@ impl<'i> Typer<'i> {
     /// Implicit-self (`receiver: None`) dispatch entry — the shared home for
     /// receiverless Kernel folds (ADR-0038 inference-cluster spec). Returns
     /// `Some(ty)` when a fold applies, `None` to decline (the caller falls to
-    /// `Dynamic[top]`, silent). This slice folds ONLY Kernel `#p` / `#pp`
-    /// identity; future Kernel folds (`format`/`String()`/`Integer()`/…) extend
-    /// this same entry.
+    /// `Dynamic[top]`, silent). Folds Kernel `#p` / `#pp` identity AND the
+    /// Kernel conversion functions `format`/`sprintf`, `String()`, `Hash()`,
+    /// `Integer()`, `Float()` (ADR-0038 spec §3, ported from the reference
+    /// `KernelDispatch`). The conversion evaluators live in [`kernel_fold`];
+    /// each folds only cases it can prove render byte-identically to Ruby, and
+    /// declines (silent) on any doubt — a fold-time error, an arg-count/-type
+    /// mismatch, or an oversized result — so a decline is a coverage gap, never
+    /// a false positive.
     ///
     /// Kernel `#p(x)` / `#pp(x)` mirror the runtime contract (reference
     /// `KernelDispatch#try_identity_printer`): `p x` returns `x`, `p a, b`
@@ -820,31 +826,114 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<TypeId> {
-        // Only `p` / `pp` are folded in this slice; every other implicit-self
-        // call declines (one string compare on the hot path).
-        if method != "p" && method != "pp" {
+        // Only a fixed set of Kernel functions is folded on this path; every
+        // other implicit-self call declines (a cheap membership test on the hot
+        // path). `format`/`sprintf`/`String`/`Hash`/`Integer`/`Float` are the
+        // Kernel constant-folds (ADR-0038 spec §3).
+        let is_printer = matches!(method, "p" | "pp");
+        let is_kernel_fold = matches!(
+            method,
+            "format" | "sprintf" | "String" | "Hash" | "Integer" | "Float"
+        );
+        if !is_printer && !is_kernel_fold {
             return None;
         }
         // User-redefinition guard (conservative file-wide substitute for the
-        // reference's scope-aware check).
+        // reference's scope-aware check): a `def <name>` anywhere in the file
+        // disables the fold for that name (under-emit, FP-safe).
         if self.file_defines_method(ast, method) {
             return None;
         }
         // Splat / forwarding guard: rigor-parse lowers a `*a` splat and a `...`
         // forwarding arg to `Node::Other` (no owned variant). Any such arg means
-        // the runtime arity is unknown, so we cannot choose identity vs `Tuple`.
+        // the runtime arity is unknown, so we cannot choose the fold shape —
+        // decline for both the printer and the conversion folds.
         if args.iter().any(|&a| matches!(ast.get(a), Node::Other { .. })) {
             return None;
         }
-        Some(match args {
-            [] => interner.intern(Type::Constant(Scalar::Nil)),
-            [only] => self.type_of(ast, *only, env, interner),
-            many => {
-                let elems: Vec<TypeId> =
-                    many.iter().map(|&a| self.type_of(ast, a, env, interner)).collect();
-                interner.intern(Type::Tuple(elems))
+
+        if is_printer {
+            return Some(match args {
+                [] => interner.intern(Type::Constant(Scalar::Nil)),
+                [only] => self.type_of(ast, *only, env, interner),
+                many => {
+                    let elems: Vec<TypeId> =
+                        many.iter().map(|&a| self.type_of(ast, a, env, interner)).collect();
+                    interner.intern(Type::Tuple(elems))
+                }
+            });
+        }
+
+        // `Hash(v)` folds on the argument's TYPE (HashShape identity, or an
+        // empty HashShape for `nil` / an empty Tuple), not on scalar values, so
+        // it is handled before the value-pinning path below.
+        if method == "Hash" {
+            return self.fold_kernel_hash(ast, args, env, interner);
+        }
+
+        // The remaining folds (`format`/`sprintf`/`String`/`Integer`/`Float`)
+        // require EVERY argument to be a value-pinned `Constant` scalar. A
+        // non-constant argument means we cannot prove the folded value, so we
+        // decline (silent — a gap, never a wrong constant).
+        let scalars = self.pin_arg_scalars(ast, args, env, interner)?;
+        let folded: Scalar = match method {
+            "format" | "sprintf" => {
+                // Template = first arg (a Constant string); the rest are the
+                // format arguments.
+                let (template, rest) = scalars.split_first()?;
+                let Scalar::Str(tmpl) = template else {
+                    return None;
+                };
+                let rendered = kernel_fold::sprintf(tmpl, rest)?;
+                Scalar::Str(rendered)
             }
-        })
+            "String" => {
+                let [only] = scalars.as_slice() else {
+                    return None;
+                };
+                Scalar::Str(kernel_fold::ruby_string_of(only))
+            }
+            "Integer" => match scalars.as_slice() {
+                [only] => Scalar::Int(kernel_fold::ruby_integer(only, None)?),
+                [only, Scalar::Int(base)] => {
+                    Scalar::Int(kernel_fold::ruby_integer(only, Some(*base))?)
+                }
+                _ => return None,
+            },
+            "Float" => {
+                let [only] = scalars.as_slice() else {
+                    return None;
+                };
+                Scalar::Float(kernel_fold::ruby_float(only)?)
+            }
+            _ => return None,
+        };
+        Some(interner.intern(Type::Constant(folded)))
+    }
+
+    /// `Kernel#Hash(v)` fold (reference `try_hash`): a `HashShape` argument
+    /// passes through unchanged (`Hash(h)` returns `h`); `Constant[nil]` and an
+    /// empty `Tuple` (`Hash([])`) collapse to the empty `HashShape`; anything
+    /// else declines (the `to_hash` protocol is not decidable from types alone).
+    fn fold_kernel_hash(
+        &self,
+        ast: &LoweredAst,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let [only] = args else {
+            return None;
+        };
+        let arg_ty = self.type_of(ast, *only, env, interner);
+        match interner.get(arg_ty).clone() {
+            Type::HashShape(_) => Some(arg_ty),
+            Type::Constant(Scalar::Nil) => Some(interner.intern(Type::HashShape(vec![]))),
+            Type::Tuple(elems) if elems.is_empty() => {
+                Some(interner.intern(Type::HashShape(vec![])))
+            }
+            _ => None,
+        }
     }
 
     /// True when the file defines an instance method named `name` anywhere (a
