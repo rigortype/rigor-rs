@@ -1,0 +1,68 @@
+{
+  "fixture": "harness/corpus/52_scalar_key_hash_shape.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 10,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for { 1 => 2, 3 => 4 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for { 1.5 => :x, true => 1, false => 2, nil => 3 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for { a: 1, \"k\": 2, 7 => 3 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for { 1 => 9 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 42"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 41,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for true"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 45,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"x\""
+    },
+    {
+      "rule": "flow.duplicate-hash-key",
+      "line": 26,
+      "column": 15,
+      "severity": "warning",
+      "message": "duplicate hash key `1' in the same literal; this entry overwrites the value first set at line 26"
+    }
+  ]
+}

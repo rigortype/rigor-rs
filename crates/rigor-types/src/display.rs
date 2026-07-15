@@ -69,7 +69,14 @@ pub fn describe_named(
                     .map(|m| {
                         let key = named_key(&m.key);
                         let key = if m.optional { format!("?{key}") } else { key };
-                        format!("{key}: {}", describe_named(i, m.value, resolve))
+                        // Reference `key_separator`: Symbol/String keys keep the
+                        // colon form (`a: 1`, `"k": 2`); every other scalar key
+                        // uses the hashrocket (`1 => 2`, `nil => 0`).
+                        let sep = match m.key {
+                            ShapeKey::Sym(_) | ShapeKey::Str(_) => ":",
+                            _ => " =>",
+                        };
+                        format!("{key}{sep} {}", describe_named(i, m.value, resolve))
                     })
                     .collect();
                 format!("{{ {} }}", inner.join(", "))
@@ -266,14 +273,34 @@ fn erase_hash_shape(
 /// Generalize a non-symbol-keyed (or otherwise non-record) shape to a
 /// `Hash[K, V]` bound: the key type is the union of each key's class, the value
 /// type the union of the member values (reference `HashShape#hash_erasure`).
+///
+/// The reference builds `union(*key_types)` / `union(*pairs.values)`, and its
+/// normalizer orders union members by `describe(:short)` (combinator.rb `sort_by
+/// { |m| m.describe(:short) }`), so both the key and value member lists are
+/// sorted by that display string before being erased — NOT by rigor-rs's own
+/// tag/ClassId canonical order. We reproduce that here so the erased bound is
+/// byte-identical to the oracle's (load-bearing for sig-gen output).
 fn hash_erasure(
     i: &Interner,
     members: &[ShapeMember],
     resolve: &dyn Fn(ClassId) -> Option<String>,
 ) -> String {
-    let key_type = uniq_join(members.iter().map(|m| shape_key_class_name(&m.key)).collect());
+    // Key bound: every key class's `describe(:short)` equals its erasure (a
+    // nominal renders its name; the `true`/`false`/`nil` literals render
+    // themselves), so sorting the erase strings reproduces the reference's
+    // describe-sorted union member order; `uniq_join` then dedups.
+    let mut key_strs: Vec<String> =
+        members.iter().map(|m| shape_key_class_name(&m.key)).collect();
+    key_strs.sort();
+    let key_type = uniq_join(key_strs);
+
+    // Value bound: sort the value TYPES by their `describe(:short)` (the
+    // reference's canonical union order), then erase each in that order; a single
+    // `untyped` member collapses the whole union (reference `Union#erase_to_rbs`).
+    let mut vals: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+    vals.sort_by_key(|&v| describe_named(i, v, resolve));
     let val_erased: Vec<String> =
-        members.iter().map(|m| erase_to_rbs_named(i, m.value, resolve)).collect();
+        vals.iter().map(|&v| erase_to_rbs_named(i, v, resolve)).collect();
     let value_type = if val_erased.iter().any(|e| e == "untyped") {
         "untyped".to_string()
     } else {
@@ -289,6 +316,14 @@ fn shape_key_class_name(k: &ShapeKey) -> String {
         ShapeKey::Sym(_) => "Symbol".to_string(),
         ShapeKey::Str(_) => "String".to_string(),
         ShapeKey::Int(_) => "Integer".to_string(),
+        ShapeKey::Float(_) => "Float".to_string(),
+        // Reference `hash_erasure_key_type`: the `true` / `false` / `nil`
+        // singletons keep their literal carrier (the constant IS the class's
+        // whole value set, and RBS spells the literal), unlike Integer/Float
+        // which widen to the class nominal.
+        ShapeKey::Bool(true) => "true".to_string(),
+        ShapeKey::Bool(false) => "false".to_string(),
+        ShapeKey::Nil => "nil".to_string(),
         ShapeKey::Other => "untyped".to_string(),
     }
 }
@@ -335,6 +370,9 @@ fn named_key(k: &ShapeKey) -> String {
         ShapeKey::Sym(s) => s.clone(),
         ShapeKey::Str(s) => format!("{s:?}"),
         ShapeKey::Int(v) => v.to_string(),
+        ShapeKey::Float(bits) => named_float(f64::from_bits(*bits)),
+        ShapeKey::Bool(b) => b.to_string(),
+        ShapeKey::Nil => "nil".to_string(),
         ShapeKey::Other => "_".to_string(),
     }
 }
@@ -532,6 +570,9 @@ fn shape_key(k: &ShapeKey) -> String {
         ShapeKey::Sym(s) => format!(":{s}"),
         ShapeKey::Str(s) => format!("{s:?}"),
         ShapeKey::Int(v) => v.to_string(),
+        ShapeKey::Float(bits) => named_float(f64::from_bits(*bits)),
+        ShapeKey::Bool(b) => b.to_string(),
+        ShapeKey::Nil => "nil".to_string(),
         ShapeKey::Other => "_".to_string(),
     }
 }
@@ -634,6 +675,31 @@ mod named_tests {
             ShapeMember { key: ShapeKey::Sym("age".to_string()), value: int, optional: true },
         ]));
         assert_eq!(describe_named(&i, shape, &resolver), "{ name: Integer, ?age: Integer }");
+    }
+
+    #[test]
+    fn hash_shape_scalar_keys_use_hashrocket() {
+        // Symbol / String keys keep the colon form; Integer / Float / true /
+        // false / nil keys render with the hashrocket (reference `key_separator`).
+        let mut i = Interner::new();
+        let (one, two, three) = (i.int(1), i.int(2), i.int(3));
+        let sym = i.intern(Type::Constant(Scalar::Sym("v".to_string())));
+        let shape = i.intern(Type::HashShape(vec![
+            ShapeMember { key: ShapeKey::Sym("a".to_string()), value: one, optional: false },
+            ShapeMember { key: ShapeKey::Str("k".to_string()), value: two, optional: false },
+            ShapeMember { key: ShapeKey::Int(3), value: three, optional: false },
+            ShapeMember {
+                key: ShapeKey::Float(1.5f64.to_bits()),
+                value: sym,
+                optional: false,
+            },
+            ShapeMember { key: ShapeKey::Bool(true), value: one, optional: false },
+            ShapeMember { key: ShapeKey::Nil, value: two, optional: false },
+        ]));
+        assert_eq!(
+            describe_named(&i, shape, &resolver),
+            "{ a: 1, \"k\": 2, 3 => 3, 1.5 => :v, true => 1, nil => 2 }"
+        );
     }
 }
 
@@ -759,6 +825,36 @@ mod erase_tests {
             optional: false,
         }]));
         assert_eq!(erase_to_rbs_named(&i, str_keyed, &resolver), "Hash[String, 2]");
+    }
+
+    #[test]
+    fn scalar_keyed_shape_erases_key_union_sorted() {
+        // Integer / Float keys widen to their class nominal; true / false / nil
+        // keep their literal carrier. The key and value unions are ordered by
+        // `describe(:short)` (the reference's `union` member order), NOT source
+        // order — so `{ true => 1, false => 2, nil => 3 }` erases with the key
+        // union `false | nil | true`.
+        let mut i = Interner::new();
+        let (one, two, three) = (i.int(1), i.int(2), i.int(3));
+        let bool_nil = i.intern(Type::HashShape(vec![
+            ShapeMember { key: ShapeKey::Bool(true), value: one, optional: false },
+            ShapeMember { key: ShapeKey::Bool(false), value: two, optional: false },
+            ShapeMember { key: ShapeKey::Nil, value: three, optional: false },
+        ]));
+        assert_eq!(
+            erase_to_rbs_named(&i, bool_nil, &resolver),
+            "Hash[false | nil | true, 1 | 2 | 3]"
+        );
+
+        // Integer + Float keys → `Float | Integer` (sorted); symbol values
+        // `:i` / `:f` → `:f | :i` (sorted by describe).
+        let si = i.intern(Type::Constant(Scalar::Sym("i".to_string())));
+        let sf = i.intern(Type::Constant(Scalar::Sym("f".to_string())));
+        let int_float = i.intern(Type::HashShape(vec![
+            ShapeMember { key: ShapeKey::Int(1), value: si, optional: false },
+            ShapeMember { key: ShapeKey::Float(1.0f64.to_bits()), value: sf, optional: false },
+        ]));
+        assert_eq!(erase_to_rbs_named(&i, int_float, &resolver), "Hash[Float | Integer, :f | :i]");
     }
 }
 

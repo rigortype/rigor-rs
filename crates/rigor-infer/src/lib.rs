@@ -38,6 +38,57 @@ fn empty_source() -> &'static SourceIndex {
     EMPTY.get_or_init(SourceIndex::default)
 }
 
+/// The value-pinned scalar key a hash-literal key NODE carries, or `None` when
+/// the key is dynamic (a computed expression, an interpolated string, a
+/// constant, a local, …). A faithful port of the reference `static_hash_key`:
+/// the accepted set is Symbol / String / Integer / Float / true / false / nil
+/// (`HashShape::ALLOWED_KEY_CLASSES`). Floats key by raw bits so `1.0` == `1.00`
+/// while `1` (an `Int`) stays a distinct key.
+fn static_shape_key_of_node(node: &Node) -> Option<ShapeKey> {
+    match node {
+        Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
+        Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
+        Node::IntegerLit { value, .. } => Some(ShapeKey::Int(*value)),
+        Node::FloatLit { value, .. } => Some(ShapeKey::Float(value.to_bits())),
+        Node::TrueLit { .. } => Some(ShapeKey::Bool(true)),
+        Node::FalseLit { .. } => Some(ShapeKey::Bool(false)),
+        Node::NilLit { .. } => Some(ShapeKey::Nil),
+        _ => None,
+    }
+}
+
+/// The [`ShapeKey`] a value-pinned [`Scalar`] denotes when used as a hash key.
+/// Every rigor-rs `Scalar` is a valid `HashShape` key (they are exactly the
+/// reference's `ALLOWED_KEY_CLASSES`), so this is total — used by the projection
+/// tier to resolve a `Constant`-typed argument to a lookup key and by `invert`
+/// to key on a member's value.
+fn scalar_to_shape_key(s: &Scalar) -> ShapeKey {
+    match s {
+        Scalar::Sym(v) => ShapeKey::Sym(v.clone()),
+        Scalar::Str(v) => ShapeKey::Str(v.clone()),
+        Scalar::Int(v) => ShapeKey::Int(*v),
+        Scalar::Float(f) => ShapeKey::Float(f.to_bits()),
+        Scalar::Bool(b) => ShapeKey::Bool(*b),
+        Scalar::Nil => ShapeKey::Nil,
+    }
+}
+
+/// The [`Scalar`] a [`ShapeKey`] denotes — the inverse of [`scalar_to_shape_key`],
+/// used by `HashShape#invert` to turn an original key back into a `Constant`
+/// value. `None` for the `Other` fallback (never built from a literal), so a
+/// projection that reaches it declines.
+fn shape_key_to_scalar(k: &ShapeKey) -> Option<Scalar> {
+    Some(match k {
+        ShapeKey::Sym(v) => Scalar::Sym(v.clone()),
+        ShapeKey::Str(v) => Scalar::Str(v.clone()),
+        ShapeKey::Int(v) => Scalar::Int(*v),
+        ShapeKey::Float(bits) => Scalar::Float(f64::from_bits(*bits)),
+        ShapeKey::Bool(b) => Scalar::Bool(*b),
+        ShapeKey::Nil => Scalar::Nil,
+        ShapeKey::Other => return None,
+    })
+}
+
 /// A flat name -> type binding environment, populated by `LocalVariableWrite`
 /// as the statement sequence is walked in order. Intentionally not
 /// flow-sensitive in this slice.
@@ -410,9 +461,15 @@ impl<'i> Typer<'i> {
     /// Build a value-pinned [`Type::HashShape`] from an all-assoc hash literal's
     /// flat `[k, v, k, v, …]` element list (guaranteed even by `all_assoc`), or
     /// fall back to the bare `Hash` nominal. A faithful port of the reference's
-    /// `static_hash_shape_for`: every key must be a static Symbol/String literal
-    /// and no key may repeat; a non-static or duplicate key degrades to `Hash`.
-    /// The empty list yields the empty `HashShape{}` (`{}`).
+    /// `static_hash_shape_for`: every key must be a value-pinned scalar literal
+    /// (Symbol / String / Integer / Float / true / false / nil — the reference's
+    /// `HashShape::ALLOWED_KEY_CLASSES`); a non-static key degrades to `Hash`.
+    ///
+    /// Duplicate keys are LAST-WINS, matching the runtime (`{ a: 1, a: 2 }` keeps
+    /// `a: 2`): the key keeps its FIRST insertion position while the value comes
+    /// from the LAST occurrence. Key identity is Ruby `Hash#eql?` (`1` ≠ `1.0`;
+    /// `1.0` == `1.00`), realised by [`ShapeKey`]'s derived equality. The empty
+    /// list yields the empty `HashShape{}` (`{}`).
     fn hash_shape_or_hash(
         &self,
         ast: &LoweredAst,
@@ -421,20 +478,20 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeId {
         let mut members: Vec<ShapeMember> = Vec::with_capacity(elem_ids.len() / 2);
-        let mut seen: std::collections::HashSet<ShapeKey> = std::collections::HashSet::new();
         let mut i = 0;
         while i + 1 < elem_ids.len() {
-            let key = match ast.get(elem_ids[i]) {
-                Node::SymbolLit { value, .. } => ShapeKey::Sym(value.clone()),
-                Node::StringLit { value, .. } => ShapeKey::Str(value.clone()),
-                // A dynamic / non-Symbol-or-String key can't pin a shape slot.
-                _ => return self.nominal_or_untyped("Hash", interner),
-            };
-            if !seen.insert(key.clone()) {
+            let Some(key) = static_shape_key_of_node(ast.get(elem_ids[i])) else {
+                // A dynamic / non-scalar key can't pin a shape slot.
                 return self.nominal_or_untyped("Hash", interner);
-            }
+            };
             let value = self.type_of(ast, elem_ids[i + 1], env, interner);
-            members.push(ShapeMember { key, value, optional: false });
+            // Last-wins: an existing key keeps its FIRST position, takes the LAST
+            // value; a new key appends in source order.
+            if let Some(m) = members.iter_mut().find(|m| m.key == key) {
+                m.value = value;
+            } else {
+                members.push(ShapeMember { key, value, optional: false });
+            }
             i += 2;
         }
         interner.intern(Type::HashShape(members))
@@ -542,6 +599,183 @@ impl<'i> Typer<'i> {
                     Some(nil(interner))
                 }
             }
+            _ => None,
+        }
+    }
+
+    /// The value-pinned scalar key an ARGUMENT node denotes, resolved through its
+    /// type (a `Constant` scalar → its [`ShapeKey`]), or `None` when the argument
+    /// is not statically a scalar. Mirrors the reference's `static_shape_key?`
+    /// gate over a `Type::Constant` argument (so a local bound to `:a` folds just
+    /// as a literal `:a` does). Non-literal / dynamic arguments decline.
+    fn hash_arg_key(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<ShapeKey> {
+        let ty = self.type_of(ast, id, env, interner);
+        match interner.get(ty) {
+            Type::Constant(s) => Some(scalar_to_shape_key(s)),
+            _ => None,
+        }
+    }
+
+    /// The value type a `HashShape` member holds under a `[]`/`dig`/`values_at`
+    /// read: its declared value for a required key, `value | nil` for an optional
+    /// key, and `Constant[nil]` for a missing key (Ruby's `Hash#[]` / `#dig`
+    /// return nil, not a raise). rigor-rs never builds optional members today, so
+    /// the optional arm is defensive parity with the reference `hash_dig_step`.
+    fn hash_read_step(
+        &self,
+        members: &[ShapeMember],
+        key: &ShapeKey,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match members.iter().find(|m| &m.key == key) {
+            Some(m) if !m.optional => m.value,
+            Some(m) => {
+                let value = m.value;
+                let nil = interner.intern(Type::Constant(Scalar::Nil));
+                rigor_types::Algebra::join(interner, value, nil)
+            }
+            None => interner.intern(Type::Constant(Scalar::Nil)),
+        }
+    }
+
+    /// Fold a static-key access / projection on a value-pinned `HashShape`
+    /// receiver to its precise member type — a faithful port of the reference
+    /// `ShapeDispatch`'s HashShape catalogue (the subset spec'd for this slice:
+    /// `[]`, `fetch`, `dig`, `has_key?`/`key?`/`member?`/`include?`, `slice`,
+    /// `except`, `values_at`, `invert`). `None` declines (leaves the RBS `Hash`
+    /// tier to answer, and a typo'd method to witness). Every fold gates on a
+    /// value-pinned scalar KEY argument (`static_shape_key?`); a non-literal key
+    /// declines. Key identity is `ShapeKey` equality = Ruby `Hash#eql?`.
+    ///
+    /// Missing-key policy matches the runtime: `[]`/`dig`/`values_at` surface
+    /// `Constant[nil]`, while `fetch` (no default, no block) DECLINES on a miss
+    /// because Ruby raises `KeyError` — we prefer the conservative RBS answer.
+    fn fold_hash_shape_projection(
+        &self,
+        recv_ty: TypeId,
+        method: &str,
+        ast: &LoweredAst,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let members = match interner.get(recv_ty) {
+            Type::HashShape(m) => m.clone(),
+            _ => return None,
+        };
+
+        match method {
+            // `h[k]` / `h.fetch(k)` — a single static scalar key. `[]` surfaces
+            // `Constant[nil]` for a missing key; `fetch` declines on a miss (it
+            // would raise `KeyError`).
+            "[]" | "fetch" if args.len() == 1 => {
+                let key = self.hash_arg_key(ast, args[0], env, interner)?;
+                let present = members.iter().any(|m| m.key == key);
+                if method == "fetch" && !present {
+                    return None;
+                }
+                Some(self.hash_read_step(&members, &key, interner))
+            }
+
+            // `h.dig(k, …)` — a chain of static keys. Each step reads the key
+            // (missing → `Constant[nil]`, Ruby's `Hash#dig` short-circuits on
+            // nil); an intermediate `HashShape` recurses, a `Constant[nil]`
+            // ends the chain, anything else declines.
+            "dig" if !args.is_empty() => {
+                let key = self.hash_arg_key(ast, args[0], env, interner)?;
+                let step = self.hash_read_step(&members, &key, interner);
+                if args.len() == 1 {
+                    return Some(step);
+                }
+                if matches!(interner.get(step), Type::HashShape(_)) {
+                    return self
+                        .fold_hash_shape_projection(step, "dig", ast, &args[1..], env, interner);
+                }
+                if matches!(interner.get(step), Type::Constant(Scalar::Nil)) {
+                    return Some(step);
+                }
+                None
+            }
+
+            // `h.has_key?(k)` (and aliases) — folds to a precise bool from the
+            // statically known key set.
+            "has_key?" | "key?" | "member?" | "include?" if args.len() == 1 => {
+                let key = self.hash_arg_key(ast, args[0], env, interner)?;
+                let present = members.iter().any(|m| m.key == key);
+                Some(interner.intern(Type::Constant(Scalar::Bool(present))))
+            }
+
+            // `h.values_at(k, …)` — a `Tuple` of the per-key values (missing key
+            // → `Constant[nil]`), in ARGUMENT order.
+            "values_at" if !args.is_empty() => {
+                let mut keys = Vec::with_capacity(args.len());
+                for &a in args {
+                    keys.push(self.hash_arg_key(ast, a, env, interner)?);
+                }
+                let vals: Vec<TypeId> =
+                    keys.iter().map(|k| self.hash_read_step(&members, k, interner)).collect();
+                Some(interner.intern(Type::Tuple(vals)))
+            }
+
+            // `h.slice(k, …)` — a sub-shape of the requested keys that are
+            // present, in ARGUMENT order (Ruby `Hash#slice` semantics); missing
+            // keys are silently omitted, duplicates deduped.
+            "slice" if !args.is_empty() => {
+                let mut keys = Vec::with_capacity(args.len());
+                for &a in args {
+                    keys.push(self.hash_arg_key(ast, a, env, interner)?);
+                }
+                let mut out: Vec<ShapeMember> = Vec::new();
+                for key in &keys {
+                    if out.iter().any(|m| &m.key == key) {
+                        continue;
+                    }
+                    if let Some(m) = members.iter().find(|m| &m.key == key) {
+                        out.push(m.clone());
+                    }
+                }
+                Some(interner.intern(Type::HashShape(out)))
+            }
+
+            // `h.except(k, …)` — the receiver shape minus the named keys, keeping
+            // RECEIVER order; keys not present are ignored.
+            "except" if !args.is_empty() => {
+                let mut excluded = Vec::with_capacity(args.len());
+                for &a in args {
+                    excluded.push(self.hash_arg_key(ast, a, env, interner)?);
+                }
+                let out: Vec<ShapeMember> =
+                    members.iter().filter(|m| !excluded.contains(&m.key)).cloned().collect();
+                Some(interner.intern(Type::HashShape(out)))
+            }
+
+            // `h.invert` — swap keys and values. Folds only when every value is a
+            // `Constant` usable as a key; a duplicate value would alias under
+            // inversion, so a collision DECLINES (matching the reference).
+            "invert" if args.is_empty() => {
+                let mut out: Vec<ShapeMember> = Vec::with_capacity(members.len());
+                for m in &members {
+                    let vs = match interner.get(m.value) {
+                        Type::Constant(s) => s.clone(),
+                        _ => return None,
+                    };
+                    let new_key = scalar_to_shape_key(&vs);
+                    if out.iter().any(|o| o.key == new_key) {
+                        return None;
+                    }
+                    let orig = shape_key_to_scalar(&m.key)?;
+                    let new_val = interner.intern(Type::Constant(orig));
+                    out.push(ShapeMember { key: new_key, value: new_val, optional: false });
+                }
+                Some(interner.intern(Type::HashShape(out)))
+            }
+
             _ => None,
         }
     }
@@ -683,6 +917,19 @@ impl<'i> Typer<'i> {
         // Only reached for BLOCK-FREE calls (the Call arm routes block calls to
         // `type_block_call`), so a block form never mis-folds here.
         if let Some(folded) = self.fold_tuple_projection(recv_ty, method, ast, args, env, interner) {
+            return folded;
+        }
+
+        // Tier 2b: value-pinned shape projection on a `HashShape` receiver
+        // (reference ShapeDispatch's HashShape catalogue). A static-key lookup /
+        // slice / inversion folds to the precise member type — `{ a: 1 }[:a]` →
+        // `1`, `{ a: 1 }.has_key?(:a)` → `true`. Declines (→ None) on any
+        // uncertainty, so the RBS `Hash` dispatch below still answers (and a
+        // typo'd method still witnesses via `class_name_of(HashShape) == Hash`).
+        // Block-free only (block calls never reach `type_call`), so no over-fold.
+        if let Some(folded) =
+            self.fold_hash_shape_projection(recv_ty, method, ast, args, env, interner)
+        {
             return folded;
         }
 
@@ -2203,6 +2450,249 @@ mod tests {
             .unwrap();
         let ty = typer.type_of(&ast, hash, &env, &mut i);
         assert_eq!(idx.class_name_of(&i, ty), Some("Hash"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Scalar-key HashShape (ADR-0038 slice 2). Widened key set, last-wins
+    // duplicate keys, and the HashShape projection tier.
+    // ---------------------------------------------------------------------
+
+    fn find_hash(ast: &LoweredAst) -> NodeId {
+        ast.iter()
+            .find_map(|(id, n)| matches!(n, Node::HashLit { .. }).then_some(id))
+            .expect("expected a hash literal")
+    }
+
+    fn hash_members(ty: &Type) -> &[ShapeMember] {
+        match ty {
+            Type::HashShape(m) => m,
+            other => panic!("expected HashShape, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hash_shape_pins_widened_scalar_keys() {
+        // Integer / Float / true / false / nil keys now pin shape slots (the
+        // reference's widened ALLOWED_KEY_CLASSES), alongside Symbol / String.
+        let ast = lower_src(b"{ 1 => 2, 1.5 => 3, true => 4, false => 5, nil => 6, :s => 7, \"k\" => 8 }\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let hash = find_hash(&ast);
+        let ty = typer.type_of(&ast, hash, &env, &mut i);
+        let keys: Vec<ShapeKey> = hash_members(i.get(ty)).iter().map(|m| m.key.clone()).collect();
+        assert_eq!(
+            keys,
+            vec![
+                ShapeKey::Int(1),
+                ShapeKey::Float(1.5f64.to_bits()),
+                ShapeKey::Bool(true),
+                ShapeKey::Bool(false),
+                ShapeKey::Nil,
+                ShapeKey::Sym("s".into()),
+                ShapeKey::Str("k".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_last_wins_keeps_first_position_last_value() {
+        // `{ a: 1, b: 2, a: 3 }` — `a` keeps its FIRST position but takes the
+        // LAST value (runtime last-wins), so members are [a=3, b=2].
+        let ast = lower_src(b"{ a: 1, b: 2, a: 3 }\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let ty = typer.type_of(&ast, find_hash(&ast), &env, &mut i);
+        let m = hash_members(i.get(ty));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].key, ShapeKey::Sym("a".into()));
+        assert_eq!(i.get(m[0].value), &Type::Constant(Scalar::Int(3)));
+        assert_eq!(m[1].key, ShapeKey::Sym("b".into()));
+        assert_eq!(i.get(m[1].value), &Type::Constant(Scalar::Int(2)));
+    }
+
+    #[test]
+    fn hash_dup_integer_key_last_wins() {
+        let ast = lower_src(b"{ 1 => 1, 1 => 9 }\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let ty = typer.type_of(&ast, find_hash(&ast), &env, &mut i);
+        let m = hash_members(i.get(ty));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].key, ShapeKey::Int(1));
+        assert_eq!(i.get(m[0].value), &Type::Constant(Scalar::Int(9)));
+    }
+
+    #[test]
+    fn hash_float_keys_collide_by_value() {
+        // `1.0` and `1.00` are the same f64 → one key, last value wins.
+        let ast = lower_src(b"{ 1.0 => :a, 1.00 => :b }\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let ty = typer.type_of(&ast, find_hash(&ast), &env, &mut i);
+        let m = hash_members(i.get(ty));
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].key, ShapeKey::Float(1.0f64.to_bits()));
+        assert_eq!(i.get(m[0].value), &Type::Constant(Scalar::Sym("b".into())));
+    }
+
+    #[test]
+    fn hash_int_and_float_keys_are_distinct() {
+        // `1` (Int) and `1.0` (Float) are DISTINCT keys (`1.eql?(1.0)` is false).
+        let ast = lower_src(b"{ 1 => :i, 1.0 => :f }\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let ty = typer.type_of(&ast, find_hash(&ast), &env, &mut i);
+        let m = hash_members(i.get(ty));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].key, ShapeKey::Int(1));
+        assert_eq!(m[1].key, ShapeKey::Float(1.0f64.to_bits()));
+    }
+
+    #[test]
+    fn hash_dynamic_key_degrades_to_hash_nominal() {
+        // A non-literal key (a method call) can't pin a slot → bare `Hash`.
+        let ast = lower_src(b"{ foo => 1 }\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let ty = typer.type_of(&ast, find_hash(&ast), &env, &mut i);
+        assert_eq!(idx.class_name_of(&i, ty), Some("Hash"));
+    }
+
+    /// Type the outermost call in `src` (a `v = <hash>.<call>` line).
+    fn type_of_projection(src: &[u8], method: &str) -> (Interner, TypeId) {
+        let ast = lower_src(src);
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, method);
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        (i, ty)
+    }
+
+    #[test]
+    fn hash_index_folds_present_and_missing_keys() {
+        // h07: `{ a: 1, b: "s" }[:b]` → `"s"`; a missing key → `nil`.
+        let (i, ty) = type_of_projection(b"v = { a: 1, b: \"s\" }[:b]\n", "[]");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Str("s".into())));
+        let (i, ty) = type_of_projection(b"v = { a: 1 }[:z]\n", "[]");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Nil));
+    }
+
+    #[test]
+    fn hash_index_on_integer_key_folds() {
+        let (i, ty) = type_of_projection(b"v = { 1 => \"x\" }[1]\n", "[]");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Str("x".into())));
+    }
+
+    #[test]
+    fn hash_fetch_present_folds_missing_declines() {
+        // h08: `.fetch(:a)` folds to the value; a miss DECLINES (KeyError) →
+        // the RBS Hash tier answers (not a folded Constant).
+        let (i, ty) = type_of_projection(b"v = { a: 1 }.fetch(:a)\n", "fetch");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
+        let (i, ty) = type_of_projection(b"v = { a: 1 }.fetch(:z)\n", "fetch");
+        assert!(!matches!(i.get(ty), Type::Constant(_)), "fetch miss must not fold to a Constant");
+    }
+
+    #[test]
+    fn hash_has_key_folds_to_bool() {
+        // h09: `.has_key?` / aliases fold to a precise bool.
+        for (src, expect) in [
+            (b"v = { a: 1 }.has_key?(:a)\n".as_slice(), true),
+            (b"v = { a: 1 }.has_key?(:z)\n".as_slice(), false),
+        ] {
+            let (i, ty) = type_of_projection(src, "has_key?");
+            assert_eq!(i.get(ty), &Type::Constant(Scalar::Bool(expect)));
+        }
+        let (i, ty) = type_of_projection(b"v = { a: 1 }.key?(:a)\n", "key?");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Bool(true)));
+        let (i, ty) = type_of_projection(b"v = { a: 1 }.include?(:z)\n", "include?");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Bool(false)));
+    }
+
+    #[test]
+    fn hash_values_at_folds_to_tuple_in_arg_order() {
+        // `{ a: 1, b: 2 }.values_at(:b, :z, :a)` → Tuple[2, nil, 1].
+        let (i, ty) = type_of_projection(b"v = { a: 1, b: 2 }.values_at(:b, :z, :a)\n", "values_at");
+        let Type::Tuple(elems) = i.get(ty) else { panic!("expected Tuple, got {:?}", i.get(ty)) };
+        let got: Vec<Type> = elems.iter().map(|&e| i.get(e).clone()).collect();
+        assert_eq!(
+            got,
+            vec![
+                Type::Constant(Scalar::Int(2)),
+                Type::Constant(Scalar::Nil),
+                Type::Constant(Scalar::Int(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn hash_slice_keeps_present_keys_in_arg_order() {
+        // `{ a: 1, b: 2, c: 3 }.slice(:c, :a)` → { c: 3, a: 1 } (arg order).
+        let (i, ty) = type_of_projection(b"v = { a: 1, b: 2, c: 3 }.slice(:c, :a)\n", "slice");
+        let m = hash_members(i.get(ty));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].key, ShapeKey::Sym("c".into()));
+        assert_eq!(m[1].key, ShapeKey::Sym("a".into()));
+    }
+
+    #[test]
+    fn hash_except_drops_keys_in_receiver_order() {
+        let (i, ty) = type_of_projection(b"v = { a: 1, b: 2, c: 3 }.except(:b)\n", "except");
+        let keys: Vec<ShapeKey> = hash_members(i.get(ty)).iter().map(|m| m.key.clone()).collect();
+        assert_eq!(keys, vec![ShapeKey::Sym("a".into()), ShapeKey::Sym("c".into())]);
+    }
+
+    #[test]
+    fn hash_invert_swaps_keys_and_values() {
+        // `{ a: 1, b: 2 }.invert` → { 1 => :a, 2 => :b }.
+        let (i, ty) = type_of_projection(b"v = { a: 1, b: 2 }.invert\n", "invert");
+        let m = hash_members(i.get(ty));
+        assert_eq!(m.len(), 2);
+        assert_eq!(m[0].key, ShapeKey::Int(1));
+        assert_eq!(i.get(m[0].value), &Type::Constant(Scalar::Sym("a".into())));
+        assert_eq!(m[1].key, ShapeKey::Int(2));
+        assert_eq!(i.get(m[1].value), &Type::Constant(Scalar::Sym("b".into())));
+    }
+
+    #[test]
+    fn hash_invert_declines_on_value_collision() {
+        // A duplicate VALUE would alias under inversion → decline (falls to RBS,
+        // not a folded HashShape).
+        let (i, ty) = type_of_projection(b"v = { a: 1, b: 1 }.invert\n", "invert");
+        assert!(!matches!(i.get(ty), Type::HashShape(_)), "collision must not fold to a HashShape");
+    }
+
+    #[test]
+    fn hash_dig_folds_single_and_nested_chains() {
+        let (i, ty) = type_of_projection(b"v = { a: 1 }.dig(:a)\n", "dig");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
+        let (i, ty) = type_of_projection(b"v = { a: { b: 5 } }.dig(:a, :b)\n", "dig");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(5)));
+        // A missing key mid-chain short-circuits to nil.
+        let (i, ty) = type_of_projection(b"v = { a: { b: 5 } }.dig(:a, :z)\n", "dig");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Nil));
+    }
+
+    #[test]
+    fn hash_projection_declines_on_dynamic_key() {
+        // A non-literal key argument declines the fold (reference gates on a
+        // value-pinned Constant key), so the RBS Hash tier answers.
+        let (i, ty) = type_of_projection(b"v = { a: 1 }[foo]\n", "[]");
+        assert!(!matches!(i.get(ty), Type::Constant(Scalar::Int(1))));
     }
 
     #[test]
