@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/46_return_in_ensure.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 40,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `do_work`. If a project file defines `do_work` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.return-in-ensure",
+      "line": 12,
+      "column": 5,
+      "severity": "warning",
+      "message": "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+    },
+    {
+      "rule": "flow.return-in-ensure",
+      "line": 19,
+      "column": 18,
+      "severity": "warning",
+      "message": "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+    },
+    {
+      "rule": "flow.return-in-ensure",
+      "line": 26,
+      "column": 12,
+      "severity": "warning",
+      "message": "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+    },
+    {
+      "rule": "flow.return-in-ensure",
+      "line": 33,
+      "column": 5,
+      "severity": "warning",
+      "message": "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+    },
+    {
+      "rule": "flow.return-in-ensure",
+      "line": 34,
+      "column": 5,
+      "severity": "warning",
+      "message": "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+    },
+    {
+      "rule": "flow.return-in-ensure",
+      "line": 42,
+      "column": 3,
+      "severity": "warning",
+      "message": "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+    }
+  ]
+}

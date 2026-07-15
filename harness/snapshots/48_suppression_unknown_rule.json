@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/48_suppression_unknown_rule.rb",
+  "diagnostics": [
+    {
+      "rule": "suppression.unknown-rule",
+      "line": 6,
+      "column": 9,
+      "severity": "warning",
+      "message": "unknown rule `call.no-such-rule` in `# rigor:disable` — the token matches no known rule, alias, or family, so this suppression has no effect. Likely a typo; `rigor explain <rule>` lists the canonical ids."
+    },
+    {
+      "rule": "suppression.unknown-rule",
+      "line": 7,
+      "column": 9,
+      "severity": "warning",
+      "message": "unknown rule `call.bogus-one` in `# rigor:disable` — the token matches no known rule, alias, or family, so this suppression has no effect. Likely a typo; `rigor explain <rule>` lists the canonical ids."
+    },
+    {
+      "rule": "suppression.unknown-rule",
+      "line": 7,
+      "column": 9,
+      "severity": "warning",
+      "message": "unknown rule `call.bogus-two` in `# rigor:disable` — the token matches no known rule, alias, or family, so this suppression has no effect. Likely a typo; `rigor explain <rule>` lists the canonical ids."
+    }
+  ]
+}

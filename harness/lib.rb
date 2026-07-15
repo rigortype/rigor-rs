@@ -201,6 +201,10 @@ module RigorHarness
       ]
 
       stdout, _stderr, _status = Open3.capture3(*cmd, chdir: tmpdir)
+      # Diagnostic messages can carry non-ASCII (e.g. the em-dash in
+      # `suppression.unknown-rule`); Open3 hands back ASCII-8BIT, so tag UTF-8
+      # before slicing/parsing or `JSON.parse` raises on the raw bytes.
+      stdout = stdout.dup.force_encoding("UTF-8")
 
       json_start = stdout.index("{")
       return [] if json_start.nil?
@@ -251,6 +255,10 @@ module RigorHarness
   # defaults to `"error"`; diagnostics are filtered to parity severities and the
   # fixture file.
   def parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
+    # Tag UTF-8 (Open3 returns ASCII-8BIT) so a non-ASCII message byte such as
+    # the em-dash in `suppression.unknown-rule` does not break `JSON.parse`.
+    stdout = stdout.dup.force_encoding("UTF-8")
+    stderr = stderr.dup.force_encoding("UTF-8")
     output = stdout.strip.empty? ? stderr.strip : stdout.strip
     return [] if output.strip.empty?
 
@@ -402,7 +410,7 @@ module RigorHarness
       abort("ERROR: missing snapshot #{path}\n" \
             "  Regenerate with: ruby harness/snapshot.rb (needs the reference checkout).")
     end
-    data = JSON.parse(File.read(path))
+    data = JSON.parse(File.read(path, encoding: "UTF-8"))
     Array(data["diagnostics"])
   end
 
