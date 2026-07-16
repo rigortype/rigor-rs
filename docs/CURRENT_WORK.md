@@ -14,6 +14,21 @@ source-class naming → Data.define/Struct class shells; sound-superset parity m
 "Generative-tool parity"**). Then PIVOTED to productization (MCP `sig_gen` tool). Read `AGENTS.md` "Working
 discipline" before continuing.
 
+**▶▶ LANDED (2026-07-17, branch `constant-shadow-gate`, MERGED) — C1+C2+C5: the largest single coverage win of
+the port (gitlab-foss lib undefined-method gaps 356 → 200, −156, 0 FP; mastodon matched 397 → 404).** From the
+first-ever UM/PN cause-classification on gitlab lib (specs:
+[constant-shadow-gate-spec](notes/20260717-constant-shadow-gate-spec.md)). **C1 (−132, measured):** the
+ConstantRead suppression matched the BARE written name project-wide, so one nested `module Time` killed all
+`Time.*` witnessing batch-wide; now lexically gated (toplevel suppresses everywhere; nested only where visible)
+— a strict relaxation, FP-free by construction. **C2 (−21):** parameter default-value expressions are now
+lowered and walked (params stay unbound — literal/const receivers only). **C5 (−3):** single-assignment
+fully-literal `CONST =` harvest, lexically gated (the first draft's bare-name harvest produced 2 measured FPs
+via a Concern constant — caught by the per-part fp_audit gate and fixed before landing; Range consts remain
+inert — Range is outside the 9-class witnessing surface, so the estimated ~24 C5 pool was Range-dominated and
+mostly stays open). Remaining UM 200 is AS-overlay-dominated + C3a (Module#name→String tier-3 optional-unwrap,
+~42, next bounded candidate); PN 169 stays ~75% Tier B/C-blocked (P2 straight-line optional-local slice ~15-20
+borderline). harness 63 fixtures / 173 matched; 725 tests.
+
 **▶▶ LANDED (2026-07-16, branch `ivar-write-mismatch`, MERGED `a2098d7`) — `def.ivar-write-mismatch` ported
 (the BOUNDED half of the unported-rule pair).** Sonnet investigation verdict
 ([spec](notes/20260716-ivar-write-mismatch-spec.md)): ivar-write-mismatch BOUNDED (ships on existing
