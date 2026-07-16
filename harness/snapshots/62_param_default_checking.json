@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/62_param_default_checking.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 14,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `current' for singleton(Time)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `current' for singleton(Time)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `frobz' for \"abc\""
+    }
+  ]
+}
