@@ -417,6 +417,7 @@ impl<'i> Typer<'i> {
             Node::LocalVariableWrite { value, .. }
             | Node::LocalVariableOpWrite { value, .. }
             | Node::VariableWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
             | Node::ConstantWrite { value, .. } => {
                 let value = *value;
                 self.type_of(ast, value, env, interner)
@@ -872,10 +873,30 @@ impl<'i> Typer<'i> {
         }
 
         // The remaining folds (`format`/`sprintf`/`String`/`Integer`/`Float`)
-        // require EVERY argument to be a value-pinned `Constant` scalar. A
-        // non-constant argument means we cannot prove the folded value, so we
-        // decline (silent — a gap, never a wrong constant).
-        let scalars = self.pin_arg_scalars(ast, args, env, interner)?;
+        // fold to a value-pinned `Constant` only when EVERY argument is itself a
+        // value-pinned `Constant` scalar.
+        let pinned = self.pin_arg_scalars(ast, args, env, interner);
+
+        // NOMINAL fallback (ADR ivar-write-mismatch increment b): when the args
+        // are NOT all value-pinned, the three CLASS conversions still type to
+        // their conversion class UNCONDITIONALLY — the reference's RBS pins
+        // `Integer(...) -> Integer`, `Float(...) -> Float`, `String(...) -> String`
+        // regardless of whether the argument folds (probed: `Float(x).bogus`
+        // witnesses on Float; `@d = Float(kwargs[:k]); @d = 0` flags Float→Integer).
+        // Gated on an arity the conversion accepts so a wrong-arity call (which
+        // raises at runtime) stays unfolded. `format`/`sprintf` need real
+        // constants (no nominal form) and `Hash` was handled above, so they keep
+        // declining. The existing shadow-def / splat guards above already ran, so
+        // this preserves the reference's FP envelope (a `def Float` in the file
+        // still declines — an FP-safe under-emit).
+        if pinned.is_none() {
+            let nominal_class = match (method, args.len()) {
+                ("String", 1) | ("Float", 1) | ("Integer", 1 | 2) => Some(method),
+                _ => None,
+            };
+            return nominal_class.map(|class| self.nominal_or_untyped(class, interner));
+        }
+        let scalars = pinned?;
         let folded: Scalar = match method {
             "format" | "sprintf" => {
                 // Template = first arg (a Constant string); the rest are the

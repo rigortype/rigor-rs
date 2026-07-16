@@ -189,6 +189,14 @@ pub struct HashKey {
 pub struct RescueClause {
     pub exceptions: Vec<NodeId>,
     pub body: Vec<NodeId>,
+    /// The name of the `=> e` bound exception variable, if present (Prism
+    /// `RescueNode#reference`, a `LocalVariableTargetNode`). `None` for a clause
+    /// with no `=>` capture. Consumed by `def.ivar-write-mismatch` (increment a):
+    /// inside the clause body, a read of this name types to the clause's single
+    /// resolvable exception class, so `@x = "s"; rescue C => e; @x = e` flags the
+    /// `String → C` drift. Populated only from a real `BeginNode` rescue chain
+    /// (empty for the reused carriers).
+    pub bound_name: Option<String>,
     pub span: Span,
 }
 
@@ -487,9 +495,30 @@ pub enum Node {
     /// `Dynamic[top]` — no ivar/cvar/gvar type tracking in this slice.
     // TODO(spec): ivar typing (ADR-0022).
     VariableRead { span: Span },
-    /// An instance/class/global variable write (`@x = v`). The value is lowered
+    /// A class/global variable write (`@@x = v`, `$x = v`). The value is lowered
     /// (so a call in the assigned expression is analysed). Not a value itself.
+    /// An INSTANCE variable write (`@x = v`) lowers to the dedicated
+    /// [`Node::InstanceVariableWrite`] instead (it carries the name the
+    /// `def.ivar-write-mismatch` rule groups on); this nameless variant keeps
+    /// covering the class-var / global-var writes, which no rule inspects by name.
     VariableWrite { value: NodeId, span: Span },
+    /// An instance variable write (`@x = v`). Lowered as a dedicated variant
+    /// (mirroring [`Node::LocalVariableWrite`]) so the `def.ivar-write-mismatch`
+    /// collector can see the target NAME + its value's type — Prism would
+    /// otherwise fold it into the nameless [`Node::VariableWrite`], losing the
+    /// name. `name` includes the leading `@` (Prism `InstanceVariableWriteNode#name`
+    /// is `:@x`), matching the reference message's `@x` spelling. `name_span` is
+    /// the precise span of the `@x` name token (Prism `name_loc`) — the anchor the
+    /// diagnostic keys on (the reference's `Diagnostic.from_name_loc`). `value` is
+    /// lowered (so a call in the assigned expression stays reachable). Not a value
+    /// itself (`x = (@y = 5)` types via the RHS at the [`Node::VariableWrite`]-shaped
+    /// consumers, which include this variant).
+    InstanceVariableWrite {
+        name: String,
+        value: NodeId,
+        name_span: Span,
+        span: Span,
+    },
     /// A constant read (`Foo`, `Foo::Bar`). For a path, the parent scope is
     /// lowered. `name` is the dotted constant path (`"Foo"`, `"Foo::Bar"`), kept
     /// so a `X.new` call can resolve `X` to a class name WITHOUT typing the bare
@@ -558,6 +587,7 @@ impl Node {
             | Node::Range { span }
             | Node::VariableRead { span }
             | Node::VariableWrite { span, .. }
+            | Node::InstanceVariableWrite { span, .. }
             | Node::ConstantRead { span, .. }
             | Node::ConstantWrite { span, .. }
             | Node::SelfExpr { span }
@@ -1247,9 +1277,14 @@ impl<'src> Builder<'src> {
                     body.extend(ids.iter().copied());
                     clause_body = ids;
                 }
+                let bound_name = r
+                    .reference()
+                    .and_then(|reference| reference.as_local_variable_target_node())
+                    .map(|target| constant_string(target.name().as_slice()));
                 clauses.push(RescueClause {
                     exceptions,
                     body: clause_body,
+                    bound_name,
                     span: span_of(&r.location()),
                 });
                 rescue = r.subsequent();
@@ -1389,9 +1424,12 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(ivw) = node.as_instance_variable_write_node() {
+            let name = constant_string(ivw.name().as_slice());
             let value = self.lower_node(&ivw.value());
-            return self.push(Node::VariableWrite {
+            return self.push(Node::InstanceVariableWrite {
+                name,
                 value,
+                name_span: span_of(&ivw.name_loc()),
                 span: span_of(&ivw.location()),
             });
         }
@@ -2386,7 +2424,9 @@ mod tests {
     fn lowers_ivar_and_constant_writes_recursively() {
         // The assigned value's call must be lowered.
         let iv = lower(&crate::parse(b"@x = a.foo\n"));
-        assert!(iv.iter().any(|(_, n)| matches!(n, Node::VariableWrite { .. })));
+        assert!(iv.iter().any(
+            |(_, n)| matches!(n, Node::InstanceVariableWrite { name, .. } if name == "@x")
+        ));
         assert!(has_call(&iv, "foo"));
         let cw = lower(&crate::parse(b"FOO = a.bar\n"));
         assert!(cw.iter().any(|(_, n)| matches!(n, Node::ConstantWrite { .. })));

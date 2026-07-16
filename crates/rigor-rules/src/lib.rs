@@ -201,6 +201,16 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-empty",
         }),
+        DEF_IVAR_WRITE_MISMATCH => Some(&RuleEntry {
+            // Authored `:error`; balanced profile stamps it `:warning` (lenient
+            // warning, strict error). rigor-rs emits the balanced-default severity
+            // directly, so the catalog default is `warning` — matching the oracle's
+            // default text output. Evidence tier `high` (concrete static class of
+            // each write, no metaprogramming escape).
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-ivar-write-mismatch",
+        }),
         _ => None,
     }
 }
@@ -320,6 +330,34 @@ pub const SUPPRESSION_UNKNOWN_RULE: &str = "suppression.unknown-rule";
 /// `suppression.empty` (v0.3.0): a bare `# rigor:disable[-file]` marker with no
 /// rule tokens (only whitespace/commas after it) — it suppresses nothing.
 pub const SUPPRESSION_EMPTY: &str = "suppression.empty";
+
+/// `def.ivar-write-mismatch` (since 0.1.2): within one class's instance methods,
+/// the same instance variable `@x` is assigned two DIFFERENT concrete classes —
+/// a likely type-confusion bug (`@x = "s"` then `@x = 42`). A faithful port of
+/// the reference `IvarWriteCollector` + `ivar_mismatch_diagnostics_for`.
+///
+/// Collector: over every ClassDef/ModuleDef reachable through class/module bodies,
+/// each DIRECT instance `def`'s body is scanned for plain `@x = value` writes
+/// (barriers at nested def/class/module; singleton `def self.x` bodies skipped;
+/// op-writes `@x ||=`/`@x +=` and `self.x=` are NOT ivar writes and never
+/// collected), grouped by (qualified class name, ivar name). The class of a write
+/// is `CoreIndex::class_name_of` of its rvalue type with `TrueClass`/`FalseClass`
+/// folded to `"bool"` (the boolean-flag idiom `@on = false; @on = true` stays
+/// silent).
+///
+/// Firing (per group of ≥2 writes): the CANONICAL class is the first write whose
+/// class is not `NilClass` (leading `@x = nil` placeholders are skipped); if that
+/// canonical write's class is unresolvable (Dynamic / union / a non-core Nominal),
+/// the WHOLE group is silent. Every LATER write fires iff its class resolves, is
+/// not `NilClass` (the clear-to-nil idiom is always silent), and differs from the
+/// canonical class. Anchored on the offending write's `@x` name token.
+///
+/// Two increments feed the two confirmed corpus gaps: (a) a `rescue C => e` /
+/// bare `rescue => e` binds `e` to the (single, resolvable) exception class within
+/// the clause body, so `@e = "s"; rescue StandardError => e; @e = e` flags
+/// String→StandardError; (b) `Integer()`/`Float()`/`String()` on a non-constant
+/// argument types NOMINALLY to the conversion class (increment lives in the typer).
+pub const DEF_IVAR_WRITE_MISMATCH: &str = "def.ivar-write-mismatch";
 
 /// `call.raise-non-exception` (v0.3.0): an implicit-self `raise` / `fail` whose
 /// first positional argument's statically-inferred type is provably NOT a legal
@@ -621,6 +659,15 @@ pub fn analyze_with_source_and_folder(
     // Ninth pass — `flow.return-in-ensure` (v0.3.0). Purely syntactic with a
     // frame-aware envelope: walk every `begin/ensure`'s ensure body for `return`s.
     return_in_ensure_diagnostics(ast, &mut out);
+
+    // Tenth pass — `def.ivar-write-mismatch` (since 0.1.2). Groups each class's
+    // instance-method `@x = value` writes by (qualified class, ivar) and fires
+    // when a later write's concrete class differs from the canonical one. Types
+    // each rvalue through the shared typer (empty local env) plus the rescue-bound
+    // exception resolution (increment a); the `Integer()`/`Float()`/`String()`
+    // NOMINAL fold (increment b) lives in the typer, so it flows through
+    // `type_of` transparently here.
+    ivar_write_mismatch_diagnostics(ast, interner, index, source, &typer, &mut out);
 
     out
 }
@@ -1920,6 +1967,257 @@ fn descend_trailing(ast: &LoweredAst, id: rigor_parse::NodeId) -> Option<rigor_p
     }
 }
 
+// ---------------------------------------------------------------------------
+// `def.ivar-write-mismatch` — faithful port of `IvarWriteCollector` +
+// `ivar_mismatch_diagnostics_for` + `ivar_class_for`.
+// ---------------------------------------------------------------------------
+
+/// One collected `@x = value` write: the rvalue node to type, the `@x` name-token
+/// span the diagnostic anchors on, and the write's byte span (for the rescue-scope
+/// lookup of increment a).
+struct IvarWrite {
+    value: rigor_parse::NodeId,
+    name_span: rigor_parse::Span,
+    span: rigor_parse::Span,
+}
+
+/// A resolved rescue binding in effect over a clause body (increment a): within
+/// `clause_span`, a read of `bound_name` types to `exception_class`.
+struct RescueBinding {
+    clause_span: rigor_parse::Span,
+    bound_name: String,
+    exception_class: String,
+}
+
+/// Collect the resolvable rescue bindings: a single-class `rescue C => e` (whose
+/// `C` names a core- or project-known class) binds `e` to `C`; a bare `rescue => e`
+/// binds `e` to `StandardError`. A multi-class `rescue A, B => e` binds a union
+/// the reference cannot name to a single concrete class, so it is NOT recorded
+/// (the write stays silent) — probed against the oracle. An unresolvable exception
+/// constant is likewise skipped (a coverage gap, FP-safe).
+fn collect_rescue_bindings(
+    ast: &LoweredAst,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Vec<RescueBinding> {
+    let mut out = Vec::new();
+    for (_, n) in ast.iter() {
+        let Node::BeginRescue { clauses, .. } = n else {
+            continue;
+        };
+        for clause in clauses {
+            let Some(bound_name) = &clause.bound_name else {
+                continue;
+            };
+            let exception_class = match clause.exceptions.as_slice() {
+                // Bare `rescue => e` catches `StandardError`.
+                [] => {
+                    if index.knows_class("StandardError") {
+                        Some("StandardError".to_string())
+                    } else {
+                        None
+                    }
+                }
+                // A single named class — resolvable via core RBS or the project
+                // source registry (`rescue MyError => e` where `MyError` is a
+                // discovered project class fires too, probed).
+                [only] => match ast.get(*only) {
+                    Node::ConstantRead { name, .. }
+                        if !name.is_empty()
+                            && (index.knows_class(name) || source.knows_class(name)) =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                },
+                // Multi-class arm ⇒ a union with no single concrete class ⇒ silent.
+                _ => None,
+            };
+            if let Some(exception_class) = exception_class {
+                out.push(RescueBinding {
+                    clause_span: clause.span,
+                    bound_name: bound_name.clone(),
+                    exception_class,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The concrete class NAME of one ivar write's rvalue — the `ivar_class_for`
+/// analog. Increment (a): a read of a rescue-bound variable inside the clause body
+/// resolves to the exception class directly (bypassing the `TypeId` layer, since
+/// exception classes are outside the 9-class `Nominal` id space). Otherwise the
+/// rvalue is typed through the shared typer against an EMPTY local env (literals
+/// and the `Integer()`/`Float()`/`String()` folds are env-independent; any other
+/// local read declines to `Dynamic` ⇒ `None`, a coverage gap that can only silence
+/// the rule, never mis-fire it) and mapped via `class_name_of`, with
+/// `TrueClass`/`FalseClass` folded to `"bool"`.
+fn ivar_write_class(
+    ast: &LoweredAst,
+    write: &IvarWrite,
+    typer: &Typer,
+    index: &CoreIndex,
+    interner: &mut Interner,
+    rescue_bindings: &[RescueBinding],
+) -> Option<String> {
+    if let Node::LocalVariableRead { name, .. } = ast.get(write.value) {
+        for binding in rescue_bindings {
+            if binding.bound_name == *name && span_within(write.span, binding.clause_span) {
+                return Some(binding.exception_class.clone());
+            }
+        }
+    }
+    let env = rigor_infer::TypeEnv::new();
+    let ty = typer.type_of(ast, write.value, &env, interner);
+    match index.class_name_of(interner, ty) {
+        Some("TrueClass") | Some("FalseClass") => Some("bool".to_string()),
+        Some(name) => Some(name.to_string()),
+        None => None,
+    }
+}
+
+/// Emit every `def.ivar-write-mismatch` diagnostic for one file. Walks each
+/// ClassDef/ModuleDef reachable through class/module bodies (a class nested in a
+/// `def` is absent from `qualified_class_names`, matching the reference walk that
+/// returns at the first `def`), collects its DIRECT instance-`def` bodies' plain
+/// `@x = value` writes (barriers at nested def/class/module; singleton `def self.x`
+/// and non-instance defs skipped), groups by (qualified class, ivar) in source
+/// order, then applies the reference firing logic.
+fn ivar_write_mismatch_diagnostics(
+    ast: &LoweredAst,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    typer: &Typer,
+    out: &mut Vec<Diagnostic>,
+) {
+    let qualified = qualified_class_names(ast);
+
+    // Every def/class/module span — the write barriers.
+    let barrier_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { span, .. }
+            | Node::ClassDef { span, .. }
+            | Node::ModuleDef { span, .. } => Some(*span),
+            _ => None,
+        })
+        .collect();
+
+    let rescue_bindings = collect_rescue_bindings(ast, index, source);
+
+    // Gather writes grouped by (qualified class, ivar), preserving first-seen
+    // (source) order.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut groups: std::collections::HashMap<(String, String), Vec<IvarWrite>> =
+        std::collections::HashMap::new();
+
+    for (class_id, node) in ast.iter() {
+        let body = match node {
+            Node::ClassDef { body, .. } | Node::ModuleDef { body, .. } => body,
+            _ => continue,
+        };
+        let Some(class_name) = qualified.get(&class_id) else {
+            continue; // un-namable / nested-in-def ⇒ never collected.
+        };
+        for &child_id in body {
+            let Node::Definition {
+                name: Some(_),
+                span: def_span,
+                ..
+            } = ast.get(child_id)
+            else {
+                continue; // singleton / non-instance def ⇒ barrier, skip.
+            };
+            let def_span = *def_span;
+            for (_, wn) in ast.iter() {
+                let Node::InstanceVariableWrite {
+                    name,
+                    value,
+                    name_span,
+                    span,
+                } = wn
+                else {
+                    continue;
+                };
+                if !span_within(*span, def_span) {
+                    continue;
+                }
+                // Exclude a write inside a nested def/class/module within this def.
+                let barriered = barrier_spans.iter().any(|b| {
+                    *b != def_span && span_within(*b, def_span) && span_within(*span, *b)
+                });
+                if barriered {
+                    continue;
+                }
+                let key = (class_name.clone(), name.clone());
+                if !groups.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                groups.entry(key).or_default().push(IvarWrite {
+                    value: *value,
+                    name_span: *name_span,
+                    span: *span,
+                });
+            }
+        }
+    }
+
+    let severity = catalog(DEF_IVAR_WRITE_MISMATCH)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Warning);
+
+    for (class_name, ivar_name) in &order {
+        let writes = &groups[&(class_name.clone(), ivar_name.clone())];
+        if writes.len() < 2 {
+            continue;
+        }
+        // The class string of every write (mapped `ivar_class_for`).
+        let mut classes: Vec<Option<String>> = Vec::with_capacity(writes.len());
+        for w in writes {
+            classes.push(ivar_write_class(ast, w, typer, index, interner, &rescue_bindings));
+        }
+
+        // Canonical = first write whose class is not "NilClass" (leading `@x = nil`
+        // placeholders skipped). If that write's class is unresolvable (`None`),
+        // the WHOLE group is silent.
+        let Some(canonical) = classes
+            .iter()
+            .position(|c| c.as_deref() != Some("NilClass"))
+        else {
+            continue;
+        };
+        let Some(first_class) = classes[canonical].clone() else {
+            continue;
+        };
+
+        for i in (canonical + 1)..writes.len() {
+            let Some(other_class) = &classes[i] else {
+                continue;
+            };
+            if other_class == "NilClass" || *other_class == first_class {
+                continue; // clear-to-nil idiom / same class ⇒ silent.
+            }
+            let w = &writes[i];
+            out.push(Diagnostic {
+                rule_id: DEF_IVAR_WRITE_MISMATCH,
+                start_offset: w.name_span.0,
+                end_offset: w.name_span.1,
+                message: format!(
+                    "instance variable `{ivar_name}' on {class_name} was previously \
+                     assigned {first_class}; this write assigns {other_class}"
+                ),
+                severity,
+                source_family: "builtin",
+                receiver_type: None,
+                method_name: None,
+            });
+        }
+    }
+}
+
 /// Render the receiver for the diagnostic message: the bare literal value for a
 /// value-pinned `Constant`, else the resolved class name.
 /// Render a receiver for a diagnostic's `message` / `receiver_type` field in the
@@ -2109,6 +2407,7 @@ fn node_children(node: &Node) -> Vec<NodeId> {
         Node::LocalVariableWrite { value, .. }
         | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => out.push(*value),
         Node::InterpolatedString { parts, .. } => out.extend(parts.iter().copied()),
         Node::Call { receiver, args, block_body, .. } => {
@@ -2302,6 +2601,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     FLOW_SHADOWED_RESCUE_CLAUSE,
     SUPPRESSION_UNKNOWN_RULE,
     SUPPRESSION_EMPTY,
+    DEF_IVAR_WRITE_MISMATCH,
 ];
 
 /// The canonical rule ids rigor-rs can actually emit — the implemented coverage
@@ -4712,5 +5012,208 @@ mod tests {
             raise_operand_verdict(&i, &index, &source, mixed),
             RaiseVerdict::Unknown
         );
+    }
+
+    // -- def.ivar-write-mismatch ------------------------------------------
+
+    fn ivar_diags(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == DEF_IVAR_WRITE_MISMATCH)
+            .collect()
+    }
+
+    #[test]
+    fn ivar_mismatch_string_then_integer_fires() {
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    @x = 42\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].rule_id, DEF_IVAR_WRITE_MISMATCH);
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(
+            d[0].message,
+            "instance variable `@x' on Foo was previously assigned String; this write assigns Integer"
+        );
+        // Anchored on the `@x` name token of the OFFENDING (second) write.
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"@x");
+        assert_eq!(d[0].start_offset, src.windows(2).enumerate().filter(|(_, w)| *w == b"@x").nth(1).unwrap().0);
+    }
+
+    #[test]
+    fn ivar_bool_flag_idiom_silent() {
+        // false then true — both fold to "bool", so no mismatch.
+        let src = b"class Foo\n  def m\n    @on = false\n    @on = true\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_bool_then_string_fires() {
+        let src = b"class Foo\n  def m\n    @x = true\n    @x = \"s\"\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(
+            d[0].message,
+            "instance variable `@x' on Foo was previously assigned bool; this write assigns String"
+        );
+    }
+
+    #[test]
+    fn ivar_op_writes_not_collected() {
+        // `@x ||=` / `@x +=` are InstanceVariable{Or,Operator}WriteNodes, never
+        // plain InstanceVariableWriteNode ⇒ never collected (probed silent).
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    @x ||= 5\n    @x += 1\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_self_setter_not_collected() {
+        // `self.x =` is a `x=` method call, not an ivar write.
+        let src = b"class Foo\n  def m\n    self.x = \"s\"\n    self.x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_write_inside_block_with_literal_fires() {
+        // A block is not a barrier; a literal write inside it is collected.
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    [1].each do |i|\n      @x = 5\n    end\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(
+            d[0].message,
+            "instance variable `@x' on Foo was previously assigned String; this write assigns Integer"
+        );
+    }
+
+    #[test]
+    fn ivar_module_instance_method_fires() {
+        let src = b"module Foo\n  def m\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on Foo was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_same_file_reopen_merges_group() {
+        let src = b"class Foo\n  def a\n    @x = \"s\"\n  end\nend\nclass Foo\n  def b\n    @x = 5\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on Foo was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_nested_class_qualified_name() {
+        let src = b"module A\n  class B\n    def m\n      @x = \"s\"\n      @x = 5\n    end\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on A::B was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_nested_def_is_barrier() {
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    def inner\n      @x = 5\n    end\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_singleton_def_skipped() {
+        let src = b"class Foo\n  def self.m\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_top_level_def_skipped() {
+        // A def outside any class ⇒ qualified prefix empty ⇒ never collected.
+        let src = b"def m\n  @x = \"s\"\n  @x = 5\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_leading_nil_then_single_typed_silent() {
+        let src = b"class Foo\n  def m\n    @x = nil\n    @x = \"s\"\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_leading_nil_fires_on_third_conflicting() {
+        let src = b"class Foo\n  def m\n    @x = nil\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on Foo was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_clear_to_nil_silent() {
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    @x = nil\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_none_canonical_kills_whole_group() {
+        // First non-nil write reads an untyped param ⇒ canonical unresolvable ⇒
+        // the WHOLE group is silent even though a later String vs Integer differs.
+        let src = b"class Foo\n  def m(arg)\n    @x = arg\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_same_name_different_classes_no_fire() {
+        let src = b"class A\n  def m\n    @x = \"s\"\n  end\nend\nclass B\n  def m\n    @x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_rescue_single_class_bound_var_fires() {
+        // Increment (a): `rescue StandardError => e` binds e to StandardError.
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue StandardError => error\n    @e = error\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@e' on Foo was previously assigned String; this write assigns StandardError");
+    }
+
+    #[test]
+    fn ivar_rescue_bare_binds_standard_error() {
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue => error\n    @e = error\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@e' on Foo was previously assigned String; this write assigns StandardError");
+    }
+
+    #[test]
+    fn ivar_rescue_multi_class_silent() {
+        // Multi-class ⇒ union ⇒ not bound ⇒ the bound-var write is unresolvable.
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue TypeError, ArgumentError => error\n    @e = error\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_rescue_project_exception_fires() {
+        // Increment (a) resolves a discovered project exception class.
+        let src = b"class MyError < StandardError\nend\nclass Foo\n  def m\n    @e = \"s\"\n  rescue MyError => error\n    @e = error\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@e' on Foo was previously assigned String; this write assigns MyError");
+    }
+
+    #[test]
+    fn ivar_rescue_unknown_exception_silent() {
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue Nonexistent::Whatever => error\n    @e = error\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_kernel_float_conversion_fires() {
+        // Increment (b): `Float(non_constant)` types Float; then `= 0` is Integer.
+        let src = b"class Foo\n  def m(k)\n    @d = Float(k)\n  rescue ArgumentError, TypeError\n    @d = 0\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@d' on Foo was previously assigned Float; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_kernel_integer_and_string_conversions_fire() {
+        let src = b"class Foo\n  def m(a)\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@n' on Foo was previously assigned Integer; this write assigns String");
     }
 }
