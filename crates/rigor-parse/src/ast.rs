@@ -973,6 +973,27 @@ impl<'src> Builder<'src> {
             if let Some(recv) = def.receiver() {
                 let _ = self.lower_node(&recv);
             }
+            // C2: lower each parameter DEFAULT-VALUE expression as an arena node
+            // so the call rules reach it (the reference checks positional and
+            // keyword defaults, incl. nested calls within — `def f(t =
+            // Time.current)`, `def g(a: [1,2].frob)`). Orphaned like the
+            // receiver above: it lives in the arena so the span-scan / `ast.iter`
+            // call walk finds it, but is not a body statement (so a default's
+            // write is not mis-attributed to the method body). Params themselves
+            // stay unbound (Dynamic ⇒ silent), so only a literal/constant
+            // receiver in a default is ever witnessed — the FP-safe subset.
+            if let Some(params) = def.parameters() {
+                for opt in params.optionals().iter() {
+                    if let Some(o) = opt.as_optional_parameter_node() {
+                        let _ = self.lower_node(&o.value());
+                    }
+                }
+                for kw in params.keywords().iter() {
+                    if let Some(o) = kw.as_optional_keyword_parameter_node() {
+                        let _ = self.lower_node(&o.value());
+                    }
+                }
+            }
             // A `def self.x` (SELF receiver) captures its method name here so
             // `sig-gen` can collect the singleton; `name` stays `None` so the
             // instance-method harvest still skips it. A non-self receiver
@@ -2282,6 +2303,17 @@ mod tests {
             "expected a Definition node for the def"
         );
         assert!(has_call(&ast, "downcase"), "call inside def must be lowered");
+    }
+
+    #[test]
+    fn lowers_parameter_default_value_calls() {
+        // C2: a call inside a POSITIONAL or KEYWORD parameter default must reach
+        // the arena so the call rules can witness a typo on a literal/constant
+        // receiver there (the reference checks parameter defaults).
+        let src = b"def f(t = Time.current, a: Foo.bar)\n  t\nend\n";
+        let ast = lower(&crate::parse(src));
+        assert!(has_call(&ast, "current"), "positional default call must be lowered");
+        assert!(has_call(&ast, "bar"), "keyword default call must be lowered");
     }
 
     #[test]
