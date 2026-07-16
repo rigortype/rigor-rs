@@ -14,6 +14,20 @@ source-class naming → Data.define/Struct class shells; sound-superset parity m
 "Generative-tool parity"**). Then PIVOTED to productization (MCP `sig_gen` tool). Read `AGENTS.md` "Working
 discipline" before continuing.
 
+**▶▶ LANDED (2026-07-16, branch `ivar-write-mismatch`, MERGED `a2098d7`) — `def.ivar-write-mismatch` ported
+(the BOUNDED half of the unported-rule pair).** Sonnet investigation verdict
+([spec](notes/20260716-ivar-write-mismatch-spec.md)): ivar-write-mismatch BOUNDED (ships on existing
+substrate), `call.argument-type-mismatch` SUBSTRATE-BLOCKED (needs per-overload/per-param RBS retention — rbs.rs
+keeps only merged arity — an alias/interface recovery layer, and a net-new acceptance/subtyping engine; 3 corpus
+gaps total, mastodon fires ONCE in 1236 files ⇒ deferred as a shared-substrate investment). Landed: dedicated
+`Node::InstanceVariableWrite` lowering (name preserved; 6 VariableWrite consumers extended), RescueClause
+`bound_name` + rescue-body exception-class binding (single-class + bare⇒StandardError; multi-class union silent,
+probe-verified), Kernel `Integer()/Float()/String()` NOMINAL fallback on non-constant args (reference types them
+unconditionally), and the collector (canonical-first-non-nil logic incl. the whole-group-bails-on-None subtlety,
+clear-to-nil idiom, bool folding, op-writes/`self.x=` excluded, block bodies NOT barriers, singleton defs
+excluded). **Measured: gitlab-foss lib ivar gaps 2 → 0** (both corpus lines byte-identical), 0 FP everywhere
+(mastodon 397 unchanged, rule fires 0 there); harness 60 fixtures / 163 matched; 716 tests; explain 26 rules.
+
 **▶▶ LANDED (2026-07-16, branch `literal-tail-fold`, MERGED `0721943`) — interprocedural literal-tail return
 folding: the FIRST measured-closeable coverage lever after four all-substrate-blocked flow surveys.** A
 37-gap classification of gitlab-foss `lib`'s non-UM/PN gaps found Cluster A (19/28 always-truthy = project
