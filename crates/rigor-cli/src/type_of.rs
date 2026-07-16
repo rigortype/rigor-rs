@@ -309,6 +309,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::Range { .. } => "Range",
         Node::VariableRead { .. } => "VariableRead",
         Node::VariableWrite { .. } => "VariableWrite",
+        Node::InstanceVariableWrite { .. } => "InstanceVariableWrite",
         Node::ConstantRead { .. } => "ConstantRead",
         Node::ConstantWrite { .. } => "ConstantWrite",
         Node::SelfExpr { .. } => "SelfExpr",
