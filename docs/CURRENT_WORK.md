@@ -14,6 +14,26 @@ source-class naming → Data.define/Struct class shells; sound-superset parity m
 "Generative-tool parity"**). Then PIVOTED to productization (MCP `sig_gen` tool). Read `AGENTS.md` "Working
 discipline" before continuing.
 
+**▶▶ LANDED (2026-07-16, branch `literal-tail-fold`, MERGED `0721943`) — interprocedural literal-tail return
+folding: the FIRST measured-closeable coverage lever after four all-substrate-blocked flow surveys.** A
+37-gap classification of gitlab-foss `lib`'s non-UM/PN gaps found Cluster A (19/28 always-truthy = project
+methods whose return joins to one scalar literal, `Gitlab::Database.read_only? = false` archetype) closeable
+— distinct from the exhausted ivar/flow substrate. Spec:
+[literal-tail-fold-spec](notes/20260716-literal-tail-fold-spec.md). Landed: SourceIndex Pass-4 —
+qualified-owner SINGLETON-method harvest (previously `def self.x` fed only sig_gen), `(method, kind)→owners`
+definers index, memoized cycle-guarded recursive literal fold (depth-capped 16; `read_write? = !read_only?`
+folds depth-2); `type_call` tier 4c for `Const.method` (dedicated tier — project constants deliberately NOT
+typed Singleton, zero blast radius); implicit-self resolution threaded with the enclosing class + ancestry.
+**Two audited spec deviations (implementer overrode the spec with oracle proof, both sound):** own-class/
+ancestry-scoped resolution instead of name-only (name-only would FP on unrelated same-name owners), and the
+reference's related-redefiner override gate instead of the single-definer guard (recovers 2 gaps from
+unrelated same-name definers — main-session audit probe confirmed byte-parity on exactly this shape).
+Declined (recall-only, documented): branch-tail joins (probe 18), boolean-chain folds. **Measured:
+gitlab-foss lib always-truthy gaps 28 → 16 (12 closed), matched 812 → 824, 0 FP on all corpora; mastodon 397
+unchanged (its 2 remaining always-truthy gaps are Cluster-B flow-substrate, still blocked).** harness 59
+fixtures / 155 matched. Remaining cluster-B/C/D/F gaps + rule-not-ported (argument-type-mismatch,
+ivar-write-mismatch): see the classification in the spec note's provenance section.
+
 **▶▶ LANDED THIS SESSION (2026-07-16) — v0.3.0-RC UPSTREAM-TRACKING ARC: pin bump + 7 slices, ALL MERGED.**
 Upstream reached the v0.3.0 release-candidate stage; this arc measured the RC gap set and closed it. Full
 survey + binding specs: `docs/notes/20260716-v030-*.md` (4 specs) + `20260716-mutation-widening-fp-spec.md`.
