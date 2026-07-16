@@ -41,7 +41,29 @@ use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, MethodBody, Node, NodeId, Visibility};
-use rigor_types::{ClassId, Interner, Scalar};
+use rigor_types::{ClassId, Interner, Scalar, ShapeKey};
+
+/// C5 (const-literal harvest): an owned, interner-INDEPENDENT representation of a
+/// fully-literal constant RHS, so a `CONST = <literal>` value can be recorded
+/// project-wide once and re-interned against each analyzed file's own
+/// [`Interner`] at the `ConstantRead` use site (interners are per-file). Mirrors
+/// exactly the carriers the Typer builds for the same inline literal so the
+/// resulting diagnostic renders identically — a scalar → `Constant`, an array →
+/// `Tuple`, a static-keyed hash → `HashShape`, a range → `Nominal[Range]`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConstLit {
+    /// A value-pinned scalar (`42`, `"hi"`, `:sym`, `1.5`, `true`, `nil`).
+    Scalar(Scalar),
+    /// A per-position array shape (`[:a, :b]`) — every element fully literal.
+    Tuple(Vec<ConstLit>),
+    /// A per-key hash shape (`{ t: 10 }`) — every key a static scalar, every
+    /// value fully literal, last-wins on a duplicate key (mirroring the Typer).
+    Hash(Vec<(ShapeKey, ConstLit)>),
+    /// A range literal (`1..1024`). Types to `Nominal[Range]` so method
+    /// witnessing resolves against Range's RBS (SOUND — `IntegerRange` would
+    /// erase to `Integer` and false-positive on real Range methods).
+    Range,
+}
 
 /// The first [`ClassId`] handed out by the per-run registry. Chosen well above
 /// the fixed core-class id space (`CORE_CLASSES`, currently 9 entries) so a
@@ -191,6 +213,17 @@ pub struct SourceIndex {
     /// always reachable), so the singleton gate stays suppressed — preserving the
     /// pre-C1 blanket behavior for Rails models (`Group`/`Report`).
     toplevel_constants: HashSet<String>,
+    /// C5 (const-literal harvest): `bare CONST NAME -> [(defining namespace,
+    /// fully-literal value)]`, for a constant assigned EXACTLY ONCE at its
+    /// QUALIFIED name, whose RHS is fully literal, and whose name does NOT also
+    /// name a class/module. Consulted by the `ConstantRead` arm BEFORE the
+    /// singleton gate — but LEXICALLY, exactly like the C1 shadow gate: the value
+    /// applies only at a use site the defining namespace is visible from (Ruby's
+    /// lexical constant lookup). This is load-bearing: a concern's
+    /// `DAYS_TO_EXPIRE = 7` in `module Expirable` must NOT fold in an including
+    /// `class Key` where it is not lexically visible (the reference resolves it
+    /// lexically too, so folding it there manufactures an `Integer#days` FP).
+    literal_constants: HashMap<String, Vec<(Vec<String>, ConstLit)>>,
     /// C1 (constant-shadow gate): for a constant the project defines NESTED, the
     /// containing-namespace segment vectors keyed by the constant's last segment
     /// (`module Gitlab; module Database; module Partitioning; module Time` keys
@@ -329,6 +362,36 @@ impl SourceIndex {
             }
         }
 
+        // C5: harvest single-assignment fully-literal `CONST = <literal>` values,
+        // LEXICALLY qualified (like the C1 override walk). A QUALIFIED name
+        // qualifies iff it is assigned EXACTLY ONCE project-wide, its RHS harvests
+        // to a `ConstLit` (fully literal), and its bare name does NOT also name a
+        // class/module. Ambiguity (multiple writes to the same qualified name, a
+        // non-literal RHS, a class-name collision) declines. The recorded value
+        // is keyed by BARE name + DEFINING NAMESPACE so the use-site consults it
+        // lexically — a constant only visible in its defining namespace never
+        // folds at an unrelated use site (the app/models concern-constant FP).
+        let mut lit_first: HashMap<String, (Vec<String>, Option<ConstLit>)> = HashMap::new();
+        let mut lit_multi: HashSet<String> = HashSet::new();
+        for ast in asts {
+            collect_literal_constants(ast, ast.root(), &[], &mut lit_first, &mut lit_multi);
+        }
+        for (qualified, (namespace, lit)) in lit_first {
+            if lit_multi.contains(&qualified) {
+                continue;
+            }
+            let bare = qualified.rsplit("::").next().unwrap_or(&qualified).to_string();
+            // A constant is never a class/module: a name collision (the qualified
+            // name names an override class, or the bare name a source class)
+            // declines — the singleton / source-class path owns that name.
+            if idx.override_classes.contains_key(&qualified) || idx.classes.contains_key(&bare) {
+                continue;
+            }
+            if let Some(l) = lit {
+                idx.literal_constants.entry(bare).or_default().push((namespace, l));
+            }
+        }
+
         // Pass 2: register an instance-class id for every `ConstantRead` whose
         // `name` is RBS-known but not a source class (source classes are already
         // registered). This lets both `Pathname.new(...)` instances AND bare
@@ -403,6 +466,22 @@ impl SourceIndex {
     /// Whether `name` names a class defined in source (has harvested structure).
     pub fn knows_class(&self, name: &str) -> bool {
         self.classes.contains_key(name)
+    }
+
+    /// C5: the harvested fully-literal value of constant `name` VISIBLE at a use
+    /// site with lexical prefix `use_prefix`, or `None`. A recorded entry applies
+    /// iff its defining namespace is an initial segment run of `use_prefix` (Ruby
+    /// lexical lookup: toplevel is visible everywhere, a nested constant only
+    /// within its namespace); among visible entries the LONGEST-namespace
+    /// (innermost) wins. The `ConstantRead` arm consults this BEFORE the
+    /// singleton gate and re-interns the value via `Typer::intern_const_lit`.
+    pub fn literal_constant(&self, name: &str, use_prefix: &[String]) -> Option<&ConstLit> {
+        self.literal_constants
+            .get(name)?
+            .iter()
+            .filter(|(ns, _)| ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
+            .max_by_key(|(ns, _)| ns.len())
+            .map(|(_, lit)| lit)
     }
 
     /// C1 (constant-shadow gate): whether a BARE read of constant `name` at a use
@@ -1357,6 +1436,110 @@ fn collect_lexical_scopes(
     }
 }
 
+/// C5: the static scalar key a hash-key NODE denotes, or `None` when dynamic.
+/// Mirrors the Typer's `static_shape_key_of_node` (the reference's
+/// `HashShape::ALLOWED_KEY_CLASSES`) so a harvested hash pins the same slots.
+fn const_shape_key_of(node: &Node) -> Option<ShapeKey> {
+    match node {
+        Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
+        Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
+        Node::IntegerLit { value, .. } => Some(ShapeKey::Int(*value)),
+        Node::FloatLit { value, .. } => Some(ShapeKey::Float(value.to_bits())),
+        Node::TrueLit { .. } => Some(ShapeKey::Bool(true)),
+        Node::FalseLit { .. } => Some(ShapeKey::Bool(false)),
+        Node::NilLit { .. } => Some(ShapeKey::Nil),
+        _ => None,
+    }
+}
+
+/// C5: recursively collect lexically-qualified `CONST = <literal>` writes from
+/// `ast` under lexical `prefix`. Each `ConstantWrite` records its QUALIFIED name
+/// (for the single-assignment gate) → `(defining namespace, harvested value)`;
+/// a second write to the same qualified name marks it multi (declined). Only
+/// class/module/program BODIES are walked (a def-nested constant is out of
+/// scope), mirroring the C1 override / fold discovery inclusion rule.
+fn collect_literal_constants(
+    ast: &LoweredAst,
+    node: NodeId,
+    prefix: &[String],
+    first: &mut HashMap<String, (Vec<String>, Option<ConstLit>)>,
+    multi: &mut HashSet<String>,
+) {
+    match ast.get(node) {
+        Node::Program { body, .. } | Node::Statements { body, .. } => {
+            for &child in body {
+                collect_literal_constants(ast, child, prefix, first, multi);
+            }
+        }
+        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+            if name.is_empty() {
+                return;
+            }
+            let child_prefix = split_qualified(&qualify(prefix, name));
+            for &child in body {
+                collect_literal_constants(ast, child, &child_prefix, first, multi);
+            }
+        }
+        Node::ConstantWrite { name, value, .. } => {
+            let qualified = qualify(prefix, name);
+            match first.entry(qualified) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    multi.insert(e.key().clone());
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert((prefix.to_vec(), const_lit_of(ast, *value)));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// C5: harvest a `ConstLit` from a constant's RHS `node`, or `None` when the RHS
+/// is not FULLY literal (declining the whole constant). Recurses into array /
+/// hash elements — any non-literal element declines the entire structure (a
+/// splat / dynamic key / non-literal value ⇒ `None`), so a recorded value is
+/// always exactly the carrier the Typer builds for the same inline literal.
+fn const_lit_of(ast: &LoweredAst, node: NodeId) -> Option<ConstLit> {
+    match ast.get(node) {
+        Node::IntegerLit { value, .. } => Some(ConstLit::Scalar(Scalar::Int(*value))),
+        Node::FloatLit { value, .. } => Some(ConstLit::Scalar(Scalar::Float(*value))),
+        Node::StringLit { value, .. } => Some(ConstLit::Scalar(Scalar::Str(value.clone()))),
+        Node::SymbolLit { value, .. } => Some(ConstLit::Scalar(Scalar::Sym(value.clone()))),
+        Node::TrueLit { .. } => Some(ConstLit::Scalar(Scalar::Bool(true))),
+        Node::FalseLit { .. } => Some(ConstLit::Scalar(Scalar::Bool(false))),
+        Node::NilLit { .. } => Some(ConstLit::Scalar(Scalar::Nil)),
+        Node::ArrayLit { elements, .. } => {
+            let mut elems = Vec::with_capacity(elements.len());
+            for &e in elements {
+                elems.push(const_lit_of(ast, e)?);
+            }
+            Some(ConstLit::Tuple(elems))
+        }
+        Node::HashLit { elements, all_assoc, .. } => {
+            if !*all_assoc {
+                return None; // a `**`splat / non-assoc element ⇒ decline.
+            }
+            let mut members: Vec<(ShapeKey, ConstLit)> = Vec::with_capacity(elements.len() / 2);
+            let mut i = 0;
+            while i + 1 < elements.len() {
+                let key = const_shape_key_of(ast.get(elements[i]))?;
+                let value = const_lit_of(ast, elements[i + 1])?;
+                // Last-wins on a duplicate key (mirrors `hash_shape_or_hash`).
+                if let Some(m) = members.iter_mut().find(|m| m.0 == key) {
+                    m.1 = value;
+                } else {
+                    members.push((key, value));
+                }
+                i += 2;
+            }
+            Some(ConstLit::Hash(members))
+        }
+        Node::Range { .. } => Some(ConstLit::Range),
+        _ => None,
+    }
+}
+
 /// Ruby truthiness of a folded scalar: only `nil` / `false` are falsey.
 fn scalar_truthy(s: &Scalar) -> bool {
     !matches!(s, Scalar::Nil | Scalar::Bool(false))
@@ -2213,6 +2396,76 @@ mod tests {
         assert!(!idx.constant_shadowed("Time", &[]));
         // A different bare name the project never defines is never shadowed.
         assert!(!idx.constant_shadowed("Time", &seg(&["Other"])));
+    }
+
+    #[test]
+    fn harvests_single_literal_constant_lexically() {
+        // `class K; R = 1..1024; A = [:a]; N = 42; end` — each is harvested and
+        // visible from within `K`, not from an unrelated scope.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class K\n  A = [1, 2]\n  N = 42\n  S = \"hi\"\nend\n",
+            &core,
+        );
+        // Visible inside `K`.
+        assert_eq!(
+            idx.literal_constant("N", &seg(&["K"])),
+            Some(&ConstLit::Scalar(Scalar::Int(42)))
+        );
+        assert!(matches!(idx.literal_constant("A", &seg(&["K"])), Some(ConstLit::Tuple(_))));
+        assert_eq!(
+            idx.literal_constant("S", &seg(&["K"])),
+            Some(&ConstLit::Scalar(Scalar::Str("hi".into())))
+        );
+        // NOT visible from an unrelated namespace or the toplevel.
+        assert_eq!(idx.literal_constant("N", &[]), None);
+        assert_eq!(idx.literal_constant("N", &seg(&["Other"])), None);
+    }
+
+    #[test]
+    fn cross_namespace_constant_not_folded() {
+        // `module Expirable; DAYS = 7; end` — `DAYS` is NOT visible from an
+        // unrelated `class Consumer` (the app/models concern-constant FP shape).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module Expirable\n  DAYS = 7\nend\nclass Consumer\n  D2 = 9\nend\n",
+            &core,
+        );
+        // Visible only within its own namespace.
+        assert_eq!(
+            idx.literal_constant("DAYS", &seg(&["Expirable"])),
+            Some(&ConstLit::Scalar(Scalar::Int(7)))
+        );
+        assert_eq!(idx.literal_constant("DAYS", &seg(&["Consumer"])), None);
+        assert_eq!(idx.literal_constant("DAYS", &[]), None);
+    }
+
+    #[test]
+    fn multiple_assignment_declines_harvest() {
+        // A constant written twice (same qualified name) is ambiguous ⇒ declined.
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"class K\n  M = 1\n  M = 2\nend\n", &core);
+        assert_eq!(idx.literal_constant("M", &seg(&["K"])), None);
+    }
+
+    #[test]
+    fn class_name_collision_declines_harvest() {
+        // `Widget = [1]` where `class Widget` also exists ⇒ declined (a constant
+        // is never a class; the class/source path owns that name).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class Widget\nend\nWidget = [1]\n",
+            &core,
+        );
+        assert_eq!(idx.literal_constant("Widget", &[]), None);
+    }
+
+    #[test]
+    fn range_constant_harvests_as_range() {
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class K\n  R = 1..1024\nend\n", &core);
+        assert_eq!(idx.literal_constant("R", &seg(&["K"])), Some(&ConstLit::Range));
     }
 
     #[test]

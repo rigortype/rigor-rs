@@ -29,7 +29,9 @@ use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
-pub use source_index::{lexical_scopes, DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
+pub use source_index::{
+    lexical_scopes, ConstLit, DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE,
+};
 
 /// A process-wide empty [`SourceIndex`], used as the default `source` for a
 /// [`Typer`] built via [`Typer::new`] (callers that predate in-source typing).
@@ -180,6 +182,36 @@ impl<'i> Typer<'i> {
         self
     }
 
+    /// C5: re-intern a harvested [`ConstLit`] against the local interner into the
+    /// SAME carrier the Typer builds for the equivalent inline literal — a scalar
+    /// → `Constant`, an array → `Tuple`, a static-keyed hash → `HashShape`, a
+    /// range → `Nominal[Range]`. This is what makes a literal-constant diagnostic
+    /// render identically to the reference's value-pinned receiver.
+    fn intern_const_lit(&self, lit: &ConstLit, interner: &mut Interner) -> TypeId {
+        match lit {
+            ConstLit::Scalar(s) => interner.intern(Type::Constant(s.clone())),
+            ConstLit::Tuple(elems) => {
+                let ids: Vec<TypeId> =
+                    elems.iter().map(|l| self.intern_const_lit(l, interner)).collect();
+                interner.intern(Type::Tuple(ids))
+            }
+            ConstLit::Hash(members) => {
+                let ms: Vec<ShapeMember> = members
+                    .iter()
+                    .map(|(key, l)| ShapeMember {
+                        key: key.clone(),
+                        value: self.intern_const_lit(l, interner),
+                        optional: false,
+                    })
+                    .collect();
+                interner.intern(Type::HashShape(ms))
+            }
+            // Range types to `Nominal[Range]` so witnessing resolves against
+            // Range's RBS (an `IntegerRange` would erase to `Integer`).
+            ConstLit::Range => self.nominal_or_untyped("Range", interner),
+        }
+    }
+
     /// C1: the use-site lexical prefix (enclosing class/module qualified segments)
     /// for a node at `span` — the INNERMOST enclosing scope by span containment,
     /// or an empty slice at toplevel / when no scopes are attached.
@@ -303,18 +335,29 @@ impl<'i> Typer<'i> {
             // receiver is intercepted earlier in `type_call` (before the constant
             // is typed), so `Time.new` still yields a Time INSTANCE, not Singleton.
             Node::ConstantRead { name, span, .. } => {
+                // Both the C5 literal-fold and the C1 shadow gate resolve against
+                // the use site's lexical prefix (Ruby constant lookup), so compute
+                // it once.
+                let prefix = self.enclosing_prefix(*span);
+                // C5: a project constant with a single fully-literal assignment,
+                // visible here lexically, types to that literal value
+                // (Range -> Nominal[Range]) — consulted BEFORE the singleton gate
+                // so `R = 1..1024; R.exclude?` witnesses on the range value.
+                if let Some(lit) = self.source.literal_constant(name, prefix) {
+                    return self.intern_const_lit(lit, interner);
+                }
                 // C1: replace the pre-C1 bare-name project-wide suppression
                 // (`!source.knows_class(name)`) with a LEXICALLY PRECISE
                 // shadow gate: a nested project `module Time` suppresses the
                 // core-RBS singleton only at use sites it is lexically visible
                 // from; a toplevel definition still suppresses everywhere. See
                 // `SourceIndex::constant_shadowed`.
-                if !name.is_empty() && self.index.knows_toplevel_class(name) {
-                    let prefix = self.enclosing_prefix(*span);
-                    if !self.source.constant_shadowed(name, prefix) {
-                        if let Some(class) = self.source.class_id(name) {
-                            return interner.intern(Type::Singleton(class));
-                        }
+                if !name.is_empty()
+                    && self.index.knows_toplevel_class(name)
+                    && !self.source.constant_shadowed(name, prefix)
+                {
+                    if let Some(class) = self.source.class_id(name) {
+                        return interner.intern(Type::Singleton(class));
                     }
                 }
                 interner.untyped()
