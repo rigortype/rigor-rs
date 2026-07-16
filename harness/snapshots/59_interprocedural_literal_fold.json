@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/59_interprocedural_literal_fold.rb",
+  "diagnostics": [
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 28,
+      "column": 8,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 35,
+      "column": 8,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 48,
+      "column": 8,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 57,
+      "column": 17,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}
