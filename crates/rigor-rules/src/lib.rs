@@ -1894,9 +1894,20 @@ fn trailing_statement(ast: &LoweredAst, body: &[rigor_parse::NodeId]) -> Option<
 
 fn descend_trailing(ast: &LoweredAst, id: rigor_parse::NodeId) -> Option<rigor_parse::NodeId> {
     match ast.get(id) {
-        // A `begin ... end` (and the lowered Statements wrapper, which uses the
-        // same owned shape) — its last statement is the real trailing node.
-        Node::BeginRescue { body, .. } | Node::Statements { body, .. } => match body.last() {
+        // A `begin ... end` — its trailing node is the last statement of the
+        // protected/rescue/else region, NOT the ensure tail: an `ensure` clause's
+        // value is discarded (the reference treats the protected-body tail as the
+        // implicit return even when an `ensure` follows it in `body`, where the
+        // lowering appends the ensure statements).
+        Node::BeginRescue {
+            body, ensure_body, ..
+        } => match body.iter().rev().find(|id| !ensure_body.contains(id)) {
+            Some(&inner) => descend_trailing(ast, inner),
+            None => Some(id),
+        },
+        // The lowered Statements wrapper — its last statement is the real
+        // trailing node.
+        Node::Statements { body, .. } => match body.last() {
             Some(&inner) => descend_trailing(ast, inner),
             None => Some(id),
         },
