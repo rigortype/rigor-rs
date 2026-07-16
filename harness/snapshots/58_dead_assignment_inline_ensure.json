@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/58_dead_assignment_inline_ensure.rb",
+  "diagnostics": [
+    {
+      "rule": "flow.dead-assignment",
+      "line": 21,
+      "column": 3,
+      "severity": "warning",
+      "message": "local `leaked' assigned in `ensure_write_is_dead' but never read"
+    },
+    {
+      "rule": "flow.return-in-ensure",
+      "line": 12,
+      "column": 3,
+      "severity": "warning",
+      "message": "`return' inside `ensure' discards the method's in-flight return value and swallows any in-flight exception"
+    }
+  ]
+}
