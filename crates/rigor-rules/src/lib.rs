@@ -451,7 +451,11 @@ pub fn analyze_with_source_and_folder(
     // object (`Singleton(X)`) for class-method witnessing. The source index also
     // drives RETURN-TYPE inference for chaining. The folder (if wired) lets a
     // sidecar-foldable literal call the Rust core declined resolve to a `Constant`.
-    let typer = Typer::with_source_and_folder(index, source, folder);
+    // C1: attach the current file's lexical class/module scopes so the typer's
+    // `ConstantRead` arm resolves each use site's lexical prefix (span
+    // containment) and applies the precise constant-shadow gate.
+    let scopes = rigor_infer::lexical_scopes(ast);
+    let typer = Typer::with_source_and_folder(index, source, folder).with_lexical_scopes(&scopes);
     let env = typer.build_toplevel_env(ast, interner);
     // ADR-0038 Slice 1: the per-call nil-receiver snapshot map (call node id ->
     // non-nil core arm), computed ONCE over the whole program via the threaded

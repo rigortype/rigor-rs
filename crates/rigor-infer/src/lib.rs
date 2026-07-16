@@ -29,7 +29,7 @@ use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
-pub use source_index::{DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
+pub use source_index::{lexical_scopes, DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
 
 /// A process-wide empty [`SourceIndex`], used as the default `source` for a
 /// [`Typer`] built via [`Typer::new`] (callers that predate in-source typing).
@@ -130,19 +130,31 @@ pub struct Typer<'i> {
     /// route a [`folding::sidecar_foldable`] call the Rust core declined to real
     /// Ruby. Must be `Sync` so one folder is shared across the file-parallel walk.
     folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
+    /// C1 (constant-shadow gate): the CURRENT FILE's lexical class/module scopes,
+    /// `(span, qualified segments)`, so the `ConstantRead` arm can recover a
+    /// use-site lexical prefix by span containment and consult
+    /// [`SourceIndex::constant_shadowed`] precisely. Empty (`&[]`) for callers
+    /// that do not set it (unit tests / pre-C1 entry points) — with no scopes
+    /// every use site reads as toplevel, so only TOPLEVEL project definitions
+    /// suppress, matching the conservative default.
+    lexical_scopes: &'i [(rigor_parse::Span, Vec<String>)],
 }
+
+/// A shared empty lexical-scope slice — the default `lexical_scopes` for a
+/// [`Typer`] built without the C1 per-file scopes.
+const EMPTY_LEXICAL_SCOPES: &[(rigor_parse::Span, Vec<String>)] = &[];
 
 impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -153,7 +165,37 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES }
+    }
+
+    /// C1: attach the CURRENT FILE's lexical class/module scopes (from
+    /// [`source_index::lexical_scopes`]) so the `ConstantRead` arm resolves a
+    /// use-site lexical prefix. A consuming builder — the analyze pass computes
+    /// the scopes once per file and threads them here.
+    pub fn with_lexical_scopes(
+        mut self,
+        scopes: &'i [(rigor_parse::Span, Vec<String>)],
+    ) -> Self {
+        self.lexical_scopes = scopes;
+        self
+    }
+
+    /// C1: the use-site lexical prefix (enclosing class/module qualified segments)
+    /// for a node at `span` — the INNERMOST enclosing scope by span containment,
+    /// or an empty slice at toplevel / when no scopes are attached.
+    fn enclosing_prefix(&self, span: rigor_parse::Span) -> &[String] {
+        let mut best: Option<&(rigor_parse::Span, Vec<String>)> = None;
+        for sc in self.lexical_scopes {
+            if sc.0 .0 <= span.0 && span.1 <= sc.0 .1 {
+                // Contained: keep the innermost (narrowest span).
+                match best {
+                    None => best = Some(sc),
+                    Some(b) if (sc.0 .1 - sc.0 .0) < (b.0 .1 - b.0 .0) => best = Some(sc),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|b| b.1.as_slice()).unwrap_or(&[])
     }
 
     /// The borrowed source index (for the rules layer's method-resolution gate).
@@ -260,13 +302,19 @@ impl<'i> Typer<'i> {
             // Any miss ⇒ fall through to Dynamic[top] (silent). Note: a `Foo.new`
             // receiver is intercepted earlier in `type_call` (before the constant
             // is typed), so `Time.new` still yields a Time INSTANCE, not Singleton.
-            Node::ConstantRead { name, .. } => {
-                if !name.is_empty()
-                    && self.index.knows_toplevel_class(name)
-                    && !self.source.knows_class(name)
-                {
-                    if let Some(class) = self.source.class_id(name) {
-                        return interner.intern(Type::Singleton(class));
+            Node::ConstantRead { name, span, .. } => {
+                // C1: replace the pre-C1 bare-name project-wide suppression
+                // (`!source.knows_class(name)`) with a LEXICALLY PRECISE
+                // shadow gate: a nested project `module Time` suppresses the
+                // core-RBS singleton only at use sites it is lexically visible
+                // from; a toplevel definition still suppresses everywhere. See
+                // `SourceIndex::constant_shadowed`.
+                if !name.is_empty() && self.index.knows_toplevel_class(name) {
+                    let prefix = self.enclosing_prefix(*span);
+                    if !self.source.constant_shadowed(name, prefix) {
+                        if let Some(class) = self.source.class_id(name) {
+                            return interner.intern(Type::Singleton(class));
+                        }
                     }
                 }
                 interner.untyped()

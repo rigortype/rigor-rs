@@ -185,6 +185,21 @@ pub struct SourceIndex {
     /// method) and the implicit-self ancestor resolution. Mirrors the reference's
     /// `method_definers_index`.
     definers: HashMap<(String, DefKind), Vec<String>>,
+    /// C1 (constant-shadow gate): constant names the project defines AT TOPLEVEL
+    /// (their fully-qualified name has no `::`). A bare read of such a name is
+    /// shadowed by the project definition EVERYWHERE (Ruby: a toplevel constant is
+    /// always reachable), so the singleton gate stays suppressed — preserving the
+    /// pre-C1 blanket behavior for Rails models (`Group`/`Report`).
+    toplevel_constants: HashSet<String>,
+    /// C1 (constant-shadow gate): for a constant the project defines NESTED, the
+    /// containing-namespace segment vectors keyed by the constant's last segment
+    /// (`module Gitlab; module Database; module Partitioning; module Time` keys
+    /// `"Time" -> [["Gitlab","Database","Partitioning"]]`). A bare read of `Time`
+    /// is shadowed ONLY at a use site whose lexical prefix has one of these
+    /// namespaces as an initial segment run — Ruby's `Module.nesting` lexical
+    /// lookup, matching the reference's `lexical_constant_candidates`. Elsewhere
+    /// the read RELAXES so the core-RBS singleton is witnessed (the C1 fix).
+    nested_constant_namespaces: HashMap<String, Vec<Vec<String>>>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
@@ -259,6 +274,27 @@ impl SourceIndex {
         // collapsed `classes` map above — no other rule is affected.
         for ast in asts {
             idx.collect_override_classes(ast, ast.root(), &[]);
+        }
+
+        // C1: derive the constant-shadow tables from the lexically-qualified
+        // override index built above (the same class/module set Ruby's lexical
+        // constant lookup sees). A key with no `::` is a TOPLEVEL definition
+        // (shadows everywhere); a namespaced key contributes its containing
+        // namespace under the constant's last segment (shadows only where
+        // lexically visible). Collected keys first to satisfy the borrow checker.
+        let qualified_defs: Vec<String> = idx.override_classes.keys().cloned().collect();
+        for qualified in &qualified_defs {
+            let segs: Vec<&str> = qualified.split("::").collect();
+            let Some((name, ns)) = segs.split_last() else { continue };
+            if ns.is_empty() {
+                idx.toplevel_constants.insert((*name).to_string());
+            } else {
+                let ns_vec: Vec<String> = ns.iter().map(|s| (*s).to_string()).collect();
+                let entry = idx.nested_constant_namespaces.entry((*name).to_string()).or_default();
+                if !entry.contains(&ns_vec) {
+                    entry.push(ns_vec);
+                }
+            }
         }
 
         // Pass 1c (ADR-34): PROJECT-WIDE toplevel method names for
@@ -367,6 +403,39 @@ impl SourceIndex {
     /// Whether `name` names a class defined in source (has harvested structure).
     pub fn knows_class(&self, name: &str) -> bool {
         self.classes.contains_key(name)
+    }
+
+    /// C1 (constant-shadow gate): whether a BARE read of constant `name` at a use
+    /// site with lexical prefix `use_prefix` (the enclosing class/module segment
+    /// vector, empty at toplevel) is SHADOWED by a project definition — i.e. the
+    /// project name resolves in Ruby's lexical lookup, so the core-RBS singleton
+    /// must NOT be witnessed. This REPLACES the pre-C1 bare-name project-wide
+    /// `!knows_class(name)` suppression with a lexically precise one, matching the
+    /// reference's `lexical_constant_candidates` walk:
+    ///
+    ///   * a TOPLEVEL project definition shadows everywhere;
+    ///   * a NESTED definition `N::name` shadows only where `N` is an initial
+    ///     segment run of `use_prefix` (`N` ∈ `Module.nesting` of the use site);
+    ///   * a name known as a project class but placed by the qualified walk at
+    ///     neither position (def-nested / walk gap) falls back to the pre-C1
+    ///     blanket suppression — ambiguity resolves to silent (never an FP).
+    ///
+    /// FP-safe by construction: the only behavior change vs the old gate is that a
+    /// nested-only definition STOPS suppressing at use sites it is not lexically
+    /// visible from — a strict relaxation whose every new firing the reference
+    /// (which resolves identically-lexically) confirms.
+    pub fn constant_shadowed(&self, name: &str, use_prefix: &[String]) -> bool {
+        if self.toplevel_constants.contains(name) {
+            return true;
+        }
+        match self.nested_constant_namespaces.get(name) {
+            Some(namespaces) => namespaces.iter().any(|ns| {
+                ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]
+            }),
+            // Not seen by the qualified walk at all: preserve pre-C1 behavior for
+            // any project class the walk did not qualify (def-nested / walk gap).
+            None => self.classes.contains_key(name),
+        }
     }
 
     /// The DISCOVERED written superclass (last path component) of a source class,
@@ -1247,6 +1316,47 @@ fn split_qualified(qualified: &str) -> Vec<String> {
     qualified.split("::").map(|s| s.to_string()).collect()
 }
 
+/// C1: the per-file lexical class/module SCOPES — each `(span, qualified segment
+/// vector)` — so a `ConstantRead`'s use-site lexical prefix can be recovered by
+/// span containment (the innermost enclosing scope). Mirrors the qualification
+/// walk of [`SourceIndex::collect_override_classes`]; computed once per analyzed
+/// file and threaded into the [`Typer`] so its `ConstantRead` arm can consult
+/// [`SourceIndex::constant_shadowed`] with the correct lexical prefix.
+///
+/// [`Typer`]: crate::Typer
+pub fn lexical_scopes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Vec<String>)> {
+    let mut out = Vec::new();
+    collect_lexical_scopes(ast, ast.root(), &[], &mut out);
+    out
+}
+
+fn collect_lexical_scopes(
+    ast: &LoweredAst,
+    node: NodeId,
+    prefix: &[String],
+    out: &mut Vec<(rigor_parse::Span, Vec<String>)>,
+) {
+    match ast.get(node) {
+        Node::Program { body, .. } | Node::Statements { body, .. } => {
+            for &child in body {
+                collect_lexical_scopes(ast, child, prefix, out);
+            }
+        }
+        Node::ClassDef { name, body, span, .. } | Node::ModuleDef { name, body, span, .. } => {
+            if name.is_empty() {
+                return; // un-namable (dynamic constant / `class << self`) ⇒ skip.
+            }
+            let qualified = qualify(prefix, name);
+            let segs = split_qualified(&qualified);
+            out.push((*span, segs.clone()));
+            for &child in body {
+                collect_lexical_scopes(ast, child, &segs, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Ruby truthiness of a folded scalar: only `nil` / `false` are falsey.
 fn scalar_truthy(s: &Scalar) -> bool {
     !matches!(s, Scalar::Nil | Scalar::Bool(false))
@@ -2067,5 +2177,57 @@ mod tests {
             &core,
         );
         assert_eq!(idx.const_singleton_literal("M", "ro?"), Some(Scalar::Bool(false)));
+    }
+
+    // --- C1: constant-shadow gate --------------------------------------------
+
+    fn seg(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn toplevel_definition_shadows_everywhere() {
+        // A toplevel `class Report` suppresses a bare `Report` read at ANY use
+        // site (Ruby: a toplevel constant is always reachable).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class Report\nend\n", &core);
+        assert!(idx.constant_shadowed("Report", &[]));
+        assert!(idx.constant_shadowed("Report", &seg(&["Foo", "Bar"])));
+    }
+
+    #[test]
+    fn nested_definition_shadows_only_where_lexically_visible() {
+        // `module A; module B; module Time; end; end; end` — a bare `Time` read
+        // is shadowed inside `A::B::*` but RELAXES (fires) elsewhere.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module A\n  module B\n    module Time\n    end\n    class C\n    end\n  end\nend\n",
+            &core,
+        );
+        // Visible: the defining namespace and any scope nested within it.
+        assert!(idx.constant_shadowed("Time", &seg(&["A", "B"])));
+        assert!(idx.constant_shadowed("Time", &seg(&["A", "B", "C"])));
+        // NOT visible: a sibling namespace, an outer scope, or the toplevel.
+        assert!(!idx.constant_shadowed("Time", &seg(&["A"])));
+        assert!(!idx.constant_shadowed("Time", &seg(&["A", "Z"])));
+        assert!(!idx.constant_shadowed("Time", &[]));
+        // A different bare name the project never defines is never shadowed.
+        assert!(!idx.constant_shadowed("Time", &seg(&["Other"])));
+    }
+
+    #[test]
+    fn lexical_scopes_records_qualified_spans() {
+        // The per-file lexical scope table qualifies nested class/module bodies
+        // so a use-site prefix can be recovered by span containment.
+        let ast = lower_src(
+            b"module A\n  module B\n    class C\n    end\n  end\nend\n",
+        );
+        let scopes = lexical_scopes(&ast);
+        let quals: Vec<Vec<String>> = scopes.iter().map(|(_, q)| q.clone()).collect();
+        assert!(quals.contains(&seg(&["A"])));
+        assert!(quals.contains(&seg(&["A", "B"])));
+        assert!(quals.contains(&seg(&["A", "B", "C"])));
+        // Innermost scope has the narrowest span (nested last).
+        assert_eq!(scopes.len(), 3);
     }
 }
