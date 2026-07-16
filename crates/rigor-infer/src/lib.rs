@@ -29,7 +29,7 @@ use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
-pub use source_index::{ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
+pub use source_index::{DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
 
 /// A process-wide empty [`SourceIndex`], used as the default `source` for a
 /// [`Typer`] built via [`Typer::new`] (callers that predate in-source typing).
@@ -972,6 +972,23 @@ impl<'i> Typer<'i> {
             // fall through to the folding / RBS-return cascade below.
         }
 
+        // Tier 4c (ADR-0038): interprocedural literal-tail fold on a `Const.method`
+        // SINGLETON call. When `receiver` is a project class/module constant whose
+        // OWN singleton `method` provably returns one scalar literal (and is not
+        // overridable), the call types that pinned `Constant` — feeding
+        // `flow.always-truthy-condition` (`Gitlab::Database.read_only? -> false`).
+        // A dedicated, minimal-blast-radius tier: it consults the definers index
+        // directly and does NOT type the bare constant as `Singleton`, so no other
+        // rule's view of a project constant changes. Any miss falls through
+        // (Dynamic, silent) — a project constant still types Dynamic as before.
+        if let Node::ConstantRead { name, .. } = ast.get(receiver) {
+            if !name.is_empty() {
+                if let Some(scalar) = self.source.const_singleton_literal(name, method) {
+                    return interner.intern(Type::Constant(scalar));
+                }
+            }
+        }
+
         let recv_ty = self.type_of(ast, receiver, env, interner);
 
         // Tier 1: constant folding on a value-pinned receiver. Fold only when
@@ -1294,11 +1311,15 @@ impl<'i> Typer<'i> {
             _ => return out,
         };
         let mut env = TypeEnv::new();
-        self.flow_eval_scope(ast, &body, &mut env, false, &writes, interner, &mut out);
+        self.flow_eval_scope(ast, &body, &mut env, false, None, DefKind::Instance, &writes, interner, &mut out);
         out
     }
 
-    /// Thread `env` through a scope's statements in source order.
+    /// Thread `env` through a scope's statements in source order. `self_qual` /
+    /// `self_kind` carry the enclosing class/module QUALIFIED name + method kind
+    /// so an implicit-self predicate call can be resolved for the interprocedural
+    /// literal-tail fold (ADR-0038); `None` at the top level (a receiverless call
+    /// there has no project self to resolve against).
     #[allow(clippy::too_many_arguments)]
     fn flow_eval_scope(
         &self,
@@ -1306,12 +1327,14 @@ impl<'i> Typer<'i> {
         stmts: &[NodeId],
         env: &mut TypeEnv,
         in_loop_or_block: bool,
+        self_qual: Option<&str>,
+        self_kind: DefKind,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, TypeId>,
     ) {
         for &s in stmts {
-            self.flow_eval_stmt(ast, s, env, in_loop_or_block, writes, interner, out);
+            self.flow_eval_stmt(ast, s, env, in_loop_or_block, self_qual, self_kind, writes, interner, out);
         }
     }
 
@@ -1323,6 +1346,8 @@ impl<'i> Typer<'i> {
         id: NodeId,
         env: &mut TypeEnv,
         in_loop_or_block: bool,
+        self_qual: Option<&str>,
+        self_kind: DefKind,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, TypeId>,
@@ -1330,7 +1355,7 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::Statements { body, .. } => {
                 let body = body.clone();
-                self.flow_eval_scope(ast, &body, env, in_loop_or_block, writes, interner, out);
+                self.flow_eval_scope(ast, &body, env, in_loop_or_block, self_qual, self_kind, writes, interner, out);
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
@@ -1338,6 +1363,20 @@ impl<'i> Typer<'i> {
                 // or capture-write via a block — widen those first, then bind.
                 let vspan = ast.get(value).span();
                 widen_flow_writes(writes, vspan, env, interner);
+                // An if-EXPRESSION assigned to a local (`strategies = if
+                // Gitlab::Database.read_write?; …`) still carries a predicate the
+                // always-truthy rule visits — record its snapshot here (the
+                // statement walk only reaches an `if` that is a bare statement).
+                // The branch writes are already conservatively widened above, so
+                // this only ADDS the predicate snapshot (no env perturbation).
+                if !in_loop_or_block {
+                    if let Node::If { predicate, .. } = ast.get(value) {
+                        let predicate = *predicate;
+                        let pty = self
+                            .flow_predicate_type(ast, predicate, env, self_qual, self_kind, interner);
+                        out.insert(value, pty);
+                    }
+                }
                 let ty = self.type_of(ast, value, env, interner);
                 env.insert(name, ty);
             }
@@ -1352,33 +1391,49 @@ impl<'i> Typer<'i> {
                 let (predicate, then_body, else_body) =
                     (*predicate, then_body.clone(), else_body.clone());
                 if !in_loop_or_block {
-                    let pty = self.type_of(ast, predicate, env, interner);
+                    let pty = self.flow_predicate_type(
+                        ast, predicate, env, self_qual, self_kind, interner,
+                    );
                     out.insert(id, pty);
                 }
                 // Independently evaluate each branch from the dominating env, then
                 // join: a binding survives only if both branches agree exactly.
                 let mut then_env = env.clone();
                 self.flow_eval_scope(
-                    ast, &then_body, &mut then_env, in_loop_or_block, writes, interner, out,
+                    ast, &then_body, &mut then_env, in_loop_or_block, self_qual, self_kind, writes, interner, out,
                 );
                 let mut else_env = env.clone();
                 self.flow_eval_scope(
-                    ast, &else_body, &mut else_env, in_loop_or_block, writes, interner, out,
+                    ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, interner, out,
                 );
                 *env = join_flow_envs(&then_env, &else_env, interner);
                 // A predicate may contain a write (`if (x = f)`); widen post-join.
                 let pspan = ast.get(predicate).span();
                 widen_flow_writes(writes, pspan, env, interner);
             }
-            Node::Definition { body, .. }
-            | Node::ClassDef { body, .. }
-            | Node::ModuleDef { body, .. } => {
-                // Independent scope: fresh local env, inherited suppression flag,
-                // no effect on the enclosing env.
-                let body = body.clone();
+            Node::Definition { body, singleton_name, .. } => {
+                // Independent scope: fresh local env, inherited suppression flag.
+                // The self KIND flips to singleton inside a `def self.x` (so an
+                // implicit-self call there resolves against the owner's singleton
+                // table); the enclosing class QUALIFIED name is unchanged.
+                let (body, kind) = (
+                    body.clone(),
+                    if singleton_name.is_some() { DefKind::Singleton } else { DefKind::Instance },
+                );
                 let mut fresh = TypeEnv::new();
                 self.flow_eval_scope(
-                    ast, &body, &mut fresh, in_loop_or_block, writes, interner, out,
+                    ast, &body, &mut fresh, in_loop_or_block, self_qual, kind, writes, interner, out,
+                );
+            }
+            Node::ClassDef { body, name, .. } | Node::ModuleDef { body, name, .. } => {
+                // Independent scope: fresh local env, inherited suppression flag.
+                // Extend the lexical self-qualified name so a nested class/module's
+                // implicit-self calls resolve against the right owner; a body-level
+                // call defaults to instance kind until a `def self.x` flips it.
+                let (body, child_qual) = (body.clone(), qualify_self(self_qual, name));
+                let mut fresh = TypeEnv::new();
+                self.flow_eval_scope(
+                    ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Instance, writes, interner, out,
                 );
             }
             // Loop / case / begin-rescue / logical / call(+block) / any other node:
@@ -1387,6 +1442,35 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(writes, other.span(), env, interner);
             }
         }
+    }
+
+    /// The recorded flow type for an `if`/`unless`/ternary predicate. Tries the
+    /// ADR-0038 interprocedural literal-tail fold on an IMPLICIT-SELF predicate
+    /// call first (resolved against the enclosing class `self_qual`/`self_kind`) —
+    /// this is the one fold that needs the self context `type_of` lacks — then
+    /// falls back to the ordinary `type_of` (which itself folds a `Const.method`
+    /// predicate via `type_call`'s tier 4c). Producing a `Type::Constant` here is
+    /// what makes `flow.always-truthy-condition` fire.
+    fn flow_predicate_type(
+        &self,
+        ast: &LoweredAst,
+        predicate: NodeId,
+        env: &TypeEnv,
+        self_qual: Option<&str>,
+        self_kind: DefKind,
+        interner: &mut Interner,
+    ) -> TypeId {
+        if let Node::Call { receiver: None, method, block_body, .. } = ast.get(predicate) {
+            if block_body.is_empty() {
+                let method = method.clone();
+                if let Some(q) = self_qual {
+                    if let Some(scalar) = self.source.implicit_self_literal(q, self_kind, &method) {
+                        return interner.intern(Type::Constant(scalar));
+                    }
+                }
+            }
+        }
+        self.type_of(ast, predicate, env, interner)
     }
 
     /// Bind a single statement into `env` if it is a local write; recurse
@@ -1809,6 +1893,17 @@ fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
             _ => None,
         })
         .collect()
+}
+
+/// Extend a lexical self-qualified name with a nested class/module `name`,
+/// mirroring the `SourceIndex` qualified-owner walk so the flow-eval self context
+/// and the fold table agree (`Some("Gitlab")` + `"Database"` -> `Gitlab::
+/// Database`). An empty enclosing prefix (top level) yields the bare name.
+fn qualify_self(prefix: Option<&str>, name: &str) -> String {
+    match prefix {
+        Some(p) if !p.is_empty() => format!("{p}::{name}"),
+        _ => name.to_string(),
+    }
 }
 
 /// Widen (to `Dynamic`) every tracked local whose write span is contained in

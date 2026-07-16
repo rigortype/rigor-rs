@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, MethodBody, Node, NodeId, Visibility};
-use rigor_types::{ClassId, Interner};
+use rigor_types::{ClassId, Interner, Scalar};
 
 /// The first [`ClassId`] handed out by the per-run registry. Chosen well above
 /// the fixed core-class id space (`CORE_CLASSES`, currently 9 entries) so a
@@ -54,6 +54,36 @@ pub const SOURCE_CLASS_BASE: u32 = 1_000_000;
 /// `OVERRIDE_ANCESTOR_WALK_LIMIT`. Past it the walk declines (a missed witness,
 /// never a false positive) rather than risk a runaway on a pathological graph.
 pub const OVERRIDE_ANCESTOR_WALK_LIMIT: usize = 100;
+
+/// Interprocedural literal-tail fold: the recursion depth cap on
+/// [`SourceIndex::fold_expr`] (bodies calling bodies — `read_write? = !read_only?`).
+/// Past it the fold declines (a missed witness, never a false positive). Bodies
+/// this deep are vanishingly rare; the cap just backstops a pathological chain the
+/// per-key cycle guard would otherwise still terminate but slowly.
+const FOLD_DEPTH_CAP: usize = 16;
+
+/// The method KIND an interprocedural literal-tail fold is keyed on: an ordinary
+/// instance `def` vs a singleton `def self.x` (`module_function` / `class << self`
+/// out of scope). The two live in SEPARATE tables — a `Foo.read_only?` singleton
+/// call never resolves an instance `read_only?` and vice versa (reference
+/// `discovered_def_nodes` vs `discovered_singleton_def_nodes`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum DefKind {
+    Instance,
+    Singleton,
+}
+
+/// One (re)definition site of a method whose interprocedural literal-tail return
+/// we may fold: which analyzed AST holds it, the tail (return) expression node,
+/// and whether the body contains any explicit `return` (a decline gate — we read
+/// only the tail). Collected per `(qualified owner, method, kind)` so reopens are
+/// joined (all sites must agree on the folded literal, else decline).
+#[derive(Clone, Copy)]
+struct FoldSite {
+    ast_idx: usize,
+    tail: NodeId,
+    has_explicit_return: bool,
+}
 
 /// Per-class structure harvested from source: own instance methods + superclass.
 #[derive(Default, Clone)]
@@ -137,6 +167,24 @@ pub struct SourceIndex {
     /// suppresses on this cross-file set — matching the reference's project-mode
     /// resolution and staying zero-FP on the multi-file corpus.
     toplevel_defs: HashSet<String>,
+    /// ADR-0038 interprocedural literal-tail fold: `(qualified owner, method,
+    /// kind) -> folded scalar literal`. Populated in Pass 4 of [`build_project`]
+    /// for a project method whose whole return provably joins to ONE scalar
+    /// `Constant` (`Gitlab::Database.read_only? -> false`, `read_write? =
+    /// !read_only? -> true`). The value already has the overridable-method
+    /// degrade applied (a `Constant` here is never re-opened by a related
+    /// subclass/includer override), so a hit types a `Type::Constant` directly.
+    /// A method that fails any fold gate has NO entry ⇒ the call stays Dynamic
+    /// (silent). Keyed by NAME (cross-file safe). SEPARATE from `method_returns`
+    /// (which widens to Nominal and drops the value pin).
+    literal_returns: HashMap<(String, String, DefKind), Scalar>,
+    /// ADR-0038 interprocedural literal-tail fold: the inverted `(method, kind)
+    /// -> [qualified owners that define it]` index over the project's own `def`
+    /// bodies. Drives the overridable-method degrade gate (a value-pinned base
+    /// return is unsound to adopt when a RELATED subclass/includer redefines the
+    /// method) and the implicit-self ancestor resolution. Mirrors the reference's
+    /// `method_definers_index`.
+    definers: HashMap<(String, DefKind), Vec<String>>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
@@ -272,6 +320,18 @@ impl SourceIndex {
         idx.method_returns = returns;
         idx.param_bound_returns = param_bound;
 
+        // Pass 4 (ADR-0038): interprocedural literal-tail return folding. Runs
+        // AFTER Pass 1b (`override_classes`, the ancestry the degrade + implicit-
+        // self resolution walk) and needs no `core`/typing state. Harvests every
+        // project instance + singleton `def` body by QUALIFIED owner name (the
+        // lexical walk, so `module Gitlab; module Database` keys `Gitlab::
+        // Database` — matching a `Gitlab::Database.read_only?` receiver), inverts
+        // to a definers index, then folds each method's tail to a scalar literal
+        // (resolving nested project calls, applying the overridable degrade).
+        let (defs, definers) = collect_fold_defs(asts);
+        idx.definers = definers;
+        idx.literal_returns = idx.compute_literal_returns(asts, &defs);
+
         idx
     }
 
@@ -351,6 +411,44 @@ impl SourceIndex {
         self.method_returns
             .get(&(class.to_string(), method.to_string()))
             .map(|s| s.as_str())
+    }
+
+    /// ADR-0038 interprocedural literal-tail fold — the folded scalar literal a
+    /// `Const.method` SINGLETON call yields, or `None` to decline (Dynamic,
+    /// silent). `receiver_name` is the receiver constant's dotted name as written
+    /// (`Gitlab::Database`, `::Gitlab::Database`); resolution is OWN-CLASS only
+    /// (the reference `try_singleton_method_inference` walks no singleton
+    /// ancestry) and the returned value already has the overridable degrade
+    /// applied. The call site interns the result as a `Type::Constant`.
+    pub fn const_singleton_literal(&self, receiver_name: &str, method: &str) -> Option<Scalar> {
+        let owner = receiver_name.strip_prefix("::").unwrap_or(receiver_name);
+        self.literal_returns
+            .get(&(owner.to_string(), method.to_string(), DefKind::Singleton))
+            .cloned()
+    }
+
+    /// ADR-0038 interprocedural literal-tail fold — the folded scalar literal an
+    /// IMPLICIT-SELF call `method` yields inside the enclosing scope `self_qual`
+    /// (a qualified class/module name) whose method kind is `self_kind`, or `None`
+    /// to decline. A singleton enclosing method (`def self.x`) resolves `method`
+    /// against `self_qual`'s OWN singleton table; an instance method resolves it
+    /// through `self_qual`'s project ancestry (nearest ancestor defining it), the
+    /// same ancestor walk the override-visibility rule uses — so an unrelated
+    /// same-name method elsewhere is NOT resolved (the cross-class zero-FP
+    /// keystone). The value already has the overridable degrade applied.
+    pub fn implicit_self_literal(
+        &self,
+        self_qual: &str,
+        self_kind: DefKind,
+        method: &str,
+    ) -> Option<Scalar> {
+        let (owner, kind) = match self_kind {
+            DefKind::Singleton => (self_qual.to_string(), DefKind::Singleton),
+            DefKind::Instance => (self.resolve_instance_owner(self_qual, method)?, DefKind::Instance),
+        };
+        self.literal_returns
+            .get(&(owner, method.to_string(), kind))
+            .cloned()
     }
 
     /// The ADR-0023 tier-4b call-site PARAMETER-BINDING descriptor for a project
@@ -595,6 +693,254 @@ impl SourceIndex {
                 entry.includes.push(inc.clone());
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-0038 — interprocedural literal-tail return folding
+    // -----------------------------------------------------------------------
+
+    /// Compute the `(qualified owner, method, kind) -> folded scalar` table from
+    /// the harvested `defs` (which carry each method's tail node), applying the
+    /// overridable-method degrade. A per-key memo makes the recursive body-to-body
+    /// fold (`read_write? = !read_only?`) linear; a per-resolution `visiting` set
+    /// makes a recursive method (`def loopy; loopy; end`) decline rather than spin.
+    fn compute_literal_returns(
+        &self,
+        asts: &[&LoweredAst],
+        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
+    ) -> HashMap<(String, String, DefKind), Scalar> {
+        let mut memo: HashMap<(String, String, DefKind), Option<Scalar>> = HashMap::new();
+        for key in defs.keys() {
+            let mut visiting: HashSet<(String, String, DefKind)> = HashSet::new();
+            self.resolve_fold_key(key, defs, asts, &mut memo, &mut visiting);
+        }
+        memo.into_iter().filter_map(|(k, v)| v.map(|s| (k, s))).collect()
+    }
+
+    /// Resolve one `(owner, method, kind)`'s folded literal (memoized), applying
+    /// the overridable degrade: a value-pinned base return is dropped when a
+    /// RELATED subclass/includer redefines the method (else adopting the base's
+    /// literal as a flow constant is unsound — the reference `degrade_if_overridable`).
+    fn resolve_fold_key(
+        &self,
+        key: &(String, String, DefKind),
+        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
+        asts: &[&LoweredAst],
+        memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
+        visiting: &mut HashSet<(String, String, DefKind)>,
+    ) -> Option<Scalar> {
+        if let Some(v) = memo.get(key) {
+            return v.clone();
+        }
+        if visiting.contains(key) {
+            return None; // cycle (recursive method) ⇒ decline, don't memoize.
+        }
+        visiting.insert(key.clone());
+        let raw = self.fold_key_sites(key, defs, asts, memo, visiting);
+        let result = match raw {
+            Some(_) if self.overridden_in_project(&key.0, &key.1, key.2) => None,
+            other => other,
+        };
+        visiting.remove(key);
+        memo.insert(key.clone(), result.clone());
+        result
+    }
+
+    /// Fold every (re)definition site of `key` and require they AGREE on one
+    /// scalar (a disagreeing reopen declines). Any site with an explicit `return`
+    /// declines the whole method (we read only the tail).
+    fn fold_key_sites(
+        &self,
+        key: &(String, String, DefKind),
+        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
+        asts: &[&LoweredAst],
+        memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
+        visiting: &mut HashSet<(String, String, DefKind)>,
+    ) -> Option<Scalar> {
+        let sites = defs.get(key)?;
+        let mut acc: Option<Scalar> = None;
+        for site in sites {
+            if site.has_explicit_return {
+                return None;
+            }
+            let ast = asts[site.ast_idx];
+            let s = self.fold_expr(ast, site.tail, &key.0, key.2, defs, asts, memo, visiting, 0)?;
+            match &acc {
+                None => acc = Some(s),
+                Some(prev) if *prev != s => return None, // disagreeing reopen.
+                _ => {}
+            }
+        }
+        acc
+    }
+
+    /// Fold one expression node to a scalar literal, or `None` to decline. Handles
+    /// literals, `!expr`, an implicit-self project call (resolved against
+    /// `self_qual`/`self_kind`), a `Const.method` singleton call, and a core fold
+    /// on a value-pinned receiver + args. A leaf that is anything else (a param /
+    /// ivar / non-folding call / branch carrier) declines the whole fold — which
+    /// is why an if/case/loop-carrier tail or a param-dependent body never folds.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_expr(
+        &self,
+        ast: &LoweredAst,
+        node_id: NodeId,
+        self_qual: &str,
+        self_kind: DefKind,
+        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
+        asts: &[&LoweredAst],
+        memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
+        visiting: &mut HashSet<(String, String, DefKind)>,
+        depth: usize,
+    ) -> Option<Scalar> {
+        if depth > FOLD_DEPTH_CAP {
+            return None;
+        }
+        match ast.get(node_id) {
+            Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
+            Node::IntegerLit { value, .. } => Some(Scalar::Int(*value)),
+            Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
+            Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+            Node::NilLit { .. } => Some(Scalar::Nil),
+            Node::TrueLit { .. } => Some(Scalar::Bool(true)),
+            Node::FalseLit { .. } => Some(Scalar::Bool(false)),
+            // An implicit-self project call (`read_only?`). Args are ignored — the
+            // fold is param-INDEPENDENT; if the body reads a param the recursive
+            // fold declines on that param leaf. A block form is out of scope.
+            Node::Call { receiver: None, method, block_body, .. } if block_body.is_empty() => {
+                let method = method.clone();
+                let (owner, kind) = match self_kind {
+                    DefKind::Singleton => (self_qual.to_string(), DefKind::Singleton),
+                    DefKind::Instance => {
+                        (self.resolve_instance_owner(self_qual, &method)?, DefKind::Instance)
+                    }
+                };
+                self.resolve_fold_key(&(owner, method, kind), defs, asts, memo, visiting)
+            }
+            Node::Call { receiver: Some(r), method, args, block_body, .. }
+                if block_body.is_empty() =>
+            {
+                let (r, method, args) = (*r, method.clone(), args.clone());
+                // `!expr` — Prism lowers unary not to a receiver-bearing call named
+                // `!`. Fold the receiver and invert its Ruby truthiness (this is
+                // what turns `read_write? = !read_only?` into `true`).
+                if method == "!" && args.is_empty() {
+                    let s = self.fold_expr(
+                        ast, r, self_qual, self_kind, defs, asts, memo, visiting, depth + 1,
+                    )?;
+                    return Some(Scalar::Bool(!scalar_truthy(&s)));
+                }
+                // `Const.method` — an OWN-CLASS singleton project call.
+                if args.is_empty() {
+                    if let Node::ConstantRead { name, .. } = ast.get(r) {
+                        if !name.is_empty() {
+                            let owner = name.strip_prefix("::").unwrap_or(name).to_string();
+                            return self.resolve_fold_key(
+                                &(owner, method, DefKind::Singleton),
+                                defs,
+                                asts,
+                                memo,
+                                visiting,
+                            );
+                        }
+                    }
+                }
+                // A core fold on a value-pinned receiver + args (`1 + 1`, `"x" ==
+                // "y"`). Declines unless every part folds.
+                let recv = self.fold_expr(
+                    ast, r, self_qual, self_kind, defs, asts, memo, visiting, depth + 1,
+                )?;
+                let mut arg_scalars = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_scalars.push(self.fold_expr(
+                        ast, a, self_qual, self_kind, defs, asts, memo, visiting, depth + 1,
+                    )?);
+                }
+                crate::folding::fold(&recv, &method, &arg_scalars)
+            }
+            _ => None,
+        }
+    }
+
+    /// The nearest project ancestor of `qual` (itself first, then its ancestry in
+    /// MRO order) that defines instance `method`, or `None`. Mirrors the reference
+    /// `resolve_user_def_with_owner`: an unrelated same-name method elsewhere is
+    /// never reached, so an implicit-self call resolves ONLY through the enclosing
+    /// class's own project chain (the cross-class zero-FP keystone).
+    fn resolve_instance_owner(&self, qual: &str, method: &str) -> Option<String> {
+        if self.owner_defines(qual, method, DefKind::Instance) {
+            return Some(qual.to_string());
+        }
+        let mut queue: Vec<String> = self.override_ancestor_names(qual);
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(qual.to_string());
+        let mut visited = 0usize;
+        while !queue.is_empty() {
+            let current = queue.remove(0);
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            visited += 1;
+            if visited > OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return None;
+            }
+            if self.owner_defines(&current, method, DefKind::Instance) {
+                return Some(current);
+            }
+            for next in self.override_ancestor_names(&current) {
+                queue.push(next);
+            }
+        }
+        None
+    }
+
+    /// Whether the qualified `owner` has its OWN project `def` of `(method, kind)`.
+    fn owner_defines(&self, owner: &str, method: &str, kind: DefKind) -> bool {
+        self.definers
+            .get(&(method.to_string(), kind))
+            .is_some_and(|owners| owners.iter().any(|o| o == owner))
+    }
+
+    /// The overridable-method degrade gate (reference `overridden_in_project?`):
+    /// true when some project class/module DISTINCT from `owner` redefines
+    /// `(method, kind)` AND is RELATED to `owner` (a transitive subclass of an
+    /// owner class, or an includer/prepender of an owner module). A same-name
+    /// method in an UNRELATED class is not an override — so the two unrelated
+    /// `force_pipeline_creation_to_continue?` definers each still fold.
+    fn overridden_in_project(&self, owner: &str, method: &str, kind: DefKind) -> bool {
+        let Some(candidates) = self.definers.get(&(method.to_string(), kind)) else {
+            return false;
+        };
+        candidates
+            .iter()
+            .any(|c| c != owner && self.related_to_owner(c, owner))
+    }
+
+    /// Whether `candidate`'s transitive project ancestry reaches `owner` — i.e.
+    /// `candidate` is a subclass of an owner class or an includer of an owner
+    /// module. Reuses the same ancestor walk as method resolution.
+    fn related_to_owner(&self, candidate: &str, owner: &str) -> bool {
+        let mut queue: Vec<String> = self.override_ancestor_names(candidate);
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(candidate.to_string());
+        let mut visited = 0usize;
+        while !queue.is_empty() {
+            let current = queue.remove(0);
+            if current == owner {
+                return true;
+            }
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            visited += 1;
+            if visited > OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return false;
+            }
+            for next in self.override_ancestor_names(&current) {
+                queue.push(next);
+            }
+        }
+        false
     }
 
     /// Decide whether `class_name` is known to LACK `method`, consulting the
@@ -899,6 +1245,98 @@ fn qualify(prefix: &[String], name: &str) -> String {
 /// as the child lexical prefix when recursing into a class/module body.
 fn split_qualified(qualified: &str) -> Vec<String> {
     qualified.split("::").map(|s| s.to_string()).collect()
+}
+
+/// Ruby truthiness of a folded scalar: only `nil` / `false` are falsey.
+fn scalar_truthy(s: &Scalar) -> bool {
+    !matches!(s, Scalar::Nil | Scalar::Bool(false))
+}
+
+/// ADR-0038 — harvest every project instance + singleton `def` body by QUALIFIED
+/// owner name (the same lexical walk `collect_override_classes` uses, so
+/// `module Gitlab; module Database` keys `Gitlab::Database`), returning the
+/// per-`(owner, method, kind)` def sites (tail node + explicit-return flag,
+/// reopens accumulated) and the inverted `(method, kind) -> [owners]` definers
+/// index. Only DIRECT `def` children of a class/module body are harvested — a
+/// def nested in a conditional / inner method is out of scope, matching the
+/// tier-4b / override discovery inclusion rule.
+#[allow(clippy::type_complexity)]
+fn collect_fold_defs(
+    asts: &[&LoweredAst],
+) -> (
+    HashMap<(String, String, DefKind), Vec<FoldSite>>,
+    HashMap<(String, DefKind), Vec<String>>,
+) {
+    let mut defs: HashMap<(String, String, DefKind), Vec<FoldSite>> = HashMap::new();
+    for (ai, ast) in asts.iter().enumerate() {
+        walk_fold_defs(ai, ast, ast.root(), &[], &mut defs);
+    }
+    let mut definers: HashMap<(String, DefKind), Vec<String>> = HashMap::new();
+    for (owner, method, kind) in defs.keys() {
+        let owners = definers.entry((method.clone(), *kind)).or_default();
+        if !owners.contains(owner) {
+            owners.push(owner.clone());
+        }
+    }
+    (defs, definers)
+}
+
+/// Recursive helper for [`collect_fold_defs`]: at each `ClassDef`/`ModuleDef`,
+/// harvest its direct `def` children (instance via `name`, singleton via
+/// `singleton_name`) keyed by the qualified owner, then recurse into the body for
+/// nested classes/modules with the extended lexical prefix.
+fn walk_fold_defs(
+    ast_idx: usize,
+    ast: &LoweredAst,
+    node: NodeId,
+    prefix: &[String],
+    defs: &mut HashMap<(String, String, DefKind), Vec<FoldSite>>,
+) {
+    match ast.get(node) {
+        Node::Program { body, .. } | Node::Statements { body, .. } => {
+            for &child in body {
+                walk_fold_defs(ast_idx, ast, child, prefix, defs);
+            }
+        }
+        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+            if name.is_empty() {
+                return;
+            }
+            let qualified = qualify(prefix, name);
+            for &child in body {
+                if let Node::Definition {
+                    name,
+                    singleton_name,
+                    body: def_body,
+                    has_explicit_return,
+                    ..
+                } = ast.get(child)
+                {
+                    let entry = match (name, singleton_name) {
+                        (Some(m), _) => Some((m.clone(), DefKind::Instance)),
+                        (None, Some(m)) => Some((m.clone(), DefKind::Singleton)),
+                        _ => None,
+                    };
+                    if let Some((method, kind)) = entry {
+                        if let Some(&tail) = def_body.last() {
+                            defs.entry((qualified.clone(), method, kind)).or_default().push(
+                                FoldSite {
+                                    ast_idx,
+                                    tail,
+                                    has_explicit_return: *has_explicit_return,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            let child_prefix = split_qualified(&qualified);
+            for &child in body {
+                walk_fold_defs(ast_idx, ast, child, &child_prefix, defs);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether a tail node is a branch/loop carrier whose type is not a single
@@ -1341,5 +1779,293 @@ mod tests {
         // A Dynamic carrier ⇒ None.
         let u = i.untyped();
         assert_eq!(idx.class_name_for_id_of(&i, u), None);
+    }
+
+    // --- ADR-0038 interprocedural literal-tail fold ---------------------------
+
+    /// Build a PROJECT index over N source strings.
+    fn build_many(srcs: &[&[u8]], core: &CoreIndex) -> SourceIndex {
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower_src(s)).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        SourceIndex::build_project(&refs, core)
+    }
+
+    #[test]
+    fn const_singleton_bare_literal_folds() {
+        // `module M; def self.ro?; false; end; end` ⇒ `M.ro?` folds to false.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"module M\n  def self.ro?\n    false\n  end\nend\n", &core);
+        assert_eq!(idx.const_singleton_literal("M", "ro?"), Some(Scalar::Bool(false)));
+    }
+
+    #[test]
+    fn const_singleton_class_receiver_folds() {
+        // A CLASS (not just a module) singleton call folds too.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class K\n  def self.on?\n    true\n  end\nend\n", &core);
+        assert_eq!(idx.const_singleton_literal("K", "on?"), Some(Scalar::Bool(true)));
+    }
+
+    #[test]
+    fn qualified_const_receiver_folds_stripping_leading_colons() {
+        // `module Gitlab; module Database; def self.read_only?; false` keys the
+        // fold at the QUALIFIED owner `Gitlab::Database`, matched by the dotted
+        // receiver (with or without a leading `::`).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module Gitlab\n  module Database\n    def self.read_only?\n      false\n    end\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(
+            idx.const_singleton_literal("Gitlab::Database", "read_only?"),
+            Some(Scalar::Bool(false))
+        );
+        assert_eq!(
+            idx.const_singleton_literal("::Gitlab::Database", "read_only?"),
+            Some(Scalar::Bool(false))
+        );
+    }
+
+    #[test]
+    fn depth_two_bang_of_singleton_call_folds() {
+        // `read_write? = !read_only?` — the tail `!read_only?` resolves the
+        // OWN-CLASS singleton `read_only?` (false) and inverts it ⇒ true.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module Gitlab\n  module Database\n    def self.read_only?\n      false\n    end\n    def self.read_write?\n      !read_only?\n    end\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(
+            idx.const_singleton_literal("Gitlab::Database", "read_write?"),
+            Some(Scalar::Bool(true))
+        );
+    }
+
+    #[test]
+    fn cross_owner_const_call_declines() {
+        // `Bar` defines `read_only?`; `Foo` does not. A `Foo.read_only?` fold must
+        // DECLINE (own-class resolution — a same-name method elsewhere is never
+        // adopted), even though `read_only?` has exactly one project definer.
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"class Foo\nend\n",
+                b"module Bar\n  def self.read_only?\n    false\n  end\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("Foo", "read_only?"), None);
+        assert_eq!(idx.const_singleton_literal("Bar", "read_only?"), Some(Scalar::Bool(false)));
+    }
+
+    #[test]
+    fn implicit_self_same_class_instance_folds() {
+        // `def flag; false; end` resolves an implicit-self `flag` in the SAME
+        // class to false.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"class Widget\n  def flag\n    false\n  end\nend\n", &core);
+        assert_eq!(
+            idx.implicit_self_literal("Widget", DefKind::Instance, "flag"),
+            Some(Scalar::Bool(false))
+        );
+    }
+
+    #[test]
+    fn implicit_self_inherited_instance_folds() {
+        // `class User < Base; Base defines flag` — an implicit-self `flag` in User
+        // resolves through the ancestry to Base#flag.
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"class Base\n  def flag\n    false\n  end\nend\n",
+                b"class User < Base\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(
+            idx.implicit_self_literal("User", DefKind::Instance, "flag"),
+            Some(Scalar::Bool(false))
+        );
+    }
+
+    #[test]
+    fn implicit_self_included_module_folds() {
+        // `class User; include Flaggable; Flaggable defines flag` — resolves
+        // through the included module.
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"module Flaggable\n  def flag\n    false\n  end\nend\n",
+                b"class User\n  include Flaggable\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(
+            idx.implicit_self_literal("User", DefKind::Instance, "flag"),
+            Some(Scalar::Bool(false))
+        );
+    }
+
+    #[test]
+    fn implicit_self_cross_class_declines() {
+        // `Widget` defines `flag`; `User` (unrelated) calls it implicitly. Even
+        // with a single project definer, the fold DECLINES — `flag` is not in
+        // User's ancestry (the cross-class zero-FP keystone).
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"class Widget\n  def flag\n    false\n  end\nend\n",
+                b"class User\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(idx.implicit_self_literal("User", DefKind::Instance, "flag"), None);
+    }
+
+    #[test]
+    fn implicit_self_singleton_kind_folds_own_class() {
+        // Inside a `def self.check`, an implicit `read_only?` resolves the OWN
+        // singleton table.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module Gitlab\n  module Database\n    def self.read_only?\n      false\n    end\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(
+            idx.implicit_self_literal("Gitlab::Database", DefKind::Singleton, "read_only?"),
+            Some(Scalar::Bool(false))
+        );
+        // The instance table is SEPARATE — no instance `read_only?` exists.
+        assert_eq!(
+            idx.implicit_self_literal("Gitlab::Database", DefKind::Instance, "read_only?"),
+            None
+        );
+    }
+
+    #[test]
+    fn related_subclass_override_degrades_even_when_values_match() {
+        // Base#flag = false, Sub < Base overrides flag = false (MATCHING value).
+        // The base's literal is the DEFAULT, not what every receiver sees, so it
+        // degrades to no-fold (reference `degrade_if_overridable`).
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"class Base\n  def flag\n    false\n  end\nend\n",
+                b"class Sub < Base\n  def flag\n    false\n  end\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(idx.implicit_self_literal("Base", DefKind::Instance, "flag"), None);
+    }
+
+    #[test]
+    fn two_unrelated_definers_each_fold() {
+        // A and B are UNRELATED modules that each define a singleton `ro? = false`.
+        // Neither is an override of the other, so each still folds (the recall the
+        // single-definer guard would have lost — the `force_pipeline_creation_to_
+        // continue?` pair).
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"module A\n  def self.ro?\n    false\n  end\nend\n",
+                b"module B\n  def self.ro?\n    false\n  end\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("A", "ro?"), Some(Scalar::Bool(false)));
+        assert_eq!(idx.const_singleton_literal("B", "ro?"), Some(Scalar::Bool(false)));
+    }
+
+    #[test]
+    fn subclass_constant_singleton_declines() {
+        // `Sub < Base`, only Base defines singleton `ro?`. A `Sub.ro?` call is an
+        // INHERITED singleton — resolution is own-class only, so it declines
+        // (reference probe 9: inherited singleton via subclass constant declines).
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"class Base\n  def self.ro?\n    false\n  end\nend\n",
+                b"class Sub < Base\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("Sub", "ro?"), None);
+        assert_eq!(idx.const_singleton_literal("Base", "ro?"), Some(Scalar::Bool(false)));
+    }
+
+    #[test]
+    fn union_branch_tail_declines() {
+        // A method whose tail is an `if`/ternary carrier never folds (a branch
+        // carrier has no single scalar leaf in this slice).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module M\n  def self.ro?\n    cond ? true : nil\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("M", "ro?"), None);
+    }
+
+    #[test]
+    fn dynamic_leaf_declines() {
+        // A non-literal tail (an unresolved call) declines.
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"module M\n  def self.ro?\n    some_dynamic_thing\n  end\nend\n", &core);
+        assert_eq!(idx.const_singleton_literal("M", "ro?"), None);
+    }
+
+    #[test]
+    fn shape_return_declines() {
+        // An array/hash literal tail is not a scalar ⇒ decline.
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"module M\n  def self.ro?\n    [1, 2]\n  end\nend\n", &core);
+        assert_eq!(idx.const_singleton_literal("M", "ro?"), None);
+    }
+
+    #[test]
+    fn explicit_return_declines_fold() {
+        // Any explicit `return` in the body declines (we read only the tail).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module M\n  def self.ro?\n    return true if x\n    false\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("M", "ro?"), None);
+    }
+
+    #[test]
+    fn disagreeing_reopen_declines_fold() {
+        // The same singleton method reopened with a DIFFERENT literal declines.
+        let core = CoreIndex::new();
+        let idx = build_many(
+            &[
+                b"module M\n  def self.ro?\n    false\n  end\nend\n",
+                b"module M\n  def self.ro?\n    true\n  end\nend\n",
+            ],
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("M", "ro?"), None);
+    }
+
+    #[test]
+    fn recursive_method_declines_fold() {
+        // A self-recursive body (`def loopy; loopy; end`) declines via the cycle
+        // guard rather than spinning.
+        let core = CoreIndex::new();
+        let (_a, idx) =
+            build_one(b"module M\n  def self.loopy\n    loopy\n  end\nend\n", &core);
+        assert_eq!(idx.const_singleton_literal("M", "loopy"), None);
+    }
+
+    #[test]
+    fn raise_guarded_tail_folds() {
+        // A raise-guarded earlier statement leaves the tail literal foldable.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module M\n  def self.ro?\n    raise \"boom\" if never\n    false\n  end\nend\n",
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("M", "ro?"), Some(Scalar::Bool(false)));
     }
 }

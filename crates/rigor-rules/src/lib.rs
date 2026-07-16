@@ -3592,6 +3592,84 @@ mod tests {
         );
     }
 
+    // -- ADR-0038 interprocedural literal-tail fold (end-to-end) -----------
+
+    #[test]
+    fn always_falsey_const_singleton_fold() {
+        // `M.ro? -> false` ⇒ `if M.ro?` is always falsey. Byte-parity with the
+        // oracle: message + the predicate-node anchor.
+        let src = b"module M\n  def self.ro?\n    false\n  end\nend\nif M.ro?\n  noop\nend\n";
+        let d = always_truthy(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert_eq!(
+            d[0].message,
+            "condition is always falsey (the surrounding flow proves it folds to a constant)"
+        );
+        // Anchor: the predicate `M.ro?` on line 6, column 4 (1-based, after `if `).
+        assert_eq!(line_col(src, d[0].start_offset), (6, 4));
+    }
+
+    #[test]
+    fn always_truthy_const_singleton_depth_two_bang_fold() {
+        // `read_write? = !read_only?` ⇒ `if Gitlab::Database.read_write?` is
+        // always TRUTHY (the depth-2 interprocedural fold).
+        let src = b"module Gitlab\n  module Database\n    def self.read_only?\n      false\n    end\n    def self.read_write?\n      !read_only?\n    end\n  end\nend\nif Gitlab::Database.read_write?\n  noop\nend\n";
+        let d = always_truthy(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert!(d[0].message.contains("always truthy"), "got {}", d[0].message);
+    }
+
+    #[test]
+    fn always_falsey_implicit_self_instance_fold() {
+        // An implicit-self `flag` in the SAME class folds to false.
+        let src = b"class Widget\n  def flag\n    false\n  end\n  def check\n    if flag\n      noop\n    end\n  end\nend\n";
+        let d = always_truthy(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert!(d[0].message.contains("always falsey"), "got {}", d[0].message);
+    }
+
+    #[test]
+    fn always_truthy_assignment_rhs_if_fold() {
+        // An `if`-expression assigned to a local still fires on a folded predicate.
+        let src = b"module M\n  def self.on?\n    true\n  end\nend\nx = if M.on?\n  1\nelse\n  2\nend\n";
+        let d = always_truthy(src);
+        assert_eq!(d.len(), 1, "expected one diagnostic, got {d:?}");
+        assert!(d[0].message.contains("always truthy"), "got {}", d[0].message);
+    }
+
+    #[test]
+    fn always_truthy_defensive_predicate_name_silent() {
+        // A project method literally named `empty?` is in the defensive skip
+        // envelope — even though it folds, always-truthy must not fire.
+        let src = b"class C\n  def empty?\n    false\n  end\n  def check\n    if empty?\n      noop\n    end\n  end\nend\n";
+        assert!(
+            always_truthy(src).is_empty(),
+            "defensive-named predicate must stay silent"
+        );
+    }
+
+    #[test]
+    fn always_truthy_cross_owner_const_call_silent() {
+        // `Foo.read_only?` where `Bar` (not `Foo`) owns `read_only?` — own-class
+        // resolution declines ⇒ no diagnostic (zero-FP keystone).
+        let src = b"class Foo\nend\nmodule Bar\n  def self.read_only?\n    false\n  end\nend\nif Foo.read_only?\n  noop\nend\n";
+        assert!(
+            always_truthy(src).is_empty(),
+            "cross-owner const call must not fold"
+        );
+    }
+
+    #[test]
+    fn always_truthy_loop_nested_fold_silent() {
+        // A folded implicit-self predicate INSIDE a block/loop is suppressed
+        // (the reference's loop/block skip envelope).
+        let src = b"class C\n  def flag\n    false\n  end\n  def check\n    [1].each do |i|\n      if flag\n        noop\n      end\n    end\n  end\nend\n";
+        assert!(
+            always_truthy(src).is_empty(),
+            "loop-nested folded predicate must be silent"
+        );
+    }
+
     // -- call.unresolved-toplevel -----------------------------------------
     //
     // An implicit-self call at TOPLEVEL (outside any class/module) whose name
