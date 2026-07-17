@@ -18,7 +18,7 @@
 # Linux (native), and aarch64 Linux (cross-compiled via `cross`, which runs the
 # bindgen-needing build inside an arch-appropriate container). musl and Windows
 # targets are intentionally DEFERRED to a later slice (musl needs a static-libc
-# bindgen story; Windows needs its own libclang setup) — see CURRENT_WORK §13.
+# bindgen story; Windows needs its own libclang setup) — see PORT_BACKLOG.md §13.
 
 name: release
 
@@ -233,7 +233,7 @@ jobs:
   # The `gem push` is GATED: it only runs when the `RUBYGEMS_API_KEY` secret is
   # present AND a manual `release` environment approval is granted, so a tag
   # push NEVER auto-publishes. RubyGems account + API key + MFA are DEFERRED
-  # (see CURRENT_WORK §13); until then this job builds + smoke-tests only.
+  # (see PORT_BACKLOG.md §13); until then this job builds + smoke-tests only.
   gem:
     name: gem ${{ matrix.gem_platform }}
     needs: build
@@ -291,7 +291,7 @@ jobs:
           # Gem::Platform (`x64-mingw-ucrt`) and packaging an MSVC `.exe` into it
           # is finicky; it's lower-value than the binstall/Releases channel which
           # already serves Windows via the `.zip` asset. Revisit if demand
-          # warrants — see CURRENT_WORK §13.
+          # warrants — see PORT_BACKLOG.md §13.
 
     steps:
       - name: Checkout
@@ -348,7 +348,7 @@ jobs:
 
       # GATED PUSH — never auto-runs. Requires the RUBYGEMS_API_KEY secret AND
       # the `release` environment approval above. DEFERRED until the RubyGems
-      # account/API key/MFA are set up (CURRENT_WORK §13).
+      # account/API key/MFA are set up (PORT_BACKLOG.md §13).
       - name: Push gem to RubyGems (gated)
         if: env.HAS_RUBYGEMS_KEY == 'true'
         working-directory: gem

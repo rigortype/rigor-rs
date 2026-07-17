@@ -1,0 +1,24 @@
+# Docs budget gate (issue #21; port of upstream rigor#119).
+#
+# ci.yml deliberately ignores "**/*.md" (docs changes don't need a Rust build),
+# which also meant md-only pushes ran ZERO checks — the hole that let
+# docs/CURRENT_WORK.md re-inflate ungated. This workflow closes it: it runs on
+# every push/PR (the job is seconds), so the budget holds whether a change is
+# docs-only or rides a code PR.
+name: docs
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 harness/docs_check.py

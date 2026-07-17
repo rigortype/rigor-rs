@@ -123,5 +123,9 @@ When splitting work to subagents:
 - Record hard-to-reverse + surprising + real-tradeoff decisions as ADRs; record
   a slice's MEASURED outcome (even "0 gaps, deferred") in the ADR, not just the
   plan. Audit findings get absorbed into the ADR + a dated note in `docs/notes/`.
-- `docs/CURRENT_WORK.md` is the session-to-session baton: newest status on top,
-  prune stale "next session" plans as they land or die.
+- `docs/CURRENT_WORK.md` is the session-to-session baton: Now/Next on top, and
+  a landed/closed arc gets ONE ledger line (verdict + numbers + link) — write
+  the detail into a dated `docs/notes/` file or ADR FIRST, then fold. No status
+  essays; the subsystem map lives in `docs/PORT_BACKLOG.md`. Budgets are
+  mechanical: `python3 harness/docs_check.py` (CI `docs` job) — hand-pruning
+  alone does not hold (issue #21; upstream rigor#119 measured the same ratchet).
