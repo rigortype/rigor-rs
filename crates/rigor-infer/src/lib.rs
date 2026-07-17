@@ -1101,7 +1101,57 @@ impl<'i> Typer<'i> {
             }
         }
 
+        // C3a Part A: `self.class.name` / `self.class.to_s` inside a lexical
+        // class/module returns the class name as a `String` (the reference
+        // unwraps the `Module#name : String?` optional to `String` for
+        // witnessing). This lights the `self.class.name.demodulize` /
+        // `.underscore` idiom.
+        //
+        // We match the SPECIFIC `(self.class).name` shape and type ONLY the tail,
+        // WITHOUT ever typing `self.class` itself to a witnessable `Singleton`.
+        // Typing `self.class` to a project `Singleton` would route
+        // `self.class.<class_method>` (calling one of the class's OWN class
+        // methods — a ubiquitous idiom) through the class-method witnessing path,
+        // which sees only the core RBS surface and cannot verify a project-defined
+        // class method ⇒ a flood of false positives (`valid_provider?`,
+        // `with_redis`, …). The reference resolves those against the project class
+        // and stays silent, so `self.class` itself must remain untyped (Dynamic)
+        // here — only the always-String `name`/`to_s` tail is resolved. Toplevel
+        // (`enclosing_prefix` empty) declines → silent, matching the reference.
+        if (method == "name" || method == "to_s") && args.is_empty() {
+            if let Node::Call { receiver: Some(inner), method: inner_m, args: inner_args, .. } =
+                ast.get(receiver)
+            {
+                if inner_m == "class"
+                    && inner_args.is_empty()
+                    && matches!(ast.get(*inner), Node::SelfExpr { .. })
+                {
+                    if let Node::SelfExpr { span } = ast.get(*inner) {
+                        if !self.enclosing_prefix(*span).is_empty() {
+                            return self.nominal_or_untyped("String", interner);
+                        }
+                    }
+                }
+            }
+        }
+
         let recv_ty = self.type_of(ast, receiver, env, interner);
+
+        // C3a Part B: `Module#name` / `Class#name` / `#to_s` on a CLASS OBJECT
+        // (`Singleton` receiver) returns the class name as a `String`. This is a
+        // real (core-RBS) `Singleton` — from the `ConstantRead` arm's zero-FP gate
+        // (`Time.name`, `Foo.name` where `Foo` is a known top-level class) — so it
+        // is NOT the project-class hazard Part A avoids: a core `Singleton` already
+        // witnesses class-method typos against a KNOWN surface. `name`/`to_s` are
+        // always valid on a class object and always yield `String`, so this is
+        // zero-FP; the returned `String` is NON-nilable, so the possible-nil
+        // channel (which resolves the receiver via `class_name_of`, `None` for a
+        // `Singleton`) never mints a nilable fact from it.
+        if (method == "name" || method == "to_s")
+            && matches!(interner.get(recv_ty), Type::Singleton(_))
+        {
+            return self.nominal_or_untyped("String", interner);
+        }
 
         // Tier 1: constant folding on a value-pinned receiver. Fold only when
         // EVERY argument also types to a value-pinned `Constant` (ADR-0008
@@ -3242,5 +3292,105 @@ mod tests {
         let typer2 = Typer::with_source(&index, &source);
         let ty2 = typer2.type_of(&ast, call_id, &env, &mut i);
         assert!(!matches!(i.get(ty2), Type::Constant(_)), "no folder ⇒ no constant");
+    }
+
+    // ------------------------------------------------------------------
+    // C3a: `self.class` nominal-return tail.
+    // ------------------------------------------------------------------
+
+    /// Type the call to `method` in `src` under a source+lexical-scope typer
+    /// (the full analyze wiring), returning its interned `Type`.
+    fn type_c3a_call(src: &[u8], method: &str) -> Type {
+        let ast = lower_src(src);
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        let scopes = crate::lexical_scopes(&ast);
+        let typer = Typer::with_source(&idx, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, method);
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        i.get(ty).clone()
+    }
+
+    #[test]
+    fn self_class_itself_is_not_witnessable_singleton() {
+        // `self.class` must NOT type to a project `Singleton` — that would route
+        // `self.class.<class_method>` through class-method witnessing and FP on
+        // every project-defined class method. It stays Dynamic (silent).
+        let ty = type_c3a_call(b"class Foo\n  def bar\n    self.class\n  end\nend\n", "class");
+        assert!(!matches!(ty, Type::Singleton(_)), "self.class must stay Dynamic, got {ty:?}");
+    }
+
+    #[test]
+    fn self_class_name_and_to_s_are_string() {
+        // `self.class.name` / `self.class.to_s` → `Nominal[String]` (the
+        // `Module#name : String?` optional is unwrapped for witnessing).
+        for (src, m) in [
+            (b"class Foo\n  def bar\n    self.class.name\n  end\nend\n".as_slice(), "name"),
+            (b"class Foo\n  def bar\n    self.class.to_s\n  end\nend\n".as_slice(), "to_s"),
+        ] {
+            let ty = type_c3a_call(src, m);
+            let idx = CoreIndex::new();
+            let mut i = Interner::new();
+            let interned = i.intern(ty.clone());
+            assert_eq!(
+                idx.class_name_of(&i, interned),
+                Some("String"),
+                "self.class.{m} must be String, got {ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_class_name_string_in_nested_class() {
+        // Deeply nested enclosing class still resolves the tail to String.
+        let ty = type_c3a_call(
+            b"module Outer\n  class Runner\n    def k\n      self.class.name\n    end\n  end\nend\n",
+            "name",
+        );
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(ty.clone());
+        assert_eq!(idx.class_name_of(&i, interned), Some("String"), "got {ty:?}");
+    }
+
+    #[test]
+    fn self_class_at_toplevel_declines() {
+        // No enclosing class ⇒ `self.class` declines to Dynamic (silent), so the
+        // tail never becomes String — matches the reference's toplevel silence.
+        let ty = type_c3a_call(b"self.class.name\n", "class");
+        assert!(!matches!(ty, Type::Singleton(_)), "toplevel self.class must not type Singleton, got {ty:?}");
+        let name_ty = type_c3a_call(b"self.class.name\n", "name");
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(name_ty.clone());
+        assert_ne!(idx.class_name_of(&i, interned), Some("String"), "toplevel tail must not be String");
+    }
+
+    #[test]
+    fn self_class_name_string_even_in_core_shadow_class() {
+        // A nested class whose WRITTEN name shadows a core class (`Time`) still
+        // resolves `self.class.name` → String (no `Singleton` is minted, so there
+        // is no core-shadow witnessing hazard) — matching the reference, which
+        // fires the String tail here too.
+        let ty = type_c3a_call(
+            b"module Shadowing\n  class Time\n    def bar\n      self.class.name\n    end\n  end\nend\n",
+            "name",
+        );
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(ty.clone());
+        assert_eq!(idx.class_name_of(&i, interned), Some("String"), "got {ty:?}");
+    }
+
+    #[test]
+    fn core_singleton_name_is_string() {
+        // Bonus: `name`/`to_s` on a core-RBS `Singleton` (`Time.name`) → String.
+        let ty = type_c3a_call(b"class Foo\n  def bar\n    Time.name\n  end\nend\n", "name");
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(ty.clone());
+        assert_eq!(idx.class_name_of(&i, interned), Some("String"), "Time.name must be String, got {ty:?}");
     }
 }

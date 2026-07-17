@@ -43,16 +43,29 @@ Rule columns: **UM** = `call.undefined-method`, **PN** = `call.possible-nil-rece
 
 ### PORT (oracle-proven, zero-FP)
 
-**Part A — `self.class` → `Singleton(enclosing class)`.** In `Typer::type_call`,
-when `method == "class"`, no args, and the receiver node is `SelfExpr` inside a
-lexical class/module (`enclosing_prefix` non-empty, `source.class_id(joined)`
-resolvable) → intern `Type::Singleton(enclosing_source_id)`. Toplevel (probe 12)
-has no enclosing scope → declines → Dynamic → silent, matching REF.
+**Part A — `self.class.name` / `self.class.to_s` tail → `Nominal[String]`.** In
+`Typer::type_call`, when `method ∈ {name, to_s}` (no args) and the RECEIVER node
+is the specific shape `(self).class` (a `class` call, no args, on a `SelfExpr`)
+inside a lexical class/module (`enclosing_prefix` non-empty) → `Nominal[String]`.
+Toplevel (probe 12) has no enclosing scope → declines → silent, matching REF.
 
-Zero-FP for probes 1/2 (`self.class.frobnicate/helpr` silent): the enclosing
-class is a PROJECT class, so the rule's `Singleton` witnessing path
-(`class_has_singleton_method`) is conservative on an unmodeled class → `true` →
-silent. Same leniency REF applies to project class-method typos (probe 15).
+**REVISED after the FP audit (initial approach was UNSOUND).** The first cut
+typed `self.class` itself → `Singleton(enclosing project class)`. That produced
+**12 false positives** on gitlab-foss/lib: `self.class.<class_method>` — calling
+one of the class's OWN class methods from an instance method (`valid_provider?`,
+`with_redis`, `aspects`, `default_options`, …), a ubiquitous idiom — routed
+through the rule's `Singleton` class-method witnessing path, which sees only the
+core RBS surface and CANNOT verify a project-defined class method, so it fired
+`undefined method X for singleton(Config)` etc. where REF (which resolves against
+the project class) stays silent. `index.class_has_singleton_method` is NOT
+conservative for a project-class name that collides with a modeled surface, so
+the "lenient on unmodeled class" assumption was false.
+
+Fix: NEVER type `self.class` to a witnessable `Singleton`. Match the SPECIFIC
+`(self.class).name`/`.to_s` shape and type ONLY the always-`String` tail; leave
+`self.class` itself Dynamic. Then `self.class.frobnicate` / `self.class.<class
+method>` stay silent (Dynamic receiver, probes 1/2/15 and the 12 FP sites), and
+`self.class.name.<x>` witnesses on the String tail. Verified 0 FP.
 
 **Part B — `name`/`to_s` on a `Singleton` receiver → `Nominal[String]`.** In
 `type_call`, when `recv_ty` is `Type::Singleton(_)` and `method ∈ {name, to_s}`
@@ -93,6 +106,19 @@ gate post-implementation.
 ## Expected deltas / gates
 
 - gitlab-foss lib UM: closes the ~21 `self.class.name.<x>` `for String` gaps
-  (+ bonus `Foo.name`/`Time.name` chains). Expect 200 → ~180±10; **0 FP REQUIRED**.
+  (+ bonus `Time.name` chains). Expect 200 → ~180±10; **0 FP REQUIRED**.
 - mastodon app + gitlab app/models: 0 FP; matched ≥ prior.
 - Fixture + snapshot with must-stay-silent rows (probes 1, 8, 9, 12, 15).
+
+## MEASURED results (final)
+
+- cargo test: 731 pass (6 new C3a typer tests); clippy clean on touched crate.
+- Harness fixture `64_self_class_nominal_tail.rb` + snapshot: run.rb (live
+  reference) Matched(3), run_snapshot PASS, 0 unregistered FP.
+- fp_audit --gaps, **0 FP on all three**:
+  - gitlab-foss/lib: UM gaps **200 → 179** (closed 21); matched 991 → **1003**.
+  - mastodon/app: matched **404**, 0 FP.
+  - gitlab-foss/app/models: matched **537**, 0 FP.
+- DECLINED as planned: general `x.class`, general `T?`-unwrap, and the
+  method-body-local case (`n = self.class.name; n.typo`) — the last a MISS via a
+  pre-existing flat-env limitation, orthogonal to C3a, not an FP.
