@@ -157,6 +157,14 @@ pub struct OverloadSignature {
 /// never collide with an actual `ClassInstanceType` return.
 const SELF_RETURN: &str = "\0self";
 
+/// The closed set of class names whose instance type admits a `nil` argument —
+/// a faithful copy of the reference `NIL_COMPATIBLE_CLASS_NAMES`
+/// (`check_rules.rb:2053`). A `ClassInstance` param admits nil iff its
+/// (namespace-stripped) name is one of these: `NilClass` itself, and the three
+/// universal ancestors nil is an instance of. Every other concrete class
+/// (`String`, `Integer`, …) rejects nil. Consumed by [`CoreData::param_admits_nil`].
+const NIL_COMPATIBLE_CLASS_NAMES: [&str; 4] = ["NilClass", "Object", "BasicObject", "Kernel"];
+
 /// Per-class data extracted from RBS: its instance methods (name -> resolved
 /// return class + arity), its direct superclass, and its included modules.
 #[derive(Default, Clone)]
@@ -912,6 +920,168 @@ impl CoreData {
             }
         }
         None
+    }
+
+    // -- ATM shared-substrate acceptance walk (Slice 2) ------------------------
+    //
+    // The two argument-compatibility predicates the `call.argument-type-mismatch`
+    // rule (Slice 3, not yet wired) decides each parameter with. Both are
+    // faithful ports of the reference (`check_rules.rb:2085-2103` /
+    // `2157-2213`) with one substitution: the reference hands a translated
+    // `ClassInstance` to its acceptance engine (`Inference::Acceptance.accepts`,
+    // gradual — refutes only on a proven rejection), where rigor-rs decides the
+    // same question with [`Self::class_ordering`] (a `Disjoint` verdict IS the
+    // proven rejection; `Superclass`/`Unknown`/`Equal`/`Subclass` all admit).
+    // Conservative-TRUE throughout: any shape we cannot decide admits, so the
+    // rule never fires on uncertainty. Read by NO consumer in this slice.
+
+    /// Depth cap on bounded `Alias` expansion (defense in depth — Slice 1 stores
+    /// each alias RHS one level deep, so ingestion itself cannot loop, but a
+    /// mutually-referential alias chain (`type a = b`, `type b = a`) could spin
+    /// here without a guard). At exhaustion we admit (conservative true).
+    const ALIAS_EXPANSION_CAP: usize = 8;
+
+    /// Does this RBS parameter type admit a `nil` argument? A faithful port of
+    /// the reference `rbs_type_admits_nil?` (`check_rules.rb:2085-2103`):
+    /// conservative-TRUE by default, so the caller (the nil channel) fires only
+    /// on a param that PROVABLY rejects nil.
+    ///
+    /// - `ClassInstance(name)` ⇒ nil is admitted iff `name` is in the closed
+    ///   `NIL_COMPATIBLE` set (`NilClass`/`Object`/`BasicObject`/`Kernel`); a
+    ///   concrete class like `String` rejects nil (returns `false`).
+    /// - `Alias` ⇒ bounded expansion; an unresolvable alias admits.
+    /// - `Interface` ⇒ admitted iff every required method exists on `NilClass`
+    ///   (so `_ToStr`/`_ToInt` reject — `NilClass` has no `to_str`/`to_int` —
+    ///   while a hypothetical `_ToS` admits, `NilClass#to_s` exists); an
+    ///   unresolvable / empty interface admits.
+    /// - `Union` ⇒ ANY member admitting admits.
+    /// - `Optional` ⇒ `T?` always admits (it explicitly includes nil).
+    /// - `Other` ⇒ every remaining shape (the reference's `else`: bases incl.
+    ///   `nil`/`bool`/`void`/`self`/`top`/`untyped`, type variables, literals,
+    ///   tuples, records, procs, intersections) admits conservatively.
+    pub fn param_admits_nil(&self, t: &RetainedParamType) -> bool {
+        self.param_admits_nil_depth(t, 0)
+    }
+
+    fn param_admits_nil_depth(&self, t: &RetainedParamType, depth: usize) -> bool {
+        match t {
+            RetainedParamType::ClassInstance(name) => {
+                let bare = name.strip_prefix("::").unwrap_or(name);
+                NIL_COMPATIBLE_CLASS_NAMES.contains(&bare)
+            }
+            RetainedParamType::Alias(name) => {
+                if depth >= Self::ALIAS_EXPANSION_CAP {
+                    return true;
+                }
+                match self.resolve_type_alias(name) {
+                    // `resolve_type_alias` borrows `self`; clone the small RHS
+                    // tag so the recursive `&self` call is not aliased.
+                    Some(rhs) => self.param_admits_nil_depth(&rhs.clone(), depth + 1),
+                    None => true,
+                }
+            }
+            RetainedParamType::Interface(name) => self.interface_admits_nil(name),
+            RetainedParamType::Union(members) => {
+                members.iter().any(|m| self.param_admits_nil_depth(m, depth))
+            }
+            RetainedParamType::Optional(_) => true,
+            RetainedParamType::Other(_) => true,
+        }
+    }
+
+    /// An interface parameter admits nil iff `NilClass` implements every method
+    /// it requires (the reference `interface_admits_nil?`). An unknown or empty
+    /// interface admits (conservative). Uses [`Self::class_has_method`] on
+    /// `NilClass`, whose zero-false-positive contract already assumes-present on
+    /// an incomplete chain — so absence is witnessed only when `NilClass`'s chain
+    /// is fully loaded and genuinely lacks the method.
+    fn interface_admits_nil(&self, name: &str) -> bool {
+        match self.interface_methods(name) {
+            Some(methods) if !methods.is_empty() => {
+                methods.iter().all(|m| self.class_has_method("NilClass", m))
+            }
+            // Unknown or empty interface admits conservatively.
+            _ => true,
+        }
+    }
+
+    /// Does this RBS parameter type accept a (non-nil) argument of class
+    /// `arg_class`? A faithful port of the reference `rbs_type_accepts_arg?`
+    /// (`check_rules.rb:2157-2213`): conservative-TRUE by default, so the caller
+    /// (the non-nil channel) fires only on a param that PROVABLY rejects the
+    /// argument's class.
+    ///
+    /// - `ClassInstance(name)` ⇒ decided by [`Self::class_ordering`]`(arg_class,
+    ///   name)`: `Equal`/`Subclass` (the arg is the param class or a descendant)
+    ///   accept; `Disjoint` (provably unrelated) is the sole rejection (`false`);
+    ///   `Superclass` (the arg is broader — a runtime value MIGHT be the param
+    ///   class) and `Unknown` (either class unloaded) admit conservatively.
+    /// - `Alias` ⇒ bounded expansion; an unresolvable alias accepts.
+    /// - `Interface` ⇒ accepted iff `arg_class` implements every required method
+    ///   (mirror of [`Self::interface_admits_nil`], asking the arg class); an
+    ///   unresolvable / empty interface, or an arg class not RBS-known, accepts.
+    /// - `Union` ⇒ ANY member accepting accepts.
+    /// - `Optional` / `Other` ⇒ accept conservatively (the reference `else`).
+    pub fn param_accepts_arg_class(&self, t: &RetainedParamType, arg_class: &str) -> bool {
+        self.param_accepts_arg_class_depth(t, arg_class, 0)
+    }
+
+    fn param_accepts_arg_class_depth(
+        &self,
+        t: &RetainedParamType,
+        arg_class: &str,
+        depth: usize,
+    ) -> bool {
+        match t {
+            RetainedParamType::ClassInstance(name) => {
+                matches!(
+                    self.class_ordering(arg_class, name),
+                    ClassOrdering::Equal
+                        | ClassOrdering::Subclass
+                        | ClassOrdering::Superclass
+                        | ClassOrdering::Unknown
+                )
+            }
+            RetainedParamType::Alias(name) => {
+                if depth >= Self::ALIAS_EXPANSION_CAP {
+                    return true;
+                }
+                match self.resolve_type_alias(name) {
+                    Some(rhs) => {
+                        self.param_accepts_arg_class_depth(&rhs.clone(), arg_class, depth + 1)
+                    }
+                    None => true,
+                }
+            }
+            RetainedParamType::Interface(name) => self.interface_accepts_arg(name, arg_class),
+            RetainedParamType::Union(members) => members
+                .iter()
+                .any(|m| self.param_accepts_arg_class_depth(m, arg_class, depth)),
+            RetainedParamType::Optional(_) => true,
+            RetainedParamType::Other(_) => true,
+        }
+    }
+
+    /// An interface parameter accepts `arg_class` iff that class implements every
+    /// method the interface requires (the reference `interface_accepts_arg?` /
+    /// `arg_class_has_method?`). Conservative on the unknown side: an unresolvable
+    /// / empty interface admits, and an arg class NOT RBS-known admits (the class
+    /// MIGHT implement the conversion via metaprogramming — the reference returns
+    /// true when the class definition is nil). Only a KNOWN arg class that
+    /// provably lacks a required method rejects.
+    fn interface_accepts_arg(&self, name: &str, arg_class: &str) -> bool {
+        match self.interface_methods(name) {
+            Some(methods) if !methods.is_empty() => {
+                // An arg class not RBS-known might implement the conversion via
+                // metaprogramming (the reference returns true on a nil definition).
+                if !self.knows_class(arg_class) {
+                    return true;
+                }
+                methods.iter().all(|m| self.class_has_method(arg_class, m))
+            }
+            // Unknown or empty interface admits conservatively.
+            _ => true,
+        }
     }
 
     // -- Sig-gen-only precise declared-return accessors (ADR-14 slice 10) ------
@@ -2461,5 +2631,226 @@ mod embedded_tests {
             idx.resolve_type_alias("boolish").is_some(),
             "core `type boolish` alias retained"
         );
+    }
+
+    // -- ATM Slice 2: acceptance-walk predicates ------------------------------
+
+    /// `ClassInstance` nil-admittance: the closed `NIL_COMPATIBLE` set admits,
+    /// every other concrete class rejects. `Object` (a universal nil ancestor)
+    /// admits; `String` does not — the load-bearing case (`"a" + nil` fires).
+    #[test]
+    fn atm_param_admits_nil_class_instance() {
+        let idx = CoreData::load();
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Object")));
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("BasicObject")));
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Kernel")));
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("NilClass")));
+        // A leading `::` is tolerated on the name.
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("::Object")));
+        // Concrete classes reject nil.
+        assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("String")));
+        assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("Integer")));
+    }
+
+    /// `Other` forms all admit nil (the reference `else`: `nil`/`untyped`/`self`/
+    /// `bool`/literals/type variables …), and `Optional` always admits.
+    #[test]
+    fn atm_param_admits_nil_other_and_optional() {
+        let idx = CoreData::load();
+        for form in ["nil", "untyped", "self", "bool", "top", "void", "1", "\"x\"", ":sym", "T"] {
+            assert!(
+                idx.param_admits_nil(&RetainedParamType::Other(form.to_string())),
+                "Other({form:?}) admits nil conservatively"
+            );
+        }
+        assert!(idx.param_admits_nil(&RetainedParamType::Optional(Box::new(
+            RetainedParamType::ClassInstance("String")
+        ))));
+    }
+
+    /// `Union` admits nil iff ANY member does. `String | Integer` rejects (both
+    /// concrete non-nil); `String | Object` admits (via `Object`).
+    #[test]
+    fn atm_param_admits_nil_union() {
+        let idx = CoreData::load();
+        assert!(!idx.param_admits_nil(&RetainedParamType::Union(vec![
+            RetainedParamType::ClassInstance("String"),
+            RetainedParamType::ClassInstance("Integer"),
+        ])));
+        assert!(idx.param_admits_nil(&RetainedParamType::Union(vec![
+            RetainedParamType::ClassInstance("String"),
+            RetainedParamType::ClassInstance("Object"),
+        ])));
+    }
+
+    /// The `string` / `int` interface-aliases reject nil: `type string = String
+    /// | _ToStr`, and `NilClass` implements neither `to_str` nor `to_int`, so
+    /// both arms reject. This is the semantic that makes `"a" + nil` fire
+    /// (proven live against the oracle). A hypothetical `_ToS`-shaped interface
+    /// admits, since `NilClass#to_s` exists.
+    #[test]
+    fn atm_param_admits_nil_string_int_aliases() {
+        let idx = CoreData::load();
+        assert!(
+            !idx.param_admits_nil(&RetainedParamType::Alias("string")),
+            "`string` (String | _ToStr) rejects nil — NilClass lacks to_str"
+        );
+        assert!(
+            !idx.param_admits_nil(&RetainedParamType::Alias("int")),
+            "`int` (Integer | _ToInt) rejects nil — NilClass lacks to_int"
+        );
+        // NilClass HAS to_s, so a `_ToS` interface param admits nil directly.
+        assert!(
+            idx.param_admits_nil(&RetainedParamType::Interface("_ToS")),
+            "_ToS admits nil — NilClass#to_s exists"
+        );
+        // An unknown interface admits conservatively.
+        assert!(idx.param_admits_nil(&RetainedParamType::Interface("_NoSuchIfaceZzz")));
+    }
+
+    /// `ClassInstance` argument acceptance via `class_ordering`: Equal / Subclass
+    /// / Superclass / Unknown accept, only a provable `Disjoint` rejects.
+    #[test]
+    fn atm_param_accepts_arg_class_instance() {
+        let idx = CoreData::load();
+        // Equal.
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String"), "String"));
+        // Subclass: ArgumentError <: Exception.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("Exception"),
+            "ArgumentError"
+        ));
+        // Superclass: arg Numeric is broader than param Integer — a runtime value
+        // MIGHT be an Integer, so admit (never a provable reject).
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("Integer"),
+            "Numeric"
+        ));
+        // Unknown: an unloaded param class cannot be refuted.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("NoSuchClassZzz"),
+            "String"
+        ));
+        // Disjoint: the sole rejection.
+        assert!(!idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String"), "Symbol"));
+        assert!(!idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("Integer"),
+            "String"
+        ));
+    }
+
+    /// The `string` / `int` aliases accept their concrete arm directly and, via
+    /// the interface walk, decline to reject a class that implements the
+    /// conversion: `int` accepts `Float` because `Float` (over `Numeric`) has
+    /// `to_int`. `string` rejects `Symbol` (no `to_str`).
+    #[test]
+    fn atm_param_accepts_arg_string_int_aliases() {
+        let idx = CoreData::load();
+        // `string` accepts String (concrete arm, Equal).
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("string"), "String"));
+        // `int` accepts Integer (concrete arm) AND Float (via _ToInt: Float has
+        // Numeric#to_int) — the interface walk declining to reject a coercible.
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("int"), "Integer"));
+        assert!(
+            idx.param_accepts_arg_class(&RetainedParamType::Alias("int"), "Float"),
+            "`int` accepts Float — Float implements to_int via Numeric"
+        );
+        // `string` rejects Symbol: Disjoint from String AND no to_str.
+        assert!(
+            !idx.param_accepts_arg_class(&RetainedParamType::Alias("string"), "Symbol"),
+            "`string` rejects Symbol — not a String and no to_str"
+        );
+    }
+
+    /// Union / Optional / Other acceptance: Union accepts iff any member does;
+    /// Optional and Other admit conservatively.
+    #[test]
+    fn atm_param_accepts_arg_union_optional_other() {
+        let idx = CoreData::load();
+        // Union: Symbol accepted by the Symbol arm though rejected by String.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Union(vec![
+                RetainedParamType::ClassInstance("String"),
+                RetainedParamType::ClassInstance("Symbol"),
+            ]),
+            "Symbol"
+        ));
+        // Union of two disjoint concretes rejects a third disjoint arg.
+        assert!(!idx.param_accepts_arg_class(
+            &RetainedParamType::Union(vec![
+                RetainedParamType::ClassInstance("String"),
+                RetainedParamType::ClassInstance("Symbol"),
+            ]),
+            "Integer"
+        ));
+        // Optional / Other admit unconditionally.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Optional(Box::new(RetainedParamType::ClassInstance("String"))),
+            "Integer"
+        ));
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::Other("untyped".to_string()), "Integer"));
+    }
+
+    /// Interface acceptance is conservative on the unknown side: an arg class not
+    /// RBS-known admits (it MIGHT implement the conversion via metaprogramming),
+    /// only a KNOWN class provably lacking a required method rejects.
+    #[test]
+    fn atm_interface_accepts_arg_unknown_side() {
+        let idx = CoreData::load();
+        // Unknown arg class → admit.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Interface("_ToStr"),
+            "NoSuchClassZzz"
+        ));
+        // Unknown interface → admit.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Interface("_NoSuchIfaceZzz"),
+            "Symbol"
+        ));
+        // Known arg class lacking the required method → reject.
+        assert!(
+            !idx.param_accepts_arg_class(&RetainedParamType::Interface("_ToStr"), "Symbol"),
+            "_ToStr rejects Symbol — no to_str"
+        );
+    }
+
+    /// Bounded alias expansion terminates on a cycle (returns conservative true
+    /// at the depth cap) and resolves a finite chain to its leaf. Uses a project
+    /// `sig/` dir since alias ingestion is parser-driven.
+    #[test]
+    fn atm_acceptance_alias_depth_cap_and_chain() {
+        let base = std::env::temp_dir().join(format!("rigor-atm-s2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp sig dir");
+        std::fs::write(
+            base.join("chains.rbs"),
+            "type a_t = b_t\n\
+             type b_t = a_t\n\
+             type int_t = Integer\n\
+             type obj_t = Object\n",
+        )
+        .expect("write sig");
+        let data = CoreData::load_for_project(&[], std::slice::from_ref(&base));
+
+        // Cyclic alias: no hang, admits at the cap (conservative true).
+        assert!(
+            data.param_admits_nil(&RetainedParamType::Alias("a_t")),
+            "cyclic alias terminates and admits at the depth cap"
+        );
+        assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("a_t"), "String"));
+
+        // Finite chain resolves to its leaf class.
+        assert!(
+            !data.param_admits_nil(&RetainedParamType::Alias("int_t")),
+            "`type int_t = Integer` inherits Integer's nil rejection"
+        );
+        assert!(
+            data.param_admits_nil(&RetainedParamType::Alias("obj_t")),
+            "`type obj_t = Object` inherits Object's nil admittance"
+        );
+        assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("int_t"), "Integer"));
+        assert!(!data.param_accepts_arg_class(&RetainedParamType::Alias("int_t"), "String"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
