@@ -14,6 +14,15 @@ source-class naming → Data.define/Struct class shells; sound-superset parity m
 "Generative-tool parity"**). Then PIVOTED to productization (MCP `sig_gen` tool). Read `AGENTS.md` "Working
 discipline" before continuing.
 
+**▶▶ LANDED (2026-07-17, branch `c3a-nominal-return-tail`, MERGED `b6d13e9`) — C3a: `self.class.name`/`to_s`
+String tail + core-Singleton `name` (gitlab lib UM 200 → 179, 0 FP; matched 991 → 1003).** Probe-first slice:
+the oracle proved the reference has NO generic `T?`→T unwrap (entangled with value tracking) — declined; and
+the first implementation (`self.class` → Singleton(project class)) produced 12 measured FPs (project class
+methods can't witness against the singleton surface) — caught by the per-part fp_audit gate, revised to the
+targeted always-String-tail-only design. Spec: [c3a spec](notes/20260717-c3a-nominal-return-tail-spec.md).
+Remaining bounded candidate: P2 straight-line optional-local possible-nil slice (~15-20, borderline).
+harness 64 fixtures; 731 tests.
+
 **▶▶ LANDED (2026-07-17, branch `constant-shadow-gate`, MERGED) — C1+C2+C5: the largest single coverage win of
 the port (gitlab-foss lib undefined-method gaps 356 → 200, −156, 0 FP; mastodon matched 397 → 404).** From the
 first-ever UM/PN cause-classification on gitlab lib (specs:
