@@ -24,6 +24,26 @@ Spec: [p2 spec](notes/20260717-p2-optional-local-nil-spec.md). **⇒ The possibl
 CONFIRMED closed at the concrete-arm level on BOTH corpora; the residual 162 needs `Dynamic|nil` firing or
 Tier B/C interprocedural inference — the deep substrate, full stop.** harness 65 fixtures; 735 tests.
 
+**▶▶ INVESTIGATED (2026-07-17) — TIER B/C / ScopeIndexer TRACK **CLOSED** (not deferred). NO-GO with evidence.**
+Full detail: [tier-bc-track-closed](notes/20260717-tier-bc-track-closed.md). The deepest remaining track was
+scoped for a go/no-go and the measurement is decisive: a 1-in-8 gitlab-lib sample's 16 possible-nil coverage
+gaps were adjudicated by reading each site — **16/16 are REFERENCE false positives, 0 real bugs** (nil-SAFE
+`present?` calls that only fire because config-less mode lacks the AS RBS; correctly-guarded sites incl. Grape
+helpers that RAISE; unprovable-invariant conservatism). The reference's own ADR-57 WD3 calls this "the one
+adjudicated ARTIFACT class" and ADR-58 exists because it was "94% of possible-nil errors". **The FP cliff is
+located**: `check_rules.rb:1226` `return true if class_name.nil?` — a `Dynamic` arm satisfies the non-nil-arm
+check for EVERY method name (probe: the reference fires on `scope.frobnicate_xyz`, a method that exists
+nowhere). rigor-rs's nameable-concrete-arm requirement IS its FP-safety mechanism. **S1/S2 of this arc are
+ALREADY BUILT** (branches `tier-bc-nilable-return`, `flow-cond-assign-nilability`) and both measured 0 gaps;
+**every gap is closed by S3 alone = deleting that mechanism.** ⇒ **THE CRUX, worth remembering: `fp_audit`
+measures FP against the REFERENCE, so S3 would score 0 FP / +129 matched and pass the whole standing battery —
+the gate cannot see this failure, while AGENTS.md's goal (a SOUND subset) is violated. First track where the
+parity gate points the wrong way; shipping it would be gaming the metric.** 5th consecutive FP-safe flow slice
+to close 0 gaps — and now we know why it always will: the residual is gated on rigor-rs declining to be
+imprecise, not on missing machinery. Next per the note: productization (LSP §12 two-tier, baseline subcommands,
+config schema, `--bleeding-edge`, `coverage --workers`), re-pin at the v0.3.0 tag, and an INVESTIGATION (not a
+slice) of the AS-overlay-dominated UM-200 residual.
+
 **▶▶ LANDED (2026-07-17, ATM ARC COMPLETE — 3 slices merged: `atm-substrate-1`, `atm-substrate-2`,
 `atm-rule`) — `call.argument-type-mismatch` + the per-param RBS substrate.** Plan:
 [atm-substrate-arc-plan](notes/20260717-atm-substrate-arc-plan.md). Slice 1: per-overload param retention
