@@ -24,6 +24,23 @@ Spec: [p2 spec](notes/20260717-p2-optional-local-nil-spec.md). **⇒ The possibl
 CONFIRMED closed at the concrete-arm level on BOTH corpora; the residual 162 needs `Dynamic|nil` firing or
 Tier B/C interprocedural inference — the deep substrate, full stop.** harness 65 fixtures; 735 tests.
 
+**▶▶ LANDED (2026-07-17, ATM ARC COMPLETE — 3 slices merged: `atm-substrate-1`, `atm-substrate-2`,
+`atm-rule`) — `call.argument-type-mismatch` + the per-param RBS substrate.** Plan:
+[atm-substrate-arc-plan](notes/20260717-atm-substrate-arc-plan.md). Slice 1: per-overload param retention
+(`RetainedParamType` one-level tags + presence flags + param NAMES) + type-alias/interface ingestion
+(previously silently dropped) — output-inert, +~1MB RSS. Slice 2: `param_admits_nil`/`param_accepts_arg_class`
+acceptance walk on `class_ordering` (NOT the dead relations.rs skeleton), conservative-true, alias/interface
+recovery. Slice 3: the rule — key oracle finding: `nil_member?` is per-member, so `T|nil` union args take the
+TRANSLATED-acceptance channel (`got String?`), not the nil channel; interface-aliases (`string`/`int`) degrade
+to Dynamic there so `"a"+5` is SILENT while the nil channel sees through aliases. Audit round-trip: main
+session caught 2 message-parity failures (missing single-overload `parameter \`name' of` prefix — param names
+were never retained; missing `BigDecimal` in labels — stdlib `...` overloading-def reopens were DROPPED at
+ingestion, a genuine bug now fixed with reopen-overloads-prepended merge). **0 FP on all corpora + 27/28
+survey projects; byte-exact messages on every firing (msgdiff gate added). The 3 named corpus gaps stay open
+honestly** — they need nilable-RETURN argument typing / namespaced-singleton resolution (typer substrate, real
+FP risk, deferred). harness 66 fixtures / 186 matched; 765 tests; explain 27 rules. The retained param
+substrate now also serves: wrong-arity block-form gate, future sig-gen --params, nilable-param rules.
+
 **▶▶ LANDED (2026-07-17, branch `c3a-nominal-return-tail`, MERGED `b6d13e9`) — C3a: `self.class.name`/`to_s`
 String tail + core-Singleton `name` (gitlab lib UM 200 → 179, 0 FP; matched 991 → 1003).** Probe-first slice:
 the oracle proved the reference has NO generic `T?`→T unwrap (entangled with value tracking) — declined; and
