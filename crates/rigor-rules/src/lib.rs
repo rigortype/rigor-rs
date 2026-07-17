@@ -1501,6 +1501,9 @@ fn faithful_param_rejects_arg(
 /// rendered `expected` label, and the argument's `TypeId` for the `got` render.
 struct AtmMismatch {
     arg: NodeId,
+    /// The declared RBS parameter name (single-overload channel only — the
+    /// multi-overload channel matches the reference's `name: nil`, no prefix).
+    param_name: Option<&'static str>,
     expected: String,
     actual: rigor_types::TypeId,
 }
@@ -1528,11 +1531,18 @@ fn single_overload_mismatch(
         .iter()
         .chain(ov.optional_positionals.iter())
         .collect();
+    let names: Vec<Option<&'static str>> = ov
+        .required_positional_names
+        .iter()
+        .chain(ov.optional_positional_names.iter())
+        .copied()
+        .collect();
 
     for (i, &arg) in args.iter().enumerate() {
         let Some(param) = params.get(i) else {
             continue; // arity mismatch is the wrong-arity rule's concern.
         };
+        let param_name = names.get(i).copied().flatten();
         let arg_ty = typer.type_of(ast, arg, env, interner);
 
         if arg_is_pure_nil(interner, index, source, arg_ty) {
@@ -1541,6 +1551,7 @@ fn single_overload_mismatch(
             }
             return Some(AtmMismatch {
                 arg,
+                param_name,
                 expected: render_retained_param(param),
                 actual: arg_ty,
             });
@@ -1555,6 +1566,7 @@ fn single_overload_mismatch(
         if faithful_param_rejects_arg(interner, index, source, arg_ty, param) {
             return Some(AtmMismatch {
                 arg,
+                param_name,
                 expected: render_retained_param(param),
                 actual: arg_ty,
             });
@@ -1609,6 +1621,7 @@ fn multi_overload_mismatch(
             }
             return Some(AtmMismatch {
                 arg,
+                param_name: None, // multi-overload: the reference sets name: nil
                 expected: expected_label_multi(&params),
                 actual: arg_ty,
             });
@@ -1625,6 +1638,7 @@ fn multi_overload_mismatch(
             }
             return Some(AtmMismatch {
                 arg,
+                param_name: None, // multi-overload: the reference sets name: nil
                 expected: expected_label_multi(&params),
                 actual: arg_ty,
             });
@@ -1698,8 +1712,16 @@ fn check_argument_type_mismatch(
 
     let (start, end) = ast.get(mismatch.arg).span();
     let actual = render_receiver(interner, index, source, mismatch.actual);
+    // Reference `build_argument_type_diagnostic` (`check_rules.rb:2322`): a
+    // single-overload mismatch names the parameter (``parameter `str' of `m' on
+    // C``); the multi-overload channel (name nil) renders the bare method label.
+    let method_label = format!("`{method}' on {class_name}");
+    let parameter_label = match mismatch.param_name {
+        Some(name) => format!("parameter `{name}' of {method_label}"),
+        None => method_label,
+    };
     let message = format!(
-        "argument type mismatch at `{method}' on {class_name}: expected {}, got {actual}",
+        "argument type mismatch at {parameter_label}: expected {}, got {actual}",
         mismatch.expected
     );
     let severity = catalog(CALL_ARGUMENT_TYPE_MISMATCH)
@@ -5673,6 +5695,11 @@ mod tests {
         assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
         assert_eq!(d[0].receiver_type.as_deref(), Some("String"));
         assert_eq!(d[0].method_name.as_deref(), Some("+"));
+        // Byte-parity with the oracle: single-overload names the parameter.
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at parameter `other_string' of `+' on String: expected string, got nil"
+        );
     }
 
     #[test]
@@ -5683,6 +5710,13 @@ mod tests {
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
         assert_eq!(d[0].receiver_type.as_deref(), Some("Integer"));
+        // Byte-parity with the oracle: multi-overload, NO parameter prefix; the
+        // label joins per-overload written types first-seen (the bigdecimal
+        // overloading reopen prepends BigDecimal onto core's four).
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at `+' on Integer: expected BigDecimal | Integer | Float | Rational | Complex, got nil"
+        );
     }
 
     #[test]
@@ -5694,6 +5728,10 @@ mod tests {
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"\"x\"");
         assert_eq!(d[0].receiver_type.as_deref(), Some("Array"));
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at `fetch' on Array: expected int, got \"x\""
+        );
     }
 
     #[test]
@@ -5704,6 +5742,10 @@ mod tests {
         let d = atm_diags(src);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at parameter `width' of `center' on String: expected int, got nil"
+        );
     }
 
     #[test]
