@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ruby_rbs::node::{
-    parse, AliasKind, ClassNode, MethodDefinitionKind, ModuleNode, Node,
+    parse, AliasKind, ClassNode, InterfaceNode, MethodDefinitionKind, ModuleNode,
+    Node, TypeAliasNode,
 };
 
 // The build-time-embedded RBS signature set: `EMBEDDED_RBS: &[(&str, &str)]`,
@@ -81,6 +82,81 @@ pub enum ClassOrdering {
     Unknown,
 }
 
+/// A one-level structural tag for a single RBS parameter type — the ATM
+/// shared-substrate leaf (Slice 1, retention only). Each variant keeps just
+/// enough shape for a later argument-compatibility walk (Slice 2) and message
+/// labels (Slice 3) WITHOUT retaining the full type AST: a `ClassInstanceType`
+/// drops its type arguments (`Array[Integer]` ⇒ `ClassInstance("Array")`), and
+/// only the two genuinely-structural wrappers — `Union` and `Optional` — recurse
+/// into their members (they carry no meaning as an opaque leaf). Everything else
+/// that isn't one of the four named kinds collapses to [`Other`](Self::Other),
+/// whose `String` is the exact WRITTEN form of the type (sliced from the RBS
+/// source) so a diagnostic can quote it verbatim later.
+///
+/// The interned names ride `&'static str` (the file-wide interning discipline);
+/// the `Other` leaf is an owned `String` because its vocabulary is unbounded.
+/// This type is RETAINED but read by NO consumer in Slice 1 — the accessors
+/// ([`CoreData::method_overloads`], [`CoreData::resolve_type_alias`],
+/// [`CoreData::interface_methods`]) exist and are unit-tested, but nothing wires
+/// them into a rule yet (the slice is output-inert by contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetainedParamType {
+    /// A concrete class instance, type arguments dropped: `Integer`, `String`,
+    /// `Array[Integer]` ⇒ `ClassInstance("Array")`.
+    ClassInstance(&'static str),
+    /// A reference to a `type` alias (RBS lowercase alias, e.g. the `string` in
+    /// `(string) -> void`). NOT expanded here — Slice 2 owns bounded expansion
+    /// via [`CoreData::resolve_type_alias`].
+    Alias(&'static str),
+    /// A reference to an `interface` (RBS `_`-prefixed, e.g. `_ToStr`). The
+    /// required method-name set is retained separately in
+    /// [`CoreData::interface_methods`].
+    Interface(&'static str),
+    /// A union `A | B | ...` — each member retained one level deep.
+    Union(Vec<RetainedParamType>),
+    /// An optional `T?` — the inner type retained one level deep.
+    Optional(Box<RetainedParamType>),
+    /// Any other type shape (base types `bool`/`nil`/`untyped`/`void`/`self`,
+    /// literals, tuples, records, procs, singletons, type variables, …). The
+    /// `String` is the verbatim written form sliced from the RBS source.
+    Other(String),
+}
+
+/// One RBS overload's positional-parameter shape, retained per-overload (NOT
+/// merged into the arity envelope). The ATM substrate (Slice 1) keeps every
+/// overload separately — `Integer#+` has four, one per numeric operand type —
+/// where the existing [`Arity`] path collapses them to a single `(min, max)`
+/// envelope. Required and optional positionals carry their one-level
+/// [`RetainedParamType`] tag; the remaining shapes are kept as presence flags
+/// only (a later argument check disqualifies an overload that has any of them
+/// rather than reasoning about them precisely).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverloadSignature {
+    /// The required positional parameters, in order, one-level-tagged.
+    pub required_positionals: Vec<RetainedParamType>,
+    /// The optional positional parameters (`?T`), in order, one-level-tagged.
+    pub optional_positionals: Vec<RetainedParamType>,
+    /// The declared NAME of each required positional (`str` in `(String str)`),
+    /// parallel to `required_positionals`; `None` for an unnamed param. Consumed
+    /// by `call.argument-type-mismatch`'s single-overload message (the
+    /// reference's ``parameter `str' of `` prefix, `check_rules.rb:2324`).
+    pub required_positional_names: Vec<Option<&'static str>>,
+    /// The declared name of each optional positional, parallel to
+    /// `optional_positionals`; `None` for an unnamed param.
+    pub optional_positional_names: Vec<Option<&'static str>>,
+    /// `true` iff the overload declares a rest positional (`*T`).
+    pub has_rest_positionals: bool,
+    /// `true` iff the overload declares any required keyword.
+    pub has_required_keywords: bool,
+    /// `true` iff the overload declares any optional keyword.
+    pub has_optional_keywords: bool,
+    /// `true` iff the overload declares a rest keyword (`**T`).
+    pub has_rest_keywords: bool,
+    /// `true` iff the overload declares any trailing positional (a positional
+    /// after a rest, e.g. `(*T, U)`).
+    pub has_trailing_positionals: bool,
+}
+
 /// Sentinel stored in [`ClassEntry::block_returns`] for a block overload whose
 /// RBS return type is `self` (e.g. `Array#each { } -> self`, `Kernel#tap { } ->
 /// self`). At lookup time it resolves to the RECEIVER's own class name (the
@@ -88,6 +164,14 @@ pub enum ClassOrdering {
 /// `arr.each { } : arr`. A distinct value (not a real class name) so it can
 /// never collide with an actual `ClassInstanceType` return.
 const SELF_RETURN: &str = "\0self";
+
+/// The closed set of class names whose instance type admits a `nil` argument —
+/// a faithful copy of the reference `NIL_COMPATIBLE_CLASS_NAMES`
+/// (`check_rules.rb:2053`). A `ClassInstance` param admits nil iff its
+/// (namespace-stripped) name is one of these: `NilClass` itself, and the three
+/// universal ancestors nil is an instance of. Every other concrete class
+/// (`String`, `Integer`, …) rejects nil. Consumed by [`CoreData::param_admits_nil`].
+const NIL_COMPATIBLE_CLASS_NAMES: [&str; 4] = ["NilClass", "Object", "BasicObject", "Kernel"];
 
 /// Per-class data extracted from RBS: its instance methods (name -> resolved
 /// return class + arity), its direct superclass, and its included modules.
@@ -102,6 +186,32 @@ struct ClassEntry {
     /// by `call.possible-nil-receiver` via [`CoreData::method_return_nilable`];
     /// no existing rule reads it (return-class / arity stay as before).
     methods: HashMap<&'static str, (Option<&'static str>, Arity, bool)>,
+    /// `method name -> per-overload positional shapes`, the ATM substrate
+    /// (Slice 1). ADDITIVE alongside `methods`: the merged arity/return path
+    /// above is untouched; this retains the per-overload, per-parameter detail
+    /// that `method_signature` discards. First write wins on reopen (mirroring
+    /// `methods`). Read only via [`CoreData::method_overloads`]; no rule wires
+    /// it yet.
+    method_overloads: HashMap<&'static str, Vec<OverloadSignature>>,
+    /// `singleton method name -> per-overload positional shapes`, the ATM
+    /// substrate for CLASS-method dispatch (`CGI.parse(...)`, `Base64.decode64`).
+    /// The singleton twin of `method_overloads`: populated for `def self.x`
+    /// (`Singleton`) AND `def self?.x` (`SingletonInstance`, which also feeds the
+    /// instance map). First write wins on reopen. Read only via
+    /// [`CoreData::singleton_method_overloads`]; ADDITIVE and output-inert for
+    /// every existing rule (the singleton arity/return path is untouched).
+    singleton_method_overloads: HashMap<&'static str, Vec<OverloadSignature>>,
+    /// Overloads contributed by an OVERLOADING method reopen (`def +:
+    /// (BigDecimal) -> BigDecimal | ...` — RBS's trailing `...` appends the
+    /// previously-defined overloads). Kept ASIDE from `method_overloads` because
+    /// the first-write-wins reopen merge would otherwise drop them; the global
+    /// merge PREPENDS these onto the base definition's overload list (RBS
+    /// semantics: the reopen's own overloads come first), which is how the
+    /// reference renders `5 + nil` as `expected BigDecimal | Integer | Float |
+    /// Rational | Complex`. Instance side.
+    overloading_method_overloads: Vec<(&'static str, Vec<OverloadSignature>)>,
+    /// The singleton twin of `overloading_method_overloads`.
+    overloading_singleton_overloads: Vec<(&'static str, Vec<OverloadSignature>)>,
     /// `method name -> block-overload return class name`, populated ONLY for
     /// methods that declare a block-bearing overload whose return is a
     /// resolvable concrete class (a `ClassInstanceType` like `Hash#filter { }
@@ -196,6 +306,18 @@ pub struct CoreData {
     /// `Pathname`), so this set is the provenance gate that keeps the two apart.
     /// Empty when no `sig/` was ingested.
     project_sig_classes: HashSet<&'static str>,
+    /// ATM substrate (Slice 1): `type` alias name → its right-hand-side one-level
+    /// [`RetainedParamType`] tag (`type string = String | _ToStr` ⇒
+    /// `"string" → Union([ClassInstance("String"), Interface("_ToStr")])`). The
+    /// RHS is stored RAW (aliases inside it are NOT expanded); bounded expansion
+    /// with a cycle cap is Slice 2's job. Read only via
+    /// [`Self::resolve_type_alias`]; no rule wires it yet.
+    type_alias_defs: HashMap<&'static str, RetainedParamType>,
+    /// ATM substrate (Slice 1): `interface` name → its declared method names, in
+    /// declaration order (`interface _ToStr; def to_str: ...; end` ⇒
+    /// `"_ToStr" → ["to_str"]`). Read only via [`Self::interface_methods`]; no
+    /// rule wires it yet.
+    interface_method_names: HashMap<&'static str, Vec<&'static str>>,
 }
 
 impl CoreData {
@@ -293,9 +415,17 @@ impl CoreData {
             .filter(|k| !pre_sig.contains(k))
             .collect();
 
-        let (classes, toplevel_classes) = builder.finish();
+        let (classes, toplevel_classes, type_alias_defs, interface_method_names) =
+            builder.finish();
         if !classes.is_empty() {
-            return Self { source, classes, toplevel_classes, project_sig_classes };
+            return Self {
+                source,
+                classes,
+                toplevel_classes,
+                project_sig_classes,
+                type_alias_defs,
+                interface_method_names,
+            };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
         // carries no plugin selectors, which stays conservative (zero-FP).
@@ -749,6 +879,269 @@ impl CoreData {
         self.lookup_on_chain(&chain, method).map(|(_, arity, _)| arity)
     }
 
+    // -- ATM shared-substrate accessors (Slice 1, retention only) --------------
+    //
+    // These expose the per-overload param shapes + type-alias / interface tables
+    // the ingestion now retains. They are wired into NO consumer yet — Slice 2
+    // builds the argument-compatibility walk on top and Slice 3 the rule. The
+    // slice is output-inert by contract (a ZERO diagnostic-diff gate), so these
+    // exist solely to be unit-tested and consumed later.
+
+    /// The per-overload positional-parameter shapes of `class_name#method`,
+    /// resolved over the flattened ancestor chain (first defining ancestor wins)
+    /// through instance `alias`es — the ATM-substrate twin of [`Self::method_arity`],
+    /// but per-overload and per-parameter rather than a merged envelope. `None`
+    /// when the method is unknown on the chain (or carries no retained overloads,
+    /// which for a real method definition cannot happen — every instance def
+    /// records at least one). Each entry is one RBS overload in declaration order.
+    pub fn method_overloads(&self, class_name: &str, method: &str) -> Option<&[OverloadSignature]> {
+        let (chain, _) = self.ancestors(class_name);
+        self.lookup_overloads_on_chain(&chain, method, 0)
+    }
+
+    /// The per-overload positional-parameter shapes of the CLASS METHOD
+    /// `class_name.method` (`CGI.parse`, `Base64.decode64`), resolved down the
+    /// singleton superclass chain — the class-method twin of
+    /// [`Self::method_overloads`]. `None` when no ancestor on the singleton chain
+    /// records overloads for `method`. Consumed by `call.argument-type-mismatch`
+    /// on a `Type::Singleton` receiver.
+    pub fn singleton_method_overloads(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<&[OverloadSignature]> {
+        // The singleton class inherits down the SUPERCLASS chain (not the
+        // include/ancestor chain). Gather it, then take the first ancestor whose
+        // own singleton-overload table records `method`.
+        let mut cur = Some(class_name);
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(name) = cur {
+            let Some((&key, entry)) = self.classes.get_key_value(name) else {
+                break;
+            };
+            if !seen.insert(key) {
+                break; // cycle guard
+            }
+            if let Some(ov) = entry.singleton_method_overloads.get(method) {
+                return Some(ov.as_slice());
+            }
+            cur = entry.superclass;
+        }
+        None
+    }
+
+    /// The right-hand side of a `type` alias, one level deep, or `None` if the
+    /// alias is unknown. The RHS is RAW: an alias reference INSIDE it stays an
+    /// [`RetainedParamType::Alias`] leaf (not expanded). Bounded expansion with a
+    /// cycle cap is Slice 2's job — because the RHS is stored one level deep,
+    /// ingestion itself can never recurse, so a self- or mutually-referential
+    /// alias (`type a = a`) is retained without any risk of a build-time loop.
+    pub fn resolve_type_alias(&self, name: &str) -> Option<&RetainedParamType> {
+        self.type_alias_defs.get(name.strip_prefix("::").unwrap_or(name))
+    }
+
+    /// The declared method names of an `interface`, in declaration order, or
+    /// `None` if the interface is unknown.
+    pub fn interface_methods(&self, name: &str) -> Option<&[&'static str]> {
+        self.interface_method_names
+            .get(name.strip_prefix("::").unwrap_or(name))
+            .map(|v| v.as_slice())
+    }
+
+    /// Find `method`'s retained per-overload shapes on the flattened ancestor
+    /// `chain`, resolving instance `alias`es exactly like [`Self::lookup_on_chain`]
+    /// (bounded against a pathological alias cycle). The first ancestor that
+    /// records overloads for `method` directly wins.
+    fn lookup_overloads_on_chain(
+        &self,
+        chain: &[&'static str],
+        method: &str,
+        depth: usize,
+    ) -> Option<&[OverloadSignature]> {
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(ov) = entry.method_overloads.get(method) {
+                    return Some(ov.as_slice());
+                }
+            }
+        }
+        if depth >= 16 {
+            return None;
+        }
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(&old) = entry.aliases.get(method) {
+                    if let Some(found) = self.lookup_overloads_on_chain(chain, old, depth + 1) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // -- ATM shared-substrate acceptance walk (Slice 2) ------------------------
+    //
+    // The two argument-compatibility predicates the `call.argument-type-mismatch`
+    // rule (Slice 3, not yet wired) decides each parameter with. Both are
+    // faithful ports of the reference (`check_rules.rb:2085-2103` /
+    // `2157-2213`) with one substitution: the reference hands a translated
+    // `ClassInstance` to its acceptance engine (`Inference::Acceptance.accepts`,
+    // gradual — refutes only on a proven rejection), where rigor-rs decides the
+    // same question with [`Self::class_ordering`] (a `Disjoint` verdict IS the
+    // proven rejection; `Superclass`/`Unknown`/`Equal`/`Subclass` all admit).
+    // Conservative-TRUE throughout: any shape we cannot decide admits, so the
+    // rule never fires on uncertainty. Read by NO consumer in this slice.
+
+    /// Depth cap on bounded `Alias` expansion (defense in depth — Slice 1 stores
+    /// each alias RHS one level deep, so ingestion itself cannot loop, but a
+    /// mutually-referential alias chain (`type a = b`, `type b = a`) could spin
+    /// here without a guard). At exhaustion we admit (conservative true).
+    const ALIAS_EXPANSION_CAP: usize = 8;
+
+    /// Does this RBS parameter type admit a `nil` argument? A faithful port of
+    /// the reference `rbs_type_admits_nil?` (`check_rules.rb:2085-2103`):
+    /// conservative-TRUE by default, so the caller (the nil channel) fires only
+    /// on a param that PROVABLY rejects nil.
+    ///
+    /// - `ClassInstance(name)` ⇒ nil is admitted iff `name` is in the closed
+    ///   `NIL_COMPATIBLE` set (`NilClass`/`Object`/`BasicObject`/`Kernel`); a
+    ///   concrete class like `String` rejects nil (returns `false`).
+    /// - `Alias` ⇒ bounded expansion; an unresolvable alias admits.
+    /// - `Interface` ⇒ admitted iff every required method exists on `NilClass`
+    ///   (so `_ToStr`/`_ToInt` reject — `NilClass` has no `to_str`/`to_int` —
+    ///   while a hypothetical `_ToS` admits, `NilClass#to_s` exists); an
+    ///   unresolvable / empty interface admits.
+    /// - `Union` ⇒ ANY member admitting admits.
+    /// - `Optional` ⇒ `T?` always admits (it explicitly includes nil).
+    /// - `Other` ⇒ every remaining shape (the reference's `else`: bases incl.
+    ///   `nil`/`bool`/`void`/`self`/`top`/`untyped`, type variables, literals,
+    ///   tuples, records, procs, intersections) admits conservatively.
+    pub fn param_admits_nil(&self, t: &RetainedParamType) -> bool {
+        self.param_admits_nil_depth(t, 0)
+    }
+
+    fn param_admits_nil_depth(&self, t: &RetainedParamType, depth: usize) -> bool {
+        match t {
+            RetainedParamType::ClassInstance(name) => {
+                let bare = name.strip_prefix("::").unwrap_or(name);
+                NIL_COMPATIBLE_CLASS_NAMES.contains(&bare)
+            }
+            RetainedParamType::Alias(name) => {
+                if depth >= Self::ALIAS_EXPANSION_CAP {
+                    return true;
+                }
+                match self.resolve_type_alias(name) {
+                    // `resolve_type_alias` borrows `self`; clone the small RHS
+                    // tag so the recursive `&self` call is not aliased.
+                    Some(rhs) => self.param_admits_nil_depth(&rhs.clone(), depth + 1),
+                    None => true,
+                }
+            }
+            RetainedParamType::Interface(name) => self.interface_admits_nil(name),
+            RetainedParamType::Union(members) => {
+                members.iter().any(|m| self.param_admits_nil_depth(m, depth))
+            }
+            RetainedParamType::Optional(_) => true,
+            RetainedParamType::Other(_) => true,
+        }
+    }
+
+    /// An interface parameter admits nil iff `NilClass` implements every method
+    /// it requires (the reference `interface_admits_nil?`). An unknown or empty
+    /// interface admits (conservative). Uses [`Self::class_has_method`] on
+    /// `NilClass`, whose zero-false-positive contract already assumes-present on
+    /// an incomplete chain — so absence is witnessed only when `NilClass`'s chain
+    /// is fully loaded and genuinely lacks the method.
+    fn interface_admits_nil(&self, name: &str) -> bool {
+        match self.interface_methods(name) {
+            Some(methods) if !methods.is_empty() => {
+                methods.iter().all(|m| self.class_has_method("NilClass", m))
+            }
+            // Unknown or empty interface admits conservatively.
+            _ => true,
+        }
+    }
+
+    /// Does this RBS parameter type accept a (non-nil) argument of class
+    /// `arg_class`? A faithful port of the reference `rbs_type_accepts_arg?`
+    /// (`check_rules.rb:2157-2213`): conservative-TRUE by default, so the caller
+    /// (the non-nil channel) fires only on a param that PROVABLY rejects the
+    /// argument's class.
+    ///
+    /// - `ClassInstance(name)` ⇒ decided by [`Self::class_ordering`]`(arg_class,
+    ///   name)`: `Equal`/`Subclass` (the arg is the param class or a descendant)
+    ///   accept; `Disjoint` (provably unrelated) is the sole rejection (`false`);
+    ///   `Superclass` (the arg is broader — a runtime value MIGHT be the param
+    ///   class) and `Unknown` (either class unloaded) admit conservatively.
+    /// - `Alias` ⇒ bounded expansion; an unresolvable alias accepts.
+    /// - `Interface` ⇒ accepted iff `arg_class` implements every required method
+    ///   (mirror of [`Self::interface_admits_nil`], asking the arg class); an
+    ///   unresolvable / empty interface, or an arg class not RBS-known, accepts.
+    /// - `Union` ⇒ ANY member accepting accepts.
+    /// - `Optional` / `Other` ⇒ accept conservatively (the reference `else`).
+    pub fn param_accepts_arg_class(&self, t: &RetainedParamType, arg_class: &str) -> bool {
+        self.param_accepts_arg_class_depth(t, arg_class, 0)
+    }
+
+    fn param_accepts_arg_class_depth(
+        &self,
+        t: &RetainedParamType,
+        arg_class: &str,
+        depth: usize,
+    ) -> bool {
+        match t {
+            RetainedParamType::ClassInstance(name) => {
+                matches!(
+                    self.class_ordering(arg_class, name),
+                    ClassOrdering::Equal
+                        | ClassOrdering::Subclass
+                        | ClassOrdering::Superclass
+                        | ClassOrdering::Unknown
+                )
+            }
+            RetainedParamType::Alias(name) => {
+                if depth >= Self::ALIAS_EXPANSION_CAP {
+                    return true;
+                }
+                match self.resolve_type_alias(name) {
+                    Some(rhs) => {
+                        self.param_accepts_arg_class_depth(&rhs.clone(), arg_class, depth + 1)
+                    }
+                    None => true,
+                }
+            }
+            RetainedParamType::Interface(name) => self.interface_accepts_arg(name, arg_class),
+            RetainedParamType::Union(members) => members
+                .iter()
+                .any(|m| self.param_accepts_arg_class_depth(m, arg_class, depth)),
+            RetainedParamType::Optional(_) => true,
+            RetainedParamType::Other(_) => true,
+        }
+    }
+
+    /// An interface parameter accepts `arg_class` iff that class implements every
+    /// method the interface requires (the reference `interface_accepts_arg?` /
+    /// `arg_class_has_method?`). Conservative on the unknown side: an unresolvable
+    /// / empty interface admits, and an arg class NOT RBS-known admits (the class
+    /// MIGHT implement the conversion via metaprogramming — the reference returns
+    /// true when the class definition is nil). Only a KNOWN arg class that
+    /// provably lacks a required method rejects.
+    fn interface_accepts_arg(&self, name: &str, arg_class: &str) -> bool {
+        match self.interface_methods(name) {
+            Some(methods) if !methods.is_empty() => {
+                // An arg class not RBS-known might implement the conversion via
+                // metaprogramming (the reference returns true on a nil definition).
+                if !self.knows_class(arg_class) {
+                    return true;
+                }
+                methods.iter().all(|m| self.class_has_method(arg_class, m))
+            }
+            // Unknown or empty interface admits conservatively.
+            _ => true,
+        }
+    }
+
     // -- Sig-gen-only precise declared-return accessors (ADR-14 slice 10) ------
     //
     // These are NOT diagnostic predicates. `class_has_method` /
@@ -1009,6 +1402,10 @@ impl CoreData {
                 name,
                 ClassEntry {
                     methods: m,
+                    // The stub models no per-overload param shapes (the ATM
+                    // substrate needs the real embedded RBS); empty keeps the
+                    // `method_overloads` accessor inert under the fallback.
+                    method_overloads: HashMap::new(),
                     // The stub doesn't model block-form returns (no block-call
                     // result typing under the fallback); empty keeps it
                     // conservative ⇒ a block-bearing call stays Dynamic/silent.
@@ -1021,6 +1418,9 @@ impl CoreData {
                     // conservative because the five base classes' singleton
                     // surface is incomplete here ⇒ always silent.
                     singleton_methods: HashMap::new(),
+                    singleton_method_overloads: HashMap::new(),
+                    overloading_method_overloads: Vec::new(),
+                    overloading_singleton_overloads: Vec::new(),
                     singleton_aliases: HashMap::new(),
                     superclass,
                     // The stub does not distinguish modules from classes; the
@@ -1251,6 +1651,10 @@ impl CoreData {
             classes,
             toplevel_classes,
             project_sig_classes: HashSet::new(),
+            // The stub models no type aliases or interfaces (the ATM substrate
+            // needs the real embedded RBS); empty keeps the accessors inert.
+            type_alias_defs: HashMap::new(),
+            interface_method_names: HashMap::new(),
         }
     }
 
@@ -1277,6 +1681,17 @@ impl CoreData {
     }
 }
 
+/// What [`Builder::finish`] hands back: the per-class map, the genuine-top-level
+/// name set, and the two ATM-substrate global tables (type aliases + interface
+/// method names). A named alias keeps the `finish` signature readable
+/// (`clippy::type_complexity`).
+type BuiltData = (
+    HashMap<&'static str, ClassEntry>,
+    HashSet<&'static str>,
+    HashMap<&'static str, RetainedParamType>,
+    HashMap<&'static str, Vec<&'static str>>,
+);
+
 /// Accumulates parsed RBS declarations into per-class entries before flattening.
 #[derive(Default)]
 struct Builder {
@@ -1298,6 +1713,13 @@ struct Builder {
     /// mirrors the reference's namespace-aware RBS environment without giving up
     /// the deliberate short-name collapse used for method-existence leniency.
     super_claimed: HashSet<&'static str>,
+    /// ATM substrate (Slice 1): global `type` alias defs, folded from every
+    /// top-level AND nested `type X = ...` declaration. First write wins.
+    type_alias_defs: HashMap<&'static str, RetainedParamType>,
+    /// ATM substrate (Slice 1): global `interface` method-name sets, folded from
+    /// every top-level AND nested `interface _X ... end` declaration. First
+    /// write wins.
+    interface_method_names: HashMap<&'static str, Vec<&'static str>>,
 }
 
 impl Builder {
@@ -1308,16 +1730,49 @@ impl Builder {
         };
         for decl in sig.declarations().iter() {
             // `false` = top-level (file-level) declaration: only these may enter
-            // the `toplevel_classes` set.
+            // the `toplevel_classes` set. `code` is threaded so the ATM substrate
+            // can slice verbatim written forms for `RetainedParamType::Other`.
             match decl {
-                Node::Class(c) => self.ingest_class(&c, false),
-                Node::Module(m) => self.ingest_module(&m, false),
+                Node::Class(c) => self.ingest_class(&c, false, code),
+                Node::Module(m) => self.ingest_module(&m, false, code),
+                Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code),
+                Node::Interface(i) => self.ingest_interface(&i),
                 _ => {}
             }
         }
     }
 
-    fn ingest_class(&mut self, c: &ClassNode, nested: bool) {
+    /// Fold one `type X = ...` alias into the global map (ATM substrate). First
+    /// write wins on reopen. The RHS is retained one level deep (aliases inside
+    /// are kept as `Alias(..)` leaves, not expanded — Slice 2 owns expansion).
+    fn ingest_type_alias(&mut self, ta: &TypeAliasNode, code: &str) {
+        let Some(name) = type_name_str(&ta.name()) else {
+            return;
+        };
+        let rhs = retained_param_type(&ta.type_(), code);
+        self.type_alias_defs.entry(name).or_insert(rhs);
+    }
+
+    /// Fold one `interface _X ... end` into the global map (ATM substrate),
+    /// recording its declared instance-method names in declaration order. First
+    /// write wins on reopen.
+    fn ingest_interface(&mut self, i: &InterfaceNode) {
+        let Some(name) = type_name_str(&i.name()) else {
+            return;
+        };
+        let mut names: Vec<&'static str> = Vec::new();
+        for member in i.members().iter() {
+            if let Node::MethodDefinition(md) = member {
+                let mname = intern(md.name().as_str());
+                if !names.contains(&mname) {
+                    names.push(mname);
+                }
+            }
+        }
+        self.interface_method_names.entry(name).or_insert(names);
+    }
+
+    fn ingest_class(&mut self, c: &ClassNode, nested: bool, code: &str) {
         let tn = c.name();
         let Some(name) = type_name_str(&tn) else {
             return;
@@ -1342,11 +1797,11 @@ impl Builder {
             superclass,
             ..Default::default()
         };
-        self.collect_members(c.members().iter(), &mut entry);
+        self.collect_members(c.members().iter(), &mut entry, code);
         self.merge(name, entry, authoritative);
     }
 
-    fn ingest_module(&mut self, m: &ModuleNode, nested: bool) {
+    fn ingest_module(&mut self, m: &ModuleNode, nested: bool, code: &str) {
         let tn = m.name();
         let Some(name) = type_name_str(&tn) else {
             return;
@@ -1359,7 +1814,7 @@ impl Builder {
             is_module: true,
             ..Default::default()
         };
-        self.collect_members(m.members().iter(), &mut entry);
+        self.collect_members(m.members().iter(), &mut entry, code);
         self.merge(name, entry, authoritative);
     }
 
@@ -1370,6 +1825,7 @@ impl Builder {
         &mut self,
         members: impl Iterator<Item = Node<'a>>,
         entry: &mut ClassEntry,
+        code: &str,
     ) {
         for member in members {
             match member {
@@ -1390,6 +1846,23 @@ impl Builder {
                         if let Some(br) = block_ret {
                             entry.block_returns.entry(mname).or_insert(br);
                         }
+                        // ATM substrate (Slice 1): retain the per-overload,
+                        // per-parameter shapes the merged arity path discards.
+                        // First write wins on reopen — EXCEPT an OVERLOADING
+                        // reopen (`def +: (BigDecimal) -> BigDecimal | ...`,
+                        // RBS's trailing `...`), whose own overloads are kept
+                        // aside and PREPENDED onto the base definition at the
+                        // global merge (RBS overloading semantics).
+                        if md.overloading() {
+                            entry
+                                .overloading_method_overloads
+                                .push((mname, method_overloads(&md, code)));
+                        } else {
+                            entry
+                                .method_overloads
+                                .entry(mname)
+                                .or_insert_with(|| method_overloads(&md, code));
+                        }
                     }
                     if matches!(
                         kind,
@@ -1397,6 +1870,20 @@ impl Builder {
                             | MethodDefinitionKind::SingletonInstance
                     ) {
                         entry.singleton_methods.entry(mname).or_insert((ret, arity));
+                        // ATM substrate: retain the class-method per-overload
+                        // shapes so `call.argument-type-mismatch` can check a
+                        // `CGI.parse(...)` class-method call site. Overloading
+                        // reopens go aside, mirroring the instance path.
+                        if md.overloading() {
+                            entry
+                                .overloading_singleton_overloads
+                                .push((mname, method_overloads(&md, code)));
+                        } else {
+                            entry
+                                .singleton_method_overloads
+                                .entry(mname)
+                                .or_insert_with(|| method_overloads(&md, code));
+                        }
                     }
                 }
                 Node::Include(inc) => {
@@ -1443,8 +1930,14 @@ impl Builder {
                 // ⇒ all typo detection silently disabled). Registering nested
                 // types by simple name keeps chains complete. (Simple-name
                 // collisions only ever ADD methods, never witness false absence.)
-                Node::Class(inner) => self.ingest_class(&inner, true),
-                Node::Module(inner) => self.ingest_module(&inner, true),
+                Node::Class(inner) => self.ingest_class(&inner, true, code),
+                Node::Module(inner) => self.ingest_module(&inner, true, code),
+                // A NESTED `type X = ...` / `interface _X ... end` folds into the
+                // SAME global maps as a top-level one (ATM substrate), keyed by
+                // simple name — consistent with how nested classes/modules are
+                // registered by simple name above.
+                Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code),
+                Node::Interface(i) => self.ingest_interface(&i),
                 _ => {}
             }
         }
@@ -1479,11 +1972,50 @@ impl Builder {
         for (k, v) in entry.methods {
             slot.methods.entry(k).or_insert(v);
         }
+        for (k, v) in entry.method_overloads {
+            slot.method_overloads.entry(k).or_insert(v);
+        }
+        // Overloading reopens (`def m: ... | ...`): PREPEND the reopen's own
+        // overloads onto the base definition's list (RBS semantics — the
+        // reference renders `Integer#+` as `BigDecimal | Integer | Float |
+        // Rational | Complex`, bigdecimal's overload first). The vendored load
+        // order is core-then-stdlib, so the base is already in the slot; a
+        // base-less overloading reopen (no prior definition anywhere) is
+        // inserted as-is (degraded, same as the old first-write behavior).
+        for (k, v) in entry.overloading_method_overloads {
+            match slot.method_overloads.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let base = std::mem::take(e.get_mut());
+                    let mut merged = v;
+                    merged.extend(base);
+                    *e.get_mut() = merged;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
+        }
         for (k, v) in entry.block_returns {
             slot.block_returns.entry(k).or_insert(v);
         }
         for (k, v) in entry.singleton_methods {
             slot.singleton_methods.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_method_overloads {
+            slot.singleton_method_overloads.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.overloading_singleton_overloads {
+            match slot.singleton_method_overloads.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let base = std::mem::take(e.get_mut());
+                    let mut merged = v;
+                    merged.extend(base);
+                    *e.get_mut() = merged;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
         }
         for (new_name, old_name) in entry.aliases {
             slot.aliases.entry(new_name).or_insert(old_name);
@@ -1512,7 +2044,7 @@ impl Builder {
     /// `BasicObject` and modules implicitly inherits `Object` when no `< X` was
     /// given) and return the class map plus the set of names declared at genuine
     /// top level (defect 2).
-    fn finish(mut self) -> (HashMap<&'static str, ClassEntry>, HashSet<&'static str>) {
+    fn finish(mut self) -> BuiltData {
         let object = intern("Object");
         let basic = intern("BasicObject");
         // A module has no superclass; only *classes* default to Object. We can't
@@ -1530,7 +2062,12 @@ impl Builder {
                 entry.superclass = Some(object);
             }
         }
-        (self.classes, self.toplevel_classes)
+        (
+            self.classes,
+            self.toplevel_classes,
+            self.type_alias_defs,
+            self.interface_method_names,
+        )
     }
 }
 
@@ -1718,6 +2255,130 @@ fn method_signature(
     // `ret_nilable` is only meaningful when `ret` is Some; callers read it via
     // `method_return_nilable`, which gates on `ret` being present.
     (ret, arity, ret_nilable)
+}
+
+/// Retain the per-overload positional-parameter shapes of a method definition —
+/// the ATM substrate (Slice 1). Unlike [`method_signature`], which collapses all
+/// overloads into a single `(min, max)` arity envelope, this keeps every overload
+/// as its own [`OverloadSignature`], with required/optional positionals carried as
+/// one-level [`RetainedParamType`] tags plus presence flags for the shapes a later
+/// argument check treats coarsely (rest / keywords / trailing). One entry per RBS
+/// overload, in declaration order. `code` is the RBS source the definition was
+/// parsed from, used to slice verbatim written forms for `RetainedParamType::Other`.
+fn method_overloads(
+    md: &ruby_rbs::node::MethodDefinitionNode,
+    code: &str,
+) -> Vec<OverloadSignature> {
+    let mut out: Vec<OverloadSignature> = Vec::new();
+    for overload in md.overloads().iter() {
+        let Node::MethodDefinitionOverload(ov) = overload else {
+            continue;
+        };
+        let Node::MethodType(mt) = ov.method_type() else {
+            continue;
+        };
+        let Node::FunctionType(ft) = mt.type_() else {
+            continue;
+        };
+        let required_positionals = ft
+            .required_positionals()
+            .iter()
+            .map(|p| param_node_type(&p, code))
+            .collect();
+        let optional_positionals = ft
+            .optional_positionals()
+            .iter()
+            .map(|p| param_node_type(&p, code))
+            .collect();
+        let required_positional_names = ft
+            .required_positionals()
+            .iter()
+            .map(|p| param_node_name(&p))
+            .collect();
+        let optional_positional_names = ft
+            .optional_positionals()
+            .iter()
+            .map(|p| param_node_name(&p))
+            .collect();
+        out.push(OverloadSignature {
+            required_positionals,
+            optional_positionals,
+            required_positional_names,
+            optional_positional_names,
+            has_rest_positionals: ft.rest_positionals().is_some(),
+            has_required_keywords: ft.required_keywords().iter().next().is_some(),
+            has_optional_keywords: ft.optional_keywords().iter().next().is_some(),
+            has_rest_keywords: ft.rest_keywords().is_some(),
+            has_trailing_positionals: ft.trailing_positionals().iter().next().is_some(),
+        });
+    }
+    out
+}
+
+/// Resolve a positional-parameter node (`RBS::Types::Function::Param`, whose
+/// `.type_()` is the parameter's type) into a one-level [`RetainedParamType`].
+fn param_node_type(param: &Node, code: &str) -> RetainedParamType {
+    match param {
+        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code),
+        // Defensive: a positional that isn't a FunctionParam node (shouldn't
+        // occur) is retained verbatim as an `Other` leaf.
+        other => RetainedParamType::Other(node_written_form(other, code)),
+    }
+}
+
+/// The declared name of a positional parameter (`str` in `(String str)`), or
+/// `None` when the RBS omits it. Feeds the reference's ``parameter `str' of ``
+/// message prefix on a single-overload argument-type mismatch.
+fn param_node_name(param: &Node) -> Option<&'static str> {
+    match param {
+        Node::FunctionParam(fp) => fp.name().map(|s| intern(s.as_str())),
+        _ => None,
+    }
+}
+
+/// Lower one RBS type node to a one-level [`RetainedParamType`] tag (ATM
+/// substrate). The four named kinds — class instance, `type` alias, `interface`,
+/// and the two structural wrappers `Union` / `Optional` — are recognised; every
+/// other shape collapses to [`RetainedParamType::Other`] carrying the verbatim
+/// written form sliced from `code`. Only `Union`/`Optional` recurse (they are
+/// meaningless as opaque leaves); a `ClassInstance` drops its type arguments.
+fn retained_param_type(node: &Node, code: &str) -> RetainedParamType {
+    match node {
+        Node::ClassInstanceType(ci) => match type_name_str(&ci.name()) {
+            Some(name) => RetainedParamType::ClassInstance(name),
+            None => RetainedParamType::Other(node_written_form(node, code)),
+        },
+        Node::AliasType(a) => match type_name_str(&a.name()) {
+            Some(name) => RetainedParamType::Alias(name),
+            None => RetainedParamType::Other(node_written_form(node, code)),
+        },
+        Node::InterfaceType(i) => match type_name_str(&i.name()) {
+            Some(name) => RetainedParamType::Interface(name),
+            None => RetainedParamType::Other(node_written_form(node, code)),
+        },
+        Node::UnionType(u) => RetainedParamType::Union(
+            u.types().iter().map(|t| retained_param_type(&t, code)).collect(),
+        ),
+        Node::OptionalType(o) => {
+            RetainedParamType::Optional(Box::new(retained_param_type(&o.type_(), code)))
+        }
+        other => RetainedParamType::Other(node_written_form(other, code)),
+    }
+}
+
+/// The verbatim written form of a type node, sliced from the RBS source `code`
+/// by the node's byte range. Falls back to an empty string if the range is out
+/// of bounds or not on a UTF-8 boundary (never panics) — the `Other` leaf is a
+/// label hint, so a degraded slice is acceptable and never load-bearing here.
+fn node_written_form(node: &Node, code: &str) -> String {
+    let range = node.location();
+    let start = range.start().max(0) as usize;
+    let end = range.end().max(0) as usize;
+    if start <= end && end <= code.len() {
+        code.get(start..end).unwrap_or("").to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// The RETURN class of the method's **block-bearing overload** — the overload
@@ -1932,6 +2593,446 @@ mod embedded_tests {
         // Core classes are unaffected by the project ingest.
         assert!(data.knows_class("String"));
         assert!(data.class_has_method("String", "upcase"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // -- ATM shared-substrate (Slice 1) retention tests ------------------------
+
+    /// Per-overload retention on a real multi-overload core method: the vendored
+    /// core `Integer#+` has FOUR overloads (`Integer`/`Float`/`Rational`/
+    /// `Complex`), and the stdlib `bigdecimal` reopen (`def +: (BigDecimal) ->
+    /// BigDecimal | ...` — an OVERLOADING def whose trailing `...` appends the
+    /// existing overloads) PREPENDS a fifth. Each has a single required
+    /// positional whose type is the concrete numeric class; the reference's
+    /// multi-overload label renders them in exactly this order (`5 + nil` ⇒
+    /// `expected BigDecimal | Integer | Float | Rational | Complex`). The merged
+    /// arity path (unchanged) still sees one `(1, Some(1))` envelope.
+    #[test]
+    fn atm_per_overload_retention_integer_plus() {
+        let idx = CoreData::load();
+        let ov = idx
+            .method_overloads("Integer", "+")
+            .expect("Integer#+ has retained overloads");
+        assert_eq!(ov.len(), 5, "Integer#+ has five overloads (bigdecimal reopen + core four)");
+        let names: Vec<&RetainedParamType> = ov
+            .iter()
+            .map(|o| {
+                assert_eq!(o.required_positionals.len(), 1, "one required positional");
+                assert!(o.optional_positionals.is_empty());
+                assert!(!o.has_rest_positionals);
+                assert!(!o.has_required_keywords);
+                assert!(!o.has_optional_keywords);
+                assert!(!o.has_rest_keywords);
+                assert!(!o.has_trailing_positionals);
+                &o.required_positionals[0]
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                &RetainedParamType::ClassInstance("BigDecimal"),
+                &RetainedParamType::ClassInstance("Integer"),
+                &RetainedParamType::ClassInstance("Float"),
+                &RetainedParamType::ClassInstance("Rational"),
+                &RetainedParamType::ClassInstance("Complex"),
+            ],
+            "the overloading reopen's operand comes first, then the core four"
+        );
+        // The merged arity envelope is untouched (additive-retention contract).
+        assert_eq!(idx.method_arity("Integer", "+"), Some((1, Some(1))));
+        // Param-NAME retention (message prefix substrate): `String#+` declares
+        // `(string other_string)`, so the name rides alongside the type.
+        let plus = idx.method_overloads("String", "+").expect("String#+ retained");
+        assert_eq!(plus.len(), 1);
+        assert_eq!(plus[0].required_positional_names, vec![Some("other_string")]);
+    }
+
+    /// Type-alias retention against the ACTUAL vendored RBS: `builtin.rbs`
+    /// declares `type string = String | _ToStr`, so `resolve_type_alias("string")`
+    /// is a two-arm union of the concrete `String` class and the `_ToStr`
+    /// interface — retained RAW (the interface is a leaf, not expanded).
+    #[test]
+    fn atm_type_alias_retention_string() {
+        let idx = CoreData::load();
+        let rhs = idx
+            .resolve_type_alias("string")
+            .expect("`type string` is retained");
+        assert_eq!(
+            rhs,
+            &RetainedParamType::Union(vec![
+                RetainedParamType::ClassInstance("String"),
+                RetainedParamType::Interface("_ToStr"),
+            ]),
+            "type string = String | _ToStr"
+        );
+        // A leading `::` on the query is tolerated.
+        assert!(idx.resolve_type_alias("::string").is_some());
+    }
+
+    /// Interface method-name retention against the ACTUAL vendored RBS:
+    /// `interface _ToStr; def to_str: () -> String; end` ⇒ `["to_str"]`.
+    #[test]
+    fn atm_interface_method_names_to_str() {
+        let idx = CoreData::load();
+        assert_eq!(
+            idx.interface_methods("_ToStr"),
+            Some(["to_str"].as_slice()),
+            "_ToStr requires exactly to_str"
+        );
+        // A richer interface (`_Each` requires `each`) is retained too.
+        let each = idx.interface_methods("_Each").expect("_Each retained");
+        assert!(each.contains(&"each"), "_Each requires each");
+    }
+
+    /// Keyword / rest / optional / trailing presence flags are set from the real
+    /// RBS. `String#gsub` has an overload with optional positionals and one with
+    /// a block; `Hash#merge` takes a rest positional. We assert the flags rather
+    /// than pin exact overload indices (which vary with the vendored RBS).
+    #[test]
+    fn atm_presence_flags_from_real_rbs() {
+        let idx = CoreData::load();
+        // `String#*` : (int) -> String — a single required positional, no rest.
+        let star = idx.method_overloads("String", "*").expect("String#* overloads");
+        assert!(star.iter().all(|o| !o.has_rest_positionals));
+        // `Array#push` / `Array#concat` take rest positionals (`*T`).
+        let push = idx.method_overloads("Array", "push").expect("Array#push overloads");
+        assert!(
+            push.iter().any(|o| o.has_rest_positionals),
+            "Array#push declares a rest positional"
+        );
+        // Optional positional retention: `String#chomp : (?string) -> String`.
+        let chomp = idx.method_overloads("String", "chomp").expect("String#chomp overloads");
+        assert!(
+            chomp.iter().any(|o| !o.optional_positionals.is_empty()),
+            "String#chomp has an optional positional overload"
+        );
+    }
+
+    /// Overloads resolve over the ancestor chain AND through instance aliases,
+    /// exactly like the merged lookups. `Integer` inherits nothing for `+` (own
+    /// method); test an inherited case: `Integer#succ` is own, but `String#size`
+    /// is `alias size length` ⇒ overloads resolve via the alias target.
+    #[test]
+    fn atm_overloads_resolve_via_alias_and_chain() {
+        let idx = CoreData::load();
+        // `String#size` is `alias size length`; overloads resolve to `length`'s.
+        let size = idx.method_overloads("String", "size");
+        let length = idx.method_overloads("String", "length");
+        assert!(size.is_some(), "aliased size resolves to length's overloads");
+        assert_eq!(size, length, "size and length share the overload set");
+        // Unknown method ⇒ None.
+        assert!(idx.method_overloads("String", "definitely_absent_zzz").is_none());
+        // Unknown class ⇒ None.
+        assert!(idx.method_overloads("NoSuchClassZzz", "foo").is_none());
+    }
+
+    /// Class-method (singleton) overload retention — the ATM substrate for
+    /// `CGI.parse(...)` / `Base64.decode64(...)`. `CGI.parse` is a plain
+    /// `def self.parse: (String query) -> ...`, so it lives ONLY in the singleton
+    /// overload table (the instance `method_overloads` does not carry it).
+    #[test]
+    fn atm_singleton_method_overloads_retained() {
+        let idx = CoreData::load();
+        // Only assert when the stdlib RBS is actually loaded (a stub build has no
+        // CGI); this keeps the test meaningful without failing a Ruby-free CI.
+        if idx.knows_class("CGI") {
+            let parse = idx
+                .singleton_method_overloads("CGI", "parse")
+                .expect("CGI.parse singleton overloads retained");
+            assert!(
+                parse
+                    .iter()
+                    .any(|o| o.required_positionals.len() == 1
+                        && matches!(o.required_positionals[0], RetainedParamType::ClassInstance("String"))),
+                "CGI.parse takes a single String positional: {parse:?}"
+            );
+            // A plain `def self.parse` is NOT an instance method.
+            assert!(
+                idx.method_overloads("CGI", "parse").is_none(),
+                "CGI#parse is not an instance method"
+            );
+        }
+        // Unknown singleton method / class ⇒ None.
+        assert!(idx.singleton_method_overloads("Array", "definitely_absent_zzz").is_none());
+        assert!(idx.singleton_method_overloads("NoSuchClassZzz", "foo").is_none());
+    }
+
+    /// Alias / interface cycle guard: a self-referential `type` alias
+    /// (`type loop_t = loop_t`) and a mutual pair are ingested WITHOUT any
+    /// build-time loop (the RHS is retained one level deep), and their raw tags
+    /// come back as `Alias(..)` leaves. Uses a project `sig/` dir since ingestion
+    /// is filesystem/parser-driven.
+    #[test]
+    fn atm_alias_cycle_guard_and_nested_retention() {
+        let base = std::env::temp_dir()
+            .join(format!("rigor-atm-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp sig dir");
+        std::fs::write(
+            base.join("cyclic.rbs"),
+            "type loop_t = loop_t\n\
+             type a_t = b_t\n\
+             type b_t = a_t\n\
+             interface _Spinner\n  def spin: () -> Integer\n  def spin: () -> Integer\nend\n",
+        )
+        .expect("write sig");
+
+        let data = CoreData::load_for_project(&[], std::slice::from_ref(&base));
+        // No hang at ingestion; the self-cycle is retained as a raw Alias leaf.
+        assert_eq!(
+            data.resolve_type_alias("loop_t"),
+            Some(&RetainedParamType::Alias("loop_t")),
+            "self-referential alias retained one level deep, no loop"
+        );
+        assert_eq!(
+            data.resolve_type_alias("a_t"),
+            Some(&RetainedParamType::Alias("b_t")),
+            "mutual alias retained raw (Slice 2 owns expansion)"
+        );
+        // Interface with a duplicate method decl dedups to one name.
+        assert_eq!(
+            data.interface_methods("_Spinner"),
+            Some(["spin"].as_slice()),
+            "duplicate interface method decls dedup"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The retention is ADDITIVE: an empty `sig_dirs` load still has the same
+    /// class count, and the substrate accessors are populated (non-degenerate)
+    /// on the embedded set — a coarse guard that ingestion actually ran.
+    #[test]
+    fn atm_substrate_is_additive_and_populated() {
+        let idx = CoreData::load();
+        // The type-alias and interface tables are non-empty on the real RBS.
+        assert!(idx.resolve_type_alias("string").is_some());
+        assert!(idx.interface_methods("_ToStr").is_some());
+        // A stdlib alias is present too (`type Pathname::glob_pattern` etc. vary;
+        // assert the core `boolish` alias which builtin.rbs declares).
+        assert!(
+            idx.resolve_type_alias("boolish").is_some(),
+            "core `type boolish` alias retained"
+        );
+    }
+
+    // -- ATM Slice 2: acceptance-walk predicates ------------------------------
+
+    /// `ClassInstance` nil-admittance: the closed `NIL_COMPATIBLE` set admits,
+    /// every other concrete class rejects. `Object` (a universal nil ancestor)
+    /// admits; `String` does not — the load-bearing case (`"a" + nil` fires).
+    #[test]
+    fn atm_param_admits_nil_class_instance() {
+        let idx = CoreData::load();
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Object")));
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("BasicObject")));
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Kernel")));
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("NilClass")));
+        // A leading `::` is tolerated on the name.
+        assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("::Object")));
+        // Concrete classes reject nil.
+        assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("String")));
+        assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("Integer")));
+    }
+
+    /// `Other` forms all admit nil (the reference `else`: `nil`/`untyped`/`self`/
+    /// `bool`/literals/type variables …), and `Optional` always admits.
+    #[test]
+    fn atm_param_admits_nil_other_and_optional() {
+        let idx = CoreData::load();
+        for form in ["nil", "untyped", "self", "bool", "top", "void", "1", "\"x\"", ":sym", "T"] {
+            assert!(
+                idx.param_admits_nil(&RetainedParamType::Other(form.to_string())),
+                "Other({form:?}) admits nil conservatively"
+            );
+        }
+        assert!(idx.param_admits_nil(&RetainedParamType::Optional(Box::new(
+            RetainedParamType::ClassInstance("String")
+        ))));
+    }
+
+    /// `Union` admits nil iff ANY member does. `String | Integer` rejects (both
+    /// concrete non-nil); `String | Object` admits (via `Object`).
+    #[test]
+    fn atm_param_admits_nil_union() {
+        let idx = CoreData::load();
+        assert!(!idx.param_admits_nil(&RetainedParamType::Union(vec![
+            RetainedParamType::ClassInstance("String"),
+            RetainedParamType::ClassInstance("Integer"),
+        ])));
+        assert!(idx.param_admits_nil(&RetainedParamType::Union(vec![
+            RetainedParamType::ClassInstance("String"),
+            RetainedParamType::ClassInstance("Object"),
+        ])));
+    }
+
+    /// The `string` / `int` interface-aliases reject nil: `type string = String
+    /// | _ToStr`, and `NilClass` implements neither `to_str` nor `to_int`, so
+    /// both arms reject. This is the semantic that makes `"a" + nil` fire
+    /// (proven live against the oracle). A hypothetical `_ToS`-shaped interface
+    /// admits, since `NilClass#to_s` exists.
+    #[test]
+    fn atm_param_admits_nil_string_int_aliases() {
+        let idx = CoreData::load();
+        assert!(
+            !idx.param_admits_nil(&RetainedParamType::Alias("string")),
+            "`string` (String | _ToStr) rejects nil — NilClass lacks to_str"
+        );
+        assert!(
+            !idx.param_admits_nil(&RetainedParamType::Alias("int")),
+            "`int` (Integer | _ToInt) rejects nil — NilClass lacks to_int"
+        );
+        // NilClass HAS to_s, so a `_ToS` interface param admits nil directly.
+        assert!(
+            idx.param_admits_nil(&RetainedParamType::Interface("_ToS")),
+            "_ToS admits nil — NilClass#to_s exists"
+        );
+        // An unknown interface admits conservatively.
+        assert!(idx.param_admits_nil(&RetainedParamType::Interface("_NoSuchIfaceZzz")));
+    }
+
+    /// `ClassInstance` argument acceptance via `class_ordering`: Equal / Subclass
+    /// / Superclass / Unknown accept, only a provable `Disjoint` rejects.
+    #[test]
+    fn atm_param_accepts_arg_class_instance() {
+        let idx = CoreData::load();
+        // Equal.
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String"), "String"));
+        // Subclass: ArgumentError <: Exception.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("Exception"),
+            "ArgumentError"
+        ));
+        // Superclass: arg Numeric is broader than param Integer — a runtime value
+        // MIGHT be an Integer, so admit (never a provable reject).
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("Integer"),
+            "Numeric"
+        ));
+        // Unknown: an unloaded param class cannot be refuted.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("NoSuchClassZzz"),
+            "String"
+        ));
+        // Disjoint: the sole rejection.
+        assert!(!idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String"), "Symbol"));
+        assert!(!idx.param_accepts_arg_class(
+            &RetainedParamType::ClassInstance("Integer"),
+            "String"
+        ));
+    }
+
+    /// The `string` / `int` aliases accept their concrete arm directly and, via
+    /// the interface walk, decline to reject a class that implements the
+    /// conversion: `int` accepts `Float` because `Float` (over `Numeric`) has
+    /// `to_int`. `string` rejects `Symbol` (no `to_str`).
+    #[test]
+    fn atm_param_accepts_arg_string_int_aliases() {
+        let idx = CoreData::load();
+        // `string` accepts String (concrete arm, Equal).
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("string"), "String"));
+        // `int` accepts Integer (concrete arm) AND Float (via _ToInt: Float has
+        // Numeric#to_int) — the interface walk declining to reject a coercible.
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("int"), "Integer"));
+        assert!(
+            idx.param_accepts_arg_class(&RetainedParamType::Alias("int"), "Float"),
+            "`int` accepts Float — Float implements to_int via Numeric"
+        );
+        // `string` rejects Symbol: Disjoint from String AND no to_str.
+        assert!(
+            !idx.param_accepts_arg_class(&RetainedParamType::Alias("string"), "Symbol"),
+            "`string` rejects Symbol — not a String and no to_str"
+        );
+    }
+
+    /// Union / Optional / Other acceptance: Union accepts iff any member does;
+    /// Optional and Other admit conservatively.
+    #[test]
+    fn atm_param_accepts_arg_union_optional_other() {
+        let idx = CoreData::load();
+        // Union: Symbol accepted by the Symbol arm though rejected by String.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Union(vec![
+                RetainedParamType::ClassInstance("String"),
+                RetainedParamType::ClassInstance("Symbol"),
+            ]),
+            "Symbol"
+        ));
+        // Union of two disjoint concretes rejects a third disjoint arg.
+        assert!(!idx.param_accepts_arg_class(
+            &RetainedParamType::Union(vec![
+                RetainedParamType::ClassInstance("String"),
+                RetainedParamType::ClassInstance("Symbol"),
+            ]),
+            "Integer"
+        ));
+        // Optional / Other admit unconditionally.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Optional(Box::new(RetainedParamType::ClassInstance("String"))),
+            "Integer"
+        ));
+        assert!(idx.param_accepts_arg_class(&RetainedParamType::Other("untyped".to_string()), "Integer"));
+    }
+
+    /// Interface acceptance is conservative on the unknown side: an arg class not
+    /// RBS-known admits (it MIGHT implement the conversion via metaprogramming),
+    /// only a KNOWN class provably lacking a required method rejects.
+    #[test]
+    fn atm_interface_accepts_arg_unknown_side() {
+        let idx = CoreData::load();
+        // Unknown arg class → admit.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Interface("_ToStr"),
+            "NoSuchClassZzz"
+        ));
+        // Unknown interface → admit.
+        assert!(idx.param_accepts_arg_class(
+            &RetainedParamType::Interface("_NoSuchIfaceZzz"),
+            "Symbol"
+        ));
+        // Known arg class lacking the required method → reject.
+        assert!(
+            !idx.param_accepts_arg_class(&RetainedParamType::Interface("_ToStr"), "Symbol"),
+            "_ToStr rejects Symbol — no to_str"
+        );
+    }
+
+    /// Bounded alias expansion terminates on a cycle (returns conservative true
+    /// at the depth cap) and resolves a finite chain to its leaf. Uses a project
+    /// `sig/` dir since alias ingestion is parser-driven.
+    #[test]
+    fn atm_acceptance_alias_depth_cap_and_chain() {
+        let base = std::env::temp_dir().join(format!("rigor-atm-s2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("temp sig dir");
+        std::fs::write(
+            base.join("chains.rbs"),
+            "type a_t = b_t\n\
+             type b_t = a_t\n\
+             type int_t = Integer\n\
+             type obj_t = Object\n",
+        )
+        .expect("write sig");
+        let data = CoreData::load_for_project(&[], std::slice::from_ref(&base));
+
+        // Cyclic alias: no hang, admits at the cap (conservative true).
+        assert!(
+            data.param_admits_nil(&RetainedParamType::Alias("a_t")),
+            "cyclic alias terminates and admits at the depth cap"
+        );
+        assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("a_t"), "String"));
+
+        // Finite chain resolves to its leaf class.
+        assert!(
+            !data.param_admits_nil(&RetainedParamType::Alias("int_t")),
+            "`type int_t = Integer` inherits Integer's nil rejection"
+        );
+        assert!(
+            data.param_admits_nil(&RetainedParamType::Alias("obj_t")),
+            "`type obj_t = Object` inherits Object's nil admittance"
+        );
+        assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("int_t"), "Integer"));
+        assert!(!data.param_accepts_arg_class(&RetainedParamType::Alias("int_t"), "String"));
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -189,6 +189,14 @@ pub struct HashKey {
 pub struct RescueClause {
     pub exceptions: Vec<NodeId>,
     pub body: Vec<NodeId>,
+    /// The name of the `=> e` bound exception variable, if present (Prism
+    /// `RescueNode#reference`, a `LocalVariableTargetNode`). `None` for a clause
+    /// with no `=>` capture. Consumed by `def.ivar-write-mismatch` (increment a):
+    /// inside the clause body, a read of this name types to the clause's single
+    /// resolvable exception class, so `@x = "s"; rescue C => e; @x = e` flags the
+    /// `String → C` drift. Populated only from a real `BeginNode` rescue chain
+    /// (empty for the reused carriers).
+    pub bound_name: Option<String>,
     pub span: Span,
 }
 
@@ -277,6 +285,17 @@ pub enum Node {
         /// positional `raise({a: 1})` fires). `false` when there is no first
         /// argument or it is an ordinary expression.
         first_arg_nonplain: bool,
+        /// `true` iff EVERY positional argument is a plain expression (none is a
+        /// splat `*a`, a bare keyword-hash `a: 1`, a block-pass `&blk`, or
+        /// forwarded `...`) — a faithful mirror of the reference's
+        /// `plain_positional_call?` (`check_rules.rb:1072`), computed over ALL
+        /// arguments (unlike `first_arg_nonplain`, which is first-only) because
+        /// the lowered subtree does not preserve the splat/keyword distinction.
+        /// A block-pass (`&blk`, a `BlockArgumentNode` in Prism's `block()`)
+        /// counts as non-plain, but an ordinary trailing block (`foo(a) { }`)
+        /// does NOT (its args are still checkable). Consumed by
+        /// `call.argument-type-mismatch`, which bails when this is `false`.
+        args_all_plain: bool,
         /// Span of the whole call expression.
         span: Span,
     },
@@ -487,9 +506,30 @@ pub enum Node {
     /// `Dynamic[top]` — no ivar/cvar/gvar type tracking in this slice.
     // TODO(spec): ivar typing (ADR-0022).
     VariableRead { span: Span },
-    /// An instance/class/global variable write (`@x = v`). The value is lowered
+    /// A class/global variable write (`@@x = v`, `$x = v`). The value is lowered
     /// (so a call in the assigned expression is analysed). Not a value itself.
+    /// An INSTANCE variable write (`@x = v`) lowers to the dedicated
+    /// [`Node::InstanceVariableWrite`] instead (it carries the name the
+    /// `def.ivar-write-mismatch` rule groups on); this nameless variant keeps
+    /// covering the class-var / global-var writes, which no rule inspects by name.
     VariableWrite { value: NodeId, span: Span },
+    /// An instance variable write (`@x = v`). Lowered as a dedicated variant
+    /// (mirroring [`Node::LocalVariableWrite`]) so the `def.ivar-write-mismatch`
+    /// collector can see the target NAME + its value's type — Prism would
+    /// otherwise fold it into the nameless [`Node::VariableWrite`], losing the
+    /// name. `name` includes the leading `@` (Prism `InstanceVariableWriteNode#name`
+    /// is `:@x`), matching the reference message's `@x` spelling. `name_span` is
+    /// the precise span of the `@x` name token (Prism `name_loc`) — the anchor the
+    /// diagnostic keys on (the reference's `Diagnostic.from_name_loc`). `value` is
+    /// lowered (so a call in the assigned expression stays reachable). Not a value
+    /// itself (`x = (@y = 5)` types via the RHS at the [`Node::VariableWrite`]-shaped
+    /// consumers, which include this variant).
+    InstanceVariableWrite {
+        name: String,
+        value: NodeId,
+        name_span: Span,
+        span: Span,
+    },
     /// A constant read (`Foo`, `Foo::Bar`). For a path, the parent scope is
     /// lowered. `name` is the dotted constant path (`"Foo"`, `"Foo::Bar"`), kept
     /// so a `X.new` call can resolve `X` to a class name WITHOUT typing the bare
@@ -558,6 +598,7 @@ impl Node {
             | Node::Range { span }
             | Node::VariableRead { span }
             | Node::VariableWrite { span, .. }
+            | Node::InstanceVariableWrite { span, .. }
             | Node::ConstantRead { span, .. }
             | Node::ConstantWrite { span, .. }
             | Node::SelfExpr { span }
@@ -860,6 +901,28 @@ impl<'src> Builder<'src> {
                         || first.as_forwarding_arguments_node().is_some()
                 }))
                 .unwrap_or(false);
+            // Whether EVERY positional argument is a plain expression — the
+            // reference `plain_positional_call?` (all args `simple_positional?`):
+            // no splat / bare keyword-hash / block-pass / forwarded-args shape.
+            // A block-pass rides Prism's `block()` (a `BlockArgumentNode`), not
+            // `arguments()`, so it is checked separately; an ordinary trailing
+            // block (a `BlockNode`) leaves the args checkable and does NOT count.
+            let block_is_pass = call
+                .block()
+                .map(|b| b.as_block_argument_node().is_some())
+                .unwrap_or(false);
+            let args_all_plain = call
+                .arguments()
+                .map(|a| {
+                    a.arguments().iter().all(|x| {
+                        x.as_splat_node().is_none()
+                            && x.as_keyword_hash_node().is_none()
+                            && x.as_block_argument_node().is_none()
+                            && x.as_forwarding_arguments_node().is_none()
+                    })
+                })
+                .unwrap_or(true)
+                && !block_is_pass;
             // Lower an attached block so calls/reads inside it reach the walk.
             //   * a BlockNode (`{ … }` / `do…end`) — lower its body statements.
             //   * a `&expr` block-pass (BlockArgumentNode) — lower the passed
@@ -899,6 +962,7 @@ impl<'src> Builder<'src> {
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
                 safe_nav: call.is_safe_navigation(),
                 first_arg_nonplain,
+                args_all_plain,
                 span: span_of(&call.location()),
             });
         }
@@ -942,6 +1006,27 @@ impl<'src> Builder<'src> {
             // lives in the arena; the span-scan analyses find it (orphan-proof).
             if let Some(recv) = def.receiver() {
                 let _ = self.lower_node(&recv);
+            }
+            // C2: lower each parameter DEFAULT-VALUE expression as an arena node
+            // so the call rules reach it (the reference checks positional and
+            // keyword defaults, incl. nested calls within — `def f(t =
+            // Time.current)`, `def g(a: [1,2].frob)`). Orphaned like the
+            // receiver above: it lives in the arena so the span-scan / `ast.iter`
+            // call walk finds it, but is not a body statement (so a default's
+            // write is not mis-attributed to the method body). Params themselves
+            // stay unbound (Dynamic ⇒ silent), so only a literal/constant
+            // receiver in a default is ever witnessed — the FP-safe subset.
+            if let Some(params) = def.parameters() {
+                for opt in params.optionals().iter() {
+                    if let Some(o) = opt.as_optional_parameter_node() {
+                        let _ = self.lower_node(&o.value());
+                    }
+                }
+                for kw in params.keywords().iter() {
+                    if let Some(o) = kw.as_optional_keyword_parameter_node() {
+                        let _ = self.lower_node(&o.value());
+                    }
+                }
             }
             // A `def self.x` (SELF receiver) captures its method name here so
             // `sig-gen` can collect the singleton; `name` stays `None` so the
@@ -1247,9 +1332,14 @@ impl<'src> Builder<'src> {
                     body.extend(ids.iter().copied());
                     clause_body = ids;
                 }
+                let bound_name = r
+                    .reference()
+                    .and_then(|reference| reference.as_local_variable_target_node())
+                    .map(|target| constant_string(target.name().as_slice()));
                 clauses.push(RescueClause {
                     exceptions,
                     body: clause_body,
+                    bound_name,
                     span: span_of(&r.location()),
                 });
                 rescue = r.subsequent();
@@ -1389,9 +1479,12 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(ivw) = node.as_instance_variable_write_node() {
+            let name = constant_string(ivw.name().as_slice());
             let value = self.lower_node(&ivw.value());
-            return self.push(Node::VariableWrite {
+            return self.push(Node::InstanceVariableWrite {
+                name,
                 value,
+                name_span: span_of(&ivw.name_loc()),
                 span: span_of(&ivw.location()),
             });
         }
@@ -2247,6 +2340,17 @@ mod tests {
     }
 
     #[test]
+    fn lowers_parameter_default_value_calls() {
+        // C2: a call inside a POSITIONAL or KEYWORD parameter default must reach
+        // the arena so the call rules can witness a typo on a literal/constant
+        // receiver there (the reference checks parameter defaults).
+        let src = b"def f(t = Time.current, a: Foo.bar)\n  t\nend\n";
+        let ast = lower(&crate::parse(src));
+        assert!(has_call(&ast, "current"), "positional default call must be lowered");
+        assert!(has_call(&ast, "bar"), "keyword default call must be lowered");
+    }
+
+    #[test]
     fn lowers_calls_inside_if_and_else_branches() {
         let src = b"if x\n  a.foo\nelse\n  b.bar\nend\n";
         let ast = lower(&crate::parse(src));
@@ -2386,7 +2490,9 @@ mod tests {
     fn lowers_ivar_and_constant_writes_recursively() {
         // The assigned value's call must be lowered.
         let iv = lower(&crate::parse(b"@x = a.foo\n"));
-        assert!(iv.iter().any(|(_, n)| matches!(n, Node::VariableWrite { .. })));
+        assert!(iv.iter().any(
+            |(_, n)| matches!(n, Node::InstanceVariableWrite { name, .. } if name == "@x")
+        ));
         assert!(has_call(&iv, "foo"));
         let cw = lower(&crate::parse(b"FOO = a.bar\n"));
         assert!(cw.iter().any(|(_, n)| matches!(n, Node::ConstantWrite { .. })));

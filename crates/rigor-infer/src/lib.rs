@@ -29,7 +29,9 @@ use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
-pub use source_index::{DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE};
+pub use source_index::{
+    lexical_scopes, ConstLit, DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE,
+};
 
 /// A process-wide empty [`SourceIndex`], used as the default `source` for a
 /// [`Typer`] built via [`Typer::new`] (callers that predate in-source typing).
@@ -130,19 +132,31 @@ pub struct Typer<'i> {
     /// route a [`folding::sidecar_foldable`] call the Rust core declined to real
     /// Ruby. Must be `Sync` so one folder is shared across the file-parallel walk.
     folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
+    /// C1 (constant-shadow gate): the CURRENT FILE's lexical class/module scopes,
+    /// `(span, qualified segments)`, so the `ConstantRead` arm can recover a
+    /// use-site lexical prefix by span containment and consult
+    /// [`SourceIndex::constant_shadowed`] precisely. Empty (`&[]`) for callers
+    /// that do not set it (unit tests / pre-C1 entry points) — with no scopes
+    /// every use site reads as toplevel, so only TOPLEVEL project definitions
+    /// suppress, matching the conservative default.
+    lexical_scopes: &'i [(rigor_parse::Span, Vec<String>)],
 }
+
+/// A shared empty lexical-scope slice — the default `lexical_scopes` for a
+/// [`Typer`] built without the C1 per-file scopes.
+const EMPTY_LEXICAL_SCOPES: &[(rigor_parse::Span, Vec<String>)] = &[];
 
 impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -153,7 +167,67 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES }
+    }
+
+    /// C1: attach the CURRENT FILE's lexical class/module scopes (from
+    /// [`source_index::lexical_scopes`]) so the `ConstantRead` arm resolves a
+    /// use-site lexical prefix. A consuming builder — the analyze pass computes
+    /// the scopes once per file and threads them here.
+    pub fn with_lexical_scopes(
+        mut self,
+        scopes: &'i [(rigor_parse::Span, Vec<String>)],
+    ) -> Self {
+        self.lexical_scopes = scopes;
+        self
+    }
+
+    /// C5: re-intern a harvested [`ConstLit`] against the local interner into the
+    /// SAME carrier the Typer builds for the equivalent inline literal — a scalar
+    /// → `Constant`, an array → `Tuple`, a static-keyed hash → `HashShape`, a
+    /// range → `Nominal[Range]`. This is what makes a literal-constant diagnostic
+    /// render identically to the reference's value-pinned receiver.
+    fn intern_const_lit(&self, lit: &ConstLit, interner: &mut Interner) -> TypeId {
+        match lit {
+            ConstLit::Scalar(s) => interner.intern(Type::Constant(s.clone())),
+            ConstLit::Tuple(elems) => {
+                let ids: Vec<TypeId> =
+                    elems.iter().map(|l| self.intern_const_lit(l, interner)).collect();
+                interner.intern(Type::Tuple(ids))
+            }
+            ConstLit::Hash(members) => {
+                let ms: Vec<ShapeMember> = members
+                    .iter()
+                    .map(|(key, l)| ShapeMember {
+                        key: key.clone(),
+                        value: self.intern_const_lit(l, interner),
+                        optional: false,
+                    })
+                    .collect();
+                interner.intern(Type::HashShape(ms))
+            }
+            // Range types to `Nominal[Range]` so witnessing resolves against
+            // Range's RBS (an `IntegerRange` would erase to `Integer`).
+            ConstLit::Range => self.nominal_or_untyped("Range", interner),
+        }
+    }
+
+    /// C1: the use-site lexical prefix (enclosing class/module qualified segments)
+    /// for a node at `span` — the INNERMOST enclosing scope by span containment,
+    /// or an empty slice at toplevel / when no scopes are attached.
+    fn enclosing_prefix(&self, span: rigor_parse::Span) -> &[String] {
+        let mut best: Option<&(rigor_parse::Span, Vec<String>)> = None;
+        for sc in self.lexical_scopes {
+            if sc.0 .0 <= span.0 && span.1 <= sc.0 .1 {
+                // Contained: keep the innermost (narrowest span).
+                match best {
+                    None => best = Some(sc),
+                    Some(b) if (sc.0 .1 - sc.0 .0) < (b.0 .1 - b.0 .0) => best = Some(sc),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|b| b.1.as_slice()).unwrap_or(&[])
     }
 
     /// The borrowed source index (for the rules layer's method-resolution gate).
@@ -260,10 +334,27 @@ impl<'i> Typer<'i> {
             // Any miss ⇒ fall through to Dynamic[top] (silent). Note: a `Foo.new`
             // receiver is intercepted earlier in `type_call` (before the constant
             // is typed), so `Time.new` still yields a Time INSTANCE, not Singleton.
-            Node::ConstantRead { name, .. } => {
+            Node::ConstantRead { name, span, .. } => {
+                // Both the C5 literal-fold and the C1 shadow gate resolve against
+                // the use site's lexical prefix (Ruby constant lookup), so compute
+                // it once.
+                let prefix = self.enclosing_prefix(*span);
+                // C5: a project constant with a single fully-literal assignment,
+                // visible here lexically, types to that literal value
+                // (Range -> Nominal[Range]) — consulted BEFORE the singleton gate
+                // so `R = 1..1024; R.exclude?` witnesses on the range value.
+                if let Some(lit) = self.source.literal_constant(name, prefix) {
+                    return self.intern_const_lit(lit, interner);
+                }
+                // C1: replace the pre-C1 bare-name project-wide suppression
+                // (`!source.knows_class(name)`) with a LEXICALLY PRECISE
+                // shadow gate: a nested project `module Time` suppresses the
+                // core-RBS singleton only at use sites it is lexically visible
+                // from; a toplevel definition still suppresses everywhere. See
+                // `SourceIndex::constant_shadowed`.
                 if !name.is_empty()
                     && self.index.knows_toplevel_class(name)
-                    && !self.source.knows_class(name)
+                    && !self.source.constant_shadowed(name, prefix)
                 {
                     if let Some(class) = self.source.class_id(name) {
                         return interner.intern(Type::Singleton(class));
@@ -417,6 +508,7 @@ impl<'i> Typer<'i> {
             Node::LocalVariableWrite { value, .. }
             | Node::LocalVariableOpWrite { value, .. }
             | Node::VariableWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
             | Node::ConstantWrite { value, .. } => {
                 let value = *value;
                 self.type_of(ast, value, env, interner)
@@ -872,10 +964,30 @@ impl<'i> Typer<'i> {
         }
 
         // The remaining folds (`format`/`sprintf`/`String`/`Integer`/`Float`)
-        // require EVERY argument to be a value-pinned `Constant` scalar. A
-        // non-constant argument means we cannot prove the folded value, so we
-        // decline (silent — a gap, never a wrong constant).
-        let scalars = self.pin_arg_scalars(ast, args, env, interner)?;
+        // fold to a value-pinned `Constant` only when EVERY argument is itself a
+        // value-pinned `Constant` scalar.
+        let pinned = self.pin_arg_scalars(ast, args, env, interner);
+
+        // NOMINAL fallback (ADR ivar-write-mismatch increment b): when the args
+        // are NOT all value-pinned, the three CLASS conversions still type to
+        // their conversion class UNCONDITIONALLY — the reference's RBS pins
+        // `Integer(...) -> Integer`, `Float(...) -> Float`, `String(...) -> String`
+        // regardless of whether the argument folds (probed: `Float(x).bogus`
+        // witnesses on Float; `@d = Float(kwargs[:k]); @d = 0` flags Float→Integer).
+        // Gated on an arity the conversion accepts so a wrong-arity call (which
+        // raises at runtime) stays unfolded. `format`/`sprintf` need real
+        // constants (no nominal form) and `Hash` was handled above, so they keep
+        // declining. The existing shadow-def / splat guards above already ran, so
+        // this preserves the reference's FP envelope (a `def Float` in the file
+        // still declines — an FP-safe under-emit).
+        if pinned.is_none() {
+            let nominal_class = match (method, args.len()) {
+                ("String", 1) | ("Float", 1) | ("Integer", 1 | 2) => Some(method),
+                _ => None,
+            };
+            return nominal_class.map(|class| self.nominal_or_untyped(class, interner));
+        }
+        let scalars = pinned?;
         let folded: Scalar = match method {
             "format" | "sprintf" => {
                 // Template = first arg (a Constant string); the rest are the
@@ -989,7 +1101,57 @@ impl<'i> Typer<'i> {
             }
         }
 
+        // C3a Part A: `self.class.name` / `self.class.to_s` inside a lexical
+        // class/module returns the class name as a `String` (the reference
+        // unwraps the `Module#name : String?` optional to `String` for
+        // witnessing). This lights the `self.class.name.demodulize` /
+        // `.underscore` idiom.
+        //
+        // We match the SPECIFIC `(self.class).name` shape and type ONLY the tail,
+        // WITHOUT ever typing `self.class` itself to a witnessable `Singleton`.
+        // Typing `self.class` to a project `Singleton` would route
+        // `self.class.<class_method>` (calling one of the class's OWN class
+        // methods — a ubiquitous idiom) through the class-method witnessing path,
+        // which sees only the core RBS surface and cannot verify a project-defined
+        // class method ⇒ a flood of false positives (`valid_provider?`,
+        // `with_redis`, …). The reference resolves those against the project class
+        // and stays silent, so `self.class` itself must remain untyped (Dynamic)
+        // here — only the always-String `name`/`to_s` tail is resolved. Toplevel
+        // (`enclosing_prefix` empty) declines → silent, matching the reference.
+        if (method == "name" || method == "to_s") && args.is_empty() {
+            if let Node::Call { receiver: Some(inner), method: inner_m, args: inner_args, .. } =
+                ast.get(receiver)
+            {
+                if inner_m == "class"
+                    && inner_args.is_empty()
+                    && matches!(ast.get(*inner), Node::SelfExpr { .. })
+                {
+                    if let Node::SelfExpr { span } = ast.get(*inner) {
+                        if !self.enclosing_prefix(*span).is_empty() {
+                            return self.nominal_or_untyped("String", interner);
+                        }
+                    }
+                }
+            }
+        }
+
         let recv_ty = self.type_of(ast, receiver, env, interner);
+
+        // C3a Part B: `Module#name` / `Class#name` / `#to_s` on a CLASS OBJECT
+        // (`Singleton` receiver) returns the class name as a `String`. This is a
+        // real (core-RBS) `Singleton` — from the `ConstantRead` arm's zero-FP gate
+        // (`Time.name`, `Foo.name` where `Foo` is a known top-level class) — so it
+        // is NOT the project-class hazard Part A avoids: a core `Singleton` already
+        // witnesses class-method typos against a KNOWN surface. `name`/`to_s` are
+        // always valid on a class object and always yield `String`, so this is
+        // zero-FP; the returned `String` is NON-nilable, so the possible-nil
+        // channel (which resolves the receiver via `class_name_of`, `None` for a
+        // `Singleton`) never mints a nilable fact from it.
+        if (method == "name" || method == "to_s")
+            && matches!(interner.get(recv_ty), Type::Singleton(_))
+        {
+            return self.nominal_or_untyped("String", interner);
+        }
 
         // Tier 1: constant folding on a value-pinned receiver. Fold only when
         // EVERY argument also types to a value-pinned `Constant` (ADR-0008
@@ -1812,6 +1974,36 @@ impl<'i> Typer<'i> {
         let recv = *recv;
         let method = method.clone();
         let args = args.clone();
+        // (c) `Regexp.last_match` — a CORE SINGLETON returning an optional (P2,
+        // 2026-07-17). `Regexp.last_match() -> MatchData?`; `Regexp.last_match(n)`
+        // / `(name) -> String?`. The receiver is a `ConstantRead "Regexp"` (both
+        // `Regexp` and `::Regexp` lower to this bare name), whose type is a
+        // `Singleton` — `class_name_of` below returns `None` for it, so this MUST
+        // be matched syntactically here, before the receiver-class resolution. The
+        // syntactic name gate mirrors the reference resolving `Regexp.last_match`
+        // against core RBS; a project constant coincidentally named `Regexp` is not
+        // a realistic hazard. The arm depends only on the arg SHAPE (see spec
+        // `docs/notes/20260717-p2-optional-local-nil-spec.md`):
+        //   - zero args        ⇒ `MatchData` (deref `#[]` / `#begin` / …),
+        //   - one INT/STR/SYM  ⇒ `String`    (deref `#gsub` / `#upcase` / …),
+        //   - anything else    ⇒ DECLINE (non-literal / multi arg — never guess).
+        if method == "last_match" {
+            if let Node::ConstantRead { name, .. } = ast.get(recv) {
+                if name == "Regexp" {
+                    return match args.as_slice() {
+                        [] => Some("MatchData"),
+                        [only] if matches!(
+                            ast.get(*only),
+                            Node::IntegerLit { .. } | Node::StringLit { .. } | Node::SymbolLit { .. }
+                        ) =>
+                        {
+                            Some("String")
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
         let rty = self.type_of(ast, recv, tenv, interner);
         // Folding-parity keystone (shared by both sources): a `Constant` receiver
         // is folded by the reference to a concrete non-nil value ⇒ decline.
@@ -2388,6 +2580,97 @@ mod tests {
             })
             .expect("sub.size call present");
         assert_eq!(snaps.get(&use_id), None, "an intervening guard must decline");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 (2026-07-17) — `Regexp.last_match` optional-local nil source
+    // -----------------------------------------------------------------------
+
+    /// Snapshot arm recorded for the FIRST call whose receiver is a bare local
+    /// read of `recv` and method is `method`, or `None`.
+    fn last_match_use_arm(src: &[u8], recv: &str, method: &str) -> Option<&'static str> {
+        let ast = lower_src(src);
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+        let use_id = ast.iter().find_map(|(id, n)| match n {
+            Node::Call { receiver: Some(r), method: m, .. }
+                if m == method
+                    && matches!(ast.get(*r), Node::LocalVariableRead { name, .. } if name == recv) =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })?;
+        snaps.get(&use_id).copied()
+    }
+
+    /// `Regexp.last_match(n) -> String?`: the integer-literal arg gives a
+    /// concrete `String` arm, so a straight-line `content.gsub(...)` fires (the
+    /// `dictionary_credentials_handler` / `hugo_transformer` gitlab cluster).
+    /// Both `::Regexp` and `Regexp` lower to `ConstantRead "Regexp"`.
+    #[test]
+    fn p2_regexp_last_match_int_arg_is_string_source() {
+        for src in [
+            b"content = ::Regexp.last_match(2)\nnew = content.gsub(\"a\", \"b\")\n".as_slice(),
+            b"content = Regexp.last_match(1)\nnew = content.gsub(\"a\", \"b\")\n".as_slice(),
+        ] {
+            assert_eq!(
+                last_match_use_arm(src, "content", "gsub"),
+                Some("String"),
+                "Regexp.last_match(int) must mint a String|nil source: {:?}",
+                std::str::from_utf8(src).unwrap()
+            );
+        }
+    }
+
+    /// `Regexp.last_match(name) -> String?` for a String / Symbol literal arg.
+    #[test]
+    fn p2_regexp_last_match_name_arg_is_string_source() {
+        for src in [
+            b"c = Regexp.last_match(:key)\nn = c.upcase\n".as_slice(),
+            b"c = Regexp.last_match(\"key\")\nn = c.upcase\n".as_slice(),
+        ] {
+            assert_eq!(last_match_use_arm(src, "c", "upcase"), Some("String"));
+        }
+    }
+
+    /// `Regexp.last_match() -> MatchData?`: the zero-arg form mints a `MatchData`
+    /// arm, so `match[0]` / `match.begin(0)` fire (the `collection` / second
+    /// `hugo_transformer` gitlab cluster).
+    #[test]
+    fn p2_regexp_last_match_zero_arg_is_matchdata_source() {
+        let src = b"m = Regexp.last_match\nfull = m[0]\nb = m.begin(0)\n";
+        assert_eq!(last_match_use_arm(src, "m", "[]"), Some("MatchData"));
+        assert_eq!(last_match_use_arm(src, "m", "begin"), Some("MatchData"));
+    }
+
+    /// Decline conditions (FP backstop): a NON-literal / multi arg to `last_match`
+    /// (return class not decidable), a NON-`Regexp` constant receiver, a guard
+    /// between the bind and the use, and a safe-nav deref all record no snapshot.
+    #[test]
+    fn p2_regexp_last_match_declines() {
+        // non-literal arg
+        assert_eq!(
+            last_match_use_arm(b"i = 2\nc = Regexp.last_match(i)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
+        // a different constant named `.last_match` is not the core Regexp source
+        assert_eq!(
+            last_match_use_arm(b"c = Foo.last_match(2)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
+        // intervening guard clears the fact
+        assert_eq!(
+            last_match_use_arm(b"c = Regexp.last_match(2)\nif c\n  noop\nend\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
+        // safe-nav deref is not a bug (short-circuits on nil)
+        assert_eq!(
+            last_match_use_arm(b"c = Regexp.last_match(2)\nn = c&.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
     }
 
     /// A same-named block parameter must NOT inherit an outer nilable fact — the
@@ -3130,5 +3413,105 @@ mod tests {
         let typer2 = Typer::with_source(&index, &source);
         let ty2 = typer2.type_of(&ast, call_id, &env, &mut i);
         assert!(!matches!(i.get(ty2), Type::Constant(_)), "no folder ⇒ no constant");
+    }
+
+    // ------------------------------------------------------------------
+    // C3a: `self.class` nominal-return tail.
+    // ------------------------------------------------------------------
+
+    /// Type the call to `method` in `src` under a source+lexical-scope typer
+    /// (the full analyze wiring), returning its interned `Type`.
+    fn type_c3a_call(src: &[u8], method: &str) -> Type {
+        let ast = lower_src(src);
+        let idx = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &idx);
+        let scopes = crate::lexical_scopes(&ast);
+        let typer = Typer::with_source(&idx, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let call = find_call(&ast, method);
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        i.get(ty).clone()
+    }
+
+    #[test]
+    fn self_class_itself_is_not_witnessable_singleton() {
+        // `self.class` must NOT type to a project `Singleton` — that would route
+        // `self.class.<class_method>` through class-method witnessing and FP on
+        // every project-defined class method. It stays Dynamic (silent).
+        let ty = type_c3a_call(b"class Foo\n  def bar\n    self.class\n  end\nend\n", "class");
+        assert!(!matches!(ty, Type::Singleton(_)), "self.class must stay Dynamic, got {ty:?}");
+    }
+
+    #[test]
+    fn self_class_name_and_to_s_are_string() {
+        // `self.class.name` / `self.class.to_s` → `Nominal[String]` (the
+        // `Module#name : String?` optional is unwrapped for witnessing).
+        for (src, m) in [
+            (b"class Foo\n  def bar\n    self.class.name\n  end\nend\n".as_slice(), "name"),
+            (b"class Foo\n  def bar\n    self.class.to_s\n  end\nend\n".as_slice(), "to_s"),
+        ] {
+            let ty = type_c3a_call(src, m);
+            let idx = CoreIndex::new();
+            let mut i = Interner::new();
+            let interned = i.intern(ty.clone());
+            assert_eq!(
+                idx.class_name_of(&i, interned),
+                Some("String"),
+                "self.class.{m} must be String, got {ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn self_class_name_string_in_nested_class() {
+        // Deeply nested enclosing class still resolves the tail to String.
+        let ty = type_c3a_call(
+            b"module Outer\n  class Runner\n    def k\n      self.class.name\n    end\n  end\nend\n",
+            "name",
+        );
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(ty.clone());
+        assert_eq!(idx.class_name_of(&i, interned), Some("String"), "got {ty:?}");
+    }
+
+    #[test]
+    fn self_class_at_toplevel_declines() {
+        // No enclosing class ⇒ `self.class` declines to Dynamic (silent), so the
+        // tail never becomes String — matches the reference's toplevel silence.
+        let ty = type_c3a_call(b"self.class.name\n", "class");
+        assert!(!matches!(ty, Type::Singleton(_)), "toplevel self.class must not type Singleton, got {ty:?}");
+        let name_ty = type_c3a_call(b"self.class.name\n", "name");
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(name_ty.clone());
+        assert_ne!(idx.class_name_of(&i, interned), Some("String"), "toplevel tail must not be String");
+    }
+
+    #[test]
+    fn self_class_name_string_even_in_core_shadow_class() {
+        // A nested class whose WRITTEN name shadows a core class (`Time`) still
+        // resolves `self.class.name` → String (no `Singleton` is minted, so there
+        // is no core-shadow witnessing hazard) — matching the reference, which
+        // fires the String tail here too.
+        let ty = type_c3a_call(
+            b"module Shadowing\n  class Time\n    def bar\n      self.class.name\n    end\n  end\nend\n",
+            "name",
+        );
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(ty.clone());
+        assert_eq!(idx.class_name_of(&i, interned), Some("String"), "got {ty:?}");
+    }
+
+    #[test]
+    fn core_singleton_name_is_string() {
+        // Bonus: `name`/`to_s` on a core-RBS `Singleton` (`Time.name`) → String.
+        let ty = type_c3a_call(b"class Foo\n  def bar\n    Time.name\n  end\nend\n", "name");
+        let idx = CoreIndex::new();
+        let mut i = Interner::new();
+        let interned = i.intern(ty.clone());
+        assert_eq!(idx.class_name_of(&i, interned), Some("String"), "Time.name must be String, got {ty:?}");
     }
 }

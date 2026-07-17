@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/63_const_literal_harvest.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobarr' for [:a, :b]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobhash' for { t: 10 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobstr' for \"hello\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobint' for 42"
+    }
+  ]
+}

@@ -143,6 +143,7 @@ fn collect_line_types(
             Node::LocalVariableWrite { value, .. }
             | Node::LocalVariableOpWrite { value, .. }
             | Node::VariableWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
             | Node::ConstantWrite { value, .. } => *value,
             _ => id,
         };
@@ -256,6 +257,7 @@ fn def_return_type(
         Node::LocalVariableWrite { value, .. }
         | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => *value,
         _ => tail,
     };

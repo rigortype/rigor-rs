@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/61_constant_shadow_gate.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 44,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `current' for singleton(Time)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `current' for singleton(Time)"
+    }
+  ]
+}

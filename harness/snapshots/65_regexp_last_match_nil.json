@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/65_regexp_last_match_nil.rb",
+  "diagnostics": [
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 17,
+      "column": 13,
+      "severity": "error",
+      "message": "possible nil receiver: `gsub' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 26,
+      "column": 23,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 27,
+      "column": 26,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 35,
+      "column": 23,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 36,
+      "column": 24,
+      "severity": "error",
+      "message": "possible nil receiver: `begin' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 63,
+      "column": 5,
+      "severity": "error",
+      "message": "possible nil receiver: `gsub' is undefined on NilClass"
+    }
+  ]
+}

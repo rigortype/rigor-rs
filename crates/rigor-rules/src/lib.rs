@@ -4,7 +4,7 @@
 //! bullet's first rule is `call.undefined-method`.
 #![allow(dead_code)]
 
-use rigor_index::CoreIndex;
+use rigor_index::{CoreIndex, OverloadSignature, RetainedParamType};
 use rigor_infer::Typer;
 use rigor_parse::{HashKeyTag, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type};
@@ -169,6 +169,17 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-return-in-ensure",
         }),
+        CALL_ARGUMENT_TYPE_MISMATCH => Some(&RuleEntry {
+            // Oracle: error across all profiles / high — a positional argument
+            // whose statically-inferred type the RBS parameter provably rejects,
+            // gated behind a zero-FP envelope (concrete + RBS-known receiver,
+            // plain-positional-only, universal-equality skip, coerce-operator
+            // skip on the multi-overload non-nil channel, faithful-param gate on
+            // the single-overload non-nil channel).
+            default_severity: Severity::Error,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-argument-type-mismatch",
+        }),
         CALL_RAISE_NON_EXCEPTION => Some(&RuleEntry {
             // Oracle: error across all profiles / high — the operand's
             // statically-inferred type is provably not a legal `raise` operand,
@@ -201,6 +212,16 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-empty",
         }),
+        DEF_IVAR_WRITE_MISMATCH => Some(&RuleEntry {
+            // Authored `:error`; balanced profile stamps it `:warning` (lenient
+            // warning, strict error). rigor-rs emits the balanced-default severity
+            // directly, so the catalog default is `warning` — matching the oracle's
+            // default text output. Evidence tier `high` (concrete static class of
+            // each write, no metaprogramming escape).
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-ivar-write-mismatch",
+        }),
         _ => None,
     }
 }
@@ -215,6 +236,15 @@ pub const CALL_UNDEFINED_METHOD: &str = "call.undefined-method";
 /// `call.wrong-arity`: a call passes a positional-argument count outside the
 /// method's known arity envelope (ADR-0030 taxonomy).
 pub const CALL_WRONG_ARITY: &str = "call.wrong-arity";
+
+/// `call.argument-type-mismatch`: a call passes a positional argument whose
+/// statically-inferred type the matching RBS parameter provably rejects (ADR-64
+/// / ADR-0030 taxonomy). Fired INDEPENDENTLY of the arity/undefined chain (the
+/// reference emits it alongside `call.wrong-arity` at the same site). Two
+/// channels, both zero-FP-gated: a `nil` argument a param that rejects nil, and
+/// a non-nil argument whose concrete class the param rejects. See
+/// [`check_argument_type_mismatch`].
+pub const CALL_ARGUMENT_TYPE_MISMATCH: &str = "call.argument-type-mismatch";
 
 /// `call.possible-nil-receiver`: a call whose receiver may be nil on some path
 /// (ADR-0030 taxonomy). In this slice only the union case is in scope; the
@@ -321,6 +351,34 @@ pub const SUPPRESSION_UNKNOWN_RULE: &str = "suppression.unknown-rule";
 /// rule tokens (only whitespace/commas after it) — it suppresses nothing.
 pub const SUPPRESSION_EMPTY: &str = "suppression.empty";
 
+/// `def.ivar-write-mismatch` (since 0.1.2): within one class's instance methods,
+/// the same instance variable `@x` is assigned two DIFFERENT concrete classes —
+/// a likely type-confusion bug (`@x = "s"` then `@x = 42`). A faithful port of
+/// the reference `IvarWriteCollector` + `ivar_mismatch_diagnostics_for`.
+///
+/// Collector: over every ClassDef/ModuleDef reachable through class/module bodies,
+/// each DIRECT instance `def`'s body is scanned for plain `@x = value` writes
+/// (barriers at nested def/class/module; singleton `def self.x` bodies skipped;
+/// op-writes `@x ||=`/`@x +=` and `self.x=` are NOT ivar writes and never
+/// collected), grouped by (qualified class name, ivar name). The class of a write
+/// is `CoreIndex::class_name_of` of its rvalue type with `TrueClass`/`FalseClass`
+/// folded to `"bool"` (the boolean-flag idiom `@on = false; @on = true` stays
+/// silent).
+///
+/// Firing (per group of ≥2 writes): the CANONICAL class is the first write whose
+/// class is not `NilClass` (leading `@x = nil` placeholders are skipped); if that
+/// canonical write's class is unresolvable (Dynamic / union / a non-core Nominal),
+/// the WHOLE group is silent. Every LATER write fires iff its class resolves, is
+/// not `NilClass` (the clear-to-nil idiom is always silent), and differs from the
+/// canonical class. Anchored on the offending write's `@x` name token.
+///
+/// Two increments feed the two confirmed corpus gaps: (a) a `rescue C => e` /
+/// bare `rescue => e` binds `e` to the (single, resolvable) exception class within
+/// the clause body, so `@e = "s"; rescue StandardError => e; @e = e` flags
+/// String→StandardError; (b) `Integer()`/`Float()`/`String()` on a non-constant
+/// argument types NOMINALLY to the conversion class (increment lives in the typer).
+pub const DEF_IVAR_WRITE_MISMATCH: &str = "def.ivar-write-mismatch";
+
 /// `call.raise-non-exception` (v0.3.0): an implicit-self `raise` / `fail` whose
 /// first positional argument's statically-inferred type is provably NOT a legal
 /// raise operand — an Exception class object, an Exception instance, a String
@@ -413,7 +471,11 @@ pub fn analyze_with_source_and_folder(
     // object (`Singleton(X)`) for class-method witnessing. The source index also
     // drives RETURN-TYPE inference for chaining. The folder (if wired) lets a
     // sidecar-foldable literal call the Rust core declined resolve to a `Constant`.
-    let typer = Typer::with_source_and_folder(index, source, folder);
+    // C1: attach the current file's lexical class/module scopes so the typer's
+    // `ConstantRead` arm resolves each use site's lexical prefix (span
+    // containment) and applies the precise constant-shadow gate.
+    let scopes = rigor_infer::lexical_scopes(ast);
+    let typer = Typer::with_source_and_folder(index, source, folder).with_lexical_scopes(&scopes);
     let env = typer.build_toplevel_env(ast, interner);
     // ADR-0038 Slice 1: the per-call nil-receiver snapshot map (call node id ->
     // non-nil core arm), computed ONCE over the whole program via the threaded
@@ -434,6 +496,7 @@ pub fn analyze_with_source_and_folder(
                 block_body,
                 message_span,
                 safe_nav,
+                args_all_plain,
                 ..
             } => Some((
                 id,
@@ -443,12 +506,13 @@ pub fn analyze_with_source_and_folder(
                 !block_body.is_empty(),
                 *message_span,
                 *safe_nav,
+                *args_all_plain,
             )),
             _ => None,
         })
         .collect();
 
-    for (call_id, recv, method, args, has_block, message_span, safe_nav) in calls {
+    for (call_id, recv, method, args, has_block, message_span, safe_nav, args_all_plain) in calls {
         // Rule precedence at one call site (avoid double-emit):
         //   1. undefined-method  (method absent on the receiver class, incl. nil)
         //   2. wrong-arity       (method present but arg count out of envelope)
@@ -469,6 +533,26 @@ pub fn analyze_with_source_and_folder(
                 )
             });
         if let Some(diag) = diag {
+            out.push(diag);
+        }
+
+        // `call.argument-type-mismatch` is an INDEPENDENT axis (argument types),
+        // NOT part of the one-per-site validity precedence above: the reference
+        // emits it ALONGSIDE `call.wrong-arity` at the same call site (a bad-arity
+        // AND wrong-typed-first-arg call yields both). Its own gate keeps it off
+        // sites the undefined-method rule owns (it requires the method to be
+        // RBS-known on the receiver).
+        if let Some(diag) = check_argument_type_mismatch(
+            ast,
+            recv,
+            &method,
+            &args,
+            args_all_plain,
+            &env,
+            &typer,
+            interner,
+            index,
+        ) {
             out.push(diag);
         }
     }
@@ -621,6 +705,15 @@ pub fn analyze_with_source_and_folder(
     // Ninth pass — `flow.return-in-ensure` (v0.3.0). Purely syntactic with a
     // frame-aware envelope: walk every `begin/ensure`'s ensure body for `return`s.
     return_in_ensure_diagnostics(ast, &mut out);
+
+    // Tenth pass — `def.ivar-write-mismatch` (since 0.1.2). Groups each class's
+    // instance-method `@x = value` writes by (qualified class, ivar) and fires
+    // when a later write's concrete class differs from the canonical one. Types
+    // each rvalue through the shared typer (empty local env) plus the rescue-bound
+    // exception resolution (increment a); the `Integer()`/`Float()`/`String()`
+    // NOMINAL fold (increment b) lives in the typer, so it flows through
+    // `type_of` transparently here.
+    ivar_write_mismatch_diagnostics(ast, interner, index, source, &typer, &mut out);
 
     out
 }
@@ -1236,6 +1329,413 @@ fn check_wrong_arity(
         severity,
         source_family: "builtin",
         receiver_type: Some(class_name.to_string()),
+        method_name: Some(method.to_string()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// call.argument-type-mismatch (ADR-64) — the reference `argument_type_diagnostic`
+// (`check_rules.rb:1943`). Ported at the CLASS-name level: rigor-rs has no
+// `Inference::Acceptance` engine, so acceptance is decided via the ATM substrate
+// (`param_admits_nil` / `param_accepts_arg_class`, both over `class_ordering`)
+// exactly as the reference's Slice-2 twins were designed to substitute.
+// ---------------------------------------------------------------------------
+
+/// Ruby's universal-equality methods (`Object#==` / `#eql?` / …) accept any
+/// object by contract and RETURN false on a type mismatch rather than raise, so
+/// a tight RBS param over-specifies — skip them wholesale (reference
+/// `UNIVERSAL_EQUALITY_METHODS`, `check_rules.rb:1925`).
+fn is_universal_equality_method(method: &str) -> bool {
+    matches!(method, "==" | "!=" | "eql?" | "equal?" | "<=>")
+}
+
+/// The binary arithmetic / bit / ordering operators that dispatch through Ruby's
+/// `coerce` protocol (`5 + Money.new` is valid via `Money#coerce`), so a non-nil
+/// argument to them is NOT statically refutable — the MULTI-overload non-nil
+/// channel excludes them (reference `COERCE_DISPATCH_METHODS`,
+/// `check_rules.rb:1940`). `nil` never coerces, so the nil channel stays in force.
+fn is_coerce_dispatch_method(method: &str) -> bool {
+    matches!(
+        method,
+        "+" | "-" | "*" | "/" | "%" | "**" | "&" | "|" | "^" | "<<" | ">>" | "<" | ">" | "<=" | ">="
+    )
+}
+
+/// An overload is eligible for argument checking iff it has none of the shapes
+/// the substrate keeps only as presence flags — rest positionals, any keyword,
+/// or trailing positionals (reference `argument_check_eligible?`,
+/// `check_rules.rb:2303`).
+fn argument_check_eligible(ov: &OverloadSignature) -> bool {
+    !ov.has_rest_positionals
+        && !ov.has_required_keywords
+        && !ov.has_optional_keywords
+        && !ov.has_rest_keywords
+        && !ov.has_trailing_positionals
+}
+
+/// Whether a parameter type is FAITHFULLY translatable to a concrete class check
+/// with NO interface degradation — the gate the single-overload non-nil channel
+/// needs so it matches the reference's `translate_param_type` → `Acceptance`
+/// (which degrades a `type` alias / `interface` param to `untyped` ⇒ skip). A
+/// `ClassInstance` (`String`) is faithful; a union of faithful members is; a
+/// bare `Alias` (`string`) / `Interface` (`_ToStr`) / `Other` is NOT (the
+/// translator would hand the acceptance engine a `Dynamic`, which never refutes,
+/// so `"abc".center("s")` — param `int` — stays silent). `Optional` is treated
+/// as non-faithful (the substrate's `param_accepts_arg_class` always admits it,
+/// so it never fires either way — declining explicitly keeps this honest).
+fn is_faithful_param(t: &RetainedParamType) -> bool {
+    match t {
+        RetainedParamType::ClassInstance(_) => true,
+        RetainedParamType::Union(members) => members.iter().all(is_faithful_param),
+        RetainedParamType::Alias(_)
+        | RetainedParamType::Interface(_)
+        | RetainedParamType::Optional(_)
+        | RetainedParamType::Other(_) => false,
+    }
+}
+
+/// The written-form label of a parameter type (reference
+/// `param.type.to_s.delete_prefix("::")`), used verbatim in the diagnostic
+/// message (presentation only; the harness keys on `(rule, line, column)`).
+fn render_retained_param(t: &RetainedParamType) -> String {
+    fn strip(n: &str) -> String {
+        n.strip_prefix("::").unwrap_or(n).to_string()
+    }
+    match t {
+        RetainedParamType::ClassInstance(n)
+        | RetainedParamType::Alias(n)
+        | RetainedParamType::Interface(n) => strip(n),
+        RetainedParamType::Union(members) => members
+            .iter()
+            .map(render_retained_param)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        RetainedParamType::Optional(inner) => format!("{}?", render_retained_param(inner)),
+        RetainedParamType::Other(s) => strip(s),
+    }
+}
+
+/// The per-overload written-form label for a multi-overload mismatch: each
+/// overload's param at the index rendered, uniq'd in first-seen order, `" | "`
+/// joined (reference `overload_param_expected_label`, `check_rules.rb:2213`).
+fn expected_label_multi(params: &[&RetainedParamType]) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for p in params {
+        let label = render_retained_param(p);
+        if !seen.contains(&label) {
+            seen.push(label);
+        }
+    }
+    seen.join(" | ")
+}
+
+/// Whether the argument type is a PURE `nil` (reference `nil_member?` applied to
+/// the whole arg type: a `Constant nil` / `Nominal NilClass`, NOT a `T | nil`
+/// union). A union-with-nil takes the non-nil translated-acceptance channel.
+fn arg_is_pure_nil(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    arg_ty: rigor_types::TypeId,
+) -> bool {
+    concrete_class_name(interner, index, source, arg_ty).as_deref() == Some("NilClass")
+}
+
+fn arg_is_dynamic_or_top(interner: &Interner, arg_ty: rigor_types::TypeId) -> bool {
+    matches!(interner.get(arg_ty), Type::Dynamic(_) | Type::Top)
+}
+
+/// The single concrete RBS-known class an argument types to for the MULTI-overload
+/// non-nil channel, or `None` (reference `single_concrete_arg_class?`,
+/// `check_rules.rb:2120`): a union arg (deferred), a class/module object
+/// (`Singleton`, special acceptance surface), or a non-RBS project class (its
+/// duck-typed conversion protocol is invisible) all decline.
+fn single_concrete_arg_class(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    arg_ty: rigor_types::TypeId,
+) -> Option<String> {
+    if matches!(interner.get(arg_ty), Type::Union(_) | Type::Singleton(_)) {
+        return None;
+    }
+    let class_name = concrete_class_name(interner, index, source, arg_ty)?;
+    if !index.knows_class(&class_name) {
+        return None;
+    }
+    Some(class_name)
+}
+
+/// Whether a FAITHFUL parameter provably rejects the (non-nil) argument type —
+/// the single-overload non-nil channel's class-level acceptance. Fires iff SOME
+/// member of the argument (its union arms, or the arg itself) types to a concrete
+/// class the param provably rejects (`class_ordering == Disjoint`, surfaced by
+/// `!param_accepts_arg_class` on a faithful param). A `Dynamic`/`Top` member — or
+/// a member with no concrete class — is a gradual `maybe`, never a proven
+/// rejection, so `d | 42` still fires (on `42`) while `d | e` (both dynamic)
+/// stays silent, matching the reference's union acceptance (`.no?` iff ANY member
+/// is definitely rejected).
+fn faithful_param_rejects_arg(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    arg_ty: rigor_types::TypeId,
+    param: &RetainedParamType,
+) -> bool {
+    let members: Vec<rigor_types::TypeId> = match interner.get(arg_ty) {
+        Type::Union(ms) => ms.clone(),
+        _ => vec![arg_ty],
+    };
+    members.iter().any(|&m| {
+        if arg_is_dynamic_or_top(interner, m) {
+            return false;
+        }
+        match concrete_class_name(interner, index, source, m) {
+            Some(class_name) => !index.param_accepts_arg_class(param, &class_name),
+            None => false,
+        }
+    })
+}
+
+/// One resolved argument-type mismatch: the argument node to anchor on, the
+/// rendered `expected` label, and the argument's `TypeId` for the `got` render.
+struct AtmMismatch {
+    arg: NodeId,
+    /// The declared RBS parameter name (single-overload channel only — the
+    /// multi-overload channel matches the reference's `name: nil`, no prefix).
+    param_name: Option<&'static str>,
+    expected: String,
+    actual: rigor_types::TypeId,
+}
+
+/// The single-overload channel (reference `first_argument_mismatch` /
+/// `single_argument_mismatch`): per positional arg with a matching param, a pure
+/// `nil` arg the param rejects (alias-aware `param_admits_nil`) OR a non-nil arg
+/// a FAITHFUL param provably rejects.
+#[allow(clippy::too_many_arguments)]
+fn single_overload_mismatch(
+    ov: &OverloadSignature,
+    args: &[NodeId],
+    ast: &LoweredAst,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Option<AtmMismatch> {
+    if !argument_check_eligible(ov) {
+        return None;
+    }
+    let params: Vec<&RetainedParamType> = ov
+        .required_positionals
+        .iter()
+        .chain(ov.optional_positionals.iter())
+        .collect();
+    let names: Vec<Option<&'static str>> = ov
+        .required_positional_names
+        .iter()
+        .chain(ov.optional_positional_names.iter())
+        .copied()
+        .collect();
+
+    for (i, &arg) in args.iter().enumerate() {
+        let Some(param) = params.get(i) else {
+            continue; // arity mismatch is the wrong-arity rule's concern.
+        };
+        let param_name = names.get(i).copied().flatten();
+        let arg_ty = typer.type_of(ast, arg, env, interner);
+
+        if arg_is_pure_nil(interner, index, source, arg_ty) {
+            if index.param_admits_nil(param) {
+                continue;
+            }
+            return Some(AtmMismatch {
+                arg,
+                param_name,
+                expected: render_retained_param(param),
+                actual: arg_ty,
+            });
+        }
+
+        if arg_is_dynamic_or_top(interner, arg_ty) {
+            continue;
+        }
+        if !is_faithful_param(param) {
+            continue;
+        }
+        if faithful_param_rejects_arg(interner, index, source, arg_ty, param) {
+            return Some(AtmMismatch {
+                arg,
+                param_name,
+                expected: render_retained_param(param),
+                actual: arg_ty,
+            });
+        }
+    }
+    None
+}
+
+/// The multi-overload channel (reference `multi_overload_argument_mismatch`,
+/// `check_rules.rb:2003`): ALL overloads eligible; per positional index with a
+/// param on EVERY overload, a pure `nil` arg NO overload admits (nil channel), or
+/// — on a non-coerce method — a single-concrete-class arg NO overload accepts
+/// (non-nil channel).
+#[allow(clippy::too_many_arguments)]
+fn multi_overload_mismatch(
+    overloads: &[OverloadSignature],
+    method: &str,
+    args: &[NodeId],
+    ast: &LoweredAst,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Option<AtmMismatch> {
+    if !overloads.iter().all(argument_check_eligible) {
+        return None;
+    }
+    let coerce = is_coerce_dispatch_method(method);
+
+    for (i, &arg) in args.iter().enumerate() {
+        // The param at index `i` on EVERY overload; `None` if any overload lacks
+        // one (arity divergence — the wrong-arity rule's concern).
+        let params: Option<Vec<&RetainedParamType>> = overloads
+            .iter()
+            .map(|ov| {
+                ov.required_positionals
+                    .iter()
+                    .chain(ov.optional_positionals.iter())
+                    .nth(i)
+            })
+            .collect();
+        let Some(params) = params else {
+            continue;
+        };
+
+        let arg_ty = typer.type_of(ast, arg, env, interner);
+
+        if arg_is_pure_nil(interner, index, source, arg_ty) {
+            if params.iter().any(|p| index.param_admits_nil(p)) {
+                continue;
+            }
+            return Some(AtmMismatch {
+                arg,
+                param_name: None, // multi-overload: the reference sets name: nil
+                expected: expected_label_multi(&params),
+                actual: arg_ty,
+            });
+        } else if !coerce {
+            let Some(class_name) = single_concrete_arg_class(interner, index, source, arg_ty)
+            else {
+                continue;
+            };
+            if params
+                .iter()
+                .any(|p| index.param_accepts_arg_class(p, &class_name))
+            {
+                continue;
+            }
+            return Some(AtmMismatch {
+                arg,
+                param_name: None, // multi-overload: the reference sets name: nil
+                expected: expected_label_multi(&params),
+                actual: arg_ty,
+            });
+        }
+    }
+    None
+}
+
+/// `call.argument-type-mismatch` for a single receiver-bearing call. Reference
+/// `argument_type_diagnostic` (`check_rules.rb:1943`), ported at the class-name
+/// level. Gates (zero-FP envelope):
+/// - skip the universal-equality methods and any non-plain-positional call;
+/// - the receiver must resolve to a concrete class the RBS index models (an
+///   instance) OR a `Singleton` class object, and the method must carry retained
+///   RBS overloads (so undefined-method / non-RBS methods are the other rules'
+///   concern — this never double-fires with undefined-method);
+/// - unlike undefined-method / wrong-arity, this does NOT skip when the project
+///   also `def`s the method: the RBS sig is the authoritative parameter contract
+///   (reference `check_rules.rb:1955`).
+#[allow(clippy::too_many_arguments)]
+fn check_argument_type_mismatch(
+    ast: &LoweredAst,
+    receiver: rigor_parse::NodeId,
+    method: &str,
+    args: &[rigor_parse::NodeId],
+    args_all_plain: bool,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+) -> Option<Diagnostic> {
+    if is_universal_equality_method(method) {
+        return None;
+    }
+    if !args_all_plain {
+        return None;
+    }
+    if args.is_empty() {
+        return None;
+    }
+
+    let source = typer.source();
+    let recv_ty = typer.type_of(ast, receiver, env, interner);
+
+    // Resolve `(class_name, overloads)` for INSTANCE or SINGLETON (class-method)
+    // dispatch. The overloads are cloned so no `index` borrow lingers across the
+    // per-arg `param_admits_nil` / `param_accepts_arg_class` consultations.
+    let (class_name, overloads): (String, Vec<OverloadSignature>) =
+        if let Type::Singleton(class) = interner.get(recv_ty) {
+            let class = *class;
+            let name = source.class_name_for_id(class)?;
+            let ov = index.singleton_method_overloads(name, method)?;
+            (name.to_string(), ov.to_vec())
+        } else {
+            let name = concrete_class_name(interner, index, source, recv_ty)?;
+            if !index.knows_class(&name) {
+                return None;
+            }
+            let ov = index.method_overloads(&name, method)?;
+            (name, ov.to_vec())
+        };
+    if overloads.is_empty() {
+        return None;
+    }
+
+    let mismatch = if overloads.len() == 1 {
+        single_overload_mismatch(&overloads[0], args, ast, env, typer, interner, index, source)
+    } else {
+        multi_overload_mismatch(&overloads, method, args, ast, env, typer, interner, index, source)
+    }?;
+
+    let (start, end) = ast.get(mismatch.arg).span();
+    let actual = render_receiver(interner, index, source, mismatch.actual);
+    // Reference `build_argument_type_diagnostic` (`check_rules.rb:2322`): a
+    // single-overload mismatch names the parameter (``parameter `str' of `m' on
+    // C``); the multi-overload channel (name nil) renders the bare method label.
+    let method_label = format!("`{method}' on {class_name}");
+    let parameter_label = match mismatch.param_name {
+        Some(name) => format!("parameter `{name}' of {method_label}"),
+        None => method_label,
+    };
+    let message = format!(
+        "argument type mismatch at {parameter_label}: expected {}, got {actual}",
+        mismatch.expected
+    );
+    let severity = catalog(CALL_ARGUMENT_TYPE_MISMATCH)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
+
+    Some(Diagnostic {
+        rule_id: CALL_ARGUMENT_TYPE_MISMATCH,
+        start_offset: start,
+        end_offset: end,
+        message,
+        severity,
+        source_family: "builtin",
+        receiver_type: Some(class_name),
         method_name: Some(method.to_string()),
     })
 }
@@ -1920,6 +2420,257 @@ fn descend_trailing(ast: &LoweredAst, id: rigor_parse::NodeId) -> Option<rigor_p
     }
 }
 
+// ---------------------------------------------------------------------------
+// `def.ivar-write-mismatch` — faithful port of `IvarWriteCollector` +
+// `ivar_mismatch_diagnostics_for` + `ivar_class_for`.
+// ---------------------------------------------------------------------------
+
+/// One collected `@x = value` write: the rvalue node to type, the `@x` name-token
+/// span the diagnostic anchors on, and the write's byte span (for the rescue-scope
+/// lookup of increment a).
+struct IvarWrite {
+    value: rigor_parse::NodeId,
+    name_span: rigor_parse::Span,
+    span: rigor_parse::Span,
+}
+
+/// A resolved rescue binding in effect over a clause body (increment a): within
+/// `clause_span`, a read of `bound_name` types to `exception_class`.
+struct RescueBinding {
+    clause_span: rigor_parse::Span,
+    bound_name: String,
+    exception_class: String,
+}
+
+/// Collect the resolvable rescue bindings: a single-class `rescue C => e` (whose
+/// `C` names a core- or project-known class) binds `e` to `C`; a bare `rescue => e`
+/// binds `e` to `StandardError`. A multi-class `rescue A, B => e` binds a union
+/// the reference cannot name to a single concrete class, so it is NOT recorded
+/// (the write stays silent) — probed against the oracle. An unresolvable exception
+/// constant is likewise skipped (a coverage gap, FP-safe).
+fn collect_rescue_bindings(
+    ast: &LoweredAst,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Vec<RescueBinding> {
+    let mut out = Vec::new();
+    for (_, n) in ast.iter() {
+        let Node::BeginRescue { clauses, .. } = n else {
+            continue;
+        };
+        for clause in clauses {
+            let Some(bound_name) = &clause.bound_name else {
+                continue;
+            };
+            let exception_class = match clause.exceptions.as_slice() {
+                // Bare `rescue => e` catches `StandardError`.
+                [] => {
+                    if index.knows_class("StandardError") {
+                        Some("StandardError".to_string())
+                    } else {
+                        None
+                    }
+                }
+                // A single named class — resolvable via core RBS or the project
+                // source registry (`rescue MyError => e` where `MyError` is a
+                // discovered project class fires too, probed).
+                [only] => match ast.get(*only) {
+                    Node::ConstantRead { name, .. }
+                        if !name.is_empty()
+                            && (index.knows_class(name) || source.knows_class(name)) =>
+                    {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                },
+                // Multi-class arm ⇒ a union with no single concrete class ⇒ silent.
+                _ => None,
+            };
+            if let Some(exception_class) = exception_class {
+                out.push(RescueBinding {
+                    clause_span: clause.span,
+                    bound_name: bound_name.clone(),
+                    exception_class,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The concrete class NAME of one ivar write's rvalue — the `ivar_class_for`
+/// analog. Increment (a): a read of a rescue-bound variable inside the clause body
+/// resolves to the exception class directly (bypassing the `TypeId` layer, since
+/// exception classes are outside the 9-class `Nominal` id space). Otherwise the
+/// rvalue is typed through the shared typer against an EMPTY local env (literals
+/// and the `Integer()`/`Float()`/`String()` folds are env-independent; any other
+/// local read declines to `Dynamic` ⇒ `None`, a coverage gap that can only silence
+/// the rule, never mis-fire it) and mapped via `class_name_of`, with
+/// `TrueClass`/`FalseClass` folded to `"bool"`.
+fn ivar_write_class(
+    ast: &LoweredAst,
+    write: &IvarWrite,
+    typer: &Typer,
+    index: &CoreIndex,
+    interner: &mut Interner,
+    rescue_bindings: &[RescueBinding],
+) -> Option<String> {
+    if let Node::LocalVariableRead { name, .. } = ast.get(write.value) {
+        for binding in rescue_bindings {
+            if binding.bound_name == *name && span_within(write.span, binding.clause_span) {
+                return Some(binding.exception_class.clone());
+            }
+        }
+    }
+    let env = rigor_infer::TypeEnv::new();
+    let ty = typer.type_of(ast, write.value, &env, interner);
+    match index.class_name_of(interner, ty) {
+        Some("TrueClass") | Some("FalseClass") => Some("bool".to_string()),
+        Some(name) => Some(name.to_string()),
+        None => None,
+    }
+}
+
+/// Emit every `def.ivar-write-mismatch` diagnostic for one file. Walks each
+/// ClassDef/ModuleDef reachable through class/module bodies (a class nested in a
+/// `def` is absent from `qualified_class_names`, matching the reference walk that
+/// returns at the first `def`), collects its DIRECT instance-`def` bodies' plain
+/// `@x = value` writes (barriers at nested def/class/module; singleton `def self.x`
+/// and non-instance defs skipped), groups by (qualified class, ivar) in source
+/// order, then applies the reference firing logic.
+fn ivar_write_mismatch_diagnostics(
+    ast: &LoweredAst,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    typer: &Typer,
+    out: &mut Vec<Diagnostic>,
+) {
+    let qualified = qualified_class_names(ast);
+
+    // Every def/class/module span — the write barriers.
+    let barrier_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { span, .. }
+            | Node::ClassDef { span, .. }
+            | Node::ModuleDef { span, .. } => Some(*span),
+            _ => None,
+        })
+        .collect();
+
+    let rescue_bindings = collect_rescue_bindings(ast, index, source);
+
+    // Gather writes grouped by (qualified class, ivar), preserving first-seen
+    // (source) order.
+    let mut order: Vec<(String, String)> = Vec::new();
+    let mut groups: std::collections::HashMap<(String, String), Vec<IvarWrite>> =
+        std::collections::HashMap::new();
+
+    for (class_id, node) in ast.iter() {
+        let body = match node {
+            Node::ClassDef { body, .. } | Node::ModuleDef { body, .. } => body,
+            _ => continue,
+        };
+        let Some(class_name) = qualified.get(&class_id) else {
+            continue; // un-namable / nested-in-def ⇒ never collected.
+        };
+        for &child_id in body {
+            let Node::Definition {
+                name: Some(_),
+                span: def_span,
+                ..
+            } = ast.get(child_id)
+            else {
+                continue; // singleton / non-instance def ⇒ barrier, skip.
+            };
+            let def_span = *def_span;
+            for (_, wn) in ast.iter() {
+                let Node::InstanceVariableWrite {
+                    name,
+                    value,
+                    name_span,
+                    span,
+                } = wn
+                else {
+                    continue;
+                };
+                if !span_within(*span, def_span) {
+                    continue;
+                }
+                // Exclude a write inside a nested def/class/module within this def.
+                let barriered = barrier_spans.iter().any(|b| {
+                    *b != def_span && span_within(*b, def_span) && span_within(*span, *b)
+                });
+                if barriered {
+                    continue;
+                }
+                let key = (class_name.clone(), name.clone());
+                if !groups.contains_key(&key) {
+                    order.push(key.clone());
+                }
+                groups.entry(key).or_default().push(IvarWrite {
+                    value: *value,
+                    name_span: *name_span,
+                    span: *span,
+                });
+            }
+        }
+    }
+
+    let severity = catalog(DEF_IVAR_WRITE_MISMATCH)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Warning);
+
+    for (class_name, ivar_name) in &order {
+        let writes = &groups[&(class_name.clone(), ivar_name.clone())];
+        if writes.len() < 2 {
+            continue;
+        }
+        // The class string of every write (mapped `ivar_class_for`).
+        let mut classes: Vec<Option<String>> = Vec::with_capacity(writes.len());
+        for w in writes {
+            classes.push(ivar_write_class(ast, w, typer, index, interner, &rescue_bindings));
+        }
+
+        // Canonical = first write whose class is not "NilClass" (leading `@x = nil`
+        // placeholders skipped). If that write's class is unresolvable (`None`),
+        // the WHOLE group is silent.
+        let Some(canonical) = classes
+            .iter()
+            .position(|c| c.as_deref() != Some("NilClass"))
+        else {
+            continue;
+        };
+        let Some(first_class) = classes[canonical].clone() else {
+            continue;
+        };
+
+        for i in (canonical + 1)..writes.len() {
+            let Some(other_class) = &classes[i] else {
+                continue;
+            };
+            if other_class == "NilClass" || *other_class == first_class {
+                continue; // clear-to-nil idiom / same class ⇒ silent.
+            }
+            let w = &writes[i];
+            out.push(Diagnostic {
+                rule_id: DEF_IVAR_WRITE_MISMATCH,
+                start_offset: w.name_span.0,
+                end_offset: w.name_span.1,
+                message: format!(
+                    "instance variable `{ivar_name}' on {class_name} was previously \
+                     assigned {first_class}; this write assigns {other_class}"
+                ),
+                severity,
+                source_family: "builtin",
+                receiver_type: None,
+                method_name: None,
+            });
+        }
+    }
+}
+
 /// Render the receiver for the diagnostic message: the bare literal value for a
 /// value-pinned `Constant`, else the resolved class name.
 /// Render a receiver for a diagnostic's `message` / `receiver_type` field in the
@@ -2109,6 +2860,7 @@ fn node_children(node: &Node) -> Vec<NodeId> {
         Node::LocalVariableWrite { value, .. }
         | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => out.push(*value),
         Node::InterpolatedString { parts, .. } => out.extend(parts.iter().copied()),
         Node::Call { receiver, args, block_body, .. } => {
@@ -2290,6 +3042,7 @@ const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppr
 const IMPLEMENTED_RULES: &[&str] = &[
     CALL_UNDEFINED_METHOD,
     CALL_WRONG_ARITY,
+    CALL_ARGUMENT_TYPE_MISMATCH,
     CALL_POSSIBLE_NIL_RECEIVER,
     FLOW_DEAD_ASSIGNMENT,
     DEF_OVERRIDE_VISIBILITY_REDUCED,
@@ -2302,6 +3055,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     FLOW_SHADOWED_RESCUE_CLAUSE,
     SUPPRESSION_UNKNOWN_RULE,
     SUPPRESSION_EMPTY,
+    DEF_IVAR_WRITE_MISMATCH,
 ];
 
 /// The canonical rule ids rigor-rs can actually emit — the implemented coverage
@@ -4712,5 +5466,368 @@ mod tests {
             raise_operand_verdict(&i, &index, &source, mixed),
             RaiseVerdict::Unknown
         );
+    }
+
+    // -- def.ivar-write-mismatch ------------------------------------------
+
+    fn ivar_diags(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == DEF_IVAR_WRITE_MISMATCH)
+            .collect()
+    }
+
+    #[test]
+    fn ivar_mismatch_string_then_integer_fires() {
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    @x = 42\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].rule_id, DEF_IVAR_WRITE_MISMATCH);
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(
+            d[0].message,
+            "instance variable `@x' on Foo was previously assigned String; this write assigns Integer"
+        );
+        // Anchored on the `@x` name token of the OFFENDING (second) write.
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"@x");
+        assert_eq!(d[0].start_offset, src.windows(2).enumerate().filter(|(_, w)| *w == b"@x").nth(1).unwrap().0);
+    }
+
+    #[test]
+    fn ivar_bool_flag_idiom_silent() {
+        // false then true — both fold to "bool", so no mismatch.
+        let src = b"class Foo\n  def m\n    @on = false\n    @on = true\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_bool_then_string_fires() {
+        let src = b"class Foo\n  def m\n    @x = true\n    @x = \"s\"\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(
+            d[0].message,
+            "instance variable `@x' on Foo was previously assigned bool; this write assigns String"
+        );
+    }
+
+    #[test]
+    fn ivar_op_writes_not_collected() {
+        // `@x ||=` / `@x +=` are InstanceVariable{Or,Operator}WriteNodes, never
+        // plain InstanceVariableWriteNode ⇒ never collected (probed silent).
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    @x ||= 5\n    @x += 1\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_self_setter_not_collected() {
+        // `self.x =` is a `x=` method call, not an ivar write.
+        let src = b"class Foo\n  def m\n    self.x = \"s\"\n    self.x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_write_inside_block_with_literal_fires() {
+        // A block is not a barrier; a literal write inside it is collected.
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    [1].each do |i|\n      @x = 5\n    end\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(
+            d[0].message,
+            "instance variable `@x' on Foo was previously assigned String; this write assigns Integer"
+        );
+    }
+
+    #[test]
+    fn ivar_module_instance_method_fires() {
+        let src = b"module Foo\n  def m\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on Foo was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_same_file_reopen_merges_group() {
+        let src = b"class Foo\n  def a\n    @x = \"s\"\n  end\nend\nclass Foo\n  def b\n    @x = 5\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on Foo was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_nested_class_qualified_name() {
+        let src = b"module A\n  class B\n    def m\n      @x = \"s\"\n      @x = 5\n    end\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on A::B was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_nested_def_is_barrier() {
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    def inner\n      @x = 5\n    end\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_singleton_def_skipped() {
+        let src = b"class Foo\n  def self.m\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_top_level_def_skipped() {
+        // A def outside any class ⇒ qualified prefix empty ⇒ never collected.
+        let src = b"def m\n  @x = \"s\"\n  @x = 5\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_leading_nil_then_single_typed_silent() {
+        let src = b"class Foo\n  def m\n    @x = nil\n    @x = \"s\"\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_leading_nil_fires_on_third_conflicting() {
+        let src = b"class Foo\n  def m\n    @x = nil\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@x' on Foo was previously assigned String; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_clear_to_nil_silent() {
+        let src = b"class Foo\n  def m\n    @x = \"s\"\n    @x = nil\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_none_canonical_kills_whole_group() {
+        // First non-nil write reads an untyped param ⇒ canonical unresolvable ⇒
+        // the WHOLE group is silent even though a later String vs Integer differs.
+        let src = b"class Foo\n  def m(arg)\n    @x = arg\n    @x = \"s\"\n    @x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_same_name_different_classes_no_fire() {
+        let src = b"class A\n  def m\n    @x = \"s\"\n  end\nend\nclass B\n  def m\n    @x = 5\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_rescue_single_class_bound_var_fires() {
+        // Increment (a): `rescue StandardError => e` binds e to StandardError.
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue StandardError => error\n    @e = error\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@e' on Foo was previously assigned String; this write assigns StandardError");
+    }
+
+    #[test]
+    fn ivar_rescue_bare_binds_standard_error() {
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue => error\n    @e = error\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@e' on Foo was previously assigned String; this write assigns StandardError");
+    }
+
+    #[test]
+    fn ivar_rescue_multi_class_silent() {
+        // Multi-class ⇒ union ⇒ not bound ⇒ the bound-var write is unresolvable.
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue TypeError, ArgumentError => error\n    @e = error\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_rescue_project_exception_fires() {
+        // Increment (a) resolves a discovered project exception class.
+        let src = b"class MyError < StandardError\nend\nclass Foo\n  def m\n    @e = \"s\"\n  rescue MyError => error\n    @e = error\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@e' on Foo was previously assigned String; this write assigns MyError");
+    }
+
+    #[test]
+    fn ivar_rescue_unknown_exception_silent() {
+        let src = b"class Foo\n  def m\n    @e = \"s\"\n  rescue Nonexistent::Whatever => error\n    @e = error\n  end\nend\n";
+        assert!(ivar_diags(src).is_empty());
+    }
+
+    #[test]
+    fn ivar_kernel_float_conversion_fires() {
+        // Increment (b): `Float(non_constant)` types Float; then `= 0` is Integer.
+        let src = b"class Foo\n  def m(k)\n    @d = Float(k)\n  rescue ArgumentError, TypeError\n    @d = 0\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@d' on Foo was previously assigned Float; this write assigns Integer");
+    }
+
+    #[test]
+    fn ivar_kernel_integer_and_string_conversions_fire() {
+        let src = b"class Foo\n  def m(a)\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
+        let d = ivar_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@n' on Foo was previously assigned Integer; this write assigns String");
+    }
+
+    // --- call.argument-type-mismatch (ADR-64) --------------------------------
+    //
+    // The probe matrix, run against the LIVE reference oracle and pinned here.
+    // Every FIRE row asserts the (rule, anchor-span) parity the harness keys on;
+    // every SILENT row is a zero-FP guard the reference also stays silent on.
+
+    fn atm_diags(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_ARGUMENT_TYPE_MISMATCH)
+            .collect()
+    }
+
+    #[test]
+    fn atm_nil_channel_single_overload_fires() {
+        // `"a" + nil` — String#+ param `string` rejects nil (alias-aware nil
+        // channel). Anchors on the `nil` argument node.
+        let src = b"\"a\" + nil\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Severity::Error);
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("String"));
+        assert_eq!(d[0].method_name.as_deref(), Some("+"));
+        // Byte-parity with the oracle: single-overload names the parameter.
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at parameter `other_string' of `+' on String: expected string, got nil"
+        );
+    }
+
+    #[test]
+    fn atm_nil_channel_multi_overload_fires() {
+        // `5 + nil` — Integer#+ has several numeric overloads, none admits nil.
+        let src = b"5 + nil\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("Integer"));
+        // Byte-parity with the oracle: multi-overload, NO parameter prefix; the
+        // label joins per-overload written types first-seen (the bigdecimal
+        // overloading reopen prepends BigDecimal onto core's four).
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at `+' on Integer: expected BigDecimal | Integer | Float | Rational | Complex, got nil"
+        );
+    }
+
+    #[test]
+    fn atm_nonnil_channel_multi_overload_fires_on_wrong_class() {
+        // `[1, 2, 3].fetch("x")` — Array#fetch index param `int`; a concrete
+        // String argument is rejected by every overload (non-coerce method).
+        let src = b"[1, 2, 3].fetch(\"x\")\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"\"x\"");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("Array"));
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at `fetch' on Array: expected int, got \"x\""
+        );
+    }
+
+    #[test]
+    fn atm_nil_channel_int_alias_param_fires() {
+        // `"abc".center(nil)` — the width param is the `int` alias; the nil
+        // channel sees through the alias (NilClass has no `to_int`).
+        let src = b"\"abc\".center(nil)\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
+        assert_eq!(
+            d[0].message,
+            "argument type mismatch at parameter `width' of `center' on String: expected int, got nil"
+        );
+    }
+
+    #[test]
+    fn atm_fires_alongside_wrong_arity_at_one_site() {
+        // `"abc".center(nil, "x", "y")` — the reference emits BOTH wrong-arity
+        // (too many args) AND argument-type-mismatch (first arg nil vs `int`).
+        let src = b"\"abc\".center(nil, \"x\", \"y\")\n";
+        let all = run(src);
+        assert!(
+            all.iter().any(|d| d.rule_id == CALL_WRONG_ARITY),
+            "expected wrong-arity: {all:?}"
+        );
+        let atm: Vec<_> = all
+            .iter()
+            .filter(|d| d.rule_id == CALL_ARGUMENT_TYPE_MISMATCH)
+            .collect();
+        assert_eq!(atm.len(), 1, "expected one ATM: {all:?}");
+        assert_eq!(&src[atm[0].start_offset..atm[0].end_offset], b"nil");
+    }
+
+    #[test]
+    fn atm_hash_literal_miss_folds_to_nil_and_fires() {
+        // `h["z"]` on a Hash literal folds to `nil`, so it takes the nil channel.
+        let src = b"h = { \"a\" => 1 }\n\"p\".center(h[\"z\"])\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("String"));
+    }
+
+    // --- SILENT rows (zero-FP guards) ----------------------------------------
+
+    #[test]
+    fn atm_silent_universal_equality() {
+        // `== != eql? equal? <=>` accept any argument by contract.
+        assert!(atm_diags(b"x = \"a\"\nx == nil\n").is_empty());
+        assert!(atm_diags(b"x = \"a\"\nx.eql?(nil)\n").is_empty());
+        assert!(atm_diags(b"x = \"a\"\nx <=> nil\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_coerce_dispatch_operator() {
+        // `5 + "s"` — a coerce-dispatch operator on a multi-overload method;
+        // any user type may define `coerce`, so the non-nil channel excludes it.
+        assert!(atm_diags(b"5 + \"s\"\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_faithful_gate_on_interface_alias_param() {
+        // `"abc".center("s")` — the `int` alias param degrades to gradual, so a
+        // concrete non-nil argument the alias would reject stays silent (the
+        // single-overload non-nil channel requires a FAITHFUL param).
+        assert!(atm_diags(b"\"abc\".center(\"s\")\n").is_empty());
+        // `"a" + 5` — String#+ param `string` (interface-alias) ⇒ silent.
+        assert!(atm_diags(b"\"a\" + 5\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_non_plain_positional_args() {
+        // A splat / bare-keyword argument makes the call non-plain-positional;
+        // the whole call is skipped (any non-plain arg, not just the first).
+        assert!(atm_diags(b"def f(a)\n  \"abc\".center(*a)\nend\n").is_empty());
+        assert!(atm_diags(b"def f(a)\n  \"abc\".center(nil, *a)\nend\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_dynamic_argument() {
+        // A method-parameter argument types Dynamic; the multi-overload non-nil
+        // channel requires a single concrete RBS-known class ⇒ silent.
+        assert!(atm_diags(b"def f(x)\n  [1, 2, 3].fetch(x)\nend\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_project_class_argument() {
+        // A non-RBS project-class argument: its duck-typed conversion protocol is
+        // invisible, so the non-nil channel cannot refute acceptance ⇒ silent.
+        assert!(atm_diags(b"class Foo\nend\n[1, 2, 3].fetch(Foo.new)\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_correct_arguments() {
+        // Well-typed arguments never fire.
+        assert!(atm_diags(b"[1, 2, 3].fetch(0)\n").is_empty());
+        assert!(atm_diags(b"\"abc\".center(5)\n").is_empty());
     }
 }
