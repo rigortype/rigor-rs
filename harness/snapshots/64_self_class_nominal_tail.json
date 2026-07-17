@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/64_self_class_nominal_tail.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `demodulize' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 26,
+      "severity": "error",
+      "message": "undefined method `underscore' for String"
+    }
+  ]
+}
