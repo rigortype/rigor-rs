@@ -1974,6 +1974,36 @@ impl<'i> Typer<'i> {
         let recv = *recv;
         let method = method.clone();
         let args = args.clone();
+        // (c) `Regexp.last_match` — a CORE SINGLETON returning an optional (P2,
+        // 2026-07-17). `Regexp.last_match() -> MatchData?`; `Regexp.last_match(n)`
+        // / `(name) -> String?`. The receiver is a `ConstantRead "Regexp"` (both
+        // `Regexp` and `::Regexp` lower to this bare name), whose type is a
+        // `Singleton` — `class_name_of` below returns `None` for it, so this MUST
+        // be matched syntactically here, before the receiver-class resolution. The
+        // syntactic name gate mirrors the reference resolving `Regexp.last_match`
+        // against core RBS; a project constant coincidentally named `Regexp` is not
+        // a realistic hazard. The arm depends only on the arg SHAPE (see spec
+        // `docs/notes/20260717-p2-optional-local-nil-spec.md`):
+        //   - zero args        ⇒ `MatchData` (deref `#[]` / `#begin` / …),
+        //   - one INT/STR/SYM  ⇒ `String`    (deref `#gsub` / `#upcase` / …),
+        //   - anything else    ⇒ DECLINE (non-literal / multi arg — never guess).
+        if method == "last_match" {
+            if let Node::ConstantRead { name, .. } = ast.get(recv) {
+                if name == "Regexp" {
+                    return match args.as_slice() {
+                        [] => Some("MatchData"),
+                        [only] if matches!(
+                            ast.get(*only),
+                            Node::IntegerLit { .. } | Node::StringLit { .. } | Node::SymbolLit { .. }
+                        ) =>
+                        {
+                            Some("String")
+                        }
+                        _ => None,
+                    };
+                }
+            }
+        }
         let rty = self.type_of(ast, recv, tenv, interner);
         // Folding-parity keystone (shared by both sources): a `Constant` receiver
         // is folded by the reference to a concrete non-nil value ⇒ decline.
@@ -2550,6 +2580,97 @@ mod tests {
             })
             .expect("sub.size call present");
         assert_eq!(snaps.get(&use_id), None, "an intervening guard must decline");
+    }
+
+    // -----------------------------------------------------------------------
+    // P2 (2026-07-17) — `Regexp.last_match` optional-local nil source
+    // -----------------------------------------------------------------------
+
+    /// Snapshot arm recorded for the FIRST call whose receiver is a bare local
+    /// read of `recv` and method is `method`, or `None`.
+    fn last_match_use_arm(src: &[u8], recv: &str, method: &str) -> Option<&'static str> {
+        let ast = lower_src(src);
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.nilable_receiver_snapshots(&ast, &mut i);
+        let use_id = ast.iter().find_map(|(id, n)| match n {
+            Node::Call { receiver: Some(r), method: m, .. }
+                if m == method
+                    && matches!(ast.get(*r), Node::LocalVariableRead { name, .. } if name == recv) =>
+            {
+                Some(id)
+            }
+            _ => None,
+        })?;
+        snaps.get(&use_id).copied()
+    }
+
+    /// `Regexp.last_match(n) -> String?`: the integer-literal arg gives a
+    /// concrete `String` arm, so a straight-line `content.gsub(...)` fires (the
+    /// `dictionary_credentials_handler` / `hugo_transformer` gitlab cluster).
+    /// Both `::Regexp` and `Regexp` lower to `ConstantRead "Regexp"`.
+    #[test]
+    fn p2_regexp_last_match_int_arg_is_string_source() {
+        for src in [
+            b"content = ::Regexp.last_match(2)\nnew = content.gsub(\"a\", \"b\")\n".as_slice(),
+            b"content = Regexp.last_match(1)\nnew = content.gsub(\"a\", \"b\")\n".as_slice(),
+        ] {
+            assert_eq!(
+                last_match_use_arm(src, "content", "gsub"),
+                Some("String"),
+                "Regexp.last_match(int) must mint a String|nil source: {:?}",
+                std::str::from_utf8(src).unwrap()
+            );
+        }
+    }
+
+    /// `Regexp.last_match(name) -> String?` for a String / Symbol literal arg.
+    #[test]
+    fn p2_regexp_last_match_name_arg_is_string_source() {
+        for src in [
+            b"c = Regexp.last_match(:key)\nn = c.upcase\n".as_slice(),
+            b"c = Regexp.last_match(\"key\")\nn = c.upcase\n".as_slice(),
+        ] {
+            assert_eq!(last_match_use_arm(src, "c", "upcase"), Some("String"));
+        }
+    }
+
+    /// `Regexp.last_match() -> MatchData?`: the zero-arg form mints a `MatchData`
+    /// arm, so `match[0]` / `match.begin(0)` fire (the `collection` / second
+    /// `hugo_transformer` gitlab cluster).
+    #[test]
+    fn p2_regexp_last_match_zero_arg_is_matchdata_source() {
+        let src = b"m = Regexp.last_match\nfull = m[0]\nb = m.begin(0)\n";
+        assert_eq!(last_match_use_arm(src, "m", "[]"), Some("MatchData"));
+        assert_eq!(last_match_use_arm(src, "m", "begin"), Some("MatchData"));
+    }
+
+    /// Decline conditions (FP backstop): a NON-literal / multi arg to `last_match`
+    /// (return class not decidable), a NON-`Regexp` constant receiver, a guard
+    /// between the bind and the use, and a safe-nav deref all record no snapshot.
+    #[test]
+    fn p2_regexp_last_match_declines() {
+        // non-literal arg
+        assert_eq!(
+            last_match_use_arm(b"i = 2\nc = Regexp.last_match(i)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
+        // a different constant named `.last_match` is not the core Regexp source
+        assert_eq!(
+            last_match_use_arm(b"c = Foo.last_match(2)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
+        // intervening guard clears the fact
+        assert_eq!(
+            last_match_use_arm(b"c = Regexp.last_match(2)\nif c\n  noop\nend\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
+        // safe-nav deref is not a bug (short-circuits on nil)
+        assert_eq!(
+            last_match_use_arm(b"c = Regexp.last_match(2)\nn = c&.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
     }
 
     /// A same-named block parameter must NOT inherit an outer nilable fact — the
