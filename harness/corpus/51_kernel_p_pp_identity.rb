@@ -3,8 +3,9 @@
 # (pins/shapes preserved), several come back as an Array of them, and zero
 # returns nil. The folded value flows into a chained call so an undefined method
 # on it is witnessed exactly where the oracle witnesses it — byte-for-byte on
-# (rule, line, column, message). The fold fires ONLY for an implicit-self (no
-# explicit receiver) `p`/`pp` call that passes the guards.
+# (rule, line, column, message). The fold fires for an implicit-self `p`/`pp`
+# call that passes the guards, AND for the explicit `Kernel.` module_function
+# spelling (`Kernel.p` dispatches to the same intrinsic — upstream c9d2e473).
 
 # 1-arg identity: the Integer pin passes through, so the chained call flags
 # `for 42` (Integer has no `frobnicate`).
@@ -31,12 +32,13 @@ e.frobnicate
 f = p({ a: 1 })
 f.frobnicate
 
-# --- silent directions (fold declines → Dynamic receiver → no witness) ---
-
-# Explicit foreign receiver: `Kernel.p` is a real Kernel call, never the
-# implicit-self identity fold, so nothing is witnessed on its result.
+# Explicit `Kernel.` receiver: `module_function` exposes each intrinsic as a
+# public singleton on the Kernel module object, so `Kernel.p(42)` dispatches to
+# the same identity fold as the implicit-self spelling and witnesses `for 42`.
 g = Kernel.p(42)
 g.frobnicate
+
+# --- silent directions (fold declines → Dynamic receiver → no witness) ---
 
 # A splat argument makes the positional arity (identity-vs-Array) statically
 # unknown, so the fold declines and the result stays Dynamic (silent).

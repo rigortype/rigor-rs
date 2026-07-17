@@ -2,6 +2,13 @@
   "fixture": "harness/corpus/48_suppression_unknown_rule.rb",
   "diagnostics": [
     {
+      "rule": "suppression.unknown-marker",
+      "line": 12,
+      "column": 9,
+      "severity": "warning",
+      "message": "unrecognised suppression marker `rigor:disable-next-line` — Rigor's markers are `# rigor:disable <rules>` (suppresses on its own line) and `# rigor:disable-file <rules>`, so this comment suppresses nothing."
+    },
+    {
       "rule": "suppression.unknown-rule",
       "line": 6,
       "column": 9,

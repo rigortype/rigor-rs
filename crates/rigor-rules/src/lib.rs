@@ -212,6 +212,14 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-empty",
         }),
+        SUPPRESSION_UNKNOWN_MARKER => Some(&RuleEntry {
+            // Oracle: warning across ALL profiles / high — the marker word is
+            // present and provably outside the suppression grammar; the prose
+            // escape is excluded before firing.
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-unknown-marker",
+        }),
         DEF_IVAR_WRITE_MISMATCH => Some(&RuleEntry {
             // Authored `:error`; balanced profile stamps it `:warning` (lenient
             // warning, strict error). rigor-rs emits the balanced-default severity
@@ -350,6 +358,14 @@ pub const SUPPRESSION_UNKNOWN_RULE: &str = "suppression.unknown-rule";
 /// `suppression.empty` (v0.3.0): a bare `# rigor:disable[-file]` marker with no
 /// rule tokens (only whitespace/commas after it) — it suppresses nothing.
 pub const SUPPRESSION_EMPTY: &str = "suppression.empty";
+
+/// `suppression.unknown-marker` (v0.3.0): a `rigor:`-prefixed marker word OUTSIDE
+/// Rigor's suppression grammar but reading like an attempted suppression — the
+/// RuboCop-reflex `# rigor:disable-next-line <rule>` / `# rigor:enable <rule>`.
+/// Such a marker is invisible to the two real patterns (`# rigor:disable[-file]`),
+/// so it silently suppresses nothing. Surveillance over the markers themselves,
+/// produced BEFORE `filter_suppressed`, so it is itself suppressible.
+pub const SUPPRESSION_UNKNOWN_MARKER: &str = "suppression.unknown-marker";
 
 /// `def.ivar-write-mismatch` (since 0.1.2): within one class's instance methods,
 /// the same instance variable `@x` is assigned two DIFFERENT concrete classes —
@@ -2943,45 +2959,157 @@ fn validate_suppression_tokens(raw: &str, marker: &str, offset: usize, out: &mut
     }
 }
 
-/// A comment carrying the bare marker word but not the token-bearing grammar. A
-/// remainder of nothing but whitespace/commas is a genuinely empty marker
-/// (`# rigor:disable`); anything else (documentation prose) is left alone.
-/// Mirrors `BARE_SUPPRESSION_MARKER` = `/#\s*rigor:disable(-file)?(?![\w-])(?<rest>.*)/`
-/// with `rest ~ /\A[\s,]*\z/`. The anchor is the comment start (offset), matching
-/// the reference's `comment.location.start_column + 1`.
+/// A comment carrying a marker word but not the token-bearing suppression
+/// grammar. First the BARE `# rigor:disable[-file]` form: an all-whitespace/comma
+/// remainder is a genuinely empty marker (`suppression.empty`); anything else
+/// (documentation prose) is left alone. Otherwise the out-of-grammar
+/// `suppression.unknown-marker` fallback (`# rigor:disable-next-line`,
+/// `# rigor:enable`, ...). Mirrors the reference's `diagnose_bare_suppression_marker`
+/// (BARE_SUPPRESSION_MARKER) chaining into `diagnose_unknown_suppression_marker`
+/// (UNKNOWN_SUPPRESSION_MARKER). The reference applies each pattern as a whole-
+/// string search — BARE has priority — so bare is scanned across every `#` before
+/// the unknown fallback is tried at all. The anchor is the comment start (offset),
+/// matching the reference's `comment.location.start_column + 1`.
 fn diagnose_bare_suppression_marker(text: &str, offset: usize, out: &mut Vec<Diagnostic>) {
-    let bytes = text.as_bytes();
-    for (i, &b) in bytes.iter().enumerate() {
-        if b != b'#' {
+    // Pass 1: BARE_SUPPRESSION_MARKER = /#\s*rigor:disable(-file)?(?![\w-])(?<rest>.*)/.
+    // The `(-file)?` is greedy but backtracks under the `(?![\w-])` lookahead:
+    // `disable-files` / `disable-file-x` fail BARE and drop to the unknown pass.
+    for after_rigor in rigor_marker_tails(text) {
+        let Some(after_disable) = after_rigor.strip_prefix("disable") else {
             continue;
+        };
+        if let Some((is_file, rest)) = match_bare_disable(after_disable) {
+            if rest.chars().all(is_suppression_ws_or_comma) {
+                let marker = if is_file { "rigor:disable-file" } else { "rigor:disable" };
+                out.push(empty_suppression_diagnostic(marker, offset));
+            }
+            return;
         }
-        // `#\s*`
+    }
+    // Pass 2: UNKNOWN_SUPPRESSION_MARKER — an out-of-grammar `rigor:` marker word.
+    for after_rigor in rigor_marker_tails(text) {
+        if let Some((marker, rest)) = parse_unknown_marker(after_rigor) {
+            // Fire only when the remainder is empty/commas or rule-list-shaped, so
+            // prose mentioning the spelling (`<rule>`, backticks) stays a comment.
+            if rest.chars().all(is_suppression_ws_or_comma) || is_rule_list_shaped(rest) {
+                out.push(unknown_suppression_marker_diagnostic(marker, offset));
+            }
+            return;
+        }
+    }
+}
+
+/// True for an ASCII `[\w-]` byte (word char or hyphen), matching Ruby's default
+/// ASCII `\w`. Non-ASCII lead bytes are not word chars, so `(?![\w-])` holds.
+fn is_word_or_hyphen_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// True when `s` begins with a `[\w-]` char — the negated `(?![\w-])` lookahead
+/// is the complement. An empty string (end-of-input) has no such char, so the
+/// lookahead holds there.
+fn starts_word_or_hyphen(s: &str) -> bool {
+    s.bytes().next().is_some_and(is_word_or_hyphen_byte)
+}
+
+/// Byte length of the leading `[\w-]+` run (all ASCII).
+fn word_or_hyphen_run_len(s: &str) -> usize {
+    s.bytes().take_while(|b| is_word_or_hyphen_byte(*b)).count()
+}
+
+/// `[\s,]` — Ruby `\s` (`[ \t\r\n\f\v]`) plus comma.
+fn is_suppression_ws_or_comma(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n' | '\u{0c}' | '\u{0b}' | ',')
+}
+
+/// Match the BARE `disable(-file)?(?![\w-])` marker against the text after
+/// `rigor:disable`, replicating the regex's `(-file)?` backtracking. Returns
+/// `(is_file, rest)` on a match, `None` when the marker word runs into a `[\w-]`
+/// char (`disable-files`, `disablexyz`) and so is not the bare grammar.
+fn match_bare_disable(after_disable: &str) -> Option<(bool, &str)> {
+    // Greedy `-file` first, valid only if `(?![\w-])` holds right after it.
+    if let Some(after_file) = after_disable.strip_prefix("-file") {
+        if !starts_word_or_hyphen(after_file) {
+            return Some((true, after_file));
+        }
+    }
+    // Backtrack: no `-file`, then `(?![\w-])` right after `disable`.
+    (!starts_word_or_hyphen(after_disable)).then_some((false, after_disable))
+}
+
+/// Match `UNKNOWN_SUPPRESSION_MARKER`'s `marker` group against the text after
+/// `rigor:` — `disable-<suffix>` (suffix other than `file`) or `enable[-<suffix>]`,
+/// each terminated by `(?![\w-])`. Returns `(marker, rest)`.
+fn parse_unknown_marker(after_rigor: &str) -> Option<(&str, &str)> {
+    // Alt A: `disable-(?!file(?![\w-]))[\w-]+`.
+    if let Some(rem) = after_rigor.strip_prefix("disable-") {
+        // Negative lookahead: reject a bare `disable-file` (handled by BARE).
+        if let Some(after_file) = rem.strip_prefix("file") {
+            if !starts_word_or_hyphen(after_file) {
+                return None;
+            }
+        }
+        let suffix = word_or_hyphen_run_len(rem);
+        if suffix == 0 {
+            return None; // `disable-` with no `[\w-]` suffix.
+        }
+        let end = "disable-".len() + suffix;
+        return Some((&after_rigor[..end], &after_rigor[end..]));
+    }
+    // Alt B: `enable(?:-[\w-]+)?(?![\w-])`.
+    if let Some(rem) = after_rigor.strip_prefix("enable") {
+        let end = if let Some(after_dash) = rem.strip_prefix('-') {
+            let suffix = word_or_hyphen_run_len(after_dash);
+            if suffix == 0 {
+                return None; // `enable-` then non-`[\w-]`: `(?![\w-])` sees `-`.
+            }
+            "enable".len() + 1 + suffix
+        } else if starts_word_or_hyphen(rem) {
+            return None; // `enablexyz` — `(?![\w-])` fails.
+        } else {
+            "enable".len()
+        };
+        return Some((&after_rigor[..end], &after_rigor[end..]));
+    }
+    None
+}
+
+/// `\A\s+[\w.,\s-]+\z` — a leading run of whitespace followed by a rule-list-
+/// shaped remainder (word / `.` / `,` / whitespace / `-`). Reduces to: the first
+/// char is whitespace and every char is in the class, with length ≥ 2.
+fn is_rule_list_shaped(rest: &str) -> bool {
+    let is_class = |c: char| {
+        c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ',' | '-') || is_suppression_ws_or_comma(c)
+    };
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some(c) if is_suppression_ws_or_comma(c) => {}
+        _ => return false,
+    }
+    let mut count = 1;
+    for c in chars {
+        if !is_class(c) {
+            return false;
+        }
+        count += 1;
+    }
+    count >= 2
+}
+
+/// Iterate the tail after each `#\s*rigor:` occurrence in a comment, replicating
+/// the `#\s*rigor:` prefix shared by the bare / unknown marker patterns.
+fn rigor_marker_tails(text: &str) -> impl Iterator<Item = &str> {
+    let bytes = text.as_bytes();
+    (0..bytes.len()).filter_map(move |i| {
+        if bytes[i] != b'#' {
+            return None;
+        }
         let mut j = i + 1;
         while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
             j += 1;
         }
-        let Some(after_kw) = text[j..].strip_prefix("rigor:disable") else {
-            continue;
-        };
-        // Optional `-file`, then `(?![\w-])` and an all-whitespace/comma remainder.
-        let (is_file, after) = match after_kw.strip_prefix("-file") {
-            Some(a) => (true, a),
-            None => (false, after_kw),
-        };
-        if let Some(c) = after.chars().next() {
-            if c == '-' || c == '_' || c.is_alphanumeric() {
-                return; // `rigor:disable-next-line`, `rigor:disablexyz` — not a marker.
-            }
-        }
-        if after
-            .chars()
-            .all(|c| matches!(c, ' ' | '\t' | ',' | '\r' | '\n'))
-        {
-            let marker = if is_file { "rigor:disable-file" } else { "rigor:disable" };
-            out.push(empty_suppression_diagnostic(marker, offset));
-        }
-        return;
-    }
+        text[j..].strip_prefix("rigor:")
+    })
 }
 
 fn unknown_suppression_rule_diagnostic(marker: &str, token: &str, offset: usize) -> Diagnostic {
@@ -2993,6 +3121,23 @@ fn unknown_suppression_rule_diagnostic(marker: &str, token: &str, offset: usize)
             "unknown rule `{token}` in `# {marker}` — the token matches no known rule, \
              alias, or family, so this suppression has no effect. Likely a typo; \
              `rigor explain <rule>` lists the canonical ids."
+        ),
+        severity: Severity::Warning,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: None,
+    }
+}
+
+fn unknown_suppression_marker_diagnostic(marker: &str, offset: usize) -> Diagnostic {
+    Diagnostic {
+        rule_id: SUPPRESSION_UNKNOWN_MARKER,
+        start_offset: offset,
+        end_offset: offset,
+        message: format!(
+            "unrecognised suppression marker `rigor:{marker}` — Rigor's markers are \
+             `# rigor:disable <rules>` (suppresses on its own line) and \
+             `# rigor:disable-file <rules>`, so this comment suppresses nothing."
         ),
         severity: Severity::Warning,
         source_family: "builtin",
@@ -3055,6 +3200,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     FLOW_SHADOWED_RESCUE_CLAUSE,
     SUPPRESSION_UNKNOWN_RULE,
     SUPPRESSION_EMPTY,
+    SUPPRESSION_UNKNOWN_MARKER,
     DEF_IVAR_WRITE_MISMATCH,
 ];
 
@@ -3093,12 +3239,14 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "flow.unreachable-clause",
     // v0.3.0 ids. `flow.duplicate-hash-key` / `flow.return-in-ensure` /
     // `call.raise-non-exception` / `flow.shadowed-rescue-clause` /
-    // `suppression.unknown-rule` / `suppression.empty` are all implemented.
+    // `suppression.unknown-rule` / `suppression.empty` /
+    // `suppression.unknown-marker` are all implemented.
     "flow.duplicate-hash-key",
     "flow.return-in-ensure",
     "flow.shadowed-rescue-clause",
     "suppression.unknown-rule",
     "suppression.empty",
+    "suppression.unknown-marker",
 ];
 
 /// True when `token` looks like a built-in-family rule id but matches none — its
@@ -5254,9 +5402,50 @@ mod tests {
     }
 
     #[test]
-    fn suppression_next_line_and_prose_are_ignored() {
-        assert!(sup("# rigor:disable-next-line call.undefined-method").is_empty());
+    fn suppression_prose_is_ignored() {
+        // A recognised marker word inside documentation prose (non-token text
+        // follows) stays an ordinary comment — neither pattern fires.
         assert!(sup("# this documents `# rigor:disable <rule>` usage").is_empty());
+        assert!(sup("# see `rigor:disable-next-line` for the RuboCop reflex").is_empty());
+        assert!(sup("# the `rigor:enable` spelling is not supported").is_empty());
+    }
+
+    #[test]
+    fn suppression_unknown_marker_fires_with_exact_message() {
+        // The RuboCop reflex: hyphenated `disable-next-line` is invisible to the
+        // real suppression grammar, so surveillance flags it (upstream 4e0ca475).
+        let d = sup("# rigor:disable-next-line call.undefined-method");
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].rule_id, SUPPRESSION_UNKNOWN_MARKER);
+        assert_eq!(d[0].severity, Severity::Warning);
+        assert_eq!(
+            d[0].message,
+            "unrecognised suppression marker `rigor:disable-next-line` — Rigor's markers are `# rigor:disable <rules>` (suppresses on its own line) and `# rigor:disable-file <rules>`, so this comment suppresses nothing."
+        );
+    }
+
+    #[test]
+    fn suppression_unknown_marker_covers_enable_and_bare_forms() {
+        // `enable` with or without a suffix, and a bare next-line marker.
+        assert_eq!(sup("# rigor:enable")[0].rule_id, SUPPRESSION_UNKNOWN_MARKER);
+        assert_eq!(sup("# rigor:enable call.undefined-method")[0].rule_id, SUPPRESSION_UNKNOWN_MARKER);
+        assert_eq!(sup("# rigor:enable-all")[0].rule_id, SUPPRESSION_UNKNOWN_MARKER);
+        assert_eq!(sup("# rigor:disable-next-line")[0].rule_id, SUPPRESSION_UNKNOWN_MARKER);
+        // `disable-file` with a further suffix is out-of-grammar too.
+        assert_eq!(sup("# rigor:disable-files")[0].rule_id, SUPPRESSION_UNKNOWN_MARKER);
+    }
+
+    #[test]
+    fn suppression_unknown_marker_declines_real_and_nonmarker_forms() {
+        // The two recognised bare markers are handled by empty/unknown-rule, never
+        // the unknown-MARKER pass.
+        assert!(sup("# rigor:disable-file").iter().all(|d| d.rule_id != SUPPRESSION_UNKNOWN_MARKER));
+        assert!(sup("# rigor:disable").iter().all(|d| d.rule_id != SUPPRESSION_UNKNOWN_MARKER));
+        // Not a marker word at all — no diagnostic.
+        assert!(sup("# rigor:disablexyz").is_empty());
+        assert!(sup("# rigor:enablexyz").is_empty());
+        // `enable-` with nothing after the hyphen is not a marker.
+        assert!(sup("# rigor:enable-").is_empty());
     }
 
     #[test]

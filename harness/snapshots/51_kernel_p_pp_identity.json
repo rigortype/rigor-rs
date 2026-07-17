@@ -3,45 +3,52 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 12,
+      "line": 13,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for 42"
     },
     {
       "rule": "call.undefined-method",
-      "line": 16,
+      "line": 17,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for 42"
     },
     {
       "rule": "call.undefined-method",
-      "line": 20,
+      "line": 21,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for [1, \"a\"]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 24,
+      "line": 25,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for nil"
     },
     {
       "rule": "call.undefined-method",
-      "line": 28,
+      "line": 29,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for 42"
     },
     {
       "rule": "call.undefined-method",
-      "line": 32,
+      "line": 33,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 39,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 42"
     }
   ]
 }
