@@ -185,6 +185,14 @@ struct ClassEntry {
     /// `methods`). Read only via [`CoreData::method_overloads`]; no rule wires
     /// it yet.
     method_overloads: HashMap<&'static str, Vec<OverloadSignature>>,
+    /// `singleton method name -> per-overload positional shapes`, the ATM
+    /// substrate for CLASS-method dispatch (`CGI.parse(...)`, `Base64.decode64`).
+    /// The singleton twin of `method_overloads`: populated for `def self.x`
+    /// (`Singleton`) AND `def self?.x` (`SingletonInstance`, which also feeds the
+    /// instance map). First write wins on reopen. Read only via
+    /// [`CoreData::singleton_method_overloads`]; ADDITIVE and output-inert for
+    /// every existing rule (the singleton arity/return path is untouched).
+    singleton_method_overloads: HashMap<&'static str, Vec<OverloadSignature>>,
     /// `method name -> block-overload return class name`, populated ONLY for
     /// methods that declare a block-bearing overload whose return is a
     /// resolvable concrete class (a `ClassInstanceType` like `Hash#filter { }
@@ -872,6 +880,37 @@ impl CoreData {
         self.lookup_overloads_on_chain(&chain, method, 0)
     }
 
+    /// The per-overload positional-parameter shapes of the CLASS METHOD
+    /// `class_name.method` (`CGI.parse`, `Base64.decode64`), resolved down the
+    /// singleton superclass chain — the class-method twin of
+    /// [`Self::method_overloads`]. `None` when no ancestor on the singleton chain
+    /// records overloads for `method`. Consumed by `call.argument-type-mismatch`
+    /// on a `Type::Singleton` receiver.
+    pub fn singleton_method_overloads(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<&[OverloadSignature]> {
+        // The singleton class inherits down the SUPERCLASS chain (not the
+        // include/ancestor chain). Gather it, then take the first ancestor whose
+        // own singleton-overload table records `method`.
+        let mut cur = Some(class_name);
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(name) = cur {
+            let Some((&key, entry)) = self.classes.get_key_value(name) else {
+                break;
+            };
+            if !seen.insert(key) {
+                break; // cycle guard
+            }
+            if let Some(ov) = entry.singleton_method_overloads.get(method) {
+                return Some(ov.as_slice());
+            }
+            cur = entry.superclass;
+        }
+        None
+    }
+
     /// The right-hand side of a `type` alias, one level deep, or `None` if the
     /// alias is unknown. The RHS is RAW: an alias reference INSIDE it stays an
     /// [`RetainedParamType::Alias`] leaf (not expanded). Bounded expansion with a
@@ -1360,6 +1399,7 @@ impl CoreData {
                     // conservative because the five base classes' singleton
                     // surface is incomplete here ⇒ always silent.
                     singleton_methods: HashMap::new(),
+                    singleton_method_overloads: HashMap::new(),
                     singleton_aliases: HashMap::new(),
                     superclass,
                     // The stub does not distinguish modules from classes; the
@@ -1800,6 +1840,13 @@ impl Builder {
                             | MethodDefinitionKind::SingletonInstance
                     ) {
                         entry.singleton_methods.entry(mname).or_insert((ret, arity));
+                        // ATM substrate: retain the class-method per-overload
+                        // shapes so `call.argument-type-mismatch` can check a
+                        // `CGI.parse(...)` class-method call site.
+                        entry
+                            .singleton_method_overloads
+                            .entry(mname)
+                            .or_insert_with(|| method_overloads(&md, code));
                     }
                 }
                 Node::Include(inc) => {
@@ -1896,6 +1943,9 @@ impl Builder {
         }
         for (k, v) in entry.singleton_methods {
             slot.singleton_methods.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_method_overloads {
+            slot.singleton_method_overloads.entry(k).or_insert(v);
         }
         for (new_name, old_name) in entry.aliases {
             slot.aliases.entry(new_name).or_insert(old_name);
@@ -2573,6 +2623,37 @@ mod embedded_tests {
         assert!(idx.method_overloads("String", "definitely_absent_zzz").is_none());
         // Unknown class ⇒ None.
         assert!(idx.method_overloads("NoSuchClassZzz", "foo").is_none());
+    }
+
+    /// Class-method (singleton) overload retention — the ATM substrate for
+    /// `CGI.parse(...)` / `Base64.decode64(...)`. `CGI.parse` is a plain
+    /// `def self.parse: (String query) -> ...`, so it lives ONLY in the singleton
+    /// overload table (the instance `method_overloads` does not carry it).
+    #[test]
+    fn atm_singleton_method_overloads_retained() {
+        let idx = CoreData::load();
+        // Only assert when the stdlib RBS is actually loaded (a stub build has no
+        // CGI); this keeps the test meaningful without failing a Ruby-free CI.
+        if idx.knows_class("CGI") {
+            let parse = idx
+                .singleton_method_overloads("CGI", "parse")
+                .expect("CGI.parse singleton overloads retained");
+            assert!(
+                parse
+                    .iter()
+                    .any(|o| o.required_positionals.len() == 1
+                        && matches!(o.required_positionals[0], RetainedParamType::ClassInstance("String"))),
+                "CGI.parse takes a single String positional: {parse:?}"
+            );
+            // A plain `def self.parse` is NOT an instance method.
+            assert!(
+                idx.method_overloads("CGI", "parse").is_none(),
+                "CGI#parse is not an instance method"
+            );
+        }
+        // Unknown singleton method / class ⇒ None.
+        assert!(idx.singleton_method_overloads("Array", "definitely_absent_zzz").is_none());
+        assert!(idx.singleton_method_overloads("NoSuchClassZzz", "foo").is_none());
     }
 
     /// Alias / interface cycle guard: a self-referential `type` alias

@@ -4,7 +4,7 @@
 //! bullet's first rule is `call.undefined-method`.
 #![allow(dead_code)]
 
-use rigor_index::CoreIndex;
+use rigor_index::{CoreIndex, OverloadSignature, RetainedParamType};
 use rigor_infer::Typer;
 use rigor_parse::{HashKeyTag, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type};
@@ -169,6 +169,17 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-return-in-ensure",
         }),
+        CALL_ARGUMENT_TYPE_MISMATCH => Some(&RuleEntry {
+            // Oracle: error across all profiles / high — a positional argument
+            // whose statically-inferred type the RBS parameter provably rejects,
+            // gated behind a zero-FP envelope (concrete + RBS-known receiver,
+            // plain-positional-only, universal-equality skip, coerce-operator
+            // skip on the multi-overload non-nil channel, faithful-param gate on
+            // the single-overload non-nil channel).
+            default_severity: Severity::Error,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-argument-type-mismatch",
+        }),
         CALL_RAISE_NON_EXCEPTION => Some(&RuleEntry {
             // Oracle: error across all profiles / high — the operand's
             // statically-inferred type is provably not a legal `raise` operand,
@@ -225,6 +236,15 @@ pub const CALL_UNDEFINED_METHOD: &str = "call.undefined-method";
 /// `call.wrong-arity`: a call passes a positional-argument count outside the
 /// method's known arity envelope (ADR-0030 taxonomy).
 pub const CALL_WRONG_ARITY: &str = "call.wrong-arity";
+
+/// `call.argument-type-mismatch`: a call passes a positional argument whose
+/// statically-inferred type the matching RBS parameter provably rejects (ADR-64
+/// / ADR-0030 taxonomy). Fired INDEPENDENTLY of the arity/undefined chain (the
+/// reference emits it alongside `call.wrong-arity` at the same site). Two
+/// channels, both zero-FP-gated: a `nil` argument a param that rejects nil, and
+/// a non-nil argument whose concrete class the param rejects. See
+/// [`check_argument_type_mismatch`].
+pub const CALL_ARGUMENT_TYPE_MISMATCH: &str = "call.argument-type-mismatch";
 
 /// `call.possible-nil-receiver`: a call whose receiver may be nil on some path
 /// (ADR-0030 taxonomy). In this slice only the union case is in scope; the
@@ -476,6 +496,7 @@ pub fn analyze_with_source_and_folder(
                 block_body,
                 message_span,
                 safe_nav,
+                args_all_plain,
                 ..
             } => Some((
                 id,
@@ -485,12 +506,13 @@ pub fn analyze_with_source_and_folder(
                 !block_body.is_empty(),
                 *message_span,
                 *safe_nav,
+                *args_all_plain,
             )),
             _ => None,
         })
         .collect();
 
-    for (call_id, recv, method, args, has_block, message_span, safe_nav) in calls {
+    for (call_id, recv, method, args, has_block, message_span, safe_nav, args_all_plain) in calls {
         // Rule precedence at one call site (avoid double-emit):
         //   1. undefined-method  (method absent on the receiver class, incl. nil)
         //   2. wrong-arity       (method present but arg count out of envelope)
@@ -511,6 +533,26 @@ pub fn analyze_with_source_and_folder(
                 )
             });
         if let Some(diag) = diag {
+            out.push(diag);
+        }
+
+        // `call.argument-type-mismatch` is an INDEPENDENT axis (argument types),
+        // NOT part of the one-per-site validity precedence above: the reference
+        // emits it ALONGSIDE `call.wrong-arity` at the same call site (a bad-arity
+        // AND wrong-typed-first-arg call yields both). Its own gate keeps it off
+        // sites the undefined-method rule owns (it requires the method to be
+        // RBS-known on the receiver).
+        if let Some(diag) = check_argument_type_mismatch(
+            ast,
+            recv,
+            &method,
+            &args,
+            args_all_plain,
+            &env,
+            &typer,
+            interner,
+            index,
+        ) {
             out.push(diag);
         }
     }
@@ -1287,6 +1329,391 @@ fn check_wrong_arity(
         severity,
         source_family: "builtin",
         receiver_type: Some(class_name.to_string()),
+        method_name: Some(method.to_string()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// call.argument-type-mismatch (ADR-64) — the reference `argument_type_diagnostic`
+// (`check_rules.rb:1943`). Ported at the CLASS-name level: rigor-rs has no
+// `Inference::Acceptance` engine, so acceptance is decided via the ATM substrate
+// (`param_admits_nil` / `param_accepts_arg_class`, both over `class_ordering`)
+// exactly as the reference's Slice-2 twins were designed to substitute.
+// ---------------------------------------------------------------------------
+
+/// Ruby's universal-equality methods (`Object#==` / `#eql?` / …) accept any
+/// object by contract and RETURN false on a type mismatch rather than raise, so
+/// a tight RBS param over-specifies — skip them wholesale (reference
+/// `UNIVERSAL_EQUALITY_METHODS`, `check_rules.rb:1925`).
+fn is_universal_equality_method(method: &str) -> bool {
+    matches!(method, "==" | "!=" | "eql?" | "equal?" | "<=>")
+}
+
+/// The binary arithmetic / bit / ordering operators that dispatch through Ruby's
+/// `coerce` protocol (`5 + Money.new` is valid via `Money#coerce`), so a non-nil
+/// argument to them is NOT statically refutable — the MULTI-overload non-nil
+/// channel excludes them (reference `COERCE_DISPATCH_METHODS`,
+/// `check_rules.rb:1940`). `nil` never coerces, so the nil channel stays in force.
+fn is_coerce_dispatch_method(method: &str) -> bool {
+    matches!(
+        method,
+        "+" | "-" | "*" | "/" | "%" | "**" | "&" | "|" | "^" | "<<" | ">>" | "<" | ">" | "<=" | ">="
+    )
+}
+
+/// An overload is eligible for argument checking iff it has none of the shapes
+/// the substrate keeps only as presence flags — rest positionals, any keyword,
+/// or trailing positionals (reference `argument_check_eligible?`,
+/// `check_rules.rb:2303`).
+fn argument_check_eligible(ov: &OverloadSignature) -> bool {
+    !ov.has_rest_positionals
+        && !ov.has_required_keywords
+        && !ov.has_optional_keywords
+        && !ov.has_rest_keywords
+        && !ov.has_trailing_positionals
+}
+
+/// Whether a parameter type is FAITHFULLY translatable to a concrete class check
+/// with NO interface degradation — the gate the single-overload non-nil channel
+/// needs so it matches the reference's `translate_param_type` → `Acceptance`
+/// (which degrades a `type` alias / `interface` param to `untyped` ⇒ skip). A
+/// `ClassInstance` (`String`) is faithful; a union of faithful members is; a
+/// bare `Alias` (`string`) / `Interface` (`_ToStr`) / `Other` is NOT (the
+/// translator would hand the acceptance engine a `Dynamic`, which never refutes,
+/// so `"abc".center("s")` — param `int` — stays silent). `Optional` is treated
+/// as non-faithful (the substrate's `param_accepts_arg_class` always admits it,
+/// so it never fires either way — declining explicitly keeps this honest).
+fn is_faithful_param(t: &RetainedParamType) -> bool {
+    match t {
+        RetainedParamType::ClassInstance(_) => true,
+        RetainedParamType::Union(members) => members.iter().all(is_faithful_param),
+        RetainedParamType::Alias(_)
+        | RetainedParamType::Interface(_)
+        | RetainedParamType::Optional(_)
+        | RetainedParamType::Other(_) => false,
+    }
+}
+
+/// The written-form label of a parameter type (reference
+/// `param.type.to_s.delete_prefix("::")`), used verbatim in the diagnostic
+/// message (presentation only; the harness keys on `(rule, line, column)`).
+fn render_retained_param(t: &RetainedParamType) -> String {
+    fn strip(n: &str) -> String {
+        n.strip_prefix("::").unwrap_or(n).to_string()
+    }
+    match t {
+        RetainedParamType::ClassInstance(n)
+        | RetainedParamType::Alias(n)
+        | RetainedParamType::Interface(n) => strip(n),
+        RetainedParamType::Union(members) => members
+            .iter()
+            .map(render_retained_param)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        RetainedParamType::Optional(inner) => format!("{}?", render_retained_param(inner)),
+        RetainedParamType::Other(s) => strip(s),
+    }
+}
+
+/// The per-overload written-form label for a multi-overload mismatch: each
+/// overload's param at the index rendered, uniq'd in first-seen order, `" | "`
+/// joined (reference `overload_param_expected_label`, `check_rules.rb:2213`).
+fn expected_label_multi(params: &[&RetainedParamType]) -> String {
+    let mut seen: Vec<String> = Vec::new();
+    for p in params {
+        let label = render_retained_param(p);
+        if !seen.contains(&label) {
+            seen.push(label);
+        }
+    }
+    seen.join(" | ")
+}
+
+/// Whether the argument type is a PURE `nil` (reference `nil_member?` applied to
+/// the whole arg type: a `Constant nil` / `Nominal NilClass`, NOT a `T | nil`
+/// union). A union-with-nil takes the non-nil translated-acceptance channel.
+fn arg_is_pure_nil(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    arg_ty: rigor_types::TypeId,
+) -> bool {
+    concrete_class_name(interner, index, source, arg_ty).as_deref() == Some("NilClass")
+}
+
+fn arg_is_dynamic_or_top(interner: &Interner, arg_ty: rigor_types::TypeId) -> bool {
+    matches!(interner.get(arg_ty), Type::Dynamic(_) | Type::Top)
+}
+
+/// The single concrete RBS-known class an argument types to for the MULTI-overload
+/// non-nil channel, or `None` (reference `single_concrete_arg_class?`,
+/// `check_rules.rb:2120`): a union arg (deferred), a class/module object
+/// (`Singleton`, special acceptance surface), or a non-RBS project class (its
+/// duck-typed conversion protocol is invisible) all decline.
+fn single_concrete_arg_class(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    arg_ty: rigor_types::TypeId,
+) -> Option<String> {
+    if matches!(interner.get(arg_ty), Type::Union(_) | Type::Singleton(_)) {
+        return None;
+    }
+    let class_name = concrete_class_name(interner, index, source, arg_ty)?;
+    if !index.knows_class(&class_name) {
+        return None;
+    }
+    Some(class_name)
+}
+
+/// Whether a FAITHFUL parameter provably rejects the (non-nil) argument type —
+/// the single-overload non-nil channel's class-level acceptance. Fires iff SOME
+/// member of the argument (its union arms, or the arg itself) types to a concrete
+/// class the param provably rejects (`class_ordering == Disjoint`, surfaced by
+/// `!param_accepts_arg_class` on a faithful param). A `Dynamic`/`Top` member — or
+/// a member with no concrete class — is a gradual `maybe`, never a proven
+/// rejection, so `d | 42` still fires (on `42`) while `d | e` (both dynamic)
+/// stays silent, matching the reference's union acceptance (`.no?` iff ANY member
+/// is definitely rejected).
+fn faithful_param_rejects_arg(
+    interner: &Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    arg_ty: rigor_types::TypeId,
+    param: &RetainedParamType,
+) -> bool {
+    let members: Vec<rigor_types::TypeId> = match interner.get(arg_ty) {
+        Type::Union(ms) => ms.clone(),
+        _ => vec![arg_ty],
+    };
+    members.iter().any(|&m| {
+        if arg_is_dynamic_or_top(interner, m) {
+            return false;
+        }
+        match concrete_class_name(interner, index, source, m) {
+            Some(class_name) => !index.param_accepts_arg_class(param, &class_name),
+            None => false,
+        }
+    })
+}
+
+/// One resolved argument-type mismatch: the argument node to anchor on, the
+/// rendered `expected` label, and the argument's `TypeId` for the `got` render.
+struct AtmMismatch {
+    arg: NodeId,
+    expected: String,
+    actual: rigor_types::TypeId,
+}
+
+/// The single-overload channel (reference `first_argument_mismatch` /
+/// `single_argument_mismatch`): per positional arg with a matching param, a pure
+/// `nil` arg the param rejects (alias-aware `param_admits_nil`) OR a non-nil arg
+/// a FAITHFUL param provably rejects.
+#[allow(clippy::too_many_arguments)]
+fn single_overload_mismatch(
+    ov: &OverloadSignature,
+    args: &[NodeId],
+    ast: &LoweredAst,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Option<AtmMismatch> {
+    if !argument_check_eligible(ov) {
+        return None;
+    }
+    let params: Vec<&RetainedParamType> = ov
+        .required_positionals
+        .iter()
+        .chain(ov.optional_positionals.iter())
+        .collect();
+
+    for (i, &arg) in args.iter().enumerate() {
+        let Some(param) = params.get(i) else {
+            continue; // arity mismatch is the wrong-arity rule's concern.
+        };
+        let arg_ty = typer.type_of(ast, arg, env, interner);
+
+        if arg_is_pure_nil(interner, index, source, arg_ty) {
+            if index.param_admits_nil(param) {
+                continue;
+            }
+            return Some(AtmMismatch {
+                arg,
+                expected: render_retained_param(param),
+                actual: arg_ty,
+            });
+        }
+
+        if arg_is_dynamic_or_top(interner, arg_ty) {
+            continue;
+        }
+        if !is_faithful_param(param) {
+            continue;
+        }
+        if faithful_param_rejects_arg(interner, index, source, arg_ty, param) {
+            return Some(AtmMismatch {
+                arg,
+                expected: render_retained_param(param),
+                actual: arg_ty,
+            });
+        }
+    }
+    None
+}
+
+/// The multi-overload channel (reference `multi_overload_argument_mismatch`,
+/// `check_rules.rb:2003`): ALL overloads eligible; per positional index with a
+/// param on EVERY overload, a pure `nil` arg NO overload admits (nil channel), or
+/// — on a non-coerce method — a single-concrete-class arg NO overload accepts
+/// (non-nil channel).
+#[allow(clippy::too_many_arguments)]
+fn multi_overload_mismatch(
+    overloads: &[OverloadSignature],
+    method: &str,
+    args: &[NodeId],
+    ast: &LoweredAst,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Option<AtmMismatch> {
+    if !overloads.iter().all(argument_check_eligible) {
+        return None;
+    }
+    let coerce = is_coerce_dispatch_method(method);
+
+    for (i, &arg) in args.iter().enumerate() {
+        // The param at index `i` on EVERY overload; `None` if any overload lacks
+        // one (arity divergence — the wrong-arity rule's concern).
+        let params: Option<Vec<&RetainedParamType>> = overloads
+            .iter()
+            .map(|ov| {
+                ov.required_positionals
+                    .iter()
+                    .chain(ov.optional_positionals.iter())
+                    .nth(i)
+            })
+            .collect();
+        let Some(params) = params else {
+            continue;
+        };
+
+        let arg_ty = typer.type_of(ast, arg, env, interner);
+
+        if arg_is_pure_nil(interner, index, source, arg_ty) {
+            if params.iter().any(|p| index.param_admits_nil(p)) {
+                continue;
+            }
+            return Some(AtmMismatch {
+                arg,
+                expected: expected_label_multi(&params),
+                actual: arg_ty,
+            });
+        } else if !coerce {
+            let Some(class_name) = single_concrete_arg_class(interner, index, source, arg_ty)
+            else {
+                continue;
+            };
+            if params
+                .iter()
+                .any(|p| index.param_accepts_arg_class(p, &class_name))
+            {
+                continue;
+            }
+            return Some(AtmMismatch {
+                arg,
+                expected: expected_label_multi(&params),
+                actual: arg_ty,
+            });
+        }
+    }
+    None
+}
+
+/// `call.argument-type-mismatch` for a single receiver-bearing call. Reference
+/// `argument_type_diagnostic` (`check_rules.rb:1943`), ported at the class-name
+/// level. Gates (zero-FP envelope):
+/// - skip the universal-equality methods and any non-plain-positional call;
+/// - the receiver must resolve to a concrete class the RBS index models (an
+///   instance) OR a `Singleton` class object, and the method must carry retained
+///   RBS overloads (so undefined-method / non-RBS methods are the other rules'
+///   concern — this never double-fires with undefined-method);
+/// - unlike undefined-method / wrong-arity, this does NOT skip when the project
+///   also `def`s the method: the RBS sig is the authoritative parameter contract
+///   (reference `check_rules.rb:1955`).
+#[allow(clippy::too_many_arguments)]
+fn check_argument_type_mismatch(
+    ast: &LoweredAst,
+    receiver: rigor_parse::NodeId,
+    method: &str,
+    args: &[rigor_parse::NodeId],
+    args_all_plain: bool,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+) -> Option<Diagnostic> {
+    if is_universal_equality_method(method) {
+        return None;
+    }
+    if !args_all_plain {
+        return None;
+    }
+    if args.is_empty() {
+        return None;
+    }
+
+    let source = typer.source();
+    let recv_ty = typer.type_of(ast, receiver, env, interner);
+
+    // Resolve `(class_name, overloads)` for INSTANCE or SINGLETON (class-method)
+    // dispatch. The overloads are cloned so no `index` borrow lingers across the
+    // per-arg `param_admits_nil` / `param_accepts_arg_class` consultations.
+    let (class_name, overloads): (String, Vec<OverloadSignature>) =
+        if let Type::Singleton(class) = interner.get(recv_ty) {
+            let class = *class;
+            let name = source.class_name_for_id(class)?;
+            let ov = index.singleton_method_overloads(name, method)?;
+            (name.to_string(), ov.to_vec())
+        } else {
+            let name = concrete_class_name(interner, index, source, recv_ty)?;
+            if !index.knows_class(&name) {
+                return None;
+            }
+            let ov = index.method_overloads(&name, method)?;
+            (name, ov.to_vec())
+        };
+    if overloads.is_empty() {
+        return None;
+    }
+
+    let mismatch = if overloads.len() == 1 {
+        single_overload_mismatch(&overloads[0], args, ast, env, typer, interner, index, source)
+    } else {
+        multi_overload_mismatch(&overloads, method, args, ast, env, typer, interner, index, source)
+    }?;
+
+    let (start, end) = ast.get(mismatch.arg).span();
+    let actual = render_receiver(interner, index, source, mismatch.actual);
+    let message = format!(
+        "argument type mismatch at `{method}' on {class_name}: expected {}, got {actual}",
+        mismatch.expected
+    );
+    let severity = catalog(CALL_ARGUMENT_TYPE_MISMATCH)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
+
+    Some(Diagnostic {
+        rule_id: CALL_ARGUMENT_TYPE_MISMATCH,
+        start_offset: start,
+        end_offset: end,
+        message,
+        severity,
+        source_family: "builtin",
+        receiver_type: Some(class_name),
         method_name: Some(method.to_string()),
     })
 }
@@ -2593,6 +3020,7 @@ const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppr
 const IMPLEMENTED_RULES: &[&str] = &[
     CALL_UNDEFINED_METHOD,
     CALL_WRONG_ARITY,
+    CALL_ARGUMENT_TYPE_MISMATCH,
     CALL_POSSIBLE_NIL_RECEIVER,
     FLOW_DEAD_ASSIGNMENT,
     DEF_OVERRIDE_VISIBILITY_REDUCED,
@@ -5219,5 +5647,145 @@ mod tests {
         let d = ivar_diags(src);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].message, "instance variable `@n' on Foo was previously assigned Integer; this write assigns String");
+    }
+
+    // --- call.argument-type-mismatch (ADR-64) --------------------------------
+    //
+    // The probe matrix, run against the LIVE reference oracle and pinned here.
+    // Every FIRE row asserts the (rule, anchor-span) parity the harness keys on;
+    // every SILENT row is a zero-FP guard the reference also stays silent on.
+
+    fn atm_diags(src: &[u8]) -> Vec<Diagnostic> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_ARGUMENT_TYPE_MISMATCH)
+            .collect()
+    }
+
+    #[test]
+    fn atm_nil_channel_single_overload_fires() {
+        // `"a" + nil` — String#+ param `string` rejects nil (alias-aware nil
+        // channel). Anchors on the `nil` argument node.
+        let src = b"\"a\" + nil\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].severity, Severity::Error);
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("String"));
+        assert_eq!(d[0].method_name.as_deref(), Some("+"));
+    }
+
+    #[test]
+    fn atm_nil_channel_multi_overload_fires() {
+        // `5 + nil` — Integer#+ has several numeric overloads, none admits nil.
+        let src = b"5 + nil\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("Integer"));
+    }
+
+    #[test]
+    fn atm_nonnil_channel_multi_overload_fires_on_wrong_class() {
+        // `[1, 2, 3].fetch("x")` — Array#fetch index param `int`; a concrete
+        // String argument is rejected by every overload (non-coerce method).
+        let src = b"[1, 2, 3].fetch(\"x\")\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"\"x\"");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("Array"));
+    }
+
+    #[test]
+    fn atm_nil_channel_int_alias_param_fires() {
+        // `"abc".center(nil)` — the width param is the `int` alias; the nil
+        // channel sees through the alias (NilClass has no `to_int`).
+        let src = b"\"abc\".center(nil)\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"nil");
+    }
+
+    #[test]
+    fn atm_fires_alongside_wrong_arity_at_one_site() {
+        // `"abc".center(nil, "x", "y")` — the reference emits BOTH wrong-arity
+        // (too many args) AND argument-type-mismatch (first arg nil vs `int`).
+        let src = b"\"abc\".center(nil, \"x\", \"y\")\n";
+        let all = run(src);
+        assert!(
+            all.iter().any(|d| d.rule_id == CALL_WRONG_ARITY),
+            "expected wrong-arity: {all:?}"
+        );
+        let atm: Vec<_> = all
+            .iter()
+            .filter(|d| d.rule_id == CALL_ARGUMENT_TYPE_MISMATCH)
+            .collect();
+        assert_eq!(atm.len(), 1, "expected one ATM: {all:?}");
+        assert_eq!(&src[atm[0].start_offset..atm[0].end_offset], b"nil");
+    }
+
+    #[test]
+    fn atm_hash_literal_miss_folds_to_nil_and_fires() {
+        // `h["z"]` on a Hash literal folds to `nil`, so it takes the nil channel.
+        let src = b"h = { \"a\" => 1 }\n\"p\".center(h[\"z\"])\n";
+        let d = atm_diags(src);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].receiver_type.as_deref(), Some("String"));
+    }
+
+    // --- SILENT rows (zero-FP guards) ----------------------------------------
+
+    #[test]
+    fn atm_silent_universal_equality() {
+        // `== != eql? equal? <=>` accept any argument by contract.
+        assert!(atm_diags(b"x = \"a\"\nx == nil\n").is_empty());
+        assert!(atm_diags(b"x = \"a\"\nx.eql?(nil)\n").is_empty());
+        assert!(atm_diags(b"x = \"a\"\nx <=> nil\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_coerce_dispatch_operator() {
+        // `5 + "s"` — a coerce-dispatch operator on a multi-overload method;
+        // any user type may define `coerce`, so the non-nil channel excludes it.
+        assert!(atm_diags(b"5 + \"s\"\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_faithful_gate_on_interface_alias_param() {
+        // `"abc".center("s")` — the `int` alias param degrades to gradual, so a
+        // concrete non-nil argument the alias would reject stays silent (the
+        // single-overload non-nil channel requires a FAITHFUL param).
+        assert!(atm_diags(b"\"abc\".center(\"s\")\n").is_empty());
+        // `"a" + 5` — String#+ param `string` (interface-alias) ⇒ silent.
+        assert!(atm_diags(b"\"a\" + 5\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_non_plain_positional_args() {
+        // A splat / bare-keyword argument makes the call non-plain-positional;
+        // the whole call is skipped (any non-plain arg, not just the first).
+        assert!(atm_diags(b"def f(a)\n  \"abc\".center(*a)\nend\n").is_empty());
+        assert!(atm_diags(b"def f(a)\n  \"abc\".center(nil, *a)\nend\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_dynamic_argument() {
+        // A method-parameter argument types Dynamic; the multi-overload non-nil
+        // channel requires a single concrete RBS-known class ⇒ silent.
+        assert!(atm_diags(b"def f(x)\n  [1, 2, 3].fetch(x)\nend\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_project_class_argument() {
+        // A non-RBS project-class argument: its duck-typed conversion protocol is
+        // invisible, so the non-nil channel cannot refute acceptance ⇒ silent.
+        assert!(atm_diags(b"class Foo\nend\n[1, 2, 3].fetch(Foo.new)\n").is_empty());
+    }
+
+    #[test]
+    fn atm_silent_correct_arguments() {
+        // Well-typed arguments never fire.
+        assert!(atm_diags(b"[1, 2, 3].fetch(0)\n").is_empty());
+        assert!(atm_diags(b"\"abc\".center(5)\n").is_empty());
     }
 }
