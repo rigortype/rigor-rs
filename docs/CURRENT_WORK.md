@@ -14,6 +14,16 @@ source-class naming → Data.define/Struct class shells; sound-superset parity m
 "Generative-tool parity"**). Then PIVOTED to productization (MCP `sig_gen` tool). Read `AGENTS.md` "Working
 discipline" before continuing.
 
+**▶▶ LANDED (2026-07-17, branch `p2-optional-local-nil`, MERGED `6592ead`) — P2: `Regexp.last_match` nilable
+source (gitlab lib possible-nil 169 → 162, 0 FP). The broad P2 hypothesis was REFUTED by full-pool
+classification:** the reference fires widely because its non-nil arm check is permissive on `Dynamic|nil`,
+which rigor-rs's substrate deliberately cannot mint (the FP-safety mechanism); `Array#find` (unnameable Elem
+arm), `MatchData#[]`/`String#match` (overload disagreement), `ENV[]` (untyped receiver) all decline. Only the
+`Regexp.last_match` singleton cluster (7 sites) was closeable — a syntactic arm in `nilable_source_class`.
+Spec: [p2 spec](notes/20260717-p2-optional-local-nil-spec.md). **⇒ The possible-nil frontier is now
+CONFIRMED closed at the concrete-arm level on BOTH corpora; the residual 162 needs `Dynamic|nil` firing or
+Tier B/C interprocedural inference — the deep substrate, full stop.** harness 65 fixtures; 735 tests.
+
 **▶▶ LANDED (2026-07-17, branch `c3a-nominal-return-tail`, MERGED `b6d13e9`) — C3a: `self.class.name`/`to_s`
 String tail + core-Singleton `name` (gitlab lib UM 200 → 179, 0 FP; matched 991 → 1003).** Probe-first slice:
 the oracle proved the reference has NO generic `T?`→T unwrap (entangled with value tracking) — declined; and
