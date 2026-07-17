@@ -136,6 +136,14 @@ pub struct OverloadSignature {
     pub required_positionals: Vec<RetainedParamType>,
     /// The optional positional parameters (`?T`), in order, one-level-tagged.
     pub optional_positionals: Vec<RetainedParamType>,
+    /// The declared NAME of each required positional (`str` in `(String str)`),
+    /// parallel to `required_positionals`; `None` for an unnamed param. Consumed
+    /// by `call.argument-type-mismatch`'s single-overload message (the
+    /// reference's ``parameter `str' of `` prefix, `check_rules.rb:2324`).
+    pub required_positional_names: Vec<Option<&'static str>>,
+    /// The declared name of each optional positional, parallel to
+    /// `optional_positionals`; `None` for an unnamed param.
+    pub optional_positional_names: Vec<Option<&'static str>>,
     /// `true` iff the overload declares a rest positional (`*T`).
     pub has_rest_positionals: bool,
     /// `true` iff the overload declares any required keyword.
@@ -185,6 +193,25 @@ struct ClassEntry {
     /// `methods`). Read only via [`CoreData::method_overloads`]; no rule wires
     /// it yet.
     method_overloads: HashMap<&'static str, Vec<OverloadSignature>>,
+    /// `singleton method name -> per-overload positional shapes`, the ATM
+    /// substrate for CLASS-method dispatch (`CGI.parse(...)`, `Base64.decode64`).
+    /// The singleton twin of `method_overloads`: populated for `def self.x`
+    /// (`Singleton`) AND `def self?.x` (`SingletonInstance`, which also feeds the
+    /// instance map). First write wins on reopen. Read only via
+    /// [`CoreData::singleton_method_overloads`]; ADDITIVE and output-inert for
+    /// every existing rule (the singleton arity/return path is untouched).
+    singleton_method_overloads: HashMap<&'static str, Vec<OverloadSignature>>,
+    /// Overloads contributed by an OVERLOADING method reopen (`def +:
+    /// (BigDecimal) -> BigDecimal | ...` — RBS's trailing `...` appends the
+    /// previously-defined overloads). Kept ASIDE from `method_overloads` because
+    /// the first-write-wins reopen merge would otherwise drop them; the global
+    /// merge PREPENDS these onto the base definition's overload list (RBS
+    /// semantics: the reopen's own overloads come first), which is how the
+    /// reference renders `5 + nil` as `expected BigDecimal | Integer | Float |
+    /// Rational | Complex`. Instance side.
+    overloading_method_overloads: Vec<(&'static str, Vec<OverloadSignature>)>,
+    /// The singleton twin of `overloading_method_overloads`.
+    overloading_singleton_overloads: Vec<(&'static str, Vec<OverloadSignature>)>,
     /// `method name -> block-overload return class name`, populated ONLY for
     /// methods that declare a block-bearing overload whose return is a
     /// resolvable concrete class (a `ClassInstanceType` like `Hash#filter { }
@@ -872,6 +899,37 @@ impl CoreData {
         self.lookup_overloads_on_chain(&chain, method, 0)
     }
 
+    /// The per-overload positional-parameter shapes of the CLASS METHOD
+    /// `class_name.method` (`CGI.parse`, `Base64.decode64`), resolved down the
+    /// singleton superclass chain — the class-method twin of
+    /// [`Self::method_overloads`]. `None` when no ancestor on the singleton chain
+    /// records overloads for `method`. Consumed by `call.argument-type-mismatch`
+    /// on a `Type::Singleton` receiver.
+    pub fn singleton_method_overloads(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<&[OverloadSignature]> {
+        // The singleton class inherits down the SUPERCLASS chain (not the
+        // include/ancestor chain). Gather it, then take the first ancestor whose
+        // own singleton-overload table records `method`.
+        let mut cur = Some(class_name);
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(name) = cur {
+            let Some((&key, entry)) = self.classes.get_key_value(name) else {
+                break;
+            };
+            if !seen.insert(key) {
+                break; // cycle guard
+            }
+            if let Some(ov) = entry.singleton_method_overloads.get(method) {
+                return Some(ov.as_slice());
+            }
+            cur = entry.superclass;
+        }
+        None
+    }
+
     /// The right-hand side of a `type` alias, one level deep, or `None` if the
     /// alias is unknown. The RHS is RAW: an alias reference INSIDE it stays an
     /// [`RetainedParamType::Alias`] leaf (not expanded). Bounded expansion with a
@@ -1360,6 +1418,9 @@ impl CoreData {
                     // conservative because the five base classes' singleton
                     // surface is incomplete here ⇒ always silent.
                     singleton_methods: HashMap::new(),
+                    singleton_method_overloads: HashMap::new(),
+                    overloading_method_overloads: Vec::new(),
+                    overloading_singleton_overloads: Vec::new(),
                     singleton_aliases: HashMap::new(),
                     superclass,
                     // The stub does not distinguish modules from classes; the
@@ -1787,12 +1848,21 @@ impl Builder {
                         }
                         // ATM substrate (Slice 1): retain the per-overload,
                         // per-parameter shapes the merged arity path discards.
-                        // Only for the INSTANCE surface (the argument check is
-                        // instance-dispatch); first write wins on reopen.
-                        entry
-                            .method_overloads
-                            .entry(mname)
-                            .or_insert_with(|| method_overloads(&md, code));
+                        // First write wins on reopen — EXCEPT an OVERLOADING
+                        // reopen (`def +: (BigDecimal) -> BigDecimal | ...`,
+                        // RBS's trailing `...`), whose own overloads are kept
+                        // aside and PREPENDED onto the base definition at the
+                        // global merge (RBS overloading semantics).
+                        if md.overloading() {
+                            entry
+                                .overloading_method_overloads
+                                .push((mname, method_overloads(&md, code)));
+                        } else {
+                            entry
+                                .method_overloads
+                                .entry(mname)
+                                .or_insert_with(|| method_overloads(&md, code));
+                        }
                     }
                     if matches!(
                         kind,
@@ -1800,6 +1870,20 @@ impl Builder {
                             | MethodDefinitionKind::SingletonInstance
                     ) {
                         entry.singleton_methods.entry(mname).or_insert((ret, arity));
+                        // ATM substrate: retain the class-method per-overload
+                        // shapes so `call.argument-type-mismatch` can check a
+                        // `CGI.parse(...)` class-method call site. Overloading
+                        // reopens go aside, mirroring the instance path.
+                        if md.overloading() {
+                            entry
+                                .overloading_singleton_overloads
+                                .push((mname, method_overloads(&md, code)));
+                        } else {
+                            entry
+                                .singleton_method_overloads
+                                .entry(mname)
+                                .or_insert_with(|| method_overloads(&md, code));
+                        }
                     }
                 }
                 Node::Include(inc) => {
@@ -1891,11 +1975,47 @@ impl Builder {
         for (k, v) in entry.method_overloads {
             slot.method_overloads.entry(k).or_insert(v);
         }
+        // Overloading reopens (`def m: ... | ...`): PREPEND the reopen's own
+        // overloads onto the base definition's list (RBS semantics — the
+        // reference renders `Integer#+` as `BigDecimal | Integer | Float |
+        // Rational | Complex`, bigdecimal's overload first). The vendored load
+        // order is core-then-stdlib, so the base is already in the slot; a
+        // base-less overloading reopen (no prior definition anywhere) is
+        // inserted as-is (degraded, same as the old first-write behavior).
+        for (k, v) in entry.overloading_method_overloads {
+            match slot.method_overloads.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let base = std::mem::take(e.get_mut());
+                    let mut merged = v;
+                    merged.extend(base);
+                    *e.get_mut() = merged;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
+        }
         for (k, v) in entry.block_returns {
             slot.block_returns.entry(k).or_insert(v);
         }
         for (k, v) in entry.singleton_methods {
             slot.singleton_methods.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_method_overloads {
+            slot.singleton_method_overloads.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.overloading_singleton_overloads {
+            match slot.singleton_method_overloads.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let base = std::mem::take(e.get_mut());
+                    let mut merged = v;
+                    merged.extend(base);
+                    *e.get_mut() = merged;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
         }
         for (new_name, old_name) in entry.aliases {
             slot.aliases.entry(new_name).or_insert(old_name);
@@ -2170,9 +2290,21 @@ fn method_overloads(
             .iter()
             .map(|p| param_node_type(&p, code))
             .collect();
+        let required_positional_names = ft
+            .required_positionals()
+            .iter()
+            .map(|p| param_node_name(&p))
+            .collect();
+        let optional_positional_names = ft
+            .optional_positionals()
+            .iter()
+            .map(|p| param_node_name(&p))
+            .collect();
         out.push(OverloadSignature {
             required_positionals,
             optional_positionals,
+            required_positional_names,
+            optional_positional_names,
             has_rest_positionals: ft.rest_positionals().is_some(),
             has_required_keywords: ft.required_keywords().iter().next().is_some(),
             has_optional_keywords: ft.optional_keywords().iter().next().is_some(),
@@ -2191,6 +2323,16 @@ fn param_node_type(param: &Node, code: &str) -> RetainedParamType {
         // Defensive: a positional that isn't a FunctionParam node (shouldn't
         // occur) is retained verbatim as an `Other` leaf.
         other => RetainedParamType::Other(node_written_form(other, code)),
+    }
+}
+
+/// The declared name of a positional parameter (`str` in `(String str)`), or
+/// `None` when the RBS omits it. Feeds the reference's ``parameter `str' of ``
+/// message prefix on a single-overload argument-type mismatch.
+fn param_node_name(param: &Node) -> Option<&'static str> {
+    match param {
+        Node::FunctionParam(fp) => fp.name().map(|s| intern(s.as_str())),
+        _ => None,
     }
 }
 
@@ -2458,17 +2600,21 @@ mod embedded_tests {
     // -- ATM shared-substrate (Slice 1) retention tests ------------------------
 
     /// Per-overload retention on a real multi-overload core method: the vendored
-    /// `Integer#+` has FOUR overloads (`Integer`/`Float`/`Rational`/`Complex`),
-    /// each a single required positional whose type is the concrete numeric
-    /// class. The merged arity path (unchanged) still sees one `(1, Some(1))`
-    /// envelope; the substrate keeps all four distinctly.
+    /// core `Integer#+` has FOUR overloads (`Integer`/`Float`/`Rational`/
+    /// `Complex`), and the stdlib `bigdecimal` reopen (`def +: (BigDecimal) ->
+    /// BigDecimal | ...` — an OVERLOADING def whose trailing `...` appends the
+    /// existing overloads) PREPENDS a fifth. Each has a single required
+    /// positional whose type is the concrete numeric class; the reference's
+    /// multi-overload label renders them in exactly this order (`5 + nil` ⇒
+    /// `expected BigDecimal | Integer | Float | Rational | Complex`). The merged
+    /// arity path (unchanged) still sees one `(1, Some(1))` envelope.
     #[test]
     fn atm_per_overload_retention_integer_plus() {
         let idx = CoreData::load();
         let ov = idx
             .method_overloads("Integer", "+")
             .expect("Integer#+ has retained overloads");
-        assert_eq!(ov.len(), 4, "Integer#+ has four numeric overloads");
+        assert_eq!(ov.len(), 5, "Integer#+ has five overloads (bigdecimal reopen + core four)");
         let names: Vec<&RetainedParamType> = ov
             .iter()
             .map(|o| {
@@ -2485,15 +2631,21 @@ mod embedded_tests {
         assert_eq!(
             names,
             vec![
+                &RetainedParamType::ClassInstance("BigDecimal"),
                 &RetainedParamType::ClassInstance("Integer"),
                 &RetainedParamType::ClassInstance("Float"),
                 &RetainedParamType::ClassInstance("Rational"),
                 &RetainedParamType::ClassInstance("Complex"),
             ],
-            "each overload's operand is its concrete numeric class"
+            "the overloading reopen's operand comes first, then the core four"
         );
         // The merged arity envelope is untouched (additive-retention contract).
         assert_eq!(idx.method_arity("Integer", "+"), Some((1, Some(1))));
+        // Param-NAME retention (message prefix substrate): `String#+` declares
+        // `(string other_string)`, so the name rides alongside the type.
+        let plus = idx.method_overloads("String", "+").expect("String#+ retained");
+        assert_eq!(plus.len(), 1);
+        assert_eq!(plus[0].required_positional_names, vec![Some("other_string")]);
     }
 
     /// Type-alias retention against the ACTUAL vendored RBS: `builtin.rbs`
@@ -2573,6 +2725,37 @@ mod embedded_tests {
         assert!(idx.method_overloads("String", "definitely_absent_zzz").is_none());
         // Unknown class ⇒ None.
         assert!(idx.method_overloads("NoSuchClassZzz", "foo").is_none());
+    }
+
+    /// Class-method (singleton) overload retention — the ATM substrate for
+    /// `CGI.parse(...)` / `Base64.decode64(...)`. `CGI.parse` is a plain
+    /// `def self.parse: (String query) -> ...`, so it lives ONLY in the singleton
+    /// overload table (the instance `method_overloads` does not carry it).
+    #[test]
+    fn atm_singleton_method_overloads_retained() {
+        let idx = CoreData::load();
+        // Only assert when the stdlib RBS is actually loaded (a stub build has no
+        // CGI); this keeps the test meaningful without failing a Ruby-free CI.
+        if idx.knows_class("CGI") {
+            let parse = idx
+                .singleton_method_overloads("CGI", "parse")
+                .expect("CGI.parse singleton overloads retained");
+            assert!(
+                parse
+                    .iter()
+                    .any(|o| o.required_positionals.len() == 1
+                        && matches!(o.required_positionals[0], RetainedParamType::ClassInstance("String"))),
+                "CGI.parse takes a single String positional: {parse:?}"
+            );
+            // A plain `def self.parse` is NOT an instance method.
+            assert!(
+                idx.method_overloads("CGI", "parse").is_none(),
+                "CGI#parse is not an instance method"
+            );
+        }
+        // Unknown singleton method / class ⇒ None.
+        assert!(idx.singleton_method_overloads("Array", "definitely_absent_zzz").is_none());
+        assert!(idx.singleton_method_overloads("NoSuchClassZzz", "foo").is_none());
     }
 
     /// Alias / interface cycle guard: a self-referential `type` alias

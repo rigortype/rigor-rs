@@ -31,7 +31,7 @@ use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 pub mod plugins;
 mod rbs;
 
-pub use rbs::{ClassOrdering, RbsSource};
+pub use rbs::{ClassOrdering, OverloadSignature, RbsSource, RetainedParamType};
 
 /// The core classes this index registers, in a fixed order. The slice index of
 /// a name in this array IS its [`ClassId`] (see [`CoreIndex::class_id`]), so the
@@ -282,6 +282,44 @@ impl CoreIndex {
     /// gated plugin's reopened method has its arity checked (ADR-25).
     pub fn method_arity(&self, class: &str, method: &str) -> Option<(usize, Option<usize>)> {
         self.data.method_arity(class, method)
+    }
+
+    // --- ATM substrate (`call.argument-type-mismatch`, Slice 3) ---------------
+    //
+    // Thin delegates onto the per-overload argument-compatibility substrate
+    // (`rbs::CoreData`, Slices 1-2). The rules crate is the first (and only)
+    // consumer; see `check_argument_type_mismatch`.
+
+    /// Per-overload positional shapes of the instance method `class#method`
+    /// (per-overload, per-parameter), or `None` if unknown on the ancestor chain.
+    pub fn method_overloads(&self, class: &str, method: &str) -> Option<&[OverloadSignature]> {
+        self.data.method_overloads(class, method)
+    }
+
+    /// Per-overload positional shapes of the CLASS method `class.method`, or
+    /// `None` if unknown on the singleton superclass chain.
+    pub fn singleton_method_overloads(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<&[OverloadSignature]> {
+        self.data.singleton_method_overloads(class, method)
+    }
+
+    /// Whether an RBS parameter type provably admits a `nil` argument
+    /// (conservative-true; only a proven rejection returns `false`). The nil
+    /// channel of `call.argument-type-mismatch` fires when this is `false`.
+    pub fn param_admits_nil(&self, t: &RetainedParamType) -> bool {
+        self.data.param_admits_nil(t)
+    }
+
+    /// Whether an RBS parameter type provably accepts a (non-nil) argument of
+    /// class `arg_class` (conservative-true; only a proven rejection returns
+    /// `false`). Resolves `type` aliases / interfaces — used by the MULTI-overload
+    /// non-nil channel (the single-overload channel gates on a faithful param
+    /// first, so alias resolution never over-fires there).
+    pub fn param_accepts_arg_class(&self, t: &RetainedParamType, arg_class: &str) -> bool {
+        self.data.param_accepts_arg_class(t, arg_class)
     }
 
     // --- class registry (name <-> ClassId) -----------------------------------

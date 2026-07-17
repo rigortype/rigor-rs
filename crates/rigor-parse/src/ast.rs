@@ -285,6 +285,17 @@ pub enum Node {
         /// positional `raise({a: 1})` fires). `false` when there is no first
         /// argument or it is an ordinary expression.
         first_arg_nonplain: bool,
+        /// `true` iff EVERY positional argument is a plain expression (none is a
+        /// splat `*a`, a bare keyword-hash `a: 1`, a block-pass `&blk`, or
+        /// forwarded `...`) — a faithful mirror of the reference's
+        /// `plain_positional_call?` (`check_rules.rb:1072`), computed over ALL
+        /// arguments (unlike `first_arg_nonplain`, which is first-only) because
+        /// the lowered subtree does not preserve the splat/keyword distinction.
+        /// A block-pass (`&blk`, a `BlockArgumentNode` in Prism's `block()`)
+        /// counts as non-plain, but an ordinary trailing block (`foo(a) { }`)
+        /// does NOT (its args are still checkable). Consumed by
+        /// `call.argument-type-mismatch`, which bails when this is `false`.
+        args_all_plain: bool,
         /// Span of the whole call expression.
         span: Span,
     },
@@ -890,6 +901,28 @@ impl<'src> Builder<'src> {
                         || first.as_forwarding_arguments_node().is_some()
                 }))
                 .unwrap_or(false);
+            // Whether EVERY positional argument is a plain expression — the
+            // reference `plain_positional_call?` (all args `simple_positional?`):
+            // no splat / bare keyword-hash / block-pass / forwarded-args shape.
+            // A block-pass rides Prism's `block()` (a `BlockArgumentNode`), not
+            // `arguments()`, so it is checked separately; an ordinary trailing
+            // block (a `BlockNode`) leaves the args checkable and does NOT count.
+            let block_is_pass = call
+                .block()
+                .map(|b| b.as_block_argument_node().is_some())
+                .unwrap_or(false);
+            let args_all_plain = call
+                .arguments()
+                .map(|a| {
+                    a.arguments().iter().all(|x| {
+                        x.as_splat_node().is_none()
+                            && x.as_keyword_hash_node().is_none()
+                            && x.as_block_argument_node().is_none()
+                            && x.as_forwarding_arguments_node().is_none()
+                    })
+                })
+                .unwrap_or(true)
+                && !block_is_pass;
             // Lower an attached block so calls/reads inside it reach the walk.
             //   * a BlockNode (`{ … }` / `do…end`) — lower its body statements.
             //   * a `&expr` block-pass (BlockArgumentNode) — lower the passed
@@ -929,6 +962,7 @@ impl<'src> Builder<'src> {
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
                 safe_nav: call.is_safe_navigation(),
                 first_arg_nonplain,
+                args_all_plain,
                 span: span_of(&call.location()),
             });
         }

@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/66_argument_type_mismatch.rb",
+  "diagnostics": [
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 13,
+      "column": 9,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `other_string' of `+' on String: expected string, got nil"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 16,
+      "column": 5,
+      "severity": "error",
+      "message": "argument type mismatch at `+' on Integer: expected BigDecimal | Integer | Float | Rational | Complex, got nil"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 20,
+      "column": 17,
+      "severity": "error",
+      "message": "argument type mismatch at `fetch' on Array: expected int, got \"x\""
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 24,
+      "column": 25,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `str' of `urlsafe_decode64' on Base64: expected String, got 42"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 28,
+      "column": 25,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `str' of `urlsafe_decode64' on Base64: expected String, got nil"
+    }
+  ]
+}
