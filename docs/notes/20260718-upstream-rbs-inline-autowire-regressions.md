@@ -14,6 +14,15 @@
 > guarded in `UPSTREAM.md` + `harness/lib.rb` + `fp_audit.py`. The re-pin
 > item is UNBLOCKED (still waiting on the v0.3.0 tag per policy). Original
 > (superseded) analysis kept below for the record.
+>
+> **Confirmed 2026-07-19 with the corrected invocation** (full battery,
+> `7a69f142` vs `b70adcb5`): 67-fixture corpus **0/0**, gitlab-foss lib
+> (4,676 files) **0/0**, mastodon models **0/0**; rbs-inline lib (a genuinely
+> annotated corpus) **+13/−0** — the INTENDED ADR-93 annotation-gated feature,
+> future coverage surface for the ADR-93/94 track. Upstream re-scoped #194 to
+> the version-skew hazard (bug / area:plugins / ready-for-human), adopting the
+> three suggestions (resolved-path visibility → bundled-plugins preference →
+> doctor skew flag).
 
 Tracking check on the post-pin upstream wave (`73141341..b70adcb5`, the ADR-93
 "auto-wire the bundled rigor-rbs-inline plugin by default" arc). The M1
