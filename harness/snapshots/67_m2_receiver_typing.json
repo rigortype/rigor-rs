@@ -65,6 +65,27 @@
       "message": "undefined method `frobnicate' for Integer"
     },
     {
+      "rule": "call.undefined-method",
+      "line": 75,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Time"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 78,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `end_of_month' for Date"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 81,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for String"
+    },
+    {
       "rule": "call.unresolved-toplevel",
       "line": 29,
       "column": 11,

@@ -489,6 +489,7 @@ impl CoreData {
         self.classes.contains_key(class_name)
     }
 
+
     /// Whether `class_name` was declared at GENUINE top level (empty namespace)
     /// in at least one RBS declaration. Conservative companion to
     /// [`Self::knows_class`]: returns `true` ONLY for names that genuinely have a
@@ -811,6 +812,20 @@ impl CoreData {
     /// untyped — `name`/`to_s` are handled by the caller (C3a Part B) and
     /// anything else declines (FP-safe under-emit).
     pub fn singleton_method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        self.singleton_method_return_inner(class_name, method, 0)
+    }
+
+    fn singleton_method_return_inner(
+        &self,
+        class_name: &str,
+        method: &str,
+        depth: usize,
+    ) -> Option<&'static str> {
+        // Alias-chain bound (`alias self.pwd self.getwd` → one hop; a
+        // pathological alias cycle terminates here).
+        if depth >= 16 {
+            return None;
+        }
         let (&self_key, _) = self.classes.get_key_value(class_name)?;
         let mut seen: HashSet<&str> = HashSet::new();
         let mut cur = Some(class_name);
@@ -823,6 +838,11 @@ impl CoreData {
             }
             if let Some(&(ret, _, is_instance)) = entry.singleton_methods.get(method) {
                 return if is_instance { Some(self_key) } else { ret };
+            }
+            // A singleton ALIAS (`alias self.pwd self.getwd`) resolves through
+            // its target on the QUERIED class (instance-binding preserved).
+            if let Some(&target) = entry.singleton_aliases.get(method) {
+                return self.singleton_method_return_inner(class_name, target, depth + 1);
             }
             cur = entry.superclass;
         }

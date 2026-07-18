@@ -269,6 +269,7 @@ impl CoreIndex {
         self.data.singleton_method_return(class, method)
     }
 
+
     /// The RETURN class of a core method **called WITH a block**, over THIS
     /// index's data — the instance counterpart of [`method_return_with_block`],
     /// plugin-aware for the same reason as [`Self::method_return`].
@@ -940,5 +941,19 @@ mod singleton_return_tests {
         // Unknown method / class decline.
         assert_eq!(idx.singleton_method_return("Time", "no_such"), None);
         assert_eq!(idx.singleton_method_return("NoSuchClass", "now"), None);
+    }
+}
+
+#[cfg(test)]
+mod singleton_alias_return_tests {
+    use super::*;
+
+    /// A singleton ALIAS resolves through its target with instance-binding
+    /// preserved (`alias self.pwd self.getwd` → `Dir.pwd -> String`).
+    #[test]
+    fn singleton_alias_resolves_to_target_return() {
+        let idx = CoreIndex::new();
+        assert_eq!(idx.singleton_method_return("Dir", "pwd"), Some("String"));
+        assert_eq!(idx.singleton_method_return("Dir", "getwd"), Some("String"));
     }
 }

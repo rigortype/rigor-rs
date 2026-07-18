@@ -63,3 +63,32 @@ def range_bound
   # A Range argument declines (the Range overload returns the element type).
   rand(1..5).frobnicate
 end
+
+# --- 4. singleton RBS returns + declaration-driven instance witnessing ------
+# `module_function`-style class methods with a unanimous declared return type
+# their instance (`Time.now -> Time`, `Date.today -> Date`, the late-bound
+# `-> instance`), and an RBS-known TOPLEVEL class's instance witnesses like a
+# core class. A singleton alias resolves through its target
+# (`alias self.pwd self.getwd` -> String).
+
+t = Time.now
+t.frobnicate
+
+d = Date.today
+d.end_of_month
+
+w = Dir.pwd
+w.frobnicate
+
+# Divergent-overload singleton returns decline by construction
+# (`Regexp.last_match`: `MatchData?` vs `String?`) - handled by the P2
+# nil-source arm instead, so no UM here on the direct chain.
+m = Regexp.last_match(1).frobnicate
+
+# The reference's constant-constructor lifts stay silent: an all-pinned
+# `Set.new` / `Date.new(2020)` lifts to a pinned value there, so rigor-rs
+# declines the mint (Dynamic).
+s = Set.new
+s.frobnicate
+dd = Date.new(2020)
+dd.frobnicate

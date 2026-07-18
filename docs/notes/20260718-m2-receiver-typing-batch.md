@@ -2,9 +2,9 @@
 
 The four mechanically-safe slices from the
 [Phase 0 M2 characterization](20260718-phase0-m1-m2-findings.md), one branch.
-Measured outcome: **gitlab-foss lib UM gaps 179 → 155 (−24), mastodon models
-5 → 3, 0 FP everywhere**; fixture 67 pins all three witnessing mechanisms
-byte-for-byte (10 diagnostics, set-identical to the reference).
+Measured outcome (with slice 4b below): **gitlab-foss lib UM gaps 179 → 148
+(−31), mastodon models 5 → 3, 0 FP everywhere**; fixture 67 pins the
+witnessing mechanisms byte-for-byte (set-identical to the reference).
 
 | # | mechanism | where |
 |---|---|---|
@@ -21,25 +21,53 @@ unit-pinned. RBS `-> instance` resolves late-bound to the QUERIED class
 consumer and the sig-gen surface (`singleton_return_lookup`, byte-parity
 frozen) see exactly the old values.
 
-## Where slice 4's payoff is gated (the two open DESIGN DECISIONS)
+## Slice 4b — declaration-driven witnessing (the resolved design decision)
 
-Slice 4 types the value (chained typing works) but most of its UM-gap payoff
-(Date 5 / Time 2 / singleton-return chains inside the String-51 cluster) does
-NOT witness yet: `Time`/`Date` are outside the 9-class core-Nominal table, so
-the minted instance is a SOURCE-RANGE Nominal, and the UM rule's ADR-0033
-provenance gate witnesses those only for `is_project_sig_class`. Widening that
-gate re-opens the exact FP class it was built against (`Pathname.new.typo`) —
-NOT done unilaterally. Options: (a) a distinct "RBS-return-minted" provenance
-the rule witnesses, (b) widen to `knows_class` for non-`.new` mints, (c) leave
-typing-only. Similarly, GO-slice 5 (namespaced `ERB::Util` singletons) touches
-the ADR-0023 ConstantRead zero-FP gate. Both need an explicit design call.
+Direction set by the user: reproduce the REPRODUCIBLE side of the reference's
+inference — its RBS-declaration-driven logic — and do not chase its
+runtime-reflection tier (machine-dependent; the known FP source).
+
+Probing the reference's actual `.new` mechanism (`meta_new`,
+`method_dispatcher.rb`) dissolved the ADR-0033 "stdlib `.new` leniency" into
+two exact declaration-driven rules:
+
+1. **Default**: EVERY `Singleton[C].new` falls to `nominal_of(C)` — a typed,
+   witnessable instance (`Time.new`, `StringIO.new`, `IPAddr.new("…")` all
+   fire there — probed live).
+2. **Curated constant-constructor lifts** produce pinned VALUE carriers the
+   UM stays silent on: `CONSTANT_CONSTRUCTORS = {Pathname}` (exactly 1 arg,
+   pinned String; `:sym` RAISES in the lift and falls back to Nominal),
+   `date_new_lift` (`Date`/`DateTime`, 1..=8 args all pinned Int/Rational/Str,
+   validated by CONSTRUCTION), `set_new_lift` (`Set.new` / pinned-Tuple arg) —
+   plus Array/Hash/Range/Regexp lifts rigor-rs already models or safely
+   under-emits. rigor-rs mirrors the lifts as mint-DECLINES (Dynamic — the
+   observable equivalent; fixture 38's `Pathname.new("x").nope` stays silent).
+
+Ported: the UM witness gate for source-range Nominals widened from
+`is_project_sig_class` to `knows_toplevel_class ∪ project-sig` (the defect-2
+short-key guard is LOAD-BEARING: `knows_class`-wide witnessing FP'd on
+gitlab's `Clusters::Instance` model whose bare name collides with an RBS
+short key — caught by fp_audit, pinned in the gate comment). Singleton
+ALIASES resolve through their target (`alias self.pwd self.getwd` →
+`Dir.pwd -> String`).
+
+Documented residual divergences (~0 corpus sites, fp_audit-clean):
+UNDER-emits — Range-constant instances (no core-table id, the 9-class Nominal
+ceiling) and invalid pinned dates (`Date.new(2020, 99)` raises in the
+reference's lift and falls to Nominal there). One synthetic-edge OVER-fire
+risk — `Pathname.new(<expr the reference folds but rigor-rs doesn't>)`
+(`"x".to_s`): the reference lifts, rigor-rs mints; no real-corpus occurrence
+(gitlab/mastodon/conference all 0 FP).
+
+GO-slice 5 (namespaced `ERB::Util` singletons / ADR-0023 gate) remains the
+one open design call.
 
 ## Evidence
 
-- live + snapshot gates: 67 fixtures / **202 matched / 0 gaps / 0 FP**
-  (fixture 67 added; its `unresolved-toplevel` differs only in EMIT ORDER —
-  set-identical).
-- fp_audit 0 FP: gitlab lib (155 UM gaps, −24) + app/models, mastodon
+- live + snapshot gates: 67 fixtures / **205 matched / 0 gaps / 0 FP**
+  (fixture 67 added + extended; its `unresolved-toplevel` differs only in
+  EMIT ORDER — set-identical).
+- fp_audit 0 FP: gitlab lib (148 UM gaps, −31) + app/models, mastodon
   models (−2) + lib, conference-app.
 - workspace tests green (+4: index unanimous/divergent returns, infer
   Array/rand/singleton-return typing); clippy clean on touched crates.

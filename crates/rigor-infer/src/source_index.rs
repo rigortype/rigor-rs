@@ -517,6 +517,21 @@ impl SourceIndex {
         }
     }
 
+    /// Whether the project defines a constant named `name` ANYWHERE (toplevel,
+    /// nested, or as a discovered class/module) — the scope-INDEPENDENT
+    /// companion to [`Self::constant_shadowed`]. Used by `type_dot_new`'s
+    /// stdlib-mint decline: a project-defined name colliding with a loaded-RBS
+    /// short key (`Selector = Data.define(...)` vs an RBS `Selector`) keeps its
+    /// project mint regardless of the caller's lexical-scope attachment
+    /// (callers without `with_lexical_scopes` have an empty prefix, which would
+    /// make the lexical predicate miss a nested definition). Conservative
+    /// toward KEEPING the mint — the pre-existing behavior.
+    pub fn constant_defined_anywhere(&self, name: &str) -> bool {
+        self.toplevel_constants.contains(name)
+            || self.nested_constant_namespaces.contains_key(name)
+            || self.classes.contains_key(name)
+    }
+
     /// The DISCOVERED written superclass (last path component) of a source class,
     /// or `None` when the name is unknown OR is a source class/module WITHOUT a
     /// `class Foo < Bar` superclass (a bare `class Foo`/`module Foo` — the two are

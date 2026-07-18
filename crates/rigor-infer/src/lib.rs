@@ -624,12 +624,70 @@ impl<'i> Typer<'i> {
         &self,
         ast: &LoweredAst,
         receiver: NodeId,
+        args: &[NodeId],
+        env: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<TypeId> {
         let Node::ConstantRead { name, .. } = ast.get(receiver) else {
             return None;
         };
         if name.is_empty() || CLASS_RETURNING_NEW.contains(&name.as_str()) {
+            return None;
+        }
+
+        // Reference `meta_new` constant-constructor lifts (faithful decline
+        // set): for a curated set of immutable value classes, an all-pinned
+        // `.new` is lifted by the reference to a pinned VALUE carrier
+        // (`Constant<Pathname>` / `Constant<Date>`), on which its UM stays
+        // silent. rigor-rs does not model those carriers, so the observable-
+        // equivalent is to DECLINE the mint (Dynamic, silent):
+        //   - `CONSTANT_CONSTRUCTORS` = { Pathname }: exactly 1 arg, pinned
+        //     String (`Pathname.new("x")` — fixture 38's pinned leniency;
+        //     `Pathname.new(:sym)` RAISES in the lift, so the reference falls
+        //     to Nominal and fires — we mint);
+        //   - `date_new_lift` = { Date, DateTime }: 1..=8 args, every one
+        //     pinned Integer|String (the reference also accepts Rational and
+        //     validates by CONSTRUCTING the date; an invalid pinned date
+        //     raises there and falls to Nominal — a rare under-emit here).
+        // Everything else falls through to `Type::Combinator.nominal_of` in
+        // the reference — a witnessable instance for ANY singleton receiver —
+        // mirrored below by the core-id / source-registry mints.
+        let pinned_lift = match name.as_str() {
+            "Pathname" => {
+                args.len() == 1
+                    && matches!(
+                        self.pin_arg_scalars(ast, args, env, interner).as_deref(),
+                        Some([Scalar::Str(_)])
+                    )
+            }
+            "Date" | "DateTime" => {
+                (1..=8).contains(&args.len())
+                    && self
+                        .pin_arg_scalars(ast, args, env, interner)
+                        .is_some_and(|scalars| {
+                            scalars
+                                .iter()
+                                .all(|s| matches!(s, Scalar::Int(_) | Scalar::Str(_)))
+                        })
+            }
+            // `set_new_lift`: `Set.new` → `Constant<Set.new>`; `Set.new(<Tuple
+            // of all-Constant elements>)` → the pinned Set value. Both silent
+            // in the reference; anything else falls to Nominal[Set].
+            "Set" => {
+                args.is_empty()
+                    || (args.len() == 1 && {
+                        let arg_ty = self.type_of(ast, args[0], env, interner);
+                        match interner.get(arg_ty).clone() {
+                            Type::Tuple(elems) => elems
+                                .iter()
+                                .all(|&e| matches!(interner.get(e), Type::Constant(_))),
+                            _ => false,
+                        }
+                    })
+            }
+            _ => false,
+        };
+        if pinned_lift {
             return None;
         }
         // Prefer a core (CORE_CLASSES) nominal id — its method existence resolves
@@ -1134,11 +1192,12 @@ impl<'i> Typer<'i> {
         // (RBS) class wins its core ClassId; a source-only class gets a
         // source-range ClassId from the SourceIndex.
         if method == "new" {
-            if let Some(ty) = self.type_dot_new(ast, receiver, interner) {
+            if let Some(ty) = self.type_dot_new(ast, receiver, args, env, interner) {
                 return ty;
             }
-            // Not a typeable `.new` (metaclass constructor / unknown constant) ⇒
-            // fall through to the folding / RBS-return cascade below.
+            // Not a typeable `.new` (metaclass constructor / unknown constant /
+            // a reference constant-constructor lift) ⇒ fall through to the
+            // folding / RBS-return cascade below.
         }
 
         // Tier 4c (ADR-0038): interprocedural literal-tail fold on a `Const.method`
@@ -1432,7 +1491,11 @@ impl<'i> Typer<'i> {
         // (e.g. `Array.new(n) { |i| … } : Array`, `Hash.new { … } : Hash`), so it
         // types via the SHARED `.new` path — not the block-overload return below.
         if method == "new" {
-            if let Some(ty) = self.type_dot_new(ast, receiver, interner) {
+            // The block form carries no positional-arg view here; the curated
+            // constant-constructor lifts key on pinned positionals, so pass
+            // none (a block-bearing `Pathname.new("x") { }` keeps its mint —
+            // the lift shapes do not occur with blocks in practice).
+            if let Some(ty) = self.type_dot_new(ast, receiver, &[], env, interner) {
                 return ty;
             }
         }
@@ -3459,21 +3522,34 @@ mod tests {
     #[test]
     fn rbs_class_new_types_to_rbs_instance() {
         // `Pathname.new("a")` — Pathname is RBS-known (with the stdlib tree) but
-        // outside CORE_CLASSES; the source registry carries its instance id and
-        // method existence defers to RBS. Under the stub fallback Pathname is not
-        // registered, so this test only asserts the registry/typing wiring when
-        // Pathname is actually loaded.
-        let ast = lower_src(b"p = Pathname.new(\"a\")\np.foo\n");
+        // outside CORE_CLASSES. The stdlib `.new` leniency now lives in the
+        // TYPING (`type_dot_new` declines the mint ⇒ Dynamic): the UM witness
+        // gate is `knows_class`-wide for source-range Nominals, so a minted
+        // Pathname instance WOULD witness — and the reference's `.new` dispatch
+        // on these classes has an intricate folding/reflection boundary
+        // (fixture 38 pins `Pathname.new("x").nope` silent). The registry /
+        // method-existence wiring stays intact for the paths that DO mint
+        // (singleton RBS returns — `Pathname.pwd` — and project classes).
+        let ast = lower_src(b"p = Pathname.new(\"a\")\np.foo\nq = Pathname.pwd\nq.foo\n");
         let idx = CoreIndex::new();
         let source = SourceIndex::build(&ast, &idx);
         if idx.knows_class("Pathname") {
             let typer = Typer::with_source(&idx, &source);
             let mut i = Interner::new();
             let env = typer.build_toplevel_env(&ast, &mut i);
+            // `.new` mint declined ⇒ Dynamic (the leniency).
             let p_ty = *env.get("p").expect("p should be bound");
-            let class = match i.get(p_ty) {
+            assert!(
+                matches!(i.get(p_ty), Type::Dynamic(_)),
+                "stdlib .new must decline the mint, got {:?}",
+                i.get(p_ty)
+            );
+            // The declaration-driven singleton return still mints the instance
+            // (`def self.pwd: () -> Pathname` in core pathname.rbs).
+            let q_ty = *env.get("q").expect("q should be bound");
+            let class = match i.get(q_ty) {
                 Type::Nominal { class, .. } => *class,
-                other => panic!("expected Nominal instance, got {other:?}"),
+                other => panic!("expected Nominal instance from Pathname.pwd, got {other:?}"),
             };
             assert_eq!(source.class_name_for_id(class), Some("Pathname"));
             // A real Pathname method is present; a typo is absent (via RBS).
@@ -3751,5 +3827,41 @@ mod m2_go_slice_tests {
         assert_eq!(ty(b"rand(5)\n"), "Class<1>");
         assert_eq!(ty(b"def f(c)\n  rand(c)\nend\n"), "Class<1>");
         assert_eq!(ty(b"rand(1..5)\n"), "Dynamic[top]");
+    }
+}
+
+#[cfg(test)]
+mod meta_new_lift_tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    fn new_ty(src: &[u8]) -> String {
+        let ast = lower(&parse(src));
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let ty = *env.get("v").expect("v bound");
+        rigor_types::describe(&i, ty)
+    }
+
+    /// The reference `meta_new` constant-constructor lifts (Pathname pinned-Str,
+    /// Date/DateTime all-pinned, Set empty/pinned-Tuple) produce pinned VALUE
+    /// carriers rigor-rs does not model — the mint declines (Dynamic). Every
+    /// other singleton `.new` mints a witnessable instance, matching the
+    /// reference's `nominal_of` fallback (probed live on all of these shapes).
+    #[test]
+    fn curated_constructor_lifts_decline_and_others_mint() {
+        // Lift shapes -> decline (Dynamic).
+        assert_eq!(new_ty(b"v = Pathname.new(\"x\")\n"), "Dynamic[top]");
+        assert_eq!(new_ty(b"v = Date.new(2020)\n"), "Dynamic[top]");
+        assert_eq!(new_ty(b"v = Set.new\n"), "Dynamic[top]");
+        assert_eq!(new_ty(b"v = Set.new([1, 2])\n"), "Dynamic[top]");
+        // Non-lift shapes -> minted instance (source-range Nominal renders
+        // Class<1000000+>).
+        assert!(new_ty(b"v = Pathname.new(:sym)\n").starts_with("Class<"));
+        assert!(new_ty(b"def f(x)\n  $g = Pathname.new(x)\nend\nv = Time.new\n").starts_with("Class<"));
+        assert!(new_ty(b"v = StringIO.new\n").starts_with("Class<"));
     }
 }
