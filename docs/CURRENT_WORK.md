@@ -20,16 +20,17 @@ parity-port arc has bottomed out — see Standing conclusions):
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge`, `coverage --workers`,
   plugins inflection probe; full config schema (§7 remainder).
 - **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`; expect
-  snapshots unchanged, then re-run `fp_audit`). Current pin: RC commit `47ec8625`.
+  snapshots unchanged, then re-run `fp_audit`). Current pin: RC commit `7a69f142`.
 - **INVESTIGATION (not a slice):** the AS-overlay-dominated undefined-method
   residual (~179 on gitlab-foss lib) — characterize before building anything.
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
   `Kernel.format` explicit-receiver folds, float sprintf directives, plugin-only
   changes (no plugin engine).
 
-State: harness 66 fixtures / 186 matched / 0 FP (live + snapshot); fp_audit 0 FP
-on mastodon, gitlab-foss lib + app/models, conference-app + 27/28 survey
-projects; 765 workspace tests; explain catalog 27 rules.
+State: harness 66 fixtures / 188 matched / 0 FP (live + snapshot, vs the new
+`7a69f142` RC); fp_audit 0 FP on mastodon, gitlab-foss lib + app/models,
+conference-app + 27/28 survey projects; 769 workspace tests; explain catalog 28
+rules (added `suppression.unknown-marker`).
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
@@ -71,6 +72,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-18 upstream RC bump `47ec8625→7a69f142`** (80 commits) — two parity divergences closed 0 FP: `suppression.unknown-marker` (new rule, upstream `4e0ca475`) + Kernel intrinsic explicit-`Kernel.`-receiver fold (`c9d2e473`); live 188 matched / 193 ref, snapshots re-baselined, core corpora + survey FP-clean. Rest of the RC's inference precision deferred as coverage-only. [note](notes/20260718-upstream-rc-bump-47ec8625-7a69f142.md).
 - **2026-07-17 docs economy** — CURRENT_WORK.md 184KB→baton + [PORT_BACKLOG.md](PORT_BACKLOG.md) split, byte-budget gate `harness/docs_check.py` + docs CI; port of upstream rigor#119 (issue #21).
 - **2026-07-17 P2 `Regexp.last_match` nilable source** (MERGED `6592ead`) — gitlab lib possible-nil 169→162, 0 FP; broad P2 hypothesis REFUTED (the ref's wide firing rides its permissive `Dynamic|nil` arm — the thing our substrate deliberately cannot mint). [spec](notes/20260717-p2-optional-local-nil-spec.md).
 - **2026-07-17 Tier B/C / ScopeIndexer track CLOSED** (no-go, evidence-backed) — see Standing conclusions. [note](notes/20260717-tier-bc-track-closed.md).

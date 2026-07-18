@@ -16,12 +16,17 @@ submodule rather than tracked against a drifting local checkout.
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
 | **Pinned ref** | **v0.3.0 release candidate** (post-`v0.2.9` master; `--version` still prints 0.2.9) |
-| Commit | `47ec8625` (Merge PR #109) |
+| Commit | `7a69f142` (Merge PR #188) |
 
-> The pin is a **commit, not a tag**, for the first time: upstream is at the
-> v0.3.0 release-candidate stage and the port is closing the RC's gap set
-> (five new rules + inference changes) ahead of the tag. Re-pin to the real
-> `v0.3.0` tag when it lands (expected to be the same or a nearby commit).
+> The pin is a **commit, not a tag**: upstream is at the v0.3.0
+> release-candidate stage and the port tracks the RC's gap set ahead of the
+> tag. Re-pin to the real `v0.3.0` tag when it lands. Previous pin: `47ec8625`
+> (Merge PR #109); the `47ec8625 → 7a69f142` bump (80 commits) landed two new
+> parity divergences — `suppression.unknown-marker` (a new rule) and the Kernel
+> intrinsic explicit-`Kernel.`-receiver fold — both closed with 0 FP; the rest
+> of the RC's inference precision (void→top, `(?)` return, `Array#join` /
+> `Data.define` / `Struct` folds, regex-match narrowing) only widens coverage
+> gaps (reference-only), which stay FP-safe and shrink as the port progresses.
 
 The differential harness (`harness/run.rb`, `harness/snapshot.rb`) defaults
 `REFERENCE_RIGOR_DIR` to this submodule (`harness/lib.rb`). The reference-free

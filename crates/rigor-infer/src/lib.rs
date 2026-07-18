@@ -900,10 +900,14 @@ impl<'i> Typer<'i> {
     /// rigor-rs has no RBS tier on the implicit-self path, so the fold must
     /// carry the nil itself — probe p03, `for nil`, depends on it).
     ///
+    /// Shared by the implicit-self dispatch entry AND the explicit `Kernel.`
+    /// receiver spelling in [`Self::type_call`]: `Kernel.p(x)` / `Kernel.format(...)`
+    /// dispatch to the same intrinsic via `module_function` (upstream c9d2e473), so
+    /// that path routes a `Singleton[Kernel]` receiver here. A FOREIGN receiver
+    /// (`obj.format(...)`) never routes here, so a user redefinition on another
+    /// class is never hijacked by the fold.
+    ///
     /// Guards (decline ⇒ Dynamic, silent), matching the reference's FP envelope:
-    /// - an explicit foreign receiver never reaches here — this path is
-    ///   `receiver: None` only, so `Kernel.p(42)` stays unfolded automatically
-    ///   (probe p05);
     /// - a user redefinition of the name: rigor-rs has no scope object, so the
     ///   sanctioned conservative substitute is a FILE-WIDE scan for any
     ///   `def p` / `def pp` — if found, decline that name across the whole file
@@ -1151,6 +1155,28 @@ impl<'i> Typer<'i> {
             && matches!(interner.get(recv_ty), Type::Singleton(_))
         {
             return self.nominal_or_untyped("String", interner);
+        }
+
+        // Kernel intrinsic explicit-receiver spelling: `Kernel.p(x)` /
+        // `Kernel.format(...)` / `Kernel.String(x)` etc. `module_function` exposes
+        // each Kernel intrinsic as a public singleton on the Kernel module object,
+        // so the explicit `Kernel.` receiver dispatches to the SAME fold as the
+        // implicit-self spelling (reference `kernel_owned_call?` +
+        // `kernel_module_receiver?`, upstream c9d2e473 — pinned after the rigor-rs
+        // port's harness found `Kernel.p` declining while `Kernel.format` folded).
+        // Gated on the receiver TYPE resolving to `Singleton[Kernel]` (not the node
+        // spelling), so a namespaced user `Kernel` constant — which types Dynamic,
+        // never `Singleton[Kernel]` — cannot slip through. The shared fold carries
+        // the same user-redefinition / splat decline guards; a non-fold Kernel
+        // method (`Kernel.puts`) returns `None` and falls through unchanged.
+        let kernel_module_receiver = matches!(
+            interner.get(recv_ty),
+            Type::Singleton(class) if self.source.class_name_for_id(*class) == Some("Kernel")
+        );
+        if kernel_module_receiver {
+            if let Some(ty) = self.type_implicit_self_call(ast, method, args, env, interner) {
+                return ty;
+            }
         }
 
         // Tier 1: constant folding on a value-pinned receiver. Fold only when
@@ -2280,15 +2306,55 @@ mod tests {
         // p10: HashShape passes through the identity unchanged.
         assert_eq!(describe_ty(b"p({a: 1})\n", true), "{:a => Constant[1]}");
 
-        // Silent directions — decline to Dynamic[top].
-        // p05: `Kernel.p(42)` — explicit receiver, never on our path.
+        // p05: `Kernel.p(42)` — the explicit `module_function` spelling folds to
+        // the SAME identity as implicit-self (upstream c9d2e473), BUT only once
+        // the receiver types to `Singleton[Kernel]`, which needs a populated
+        // source index. This no-source harness types `Kernel` to Dynamic, so it
+        // declines here; the fold is exercised in
+        // `kernel_explicit_receiver_folds_like_implicit_self` (with a real source).
         assert_eq!(describe_ty(b"Kernel.p(42)\n", false), "Dynamic[top]");
+
+        // Silent directions — decline to Dynamic[top].
         // p07: a file-wide `def p` disables the fold file-wide.
         assert_eq!(describe_ty(b"def p(*a); nil; end\np 42\n", true), "Dynamic[top]");
         // p08: a splat arg makes arity unknown → decline.
         assert_eq!(describe_ty(b"a = [1, 2]\np(*a)\n", true), "Dynamic[top]");
         // p11: a Dynamic (unknown local) arg passes through identity as Dynamic.
         assert_eq!(describe_ty(b"p some_unknown_local\n", true), "Dynamic[top]");
+    }
+
+    /// The explicit `Kernel.` module_function spelling folds like implicit-self
+    /// across the whole intrinsic family (upstream c9d2e473): `Kernel.p`,
+    /// `Kernel.format`/`sprintf`, `Kernel.String`/`Integer`/`Float`. A non-fold
+    /// Kernel method stays Dynamic (falls through to the RBS surface).
+    #[test]
+    fn kernel_explicit_receiver_folds_like_implicit_self() {
+        let index = CoreIndex::new();
+        // A populated source index so the bare `Kernel` constant read types to
+        // `Singleton[Kernel]` (the ConstantRead zero-FP gate resolves it via the
+        // source registry) — the receiver shape the explicit-spelling fold keys on.
+        let last_call_ty = |src: &[u8]| -> String {
+            let ast = lower_src(src);
+            let source = SourceIndex::build(&ast, &index);
+            let typer = Typer::with_source(&index, &source);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let call_id = ast
+                .iter()
+                .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+                .last()
+                .unwrap();
+            let ty = typer.type_of(&ast, call_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+        // Identity printer via the module object.
+        assert_eq!(last_call_ty(b"Kernel.p(42)\n"), "Constant[42]");
+        assert_eq!(last_call_ty(b"Kernel.pp(1, 2)\n"), "Tuple[Constant[1], Constant[2]]");
+        // Conversion + format folds, same envelope as implicit self.
+        assert_eq!(last_call_ty(b"Kernel.format(\"%d\", 1)\n"), "Constant[\"1\"]");
+        assert_eq!(last_call_ty(b"Kernel.String(42)\n"), "Constant[\"42\"]");
+        // A non-fold Kernel method is not a fold target → Dynamic (RBS answers).
+        assert_eq!(last_call_ty(b"Kernel.puts(\"x\")\n"), "Dynamic[top]");
     }
 
     /// An `if`/`unless`/ternary as an expression types to the union of its
