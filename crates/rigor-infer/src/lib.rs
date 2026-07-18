@@ -929,7 +929,7 @@ impl<'i> Typer<'i> {
         let is_printer = matches!(method, "p" | "pp");
         let is_kernel_fold = matches!(
             method,
-            "format" | "sprintf" | "String" | "Hash" | "Integer" | "Float"
+            "format" | "sprintf" | "String" | "Hash" | "Integer" | "Float" | "Array" | "rand"
         );
         if !is_printer && !is_kernel_fold {
             return None;
@@ -975,6 +975,48 @@ impl<'i> Typer<'i> {
         // it is handled before the value-pinning path below.
         if method == "Hash" {
             return self.fold_kernel_hash(ast, args, env, interner);
+        }
+
+        // `Array(v)` folds on the argument's TYPE (M2-GO slice 2, reference
+        // `try_array`): a Tuple passes through (Array(arr) returns arr), nil
+        // collapses to the empty Tuple, a value-pinned scalar wraps
+        // (`Array(5)` -> [5]), and ANYTHING else still types nominal Array —
+        // the RBS envelope pins `Array(...) -> Array` regardless of the
+        // argument (probed: the reference witnesses `Array(c).presence` on
+        // `Array[Dynamic[top]]`; rigor-rs was silent).
+        if method == "Array" {
+            let [only] = args else {
+                return None; // 0-arg raises; 2+ has no overload.
+            };
+            let arg_ty = self.type_of(ast, *only, env, interner);
+            return Some(match interner.get(arg_ty).clone() {
+                Type::Tuple(_) => arg_ty,
+                Type::Constant(Scalar::Nil) => interner.intern(Type::Tuple(vec![])),
+                Type::Constant(_) => interner.intern(Type::Tuple(vec![arg_ty])),
+                _ => self.nominal_or_untyped("Array", interner),
+            });
+        }
+
+        // `rand` (M2-GO slice 3), matching the reference's measured overload
+        // pick exactly: `rand()` -> Float; ANY 1-arg call -> Integer (probed:
+        // even a Float-pinned arg resolves its `(int) -> Integer` overload)
+        // EXCEPT a Range argument, which it declines (the Range overload
+        // returns the element type). Multi-arg raises -> decline.
+        if method == "rand" {
+            return match args {
+                [] => Some(self.nominal_or_untyped("Float", interner)),
+                [only] => {
+                    if matches!(ast.get(*only), Node::Range { .. }) {
+                        return None;
+                    }
+                    let arg_ty = self.type_of(ast, *only, env, interner);
+                    if self.index.class_name_of(interner, arg_ty) == Some("Range") {
+                        return None;
+                    }
+                    Some(self.nominal_or_untyped("Integer", interner))
+                }
+                _ => None,
+            };
         }
 
         // The remaining folds (`format`/`sprintf`/`String`/`Integer`/`Float`)
@@ -1187,6 +1229,35 @@ impl<'i> Typer<'i> {
         if kernel_module_receiver {
             if let Some(ty) = self.type_implicit_self_call(ast, method, args, env, interner) {
                 return ty;
+            }
+        }
+
+        // Singleton-method RBS return typing (M2-GO slice 4): a CLASS-method
+        // call on a core `Singleton` receiver types its RBS return when that
+        // return is unanimous across every overload (`Date.today -> Date`,
+        // `Time.at -> Time`), so a chained AS-method typo witnesses
+        // (`Date.today.end_of_month` — probed: the reference fires, rigor-rs
+        // was silent). Divergent-overload returns (`Regexp.last_match`:
+        // `MatchData?` vs `String?`) are `None` by the index's
+        // all-overloads-agree collapse — decline, fall through (the receiver
+        // stays `Singleton`, so class-method typo witnessing is unchanged).
+        // `.new` never reaches here (intercepted by `type_dot_new` above).
+        if let Type::Singleton(class) = interner.get(recv_ty) {
+            let class = *class;
+            if let Some(class_name) = self.source.class_name_for_id(class) {
+                if let Some(ret) = self.index.singleton_method_return(class_name, method) {
+                    // Mint the return instance with the type_dot_new id
+                    // resolution: a core (CORE_CLASSES) nominal id when
+                    // available, else the source-registry id in the high range
+                    // (`Time`/`Date` are not in the 9-class core id space; the
+                    // rules recover their name via `class_name_for_id_of`).
+                    if let Some(class_id) = self.index.class_id(ret) {
+                        return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                    }
+                    if let Some(class_id) = self.source.class_id(ret) {
+                        return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                    }
+                }
             }
         }
 
@@ -3615,3 +3686,70 @@ mod tests {
     }
 }
 
+
+
+#[cfg(test)]
+mod m2_go_slice_tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    fn ty_of_last_recv_call(src: &[u8]) -> String {
+        let ast = lower(&parse(src));
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = TypeEnv::new();
+        let call_id = ast
+            .iter()
+            .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+            .last()
+            .unwrap();
+        let ty = typer.type_of(&ast, call_id, &env, &mut i);
+        rigor_types::describe(&i, ty)
+    }
+
+    /// Slice 4: a class-method call on a core Singleton types its unanimous RBS
+    /// return (source-range Nominal for classes outside the 9-class core table).
+    #[test]
+    fn singleton_rbs_return_types_time_now() {
+        // Core-table return resolves to the core Nominal directly
+        // (`describe` renders a Nominal by id: Integer = Class<1>).
+        assert_eq!(ty_of_last_recv_call(b"s = Integer.sqrt(4)\n"), "Class<1>");
+        // Divergent overloads (Regexp.last_match) stay Dynamic on THIS path.
+        assert_eq!(ty_of_last_recv_call(b"m = Regexp.last_match(2)\n"), "Dynamic[top]");
+    }
+
+    /// Slice 2/3: Kernel#Array folds by argument type; rand types by arity.
+    #[test]
+    fn kernel_array_and_rand_type() {
+        let ty = |src: &[u8]| -> String {
+            let ast = lower(&parse(src));
+            let index = CoreIndex::new();
+            let typer = Typer::new(&index);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let call_id = ast
+                .iter()
+                .filter_map(|(id, n)| {
+                    matches!(n, Node::Call { receiver: None, .. }).then_some(id)
+                })
+                .last()
+                .unwrap();
+            let t = typer.type_of(&ast, call_id, &env, &mut i);
+            rigor_types::describe(&i, t)
+        };
+        // Tuple identity / nil collapse / scalar wrap / nominal fallback.
+        assert_eq!(ty(b"Array([1, 2])\n"), "Tuple[Constant[1], Constant[2]]");
+        assert_eq!(ty(b"Array(nil)\n"), "Tuple[]");
+        assert_eq!(ty(b"Array(5)\n"), "Tuple[Constant[5]]");
+        // Nominal Array renders by core id (Array = Class<4>).
+        assert_eq!(ty(b"def f(c)\n  Array(c)\nend\n"), "Class<4>");
+        // rand: 0-arg Float (Class<2>); ANY non-Range 1-arg Integer (Class<1>,
+        // the reference's measured overload pick); a Range arg declines.
+        assert_eq!(ty(b"rand\n"), "Class<2>");
+        assert_eq!(ty(b"rand(5)\n"), "Class<1>");
+        assert_eq!(ty(b"def f(c)\n  rand(c)\nend\n"), "Class<1>");
+        assert_eq!(ty(b"rand(1..5)\n"), "Dynamic[top]");
+    }
+}

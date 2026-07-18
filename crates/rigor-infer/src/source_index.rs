@@ -1536,6 +1536,17 @@ fn const_lit_of(ast: &LoweredAst, node: NodeId) -> Option<ConstLit> {
             Some(ConstLit::Hash(members))
         }
         Node::Range { .. } => Some(ConstLit::Range),
+        // `.freeze` is identity on the literal (M2-GO slice 1): the ubiquitous
+        // `CONST = %w[...].freeze` / `{...}.freeze` spelling (RuboCop's
+        // Style/MutableConstant autocorrect) harvests as the literal underneath.
+        // Zero-arg, block-free `freeze` only; recursion makes nested
+        // `["a".freeze].freeze` work at any depth. The reference folds the same
+        // way (probed: `A = %w[a b].freeze; A.exclude?("c")` fires there).
+        Node::Call { receiver: Some(r), method, args, block_body, .. }
+            if method == "freeze" && args.is_empty() && block_body.is_empty() =>
+        {
+            const_lit_of(ast, *r)
+        }
         _ => None,
     }
 }

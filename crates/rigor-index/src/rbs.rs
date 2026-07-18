@@ -233,7 +233,7 @@ struct ClassEntry {
     /// bare concrete `ClassInstanceType` ⇒ `Some(name)`, else `None`) and is read
     /// ONLY by the sig-gen-only [`Self::declared_singleton_return`]; the existence
     /// check ([`Self::class_has_singleton_method`]) uses just the key set.
-    singleton_methods: HashMap<&'static str, (Option<&'static str>, Arity)>,
+    singleton_methods: HashMap<&'static str, (Option<&'static str>, Arity, bool)>,
     /// Instance-method aliases `new_name -> old_name` (RBS `alias size length`).
     /// The alias target is resolved at lookup time so `new_name` inherits
     /// `old_name`'s existence / return type / arity (the old name may live on
@@ -796,6 +796,39 @@ impl CoreData {
         self.lookup_on_chain(&chain, method).and_then(|(ret, _, _)| ret)
     }
 
+    /// The RETURN class of the CLASS method `class_name.method` (M2-GO slice 4)
+    /// — the singleton counterpart of [`Self::method_return`], diagnostic-grade:
+    /// the stored return is already collapsed under the all-overloads-agree
+    /// discipline (class, nil bit AND instance-ness must agree across every
+    /// overload, else `None` — so `Regexp.last_match`, whose overloads return
+    /// `MatchData?` vs `String?`, declines by construction). An `-> instance`
+    /// return resolves LATE-BOUND to the QUERIED class (an inherited
+    /// `Date.today -> instance` called as `DateTime.today` yields a DateTime).
+    ///
+    /// Deliberately narrower than `singleton_return_lookup` (the sig-gen
+    /// surface, untouched): only own/inherited `def self.x` resolves; the
+    /// `extend`ed-module and base-object (`Class`/`Module`) surfaces stay
+    /// untyped — `name`/`to_s` are handled by the caller (C3a Part B) and
+    /// anything else declines (FP-safe under-emit).
+    pub fn singleton_method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        let (&self_key, _) = self.classes.get_key_value(class_name)?;
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let Some((&key, entry)) = self.classes.get_key_value(name) else {
+                return None; // unknown ancestor: the chain is not fully modeled.
+            };
+            if !seen.insert(key) {
+                return None; // superclass cycle guard.
+            }
+            if let Some(&(ret, _, is_instance)) = entry.singleton_methods.get(method) {
+                return if is_instance { Some(self_key) } else { ret };
+            }
+            cur = entry.superclass;
+        }
+        None
+    }
+
     /// Resolve `class_name#method` to `(return class, nilable)` over the
     /// ancestor chain — the nil-aware variant of [`Self::method_return`], used
     /// ONLY by `call.possible-nil-receiver`. `nilable` is `true` iff the RBS
@@ -1248,7 +1281,7 @@ impl CoreData {
         // (1) direct `def self.x` on any class in the chain.
         for &anc in &chain {
             if let Some(entry) = self.classes.get(anc) {
-                if let Some(&(ret, _)) = entry.singleton_methods.get(method) {
+                if let Some(&(ret, _, _)) = entry.singleton_methods.get(method) {
                     return (ret, true, complete);
                 }
             }
@@ -1831,7 +1864,7 @@ impl Builder {
             match member {
                 Node::MethodDefinition(md) => {
                     let mname = intern(md.name().as_str());
-                    let (ret, arity, nilable) = method_signature(&md);
+                    let (ret, arity, nilable, ret_instance) = method_signature(&md);
                     let block_ret = block_overload_return(&md);
                     let kind = md.kind();
                     // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
@@ -1869,7 +1902,7 @@ impl Builder {
                         MethodDefinitionKind::Singleton
                             | MethodDefinitionKind::SingletonInstance
                     ) {
-                        entry.singleton_methods.entry(mname).or_insert((ret, arity));
+                        entry.singleton_methods.entry(mname).or_insert((ret, arity, ret_instance));
                         // ATM substrate: retain the class-method per-overload
                         // shapes so `call.argument-type-mismatch` can check a
                         // `CGI.parse(...)` class-method call site. Overloading
@@ -2190,7 +2223,7 @@ fn is_toplevel_name(tn: &ruby_rbs::node::TypeNameNode) -> bool {
 /// conservative here only loses recall in `possible-nil-receiver`, never an FP).
 fn method_signature(
     md: &ruby_rbs::node::MethodDefinitionNode,
-) -> (Option<&'static str>, Arity, bool) {
+) -> (Option<&'static str>, Arity, bool, bool) {
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = Some(0);
     let mut variadic = false;
@@ -2199,6 +2232,7 @@ fn method_signature(
     // together so a disagreement on EITHER collapses the return to `None`.
     let mut ret: Option<&'static str> = None;
     let mut ret_nilable = false;
+    let mut ret_instance = false;
     let mut ret_seen = false;
 
     for overload in md.overloads().iter() {
@@ -2225,36 +2259,48 @@ fn method_signature(
         }
 
         // Return type: resolve a concrete ClassInstanceType, OR an `Optional`
-        // wrapping one (`String?` ⇒ class `String`, nilable). Across overloads,
-        // only adopt a return if ALL resolvable overloads agree on BOTH the
-        // class AND the nil bit; any disagreement ⇒ leave None (never guess).
-        let (this_ret, this_nilable) = match ft.return_type() {
-            Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), false),
+        // wrapping one (`String?` ⇒ class `String`, nilable), OR the late-bound
+        // `instance` base (tracked as a flag, NOT a class — `Time.now: () ->
+        // instance` means "an instance of the receiver", which only the LOOKUP
+        // knows). Across overloads, only adopt a return if ALL resolvable
+        // overloads agree on class, nil bit AND instance-ness; any
+        // disagreement ⇒ leave None (never guess).
+        let (this_ret, this_nilable, this_instance) = match ft.return_type() {
+            Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), false, false),
+            // `-> instance` (M2-GO slice 4): the receiver-class instance.
+            Node::InstanceType(_) => (None, false, true),
             // `String?` lowers to `OptionalType(ClassInstanceType String)`.
             // Recurse into the inner type; a nested optional/union/generic
             // inside the optional is not a single concrete class ⇒ None.
             Node::OptionalType(opt) => match opt.type_() {
-                Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), true),
-                _ => (None, false),
+                Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), true, false),
+                Node::InstanceType(_) => (None, true, true),
+                _ => (None, false, false),
             },
-            _ => (None, false),
+            _ => (None, false, false),
         };
         if !ret_seen {
             ret = this_ret;
             ret_nilable = this_nilable;
+            ret_instance = this_instance;
             ret_seen = true;
-        } else if ret != this_ret || ret_nilable != this_nilable {
-            // Disagreement on class or nilability ⇒ drop the return entirely
-            // (and with it the nil bit), the conservative choice.
+        } else if ret != this_ret || ret_nilable != this_nilable || ret_instance != this_instance
+        {
+            // Disagreement on class, nilability or instance-ness ⇒ drop the
+            // return entirely (and with it the nil bit), the conservative choice.
             ret = None;
             ret_nilable = false;
+            ret_instance = false;
         }
     }
 
     let arity = (min.unwrap_or(0), if variadic { None } else { max });
     // `ret_nilable` is only meaningful when `ret` is Some; callers read it via
     // `method_return_nilable`, which gates on `ret` being present.
-    (ret, arity, ret_nilable)
+    // `ret_instance` is meaningful only on the SINGLETON insert path (an
+    // instance method's `-> instance`/`-> self` stays untyped as before);
+    // when set, `ret` is None, so every existing consumer is unchanged.
+    (ret, arity, ret_nilable, ret_instance)
 }
 
 /// Retain the per-overload positional-parameter shapes of a method definition —

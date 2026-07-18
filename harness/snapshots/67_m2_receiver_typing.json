@@ -1,0 +1,75 @@
+{
+  "fixture": "harness/corpus/67_m2_receiver_typing.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 14,
+      "column": 47,
+      "severity": "error",
+      "message": "undefined method `exclude?' for [\"count\", \"sum\", \"average\"]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `deep_merge!' for { low: 1, high: 10 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for [[\"a\", \"b\"], [\"c\", \"d\"]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `presence' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 41,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Array[1 | 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 43,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Array[bot]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 49,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `hours' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 59,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Integer"
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 29,
+      "column": 11,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `compute_something`. If a project file defines `compute_something` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}
