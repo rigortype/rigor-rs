@@ -59,8 +59,14 @@ risk — `Pathname.new(<expr the reference folds but rigor-rs doesn't>)`
 (`"x".to_s`): the reference lifts, rigor-rs mints; no real-corpus occurrence
 (gitlab/mastodon/conference all 0 FP).
 
-GO-slice 5 (namespaced `ERB::Util` singletons / ADR-0023 gate) remains the
-one open design call.
+GO-slice 5 (namespaced `ERB::Util` singletons, ~5 gitlab sites) is BLOCKED on
+a real design decision: `A::B` receivers already lower to a full-path
+`ConstantRead` ("ERB::Util"), but the index registers nested RBS decls by
+SHORT key — and `module Util` exists in BOTH erb.rbs and cgi.rbs, so the two
+merge into one ambiguous "Util" entry. Sound resolution needs QUALIFIED-key
+registration in the index (the defect-2 root fix) — an ADR-scale key-space
+change touching reopen/merge semantics across every knows_class consumer,
+not a slice. Parked with this note as the evidence.
 
 ## Evidence
 

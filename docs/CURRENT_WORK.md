@@ -20,8 +20,9 @@ parity-port arc has bottomed out — see Standing conclusions):
   Phase 0+1 DONE ([findings](notes/20260718-phase0-m1-m2-findings.md)): Phase 2
   CLOSED by measurement (M1: 0 added diags on ~17k); M2-GO slices 1–4 + 4b
   built (UM 179→148, 0 FP; declaration-driven per the set direction — no
-  reflection-tier chasing). Remaining design call: slice 5 (namespaced
-  singletons) vs the ADR-0023 ConstantRead gate; then Phase 3 new-rule
+  reflection-tier chasing). Slice 5 (namespaced singletons, ~5 sites) BLOCKED
+  on an ADR-scale index change (qualified-key registration, the defect-2 root
+  fix — `module Util` merges ERB's and CGI's today). Next: Phase 3 new-rule
   surfaces.
 - **LSP §12 two-tier** — watched-files invalidation, debounce, worker pool.
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge`, `coverage --workers`,
