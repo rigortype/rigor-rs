@@ -16,16 +16,17 @@ Last updated: 2026-07-17.
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
 
+- **ACTIVE: compat next stage** — 4-phase plan (M1 ref self-diff + M2 UM-residual
+  gates → fixture 193/193 → measured RC inference ports → new rule surfaces).
+  [plan](notes/20260718-compat-next-stage-plan.md).
 - **LSP §12 two-tier** — watched-files invalidation, debounce, worker pool.
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge`, `coverage --workers`,
   plugins inflection probe; full config schema (§7 remainder).
 - **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`; expect
   snapshots unchanged, then re-run `fp_audit`). Current pin: RC commit `7a69f142`.
-- **INVESTIGATION (not a slice):** the AS-overlay-dominated undefined-method
-  residual (~179 on gitlab-foss lib) — characterize before building anything.
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
-  `Kernel.format` explicit-receiver folds, float sprintf directives, plugin-only
-  changes (no plugin engine).
+  plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
+  remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
 
 State: harness 66 fixtures / 188 matched / 0 FP (live + snapshot, vs the new
 `7a69f142` RC); fp_audit 0 FP on mastodon, gitlab-foss lib + app/models,
