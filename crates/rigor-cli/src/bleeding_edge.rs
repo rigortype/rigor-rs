@@ -19,7 +19,8 @@
 
 use std::process::ExitCode;
 
-use crate::config::Config;
+use crate::config::{BleedingEdgeSelector, Config};
+use crate::severity::ResolvedSeverity;
 
 /// One queued change (reference `BleedingEdge::Feature`).
 pub struct Feature {
@@ -59,6 +60,32 @@ pub const FEATURES: &[Feature] = &[
         severity_overrides: &[("static.value-use.void", "warning")],
     },
 ];
+
+/// The merged severity-override map the ACTIVE features impose for a selector
+/// (reference `BleedingEdge.severity_overrides_for`) — composed BELOW the
+/// user's own `severity_overrides:` and ABOVE the profile table in
+/// [`crate::severity::resolve`]. Later features win on a (hypothetical) rule
+/// collision, matching the reference's hash merge order.
+#[must_use]
+pub fn severity_overrides_for(
+    selector: &BleedingEdgeSelector,
+) -> Vec<(&'static str, ResolvedSeverity)> {
+    let mut out: Vec<(&'static str, ResolvedSeverity)> = Vec::new();
+    for f in FEATURES {
+        if !selector.activates(f.id) {
+            continue;
+        }
+        for (rule, sev) in f.severity_overrides {
+            let Some(sev) = ResolvedSeverity::from_str(sev) else { continue };
+            if let Some(slot) = out.iter_mut().find(|(r, _)| r == rule) {
+                slot.1 = sev;
+            } else {
+                out.push((rule, sev));
+            }
+        }
+    }
+    out
+}
 
 /// `rigor show-bleedingedge` — print the overlay + what the cwd's config
 /// adopts, byte-matching the reference command's text output.

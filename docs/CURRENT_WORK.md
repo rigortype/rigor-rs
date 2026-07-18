@@ -26,9 +26,9 @@ parity-port arc has bottomed out — see Standing conclusions):
   compat plan is exhausted; next work returns to the productization track
   (LSP §12, `--bleeding-edge` + CLI §7, re-pin at the v0.3.0 tag).
 - **LSP §12 two-tier** — watched-files invalidation, debounce, worker pool.
-- **CLI surface from the v0.3.0 RC** — `--bleeding-edge` DONE (with
-  `static.value-use.void`); remaining: `coverage --workers`, plugins
-  inflection probe, full config schema (§7 remainder).
+- **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
+  profile/overrides DONE; remaining: `coverage --workers` (needs a scoping
+  call vs the existing `type-scan`), plugins inflection probe.
 - **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`; expect
   snapshots unchanged, then re-run `fp_audit`). Current pin: RC commit `7a69f142`.
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
@@ -80,6 +80,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-18 severity-resolution machinery** (branch `severity-profile-machinery`) — `severity_profile:`/`severity_overrides:` were silently IGNORED (real incompatibility for configured projects); reference `SeverityProfile.resolve` + `SeverityStamp` ported (verbatim 28-row profile tables, family overrides, `:off` drop, internal-error bypass, memoized void-rule gate); 8/8 live config byte-diffs IDENTICAL, default output unchanged. [note](notes/20260718-severity-profile-machinery.md).
 - **2026-07-18 bleeding-edge + `static.value-use.void`** (branch `bleeding-edge-void-rule`) — ADR-50 WD2 surface end-to-end (`bleeding_edge:` config, `--bleeding-edge[=LIST]`/`--no-bleeding-edge`, `show-bleedingedge` byte-identical) + the ADR-100 void rule (index void flags, value-context collector, feature-gated); probe byte-identical to the reference, default gates unchanged (flag-off). Closes the Phase-3 deferral. [note](notes/20260718-bleeding-edge-void-rule.md).
 - **2026-07-18 compat Phase 3** (branch `phase3-new-rule-surfaces`) — unknown-config-key warning ported byte-exact (verbatim DidYouMean port, 13-case stdlib parity pin); `rbs.coverage.environment-build-failed` structurally absent (union-merge env cannot collapse); `static.value-use.void` deferred to the `--bleeding-edge` productization item (`:off` in every shipped profile — verified). [note](notes/20260718-phase3-new-rule-surfaces.md).
 - **2026-07-18 M2-GO receiver-typing batch, slices 1–4 + 4b** (branch `m2-receiver-typing-batch`) — freeze-unwrap + Kernel#Array + rand + singleton RBS returns + declaration-driven `.new`/witnessing (the reference's `meta_new` lifts reproduced as mint-declines; witness gate → `knows_toplevel_class ∪ project-sig`); gitlab UM 179→148, mastodon models 5→3, 0 FP (one `Clusters::Instance` FP caught+fixed by the defect-2 guard); fixture 67 pins the batch. Slice 5 (namespaced singletons, ADR-0023) = the one open design call. [note](notes/20260718-m2-receiver-typing-batch.md).

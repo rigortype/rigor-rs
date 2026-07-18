@@ -136,13 +136,7 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
     };
     let (expanded_owned, _errs) = crate::expand_check_paths(roots);
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
-    let (findings, _io) = crate::analyze_files(
-        &expanded,
-        &cfg,
-        "triage",
-        None,
-        cfg.bleeding_edge_selector().activates("use-of-void-value"),
-    );
+    let (findings, _io) = crate::analyze_files(&expanded, &cfg, "triage", None, &cfg.bleeding_edge_selector());
 
     // (path, diagnostic) pairs — `path` rides the findings tuple, not the diag.
     let diags: Vec<DiagRef> =
