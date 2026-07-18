@@ -79,6 +79,30 @@ pub struct Config {
     /// four spellings) and coerced by [`Config::bleeding_edge_selector`].
     #[serde(default)]
     pub bleeding_edge: serde_yaml::Value,
+    /// ADR-8 § "Severity profile" — `severity_profile:`, one of `lenient` |
+    /// `balanced` | `strict`. Deserialized untyped so an absent key, a
+    /// non-string, or an unrecognized name are all accepted at the parse
+    /// layer and coerced by [`Config::severity_profile`].
+    ///
+    /// `#[allow(dead_code)]`: this is severity-resolution MACHINERY
+    /// ([`crate::severity`]) landed ahead of the runner wiring that will
+    /// read the accessor; not read directly (`Debug`'s derive doesn't count
+    /// for dead-code analysis), only through [`Config::severity_profile`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub severity_profile: serde_yaml::Value,
+    /// ADR-8 — `severity_overrides:`, a mapping of rule id or rule FAMILY (the
+    /// first `.`-segment, e.g. `call`) to a severity string. Deserialized
+    /// untyped (rather than `HashMap<String, String>`) so an invalid entry —
+    /// wrong value type, unknown severity name, or YAML 1.1's bare `off`
+    /// misparsing as `false` — degrades per-entry instead of failing the
+    /// whole map; see [`Config::severity_overrides`]'s doc comment.
+    ///
+    /// `#[allow(dead_code)]`: see [`Self::severity_profile`]'s note — the
+    /// runner wiring that consumes [`Config::severity_overrides`] lands later.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub severity_overrides: serde_yaml::Value,
     /// ADR-0036: rigor-rs-SPECIFIC config, namespaced so it stays transparent to
     /// the pure-Ruby reference (which ignores unknown keys) — the same `.rigor.yml`
     /// feeds both. Reference-schema keys stay top-level; rigor-rs-only knobs live
@@ -170,6 +194,8 @@ impl Default for Config {
             plugins: Vec::new(),
             baseline: serde_yaml::Value::Null,
             bleeding_edge: serde_yaml::Value::Null,
+            severity_profile: serde_yaml::Value::Null,
+            severity_overrides: serde_yaml::Value::Null,
             signature_paths: default_signature_paths(),
             rbs_collection: RbsCollectionConfig::default(),
             bundler: BundlerConfig::default(),
@@ -333,6 +359,83 @@ impl Config {
             }
             _ => BleedingEdgeSelector::None,
         }
+    }
+
+    /// The coerced `severity_profile:` value (ADR-8, reference
+    /// `Configuration#severity_profile` / `SeverityProfile::VALID_PROFILES`).
+    /// A string naming one of the three profiles maps to it; anything else —
+    /// absent/`null`, a non-string value, or an unrecognized name — degrades
+    /// to [`crate::severity::Profile::default`] (`balanced`). The reference
+    /// RAISES on an invalid value; rigor-rs's config layer never aborts a run
+    /// on a bad `.rigor.yml` value (the same convention
+    /// [`Self::bleeding_edge_selector`] documents) — a typo'd profile name
+    /// silently runs `balanced` rather than crashing the CLI.
+    ///
+    /// `#[allow(dead_code)]`: not yet called from the diagnostic pipeline —
+    /// wiring severity resolution into the runner is a later step (see the
+    /// [`crate::severity`] module doc comment); exercised by this module's
+    /// own unit tests today.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn severity_profile(&self) -> crate::severity::Profile {
+        self.severity_profile
+            .as_str()
+            .and_then(crate::severity::Profile::from_str)
+            .unwrap_or_default()
+    }
+
+    /// The coerced `severity_overrides:` map (ADR-8, reference
+    /// `Configuration#severity_overrides`), as an ordered list of (rule-or-family,
+    /// severity) pairs ready for [`crate::severity::resolve`]'s `overrides`
+    /// parameter.
+    ///
+    /// Each mapping entry's key is stringified (accepting the family
+    /// shorthand, e.g. `call:`, as well as a full rule id) and its value must
+    /// parse as one of `error` | `warning` | `info` | `off`
+    /// ([`crate::severity::ResolvedSeverity::from_str`]). An entry that fails
+    /// either check is DROPPED rather than failing the whole map or the run —
+    /// same degrade-don't-abort convention as [`Self::severity_profile`].
+    ///
+    /// YAML TRAP (reference divergence, verified empirically against this
+    /// crate's actual parser): the reference's Ruby YAML loader (Psych,
+    /// YAML 1.1 core schema) folds a BARE `off` scalar to the boolean
+    /// `false` (also `no`/`n`/`on`/`yes`), so the reference raises with a
+    /// "quote it" hint unless the author writes `call: "off"`. `serde_yaml`
+    /// 0.9 (the crate this loader actually uses, backed by `unsafe-libyaml`)
+    /// implements YAML 1.2's Core Schema instead: ONLY `true`/`false`
+    /// (case-insensitive) fold to booleans — `off`/`on`/`yes`/`no` parse as
+    /// plain strings. So here `severity_overrides: { call: off }` parses
+    /// `off` as the string `"off"` and resolves correctly WITHOUT quoting;
+    /// quoting it also still works (a string either way). What DOES fold to
+    /// [`serde_yaml::Value::Bool`] here — and is dropped like any other
+    /// invalid entry, since `"true"`/`"false"` are not
+    /// [`crate::severity::ResolvedSeverity`] spellings — is the literal word
+    /// `true` or `false` as a value (e.g. a stray `call: false`). The
+    /// reference's "quote it" hint has no analogue to port here since the
+    /// trap it guards against doesn't reproduce; a future config-audit hint
+    /// for a bare `true`/`false` value is out of scope for this port.
+    ///
+    /// Order: this preserves the source `.rigor.yml` mapping's iteration
+    /// order (`serde_yaml::Mapping` is insertion-ordered), so an exact-id
+    /// entry that happens to sort after its family entry still resolves
+    /// correctly — [`crate::severity::resolve`]'s precedence is by exact-vs-family
+    /// match, not by list position, so the order here is for determinism /
+    /// display only, not correctness.
+    ///
+    /// `#[allow(dead_code)]`: see [`Self::severity_profile`]'s note.
+    #[must_use]
+    #[allow(dead_code)]
+    pub fn severity_overrides(&self) -> Vec<(String, crate::severity::ResolvedSeverity)> {
+        let serde_yaml::Value::Mapping(map) = &self.severity_overrides else {
+            return Vec::new();
+        };
+        map.iter()
+            .filter_map(|(k, v)| {
+                let key = k.as_str()?.to_string();
+                let sev = v.as_str().and_then(crate::severity::ResolvedSeverity::from_str)?;
+                Some((key, sev))
+            })
+            .collect()
     }
 
     /// The `signature_paths:` entries when the key was EXPLICITLY configured, or
@@ -666,5 +769,92 @@ mod bleeding_edge_selector_tests {
         assert!(!BleedingEdgeSelector::All { except: vec![id.into()] }.activates(id));
         assert!(BleedingEdgeSelector::List(vec![id.into()]).activates(id));
         assert!(!BleedingEdgeSelector::List(vec!["nope".into()]).activates(id));
+    }
+}
+
+#[cfg(test)]
+mod severity_config_tests {
+    use super::*;
+    use crate::severity::{Profile, ResolvedSeverity};
+
+    fn cfg(yaml: &str) -> Config {
+        Config::parse_or_warn(yaml, "test")
+    }
+
+    /// `severity_profile:` parses all three names; anything else (absent, a
+    /// non-string, an unknown name) degrades to `balanced` — never aborts.
+    #[test]
+    fn severity_profile_parses_known_names() {
+        assert_eq!(cfg("severity_profile: lenient\n").severity_profile(), Profile::Lenient);
+        assert_eq!(cfg("severity_profile: balanced\n").severity_profile(), Profile::Balanced);
+        assert_eq!(cfg("severity_profile: strict\n").severity_profile(), Profile::Strict);
+    }
+
+    #[test]
+    fn severity_profile_degrades_to_balanced() {
+        // Absent key.
+        assert_eq!(Config::default().severity_profile(), Profile::Balanced);
+        assert_eq!(cfg("disable: []\n").severity_profile(), Profile::Balanced);
+        // Wrong type (an integer, not a string).
+        assert_eq!(cfg("severity_profile: 42\n").severity_profile(), Profile::Balanced);
+        // Unknown name.
+        assert_eq!(cfg("severity_profile: unknown\n").severity_profile(), Profile::Balanced);
+    }
+
+    /// `severity_overrides:` accepts a rule id, a family key, and both a
+    /// QUOTED and a bare `off` (see the YAML-trap divergence note on
+    /// [`Config::severity_overrides`] — this crate's YAML parser does not
+    /// fold `off` to a boolean the way the reference's Psych does); drops a
+    /// literal `false`/`true` value, an integer value, and an unknown
+    /// severity name.
+    #[test]
+    fn severity_overrides_parses_valid_entries_and_drops_invalid_ones() {
+        let yaml = "severity_overrides:\n  \
+                    call.undefined-method: warning\n  \
+                    call: \"off\"\n  \
+                    dump.type: off\n  \
+                    def.method-visibility-mismatch: false\n  \
+                    def.ivar-write-mismatch: 42\n  \
+                    flow.dead-assignment: not-a-severity\n";
+        let overrides = cfg(yaml).severity_overrides();
+        assert!(overrides.contains(&("call.undefined-method".to_string(), ResolvedSeverity::Warning)));
+        assert!(overrides.contains(&("call".to_string(), ResolvedSeverity::Off)));
+        // A BARE (unquoted) `off` is not a YAML 1.2 boolean literal in this
+        // crate — it parses as the plain string "off", so it resolves to the
+        // Off severity same as the quoted spelling above.
+        assert!(overrides.contains(&("dump.type".to_string(), ResolvedSeverity::Off)));
+        // A literal `false` DOES fold to a real YAML boolean here (unlike
+        // `off`) — not a string, so it is dropped like any other non-string
+        // value; same for an integer and an unrecognized severity name.
+        assert!(!overrides.iter().any(|(k, _)| k == "def.method-visibility-mismatch"));
+        assert!(!overrides.iter().any(|(k, _)| k == "def.ivar-write-mismatch"));
+        assert!(!overrides.iter().any(|(k, _)| k == "flow.dead-assignment"));
+        assert_eq!(overrides.len(), 3);
+    }
+
+    #[test]
+    fn severity_overrides_absent_is_empty() {
+        assert!(Config::default().severity_overrides().is_empty());
+        assert!(cfg("disable: []\n").severity_overrides().is_empty());
+    }
+
+    #[test]
+    fn severity_overrides_literal_boolean_value_is_dropped() {
+        // Isolated repro of the actual (not the assumed) YAML edge case: a
+        // literal `false`/`true` value folds to a real boolean in this
+        // crate's parser and must not be mistaken for a severity string.
+        let overrides = cfg("severity_overrides:\n  call: false\n").severity_overrides();
+        assert!(overrides.is_empty());
+        let overrides = cfg("severity_overrides:\n  call: true\n").severity_overrides();
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn severity_overrides_bare_off_is_not_a_yaml_boolean_here() {
+        // Contrast case for the divergence note: the reference's Ruby Psych
+        // loader (YAML 1.1) folds bare `off` to boolean `false`; this crate's
+        // parser (YAML 1.2 Core Schema) does not, so it resolves normally.
+        let overrides = cfg("severity_overrides:\n  call: off\n").severity_overrides();
+        assert_eq!(overrides, vec![("call".to_string(), ResolvedSeverity::Off)]);
     }
 }

@@ -43,6 +43,7 @@ mod outline;
 mod plugins_cmd;
 mod rbs_collection;
 mod ruby_mode;
+mod severity;
 mod sidecar;
 mod sig_gen;
 mod type_of;
@@ -221,13 +222,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     config_audit::emit(&cfg, Path::new("."));
 
     // ADR-50 WD2 — the effective bleeding-edge selection: CLI flag > config.
-    // The one engine-relevant feature today is `use-of-void-value`, which
-    // gates the `static.value-use.void` collector (the reference gates by
-    // severity resolution — authored :warning, profile :off, feature
-    // :warning — with the same observable).
+    // Threaded into `analyze_files`, where it feeds the severity-resolution
+    // pipeline (ADR-8 "Severity profile"): user `severity_overrides:` >
+    // bleeding-edge overrides > `severity_profile:` table > authored.
     let bleeding_edge =
         bleeding_edge_cli.unwrap_or_else(|| cfg.bleeding_edge_selector());
-    let void_rule_active = bleeding_edge.activates("use-of-void-value");
 
     // ADR-0036 coverage posture (ADR-0008 sidecar). Resolve the mode, then bring
     // up the Ruby sidecar accordingly: `require`/`<path>` MUST have it (exit 69 on
@@ -261,7 +260,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
     // `# rigor:disable` applied). Shared with `baseline generate`.
     let (mut findings, had_io_error) =
-        analyze_files(&expanded, &cfg, "check", folder_ref, void_rule_active);
+        analyze_files(&expanded, &cfg, "check", folder_ref, &bleeding_edge);
 
     // ADR-22 slice 5 — snapshot the RAW (pre-baseline-filter) findings for the
     // `--baseline-strict` audit. The reference audits `raw_result.diagnostics`
@@ -619,9 +618,29 @@ fn analyze_files(
     cfg: &Config,
     verb: &str,
     folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
-    void_rule_active: bool,
+    bleeding_edge: &config::BleedingEdgeSelector,
 ) -> (Vec<(usize, String, String, Diagnostic)>, bool) {
     let disable_matcher = cfg.disable_matcher();
+    // ADR-8 "Severity profile" — the resolution inputs, computed once: the
+    // configured profile, the user's per-rule/family overrides, and the merged
+    // overrides of the ACTIVE bleeding-edge features (reference
+    // `Configuration#bleeding_edge_severity_overrides`).
+    let profile = cfg.severity_profile();
+    let user_overrides = cfg.severity_overrides();
+    let bleeding_overrides = bleeding_edge::severity_overrides_for(bleeding_edge);
+    // The reference's memoised rule-activation gate (`runner.rb`): the
+    // `static.value-use.void` collector runs only when the rule's RESOLVED
+    // severity is not `:off` — authored `:warning`, every shipped profile
+    // `:off`, promoted by the `use-of-void-value` feature OR a user
+    // `severity_overrides:` entry (the override alone resurrects it there,
+    // and must here too). `disable:` still filters downstream as usual.
+    let void_rule_active = severity::resolve(
+        rigor_rules::STATIC_VALUE_USE_VOID,
+        severity::ResolvedSeverity::Warning,
+        profile,
+        &user_overrides,
+        &bleeding_overrides,
+    ) != severity::ResolvedSeverity::Off;
     // ADR-25 — config-gated plugins. With no `plugins:` in `.rigor.yml` this is
     // byte-identical to `CoreIndex::new()` (empty list ⇒ default no-config path),
     // so the differential harness + default corpus run are unaffected. A named,
@@ -795,11 +814,49 @@ fn analyze_files(
                         .map(|diag| (line_col(&p.source, diag.start_offset).0, diag))
                         .collect();
                     let mut local = Vec::new();
-                    for (_line, diag) in rigor_rules::filter_suppressed(with_lines, &p.comments) {
+                    for (_line, mut diag) in
+                        rigor_rules::filter_suppressed(with_lines, &p.comments)
+                    {
                         // Config `disable:` — drop diagnostics whose rule matches the
                         // expanded disable set (the internal-error sentinel never matches).
                         if disable_matcher.suppresses(diag.rule_id) {
                             continue;
+                        }
+                        // SeverityStamp (reference `severity_stamp.rb`, ADR-8
+                        // "Severity profile"): re-stamp from the profile +
+                        // overrides and DROP a `:off` resolution. The
+                        // internal-error sentinel bypasses (the reference's
+                        // `rule.nil?` short-circuit — a per-file panic must
+                        // never be silenced by configuration). The stamp input
+                        // is the emitted severity; every catalogued rule is in
+                        // all three profile tables, so the authored-fallback
+                        // arm is only ever consulted for ids outside them.
+                        if diag.rule_id != "internal-error" {
+                            let current = match diag.severity {
+                                rigor_rules::Severity::Error => severity::ResolvedSeverity::Error,
+                                rigor_rules::Severity::Warning => {
+                                    severity::ResolvedSeverity::Warning
+                                }
+                                rigor_rules::Severity::Info => severity::ResolvedSeverity::Info,
+                            };
+                            match severity::resolve(
+                                diag.rule_id,
+                                current,
+                                profile,
+                                &user_overrides,
+                                &bleeding_overrides,
+                            ) {
+                                severity::ResolvedSeverity::Off => continue,
+                                severity::ResolvedSeverity::Error => {
+                                    diag.severity = rigor_rules::Severity::Error;
+                                }
+                                severity::ResolvedSeverity::Warning => {
+                                    diag.severity = rigor_rules::Severity::Warning;
+                                }
+                                severity::ResolvedSeverity::Info => {
+                                    diag.severity = rigor_rules::Severity::Info;
+                                }
+                            }
                         }
                         local.push((p.order, p.path.clone(), p.source.clone(), diag));
                     }
@@ -1013,13 +1070,8 @@ fn baseline_analysis(
     };
     let (expanded_owned, _path_errors) = expand_check_paths(roots);
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
-    let (findings, _had_io_error) = analyze_files(
-        &expanded,
-        &cfg,
-        verb,
-        folder_ref,
-        cfg.bleeding_edge_selector().activates("use-of-void-value"),
-    );
+    let (findings, _had_io_error) =
+        analyze_files(&expanded, &cfg, verb, folder_ref, &cfg.bleeding_edge_selector());
     Ok((cfg, findings))
 }
 
