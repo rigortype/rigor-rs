@@ -47,6 +47,24 @@ git submodule update --init reference/rigor
 ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.2.9 (v0.3.0 RC)
 ```
 
+## Oracle invocation hazard: stale-gem plugin hijack (issue rigortype/rigor#194)
+
+Since the ADR-93 auto-wire (upstream `861b08b9`), the reference `require`s
+`rigor-rbs-inline` at startup. A bare `ruby -I reference/rigor/lib` invocation
+lets RubyGems resolve that require against an INSTALLED `rigortype` gem's
+bundled plugin copy — a stale version without the annotation gate synthesizes
+untyped skeletons for every source file and silently poisons every diagnostic
+comparison (measured: three phantom "regressions", one phantom feature). Every
+oracle invocation MUST therefore pin the checkout's own plugin:
+
+```sh
+ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
+  reference/rigor/exe/rigor check <path>
+```
+
+`harness/lib.rb` and `harness/fp_audit.py` do this unconditionally (harmless at
+pre-auto-wire pins). Ad-hoc probes must too.
+
 ## Bumping the pin (following upstream)
 
 1. Fetch + check out the new tag inside the submodule:

@@ -192,6 +192,13 @@ module RigorHarness
       cmd = [
         "ruby",
         "-I", REFERENCE_LIB,
+        # Pin the CHECKOUT's bundled rigor-rbs-inline onto the load path
+        # UNCONDITIONALLY (upstream issue #194): the ADR-93 auto-wire
+        # `require "rigor-rbs-inline"` otherwise resolves a stale installed
+        # rigortype gem's pre-annotation-gate plugin copy, which synthesizes
+        # untyped skeletons for every file and poisons the oracle. Harmless at
+        # pre-auto-wire pins (nothing requires it); load-bearing after.
+        "-I", File.join(REFERENCE_RIGOR_DIR, "plugins", "rigor-rbs-inline", "lib"),
         *reference_plugin_includes(sidecar),
         REFERENCE_EXE,
         "check",

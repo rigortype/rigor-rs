@@ -56,7 +56,12 @@ def run_ref(files):
     # batch failure (one poison file aborting the whole run) would otherwise look
     # like "reference found nothing", turning all of rigor-rs's output into false
     # FP candidates. A None result means the comparison is invalid, not FP-free.
-    r = subprocess.run(["ruby", "-I", REF_LIB, REF_EXE, "check", "--format", "json"] + files,
+    # The bundled rigor-rbs-inline lib is pinned onto the load path (upstream
+    # issue #194): the ADR-93 auto-wire otherwise resolves a stale installed
+    # rigortype gem's pre-gate plugin copy and poisons the comparison.
+    ref_plugin = os.path.join(REF_DIR, "plugins", "rigor-rbs-inline", "lib")
+    r = subprocess.run(["ruby", "-I", REF_LIB, "-I", ref_plugin,
+                        REF_EXE, "check", "--format", "json"] + files,
                        capture_output=True, text=True, cwd="/tmp")
     i = r.stdout.find("{")
     if i < 0:

@@ -29,9 +29,9 @@ parity-port arc has bottomed out — see Standing conclusions):
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
   profile/overrides DONE; remaining: `coverage --workers` (needs a scoping
   call vs the existing `type-scan`), plugins inflection probe.
-- **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`) —
-  BLOCKED on the rbs-inline auto-wire regressions
-  ([note](notes/20260718-upstream-rbs-inline-autowire-regressions.md)); pin `7a69f142`.
+- **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`;
+  oracle invocations must pin the checkout plugin path — see the #194 hazard
+  note there). Pin `7a69f142`; wave delta remeasured CLEAN (0/0).
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
@@ -81,6 +81,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-19 #194 root-caused: stale-gem plugin hijack** — the 3 "upstream regressions" were artifacts of `rigortype 0.2.4`'s pre-gate plugin copy hijacking the auto-wire require; corrected wave delta 0/0; oracle invocations hardened (`harness/lib.rb`, `fp_audit.py`, `UPSTREAM.md`); upstream keeps #194 for the version-skew hazard. [note](notes/20260718-upstream-rbs-inline-autowire-regressions.md).
 - **2026-07-18 upstream rbs-inline auto-wire: 3 single-file regressions measured** (in-source chain inference lost ×2, interprocedural folds lost + cross-owner singleton FP on an explicit negative); pin HELD at `7a69f142`; feedback package ready. [note](notes/20260718-upstream-rbs-inline-autowire-regressions.md).
 - **2026-07-18 severity-resolution machinery** (branch `severity-profile-machinery`) — `severity_profile:`/`severity_overrides:` were silently IGNORED (real incompatibility for configured projects); reference `SeverityProfile.resolve` + `SeverityStamp` ported (verbatim 28-row profile tables, family overrides, `:off` drop, internal-error bypass, memoized void-rule gate); 8/8 live config byte-diffs IDENTICAL, default output unchanged. [note](notes/20260718-severity-profile-machinery.md).
 - **2026-07-18 bleeding-edge + `static.value-use.void`** (branch `bleeding-edge-void-rule`) — ADR-50 WD2 surface end-to-end (`bleeding_edge:` config, `--bleeding-edge[=LIST]`/`--no-bleeding-edge`, `show-bleedingedge` byte-identical) + the ADR-100 void rule (index void flags, value-context collector, feature-gated); probe byte-identical to the reference, default gates unchanged (flag-off). Closes the Phase-3 deferral. [note](notes/20260718-bleeding-edge-void-rule.md).
