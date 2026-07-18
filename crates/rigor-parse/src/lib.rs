@@ -103,3 +103,4 @@ mod tests {
         assert!(!looks_like_erb_template(b""));
     }
 }
+

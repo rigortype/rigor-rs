@@ -18,9 +18,12 @@ parity-port arc has bottomed out — see Standing conclusions):
 
 - **ACTIVE: compat next stage** — [plan](notes/20260718-compat-next-stage-plan.md);
   Phase 0+1 DONE ([findings](notes/20260718-phase0-m1-m2-findings.md)): Phase 2
-  CLOSED by measurement (M1: 0 added diags on ~17k); next = the 5 proven M2-GO
-  receiver-typing slices (freeze-unwrap, Array(), rand, singleton returns,
-  namespaced singletons), then Phase 3 new-rule surfaces.
+  CLOSED by measurement (M1: 0 added diags on ~17k); M2-GO slices 1–4 + 4b
+  built (UM 179→148, 0 FP; declaration-driven per the set direction — no
+  reflection-tier chasing). Slice 5 (namespaced singletons, ~5 sites) BLOCKED
+  on an ADR-scale index change (qualified-key registration, the defect-2 root
+  fix — `module Util` merges ERB's and CGI's today). Next: Phase 3 new-rule
+  surfaces.
 - **LSP §12 two-tier** — watched-files invalidation, debounce, worker pool.
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge`, `coverage --workers`,
   plugins inflection probe; full config schema (§7 remainder).
@@ -75,6 +78,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-18 M2-GO receiver-typing batch, slices 1–4 + 4b** (branch `m2-receiver-typing-batch`) — freeze-unwrap + Kernel#Array + rand + singleton RBS returns + declaration-driven `.new`/witnessing (the reference's `meta_new` lifts reproduced as mint-declines; witness gate → `knows_toplevel_class ∪ project-sig`); gitlab UM 179→148, mastodon models 5→3, 0 FP (one `Clusters::Instance` FP caught+fixed by the defect-2 guard); fixture 67 pins the batch. Slice 5 (namespaced singletons, ADR-0023) = the one open design call. [note](notes/20260718-m2-receiver-typing-batch.md).
 - **2026-07-18 compat Phase 0 (M1+M2)** — M1 ref self-diff: RC inference deltas add 0 diags on ~17k measured (Phase 2 CLOSED ex ante); M2: gitlab UM 179 characterized — no AS-leniency in rigor-rs, silence is receiver-typing substrate; 5 GO mechanisms proven by minimal repro. [findings](notes/20260718-phase0-m1-m2-findings.md).
 - **2026-07-18 compat Phase 1** (PR #24) — fixture parity 100%: S1 fold-decline nominal fallback (53×3) + S2 last_match arity `String|nil` (65×1); live+snapshot 0 gaps / 0 FP, fp_audit 5 corpora clean.
 - **2026-07-18 upstream RC bump `47ec8625→7a69f142`** (80 commits) — two parity divergences closed 0 FP: `suppression.unknown-marker` (new rule, upstream `4e0ca475`) + Kernel intrinsic explicit-`Kernel.`-receiver fold (`c9d2e473`); live 188 matched / 193 ref, snapshots re-baselined, core corpora + survey FP-clean. Rest of the RC's inference precision deferred as coverage-only. [note](notes/20260718-upstream-rc-bump-47ec8625-7a69f142.md).

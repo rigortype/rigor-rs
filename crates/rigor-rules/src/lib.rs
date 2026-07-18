@@ -1185,19 +1185,33 @@ fn check_call(
         });
     }
 
-    // Project-`sig/`-declared class instance (ADR-0033): `Widget.new` types to a
-    // source-registry `Nominal` that `class_name_of` (core-id only) will not
-    // resolve, so recover the name from the source registry. Witness a typo ONLY
-    // when the class was INTRODUCED by the project's OWN signatures
-    // (`is_project_sig_class`) — the reference treats project sig as
-    // authoritative, unlike a bundled stdlib/gem RBS class (`Pathname.new.typo`),
-    // which stays lenient, and unlike an in-source-only class (not sig-declared),
-    // which also stays lenient. `class_has_method` keeps its conservative gate
-    // (an incomplete ancestor chain ⇒ `true` ⇒ silent), so this never fires on a
-    // sig class whose charted super is unknown.
+    // RBS-known class instance carried by a source-registry `Nominal` that
+    // `class_name_of` (core-id only) will not resolve — recover the name from
+    // the source registry and witness when the loaded RBS models the class
+    // (`knows_class`): a project-`sig/` class (ADR-0033, `Widget.new` — project
+    // sig is authoritative) AND a stdlib/core instance minted by a
+    // declaration-driven path (a singleton RBS return — `Date.today`,
+    // `Time.now` — or a C5 `Range` constant), which the reference witnesses
+    // identically (probed: `Date.today.end_of_month`, `R.frobnicate` for a
+    // Range constant both fire there). An in-source-only class (not in any
+    // loaded RBS) stays lenient, and the stdlib `.new` leniency
+    // (`Pathname.new("x").nope`) now lives in `type_dot_new`, which declines
+    // the mint for a bundled non-core class, so no such Nominal reaches this
+    // gate. `class_has_method` keeps its conservative completeness gate (an
+    // incomplete ancestor chain ⇒ `true` ⇒ silent).
+    // Gated on `knows_toplevel_class` (∪ project-sig), NOT `knows_class`: a
+    // name the index knows only via a namespaced short-key registration
+    // (`Instance` = some RBS `…::Instance`; the defect-2 set) can equally be a
+    // PROJECT model's bare name (`Clusters::Instance` — gitlab), which the
+    // reference resolves lexically to the project class and stays silent on;
+    // witnessing it against the unrelated stdlib surface is an FP (caught by
+    // fp_audit on gitlab app/models the first time this gate was
+    // `knows_class`-wide).
     if index.class_name_of(interner, recv_ty).is_none() {
         if let Some(name) = typer.source().class_name_for_id_of(interner, recv_ty) {
-            if index.is_project_sig_class(name) && !index.class_has_method(name, method) {
+            if (index.knows_toplevel_class(name) || index.is_project_sig_class(name))
+                && !index.class_has_method(name, method)
+            {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
                 let severity = catalog(CALL_UNDEFINED_METHOD)

@@ -517,6 +517,21 @@ impl SourceIndex {
         }
     }
 
+    /// Whether the project defines a constant named `name` ANYWHERE (toplevel,
+    /// nested, or as a discovered class/module) — the scope-INDEPENDENT
+    /// companion to [`Self::constant_shadowed`]. Used by `type_dot_new`'s
+    /// stdlib-mint decline: a project-defined name colliding with a loaded-RBS
+    /// short key (`Selector = Data.define(...)` vs an RBS `Selector`) keeps its
+    /// project mint regardless of the caller's lexical-scope attachment
+    /// (callers without `with_lexical_scopes` have an empty prefix, which would
+    /// make the lexical predicate miss a nested definition). Conservative
+    /// toward KEEPING the mint — the pre-existing behavior.
+    pub fn constant_defined_anywhere(&self, name: &str) -> bool {
+        self.toplevel_constants.contains(name)
+            || self.nested_constant_namespaces.contains_key(name)
+            || self.classes.contains_key(name)
+    }
+
     /// The DISCOVERED written superclass (last path component) of a source class,
     /// or `None` when the name is unknown OR is a source class/module WITHOUT a
     /// `class Foo < Bar` superclass (a bare `class Foo`/`module Foo` — the two are
@@ -1536,6 +1551,17 @@ fn const_lit_of(ast: &LoweredAst, node: NodeId) -> Option<ConstLit> {
             Some(ConstLit::Hash(members))
         }
         Node::Range { .. } => Some(ConstLit::Range),
+        // `.freeze` is identity on the literal (M2-GO slice 1): the ubiquitous
+        // `CONST = %w[...].freeze` / `{...}.freeze` spelling (RuboCop's
+        // Style/MutableConstant autocorrect) harvests as the literal underneath.
+        // Zero-arg, block-free `freeze` only; recursion makes nested
+        // `["a".freeze].freeze` work at any depth. The reference folds the same
+        // way (probed: `A = %w[a b].freeze; A.exclude?("c")` fires there).
+        Node::Call { receiver: Some(r), method, args, block_body, .. }
+            if method == "freeze" && args.is_empty() && block_body.is_empty() =>
+        {
+            const_lit_of(ast, *r)
+        }
         _ => None,
     }
 }

@@ -260,6 +260,16 @@ impl CoreIndex {
         self.data.method_return(class, method)
     }
 
+    /// The RETURN class of the CLASS method `class.method` — the singleton
+    /// counterpart of [`Self::method_return`], plugin-aware for the same reason.
+    /// Diagnostic-grade (all-overloads-agree, see
+    /// [`rbs::CoreData::singleton_method_return`]): lets `Date.today` type
+    /// `Date` so a chained AS-method typo witnesses (M2-GO slice 4).
+    pub fn singleton_method_return(&self, class: &str, method: &str) -> Option<&'static str> {
+        self.data.singleton_method_return(class, method)
+    }
+
+
     /// The RETURN class of a core method **called WITH a block**, over THIS
     /// index's data — the instance counterpart of [`method_return_with_block`],
     /// plugin-aware for the same reason as [`Self::method_return`].
@@ -909,5 +919,41 @@ mod tests {
         let idx = CoreIndex::new();
         assert!(idx.knows_toplevel_class("Array"));
         assert!(!idx.knows_toplevel_class("DefinitelyNotAClass_xyz"));
+    }
+}
+
+
+#[cfg(test)]
+mod singleton_return_tests {
+    use super::*;
+
+    /// M2-GO slice 4: diagnostic-grade singleton returns. Concrete unanimous
+    /// returns resolve; divergent-overload methods (`Regexp.last_match`:
+    /// `MatchData?` vs `String?`) decline by the all-overloads-agree collapse.
+    #[test]
+    fn singleton_method_return_unanimous_and_divergent() {
+        let idx = CoreIndex::new();
+        assert_eq!(idx.singleton_method_return("Time", "now"), Some("Time"));
+        assert_eq!(idx.singleton_method_return("Time", "at"), Some("Time"));
+        assert_eq!(idx.singleton_method_return("Date", "today"), Some("Date"));
+        // Divergent overload returns MUST decline (the FP keystone).
+        assert_eq!(idx.singleton_method_return("Regexp", "last_match"), None);
+        // Unknown method / class decline.
+        assert_eq!(idx.singleton_method_return("Time", "no_such"), None);
+        assert_eq!(idx.singleton_method_return("NoSuchClass", "now"), None);
+    }
+}
+
+#[cfg(test)]
+mod singleton_alias_return_tests {
+    use super::*;
+
+    /// A singleton ALIAS resolves through its target with instance-binding
+    /// preserved (`alias self.pwd self.getwd` → `Dir.pwd -> String`).
+    #[test]
+    fn singleton_alias_resolves_to_target_return() {
+        let idx = CoreIndex::new();
+        assert_eq!(idx.singleton_method_return("Dir", "pwd"), Some("String"));
+        assert_eq!(idx.singleton_method_return("Dir", "getwd"), Some("String"));
     }
 }
