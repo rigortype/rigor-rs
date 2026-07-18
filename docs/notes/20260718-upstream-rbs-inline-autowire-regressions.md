@@ -1,5 +1,20 @@
 # Upstream rbs-inline auto-wire: measured regressions (2026-07-18)
 
+> **CORRECTED 2026-07-19 — all three "regressions" (and the cross-file
+> "feature") were ENVIRONMENT ARTIFACTS, not upstream changes.** The auto-wire's
+> `require "rigor-rbs-inline"` resolved a stale installed `rigortype 0.2.4`
+> gem's plugin copy (pre-annotation-gate: 0 hits for `annotated?`) instead of
+> the checkout's, synthesizing skeletons for every file. With the checkout's
+> plugin pinned (`-I plugins/rigor-rbs-inline/lib`) the wave's fixture-corpus
+> delta is **0 added / 0 dropped**. Root-caused via upstream's triage
+> discriminators (universe count 1348→1349 = the skeleton entering; a
+> gem-less Ruby env load-erroring = the breadcrumb) — full trail on
+> [rigortype/rigor#194](https://github.com/rigortype/rigor/issues/194). The
+> REAL reportable finding is the engine↔plugin version-skew hazard, now
+> guarded in `UPSTREAM.md` + `harness/lib.rb` + `fp_audit.py`. The re-pin
+> item is UNBLOCKED (still waiting on the v0.3.0 tag per policy). Original
+> (superseded) analysis kept below for the record.
+
 Tracking check on the post-pin upstream wave (`73141341..b70adcb5`, the ADR-93
 "auto-wire the bundled rigor-rbs-inline plugin by default" arc). The M1
 self-diff tool (old pin `7a69f142` vs `b70adcb5`, `--no-cache`) plus minimal
