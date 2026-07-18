@@ -1230,9 +1230,17 @@ fn check_call(
     // `knows_class`-wide).
     if index.class_name_of(interner, recv_ty).is_none() {
         if let Some(name) = typer.source().class_name_for_id_of(interner, recv_ty) {
-            if (index.knows_toplevel_class(name) || index.is_project_sig_class(name))
-                && !index.class_has_method(name, method)
-            {
+            // `knows_toplevel_class` ALONE (ADR-0042 gate probe s5): a
+            // TOPLEVEL project-sig class (`Widget`) is in the toplevel set via
+            // its authoritative registration, so the former
+            // `|| is_project_sig_class` arm only ever ADDED nested-only sig
+            // classes (`module Outer; class Inner` reached by a bare `Inner`
+            // read) — a short-key artifact door the reference does not have:
+            // it witnesses `Outer::Inner` through the QUALIFIED path only and
+            // keeps bare `Inner` (which resolves to nothing at runtime)
+            // silent. Probed: rigor-rs fired `spni' for Inner` where the
+            // reference is silent — an oracle FP shape, now closed.
+            if index.knows_toplevel_class(name) && !index.class_has_method(name, method) {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
                 let severity = catalog(CALL_UNDEFINED_METHOD)

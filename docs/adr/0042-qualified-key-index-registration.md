@@ -1,8 +1,11 @@
 # Qualified-key index registration (the defect-2 root fix)
 
-Status: proposed — filed 2026-07-18 while the evidence is fresh; NOT scheduled.
-Implementation gated on a dedicated nested-class regression surface being built
-first (see "Gate" below).
+Status: proposed — filed 2026-07-18; **gate SATISFIED 2026-07-19**
+([deliverables](../notes/20260719-adr0042-gate-deliverables.md): fixtures
+68–70 pin the 9-gap regression surface; the consumer inventory found no
+unsound consumer under alias-collapse and TWO additional latent-FP sites the
+migration fixes for free). Implementation remains a separate approved arc and
+MUST also cover the reference-resolution scope item added below.
 
 ## Context — the short-key wall, measured twice
 
@@ -57,11 +60,21 @@ scheduled".
 
 ## Gate (before any implementation)
 
-1. Build a nested-class regression surface FIRST: fixtures exercising
+1. ✅ Build a nested-class regression surface FIRST: fixtures exercising
    `A::B.new`, `A::B.singleton`, bare-`B` project shadowing, cross-file
    reopens of nested classes — checked against the live reference.
-2. Inventory every `knows_class` / `knows_toplevel_class` /
+   (Fixtures 68–70, 2026-07-19.)
+2. ✅ Inventory every `knows_class` / `knows_toplevel_class` /
    `class_has_method` / `ancestors` call site and classify short-key
-   assumptions BEFORE flipping registration.
-3. The usual gates: 0 FP on the fixture set + fp_audit corpora; the sig-gen
+   assumptions BEFORE flipping registration. (~46 SAFE / 6 GUARD /
+   5 NEEDS-ALIAS / 1 TEST-PIN; no unsound consumer under
+   alias-collapse-to-nothing.)
+3. **NEW scope item (from the inventory)**: qualifying the DECLARATION key
+   does not fix superclass/include/extend/return-type/param-type REFERENCES
+   (short-only `type_name_str` extraction). A relative reference inside a
+   nested class must either be resolved against the enclosing lexical prefix
+   or fall to the alias table; unresolved degrades to chain-incomplete ⇒
+   silent (FP-safe) but is a coverage-regression risk the implementation must
+   measure explicitly (fixtures 68–70 + fp_audit before/after).
+4. The usual gates: 0 FP on the fixture set + fp_audit corpora; the sig-gen
    byte-parity surface must not move.

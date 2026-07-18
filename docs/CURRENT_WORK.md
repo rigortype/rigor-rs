@@ -16,6 +16,8 @@ Last updated: 2026-07-17.
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
 
+- **ADR-0042 implementation** — gate satisfied; awaiting an explicit go
+  (the migration + the reference-resolution sub-decision, ADR step 3).
 - **ACTIVE: compat next stage** — [plan](notes/20260718-compat-next-stage-plan.md);
   Phase 0+1 DONE ([findings](notes/20260718-phase0-m1-m2-findings.md)): Phase 2
   CLOSED by measurement (M1: 0 added diags on ~17k); M2-GO slices 1–4 + 4b
@@ -81,6 +83,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-19 ADR-0042 gate SATISFIED** (branch `adr-0042-gate`, subagent-parallel) — oracle matrix (12 scenarios) → fixtures 68–70 pin the 9-gap nested-class surface; consumer inventory: no unsound consumer under alias-collapse, +2 latent-FP sites the migration fixes free, +1 real scope item (reference-name resolution) absorbed into the ADR; the s5 bare-door oracle-FP shape CLOSED (witness gate → `knows_toplevel_class` only). [deliverables](notes/20260719-adr0042-gate-deliverables.md).
 - **2026-07-19 #194 root-caused: stale-gem plugin hijack** — the 3 "upstream regressions" were artifacts of `rigortype 0.2.4`'s pre-gate plugin copy hijacking the auto-wire require; corrected wave delta 0/0; oracle invocations hardened (`harness/lib.rb`, `fp_audit.py`, `UPSTREAM.md`); upstream keeps #194 for the version-skew hazard. [note](notes/20260718-upstream-rbs-inline-autowire-regressions.md).
 - **2026-07-18 upstream rbs-inline auto-wire: 3 single-file regressions measured** (in-source chain inference lost ×2, interprocedural folds lost + cross-owner singleton FP on an explicit negative); pin HELD at `7a69f142`; feedback package ready. [note](notes/20260718-upstream-rbs-inline-autowire-regressions.md).
 - **2026-07-18 severity-resolution machinery** (branch `severity-profile-machinery`) — `severity_profile:`/`severity_overrides:` were silently IGNORED (real incompatibility for configured projects); reference `SeverityProfile.resolve` + `SeverityStamp` ported (verbatim 28-row profile tables, family overrides, `:off` drop, internal-error bypass, memoized void-rule gate); 8/8 live config byte-diffs IDENTICAL, default output unchanged. [note](notes/20260718-severity-profile-machinery.md).

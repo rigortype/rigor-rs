@@ -1,0 +1,3 @@
+class Instance
+  def clusters: () -> Array[untyped]
+end

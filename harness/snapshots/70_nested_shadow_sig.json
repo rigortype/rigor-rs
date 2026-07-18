@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/70_nested_shadow_sig.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 24,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `exited?' for Status"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Status"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `digest' for Instance"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Instance"
+    }
+  ]
+}

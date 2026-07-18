@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/69_nested_project_sig.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 18,
+      "severity": "error",
+      "message": "undefined method `spni' for Outer::Inner"
+    }
+  ]
+}
