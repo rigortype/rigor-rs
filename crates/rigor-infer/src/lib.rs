@@ -940,11 +940,21 @@ impl<'i> Typer<'i> {
         if self.file_defines_method(ast, method) {
             return None;
         }
-        // Splat / forwarding guard: rigor-parse lowers a `*a` splat and a `...`
-        // forwarding arg to `Node::Other` (no owned variant). Any such arg means
-        // the runtime arity is unknown, so we cannot choose the fold shape —
-        // decline for both the printer and the conversion folds.
-        if args.iter().any(|&a| matches!(ast.get(a), Node::Other { .. })) {
+        // Splat / forwarding guard: rigor-parse lowers a `*a` splat arg to a
+        // `Statements` wrapper and a `...` forwarding arg to `Node::Other` (no
+        // owned variants). Any such arg means the runtime arity is unknown, so
+        // we cannot choose the fold shape — decline for the printer
+        // (identity-vs-Tuple undecidable) and the conversion folds.
+        // `format`/`sprintf` are the exception: their return is String
+        // REGARDLESS of the positional arity, so the reference's literal-string
+        // lift still types them under a splat (fixture 53) — nominal String.
+        if args
+            .iter()
+            .any(|&a| matches!(ast.get(a), Node::Other { .. } | Node::Statements { .. }))
+        {
+            if matches!(method, "format" | "sprintf") && !args.is_empty() {
+                return Some(self.nominal_or_untyped("String", interner));
+            }
             return None;
         }
 
@@ -969,62 +979,63 @@ impl<'i> Typer<'i> {
 
         // The remaining folds (`format`/`sprintf`/`String`/`Integer`/`Float`)
         // fold to a value-pinned `Constant` only when EVERY argument is itself a
-        // value-pinned `Constant` scalar.
-        let pinned = self.pin_arg_scalars(ast, args, env, interner);
-
-        // NOMINAL fallback (ADR ivar-write-mismatch increment b): when the args
-        // are NOT all value-pinned, the three CLASS conversions still type to
-        // their conversion class UNCONDITIONALLY — the reference's RBS pins
-        // `Integer(...) -> Integer`, `Float(...) -> Float`, `String(...) -> String`
-        // regardless of whether the argument folds (probed: `Float(x).bogus`
-        // witnesses on Float; `@d = Float(kwargs[:k]); @d = 0` flags Float→Integer).
-        // Gated on an arity the conversion accepts so a wrong-arity call (which
-        // raises at runtime) stays unfolded. `format`/`sprintf` need real
-        // constants (no nominal form) and `Hash` was handled above, so they keep
-        // declining. The existing shadow-def / splat guards above already ran, so
-        // this preserves the reference's FP envelope (a `def Float` in the file
-        // still declines — an FP-safe under-emit).
-        if pinned.is_none() {
-            let nominal_class = match (method, args.len()) {
-                ("String", 1) | ("Float", 1) | ("Integer", 1 | 2) => Some(method),
+        // value-pinned `Constant` scalar. A fold-time DECLINE (arg-type mismatch,
+        // unparseable input, oversized result) does NOT go silent: it falls to
+        // the nominal fallback below, because the reference does not go silent
+        // there either — its literal-string lift / RBS envelope still types
+        // `format("%d", "abc")` String and `Integer("abc")` Integer (fixture 53).
+        if let Some(scalars) = self.pin_arg_scalars(ast, args, env, interner) {
+            let folded: Option<Scalar> = match method {
+                "format" | "sprintf" => {
+                    // Template = first arg (a Constant string); the rest are the
+                    // format arguments.
+                    scalars.split_first().and_then(|(template, rest)| {
+                        let Scalar::Str(tmpl) = template else {
+                            return None;
+                        };
+                        kernel_fold::sprintf(tmpl, rest).map(Scalar::Str)
+                    })
+                }
+                "String" => match scalars.as_slice() {
+                    [only] => Some(Scalar::Str(kernel_fold::ruby_string_of(only))),
+                    _ => None,
+                },
+                "Integer" => match scalars.as_slice() {
+                    [only] => kernel_fold::ruby_integer(only, None).map(Scalar::Int),
+                    [only, Scalar::Int(base)] => {
+                        kernel_fold::ruby_integer(only, Some(*base)).map(Scalar::Int)
+                    }
+                    _ => None,
+                },
+                "Float" => match scalars.as_slice() {
+                    [only] => kernel_fold::ruby_float(only).map(Scalar::Float),
+                    _ => None,
+                },
                 _ => None,
             };
-            return nominal_class.map(|class| self.nominal_or_untyped(class, interner));
+            if let Some(folded) = folded {
+                return Some(interner.intern(Type::Constant(folded)));
+            }
         }
-        let scalars = pinned?;
-        let folded: Scalar = match method {
-            "format" | "sprintf" => {
-                // Template = first arg (a Constant string); the rest are the
-                // format arguments.
-                let (template, rest) = scalars.split_first()?;
-                let Scalar::Str(tmpl) = template else {
-                    return None;
-                };
-                let rendered = kernel_fold::sprintf(tmpl, rest)?;
-                Scalar::Str(rendered)
-            }
-            "String" => {
-                let [only] = scalars.as_slice() else {
-                    return None;
-                };
-                Scalar::Str(kernel_fold::ruby_string_of(only))
-            }
-            "Integer" => match scalars.as_slice() {
-                [only] => Scalar::Int(kernel_fold::ruby_integer(only, None)?),
-                [only, Scalar::Int(base)] => {
-                    Scalar::Int(kernel_fold::ruby_integer(only, Some(*base))?)
-                }
-                _ => return None,
-            },
-            "Float" => {
-                let [only] = scalars.as_slice() else {
-                    return None;
-                };
-                Scalar::Float(kernel_fold::ruby_float(only)?)
-            }
-            _ => return None,
+
+        // NOMINAL fallback (ADR ivar-write-mismatch increment b; widened by the
+        // compat plan S1): when the args are NOT all value-pinned OR the value
+        // fold declined, the calls still type to their conversion class — the
+        // reference's RBS pins `Integer(...) -> Integer`, `Float(...) -> Float`,
+        // `String(...) -> String` regardless of whether the argument folds
+        // (probed: `Float(x).bogus` witnesses on Float), and its literal-string
+        // lift types `format`/`sprintf` String on ANY arity ≥ 1. Gated on an
+        // arity the conversion accepts so a wrong-arity call (which raises at
+        // runtime) stays unfolded. `Hash` was handled above and keeps declining.
+        // The shadow-def / splat guards above already ran, so this preserves the
+        // reference's FP envelope (a `def Float` in the file still declines — an
+        // FP-safe under-emit).
+        let nominal_class = match (method, args.len()) {
+            ("format" | "sprintf", n) if n >= 1 => Some("String"),
+            ("String", 1) | ("Float", 1) | ("Integer", 1 | 2) => Some(method),
+            _ => None,
         };
-        Some(interner.intern(Type::Constant(folded)))
+        nominal_class.map(|class| self.nominal_or_untyped(class, interner))
     }
 
     /// `Kernel#Hash(v)` fold (reference `try_hash`): a `HashShape` argument
@@ -2008,19 +2019,25 @@ impl<'i> Typer<'i> {
         // be matched syntactically here, before the receiver-class resolution. The
         // syntactic name gate mirrors the reference resolving `Regexp.last_match`
         // against core RBS; a project constant coincidentally named `Regexp` is not
-        // a realistic hazard. The arm depends only on the arg SHAPE (see spec
-        // `docs/notes/20260717-p2-optional-local-nil-spec.md`):
-        //   - zero args        ⇒ `MatchData` (deref `#[]` / `#begin` / …),
-        //   - one INT/STR/SYM  ⇒ `String`    (deref `#gsub` / `#upcase` / …),
-        //   - anything else    ⇒ DECLINE (non-literal / multi arg — never guess).
+        // a realistic hazard. The arm depends only on the ARITY (spec
+        // `docs/notes/20260717-p2-optional-local-nil-spec.md`, widened by the
+        // compat plan S2): EVERY 1-arity overload returns `String?` —
+        // `(Integer) -> String?`, `(Symbol|String name) -> String?` — so the
+        // reference resolves a 1-arg call to `String?` even when the arg is
+        // non-literal (fixture 65). Arity, not arg shape, decides:
+        //   - zero args         ⇒ `MatchData` (deref `#[]` / `#begin` / …),
+        //   - one non-splat arg ⇒ `String`    (deref `#gsub` / `#upcase` / …),
+        //   - splat / multi arg ⇒ DECLINE (arity unknown / raises — never guess).
         if method == "last_match" {
             if let Node::ConstantRead { name, .. } = ast.get(recv) {
                 if name == "Regexp" {
                     return match args.as_slice() {
                         [] => Some("MatchData"),
-                        [only] if matches!(
+                        // A splat lowers to `Statements` (receiver-call args) or
+                        // `Other` (`...` forwarding) — arity unknown, decline.
+                        [only] if !matches!(
                             ast.get(*only),
-                            Node::IntegerLit { .. } | Node::StringLit { .. } | Node::SymbolLit { .. }
+                            Node::Other { .. } | Node::Statements { .. }
                         ) =>
                         {
                             Some("String")
@@ -2712,14 +2729,30 @@ mod tests {
         assert_eq!(last_match_use_arm(src, "m", "begin"), Some("MatchData"));
     }
 
-    /// Decline conditions (FP backstop): a NON-literal / multi arg to `last_match`
-    /// (return class not decidable), a NON-`Regexp` constant receiver, a guard
+    /// A NON-literal 1-arg call fires too (compat plan S2): every 1-arity
+    /// overload returns `String?`, so the reference resolves BY ARITY — the arg's
+    /// shape does not matter (fixture 65 `non_literal_arg`).
+    #[test]
+    fn p2_regexp_last_match_non_literal_arg_is_string_source() {
+        assert_eq!(
+            last_match_use_arm(b"i = 2\nc = Regexp.last_match(i)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            Some("String")
+        );
+    }
+
+    /// Decline conditions (FP backstop): a splat / multi arg to `last_match`
+    /// (arity unknown / raises), a NON-`Regexp` constant receiver, a guard
     /// between the bind and the use, and a safe-nav deref all record no snapshot.
     #[test]
     fn p2_regexp_last_match_declines() {
-        // non-literal arg
+        // splat arg — arity statically unknown (could be the 0-arg MatchData form)
         assert_eq!(
-            last_match_use_arm(b"i = 2\nc = Regexp.last_match(i)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            last_match_use_arm(b"a = [1]\nc = Regexp.last_match(*a)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
+            None
+        );
+        // multi arg — no such overload (raises at runtime)
+        assert_eq!(
+            last_match_use_arm(b"c = Regexp.last_match(1, 2)\nn = c.gsub(\"a\", \"b\")\n", "c", "gsub"),
             None
         );
         // a different constant named `.last_match` is not the core Regexp source
@@ -3581,3 +3614,4 @@ mod tests {
         assert_eq!(idx.class_name_of(&i, interned), Some("String"), "Time.name must be String, got {ty:?}");
     }
 }
+

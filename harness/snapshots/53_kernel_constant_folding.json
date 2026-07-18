@@ -94,14 +94,14 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 69,
+      "line": 70,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for Integer"
     },
     {
       "rule": "call.undefined-method",
-      "line": 74,
+      "line": 76,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for String"

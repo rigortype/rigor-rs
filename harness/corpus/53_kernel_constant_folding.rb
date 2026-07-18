@@ -57,18 +57,20 @@ k.frobnicate
 l = Float("1e3")
 l.frobnicate
 
-# --- silent directions (fold declines → Dynamic receiver → no witness) ---
+# --- nominal fallback (fold declines → conversion-class witness, S1) ---
 
-# A fold-time error (arg-type mismatch) declines: the oracle falls to its
-# literal-string lift, rigor-rs stays silent (a coverage gap, never an FP).
+# A fold-time error (arg-type mismatch) declines the VALUE fold, but not the
+# class: the oracle's literal-string lift and rigor-rs's nominal String agree.
 m = format("%d", "not a number")
 m.frobnicate
 
-# An unparseable Integer() raises in Ruby; the fold declines and stays silent.
+# An unparseable Integer() raises in Ruby; the value fold declines but the RBS
+# envelope still pins the conversion class — witnesses on Integer.
 n = Integer("abc")
 n.frobnicate
 
-# A splat argument makes the arity statically unknown, so the fold declines.
+# A splat arity is statically unknown, but format returns String REGARDLESS of
+# arity, so the nominal String fallback still witnesses.
 args = [1]
 o = format("%d", *args)
 o.frobnicate

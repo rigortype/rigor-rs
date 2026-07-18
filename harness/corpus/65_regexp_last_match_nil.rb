@@ -6,7 +6,7 @@
 # concrete arm. Both `Regexp` and `::Regexp` are recognized.
 #
 # Byte-for-byte against the oracle on (rule, line, column). The decline backstop
-# keeps every ambiguous / guarded / non-literal-arg shape silent (zero-FP).
+# keeps every ambiguous / guarded / splat / multi-arg shape silent (zero-FP).
 
 # --- FIRES: last_match(int) -> String, straight-line String deref ----------
 
@@ -55,9 +55,9 @@ def safe_nav
   c&.gsub("a", "b")
 end
 
-# --- rigor-rs DECLINES (reference fires — a coverage gap, NOT a false positive):
-#     a non-literal arg makes the return class undecidable for rigor-rs, which
-#     conservatively declines; the reference resolves it to `String?` and fires.
+# --- FIRES: a non-literal arg still selects `String?` BY ARITY (every 1-arg
+#     overload returns `String?` — `(Integer)` and `(name)` alike), matching
+#     the reference's overload resolution (compat plan S2).
 def non_literal_arg(i)
   c = Regexp.last_match(i)
   c.gsub("a", "b")
