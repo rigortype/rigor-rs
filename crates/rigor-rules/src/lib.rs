@@ -6171,8 +6171,12 @@ mod void_value_use_tests {
     use super::*;
     use rigor_parse::{lower, parse};
 
-    fn void_diags(src: &[u8]) -> Vec<Diagnostic> {
-        let dir = std::env::temp_dir().join("rigor_void_rule_test");
+    fn void_diags(tag: &str, src: &[u8]) -> Vec<Diagnostic> {
+        // A UNIQUE dir per calling test: the two tests in this module run in
+        // parallel, and a shared fixed path races one test's remove_dir_all
+        // against the other's sig ingestion (flaked on ubuntu CI: the Widget
+        // sig vanished mid-build and the singleton case read 0 diagnostics).
+        let dir = std::env::temp_dir().join(format!("rigor_void_rule_test_{tag}"));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -6195,6 +6199,7 @@ mod void_value_use_tests {
     #[test]
     fn void_value_contexts_fire() {
         let d = void_diags(
+            "contexts",
             b"w = Widget.new\nx = w.fire\nputs(w.fire)\nw.fire.to_s\n@i = w.fire\n",
         );
         assert_eq!(d.len(), 4, "{d:?}");
@@ -6204,7 +6209,7 @@ mod void_value_use_tests {
             "value use of `void': `Widget#fire' declares `-> void', so its return recovers to `top' and should not be used as a value"
         );
         // The singleton spelling labels with a dot.
-        let s = void_diags(b"y = Widget.reset\n");
+        let s = void_diags("contexts", b"y = Widget.reset\n");
         assert_eq!(s.len(), 1, "{s:?}");
         assert!(s[0].message.contains("`Widget.reset'"), "{}", s[0].message);
     }
@@ -6213,8 +6218,8 @@ mod void_value_use_tests {
     /// method, and an unresolvable receiver.
     #[test]
     fn void_bare_statement_and_nonvoid_stay_silent() {
-        assert!(void_diags(b"w = Widget.new\nw.fire\n").is_empty());
-        assert!(void_diags(b"w = Widget.new\ny = w.spin\n").is_empty());
-        assert!(void_diags(b"y = unknown_thing.fire\n").is_empty());
+        assert!(void_diags("silent", b"w = Widget.new\nw.fire\n").is_empty());
+        assert!(void_diags("silent", b"w = Widget.new\ny = w.spin\n").is_empty());
+        assert!(void_diags("silent", b"y = unknown_thing.fire\n").is_empty());
     }
 }
