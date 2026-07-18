@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/68_nested_stdlib_singleton.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `html_escape_once' for singleton(ERB::Util)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `no_such_method' for singleton(ERB::Util)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `pretty' for singleton(CGI::Util)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `pretty' for singleton(ERB::Util)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `html_escape' for singleton(CGI::Util)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `no_such_method_xyz' for singleton(CGI)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Process::Status"
+    }
+  ]
+}

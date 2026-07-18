@@ -1,0 +1,5 @@
+module Outer
+  class Inner
+    def brake: () -> Integer
+  end
+end
