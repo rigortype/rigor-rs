@@ -23,6 +23,7 @@ mod config;
 use config::Config;
 mod annotate;
 mod bundler;
+mod bleeding_edge;
 mod config_audit;
 mod diff;
 mod triage;
@@ -50,7 +51,7 @@ mod type_of;
 const COMMANDS: &[&str] = &[
     "check", "annotate", "type-of", "trace", "type-scan", "explain", "diff",
     "sig-gen", "baseline", "triage", "coverage", "plugins", "plugin", "lsp",
-    "mcp", "skill", "docs", "init", "doctor", "version",
+    "mcp", "skill", "docs", "init", "doctor", "version", "show-bleedingedge",
 ];
 
 fn main() -> ExitCode {
@@ -76,6 +77,7 @@ fn main() -> ExitCode {
         Some("explain") => explain::cmd_explain(&args[1..]),
         Some("init") => init::cmd_init(&args[1..]),
         Some("doctor") => doctor::cmd_doctor(&args[1..]),
+        Some("show-bleedingedge") => bleeding_edge::cmd_show_bleedingedge(&args[1..]),
         Some("plugins") => plugins_cmd::cmd_plugins(&args[1..]),
         Some("docs") => docs::cmd_docs(&args[1..]),
         Some("lsp") => lsp::cmd_lsp(&args[1..]),
@@ -118,6 +120,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // note when no baseline is active (WD2 — the flag never loads a baseline the
     // config did not name).
     let mut baseline_strict = false;
+    // ADR-50 WD2 — the `--bleeding-edge[=LIST]` / `--no-bleeding-edge` CLI
+    // mirror of the `bleeding_edge:` config key. `None` means "no flag — use
+    // the configured selection". `=LIST` (not ` LIST`) so a bare
+    // `--bleeding-edge` never swallows a following positional path.
+    let mut bleeding_edge_cli: Option<config::BleedingEdgeSelector> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -163,6 +170,26 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 }
             },
             "--no-ruby" => no_ruby_flag = true,
+            "--bleeding-edge" => {
+                bleeding_edge_cli =
+                    Some(config::BleedingEdgeSelector::All { except: Vec::new() });
+            }
+            "--no-bleeding-edge" => {
+                bleeding_edge_cli = Some(config::BleedingEdgeSelector::None);
+            }
+            other if other.starts_with("--bleeding-edge=") => {
+                let ids: Vec<String> = other["--bleeding-edge=".len()..]
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                bleeding_edge_cli = Some(if ids.is_empty() {
+                    config::BleedingEdgeSelector::All { except: Vec::new() }
+                } else {
+                    config::BleedingEdgeSelector::List(ids)
+                });
+            }
             other if other.starts_with("--ruby=") => {
                 ruby_cli = Some(ruby_mode::parse_value(&other["--ruby=".len()..]));
             }
@@ -192,6 +219,15 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // stream is untouched (0-FP / harness-safe — the harness runs configless).
     // `project_root` is the process cwd, the base config discovery resolves against.
     config_audit::emit(&cfg, Path::new("."));
+
+    // ADR-50 WD2 — the effective bleeding-edge selection: CLI flag > config.
+    // The one engine-relevant feature today is `use-of-void-value`, which
+    // gates the `static.value-use.void` collector (the reference gates by
+    // severity resolution — authored :warning, profile :off, feature
+    // :warning — with the same observable).
+    let bleeding_edge =
+        bleeding_edge_cli.unwrap_or_else(|| cfg.bleeding_edge_selector());
+    let void_rule_active = bleeding_edge.activates("use-of-void-value");
 
     // ADR-0036 coverage posture (ADR-0008 sidecar). Resolve the mode, then bring
     // up the Ruby sidecar accordingly: `require`/`<path>` MUST have it (exit 69 on
@@ -224,7 +260,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
     // `# rigor:disable` applied). Shared with `baseline generate`.
-    let (mut findings, had_io_error) = analyze_files(&expanded, &cfg, "check", folder_ref);
+    let (mut findings, had_io_error) =
+        analyze_files(&expanded, &cfg, "check", folder_ref, void_rule_active);
 
     // ADR-22 slice 5 — snapshot the RAW (pre-baseline-filter) findings for the
     // `--baseline-strict` audit. The reference audits `raw_result.diagnostics`
@@ -582,6 +619,7 @@ fn analyze_files(
     cfg: &Config,
     verb: &str,
     folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
+    void_rule_active: bool,
 ) -> (Vec<(usize, String, String, Diagnostic)>, bool) {
     let disable_matcher = cfg.disable_matcher();
     // ADR-25 — config-gated plugins. With no `plugins:` in `.rigor.yml` this is
@@ -733,6 +771,17 @@ fn analyze_files(
                 diags.extend(rigor_rules::shadowed_rescue_diagnostics(
                     &p.ast, &index, &project_source, &p.source,
                 ));
+                // `static.value-use.void` (ADR-100) — behind the
+                // `use-of-void-value` bleeding-edge feature; produced BEFORE
+                // suppression filtering like every check rule.
+                if void_rule_active {
+                    diags.extend(rigor_rules::void_value_use_diagnostics(
+                        &p.ast,
+                        &mut interner,
+                        &index,
+                        &project_source,
+                    ));
+                }
                 diags
             }));
             match result {
@@ -964,7 +1013,13 @@ fn baseline_analysis(
     };
     let (expanded_owned, _path_errors) = expand_check_paths(roots);
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
-    let (findings, _had_io_error) = analyze_files(&expanded, &cfg, verb, folder_ref);
+    let (findings, _had_io_error) = analyze_files(
+        &expanded,
+        &cfg,
+        verb,
+        folder_ref,
+        cfg.bleeding_edge_selector().activates("use-of-void-value"),
+    );
     Ok((cfg, findings))
 }
 

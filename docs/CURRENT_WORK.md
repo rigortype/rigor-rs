@@ -26,8 +26,9 @@ parity-port arc has bottomed out — see Standing conclusions):
   compat plan is exhausted; next work returns to the productization track
   (LSP §12, `--bleeding-edge` + CLI §7, re-pin at the v0.3.0 tag).
 - **LSP §12 two-tier** — watched-files invalidation, debounce, worker pool.
-- **CLI surface from the v0.3.0 RC** — `--bleeding-edge`, `coverage --workers`,
-  plugins inflection probe; full config schema (§7 remainder).
+- **CLI surface from the v0.3.0 RC** — `--bleeding-edge` DONE (with
+  `static.value-use.void`); remaining: `coverage --workers`, plugins
+  inflection probe, full config schema (§7 remainder).
 - **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`; expect
   snapshots unchanged, then re-run `fp_audit`). Current pin: RC commit `7a69f142`.
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
@@ -36,7 +37,7 @@ parity-port arc has bottomed out — see Standing conclusions):
 
 State: harness 66 fixtures / 188 matched / 0 FP (live + snapshot, vs the new
 `7a69f142` RC); fp_audit 0 FP on mastodon, gitlab-foss lib + app/models,
-conference-app + 27/28 survey projects; 769 workspace tests; explain catalog 28
+conference-app + 27/28 survey projects; 769 workspace tests; explain catalog 29
 rules (added `suppression.unknown-marker`).
 
 ## Standing conclusions (do not re-litigate without new evidence)
@@ -79,6 +80,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-18 bleeding-edge + `static.value-use.void`** (branch `bleeding-edge-void-rule`) — ADR-50 WD2 surface end-to-end (`bleeding_edge:` config, `--bleeding-edge[=LIST]`/`--no-bleeding-edge`, `show-bleedingedge` byte-identical) + the ADR-100 void rule (index void flags, value-context collector, feature-gated); probe byte-identical to the reference, default gates unchanged (flag-off). Closes the Phase-3 deferral. [note](notes/20260718-bleeding-edge-void-rule.md).
 - **2026-07-18 compat Phase 3** (branch `phase3-new-rule-surfaces`) — unknown-config-key warning ported byte-exact (verbatim DidYouMean port, 13-case stdlib parity pin); `rbs.coverage.environment-build-failed` structurally absent (union-merge env cannot collapse); `static.value-use.void` deferred to the `--bleeding-edge` productization item (`:off` in every shipped profile — verified). [note](notes/20260718-phase3-new-rule-surfaces.md).
 - **2026-07-18 M2-GO receiver-typing batch, slices 1–4 + 4b** (branch `m2-receiver-typing-batch`) — freeze-unwrap + Kernel#Array + rand + singleton RBS returns + declaration-driven `.new`/witnessing (the reference's `meta_new` lifts reproduced as mint-declines; witness gate → `knows_toplevel_class ∪ project-sig`); gitlab UM 179→148, mastodon models 5→3, 0 FP (one `Clusters::Instance` FP caught+fixed by the defect-2 guard); fixture 67 pins the batch. Slice 5 (namespaced singletons, ADR-0023) = the one open design call. [note](notes/20260718-m2-receiver-typing-batch.md).
 - **2026-07-18 compat Phase 0 (M1+M2)** — M1 ref self-diff: RC inference deltas add 0 diags on ~17k measured (Phase 2 CLOSED ex ante); M2: gitlab UM 179 characterized — no AS-leniency in rigor-rs, silence is receiver-typing substrate; 5 GO mechanisms proven by minimal repro. [findings](notes/20260718-phase0-m1-m2-findings.md).
