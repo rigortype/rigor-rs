@@ -3,49 +3,49 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 17,
+      "line": 19,
       "column": 15,
       "severity": "error",
       "message": "undefined method `html_escape_once' for singleton(ERB::Util)"
     },
     {
       "rule": "call.undefined-method",
-      "line": 21,
+      "line": 23,
       "column": 11,
       "severity": "error",
       "message": "undefined method `no_such_method' for singleton(ERB::Util)"
     },
     {
       "rule": "call.undefined-method",
-      "line": 27,
+      "line": 29,
       "column": 11,
       "severity": "error",
       "message": "undefined method `pretty' for singleton(CGI::Util)"
     },
     {
       "rule": "call.undefined-method",
-      "line": 28,
+      "line": 30,
       "column": 11,
       "severity": "error",
       "message": "undefined method `pretty' for singleton(ERB::Util)"
     },
     {
       "rule": "call.undefined-method",
-      "line": 29,
+      "line": 31,
       "column": 11,
       "severity": "error",
       "message": "undefined method `html_escape' for singleton(CGI::Util)"
     },
     {
       "rule": "call.undefined-method",
-      "line": 33,
+      "line": 35,
       "column": 5,
       "severity": "error",
       "message": "undefined method `no_such_method_xyz' for singleton(CGI)"
     },
     {
       "rule": "call.undefined-method",
-      "line": 38,
+      "line": 40,
       "column": 8,
       "severity": "error",
       "message": "undefined method `frobnicate' for Process::Status"

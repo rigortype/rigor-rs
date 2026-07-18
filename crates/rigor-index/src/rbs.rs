@@ -572,6 +572,56 @@ impl CoreData {
             .is_some_and(|entry| entry.methods.contains_key(method))
     }
 
+    /// ADR-0042 Slice 2: the qualified-registry analogue of
+    /// [`Self::class_has_singleton_method`] for a namespaced receiver
+    /// (`ERB::Util.html_escape`). The qualified entry's OWN singleton surface
+    /// (own `def self.x` + every `extend`ed module's instance methods, resolved
+    /// short — modules are typically top-level) PLUS the base-object surface
+    /// (`Class`/`Module`/`Object`/`Kernel`/`BasicObject`, reused verbatim). A
+    /// superclass or `extend` target that is not resolvable truncates the
+    /// surface ⇒ conservative silent (never a false positive). References are
+    /// kept short in this slice (measure-first); a nested unresolvable
+    /// reference just marks the surface incomplete.
+    fn qualified_class_has_singleton_method(&self, qname: &str, method: &str) -> bool {
+        let Some(entry) = self.qualified.get(qname) else {
+            return true; // unknown ⇒ silent
+        };
+        // (1) own singleton methods.
+        if entry.singleton_methods.contains_key(method) {
+            return true;
+        }
+        // (2) extended modules' instance methods (resolved short: an extended
+        //     module is almost always a top-level or already-qualified name);
+        //     an unresolvable extend truncates the surface.
+        let mut complete = entry.superclass.is_none_or(|s| self.classes.contains_key(s));
+        for &module in &entry.extends {
+            let resolved = if self.classes.contains_key(module) {
+                Some(module)
+            } else {
+                self.resolve_short_unambiguous(module)
+            };
+            match resolved {
+                Some(m) => {
+                    let (chain, _) = self.ancestors(m);
+                    if self.lookup_on_chain(&chain, method).is_some() {
+                        return true;
+                    }
+                }
+                None => complete = false,
+            }
+        }
+        // (3) the base-object surface (shared with the short-key path).
+        let (bases_found, bases_loaded) = self.singleton_bases_lookup(method);
+        if bases_found {
+            return true;
+        }
+        // Witness absence only when the whole surface is known.
+        if complete && bases_loaded {
+            return false;
+        }
+        true
+    }
+
     /// Walk the full flattened ancestor chain; a method is present if ANY
     /// ancestor defines it directly OR via an instance `alias`. Conservative
     /// gate: if the chain is not fully loaded (an ancestor missing from the
@@ -725,6 +775,15 @@ impl CoreData {
     /// are loaded, and none of (a)/(b) defines `method`. If the class is unknown,
     /// its chain is incomplete, or any base class is missing ⇒ `true`.
     pub fn class_has_singleton_method(&self, class_name: &str, method: &str) -> bool {
+        // ADR-0042 Slice 2: a QUALIFIED name (`ERB::Util`) is absent from the
+        // short-key `classes` map but present in the qualified registry — route
+        // it to the qualified singleton resolution. A top-level name (its own
+        // qualified key == its short key) is handled by the short-key path
+        // below unchanged (this branch only fires for a genuinely-namespaced
+        // name the short map lacks), so no existing behavior moves.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_class_has_singleton_method(class_name, method);
+        }
         // Unknown class ⇒ stay silent.
         if !self.classes.contains_key(class_name) {
             return true;
@@ -3477,5 +3536,34 @@ mod qualified_registry_tests {
             return;
         }
         assert!(idx.knows_class("Util"));
+    }
+}
+
+#[cfg(test)]
+mod qualified_singleton_witness_tests {
+    use super::*;
+
+    /// ADR-0042 Slice 2: `class_has_singleton_method` transparently resolves a
+    /// QUALIFIED namespaced receiver via the qualified registry, with the full
+    /// base-object surface, so a real method is present and a typo is ABSENT —
+    /// and ERB::Util / CGI::Util stay method-disjoint (no short-key merge).
+    #[test]
+    fn qualified_singleton_witness_split_and_ancestry() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("ERB::Util") {
+            return; // stub fallback (no vendored rbs) — nothing to assert.
+        }
+        // Real method present (ERB::Util declares `self?.html_escape`).
+        assert!(idx.class_has_singleton_method("ERB::Util", "html_escape"));
+        // Genuine typo ABSENT (own surface complete + base surface known).
+        assert!(!idx.class_has_singleton_method("ERB::Util", "no_such_method"));
+        // MERGE-collision split: CGI::Util-only `pretty` is absent on ERB::Util
+        // and vice-versa, despite the shared short key "Util".
+        assert!(!idx.class_has_singleton_method("ERB::Util", "pretty"));
+        assert!(!idx.class_has_singleton_method("CGI::Util", "html_escape"));
+        // A base-object method (`name`, from Module) is present on any class obj.
+        assert!(idx.class_has_singleton_method("ERB::Util", "name"));
+        // An unknown qualified name stays silent (assume-present).
+        assert!(idx.class_has_singleton_method("No::Such", "whatever"));
     }
 }

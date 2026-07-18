@@ -1,9 +1,11 @@
-# ADR-0042 gate (oracle matrix s1/s1b/s3/s7): witnessing through QUALIFIED
-# nested-stdlib names. rigor-rs's index registers nested RBS declarations by
-# SHORT key, so every qualified-path case below is a documented coverage gap
-# (the GO-slice-5 surface); the non-nested CGI contrast pins the already-
-# matching baseline the migration must not regress. Byte-for-byte against the
-# oracle on (rule, line, column).
+# ADR-0042 (qualified-key index migration): witnessing through QUALIFIED
+# nested-stdlib names. Slice 2 CLOSED the SINGLETON cases — `ERB::Util` /
+# `CGI::Util` class-method witnessing now matches the oracle byte-for-byte,
+# including the short-key MERGE-collision split (no cross-contamination). The
+# non-nested CGI contrast stays matching. Still open (later slice): the nested
+# stdlib CLASS INSTANCE (`Process::Status` via `Process.wait2`, line ~38) —
+# an instance-path witness through a qualified-class-typed value.
+# Byte-for-byte against the oracle on (rule, line, column).
 
 require "erb"
 require "cgi"

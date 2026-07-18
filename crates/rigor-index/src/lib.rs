@@ -137,6 +137,15 @@ impl CoreIndex {
         self.data.knows_class(class_name)
     }
 
+    /// ADR-0042 Slice 2: whether `qname` (a fully-qualified name like
+    /// `"ERB::Util"`) is in the qualified registry — an entry NOT collapsed
+    /// onto a shared short key. Used by the typer's `ConstantRead` arm to mint
+    /// a `Singleton` for an unambiguous namespaced constant so a class-method
+    /// typo on it can be witnessed.
+    pub fn knows_qualified_class(&self, qname: &str) -> bool {
+        self.data.knows_qualified_class(qname)
+    }
+
     /// Whether `class_name` was INTRODUCED by project-`sig/` ingestion (ADR-0033)
     /// rather than carried by a bundled (core/stdlib/plugin) RBS. The dispatch
     /// rules witness an `X.new` instance-method typo on such a project-authored
