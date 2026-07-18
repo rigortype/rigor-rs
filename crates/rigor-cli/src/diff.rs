@@ -183,7 +183,13 @@ fn run_current(explicit_config: Option<&str>, paths: &[&str]) -> Vec<Value> {
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     // Sound subset (folder = None): diagnostic-identical to full fidelity per
     // ADR-0037, and keeps `diff` Ruby-free / hard-error-free.
-    let (findings, _io) = crate::analyze_files(&expanded, &cfg, "diff", None);
+    let (findings, _io) = crate::analyze_files(
+        &expanded,
+        &cfg,
+        "diff",
+        None,
+        cfg.bleeding_edge_selector().activates("use-of-void-value"),
+    );
 
     findings
         .iter()

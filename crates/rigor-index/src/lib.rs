@@ -269,6 +269,17 @@ impl CoreIndex {
         self.data.singleton_method_return(class, method)
     }
 
+    /// Whether `class#method`'s author-declared RBS return is `void` (ADR-100;
+    /// `static.value-use.void`). First-definer-wins over the ancestor chain.
+    pub fn method_return_is_void(&self, class: &str, method: &str) -> bool {
+        self.data.method_return_is_void(class, method)
+    }
+
+    /// The singleton twin of [`Self::method_return_is_void`].
+    pub fn singleton_method_is_void(&self, class: &str, method: &str) -> bool {
+        self.data.singleton_method_is_void(class, method)
+    }
+
 
     /// The RETURN class of a core method **called WITH a block**, over THIS
     /// index's data — the instance counterpart of [`method_return_with_block`],
@@ -955,5 +966,32 @@ mod singleton_alias_return_tests {
         let idx = CoreIndex::new();
         assert_eq!(idx.singleton_method_return("Dir", "pwd"), Some("String"));
         assert_eq!(idx.singleton_method_return("Dir", "getwd"), Some("String"));
+    }
+}
+
+#[cfg(test)]
+mod void_return_tests {
+    use super::*;
+
+    /// ADR-100: `-> void` returns are tracked (project sigs are the main
+    /// source; core RBS also declares them, e.g. `Comparable#clamp`-adjacent
+    /// void writers). A non-void method reads false; unknown reads false.
+    #[test]
+    fn void_flags_resolve_over_project_sigs() {
+        let dir = std::env::temp_dir().join("rigor_void_sig_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("w.rbs"),
+            "class Widget\n  def fire: () -> void\n  def spin: () -> Integer\n  def self.reset: () -> void\nend\n",
+        )
+        .unwrap();
+        let idx = CoreIndex::for_project(&[], &[dir.clone()]);
+        assert!(idx.method_return_is_void("Widget", "fire"));
+        assert!(!idx.method_return_is_void("Widget", "spin"));
+        assert!(idx.singleton_method_is_void("Widget", "reset"));
+        assert!(!idx.singleton_method_is_void("Widget", "fire"));
+        assert!(!idx.method_return_is_void("NoSuch", "fire"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

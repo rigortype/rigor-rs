@@ -212,6 +212,17 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             evidence_tier: "high",
             documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-empty",
         }),
+        STATIC_VALUE_USE_VOID => Some(&RuleEntry {
+            // Oracle: authored :warning, resolved :off by every shipped profile
+            // (ADR-50 WD1) — emitted only under the `use-of-void-value`
+            // bleeding-edge feature, where it is :warning. rigor-rs gates the
+            // COLLECTOR on the feature, so the catalog carries the active
+            // severity. Evidence high: only an author-written `-> void` on the
+            // direct-dispatch path enters the table.
+            default_severity: Severity::Warning,
+            evidence_tier: "high",
+            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-static-value-use-void",
+        }),
         SUPPRESSION_UNKNOWN_MARKER => Some(&RuleEntry {
             // Oracle: warning across ALL profiles / high — the marker word is
             // present and provably outside the suppression grammar; the prose
@@ -366,6 +377,16 @@ pub const SUPPRESSION_EMPTY: &str = "suppression.empty";
 /// so it silently suppresses nothing. Surveillance over the markers themselves,
 /// produced BEFORE `filter_suppressed`, so it is itself suppressible.
 pub const SUPPRESSION_UNKNOWN_MARKER: &str = "suppression.unknown-marker";
+
+/// `static.value-use.void` (ADR-100, v0.3.0 RC): a value recovered from an
+/// author-declared `-> void` return, used in VALUE context (an assignment RHS,
+/// a call receiver, or a positional argument). An explicit `-> void` is the
+/// strongest "do not rely on this return" signal an author can give. Authored
+/// `:warning` but resolved `:off` by every shipped profile — it reaches a user
+/// only through the `use-of-void-value` bleeding-edge feature (ADR-50 WD1), so
+/// the CLI runs [`void_value_use_diagnostics`] only when that feature is
+/// active (the observable equivalent of the reference's severity gate).
+pub const STATIC_VALUE_USE_VOID: &str = "static.value-use.void";
 
 /// `def.ivar-write-mismatch` (since 0.1.2): within one class's instance methods,
 /// the same instance variable `@x` is assigned two DIFFERENT concrete classes —
@@ -2932,6 +2953,114 @@ fn node_children(node: &Node) -> Vec<NodeId> {
 }
 
 // ---------------------------------------------------------------------------
+// static.value-use.void (ADR-100; bleeding-edge `use-of-void-value`)
+// ---------------------------------------------------------------------------
+
+/// Collect `static.value-use.void` diagnostics: a call whose author-declared
+/// RBS return is `void`, sitting in VALUE context (reference
+/// `VoidValueUseCollector`, upstream 8c87f68e). Value context is read top-down
+/// from the consumer node — an assignment's RHS (local / ivar / constant
+/// writes; the reference also covers cvar / gvar / const-path writes, which
+/// rigor-parse lowers opaquely — under-emit), a call's explicit receiver, and
+/// a call's positional arguments. A bare-statement void call stays silent.
+///
+/// The CALLER gates this on the `use-of-void-value` bleeding-edge feature
+/// being active — the observable equivalent of the reference's authored
+/// `:warning` / profile-`:off` severity resolution. Runs BEFORE
+/// `filter_suppressed`, so `# rigor:disable static.value-use.void` works.
+#[must_use]
+pub fn void_value_use_diagnostics(
+    ast: &LoweredAst,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+) -> Vec<Diagnostic> {
+    let scopes = rigor_infer::lexical_scopes(ast);
+    let typer = Typer::with_source(index, source).with_lexical_scopes(&scopes);
+    let env = typer.build_toplevel_env(ast, interner);
+    let mut out = Vec::new();
+    for (_id, node) in ast.iter() {
+        match node {
+            Node::LocalVariableWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. } => {
+                check_void_value_use(ast, *value, &env, &typer, interner, index, &mut out);
+            }
+            Node::Call { receiver, args, .. } => {
+                if let Some(recv) = receiver {
+                    check_void_value_use(ast, *recv, &env, &typer, interner, index, &mut out);
+                }
+                for &arg in args {
+                    check_void_value_use(ast, arg, &env, &typer, interner, index, &mut out);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Fire when `value_id` is a receiver-bearing call whose method's declared RBS
+/// return is `void` on the DIRECT-dispatch path — the receiver types to a
+/// resolvable class (core Nominal, source-range Nominal with an RBS-known
+/// name, or a class object for the singleton spelling). Everything else is
+/// silent: a literal, a variable read, a non-void call, an unresolvable
+/// receiver (never guess).
+#[allow(clippy::too_many_arguments)]
+fn check_void_value_use(
+    ast: &LoweredAst,
+    value_id: NodeId,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    out: &mut Vec<Diagnostic>,
+) {
+    let Node::Call { receiver: Some(recv), method, span, .. } = ast.get(value_id) else {
+        return;
+    };
+    let (recv, method, span) = (*recv, method.clone(), *span);
+    let recv_ty = typer.type_of(ast, recv, env, interner);
+    // Resolve the receiver to (class name, dispatch kind).
+    let (class_name, is_singleton) = if let Type::Singleton(class) = interner.get(recv_ty) {
+        match typer.source().class_name_for_id(*class) {
+            Some(n) => (n.to_string(), true),
+            None => return,
+        }
+    } else if let Some(n) = index.class_name_of(interner, recv_ty) {
+        (n.to_string(), false)
+    } else if let Some(n) = typer.source().class_name_for_id_of(interner, recv_ty) {
+        (n.to_string(), false)
+    } else {
+        return;
+    };
+    let is_void = if is_singleton {
+        index.singleton_method_is_void(&class_name, &method)
+    } else {
+        index.method_return_is_void(&class_name, &method)
+    };
+    if !is_void {
+        return;
+    }
+    // The reference's `VoidOrigin#label`: `Class#method` / `Class.method`.
+    let separator = if is_singleton { "." } else { "#" };
+    let label = format!("{class_name}{separator}{method}");
+    out.push(Diagnostic {
+        rule_id: STATIC_VALUE_USE_VOID,
+        start_offset: span.0,
+        end_offset: span.1,
+        message: format!(
+            "value use of `void': `{label}' declares `-> void', so its return \
+             recovers to `top' and should not be used as a value"
+        ),
+        severity: Severity::Warning,
+        source_family: "builtin",
+        receiver_type: None,
+        method_name: Some(method),
+    });
+}
+
+// ---------------------------------------------------------------------------
 // suppression.unknown-rule / suppression.empty (v0.3.0)
 // ---------------------------------------------------------------------------
 
@@ -3192,7 +3321,7 @@ const INTERNAL_ERROR_RULE: &str = "internal-error";
 /// every canonical rule whose id starts with `<token>.` (reference
 /// `RULE_FAMILIES`). Only `call` can match an implemented rule today; the rest
 /// are carried for forward-compat with the reference's catalogue.
-const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppression"];
+const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppression", "static"];
 
 /// The canonical rule ids rigor-rs can actually emit. Family expansion and the
 /// `disable all` wildcard are checked against this set, so a `call` family token
@@ -3216,6 +3345,7 @@ const IMPLEMENTED_RULES: &[&str] = &[
     SUPPRESSION_EMPTY,
     SUPPRESSION_UNKNOWN_MARKER,
     DEF_IVAR_WRITE_MISMATCH,
+    STATIC_VALUE_USE_VOID,
 ];
 
 /// The canonical rule ids rigor-rs can actually emit — the implemented coverage
@@ -3261,6 +3391,7 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "suppression.unknown-rule",
     "suppression.empty",
     "suppression.unknown-marker",
+    "static.value-use.void",
 ];
 
 /// True when `token` looks like a built-in-family rule id but matches none — its
@@ -6032,5 +6163,58 @@ mod tests {
         // Well-typed arguments never fire.
         assert!(atm_diags(b"[1, 2, 3].fetch(0)\n").is_empty());
         assert!(atm_diags(b"\"abc\".center(5)\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod void_value_use_tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    fn void_diags(src: &[u8]) -> Vec<Diagnostic> {
+        let dir = std::env::temp_dir().join("rigor_void_rule_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("w.rbs"),
+            "class Widget\n  def fire: () -> void\n  def spin: () -> Integer\n  def self.reset: () -> void\nend\n",
+        )
+        .unwrap();
+        let index = CoreIndex::for_project(&[], &[dir.clone()]);
+        let ast = lower(&parse(src));
+        let source = rigor_infer::SourceIndex::build(&ast, &index);
+        let mut interner = Interner::new();
+        let out = void_value_use_diagnostics(&ast, &mut interner, &index, &source);
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
+    /// The three value contexts fire (assignment RHS, argument, receiver);
+    /// message byte-matched against the live reference under
+    /// `--bleeding-edge=use-of-void-value`.
+    #[test]
+    fn void_value_contexts_fire() {
+        let d = void_diags(
+            b"w = Widget.new\nx = w.fire\nputs(w.fire)\nw.fire.to_s\n@i = w.fire\n",
+        );
+        assert_eq!(d.len(), 4, "{d:?}");
+        assert!(d.iter().all(|x| x.rule_id == STATIC_VALUE_USE_VOID));
+        assert_eq!(
+            d[0].message,
+            "value use of `void': `Widget#fire' declares `-> void', so its return recovers to `top' and should not be used as a value"
+        );
+        // The singleton spelling labels with a dot.
+        let s = void_diags(b"y = Widget.reset\n");
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].message.contains("`Widget.reset'"), "{}", s[0].message);
+    }
+
+    /// Silent: a bare-statement void call (the declared contract), a non-void
+    /// method, and an unresolvable receiver.
+    #[test]
+    fn void_bare_statement_and_nonvoid_stay_silent() {
+        assert!(void_diags(b"w = Widget.new\nw.fire\n").is_empty());
+        assert!(void_diags(b"w = Widget.new\ny = w.spin\n").is_empty());
+        assert!(void_diags(b"y = unknown_thing.fire\n").is_empty());
     }
 }

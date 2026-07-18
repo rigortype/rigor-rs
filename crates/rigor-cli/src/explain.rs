@@ -629,6 +629,31 @@ const ENTRIES: &[Entry] = &[
         evidence_tier: Some("high"),
         since: "0.3.0",
     },
+    Entry {
+        id: "static.value-use.void",
+        summary: "A value recovered from an author-declared `-> void` return is used in value context.",
+        fires_when: &[
+            "A call whose RBS declares `-> void` sits in a VALUE position: an assignment's right-hand \
+             side, a call's explicit receiver, or a positional argument.",
+            "An explicit `-> void` is the strongest \"do not rely on this return\" signal an author can \
+             give; the engine recovers the value to `top`, which is otherwise silent (ADR-100).",
+        ],
+        does_not_fire_when: &[
+            "The void call is a bare statement (its result is discarded — the declared contract).",
+            "The receiver is not resolvable to a class whose RBS declares the method (never guess), or \
+             the method's overloads disagree on void-ness.",
+            "The `use-of-void-value` bleeding-edge feature is not active: the rule is authored `warning` \
+             but resolved `off` by every shipped profile (ADR-50 WD1 — a new required diagnostic is a \
+             compatibility change), so it reaches a user only through `--bleeding-edge` / `bleeding_edge:`.",
+        ],
+        suppression: "Discard the result (make the call a bare statement) or fix the signature if the \
+                      method genuinely returns a value; `disable: [\"static.value-use.void\"]` in \
+                      `.rigor.yml`.",
+        severity_authored: "warning",
+        severity_by_profile: [("lenient", "off"), ("balanced", "off"), ("strict", "off")],
+        evidence_tier: Some("high"),
+        since: "0.3.0",
+    },
 ];
 
 /// Resolve a token to its catalogue entries (reference `RuleCatalog.resolve`):
@@ -993,9 +1018,9 @@ mod tests {
     #[test]
     fn all_is_id_sorted_and_complete() {
         let ids: Vec<&str> = all().iter().map(|e| e.id).collect();
-        // 26 rules: every canonical id rigor-rs recognizes, now including
-        // `suppression.unknown-marker` (implemented v0.3.0).
-        assert_eq!(ids.len(), 26);
+        // 27 rules: every canonical id rigor-rs recognizes, now including
+        // `static.value-use.void` (ADR-100, bleeding-edge-gated).
+        assert_eq!(ids.len(), 27);
         // Sorted ascending by id.
         let mut sorted = ids.clone();
         sorted.sort_unstable();

@@ -73,6 +73,12 @@ pub struct Config {
     /// that ships no RBS (currently `activesupport` → `activesupport-core-ext`),
     /// so a Rails project "just works" without naming the plugin in `plugins:`.
     pub bundler: BundlerConfig,
+    /// ADR-50 WD2 — the `bleeding_edge:` selector: `false` (default) adopts
+    /// nothing, `true` the whole overlay, a list of feature ids only those, and
+    /// `{ all: true, except: [ids] }` everything but. Deserialized untyped (all
+    /// four spellings) and coerced by [`Config::bleeding_edge_selector`].
+    #[serde(default)]
+    pub bleeding_edge: serde_yaml::Value,
     /// ADR-0036: rigor-rs-SPECIFIC config, namespaced so it stays transparent to
     /// the pure-Ruby reference (which ignores unknown keys) — the same `.rigor.yml`
     /// feeds both. Reference-schema keys stay top-level; rigor-rs-only knobs live
@@ -125,6 +131,30 @@ pub struct BundlerConfig {
     pub auto_detect: bool,
 }
 
+/// ADR-50 WD2 — the resolved bleeding-edge adoption (config `bleeding_edge:`,
+/// overridable by `--bleeding-edge[=LIST]` / `--no-bleeding-edge`). Feature ids
+/// are contract vocabulary (kebab-case discipline names); an unknown id in a
+/// `List` / `except` is simply absent from the overlay and contributes nothing
+/// — symmetric with the reference (robust across versions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BleedingEdgeSelector {
+    None,
+    All { except: Vec<String> },
+    List(Vec<String>),
+}
+
+impl BleedingEdgeSelector {
+    /// Whether the selector adopts feature `id`.
+    #[must_use]
+    pub fn activates(&self, id: &str) -> bool {
+        match self {
+            BleedingEdgeSelector::None => false,
+            BleedingEdgeSelector::All { except } => !except.iter().any(|e| e == id),
+            BleedingEdgeSelector::List(ids) => ids.iter().any(|e| e == id),
+        }
+    }
+}
+
 impl Default for BundlerConfig {
     fn default() -> Self {
         BundlerConfig { auto_detect: true }
@@ -139,6 +169,7 @@ impl Default for Config {
             paths: default_paths(),
             plugins: Vec::new(),
             baseline: serde_yaml::Value::Null,
+            bleeding_edge: serde_yaml::Value::Null,
             signature_paths: default_signature_paths(),
             rbs_collection: RbsCollectionConfig::default(),
             bundler: BundlerConfig::default(),
@@ -269,6 +300,39 @@ impl Config {
             .filter(|k| !Self::KNOWN_KEYS.contains(&k.as_str()))
             .map(String::as_str)
             .collect()
+    }
+
+    /// The coerced `bleeding_edge:` selector (reference
+    /// `Configuration#coerce_bleeding_edge`): an unrecognized shape degrades to
+    /// `None` rather than erroring (the reference raises; config here never
+    /// aborts a run — the audit surface owns misconfiguration complaints).
+    #[must_use]
+    pub fn bleeding_edge_selector(&self) -> BleedingEdgeSelector {
+        match &self.bleeding_edge {
+            serde_yaml::Value::Bool(true) => BleedingEdgeSelector::All { except: Vec::new() },
+            serde_yaml::Value::Sequence(ids) => BleedingEdgeSelector::List(
+                ids.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+            ),
+            serde_yaml::Value::Mapping(m) => {
+                let all = m
+                    .get(serde_yaml::Value::String("all".into()))
+                    .and_then(serde_yaml::Value::as_bool)
+                    .unwrap_or(false);
+                if all {
+                    let except = m
+                        .get(serde_yaml::Value::String("except".into()))
+                        .and_then(|v| v.as_sequence())
+                        .map(|seq| {
+                            seq.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()
+                        })
+                        .unwrap_or_default();
+                    BleedingEdgeSelector::All { except }
+                } else {
+                    BleedingEdgeSelector::None
+                }
+            }
+            _ => BleedingEdgeSelector::None,
+        }
     }
 
     /// The `signature_paths:` entries when the key was EXPLICITLY configured, or
@@ -558,5 +622,49 @@ mod tests {
         assert_eq!(f.baseline_path(), None);
         let n: Config = serde_yaml::from_str("disable: []\n").unwrap();
         assert_eq!(n.baseline_path(), None);
+    }
+}
+
+#[cfg(test)]
+mod bleeding_edge_selector_tests {
+    use super::*;
+
+    fn sel(yaml: &str) -> BleedingEdgeSelector {
+        Config::parse_or_warn(yaml, "test").bleeding_edge_selector()
+    }
+
+    /// The reference's `coerce_bleeding_edge` shapes: false/absent → None,
+    /// true → All, list → List, `{all: true, except: [...]}` → All-with-except,
+    /// `{all: false}` / garbage → None (degrade, never abort).
+    #[test]
+    fn selector_coercion_matches_reference_shapes() {
+        assert_eq!(sel(""), BleedingEdgeSelector::None);
+        assert_eq!(sel("bleeding_edge: false\n"), BleedingEdgeSelector::None);
+        assert_eq!(
+            sel("bleeding_edge: true\n"),
+            BleedingEdgeSelector::All { except: Vec::new() }
+        );
+        assert_eq!(
+            sel("bleeding_edge:\n  - use-of-void-value\n"),
+            BleedingEdgeSelector::List(vec!["use-of-void-value".into()])
+        );
+        assert_eq!(
+            sel("bleeding_edge:\n  all: true\n  except:\n    - use-of-void-value\n"),
+            BleedingEdgeSelector::All { except: vec!["use-of-void-value".into()] }
+        );
+        assert_eq!(sel("bleeding_edge:\n  all: false\n"), BleedingEdgeSelector::None);
+        assert_eq!(sel("bleeding_edge: 42\n"), BleedingEdgeSelector::None);
+    }
+
+    /// `activates`: None never; All unless excepted; List by membership —
+    /// unknown ids inert in both list positions.
+    #[test]
+    fn selector_activation() {
+        let id = "use-of-void-value";
+        assert!(!BleedingEdgeSelector::None.activates(id));
+        assert!(BleedingEdgeSelector::All { except: vec![] }.activates(id));
+        assert!(!BleedingEdgeSelector::All { except: vec![id.into()] }.activates(id));
+        assert!(BleedingEdgeSelector::List(vec![id.into()]).activates(id));
+        assert!(!BleedingEdgeSelector::List(vec!["nope".into()]).activates(id));
     }
 }
