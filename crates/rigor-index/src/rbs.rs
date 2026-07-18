@@ -586,8 +586,26 @@ impl CoreData {
         let Some(entry) = self.qualified.get(qname) else {
             return true; // unknown ⇒ silent
         };
-        // (1) own singleton methods.
-        if entry.singleton_methods.contains_key(method) {
+        // Measure-first scope (ADR-0042 Slice 2): witness a qualified-singleton
+        // absence ONLY for a MODULE, whose class-object surface is its own
+        // `module_function`s + `extend`s + the base-object surface — fully
+        // modelled here. A CLASS additionally inherits class methods down its
+        // superclass chain, which this slice does NOT walk over the qualified
+        // registry (references are stored short pending ADR step 3); witnessing
+        // absence on a class therefore over-fires (measured: 36 FPs on
+        // dependabot-core, all `singleton(Gem::Specification)` — inherited class
+        // methods judged absent). Stay silent on qualified classes until the
+        // chain walk lands.
+        if !entry.is_module {
+            return true;
+        }
+        // (1) own singleton methods, resolving a singleton ALIAS to its target
+        //     (`alias self.h self.html_escape` on ERB::Util — measured: 3 rails
+        //     FPs on `ERB::Util.h`). Bounded one hop is enough for the aliases
+        //     seen; a target that is itself an alias resolves via recursion.
+        if entry.singleton_methods.contains_key(method)
+            || self.qualified_singleton_alias_resolves(qname, method, 0)
+        {
             return true;
         }
         // (2) extended modules' instance methods (resolved short: an extended
@@ -620,6 +638,23 @@ impl CoreData {
             return false;
         }
         true
+    }
+
+    /// Whether `method` on the qualified module `qname` resolves through a
+    /// singleton ALIAS to a real singleton method (`alias self.h
+    /// self.html_escape`). Bounded recursion (target may itself be aliased).
+    fn qualified_singleton_alias_resolves(&self, qname: &str, method: &str, depth: usize) -> bool {
+        if depth >= 16 {
+            return false;
+        }
+        let Some(entry) = self.qualified.get(qname) else {
+            return false;
+        };
+        let Some(&target) = entry.singleton_aliases.get(method) else {
+            return false;
+        };
+        entry.singleton_methods.contains_key(target)
+            || self.qualified_singleton_alias_resolves(qname, target, depth + 1)
     }
 
     /// Walk the full flattened ancestor chain; a method is present if ANY
@@ -3563,7 +3598,18 @@ mod qualified_singleton_witness_tests {
         assert!(!idx.class_has_singleton_method("CGI::Util", "html_escape"));
         // A base-object method (`name`, from Module) is present on any class obj.
         assert!(idx.class_has_singleton_method("ERB::Util", "name"));
+        // A singleton ALIAS resolves (`alias self.h self.html_escape`) — the
+        // measured rails FP. Present, not witnessed absent.
+        assert!(idx.class_has_singleton_method("ERB::Util", "h"));
         // An unknown qualified name stays silent (assume-present).
         assert!(idx.class_has_singleton_method("No::Such", "whatever"));
+        // Measure-first scope: a qualified CLASS (not module) stays SILENT even
+        // for a genuine typo — its inherited class-method chain is not walked in
+        // this slice (the measured dependabot `Gem::Specification` FP). Use a
+        // qualified class known to exist; `Gem::Specification` is heavily
+        // reopened in the vendored rbs.
+        if idx.knows_qualified_class("Gem::Specification") {
+            assert!(idx.class_has_singleton_method("Gem::Specification", "no_such_zzz"));
+        }
     }
 }
