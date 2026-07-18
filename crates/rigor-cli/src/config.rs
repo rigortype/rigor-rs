@@ -209,7 +209,7 @@ impl Config {
     /// Parse YAML text, warning and falling back to default on a parse error.
     /// Records the file's top-level keys ([`Config::present_keys`]) so the config
     /// audit can tell an explicitly-configured key from a defaulted one.
-    fn parse_or_warn(text: &str, label: &str) -> Config {
+    pub(crate) fn parse_or_warn(text: &str, label: &str) -> Config {
         match serde_yaml::from_str::<Config>(text) {
             Ok(mut cfg) => {
                 cfg.present_keys = top_level_keys(text);
@@ -220,6 +220,55 @@ impl Config {
                 Config::default()
             }
         }
+    }
+
+    /// The reference's full `Configuration::KNOWN_KEYS` — every top-level key a
+    /// conforming `.rigor.yml` may carry (its `DEFAULTS` keys + `includes` + the
+    /// reserved namespaces), dumped verbatim from the pinned reference. This is
+    /// deliberately the REFERENCE's superset, not rigor-rs's parsed subset: a
+    /// key the reference owns but rigor-rs does not parse (`severity_overrides`,
+    /// `libraries`, …) is a REAL key that must never be warned about. Doubles as
+    /// the did-you-mean dictionary. `rigor_rs` is the reserved namespace (ADR-99
+    /// / ADR-0036) — known by construction, so the reserved-namespace exemption
+    /// is inherent.
+    pub const KNOWN_KEYS: [&'static str; 21] = [
+        "target_ruby",
+        "paths",
+        "exclude",
+        "plugins",
+        "disable",
+        "libraries",
+        "signature_paths",
+        "pre_eval",
+        "baseline",
+        "fold_platform_specific_paths",
+        "cache",
+        "plugins_io",
+        "severity_profile",
+        "severity_overrides",
+        "bleeding_edge",
+        "dependencies",
+        "parallel",
+        "bundler",
+        "rbs_collection",
+        "includes",
+        "rigor_rs",
+    ];
+
+    /// Top-level keys the loaded file carried that no implementation owns —
+    /// not a [`Self::KNOWN_KEYS`] entry (which includes the reserved
+    /// namespaces). The reference records these on `Configuration#unknown_keys`
+    /// at load time and `ConfigAudit` turns each into a warning; the archetypal
+    /// case is a typo (`excludee:` for `exclude:`) that the loader drops in
+    /// silence. Top level only, deliberately (nested unknowns are the schema
+    /// tier's job — ADR-99). Empty for every conforming config.
+    #[must_use]
+    pub fn unknown_keys(&self) -> Vec<&str> {
+        self.present_keys
+            .iter()
+            .filter(|k| !Self::KNOWN_KEYS.contains(&k.as_str()))
+            .map(String::as_str)
+            .collect()
     }
 
     /// The `signature_paths:` entries when the key was EXPLICITLY configured, or

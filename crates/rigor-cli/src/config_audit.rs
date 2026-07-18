@@ -50,10 +50,189 @@ pub struct ConfigWarning {
 #[must_use]
 pub fn warnings(cfg: &Config, project_root: &Path) -> Vec<ConfigWarning> {
     let mut out = Vec::new();
+    unknown_key_warnings(cfg, &mut out);
     signature_path_warnings(cfg, project_root, &mut out);
     rule_token_warnings(cfg, &mut out);
     explicit_path_warnings(cfg, project_root, &mut out);
     out
+}
+
+/// Top-level keys the loader does not own (reference `unknown_key_warnings`,
+/// upstream 209f6fd9 / #166). The archetypal case is a typo — `excludee:` for
+/// `exclude:` — which the loader drops in silence, so the exclusion never
+/// applies and the run reports errors from the very files the user meant to
+/// skip. The reserved `rigor_rs:` namespace is exempt by construction (it is a
+/// [`Config::KNOWN_KEYS`] entry). Top level only, deliberately — nested
+/// unknowns are the reference's schema tier's job (ADR-99).
+fn unknown_key_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
+    for key in cfg.unknown_keys() {
+        let suggestion = spell_checker_correct(key, &Config::KNOWN_KEYS);
+        let hint = suggestion
+            .as_deref()
+            .map(|s| format!(" Did you mean `{s}`?"))
+            .unwrap_or_default();
+        out.push(ConfigWarning {
+            kind: "unknown_key",
+            message: format!(
+                "`{key}` is not a recognized configuration key; it has no effect.{hint}"
+            ),
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DidYouMean::SpellChecker — a verbatim port (Ruby 4.0 stdlib `did_you_mean`:
+// spell_checker.rb + jaro_winkler.rb + levenshtein.rb), so the suggestion in
+// the warning text is byte-identical to the reference's. The dictionary here
+// is ~21 short config keys, so the quadratic loops are irrelevant.
+// ---------------------------------------------------------------------------
+
+/// `SpellChecker#correct(input).first` — the nearest dictionary word, or None.
+fn spell_checker_correct(input: &str, dictionary: &[&'static str]) -> Option<String> {
+    let normalized_input = spell_normalize(input);
+    let threshold = if normalized_input.chars().count() > 3 { 0.834 } else { 0.77 };
+
+    let mut words: Vec<&&str> = dictionary
+        .iter()
+        .filter(|w| jaro_winkler(&spell_normalize(w), &normalized_input) >= threshold)
+        .collect();
+    words.retain(|w| input != **w);
+    // Ruby: `sort_by! { JaroWinkler.distance(word.to_s, normalized_input) }`
+    // (the UN-normalized word on purpose) then `reverse!`. A stable sort keeps
+    // dictionary order on ties, matching Ruby's merge sort.
+    words.sort_by(|a, b| {
+        jaro_winkler(a, &normalized_input)
+            .partial_cmp(&jaro_winkler(b, &normalized_input))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    words.reverse();
+
+    // Correct mistypes: Levenshtein within ceil(len * 0.25).
+    let lev_threshold = (normalized_input.chars().count() as f64 * 0.25).ceil() as usize;
+    let mistypes: Vec<&&&str> = words
+        .iter()
+        .filter(|w| levenshtein(&spell_normalize(w), &normalized_input) <= lev_threshold)
+        .collect();
+    if let Some(first) = mistypes.first() {
+        return Some((***first).to_string());
+    }
+
+    // Correct misspells: Levenshtein strictly below the shorter length, first 1.
+    words
+        .iter()
+        .find(|w| {
+            let word = spell_normalize(w);
+            let length = normalized_input.chars().count().min(word.chars().count());
+            levenshtein(&word, &normalized_input) < length
+        })
+        .map(|w| (**w).to_string())
+}
+
+/// `SpellChecker#normalize`: downcase + strip `@`.
+fn spell_normalize(s: &str) -> String {
+    s.to_lowercase().replace('@', "")
+}
+
+/// `DidYouMean::Jaro.distance` — verbatim, including the bitmask matching and
+/// the transposition scan. Codepoint-based like the Ruby original.
+#[allow(clippy::cast_precision_loss)]
+fn jaro(str1: &str, str2: &str) -> f64 {
+    let (a, b): (Vec<char>, Vec<char>) = (str1.chars().collect(), str2.chars().collect());
+    let (s1, s2) = if a.len() > b.len() { (b, a) } else { (a, b) };
+    let (length1, length2) = (s1.len(), s2.len());
+
+    let mut m = 0.0_f64;
+    let mut t = 0.0_f64;
+    let range = if length2 > 3 { length2 / 2 - 1 } else { 0 };
+    let mut flags1: u128 = 0;
+    let mut flags2: u128 = 0;
+
+    for (i, &c1) in s1.iter().enumerate() {
+        let last = i + range;
+        let mut j = i.saturating_sub(range);
+        while j <= last && j < length2 {
+            if flags2 & (1 << j) == 0 && c1 == s2[j] {
+                flags2 |= 1 << j;
+                flags1 |= 1 << i;
+                m += 1.0;
+                break;
+            }
+            j += 1;
+        }
+    }
+
+    let mut k = 0usize;
+    for (i, &c1) in s1.iter().enumerate() {
+        if flags1 & (1 << i) != 0 {
+            let mut j = k;
+            let mut index = k;
+            while j < length2 {
+                index = j;
+                if flags2 & (1 << j) != 0 {
+                    k = j + 1;
+                    break;
+                }
+                j += 1;
+            }
+            if c1 != s2[index] {
+                t += 1.0;
+            }
+        }
+    }
+    t = (t / 2.0).floor();
+
+    if m == 0.0 {
+        0.0
+    } else {
+        (m / length1 as f64 + m / length2 as f64 + (m - t) / m) / 3.0
+    }
+}
+
+/// `DidYouMean::JaroWinkler.distance` — weight 0.1, threshold 0.7, prefix ≤ 4.
+fn jaro_winkler(str1: &str, str2: &str) -> f64 {
+    const WEIGHT: f64 = 0.1;
+    const THRESHOLD: f64 = 0.7;
+    let jaro_distance = jaro(str1, str2);
+    if jaro_distance > THRESHOLD {
+        let codepoints2: Vec<char> = str2.chars().collect();
+        let mut prefix_bonus = 0usize;
+        for char1 in str1.chars() {
+            if Some(&char1) == codepoints2.get(prefix_bonus) && prefix_bonus < 4 {
+                prefix_bonus += 1;
+            } else {
+                break;
+            }
+        }
+        jaro_distance + (prefix_bonus as f64 * WEIGHT * (1.0 - jaro_distance))
+    } else {
+        jaro_distance
+    }
+}
+
+/// `DidYouMean::Levenshtein.distance` — the Text-gem variant, verbatim.
+fn levenshtein(str1: &str, str2: &str) -> usize {
+    let s1: Vec<char> = str1.chars().collect();
+    let s2: Vec<char> = str2.chars().collect();
+    let (n, m) = (s1.len(), s2.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut d: Vec<usize> = (0..=m).collect();
+    let mut x = 0usize;
+    for (i, &char1) in s1.iter().enumerate() {
+        let mut i_cost = i + 1;
+        for j in 0..m {
+            let cost = usize::from(char1 != s2[j]);
+            x = (d[j + 1] + 1).min(i_cost + 1).min(d[j] + cost);
+            d[j] = i_cost;
+            i_cost = x;
+        }
+        d[m] = x;
+    }
+    x
 }
 
 /// Emit the audit to stderr as `rigor: <message>`, matching the reference's
@@ -257,5 +436,78 @@ mod tests {
             vec!["rbs_collection.lockfile: \"rbs_collection.lock.yaml\" does not exist".to_string()]
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod unknown_key_tests {
+    use super::*;
+
+    fn msgs(yaml: &str) -> Vec<String> {
+        let cfg = Config::parse_or_warn(yaml, "test");
+        warnings(&cfg, Path::new(".")).into_iter().map(|w| w.message).collect()
+    }
+
+    /// Byte-parity with the reference (probed live): the typo'd key warns with
+    /// the did-you-mean hint; a no-suggestion unknown warns without one.
+    #[test]
+    fn unknown_key_warns_byte_exact() {
+        let m = msgs("excludee:\n  - spec\n");
+        assert_eq!(
+            m,
+            vec![
+                "`excludee` is not a recognized configuration key; it has no effect. Did you mean `exclude`?"
+                    .to_string()
+            ]
+        );
+        let m = msgs("zzzz_nothing_close: 1\n");
+        assert_eq!(
+            m,
+            vec!["`zzzz_nothing_close` is not a recognized configuration key; it has no effect."
+                .to_string()]
+        );
+    }
+
+    /// The reserved `rigor_rs:` namespace and reference-owned keys rigor-rs
+    /// does not parse (`severity_overrides:`) are KNOWN — never warned.
+    #[test]
+    fn reserved_and_reference_owned_keys_stay_silent() {
+        assert!(msgs("rigor_rs:\n  ruby: off\n").is_empty());
+        assert!(msgs("severity_overrides:\n  call.undefined-method: warning\n").is_empty());
+        assert!(msgs("libraries:\n  - csv\n").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod spell_checker_parity_tests {
+    use super::*;
+
+    /// Byte-parity with Ruby's `DidYouMean::SpellChecker` over the config-key
+    /// dictionary. The expected values are dumped from the REAL stdlib
+    /// (`ruby -r did_you_mean -e '...'`, Ruby 4.0 / did_you_mean bundled) —
+    /// regenerate with the one-liner in the batch note if the dictionary grows.
+    #[test]
+    fn suggestions_match_ruby_did_you_mean() {
+        for (input, expected) in [
+            ("excludee", Some("exclude")),
+            ("exlude", Some("exclude")),
+            ("pathes", Some("paths")),
+            ("disabled", Some("disable")),
+            ("plugin", Some("plugins")),
+            ("include", Some("includes")),
+            ("signature_path", Some("signature_paths")),
+            ("severity_override", Some("severity_overrides")),
+            ("basline", Some("baseline")),
+            ("bundle", Some("bundler")),
+            ("librarys", Some("libraries")),
+            ("target_rubby", Some("target_ruby")),
+            ("zzzz_nothing_close", None),
+        ] {
+            assert_eq!(
+                spell_checker_correct(input, &Config::KNOWN_KEYS).as_deref(),
+                expected,
+                "input: {input}"
+            );
+        }
     }
 }
