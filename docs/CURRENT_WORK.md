@@ -16,9 +16,11 @@ Last updated: 2026-07-17.
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
 
-- **ACTIVE: compat next stage** — 4-phase plan (M1 ref self-diff + M2 UM-residual
-  gates → fixture 193/193 → measured RC inference ports → new rule surfaces).
-  [plan](notes/20260718-compat-next-stage-plan.md).
+- **ACTIVE: compat next stage** — [plan](notes/20260718-compat-next-stage-plan.md);
+  Phase 0+1 DONE ([findings](notes/20260718-phase0-m1-m2-findings.md)): Phase 2
+  CLOSED by measurement (M1: 0 added diags on ~17k); next = the 5 proven M2-GO
+  receiver-typing slices (freeze-unwrap, Array(), rand, singleton returns,
+  namespaced singletons), then Phase 3 new-rule surfaces.
 - **LSP §12 two-tier** — watched-files invalidation, debounce, worker pool.
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge`, `coverage --workers`,
   plugins inflection probe; full config schema (§7 remainder).
@@ -73,6 +75,8 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-18 compat Phase 0 (M1+M2)** — M1 ref self-diff: RC inference deltas add 0 diags on ~17k measured (Phase 2 CLOSED ex ante); M2: gitlab UM 179 characterized — no AS-leniency in rigor-rs, silence is receiver-typing substrate; 5 GO mechanisms proven by minimal repro. [findings](notes/20260718-phase0-m1-m2-findings.md).
+- **2026-07-18 compat Phase 1** (PR #24) — fixture parity 100%: S1 fold-decline nominal fallback (53×3) + S2 last_match arity `String|nil` (65×1); live+snapshot 0 gaps / 0 FP, fp_audit 5 corpora clean.
 - **2026-07-18 upstream RC bump `47ec8625→7a69f142`** (80 commits) — two parity divergences closed 0 FP: `suppression.unknown-marker` (new rule, upstream `4e0ca475`) + Kernel intrinsic explicit-`Kernel.`-receiver fold (`c9d2e473`); live 188 matched / 193 ref, snapshots re-baselined, core corpora + survey FP-clean. Rest of the RC's inference precision deferred as coverage-only. [note](notes/20260718-upstream-rc-bump-47ec8625-7a69f142.md).
 - **2026-07-17 docs economy** — CURRENT_WORK.md 184KB→baton + [PORT_BACKLOG.md](PORT_BACKLOG.md) split, byte-budget gate `harness/docs_check.py` + docs CI; port of upstream rigor#119 (issue #21).
 - **2026-07-17 P2 `Regexp.last_match` nilable source** (MERGED `6592ead`) — gitlab lib possible-nil 169→162, 0 FP; broad P2 hypothesis REFUTED (the ref's wide firing rides its permissive `Dynamic|nil` arm — the thing our substrate deliberately cannot mint). [spec](notes/20260717-p2-optional-local-nil-spec.md).
