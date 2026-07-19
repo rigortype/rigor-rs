@@ -60,7 +60,12 @@ parity-port arc has bottomed out — see Standing conclusions):
   deferred by [scoping call](notes/20260719-coverage-command-scoping.md).
 - **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`; note
   BOTH oracle hazards there — #194 plugin path AND the non-version-scoped
-  result cache). Pin `7a69f142`; tip `e447cb86` self-diff 0/0 (no tag yet).
+  result cache). Pin `7a69f142`; tip `ff6b6158` self-diff 0/0 (STILL no tag —
+  version pins 0.2.9, both new clusters sit in `[Unreleased]`). The 2 new
+  inference clusters (ADR-58 massign-ivar seed, ADR-67 WD6 call-site param
+  inference) are substrate-blocked large arcs AND precision-additive (0 new
+  diagnostics on corpora; cluster 2 is off-by-default opt-in) — nothing to
+  port; don't re-investigate.
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
@@ -111,6 +116,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-19 upstream tracking `e447cb86..ff6b6158`** (10 commits: ADR-58 constructor-massign ivar seeding `48a7af6c`; ADR-67 WD6 call-site parameter inference activated on the check walk `a84efcbd` + design/guard/perf; handoff docs) — hardened self-diff (both oracle hazards) **0 added / 0 dropped** on all four battery corpora (fixtures/gitlab lib/mastodon models/conference-app), runtimes symmetric (cache bypass confirmed). STILL no v0.3.0 tag (version pins 0.2.9; both clusters in `[Unreleased]`). Mechanism assessment: both clusters are substrate-blocked large arcs (need the ADR-0022 flow substrate + ivar-typing rigor-rs deliberately defers) AND precision-additive (protection coverage only, 0 new diagnostics; ADR-67 WD6 is off-by-default opt-in `parameter_inference:`). Pin `7a69f142` HELD, nothing to port.
 - **2026-07-19 LSP §12 two-tier tier-1 COMPLETE** (S1–S4, PRs #35–#38, each design→implement→adversarial-review→merge) — S1 BufferTable + `select!` loop + worker-results channel (pure refactor, byte-identical); S2 200ms per-URI debounce (clockless injectable Debouncer, non-flaky); S3 rayon dispatch + version stale-drop + one-in-flight/no-lost-update + shared Mutex'd sidecar; S4 generation+epoch stale-drop (3-axis) + ProjectContext synchronous-rebuild invalidation (didChangeWatchedFiles/Configuration) + dynamic registration + reopen-nit closed. 318 workspace tests, harness 216/218 byte-identical throughout, 0 FP. Design refinements vs the plan: generation moved S3→S4 (lands with its trigger), rebuild is synchronous not lazy-async (rare events). Only S4b (cross-file overlay) left. Notes: [s1](notes/20260719-lsp-s12-s1.md)/[s2](notes/20260719-lsp-s12-s2.md)/[s3](notes/20260719-lsp-s12-s3.md)/[s4](notes/20260719-lsp-s12-s4.md).
 - **2026-07-19 coverage broader over-claim audit** (PR #40, node-level) — 0 factually-wrong over-claims across 1217 new files / 186k nodes (binpacker, ruby-date/io-console/openssl/strscan, rbs, rbs-inline, mastodon app/{controllers,lib,services,…} + lib, conference-app lib); harness anchors reproduced exactly (fixtures 0, gitlab-foss 27); 8 new over-claims all provably sound (nominal-where-ref-dynamic, enumerated). Confirms the coverage command's sound-superset parity holds broadly. Also PR #39: cleared 5 test-code clippy lints outside the CI-gated `--tests`-less form. [audit](notes/20260719-coverage-broader-audit.md).
 - **2026-07-19 `coverage` precision mode + MCP tool** (PR #33, 3 review rounds) — reference precision-tier scan ported on rayon (`--workers` = pool size, byte-identical any N); denominators byte-equal on ALL targets (70 fixtures + conference-app 4235 + mastodon 31381 + gitlab lib 624,233 nodes); node-level audit 0 over-claims except 27 gitlab nodes ACCEPTED as reviewer-verified sound-superset (AGENTS.md anti-convergence); 15+ over-claim defect classes found/fixed across rounds — histogram-level audits provably mask over-claims. [scoping](notes/20260719-coverage-command-scoping.md) / [results](notes/20260719-coverage-precision-mode.md).
