@@ -76,6 +76,12 @@ was the tell; symmetric 24 s/24 s once eliminated). Any comparison of two
 reference checkouts MUST pass `--no-cache` and run each invocation from its
 own fresh temp cwd.
 
+Harness status (audited 2026-07-19): `harness/lib.rb` (`run_reference`, used by
+run.rb/snapshot.rb) and `harness/run_corpus.rb` use a fresh per-invocation
+`Dir.mktmpdir` cwd — safe. `harness/fp_audit.py` previously ran from a shared
+persistent `cwd="/tmp"` (a stale `/tmp/.rigor/cache` could survive a pin bump
+and poison a re-baseline); it now uses a fresh temp cwd AND `--no-cache`.
+
 ## Bumping the pin (following upstream)
 
 1. Fetch + check out the new tag inside the submodule:

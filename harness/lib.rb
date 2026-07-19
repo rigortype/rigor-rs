@@ -173,7 +173,9 @@ module RigorHarness
   # -------------------------------------------------------------------------
 
   # Run the reference Ruby Rigor on a fixture, isolated from any .rigor.yml in
-  # parent directories by using a clean temp dir as cwd.
+  # parent directories by using a clean temp dir as cwd. The fresh
+  # per-invocation cwd also defuses the reference's cwd-keyed persistent result
+  # cache (UPSTREAM.md hazard 2) — no --no-cache needed here.
   #
   # Returns an array of diagnostic hashes, filtered to:
   #   - severity in PARITY_SEVERITIES

@@ -104,7 +104,9 @@ end
 # Returns a Hash { canonical_path => [diag, …] } where canonical_path is the
 # ORIGINAL file path (not the temp copy).
 def run_reference_batch(file_map, tmpdir_with_files)
-  # cwd is a separate throw-away dir to isolate config discovery
+  # cwd is a separate throw-away dir to isolate config discovery; being fresh
+  # per invocation it also defuses the reference's cwd-keyed persistent result
+  # cache (UPSTREAM.md hazard 2).
   Dir.mktmpdir("rigor-corpus-ref-cwd") do |cwd|
     # Pass the staging directory — reference accepts a directory and analyzes
     # all .rb files recursively.
