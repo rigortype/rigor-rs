@@ -226,6 +226,24 @@ fn tool_catalog() -> Value {
             }
         },
         {
+            "name": "coverage",
+            "description": "Report type-precision coverage: the ratio of expressions Rigor types as \
+                            Constant / Nominal / shaped / refined (precise) vs Dynamic or top (opaque). \
+                            Returns JSON. Useful for measuring the impact of adding new fold rules.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Files or directories to scan (required)"
+                    },
+                    "config": { "type": "string", "description": "Path to .rigor.yml (optional)" }
+                },
+                "required": ["paths"]
+            }
+        },
+        {
             "name": "sig_gen",
             "description": "Generate RBS skeleton signatures inferred from Ruby source FILES (read-only, \
                             like `sig-gen --print --format=json`). Returns a JSON report of candidates \
@@ -262,6 +280,7 @@ fn tools_call(ctx: &ServerContext, params: &Value) -> Value {
         "triage" => tool_triage(ctx, &args),
         "annotate" => tool_annotate(ctx, &args),
         "sig_gen" => tool_sig_gen(&args),
+        "coverage" => tool_coverage(&args),
         other => Err(format!("unknown tool: {other}")),
     };
     match outcome {
@@ -374,6 +393,21 @@ fn tool_sig_gen(args: &Value) -> Result<String, String> {
     let config = args.get("config").and_then(Value::as_str).map(std::path::Path::new);
     panic::catch_unwind(AssertUnwindSafe(|| crate::sig_gen::mcp_report_json(&path_refs, config)))
         .map_err(|_| "internal error: sig-gen panicked".to_string())
+}
+
+/// The `coverage` tool: the type-precision coverage report for the given FILE
+/// paths (read-only; reference `rigor_coverage` shells `coverage --format=json`).
+/// Output is byte-identical to the CLI's `coverage --format=json`. Like
+/// `sig_gen`, it reads files from the server's filesystem. Panic-isolated.
+fn tool_coverage(args: &Value) -> Result<String, String> {
+    let paths: Vec<String> = args
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    let config = args.get("config").and_then(Value::as_str).map(std::path::Path::new);
+    panic::catch_unwind(AssertUnwindSafe(|| crate::coverage::mcp_coverage_json(&paths, config)))
+        .map_err(|_| "internal error: coverage scan panicked".to_string())?
 }
 
 /// The `type_of` tool: type the deepest expression at a 1-based (line, column).
@@ -504,6 +538,7 @@ mod tests {
         assert!(names.contains(&"triage"));
         assert!(names.contains(&"annotate"));
         assert!(names.contains(&"sig_gen"));
+        assert!(names.contains(&"coverage"));
         // Every tool declares an object inputSchema.
         for t in tools.as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object");
@@ -671,5 +706,49 @@ mod tests {
     fn dispatch_unknown_method_is_jsonrpc_error() {
         let e = dispatch(&ctx(), "frobnicate", &Value::Null).unwrap_err();
         assert_eq!(e.0, -32601);
+    }
+
+    #[test]
+    fn coverage_tool_reports_the_precision_summary() {
+        // A file whose 4 expressions split 3 constant / 1 dynamic_top (the same
+        // shape as harness fixture 01).
+        let dir = std::env::temp_dir().join(format!("rigor-mcp-cov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.rb");
+        std::fs::write(&file, "s = \"Hello\"\ns.lenght\n").unwrap();
+
+        let out = tools_call(
+            &ctx(),
+            &json!({ "name": "coverage", "arguments": { "paths": [file.to_str().unwrap()] } }),
+        );
+        assert_eq!(out["isError"], false);
+        let text = out["content"][0]["text"].as_str().unwrap();
+        let report: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(report["summary"]["expressions_typed"], 4);
+        assert_eq!(report["by_tier"]["constant"]["count"], 3);
+        assert_eq!(report["by_tier"]["dynamic_top"]["count"], 1);
+        // Byte-identity with the CLI `--format=json` path: the tool IS the CLI
+        // renderer over the same scan.
+        let cli = crate::coverage::mcp_coverage_json(
+            &[file.to_str().unwrap().to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(text, cli);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn coverage_tool_bad_path_is_an_error() {
+        let out = tools_call(
+            &ctx(),
+            &json!({ "name": "coverage", "arguments": { "paths": ["/nonexistent/xyz.rb"] } }),
+        );
+        assert_eq!(out["isError"], true);
+        assert!(out["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not a file or directory"));
     }
 }

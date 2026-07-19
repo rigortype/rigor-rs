@@ -2262,7 +2262,7 @@ const MUTATOR_METHODS: &[&str] = &[
 ///   mutation deep inside an `each`/`case` is found and its span is contained by
 ///   the enclosing construct; a straight-line mutation is its own containing span
 ///   and widens through the catch-all/`If` arms.
-fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     ast.iter()
         .filter_map(|(_, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
