@@ -22,6 +22,7 @@ use rigor_types::Interner;
 mod config;
 use config::Config;
 mod annotate;
+mod coverage;
 mod bundler;
 mod bleeding_edge;
 mod config_audit;
@@ -83,6 +84,7 @@ fn main() -> ExitCode {
         Some("docs") => docs::cmd_docs(&args[1..]),
         Some("lsp") => lsp::cmd_lsp(&args[1..]),
         Some("mcp") => mcp::cmd_mcp(&args[1..]),
+        Some("coverage") => coverage::cmd_coverage(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => {
             eprintln!("rigor-rs: `{cmd}` is recognized but not yet implemented in this phase");
             ExitCode::from(2)
