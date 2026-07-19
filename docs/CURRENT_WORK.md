@@ -9,25 +9,22 @@ one-line ledger of what landed**. The complete per-subsystem port map is
 ledger line here — verdict + numbers + link — and its detail goes to a dated
 note or ADR *first*. No status essays; this file has a hard byte budget.
 
-Last updated: 2026-07-17.
+Last updated: 2026-07-19.
 
 ## Now / Next
 
-**▶ NEXT SESSION — pick one (last turn ended at this decision, recommend B):**
-- **A.** `Process::Status` last fixture gap — needs TUPLE-return singleton
-  typing + multi-assign destructuring propagation (probed: both unimplemented).
-  Orthogonal general inference, broadly useful, but a large arc; would make
-  fixtures 100%.
-- **B. (recommended)** Treat ADR-0042 as complete and move to another high-ROI
-  track: productization (`coverage --workers` — needs a scoping call vs
-  `type-scan`; LSP §12 — architecture design), or the upstream #194 slices when
-  they land (resolved-plugin-path visibility is `ready-for-agent`; verify with
-  the differential battery).
-- **C.** Routine upstream tracking (pin `7a69f142`, 19 commits behind
-  `origin/master`; last hardened self-diff was 0/0). Cheap, no design call.
+**Track B (productization) taken 2026-07-19**: coverage scoping call resolved
++ precision mode SHIPPED (PR #33); LSP §12 impl plan written — **next session:
+implement LSP §12 Slices S1–S4 per
+[the plan](notes/20260719-lsp-s12-two-tier-impl-plan.md)** (each slice an
+independently gated PR). Option A (`Process::Status` tuple-return +
+destructuring, would make fixtures 100%) remains open as the large orthogonal
+inference arc.
 - Clippy verify MUST use `CARGO_TARGET_DIR=<fresh> cargo clippy --workspace --
   -D warnings` (the incremental cache hides `only_used_in_recursion` etc. —
   cost a CI red on PR #32).
+- Coverage-tool parity lesson (binding for measurement tools): audit at NODE
+  granularity — per-file histograms net over-claims out against under-claims.
 
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
@@ -46,13 +43,15 @@ parity-port arc has bottomed out — see Standing conclusions):
   Phase 3 DONE (1 ported / 1 absent / 1 deferred to `--bleeding-edge`) — the
   compat plan is exhausted; next work returns to the productization track
   (LSP §12, `--bleeding-edge` + CLI §7, re-pin at the v0.3.0 tag).
-- **LSP §12 two-tier** — watched-files invalidation, debounce, worker pool.
+- **LSP §12 two-tier** — impl plan ready
+  ([note](notes/20260719-lsp-s12-two-tier-impl-plan.md)); build S1–S4.
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
-  profile/overrides DONE; remaining: `coverage --workers` (needs a scoping
-  call vs the existing `type-scan`), plugins inflection probe.
-- **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`;
-  oracle invocations must pin the checkout plugin path — see the #194 hazard
-  note there). Pin `7a69f142`; wave delta remeasured CLEAN (0/0).
+  profile/overrides + `coverage` precision mode DONE; remaining: plugins
+  inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
+  deferred by [scoping call](notes/20260719-coverage-command-scoping.md).
+- **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`; note
+  BOTH oracle hazards there — #194 plugin path AND the non-version-scoped
+  result cache). Pin `7a69f142`; tip `e447cb86` self-diff 0/0 (no tag yet).
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
@@ -103,6 +102,9 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-19 `coverage` precision mode + MCP tool** (PR #33, 3 review rounds) — reference precision-tier scan ported on rayon (`--workers` = pool size, byte-identical any N); denominators byte-equal on ALL targets (70 fixtures + conference-app 4235 + mastodon 31381 + gitlab lib 624,233 nodes); node-level audit 0 over-claims except 27 gitlab nodes ACCEPTED as reviewer-verified sound-superset (AGENTS.md anti-convergence); 15+ over-claim defect classes found/fixed across rounds — histogram-level audits provably mask over-claims. [scoping](notes/20260719-coverage-command-scoping.md) / [results](notes/20260719-coverage-precision-mode.md).
+- **2026-07-19 upstream tracking `48a26c20..e447cb86`** (10 commits: the #194 loader stack landed+closed upstream, doctor skew check, cache-validation auto) — hardened self-diff **0/0 on all four battery corpora**; plugin-loader-only surface, nothing to port; pin `7a69f142` held (no v0.3.0 tag yet). NEW oracle hazard 2 recorded in `UPSTREAM.md`: the reference result cache is not version-scoped — pin-vs-tip self-diffs REQUIRE `--no-cache` + isolated cwds.
+- **2026-07-19 LSP §12 impl plan** (design only) — ADR-0029 mapped to the sync `lsp-server` + rayon substrate: single-writer `select!` loop, per-URI 200ms debounce, stale-drop via version+generation stamps, shared Mutex'd sidecar (check-pipeline pattern), slices S1–S4b. [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
 - **2026-07-19 ADR-0042 Slices 3–4** (branch `adr-0042-instance`) — qualified INSTANCE witnessing: fixture 70 shadow-sig unsoundness fix (`Status.exited?` now witnessed via the isolated qualified surface) + fixture 69 nested project-sig `.new` typo (`Outer::Inner.new.spni`); live 213→216 matched, gaps 4→1, 0 FP all corpora; narrow project-sig-only changes (configless untouched). [note](notes/20260719-adr0042-slices-3-4.md).
 - **2026-07-19 ADR-0042 Slices 1–2** (branch `adr-0042-impl`) — qualified-key substrate (additive, gates byte-unchanged) + qualified singleton witnessing; fixture 68 six singleton cases byte-match incl. the ERB::Util/CGI::Util MERGE split, gitlab UM 148→145, 0 FP all core corpora; measure-first per the ratified approach. [note](notes/20260719-adr0042-slices-1-2.md).
 - **2026-07-19 upstream tracking `b70adcb5..48a26c20`** (9 commits: transitive-void ADR-100 WD4, type-of plugin-env parity, IO/File line-iteration non-escaping) — hardened self-diff (fixtures 70 + gitlab lib 4676 + mastodon models + conference-app) **0 added / 0 dropped** on default surfaces (transitive void stays bleeding-edge-gated); nothing to port; pin `7a69f142` held (tag-gated).

@@ -179,6 +179,20 @@ fixed (stale bindings, bogus constants, span collisions, lexically-invalid
 resolutions — types a value cannot have); types a value provably HAS are kept
 and enumerated here.
 
+Reviewer-verified addendum (final acceptance pass): each family sampled at
+real gitlab source lines against the reference binary — no sampled site's
+extra precision can be wrong at runtime. One named member of the wrapper-echo
+set: `click_house/migration_support/migrator.rb:150`, rs `Constant[nil]`
+where ref `bot` (the reference's own fixpoint artifact pins `attempts=1`;
+rigor-rs is the more correct side; both tiers are precise-numerator so ratios
+are unaffected).
+
+Metric scope note: nominal-where-ref-refined/shaped RANK inversions (e.g.
+`Nominal[String]` where the reference keeps a literal-string or a shaped
+`map` carrier) are deliberately excluded from the over-claim metric — they
+are semantically coarser-or-equal claims that never cross the precise/opaque
+boundary, never move a ratio, and are never claims a value cannot satisfy.
+
 Final node-audit table (strict metric: precise-where-ref-dynamic OR
 constant-where-ref-weaker-precise):
 

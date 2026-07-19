@@ -493,10 +493,14 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   content).
 - ✅ `lsp` — `rigor lsp [--transport=stdio] [--log=PATH]` (see §12).
 - ✅ `mcp` — `rigor mcp` read-only MCP server over stdio (`check` + `type_of` tools; see §12).
+- ✅ `coverage` precision mode + MCP `coverage` tool (2026-07-19, PR #33;
+  `--workers` = rayon pool size, byte-identical any N; sound-superset parity —
+  [scoping](notes/20260719-coverage-command-scoping.md)).
 - ⬜ `annotate` · `diff` · `triage` ·
-  `coverage` (incl. `--protection`, ref ADR-63/70) · `plugin` ·
+  `coverage --protection`/`--mutation` (ref ADR-63/70, deferred by scoping
+  call) · `plugin` ·
   `sig-gen` (ref ADR-14) · `skill`/`describe` ·
-  `trace` · `type-scan`.
+  `trace` · `type-scan` (deferred: subsumed by coverage precision mode).
 
 ### 12. Editor / agent servers (ADR-0029)
 - ✅ **LSP server v1 landed (2026-07-01) — `rigor lsp --transport=stdio`.** An in-process
