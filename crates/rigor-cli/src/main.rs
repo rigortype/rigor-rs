@@ -1047,21 +1047,33 @@ impl<'a> OptParse<'a> {
 /// build the sidecar folder, resolve roots, analyze, and return the findings
 /// paired with their project-root-relative path (the baseline matcher key).
 ///
-/// `roots`: positional path args (empty → config `paths:`). drift/prune pass an
-/// empty slice (they never take positionals); generate/regenerate pass their
-/// positionals — a deliberate rigor-rs extension over the reference, which
-/// always analyzes config `paths:`.
+/// `roots`: positional path args (empty → config `paths:`). generate/regenerate
+/// and (since ADR-22-followup) drift/prune pass their positionals — a deliberate
+/// rigor-rs extension over the reference, which always analyzes config `paths:`.
+/// A caller that passes an empty slice still falls back to config `paths:`, so
+/// the no-positional invocation stays reference-faithful.
+///
+/// The returned `bool` is `scope_undeclared`: `true` when there is NO explicit
+/// analysis scope — no positional roots were passed AND `.rigor.yml` did not
+/// declare `paths:` (so the run falls back to the implicit `["lib"]` default).
+/// drift/prune use it to refuse a scope-less audit against a non-empty baseline
+/// (which would silently misjudge every out-of-`lib` bucket as cleared);
+/// generate/regenerate ignore it (writing a `lib`-scoped baseline is fine).
 ///
 /// Returns `Err(code)` if the sidecar folder fails to build.
 fn baseline_analysis(
     explicit_config: Option<&str>,
     roots: &[&str],
     verb: &'static str,
-) -> Result<(Config, Findings), ExitCode> {
+) -> Result<(Config, Findings, bool), ExitCode> {
     let cfg = Config::load(explicit_config.map(Path::new));
     let sidecar_folder = build_sidecar_folder(&cfg, None)?;
     let folder_ref =
         sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
+
+    // "No positional roots AND no declared `paths:`" — the reference's default
+    // `["lib"]` is a fallback, not a user-declared scope.
+    let scope_undeclared = roots.is_empty() && !cfg.paths_explicitly_declared();
 
     let config_paths: Vec<&str>;
     let roots: &[&str] = if roots.is_empty() {
@@ -1074,7 +1086,7 @@ fn baseline_analysis(
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _had_io_error) =
         analyze_files(&expanded, &cfg, verb, folder_ref, &cfg.bleeding_edge_selector());
-    Ok((cfg, findings))
+    Ok((cfg, findings, scope_undeclared))
 }
 
 /// Relativize findings against cwd, as the baseline matcher keys on
@@ -1213,10 +1225,13 @@ fn write_baseline(
     // records the UNFILTERED set — `analyze_files` never applies an existing
     // baseline, so the new file records live diagnostics, not the post-baseline
     // (empty) surface.
-    let (cfg, findings) = match baseline_analysis(explicit_config, files, "baseline") {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
+    // generate/regenerate ignore `analysis_set_empty`: an empty resolved set
+    // legitimately writes an empty baseline (nothing to record).
+    let (cfg, findings, _analysis_set_empty) =
+        match baseline_analysis(explicit_config, files, "baseline") {
+            Ok(v) => v,
+            Err(code) => return code,
+        };
     let entries = baseline_entries(&findings);
     let baseline = Baseline::from_diagnostics(&entries, mode);
     if let Err(e) = std::fs::write(output, baseline.to_yaml()) {
@@ -1290,6 +1305,7 @@ fn baseline_drift(args: &[String]) -> ExitCode {
     let mut path = DEFAULT_BASELINE_PATH.to_string();
     let mut only: Option<DriftStatus> = None;
     let mut explicit_config: Option<String> = None;
+    let mut files: Vec<&str> = Vec::new();
 
     let mut p = OptParse::new(args);
     while let Some(ev) = p.next(&["--baseline", "--only", "--config"]) {
@@ -1317,8 +1333,9 @@ fn baseline_drift(args: &[String]) -> ExitCode {
                 eprintln!("invalid option: {name}");
                 return ExitCode::from(64);
             }
-            // Positionals are ignored (optparse `parse!` leaves them unused).
-            Ok(OptEvent::Positional { .. }) => {}
+            // A rigor-rs generate-parity extension: positional roots override
+            // config `paths:`. The reference accepts no positionals here.
+            Ok(OptEvent::Positional { token }) => files.push(token),
         }
     }
     let explicit_config = explicit_config.as_deref();
@@ -1327,9 +1344,21 @@ fn baseline_drift(args: &[String]) -> ExitCode {
         Ok(b) => b,
         Err(code) => return code,
     };
-    // drift/prune never take positional roots — always config `paths:`.
-    let findings = match baseline_analysis(explicit_config, &[], "baseline") {
-        Ok((_cfg, f)) => f,
+    // Positionals-if-given, else config `paths:` (the reference-faithful path).
+    let findings = match baseline_analysis(explicit_config, &files, "baseline") {
+        Ok((_cfg, f, scope_undeclared)) => {
+            // Guard the scope-less audit: with no declared analysis scope, every
+            // bucket outside the implicit `lib` default would falsely read as
+            // "cleared". Refuse rather than mislead.
+            if scope_undeclared && !baseline.is_empty() {
+                eprintln!(
+                    "rigor: baseline drift: nothing to analyze — pass a path \
+                     (e.g. `rigor baseline drift .`) or declare `paths:` in .rigor.yml"
+                );
+                return ExitCode::from(64);
+            }
+            f
+        }
         Err(code) => return code,
     };
     let entries = baseline_entries(&findings);
@@ -1393,6 +1422,7 @@ fn baseline_prune(args: &[String]) -> ExitCode {
     let mut path = DEFAULT_BASELINE_PATH.to_string();
     let mut dry_run = false;
     let mut explicit_config: Option<String> = None;
+    let mut files: Vec<&str> = Vec::new();
 
     let mut p = OptParse::new(args);
     while let Some(ev) = p.next(&["--baseline", "--config"]) {
@@ -1409,7 +1439,9 @@ fn baseline_prune(args: &[String]) -> ExitCode {
                 eprintln!("invalid option: {name}");
                 return ExitCode::from(64);
             }
-            Ok(OptEvent::Positional { .. }) => {}
+            // A rigor-rs generate-parity extension: positional roots override
+            // config `paths:`. The reference accepts no positionals here.
+            Ok(OptEvent::Positional { token }) => files.push(token),
         }
     }
     let explicit_config = explicit_config.as_deref();
@@ -1418,8 +1450,21 @@ fn baseline_prune(args: &[String]) -> ExitCode {
         Ok(b) => b,
         Err(code) => return code,
     };
-    let findings = match baseline_analysis(explicit_config, &[], "baseline") {
-        Ok((_cfg, f)) => f,
+    // Positionals-if-given, else config `paths:` (the reference-faithful path).
+    let findings = match baseline_analysis(explicit_config, &files, "baseline") {
+        Ok((_cfg, f, scope_undeclared)) => {
+            // Guard the scope-less audit: with no declared analysis scope, every
+            // cleared-looking bucket outside the implicit `lib` default would be
+            // dropped — emptying a live baseline. Refuse.
+            if scope_undeclared && !baseline.is_empty() {
+                eprintln!(
+                    "rigor: baseline prune: nothing to analyze — pass a path \
+                     (e.g. `rigor baseline prune .`) or declare `paths:` in .rigor.yml"
+                );
+                return ExitCode::from(64);
+            }
+            f
+        }
         Err(code) => return code,
     };
     let entries = baseline_entries(&findings);
