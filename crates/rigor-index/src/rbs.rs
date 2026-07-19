@@ -707,7 +707,7 @@ impl CoreData {
             return true; // unknown ⇒ silent
         };
         // Leaf's own instance methods + instance aliases.
-        if entry.methods.contains_key(method) || self.instance_alias_resolves(entry, method, 0) {
+        if entry.methods.contains_key(method) || Self::instance_alias_resolves(entry, method) {
             return true;
         }
         // Ancestors: walk each include + the superclass through the SHORT-key
@@ -739,19 +739,23 @@ impl CoreData {
     }
 
     /// Whether an INSTANCE `alias` on `entry` resolves `method` to a real
-    /// instance method (bounded recursion). Mirrors the qualified singleton
-    /// alias resolution for the instance surface.
-    fn instance_alias_resolves(&self, entry: &ClassEntry, method: &str, depth: usize) -> bool {
-        if depth >= 16 {
-            return false;
-        }
-        match entry.aliases.get(method) {
-            Some(&target) => {
-                entry.methods.contains_key(target)
-                    || self.instance_alias_resolves(entry, target, depth + 1)
+    /// instance method (`alias size length`). Walks the alias chain iteratively
+    /// (bounded) — a free helper (no `self`): resolution stays within one
+    /// `entry`'s own alias table. Mirrors the singleton alias resolution.
+    fn instance_alias_resolves(entry: &ClassEntry, method: &str) -> bool {
+        let mut cur = method;
+        for _ in 0..16 {
+            match entry.aliases.get(cur) {
+                Some(&target) => {
+                    if entry.methods.contains_key(target) {
+                        return true;
+                    }
+                    cur = target;
+                }
+                None => return false,
             }
-            None => false,
         }
+        false
     }
 
     /// Whether `name` was declared as a `module` in RBS (the analogue of the
