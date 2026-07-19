@@ -16,9 +16,10 @@ Last updated: 2026-07-17.
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
 
-- **ADR-0042 implementation** — IN PROGRESS (Slices 1–2 landed: substrate +
-  qualified singleton witnessing, 0 FP). Next: nested-class INSTANCE paths
-  (fixtures 68 tail / 69 / 70), then the defect-2 guard retirement.
+- **ADR-0042 implementation** — IN PROGRESS (Slices 1–4 landed: substrate +
+  qualified singleton + qualified instance witnessing; fixtures 68 singleton /
+  69 / 70 closed, 0 FP). Last gap: fixture 68's `Process::Status` INSTANCE via
+  a tuple return (value-typing wire-up). Then the defect-2 guard retirement.
 - **ACTIVE: compat next stage** — [plan](notes/20260718-compat-next-stage-plan.md);
   Phase 0+1 DONE ([findings](notes/20260718-phase0-m1-m2-findings.md)): Phase 2
   CLOSED by measurement (M1: 0 added diags on ~17k); M2-GO slices 1–4 + 4b
@@ -84,6 +85,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-19 ADR-0042 Slices 3–4** (branch `adr-0042-instance`) — qualified INSTANCE witnessing: fixture 70 shadow-sig unsoundness fix (`Status.exited?` now witnessed via the isolated qualified surface) + fixture 69 nested project-sig `.new` typo (`Outer::Inner.new.spni`); live 213→216 matched, gaps 4→1, 0 FP all corpora; narrow project-sig-only changes (configless untouched). [note](notes/20260719-adr0042-slices-3-4.md).
 - **2026-07-19 ADR-0042 Slices 1–2** (branch `adr-0042-impl`) — qualified-key substrate (additive, gates byte-unchanged) + qualified singleton witnessing; fixture 68 six singleton cases byte-match incl. the ERB::Util/CGI::Util MERGE split, gitlab UM 148→145, 0 FP all core corpora; measure-first per the ratified approach. [note](notes/20260719-adr0042-slices-1-2.md).
 - **2026-07-19 upstream tracking `b70adcb5..48a26c20`** (9 commits: transitive-void ADR-100 WD4, type-of plugin-env parity, IO/File line-iteration non-escaping) — hardened self-diff (fixtures 70 + gitlab lib 4676 + mastodon models + conference-app) **0 added / 0 dropped** on default surfaces (transitive void stays bleeding-edge-gated); nothing to port; pin `7a69f142` held (tag-gated).
 - **2026-07-19 ADR-0042 gate SATISFIED** (branch `adr-0042-gate`, subagent-parallel) — oracle matrix (12 scenarios) → fixtures 68–70 pin the 9-gap nested-class surface; consumer inventory: no unsound consumer under alias-collapse, +2 latent-FP sites the migration fixes free, +1 real scope item (reference-name resolution) absorbed into the ADR; the s5 bare-door oracle-FP shape CLOSED (witness gate → `knows_toplevel_class` only). [deliverables](notes/20260719-adr0042-gate-deliverables.md).
