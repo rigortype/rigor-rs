@@ -350,6 +350,8 @@ mod tests {
     }
 
     #[test]
+    // 3.14159/3.14 are `Float#round(2)` fold test data, not PI approximations.
+    #[allow(clippy::approx_constant)]
     fn fold_real_ruby_executes_gated_calls() {
         if !ruby_on_path() {
             eprintln!("skipping: no ruby on PATH");
