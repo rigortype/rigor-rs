@@ -75,3 +75,10 @@ rayon = "1"
 # reuses the exact `check`/`type-of` analysis path so diagnostics stay consistent.
 lsp-server = "0.8.0"
 lsp-types = "0.97.0"
+# crossbeam-channel (§12 S1, ADR-0029): the LSP event loop `select!`s over the
+# connection receiver and an internal worker-results channel — the single-writer
+# publish seam that S3 will feed from rayon workers. Already an unpacked
+# transitive dep of `lsp-server` (which exposes `Connection.receiver` as a
+# `crossbeam_channel::Receiver`), so this direct pin adds no network fetch and
+# `--offline` keeps working; the version matches lsp-server's (0.5.x in the lock).
+crossbeam-channel = "0.5"
