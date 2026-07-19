@@ -264,6 +264,11 @@ impl<'i> Typer<'i> {
             // `.squish`, `.constantize`) then resolves against the real String
             // RBS and is witnessed, matching the reference.
             Node::InterpolatedString { .. } => self.nominal_or_untyped("String", interner),
+            // An interpolated symbol (`:"a#{x}b"`) is always a `Symbol`
+            // instance regardless of the interpolated values — a structural
+            // twin of `InterpolatedString` above, differing only in the
+            // nominal type name, so it never mis-types as a `String`.
+            Node::InterpolatedSymbol { .. } => self.nominal_or_untyped("Symbol", interner),
             Node::IntegerLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Int(*value)))
             }

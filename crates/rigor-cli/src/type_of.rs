@@ -288,6 +288,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::LocalVariableRead { .. } => "LocalVariableRead",
         Node::StringLit { .. } => "StringLit",
         Node::InterpolatedString { .. } => "InterpolatedString",
+        Node::InterpolatedSymbol { .. } => "InterpolatedSymbol",
         Node::IntegerLit { .. } => "IntegerLit",
         Node::FloatLit { .. } => "FloatLit",
         Node::SymbolLit { .. } => "SymbolLit",
