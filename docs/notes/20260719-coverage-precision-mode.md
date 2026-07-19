@@ -124,10 +124,87 @@ on a bad path; exit 2 for the deferred `--protection`/`--mutation` family
 
 Unexplained diffs: **0**. Over-claims: **0** at node granularity.
 
+## Second re-review round: residual rebind channels + gitlab-foss lib
+
+The PR #33 re-review flagged two residual channels; fixing them surfaced (via
+a gitlab-foss lib node audit, 4676 files / 624,233 nodes — denominator exact
+there too) several more. All fixed classes, with witnesses:
+
+5. **Un-modeled rebind forms** — multi-write (`x, y = f, 2 if c`), `for x
+   in …` index, `rescue => x` captures: none produce arena flow-writes, so a
+   straight-line binding survived them. Fixed with Prism-side taints in
+   coverage.rs (per review direction, NOT by widening the substrate's
+   `collect_flow_writes`). Plus, found by the same audit: index-writes
+   (`h[:k] += v` — gitlab metrics_interceptor.rb) and block-parameter
+   SHADOWING (`with_object(iterator) do |text, iterator|` — gitlab
+   gitmodules_parser.rb) taint too.
+6. **Composite entry-scope semantics** — the reference types every walked
+   node (and its handler's whole recursion) under the ONE scope recorded AT
+   that node. Generalized `eval_ctx` (pinned env at the walked node's start,
+   own-span scope/lexical entries excluded) replaces the wrapper-only context:
+   fixes the class/module wrapper tier (`module M; x = 5; x; end` → wrapper
+   dynamic, headline 80.0% not 100.0%), the reopened-module constant
+   resolution, and `@f ||= begin; present = …; present - w; end` (the
+   composite must not see bindings established inside itself).
+7. **Untrusted composite bindings invalidate, never bind** — the Typer's
+   composite arms type to the LAST-child constant (an interpolated-symbol
+   branch yields the factually wrong `Constant["_z"]`); the walker collector
+   also missed nodes reached via CONCRETE-typed Prism fields (RescueNode et
+   al — the generated `Visit` bypasses the enter hooks for those). Both
+   fixed; a declined bind still pushes an untyped INVALIDATION event so a
+   later read cannot fall back to a stale earlier binding (gitlab
+   api/helpers.rb `messages`).
+8. **`.new` gate completed** — applied in the BIND pass too (the Typer's
+   `.new` interception is unconditional: `Group.new` types `Group` with no
+   Group in scope), and extended to core classes without an RBS-declared
+   singleton `new` (`Integer.new` is a NoMethodError — gitlab
+   template_parser/ast.rb).
+9. **Dispatch fidelity** — `__FILE__` → non-empty-string (nominal, was
+   constant), `__LINE__` → positive-int (shaped, was constant), backtick
+   XString → nominal (was constant), embedded `#{…}` → its statements' value
+   structurally (was a span-map collision minting Nominal[String]).
+
+**Residual over-claims: 27 nodes on gitlab-foss lib (0 on the other three
+targets), all enumerated, all PROVABLY SOUND extra precision** — method-chain
+returns that are unconditional in RBS and cannot be otherwise at runtime:
+`File.join/dirname/basename(…) → String` (12), `Integer#to_s(36)` chains the
+reference loses at its own IntegerRange carrier (5), `Array#-`/`select{}` +
+`join → String` (6, incl. their `#{}` wrappers), `String#*`/`+` (1), plus 3
+wrapper echoes. The reference declines these on argument-dependent dispatch
+or its own carrier gaps — transient reference gaps, not permanent semantics.
+Per AGENTS.md (generative-tool parity), sound extra precision is NOT guarded:
+encoding transient reference gaps is anti-convergence. This is the principled
+line drawn: every FACTUALLY-WRONG claim class found by any audit round was
+fixed (stale bindings, bogus constants, span collisions, lexically-invalid
+resolutions — types a value cannot have); types a value provably HAS are kept
+and enumerated here.
+
+Final node-audit table (strict metric: precise-where-ref-dynamic OR
+constant-where-ref-weaker-precise):
+
+| target | files | nodes | over-claims |
+|---|---|---|---|
+| harness fixtures | 70 | 2268 | **0** |
+| conference-app/app | 98 | 4235 | **0** |
+| mastodon/app/models | 248 | 31381 | **0** |
+| gitlab-foss/lib | 4676 | 624233 | **27 (all sound, enumerated above)** |
+
+Whole-output fixtures after this round: 30/70 byte-exact (fixture 56 joined
+the divergent set — the rescue-taint/composite rules under-claim a few more
+nodes; node-audit-verified all-coarsen). Ratios (ref/rs): fixtures
+0.8386/0.679, conference-app 0.3922/0.3629, mastodon 0.4911/0.4261,
+gitlab-foss lib rs 0.4364.
+
+Substrate finding flagged for separate triage (not this slice): the Typer
+types `x = if c; :"a#{b}_z"; …` to `Constant["_z"]` (interpolated symbols
+lower to a `Statements` wrapper; Statements types as its last child) — a
+potential check-pipeline hazard, spawn-tasked.
+
 ## Gates (all green, re-run post-fix)
 
-- `cargo build --offline` + `cargo test --offline --workspace` (827 tests;
-  includes the 5-form conditional-reassign regression + user.rb extract)
+- `cargo build --offline` + `cargo test --offline --workspace` (833 tests;
+  incl. the 5-form conditional-reassign regression, the user.rb extract, and
+  the 6 rebind/wrapper witnesses from the re-review rounds)
 - `ruby harness/run.rb`: PASS, 0 unregistered FP, 216/218
 - `ruby harness/run_snapshot.rb`: PASS
 - `python3 harness/docs_check.py`: PASS

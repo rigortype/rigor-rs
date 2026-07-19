@@ -47,6 +47,10 @@ use crate::config::Config;
 
 const USAGE: &str = "Usage: rigor coverage [options] PATH...";
 
+/// One scope's positional binding events: `(stmt end offset, name, type)` in
+/// bind order (see `FileScanner::toplevel_env`).
+type BindEvents = Vec<(usize, String, TypeId)>;
+
 // ---------------------------------------------------------------------------
 // Tiers
 // ---------------------------------------------------------------------------
@@ -549,8 +553,9 @@ fn scan_file(path: &str, index: &CoreIndex) -> Result<FileResult, Vec<String>> {
         eprintln!("== {path}");
     }
 
-    let mut scanner = FileScanner::new(&ast, &typer, index, &mut interner);
-    Ok(scanner.scan(&parse_result.node()))
+    let root = parse_result.node();
+    let mut scanner = FileScanner::new(&ast, &typer, index, &mut interner, &root);
+    Ok(scanner.scan(&root))
 }
 
 // ---------------------------------------------------------------------------
@@ -563,12 +568,280 @@ struct NodeCollector<'pr> {
     nodes: Vec<Node<'pr>>,
 }
 
+/// The node classes some parent reaches through a CONCRETELY-TYPED field
+/// (`BeginNode#rescue_clause: RescueNode`, `MatchWriteNode#call: CallNode`, …).
+/// The generated `Visit` walker dispatches those children DIRECTLY to their
+/// `visit_x_node` method — `visit()` and the branch/leaf enter hooks never
+/// fire — so a collector relying on the hooks alone silently misses them
+/// (caught on the `rescue => x` taint: the RescueNode never surfaced). For
+/// these classes the per-method overrides below do the push; the enter hooks
+/// skip them to avoid double-counting when they arrive via a generic field.
+fn reached_via_concrete_field(node: &Node<'_>) -> bool {
+    matches!(
+        node,
+        Node::ArgumentsNode { .. }
+            | Node::BlockArgumentNode { .. }
+            | Node::BlockNode { .. }
+            | Node::BlockParameterNode { .. }
+            | Node::CallNode { .. }
+            | Node::ConstantPathNode { .. }
+            | Node::ElseNode { .. }
+            | Node::EnsureNode { .. }
+            | Node::LocalVariableTargetNode { .. }
+            | Node::ParametersNode { .. }
+            | Node::RescueNode { .. }
+            | Node::SplatNode { .. }
+            | Node::StatementsNode { .. }
+    )
+}
+
 impl<'pr> Visit<'pr> for NodeCollector<'pr> {
     fn visit_branch_node_enter(&mut self, node: Node<'pr>) {
-        self.nodes.push(node);
+        if !reached_via_concrete_field(&node) {
+            self.nodes.push(node);
+        }
     }
     fn visit_leaf_node_enter(&mut self, node: Node<'pr>) {
-        self.nodes.push(node);
+        if !reached_via_concrete_field(&node) {
+            self.nodes.push(node);
+        }
+    }
+    fn visit_arguments_node(&mut self, node: &ruby_prism::ArgumentsNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_arguments_node(self, node);
+    }
+    fn visit_block_argument_node(&mut self, node: &ruby_prism::BlockArgumentNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_block_argument_node(self, node);
+    }
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_block_node(self, node);
+    }
+    fn visit_block_parameter_node(&mut self, node: &ruby_prism::BlockParameterNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_block_parameter_node(self, node);
+    }
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_call_node(self, node);
+    }
+    fn visit_constant_path_node(&mut self, node: &ruby_prism::ConstantPathNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_constant_path_node(self, node);
+    }
+    fn visit_else_node(&mut self, node: &ruby_prism::ElseNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_else_node(self, node);
+    }
+    fn visit_ensure_node(&mut self, node: &ruby_prism::EnsureNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_ensure_node(self, node);
+    }
+    fn visit_local_variable_target_node(
+        &mut self,
+        node: &ruby_prism::LocalVariableTargetNode<'pr>,
+    ) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_local_variable_target_node(self, node);
+    }
+    fn visit_parameters_node(&mut self, node: &ruby_prism::ParametersNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_parameters_node(self, node);
+    }
+    fn visit_rescue_node(&mut self, node: &ruby_prism::RescueNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_rescue_node(self, node);
+    }
+    fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_splat_node(self, node);
+    }
+    fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        self.nodes.push(node.as_node());
+        ruby_prism::visit_statements_node(self, node);
+    }
+}
+
+/// PRISM-side local-rebind taints the arena cannot supply (PR #33 re-review
+/// BLOCKING-1): `MultiWriteNode` local targets (multi-writes have no arena
+/// lowering), `for x in …` index targets (the lowering drops the index), and
+/// `rescue => x` captures. Each yields `(target span, name)` — same shape as
+/// the substrate `collect_flow_writes` entries the taint scan consumes.
+fn collect_prism_taints(root: &Node<'_>) -> Vec<((usize, usize), String)> {
+    let mut collector = NodeCollector { nodes: Vec::new() };
+    collector.visit(root);
+    let mut out = Vec::new();
+    for node in &collector.nodes {
+        match node {
+            Node::MultiWriteNode { .. } => {
+                let n = node.as_multi_write_node().unwrap();
+                for t in n.lefts().iter() {
+                    collect_local_targets(&t, &mut out);
+                }
+                if let Some(t) = n.rest() {
+                    collect_local_targets(&t, &mut out);
+                }
+                for t in n.rights().iter() {
+                    collect_local_targets(&t, &mut out);
+                }
+            }
+            Node::ForNode { .. } => {
+                collect_local_targets(&node.as_for_node().unwrap().index(), &mut out);
+            }
+            Node::RescueNode { .. } => {
+                if let Some(t) = node.as_rescue_node().unwrap().reference() {
+                    collect_local_targets(&t, &mut out);
+                }
+            }
+            // Index-writes on a bare-local receiver mutate its CONTENT
+            // (`h[:k] += x` invalidates a HashShape/Tuple binding — the
+            // reference's `[]=` mutator widening; PR #33 re-review, gitlab
+            // metrics_interceptor.rb `response_size[:total]`).
+            Node::IndexOperatorWriteNode { .. } => {
+                if let Some(r) = node.as_index_operator_write_node().unwrap().receiver() {
+                    collect_local_receiver(&r, node, &mut out);
+                }
+            }
+            Node::IndexOrWriteNode { .. } => {
+                if let Some(r) = node.as_index_or_write_node().unwrap().receiver() {
+                    collect_local_receiver(&r, node, &mut out);
+                }
+            }
+            Node::IndexAndWriteNode { .. } => {
+                if let Some(r) = node.as_index_and_write_node().unwrap().receiver() {
+                    collect_local_receiver(&r, node, &mut out);
+                }
+            }
+            Node::IndexTargetNode { .. } => {
+                let r = node.as_index_target_node().unwrap().receiver();
+                collect_local_receiver(&r, node, &mut out);
+            }
+            // A block/lambda PARAMETER shadowing an enclosing local makes
+            // reads inside the block refer to the parameter, not the binding
+            // (Prism resolves depth statically). The flat name-keyed env
+            // cannot model shadowing, so the shadowed name is dropped
+            // entirely (gitmodules_parser.rb `with_object(iterator) do
+            // |text, iterator|`).
+            Node::BlockParametersNode { .. } => {
+                let bp = node.as_block_parameters_node().unwrap();
+                if let Some(params) = bp.parameters() {
+                    collect_param_names(&params.as_node(), &mut out);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Record a bare-local RECEIVER of an index-write as a taint entry.
+fn collect_local_receiver(
+    receiver: &Node<'_>,
+    write: &Node<'_>,
+    out: &mut Vec<((usize, usize), String)>,
+) {
+    if let Some(lvr) = receiver.as_local_variable_read_node() {
+        let name = String::from_utf8_lossy(lvr.name().as_slice()).into_owned();
+        out.push((span_of(write), name));
+    }
+}
+
+/// Collect every plain parameter NAME under a block's `ParametersNode`
+/// (required / optional / rest / keyword / block params — any of them shadows).
+fn collect_param_names(node: &Node<'_>, out: &mut Vec<((usize, usize), String)>) {
+    match node {
+        Node::RequiredParameterNode { .. } => {
+            let p = node.as_required_parameter_node().unwrap();
+            let name = String::from_utf8_lossy(p.name().as_slice()).into_owned();
+            out.push((span_of(node), name));
+        }
+        Node::OptionalParameterNode { .. } => {
+            let p = node.as_optional_parameter_node().unwrap();
+            let name = String::from_utf8_lossy(p.name().as_slice()).into_owned();
+            out.push((span_of(node), name));
+        }
+        Node::RestParameterNode { .. } => {
+            let p = node.as_rest_parameter_node().unwrap();
+            if let Some(n) = p.name() {
+                out.push((span_of(node), String::from_utf8_lossy(n.as_slice()).into_owned()));
+            }
+        }
+        Node::RequiredKeywordParameterNode { .. } => {
+            let p = node.as_required_keyword_parameter_node().unwrap();
+            let name = String::from_utf8_lossy(p.name().as_slice()).into_owned();
+            out.push((span_of(node), name));
+        }
+        Node::OptionalKeywordParameterNode { .. } => {
+            let p = node.as_optional_keyword_parameter_node().unwrap();
+            let name = String::from_utf8_lossy(p.name().as_slice()).into_owned();
+            out.push((span_of(node), name));
+        }
+        Node::BlockParameterNode { .. } => {
+            let p = node.as_block_parameter_node().unwrap();
+            if let Some(n) = p.name() {
+                out.push((span_of(node), String::from_utf8_lossy(n.as_slice()).into_owned()));
+            }
+        }
+        Node::MultiTargetNode { .. } => {
+            collect_local_targets(node, out);
+        }
+        Node::ParametersNode { .. } => {
+            let p = node.as_parameters_node().unwrap();
+            for c in p.requireds().iter() {
+                collect_param_names(&c, out);
+            }
+            for c in p.optionals().iter() {
+                collect_param_names(&c, out);
+            }
+            if let Some(r) = p.rest() {
+                collect_param_names(&r, out);
+            }
+            for c in p.posts().iter() {
+                collect_param_names(&c, out);
+            }
+            for c in p.keywords().iter() {
+                collect_param_names(&c, out);
+            }
+            if let Some(kr) = p.keyword_rest() {
+                collect_param_names(&kr, out);
+            }
+            if let Some(b) = p.block() {
+                collect_param_names(&b.as_node(), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the LOCAL-variable target names under a (possibly nested / splatted)
+/// assignment-target node. Non-local targets (ivar / constant / call / index)
+/// do not touch the local env and are skipped.
+fn collect_local_targets(node: &Node<'_>, out: &mut Vec<((usize, usize), String)>) {
+    match node {
+        Node::LocalVariableTargetNode { .. } => {
+            let t = node.as_local_variable_target_node().unwrap();
+            let name = String::from_utf8_lossy(t.name().as_slice()).into_owned();
+            out.push((span_of(node), name));
+        }
+        Node::SplatNode { .. } => {
+            if let Some(e) = node.as_splat_node().unwrap().expression() {
+                collect_local_targets(&e, out);
+            }
+        }
+        Node::MultiTargetNode { .. } => {
+            let n = node.as_multi_target_node().unwrap();
+            for t in n.lefts().iter() {
+                collect_local_targets(&t, out);
+            }
+            if let Some(t) = n.rest() {
+                collect_local_targets(&t, out);
+            }
+            for t in n.rights().iter() {
+                collect_local_targets(&t, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -580,8 +853,15 @@ struct FileScanner<'a> {
     /// Exact `(start, end)` span → arena `NodeId`, for routing value-leaves to
     /// the arena typer. Last-writer (outermost / largest id) wins on collision.
     span_to_arena: HashMap<(usize, usize), rigor_parse::NodeId>,
-    /// The top-level env (Program-body straight-line writes, taint-widened).
-    toplevel_env: TypeEnv,
+    /// The top-level scope's POSITIONAL binding events (Program-body
+    /// straight-line writes, taint-widened): `(stmt end offset, name, type)`
+    /// in bind order. A node sees only the bindings whose statement ENDS
+    /// before it — the reference records the scope ENTERING each statement,
+    /// and expression-interior nodes inherit it, so a read inside (or before)
+    /// its own binding statement must not see that binding
+    /// (`options = {...}.merge(options)`: the RHS `options` read is the
+    /// param, not the fresh Hash — PR #33 re-review, gitlab api/helpers.rb).
+    toplevel_env: BindEvents,
     /// Every FRESH-local-scope carrier's span (def / class / module /
     /// `class << self` bodies): a local write inside one is invisible to the
     /// enclosing scope's env AND to its taint scan (Ruby scoping).
@@ -591,9 +871,18 @@ struct FileScanner<'a> {
     /// `Tuple[]`-pinned binding). The SAME substrate collector the Typer's flow
     /// passes widen from ([`rigor_infer::collect_flow_writes`]).
     flow_writes: Vec<(rigor_parse::Span, String)>,
+    /// PRISM-side supplement to `flow_writes` (PR #33 re-review BLOCKING-1):
+    /// local rebind forms the arena does not carry — `MultiWriteNode` targets
+    /// (no arena lowering), `for x in …` index targets (lowering drops them),
+    /// and `rescue => x` captures. Collected here in coverage.rs, NOT by
+    /// widening `collect_flow_writes` itself (that would reach check-pipeline
+    /// behavior and need its own parity run).
+    extra_taints: Vec<((usize, usize), String)>,
     /// Per fresh scope (def/class/module), its straight-line + taint-widened
-    /// env. `env_at` picks the innermost containing entry, else the toplevel.
-    scope_envs: Vec<((usize, usize), TypeEnv)>,
+    /// POSITIONAL binding events (same shape as `toplevel_env`). `env_at`
+    /// picks the innermost containing scope, then materializes the bindings
+    /// visible at the query position.
+    scope_envs: Vec<((usize, usize), BindEvents)>,
     /// The current file's lexical class/module scopes `(span, qualified
     /// segments)` — the use-site prefix source for the in-source constant
     /// visibility gate, and the declared-class-name table.
@@ -605,6 +894,18 @@ struct FileScanner<'a> {
     /// `class Foo`): declaration positions the reference pre-fills with the
     /// qualified `Singleton` (`ScopeIndexer` declared_types) → nominal.
     header_spans: std::collections::HashSet<(usize, usize)>,
+    /// The WALKED node's evaluation context, pinned for its entire tier
+    /// recursion: `(env, lexical prefix, walked-node span)`. The reference
+    /// types each walked node — and every interior node its handler recurses
+    /// into — under the ONE scope recorded AT that node (`scope_index[node]`,
+    /// the statement-entry scope). So the env is materialized at the walked
+    /// node's START (a binding established INSIDE a composite is invisible to
+    /// the composite's own tier: `@f ||= begin; present = …; present - w; end`
+    /// must type dynamic even though `present - w`'s own later walk sees the
+    /// binding), and a scope/lexical entry whose span EQUALS the walked node
+    /// is excluded (a class/module wrapper types its body under the ENCLOSING
+    /// scope — the reference's `type_of_class_or_module`).
+    eval_ctx: Option<(TypeEnv, Vec<String>, (usize, usize))>,
 }
 
 impl<'a> FileScanner<'a> {
@@ -613,6 +914,7 @@ impl<'a> FileScanner<'a> {
         typer: &'a Typer<'a>,
         index: &'a CoreIndex,
         interner: &'a mut Interner,
+        prism_root: &Node<'_>,
     ) -> Self {
         // Map every arena node's exact span to its id. `Program` / `Statements`
         // wrappers are EXCLUDED: a wrapper often shares its span with its sole
@@ -644,6 +946,7 @@ impl<'a> FileScanner<'a> {
             .collect();
         let lexical = rigor_infer::lexical_scopes(ast);
         let flow_writes = rigor_infer::collect_flow_writes(ast);
+        let extra_taints = collect_prism_taints(prism_root);
 
         let mut scanner = FileScanner {
             ast,
@@ -651,13 +954,15 @@ impl<'a> FileScanner<'a> {
             index,
             interner,
             span_to_arena,
-            toplevel_env: TypeEnv::new(),
+            toplevel_env: Vec::new(),
             inner_scope_spans,
             flow_writes,
+            extra_taints,
             scope_envs: Vec::new(),
             lexical,
             class_spans: Vec::new(),
             header_spans: std::collections::HashSet::new(),
+            eval_ctx: None,
         };
         scanner.build_all_scope_envs();
         scanner
@@ -732,6 +1037,11 @@ impl<'a> FileScanner<'a> {
             if is_non_expression(node) {
                 continue;
             }
+            // Pin the walked node's evaluation context (see `eval_ctx`).
+            let span = span_of(node);
+            let env = self.env_for_walked(span);
+            let prefix = self.prefix_outside(span).to_vec();
+            self.eval_ctx = Some((env, prefix, span));
             let tier = self.node_tier(node);
             result.counts[tier.idx()] += 1;
             result.total += 1;
@@ -777,7 +1087,7 @@ impl<'a> FileScanner<'a> {
         &mut self,
         scope_span: (usize, usize),
         body: &[rigor_parse::NodeId],
-    ) -> TypeEnv {
+    ) -> BindEvents {
         // The straight-line write SPANS this env may bind (top-level statements
         // of the body, through `Statements` wrappers).
         let mut straight_line: std::collections::HashSet<(usize, usize)> =
@@ -793,7 +1103,7 @@ impl<'a> FileScanner<'a> {
         // node-level audit, mastodon report.rb `history!`). Span-keyed —
         // orphan-proof, same discipline as the dead-assignment collector.
         let mut tainted: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for (wspan, name) in &self.flow_writes {
+        for (wspan, name) in self.flow_writes.iter().chain(self.extra_taints.iter()) {
             if straight_line.contains(wspan) {
                 continue; // this scope's own straight-line binding
             }
@@ -806,11 +1116,16 @@ impl<'a> FileScanner<'a> {
             tainted.insert(name.clone());
         }
 
+        // Positional bind pass: a running map feeds each RHS, and every
+        // accepted binding is also recorded as a `(stmt end, name, type)`
+        // EVENT so lookups can hide bindings from nodes positioned before
+        // (or inside) the binding statement.
         let mut env = TypeEnv::new();
+        let mut events: BindEvents = Vec::new();
         for &stmt in body {
-            self.bind_stmt_untainted(stmt, &tainted, &mut env);
+            self.bind_stmt_untainted(stmt, &tainted, &mut env, &mut events);
         }
-        env
+        events
     }
 
     /// Whether `wspan` sits inside a fresh scope STRICTLY nested within
@@ -834,43 +1149,116 @@ impl<'a> FileScanner<'a> {
         id: rigor_parse::NodeId,
         tainted: &std::collections::HashSet<String>,
         env: &mut TypeEnv,
+        events: &mut BindEvents,
     ) {
         match self.ast.get(id) {
-            rigor_parse::Node::LocalVariableWrite { name, value, .. } => {
-                let (name, value) = (name.clone(), *value);
-                let mut ty = self.typer.type_of(self.ast, value, env, self.interner);
-                // A CERTAIN nilable RBS return (`String#byteslice -> String?`)
-                // binds the honest `C | nil` union, exactly as the reference
-                // scope does. The Typer's own binding carries the nil bit in
-                // the ADR-0038 provenance side-channel instead of the carrier;
-                // for coverage the carrier must widen, or every later dispatch
-                // on the local out-claims the reference (PR #33 node audit,
-                // fixtures 27/28: the read still counts nominal — worst member
-                // of `String | nil` — while `x.upcase` declines to dynamic).
-                if let rigor_parse::Node::Call { receiver: Some(r), method, .. } =
-                    self.ast.get(value)
-                {
-                    let (r, method) = (*r, method.clone());
-                    let rty = self.typer.type_of(self.ast, r, env, self.interner);
-                    if let Some(cls) = self.index.class_name_of(self.interner, rty) {
-                        if let Some((_, true)) = self.index.method_return_nilable(cls, &method)
-                        {
-                            let nil = self.interner.nil();
-                            ty = rigor_types::Algebra::join(self.interner, ty, nil);
-                        }
-                    }
-                }
-                if !tainted.contains(&name) {
-                    env.insert(name, ty);
-                }
+            rigor_parse::Node::LocalVariableWrite { name, value, span, .. } => {
+                let (name, value, stmt_end) = (name.clone(), *value, span.1);
+                // Every straight-line write emits an EVENT: a typed binding
+                // when the value is trusted, else an UNTYPED INVALIDATION —
+                // the write DID rebind the name at runtime, so a declined
+                // bind must still hide any earlier binding from later reads
+                // (`messages = errs.map(..); messages = messages.count == 1 ?
+                // … : …; messages` — the ternary rebind must widen the read,
+                // not leak the map result; PR #33 re-review, gitlab
+                // api/helpers.rb).
+                let ty = if tainted.contains(&name) {
+                    self.interner.untyped()
+                } else {
+                    self.trusted_value_type(value, env)
+                };
+                env.insert(name.clone(), ty);
+                events.push((stmt_end, name, ty));
             }
             rigor_parse::Node::Statements { body, .. } => {
                 for s in body.clone() {
-                    self.bind_stmt_untainted(s, tainted, env);
+                    self.bind_stmt_untainted(s, tainted, env, events);
                 }
             }
             _ => {}
         }
+    }
+
+    /// The bind-worthy type of a straight-line write's rvalue, or `untyped`
+    /// when the Typer's answer is not trusted for a BINDING:
+    ///
+    /// - COMPOSITE values (if/case/loop/begin/logical/statements/other): the
+    ///   arena Typer's composite arms type to the LAST-child constant, which
+    ///   for an interpolated-symbol branch is a factually wrong pin
+    ///   (`x = if c; :"a#{b}_z"; …` ⇒ Constant["_z"] — PR #33 re-review,
+    ///   gitlab active_record.rb prometheus_key).
+    /// - `X.new` on a bare-constant receiver that the reference-visible rules
+    ///   do not resolve, or a CORE class without an RBS-declared `new`
+    ///   (`Integer.new` is a NoMethodError): the Typer's `.new` interception
+    ///   is unconditional (`Group.new` types `Group` with no Group anywhere)
+    ///   — Ruby's actual semantics are the reference's PERMANENT behavior
+    ///   (gitlab visibility_level.rb `subgroup`, duplicate_job.rb
+    ///   `my_cookie`).
+    /// - A CERTAIN nilable RBS return (`String#byteslice -> String?`) binds
+    ///   the honest `C | nil` union, exactly as the reference scope does
+    ///   (fixtures 27/28: the read stays nominal — worst member — while a
+    ///   dispatch on the local declines to dynamic).
+    fn trusted_value_type(&mut self, value: rigor_parse::NodeId, env: &TypeEnv) -> TypeId {
+        if matches!(
+            self.ast.get(value),
+            rigor_parse::Node::If { .. }
+                | rigor_parse::Node::Case { .. }
+                | rigor_parse::Node::Loop { .. }
+                | rigor_parse::Node::BeginRescue { .. }
+                | rigor_parse::Node::Logical { .. }
+                | rigor_parse::Node::Statements { .. }
+                | rigor_parse::Node::Other { .. }
+        ) {
+            return self.interner.untyped();
+        }
+
+        if let rigor_parse::Node::Call { receiver: Some(r), method, .. } = self.ast.get(value) {
+            let (r, method) = (*r, method.clone());
+
+            // The `.new` receiver gate (mirrors the Prism-side CallNode arm).
+            if method == "new" {
+                if let rigor_parse::Node::ConstantRead { name, span, .. } = self.ast.get(r) {
+                    let (name, rspan) = (name.clone(), *span);
+                    if !self.new_receiver_allowed_arena(&name, rspan, r, env) {
+                        return self.interner.untyped();
+                    }
+                }
+            }
+
+            let mut ty = self.typer.type_of(self.ast, value, env, self.interner);
+            let rty = self.typer.type_of(self.ast, r, env, self.interner);
+            if let Some(cls) = self.index.class_name_of(self.interner, rty) {
+                if let Some((_, true)) = self.index.method_return_nilable(cls, &method) {
+                    let nil = self.interner.nil();
+                    ty = rigor_types::Algebra::join(self.interner, ty, nil);
+                }
+            }
+            return ty;
+        }
+
+        self.typer.type_of(self.ast, value, env, self.interner)
+    }
+
+    /// Whether `.new` on the bare-constant arena receiver `name` resolves
+    /// under the reference-visible rules: an in-source lexically-visible
+    /// class, or a core class whose RBS actually declares a singleton `new`.
+    fn new_receiver_allowed_arena(
+        &mut self,
+        name: &str,
+        rspan: (usize, usize),
+        r: rigor_parse::NodeId,
+        env: &TypeEnv,
+    ) -> bool {
+        if self.declared_visible(name, rspan) {
+            return true;
+        }
+        let rty = self.typer.type_of(self.ast, r, env, self.interner);
+        if let Type::Singleton(cid) = self.interner.get(rty) {
+            if let Some(cn) = self.index.class_name_for_id(*cid) {
+                return self.index.class_has_singleton_method(cn, "new");
+            }
+        }
+        false
     }
 
     /// Collect the SPANS of the plain local writes a straight-line bind pass
@@ -894,13 +1282,15 @@ impl<'a> FileScanner<'a> {
         }
     }
 
-    /// The env visible at a node: the innermost enclosing fresh scope's env
-    /// (def / class / module body), else the top-level env.
-    fn env_at(&self, span: (usize, usize)) -> &TypeEnv {
-        let mut best: Option<&((usize, usize), TypeEnv)> = None;
+    /// The env visible AT a walked node: the innermost enclosing fresh scope
+    /// (excluding a scope whose span IS the node — a def/class/module wrapper
+    /// is typed under the scope it is a statement in), materialized at the
+    /// node's start (bindings whose statement ends before it; last wins).
+    fn env_for_walked(&self, span: (usize, usize)) -> TypeEnv {
+        let mut best: Option<&((usize, usize), BindEvents)> = None;
         for entry in &self.scope_envs {
             let (ds, de) = entry.0;
-            if ds <= span.0 && span.1 <= de {
+            if (ds, de) != span && ds <= span.0 && span.1 <= de {
                 match best {
                     None => best = Some(entry),
                     Some(b) if (de - ds) < (b.0 .1 - b.0 .0) => best = Some(entry),
@@ -908,7 +1298,8 @@ impl<'a> FileScanner<'a> {
                 }
             }
         }
-        best.map(|e| &e.1).unwrap_or(&self.toplevel_env)
+        let events = best.map(|e| &e.1).unwrap_or(&self.toplevel_env);
+        materialize_env(events, span.0)
     }
 
     /// The use-site lexical prefix: the innermost `lexical` scope containing
@@ -927,13 +1318,49 @@ impl<'a> FileScanner<'a> {
         best.map(|b| b.1.as_slice()).unwrap_or(&[])
     }
 
+    /// The lexical prefix OUTSIDE a class/module wrapper whose span is exactly
+    /// `span` (skips the wrapper's own `lexical` entry).
+    fn prefix_outside(&self, span: (usize, usize)) -> &[String] {
+        let mut best: Option<&(rigor_parse::Span, Vec<String>)> = None;
+        for sc in &self.lexical {
+            if sc.0 != span && sc.0 .0 <= span.0 && span.1 <= sc.0 .1 {
+                match best {
+                    None => best = Some(sc),
+                    Some(b) if (sc.0 .1 - sc.0 .0) < (b.0 .1 - b.0 .0) => best = Some(sc),
+                    _ => {}
+                }
+            }
+        }
+        best.map(|b| b.1.as_slice()).unwrap_or(&[])
+    }
+
+    /// The tier of a class/module/singleton-class WRAPPER node: the body's
+    /// value under the walked node's pinned `eval_ctx` — which, for a wrapper,
+    /// resolves OUTSIDE it (own-span exclusion in `env_for_walked` /
+    /// `prefix_outside`), matching the reference's `type_of_class_or_module`
+    /// ("the body is typed in the surrounding scope"; PR #33 re-review
+    /// BLOCKING-2: `module M; x = 5; x; end`'s wrapper must not read the
+    /// body-scope binding). An empty body is `Constant[nil]`.
+    fn wrapper_tier(&mut self, body: Option<Node<'_>>) -> Tier {
+        match body {
+            Some(body) => self.value_tier(body),
+            None => Tier::Constant,
+        }
+    }
+
     /// Ruby lexical constant visibility for an in-source class/module: `name`
     /// read at a site with lexical prefix `P` resolves iff some declared
     /// class/module's qualified name equals `P[0..k] + [name]` for some k
     /// (innermost-out walk; ancestor lookup not modeled — a conservative miss).
     /// The declared-name table is the `lexical` scopes' own qualified names.
     fn declared_visible(&self, name: &str, span: (usize, usize)) -> bool {
-        let prefix = self.prefix_at(span);
+        // The WALKED node's pinned lexical prefix (a wrapper resolves from
+        // OUTSIDE itself: a reopened `module M`'s wrapper must not see an
+        // `M::Foo` declared in the first block as a bare-`Foo` hit).
+        let prefix: &[String] = match &self.eval_ctx {
+            Some((_, p, _)) => p.as_slice(),
+            None => self.prefix_at(span),
+        };
         for k in (0..=prefix.len()).rev() {
             let candidate_len = k + 1;
             if self.lexical.iter().any(|(_, segs)| {
@@ -947,13 +1374,6 @@ impl<'a> FileScanner<'a> {
         false
     }
 
-    /// Whether a span sits inside any class/module body (→ `self` is nominal).
-    fn inside_class(&self, span: (usize, usize)) -> bool {
-        self.class_spans
-            .iter()
-            .any(|(s, e)| *s <= span.0 && span.1 <= *e)
-    }
-
     /// Classify one Prism node into a tier, reproducing `ExpressionTyper#type_of`
     /// (`PRISM_DISPATCH`).
     fn node_tier(&mut self, node: &Node<'_>) -> Tier {
@@ -965,13 +1385,20 @@ impl<'a> FileScanner<'a> {
             | Node::RationalNode { .. }
             | Node::SymbolNode { .. }
             | Node::StringNode { .. }
-            | Node::XStringNode { .. }
-            | Node::SourceFileNode { .. }
-            | Node::SourceLineNode { .. }
             | Node::TrueNode { .. }
             | Node::FalseNode { .. }
             | Node::NilNode { .. }
             | Node::RegularExpressionNode { .. } => Tier::Constant,
+
+            // Backtick command output is a runtime String, never a pinned
+            // value (reference `type_of_xstring` → Nominal[String]).
+            Node::XStringNode { .. } | Node::InterpolatedXStringNode { .. } => Tier::Nominal,
+            // `__FILE__` → `non-empty-string` = Difference[String, ""] —
+            // classify(Difference) follows its BASE → nominal (PR #33
+            // re-review gitlab audit: Constant here was an over-claim).
+            Node::SourceFileNode { .. } => Tier::Nominal,
+            // `__LINE__` → `positive-int` = IntegerRange[1, +inf) → shaped.
+            Node::SourceLineNode { .. } => Tier::Shaped,
 
             // ---- Definitions ----------------------------------------------
             // `def foo` evaluates to `Constant[:foo]`.
@@ -1108,20 +1535,19 @@ impl<'a> FileScanner<'a> {
                 self.arena_tier(node)
             }
 
-            // ---- Definitions that recurse into their body ------------------
-            Node::ClassNode { .. } => match node.as_class_node().unwrap().body() {
-                None => Tier::Constant,
-                Some(b) => self.value_tier(b),
-            },
-            Node::ModuleNode { .. } => match node.as_module_node().unwrap().body() {
-                None => Tier::Constant,
-                Some(b) => self.value_tier(b),
-            },
+            // ---- Definitions that recurse into their body (under the
+            // ENCLOSING scope's context — see `wrapper_tier`) ----------------
+            Node::ClassNode { .. } => {
+                let body = node.as_class_node().unwrap().body();
+                self.wrapper_tier(body)
+            }
+            Node::ModuleNode { .. } => {
+                let body = node.as_module_node().unwrap().body();
+                self.wrapper_tier(body)
+            }
             Node::SingletonClassNode { .. } => {
-                match node.as_singleton_class_node().unwrap().body() {
-                    None => Tier::Constant,
-                    Some(b) => self.value_tier(b),
-                }
+                let body = node.as_singleton_class_node().unwrap().body();
+                self.wrapper_tier(body)
             }
 
             // ---- Control-flow structural composers ------------------------
@@ -1204,11 +1630,19 @@ impl<'a> FileScanner<'a> {
 
             // ---- `self` --------------------------------------------------
             Node::SelfNode { .. } => {
-                if self.inside_class(span_of(node)) {
-                    Tier::Nominal
-                } else {
-                    Tier::DynamicTop
-                }
+                // Judged at the WALKED node's position, excluding the walked
+                // node's own class span — a wrapper's body-`self` is the
+                // OUTER scope's self (`module M; self; end` at toplevel →
+                // main → dynamic).
+                let judge = match &self.eval_ctx {
+                    Some((_, _, wspan)) => *wspan,
+                    None => span_of(node),
+                };
+                let inside = self
+                    .class_spans
+                    .iter()
+                    .any(|&(s, e)| (s, e) != judge && s <= judge.0 && judge.1 <= e);
+                if inside { Tier::Nominal } else { Tier::DynamicTop }
             }
 
             // ---- Constant reads: resolve in-source / core → Singleton -----
@@ -1242,6 +1676,27 @@ impl<'a> FileScanner<'a> {
                             if self.constant_name_tier(&name, &recv) != Tier::Nominal {
                                 return Tier::DynamicTop;
                             }
+                            // A CORE class must actually declare a singleton
+                            // `new` in RBS — `Integer.new` is a runtime
+                            // NoMethodError the reference types Dynamic
+                            // (gitlab template_parser/ast.rb). An in-source
+                            // visible class inherits `Class#new` — allowed.
+                            if !self.declared_visible(&name, span_of(&recv)) {
+                                let sty = self.arena_type(&recv);
+                                if let Some(sty) = sty {
+                                    if let Type::Singleton(cid) = self.interner.get(sty) {
+                                        let has_new = self
+                                            .index
+                                            .class_name_for_id(*cid)
+                                            .is_some_and(|cn| {
+                                                self.index.class_has_singleton_method(cn, "new")
+                                            });
+                                        if !has_new {
+                                            return Tier::DynamicTop;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -1257,8 +1712,19 @@ impl<'a> FileScanner<'a> {
             | Node::ItLocalVariableReadNode { .. }
             | Node::InstanceVariableReadNode { .. }
             | Node::ClassVariableReadNode { .. }
-            | Node::GlobalVariableReadNode { .. }
-            | Node::EmbeddedStatementsNode { .. } => self.arena_tier(node),
+            | Node::GlobalVariableReadNode { .. } => self.arena_tier(node),
+
+            // `"#{expr}"`'s embedded-statements part: the statements' value
+            // (reference `type_of_embedded_statements`). STRUCTURAL — routing
+            // it through the span map collided with same-span arena nodes and
+            // minted Nominal[String] for `"#{dynamic_call}"` parts (PR #33
+            // re-review gitlab audit, 23 nodes).
+            Node::EmbeddedStatementsNode { .. } => {
+                match node.as_embedded_statements_node().unwrap().statements() {
+                    Some(s) => self.statements_tier(&s.as_node()),
+                    None => Tier::Constant,
+                }
+            }
 
             // ---- Non-value positions & everything else → dynamic_top -------
             _ => Tier::DynamicTop,
@@ -1408,8 +1874,13 @@ impl<'a> FileScanner<'a> {
         if !arena_kind_compatible(node, self.ast.get(id)) {
             return None;
         }
-        // Clone the env out to avoid borrowing `self` immutably + mutably.
-        let env = self.env_at(span).clone();
+        // The WALKED node's pinned env (see `eval_ctx`): interior nodes of a
+        // composite are typed under the composite's entry scope, exactly as
+        // the reference's single-scope `type_of` recursion does.
+        let env = match &self.eval_ctx {
+            Some((env, _, _)) => env.clone(),
+            None => self.env_for_walked(span),
+        };
         Some(self.typer.type_of(self.ast, id, &env, self.interner))
     }
 
@@ -1422,6 +1893,19 @@ impl<'a> FileScanner<'a> {
             None => Tier::DynamicTop,
         }
     }
+}
+
+/// Materialize the bindings visible at byte position `pos` from a scope's
+/// positional binding events: every event whose statement ends at or before
+/// `pos`, last write wins.
+fn materialize_env(events: &[(usize, String, TypeId)], pos: usize) -> TypeEnv {
+    let mut env = TypeEnv::new();
+    for (end, name, ty) in events {
+        if *end <= pos {
+            env.insert(name.clone(), *ty);
+        }
+    }
+    env
 }
 
 /// The `(start, end)` byte span of a Prism node.
@@ -1935,8 +2419,9 @@ mod tests {
         let source_index = SourceIndex::build(&ast, &index);
         let typer = Typer::with_source(&index, &source_index);
         let mut interner = Interner::new();
-        let mut scanner = FileScanner::new(&ast, &typer, &index, &mut interner);
-        scanner.scan(&parse_result.node())
+        let root = parse_result.node();
+        let mut scanner = FileScanner::new(&ast, &typer, &index, &mut interner, &root);
+        scanner.scan(&root)
     }
 
     #[test]
@@ -2105,5 +2590,98 @@ mod tests {
 
         assert!(collect_paths(&["/nonexistent/xyz.rb".to_string()]).is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod rebind_taint_regressions {
+    //! PR #33 re-review BLOCKING-1/2: rebind forms the arena does not carry
+    //! (multi-write / for-index / rescue-capture) must invalidate a
+    //! straight-line binding, and a class/module WRAPPER's own tier must be
+    //! computed under the ENCLOSING scope. Expectations oracle-verified
+    //! (per-node dumps against the pinned reference).
+    use super::*;
+
+    fn scan_src(src: &str) -> FileResult {
+        let parse_result = ruby_prism::parse(src.as_bytes());
+        assert_eq!(parse_result.errors().count(), 0, "test source must parse");
+        let ast = lower(&parse_result);
+        let index = CoreIndex::new();
+        let source_index = SourceIndex::build(&ast, &index);
+        let typer = Typer::with_source(&index, &source_index);
+        let mut interner = Interner::new();
+        let root = parse_result.node();
+        let mut scanner = FileScanner::new(&ast, &typer, &index, &mut interner, &root);
+        scanner.scan(&root)
+    }
+
+    #[test]
+    fn rescue_capture_is_collected_as_taint() {
+        let src = "x = 5\nbegin\n  g\nrescue => x\nend\nx\n";
+        let pr = ruby_prism::parse(src.as_bytes());
+        let root = pr.node();
+        let taints = collect_prism_taints(&root);
+        assert!(
+            taints.iter().any(|(_, n)| n == "x"),
+            "rescue => x must taint x; got {taints:?}"
+        );
+    }
+
+    #[test]
+    fn multi_write_if_invalidates_the_binding() {
+        // `x = 5; x, y = frob, 2 if c; x` — the final read must NOT keep 5.
+        // Oracle: constant 3 (5, 2, and the write) / dynamic_top 8; the ref's
+        // three `shaped` nodes (if/multiwrite/rhs-array wrappers) are rs
+        // dynamic — an under-claim.
+        let r = scan_src("x = 5\nx, y = frob, 2 if c\nx\n");
+        assert_eq!(r.tier(Tier::Constant), 3);
+        assert_eq!(r.tier(Tier::DynamicTop), 8);
+    }
+
+    #[test]
+    fn for_index_invalidates_the_binding() {
+        // `x = 5; for x in p; end; x` — oracle-exact: constant 4 (incl. the
+        // for-loop's Constant[nil]) / dynamic_top 2 (p and the final x).
+        let r = scan_src("x = 5\nfor x in p\nend\nx\n");
+        assert_eq!(r.tier(Tier::Constant), 4);
+        assert_eq!(r.tier(Tier::DynamicTop), 2);
+    }
+
+    #[test]
+    fn rescue_capture_invalidates_the_binding() {
+        // `x = 5; begin; g; rescue => x; end; x` — the final read must NOT
+        // keep Constant[5]. Oracle types it nominal (the Constant|StandardError
+        // join); the taint widens to dynamic_top — an under-claim, never the
+        // constant over-claim. constant 2 / dynamic_top 4.
+        let r = scan_src("x = 5\nbegin\n  g\nrescue => x\nend\nx\n");
+        assert_eq!(r.tier(Tier::Constant), 2);
+        assert_eq!(r.tier(Tier::DynamicTop), 4);
+    }
+
+    #[test]
+    fn module_wrapper_types_under_the_enclosing_scope() {
+        // `module M; x = 5; x; end` — the WRAPPER's tier is the body value
+        // typed OUTSIDE the module (where x is unbound) → dynamic_top, while
+        // the interior write/read stay constant. Oracle-exact histogram:
+        // constant 3, nominal 1 (header M), dynamic_top 1 (the wrapper).
+        let r = scan_src("module M\n  x = 5\n  x\nend\n");
+        assert_eq!(r.total, 5);
+        assert_eq!(r.tier(Tier::Constant), 3);
+        assert_eq!(r.tier(Tier::Nominal), 1);
+        assert_eq!(r.tier(Tier::DynamicTop), 1);
+    }
+
+    #[test]
+    fn reopened_module_wrapper_resolves_constants_outside() {
+        // The second `module M` wrapper types `f = Foo` from OUTSIDE, where
+        // bare `Foo` (declared only as M::Foo) does not resolve → the wrapper
+        // is dynamic_top; the INTERIOR `Foo` read (prefix [M]) stays nominal.
+        // Oracle-exact: constant 2, nominal 5, dynamic_top 1.
+        let src = "module M\n  class Foo\n  end\nend\nmodule M\n  f = Foo\nend\n";
+        let r = scan_src(src);
+        assert_eq!(r.total, 8);
+        assert_eq!(r.tier(Tier::Constant), 2);
+        assert_eq!(r.tier(Tier::Nominal), 5);
+        assert_eq!(r.tier(Tier::DynamicTop), 1);
     }
 }
