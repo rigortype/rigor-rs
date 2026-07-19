@@ -676,6 +676,69 @@ impl CoreData {
         !complete
     }
 
+    /// ADR-0042 Slice 3: the qualified-registry analogue of
+    /// [`Self::class_has_method`] — instance-method existence over the ISOLATED
+    /// qualified entry (`qualified["Status"]` = the project's own surface, NOT
+    /// the short-key merge of project `Status` + stdlib `Process::Status`). The
+    /// LEAF's own methods + instance aliases come from the qualified entry; its
+    /// ANCESTORS (superclass / includes — stored short, but ancestors are
+    /// top-level/global names) resolve through the existing short-key chain
+    /// walk, so `Object`/`Kernel`/`BasicObject` are found. A class with no
+    /// declared superclass defaults to `Object` (mirroring [`Self::finish`],
+    /// which defaults only the short map). Absence is witnessed ONLY when the
+    /// whole chain is loaded (conservative-complete, never a false positive).
+    pub fn qualified_class_has_method(&self, qname: &str, method: &str) -> bool {
+        let Some(entry) = self.qualified.get(qname) else {
+            return true; // unknown ⇒ silent
+        };
+        // Leaf's own instance methods + instance aliases.
+        if entry.methods.contains_key(method) || self.instance_alias_resolves(entry, method, 0) {
+            return true;
+        }
+        // Ancestors: walk each include + the superclass through the SHORT-key
+        // chain (ancestors are global names). A class's implicit `Object`
+        // superclass is defaulted here (the qualified map is not Object-defaulted
+        // in `finish`).
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        let mut complete = true;
+        for inc in &entry.includes {
+            self.collect(inc, &mut order, &mut seen, &mut complete);
+        }
+        let sup = entry.superclass.or({
+            if !entry.is_module && qname != "BasicObject" {
+                Some("Object")
+            } else {
+                None
+            }
+        });
+        if let Some(s) = sup {
+            self.collect(s, &mut order, &mut seen, &mut complete);
+        }
+        if self.lookup_on_chain(&order, method).is_some() {
+            return true;
+        }
+        // Absent across the leaf + its resolvable ancestry: witness only when
+        // the chain is fully loaded.
+        !complete
+    }
+
+    /// Whether an INSTANCE `alias` on `entry` resolves `method` to a real
+    /// instance method (bounded recursion). Mirrors the qualified singleton
+    /// alias resolution for the instance surface.
+    fn instance_alias_resolves(&self, entry: &ClassEntry, method: &str, depth: usize) -> bool {
+        if depth >= 16 {
+            return false;
+        }
+        match entry.aliases.get(method) {
+            Some(&target) => {
+                entry.methods.contains_key(target)
+                    || self.instance_alias_resolves(entry, target, depth + 1)
+            }
+            None => false,
+        }
+    }
+
     /// Whether `name` was declared as a `module` in RBS (the analogue of the
     /// reference `Environment#rbs_module?`). `false` for a class or an unknown
     /// name. Read only by `call.raise-non-exception`'s instance path.
@@ -3611,5 +3674,30 @@ mod qualified_singleton_witness_tests {
         if idx.knows_qualified_class("Gem::Specification") {
             assert!(idx.class_has_singleton_method("Gem::Specification", "no_such_zzz"));
         }
+    }
+}
+
+#[cfg(test)]
+mod qualified_instance_method_tests {
+    use super::*;
+
+    /// ADR-0042 Slice 3: `qualified_class_has_method` resolves the leaf's own
+    /// instance surface + ancestry (Object/Kernel/BasicObject via the short
+    /// chain) + instance aliases; a genuine typo on a top-level class is
+    /// witnessed ABSENT and a real method (incl. an inherited one) present.
+    #[test]
+    fn qualified_instance_own_ancestry_and_alias() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("String") {
+            return; // stub fallback.
+        }
+        // Own method present; inherited (Object#frozen?) present; typo absent.
+        assert!(idx.qualified_class_has_method("String", "upcase"));
+        assert!(idx.qualified_class_has_method("String", "frozen?"));
+        assert!(!idx.qualified_class_has_method("String", "no_such_zzz"));
+        // An instance alias resolves (`String#size` aliases `length`).
+        assert!(idx.qualified_class_has_method("String", "size"));
+        // Unknown qualified name ⇒ silent (assume-present).
+        assert!(idx.qualified_class_has_method("No::Such", "whatever"));
     }
 }

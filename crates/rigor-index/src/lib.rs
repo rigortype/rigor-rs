@@ -188,6 +188,16 @@ impl CoreIndex {
         self.data.class_has_method(class_name, method)
     }
 
+    /// ADR-0042 Slice 3: instance-method existence over the ISOLATED qualified
+    /// entry (project `Status`'s own surface, NOT the short-key merge with
+    /// stdlib `Process::Status`). Differs from [`Self::class_has_method`] ONLY
+    /// when the name collides with a NESTED same-leaf class (toplevel-vs-toplevel
+    /// collisions still merge identically). Used by the source-range project-sig
+    /// witness so a shadow class does not silently inherit the stdlib surface.
+    pub fn qualified_class_has_method(&self, class_name: &str, method: &str) -> bool {
+        self.data.qualified_class_has_method(class_name, method)
+    }
+
     /// Whether the class OBJECT `class_name` responds to a singleton (class)
     /// `method` — e.g. `Time.now`, `Array.new`. The singleton surface is the
     /// class's own + inherited `def self.x` methods (up the superclass chain)

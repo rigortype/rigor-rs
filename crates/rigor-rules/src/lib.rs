@@ -1240,7 +1240,13 @@ fn check_call(
             // keeps bare `Inner` (which resolves to nothing at runtime)
             // silent. Probed: rigor-rs fired `spni' for Inner` where the
             // reference is silent — an oracle FP shape, now closed.
-            if index.knows_toplevel_class(name) && !index.class_has_method(name, method) {
+            // ADR-0042 Slice 3: check the ISOLATED qualified surface, not the
+            // short-key merge. A toplevel project-sig `Status` colliding with a
+            // NESTED stdlib `Process::Status` no longer silently inherits
+            // `exited?` from the stdlib class (fixture 70 — residual defect-2
+            // unsoundness). For a non-colliding class or a toplevel-vs-toplevel
+            // collision, this is identical to `class_has_method`.
+            if index.knows_toplevel_class(name) && !index.qualified_class_has_method(name, method) {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
                 let severity = catalog(CALL_UNDEFINED_METHOD)
