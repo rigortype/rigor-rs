@@ -438,6 +438,19 @@ impl Config {
             .collect()
     }
 
+    /// Whether `paths:` was EXPLICITLY declared in the loaded `.rigor.yml` (vs.
+    /// left to the `["lib"]` default). `baseline drift`/`prune` use this to tell
+    /// a real, user-declared analysis scope from the implicit default: with no
+    /// positional roots AND no declared `paths:`, an audit against a non-empty
+    /// baseline has no meaningful scope and would mislead (every out-of-default
+    /// bucket falsely reads as cleared), so those commands refuse instead. Always
+    /// `false` for `Config::default` / a direct `serde_yaml::from_str` (only
+    /// [`Config::load`] populates `present_keys`).
+    #[must_use]
+    pub fn paths_explicitly_declared(&self) -> bool {
+        self.present_keys.contains("paths")
+    }
+
     /// The `signature_paths:` entries when the key was EXPLICITLY configured, or
     /// `None` when it was left to the `["sig"]` default. The config audit only
     /// warns on explicit paths — an absent (auto-detected) `sig/` is a normal
