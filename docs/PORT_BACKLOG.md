@@ -556,12 +556,20 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   span, `selectionRange` = the name token (`name_span` for methods). Advertised
   `documentSymbolProvider`. +2 tests (nested class→methods + module; empty for a script-ish file)
   and an e2e stdio session. 386 tests, harnesses PASS (0 FP), clippy-clean.
-- ⬜ **Deferred (LSP v4+):** `::` constant/namespace completion (currently `::` yields singleton
-  methods, not nested constants); Union-receiver method intersection + private-method visibility
-  filter; the full two-tier `ProjectContext` (generation counter,
-  `didChangeWatchedFiles`/`didChangeConfiguration` invalidation), cross-file project context for
-  open buffers, a pre-warmed worker pool, 200ms `didChange` debounce, temp-file `BufferBinding`,
-  incremental UTF-16 `didChange` sync, `--log` wiring, and TCP/socket transport.
+- ✅ **Two-tier tier-1 landed (2026-07-19, S1–S4, PRs #35–#38).** The `select!` event loop +
+  `BufferTable{bytes,version,dirty}`; 200ms per-URI `didChange` debounce (didOpen immediate);
+  pre-warmed rayon worker pool with 3-axis (version/generation/open-epoch) stale-drop and a
+  one-in-flight/no-lost-update lifecycle; a generation-counter `ProjectContext` invalidated
+  synchronously on `didChangeWatchedFiles`(`.rigor.yml`/`Gemfile.lock`/`*.rb`/`sig/**/*.rbs`) +
+  `didChangeConfiguration` (never on buffer `didChange`); LSP dynamic registration
+  (`client/registerCapability`, degrades gracefully). Sidecar shared as `Arc` behind its Mutex
+  (the check pipeline's pattern). Known limit: invalidate re-reads sig CONTENT, not parsed
+  `.rigor.yml` (reference-parity). [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
+- ⬜ **Deferred:** **S4b cross-file project context for open buffers** (the last tier-1 item — a
+  dirty-buffer overlay over the file's indexed contribution; needs a mini-spec). Plus LSP v4+:
+  `::` constant/namespace completion (currently `::` yields singleton methods, not nested
+  constants); Union-receiver method intersection + private-method visibility filter; temp-file
+  `BufferBinding`; incremental UTF-16 `didChange` sync; `--log` wiring; TCP/socket transport.
 - ✅ **MCP server landed (2026-07-01) — `rigor mcp`.** A read-only Model Context Protocol server
   over stdio so an AI agent can analyse Ruby with rigor as a tool. **Transport hand-rolled on
   `serde_json`** (MCP stdio = newline-delimited JSON-RPC 2.0, one message per line — simpler than

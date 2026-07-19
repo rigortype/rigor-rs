@@ -70,16 +70,32 @@ needed; only the "sequential loop, single worker suffices" comment at
 
 ## Slicing (each an independently gated PR)
 
-- **S1** — BufferTable + `select!` loop refactor + worker-results channel
-  with an inline synchronous executor. Pure refactor, behavior unchanged;
-  integration tests via `lsp_server::Connection::memory()`.
-- **S2** — 200 ms per-URI debounce on the new loop (didOpen immediate,
-  didClose cancels). Scripted-timing memory-connection tests.
-- **S3** — rayon dispatch + version/generation stale-drop + shared sidecar.
-  Tests: burst-edit coalescing, stale-result drop, publish ordering.
-- **S4** — ProjectContext generation + watched-files/config invalidation +
-  dynamic registration + lazy worker rebuild. **S4b** (cross-file overlay)
-  follows separately after its overlay mini-spec.
+**Status: S1–S4 DONE + MERGED 2026-07-19 (PRs #35–#38). S4b remaining.**
+Two design refinements emerged during implementation (both applied):
+generation stale-drop moved **S3→S4** (it lands with its trigger —
+ProjectContext invalidation — so guard + trigger are tested as one unit); the
+ProjectContext rebuild is **synchronous on the loop thread**, not the plan's
+lazy-async-worker rebuild (invalidations are rare config/sig saves — a
+~100-300ms inline build is acceptable and avoids a second concurrency hazard).
+Also: the close+reopen version-reuse identity nit (surfaced in S3 review) is
+closed in S4 by a **per-URI open-epoch** (generation is project-scoped and
+doesn't bump on reopen); the LSP `initialized` notification is consumed by
+lsp-server's handshake, so dynamic registration is sent at the top of
+`main_loop` (post-handshake). Known limitation: `invalidate` re-reads sig-dir
+CONTENT but does not re-parse `.rigor.yml` (reference-parity — restart needed
+for disable/plugins/paths key changes).
+
+- **S1** ✅ (PR #35) — BufferTable + `select!` loop refactor + worker-results
+  channel, inline synchronous executor. Pure refactor, byte-identical.
+- **S2** ✅ (PR #36) — 200 ms per-URI debounce (didOpen immediate, didClose
+  cancels). Clockless injectable Debouncer; non-flaky tests.
+- **S3** ✅ (PR #37) — rayon dispatch + VERSION stale-drop + one-in-flight/
+  no-lost-update lifecycle + shared Mutex'd sidecar.
+- **S4** ✅ (PR #38) — ProjectContext generation+epoch (3-axis stale-drop) +
+  synchronous-rebuild watched-files/config invalidation + dynamic
+  registration + reopen-epoch nit closure.
+- **S4b** ⬜ — cross-file overlay for open buffers (see item 8). The ONLY
+  tier-1 item left; needs its own mini-spec before build.
 
 ## Non-goals (ADR-0029 rejected options — unchanged)
 

@@ -13,13 +13,21 @@ Last updated: 2026-07-19.
 
 ## Now / Next
 
-**Track B (productization) taken 2026-07-19**: coverage scoping call resolved
-+ precision mode SHIPPED (PR #33); LSP §12 impl plan written — **next session:
-implement LSP §12 Slices S1–S4 per
-[the plan](notes/20260719-lsp-s12-two-tier-impl-plan.md)** (each slice an
-independently gated PR). Option A (`Process::Status` tuple-return +
-destructuring, would make fixtures 100%) remains open as the large orthogonal
-inference arc.
+**Track B (productization) taken 2026-07-19**: coverage precision mode SHIPPED
+(PR #33) + **LSP §12 tier-1 COMPLETE** (S1–S4, PRs #35–#38; two-tier loop,
+200ms debounce, rayon workers + 3-axis stale-drop, ProjectContext
+invalidation). **▶ NEXT: LSP §12 S4b** — the only tier-1 item left
+(cross-file overlay for open buffers); needs its own mini-spec before build
+(overlay the dirty buffer over its file's indexed contribution against
+`analyze_with_source_and_folder`'s project-source param). Then LSP §12 moves
+to v4+ features (`::` completion, visibility filters) or another track. Option
+A (`Process::Status` tuple-return + destructuring, fixtures→100%) remains the
+large orthogonal inference arc.
+- LSP §12 known limitation (reference-parity, ADR-0029): editing `.rigor.yml`
+  `disable:`/`plugins:`/`paths:` needs an LSP restart — `invalidate` re-reads
+  sig-dir CONTENT but not the parsed YAML (matches the reference's
+  `ProjectContext#invalidate!`). Improving on the reference here is a future
+  call, out of S4 scope.
 - Clippy verify MUST use `CARGO_TARGET_DIR=<fresh> cargo clippy --workspace --
   -D warnings` (the incremental cache hides `only_used_in_recursion` etc. —
   cost a CI red on PR #32).
@@ -43,8 +51,9 @@ parity-port arc has bottomed out — see Standing conclusions):
   Phase 3 DONE (1 ported / 1 absent / 1 deferred to `--bleeding-edge`) — the
   compat plan is exhausted; next work returns to the productization track
   (LSP §12, `--bleeding-edge` + CLI §7, re-pin at the v0.3.0 tag).
-- **LSP §12 two-tier** — impl plan ready
-  ([note](notes/20260719-lsp-s12-two-tier-impl-plan.md)); build S1–S4.
+- **LSP §12 two-tier** — tier-1 DONE (S1–S4, PRs #35–#38); only S4b
+  (cross-file overlay) left, needs a mini-spec.
+  [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
   inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
@@ -102,6 +111,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-19 LSP §12 two-tier tier-1 COMPLETE** (S1–S4, PRs #35–#38, each design→implement→adversarial-review→merge) — S1 BufferTable + `select!` loop + worker-results channel (pure refactor, byte-identical); S2 200ms per-URI debounce (clockless injectable Debouncer, non-flaky); S3 rayon dispatch + version stale-drop + one-in-flight/no-lost-update + shared Mutex'd sidecar; S4 generation+epoch stale-drop (3-axis) + ProjectContext synchronous-rebuild invalidation (didChangeWatchedFiles/Configuration) + dynamic registration + reopen-nit closed. 318 workspace tests, harness 216/218 byte-identical throughout, 0 FP. Design refinements vs the plan: generation moved S3→S4 (lands with its trigger), rebuild is synchronous not lazy-async (rare events). Only S4b (cross-file overlay) left. Notes: [s1](notes/20260719-lsp-s12-s1.md)/[s2](notes/20260719-lsp-s12-s2.md)/[s3](notes/20260719-lsp-s12-s3.md)/[s4](notes/20260719-lsp-s12-s4.md).
 - **2026-07-19 `coverage` precision mode + MCP tool** (PR #33, 3 review rounds) — reference precision-tier scan ported on rayon (`--workers` = pool size, byte-identical any N); denominators byte-equal on ALL targets (70 fixtures + conference-app 4235 + mastodon 31381 + gitlab lib 624,233 nodes); node-level audit 0 over-claims except 27 gitlab nodes ACCEPTED as reviewer-verified sound-superset (AGENTS.md anti-convergence); 15+ over-claim defect classes found/fixed across rounds — histogram-level audits provably mask over-claims. [scoping](notes/20260719-coverage-command-scoping.md) / [results](notes/20260719-coverage-precision-mode.md).
 - **2026-07-19 upstream tracking `48a26c20..e447cb86`** (10 commits: the #194 loader stack landed+closed upstream, doctor skew check, cache-validation auto) — hardened self-diff **0/0 on all four battery corpora**; plugin-loader-only surface, nothing to port; pin `7a69f142` held (no v0.3.0 tag yet). NEW oracle hazard 2 recorded in `UPSTREAM.md`: the reference result cache is not version-scoped — pin-vs-tip self-diffs REQUIRE `--no-cache` + isolated cwds.
 - **2026-07-19 LSP §12 impl plan** (design only) — ADR-0029 mapped to the sync `lsp-server` + rayon substrate: single-writer `select!` loop, per-URI 200ms debounce, stale-drop via version+generation stamps, shared Mutex'd sidecar (check-pipeline pattern), slices S1–S4b. [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
