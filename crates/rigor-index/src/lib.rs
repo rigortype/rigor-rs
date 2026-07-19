@@ -156,6 +156,13 @@ impl CoreIndex {
         self.data.is_project_sig_class(class_name)
     }
 
+    /// ADR-0042 Slice 4: whether the QUALIFIED name `qname` was introduced by
+    /// project `sig/` — the witness gate for a nested project-sig `.new` typo
+    /// (`Outer::Inner.new.spni`). See [`rbs::CoreData::is_qualified_project_sig_class`].
+    pub fn is_qualified_project_sig_class(&self, qname: &str) -> bool {
+        self.data.is_qualified_project_sig_class(qname)
+    }
+
     /// Whether `class_name` was declared at GENUINE top level (empty namespace)
     /// in the loaded RBS — a conservative companion to [`CoreIndex::knows_class`].
     ///
@@ -186,6 +193,16 @@ impl CoreIndex {
     /// [`CoreIndex::knows_class`] first (they do).
     pub fn class_has_method(&self, class_name: &str, method: &str) -> bool {
         self.data.class_has_method(class_name, method)
+    }
+
+    /// ADR-0042 Slice 3: instance-method existence over the ISOLATED qualified
+    /// entry (project `Status`'s own surface, NOT the short-key merge with
+    /// stdlib `Process::Status`). Differs from [`Self::class_has_method`] ONLY
+    /// when the name collides with a NESTED same-leaf class (toplevel-vs-toplevel
+    /// collisions still merge identically). Used by the source-range project-sig
+    /// witness so a shadow class does not silently inherit the stdlib surface.
+    pub fn qualified_class_has_method(&self, class_name: &str, method: &str) -> bool {
+        self.data.qualified_class_has_method(class_name, method)
     }
 
     /// Whether the class OBJECT `class_name` responds to a singleton (class)

@@ -314,6 +314,12 @@ pub struct CoreData {
     /// `Pathname`), so this set is the provenance gate that keeps the two apart.
     /// Empty when no `sig/` was ingested.
     project_sig_classes: HashSet<&'static str>,
+    /// ADR-0042 Slice 4: the QUALIFIED-key twin of `project_sig_classes` — the
+    /// fully-qualified names the project `sig/` INTRODUCED (`Outer::Inner`),
+    /// so a `.new` typo on a NESTED project-sig class witnesses through the
+    /// qualified path the reference uses (`is_project_sig_class` is short-key
+    /// and would miss `Outer::Inner`).
+    qualified_project_sig_classes: HashSet<&'static str>,
     /// ATM substrate (Slice 1): `type` alias name → its right-hand-side one-level
     /// [`RetainedParamType`] tag (`type string = String | _ToStr` ⇒
     /// `"string" → Union([ClassInstance("String"), Interface("_ToStr")])`). The
@@ -423,6 +429,8 @@ impl CoreData {
         //    reopens of an already-bundled class) are recorded as project-sig
         //    provenance — the witnessing gate for `X.new` typos.
         let pre_sig: HashSet<&'static str> = builder.classes.keys().copied().collect();
+        let pre_sig_qualified: HashSet<&'static str> =
+            builder.qualified.keys().copied().collect();
         for dir in sig_dirs {
             ingest_rbs_dir(&mut builder, dir);
         }
@@ -431,6 +439,12 @@ impl CoreData {
             .keys()
             .copied()
             .filter(|k| !pre_sig.contains(k))
+            .collect();
+        let qualified_project_sig_classes: HashSet<&'static str> = builder
+            .qualified
+            .keys()
+            .copied()
+            .filter(|k| !pre_sig_qualified.contains(k))
             .collect();
 
         let (
@@ -447,6 +461,7 @@ impl CoreData {
                 classes,
                 toplevel_classes,
                 project_sig_classes,
+                qualified_project_sig_classes,
                 type_alias_defs,
                 interface_method_names,
                 qualified,
@@ -674,6 +689,73 @@ impl CoreData {
         // Not found across the chain. Only witness absence if the chain is
         // fully loaded; otherwise assume present (zero false positive).
         !complete
+    }
+
+    /// ADR-0042 Slice 3: the qualified-registry analogue of
+    /// [`Self::class_has_method`] — instance-method existence over the ISOLATED
+    /// qualified entry (`qualified["Status"]` = the project's own surface, NOT
+    /// the short-key merge of project `Status` + stdlib `Process::Status`). The
+    /// LEAF's own methods + instance aliases come from the qualified entry; its
+    /// ANCESTORS (superclass / includes — stored short, but ancestors are
+    /// top-level/global names) resolve through the existing short-key chain
+    /// walk, so `Object`/`Kernel`/`BasicObject` are found. A class with no
+    /// declared superclass defaults to `Object` (mirroring [`Self::finish`],
+    /// which defaults only the short map). Absence is witnessed ONLY when the
+    /// whole chain is loaded (conservative-complete, never a false positive).
+    pub fn qualified_class_has_method(&self, qname: &str, method: &str) -> bool {
+        let Some(entry) = self.qualified.get(qname) else {
+            return true; // unknown ⇒ silent
+        };
+        // Leaf's own instance methods + instance aliases.
+        if entry.methods.contains_key(method) || Self::instance_alias_resolves(entry, method) {
+            return true;
+        }
+        // Ancestors: walk each include + the superclass through the SHORT-key
+        // chain (ancestors are global names). A class's implicit `Object`
+        // superclass is defaulted here (the qualified map is not Object-defaulted
+        // in `finish`).
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        let mut complete = true;
+        for inc in &entry.includes {
+            self.collect(inc, &mut order, &mut seen, &mut complete);
+        }
+        let sup = entry.superclass.or({
+            if !entry.is_module && qname != "BasicObject" {
+                Some("Object")
+            } else {
+                None
+            }
+        });
+        if let Some(s) = sup {
+            self.collect(s, &mut order, &mut seen, &mut complete);
+        }
+        if self.lookup_on_chain(&order, method).is_some() {
+            return true;
+        }
+        // Absent across the leaf + its resolvable ancestry: witness only when
+        // the chain is fully loaded.
+        !complete
+    }
+
+    /// Whether an INSTANCE `alias` on `entry` resolves `method` to a real
+    /// instance method (`alias size length`). Walks the alias chain iteratively
+    /// (bounded) — a free helper (no `self`): resolution stays within one
+    /// `entry`'s own alias table. Mirrors the singleton alias resolution.
+    fn instance_alias_resolves(entry: &ClassEntry, method: &str) -> bool {
+        let mut cur = method;
+        for _ in 0..16 {
+            match entry.aliases.get(cur) {
+                Some(&target) => {
+                    if entry.methods.contains_key(target) {
+                        return true;
+                    }
+                    cur = target;
+                }
+                None => return false,
+            }
+        }
+        false
     }
 
     /// Whether `name` was declared as a `module` in RBS (the analogue of the
@@ -1909,6 +1991,7 @@ impl CoreData {
             classes,
             toplevel_classes,
             project_sig_classes: HashSet::new(),
+            qualified_project_sig_classes: HashSet::new(),
             // The stub models no type aliases or interfaces (the ATM substrate
             // needs the real embedded RBS); empty keeps the accessors inert.
             type_alias_defs: HashMap::new(),
@@ -1935,6 +2018,14 @@ impl CoreData {
     /// ingested.
     pub fn is_project_sig_class(&self, class_name: &str) -> bool {
         self.project_sig_classes.contains(class_name)
+    }
+
+    /// ADR-0042 Slice 4: whether the QUALIFIED name `qname` (`Outer::Inner`)
+    /// was INTRODUCED by project `sig/` ingestion — the qualified twin of
+    /// [`Self::is_project_sig_class`], so a nested project-sig class's `.new`
+    /// typo witnesses through the qualified path.
+    pub fn is_qualified_project_sig_class(&self, qname: &str) -> bool {
+        self.qualified_project_sig_classes.contains(qname)
     }
 
     /// How many distinct classes the loaded RBS surface registered. A coarse
@@ -3611,5 +3702,58 @@ mod qualified_singleton_witness_tests {
         if idx.knows_qualified_class("Gem::Specification") {
             assert!(idx.class_has_singleton_method("Gem::Specification", "no_such_zzz"));
         }
+    }
+}
+
+#[cfg(test)]
+mod qualified_instance_method_tests {
+    use super::*;
+
+    /// ADR-0042 Slice 3: `qualified_class_has_method` resolves the leaf's own
+    /// instance surface + ancestry (Object/Kernel/BasicObject via the short
+    /// chain) + instance aliases; a genuine typo on a top-level class is
+    /// witnessed ABSENT and a real method (incl. an inherited one) present.
+    #[test]
+    fn qualified_instance_own_ancestry_and_alias() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("String") {
+            return; // stub fallback.
+        }
+        // Own method present; inherited (Object#frozen?) present; typo absent.
+        assert!(idx.qualified_class_has_method("String", "upcase"));
+        assert!(idx.qualified_class_has_method("String", "frozen?"));
+        assert!(!idx.qualified_class_has_method("String", "no_such_zzz"));
+        // An instance alias resolves (`String#size` aliases `length`).
+        assert!(idx.qualified_class_has_method("String", "size"));
+        // Unknown qualified name ⇒ silent (assume-present).
+        assert!(idx.qualified_class_has_method("No::Such", "whatever"));
+    }
+}
+
+#[cfg(test)]
+mod qualified_project_sig_tests {
+    use super::*;
+
+    /// ADR-0042 Slice 4: a NESTED project-sig class is tracked by its QUALIFIED
+    /// name, so `Outer::Inner.new.spni` witnesses through the qualified path.
+    #[test]
+    fn qualified_nested_project_sig_provenance_and_witness() {
+        let dir = std::env::temp_dir().join("rigor_qual_projsig_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("n.rbs"),
+            "module Outer\n  class Inner\n    def spin: () -> Integer\n  end\nend\n",
+        )
+        .unwrap();
+        let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+        // Introduced-by-sig, tracked qualified.
+        assert!(idx.is_qualified_project_sig_class("Outer::Inner"));
+        assert!(idx.knows_qualified_class("Outer::Inner"));
+        // Instance witness over the isolated qualified surface: valid present,
+        // typo absent.
+        assert!(idx.qualified_class_has_method("Outer::Inner", "spin"));
+        assert!(!idx.qualified_class_has_method("Outer::Inner", "spni"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
