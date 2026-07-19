@@ -12,14 +12,16 @@
 //!
 //! Two-tier essence (ADR-0029): the RBS environment (`CoreIndex`) + config are
 //! built ONCE at startup and reused across every request — the per-keystroke cost
-//! is a single-file parse+lower+analyze, never the RBS-load floor. The heavier
-//! two-tier machinery (generation counter, watched-files invalidation, worker
-//! pool, debounce, temp-file `BufferBinding`, cross-file project context for open
-//! buffers) is deferred; a single open buffer is analysed in-memory at file scope.
+//! is a single-file parse+lower+analyze, never the RBS-load floor. `didChange`
+//! diagnostics are debounced 200 ms per URI (S2); the remaining heavier two-tier
+//! machinery (generation counter, watched-files invalidation, worker pool,
+//! temp-file `BufferBinding`, cross-file project context for open buffers) is
+//! deferred; a single open buffer is analysed in-memory at file scope.
 
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use lsp_server::{Connection, Message, Response};
 use lsp_types::{
@@ -155,6 +157,7 @@ fn run_stdio() -> Result<(), String> {
         index: CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new("."))),
         disable: cfg.disable_matcher(),
         folder,
+        debounce: DEBOUNCE_DEFAULT,
     };
 
     let mut buffers = BufferTable::new();
@@ -169,6 +172,12 @@ fn run_stdio() -> Result<(), String> {
     Ok(())
 }
 
+/// The default per-URI `didChange` debounce (ADR-0029 §debounce; matches the
+/// reference `DiagnosticPublisher`'s `debounce_seconds: 0.2`). Injectable via
+/// [`ServerContext::debounce`] so timing tests can drive a small or large value
+/// deterministically rather than sleeping the real 200 ms.
+const DEBOUNCE_DEFAULT: Duration = Duration::from_millis(200);
+
 /// The session-stable context (ADR-0029 `ProjectContext`, minimal form): the RBS
 /// index + the config-derived suppression set, both built once at startup.
 struct ServerContext {
@@ -181,6 +190,13 @@ struct ServerContext {
     /// as `&(dyn RubyFolder + Sync)` exactly as the `check` pipeline already does
     /// (`sidecar.rs`), so no new sidecar machinery is needed.
     folder: Option<sidecar::SidecarFolder>,
+    /// The per-URI `didChange` debounce interval (S2, ADR-0029 §debounce).
+    /// Injectable — production uses [`DEBOUNCE_DEFAULT`] (200 ms); tests pass a
+    /// small value (assert the deferred publish eventually arrives) or a large
+    /// one (assert it does NOT fire within a round-trip), so no test depends on
+    /// wall-clock precision. Only the PUBLISH is deferred; the BufferTable is
+    /// updated synchronously on each change so hover/completion see latest text.
+    debounce: Duration,
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +253,83 @@ impl BufferTable {
     fn text(&self, uri: &Uri) -> Option<&str> {
         self.entries.get(&uri_key(uri)).map(|e| e.bytes.as_str())
     }
+
+    /// The current `(text, version)` for `uri`, or `None` if the buffer is not
+    /// open. Used when a debounced publish fires (S2): the deferred compute reads
+    /// the LATEST buffer content — a burst of edits coalesced into one publish
+    /// therefore analyses the final text, never an intermediate snapshot.
+    fn snapshot(&self, uri: &Uri) -> Option<(&str, i32)> {
+        self.entries.get(&uri_key(uri)).map(|e| (e.bytes.as_str(), e.version))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Debouncer (ADR-0029 §debounce) — per-URI deferred-publish deadlines.
+// ---------------------------------------------------------------------------
+
+/// One pending debounced publish: the buffer `uri` and the `Instant` its publish
+/// is due.
+struct Pending {
+    uri: Uri,
+    deadline: Instant,
+}
+
+/// Per-URI publish debounce (ADR-0029 §debounce; the Rust analogue of the
+/// reference [`Debouncer`]). Maps a buffer URI to the `Instant` its debounced
+/// publish is due. [`schedule`](Self::schedule) (re)sets the deadline — a later
+/// `didChange` within the window overwrites the earlier deadline, so a burst of
+/// edits **coalesces** into a single publish of the final content.
+/// [`cancel`](Self::cancel) drops a pending publish (`didClose`, so no stale
+/// diagnostics fire after a close). [`take_due`](Self::take_due) removes and
+/// returns every URI whose deadline has passed.
+///
+/// The struct holds **no clock**: the caller computes deadlines
+/// (`Instant::now() + interval`) and passes `now` to `take_due`. So the
+/// fire/no-fire decision is a pure function of explicit `Instant`s —
+/// deterministically unit-testable without any wall-clock sleep (the timing seam
+/// S2's non-flaky tests drive).
+#[derive(Default)]
+struct Debouncer {
+    pending: HashMap<String, Pending>,
+}
+
+impl Debouncer {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Schedule (or reschedule) a debounced publish for `uri` at `deadline`.
+    /// Replacing the entry is the coalescing rule: the last change in a burst
+    /// wins the deadline, and there is at most one pending publish per URI.
+    fn schedule(&mut self, uri: &Uri, deadline: Instant) {
+        self.pending
+            .insert(uri_key(uri), Pending { uri: uri.clone(), deadline });
+    }
+
+    /// Cancel any pending publish for `uri` (`didClose`). Idempotent.
+    fn cancel(&mut self, uri: &Uri) {
+        self.pending.remove(&uri_key(uri));
+    }
+
+    /// The earliest pending deadline, or `None` when nothing is pending. The loop
+    /// blocks its `select!` until this instant (or indefinitely when `None`).
+    fn earliest(&self) -> Option<Instant> {
+        self.pending.values().map(|p| p.deadline).min()
+    }
+
+    /// Remove and return every URI whose deadline is at or before `now`.
+    fn take_due(&mut self, now: Instant) -> Vec<Uri> {
+        let due: Vec<String> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.deadline <= now)
+            .map(|(k, _)| k.clone())
+            .collect();
+        due.iter()
+            .filter_map(|k| self.pending.remove(k))
+            .map(|p| p.uri)
+            .collect()
+    }
 }
 
 /// A computed-diagnostics result carried over the internal worker-results channel
@@ -265,14 +358,22 @@ struct Computed {
 ///   `Computed` from off-thread and the loop stays the single writer, so
 ///   ordering (and later version/generation stale-drop) hold by construction.
 ///
-/// **S1 feeds (b) synchronously.** `dispatch_diagnostics` runs
-/// `compute_diagnostics` *inline* on the loop thread and enqueues the result;
-/// the top-of-loop drain then publishes it *before* the next `select!` services
-/// another connection message. So a dispatched compute always publishes before
-/// the next input is handled — the emitted message sequence is byte-identical to
-/// the former inline `publish`. (The (b) `select!` arm is therefore dormant in
-/// S1 — results are drained before we block — and comes alive only once S3's
-/// rayon workers push results asynchronously.)
+/// **S1 feeds (b) synchronously.** For a `didOpen` (immediate publish, fast
+/// first paint) `dispatch_diagnostics` runs `compute_diagnostics` *inline* on the
+/// loop thread and enqueues the result; the top-of-loop drain then publishes it
+/// *before* the next `select!` services another connection message. (The (b)
+/// `select!` arm is therefore dormant — results are drained before we block — and
+/// comes alive only once S3's rayon workers push results asynchronously.)
+///
+/// **S2 adds a debounce timeout arm (c).** A `didChange` updates the BufferTable
+/// synchronously (so hover/completion see latest text) but does NOT publish;
+/// instead it schedules a deadline `ctx.debounce` out in the [`Debouncer`]. The
+/// `select!` blocks until the earliest pending deadline (or indefinitely when
+/// nothing is pending); on timeout, `fire_due` dispatches the now-due publish(es)
+/// from the LATEST buffer content — so a burst of edits within the window
+/// coalesces into ONE publish. `didClose` cancels a URI's pending deadline (no
+/// stale publish after a close). Only the loop thread sends `publishDiagnostics`
+/// (single-writer invariant preserved).
 ///
 /// `shutdown`/`exit` are handled by the scaffold's `handle_shutdown`.
 fn main_loop(
@@ -285,43 +386,95 @@ fn main_loop(
     // worker closures that push `Computed` from off-thread. Unbounded so a
     // synchronous dispatch never blocks the loop thread.
     let (results_tx, results_rx) = crossbeam_channel::unbounded::<Computed>();
+    // Per-URI `didChange` debounce deadlines (S2). Owned solely by the loop.
+    let mut debouncer = Debouncer::new();
 
     loop {
         // Single-writer publish point: flush every ready worker result before
-        // servicing the next input. In S1 this drains the compute the connection
-        // arm just enqueued (guaranteeing publish-before-next-message ordering);
-        // in S3 it also flushes async worker results that arrived while blocked.
+        // servicing the next input. This drains a `didOpen`/debounce-fire compute
+        // the arms just enqueued (guaranteeing publish-before-next-message
+        // ordering); in S3 it also flushes async worker results that arrived
+        // while blocked.
         while let Ok(computed) = results_rx.try_recv() {
             publish_result(connection, computed)?;
         }
 
-        crossbeam_channel::select! {
-            recv(connection.receiver) -> msg => {
-                let Ok(msg) = msg else { return Ok(()) }; // connection closed
-                if handle_message(connection, ctx, buffers, &results_tx, msg)? {
-                    return Ok(()); // shutdown
+        // Timeout = time until the earliest pending debounce deadline (clamped to
+        // 0 if already passed). No pending deadline ⇒ block with no timeout. An
+        // incoming message wakes `select!` immediately regardless of the timeout,
+        // so `didClose`'s cancel is serviced without waiting out the deadline.
+        match debouncer.earliest() {
+            Some(deadline) => {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                crossbeam_channel::select! {
+                    recv(connection.receiver) -> msg => {
+                        let Ok(msg) = msg else { return Ok(()) }; // connection closed
+                        if handle_message(connection, ctx, buffers, &mut debouncer, &results_tx, msg)? {
+                            return Ok(()); // shutdown
+                        }
+                    }
+                    recv(results_rx) -> computed => {
+                        if let Ok(computed) = computed {
+                            publish_result(connection, computed)?;
+                        }
+                    }
+                    default(timeout) => {
+                        fire_due(&mut debouncer, buffers, ctx, &results_tx);
+                    }
                 }
             }
-            recv(results_rx) -> computed => {
-                // The S3 seam: a worker result arriving independently of a
-                // connection message. Dormant in S1 (results are drained above
-                // before we block here), wired now so the publish path is unified.
-                if let Ok(computed) = computed {
-                    publish_result(connection, computed)?;
+            None => {
+                crossbeam_channel::select! {
+                    recv(connection.receiver) -> msg => {
+                        let Ok(msg) = msg else { return Ok(()) }; // connection closed
+                        if handle_message(connection, ctx, buffers, &mut debouncer, &results_tx, msg)? {
+                            return Ok(()); // shutdown
+                        }
+                    }
+                    recv(results_rx) -> computed => {
+                        // The S3 seam: a worker result arriving independently of a
+                        // connection message. Dormant today (results are drained
+                        // above before we block), wired now so the publish path is
+                        // unified.
+                        if let Ok(computed) = computed {
+                            publish_result(connection, computed)?;
+                        }
+                    }
                 }
             }
         }
     }
 }
 
+/// Dispatch every debounced publish whose deadline has passed (S2). Reads the
+/// LATEST buffer content for each due URI, so a coalesced burst analyses the
+/// final text; the enqueued `Computed` is published by the loop's top-of-loop
+/// drain. A URI whose buffer was closed mid-window is skipped (its `didClose`
+/// already cleared the markers and cancelled the deadline, so this is defensive).
+fn fire_due(
+    debouncer: &mut Debouncer,
+    buffers: &BufferTable,
+    ctx: &ServerContext,
+    results_tx: &crossbeam_channel::Sender<Computed>,
+) {
+    for uri in debouncer.take_due(Instant::now()) {
+        if let Some((text, version)) = buffers.snapshot(&uri) {
+            dispatch_diagnostics(results_tx, ctx, &uri, text, version);
+        }
+    }
+}
+
 /// Handle one message from the connection. Returns `Ok(true)` when the server
-/// should shut down. Requests are answered inline; `didOpen`/`didChange`
-/// *dispatch* a diagnostics computation onto `results_tx` (published by the loop
-/// drain, not here); `didClose` clears inline markers immediately.
+/// should shut down. Requests are answered inline; `didOpen` *dispatches* an
+/// immediate diagnostics computation onto `results_tx` (published by the loop
+/// drain, not here); `didChange` updates the buffer synchronously and *schedules*
+/// a debounced publish in `debouncer` (S2); `didClose` cancels any pending
+/// publish and clears inline markers immediately.
 fn handle_message(
     connection: &Connection,
     ctx: &ServerContext,
     buffers: &mut BufferTable,
+    debouncer: &mut Debouncer,
     results_tx: &crossbeam_channel::Sender<Computed>,
     msg: Message,
 ) -> Result<bool, String> {
@@ -390,6 +543,10 @@ fn handle_message(
                     let uri = p.text_document.uri;
                     let text = p.text_document.text;
                     let version = p.text_document.version;
+                    // Fast first paint: `didOpen` publishes IMMEDIATELY (ADR-0029
+                    // plan §4), NOT debounced. Clear any stale pending publish for
+                    // a re-opened URI so it can't fire against the fresh content.
+                    debouncer.cancel(&uri);
                     dispatch_diagnostics(results_tx, ctx, &uri, &text, version);
                     buffers.open(&uri, text, version);
                 }
@@ -400,8 +557,14 @@ fn handle_message(
                     let version = p.text_document.version;
                     if let Some(change) = p.content_changes.into_iter().last() {
                         let uri = p.text_document.uri;
-                        dispatch_diagnostics(results_tx, ctx, &uri, &change.text, version);
+                        // Update the buffer SYNCHRONOUSLY (hover/completion/symbols
+                        // must see the latest text at once) but DEFER the publish:
+                        // schedule a debounced fire `ctx.debounce` after this (the
+                        // last) change. A further didChange within the window
+                        // overwrites this deadline, coalescing the burst into one
+                        // publish of the final content (S2, ADR-0029 §debounce).
                         buffers.change(&uri, change.text, version);
+                        debouncer.schedule(&uri, Instant::now() + ctx.debounce);
                     }
                 }
             }
@@ -409,10 +572,11 @@ fn handle_message(
                 if let Ok(p) = not.extract::<DidCloseTextDocumentParams>("textDocument/didClose") {
                     let uri = p.text_document.uri;
                     buffers.close(&uri);
-                    // Clear inline markers by publishing an empty set immediately
-                    // (an idle-clear, not a compute — so it does not go through the
-                    // worker channel; it stays a loop-thread publish, which S2's
-                    // "didClose cancels pending + clears" will build on).
+                    // Cancel any pending debounced publish so no stale diagnostics
+                    // fire after the close, THEN clear inline markers with an empty
+                    // publish (an idle-clear on the loop thread, not a compute — so
+                    // it does not go through the worker channel).
+                    debouncer.cancel(&uri);
                     send_diagnostics(connection, &uri, Vec::new())?;
                 }
             }
@@ -890,6 +1054,7 @@ mod tests {
             index: CoreIndex::new(),
             disable: Config::default().disable_matcher(),
             folder: None,
+            debounce: DEBOUNCE_DEFAULT,
         }
     }
 
@@ -1156,6 +1321,62 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // Debouncer: pure, deterministic unit tests (explicit `Instant`s, no sleep).
+    // These prove the coalescing + cancel + earliest/take_due invariants without
+    // any wall-clock dependency — the timing seam the integration tests lean on.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn debouncer_coalesces_and_last_deadline_wins() {
+        let mut d = Debouncer::new();
+        let u: Uri = "file:///a.rb".parse().unwrap();
+        let t0 = Instant::now();
+        // Two schedules for the same URI within the window: the second wins.
+        d.schedule(&u, t0 + Duration::from_millis(200));
+        d.schedule(&u, t0 + Duration::from_millis(500));
+        assert_eq!(d.pending.len(), 1, "one pending entry per URI (coalesced)");
+        assert_eq!(d.earliest(), Some(t0 + Duration::from_millis(500)));
+        // Not due at +300 (the deadline moved out to +500).
+        assert!(d.take_due(t0 + Duration::from_millis(300)).is_empty());
+        // Due at +600: exactly the final entry, then removed.
+        let due = d.take_due(t0 + Duration::from_millis(600));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].as_str(), "file:///a.rb");
+        assert!(d.earliest().is_none(), "a fired entry is removed");
+    }
+
+    #[test]
+    fn debouncer_cancel_drops_pending() {
+        let mut d = Debouncer::new();
+        let u: Uri = "file:///a.rb".parse().unwrap();
+        let t0 = Instant::now();
+        d.schedule(&u, t0 + Duration::from_millis(100));
+        d.cancel(&u); // didClose
+        assert!(d.earliest().is_none());
+        assert!(
+            d.take_due(t0 + Duration::from_millis(200)).is_empty(),
+            "a cancelled publish never fires"
+        );
+        d.cancel(&u); // idempotent
+    }
+
+    #[test]
+    fn debouncer_earliest_is_the_min_across_uris() {
+        let mut d = Debouncer::new();
+        let a: Uri = "file:///a.rb".parse().unwrap();
+        let b: Uri = "file:///b.rb".parse().unwrap();
+        let t0 = Instant::now();
+        d.schedule(&a, t0 + Duration::from_millis(300));
+        d.schedule(&b, t0 + Duration::from_millis(100));
+        assert_eq!(d.earliest(), Some(t0 + Duration::from_millis(100)));
+        // Only `b` is due at +150; `a`'s later deadline stays pending.
+        let due = d.take_due(t0 + Duration::from_millis(150));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].as_str(), "file:///b.rb");
+        assert_eq!(d.earliest(), Some(t0 + Duration::from_millis(300)));
+    }
+
+    // ---------------------------------------------------------------------
     // Integration tests: the REAL loop over an in-memory connection.
     //
     // These drive `main_loop` through `lsp_server::Connection::memory()` and
@@ -1176,14 +1397,24 @@ mod tests {
     }
 
     impl Harness {
-        /// Spawn the server loop on a thread and complete the LSP handshake.
+        /// Spawn the server loop with the default (200 ms) debounce.
         fn start() -> Self {
+            Self::start_with_debounce(DEBOUNCE_DEFAULT)
+        }
+
+        /// Spawn the server loop on a thread (with an injected debounce interval)
+        /// and complete the LSP handshake. Timing tests pass a SMALL interval
+        /// (assert the deferred publish eventually arrives) or a LARGE one (assert
+        /// it does NOT fire within a synchronous round-trip) — never a value the
+        /// assertions race against.
+        fn start_with_debounce(debounce: Duration) -> Self {
             let (server_conn, client) = Connection::memory();
             let handle = thread::spawn(move || {
                 let ctx = ServerContext {
                     index: CoreIndex::new(),
                     disable: Config::default().disable_matcher(),
                     folder: None,
+                    debounce,
                 };
                 let caps = serde_json::to_value(server_capabilities()).unwrap();
                 server_conn.initialize(caps).unwrap();
@@ -1236,6 +1467,12 @@ mod tests {
                 .receiver
                 .recv_timeout(Duration::from_secs(10))
                 .expect("a server message")
+        }
+
+        /// Wait up to `dur` for a message; `None` on timeout. Used to assert a
+        /// debounced publish does NOT arrive before its interval elapses.
+        fn try_recv(&self, dur: Duration) -> Option<Message> {
+            self.client.receiver.recv_timeout(dur).ok()
         }
 
         /// The next message, asserted to be a `publishDiagnostics`, parsed.
@@ -1292,11 +1529,15 @@ mod tests {
 
     #[test]
     fn integration_didchange_to_clean_republishes_empty() {
-        let mut h = Harness::start();
+        // S2: didChange is now DEBOUNCED. With a small injected interval the
+        // deferred publish still arrives (recv_diags waits up to 10 s); we assert
+        // only that it arrives and is empty — no coalescing race here (one change).
+        let mut h = Harness::start_with_debounce(Duration::from_millis(10));
         h.notify(
             "textDocument/didOpen",
             open_params("file:///g.rb", "x = \"hi\"\nx.lenght\n", 1),
         );
+        // didOpen publishes IMMEDIATELY (not debounced): the one diagnostic.
         assert_eq!(h.recv_diags().diagnostics.len(), 1);
         h.notify(
             "textDocument/didChange",
@@ -1305,9 +1546,170 @@ mod tests {
                 "contentChanges": [ { "text": "x = \"hi\"\nx.upcase\n" } ]
             }),
         );
+        // The debounced publish fires ~10 ms later, carrying the (clean) content.
         let d = h.recv_diags();
         assert_eq!(d.uri.as_str(), "file:///g.rb");
         assert!(d.diagnostics.is_empty(), "clean content republishes an empty set");
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_didchange_deferred_until_interval() {
+        // A didChange's publish does NOT appear before the debounce interval, but
+        // DOES after. Interval 150 ms; we assert nothing arrives in a 20 ms window
+        // (comfortably < 150 ms, so no race), then that the publish arrives.
+        let mut h = Harness::start_with_debounce(Duration::from_millis(150));
+        h.notify("textDocument/didOpen", open_params("file:///g.rb", "n = 42\n", 1));
+        assert!(h.recv_diags().diagnostics.is_empty(), "clean didOpen → empty (immediate)");
+        h.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb", "version": 2 },
+                "contentChanges": [ { "text": "x = \"hi\"\nx.lenght\n" } ]
+            }),
+        );
+        // Not yet: the deadline is 150 ms out, this window is only 20 ms.
+        assert!(
+            h.try_recv(Duration::from_millis(20)).is_none(),
+            "no publish before the debounce interval elapses"
+        );
+        // After the interval: the debounced publish with the typo diagnostic.
+        let d = h.recv_diags();
+        assert_eq!(d.diagnostics.len(), 1, "debounced publish carries the diagnostic");
+        assert_eq!(
+            d.diagnostics[0].code,
+            Some(NumberOrString::String("call.undefined-method".to_string()))
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_rapid_didchanges_coalesce_to_one_publish() {
+        // Two rapid didChanges → exactly ONE publish carrying the FINAL content.
+        // Both notifications are queued to the connection before the 120 ms
+        // deadline can elapse, so the loop processes #1 (schedule) then #2
+        // (reschedule) microseconds apart and fires once. The strict
+        // last-writer-wins invariant is also proven deterministically in
+        // `debouncer_coalesces_and_last_deadline_wins`.
+        let mut h = Harness::start_with_debounce(Duration::from_millis(120));
+        h.notify("textDocument/didOpen", open_params("file:///g.rb", "n = 42\n", 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        // #1: clean. #2 (final): a typo → one diagnostic.
+        h.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb", "version": 2 },
+                "contentChanges": [ { "text": "x = \"hi\"\nx.upcase\n" } ]
+            }),
+        );
+        h.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb", "version": 3 },
+                "contentChanges": [ { "text": "x = \"hi\"\nx.lenght\n" } ]
+            }),
+        );
+        // Exactly one publish, of the FINAL content.
+        let d = h.recv_diags();
+        assert_eq!(d.diagnostics.len(), 1, "coalesced: one publish of the final content");
+        assert_eq!(
+            d.diagnostics[0].code,
+            Some(NumberOrString::String("call.undefined-method".to_string()))
+        );
+        // No second publish: a hover round-trips as the very next message.
+        h.request(
+            2,
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb" },
+                "position": { "line": 0, "character": 0 }
+            }),
+        );
+        match h.recv() {
+            Message::Response(r) => assert_eq!(r.id, RequestId::from(2)),
+            other => panic!("expected hover response (a publish would mean a leaked debounce), got {other:?}"),
+        }
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_didclose_cancels_pending_no_stale_publish() {
+        // A didClose BEFORE the deadline cancels the pending publish and clears
+        // markers; NO stale publish fires afterward. A 30 s interval guarantees
+        // the debounce cannot fire during this millisecond-scale test.
+        let mut h = Harness::start_with_debounce(Duration::from_secs(30));
+        h.notify("textDocument/didOpen", open_params("file:///g.rb", "n = 42\n", 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        // A change (schedules a publish 30 s out) then an immediate close.
+        h.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb", "version": 2 },
+                "contentChanges": [ { "text": "x = \"hi\"\nx.lenght\n" } ]
+            }),
+        );
+        h.notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": "file:///g.rb" } }),
+        );
+        // The didClose empty clear.
+        let d = h.recv_diags();
+        assert!(d.diagnostics.is_empty(), "didClose clears diagnostics");
+        // No stale debounced publish: a hover round-trips as the next message
+        // (the buffer is closed, so the result is null — but it's a Response).
+        h.request(
+            2,
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb" },
+                "position": { "line": 0, "character": 0 }
+            }),
+        );
+        match h.recv() {
+            Message::Response(r) => assert_eq!(r.id, RequestId::from(2)),
+            other => panic!("expected hover response (a publish would be a stale debounce), got {other:?}"),
+        }
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_hover_during_debounce_window_sees_latest_text_no_publish() {
+        // Hover during the debounce window is answered SYNCHRONOUSLY from the
+        // latest buffer text, and no publish precedes the response. 30 s interval
+        // so the deferred publish cannot fire mid-test.
+        let mut h = Harness::start_with_debounce(Duration::from_secs(30));
+        h.notify("textDocument/didOpen", open_params("file:///g.rb", "s = \"hi\"\ns.upcase\n", 1));
+        assert!(h.recv_diags().diagnostics.is_empty(), "clean didOpen → empty (immediate)");
+        // Edit to a new expression; the buffer updates synchronously, publish
+        // deferred 30 s.
+        h.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb", "version": 2 },
+                "contentChanges": [ { "text": "n = 42\n" } ]
+            }),
+        );
+        // Hover on the `42` in the LATEST text: the response comes back (not a
+        // publish), and it reflects the edited content.
+        h.request(
+            2,
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb" },
+                "position": { "line": 0, "character": 4 }
+            }),
+        );
+        match h.recv() {
+            Message::Response(r) => {
+                assert_eq!(r.id, RequestId::from(2));
+                let hover: Option<Hover> = serde_json::from_value(r.result.unwrap()).unwrap();
+                let Some(Hover { contents: HoverContents::Markup(m), .. }) = hover else {
+                    panic!("expected a markup hover from the latest buffer text");
+                };
+                assert!(m.value.contains("42"), "hover sees the edited text: {}", m.value);
+            }
+            other => panic!("expected hover response (a publish would mean the debounce leaked), got {other:?}"),
+        }
         h.shutdown();
     }
 
