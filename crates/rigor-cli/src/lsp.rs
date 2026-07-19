@@ -117,9 +117,15 @@ fn run_stdio() -> Result<(), String> {
     let (connection, io_threads) = Connection::stdio();
 
     let caps_value = serde_json::to_value(server_capabilities()).map_err(|e| e.to_string())?;
-    connection
+    // `initialize` returns the client's `InitializeParams` (S4): we thread the
+    // client's `workspace.didChangeWatchedFiles.dynamicRegistration` capability out
+    // of it so the `initialized` handler knows whether to `client/registerCapability`
+    // the file watchers (or degrade gracefully when the client won't accept dynamic
+    // registration). Pre-S4 this return value was discarded.
+    let init_params = connection
         .initialize(caps_value)
         .map_err(|e| format!("initialize handshake failed: {e}"))?;
+    let watched_files_dynamic_registration = client_supports_watched_files_registration(&init_params);
 
     // Two-tier essence: the RBS environment + config are built ONCE and reused
     // for the whole session (the per-keystroke path never pays the RBS-load floor).
@@ -144,7 +150,10 @@ fn run_stdio() -> Result<(), String> {
                 Ok(sc) => {
                     let v = sc.ruby_version().to_string();
                     (
-                        Some(sidecar::SidecarFolder::new(sc)),
+                        // Behind an `Arc` so it is PRESERVED across `ProjectContext`
+                        // rebuilds (S4 `invalidate`): a project-context rebuild reuses
+                        // the same live sidecar rather than respawning the Ruby VM.
+                        Some(Arc::new(sidecar::SidecarFolder::new(sc))),
                         format!("full fidelity — Ruby sidecar (ruby {v})"),
                         MessageType::INFO,
                     )
@@ -159,17 +168,24 @@ fn run_stdio() -> Result<(), String> {
     };
     send_show_message(&connection, typ, format!("rigor: coverage posture — {posture}"))?;
 
+    // The tier-1 project context: RBS index + suppression set + shared sidecar,
+    // stamped with generation 0. Loop-owned (swapped on `invalidate`), so it is
+    // built here and MOVED into `main_loop` rather than held in the immutable
+    // `ServerContext`.
+    let project = Arc::new(ProjectContext {
+        generation: 0,
+        index: CoreIndex::for_project(
+            &cfg.plugins,
+            &cfg.all_signature_dirs(std::path::Path::new(".")),
+        ),
+        disable: cfg.disable_matcher(),
+        folder,
+    });
+
     let ctx = ServerContext {
-        analysis: Arc::new(Analysis {
-            index: CoreIndex::for_project(
-                &cfg.plugins,
-                &cfg.all_signature_dirs(std::path::Path::new(".")),
-            ),
-            disable: cfg.disable_matcher(),
-            folder,
-        }),
         debounce: DEBOUNCE_DEFAULT,
         worker_gate: production_gate(),
+        watched_files_dynamic_registration,
     };
 
     // Pre-warm the rayon global pool at startup (ADR-0029 "pre-warmed worker
@@ -179,9 +195,7 @@ fn run_stdio() -> Result<(), String> {
     // `--workers` flag is added.
     rayon::spawn(|| {});
 
-    let mut buffers = BufferTable::new();
-
-    main_loop(&connection, &ctx, &mut buffers)?;
+    main_loop(&connection, &ctx, project, cfg)?;
 
     // Drop the connection BEFORE joining: the writer IO thread only terminates
     // when its channel disconnects, i.e. when the `Connection` (which owns the
@@ -191,50 +205,80 @@ fn run_stdio() -> Result<(), String> {
     Ok(())
 }
 
+/// Read the client's `initialize` params for
+/// `capabilities.workspace.didChangeWatchedFiles.dynamicRegistration` (S4). `true`
+/// means the client accepts a runtime `client/registerCapability`, so the server
+/// registers its file watchers after `initialized`. Absent/false ⇒ degrade
+/// gracefully: no registration is sent, and the server still honours any
+/// `didChangeWatchedFiles` the client chooses to send (static registration).
+fn client_supports_watched_files_registration(init_params: &serde_json::Value) -> bool {
+    init_params
+        .get("capabilities")
+        .and_then(|c| c.get("workspace"))
+        .and_then(|w| w.get("didChangeWatchedFiles"))
+        .and_then(|d| d.get("dynamicRegistration"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+}
+
 /// The default per-URI `didChange` debounce (ADR-0029 §debounce; matches the
 /// reference `DiagnosticPublisher`'s `debounce_seconds: 0.2`). Injectable via
 /// [`ServerContext::debounce`] so timing tests can drive a small or large value
 /// deterministically rather than sleeping the real 200 ms.
 const DEBOUNCE_DEFAULT: Duration = Duration::from_millis(200);
 
-/// The session-stable analysis context (ADR-0029 `ProjectContext`, minimal form):
-/// the RBS index + the config-derived suppression set + the optional Ruby folder,
-/// all built once at startup. Held behind an `Arc` in [`ServerContext`] so a
-/// clone can be captured into each rayon worker closure (S3) — this is the shared
-/// analysis context the worker pool reads. Must be `Send + Sync`: `CoreIndex` and
-/// `SidecarFolder` are already shared as `&(dyn RubyFolder + Sync)` across the
-/// `check` pipeline's `par_iter` workers (`main.rs`), so sharing them across the
-/// LSP worker pool reuses that exact contract.
-struct Analysis {
+/// The tier-1 project context (ADR-0029 `ProjectContext`): the RBS index + the
+/// config-derived suppression set + the optional Ruby folder, stamped with a
+/// `generation` counter. Built once at startup and thereafter **loop-owned** —
+/// [`invalidate`] swaps in a fresh `Arc` with a bumped generation on a
+/// watched-files / configuration change (S4). Held behind an `Arc` so a clone is
+/// captured into each rayon worker (S3): a worker computes against whichever
+/// context was current at dispatch, and a result computed against a superseded
+/// generation is dropped by the generation guard in [`handle_result`]. In-flight
+/// workers holding the OLD `Arc` finish against it (their results are
+/// generation-dropped); new dispatches read the new `Arc`.
+///
+/// Must be `Send + Sync`: `CoreIndex` and `SidecarFolder` are already shared as
+/// `&(dyn RubyFolder + Sync)` across the `check` pipeline's `par_iter` workers
+/// (`main.rs`), so sharing them across the LSP worker pool reuses that exact
+/// contract; `Arc<SidecarFolder>` keeps that bound.
+struct ProjectContext {
+    /// Bumped by [`invalidate`] on every project-context rebuild. A worker stamps
+    /// its result with the generation it computed against; a stale (superseded)
+    /// generation is dropped at publish time — orthogonal to the buffer version
+    /// guard (version guards edits; generation guards project rebuilds).
+    generation: u64,
     index: CoreIndex,
     disable: SuppressSet,
     /// The ADR-0008 real-Ruby folder for full-fidelity constant folds, when a
-    /// sidecar was reachable at startup. `None` = sound subset. Shared across the
-    /// concurrent LSP workers as `&(dyn RubyFolder + Sync)` exactly as the `check`
-    /// pipeline does (`sidecar.rs`); the folder's internal `Mutex` serializes
-    /// folds across the workers (contention accepted, measure later per ADR-0029).
-    folder: Option<sidecar::SidecarFolder>,
+    /// sidecar was reachable at startup. `None` = sound subset. Behind an `Arc` so
+    /// it is PRESERVED (not respawned) across `invalidate` rebuilds — a rebuild
+    /// clones this `Arc` into the new context. Shared across the concurrent LSP
+    /// workers as `&(dyn RubyFolder + Sync)` exactly as the `check` pipeline does
+    /// (`sidecar.rs`); the folder's internal `Mutex` serializes folds across the
+    /// workers (contention accepted, measure later per ADR-0029).
+    folder: Option<Arc<sidecar::SidecarFolder>>,
 }
 
-/// The test seam for the worker's compute (S3). Called at the START of each
-/// worker's body with the buffer `version`, so a concurrency test can hold a
-/// worker mid-flight (block until released) or force it to panic, deterministically
+/// The test seam for the worker's compute (S3/S4). Called at the START of each
+/// worker's body with the buffer `version` AND the project `generation` it is
+/// computing against, so a concurrency test can hold a worker mid-flight (block
+/// until released) or force it to panic, deterministically — keyed on either axis
 /// — without depending on real rayon timing. Production is a no-op
 /// ([`production_gate`]); it lives INSIDE the worker's `catch_unwind`, so a gate
 /// panic is caught and the worker still sends its `Computed` (never-stuck).
-type WorkerGate = dyn Fn(i32) + Send + Sync;
+type WorkerGate = dyn Fn(i32, u64) + Send + Sync;
 
 /// The production [`WorkerGate`]: a no-op (no test is holding workers).
 fn production_gate() -> Arc<WorkerGate> {
-    Arc::new(|_version: i32| {})
+    Arc::new(|_version: i32, _generation: u64| {})
 }
 
-/// The session-stable server context. Holds the shared [`Analysis`] behind an
-/// `Arc` (captured by workers), the injectable debounce interval, and the worker
-/// gate test seam.
+/// The session-stable server context: the injectable debounce interval, the worker
+/// gate test seam, and the client's watched-files dynamic-registration capability.
+/// The mutable, loop-owned state (buffers, debounce deadlines, in-flight set, open
+/// epochs, and the current `Arc<ProjectContext>`) lives in [`Session`], NOT here.
 struct ServerContext {
-    /// The shared analysis context, `Arc`-cloned into each rayon worker (S3).
-    analysis: Arc<Analysis>,
     /// The per-URI `didChange` debounce interval (S2, ADR-0029 §debounce).
     /// Injectable — production uses [`DEBOUNCE_DEFAULT`] (200 ms); tests pass a
     /// small value (assert the deferred publish eventually arrives) or a large
@@ -245,6 +289,45 @@ struct ServerContext {
     /// The worker-compute test seam (S3). Production = [`production_gate`] (no-op);
     /// concurrency tests inject a gate that blocks/panics a worker deterministically.
     worker_gate: Arc<WorkerGate>,
+    /// Whether the client advertised
+    /// `workspace.didChangeWatchedFiles.dynamicRegistration` at `initialize` (S4).
+    /// When `true`, the `initialized` handler sends a `client/registerCapability`
+    /// for the config + project-signature file watchers; when `false`, no
+    /// registration is sent and the server degrades to honouring whatever
+    /// `didChangeWatchedFiles` the client sends statically.
+    watched_files_dynamic_registration: bool,
+}
+
+/// The mutable, single-threaded state the dispatch loop owns (ADR-0029
+/// single-writer). Bundled into one struct so the lifecycle functions take
+/// `&mut Session` instead of threading a growing parameter list (and tripping
+/// clippy's `too_many_arguments`). Never captured into a worker — workers get an
+/// `Arc<ProjectContext>` clone only.
+struct Session {
+    /// The open-document store (S1).
+    buffers: BufferTable,
+    /// Per-URI debounced-publish deadlines (S2).
+    debouncer: Debouncer,
+    /// URIs with a rayon worker in flight — at most one per URI (S3).
+    in_flight: HashSet<String>,
+    /// Per-URI **open-epoch** (S4): a monotonic counter bumped on every `didOpen`
+    /// AND `didClose` for the URI, persisting across close (unlike the buffer
+    /// entry). A worker stamps its result with the epoch at dispatch; a result
+    /// whose epoch no longer matches is dropped. This closes the close+reopen
+    /// version-reuse nit: a reopen (VS Code resends version 1) that reuses the LSP
+    /// version cannot let a stale pre-close worker's result publish, because the
+    /// epoch advanced past what that worker captured. Generation does NOT bump on
+    /// reopen (it is project-scoped), so the epoch — not the generation — is what
+    /// closes this.
+    epochs: HashMap<String, u64>,
+    /// The current tier-1 [`ProjectContext`], swapped by [`invalidate`] (S4).
+    project: Arc<ProjectContext>,
+    /// The loaded config, retained so [`invalidate`] can rebuild the index from
+    /// its plugin list + signature dirs.
+    cfg: Config,
+    /// The worker-results sender, cloned into each worker (S3). The matching
+    /// receiver stays local to [`main_loop`]'s `select!`.
+    results_tx: crossbeam_channel::Sender<Computed>,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +398,13 @@ impl BufferTable {
     /// newer edit superseded it → drop + re-dispatch).
     fn current_version(&self, uri: &Uri) -> Option<i32> {
         self.entries.get(&uri_key(uri)).map(|e| e.version)
+    }
+
+    /// Every currently-open URI (S4). Used to re-analyse ALL open buffers after an
+    /// `invalidate` (a project-context rebuild can move any buffer's diagnostics).
+    /// Reconstructs the `Uri` from its string key (the key is that URI's `as_str`).
+    fn open_uris(&self) -> Vec<Uri> {
+        self.entries.keys().filter_map(|k| k.parse().ok()).collect()
     }
 }
 
@@ -397,6 +487,14 @@ impl Debouncer {
 struct Computed {
     uri: Uri,
     version: i32,
+    /// The project generation this result was computed against (S4). At publish
+    /// time it must still equal the current `ProjectContext.generation`, else an
+    /// `invalidate` superseded it → drop + re-dispatch under the new context.
+    generation: u64,
+    /// The URI's open-epoch at dispatch (S4). Must still equal the URI's current
+    /// epoch at publish, else a `didClose`/`didOpen` cycle superseded it (the
+    /// close+reopen version-reuse nit) → drop + re-dispatch.
+    epoch: u64,
     diags: Vec<Diagnostic>,
 }
 
@@ -452,47 +550,67 @@ struct Computed {
 fn main_loop(
     connection: &Connection,
     ctx: &ServerContext,
-    buffers: &mut BufferTable,
+    project: Arc<ProjectContext>,
+    cfg: Config,
 ) -> Result<(), String> {
     // The worker-results channel (ADR-0029 single-writer seam). `results_tx` is
     // cloned into each rayon worker closure, which pushes its `Computed` from
     // off-thread. Unbounded so a worker's `send` never blocks its rayon thread.
+    // The receiver stays local (the `select!` reads it); the sender lives in the
+    // loop-owned `Session`.
     let (results_tx, results_rx) = crossbeam_channel::unbounded::<Computed>();
-    // Per-URI `didChange` debounce deadlines (S2). Owned solely by the loop.
-    let mut debouncer = Debouncer::new();
-    // The URIs with a rayon worker in flight (S3): at most one per URI. Inserted
-    // by `spawn_worker`, cleared in `handle_result`. Owned solely by the loop.
-    let mut in_flight: HashSet<String> = HashSet::new();
+    let mut st = Session {
+        buffers: BufferTable::new(),
+        debouncer: Debouncer::new(),
+        in_flight: HashSet::new(),
+        epochs: HashMap::new(),
+        project,
+        cfg,
+        results_tx,
+    };
+
+    // Dynamic registration (S4): the `initialized` notification is CONSUMED by the
+    // `Connection::initialize` handshake (`initialize_finish` waits for it), so it
+    // never reaches this loop — the registration is sent here, once, at the top of
+    // the loop. If the client advertised
+    // `didChangeWatchedFiles.dynamicRegistration`, register the config +
+    // project-signature file watchers now (fire-and-forget: the client's response is
+    // ignored by the `Message::Response(_)` arm). Otherwise degrade gracefully — no
+    // registration; the server still honours statically-configured
+    // `didChangeWatchedFiles`.
+    if ctx.watched_files_dynamic_registration {
+        register_watched_files(connection)?;
+    }
 
     loop {
         // Single-writer publish point: flush every ready worker result before
         // servicing the next input. This keeps publish-before-next-message
         // ordering and clears `in_flight` promptly (so a re-dispatch can proceed).
         while let Ok(computed) = results_rx.try_recv() {
-            handle_result(connection, ctx, buffers, &mut debouncer, &mut in_flight, &results_tx, computed)?;
+            handle_result(connection, ctx, &mut st, computed)?;
         }
 
         // Timeout = time until the earliest pending debounce deadline (clamped to
         // 0 if already passed). No pending deadline ⇒ block with no timeout. An
         // incoming message wakes `select!` immediately regardless of the timeout,
         // so `didClose`'s cancel is serviced without waiting out the deadline.
-        match debouncer.earliest() {
+        match st.debouncer.earliest() {
             Some(deadline) => {
                 let timeout = deadline.saturating_duration_since(Instant::now());
                 crossbeam_channel::select! {
                     recv(connection.receiver) -> msg => {
                         let Ok(msg) = msg else { return Ok(()) }; // connection closed
-                        if handle_message(connection, ctx, buffers, &mut debouncer, &mut in_flight, &results_tx, msg)? {
+                        if handle_message(connection, ctx, &mut st, msg)? {
                             return Ok(()); // shutdown
                         }
                     }
                     recv(results_rx) -> computed => {
                         if let Ok(computed) = computed {
-                            handle_result(connection, ctx, buffers, &mut debouncer, &mut in_flight, &results_tx, computed)?;
+                            handle_result(connection, ctx, &mut st, computed)?;
                         }
                     }
                     default(timeout) => {
-                        fire_due(&mut debouncer, buffers, &mut in_flight, ctx, &results_tx);
+                        fire_due(ctx, &mut st);
                     }
                 }
             }
@@ -500,7 +618,7 @@ fn main_loop(
                 crossbeam_channel::select! {
                     recv(connection.receiver) -> msg => {
                         let Ok(msg) = msg else { return Ok(()) }; // connection closed
-                        if handle_message(connection, ctx, buffers, &mut debouncer, &mut in_flight, &results_tx, msg)? {
+                        if handle_message(connection, ctx, &mut st, msg)? {
                             return Ok(()); // shutdown
                         }
                     }
@@ -508,7 +626,7 @@ fn main_loop(
                         // A rayon worker result arriving asynchronously while the
                         // loop was blocked (the live S3 path).
                         if let Ok(computed) = computed {
-                            handle_result(connection, ctx, buffers, &mut debouncer, &mut in_flight, &results_tx, computed)?;
+                            handle_result(connection, ctx, &mut st, computed)?;
                         }
                     }
                 }
@@ -517,21 +635,69 @@ fn main_loop(
     }
 }
 
+/// Rebuild the tier-1 [`ProjectContext`] and bump its generation (S4). Invoked on
+/// a relevant `workspace/didChangeWatchedFiles` and on
+/// `workspace/didChangeConfiguration` — NEVER on a buffer `didChange`.
+///
+/// **The rebuild is SYNCHRONOUS on the loop thread** (orchestrator decision,
+/// overriding the plan's "lazy rebuild on a worker"): invalidation events are RARE
+/// (config / `Gemfile.lock` / signature save), unlike keystrokes, so paying a
+/// ~100-300 ms `CoreIndex::for_project` build inline is acceptable UX and avoids a
+/// second concurrency hazard (a worker-produced context swap). If profiling ever
+/// shows this stall matters, the future optimization is a lazy async rebuild that
+/// keeps serving the old context until the stamped replacement lands.
+///
+/// The sidecar folder is PRESERVED (its `Arc` is cloned into the new context), so
+/// the Ruby VM is not respawned. The config file is not re-parsed here (matching
+/// the reference `ProjectContext#invalidate!`, which rebuilds from the same
+/// `@configuration`); the rebuild re-reads the signature dirs from disk, so
+/// changed `sig/**/*.rbs` content is picked up. In-flight workers holding the OLD
+/// `Arc` finish against it and are generation-dropped in [`handle_result`].
+fn invalidate(st: &mut Session) {
+    let generation = st.project.generation + 1;
+    let index = CoreIndex::for_project(
+        &st.cfg.plugins,
+        &st.cfg.all_signature_dirs(std::path::Path::new(".")),
+    );
+    let disable = st.cfg.disable_matcher();
+    let folder = st.project.folder.clone(); // reuse the live sidecar; no respawn.
+    st.project = Arc::new(ProjectContext { generation, index, disable, folder });
+}
+
+/// After an [`invalidate`], re-analyse EVERY open buffer (S4): a project-context
+/// rebuild can move any buffer's diagnostics. Each open URI is routed through
+/// [`request_dispatch`]; a URI with a worker still in flight (against the old
+/// generation) is a no-op here — that worker is generation-dropped and re-dispatched
+/// by [`handle_result`], so the new context is always eventually applied.
+fn reanalyze_open_buffers(ctx: &ServerContext, st: &mut Session) {
+    for uri in st.buffers.open_uris() {
+        request_dispatch(&uri, ctx, st);
+    }
+}
+
+/// Bump and return the open-epoch for `uri` (S4). Called on `didOpen` AND
+/// `didClose`. Persists in `st.epochs` across the buffer's lifetime, so a
+/// close+reopen advances the epoch past what any pre-close worker captured.
+fn bump_epoch(st: &mut Session, uri: &Uri) -> u64 {
+    let e = st.epochs.entry(uri_key(uri)).or_insert(0);
+    *e += 1;
+    *e
+}
+
+/// The URI's current open-epoch (0 if never opened).
+fn current_epoch(st: &Session, uri: &Uri) -> u64 {
+    st.epochs.get(&uri_key(uri)).copied().unwrap_or(0)
+}
+
 /// Request a dispatch for every debounced publish whose deadline has passed (S2).
 /// Each due URI is routed through [`request_dispatch`], which reads the LATEST
 /// buffer content (so a coalesced burst analyses the final text) and spawns a
 /// rayon worker unless one is already in flight for that URI. A URI whose buffer
 /// was closed mid-window is skipped inside `request_dispatch` (its snapshot is
 /// `None`).
-fn fire_due(
-    debouncer: &mut Debouncer,
-    buffers: &BufferTable,
-    in_flight: &mut HashSet<String>,
-    ctx: &ServerContext,
-    results_tx: &crossbeam_channel::Sender<Computed>,
-) {
-    for uri in debouncer.take_due(Instant::now()) {
-        request_dispatch(&uri, buffers, in_flight, debouncer, ctx, results_tx);
+fn fire_due(ctx: &ServerContext, st: &mut Session) {
+    for uri in st.debouncer.take_due(Instant::now()) {
+        request_dispatch(&uri, ctx, st);
     }
 }
 
@@ -542,19 +708,15 @@ fn fire_due(
 /// always eventually analysed without ever running two concurrent workers for one
 /// URI. Otherwise spawn a worker for the current snapshot. A closed/unknown buffer
 /// (snapshot `None`) is skipped.
-fn request_dispatch(
-    uri: &Uri,
-    buffers: &BufferTable,
-    in_flight: &mut HashSet<String>,
-    debouncer: &mut Debouncer,
-    ctx: &ServerContext,
-    results_tx: &crossbeam_channel::Sender<Computed>,
-) {
-    if in_flight.contains(&uri_key(uri)) {
+fn request_dispatch(uri: &Uri, ctx: &ServerContext, st: &mut Session) {
+    if st.in_flight.contains(&uri_key(uri)) {
         return; // one-in-flight: the running worker's result drives re-dispatch.
     }
-    if let Some((text, version)) = buffers.snapshot(uri) {
-        spawn_worker(uri, text.to_string(), version, in_flight, debouncer, ctx, results_tx);
+    // Copy the snapshot out to end the immutable borrow of `st.buffers` before
+    // `spawn_worker` takes `&mut st`.
+    let snapshot = st.buffers.snapshot(uri).map(|(t, v)| (t.to_string(), v));
+    if let Some((text, version)) = snapshot {
+        spawn_worker(uri, text, version, ctx, st);
     }
 }
 
@@ -562,15 +724,17 @@ fn request_dispatch(
 /// should shut down. Requests are answered SYNCHRONOUSLY on the loop thread (they
 /// never go through the worker pool); `didOpen` *requests* an immediate diagnostics
 /// dispatch (a rayon worker publishes via the loop, not here); `didChange` updates
-/// the buffer synchronously and *schedules* a debounced dispatch in `debouncer`
-/// (S2); `didClose` cancels any pending publish and clears inline markers.
+/// the buffer synchronously and *schedules* a debounced dispatch (S2); `didClose`
+/// cancels any pending publish and clears inline markers.
+/// `workspace/didChangeWatchedFiles` (on a relevant path) and
+/// `workspace/didChangeConfiguration` (S4) invalidate the project context and
+/// re-analyse open buffers. A buffer `didChange` NEVER invalidates. (The
+/// `initialized` notification is consumed by the handshake, not here — the
+/// watched-files `client/registerCapability` is sent at the top of [`main_loop`].)
 fn handle_message(
     connection: &Connection,
     ctx: &ServerContext,
-    buffers: &mut BufferTable,
-    debouncer: &mut Debouncer,
-    in_flight: &mut HashSet<String>,
-    results_tx: &crossbeam_channel::Sender<Computed>,
+    st: &mut Session,
     msg: Message,
 ) -> Result<bool, String> {
     match msg {
@@ -582,7 +746,7 @@ fn handle_message(
                 "textDocument/hover" => {
                     match req.extract::<HoverParams>("textDocument/hover") {
                         Ok((id, params)) => {
-                            let hover = hover(ctx, buffers, &params);
+                            let hover = hover(&st.project, &st.buffers, &params);
                             let resp = Response::new_ok(id, hover);
                             connection
                                 .sender
@@ -598,7 +762,7 @@ fn handle_message(
                 "textDocument/completion" => {
                     match req.extract::<CompletionParams>("textDocument/completion") {
                         Ok((id, params)) => {
-                            let items = completion(ctx, buffers, &params);
+                            let items = completion(&st.project, &st.buffers, &params);
                             let resp = Response::new_ok(id, items);
                             connection
                                 .sender
@@ -611,7 +775,7 @@ fn handle_message(
                 "textDocument/documentSymbol" => {
                     match req.extract::<DocumentSymbolParams>("textDocument/documentSymbol") {
                         Ok((id, params)) => {
-                            let syms = document_symbols(buffers, &params);
+                            let syms = document_symbols(&st.buffers, &params);
                             let resp = Response::new_ok(id, syms);
                             connection
                                 .sender
@@ -640,13 +804,16 @@ fn handle_message(
                     let version = p.text_document.version;
                     // Fast first paint: `didOpen` requests an IMMEDIATE dispatch
                     // (ADR-0029 plan §4), NOT debounced. Record the buffer first so
-                    // the worker snapshots it, then clear any stale pending publish
-                    // for a re-opened URI. If a worker is somehow still in flight for
-                    // a re-opened URI, `request_dispatch` no-ops and the stale-drop
-                    // re-dispatch picks up the fresh content.
-                    buffers.open(&uri, text, version);
-                    debouncer.cancel(&uri);
-                    request_dispatch(&uri, buffers, in_flight, debouncer, ctx, results_tx);
+                    // the worker snapshots it; bump the open-epoch (S4) so a worker
+                    // spawned now captures the fresh epoch AND any pre-close worker
+                    // for a re-opened URI is epoch-dropped; then clear any stale
+                    // pending publish. If a worker is still in flight for a re-opened
+                    // URI, `request_dispatch` no-ops and the stale-drop re-dispatch
+                    // (epoch mismatch) picks up the fresh content.
+                    st.buffers.open(&uri, text, version);
+                    bump_epoch(st, &uri);
+                    st.debouncer.cancel(&uri);
+                    request_dispatch(&uri, ctx, st);
                 }
             }
             "textDocument/didChange" => {
@@ -655,37 +822,119 @@ fn handle_message(
                     let version = p.text_document.version;
                     if let Some(change) = p.content_changes.into_iter().last() {
                         let uri = p.text_document.uri;
+                        // A buffer edit NEVER invalidates the project context (S4,
+                        // ADR-0029): buffer edits are virtual and single-file scope;
+                        // only the config / watched-file surface bumps the generation.
                         // Update the buffer SYNCHRONOUSLY (hover/completion/symbols
                         // must see the latest text at once) but DEFER the publish:
                         // schedule a debounced fire `ctx.debounce` after this (the
                         // last) change. A further didChange within the window
                         // overwrites this deadline, coalescing the burst into one
                         // publish of the final content (S2, ADR-0029 §debounce).
-                        buffers.change(&uri, change.text, version);
-                        debouncer.schedule(&uri, Instant::now() + ctx.debounce);
+                        st.buffers.change(&uri, change.text, version);
+                        st.debouncer.schedule(&uri, Instant::now() + ctx.debounce);
                     }
                 }
             }
             "textDocument/didClose" => {
                 if let Ok(p) = not.extract::<DidCloseTextDocumentParams>("textDocument/didClose") {
                     let uri = p.text_document.uri;
-                    buffers.close(&uri);
-                    // Cancel any pending debounced publish so no stale diagnostics
-                    // fire after the close, THEN clear inline markers with an empty
-                    // publish (an idle-clear on the loop thread, not a compute — so
-                    // it does not go through the worker channel). A worker still in
-                    // flight for this URI is left to finish; `handle_result` finds
-                    // the buffer closed (current version `None`) and DROPS its
-                    // result — no stale publish escapes.
-                    debouncer.cancel(&uri);
+                    st.buffers.close(&uri);
+                    // Bump the open-epoch (S4) so a worker still in flight for this
+                    // URI is epoch-dropped when it returns — even if a reopen reuses
+                    // the same LSP version. Cancel any pending debounced publish so
+                    // no stale diagnostics fire after the close, THEN clear inline
+                    // markers with an empty publish (an idle-clear on the loop
+                    // thread, not a compute — so it does not go through the worker
+                    // channel). A worker still in flight is left to finish;
+                    // `handle_result` finds the buffer closed (current version
+                    // `None`) and DROPS its result — no stale publish escapes.
+                    bump_epoch(st, &uri);
+                    st.debouncer.cancel(&uri);
                     send_diagnostics(connection, &uri, Vec::new())?;
                 }
+            }
+            "workspace/didChangeWatchedFiles" => {
+                // Tier-1 invalidation trigger (S4). Invalidate + re-analyse ALL open
+                // buffers ONLY if a changed URI is on the config + project-signature
+                // surface (`.rigor.yml` / `Gemfile.lock` / a project `*.rb` /
+                // `sig/**/*.rbs`). An unrelated path (a `.txt`, a build artifact) does
+                // NOT invalidate — avoiding a needless ~100-300 ms rebuild.
+                let relevant = watched_files_params_are_relevant(&not.params);
+                if relevant {
+                    invalidate(st);
+                    reanalyze_open_buffers(ctx, st);
+                }
+            }
+            "workspace/didChangeConfiguration" => {
+                // Configuration refresh (S4): always invalidate + re-analyse open
+                // buffers (the payload shape is client-specific; v1 ignores it and
+                // rebuilds so the next publish observes any external config change).
+                invalidate(st);
+                reanalyze_open_buffers(ctx, st);
             }
             _ => {}
         },
         Message::Response(_) => {}
     }
     Ok(false)
+}
+
+/// Send the server→client `client/registerCapability` request registering the
+/// watched-files globs (S4): the config + project-signature surface that tier-1
+/// invalidation cares about. Fire-and-forget — the client's response is ignored.
+fn register_watched_files(connection: &Connection) -> Result<(), String> {
+    let params = serde_json::json!({
+        "registrations": [{
+            "id": "rigor-watched-files",
+            "method": "workspace/didChangeWatchedFiles",
+            "registerOptions": {
+                "watchers": [
+                    { "globPattern": "**/*.rb" },
+                    { "globPattern": "**/.rigor.yml" },
+                    { "globPattern": "**/Gemfile.lock" },
+                    { "globPattern": "**/sig/**/*.rbs" }
+                ]
+            }
+        }]
+    });
+    let req = lsp_server::Request::new(
+        lsp_server::RequestId::from("rigor-watched-files".to_string()),
+        "client/registerCapability".to_string(),
+        params,
+    );
+    connection
+        .sender
+        .send(Message::Request(req))
+        .map_err(|e| e.to_string())
+}
+
+/// Whether a `workspace/didChangeWatchedFiles` payload touches the config +
+/// project-signature surface (S4). Parses `{ changes: [{ uri, .. }] }` and returns
+/// `true` if ANY changed URI is relevant per [`watched_file_is_relevant`]. A
+/// malformed / empty payload is not relevant (no invalidation).
+fn watched_files_params_are_relevant(params: &serde_json::Value) -> bool {
+    params
+        .get("changes")
+        .and_then(|c| c.as_array())
+        .is_some_and(|changes| {
+            changes.iter().any(|c| {
+                c.get("uri")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(watched_file_is_relevant)
+            })
+        })
+}
+
+/// Whether a single changed-file URI is on the tier-1 invalidation surface (S4):
+/// `.rigor.yml`, `Gemfile.lock`, a project `*.rb`, or a `sig/**/*.rbs` signature
+/// (project sig dirs matter for rigor-rs per ADR-0033). Matches on the URI string
+/// tail — sufficient for the watcher globs the server registers.
+fn watched_file_is_relevant(uri: &str) -> bool {
+    uri.ends_with(".rigor.yml")
+        || uri.ends_with("Gemfile.lock")
+        || uri.ends_with(".rb")
+        || (uri.ends_with(".rbs") && uri.contains("/sig/"))
 }
 
 /// A stable string key for a document URI (the buffer table is keyed by it).
@@ -697,9 +946,10 @@ fn uri_key(uri: &Uri) -> String {
 /// Records the URI as in-flight and CANCELS its pending debounce (the worker now
 /// covers the latest content — no separate deferred publish needed, so no
 /// redundant re-analysis). The worker captures the buffer snapshot `(text,
-/// version)`, an `Arc<Analysis>` clone (the shared analysis context — index /
-/// suppress set / sidecar folder, exactly the `check` pipeline's shared-worker
-/// contract), a `worker_gate` clone (the test seam), and a `results_tx` clone.
+/// version)`, the project `generation` + the URI's open-`epoch` at dispatch (S4),
+/// an `Arc<ProjectContext>` clone (the shared analysis context — index / suppress
+/// set / sidecar folder, exactly the `check` pipeline's shared-worker contract), a
+/// `worker_gate` clone (the test seam), and a `results_tx` clone.
 ///
 /// **Never-stuck.** The worker's body is `catch_unwind`-wrapped, so even a panic
 /// (in the gate or the compute) yields an empty-diags result rather than a lost
@@ -710,67 +960,59 @@ fn uri_key(uri: &Uri) -> String {
 ///
 /// The unbounded `send` only fails if the receiver is gone (the loop returned —
 /// shutdown); that `Err` is ignored, so a detached worker never blocks or panics.
-fn spawn_worker(
-    uri: &Uri,
-    text: String,
-    version: i32,
-    in_flight: &mut HashSet<String>,
-    debouncer: &mut Debouncer,
-    ctx: &ServerContext,
-    results_tx: &crossbeam_channel::Sender<Computed>,
-) {
-    in_flight.insert(uri_key(uri));
-    debouncer.cancel(uri);
-    let analysis = Arc::clone(&ctx.analysis);
+fn spawn_worker(uri: &Uri, text: String, version: i32, ctx: &ServerContext, st: &mut Session) {
+    st.in_flight.insert(uri_key(uri));
+    st.debouncer.cancel(uri);
+    let generation = st.project.generation;
+    let epoch = current_epoch(st, uri);
+    let project = Arc::clone(&st.project);
     let gate = Arc::clone(&ctx.worker_gate);
-    let tx = results_tx.clone();
+    let tx = st.results_tx.clone();
     let uri = uri.clone();
     rayon::spawn(move || {
         let diags = panic::catch_unwind(AssertUnwindSafe(|| {
-            gate(version); // test seam: may block (hold mid-flight) or panic.
-            compute_diagnostics(&analysis, &text)
+            gate(version, generation); // test seam: may block (hold mid-flight) or panic.
+            compute_diagnostics(&project, &text)
         }))
         .unwrap_or_default();
         // Always send exactly one result (even empty on a caught panic), so the
         // loop's in-flight tracking for this URI clears. `Err` = loop gone (shutdown).
-        let _ = tx.send(Computed { uri, version, diags });
+        let _ = tx.send(Computed { uri, version, generation, epoch, diags });
     });
 }
 
-/// Handle one worker result — the loop's single-writer publish point (S3). Clears
-/// the URI's `in_flight` entry (a worker that returned is no longer in flight),
-/// then applies the **version stale-drop** with **no-lost-update re-dispatch**:
-///
-/// - buffer closed (`current_version` is `None`) → DROP (a `didClose` already
-///   cleared its markers; publishing would resurrect diagnostics for a closed doc);
-/// - `computed.version == current` → PUBLISH (this result reflects the live buffer);
-/// - otherwise the buffer moved on (a newer edit superseded this result) → DROP and
-///   [`request_dispatch`] the LATEST content. `in_flight` was just cleared, so this
-///   spawns a fresh worker for the newest snapshot — guaranteeing the final buffer
-///   state is eventually published (a dropped stale result never strands the latest
-///   content unpublished).
+/// Handle one worker result — the loop's single-writer publish point (S3/S4).
+/// Clears the URI's `in_flight` entry, then applies the three-axis stale-drop with
+/// **no-lost-update re-dispatch**. A result is LIVE only if all three still match:
+/// **version** (no edit past what was analysed, S3), **generation** (no `invalidate`
+/// since dispatch, S4), and **epoch** (no `didClose`/`didOpen` cycle since dispatch,
+/// S4 — the close+reopen version-reuse nit). Otherwise: a closed buffer drops
+/// silently; any stale axis DROPS + [`request_dispatch`]es the latest content under
+/// the current context (so the final state is always eventually published).
 fn handle_result(
     connection: &Connection,
     ctx: &ServerContext,
-    buffers: &mut BufferTable,
-    debouncer: &mut Debouncer,
-    in_flight: &mut HashSet<String>,
-    results_tx: &crossbeam_channel::Sender<Computed>,
+    st: &mut Session,
     computed: Computed,
 ) -> Result<(), String> {
-    in_flight.remove(&uri_key(&computed.uri));
-    match buffers.current_version(&computed.uri) {
+    st.in_flight.remove(&uri_key(&computed.uri));
+    match st.buffers.current_version(&computed.uri) {
         // Buffer closed while the worker ran — drop the result (no stale publish).
         None => Ok(()),
-        // Still current — publish (the live single-writer emit).
-        Some(cur) if cur == computed.version => {
-            send_diagnostics(connection, &computed.uri, computed.diags)
-        }
-        // Superseded by a newer edit — drop this result and re-dispatch the latest
-        // content so the final buffer state is always eventually published.
-        Some(_) => {
-            request_dispatch(&computed.uri, buffers, in_flight, debouncer, ctx, results_tx);
-            Ok(())
+        Some(cur) => {
+            let live = cur == computed.version
+                && computed.generation == st.project.generation
+                && computed.epoch == current_epoch(st, &computed.uri);
+            if live {
+                // All three axes (version / generation / epoch) current — publish.
+                send_diagnostics(connection, &computed.uri, computed.diags)
+            } else {
+                // Superseded (edit / invalidate / close+reopen) — drop this result
+                // and re-dispatch the latest content so the final state is always
+                // eventually published under the current context.
+                request_dispatch(&computed.uri, ctx, st);
+                Ok(())
+            }
         }
     }
 }
@@ -812,7 +1054,7 @@ fn send_diagnostics(
 /// `# rigor:disable` and config `disable:` suppression, so the editor's inline
 /// markers match `rigor check` on the same content. Panic-isolated (ADR-0016): a
 /// malformed buffer that trips the parser yields no diagnostics, never a crash.
-fn compute_diagnostics(analysis: &Analysis, text: &str) -> Vec<Diagnostic> {
+fn compute_diagnostics(project: &ProjectContext, text: &str) -> Vec<Diagnostic> {
     let bytes = text.as_bytes().to_vec();
     // Skip ERB templates (matches `check` + the reference's ErbTemplateDetector):
     // Prism's error recovery over a `<%= … %>` template yields a garbage AST.
@@ -823,16 +1065,16 @@ fn compute_diagnostics(analysis: &Analysis, text: &str) -> Vec<Diagnostic> {
         let result = parse(&bytes);
         let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
-        let source = SourceIndex::build(&ast, &analysis.index);
+        let source = SourceIndex::build(&ast, &project.index);
         let mut interner = Interner::new();
-        let folder = analysis
+        let folder = project
             .folder
-            .as_ref()
+            .as_deref()
             .map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
         let mut diags =
-            analyze_with_source_and_folder(&ast, &mut interner, &analysis.index, &source, folder);
+            analyze_with_source_and_folder(&ast, &mut interner, &project.index, &source, folder);
         diags.extend(rigor_rules::shadowed_rescue_diagnostics(
-            &ast, &analysis.index, &source, text,
+            &ast, &project.index, &source, text,
         ));
         (diags, comments)
     }));
@@ -853,7 +1095,7 @@ fn compute_diagnostics(analysis: &Analysis, text: &str) -> Vec<Diagnostic> {
 
     filter_suppressed(with_lines, &comments)
         .into_iter()
-        .filter(|(_, d)| !analysis.disable.suppresses(d.rule_id))
+        .filter(|(_, d)| !project.disable.suppresses(d.rule_id))
         .map(|(_, d)| to_lsp_diagnostic(text, &d))
         .collect()
 }
@@ -887,7 +1129,7 @@ fn to_lsp_diagnostic(text: &str, d: &rigor_rules::Diagnostic) -> Diagnostic {
 /// the `type-of` node-locator + type renderer. Returns `None` when the buffer is
 /// unknown, the position is out of range, or no node covers it — a null hover.
 fn hover(
-    ctx: &ServerContext,
+    project: &ProjectContext,
     buffers: &BufferTable,
     params: &HoverParams,
 ) -> Option<Hover> {
@@ -898,13 +1140,13 @@ fn hover(
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let ast = lower(&parse(text.as_bytes()));
         let node_id = crate::type_of::locate_node(&ast, offset)?;
-        let source = SourceIndex::build(&ast, &ctx.analysis.index);
-        let typer = Typer::with_source(&ctx.analysis.index, &source);
+        let source = SourceIndex::build(&ast, &project.index);
+        let typer = Typer::with_source(&project.index, &source);
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, node_id, &env, &mut interner);
         let (start, end) = ast.get(node_id).span();
-        let type_render = crate::type_of::render_type(&interner, &ctx.analysis.index, &source, ty);
+        let type_render = crate::type_of::render_type(&interner, &project.index, &source, ty);
 
         // Extract owned node bits so later `&mut interner` calls don't clash with
         // the `&ast` borrow of `node`.
@@ -935,11 +1177,11 @@ fn hover(
         let body = if let Some((receiver, method)) = call_bits {
             let recv_ty = receiver.map(|r| typer.type_of(&ast, r, &env, &mut interner));
             let recv_disp = recv_ty
-                .map(|rt| receiver_display(&ctx.analysis.index, &typer, &interner, rt))
+                .map(|rt| receiver_display(&project.index, &typer, &interner, rt))
                 .unwrap_or_else(|| "self".to_string());
             let mut sig = format!("{recv_disp}#{method} → {type_render}");
-            if let Some(cls) = recv_ty.and_then(|rt| ctx.analysis.index.class_name_of(&interner, rt)) {
-                if let Some((min, max)) = ctx.analysis.index.method_arity(cls, &method) {
+            if let Some(cls) = recv_ty.and_then(|rt| project.index.class_name_of(&interner, rt)) {
+                if let Some((min, max)) = project.index.method_arity(cls, &method) {
                     let max_s = max.map_or_else(|| "∞".to_string(), |m| m.to_string());
                     sig.push_str(&format!("  (arity {min}..{max_s})"));
                 }
@@ -989,7 +1231,7 @@ const COMPLETION_STUB: &str = "rigorCompletionHole";
 /// use; its class drives instance- vs singleton-method enumeration. The half-typed
 /// prefix is intentionally dropped — the client filters the full set by it.
 fn completion(
-    ctx: &ServerContext,
+    project: &ProjectContext,
     buffers: &BufferTable,
     params: &CompletionParams,
 ) -> Option<CompletionResponse> {
@@ -1025,12 +1267,12 @@ fn completion(
             Node::Call { receiver, message_span, .. } if message_span.0 == stub_at => Some(*receiver),
             _ => None,
         })??;
-        let source = SourceIndex::build(&ast, &ctx.analysis.index);
-        let typer = Typer::with_source(&ctx.analysis.index, &source);
+        let source = SourceIndex::build(&ast, &project.index);
+        let typer = Typer::with_source(&project.index, &source);
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, receiver, &env, &mut interner);
-        Some(method_names_for(&ctx.analysis.index, &typer, &interner, ty))
+        Some(method_names_for(&project.index, &typer, &interner, ty))
     }));
 
     let names = result.ok().flatten()?;
@@ -1208,21 +1450,14 @@ fn position_to_offset(text: &str, pos: Position) -> Option<usize> {
 mod tests {
     use super::*;
 
-    /// A minimal shared analysis context (empty core index, no sidecar) for the
-    /// pure `compute_diagnostics` unit tests.
-    fn analysis() -> Analysis {
-        Analysis {
+    /// A minimal tier-1 project context (empty core index, no sidecar, generation
+    /// 0) for the pure `compute_diagnostics` / `hover` / `completion` unit tests.
+    fn project() -> ProjectContext {
+        ProjectContext {
+            generation: 0,
             index: CoreIndex::new(),
             disable: Config::default().disable_matcher(),
             folder: None,
-        }
-    }
-
-    fn ctx() -> ServerContext {
-        ServerContext {
-            analysis: Arc::new(analysis()),
-            debounce: DEBOUNCE_DEFAULT,
-            worker_gate: production_gate(),
         }
     }
 
@@ -1251,7 +1486,7 @@ mod tests {
     #[test]
     fn diagnostics_flag_a_typo() {
         // `"hi".lenght` — undefined method, one diagnostic.
-        let diags = compute_diagnostics(&analysis(), "x = \"hi\"\nx.lenght\n");
+        let diags = compute_diagnostics(&project(), "x = \"hi\"\nx.lenght\n");
         assert_eq!(diags.len(), 1, "one undefined-method diagnostic");
         let d = &diags[0];
         assert_eq!(d.source.as_deref(), Some("rigor"));
@@ -1266,13 +1501,13 @@ mod tests {
         // `check` (a bare `# rigor:disable` with no rule token is a no-op — it
         // needs a rule, matching the reference's `\s+(rules)` directive grammar).
         let diags =
-            compute_diagnostics(&analysis(), "x = \"hi\"\nx.lenght # rigor:disable undefined-method\n");
+            compute_diagnostics(&project(), "x = \"hi\"\nx.lenght # rigor:disable undefined-method\n");
         assert!(diags.is_empty(), "inline disable suppresses the diagnostic");
     }
 
     #[test]
     fn diagnostics_clean_source_is_empty() {
-        let diags = compute_diagnostics(&analysis(), "x = \"hi\"\nx.upcase\n");
+        let diags = compute_diagnostics(&project(), "x = \"hi\"\nx.upcase\n");
         assert!(diags.is_empty());
     }
 
@@ -1288,7 +1523,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        let h = hover(&ctx(), &buffers, &params).expect("a hover");
+        let h = hover(&project(), &buffers, &params).expect("a hover");
         match h.contents {
             HoverContents::Markup(m) => assert!(m.value.contains("42"), "{}", m.value),
             _ => panic!("expected markup hover"),
@@ -1310,7 +1545,7 @@ mod tests {
             partial_result_params: Default::default(),
             context: None,
         };
-        match completion(&ctx(), &buffers, &params) {
+        match completion(&project(), &buffers, &params) {
             Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
             _ => Vec::new(),
         }
@@ -1415,7 +1650,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        let h = hover(&ctx(), &buffers, &params).expect("a hover");
+        let h = hover(&project(), &buffers, &params).expect("a hover");
         let HoverContents::Markup(m) = h.contents else { panic!("markup") };
         assert!(m.value.contains("String#upcase"), "signature: {}", m.value);
         assert!(m.value.contains("arity"), "arity shown: {}", m.value);
@@ -1434,7 +1669,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        match hover(&ctx(), &buffers, &params) {
+        match hover(&project(), &buffers, &params) {
             Some(Hover { contents: HoverContents::Markup(m), .. }) => m.value,
             _ => String::new(),
         }
@@ -1466,7 +1701,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        assert!(hover(&ctx(), &BufferTable::new(), &params).is_none());
+        assert!(hover(&project(), &BufferTable::new(), &params).is_none());
     }
 
     #[test]
@@ -1581,26 +1816,43 @@ mod tests {
 
         /// Spawn the server loop with an injected debounce AND a worker gate (S3
         /// concurrency tests). The gate is called at the start of every rayon
-        /// worker with the buffer version, so a test can hold a worker mid-flight
-        /// (block until released) or force a panic — driving the version stale-drop
-        /// / one-in-flight / never-stuck lifecycle deterministically, without any
-        /// dependence on real rayon timing.
+        /// worker with the buffer version + project generation, so a test can hold a
+        /// worker mid-flight (block until released) or force a panic — driving the
+        /// version / generation / epoch stale-drop, one-in-flight, and never-stuck
+        /// lifecycle deterministically, without any dependence on real rayon timing.
+        /// The client advertises NO capabilities (no dynamic registration).
         fn start_with_gate(debounce: Duration, worker_gate: Arc<WorkerGate>) -> Self {
+            Self::start_full(debounce, worker_gate, serde_json::json!({}))
+        }
+
+        /// Spawn the server loop, driving the client `initialize` with the given
+        /// `client_caps` (S4): the server derives `watched_files_dynamic_registration`
+        /// from the InitializeParams it receives, exactly as production does, so a
+        /// test can assert the `client/registerCapability` handshake (or its absence).
+        fn start_full(
+            debounce: Duration,
+            worker_gate: Arc<WorkerGate>,
+            client_caps: serde_json::Value,
+        ) -> Self {
             let (server_conn, client) = Connection::memory();
             let handle = thread::spawn(move || {
+                let caps = serde_json::to_value(server_capabilities()).unwrap();
+                // The authentic path: read the client's capabilities from the
+                // InitializeParams the handshake returns (not discarded).
+                let init_params = server_conn.initialize(caps).unwrap();
                 let ctx = ServerContext {
-                    analysis: Arc::new(Analysis {
-                        index: CoreIndex::new(),
-                        disable: Config::default().disable_matcher(),
-                        folder: None,
-                    }),
                     debounce,
                     worker_gate,
+                    watched_files_dynamic_registration:
+                        client_supports_watched_files_registration(&init_params),
                 };
-                let caps = serde_json::to_value(server_capabilities()).unwrap();
-                server_conn.initialize(caps).unwrap();
-                let mut buffers = BufferTable::new();
-                main_loop(&server_conn, &ctx, &mut buffers).unwrap();
+                let project = Arc::new(ProjectContext {
+                    generation: 0,
+                    index: CoreIndex::new(),
+                    disable: Config::default().disable_matcher(),
+                    folder: None,
+                });
+                main_loop(&server_conn, &ctx, project, Config::default()).unwrap();
             });
             // Client-side handshake: initialize request → response → initialized.
             client
@@ -1608,7 +1860,7 @@ mod tests {
                 .send(Message::Request(Request::new(
                     RequestId::from(1),
                     "initialize".to_string(),
-                    serde_json::json!({ "capabilities": {} }),
+                    serde_json::json!({ "capabilities": client_caps }),
                 )))
                 .unwrap();
             client
@@ -1978,7 +2230,7 @@ mod tests {
             recvs.insert(v, rx);
         }
         let panics: HashSet<i32> = panic_on.iter().copied().collect();
-        let gate: Arc<WorkerGate> = Arc::new(move |version: i32| {
+        let gate: Arc<WorkerGate> = Arc::new(move |version: i32, _generation: u64| {
             if panics.contains(&version) {
                 panic!("test gate: forced panic for version {version}");
             }
@@ -2120,5 +2372,268 @@ mod tests {
         hover_sync(&h, 100, "file:///g.rb"); // the worker is spawned + in flight.
         h.shutdown(); // must return without waiting for the held worker.
         g.release(1); // detached worker proceeds; its send finds the rx gone (no-op).
+    }
+
+    // ---------------------------------------------------------------------
+    // S4: tier-1 ProjectContext generation + watched-files/config invalidation
+    // + dynamic registration + the close+reopen open-epoch nit. All driven
+    // DETERMINISTICALLY via the worker-gate seam + hover FIFO barriers — no
+    // wall-clock races (30 s debounce where a stray timer would interfere).
+    // ---------------------------------------------------------------------
+
+    /// A `workspace/didChangeWatchedFiles` payload naming one changed `uri`.
+    fn watched_change(uri: &str) -> serde_json::Value {
+        serde_json::json!({ "changes": [ { "uri": uri, "type": 2 } ] })
+    }
+
+    /// A recording gate that holds every GENERATION-0 worker (until released) and
+    /// records `(version, generation)` for every worker it gates. Keying the hold on
+    /// generation (not version) lets the re-dispatched new-generation worker run
+    /// freely, while the recording proves whether a fresh worker ran under the new
+    /// generation — the observable signature of a generation stale-drop.
+    struct GenGate {
+        release_gen0: crossbeam_channel::Sender<()>,
+        calls: Arc<std::sync::Mutex<Vec<(i32, u64)>>>,
+        gate: Arc<WorkerGate>,
+    }
+
+    fn gate_recording_hold_gen0() -> GenGate {
+        let (tx, rx) = crossbeam_channel::unbounded::<()>();
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_w = Arc::clone(&calls);
+        let gate: Arc<WorkerGate> = Arc::new(move |version: i32, generation: u64| {
+            calls_w.lock().unwrap().push((version, generation));
+            if generation == 0 {
+                let _ = rx.recv(); // block gen-0 workers until released.
+            }
+        });
+        GenGate { release_gen0: tx, calls, gate }
+    }
+
+    #[test]
+    fn integration_s4_generation_stale_drop_after_invalidate() {
+        // A worker in flight when an invalidation bumps the generation has its
+        // result DROPPED; a fresh dispatch under the new generation publishes. The
+        // gen-0 worker is held; a relevant watched-files change bumps the generation
+        // to 1; on release the gen-0 result is generation-stale → dropped +
+        // re-dispatched → a gen-1 worker publishes.
+        let g = gate_recording_hold_gen0();
+        let mut h = Harness::start_with_gate(Duration::from_secs(30), g.gate.clone());
+        // didOpen v1 (CLEAN) → worker (v1, gen0) spawns and blocks in the gate.
+        h.notify("textDocument/didOpen", open_params("file:///g.rb", CLEAN, 1));
+        hover_sync(&h, 100, "file:///g.rb"); // barrier: the gen0 worker is in flight.
+        // Invalidate via a relevant watched-files change → generation → 1; re-analyse
+        // open buffers (the URI is in flight → no-op; the eventual gen-drop covers it).
+        h.notify("workspace/didChangeWatchedFiles", watched_change("file:///proj/.rigor.yml"));
+        hover_sync(&h, 101, "file:///g.rb"); // barrier: the invalidation is processed.
+        // Release the gen0 worker → its result is generation-stale (gen0 != gen1) →
+        // DROPPED + re-dispatched → a fresh (v1, gen1) worker publishes the clean set.
+        g.release_gen0.send(()).unwrap();
+        let d = h.recv_diags();
+        assert!(
+            d.diagnostics.is_empty(),
+            "the fresh gen-1 result publishes (clean): {:?}",
+            d.diagnostics
+        );
+        hover_sync(&h, 102, "file:///g.rb"); // exactly one publish.
+        // Proof of the generation drop: a worker ran under generation 1 (the
+        // re-dispatch). Without the generation guard the gen-0 result would have
+        // published directly and NO gen-1 worker would ever have run.
+        let calls = g.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|&(_, genr)| genr == 0),
+            "the initial worker ran under generation 0: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|&(_, genr)| genr == 1),
+            "a re-dispatched worker ran under the new generation (proves the stale \
+             gen-0 result was dropped, not published): {calls:?}"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_s4_watched_files_relevant_reanalyzes_all_open_buffers() {
+        // A relevant `didChangeWatchedFiles` (`.rigor.yml`) invalidates + re-analyses
+        // ALL open buffers — both `a.rb` and `b.rb` re-publish. 30 s debounce so only
+        // the invalidation (never a timer) drives the re-publishes.
+        let mut h = Harness::start_with_debounce(Duration::from_secs(30));
+        h.notify("textDocument/didOpen", open_params("file:///a.rb", CLEAN, 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        h.notify("textDocument/didOpen", open_params("file:///b.rb", CLEAN, 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        h.notify(
+            "workspace/didChangeWatchedFiles",
+            watched_change("file:///proj/.rigor.yml"),
+        );
+        // Both buffers re-publish (worker order is nondeterministic; collect a set).
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(h.recv_diags().uri.as_str().to_string());
+        seen.insert(h.recv_diags().uri.as_str().to_string());
+        assert!(
+            seen.contains("file:///a.rb") && seen.contains("file:///b.rb"),
+            "both open buffers re-analysed after invalidate: {seen:?}"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_s4_watched_files_unrelated_does_not_invalidate() {
+        // An unrelated watched path (a `.txt`) does NOT invalidate → no re-analysis.
+        let mut h = Harness::start_with_debounce(Duration::from_secs(30));
+        h.notify("textDocument/didOpen", open_params("file:///a.rb", CLEAN, 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        h.notify(
+            "workspace/didChangeWatchedFiles",
+            watched_change("file:///proj/notes.txt"),
+        );
+        // No re-publish: a hover round-trips as the very next message (a publish here
+        // would mean the unrelated change wrongly invalidated).
+        hover_sync(&h, 100, "file:///a.rb");
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_s4_did_change_configuration_reanalyzes() {
+        // `didChangeConfiguration` always invalidates + re-analyses open buffers.
+        let mut h = Harness::start_with_debounce(Duration::from_secs(30));
+        h.notify("textDocument/didOpen", open_params("file:///a.rb", CLEAN, 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        h.notify(
+            "workspace/didChangeConfiguration",
+            serde_json::json!({ "settings": {} }),
+        );
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), "file:///a.rb", "the open buffer re-analysed");
+        assert!(d.diagnostics.is_empty());
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_s4_buffer_didchange_never_invalidates() {
+        // A buffer `didChange` NEVER invalidates: only the EDITED buffer re-publishes;
+        // an untouched second open buffer is NOT re-analysed (an invalidate would
+        // re-publish BOTH — see `..._reanalyzes_all_open_buffers`).
+        let mut h = Harness::start_with_debounce(Duration::from_millis(10));
+        h.notify("textDocument/didOpen", open_params("file:///a.rb", CLEAN, 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        h.notify("textDocument/didOpen", open_params("file:///b.rb", CLEAN, 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        // Edit ONLY a.rb → its debounced publish carries the typo; b.rb stays quiet.
+        h.notify("textDocument/didChange", change_params("file:///a.rb", TYPO, 2));
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), "file:///a.rb", "only the edited buffer republishes");
+        assert_eq!(d.diagnostics.len(), 1);
+        // Prove b.rb did NOT re-publish (no invalidation): a hover on b.rb round-trips
+        // as the next message.
+        hover_sync(&h, 100, "file:///b.rb");
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_s4_dynamic_registration_sent_when_advertised() {
+        // Client advertises `didChangeWatchedFiles.dynamicRegistration` → the server
+        // sends a `client/registerCapability` request after `initialized`.
+        let caps = serde_json::json!({
+            "workspace": { "didChangeWatchedFiles": { "dynamicRegistration": true } }
+        });
+        let mut h = Harness::start_full(DEBOUNCE_DEFAULT, production_gate(), caps);
+        match h.recv() {
+            Message::Request(r) => {
+                assert_eq!(r.method, "client/registerCapability");
+                // Reply so the request isn't left outstanding (the server ignores it).
+                h.client
+                    .sender
+                    .send(Message::Response(Response::new_ok(r.id, serde_json::Value::Null)))
+                    .unwrap();
+            }
+            other => panic!("expected client/registerCapability, got {other:?}"),
+        }
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_s4_no_registration_when_not_advertised_but_watched_files_still_honored() {
+        // Client does NOT advertise dynamic registration → NO `client/registerCapability`
+        // is sent (the first server message is the didOpen publish, not a request);
+        // yet a subsequently-received `didChangeWatchedFiles` is STILL honoured (the
+        // static-registration degrade path — no regression).
+        let mut h = Harness::start_full(DEBOUNCE_DEFAULT, production_gate(), serde_json::json!({}));
+        h.notify("textDocument/didOpen", open_params("file:///a.rb", CLEAN, 1));
+        // `recv_diags` panics on a Request, so this asserts no registration preceded it.
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), "file:///a.rb");
+        h.notify(
+            "workspace/didChangeWatchedFiles",
+            watched_change("file:///proj/.rigor.yml"),
+        );
+        let d2 = h.recv_diags();
+        assert_eq!(
+            d2.uri.as_str(),
+            "file:///a.rb",
+            "didChangeWatchedFiles is honoured even without dynamic registration"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_s4_close_reopen_version_reuse_drops_stale_preclose_worker() {
+        // The S3 reopen-identity nit. A pre-close worker is held in flight; then
+        // didClose; then didOpen REUSING version 1 (VS Code resends version 1 on
+        // reopen) with DIFFERENT (clean) content. Version matches and the generation
+        // is unchanged (project-scoped — a reopen never bumps it), so ONLY the
+        // open-epoch closes this: the pre-close worker (a TYPO) is epoch-dropped and
+        // the reopened CLEAN content is analysed fresh.
+        let g = gate_holding(&[1], &[]);
+        let mut h = Harness::start_with_gate(Duration::from_secs(30), g.gate.clone());
+        // v1 = TYPO, worker held in flight (open-epoch 1).
+        h.notify("textDocument/didOpen", open_params("file:///g.rb", TYPO, 1));
+        hover_sync(&h, 100, "file:///g.rb"); // the pre-close worker is in flight.
+        // Close (open-epoch → 2) — clears markers with an empty publish.
+        h.notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": "file:///g.rb" } }),
+        );
+        assert!(h.recv_diags().diagnostics.is_empty(), "didClose clears markers");
+        // Reopen REUSING version 1 with CLEAN content (open-epoch → 3). The reopen's
+        // dispatch no-ops (the pre-close worker is still in flight); its content is
+        // picked up by the epoch-drop re-dispatch.
+        h.notify("textDocument/didOpen", open_params("file:///g.rb", CLEAN, 1));
+        hover_sync(&h, 101, "file:///g.rb"); // the reopen is processed.
+        // Two release tokens (same version 1): the first unblocks the pre-close
+        // worker; the second is buffered for the epoch-drop re-dispatch (also v1).
+        g.release(1);
+        g.release(1);
+        // The pre-close worker returns: version matches (1) and generation matches,
+        // but its EPOCH (1) != current (3) → DROPPED + re-dispatched → the reopened
+        // CLEAN content publishes. Under S3 (no epoch guard) the stale TYPO would
+        // have published (1 diagnostic) — this empty publish proves the epoch drop.
+        let d = h.recv_diags();
+        assert!(
+            d.diagnostics.is_empty(),
+            "the stale pre-close (TYPO) worker was epoch-dropped; the reopened CLEAN \
+             content publishes: {:?}",
+            d.diagnostics
+        );
+        hover_sync(&h, 102, "file:///g.rb"); // exactly one publish.
+        h.shutdown();
+    }
+
+    #[test]
+    fn watched_file_relevance_matches_the_config_and_signature_surface() {
+        // Relevant: `.rigor.yml`, `Gemfile.lock`, project `*.rb`, `sig/**/*.rbs`.
+        assert!(watched_file_is_relevant("file:///p/.rigor.yml"));
+        assert!(watched_file_is_relevant("file:///p/Gemfile.lock"));
+        assert!(watched_file_is_relevant("file:///p/app/models/user.rb"));
+        assert!(watched_file_is_relevant("file:///p/sig/user.rbs"));
+        assert!(watched_file_is_relevant("file:///p/sig/models/user.rbs"));
+        // Not relevant: an `.rbs` outside a `sig/` dir, and unrelated files.
+        assert!(!watched_file_is_relevant("file:///p/vendor/other.rbs"));
+        assert!(!watched_file_is_relevant("file:///p/notes.txt"));
+        assert!(!watched_file_is_relevant("file:///p/README.md"));
+        // A payload with any relevant change is relevant; an all-unrelated one is not.
+        assert!(watched_files_params_are_relevant(&watched_change("file:///p/.rigor.yml")));
+        assert!(!watched_files_params_are_relevant(&watched_change("file:///p/notes.txt")));
+        assert!(!watched_files_params_are_relevant(&serde_json::json!({})));
     }
 }
