@@ -65,6 +65,17 @@ ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
 `harness/lib.rb` and `harness/fp_audit.py` do this unconditionally (harmless at
 pre-auto-wire pins). Ad-hoc probes must too.
 
+## Oracle invocation hazard 2: cross-checkout result-cache hits
+
+The reference's persistent result cache (`.rigor/cache`, on by default,
+stat-mode validation, keyed by cwd) is NOT scoped to the reference version
+that produced it. Two invocations sharing a cwd — e.g. a pin-vs-tip self-diff —
+silently cross-serve each other's cached diagnostics, making a "0/0" diff
+meaningless (measured 2026-07-19: pin 0.3 s vs tip 26.8 s on gitlab-foss lib
+was the tell; symmetric 24 s/24 s once eliminated). Any comparison of two
+reference checkouts MUST pass `--no-cache` and run each invocation from its
+own fresh temp cwd.
+
 ## Bumping the pin (following upstream)
 
 1. Fetch + check out the new tag inside the submodule:
