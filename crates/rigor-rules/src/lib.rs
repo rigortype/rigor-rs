@@ -1246,7 +1246,14 @@ fn check_call(
             // `exited?` from the stdlib class (fixture 70 — residual defect-2
             // unsoundness). For a non-colliding class or a toplevel-vs-toplevel
             // collision, this is identical to `class_has_method`.
-            if index.knows_toplevel_class(name) && !index.qualified_class_has_method(name, method) {
+            // ADR-0042 Slice 4: fire for a TOPLEVEL known class (unchanged) OR
+            // a NESTED project-sig class (`Outer::Inner`) — the reference
+            // witnesses the latter through the qualified path, which
+            // `knows_toplevel_class` refuses for the defect-2 reason. Both use
+            // the ISOLATED qualified surface.
+            if (index.knows_toplevel_class(name) || index.is_qualified_project_sig_class(name))
+                && !index.qualified_class_has_method(name, method)
+            {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
                 let severity = catalog(CALL_UNDEFINED_METHOD)

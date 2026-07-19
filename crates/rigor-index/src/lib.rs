@@ -156,6 +156,13 @@ impl CoreIndex {
         self.data.is_project_sig_class(class_name)
     }
 
+    /// ADR-0042 Slice 4: whether the QUALIFIED name `qname` was introduced by
+    /// project `sig/` — the witness gate for a nested project-sig `.new` typo
+    /// (`Outer::Inner.new.spni`). See [`rbs::CoreData::is_qualified_project_sig_class`].
+    pub fn is_qualified_project_sig_class(&self, qname: &str) -> bool {
+        self.data.is_qualified_project_sig_class(qname)
+    }
+
     /// Whether `class_name` was declared at GENUINE top level (empty namespace)
     /// in the loaded RBS — a conservative companion to [`CoreIndex::knows_class`].
     ///

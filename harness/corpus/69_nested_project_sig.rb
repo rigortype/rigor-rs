@@ -1,10 +1,9 @@
-# ADR-0042 gate (oracle matrix s5/s6): a NESTED project-sig class. The oracle
-# witnesses typos through the QUALIFIED path only (`Outer::Inner`), merging
-# reopens across sig files, and keeps the bare short name (`Inner`, which
-# resolves to nothing at runtime) silent. rigor-rs's short-key registration
-# is blind on the qualified path (documented gap = the migration target); the
-# bare-name door is pinned SILENT on both engines (the s5 mirror-image FP was
-# closed by gating the witness on `knows_toplevel_class`).
+# ADR-0042 (Slice 4): a NESTED project-sig class. The oracle witnesses typos
+# through the QUALIFIED path only (`Outer::Inner`), merging reopens across sig
+# files, and keeps the bare short name (`Inner`) silent. rigor-rs now MATCHES:
+# the qualified registry + `is_qualified_project_sig_class` gate witness
+# `Outer::Inner.new.spni` and stay silent on the valid `spin`/`brake` (merged
+# across outer_a/outer_b.rbs) AND on bare `Inner` (which resolves to nothing).
 
 module Outer
   class Inner

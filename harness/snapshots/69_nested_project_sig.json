@@ -3,7 +3,7 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 27,
+      "line": 26,
       "column": 18,
       "severity": "error",
       "message": "undefined method `spni' for Outer::Inner"
