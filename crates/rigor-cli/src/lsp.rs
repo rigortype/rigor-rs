@@ -83,11 +83,10 @@ pub fn cmd_lsp(args: &[String]) -> ExitCode {
     }
 }
 
-/// Boot the stdio server: handshake, build the shared context once, run the loop.
-fn run_stdio() -> Result<(), String> {
-    let (connection, io_threads) = Connection::stdio();
-
-    let capabilities = ServerCapabilities {
+/// The static server capabilities advertised at `initialize` (extracted so the
+/// integration tests can drive the same handshake the stdio boot does).
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
         // FULL sync: each edit resends the whole buffer (ADR-0029 — local stdio
         // bandwidth is irrelevant; UTF-16 incremental diffing is a later slice).
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
@@ -102,8 +101,14 @@ fn run_stdio() -> Result<(), String> {
         // Outline: classes/modules/methods as a nested symbol tree.
         document_symbol_provider: Some(OneOf::Left(true)),
         ..Default::default()
-    };
-    let caps_value = serde_json::to_value(capabilities).map_err(|e| e.to_string())?;
+    }
+}
+
+/// Boot the stdio server: handshake, build the shared context once, run the loop.
+fn run_stdio() -> Result<(), String> {
+    let (connection, io_threads) = Connection::stdio();
+
+    let caps_value = serde_json::to_value(server_capabilities()).map_err(|e| e.to_string())?;
     connection
         .initialize(caps_value)
         .map_err(|e| format!("initialize handshake failed: {e}"))?;
@@ -152,7 +157,7 @@ fn run_stdio() -> Result<(), String> {
         folder,
     };
 
-    let mut buffers: HashMap<String, String> = HashMap::new();
+    let mut buffers = BufferTable::new();
 
     main_loop(&connection, &ctx, &mut buffers)?;
 
@@ -170,121 +175,252 @@ struct ServerContext {
     index: CoreIndex,
     disable: SuppressSet,
     /// The ADR-0008 real-Ruby folder for full-fidelity constant folds, when a
-    /// sidecar was reachable at startup. `None` = sound subset. The LSP request
-    /// loop is sequential, so a single worker suffices.
+    /// sidecar was reachable at startup. `None` = sound subset. Shared read-only
+    /// across the loop; the S1 diagnostics executor runs inline on the loop
+    /// thread, and when S3 moves compute onto rayon workers this folder is shared
+    /// as `&(dyn RubyFolder + Sync)` exactly as the `check` pipeline already does
+    /// (`sidecar.rs`), so no new sidecar machinery is needed.
     folder: Option<sidecar::SidecarFolder>,
 }
 
-/// The synchronous dispatch loop. Requests are answered inline; notifications
-/// mutate the buffer table and (re)publish diagnostics. `shutdown`/`exit` are
-/// handled by the scaffold's `handle_shutdown`.
+// ---------------------------------------------------------------------------
+// BufferTable (ADR-0029) — the loop's owned open-document store.
+// ---------------------------------------------------------------------------
+
+/// One open document: its full text (`bytes`, FULL sync so this is the whole
+/// buffer), the LSP `version` from the last open/change, and a `dirty` flag set
+/// on every `didChange`. In S1 nothing branches on `dirty` — it is maintained
+/// for the S2/S3 debounce + temp-file `BufferBinding` consumers (ADR-0029).
+struct BufferEntry {
+    bytes: String,
+    #[allow(dead_code)] // recorded now; the version stale-drop check lands in S3.
+    version: i32,
+    #[allow(dead_code)] // maintained now; the dirty-materialize consumer lands in S2/S3.
+    dirty: bool,
+}
+
+/// The open-buffer store, keyed by URI string (`uri_key` semantics unchanged).
+/// Replaces the former raw `HashMap<String, String>`: same lookup, but each
+/// entry now carries the LSP `version` and a `dirty` flag per ADR-0029, so the
+/// later slices have the metadata without another buffer-store refactor.
+#[derive(Default)]
+struct BufferTable {
+    entries: HashMap<String, BufferEntry>,
+}
+
+impl BufferTable {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a `didOpen`: fresh entry, `dirty = false` (an opened buffer matches
+    /// its on-disk file until edited).
+    fn open(&mut self, uri: &Uri, bytes: String, version: i32) {
+        self.entries
+            .insert(uri_key(uri), BufferEntry { bytes, version, dirty: false });
+    }
+
+    /// Record a `didChange`: replace the text, bump the version, mark `dirty`.
+    fn change(&mut self, uri: &Uri, bytes: String, version: i32) {
+        self.entries
+            .insert(uri_key(uri), BufferEntry { bytes, version, dirty: true });
+    }
+
+    /// Drop a closed buffer.
+    fn close(&mut self, uri: &Uri) {
+        self.entries.remove(&uri_key(uri));
+    }
+
+    /// The current text for `uri`, or `None` if the buffer is not open. This is
+    /// the `&str` accessor the query handlers (hover / completion / symbols) read
+    /// through, in place of the former `HashMap::get`.
+    fn text(&self, uri: &Uri) -> Option<&str> {
+        self.entries.get(&uri_key(uri)).map(|e| e.bytes.as_str())
+    }
+}
+
+/// A computed-diagnostics result carried over the internal worker-results channel
+/// from the executor back to the loop's single-writer publish point. In S1 the
+/// executor is inline (synchronous), so `version` is always current; it is
+/// recorded now for the S3 stale-drop check (publish only if the buffer's version
+/// still matches), per ADR-0029.
+struct Computed {
+    uri: Uri,
+    #[allow(dead_code)] // carried for the S3 version stale-drop check.
+    version: i32,
+    diags: Vec<Diagnostic>,
+}
+
+/// The dispatch loop. It is the **sole owner** of the `BufferTable` and the
+/// **sole sender** of `textDocument/publishDiagnostics` — the Rust analogue of
+/// the reference's `SynchronizedWriter` (ADR-0029). It `select!`s over two
+/// receivers:
+///
+/// - (a) `connection.receiver` — client requests/notifications. A `didOpen` /
+///   `didChange` *dispatches* a diagnostics computation (it does NOT publish
+///   directly); requests (hover/completion/symbols) are answered inline.
+/// - (b) `results_rx` — an internal **worker-results** channel. A dispatched
+///   computation lands here as a [`Computed`], and the loop drains it and
+///   publishes. This is the seam S3 swaps to `rayon::spawn`: workers will push
+///   `Computed` from off-thread and the loop stays the single writer, so
+///   ordering (and later version/generation stale-drop) hold by construction.
+///
+/// **S1 feeds (b) synchronously.** `dispatch_diagnostics` runs
+/// `compute_diagnostics` *inline* on the loop thread and enqueues the result;
+/// the top-of-loop drain then publishes it *before* the next `select!` services
+/// another connection message. So a dispatched compute always publishes before
+/// the next input is handled — the emitted message sequence is byte-identical to
+/// the former inline `publish`. (The (b) `select!` arm is therefore dormant in
+/// S1 — results are drained before we block — and comes alive only once S3's
+/// rayon workers push results asynchronously.)
+///
+/// `shutdown`/`exit` are handled by the scaffold's `handle_shutdown`.
 fn main_loop(
     connection: &Connection,
     ctx: &ServerContext,
-    buffers: &mut HashMap<String, String>,
+    buffers: &mut BufferTable,
 ) -> Result<(), String> {
-    for msg in &connection.receiver {
-        match msg {
-            Message::Request(req) => {
-                if connection
-                    .handle_shutdown(&req)
-                    .map_err(|e| e.to_string())?
-                {
-                    return Ok(());
+    // The worker-results channel (ADR-0029 single-writer seam). S1: fed inline
+    // from the connection arm below; S3: `results_tx` is cloned into rayon
+    // worker closures that push `Computed` from off-thread. Unbounded so a
+    // synchronous dispatch never blocks the loop thread.
+    let (results_tx, results_rx) = crossbeam_channel::unbounded::<Computed>();
+
+    loop {
+        // Single-writer publish point: flush every ready worker result before
+        // servicing the next input. In S1 this drains the compute the connection
+        // arm just enqueued (guaranteeing publish-before-next-message ordering);
+        // in S3 it also flushes async worker results that arrived while blocked.
+        while let Ok(computed) = results_rx.try_recv() {
+            publish_result(connection, computed)?;
+        }
+
+        crossbeam_channel::select! {
+            recv(connection.receiver) -> msg => {
+                let Ok(msg) = msg else { return Ok(()) }; // connection closed
+                if handle_message(connection, ctx, buffers, &results_tx, msg)? {
+                    return Ok(()); // shutdown
                 }
-                match req.method.as_str() {
-                    "textDocument/hover" => {
-                        let resp = match req.extract::<HoverParams>("textDocument/hover") {
-                            Ok((id, params)) => {
-                                let hover = hover(ctx, buffers, &params);
-                                Response::new_ok(id, hover)
-                            }
-                            Err(e) => {
-                                // Malformed params — reply null so the client isn't
-                                // left waiting (id is unknown on extract error, so
-                                // this can only happen on a truly bad message).
-                                eprintln!("rigor lsp: bad hover params: {e:?}");
-                                continue;
-                            }
-                        };
-                        connection
-                            .sender
-                            .send(Message::Response(resp))
-                            .map_err(|e| e.to_string())?;
-                    }
-                    "textDocument/completion" => {
-                        match req.extract::<CompletionParams>("textDocument/completion") {
-                            Ok((id, params)) => {
-                                let items = completion(ctx, buffers, &params);
-                                let resp = Response::new_ok(id, items);
-                                connection
-                                    .sender
-                                    .send(Message::Response(resp))
-                                    .map_err(|e| e.to_string())?;
-                            }
-                            Err(e) => eprintln!("rigor lsp: bad completion params: {e:?}"),
+            }
+            recv(results_rx) -> computed => {
+                // The S3 seam: a worker result arriving independently of a
+                // connection message. Dormant in S1 (results are drained above
+                // before we block here), wired now so the publish path is unified.
+                if let Ok(computed) = computed {
+                    publish_result(connection, computed)?;
+                }
+            }
+        }
+    }
+}
+
+/// Handle one message from the connection. Returns `Ok(true)` when the server
+/// should shut down. Requests are answered inline; `didOpen`/`didChange`
+/// *dispatch* a diagnostics computation onto `results_tx` (published by the loop
+/// drain, not here); `didClose` clears inline markers immediately.
+fn handle_message(
+    connection: &Connection,
+    ctx: &ServerContext,
+    buffers: &mut BufferTable,
+    results_tx: &crossbeam_channel::Sender<Computed>,
+    msg: Message,
+) -> Result<bool, String> {
+    match msg {
+        Message::Request(req) => {
+            if connection.handle_shutdown(&req).map_err(|e| e.to_string())? {
+                return Ok(true);
+            }
+            match req.method.as_str() {
+                "textDocument/hover" => {
+                    match req.extract::<HoverParams>("textDocument/hover") {
+                        Ok((id, params)) => {
+                            let hover = hover(ctx, buffers, &params);
+                            let resp = Response::new_ok(id, hover);
+                            connection
+                                .sender
+                                .send(Message::Response(resp))
+                                .map_err(|e| e.to_string())?;
                         }
+                        // Malformed params — no reply (the id is unknown on an
+                        // extract error, so this can only happen on a truly bad
+                        // message); matches the pre-refactor `continue`.
+                        Err(e) => eprintln!("rigor lsp: bad hover params: {e:?}"),
                     }
-                    "textDocument/documentSymbol" => {
-                        match req.extract::<DocumentSymbolParams>("textDocument/documentSymbol") {
-                            Ok((id, params)) => {
-                                let syms = document_symbols(buffers, &params);
-                                let resp = Response::new_ok(id, syms);
-                                connection
-                                    .sender
-                                    .send(Message::Response(resp))
-                                    .map_err(|e| e.to_string())?;
-                            }
-                            Err(e) => eprintln!("rigor lsp: bad documentSymbol params: {e:?}"),
+                }
+                "textDocument/completion" => {
+                    match req.extract::<CompletionParams>("textDocument/completion") {
+                        Ok((id, params)) => {
+                            let items = completion(ctx, buffers, &params);
+                            let resp = Response::new_ok(id, items);
+                            connection
+                                .sender
+                                .send(Message::Response(resp))
+                                .map_err(|e| e.to_string())?;
                         }
+                        Err(e) => eprintln!("rigor lsp: bad completion params: {e:?}"),
                     }
-                    // Unknown request: reply with a MethodNotFound-ish null result
-                    // so the client doesn't hang (we advertise a small surface).
-                    _ => {
-                        let resp = Response::new_ok(req.id, serde_json::Value::Null);
-                        connection
-                            .sender
-                            .send(Message::Response(resp))
-                            .map_err(|e| e.to_string())?;
+                }
+                "textDocument/documentSymbol" => {
+                    match req.extract::<DocumentSymbolParams>("textDocument/documentSymbol") {
+                        Ok((id, params)) => {
+                            let syms = document_symbols(buffers, &params);
+                            let resp = Response::new_ok(id, syms);
+                            connection
+                                .sender
+                                .send(Message::Response(resp))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Err(e) => eprintln!("rigor lsp: bad documentSymbol params: {e:?}"),
+                    }
+                }
+                // Unknown request: reply with a null result so the client doesn't
+                // hang (we advertise a small surface).
+                _ => {
+                    let resp = Response::new_ok(req.id, serde_json::Value::Null);
+                    connection
+                        .sender
+                        .send(Message::Response(resp))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        Message::Notification(not) => match not.method.as_str() {
+            "textDocument/didOpen" => {
+                if let Ok(p) = not.extract::<DidOpenTextDocumentParams>("textDocument/didOpen") {
+                    let uri = p.text_document.uri;
+                    let text = p.text_document.text;
+                    let version = p.text_document.version;
+                    dispatch_diagnostics(results_tx, ctx, &uri, &text, version);
+                    buffers.open(&uri, text, version);
+                }
+            }
+            "textDocument/didChange" => {
+                if let Ok(p) = not.extract::<DidChangeTextDocumentParams>("textDocument/didChange") {
+                    // FULL sync: the last content change IS the whole buffer.
+                    let version = p.text_document.version;
+                    if let Some(change) = p.content_changes.into_iter().last() {
+                        let uri = p.text_document.uri;
+                        dispatch_diagnostics(results_tx, ctx, &uri, &change.text, version);
+                        buffers.change(&uri, change.text, version);
                     }
                 }
             }
-            Message::Notification(not) => match not.method.as_str() {
-                "textDocument/didOpen" => {
-                    if let Ok(p) = not.extract::<DidOpenTextDocumentParams>("textDocument/didOpen") {
-                        let uri = p.text_document.uri;
-                        let text = p.text_document.text;
-                        publish(connection, ctx, &uri, &text)?;
-                        buffers.insert(uri_key(&uri), text);
-                    }
+            "textDocument/didClose" => {
+                if let Ok(p) = not.extract::<DidCloseTextDocumentParams>("textDocument/didClose") {
+                    let uri = p.text_document.uri;
+                    buffers.close(&uri);
+                    // Clear inline markers by publishing an empty set immediately
+                    // (an idle-clear, not a compute — so it does not go through the
+                    // worker channel; it stays a loop-thread publish, which S2's
+                    // "didClose cancels pending + clears" will build on).
+                    send_diagnostics(connection, &uri, Vec::new())?;
                 }
-                "textDocument/didChange" => {
-                    if let Ok(p) =
-                        not.extract::<DidChangeTextDocumentParams>("textDocument/didChange")
-                    {
-                        // FULL sync: the last content change IS the whole buffer.
-                        if let Some(change) = p.content_changes.into_iter().last() {
-                            let uri = p.text_document.uri;
-                            publish(connection, ctx, &uri, &change.text)?;
-                            buffers.insert(uri_key(&uri), change.text);
-                        }
-                    }
-                }
-                "textDocument/didClose" => {
-                    if let Ok(p) = not.extract::<DidCloseTextDocumentParams>("textDocument/didClose")
-                    {
-                        let uri = p.text_document.uri;
-                        buffers.remove(&uri_key(&uri));
-                        // Clear inline markers by publishing an empty set.
-                        send_diagnostics(connection, &uri, Vec::new())?;
-                    }
-                }
-                _ => {}
-            },
-            Message::Response(_) => {}
-        }
+            }
+            _ => {}
+        },
+        Message::Response(_) => {}
     }
-    Ok(())
+    Ok(false)
 }
 
 /// A stable string key for a document URI (the buffer table is keyed by it).
@@ -292,15 +428,28 @@ fn uri_key(uri: &Uri) -> String {
     uri.as_str().to_string()
 }
 
-/// Analyse `text` and publish its diagnostics for `uri`.
-fn publish(
-    connection: &Connection,
+/// Dispatch a diagnostics computation for `uri`. **S1 inline executor**: compute
+/// on the loop thread and enqueue the result onto the worker-results channel. S3
+/// replaces this body with a `rayon::spawn` that captures a buffer snapshot and
+/// pushes the `Computed` from a worker thread. `send` on the unbounded channel
+/// only fails if the receiver is gone (impossible while the loop owns it).
+fn dispatch_diagnostics(
+    results_tx: &crossbeam_channel::Sender<Computed>,
     ctx: &ServerContext,
     uri: &Uri,
     text: &str,
-) -> Result<(), String> {
+    version: i32,
+) {
     let diags = compute_diagnostics(ctx, text);
-    send_diagnostics(connection, uri, diags)
+    let _ = results_tx.send(Computed { uri: uri.clone(), version, diags });
+}
+
+/// Publish one worker result. The loop's single-writer publish point. `version`
+/// is unused in S1 (every result is current); S3 will drop the result here if the
+/// buffer's version has moved on.
+fn publish_result(connection: &Connection, computed: Computed) -> Result<(), String> {
+    let Computed { uri, version: _, diags } = computed;
+    send_diagnostics(connection, &uri, diags)
 }
 
 /// Send a `window/showMessage` notification (ADR-0036 posture disclosure).
@@ -416,11 +565,11 @@ fn to_lsp_diagnostic(text: &str, d: &rigor_rules::Diagnostic) -> Diagnostic {
 /// unknown, the position is out of range, or no node covers it — a null hover.
 fn hover(
     ctx: &ServerContext,
-    buffers: &HashMap<String, String>,
+    buffers: &BufferTable,
     params: &HoverParams,
 ) -> Option<Hover> {
     let pos = &params.text_document_position_params;
-    let text = buffers.get(&uri_key(&pos.text_document.uri))?;
+    let text = buffers.text(&pos.text_document.uri)?;
     let offset = position_to_offset(text, pos.position)?;
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
@@ -518,11 +667,11 @@ const COMPLETION_STUB: &str = "rigorCompletionHole";
 /// prefix is intentionally dropped — the client filters the full set by it.
 fn completion(
     ctx: &ServerContext,
-    buffers: &HashMap<String, String>,
+    buffers: &BufferTable,
     params: &CompletionParams,
 ) -> Option<CompletionResponse> {
     let tdp = &params.text_document_position;
-    let text = buffers.get(&uri_key(&tdp.text_document.uri))?;
+    let text = buffers.text(&tdp.text_document.uri)?;
     let offset = position_to_offset(text, tdp.position)?;
     let bytes = text.as_bytes();
 
@@ -632,10 +781,10 @@ fn receiver_display(
 /// classes, modules, and methods, built from the lowered AST. Returns `None`
 /// (null) for an unknown buffer or a file with no definitions. Panic-isolated.
 fn document_symbols(
-    buffers: &HashMap<String, String>,
+    buffers: &BufferTable,
     params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
-    let text = buffers.get(&uri_key(&params.text_document.uri))?;
+    let text = buffers.text(&params.text_document.uri)?;
     let syms = panic::catch_unwind(AssertUnwindSafe(|| {
         let ast = lower(&parse(text.as_bytes()));
         crate::outline::build(&ast).iter().map(|s| to_document_symbol(s, text)).collect::<Vec<_>>()
@@ -796,9 +945,9 @@ mod tests {
 
     #[test]
     fn hover_reports_a_type() {
-        let mut buffers = HashMap::new();
+        let mut buffers = BufferTable::new();
         let uri: Uri = "file:///t.rb".parse().unwrap();
-        buffers.insert(uri_key(&uri), "n = 42\n".to_string());
+        buffers.open(&uri, "n = 42\n".to_string(), 1);
         let params = HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri },
@@ -816,9 +965,9 @@ mod tests {
     /// Run completion at a 0-based (line, character) over a single buffer,
     /// returning the candidate labels (empty when None).
     fn complete(text: &str, line: u32, character: u32) -> Vec<String> {
-        let mut buffers = HashMap::new();
+        let mut buffers = BufferTable::new();
         let uri: Uri = "file:///c.rb".parse().unwrap();
-        buffers.insert(uri_key(&uri), text.to_string());
+        buffers.open(&uri, text.to_string(), 1);
         let params = CompletionParams {
             text_document_position: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri },
@@ -879,9 +1028,9 @@ mod tests {
     #[test]
     fn document_symbols_nest_methods_under_classes() {
         let src = "class Foo\n  def bar\n  end\n  def baz\n  end\nend\nmodule M\nend\n";
-        let mut buffers = HashMap::new();
+        let mut buffers = BufferTable::new();
         let uri: Uri = "file:///s.rb".parse().unwrap();
-        buffers.insert(uri_key(&uri), src.to_string());
+        buffers.open(&uri, src.to_string(), 1);
         let params = DocumentSymbolParams {
             text_document: lsp_types::TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
@@ -908,9 +1057,9 @@ mod tests {
 
     #[test]
     fn document_symbols_empty_for_scriptish_file() {
-        let mut buffers = HashMap::new();
+        let mut buffers = BufferTable::new();
         let uri: Uri = "file:///s.rb".parse().unwrap();
-        buffers.insert(uri_key(&uri), "x = 1\nputs x\n".to_string());
+        buffers.open(&uri, "x = 1\nputs x\n".to_string(), 1);
         let params = DocumentSymbolParams {
             text_document: lsp_types::TextDocumentIdentifier { uri },
             work_done_progress_params: Default::default(),
@@ -923,9 +1072,9 @@ mod tests {
     fn hover_call_shows_receiver_method_signature() {
         // `s = "hi"\ns.upcase` — hover on `upcase` (line 2, char 3) shows a
         // `String#upcase → …` signature with the RBS arity.
-        let mut buffers = HashMap::new();
+        let mut buffers = BufferTable::new();
         let uri: Uri = "file:///t.rb".parse().unwrap();
-        buffers.insert(uri_key(&uri), "s = \"hi\"\ns.upcase\n".to_string());
+        buffers.open(&uri, "s = \"hi\"\ns.upcase\n".to_string(), 1);
         let params = HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri },
@@ -942,9 +1091,9 @@ mod tests {
 
     /// Hover value at a 0-based (line, char) over a single buffer (or empty).
     fn hover_value(text: &str, line: u32, character: u32) -> String {
-        let mut buffers = HashMap::new();
+        let mut buffers = BufferTable::new();
         let uri: Uri = "file:///h.rb".parse().unwrap();
-        buffers.insert(uri_key(&uri), text.to_string());
+        buffers.open(&uri, text.to_string(), 1);
         let params = HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
                 text_document: lsp_types::TextDocumentIdentifier { uri },
@@ -984,6 +1133,227 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        assert!(hover(&ctx(), &HashMap::new(), &params).is_none());
+        assert!(hover(&ctx(), &BufferTable::new(), &params).is_none());
+    }
+
+    #[test]
+    fn buffer_table_records_version_and_dirty() {
+        // The BufferTable metadata (version, dirty) is maintained per ADR-0029
+        // even though S1 branches on neither — the S2/S3 consumers arrive later.
+        let mut t = BufferTable::new();
+        let uri: Uri = "file:///b.rb".parse().unwrap();
+        t.open(&uri, "a\n".to_string(), 1);
+        let e = t.entries.get(&uri_key(&uri)).unwrap();
+        assert_eq!(e.version, 1);
+        assert!(!e.dirty, "an opened buffer is clean");
+        t.change(&uri, "b\n".to_string(), 2);
+        let e = t.entries.get(&uri_key(&uri)).unwrap();
+        assert_eq!(e.version, 2);
+        assert!(e.dirty, "a changed buffer is dirty");
+        assert_eq!(t.text(&uri), Some("b\n"));
+        t.close(&uri);
+        assert_eq!(t.text(&uri), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Integration tests: the REAL loop over an in-memory connection.
+    //
+    // These drive `main_loop` through `lsp_server::Connection::memory()` and
+    // assert the EXACT published-message sequence. The expected sequences were
+    // captured from the pre-refactor (inline-publish) loop as the golden
+    // reference; the S1 `select!`/worker-channel refactor must reproduce them
+    // byte-for-byte.
+    // ---------------------------------------------------------------------
+
+    use lsp_server::{Notification, Request, RequestId};
+    use std::thread;
+    use std::time::Duration;
+
+    /// A running server loop over an in-memory connection, plus the client end.
+    struct Harness {
+        client: Connection,
+        server: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Harness {
+        /// Spawn the server loop on a thread and complete the LSP handshake.
+        fn start() -> Self {
+            let (server_conn, client) = Connection::memory();
+            let handle = thread::spawn(move || {
+                let ctx = ServerContext {
+                    index: CoreIndex::new(),
+                    disable: Config::default().disable_matcher(),
+                    folder: None,
+                };
+                let caps = serde_json::to_value(server_capabilities()).unwrap();
+                server_conn.initialize(caps).unwrap();
+                let mut buffers = BufferTable::new();
+                main_loop(&server_conn, &ctx, &mut buffers).unwrap();
+            });
+            // Client-side handshake: initialize request → response → initialized.
+            client
+                .sender
+                .send(Message::Request(Request::new(
+                    RequestId::from(1),
+                    "initialize".to_string(),
+                    serde_json::json!({ "capabilities": {} }),
+                )))
+                .unwrap();
+            client
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("initialize response");
+            client
+                .sender
+                .send(Message::Notification(Notification::new(
+                    "initialized".to_string(),
+                    serde_json::json!({}),
+                )))
+                .unwrap();
+            Harness { client, server: Some(handle) }
+        }
+
+        fn notify(&self, method: &str, params: serde_json::Value) {
+            self.client
+                .sender
+                .send(Message::Notification(Notification::new(method.to_string(), params)))
+                .unwrap();
+        }
+
+        fn request(&self, id: i32, method: &str, params: serde_json::Value) {
+            self.client
+                .sender
+                .send(Message::Request(Request::new(
+                    RequestId::from(id),
+                    method.to_string(),
+                    params,
+                )))
+                .unwrap();
+        }
+
+        fn recv(&self) -> Message {
+            self.client
+                .receiver
+                .recv_timeout(Duration::from_secs(10))
+                .expect("a server message")
+        }
+
+        /// The next message, asserted to be a `publishDiagnostics`, parsed.
+        fn recv_diags(&self) -> PublishDiagnosticsParams {
+            match self.recv() {
+                Message::Notification(n) if n.method == "textDocument/publishDiagnostics" => {
+                    serde_json::from_value(n.params).unwrap()
+                }
+                other => panic!("expected publishDiagnostics, got {other:?}"),
+            }
+        }
+
+        fn shutdown(&mut self) {
+            self.request(999, "shutdown", serde_json::json!(null));
+            match self.recv() {
+                Message::Response(r) if r.id == RequestId::from(999) => {}
+                other => panic!("expected shutdown response, got {other:?}"),
+            }
+            self.notify("exit", serde_json::json!(null));
+            if let Some(h) = self.server.take() {
+                h.join().unwrap();
+            }
+        }
+    }
+
+    /// A `didOpen` params JSON for `uri` / `text` / `version`.
+    fn open_params(uri: &str, text: &str, version: i32) -> serde_json::Value {
+        serde_json::json!({
+            "textDocument": { "uri": uri, "languageId": "ruby", "version": version, "text": text }
+        })
+    }
+
+    #[test]
+    fn integration_didopen_publishes_one_diagnostic() {
+        let mut h = Harness::start();
+        h.notify(
+            "textDocument/didOpen",
+            open_params("file:///g.rb", "x = \"hi\"\nx.lenght\n", 1),
+        );
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), "file:///g.rb");
+        assert_eq!(d.diagnostics.len(), 1, "exactly one diagnostic");
+        let diag = &d.diagnostics[0];
+        assert_eq!(
+            diag.code,
+            Some(NumberOrString::String("call.undefined-method".to_string()))
+        );
+        assert_eq!(diag.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(diag.source.as_deref(), Some("rigor"));
+        assert_eq!(diag.range.start, Position { line: 1, character: 2 });
+        assert_eq!(diag.range.end, Position { line: 1, character: 8 });
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_didchange_to_clean_republishes_empty() {
+        let mut h = Harness::start();
+        h.notify(
+            "textDocument/didOpen",
+            open_params("file:///g.rb", "x = \"hi\"\nx.lenght\n", 1),
+        );
+        assert_eq!(h.recv_diags().diagnostics.len(), 1);
+        h.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///g.rb", "version": 2 },
+                "contentChanges": [ { "text": "x = \"hi\"\nx.upcase\n" } ]
+            }),
+        );
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), "file:///g.rb");
+        assert!(d.diagnostics.is_empty(), "clean content republishes an empty set");
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_didclose_publishes_empty() {
+        let mut h = Harness::start();
+        h.notify(
+            "textDocument/didOpen",
+            open_params("file:///g.rb", "x = \"hi\"\nx.lenght\n", 1),
+        );
+        assert_eq!(h.recv_diags().diagnostics.len(), 1);
+        h.notify(
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": "file:///g.rb" } }),
+        );
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), "file:///g.rb");
+        assert!(d.diagnostics.is_empty(), "didClose clears diagnostics");
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_hover_request_answers_like_inline() {
+        let mut h = Harness::start();
+        h.notify("textDocument/didOpen", open_params("file:///h.rb", "n = 42\n", 1));
+        // A clean buffer's didOpen publishes an empty set first.
+        assert!(h.recv_diags().diagnostics.is_empty());
+        h.request(
+            2,
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": "file:///h.rb" },
+                "position": { "line": 0, "character": 4 }
+            }),
+        );
+        match h.recv() {
+            Message::Response(r) => {
+                assert_eq!(r.id, RequestId::from(2));
+                let hover: Option<Hover> = serde_json::from_value(r.result.unwrap()).unwrap();
+                let Some(Hover { contents: HoverContents::Markup(m), .. }) = hover else {
+                    panic!("expected a markup hover");
+                };
+                assert!(m.value.contains("42"), "hover value: {}", m.value);
+            }
+            other => panic!("expected hover response, got {other:?}"),
+        }
+        h.shutdown();
     }
 }
