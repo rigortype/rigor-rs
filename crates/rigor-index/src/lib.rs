@@ -1012,7 +1012,7 @@ mod void_return_tests {
             "class Widget\n  def fire: () -> void\n  def spin: () -> Integer\n  def self.reset: () -> void\nend\n",
         )
         .unwrap();
-        let idx = CoreIndex::for_project(&[], &[dir.clone()]);
+        let idx = CoreIndex::for_project(&[], std::slice::from_ref(&dir));
         assert!(idx.method_return_is_void("Widget", "fire"));
         assert!(!idx.method_return_is_void("Widget", "spin"));
         assert!(idx.singleton_method_is_void("Widget", "reset"));

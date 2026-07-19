@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn drift_default_filter_hides_zero_delta() {
-        let rows = vec![
+        let rows = [
             (DriftStatus::Within, 0i64),
             (DriftStatus::Over, 1i64),
             (DriftStatus::Cleared, -1i64),

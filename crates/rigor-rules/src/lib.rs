@@ -6207,7 +6207,7 @@ mod void_value_use_tests {
             "class Widget\n  def fire: () -> void\n  def spin: () -> Integer\n  def self.reset: () -> void\nend\n",
         )
         .unwrap();
-        let index = CoreIndex::for_project(&[], &[dir.clone()]);
+        let index = CoreIndex::for_project(&[], std::slice::from_ref(&dir));
         let ast = lower(&parse(src));
         let source = rigor_infer::SourceIndex::build(&ast, &index);
         let mut interner = Interner::new();
