@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 
@@ -37,7 +38,11 @@ PARITY = {"error", "warning"}
 
 
 def rb_files(d):
-    return sorted(glob.glob(os.path.join(d, "**", "*.rb"), recursive=True))
+    # Absolute paths: run_ref invokes the reference from a temp cwd, so
+    # relative paths would resolve against the wrong directory.
+    return sorted(os.path.abspath(f)
+                  for f in glob.glob(os.path.join(d, "**", "*.rb"),
+                                     recursive=True))
 
 
 def run_rs(files):
@@ -59,10 +64,16 @@ def run_ref(files):
     # The bundled rigor-rbs-inline lib is pinned onto the load path (upstream
     # issue #194): the ADR-93 auto-wire otherwise resolves a stale installed
     # rigortype gem's pre-gate plugin copy and poisons the comparison.
+    # Fresh per-invocation temp cwd + --no-cache (UPSTREAM.md hazard 2): the
+    # reference's persistent result cache is keyed by cwd and NOT scoped to the
+    # reference version, so a shared cwd (the old cwd="/tmp") could serve stale
+    # results across invocations — surviving even a submodule pin bump.
     ref_plugin = os.path.join(REF_DIR, "plugins", "rigor-rbs-inline", "lib")
-    r = subprocess.run(["ruby", "-I", REF_LIB, "-I", ref_plugin,
-                        REF_EXE, "check", "--format", "json"] + files,
-                       capture_output=True, text=True, cwd="/tmp")
+    with tempfile.TemporaryDirectory(prefix="rigor-fp-audit-ref") as tmpcwd:
+        r = subprocess.run(["ruby", "-I", REF_LIB, "-I", ref_plugin,
+                            REF_EXE, "check", "--format", "json", "--no-cache"]
+                           + files,
+                           capture_output=True, text=True, cwd=tmpcwd)
     i = r.stdout.find("{")
     if i < 0:
         return None

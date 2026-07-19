@@ -2934,7 +2934,9 @@ fn node_children(node: &Node) -> Vec<NodeId> {
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => out.push(*value),
-        Node::InterpolatedString { parts, .. } => out.extend(parts.iter().copied()),
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            out.extend(parts.iter().copied())
+        }
         Node::Call { receiver, args, block_body, .. } => {
             if let Some(r) = receiver {
                 out.push(*r);

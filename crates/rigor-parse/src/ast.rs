@@ -240,6 +240,13 @@ pub enum Node {
     /// values. `parts` carries the lowered interpolation segments so calls
     /// inside `#{ … }` stay reachable for the walk.
     InterpolatedString { parts: Vec<NodeId>, span: Span },
+    /// An interpolated symbol (`:"a#{x}b"`). A structural twin of
+    /// `InterpolatedString`: it types as a `Nominal { Symbol }` instance
+    /// instead of `String`, so a symbol never mis-types as a `String`
+    /// (e.g. via value-descent picking the trailing string fragment). `parts`
+    /// carries the lowered interpolation segments so calls inside `#{ … }`
+    /// stay reachable for the walk, exactly like `InterpolatedString`.
+    InterpolatedSymbol { parts: Vec<NodeId>, span: Span },
     /// An integer literal (`42`).
     IntegerLit { value: i64, span: Span },
     /// A float literal (`3.14`); `value` is the parsed `f64`.
@@ -577,6 +584,7 @@ impl Node {
             | Node::LocalVariableRead { span, .. }
             | Node::StringLit { span, .. }
             | Node::InterpolatedString { span, .. }
+            | Node::InterpolatedSymbol { span, .. }
             | Node::IntegerLit { span, .. }
             | Node::FloatLit { span, .. }
             | Node::SymbolLit { span, .. }
@@ -1566,18 +1574,23 @@ impl<'src> Builder<'src> {
             });
         }
         if let Some(interp) = node.as_interpolated_symbol_node() {
-            // `:"sym#{x}"` — lower and KEEP the parts linked (a `Statements`
-            // carrier, NOT InterpolatedString: a symbol must not type as String,
-            // which would risk a `String#typo` false positive). The link keeps a
-            // local read inside the interpolation visible to structural walks like
-            // `flow.dead-assignment`; `Statements` itself types Dynamic.
+            // `:"sym#{x}"` — lower into a dedicated `InterpolatedSymbol`
+            // variant: a structural twin of `InterpolatedString` that types as
+            // `Nominal { Symbol }` instead of `Nominal { String }`. Using the
+            // generic `Statements` wrapper here was the bug: value-descent
+            // resolves a `Statements` to its LAST child (the trailing string
+            // fragment), so the symbol mis-typed as a `String` and minted
+            // false `undefined-method` diagnostics (e.g. `.to_proc`). `parts`
+            // is kept as the reachability carrier so a local read inside the
+            // interpolation stays visible to structural walks like
+            // `flow.dead-assignment`, exactly as `InterpolatedString` does.
             let parts: Vec<NodeId> = interp
                 .parts()
                 .iter()
                 .map(|p| self.lower_node(&p))
                 .collect();
-            return self.push(Node::Statements {
-                body: parts,
+            return self.push(Node::InterpolatedSymbol {
+                parts,
                 span: span_of(&interp.location()),
             });
         }
