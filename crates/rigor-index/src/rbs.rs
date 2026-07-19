@@ -326,6 +326,16 @@ pub struct CoreData {
     /// `"_ToStr" → ["to_str"]`). Read only via [`Self::interface_methods`]; no
     /// rule wires it yet.
     interface_method_names: HashMap<&'static str, Vec<&'static str>>,
+    /// ADR-0042 Slice 1: the qualified-key registry — `"ERB::Util"` and
+    /// `"CGI::Util"` are DISTINCT entries here, unlike `classes` where both
+    /// collapse onto the shared short key `"Util"`. PURELY ADDITIVE: no
+    /// existing accessor reads this; it backs only the new
+    /// `knows_qualified_class` / `qualified_declares_instance` /
+    /// `qualified_declares_singleton` accessors below (Slice 2's seam).
+    qualified: HashMap<&'static str, ClassEntry>,
+    /// ADR-0042 Slice 1: leaf (short) name -> the qualified keys sharing it.
+    /// Backs [`Self::resolve_short_unambiguous`].
+    short_to_qualified: HashMap<&'static str, Vec<&'static str>>,
 }
 
 impl CoreData {
@@ -423,8 +433,14 @@ impl CoreData {
             .filter(|k| !pre_sig.contains(k))
             .collect();
 
-        let (classes, toplevel_classes, type_alias_defs, interface_method_names) =
-            builder.finish();
+        let (
+            classes,
+            toplevel_classes,
+            type_alias_defs,
+            interface_method_names,
+            qualified,
+            short_to_qualified,
+        ) = builder.finish();
         if !classes.is_empty() {
             return Self {
                 source,
@@ -433,6 +449,8 @@ impl CoreData {
                 project_sig_classes,
                 type_alias_defs,
                 interface_method_names,
+                qualified,
+                short_to_qualified,
             };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
@@ -508,6 +526,135 @@ impl CoreData {
     /// (defect 2). Instance-method behavior and `knows_class` are unchanged.
     pub fn knows_toplevel_class(&self, class_name: &str) -> bool {
         self.toplevel_classes.contains(class_name)
+    }
+
+    /// ADR-0042 Slice 1: whether `qname` (a fully qualified name like
+    /// `"ERB::Util"`) is in the qualified registry. Unlike [`Self::knows_class`],
+    /// this does NOT collapse `ERB::Util` and `CGI::Util` onto a shared short
+    /// key — each qualified name is its own entry. This is the Slice-2 seam;
+    /// no existing rule calls it yet.
+    pub fn knows_qualified_class(&self, qname: &str) -> bool {
+        self.qualified.contains_key(qname)
+    }
+
+    /// ADR-0042 Slice 1: resolve a bare short name to its qualified key, but
+    /// ONLY when unambiguous — i.e. exactly one qualified key shares that leaf.
+    /// Returns `None` when the short name is unknown OR ambiguous (2+
+    /// qualified keys share it, e.g. `"Util"` ⇒ both `ERB::Util` and
+    /// `CGI::Util`): the ambiguity-collapses-to-nothing rule, so an ambiguous
+    /// short name is never silently resolved to the wrong one. This is the
+    /// Slice-2 seam; no existing rule calls it yet.
+    pub fn resolve_short_unambiguous(&self, short: &str) -> Option<&'static str> {
+        match self.short_to_qualified.get(short) {
+            Some(quals) if quals.len() == 1 => Some(quals[0]),
+            _ => None,
+        }
+    }
+
+    /// ADR-0042 Slice 1: whether the qualified class/module `qname` declares
+    /// `method` as a SINGLETON (class) method, checking ONLY that entry's own
+    /// `singleton_methods` — NO ancestor-chain walk (Slice 2 owns full
+    /// resolution over the qualified registry). `false` for an unknown
+    /// `qname`. This is the Slice-2 seam; no existing rule calls it yet.
+    pub fn qualified_declares_singleton(&self, qname: &str, method: &str) -> bool {
+        self.qualified
+            .get(qname)
+            .is_some_and(|entry| entry.singleton_methods.contains_key(method))
+    }
+
+    /// ADR-0042 Slice 1: the instance-method twin of
+    /// [`Self::qualified_declares_singleton`] — checks ONLY the qualified
+    /// entry's own `methods`, no ancestor-chain walk. `false` for an unknown
+    /// `qname`. This is the Slice-2 seam; no existing rule calls it yet.
+    pub fn qualified_declares_instance(&self, qname: &str, method: &str) -> bool {
+        self.qualified
+            .get(qname)
+            .is_some_and(|entry| entry.methods.contains_key(method))
+    }
+
+    /// ADR-0042 Slice 2: the qualified-registry analogue of
+    /// [`Self::class_has_singleton_method`] for a namespaced receiver
+    /// (`ERB::Util.html_escape`). The qualified entry's OWN singleton surface
+    /// (own `def self.x` + every `extend`ed module's instance methods, resolved
+    /// short — modules are typically top-level) PLUS the base-object surface
+    /// (`Class`/`Module`/`Object`/`Kernel`/`BasicObject`, reused verbatim). A
+    /// superclass or `extend` target that is not resolvable truncates the
+    /// surface ⇒ conservative silent (never a false positive). References are
+    /// kept short in this slice (measure-first); a nested unresolvable
+    /// reference just marks the surface incomplete.
+    fn qualified_class_has_singleton_method(&self, qname: &str, method: &str) -> bool {
+        let Some(entry) = self.qualified.get(qname) else {
+            return true; // unknown ⇒ silent
+        };
+        // Measure-first scope (ADR-0042 Slice 2): witness a qualified-singleton
+        // absence ONLY for a MODULE, whose class-object surface is its own
+        // `module_function`s + `extend`s + the base-object surface — fully
+        // modelled here. A CLASS additionally inherits class methods down its
+        // superclass chain, which this slice does NOT walk over the qualified
+        // registry (references are stored short pending ADR step 3); witnessing
+        // absence on a class therefore over-fires (measured: 36 FPs on
+        // dependabot-core, all `singleton(Gem::Specification)` — inherited class
+        // methods judged absent). Stay silent on qualified classes until the
+        // chain walk lands.
+        if !entry.is_module {
+            return true;
+        }
+        // (1) own singleton methods, resolving a singleton ALIAS to its target
+        //     (`alias self.h self.html_escape` on ERB::Util — measured: 3 rails
+        //     FPs on `ERB::Util.h`). Bounded one hop is enough for the aliases
+        //     seen; a target that is itself an alias resolves via recursion.
+        if entry.singleton_methods.contains_key(method)
+            || self.qualified_singleton_alias_resolves(qname, method, 0)
+        {
+            return true;
+        }
+        // (2) extended modules' instance methods (resolved short: an extended
+        //     module is almost always a top-level or already-qualified name);
+        //     an unresolvable extend truncates the surface.
+        let mut complete = entry.superclass.is_none_or(|s| self.classes.contains_key(s));
+        for &module in &entry.extends {
+            let resolved = if self.classes.contains_key(module) {
+                Some(module)
+            } else {
+                self.resolve_short_unambiguous(module)
+            };
+            match resolved {
+                Some(m) => {
+                    let (chain, _) = self.ancestors(m);
+                    if self.lookup_on_chain(&chain, method).is_some() {
+                        return true;
+                    }
+                }
+                None => complete = false,
+            }
+        }
+        // (3) the base-object surface (shared with the short-key path).
+        let (bases_found, bases_loaded) = self.singleton_bases_lookup(method);
+        if bases_found {
+            return true;
+        }
+        // Witness absence only when the whole surface is known.
+        if complete && bases_loaded {
+            return false;
+        }
+        true
+    }
+
+    /// Whether `method` on the qualified module `qname` resolves through a
+    /// singleton ALIAS to a real singleton method (`alias self.h
+    /// self.html_escape`). Bounded recursion (target may itself be aliased).
+    fn qualified_singleton_alias_resolves(&self, qname: &str, method: &str, depth: usize) -> bool {
+        if depth >= 16 {
+            return false;
+        }
+        let Some(entry) = self.qualified.get(qname) else {
+            return false;
+        };
+        let Some(&target) = entry.singleton_aliases.get(method) else {
+            return false;
+        };
+        entry.singleton_methods.contains_key(target)
+            || self.qualified_singleton_alias_resolves(qname, target, depth + 1)
     }
 
     /// Walk the full flattened ancestor chain; a method is present if ANY
@@ -663,6 +810,15 @@ impl CoreData {
     /// are loaded, and none of (a)/(b) defines `method`. If the class is unknown,
     /// its chain is incomplete, or any base class is missing ⇒ `true`.
     pub fn class_has_singleton_method(&self, class_name: &str, method: &str) -> bool {
+        // ADR-0042 Slice 2: a QUALIFIED name (`ERB::Util`) is absent from the
+        // short-key `classes` map but present in the qualified registry — route
+        // it to the qualified singleton resolution. A top-level name (its own
+        // qualified key == its short key) is handled by the short-key path
+        // below unchanged (this branch only fires for a genuinely-namespaced
+        // name the short map lacks), so no existing behavior moves.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_class_has_singleton_method(class_name, method);
+        }
         // Unknown class ⇒ stay silent.
         if !self.classes.contains_key(class_name) {
             return true;
@@ -1757,6 +1913,11 @@ impl CoreData {
             // needs the real embedded RBS); empty keeps the accessors inert.
             type_alias_defs: HashMap::new(),
             interface_method_names: HashMap::new(),
+            // ADR-0042 Slice 1: the stub models no qualified registry either —
+            // empty keeps the new accessors conservatively inert (never
+            // falsely `true`), same as the other ATM-substrate maps above.
+            qualified: HashMap::new(),
+            short_to_qualified: HashMap::new(),
         }
     }
 
@@ -1792,6 +1953,8 @@ type BuiltData = (
     HashSet<&'static str>,
     HashMap<&'static str, RetainedParamType>,
     HashMap<&'static str, Vec<&'static str>>,
+    HashMap<&'static str, ClassEntry>,
+    HashMap<&'static str, Vec<&'static str>>,
 );
 
 /// Accumulates parsed RBS declarations into per-class entries before flattening.
@@ -1822,6 +1985,20 @@ struct Builder {
     /// every top-level AND nested `interface _X ... end` declaration. First
     /// write wins.
     interface_method_names: HashMap<&'static str, Vec<&'static str>>,
+    /// ADR-0042 Slice 1: the NEW qualified-key registry, keyed by
+    /// [`qualified_name`] instead of the short leaf. Populated ALONGSIDE
+    /// `classes` (every class/module ingest writes to BOTH); PURELY ADDITIVE —
+    /// nothing reads this yet except the new `CoreData` accessors, and nothing
+    /// existing writes to or reads from it. A qualified key never collides
+    /// (each lexical nesting path is unique), so this is a simple union merge
+    /// with no `super_claimed`/authoritative cycle-avoidance needed.
+    qualified: HashMap<&'static str, ClassEntry>,
+    /// ADR-0042 Slice 1: leaf (short) name -> the qualified keys that share it,
+    /// in first-seen order (deduplicated). Lets [`CoreData::resolve_short_unambiguous`]
+    /// tell an unambiguous short name (exactly one qualified key) from an
+    /// ambiguous one (2+, e.g. `ERB::Util` and `CGI::Util` both share the leaf
+    /// `"Util"`).
+    short_to_qualified: HashMap<&'static str, Vec<&'static str>>,
 }
 
 impl Builder {
@@ -1835,8 +2012,8 @@ impl Builder {
             // the `toplevel_classes` set. `code` is threaded so the ATM substrate
             // can slice verbatim written forms for `RetainedParamType::Other`.
             match decl {
-                Node::Class(c) => self.ingest_class(&c, false, code),
-                Node::Module(m) => self.ingest_module(&m, false, code),
+                Node::Class(c) => self.ingest_class(&c, false, &[], code),
+                Node::Module(m) => self.ingest_module(&m, false, &[], code),
                 Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code),
                 Node::Interface(i) => self.ingest_interface(&i),
                 _ => {}
@@ -1874,7 +2051,7 @@ impl Builder {
         self.interface_method_names.entry(name).or_insert(names);
     }
 
-    fn ingest_class(&mut self, c: &ClassNode, nested: bool, code: &str) {
+    fn ingest_class(&mut self, c: &ClassNode, nested: bool, enclosing: &[&'static str], code: &str) {
         let tn = c.name();
         let Some(name) = type_name_str(&tn) else {
             return;
@@ -1899,11 +2076,18 @@ impl Builder {
             superclass,
             ..Default::default()
         };
-        self.collect_members(c.members().iter(), &mut entry, code);
+        // ADR-0042 Slice 1: this decl's own qualified key, and the enclosing
+        // context a NESTED decl within its members will qualify against.
+        let qual = qualified_name(enclosing, &tn);
+        let child_enclosing: Vec<&'static str> =
+            enclosing.iter().copied().chain(std::iter::once(qual)).collect();
+        self.collect_members(c.members().iter(), &mut entry, &child_enclosing, code);
+        self.merge_qualified(qual, entry.clone());
+        self.short_to_qualified_push(name, qual);
         self.merge(name, entry, authoritative);
     }
 
-    fn ingest_module(&mut self, m: &ModuleNode, nested: bool, code: &str) {
+    fn ingest_module(&mut self, m: &ModuleNode, nested: bool, enclosing: &[&'static str], code: &str) {
         let tn = m.name();
         let Some(name) = type_name_str(&tn) else {
             return;
@@ -1916,8 +2100,22 @@ impl Builder {
             is_module: true,
             ..Default::default()
         };
-        self.collect_members(m.members().iter(), &mut entry, code);
+        let qual = qualified_name(enclosing, &tn);
+        let child_enclosing: Vec<&'static str> =
+            enclosing.iter().copied().chain(std::iter::once(qual)).collect();
+        self.collect_members(m.members().iter(), &mut entry, &child_enclosing, code);
+        self.merge_qualified(qual, entry.clone());
+        self.short_to_qualified_push(name, qual);
         self.merge(name, entry, authoritative);
+    }
+
+    /// ADR-0042 Slice 1: record `qual` under `short`'s qualified-key list,
+    /// deduplicated (a reopen ingests the same qualified key more than once).
+    fn short_to_qualified_push(&mut self, short: &'static str, qual: &'static str) {
+        let list = self.short_to_qualified.entry(short).or_default();
+        if !list.contains(&qual) {
+            list.push(qual);
+        }
     }
 
     /// Fold method definitions and `include` directives from a member list into
@@ -1927,6 +2125,7 @@ impl Builder {
         &mut self,
         members: impl Iterator<Item = Node<'a>>,
         entry: &mut ClassEntry,
+        enclosing: &[&'static str],
         code: &str,
     ) {
         for member in members {
@@ -2038,8 +2237,8 @@ impl Builder {
                 // ⇒ all typo detection silently disabled). Registering nested
                 // types by simple name keeps chains complete. (Simple-name
                 // collisions only ever ADD methods, never witness false absence.)
-                Node::Class(inner) => self.ingest_class(&inner, true, code),
-                Node::Module(inner) => self.ingest_module(&inner, true, code),
+                Node::Class(inner) => self.ingest_class(&inner, true, enclosing, code),
+                Node::Module(inner) => self.ingest_module(&inner, true, enclosing, code),
                 // A NESTED `type X = ...` / `interface _X ... end` folds into the
                 // SAME global maps as a top-level one (ATM substrate), keyed by
                 // simple name — consistent with how nested classes/modules are
@@ -2156,6 +2355,85 @@ impl Builder {
         }
     }
 
+    /// ADR-0042 Slice 1: union-merge `entry` into `self.qualified` under
+    /// `qual`. A simple twin of the union half of [`Self::merge`] — no
+    /// `authoritative`/`super_claimed` cycle-avoidance is needed because a
+    /// qualified key never collides across distinct classes (each lexical
+    /// nesting path is unique), so there is no short-name-collapse superclass
+    /// cycle to guard against here.
+    fn merge_qualified(&mut self, qual: &'static str, entry: ClassEntry) {
+        let slot = self.qualified.entry(qual).or_default();
+        if slot.superclass.is_none() {
+            slot.superclass = entry.superclass;
+        }
+        slot.is_module |= entry.is_module;
+        for (k, v) in entry.methods {
+            let newly = !slot.methods.contains_key(k);
+            slot.methods.entry(k).or_insert(v);
+            if newly && entry.void_methods.contains(k) {
+                slot.void_methods.insert(k);
+            }
+        }
+        for (k, v) in entry.method_overloads {
+            slot.method_overloads.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.overloading_method_overloads {
+            match slot.method_overloads.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let base = std::mem::take(e.get_mut());
+                    let mut merged = v;
+                    merged.extend(base);
+                    *e.get_mut() = merged;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
+        }
+        for (k, v) in entry.block_returns {
+            slot.block_returns.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_methods {
+            let newly = !slot.singleton_methods.contains_key(k);
+            slot.singleton_methods.entry(k).or_insert(v);
+            if newly && entry.void_singleton_methods.contains(k) {
+                slot.void_singleton_methods.insert(k);
+            }
+        }
+        for (k, v) in entry.singleton_method_overloads {
+            slot.singleton_method_overloads.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.overloading_singleton_overloads {
+            match slot.singleton_method_overloads.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let base = std::mem::take(e.get_mut());
+                    let mut merged = v;
+                    merged.extend(base);
+                    *e.get_mut() = merged;
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
+        }
+        for (new_name, old_name) in entry.aliases {
+            slot.aliases.entry(new_name).or_insert(old_name);
+        }
+        for (new_name, old_name) in entry.singleton_aliases {
+            slot.singleton_aliases.entry(new_name).or_insert(old_name);
+        }
+        for inc in entry.includes {
+            if !slot.includes.contains(&inc) {
+                slot.includes.push(inc);
+            }
+        }
+        for ext in entry.extends {
+            if !slot.extends.contains(&ext) {
+                slot.extends.push(ext);
+            }
+        }
+    }
+
     /// Finish: apply implicit-`Object` superclass defaulting (every class except
     /// `BasicObject` and modules implicitly inherits `Object` when no `< X` was
     /// given) and return the class map plus the set of names declared at genuine
@@ -2183,6 +2461,8 @@ impl Builder {
             self.toplevel_classes,
             self.type_alias_defs,
             self.interface_method_names,
+            self.qualified,
+            self.short_to_qualified,
         )
     }
 }
@@ -2288,6 +2568,28 @@ fn type_name_str(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
 /// top-level class (defect 2).
 fn is_toplevel_name(tn: &ruby_rbs::node::TypeNameNode) -> bool {
     tn.namespace().path().iter().next().is_none()
+}
+
+/// ADR-0042 Slice 1: the FULLY QUALIFIED name for a class/module decl — the
+/// lexical `enclosing` prefix (from lexically-nesting `class`/`module`
+/// bodies), then the `TypeNameNode`'s OWN namespace path (`Process::Status`
+/// written at top level has namespace path `[Process]`), then its leaf
+/// (`type_name_str`), all joined by `"::"`. A genuine top-level decl with no
+/// enclosing and no own namespace (`class Time`) returns just `"Time"` — the
+/// SAME string as the existing short key, by design (Slice 2's resolution
+/// seam). Interned so repeated qualifications of the same name are the same
+/// pointer, mirroring `intern`'s use elsewhere.
+fn qualified_name(enclosing: &[&'static str], tn: &ruby_rbs::node::TypeNameNode) -> &'static str {
+    let mut parts: Vec<String> = enclosing.iter().map(|s| (*s).to_string()).collect();
+    for seg in tn.namespace().path().iter() {
+        if let Node::Symbol(sym) = seg {
+            parts.push(sym.as_str().to_string());
+        }
+    }
+    if let Some(leaf) = type_name_str(tn) {
+        parts.push(leaf.to_string());
+    }
+    intern(&parts.join("::"))
 }
 
 /// Extract `(return class, arity envelope)` from a method definition by reading
@@ -3176,5 +3478,138 @@ mod embedded_tests {
         assert!(!data.param_accepts_arg_class(&RetainedParamType::Alias("int_t"), "String"));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// ADR-0042 Slice 1: the new qualified-key registry, alongside-additive to the
+/// short-key `classes` map. Guarded (`if idx.knows_class("ERB") { ... }`, mirroring
+/// `rbs_class_new_types_to_rbs_instance`'s `knows_class("Pathname")` guard) so
+/// these don't false-fail if the embedded/override RBS isn't loadable in the
+/// sandbox and `CoreData::load()` falls back to the stub (empty qualified maps).
+#[cfg(test)]
+mod qualified_registry_tests {
+    use super::*;
+
+    /// `ERB::Util` is registered under its full qualified key, and BOTH its
+    /// `self?.html_escape` singleton and instance halves are visible via the
+    /// new own-entry-only accessors (vendored
+    /// `stdlib/erb/0/erb.rbs`: `module ERB; module Util; def self?.html_escape`).
+    #[test]
+    fn erb_util_qualified_singleton_instance_both_true() {
+        let idx = CoreData::load();
+        if !idx.knows_class("ERB") {
+            return; // stub fallback: qualified registry is empty, nothing to assert.
+        }
+        assert!(idx.knows_qualified_class("ERB::Util"));
+        assert!(idx.qualified_declares_instance("ERB::Util", "html_escape"));
+        assert!(idx.qualified_declares_singleton("ERB::Util", "html_escape"));
+        assert!(!idx.qualified_declares_singleton("ERB::Util", "no_such_method"));
+        assert!(!idx.qualified_declares_instance("ERB::Util", "no_such_method"));
+    }
+
+    /// The short-key MERGE collision (`ERB::Util` and `CGI::Util` both collapse
+    /// onto the shared short key `"Util"` in `classes`) is now SPLIT in the
+    /// qualified registry: both are known, DISTINCT entries — an ERB::Util-only
+    /// instance method (`html_escape`) is absent from `CGI::Util`, and a
+    /// CGI::Util-only instance method (`pretty`, vendored
+    /// `stdlib/cgi/0/core.rbs`: `module CGI; module Util; def pretty`) is absent
+    /// from `ERB::Util`.
+    #[test]
+    fn erb_util_and_cgi_util_are_distinct_qualified_entries() {
+        let idx = CoreData::load();
+        if !idx.knows_class("ERB") || !idx.knows_class("CGI") {
+            return;
+        }
+        assert!(idx.knows_qualified_class("ERB::Util"));
+        assert!(idx.knows_qualified_class("CGI::Util"));
+        // ERB::Util-only method is not on CGI::Util.
+        assert!(idx.qualified_declares_instance("ERB::Util", "html_escape"));
+        assert!(!idx.qualified_declares_instance("CGI::Util", "html_escape"));
+        // CGI::Util-only method is not on ERB::Util.
+        assert!(idx.qualified_declares_instance("CGI::Util", "pretty"));
+        assert!(!idx.qualified_declares_instance("ERB::Util", "pretty"));
+    }
+
+    /// `resolve_short_unambiguous` collapses to `None` for an AMBIGUOUS short
+    /// name (`"Util"` is shared by `ERB::Util` and `CGI::Util`), resolves a
+    /// genuinely-unique nested short name (`"DefMethod"`, only
+    /// `ERB::DefMethod` in the vendored set) to its single qualified key, and
+    /// is `None` for an unknown name.
+    #[test]
+    fn resolve_short_unambiguous_collapses_ambiguity() {
+        let idx = CoreData::load();
+        if !idx.knows_class("ERB") || !idx.knows_class("CGI") {
+            return;
+        }
+        assert_eq!(idx.resolve_short_unambiguous("Util"), None);
+        assert_eq!(
+            idx.resolve_short_unambiguous("DefMethod"),
+            Some("ERB::DefMethod")
+        );
+        assert_eq!(idx.resolve_short_unambiguous("NoSuchNameZZZ"), None);
+    }
+
+    /// A genuine top-level class round-trips: its qualified key equals its
+    /// short key (no enclosing, no own namespace).
+    #[test]
+    fn toplevel_class_qualified_equals_short() {
+        let idx = CoreData::load();
+        if !idx.knows_class("Time") {
+            return;
+        }
+        assert!(idx.knows_qualified_class("Time"));
+    }
+
+    /// Regression guard: the EXISTING short-key `knows_class` API is
+    /// UNCHANGED by this slice — `"Util"` is still known there too (the
+    /// short-key map still holds the merged, collapsed-union composite
+    /// exactly as before). This documents that Slice 1 is purely additive.
+    #[test]
+    fn short_key_map_unchanged_still_knows_util() {
+        let idx = CoreData::load();
+        if !idx.knows_class("ERB") {
+            return;
+        }
+        assert!(idx.knows_class("Util"));
+    }
+}
+
+#[cfg(test)]
+mod qualified_singleton_witness_tests {
+    use super::*;
+
+    /// ADR-0042 Slice 2: `class_has_singleton_method` transparently resolves a
+    /// QUALIFIED namespaced receiver via the qualified registry, with the full
+    /// base-object surface, so a real method is present and a typo is ABSENT —
+    /// and ERB::Util / CGI::Util stay method-disjoint (no short-key merge).
+    #[test]
+    fn qualified_singleton_witness_split_and_ancestry() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("ERB::Util") {
+            return; // stub fallback (no vendored rbs) — nothing to assert.
+        }
+        // Real method present (ERB::Util declares `self?.html_escape`).
+        assert!(idx.class_has_singleton_method("ERB::Util", "html_escape"));
+        // Genuine typo ABSENT (own surface complete + base surface known).
+        assert!(!idx.class_has_singleton_method("ERB::Util", "no_such_method"));
+        // MERGE-collision split: CGI::Util-only `pretty` is absent on ERB::Util
+        // and vice-versa, despite the shared short key "Util".
+        assert!(!idx.class_has_singleton_method("ERB::Util", "pretty"));
+        assert!(!idx.class_has_singleton_method("CGI::Util", "html_escape"));
+        // A base-object method (`name`, from Module) is present on any class obj.
+        assert!(idx.class_has_singleton_method("ERB::Util", "name"));
+        // A singleton ALIAS resolves (`alias self.h self.html_escape`) — the
+        // measured rails FP. Present, not witnessed absent.
+        assert!(idx.class_has_singleton_method("ERB::Util", "h"));
+        // An unknown qualified name stays silent (assume-present).
+        assert!(idx.class_has_singleton_method("No::Such", "whatever"));
+        // Measure-first scope: a qualified CLASS (not module) stays SILENT even
+        // for a genuine typo — its inherited class-method chain is not walked in
+        // this slice (the measured dependabot `Gem::Specification` FP). Use a
+        // qualified class known to exist; `Gem::Specification` is heavily
+        // reopened in the vendored rbs.
+        if idx.knows_qualified_class("Gem::Specification") {
+            assert!(idx.class_has_singleton_method("Gem::Specification", "no_such_zzz"));
+        }
     }
 }

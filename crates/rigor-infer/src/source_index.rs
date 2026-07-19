@@ -400,9 +400,15 @@ impl SourceIndex {
         for ast in asts {
             for (_, node) in ast.iter() {
                 if let Node::ConstantRead { name, .. } = node {
+                    // ADR-0042 Slice 2: register a QUALIFIED RBS-known constant
+                    // read (`ERB::Util`) too, so it carries a registry id that
+                    // round-trips for `Singleton` rendering. `knows_class` (short
+                    // key) covers top-level and the merged composite; the added
+                    // `knows_qualified_class` covers a namespaced name the short
+                    // map lacks.
                     if !name.is_empty()
                         && !idx.classes.contains_key(name)
-                        && core.knows_class(name)
+                        && (core.knows_class(name) || core.knows_qualified_class(name))
                     {
                         idx.register(name);
                     }

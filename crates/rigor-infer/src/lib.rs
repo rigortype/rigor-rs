@@ -360,6 +360,22 @@ impl<'i> Typer<'i> {
                         return interner.intern(Type::Singleton(class));
                     }
                 }
+                // ADR-0042 Slice 2: an unambiguous NAMESPACED constant
+                // (`ERB::Util`) types to its class object so a class-method typo
+                // witnesses. Gated on the QUALIFIED registry (not the short-key
+                // `knows_toplevel_class`, which refuses namespaced names for the
+                // defect-2 reason): a qualified key is its own isolated entry,
+                // so `ERB::Util` never collides with `CGI::Util` or a project
+                // `Util`. The project-shadow gate still applies (a project decl
+                // of the same qualified name wins).
+                if name.contains("::")
+                    && self.index.knows_qualified_class(name)
+                    && !self.source.constant_shadowed(name, prefix)
+                {
+                    if let Some(class) = self.source.class_id(name) {
+                        return interner.intern(Type::Singleton(class));
+                    }
+                }
                 interner.untyped()
             }
             // An array literal types to a value-pinned `Tuple` of its element
