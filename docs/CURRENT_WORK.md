@@ -13,6 +13,22 @@ Last updated: 2026-07-17.
 
 ## Now / Next
 
+**▶ NEXT SESSION — pick one (last turn ended at this decision, recommend B):**
+- **A.** `Process::Status` last fixture gap — needs TUPLE-return singleton
+  typing + multi-assign destructuring propagation (probed: both unimplemented).
+  Orthogonal general inference, broadly useful, but a large arc; would make
+  fixtures 100%.
+- **B. (recommended)** Treat ADR-0042 as complete and move to another high-ROI
+  track: productization (`coverage --workers` — needs a scoping call vs
+  `type-scan`; LSP §12 — architecture design), or the upstream #194 slices when
+  they land (resolved-plugin-path visibility is `ready-for-agent`; verify with
+  the differential battery).
+- **C.** Routine upstream tracking (pin `7a69f142`, 19 commits behind
+  `origin/master`; last hardened self-diff was 0/0). Cheap, no design call.
+- Clippy verify MUST use `CARGO_TARGET_DIR=<fresh> cargo clippy --workspace --
+  -D warnings` (the incremental cache hides `only_used_in_recursion` etc. —
+  cost a CI red on PR #32).
+
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
 
@@ -41,10 +57,11 @@ parity-port arc has bottomed out — see Standing conclusions):
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
 
-State: harness 66 fixtures / 188 matched / 0 FP (live + snapshot, vs the new
-`7a69f142` RC); fp_audit 0 FP on mastodon, gitlab-foss lib + app/models,
-conference-app + 27/28 survey projects; 769 workspace tests; explain catalog 29
-rules (added `suppression.unknown-marker`).
+State: harness **70 fixtures / 216 matched / 1 gap / 0 FP** (live + snapshot, vs
+pin `7a69f142`; the 1 gap = fixture 68 `Process::Status`); fp_audit 0 FP on
+mastodon, gitlab-foss lib (UM gaps 145) + app/models, conference-app + survey
+(dependabot/rails at baseline); explain catalog 29 rules. Clippy: workspace
+`-D warnings`, verify in a FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
