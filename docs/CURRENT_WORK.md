@@ -16,10 +16,11 @@ Last updated: 2026-07-17.
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
 
-- **ADR-0042 implementation** — IN PROGRESS (Slices 1–4 landed: substrate +
-  qualified singleton + qualified instance witnessing; fixtures 68 singleton /
-  69 / 70 closed, 0 FP). Last gap: fixture 68's `Process::Status` INSTANCE via
-  a tuple return (value-typing wire-up). Then the defect-2 guard retirement.
+- **ADR-0042 core migration DONE** (Slices 1–4, PRs #31/#32; ADR now accepted).
+  Defect-2 unsoundness fixed, Util MERGE split, nested project-sig witnessing,
+  gitlab UM 148→145, 0 FP. Remaining items deferred as NON-core: the last
+  fixture gap (`Process::Status` needs tuple-return + destructuring = orthogonal
+  general inference) and the guard retirement (a near-no-op consolidation).
 - **ACTIVE: compat next stage** — [plan](notes/20260718-compat-next-stage-plan.md);
   Phase 0+1 DONE ([findings](notes/20260718-phase0-m1-m2-findings.md)): Phase 2
   CLOSED by measurement (M1: 0 added diags on ~17k); M2-GO slices 1–4 + 4b

@@ -1,11 +1,27 @@
 # Qualified-key index registration (the defect-2 root fix)
 
-Status: proposed — filed 2026-07-18; **gate SATISFIED 2026-07-19**
-([deliverables](../notes/20260719-adr0042-gate-deliverables.md): fixtures
-68–70 pin the 9-gap regression surface; the consumer inventory found no
-unsound consumer under alias-collapse and TWO additional latent-FP sites the
-migration fixes for free). Implementation remains a separate approved arc and
-MUST also cover the reference-resolution scope item added below.
+Status: accepted — **core migration IMPLEMENTED 2026-07-19** (Slices 1–4,
+PRs #31/#32). The qualified-key registry + alias table + qualified singleton
+and instance witnessing landed with 0 FP throughout; the residual defect-2
+UNSOUNDNESS is fixed (a shadow class no longer inherits the nested-stdlib
+surface), the `ERB::Util`/`CGI::Util` MERGE collision is split, nested
+project-sig `.new` witnessing works, and gitlab UM gaps fell 148→145. See the
+[Slices 1–2](../notes/20260719-adr0042-slices-1-2.md) and
+[Slices 3–4](../notes/20260719-adr0042-slices-3-4.md) notes. The gate is
+[satisfied](../notes/20260719-adr0042-gate-deliverables.md).
+
+**Remaining (deliberately deferred — neither is ADR-0042 core):**
+- One fixture gap: `Process::Status` INSTANCE via `Process.wait2` (fixture 68
+  tail) needs TUPLE-return singleton typing + multi-assign destructuring
+  propagation — orthogonal general inference, not the key-scheme migration.
+- The `knows_toplevel_class` bypass-gate RETIREMENT is now a near-no-op
+  consolidation: under qualified registration `knows_toplevel_class(name)` and
+  `knows_qualified_class(name)` are equivalent for a bare name (a top-level
+  decl is the only source of a `::`-free qualified key), so replacing it is
+  cosmetic, not a behavior fix — low value, left in place.
+- ADR step 3 (reference-name resolution): still deferred — the vendored-RBS
+  measurement showed ~0 relative nested-superclass refs, and Slices 1–4 needed
+  no reference-side qualification (ancestors are global names).
 
 ## Context — the short-key wall, measured twice
 
