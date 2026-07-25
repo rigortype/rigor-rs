@@ -16,11 +16,11 @@ Last updated: 2026-07-25.
 **Track B (productization) 2026-07-19/25**: coverage precision mode SHIPPED
 (#33) + **LSP §12 COMPLETE** (S1–S4b) + **stage-3 parity tail** (#44: ADR-8
 SeverityStamp — an `off` rule no longer shows editor markers — + the
-bleeding-edge gate). ▶ IN FLIGHT: LSP `exclude:` parity (the same
-presence-mismatch class, for the open buffer); **MultiWriteNode substrate**
-— [spec](notes/20260725-multiwrite-substrate-spec.md), a measured LIVE `check`
-FP. ▶ THEN: slice 2 of that spec (`Process::Status` tuple-return →
-fixtures 100%), or LSP v4+ (`::` completion, union-receiver intersection,
+bleeding-edge gate). + **MultiWriteNode substrate slice 1** (#46: closed a measured live `check`
+FP). ▶ IN FLIGHT: LSP `exclude:` parity (the same presence-mismatch class,
+for the open buffer). ▶ THEN: MultiWrite slice 2 (RBS tuple returns →
+`Process::Status` → fixtures 100%,
+[spec](notes/20260725-multiwrite-substrate-spec.md)), or LSP v4+ (`::` completion, union-receiver intersection,
 visibility filter, `rootUri` — the root is still the process cwd).
 - LSP §12 known limitation (reference-parity, ADR-0029): editing `.rigor.yml`
   `disable:`/`plugins:`/`paths:`/`severity_*`/`bleeding_edge:` needs an LSP
@@ -37,34 +37,18 @@ visibility filter, `rootUri` — the root is still the process cwd).
 Default track is **productization** (measurement-proven highest ROI; the
 parity-port arc has bottomed out — see Standing conclusions):
 
-- **ADR-0042 core migration DONE** (Slices 1–4, PRs #31/#32; ADR now accepted).
-  Defect-2 unsoundness fixed, Util MERGE split, nested project-sig witnessing,
-  gitlab UM 148→145, 0 FP. Remaining items deferred as NON-core: the last
-  fixture gap (`Process::Status` needs tuple-return + destructuring = orthogonal
-  general inference) and the guard retirement (a near-no-op consolidation).
-- **ACTIVE: compat next stage** — [plan](notes/20260718-compat-next-stage-plan.md);
-  Phase 0+1 DONE ([findings](notes/20260718-phase0-m1-m2-findings.md)): Phase 2
-  CLOSED by measurement (M1: 0 added diags on ~17k); M2-GO slices 1–4 + 4b
-  built (UM 179→148, 0 FP; declaration-driven per the set direction — no
-  reflection-tier chasing). Slice 5 (namespaced singletons, ~5 sites) parked
-  under [ADR-0042](adr/0042-qualified-key-index-registration.md) (proposed).
-  Phase 3 DONE (1 ported / 1 absent / 1 deferred to `--bleeding-edge`) — the
-  compat plan is exhausted; next work returns to the productization track
-  (LSP §12, `--bleeding-edge` + CLI §7, re-pin at the v0.3.0 tag).
+- **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
+  (PRs #31/#32, accepted) and the compat next-stage plan (Phases 0–3 done,
+  exhausted — [plan](notes/20260718-compat-next-stage-plan.md)). Their only
+  live remnant is fixture 68, now slice 2 of the MultiWrite spec.
 - **LSP §12 two-tier** — COMPLETE (S1–S4b) + the stage-3 parity tail (#44).
   [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
   inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
   deferred by [scoping call](notes/20260719-coverage-command-scoping.md).
-- **Re-pin at the v0.3.0 tag** when upstream tags it (per `UPSTREAM.md`; note
-  BOTH oracle hazards there — #194 plugin path AND the non-version-scoped
-  result cache). Pin `7a69f142`; tip `ff6b6158` self-diff 0/0 (STILL no tag —
-  version pins 0.2.9, both new clusters sit in `[Unreleased]`). The 2 new
-  inference clusters (ADR-58 massign-ivar seed, ADR-67 WD6 call-site param
-  inference) are substrate-blocked large arcs AND precision-additive (0 new
-  diagnostics on corpora; cluster 2 is off-by-default opt-in) — nothing to
-  port; don't re-investigate.
+- **Re-pin at the v0.3.0 tag** when upstream tags it (`UPSTREAM.md`, all THREE
+  oracle hazards). Pin `7a69f142`; tip `ff6b6158` self-diff 0/0, still no tag.
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
@@ -115,12 +99,14 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-25 MultiWriteNode substrate, slice 1** (PR #46) — `a, b = rhs` had NO arena lowering, so `collect_flow_writes` never saw the rebind: a MEASURED live `check` FP (`x = 5; x, _y = o, 2; if x` fired always-truthy where the reference is silent). Added `Node::MultiWrite` (+ `target_exprs` for locals embedded in non-local targets — an FP the harness, unit tests and 3 mandated corpora all missed) + a rule-for-rule port of the reference's `MultiTargetBinder` incl. `soften_optional_slot`. ~32k-file sweep: **2 removed** (a live corpus witness), **5 added** (oracle-verified), **0 new FPs**; harness unchanged; coverage/annotate/sig-gen now oracle-exact. Slice 2 (RBS tuple returns → fixture 68) next. [spec](notes/20260725-multiwrite-substrate-spec.md) / [results](notes/20260725-multiwrite-substrate-s1.md).
+
 - **2026-07-25 LSP stage-3 parity tail** (PR #44) — the LSP never applied the ADR-8 SeverityStamp: a rule resolved `off` still published markers `check` DROPS (PRESENCE mismatch), severities were authored not profile-resolved, bleeding-edge unplumbed. The stamp now rides `ProjectContext` beside `disable:` (rebuilt by `invalidate` under the S4 generation guard); composition order verified against `main.rs` statement-by-statement. 4 E2E tests vs real `check` output, each proven non-vacuous by re-breaking. Remaining divergences enumerated in the note. [note](notes/20260725-lsp-stage3-parity.md).
 
 - **2026-07-19 LSP §12 two-tier COMPLETE (S1–S4b)** (PRs #35–#38/#42/#43 + `16bfb9e`) — `select!` loop + BufferTable; 200ms debounce; rayon workers, 3-axis stale-drop, no-lost-update; generation-counter `ProjectContext` invalidation; cross-file overlay (swap-and-rebuild under a hysteresis scale guard; incremental `.rb` re-harvest 111ms→0.2ms under a conservative held-entry-only rule). Harness 216/218 0 FP throughout. 6 adversarial-review rounds found 8 real defects (3 live FPs); the mandated differential test (entries + ORDER + AST fingerprint × `paths:` shapes × root spellings) found a 4th itself. [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md) / [S4b spec](notes/20260719-lsp-s4b-overlay-mini-spec.md) / notes `20260719-lsp-s12-s{1..4,4b}.md`.
 
 - **2026-07-19 baseline drift/prune positional-roots + scope guard** (PR #41) — found via a real-product baseline check (conference-app, no `.rigor.yml`): drift/prune ignored positional roots (config `paths:` only), so `generate .` wrote 1956 diags but `drift .` silently reported all 98 buckets "Cleared" (a `prune`-acts-on-it footgun). Fix: (a) drift/prune honor positional roots like generate (additive; no-positional path unchanged); (b) `paths_explicitly_declared()` guard refuses a scope-less audit vs a non-empty baseline (exit 64). 4 regression tests, 0 FP. [note](notes/20260719-baseline-drift-roots-fix.md).
-- **2026-07-19 upstream tracking `e447cb86..ff6b6158`** (10 commits: ADR-58 constructor-massign ivar seeding `48a7af6c`; ADR-67 WD6 call-site parameter inference activated on the check walk `a84efcbd` + design/guard/perf; handoff docs) — hardened self-diff (both oracle hazards) **0 added / 0 dropped** on all four battery corpora (fixtures/gitlab lib/mastodon models/conference-app), runtimes symmetric (cache bypass confirmed). STILL no v0.3.0 tag (version pins 0.2.9; both clusters in `[Unreleased]`). Mechanism assessment: both clusters are substrate-blocked large arcs (need the ADR-0022 flow substrate + ivar-typing rigor-rs deliberately defers) AND precision-additive (protection coverage only, 0 new diagnostics; ADR-67 WD6 is off-by-default opt-in `parameter_inference:`). Pin `7a69f142` HELD, nothing to port.
+- **2026-07-19 upstream tracking `e447cb86..ff6b6158`** (10 commits: ADR-58 massign-ivar seeding, ADR-67 WD6 call-site param inference, handoff docs) — hardened self-diff **0 added / 0 dropped** on all four battery corpora, runtimes symmetric. STILL no v0.3.0 tag. Both clusters are substrate-blocked large arcs AND precision-additive (0 new diagnostics; cluster 2 off-by-default) — pin `7a69f142` HELD, nothing to port.
 - **2026-07-19 coverage broader over-claim audit** (PR #40, node-level) — 0 factually-wrong over-claims across 1217 new files / 186k nodes (binpacker, ruby-date/io-console/openssl/strscan, rbs, rbs-inline, mastodon app/{controllers,lib,services,…} + lib, conference-app lib); harness anchors reproduced exactly (fixtures 0, gitlab-foss 27); 8 new over-claims all provably sound (nominal-where-ref-dynamic, enumerated). Confirms the coverage command's sound-superset parity holds broadly. Also PR #39: cleared 5 test-code clippy lints outside the CI-gated `--tests`-less form. [audit](notes/20260719-coverage-broader-audit.md).
 - **2026-07-19 `coverage` precision mode + MCP tool** (PR #33, 3 review rounds) — reference precision-tier scan ported on rayon (`--workers` = pool size, byte-identical any N); denominators byte-equal on ALL targets (70 fixtures + conference-app 4235 + mastodon 31381 + gitlab lib 624,233 nodes); node-level audit 0 over-claims except 27 gitlab nodes ACCEPTED as reviewer-verified sound-superset (AGENTS.md anti-convergence); 15+ over-claim defect classes found/fixed across rounds — histogram-level audits provably mask over-claims. [scoping](notes/20260719-coverage-command-scoping.md) / [results](notes/20260719-coverage-precision-mode.md).
 - **2026-07-19 upstream tracking `48a26c20..e447cb86`** (10 commits: the #194 loader stack landed+closed upstream, doctor skew check, cache-validation auto) — hardened self-diff **0/0 on all four battery corpora**; plugin-loader-only surface, nothing to port; pin `7a69f142` held (no v0.3.0 tag yet). NEW oracle hazard 2 recorded in `UPSTREAM.md`: the reference result cache is not version-scoped — pin-vs-tip self-diffs REQUIRE `--no-cache` + isolated cwds.
