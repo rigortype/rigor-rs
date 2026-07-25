@@ -95,8 +95,14 @@ shortcut: a non-symlink spelling names its own file, and every such spelling of 
 buffer is already among tier 2's candidates. The only name tier 2 structurally
 cannot see is a symlink elsewhere in the tree pointing at the buffer.
 
-> **Cost, measured** on a synthetic 3 000-file / 60-directory tree, warm: **~6 ms**
-> for the whole tier-3 pass, versus **~25-40 ms** for the naive form that
+> **Cost.** Round-2 review re-measured the same shape on a RELEASE build at
+> **~40 ms** for tiers 2+3 (walk 11 ms, glob 1.5 ms, ~27 ms of `symlink_metadata`),
+> not the ~6 ms first recorded here — and because an excluded buffer is by
+> definition absent from the overlay, tier 1 never answers for it, so this is paid
+> on EVERY post-debounce dispatch in that buffer and scales with project size. It is
+> off the loop thread and the publish is empty either way, so it is not urgent;
+> memoizing the tier-3 answer per (canonical path, `generation`) would remove it.
+> The original comparison stands directionally: **~25-40 ms** for the naive form that
 > `canonicalize`s every surviving spelling (`realpath` walks the whole path per
 > file). An `lstat` per candidate answers the common case; the full resolve is paid
 > only for real symlinks. Tier 3 runs ONLY for a buffer already judged excluded — a
@@ -168,8 +174,11 @@ is precisely the case tier 3 exists for, and it is in the differential matrix
 discovery does NOT traverse symlinked directories, so the file never reaches the
 overlay and tier 1 cannot answer; tier 2's **decoded** spelling is
 `lib/vendor/x.rb`, which the pattern matches, and the canonical name is outside
-every root and contributes nothing — so the buffer is correctly excluded, matching
-`rigor check lib/vendor/x.rb`. That is what the `decoded` name is in the triple for.
+every root. **Measured in round-2 review: the buffer is ANALYSED, not excluded** —
+the project-root-relative fallback contributes `vendored/x.rb`, the pattern does not
+match it, so `all` fails and the gate returns false. (With BOTH spellings excluded it
+does return true.) This is the safe direction — the LSP shows a marker rather than
+hiding one — but N2 is NOT closed; it stays on the divergence list.
 
 ## Acceptance results
 
@@ -257,10 +266,12 @@ stage-3 note applied to the bleeding-edge gate):
   whole matrix green, because tiers 2+3 are exact on their own. It is kept because
   it answers the common case (a buffer in the project) with a pointer comparison
   instead of a walk. In-overlay ⇒ survives discovery, so it can never disagree.
-- **Tier 2's `all` vs `any` is not discriminated either**, because tier 3 rescues
-  every surviving spelling regardless. `all` is kept because it is the invariant's
-  literal shape and is the safe direction for the only case tier 3 cannot answer: a
-  buffer with no on-disk identity in discovery.
+- **Tier 2's `all` IS load-bearing — do not weaken it to `any`.** (Round-2 review
+  corrected an earlier claim here that it was undiscriminated.) Flipping it fails
+  the 144-run matrix AND the dedicated B3 test, because B3's surviving spelling
+  (`lib/a.rb` under overlapping roots) is not a symlink, so tier 3 structurally
+  cannot rescue it. `all` and the symlink-only tier 3 are COMPLEMENTARY: `all`
+  covers surviving non-symlink spellings, tier 3 covers symlink aliases.
 
 **N3** (review): under `RootSpelling::Absolute` the relative patterns match nothing
 on either side, so those cells agree vacuously. They are kept — they cost nothing
