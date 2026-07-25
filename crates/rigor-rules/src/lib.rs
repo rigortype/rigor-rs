@@ -2934,6 +2934,14 @@ fn node_children(node: &Node) -> Vec<NodeId> {
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => out.push(*value),
+        // A multi-write descends into its RHS *and* the expressions embedded in
+        // non-local targets (`obj.attr, b = (return 1), 2` — the `return` can
+        // hide in either). Correct descent regardless of whether a probe
+        // currently reaches it.
+        Node::MultiWrite { value, target_exprs, .. } => {
+            out.push(*value);
+            out.extend(target_exprs.iter().copied());
+        }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             out.extend(parts.iter().copied())
         }
@@ -4355,10 +4363,30 @@ mod tests {
 
     #[test]
     fn dead_assignment_multi_write_is_silent() {
-        // `a, b = foo` lowers to `Node::Other` (no LocalVariableWrite) ⇒ never a
-        // candidate ⇒ silent, matching the reference (MultiWriteNode skipped).
+        // `a, b = foo` lowers to `Node::MultiWrite`, NOT `LocalVariableWrite`, so
+        // its targets are never dead-assignment candidates ⇒ silent, matching the
+        // reference (`DeadAssignmentCollector` skips `MultiWriteNode` — its write
+        // semantics are intertwined with a wider tuple binding). This is a PARITY
+        // GUARD: the multi-write arena lowering must not make destructured
+        // targets fireable.
         let diags = dead(b"def f\n  a, b = bar\n  77\nend\n");
         assert!(diags.is_empty(), "multi-write must be silent, got {diags:?}");
+        // Also silent for the splat / nested / ignorable target forms.
+        let diags = dead(b"def f\n  a, (b, c), *r = bar\n  77\nend\n");
+        assert!(diags.is_empty(), "multi-write forms must be silent, got {diags:?}");
+    }
+
+    #[test]
+    fn dead_assignment_reads_inside_multi_write_targets_count() {
+        // FP REGRESSION (netrc 0.11.0 `Netrc#[]=`, caught by the corpus sweep):
+        // a NON-LOCAL multi-write target embeds a local READ (`item` in
+        // `item[3], item[5] = info`). The reference gathers reads from the whole
+        // Prism subtree, so `item` is read and `item = …` is NOT dead. The arena
+        // must therefore carry those embedded expressions (`MultiWrite::
+        // target_exprs`) — dropping them made `item = …` fire.
+        let src = b"def setter(k, info)\n  if item = @data.detect { |d| d[1] == k }\n    item[3], item[5] = info\n  end\nend\n";
+        let diags = dead(src);
+        assert!(diags.is_empty(), "a read inside a multi-write target counts, got {diags:?}");
     }
 
     #[test]
@@ -4624,6 +4652,30 @@ mod tests {
         assert!(
             always_truthy(src).is_empty(),
             "a conditionally-reassigned local must NOT fold to a constant"
+        );
+    }
+
+    #[test]
+    fn always_truthy_multi_write_rebind_widens_silent() {
+        // FP REGRESSION (2026-07-25). `x = 5` then a MULTI-WRITE rebind
+        // `x, _y = other, 2` ⇒ `x` is the destructured `Dynamic[top]` slot, not
+        // `5`, so `if x` must be SILENT. Measured against the oracle before the
+        // `Node::MultiWrite` lowering: rigor-rs fired at 4:6, the reference was
+        // silent — the multi-write's target names never reached
+        // `collect_flow_writes`, so the earlier binding survived the rebind.
+        let src = b"def probe(other)\n  x = 5\n  x, _y = other, 2\n  if x\n    puts \"truthy\"\n  end\nend\n";
+        assert!(
+            always_truthy(src).is_empty(),
+            "a multi-write rebind must widen the earlier binding"
+        );
+        // Same at top level, and through a nested / splat target.
+        assert!(
+            always_truthy(b"x = 5\na, (x, c) = other\nif x\n  noop\nend\n").is_empty(),
+            "a NESTED multi-write target must widen the earlier binding"
+        );
+        assert!(
+            always_truthy(b"x = 5\na, *x = other\nif x\n  noop\nend\n").is_empty(),
+            "a SPLAT multi-write target must widen the earlier binding"
         );
     }
 
@@ -5514,6 +5566,26 @@ mod tests {
         assert!(ret(b"def m\n  work\nensure\n  cleanup\nend\n").is_empty());
     }
 
+    #[test]
+    fn return_in_ensure_descends_through_a_multi_write() {
+        // PR #46 review nit: `node_children` needs a `MultiWrite` arm, or the
+        // descent stops one hop short of the `Node::Return` the multi-write
+        // lowering now puts in the arena. Oracle-verified: the reference fires
+        // at 4:19 on this exact source (rigor-rs was silent before the arm —
+        // not a regression, since master could not lower the return at all).
+        let d = ret(b"def m(flag)\n  do_work\nensure\n  a, b = (flag ? (return 1) : 2), 3\n  [a, b]\nend\n");
+        assert_eq!(d.len(), 1, "{d:?}");
+        // The `target_exprs` half of the arm is correct descent but currently
+        // unreachable for THIS rule: a `return` embedded in a non-local target
+        // (`obj[flag ? (return 1) : 2], b = 3, 4`) never enters the arena,
+        // because `collect_recoverable_children` recovers reads / writes /
+        // calls and NOT `ReturnNode`. That gap is orthogonal to multi-writes
+        // and pre-existing (silent on old AND new; the oracle fires at 4:15).
+        // Pinned here so a later `ReturnNode` recovery flips it visibly.
+        let d = ret(b"def m(flag)\n  do_work\nensure\n  obj[flag ? (return 1) : 2], b = 3, 4\nend\n");
+        assert!(d.is_empty(), "known gap: ReturnNode is not a recoverable child; got {d:?}");
+    }
+
     // -----------------------------------------------------------------------
     // suppression.unknown-rule / suppression.empty (v0.3.0)
     // -----------------------------------------------------------------------
@@ -6244,5 +6316,15 @@ mod void_value_use_tests {
         assert!(void_diags("silent", b"w = Widget.new\nw.fire\n").is_empty());
         assert!(void_diags("silent", b"w = Widget.new\ny = w.spin\n").is_empty());
         assert!(void_diags("silent", b"y = unknown_thing.fire\n").is_empty());
+    }
+
+    /// PARITY GUARD: a MULTI-WRITE RHS is not a value context. The reference's
+    /// `VoidValueUseCollector::WRITE_NODE_CLASSES` deliberately excludes
+    /// `Prism::MultiWriteNode` ("its `value` is a container the void call would
+    /// have to be spread through, not a direct use"), so adding the
+    /// `Node::MultiWrite` arena lowering must not make it fire.
+    #[test]
+    fn void_multi_write_rhs_stays_silent() {
+        assert!(void_diags("multiwrite", b"w = Widget.new\na, b = w.fire\n").is_empty());
     }
 }
