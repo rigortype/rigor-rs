@@ -16,12 +16,11 @@ Last updated: 2026-07-25.
 **Track B (productization) 2026-07-19/25**: coverage precision mode SHIPPED
 (#33) + **LSP §12 COMPLETE** (S1–S4b) + **stage-3 parity tail** (#44: ADR-8
 SeverityStamp — an `off` rule no longer shows editor markers — + the
-bleeding-edge gate). + **MultiWriteNode substrate slice 1** (#46: closed a measured live `check`
-FP). ▶ IN FLIGHT: LSP `exclude:` parity (the same presence-mismatch class,
-for the open buffer). ▶ THEN: MultiWrite slice 2 (RBS tuple returns →
-`Process::Status` → fixtures 100%,
-[spec](notes/20260725-multiwrite-substrate-spec.md)), or LSP v4+ (`::` completion, union-receiver intersection,
-visibility filter, `rootUri` — the root is still the process cwd).
+bleeding-edge gate) + **MultiWrite substrate slice 1** (#46: closed a measured
+live `check` FP) + **LSP `exclude:` parity** (#45). ▶ NEXT: MultiWrite slice 2
+(RBS tuple returns → `Process::Status` → fixtures 100%,
+[spec](notes/20260725-multiwrite-substrate-spec.md)), or LSP v4+ (`::`
+completion, union-receiver intersection, visibility filter, `rootUri`).
 - LSP §12 known limitation (reference-parity, ADR-0029): editing `.rigor.yml`
   `disable:`/`plugins:`/`paths:`/`severity_*`/`bleeding_edge:` needs an LSP
   restart — `invalidate` re-reads sig-dir CONTENT but not the parsed YAML
@@ -99,6 +98,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-25 LSP `exclude:` parity** (PR #45) — an excluded file opened in the editor published markers `check` never produces. Decision rule: a buffer is excluded iff EVERY discovery spelling of it is excluded, expressed as 3 tiers — overlay membership (fast path), all-roots × 3 name forms (decoded/named/canonical, `all` load-bearing), then a confirm pass over the SHARED `discovery_spellings` walk so it cannot drift from `project_files`. Review round 1 found 3 regressions (symlinked `.rb`, symlink whose target is excluded, overlapping roots — the first-match + canonicalize-only gate); matrix widened 24→144 runs (+ symlink and multi-root axes). `check` byte-identical under 3 configs incl. an invalid glob. [note](notes/20260725-lsp-exclude-parity.md).
 - **2026-07-25 MultiWriteNode substrate, slice 1** (PR #46) — `a, b = rhs` had NO arena lowering, so `collect_flow_writes` never saw the rebind: a MEASURED live `check` FP (`x = 5; x, _y = o, 2; if x` fired always-truthy where the reference is silent). Added `Node::MultiWrite` (+ `target_exprs` for locals embedded in non-local targets — an FP the harness, unit tests and 3 mandated corpora all missed) + a rule-for-rule port of the reference's `MultiTargetBinder` incl. `soften_optional_slot`. ~32k-file sweep: **2 removed** (a live corpus witness), **5 added** (oracle-verified), **0 new FPs**; harness unchanged; coverage/annotate/sig-gen now oracle-exact. Slice 2 (RBS tuple returns → fixture 68) next. [spec](notes/20260725-multiwrite-substrate-spec.md) / [results](notes/20260725-multiwrite-substrate-s1.md).
 
 - **2026-07-25 LSP stage-3 parity tail** (PR #44) — the LSP never applied the ADR-8 SeverityStamp: a rule resolved `off` still published markers `check` DROPS (PRESENCE mismatch), severities were authored not profile-resolved, bleeding-edge unplumbed. The stamp now rides `ProjectContext` beside `disable:` (rebuilt by `invalidate` under the S4 generation guard); composition order verified against `main.rs` statement-by-statement. 4 E2E tests vs real `check` output, each proven non-vacuous by re-breaking. Remaining divergences enumerated in the note. [note](notes/20260725-lsp-stage3-parity.md).
