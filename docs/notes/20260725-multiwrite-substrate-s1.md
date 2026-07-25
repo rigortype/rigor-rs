@@ -228,15 +228,33 @@ Slice 2's target). No fixture expectation moved.
 
 Every diagnostic emitted by the pre-change and post-change release binaries was
 diffed over ~29k files (mastodon `app`, gitlab-foss `app`+`lib`,
-conference-app, rails, redmine, dependabot-core, rubocop-ast, haml, mail).
+conference-app, rails, redmine, dependabot-core, rubocop-ast, haml, mail); the
+PR #46 reviewer independently swept 26,255 files.
 
-- **Removed: 0.** The FP shape (straight-line binding → multi-write rebind →
-  condition on it) genuinely does not occur in the surveyed corpora, exactly as
-  the spec predicted. The fix is demonstrated by the probe, not by a corpus
-  delta.
-- **Added: 4, all COVERAGE GAINS, all spot-verified against the oracle.**
-  - `logger-1.7.0/lib/logger.rb:372:6 flow.always-truthy-condition` (×3, the
-    same vendored gem under redmine / haml / mail). Source:
+- **Removed: 2 — and they are a REAL-CORPUS WITNESS of the FP fix.**
+  `liquid/vendor/bundle/…/liquid-spec-ae64d5b5bf13/lib/liquid/spec/cli/eval.rb`
+  at `187:18` and `190:21`, both `flow.always-truthy-condition` ("always
+  falsey"). The source is the spec's shape verbatim:
+
+  ```ruby
+  reference_output = nil
+  reference_error  = nil
+  if compare_mode
+    reference_output, reference_error = run_reference_implementation(…)
+    if reference_error          # 187:18 — rigor-rs OLD fired, oracle silent
+      …
+    elsif reference_output      # 190:21 — rigor-rs OLD fired, oracle silent
+  ```
+
+  Two straight-line `= nil` bindings, a multi-write rebind, then conditions on
+  both names. The oracle returns NO diagnostics for that file; rigor-rs OLD
+  emitted two, rigor-rs NEW emits none. **The FP therefore has a live corpus
+  witness, not only the synthetic probe** — an earlier draft of this note said
+  "Removed: 0", which was wrong: the file sits under `liquid/vendor/bundle/`,
+  outside the `liquid/lib` path this session originally swept.
+- **Added: 5 (2 distinct shapes), all COVERAGE GAINS, all oracle-verified.**
+  - `logger-1.7.0/lib/logger.rb:372:6 flow.always-truthy-condition` (×4 — the
+    same vendored gem under redmine / haml / mail / liquid). Source:
     `_, name, rev = %w$Id$` then `if name` — `name` is a MISSING tuple slot ⇒
     `Constant[nil]` ⇒ always falsey. **The reference emits the byte-identical
     diagnostic at the same position** (verified directly).
@@ -255,3 +273,69 @@ conference-app, rails, redmine, dependabot-core, rubocop-ast, haml, mail).
 
 Both gains are the direct consequence of `slot_type`'s "missing slot ⇒
 `Constant[nil]`" rule — the reference's own rule, now reachable in rigor-rs.
+
+### One new coverage GAP (FP-safe direction) — do not read the delta as "gains only"
+
+The delta above is not uniformly toward the oracle. A multi-write under a
+`return` wrapper now widens the earlier binding, because its whole-statement
+span is a `collect_flow_writes` entry contained in the `Return`'s span:
+
+```ruby
+def m(src)
+  x = 5
+  return (x, y = src.pair)
+  if x                        # OLD: fired.  oracle: fires.  NEW: SILENT
+```
+
+0 occurrences in the 26k-file sweep. The SINGLE-target control (`return (x =
+src.pair)`) was already a gap on OLD, so the multi-write has merely joined
+rigor-rs's pre-existing span-based conservatism — a coverage loss in the
+FP-SAFE direction (rigor-rs under-emits), never an FP. Named here so the
+claim "`check` output moved only toward the oracle" is not made: it moved
+toward the oracle in 6 places (2 removals + 4 additions) and away from it in
+this one shape.
+
+Net over the whole sweep: **2 removed / 5 added / 0 new FPs**. The
+`node_children` review fix (below) added nothing on real corpora — it needs a
+`return` inside a multi-write inside an `ensure`, which does not occur.
+
+## `annotate` and `sig-gen` — user-visible output improved (oracle-exact)
+
+Command output is user-facing surface, so the change is recorded even though
+neither is a diagnostic:
+
+| | OLD | NEW | oracle |
+| --- | --- | --- | --- |
+| `annotate`, `a, b = [1, 2]` | `#=> Dynamic[top]` | `#=> [1, 2]` | `#=> [1, 2]` |
+| `annotate`, the following `[a, b]` | `#=> [Dynamic[top], Dynamic[top]]` | `#=> [1, 2]` | `#=> [1, 2]` |
+| `sig-gen --print`, `def pair; a, b = [1, 2]; end` | `No candidates` | `def pair: () -> [1, 2]` | `def pair: () -> [1, 2]` |
+
+Both are now byte-identical to the reference where OLD was wrong. The read side
+(`[a, b]`) improves only at TOP LEVEL: `annotate` and `sig-gen` both build their
+env with `build_toplevel_env` (→ `bind_statement`, wired here), so a def-LOCAL
+multi-write's targets are still unbound for them. That def-scoping limitation is
+pre-existing and orthogonal to this slice.
+
+## Review follow-up (PR #46)
+
+- **`node_children` gained a `MultiWrite` arm** (`crates/rigor-rules/src/lib.rs`).
+  Without it `flow.return-in-ensure`'s generic descent stopped one hop short of
+  the `Node::Return` this lowering now puts in the arena. Probe
+  `def m(flag); do_work; ensure; a, b = (flag ? (return 1) : 2), 3; [a, b]; end`
+  now fires at `4:19`, byte-identical to the oracle (silent on old AND new
+  before the arm, so this is a coverage gain, not a regression fix). Pinned by
+  `return_in_ensure_descends_through_a_multi_write`.
+  - The arm's `target_exprs` half is correct descent but currently unreachable
+    for this rule: a `return` embedded in a NON-local target
+    (`obj[flag ? (return 1) : 2], b = 3, 4`) never enters the arena, because
+    `collect_recoverable_children` recovers reads / writes / calls and NOT
+    `ReturnNode`. Pre-existing and orthogonal to multi-writes (silent on old AND
+    new; the oracle fires at `4:15`); the single-target control `obj[…] = 3`
+    fires on both, since that lowers to a `Node::Call` whose args are descended.
+    Pinned as a known gap in the same test so a later `ReturnNode` recovery
+    flips it visibly.
+- **Deferred (separate slice):** `flow_eval`'s `MultiWrite` arm does not record
+  the if-EXPRESSION predicate snapshot its single-target sibling does
+  (`crates/rigor-infer/src/lib.rs`, the `Node::If` peek before the bind). Silent
+  on OLD and NEW, so it is a coverage gain needing its own parity evidence, not
+  a fix.

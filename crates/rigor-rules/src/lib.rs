@@ -2934,6 +2934,14 @@ fn node_children(node: &Node) -> Vec<NodeId> {
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => out.push(*value),
+        // A multi-write descends into its RHS *and* the expressions embedded in
+        // non-local targets (`obj.attr, b = (return 1), 2` — the `return` can
+        // hide in either). Correct descent regardless of whether a probe
+        // currently reaches it.
+        Node::MultiWrite { value, target_exprs, .. } => {
+            out.push(*value);
+            out.extend(target_exprs.iter().copied());
+        }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             out.extend(parts.iter().copied())
         }
@@ -5556,6 +5564,26 @@ mod tests {
     #[test]
     fn return_in_ensure_no_return_is_silent() {
         assert!(ret(b"def m\n  work\nensure\n  cleanup\nend\n").is_empty());
+    }
+
+    #[test]
+    fn return_in_ensure_descends_through_a_multi_write() {
+        // PR #46 review nit: `node_children` needs a `MultiWrite` arm, or the
+        // descent stops one hop short of the `Node::Return` the multi-write
+        // lowering now puts in the arena. Oracle-verified: the reference fires
+        // at 4:19 on this exact source (rigor-rs was silent before the arm —
+        // not a regression, since master could not lower the return at all).
+        let d = ret(b"def m(flag)\n  do_work\nensure\n  a, b = (flag ? (return 1) : 2), 3\n  [a, b]\nend\n");
+        assert_eq!(d.len(), 1, "{d:?}");
+        // The `target_exprs` half of the arm is correct descent but currently
+        // unreachable for THIS rule: a `return` embedded in a non-local target
+        // (`obj[flag ? (return 1) : 2], b = 3, 4`) never enters the arena,
+        // because `collect_recoverable_children` recovers reads / writes /
+        // calls and NOT `ReturnNode`. That gap is orthogonal to multi-writes
+        // and pre-existing (silent on old AND new; the oracle fires at 4:15).
+        // Pinned here so a later `ReturnNode` recovery flips it visibly.
+        let d = ret(b"def m(flag)\n  do_work\nensure\n  obj[flag ? (return 1) : 2], b = 3, 4\nend\n");
+        assert!(d.is_empty(), "known gap: ReturnNode is not a recoverable child; got {d:?}");
     }
 
     // -----------------------------------------------------------------------
