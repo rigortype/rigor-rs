@@ -335,13 +335,20 @@ struct OverlayBuild {
 /// the guard test can force a trip.
 const OVERLAY_BUILD_BUDGET_DEFAULT: Duration = Duration::from_millis(100);
 
-/// How many CONSECUTIVE samples on one side of the budget flip the scale guard
-/// (review N2). One sample is not a classifier: measured on an idle machine at
-/// 3 117 files, six consecutive `build_project` runs were 93.9 / 93.7 / 90.9 /
-/// **106.2** / 94.7 / 92.9 ms against a 100 ms budget — a 1-in-6 false trip on a
-/// single sample, and the same quantity spans 3.3× across machines (145–485 ms).
-/// Requiring two consecutive samples squares that error probability, and the
-/// symmetric re-enable means a session that trips on a fluke recovers on its own.
+/// How many CONSECUTIVE over-budget samples DISABLE the overlay (review N2). One
+/// sample is not a classifier: measured on an idle machine at 3 117 files, six
+/// consecutive `build_project` runs were 93.9 / 93.7 / 90.9 / **106.2** / 94.7 /
+/// 92.9 ms against a 100 ms budget — a 1-in-6 false trip on a single sample, and
+/// the same quantity spans 3.3× across machines (145–485 ms). Requiring two
+/// consecutive samples squares that error probability.
+///
+/// **Re-enabling takes a SINGLE under-budget sample** — the hysteresis is
+/// deliberately ASYMMETRIC. Disabling must resist a transient stall, but
+/// re-enabling is cheap to undo: once the overlay is ON, per-dispatch samples are
+/// plentiful, so a wrong re-enable self-corrects within two dispatches. Symmetry
+/// would also make recovery near-unreachable, since while OFF the only samples
+/// come from structural invalidations — requiring two consecutive ones would have
+/// made the "re-evaluated, no restart needed" disclosure effectively false.
 const OVERLAY_GUARD_STRIKES: u32 = 2;
 
 /// The S4b scale guard's HYSTERESIS state (review N2, superseding the mini-spec's
@@ -360,8 +367,6 @@ struct OverlayGuard {
     enabled: bool,
     /// Consecutive over-budget samples (reset by any under-budget one).
     over: u32,
-    /// Consecutive under-budget samples (reset by any over-budget one).
-    under: u32,
 }
 
 /// What one [`OverlayGuard::record`] did to the posture.
@@ -377,13 +382,16 @@ enum GuardVerdict {
 
 impl OverlayGuard {
     fn new() -> Self {
-        Self { enabled: true, over: 0, under: 0 }
+        Self { enabled: true, over: 0 }
     }
 
     /// Feed one `build_project` timing to the guard and report any posture flip.
+    ///
+    /// Callers must only pass samples that describe the CURRENT posture: a worker
+    /// result produced before a disable-swap says nothing about the state it lands
+    /// in, and acting on one would be terminal (see [`handle_result`]).
     fn record(&mut self, sample: Duration, budget: Duration) -> GuardVerdict {
         if sample > budget {
-            self.under = 0;
             self.over += 1;
             if self.enabled && self.over >= OVERLAY_GUARD_STRIKES {
                 self.enabled = false;
@@ -391,11 +399,13 @@ impl OverlayGuard {
                 return GuardVerdict::Disabled;
             }
         } else {
+            // Any under-budget sample clears the streak, so an isolated spike among
+            // healthy samples can never accumulate into a trip…
             self.over = 0;
-            self.under += 1;
-            if !self.enabled && self.under >= OVERLAY_GUARD_STRIKES {
+            // …and, while OFF, a single one is enough to recover (asymmetric by
+            // design — see `OVERLAY_GUARD_STRIKES`).
+            if !self.enabled {
                 self.enabled = true;
-                self.under = 0;
                 return GuardVerdict::ReEnabled;
             }
         }
@@ -539,17 +549,17 @@ fn overlay_guard_message(
         GuardVerdict::Disabled => Some(format!(
             "rigor: cross-file diagnostics disabled — the project index for {files} files took \
              {:.0}ms to build, over the {:.0}ms budget, on {OVERLAY_GUARD_STRIKES} consecutive \
-             measurements; diagnostics fall back to single-file scope. This is re-evaluated as \
-             the project changes — no restart needed.",
+             measurements; diagnostics fall back to single-file scope. Saving a config or \
+             signature file re-measures it, and one under-budget rebuild restores cross-file \
+             diagnostics — no restart needed.",
             ms(sample),
             ms(budget),
         )),
         GuardVerdict::ReEnabled => Some(format!(
-            "rigor: cross-file diagnostics re-enabled — the project index for {files} files is \
-             back inside the {:.0}ms budget ({:.0}ms on {OVERLAY_GUARD_STRIKES} consecutive \
-             measurements).",
-            ms(budget),
+            "rigor: cross-file diagnostics re-enabled — rebuilding the project index for {files} \
+             files took {:.0}ms, back inside the {:.0}ms budget.",
             ms(sample),
+            ms(budget),
         )),
     }
 }
@@ -1044,11 +1054,30 @@ fn swap_project(st: &mut Session, index: Arc<CoreIndex>, overlay: Option<Project
 /// `Vec<(PathBuf, Arc<LoweredAst>)>`, so replacing or removing one entry is a
 /// cheap clone + one file's parse — sub-millisecond regardless of project size.
 ///
-/// A changed file that is NOT already held but IS in project scope (a newly
-/// created file) falls back to a FULL rebuild: appending would put it at the end
-/// of the table, whereas `build_overlay` yields `check`'s sorted order, and
-/// `build_project`'s multi-pass harvest is order-sensitive for conflicting
-/// definitions. Correctness over speed on the rarer event.
+/// **The invariant** (adversarial review of PR #43): the incremental state must be
+/// byte-identical to what a full rebuild would produce. The first implementation
+/// tried to decide membership with a `ProjectScope` predicate re-deriving
+/// bare-`check`'s discovery rule, and diverged from it three ways (a deleted
+/// DIRECTORY, a symlinked `.rb` stored under its out-of-root canonical path, and
+/// `paths: ["."]`). A predicate that must agree with a tree walk is the wrong
+/// shape; this is the conservative rule that replaces it:
+///
+/// - **Replace in place ONLY when the changed path resolves to an entry ALREADY
+///   HELD** (looked up by canonical path, keeping its original position — order
+///   matters to `build_project`'s multi-pass harvest). A held entry whose file is
+///   confirmed gone is removed in place.
+/// - **EVERY other case falls back to [`apply_full_overlay_build`]**: an
+///   unresolvable path (the deleted-directory case), a path not currently held (it
+///   could be a new in-scope file), a read/parse failure, anything ambiguous.
+///   Correct by construction — no predicate to keep in sync with discovery.
+/// - An event is IGNORED only when BOTH: its canonical form is not held AND its
+///   path is not under any configured root. Both conditions, because a filter that
+///   can drop a real event reintroduces the divergence.
+///
+/// The fast path still covers the overwhelmingly common event — saving the file
+/// you are editing is a held entry, so it is a clone of a `Vec<(PathBuf, Arc<_>)>`
+/// plus one file's parse (measured 0.067 ms at 3 117 files, vs 111 ms for the full
+/// rebuild it replaced).
 ///
 /// Never rebuilds the `CoreIndex`: it depends on the plugin set and the signature
 /// dirs, neither of which a project `.rb` file can change.
@@ -1061,58 +1090,87 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
         swap_project(st, index, None);
         return None;
     };
-    let scope = ProjectScope::new(&ctx.project_root, &st.cfg);
     for uri_str in uris {
-        let Ok(uri) = uri_str.parse::<Uri>() else { continue };
-        // The parent-fallback canonicalization matters here too: a DELETED file
-        // must still resolve to the path tier 1 recorded, or its stale entry could
-        // never be found and removed.
-        let Some(path) = uri_to_canonical_path(&uri) else { continue };
-        let held = files.files.iter().position(|(p, _)| p == &path);
-        let harvested = scope
-            .contains(&st.cfg, &path)
-            .then(|| harvest_one(&path.to_string_lossy()))
-            .flatten();
-        match (harvested, held) {
-            // An edit to a file we already hold: replace its AST in place, which
-            // preserves the table's `check`-equivalent ordering exactly.
-            (Some(ast), Some(i)) => files.files[i].1 = Arc::new(ast),
-            // A NEW in-scope file — full rebuild for ordering fidelity.
-            (Some(_), None) => return apply_full_overlay_build(ctx, st, index),
-            // Deleted, excluded, ERB or unparseable: drop any entry it had.
-            (None, Some(i)) => {
-                files.files.remove(i);
+        let Ok(uri) = uri_str.parse::<Uri>() else {
+            return apply_full_overlay_build(ctx, st, index); // unparseable ⇒ ambiguous
+        };
+        // The parent-fallback canonicalization matters here: a DELETED file must
+        // still resolve to the path tier 1 recorded, or its stale entry could never
+        // be found and removed. `None` means even the parent is gone (a deleted
+        // directory) — not resolvable, so not decidable here.
+        let canonical = uri_to_canonical_path(&uri);
+        // ALL positions holding this canonical path, not just the first. Discovery
+        // can legitimately yield the same file twice — under `paths: ["."]` a
+        // symlinked `.rb` and its target are both walked, and both canonicalize to
+        // the target — and a full rebuild keeps both entries (as does `check`). The
+        // invariant is to match the rebuild, so every occurrence is updated or
+        // removed together.
+        let held: Vec<usize> = canonical
+            .as_deref()
+            .map(|p| {
+                files
+                    .files
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (q, _))| q == p)
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if held.is_empty() {
+            // Not held. Ignore ONLY if it also cannot be in project scope; anything
+            // that might be a new in-scope file gets the full rebuild.
+            if touches_configured_root(ctx, &st.cfg, canonical.as_deref(), &uri) {
+                return apply_full_overlay_build(ctx, st, index);
             }
-            (None, None) => {}
+            continue;
+        }
+        let path = canonical.expect("a held match implies a resolved path");
+        if !path.exists() {
+            // Confirmed gone — remove in place (back-to-front, so the earlier
+            // indices stay valid).
+            for i in held.iter().rev() {
+                files.files.remove(*i);
+            }
+        } else if let Some(ast) = harvest_one(&path.to_string_lossy()) {
+            let ast = Arc::new(ast);
+            for i in &held {
+                files.files[*i].1 = Arc::clone(&ast);
+            }
+        } else {
+            // Present but unharvestable (read error, now an ERB template, a parser
+            // panic) — ambiguous, so let a full rebuild decide.
+            return apply_full_overlay_build(ctx, st, index);
         }
     }
     swap_project(st, index, Some(files));
     None
 }
 
-/// The set of paths the project index harvests, as a cheap membership test —
-/// bare-`check`'s rule without re-walking the tree: a path must sit under the
-/// canonical project root, under one of the config `paths:` roots, and survive the
-/// config `exclude:` globs (matched against the SAME project-relative string
-/// `project_files` produces, so the two agree).
-struct ProjectScope {
-    root: Option<PathBuf>,
-    paths: Vec<String>,
-}
-
-impl ProjectScope {
-    fn new(root: &Path, cfg: &Config) -> Self {
-        Self { root: std::fs::canonicalize(root).ok(), paths: cfg.paths.clone() }
-    }
-
-    fn contains(&self, cfg: &Config, path: &Path) -> bool {
-        let Some(root) = &self.root else { return false };
-        let Ok(rel) = path.strip_prefix(root) else { return false };
-        if cfg.is_excluded(&rel.to_string_lossy()) {
-            return false;
-        }
-        self.paths.iter().any(|p| rel.starts_with(p))
-    }
+/// Whether a watched-file event could possibly concern a path the project index
+/// harvests — the second half of [`reharvest_sources`]'s ignore condition.
+///
+/// Deliberately one-sided: it answers "is it safe to IGNORE this?", so every
+/// uncertainty (an unresolvable configured root, a path that resolves under either
+/// its decoded or its canonical spelling) answers `true` and costs at most one
+/// full rebuild. It is NOT a discovery predicate — it never decides that a file
+/// belongs in the index, only that an event is not obviously irrelevant.
+fn touches_configured_root(
+    ctx: &ServerContext,
+    cfg: &Config,
+    canonical: Option<&Path>,
+    uri: &Uri,
+) -> bool {
+    let decoded = uri_decoded_path(uri);
+    let candidates: Vec<&Path> = decoded.as_deref().into_iter().chain(canonical).collect();
+    cfg.paths.iter().any(|p| {
+        let joined = join_root(&ctx.project_root, p);
+        // An unresolvable configured root cannot rule anything out.
+        let Ok(canon_root) = std::fs::canonicalize(&joined) else { return true };
+        candidates
+            .iter()
+            .any(|c| c.starts_with(&canon_root) || c.starts_with(&joined))
+    })
 }
 
 /// After an [`invalidate`], re-analyse EVERY open buffer (S4): a project-context
@@ -1514,8 +1572,18 @@ fn handle_result(
     // Feed the scale guard the overlay rebuild this dispatch already paid for
     // (review N2). Done AFTER the result is handled, so a posture flip never
     // suppresses the (correct, overlay-computed) publish that produced the sample.
-    if let Some(sample) = sample {
+    //
+    // **Only while the guard is ENABLED** (review B-2). A sample arriving once the
+    // overlay is off necessarily comes from a dispatch that PREDATES the
+    // disable-swap (a concurrent per-URI dispatch, or a buffer closed mid-flight),
+    // so it describes a posture that no longer exists. Acting on one would also be
+    // terminal: `ReEnabled` here would flip the guard on while `project.overlay` is
+    // still `None`, and with no overlay no further sample is ever produced — the
+    // session could never actually recover, while telling the user it had.
+    // Recovery belongs where the overlay is being rebuilt anyway, in `invalidate`.
+    if let Some(sample) = sample.filter(|_| st.guard.enabled) {
         let verdict = st.guard.record(sample, ctx.overlay_budget);
+        // Read the count BEFORE the swap empties the overlay.
         let files = st.project.overlay.as_ref().map_or(0, |o| o.files.len());
         if let Some(msg) = overlay_guard_message(&verdict, files, sample, ctx.overlay_budget) {
             if verdict == GuardVerdict::Disabled {
@@ -1594,18 +1662,27 @@ fn overlay_source_index(
 /// path whose parent is also unresolvable (a genuinely non-filesystem buffer) is
 /// `None`, and only that case appends.
 fn uri_to_canonical_path(uri: &Uri) -> Option<PathBuf> {
-    let rest = uri.as_str().strip_prefix("file://")?;
-    // Skip the (empty or `localhost`) authority component: `file:///a/b` → `/a/b`.
-    let start = rest.find('/')?;
-    let decoded = PathBuf::from(percent_decode(&rest[start..]));
+    let decoded = uri_decoded_path(uri)?;
     if let Ok(canonical) = std::fs::canonicalize(&decoded) {
         return Some(canonical);
     }
     // The file is gone (or not yet written) — canonicalize its directory instead,
-    // which yields the SAME path tier 1 recorded while the file still existed.
+    // which yields the SAME path tier 1 recorded while the file still existed. When
+    // the DIRECTORY is gone too this returns `None`, and callers must treat that as
+    // "not decidable here" rather than "no on-disk identity".
     let name = decoded.file_name()?;
     let parent = std::fs::canonicalize(decoded.parent()?).ok()?;
     Some(parent.join(name))
+}
+
+/// The literal filesystem path a `file:` URI spells, percent-decoded but NOT
+/// resolved — so it survives a path whose directory no longer exists, which
+/// [`uri_to_canonical_path`] cannot.
+fn uri_decoded_path(uri: &Uri) -> Option<PathBuf> {
+    let rest = uri.as_str().strip_prefix("file://")?;
+    // Skip the (empty or `localhost`) authority component: `file:///a/b` → `/a/b`.
+    let start = rest.find('/')?;
+    Some(PathBuf::from(percent_decode(&rest[start..])))
 }
 
 /// Percent-decode a URI path component (`%20` → a space). Invalid escapes are
@@ -3350,15 +3427,19 @@ mod tests {
         assert_eq!(g.record(over, budget), GuardVerdict::Disabled);
         assert!(!g.enabled);
 
-        // Symmetrically: one good sample does not re-enable…
-        assert_eq!(g.record(under, budget), GuardVerdict::Unchanged);
-        assert!(!g.enabled);
-        assert_eq!(g.record(over, budget), GuardVerdict::Unchanged, "streak reset");
-        // …two consecutive ones do — so a session that tripped on a slow moment
-        // recovers on its own, with no restart.
-        assert_eq!(g.record(under, budget), GuardVerdict::Unchanged);
+        // Recovery is ASYMMETRIC: a SINGLE under-budget sample re-enables. While
+        // OFF the only samples come from structural invalidations, so requiring two
+        // consecutive ones made recovery near-unreachable — and the "no restart
+        // needed" disclosure false. A wrong re-enable is cheap: once ON, dispatch
+        // samples are plentiful and it self-corrects within two of them.
         assert_eq!(g.record(under, budget), GuardVerdict::ReEnabled);
         assert!(g.enabled);
+
+        // …and the re-enabled guard still needs two consecutive over-budget samples
+        // to trip again (recovery does not leave it hair-trigger).
+        assert_eq!(g.record(over, budget), GuardVerdict::Unchanged);
+        assert_eq!(g.record(over, budget), GuardVerdict::Disabled);
+        assert_eq!(g.record(under, budget), GuardVerdict::ReEnabled);
 
         // A sample exactly AT the budget is inside it (the test is `>`).
         let mut edge = OverlayGuard::new();
@@ -3884,32 +3965,142 @@ mod tests {
         h.shutdown();
     }
 
+    /// A complete structural fingerprint of a held overlay: every entry's path AND
+    /// its AST's full `Debug` dump, IN ORDER. Comparing this against a fresh
+    /// `build_overlay` is the strong form of N3's invariant — not just "the same
+    /// files" but the same ASTs in the same positions, which is what
+    /// `build_project`'s order-sensitive multi-pass harvest actually consumes.
+    fn overlay_fingerprint(files: &ProjectFiles) -> Vec<(String, String)> {
+        files
+            .files
+            .iter()
+            .map(|(p, a)| (p.to_string_lossy().into_owned(), format!("{a:?}")))
+            .collect()
+    }
+
+    /// A `Session` over a real temp project, for driving [`reharvest_sources`]
+    /// directly (the incremental path is loop-thread state, not protocol surface).
+    fn session_for(root: &Path, cfg: Config, budget: Duration) -> (ServerContext, Session) {
+        let ctx = ServerContext {
+            debounce: Duration::from_secs(30),
+            worker_gate: production_gate(),
+            watched_files_dynamic_registration: false,
+            project_root: root.to_path_buf(),
+            overlay_budget: budget,
+        };
+        let index = Arc::new(CoreIndex::new());
+        let build = build_overlay(root, &cfg, &index);
+        let (results_tx, _rx) = crossbeam_channel::unbounded();
+        let st = Session {
+            buffers: BufferTable::new(),
+            debouncer: Debouncer::new(),
+            in_flight: HashSet::new(),
+            epochs: HashMap::new(),
+            project: Arc::new(ProjectContext {
+                generation: 0,
+                index,
+                disable: cfg.disable_matcher(),
+                folder: None,
+                overlay: Some(build.files),
+            }),
+            cfg,
+            results_tx,
+            guard: OverlayGuard::new(),
+        };
+        (ctx, st)
+    }
+
     #[test]
-    fn project_scope_matches_bare_check_discovery() {
-        // The membership test the per-file re-harvest gates on must agree with
-        // `project_files` — otherwise a save could insert a file `check` would
-        // never index (or skip one it would).
-        let p = TempProject::new("scope");
-        p.write("a.rb", "class A\nend\n");
-        std::fs::create_dir_all(p.root.join("spec")).unwrap();
-        std::fs::write(p.root.join("spec/a_spec.rb"), "class ASpec\nend\n").unwrap();
-        let cfg = Config::default(); // paths: ["lib"]
-        let scope = ProjectScope::new(&p.root, &cfg);
-        assert!(scope.contains(&cfg, &p.root.join("lib/a.rb")), "under paths: lib");
-        assert!(
-            !scope.contains(&cfg, &p.root.join("spec/a_spec.rb")),
-            "outside paths: ⇒ not harvested, exactly as bare `check` skips it"
-        );
-        assert!(
-            !scope.contains(&cfg, Path::new("/elsewhere/x.rb")),
-            "outside the project root entirely"
-        );
-        // `exclude:` prunes here too, matched against the same project-relative
-        // string `project_files` builds.
-        let excluded: Config = serde_yaml::from_str("exclude:\n  - \"lib/vendor/**\"\n").unwrap();
-        let scope = ProjectScope::new(&p.root, &excluded);
-        assert!(!scope.contains(&excluded, &p.root.join("lib/vendor/dep.rb")));
-        assert!(scope.contains(&excluded, &p.root.join("lib/a.rb")));
+    fn incremental_reharvest_is_byte_identical_to_a_full_rebuild() {
+        // THE N3 INVARIANT (adversarial review of PR #43): after ANY sequence of
+        // incremental updates, the held set must equal what a full rebuild of the
+        // same tree would produce — entries, ASTs, and ORDER.
+        //
+        // The first implementation decided membership with a `ProjectScope`
+        // predicate that re-derived bare-`check`'s discovery rule, and diverged from
+        // it on a deleted DIRECTORY, a symlinked `.rb` (held under its out-of-root
+        // canonical path), and `paths: ["."]`. This test drives all three, plus the
+        // ordinary transitions, and compares against the ground truth each time —
+        // so it fails on ANY divergence, not just the three that were found.
+        for paths_yaml in ["paths:\n  - lib\n", "paths:\n  - \".\"\n"] {
+            let cfg: Config = serde_yaml::from_str(paths_yaml).unwrap();
+            let cfg2: Config = serde_yaml::from_str(paths_yaml).unwrap();
+            let p = TempProject::new("differential");
+            p.write("a.rb", "class A\nend\n");
+            p.write("b.rb", BASE_RB);
+            std::fs::create_dir_all(p.root.join("lib/nested")).unwrap();
+            std::fs::write(p.root.join("lib/nested/c.rb"), "class C\nend\n").unwrap();
+            // A symlinked `.rb` FILE: bare-`check` discovery harvests it (a symlink
+            // to a file matches `Dir.glob`), and it is held under its CANONICAL,
+            // out-of-`lib` path.
+            std::fs::create_dir_all(p.root.join("shared")).unwrap();
+            std::fs::write(p.root.join("shared/linked.rb"), "class Linked\nend\n").unwrap();
+            std::os::unix::fs::symlink(
+                p.root.join("shared/linked.rb"),
+                p.root.join("lib/linked.rb"),
+            )
+            .unwrap();
+
+            let (ctx, mut st) = session_for(&p.root, cfg2, OVERLAY_BUILD_BUDGET_DEFAULT);
+            let index = Arc::new(CoreIndex::new());
+            let check = |st: &Session, label: &str| {
+                let truth = build_overlay(&p.root, &cfg, &index);
+                let held = st.project.overlay.as_ref().expect("overlay stays live");
+                assert_eq!(
+                    overlay_fingerprint(held),
+                    overlay_fingerprint(&truth.files),
+                    "[{paths_yaml:?} / {label}] incremental state diverged from a full rebuild"
+                );
+            };
+            check(&st, "initial");
+
+            // (1) EDIT a held file — the fast path (replace in place).
+            p.write("a.rb", "class A\n  def extra\n  end\nend\n");
+            reharvest_sources(&ctx, &mut st, &[p.uri("a.rb")]);
+            check(&st, "edit held file");
+
+            // (2) EDIT through the SYMLINK's path. The event names lib/linked.rb;
+            // the held entry is shared/linked.rb. Canonicalization is what makes
+            // these the same entry — the scope predicate got this wrong (probe C).
+            std::fs::write(p.root.join("shared/linked.rb"), "class Linked\n  def x\n  end\nend\n")
+                .unwrap();
+            reharvest_sources(&ctx, &mut st, &[p.uri("linked.rb")]);
+            check(&st, "edit via symlink path");
+
+            // (3) DELETE a held file whose parent still exists — removed in place.
+            std::fs::remove_file(p.root.join("lib/b.rb")).unwrap();
+            reharvest_sources(&ctx, &mut st, &[p.uri("b.rb")]);
+            check(&st, "delete file");
+
+            // (4) CREATE a new file — not held ⇒ full rebuild ⇒ correct ORDER
+            //     (an append would put it last; `build_overlay` sorts).
+            p.write("aa.rb", "class Aa\nend\n");
+            reharvest_sources(&ctx, &mut st, &[p.uri("aa.rb")]);
+            check(&st, "create file");
+
+            // (5) DELETE A DIRECTORY — the path no longer resolves even via its
+            //     parent, so it is not decidable incrementally (probe A).
+            std::fs::remove_dir_all(p.root.join("lib/nested")).unwrap();
+            let gone = format!("file://{}", p.root.join("lib/nested/c.rb").display());
+            reharvest_sources(&ctx, &mut st, &[gone]);
+            check(&st, "delete directory");
+
+            // (6) An out-of-project `.rb` event: ignored (or full-rebuilt) — either
+            //     way the state must still match the ground truth.
+            reharvest_sources(&ctx, &mut st, &["file:///nowhere/at/all/x.rb".to_string()]);
+            check(&st, "unrelated file");
+
+            // (7) A BATCH mixing an edit, a delete and a creation in one payload.
+            p.write("a.rb", "class A\nend\n");
+            std::fs::remove_file(p.root.join("lib/aa.rb")).unwrap();
+            p.write("z.rb", "class Z\nend\n");
+            reharvest_sources(
+                &ctx,
+                &mut st,
+                &[p.uri("a.rb"), p.uri("aa.rb"), p.uri("z.rb")],
+            );
+            check(&st, "mixed batch");
+        }
     }
 
     #[test]
@@ -3989,4 +4180,149 @@ mod tests {
             "a deleted file keeps its canonical identity via its parent directory"
         );
     }
+
+    /// PROBE A [BLOCKING]: `rm -rf` of a SUBDIRECTORY holding project files.
+    /// `uri_to_canonical_path` resolves a deleted file via its PARENT; when the
+    /// parent directory is gone too it returns `None`, and `reharvest_sources`
+    /// `continue`s (lsp.rs:1070) — so the stale AST is never removed. The pre-N3
+    /// full rebuild dropped it.
+    #[test]
+    fn probe_a_directory_deletion_leaves_stale_asts() {
+        let p = TempProject::new("probe_a");
+        std::fs::create_dir_all(p.root.join("lib/nested")).unwrap();
+        std::fs::write(p.root.join("lib/nested/base.rb"), BASE_RB).unwrap();
+        p.write("sub.rb", SUB_RB);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("sub.rb"), SUB_RB, 1));
+        assert_eq!(h.recv_diags().diagnostics.len(), 1, "override fires against Base");
+
+        // rm -rf lib/nested  (a `git checkout` that drops a directory)
+        std::fs::remove_dir_all(p.root.join("lib/nested")).unwrap();
+        let gone = format!("file://{}", p.root.join("lib/nested/base.rb").display());
+        h.notify(
+            "workspace/didChangeWatchedFiles",
+            serde_json::json!({ "changes": [ { "uri": gone, "type": 3 } ] }),
+        );
+        let d = h.recv_diags();
+        assert!(
+            d.diagnostics.is_empty(),
+            "PROBE A FAILED: stale AST for a file in a deleted DIRECTORY survives \
+             the incremental re-harvest: {:?}",
+            d.diagnostics
+        );
+        h.shutdown();
+    }
+
+    /// PROBE D [BLOCKING, fixed]: the guard's OFF->ON flip used to happen in
+    /// `handle_result`, which never re-installs the overlay. Samples arrive from
+    /// workers dispatched BEFORE the disable-swap (a concurrent per-URI dispatch, a
+    /// buffer closed mid-flight), so under-budget stragglers after a trip re-ENABLED
+    /// the guard while `project.overlay` was still `None` — terminal, because with
+    /// no overlay no further sample is ever produced, and the user was told
+    /// "re-enabled ... for 0 files" (the count read from the already-emptied
+    /// overlay).
+    ///
+    /// The fix: worker samples are IGNORED while the guard is disabled. They
+    /// necessarily predate the disable-swap, so they carry no information about the
+    /// current posture. Recovery lives in `invalidate`, where the overlay is being
+    /// rebuilt anyway (see the companion test below).
+    #[test]
+    fn probe_d_worker_samples_are_ignored_while_the_guard_is_disabled() {
+        let p = TempProject::new("probe_d");
+        p.write("base.rb", BASE_RB);
+        p.write("sub.rb", SUB_RB);
+        let (server_conn, _client) = Connection::memory();
+        let (ctx, mut st) = session_for(&p.root, Config::default(), Duration::from_millis(100));
+        assert_eq!(st.project.overlay.as_ref().unwrap().files.len(), 2);
+
+        // A result whose buffer is not open is DROPPED for publishing but still
+        // reaches the guard — the minimal reachable shape of "a sample from a
+        // dispatch that predates the current posture".
+        let uri: Uri = p.uri("sub.rb").parse().unwrap();
+        let feed = |st: &mut Session, ms: u64| {
+            handle_result(
+                &server_conn,
+                &ctx,
+                st,
+                Computed {
+                    uri: uri.clone(),
+                    version: 1,
+                    generation: 0,
+                    epoch: 0,
+                    diags: Vec::new(),
+                    overlay_build: Some(Duration::from_millis(ms)),
+                },
+            )
+            .unwrap();
+        };
+        feed(&mut st, 150); // over #1
+        feed(&mut st, 150); // over #2 -> Disabled, overlay dropped
+        assert!(!st.guard.enabled, "two over-budget samples disable");
+        assert!(st.project.overlay.is_none(), "the held ASTs are dropped");
+
+        // Stragglers must NOT flip the posture from here.
+        feed(&mut st, 10);
+        feed(&mut st, 10);
+        assert!(
+            !st.guard.enabled,
+            "a worker sample that predates the disable cannot re-enable the guard"
+        );
+        assert!(
+            st.project.overlay.is_none(),
+            "and the overlay must never be ENABLED-but-empty (that state is terminal)"
+        );
+        drop(st);
+    }
+
+    #[test]
+    fn guard_recovers_through_a_structural_rebuild() {
+        // The companion to probe D: recovery is real, and it happens where the
+        // overlay is rebuilt anyway. A single under-budget sample re-enables
+        // (asymmetric hysteresis), the freshly built ASTs are installed, and the
+        // disclosure reports the count from the NEW overlay — not 0.
+        let p = TempProject::new("recover");
+        p.write("base.rb", BASE_RB);
+        p.write("sub.rb", SUB_RB);
+        let (mut ctx, mut st) = session_for(&p.root, Config::default(), Duration::ZERO);
+
+        // Trip it with two over-budget samples (budget ZERO => every sample is over).
+        let (server_conn, _client) = Connection::memory();
+        let uri: Uri = p.uri("sub.rb").parse().unwrap();
+        for _ in 0..2 {
+            handle_result(
+                &server_conn,
+                &ctx,
+                &mut st,
+                Computed {
+                    uri: uri.clone(),
+                    version: 1,
+                    generation: 0,
+                    epoch: 0,
+                    diags: Vec::new(),
+                    overlay_build: Some(Duration::from_millis(1)),
+                },
+            )
+            .unwrap();
+        }
+        assert!(!st.guard.enabled && st.project.overlay.is_none(), "tripped");
+
+        // A structural invalidation under a generous budget: ONE under-budget
+        // sample restores the overlay.
+        ctx.overlay_budget = Duration::from_secs(30);
+        let msg = invalidate(&ctx, &mut st).expect("a posture flip discloses");
+        assert!(st.guard.enabled, "one under-budget rebuild re-enables");
+        let restored = st.project.overlay.as_ref().expect("the overlay is re-installed");
+        assert_eq!(restored.files.len(), 2, "with the freshly harvested ASTs");
+        assert!(
+            msg.contains("re-enabled") && msg.contains("2 files"),
+            "the disclosure reports the NEW overlay's count, not the emptied one: {msg}"
+        );
+    }
+
 }
