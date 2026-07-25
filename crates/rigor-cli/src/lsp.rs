@@ -202,6 +202,7 @@ fn run_stdio() -> Result<(), String> {
         disable: cfg.disable_matcher(),
         folder,
         stamp: SeverityStamp::from_config(&cfg),
+        exclude: ExcludeMatcher::from_config(&root, &cfg),
         overlay,
     });
 
@@ -291,6 +292,11 @@ struct ProjectContext {
     /// exactly like [`Self::disable`], so it sits beside it and is rebuilt for free
     /// by [`invalidate`] / [`swap_project`].
     stamp: SeverityStamp,
+    /// The config `exclude:` gate for the OPEN BUFFER — `check`'s STAGE-1 file
+    /// filter. Config-derived like [`Self::disable`] and [`Self::stamp`], so it
+    /// sits beside them and rides the same `invalidate` / `swap_project` rebuild
+    /// and the same S4 generation guard.
+    exclude: ExcludeMatcher,
     /// The **cross-file overlay substrate** (S4b): every project `.rb` file's
     /// canonical path + its held `LoweredAst`, harvested at build time. A
     /// diagnostics dispatch rebuilds the project `SourceIndex` from these ASTs
@@ -386,6 +392,100 @@ impl SeverityStamp {
             severity::ResolvedSeverity::Info => diag.severity = Severity::Info,
         }
         true
+    }
+}
+
+/// The config `exclude:` gate for the OPEN BUFFER — the LSP's counterpart of
+/// `check`'s STAGE-1 file filter (`main.rs`: `if cfg.is_excluded(path) { return
+/// Stage1::Excluded; }`, the very first thing stage 1 does, before the file is
+/// even read).
+///
+/// Carried on [`ProjectContext`] beside [`ProjectContext::disable`] and
+/// [`ProjectContext::stamp`] for the same reason those live there: every field is
+/// config-derived, so `invalidate` / `swap_project` rebuild it for free and the S4
+/// generation guard covers it with no new concurrency reasoning. Nothing re-reads
+/// `.rigor.yml` per dispatch.
+///
+/// **The path form is the whole difficulty.** `exclude:` patterns are matched
+/// against the path string as `check` SPELLS it, not against an absolute canonical
+/// path: bare `check` expands each `paths:` root (`expand_check_paths` →
+/// `collect_rb_files`, which builds `<root>/<rel>` by `Path::join`), so with the
+/// production root `.` the matched string is `lib/sub.rb`, and under
+/// `paths: ["."]` it is `./lib/sub.rb`. A buffer arrives here as a CANONICAL
+/// absolute path instead, so it must be re-spelled the way discovery would have
+/// spelled it — [`Self::check_spelling`] — or a pattern like `lib/**` would silently
+/// match nothing. That is also what keeps this gate and [`project_files`] (which
+/// applies `cfg.is_excluded` to exactly those discovery spellings) in agreement: a
+/// mismatch between them would be its own divergence.
+struct ExcludeMatcher {
+    /// The project root AS SPELLED to the server: `.` in production, an absolute
+    /// temp dir in tests — the same `join_root` convention [`project_files`] and
+    /// [`touches_configured_root`] use.
+    root: PathBuf,
+    /// `paths:` — the discovery roots, needed to reproduce discovery's spelling of
+    /// a buffer's path.
+    paths: Vec<String>,
+    /// `exclude:` verbatim. Matched by [`crate::config::matches_exclude`], the same
+    /// entry point `Config::is_excluded` (and so `check`) calls — never a second
+    /// implementation of the glob rule.
+    patterns: Vec<String>,
+}
+
+impl ExcludeMatcher {
+    fn from_config(root: &Path, cfg: &Config) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            paths: cfg.paths.clone(),
+            patterns: cfg.exclude.clone(),
+        }
+    }
+
+    /// Whether the buffer at `path` is `exclude:`d, i.e. whether `check` would
+    /// report nothing for it. `None` (an untitled / non-`file:` buffer) is never
+    /// excluded — it has no path for a pattern to match, and `check` never sees it.
+    fn excludes(&self, path: Option<&Path>) -> bool {
+        if self.patterns.is_empty() {
+            return false; // the overwhelmingly common case: no filesystem work.
+        }
+        let Some(path) = path else { return false };
+        let Some(spelled) = self.check_spelling(path) else { return false };
+        crate::config::matches_exclude(&self.patterns, &spelled.to_string_lossy())
+    }
+
+    /// Re-spell a canonical buffer path the way `check` spells it, or `None` when
+    /// no `check` invocation would name this file.
+    ///
+    /// FIRST the discovery spelling: the buffer under configured root `p` is spelled
+    /// `join_root(root, p).join(<path relative to that root's canonical form>)` —
+    /// byte-identical to what [`project_files`] produces for the same file, which is
+    /// what `check`'s stage 1 matches `exclude:` against on a bare run. Roots are
+    /// canonicalized before the comparison (like [`touches_configured_root`]) so a
+    /// symlinked workspace spelling cannot defeat the match.
+    ///
+    /// FAILING THAT, the project-root-relative spelling — the buffer is inside the
+    /// workspace but outside every `paths:` root, so the only `check` run that would
+    /// ever report on it is an explicit `rigor check <that file>` from the project
+    /// root, which matches `exclude:` against exactly that relative spelling.
+    ///
+    /// `None` for a buffer outside the project root entirely: no `check` invocation
+    /// from this root names it, so there is no spelling to match and it is left
+    /// alone.
+    fn check_spelling(&self, path: &Path) -> Option<PathBuf> {
+        for p in &self.paths {
+            let base = join_root(&self.root, p);
+            let Ok(canonical_base) = std::fs::canonicalize(&base) else {
+                continue; // a configured root that does not exist excludes nothing.
+            };
+            let Ok(rel) = path.strip_prefix(&canonical_base) else {
+                continue;
+            };
+            // `paths:` may name a FILE (`project_files` pushes the joined path as
+            // is); then `rel` is empty and the spelling is the root itself.
+            return Some(if rel.as_os_str().is_empty() { base } else { base.join(rel) });
+        }
+        let canonical_root = std::fs::canonicalize(&self.root).ok()?;
+        let rel = path.strip_prefix(&canonical_root).ok()?;
+        Some(join_root(&self.root, &rel.to_string_lossy()))
     }
 }
 
@@ -1116,7 +1216,7 @@ fn apply_full_overlay_build(
     };
     report_overlay_timing(&build, st.guard.enabled);
     let overlay = (st.guard.enabled && build.file_count > 0).then_some(build.files);
-    swap_project(st, index, overlay);
+    swap_project(ctx, st, index, overlay);
     message
 }
 
@@ -1127,7 +1227,12 @@ fn apply_full_overlay_build(
 /// the previous context, so its result is generation-dropped and re-dispatched by
 /// [`handle_result`] — the 3-axis stale-drop covers an overlay swap exactly as it
 /// covers an index rebuild, with no new concurrency reasoning.
-fn swap_project(st: &mut Session, index: Arc<CoreIndex>, overlay: Option<ProjectFiles>) {
+fn swap_project(
+    ctx: &ServerContext,
+    st: &mut Session,
+    index: Arc<CoreIndex>,
+    overlay: Option<ProjectFiles>,
+) {
     st.project = Arc::new(ProjectContext {
         generation: st.project.generation + 1,
         index,
@@ -1140,6 +1245,11 @@ fn swap_project(st: &mut Session, index: Arc<CoreIndex>, overlay: Option<Project
         // written this way so the stamp follows `st.cfg` the moment a future slice
         // makes the config reloadable, rather than silently going stale.
         stamp: SeverityStamp::from_config(&st.cfg),
+        // Same provenance, same schedule: rebuilt from `st.cfg` (and the immutable
+        // session root) on every context swap, so the day `.rigor.yml` becomes
+        // reloadable a newly-added `exclude:` entry takes effect on the very next
+        // publish instead of going stale.
+        exclude: ExcludeMatcher::from_config(&ctx.project_root, &st.cfg),
         overlay,
     });
 }
@@ -1197,7 +1307,7 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
         // Overlay off (guard tripped, or an empty project): `.rb` content feeds
         // nothing. Still bump the generation so open buffers re-publish under a
         // fresh context, matching S4's observable "a watched change re-analyses".
-        swap_project(st, index, None);
+        swap_project(ctx, st, index, None);
         return None;
     };
     for uri_str in uris {
@@ -1266,7 +1376,7 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
             return apply_full_overlay_build(ctx, st, index);
         }
     }
-    swap_project(st, index, Some(files));
+    swap_project(ctx, st, index, Some(files));
     None
 }
 
@@ -1744,7 +1854,7 @@ fn handle_result(
                 // memory goes back. The generation bump inside `swap_project`
                 // re-dispatches anything in flight under the new posture.
                 let index = Arc::clone(&st.project.index);
-                swap_project(st, index, None);
+                swap_project(ctx, st, index, None);
             }
             send_show_message(connection, MessageType::WARNING, msg)?;
         }
@@ -1900,6 +2010,11 @@ fn send_diagnostics(
 /// markers match `rigor check` on the same content. Panic-isolated (ADR-0016): a
 /// malformed buffer that trips the parser yields no diagnostics, never a crash.
 ///
+/// **The stage-1 head.** `check` never even reads a file the config `exclude:`
+/// patterns cover, so it reports no rows for it; the LSP applies the same gate to
+/// the open buffer ([`ExcludeMatcher`]) and returns an EMPTY set — a publish that
+/// clears, not a silent skip.
+///
 /// **The stage-3 tail.** `check`'s stage 3 ends by re-stamping each diagnostic's
 /// severity from the profile + user + bleeding-edge overrides and DROPPING an
 /// `:off` resolution ([`SeverityStamp::apply`]); the bleeding-edge selection also
@@ -1922,9 +2037,20 @@ fn compute_diagnostics(
     path: Option<&Path>,
     text: &str,
 ) -> (Vec<Diagnostic>, Option<Duration>) {
+    // STAGE-1 PARITY, in `check`'s order (`main.rs`): config `exclude:` FIRST —
+    // before the file is even read there, before the buffer is parsed here — then
+    // the ERB-template skip. An excluded buffer yields an EMPTY set rather than no
+    // publish at all, so the caller's publish CLEARS any markers the editor is
+    // already showing for it (the same empty-publish `didClose` uses).
+    if project.exclude.excludes(path) {
+        return (Vec::new(), None);
+    }
     let bytes = text.as_bytes().to_vec();
     // Skip ERB templates (matches `check` + the reference's ErbTemplateDetector):
     // Prism's error recovery over a `<%= … %>` template yields a garbage AST.
+    // `check` runs the same `rigor_parse::looks_like_erb_template` on the file's
+    // bytes; the LSP runs it on the BUFFER's, which is the same predicate over the
+    // content the user is actually editing.
     if rigor_parse::looks_like_erb_template(&bytes) {
         return (Vec::new(), None);
     }
@@ -2348,12 +2474,20 @@ mod tests {
     /// stage-3 stamp unit tests drive (`severity_profile:` / `severity_overrides:`
     /// / `bleeding_edge:` all reach `compute_diagnostics` through here).
     fn project_with_config(cfg: &Config) -> ProjectContext {
+        project_with_config_rooted(cfg, Path::new("/nonexistent-rigor-lsp-test-root"))
+    }
+
+    /// …and rooted at an explicit project root, which is what the `exclude:` gate
+    /// needs: the matcher re-spells a buffer path relative to the configured roots,
+    /// so a test that drives it must name a real on-disk root.
+    fn project_with_config_rooted(cfg: &Config, root: &Path) -> ProjectContext {
         ProjectContext {
             generation: 0,
             index: Arc::new(CoreIndex::new()),
             disable: cfg.disable_matcher(),
             folder: None,
             stamp: SeverityStamp::from_config(cfg),
+            exclude: ExcludeMatcher::from_config(root, cfg),
             overlay: None,
         }
     }
@@ -2859,6 +2993,29 @@ mod tests {
             root: PathBuf,
             overlay_budget: Duration,
         ) -> Self {
+            Self::start_project_with_config(
+                debounce,
+                worker_gate,
+                client_caps,
+                root,
+                overlay_budget,
+                Config::default(),
+            )
+        }
+
+        /// …and with an injected `.rigor.yml` equivalent. Production reads the
+        /// config from disk once at startup (`Config::load`); injecting the parsed
+        /// value is the same thing minus the file, and it is what the `exclude:`
+        /// tests drive — the whole point being that the gate is CONFIG-derived and
+        /// carried on the context, never re-read per dispatch.
+        fn start_project_with_config(
+            debounce: Duration,
+            worker_gate: Arc<WorkerGate>,
+            client_caps: serde_json::Value,
+            root: PathBuf,
+            overlay_budget: Duration,
+            cfg: Config,
+        ) -> Self {
             let (server_conn, client) = Connection::memory();
             let handle = thread::spawn(move || {
                 let caps = serde_json::to_value(server_capabilities()).unwrap();
@@ -2873,7 +3030,6 @@ mod tests {
                     project_root: root.clone(),
                     overlay_budget,
                 };
-                let cfg = Config::default();
                 // `CoreIndex::new()` (not `build_core_index`) keeps the tests fast
                 // and hermetic — no Gemfile.lock probing under a temp root.
                 let index = Arc::new(CoreIndex::new());
@@ -2891,6 +3047,7 @@ mod tests {
                     disable: cfg.disable_matcher(),
                     folder: None,
                     stamp: SeverityStamp::from_config(&cfg),
+                    exclude: ExcludeMatcher::from_config(&root, &cfg),
                     overlay,
                 });
                 main_loop(&server_conn, &ctx, project, cfg, guard).unwrap();
@@ -4348,6 +4505,7 @@ mod tests {
                 disable: cfg.disable_matcher(),
                 folder: None,
                 stamp: SeverityStamp::from_config(&cfg),
+                exclude: ExcludeMatcher::from_config(root, &cfg),
                 overlay: Some(build.files),
             }),
             cfg,
@@ -4525,6 +4683,250 @@ mod tests {
         let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/nested/**\"\n").unwrap();
         let pruned = project_files(&p.root, &cfg);
         assert_eq!(pruned.len(), 2, "the excluded dir is not harvested: {pruned:?}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Config `exclude:` for the OPEN BUFFER — `check`'s stage-1 file filter.
+    //
+    // `check` skips an excluded file before it is even read (`main.rs`
+    // `Stage1::Excluded`), so it reports no rows for it; the LSP published
+    // markers for it anyway. The gate below is the same filter, applied to the
+    // buffer, against the same path SPELLING discovery matches on.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn exclude_gate_agrees_with_bare_check_discovery() {
+        // THE AGREEMENT INVARIANT. For every file bare-`check` discovery walks, the
+        // per-buffer gate must answer EXACTLY what discovery's own `exclude:` filter
+        // answered for it — same patterns, same path spelling. Anything else is a
+        // second divergence (the overlay and the analysed buffer disagreeing about
+        // which files are in the project), which is what a hand-rolled
+        // "relativize against the root" would have produced: under
+        // `paths: ["."]` discovery spells the file `./lib/a.rb`, not `lib/a.rb`.
+        //
+        // Driven across BOTH `paths:` shapes and BOTH root spellings, because the
+        // spelling is precisely what the gate has to reproduce.
+        for paths_yaml in ["paths:\n  - lib\n", "paths:\n  - \".\"\n"] {
+            for patterns in [
+                "exclude: []\n",
+                "exclude:\n  - \"**/vendor/**\"\n",
+                "exclude:\n  - \"**/b.rb\"\n",
+                "exclude:\n  - \"**/*.rb\"\n",
+                "exclude:\n  - \"lib/a.rb\"\n",
+                "exclude:\n  - \"./lib/a.rb\"\n",
+            ] {
+                for spelling in [RootSpelling::Absolute, RootSpelling::DotThroughSymlink] {
+                    exclude_agreement_run(paths_yaml, patterns, spelling);
+                }
+            }
+        }
+    }
+
+    fn exclude_agreement_run(paths_yaml: &str, patterns: &str, spelling: RootSpelling) {
+        let yaml = format!("{paths_yaml}{patterns}");
+        let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
+        // The same `paths:` with NO `exclude:` — the unfiltered discovery set, i.e.
+        // every candidate the gate has to answer about.
+        let unfiltered: Config = serde_yaml::from_str(paths_yaml).unwrap();
+
+        let p = TempProject::new("exclgate");
+        p.write("a.rb", "class A\nend\n");
+        p.write("b.rb", "class B\nend\n");
+        std::fs::create_dir_all(p.root.join("lib/vendor")).unwrap();
+        std::fs::write(p.root.join("lib/vendor/v.rb"), "class V\nend\n").unwrap();
+
+        let alias = matches!(spelling, RootSpelling::DotThroughSymlink)
+            .then(|| AliasLink::to(&p.root));
+        let _cwd = alias.as_ref().map(|a| CwdGuard::enter(a.path()));
+        let root = match &alias {
+            Some(_) => PathBuf::from("."),
+            None => p.root.clone(),
+        };
+
+        let all = project_files(&root, &unfiltered);
+        let kept = project_files(&root, &cfg);
+        let matcher = ExcludeMatcher::from_config(&root, &cfg);
+        for f in &all {
+            let canonical = std::fs::canonicalize(f).unwrap();
+            assert_eq!(
+                matcher.excludes(Some(&canonical)),
+                !kept.contains(f),
+                "[{yaml:?} / {spelling:?}] the buffer gate and bare-`check` discovery \
+                 disagree about {f}"
+            );
+        }
+        // Non-vacuity of the loop itself: the `**/*.rb` case must prune everything
+        // and the empty case nothing, so the comparison above is exercised on BOTH
+        // answers somewhere in the matrix.
+        if patterns.contains("*.rb\"") {
+            assert!(kept.is_empty(), "[{yaml:?}] the catch-all pattern prunes the whole set");
+        }
+        if patterns == "exclude: []\n" {
+            assert_eq!(kept.len(), all.len(), "[{yaml:?}] no patterns ⇒ nothing pruned");
+        }
+    }
+
+    #[test]
+    fn exclude_gate_leaves_pathless_and_out_of_workspace_buffers_alone() {
+        // Two cases where NO `check` invocation from this root names the file, so
+        // there is no spelling to match and the gate must not guess: an untitled /
+        // non-`file:` buffer (`path == None`), and a file outside the workspace.
+        // Both keep exactly today's behaviour.
+        let p = TempProject::new("exclscope");
+        let inside = p.write("a.rb", "class A\nend\n");
+        let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/*.rb\"\n").unwrap();
+        let matcher = ExcludeMatcher::from_config(&p.root, &cfg);
+
+        assert!(matcher.excludes(Some(&inside)), "the control: an in-project file IS excluded");
+        assert!(!matcher.excludes(None), "an untitled buffer has no path to match");
+
+        let outside = TempProject::new("exclscope_other");
+        let elsewhere = outside.write("a.rb", "class A\nend\n");
+        assert!(
+            !matcher.excludes(Some(&elsewhere)),
+            "a buffer outside the workspace is not `check`'s to exclude"
+        );
+    }
+
+    #[test]
+    fn exclude_gate_uses_the_root_relative_spelling_outside_paths() {
+        // A buffer inside the workspace but outside every `paths:` root: bare
+        // `check` never discovers it, so the ONLY run that reports on it is an
+        // explicit `rigor check spec/x.rb` from the project root — which matches
+        // `exclude:` against exactly that root-relative spelling. The gate uses it,
+        // so such a buffer is silenced iff that `check` run would report nothing.
+        //
+        // This does NOT touch the S4b/N5 divergence (an out-of-`paths:` buffer is
+        // still analysed against the full project index): it only decides whether
+        // the buffer is analysed at all, on the same input `check` decides it on.
+        let p = TempProject::new("exclout");
+        std::fs::create_dir_all(p.root.join("spec")).unwrap();
+        let spec = p.root.join("spec/x_spec.rb");
+        std::fs::write(&spec, "class X\nend\n").unwrap();
+        let spec = std::fs::canonicalize(&spec).unwrap();
+        // The production root shape: `project_root = "."` with the cwd IN the
+        // project, which is what makes a relative `exclude:` pattern meaningful.
+        let _cwd = CwdGuard::enter(&p.root);
+
+        let matching: Config = serde_yaml::from_str("exclude:\n  - \"spec/**\"\n").unwrap();
+        assert!(
+            ExcludeMatcher::from_config(&PathBuf::from("."), &matching).excludes(Some(&spec)),
+            "an out-of-`paths:` buffer is excluded exactly when `rigor check \
+             spec/x_spec.rb` from the project root would report nothing for it"
+        );
+        // The control: a pattern that does NOT cover it leaves it analysed, exactly
+        // as today (the N5 divergence is untouched by this slice).
+        let other: Config = serde_yaml::from_str("exclude:\n  - \"vendor/**\"\n").unwrap();
+        assert!(
+            !ExcludeMatcher::from_config(&PathBuf::from("."), &other).excludes(Some(&spec))
+        );
+    }
+
+    #[test]
+    fn an_excluded_buffer_computes_no_diagnostics() {
+        // The gate at the `compute_diagnostics` seam, with its control in the same
+        // test: the SAME buffer, SAME content, only the config differs.
+        let p = TempProject::new("exclcompute");
+        let path = p.write("typo.rb", TYPO);
+
+        let control = compute_diagnostics(
+            &project_with_config_rooted(&Config::default(), &p.root),
+            Some(&path),
+            TYPO,
+        );
+        assert_eq!(control.0.len(), 1, "the control: the rule fires unconfigured");
+
+        let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/typo.rb\"\n").unwrap();
+        let excluded =
+            compute_diagnostics(&project_with_config_rooted(&cfg, &p.root), Some(&path), TYPO);
+        assert!(
+            excluded.0.is_empty(),
+            "an `exclude:`d buffer publishes NOTHING, as `check` reports nothing: {:?}",
+            excluded.0
+        );
+    }
+
+    #[test]
+    fn swap_project_rebuilds_the_exclude_matcher_from_the_session_config() {
+        // The mechanism behind "a buffer that BECOMES excluded ends up cleared":
+        // the gate is config-derived and rebuilt by `swap_project`, so it follows
+        // `st.cfg` on every `invalidate`. It cannot be driven end to end today
+        // because `.rigor.yml` is read ONCE at startup (`invalidate` rebuilds from
+        // the same `st.cfg`, matching the reference's `ProjectContext#invalidate!`)
+        // — so the transition is exercised HERE, at the seam a config-reload slice
+        // would feed, rather than claimed untested.
+        let p = TempProject::new("exclswap");
+        let path = p.write("a.rb", TYPO);
+        let (ctx, mut st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
+        assert!(
+            !st.project.exclude.excludes(Some(&path)),
+            "the control: nothing is excluded under the starting config"
+        );
+
+        // The config gains an `exclude:` entry covering the open buffer…
+        st.cfg = serde_yaml::from_str("exclude:\n  - \"**/a.rb\"\n").unwrap();
+        let index = Arc::clone(&st.project.index);
+        let overlay = st.project.overlay.clone();
+        swap_project(&ctx, &mut st, index, overlay);
+
+        assert!(
+            st.project.exclude.excludes(Some(&path)),
+            "the rebuilt context's gate follows `st.cfg` — no stale matcher survives"
+        );
+        assert_eq!(st.project.generation, 1, "and the swap bumped the generation as always");
+    }
+
+    #[test]
+    fn integration_excluded_buffer_publishes_empty_and_a_sibling_still_fires() {
+        // End to end through the real loop: an `exclude:`d buffer gets an EMPTY
+        // publish (a publish, not a silent skip — that is what clears the editor's
+        // markers), while a non-excluded sibling in the same project still gets its
+        // diagnostics. The sibling is the over-broadness control.
+        let p = TempProject::new("exclloop");
+        p.write("skipped.rb", TYPO);
+        p.write("kept.rb", TYPO);
+        let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/skipped.rb\"\n").unwrap();
+        let mut h = Harness::start_project_with_config(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+            cfg,
+        );
+
+        h.notify("textDocument/didOpen", open_params(&p.uri("skipped.rb"), TYPO, 1));
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), p.uri("skipped.rb"));
+        assert!(
+            d.diagnostics.is_empty(),
+            "an excluded buffer publishes an EMPTY set (clearing any markers): {:?}",
+            d.diagnostics
+        );
+
+        h.notify("textDocument/didOpen", open_params(&p.uri("kept.rb"), TYPO, 1));
+        let d = h.recv_diags();
+        assert_eq!(d.uri.as_str(), p.uri("kept.rb"));
+        assert_eq!(
+            d.diagnostics.len(),
+            1,
+            "the control: a non-excluded sibling still gets its diagnostics — the \
+             filter is not over-broad: {:?}",
+            d.diagnostics
+        );
+
+        // An `invalidate` (didChangeConfiguration) re-analyses every open buffer:
+        // the excluded one must come back EMPTY again, not with regained markers,
+        // which is what proves `swap_project` carried the gate across the rebuild.
+        h.notify("workspace/didChangeConfiguration", serde_json::json!({ "settings": {} }));
+        let mut seen = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let d = h.recv_diags();
+            seen.insert(d.uri.as_str().to_string(), d.diagnostics.len());
+        }
+        assert_eq!(seen.get(&p.uri("skipped.rb")), Some(&0), "still empty after invalidate");
+        assert_eq!(seen.get(&p.uri("kept.rb")), Some(&1), "and the sibling still fires");
+        h.shutdown();
     }
 
     #[test]

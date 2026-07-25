@@ -556,11 +556,25 @@ impl Config {
     /// in config can never crash the run.
     #[must_use]
     pub fn is_excluded(&self, path: &str) -> bool {
-        self.exclude.iter().any(|pat| match Pattern::new(pat) {
-            Ok(p) => p.matches(path),
-            Err(_) => false,
-        })
+        matches_exclude(&self.exclude, path)
     }
+}
+
+/// Whether `path` matches any of the `exclude:` `patterns`. Invalid globs are
+/// skipped (they match nothing) so a config typo can never crash a run.
+///
+/// Split out of [`Config::is_excluded`] so the LSP's per-buffer gate can be
+/// matched by the SAME authority `check`'s stage-1 filter uses
+/// (`main.rs`'s `if cfg.is_excluded(path)`), against a pattern list carried on
+/// the LSP's `ProjectContext` rather than a live `Config` borrow. A second
+/// re-implementation of the glob rule is exactly the kind of drift that produced
+/// the divergence this seam closes.
+#[must_use]
+pub fn matches_exclude(patterns: &[String], path: &str) -> bool {
+    patterns.iter().any(|pat| match Pattern::new(pat) {
+        Ok(p) => p.matches(path),
+        Err(_) => false,
+    })
 }
 
 #[cfg(test)]
