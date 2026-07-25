@@ -69,6 +69,13 @@ const GEMFILE_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    
 /// `undefined method` error.
 const BLANK_RB: &str = "s = \"hello\"\ns.blank?\n";
 
+/// A project RBS declaring an explicit `-> void` return — the only way to make
+/// `static.value-use.void` (the ADR-100 bleeding-edge rule) fire.
+const WIDGET_RBS: &str = "class Widget\n  def fire: () -> void\nend\n";
+
+/// Uses that `-> void` return as a value: the rule's assignment-RHS context.
+const VOID_USE_RB: &str = "w = Widget.new\nx = w.fire\n";
+
 /// Run `rigor <args>` in `cwd` under the hermetic Ruby-free posture, returning
 /// stdout.
 fn rigor_check(cwd: &Path, args: &[&str]) -> String {
@@ -83,23 +90,33 @@ fn rigor_check(cwd: &Path, args: &[&str]) -> String {
 }
 
 /// One diagnostic in the comparable shape: `(1-based line, 1-based column,
-/// severity word, message)`.
-type Finding = (u32, u32, String, String);
+/// severity word, rule id, message)`.
+///
+/// The rule id is part of the tuple because the stage-3 parity slice compares
+/// SEVERITIES: a comparison keyed only on position + message could be satisfied
+/// by the wrong rule at the same span, and "rule id + line + column + severity"
+/// is the shape that acceptance asks for.
+type Finding = (u32, u32, String, String, String);
 
-/// Parse `check`'s text output, keeping only the rows for `file` (a path suffix).
-/// Row grammar: `path:line:col: severity: message`.
-fn check_findings(stdout: &str, file: &str) -> Vec<Finding> {
-    stdout
-        .lines()
-        .filter(|l| l.starts_with(file))
-        .map(|l| {
-            let rest = &l[file.len() + 1..]; // past "path:"
-            let mut it = rest.splitn(3, ':');
-            let line: u32 = it.next().unwrap().parse().unwrap();
-            let col: u32 = it.next().unwrap().parse().unwrap();
-            let tail = it.next().unwrap().trim(); // "severity: message"
-            let (sev, msg) = tail.split_once(": ").unwrap();
-            (line, col, sev.trim().to_string(), msg.trim().to_string())
+/// `rigor check --format json <args…>` in `cwd`, keeping only the rows whose
+/// `path` is `file`. JSON rather than the text renderer because only the JSON
+/// shape carries the `rule` id.
+fn check_findings(cwd: &Path, args: &[&str], file: &str) -> Vec<Finding> {
+    let mut argv = vec!["check", "--format", "json"];
+    argv.extend_from_slice(args);
+    let stdout = rigor_check(cwd, &argv);
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|e| panic!("parse {stdout:?}: {e}"));
+    rows.iter()
+        .filter(|r| r["path"].as_str() == Some(file))
+        .map(|r| {
+            (
+                r["line"].as_u64().unwrap() as u32,
+                r["column"].as_u64().unwrap() as u32,
+                r["severity"].as_str().unwrap().to_string(),
+                r["rule"].as_str().unwrap().to_string(),
+                r["message"].as_str().unwrap().to_string(),
+            )
         })
         .collect()
 }
@@ -196,16 +213,12 @@ fn lsp_saved_buffer_diagnostics_equal_project_check_diagnostics() {
 
     // (1) The single-file answer: SILENT. The fixture's finding is purely
     // cross-file, so a pre-S4b (single-file-index) LSP fails the comparison below.
-    let single = rigor_check(dir.path(), &["check", "lib/sub.rb"]);
-    assert!(
-        check_findings(&single, "lib/sub.rb").is_empty(),
-        "single-file `check` must be silent for this fixture: {single}"
-    );
+    let single = check_findings(dir.path(), &["lib/sub.rb"], "lib/sub.rb");
+    assert!(single.is_empty(), "single-file `check` must be silent for this fixture: {single:?}");
 
     // (2) The project answer: the override-visibility finding.
-    let project = rigor_check(dir.path(), &["check", "lib"]);
-    let expected = check_findings(&project, "lib/sub.rb");
-    assert_eq!(expected.len(), 1, "project `check` reports the cross-file finding: {project}");
+    let expected = check_findings(dir.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(expected.len(), 1, "project `check` reports the cross-file finding: {expected:?}");
 
     // (3) The LSP's answer for the same, SAVED (never edited) buffer.
     let actual = lsp_findings(dir.path(), "lib/sub.rb", SUB_RB);
@@ -231,11 +244,10 @@ fn lsp_applies_the_same_gemfile_lock_plugin_overlays_as_check() {
     fs::write(dir.path().join("lib/blank.rb"), BLANK_RB).unwrap();
 
     // `check` is silent: the activesupport overlay reopens `String` with `blank?`.
-    let project = rigor_check(dir.path(), &["check", "lib"]);
-    let expected = check_findings(&project, "lib/blank.rb");
+    let expected = check_findings(dir.path(), &["lib"], "lib/blank.rb");
     assert!(
         expected.is_empty(),
-        "`check` resolves `blank?` via the Gemfile.lock overlay: {project}"
+        "`check` resolves `blank?` via the Gemfile.lock overlay: {expected:?}"
     );
 
     // The LSP must agree — and, as everywhere in this file, the comparison is an
@@ -244,6 +256,111 @@ fn lsp_applies_the_same_gemfile_lock_plugin_overlays_as_check() {
     assert_eq!(
         actual, expected,
         "the LSP must apply the same Gemfile.lock plugin overlays `check` does"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Stage-3 parity tail: the ADR-8 SeverityStamp + the bleeding-edge rule gate.
+//
+// `check`'s stage 3 ends by re-stamping each diagnostic's severity from the
+// profile + user + bleeding-edge overrides and DROPPING an `:off` resolution; it
+// also gates the `static.value-use.void` collector on the same resolution. The
+// LSP did neither, so a project on a non-default `severity_profile:` /
+// `severity_overrides:` saw a different rule SET and different levels in the
+// editor than its CI run reported. Each test below asserts LSP == `check` and
+// carries its own non-vacuity control in the same fixture.
+// ---------------------------------------------------------------------------
+
+/// A rule the config turns OFF is absent from BOTH tools — a PRESENCE parity, not
+/// merely a severity one. The control run (same fixture, no `.rigor.yml`) proves
+/// the rule fires at all, so the empty-vs-empty comparison cannot pass vacuously.
+#[test]
+fn lsp_drops_an_off_rule_exactly_as_check_does() {
+    let dir = TempDir::new("lsp-sev-off");
+    fs::write(dir.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(dir.path().join("lib/sub.rb"), SUB_RB).unwrap();
+
+    // CONTROL — no config: both tools report the one cross-file finding.
+    let control_check = check_findings(dir.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(control_check.len(), 1, "the fixture fires unconfigured: {control_check:?}");
+    assert_eq!(control_check[0].3, "def.override-visibility-reduced");
+    assert_eq!(lsp_findings(dir.path(), "lib/sub.rb", SUB_RB), control_check);
+
+    // …now turn that exact rule off.
+    fs::write(
+        dir.path().join(".rigor.yml"),
+        "severity_overrides:\n  def.override-visibility-reduced: off\n",
+    )
+    .unwrap();
+
+    let expected = check_findings(dir.path(), &["lib"], "lib/sub.rb");
+    assert!(expected.is_empty(), "`check` drops an `off` rule: {expected:?}");
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/sub.rb", SUB_RB),
+        expected,
+        "an `off` rule must publish NOTHING to the editor, exactly as `check` reports nothing"
+    );
+}
+
+/// Under a non-default `severity_profile:` the LSP's published severities equal
+/// `check`'s, per (rule id, line, column, severity). Non-vacuous by construction:
+/// the profile moves this rule's severity AWAY from its authored one, so the
+/// pre-stamp LSP (which published the authored severity) disagrees.
+#[test]
+fn lsp_publishes_the_profile_resolved_severity_like_check() {
+    let dir = TempDir::new("lsp-sev-profile");
+    fs::write(dir.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(dir.path().join("lib/sub.rb"), SUB_RB).unwrap();
+
+    // CONTROL — the AUTHORED severity, as published with no profile configured.
+    let authored = check_findings(dir.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(authored.len(), 1);
+    assert_eq!(authored[0].2, "warning", "authored/balanced level: {authored:?}");
+
+    // `strict` re-stamps `def.override-visibility-reduced` warning → error.
+    fs::write(dir.path().join(".rigor.yml"), "severity_profile: strict\n").unwrap();
+    let expected = check_findings(dir.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(expected.len(), 1, "the rule still fires under `strict`: {expected:?}");
+    assert_eq!(
+        expected[0].2, "error",
+        "the control: `strict` MOVES the severity, so this comparison discriminates"
+    );
+
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/sub.rb", SUB_RB),
+        expected,
+        "the editor's severity must be the profile-RESOLVED one, not the authored one"
+    );
+}
+
+/// The bleeding-edge `static.value-use.void` rule runs in the editor exactly when
+/// it runs in `check`: not at all by default (every shipped profile has it
+/// `:off`), and on both sides once `bleeding_edge:` adopts the feature.
+#[test]
+fn lsp_runs_the_bleeding_edge_void_rule_exactly_when_check_does() {
+    let dir = TempDir::new("lsp-bleeding");
+    fs::create_dir_all(dir.path().join("sig")).unwrap();
+    fs::write(dir.path().join("sig/widget.rbs"), WIDGET_RBS).unwrap();
+    fs::write(dir.path().join("lib/void_use.rb"), VOID_USE_RB).unwrap();
+
+    // DEFAULT: the feature is off, so neither tool reports the rule.
+    let off_check = check_findings(dir.path(), &["lib"], "lib/void_use.rb");
+    assert!(off_check.is_empty(), "the void rule is off by default: {off_check:?}");
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/void_use.rb", VOID_USE_RB),
+        off_check,
+        "the LSP must not publish a rule `check` does not run"
+    );
+
+    // ADOPTED: both tools report it, at the same place and level.
+    fs::write(dir.path().join(".rigor.yml"), "bleeding_edge:\n  - use-of-void-value\n").unwrap();
+    let expected = check_findings(dir.path(), &["lib"], "lib/void_use.rb");
+    assert_eq!(expected.len(), 1, "the control: the feature turns the rule ON: {expected:?}");
+    assert_eq!(expected[0].3, "static.value-use.void");
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/void_use.rb", VOID_USE_RB),
+        expected,
+        "an adopted bleeding-edge rule must reach the editor too"
     );
 }
 
@@ -277,7 +394,13 @@ fn lsp_findings(root: &Path, rel: &str, text: &str) -> Vec<Finding> {
                 2 => "warning",
                 _ => "info",
             };
-            (line, col, sev.to_string(), d["message"].as_str().unwrap().to_string())
+            (
+                line,
+                col,
+                sev.to_string(),
+                d["code"].as_str().unwrap().to_string(),
+                d["message"].as_str().unwrap().to_string(),
+            )
         })
         .collect();
     lsp.shutdown();
