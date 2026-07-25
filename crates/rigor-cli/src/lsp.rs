@@ -54,6 +54,7 @@ use rigor_types::{Interner, Type, TypeId};
 
 use crate::config::Config;
 use crate::ruby_mode;
+use crate::severity;
 use crate::sidecar;
 
 /// `rigor lsp [--transport=stdio] [--log=PATH]`. Only `stdio` transport is
@@ -200,6 +201,7 @@ fn run_stdio() -> Result<(), String> {
         index,
         disable: cfg.disable_matcher(),
         folder,
+        stamp: SeverityStamp::from_config(&cfg),
         overlay,
     });
 
@@ -285,6 +287,10 @@ struct ProjectContext {
     /// (`sidecar.rs`); the folder's internal `Mutex` serializes folds across the
     /// workers (contention accepted, measure later per ADR-0029).
     folder: Option<Arc<sidecar::SidecarFolder>>,
+    /// The ADR-8 [`SeverityStamp`] inputs — `check`'s stage-3 tail. Config-derived
+    /// exactly like [`Self::disable`], so it sits beside it and is rebuilt for free
+    /// by [`invalidate`] / [`swap_project`].
+    stamp: SeverityStamp,
     /// The **cross-file overlay substrate** (S4b): every project `.rb` file's
     /// canonical path + its held `LoweredAst`, harvested at build time. A
     /// diagnostics dispatch rebuilds the project `SourceIndex` from these ASTs
@@ -294,6 +300,93 @@ struct ProjectContext {
     /// or no project files were found) and diagnostics fall back to today's
     /// single-file [`SourceIndex::build`].
     overlay: Option<ProjectFiles>,
+}
+
+/// The ADR-8 SeverityStamp inputs (reference `severity_stamp.rb`), carried on the
+/// tier-1 [`ProjectContext`] so the LSP's post-analysis tail is `check`'s stage-3
+/// tail. Every field is config-derived — the same provenance as
+/// [`ProjectContext::disable`] — so a config/watched-file `invalidate` rebuilds
+/// them for free.
+///
+/// Grouped into one struct rather than four `ProjectContext` fields because they
+/// are one decision with one build site; `check` computes exactly these once per
+/// run in `analyze_files` and threads them through stage 3.
+///
+/// The bleeding-edge SELECTOR itself is deliberately NOT stored: `check` uses it
+/// for exactly two things, and both are already reduced here — the merged
+/// override map ([`Self::bleeding_overrides`]) and the void-rule activation gate
+/// ([`Self::void_rule_active`], which `check` derives with the same
+/// `severity::resolve` call, not from the selector directly). A stored selector
+/// would be a dead field.
+struct SeverityStamp {
+    /// `severity_profile:` — the ADR-8 profile table consulted below the overrides.
+    profile: severity::Profile,
+    /// `severity_overrides:` — the user's per-rule / per-FAMILY overrides.
+    user_overrides: Vec<(String, severity::ResolvedSeverity)>,
+    /// The merged overrides of the ACTIVE bleeding-edge features
+    /// (`bleeding_edge::severity_overrides_for`), composed below the user's.
+    bleeding_overrides: Vec<(&'static str, severity::ResolvedSeverity)>,
+    /// The reference's memoised rule-activation gate: `static.value-use.void` runs
+    /// only when its RESOLVED severity is not `:off` (authored `:warning`, every
+    /// shipped profile `:off`, promoted by the `use-of-void-value` feature OR by a
+    /// user `severity_overrides:` entry). Byte-identical to `check`'s
+    /// `void_rule_active`.
+    void_rule_active: bool,
+}
+
+impl SeverityStamp {
+    /// Compute the stamp inputs from the session config — the LSP's counterpart of
+    /// the block at the top of `main.rs`'s `analyze_files`.
+    ///
+    /// The bleeding-edge selection comes from `bleeding_edge:` in `.rigor.yml`
+    /// only: unlike `check`, `rigor lsp` accepts no `--bleeding-edge` flag (an
+    /// editor launches the server, so a per-invocation flag has no user).
+    fn from_config(cfg: &Config) -> Self {
+        let selector = cfg.bleeding_edge_selector();
+        let bleeding_overrides = crate::bleeding_edge::severity_overrides_for(&selector);
+        let profile = cfg.severity_profile();
+        let user_overrides = cfg.severity_overrides();
+        let void_rule_active = severity::resolve(
+            rigor_rules::STATIC_VALUE_USE_VOID,
+            severity::ResolvedSeverity::Warning,
+            profile,
+            &user_overrides,
+            &bleeding_overrides,
+        ) != severity::ResolvedSeverity::Off;
+        Self { profile, user_overrides, bleeding_overrides, void_rule_active }
+    }
+
+    /// Re-stamp `diag`'s severity from the profile + overrides, returning `false`
+    /// when the resolution is `:off` — i.e. when `check` would DROP the diagnostic
+    /// (`severity::ResolvedSeverity::Off => continue`). That drop is why the
+    /// pre-stamp LSP diverged on PRESENCE, not merely on severity.
+    ///
+    /// The `internal-error` sentinel BYPASSES the stamp entirely (the reference's
+    /// `rule.nil?` short-circuit): a per-file panic must never be silenced by
+    /// configuration.
+    fn apply(&self, diag: &mut rigor_rules::Diagnostic) -> bool {
+        if diag.rule_id == "internal-error" {
+            return true;
+        }
+        let current = match diag.severity {
+            Severity::Error => severity::ResolvedSeverity::Error,
+            Severity::Warning => severity::ResolvedSeverity::Warning,
+            Severity::Info => severity::ResolvedSeverity::Info,
+        };
+        match severity::resolve(
+            diag.rule_id,
+            current,
+            self.profile,
+            &self.user_overrides,
+            &self.bleeding_overrides,
+        ) {
+            severity::ResolvedSeverity::Off => return false,
+            severity::ResolvedSeverity::Error => diag.severity = Severity::Error,
+            severity::ResolvedSeverity::Warning => diag.severity = Severity::Warning,
+            severity::ResolvedSeverity::Info => diag.severity = Severity::Info,
+        }
+        true
+    }
 }
 
 /// The tier-1 held project ASTs backing the S4b cross-file overlay: one entry per
@@ -1040,6 +1133,13 @@ fn swap_project(st: &mut Session, index: Arc<CoreIndex>, overlay: Option<Project
         index,
         disable: st.cfg.disable_matcher(),
         folder: st.project.folder.clone(), // reuse the live sidecar; no respawn.
+        // Config-derived exactly like `disable`, and rebuilt from `st.cfg` on the
+        // same schedule. `invalidate` does NOT re-parse `.rigor.yml` (matching the
+        // reference `ProjectContext#invalidate!`, which rebuilds from the same
+        // `@configuration`), so today this reproduces the startup stamp — it is
+        // written this way so the stamp follows `st.cfg` the moment a future slice
+        // makes the config reloadable, rather than silently going stale.
+        stamp: SeverityStamp::from_config(&st.cfg),
         overlay,
     });
 }
@@ -1796,9 +1896,16 @@ fn send_diagnostics(
 /// Run the analysis path over `text` and map the findings to LSP diagnostics.
 /// Reuses the exact `check` pipeline (parse → lower → build a `SourceIndex` →
 /// `analyze_with_source_and_folder`), plus the inline `# rigor:disable` and config
-/// `disable:` suppression, so the editor's inline markers match `rigor check` on
-/// the same content. Panic-isolated (ADR-0016): a malformed buffer that trips the
-/// parser yields no diagnostics, never a crash.
+/// `disable:` suppression and the ADR-8 SeverityStamp, so the editor's inline
+/// markers match `rigor check` on the same content. Panic-isolated (ADR-0016): a
+/// malformed buffer that trips the parser yields no diagnostics, never a crash.
+///
+/// **The stage-3 tail.** `check`'s stage 3 ends by re-stamping each diagnostic's
+/// severity from the profile + user + bleeding-edge overrides and DROPPING an
+/// `:off` resolution ([`SeverityStamp::apply`]); the bleeding-edge selection also
+/// gates the `static.value-use.void` collector. Both run here, in `check`'s order,
+/// so a project on a non-default `severity_profile:` sees the same rule SET and
+/// the same severities in the editor that its CI run reports.
 ///
 /// **S4b — the cross-file overlay.** When tier 1 holds the project ASTs, the
 /// `SourceIndex` is the PROJECT index rebuilt with this buffer's file swapped for
@@ -1836,6 +1943,17 @@ fn compute_diagnostics(
         diags.extend(rigor_rules::shadowed_rescue_diagnostics(
             &ast, &project.index, &source, text,
         ));
+        // `static.value-use.void` (ADR-100) — behind the `use-of-void-value`
+        // bleeding-edge feature, under the SAME resolved-severity gate `check`
+        // uses, and produced BEFORE suppression filtering like every check rule.
+        if project.stamp.void_rule_active {
+            diags.extend(rigor_rules::void_value_use_diagnostics(
+                &ast,
+                &mut interner,
+                &project.index,
+                &source,
+            ));
+        }
         (diags, comments, overlay_build)
     }));
 
@@ -1853,10 +1971,19 @@ fn compute_diagnostics(
         .map(|d| (offset_to_position(text, d.start_offset).line as usize + 1, d))
         .collect();
 
+    // COMPOSITION ORDER, verified against `main.rs`'s stage 3 (do not reorder):
+    // rules → `suppression_marker_diagnostics` → `filter_suppressed` (inline
+    // `# rigor:disable`) → config `disable:` → the ADR-8 SeverityStamp. The stamp
+    // runs LAST because it is the only step that can also REWRITE a diagnostic; a
+    // suppression that ran after it would be deciding on a re-stamped severity.
+    // (`check` then applies the ADR-22 baseline after the stamp; the LSP has no
+    // baseline — see the stage-3-parity note.)
     let out = filter_suppressed(with_lines, &comments)
         .into_iter()
         .filter(|(_, d)| !project.disable.suppresses(d.rule_id))
-        .map(|(_, d)| to_lsp_diagnostic(text, &d))
+        .filter_map(|(_, mut d)| {
+            project.stamp.apply(&mut d).then(|| to_lsp_diagnostic(text, &d))
+        })
         .collect();
     (out, overlay_build)
 }
@@ -2214,11 +2341,19 @@ mod tests {
     /// A minimal tier-1 project context (empty core index, no sidecar, generation
     /// 0) for the pure `compute_diagnostics` / `hover` / `completion` unit tests.
     fn project() -> ProjectContext {
+        project_with_config(&Config::default())
+    }
+
+    /// The same minimal context, built from an explicit config — the seam the
+    /// stage-3 stamp unit tests drive (`severity_profile:` / `severity_overrides:`
+    /// / `bleeding_edge:` all reach `compute_diagnostics` through here).
+    fn project_with_config(cfg: &Config) -> ProjectContext {
         ProjectContext {
             generation: 0,
             index: Arc::new(CoreIndex::new()),
-            disable: Config::default().disable_matcher(),
+            disable: cfg.disable_matcher(),
             folder: None,
+            stamp: SeverityStamp::from_config(cfg),
             overlay: None,
         }
     }
@@ -2271,6 +2406,108 @@ mod tests {
     fn diagnostics_clean_source_is_empty() {
         let (diags, _) = compute_diagnostics(&project(), None, "x = \"hi\"\nx.upcase\n");
         assert!(diags.is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Stage-3 parity tail (ADR-8 SeverityStamp + the bleeding-edge gate).
+    // The end-to-end LSP-vs-`check` equalities live in
+    // `tests/lsp_check_parity.rs`; these pin the unit-level contract.
+    // ---------------------------------------------------------------------
+
+    /// A `severity_overrides:` entry resolving to `off` removes the diagnostic
+    /// ENTIRELY — the presence mismatch the pre-stamp LSP had (`check` drops it,
+    /// the editor still published a marker).
+    #[test]
+    fn stage3_stamp_drops_an_off_resolution() {
+        let cfg = Config::parse_or_warn(
+            "severity_overrides:\n  call.undefined-method: off\n",
+            "test",
+        );
+        let (diags, _) =
+            compute_diagnostics(&project_with_config(&cfg), None, "x = \"hi\"\nx.lenght\n");
+        assert!(diags.is_empty(), "an `off` resolution is DROPPED, not merely downgraded");
+    }
+
+    /// A non-`off` resolution re-stamps the published severity (here authored
+    /// `error` → `info`), so the editor shows the project's configured level.
+    #[test]
+    fn stage3_stamp_restamps_a_resolved_severity() {
+        let cfg = Config::parse_or_warn(
+            "severity_overrides:\n  call.undefined-method: info\n",
+            "test",
+        );
+        let (diags, _) =
+            compute_diagnostics(&project_with_config(&cfg), None, "x = \"hi\"\nx.lenght\n");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(
+            diags[0].severity,
+            Some(DiagnosticSeverity::INFORMATION),
+            "the published severity is the RESOLVED one, not the authored `error`"
+        );
+    }
+
+    /// A FAMILY override reaches the rule too (`severity::resolve`'s exact-id →
+    /// family fallback), so the LSP honours `call: off` exactly as `check` does.
+    #[test]
+    fn stage3_stamp_honours_a_family_override() {
+        let cfg = Config::parse_or_warn("severity_overrides:\n  call: off\n", "test");
+        let (diags, _) =
+            compute_diagnostics(&project_with_config(&cfg), None, "x = \"hi\"\nx.lenght\n");
+        assert!(diags.is_empty(), "the `call` family override covers call.undefined-method");
+    }
+
+    /// Acceptance 3: the `internal-error` sentinel BYPASSES the stamp. Even a
+    /// config that names it explicitly cannot silence a per-file panic (the
+    /// reference's `rule.nil?` short-circuit).
+    #[test]
+    fn stage3_stamp_never_silences_internal_error() {
+        let cfg = Config::parse_or_warn(
+            "severity_overrides:\n  internal-error: off\n  call.undefined-method: off\n",
+            "test",
+        );
+        let stamp = SeverityStamp::from_config(&cfg);
+
+        let mut panic_diag = rigor_rules::Diagnostic {
+            rule_id: "internal-error",
+            start_offset: 0,
+            end_offset: 0,
+            message: "internal panic: boom".to_string(),
+            severity: Severity::Error,
+            source_family: "builtin",
+            receiver_type: None,
+            method_name: None,
+        };
+        assert!(stamp.apply(&mut panic_diag), "internal-error survives an `off` config");
+        assert_eq!(panic_diag.severity, Severity::Error, "and is not re-stamped either");
+
+        // The control: an ordinary rule under the SAME config IS dropped, so the
+        // survival above is the bypass and not an inert override.
+        let mut ordinary = rigor_rules::Diagnostic {
+            rule_id: "call.undefined-method",
+            ..panic_diag.clone()
+        };
+        assert!(!stamp.apply(&mut ordinary), "an ordinary rule under the same config drops");
+    }
+
+    /// The `static.value-use.void` activation gate is `check`'s: off by default
+    /// (every shipped profile has it `:off`), promoted by the `use-of-void-value`
+    /// bleeding-edge feature, and resurrectable by a user override alone.
+    #[test]
+    fn stage3_void_rule_gate_matches_check() {
+        let gate = |yaml: &str| SeverityStamp::from_config(&Config::parse_or_warn(yaml, "test")).void_rule_active;
+        assert!(!gate(""), "off by default");
+        assert!(!gate("bleeding_edge: false\n"));
+        assert!(gate("bleeding_edge: true\n"), "`all` activates the feature");
+        assert!(gate("bleeding_edge:\n  - use-of-void-value\n"));
+        assert!(!gate("bleeding_edge:\n  - some-other-feature\n"));
+        assert!(
+            gate("severity_overrides:\n  static.value-use.void: warning\n"),
+            "a user override alone resurrects the rule (it outranks the profile table)"
+        );
+        assert!(
+            !gate("bleeding_edge: true\nseverity_overrides:\n  static.value-use.void: off\n"),
+            "and a user `off` outranks the bleeding-edge promotion"
+        );
     }
 
     #[test]
@@ -2653,6 +2890,7 @@ mod tests {
                     index,
                     disable: cfg.disable_matcher(),
                     folder: None,
+                    stamp: SeverityStamp::from_config(&cfg),
                     overlay,
                 });
                 main_loop(&server_conn, &ctx, project, cfg, guard).unwrap();
@@ -4109,6 +4347,7 @@ mod tests {
                 index,
                 disable: cfg.disable_matcher(),
                 folder: None,
+                stamp: SeverityStamp::from_config(&cfg),
                 overlay: Some(build.files),
             }),
             cfg,
