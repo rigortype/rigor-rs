@@ -94,17 +94,60 @@ rejected: `class_name_for_id` recovery is plumbed through the source registry in
 the rules, `render_receiver`, coverage and the LSP, so a new range would have
 touched all of them for no semantic gain.
 
-## The witness gate
+## The witness gate — and the FP that shaped it
 
 `check_call`'s source-registry arm (`crates/rigor-rules/src/lib.rs`) gained one
-disjunct: `index.knows_qualified_class(name)`. `knows_toplevel_class` refuses
-every namespaced name for the defect-2 reason (a SHORT key like `Status` may be a
-project class), but a QUALIFIED key is an isolated entry no project name can
-collide with — the same argument the typer's `ConstantRead` arm already makes for
-`ERB::Util`, and the same surface `qualified_class_has_method` (ADR-0042 slice 3,
-already built) checks. It adds nothing for a bare name: a top-level class is
-already in `knows_toplevel_class`, and a nested-only class's SHORT key has no
-qualified entry.
+disjunct: `index.knows_qualified_class(name) && source.is_declaration_only_class(name)`.
+`knows_toplevel_class` refuses every namespaced name for the defect-2 reason (a
+SHORT key like `Status` may be a project class), but a QUALIFIED key is an
+isolated entry no project name can collide with — the same argument the typer's
+`ConstantRead` arm already makes for `ERB::Util`, and the same surface
+`qualified_class_has_method` (ADR-0042 slice 3, already built) checks. It adds
+nothing for a bare name: a top-level class is already in `knows_toplevel_class`,
+and a nested-only class's SHORT key has no qualified entry.
+
+**The second conjunct is load-bearing, and it was measured.** The first draft of
+this slice had the bare `knows_qualified_class` disjunct. A probe (not a corpus —
+none of the corpora contain the shape) found a REAL false positive:
+
+```ruby
+g = Gem::Version.new("1.0")
+g.segments        # oracle: SILENT.  first draft: undefined method `segments'
+```
+
+`segments` is a real `Gem::Version` method, and the vendored rbs-4.0.3 does not
+declare it — but the reference does, in
+`reference/rigor/data/vendored_gem_sigs/rubygems/rubygems_extras.rbs:129`. The
+reference ships hand-written EXTRAS for twelve gems (ast, bcrypt, bundler, cgi,
+did_you_mean, idn-ruby, mysql2, nokogiri, pg, prism, redis, rubygems) that
+rigor-rs does not vendor, so for those classes **rigor-rs's method surface is a
+strict SUBSET of the oracle's** and witnessing absence over it is unsound.
+
+Two fixes were built and one was measured out:
+
+1. **Decline the `.new` mint for a bundled qualified class** (in `type_dot_new`).
+   Closes the FP, but REGRESSES generative output: `def version; Gem::Version.new("1.0"); end`
+   went from `def version: () -> Gem::Version` (byte-identical to the oracle, on
+   BOTH old and new) to `No candidates`. Rejected.
+2. **Restrict the witness (not the type) to DECLARATION-ONLY classes**
+   (`SourceIndex::is_declaration_only_class`): a class whose registry id came
+   ONLY from the Pass 2b tuple-element sweep — the analyzed source neither
+   declares the class nor names the constant anywhere, so the value can only have
+   come from an RBS declaration. `Gem::Version.new(...)` names the constant ⇒ not
+   declaration-only ⇒ silent (the pre-Slice-2 behaviour); `Process::Status` is
+   never named in fixture 68 ⇒ witnesses. Types are untouched, so `sig-gen` and
+   `annotate` keep their oracle-matching precision. **Shipped.**
+
+Residual surface, audited: a tuple return only resolves for a TOP-LEVEL receiver
+(both lookups ride the SHORT-key map, which holds no qualified keys), so of the
+four QUALIFIED element classes — `Process::Status`, `Gem::Version`,
+`Resolv::DNS::{Message,Name,Resource}` — only `Process::Status` (from `Process`)
+is reachable at all; `Gem::Version` comes solely from `Gem::Requirement.parse`
+and the `Resolv::DNS::*` ones solely from `Resolv::DNS::*` methods, all qualified
+receivers. The restriction should be lifted when rigor-rs vendors the extras
+bundle (its own slice — it changes `knows_class`, arity and ATM surfaces too).
+
+The FP is pinned by `a_source_named_qualified_gem_class_stays_lenient`.
 
 ## Existing callers — none shift
 
@@ -182,7 +225,43 @@ three mandated corpora. The old-vs-new differential (the pre-change and
 post-change release binaries diffed per `(path, line, column, rule)`, each delta
 classified against the oracle) confirms it — `0 added / 0 removed` on all three.
 
-<!-- WIDE_SWEEP -->
+Coverage tiers are unchanged too (`rigor coverage --format json`, old vs new vs
+oracle: mastodon `app/models` and haml `lib` — every tier bucket identical), so
+the new `Type::Tuple`s displaced no node's classification.
+
+### The wide sweep — 35,706 files, ZERO diagnostics moved
+
+The same old-vs-new differential over fourteen corpora, every delta classified
+against the oracle:
+
+| corpus | files | old = new | added | removed | new FPs |
+| --- | --- | --- | --- | --- | --- |
+| mastodon `app/models` | 248 | 112 | 0 | 0 | **0** |
+| conference-app | 244 | 1998 | 0 | 0 | **0** |
+| gitlab-foss `lib` | 4676 | 1044 | 0 | 0 | **0** |
+| mastodon `app` | 1236 | 410 | 0 | 0 | **0** |
+| gitlab-foss `app` | 6513 | 1592 | 0 | 0 | **0** |
+| rails | 3432 | 3093 | 0 | 0 | **0** |
+| redmine | 4784 | 7622 | 0 | 0 | **0** |
+| dependabot-core | 1650 | 138789 | 0 | 0 | **0** |
+| haml (incl. `vendor/bundle`) | 3342 | 2511 | 0 | 0 | **0** |
+| liquid (incl. `vendor/bundle`) | 3002 | 2356 | 0 | 0 | **0** |
+| rubocop-ast | 2327 | 12380 | 0 | 0 | **0** |
+| mail | 874 | 6666 | 0 | 0 | **0** |
+| kramdown | 63 | 30 | 0 | 0 | **0** |
+| faraday | 3315 | 5976 | 0 | 0 | **0** |
+
+**The `check` output is bit-identical on every corpus swept** — this slice moves
+no real-corpus diagnostic in either direction. The whole-repo corpora (haml /
+liquid / faraday include their `vendor/bundle`, which is where Slice 1's reviewer
+found its only real-corpus witness) were swept for exactly that reason.
+
+Why nothing moved, mechanically: the instance tuple path needs a receiver whose
+class the index resolves, and in real code `partition` / `divmod` receivers are
+overwhelmingly untyped parameters (`line.to_s.partition(":")` — probed, both
+engines silent, before and after); the singleton path needs a tuple-returning
+class method, and `Process.wait2` / `Process.waitpid2` do not occur. The gain is
+therefore fixture 68 plus the probe-verified shapes below — not a corpus number.
 
 ## Oracle-checked additions (synthetic probes)
 
@@ -198,6 +277,8 @@ invocation (pinned `rigor-rbs-inline` plugin path, fresh cwd, `--no-cache`):
 | `"x-y".partition("-").frobnicate` | silent | `… for [String, String, String]` | same position; oracle renders `["x", "-", "y"]` |
 | `Delegator.delegating_block(:m).frobnicate` | silent | `5:32 … for Proc` | **identical** |
 | `r, w = IO.pipe` ⇒ `r.frobnicate` | silent | silent | oracle FIRES (`for IO`) — a remaining gap, see below |
+| `g = Gem::Version.new("1.0")` ⇒ `g.segments` | silent | silent | oracle silent — the FP above, closed |
+| `Gem::Version.new("1.0").frobnicate` | silent | silent | oracle FIRES — the price of that guard (FP-safe) |
 
 The two `partition` rows are the only message-text divergence: the reference's
 ConstantFolding pins `"x-y".partition("-")` to the literal tuple `["x", "-", "y"]`
@@ -220,16 +301,21 @@ selection flips it visibly.
 | --- | --- | --- | --- |
 | `sig-gen --print`, `def reap; Process.wait2; end` | `No candidates` | `def reap: () -> [Integer, Process::Status]` | **byte-identical** |
 | `annotate`, the same body | `#=> Dynamic[top]` | `#=> [Integer, Process::Status]` | **byte-identical** |
+| `sig-gen --print`, `def version; Gem::Version.new("1.0"); end` | `-> Gem::Version` | `-> Gem::Version` | **byte-identical** (the rejected `type_dot_new` guard would have lost this) |
 
 ## What the spec got wrong / underspecified
 
-1. **"The witness gate is already built."** `qualified_class_has_method` was
-   indeed built, but the GATE that reaches it
+1. **"The witness gate is already built" is the spec's biggest miss.**
+   `qualified_class_has_method` was indeed built, but the GATE that reaches it
    (`knows_toplevel_class(name) || is_qualified_project_sig_class(name)`) refuses
-   every bundled-RBS nested name, so `Process::Status` never reached the check.
-   One disjunct had to be added (above). The spec's framing — "a value-typing
-   wire-up, not new index machinery" — still holds: no index machinery was added
-   for the witness, only a gate disjunct.
+   every bundled-RBS nested name, so `Process::Status` never reached the check —
+   and, more importantly, opening that gate NAIVELY is a false positive: for a
+   namespaced gem class rigor-rs's surface is a strict subset of the oracle's
+   (the unvendored `vendored_gem_sigs` extras). ADR-0042 slices 3-4 stopping at
+   `is_qualified_project_sig_class` was not an oversight; the bundled half needs
+   the declaration-only provenance restriction built here. The spec's framing —
+   "a value-typing wire-up, not new index machinery" — still holds for the index
+   (nothing was added there for the witness), but the gate needed real design.
 2. **The id-minting problem is broader than the spec's framing.** The spec named
    the missing registry id, but not that the fix must also be enumerable: the
    registry is shared, so registering a name changes `class_id` for every

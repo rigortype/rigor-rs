@@ -154,6 +154,13 @@ pub struct SourceIndex {
     names: Vec<String>,
     /// Fast name -> registry position lookup.
     name_to_id: HashMap<String, u32>,
+    /// MultiWrite substrate Slice 2: names registered ONLY because an RBS TUPLE
+    /// return names them as an element (Pass 2b) — i.e. classes the analyzed
+    /// SOURCE never mentions and no source file declares, reachable only THROUGH
+    /// a declaration (`Process::Status` via `Process.wait2`). Read by the rules'
+    /// qualified-witness gate; see [`Self::is_declaration_only_class`] for why
+    /// the distinction is load-bearing.
+    declaration_only_classes: HashSet<String>,
     /// ADR-0023 tier-4b: `(class NAME, method NAME) -> inferred CORE class NAME`
     /// (e.g. `("User", "full_name") -> "String"`). Populated in a Pass 3 of
     /// [`build_project`] for direct instance methods whose RETURN (tail)
@@ -434,6 +441,12 @@ impl SourceIndex {
             if !idx.classes.contains_key(name)
                 && (core.knows_class(name) || core.knows_qualified_class(name))
             {
+                // A name the source ALREADY registered (a class it declares, or
+                // a constant it reads) is not declaration-only — see
+                // `is_declaration_only_class`.
+                if !idx.name_to_id.contains_key(name) {
+                    idx.declaration_only_classes.insert(name.to_string());
+                }
                 idx.register(name);
             }
         }
@@ -575,6 +588,39 @@ impl SourceIndex {
     /// or registered RBS instance class).
     pub fn is_registered(&self, name: &str) -> bool {
         self.name_to_id.contains_key(name)
+    }
+
+    /// MultiWrite substrate Slice 2: whether `name` got its registry id ONLY
+    /// from the RBS tuple-element sweep (Pass 2b) — the analyzed source neither
+    /// declares the class nor names the constant anywhere, so a value of this
+    /// class can ONLY have come from an RBS DECLARATION (`Process.wait2`'s
+    /// `[Integer, Process::Status]`).
+    ///
+    /// ## Why the rules need this (an FP measured, not theorised)
+    ///
+    /// The rules' qualified-witness arm reports a method as undefined over the
+    /// ADR-0042 qualified surface. For a NAMESPACED *gem* class that surface is
+    /// knowingly WEAKER than the oracle's: the reference supplements the rbs gem
+    /// with `data/vendored_gem_sigs/` (rubygems / cgi / nokogiri / prism / …),
+    /// which rigor-rs does not vendor. Probed: `Gem::Version.new("1.0").segments`
+    /// — `segments` is declared ONLY in the reference's `rubygems_extras.rbs`, so
+    /// the ORACLE IS SILENT and an unrestricted arm fired ⇒ a false positive.
+    ///
+    /// Restricting the arm to declaration-only classes closes that door
+    /// structurally rather than by name: a project that writes `Gem::Version`
+    /// registers the constant in Pass 2, so the class is NOT declaration-only and
+    /// the witness stays silent (the pre-Slice-2 behaviour — a coverage gap in
+    /// the FP-safe direction). Nothing about the value's TYPE changes, so
+    /// `sig-gen` / `annotate` keep their (oracle-matching) precision.
+    ///
+    /// The residual surface is closed and auditable: over the vendored rbs-4.0.3
+    /// the only tuple-element class reachable from a TOP-LEVEL receiver — the
+    /// only receivers whose tuple return resolves, since the lookup rides the
+    /// SHORT-key map, which holds no qualified keys — is `Process::Status`.
+    /// Remove this restriction when rigor-rs vendors the reference's gem-sig
+    /// extras.
+    pub fn is_declaration_only_class(&self, name: &str) -> bool {
+        self.declaration_only_classes.contains(name)
     }
 
     /// The [`ClassId`] for a registered class name. `None` if not registered.

@@ -1262,9 +1262,18 @@ fn check_call(
             // checks. Adds nothing for a bare name: a top-level class is already
             // in `knows_toplevel_class`, and a nested-only class's SHORT key has
             // no qualified entry.
+            //
+            // The DECLARATION-ONLY restriction is load-bearing and was measured,
+            // not theorised: for a namespaced GEM class rigor-rs's surface is
+            // knowingly weaker than the oracle's (the reference's
+            // `data/vendored_gem_sigs/`, which rigor-rs does not vendor), and
+            // `Gem::Version.new("1.0").segments` fired here while the oracle
+            // stayed silent. See `SourceIndex::is_declaration_only_class` for
+            // the full argument and the audit of what remains reachable.
             if (index.knows_toplevel_class(name)
                 || index.is_qualified_project_sig_class(name)
-                || index.knows_qualified_class(name))
+                || (index.knows_qualified_class(name)
+                    && typer.source().is_declaration_only_class(name)))
                 && !index.qualified_class_has_method(name, method)
             {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
@@ -6382,6 +6391,28 @@ mod rbs_tuple_witness_tests {
         // usual way.
         assert!(run(b"pid, _s = Process.wait2\npid.succ\n").is_empty());
         assert_eq!(run(b"pid, _s = Process.wait2\npid.frobnicate\n").len(), 1);
+    }
+
+    /// FP REGRESSION (measured 2026-07-25, PROBE not corpus). The qualified
+    /// witness arm must NOT fire on a namespaced GEM class the SOURCE names:
+    /// rigor-rs's surface for those is knowingly weaker than the oracle's (the
+    /// reference's `data/vendored_gem_sigs/`, unvendored here). `segments` is a
+    /// real `Gem::Version` method declared only in `rubygems_extras.rbs`, so the
+    /// ORACLE IS SILENT on both lines below; an unrestricted arm fired on the
+    /// first. See `SourceIndex::is_declaration_only_class`.
+    #[test]
+    fn a_source_named_qualified_gem_class_stays_lenient() {
+        assert!(
+            run(b"g = Gem::Version.new(\"1.0\")\ng.segments\n").is_empty(),
+            "an extras-only method on a source-named nested gem class must stay silent"
+        );
+        assert!(
+            run(b"Gem::Version.new(\"1.0\").frobnicate\n").is_empty(),
+            "and so must a typo on it (the FP-safe direction: the oracle fires, we do not)"
+        );
+        // The declaration-only twin still witnesses — the restriction is on
+        // PROVENANCE, not on the qualified surface itself.
+        assert_eq!(run(b"_pid, status = Process.wait2\nstatus.frobnicate\n").len(), 1);
     }
 
     /// An INSTANCE tuple return witnesses through the same mint
