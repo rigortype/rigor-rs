@@ -364,6 +364,165 @@ fn lsp_runs_the_bleeding_edge_void_rule_exactly_when_check_does() {
     );
 }
 
+/// A single-file finding (`call.undefined-method`) — the non-excluded sibling's
+/// diagnostic, independent of any cross-file context so excluding another file
+/// cannot move it.
+const TYPO_RB: &str = "s = \"hi\"\ns.lenght\n";
+
+/// Config `exclude:` is `check`'s STAGE-1 file filter: an excluded file is never
+/// even read, so `check` reports no rows for it. The LSP published markers for the
+/// open buffer anyway — a PRESENCE mismatch of exactly the class the stage-3 slice
+/// closed for `severity: off`.
+///
+/// The fixture carries both controls in one project: `lib/sub.rb` (the excluded
+/// file) provably fires when it is NOT excluded, and `lib/typo.rb` (never
+/// excluded) provably still fires when it IS — so neither the empty-vs-empty
+/// comparison nor the "not over-broad" claim can pass vacuously.
+#[test]
+fn lsp_honours_config_exclude_exactly_as_check_does() {
+    let dir = TempDir::new("lsp-exclude");
+    fs::write(dir.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(dir.path().join("lib/sub.rb"), SUB_RB).unwrap();
+    fs::write(dir.path().join("lib/typo.rb"), TYPO_RB).unwrap();
+
+    // CONTROL — no config: both files fire, in both tools.
+    let control_sub = check_findings(dir.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(control_sub.len(), 1, "the fixture fires unexcluded: {control_sub:?}");
+    assert_eq!(control_sub[0].3, "def.override-visibility-reduced");
+    assert_eq!(lsp_findings(dir.path(), "lib/sub.rb", SUB_RB), control_sub);
+
+    let control_typo = check_findings(dir.path(), &["lib"], "lib/typo.rb");
+    assert_eq!(control_typo.len(), 1, "the sibling fires too: {control_typo:?}");
+    assert_eq!(lsp_findings(dir.path(), "lib/typo.rb", TYPO_RB), control_typo);
+
+    // …now exclude ONE of them. The pattern is spelled the way `check` matches it:
+    // bare `check` expands `paths: ["lib"]` to `lib/sub.rb` and applies
+    // `cfg.is_excluded` to that string (`main.rs` stage 1).
+    fs::write(dir.path().join(".rigor.yml"), "exclude:\n  - \"lib/sub.rb\"\n").unwrap();
+
+    // (1) The excluded buffer: `check` reports nothing, and the LSP publishes an
+    // EMPTY set — which is also what clears any markers the editor already holds.
+    let expected = check_findings(dir.path(), &["lib"], "lib/sub.rb");
+    assert!(expected.is_empty(), "`check` never reads an excluded file: {expected:?}");
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/sub.rb", SUB_RB),
+        expected,
+        "an `exclude:`d buffer must publish NOTHING, exactly as `check` reports nothing"
+    );
+
+    // (2) The non-excluded sibling is untouched — the filter is not over-broad.
+    let sibling = check_findings(dir.path(), &["lib"], "lib/typo.rb");
+    assert_eq!(sibling.len(), 1, "the control: the sibling still fires under `check`");
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/typo.rb", TYPO_RB),
+        sibling,
+        "excluding one file must not silence another"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR #45 review — the three path forms the first cut of the `exclude:` gate
+// silently DROPPED while `check` analyses them. Each is a measured regression
+// probe: `check` is asked first and the LSP must equal it.
+//
+// The invariant they pin: a buffer is excluded iff EVERY discovery spelling of
+// that file is excluded. One file reaches discovery under several names — a
+// symlinked `.rb` under the LINK's name (`collect_rb_files` includes symlinked
+// files on purpose, matching `Dir.glob`), overlapping `paths:` roots under two —
+// and `check` analyses it if ANY of them survives `exclude:`.
+// ---------------------------------------------------------------------------
+
+/// B1 — a symlinked `.rb` inside `paths:` pointing at an EXCLUDED tree.
+/// Discovery walks `lib/shared.rb` (not excluded by `**/vendor/**`), so `check`
+/// analyses it; the buffer's canonical path is `vendor/shared.rb`, which is.
+#[test]
+fn lsp_analyses_a_symlinked_file_whose_target_is_excluded() {
+    let dir = TempDir::new("lsp-exclude-b1");
+    fs::create_dir_all(dir.path().join("vendor")).unwrap();
+    fs::write(dir.path().join("vendor/shared.rb"), TYPO_RB).unwrap();
+    std::os::unix::fs::symlink(
+        dir.path().join("vendor/shared.rb"),
+        dir.path().join("lib/shared.rb"),
+    )
+    .unwrap();
+    fs::write(dir.path().join(".rigor.yml"), "exclude:\n  - \"**/vendor/**\"\n").unwrap();
+
+    let expected = check_findings(dir.path(), &["lib"], "lib/shared.rb");
+    assert_eq!(
+        expected.len(),
+        1,
+        "the control: discovery walks the LINK's name, which `**/vendor/**` does not \
+         cover, so `check` analyses it: {expected:?}"
+    );
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/shared.rb", TYPO_RB),
+        expected,
+        "B1: the LSP must not drop a file `check` analyses under its link name"
+    );
+}
+
+/// B2 — a symlink inside `paths:` whose TARGET's own spelling is excluded.
+/// Discovery keeps `lib/link.rb`, so `check` reports the content under that name.
+#[test]
+fn lsp_analyses_a_symlink_whose_target_spelling_is_excluded() {
+    let dir = TempDir::new("lsp-exclude-b2");
+    fs::write(dir.path().join("lib/real.rb"), TYPO_RB).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("lib/real.rb"), dir.path().join("lib/link.rb"))
+        .unwrap();
+    fs::write(dir.path().join(".rigor.yml"), "exclude:\n  - \"lib/real.rb\"\n").unwrap();
+
+    let expected = check_findings(dir.path(), &["lib"], "lib/link.rb");
+    assert_eq!(
+        expected.len(),
+        1,
+        "the control: `lib/link.rb` survives `exclude:`, so `check` analyses the \
+         content under that name: {expected:?}"
+    );
+    // …and the target's own name reports nothing, which is what makes the two
+    // spellings genuinely disagree.
+    assert!(check_findings(dir.path(), &["lib"], "lib/real.rb").is_empty());
+    assert_eq!(
+        lsp_findings(dir.path(), "lib/link.rb", TYPO_RB),
+        expected,
+        "B2: the buffer opened under the surviving name must still be analysed"
+    );
+}
+
+/// B3 — OVERLAPPING `paths:` roots. Discovery yields both `./lib/a.rb` (pruned by
+/// `./lib/**`) and `lib/a.rb` (kept), so `check` analyses the file. The first cut
+/// returned on the first containing root, making the answer depend on config order
+/// — so both orders are driven.
+#[test]
+fn lsp_analyses_a_file_kept_by_one_of_two_overlapping_roots() {
+    for (tag, order) in [
+        ("lsp-exclude-b3a", "paths:\n  - \".\"\n  - lib\n"),
+        ("lsp-exclude-b3b", "paths:\n  - lib\n  - \".\"\n"),
+    ] {
+        let dir = TempDir::new(tag);
+        fs::write(dir.path().join("lib/a.rb"), TYPO_RB).unwrap();
+        fs::write(
+            dir.path().join(".rigor.yml"),
+            format!("{order}exclude:\n  - \"./lib/**\"\n"),
+        )
+        .unwrap();
+
+        // Bare `check` (no path args) — the invocation `paths:` governs.
+        let expected = check_findings(dir.path(), &[], "lib/a.rb");
+        assert_eq!(
+            expected.len(),
+            1,
+            "[{order:?}] the control: the `lib` root's spelling survives, so `check` \
+             analyses the file: {expected:?}"
+        );
+        assert_eq!(
+            lsp_findings(dir.path(), "lib/a.rb", TYPO_RB),
+            expected,
+            "[{order:?}] B3: one surviving root spelling is enough — and the answer \
+             must not depend on `paths:` order"
+        );
+    }
+}
+
 /// Boot `rigor lsp` in `root`, `didOpen` `rel` with `text`, and return its
 /// published diagnostics in the same comparable shape [`check_findings`] yields.
 fn lsp_findings(root: &Path, rel: &str, text: &str) -> Vec<Finding> {
