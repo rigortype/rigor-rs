@@ -1170,9 +1170,6 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
     None
 }
 
-/// Whether a watched-file event could possibly concern a path the project index
-/// harvests — the second half of [`reharvest_sources`]'s ignore condition.
-///
 /// Whether a watched event for a path that is NOT currently held may be dropped
 /// without rebuilding — the complete ignore rule (review R-1), named so the
 /// implementation and its tests share one definition.
@@ -4520,29 +4517,39 @@ mod tests {
         );
     }
 
-    /// PROBE F [BLOCKING]: the LITERAL production shape — `project_root = "."`, so
-    /// `join_root` yields the RELATIVE "lib" and the `c.starts_with(&joined)` arm of
-    /// `touches_configured_root` is DEAD (an absolute path never starts with a
-    /// relative one). Production therefore depends entirely on the canonicalized arm.
-    /// The differential test never sees this because its roots are absolute temp
-    /// dirs, where the dead arm silently rescues every case.
+    /// PROBE F [BLOCKING, fixed]: the LITERAL production shape — `project_root =
+    /// "."` with the workspace entered through a SYMLINK, as an editor launched
+    /// from the user-visible path gives it.
+    ///
+    /// This shape used to be the one the scope comparison could not survive. With
+    /// `project_root = "."`, `join_root` yields the RELATIVE `"lib"`, so the
+    /// literal-root comparison could never match an absolute candidate and the
+    /// decision rested entirely on the canonicalized root — against which the URI's
+    /// decoded, symlink-spelled path does not match either. A deleted-directory
+    /// event was therefore judged out of scope and its stale AST kept. (That
+    /// literal-root arm is now deleted, and the ignore rule short-circuits before
+    /// any comparison when the path does not resolve — see
+    /// `watched_event_is_ignorable`.)
+    ///
+    /// The assertion is cwd-independent TODAY only because of that short-circuit,
+    /// so the production cwd shape is still set up deliberately: if the
+    /// short-circuit is ever removed, this test must go back to exercising the
+    /// comparison under the spelling that broke it.
     #[test]
-    fn probe_f_production_root_shape_has_a_dead_arm_and_ignores_a_symlinked_spelling() {
+    fn probe_f_production_root_shape_never_ignores_a_symlinked_deleted_directory() {
         let p = TempProject::new("probe_f");
         p.write("a.rb", "class A\nend\n");
         std::fs::create_dir_all(p.root.join("lib/nested")).unwrap();
         std::fs::write(p.root.join("lib/nested/c.rb"), "class C\nend\n").unwrap();
-        let alias = p.root.parent().unwrap().join(format!(
-            "{}_alias",
-            p.root.file_name().unwrap().to_string_lossy()
-        ));
-        let _ = std::fs::remove_file(&alias);
-        std::os::unix::fs::symlink(&p.root, &alias).unwrap();
+        // Declared before the cwd guard so it is dropped AFTER it: the cwd is
+        // restored first, then the symlink is removed.
+        let alias = AliasLink::to(&p.root);
+        // Enter the workspace through the SYMLINK. `CwdGuard` holds the process-wide
+        // cwd mutex for the rest of this scope and restores the previous directory
+        // on drop — including on a panic — so no concurrently-running test can
+        // observe (or be stranded by) this mutation.
+        let _cwd = CwdGuard::enter(alias.path());
 
-        let prev = std::env::current_dir().unwrap();
-        // Enter the workspace through the SYMLINK, as an editor launched from the
-        // user-visible path does.
-        std::env::set_current_dir(&alias).unwrap();
         let ctx = ServerContext {
             debounce: Duration::from_secs(30),
             worker_gate: production_gate(),
@@ -4552,15 +4559,12 @@ mod tests {
         };
         let cfg = Config::default();
         std::fs::remove_dir_all(p.root.join("lib/nested")).unwrap();
-        let gone = format!("file://{}", alias.join("lib/nested/c.rb").display());
+        let gone = format!("file://{}", alias.path().join("lib/nested/c.rb").display());
         let uri: Uri = gone.parse().unwrap();
         let canonical = uri_to_canonical_path(&uri);
-        let verdict = !watched_event_is_ignorable(&ctx, &cfg, canonical.as_deref(), &uri);
-        std::env::set_current_dir(prev).unwrap();
-        let _ = std::fs::remove_file(&alias);
         assert!(canonical.is_none(), "precondition: deleted directory");
         assert!(
-            verdict,
+            !watched_event_is_ignorable(&ctx, &cfg, canonical.as_deref(), &uri),
             "PROBE F FAILED: under the production root shape a deleted-directory \
              event spelled through the workspace symlink is IGNORED"
         );
