@@ -406,17 +406,40 @@ impl SeverityStamp {
 /// generation guard covers it with no new concurrency reasoning. Nothing re-reads
 /// `.rigor.yml` per dispatch.
 ///
-/// **The path form is the whole difficulty.** `exclude:` patterns are matched
-/// against the path string as `check` SPELLS it, not against an absolute canonical
-/// path: bare `check` expands each `paths:` root (`expand_check_paths` →
-/// `collect_rb_files`, which builds `<root>/<rel>` by `Path::join`), so with the
-/// production root `.` the matched string is `lib/sub.rb`, and under
-/// `paths: ["."]` it is `./lib/sub.rb`. A buffer arrives here as a CANONICAL
-/// absolute path instead, so it must be re-spelled the way discovery would have
-/// spelled it — [`Self::check_spelling`] — or a pattern like `lib/**` would silently
-/// match nothing. That is also what keeps this gate and [`project_files`] (which
-/// applies `cfg.is_excluded` to exactly those discovery spellings) in agreement: a
-/// mismatch between them would be its own divergence.
+/// **THE INVARIANT** (PR #45 review): a buffer is excluded **iff EVERY discovery
+/// spelling of that file is excluded**. One file can reach discovery under several
+/// names — a symlinked `.rb` is walked under the LINK's name while its content
+/// lives elsewhere (`collect_rb_files` includes symlinked files on purpose,
+/// `main.rs`, matching `Dir.glob`), and overlapping `paths:` roots
+/// (`[".", "lib"]`) walk the same file twice — and `check` analyses the file if ANY
+/// of those names survives `exclude:`. A gate that re-derives one canonical
+/// spelling cannot express that, and the first implementation of this slice
+/// silently dropped three such shapes that `check` analyses.
+///
+/// So the gate is answered in two tiers:
+///
+/// 1. **Discovery MEMBERSHIP — the primary, exact signal.** [`ProjectFiles`]
+///    already holds the canonical path of every file in the POST-`exclude:`
+///    discovery set, i.e. exactly the files `check` analyses. Buffer present ⇒ some
+///    spelling survived ⇒ **not excluded**. This satisfies the invariant by
+///    construction, with no spelling arithmetic at all.
+/// 2. **Spelling fallback — only when the overlay cannot answer**: the scale guard
+///    tripped (`overlay: None`), the project is empty, the buffer is new/unsaved, or
+///    it lives outside `paths:`. Then every candidate spelling of the buffer is
+///    enumerated ([`Self::check_spellings`]) and the buffer is excluded only if they
+///    are ALL excluded — the invariant again, this time computed.
+///
+/// The spelling half still matters because `exclude:` patterns are matched against
+/// the path string as `check` SPELLS it, not an absolute canonical path: bare
+/// `check` expands each `paths:` root (`expand_check_paths` → `collect_rb_files`,
+/// building `<root>/<rel>` by `Path::join`), so with the production root `.` the
+/// matched string is `lib/sub.rb`, and under `paths: ["."]` it is `./lib/sub.rb`.
+///
+/// Carried on [`ProjectContext`] beside [`ProjectContext::disable`] and
+/// [`ProjectContext::stamp`] for the same reason those live there: every field is
+/// config-derived, so `invalidate` / `swap_project` rebuild it for free and the S4
+/// generation guard covers it with no new concurrency reasoning. Nothing re-reads
+/// `.rigor.yml` per dispatch.
 struct ExcludeMatcher {
     /// The project root AS SPELLED to the server: `.` in production, an absolute
     /// temp dir in tests — the same `join_root` convention [`project_files`] and
@@ -431,6 +454,38 @@ struct ExcludeMatcher {
     patterns: Vec<String>,
 }
 
+/// The three ways one open buffer's file can be NAMED, all of which `check` may
+/// legitimately use — which is why the gate reasons over all of them rather than
+/// picking one.
+///
+/// Resolved once per dispatch, off the loop thread, from the document URI.
+#[derive(Default, Clone)]
+struct BufferPaths {
+    /// Fully resolved — the overlay's REPLACE key and the discovery-membership
+    /// lookup key. `None` for a buffer with no filesystem identity at all.
+    canonical: Option<PathBuf>,
+    /// Literally what the editor named, percent-decoded and NOT resolved. This is
+    /// the spelling `rigor check <that file>` would receive, and the only one that
+    /// survives a symlinked DIRECTORY (which discovery never traverses).
+    decoded: Option<PathBuf>,
+    /// The decoded path with its DIRECTORY resolved but the file NAME kept. A
+    /// symlinked `.rb` FILE is walked by discovery under the link's name, so this
+    /// is the name `exclude:` is matched against for it — while `canonical` points
+    /// at the target and would be matched against the wrong patterns.
+    named: Option<PathBuf>,
+}
+
+impl BufferPaths {
+    fn for_uri(uri: &Uri) -> Self {
+        let decoded = uri_decoded_path(uri);
+        let named = decoded.as_deref().and_then(|d| {
+            let name = d.file_name()?;
+            Some(std::fs::canonicalize(d.parent()?).ok()?.join(name))
+        });
+        Self { canonical: uri_to_canonical_path(uri), decoded, named }
+    }
+}
+
 impl ExcludeMatcher {
     fn from_config(root: &Path, cfg: &Config) -> Self {
         Self {
@@ -440,52 +495,118 @@ impl ExcludeMatcher {
         }
     }
 
-    /// Whether the buffer at `path` is `exclude:`d, i.e. whether `check` would
-    /// report nothing for it. `None` (an untitled / non-`file:` buffer) is never
-    /// excluded — it has no path for a pattern to match, and `check` never sees it.
-    fn excludes(&self, path: Option<&Path>) -> bool {
+    /// Whether this buffer is `exclude:`d — i.e. whether `check` would report
+    /// nothing for it. See the type docs for the two tiers and the invariant.
+    fn excludes(&self, buf: &BufferPaths, overlay: Option<&ProjectFiles>) -> bool {
         if self.patterns.is_empty() {
-            return false; // the overwhelmingly common case: no filesystem work.
+            return false; // the overwhelmingly common case: no work at all.
         }
-        let Some(path) = path else { return false };
-        let Some(spelled) = self.check_spelling(path) else { return false };
-        crate::config::matches_exclude(&self.patterns, &spelled.to_string_lossy())
+        // TIER 1 — discovery membership. The overlay IS the post-`exclude:` set.
+        if let (Some(canonical), Some(overlay)) = (buf.canonical.as_deref(), overlay) {
+            if overlay.files.iter().any(|(p, _)| p == canonical) {
+                return false;
+            }
+        }
+        // TIER 2 — every candidate spelling of the buffer must be excluded. An empty
+        // candidate set means no `check` invocation from this root names the file
+        // (an untitled buffer, or one outside the workspace) ⇒ never excluded.
+        let spellings = self.check_spellings(buf);
+        if spellings.is_empty()
+            || !spellings
+                .iter()
+                .all(|s| crate::config::matches_exclude(&self.patterns, s))
+        {
+            return false;
+        }
+        // TIER 3 — the buffer's OWN names are all excluded, but the file may still
+        // reach discovery under a name the buffer does not carry: `lib/link.rb` is a
+        // symlink to `lib/real.rb`, `exclude: ["lib/real.rb"]` prunes only the
+        // target's spelling, and `check` analyses the content under the link's name.
+        // Dropping output is the consequential direction, so it is confirmed against
+        // the REAL walk before it happens — and only here, so the common path pays
+        // nothing (this runs only for a buffer already judged excluded, in a session
+        // whose overlay could not answer).
+        !self.survives_discovery(buf.canonical.as_deref())
     }
 
-    /// Re-spell a canonical buffer path the way `check` spells it, or `None` when
-    /// no `check` invocation would name this file.
+    /// Whether bare-`check` discovery keeps SOME spelling of this canonical file —
+    /// i.e. whether `check` analyses its content under any name. Consults
+    /// [`discovery_spellings`], the same walk [`project_files`] uses, so it can
+    /// never drift from what discovery actually does.
     ///
-    /// FIRST the discovery spelling: the buffer under configured root `p` is spelled
-    /// `join_root(root, p).join(<path relative to that root's canonical form>)` —
-    /// byte-identical to what [`project_files`] produces for the same file, which is
-    /// what `check`'s stage 1 matches `exclude:` against on a bare run. Roots are
-    /// canonicalized before the comparison (like [`touches_configured_root`]) so a
-    /// symlinked workspace spelling cannot defeat the match.
+    /// **Only SYMLINKED spellings are consulted**, and that is complete rather than
+    /// a shortcut: a spelling that is not a symlink names its own file, and every
+    /// such spelling of the buffer is already among tier 2's candidates (tier 2
+    /// re-spells the buffer under EVERY configured root, so the multi-root alias is
+    /// covered there). The only name tier 2 structurally cannot see is one the
+    /// buffer does not carry — a symlink elsewhere in the tree pointing at it.
     ///
-    /// FAILING THAT, the project-root-relative spelling — the buffer is inside the
-    /// workspace but outside every `paths:` root, so the only `check` run that would
-    /// ever report on it is an explicit `rigor check <that file>` from the project
-    /// root, which matches `exclude:` against exactly that relative spelling.
+    /// **Cost, measured** (3 000 files / 60 directories, warm): ~6 ms, versus
+    /// ~25-40 ms for the naive form that `canonicalize`s every surviving spelling
+    /// (`realpath` walks the whole path per file). An `lstat` per candidate answers
+    /// the common case; the full resolve is paid only for entries that really are
+    /// symlinks — of which a project has very few. This runs ONLY for a buffer
+    /// already judged excluded — a dispatch that publishes nothing either way — so
+    /// it never sits on the latency path of a buffer that is getting diagnostics.
+    fn survives_discovery(&self, canonical: Option<&Path>) -> bool {
+        let Some(canonical) = canonical else { return false };
+        discovery_spellings(&self.root, &self.paths)
+            .iter()
+            .filter(|f| !crate::config::matches_exclude(&self.patterns, f))
+            .any(|f| {
+                std::fs::symlink_metadata(f).is_ok_and(|m| m.file_type().is_symlink())
+                    && std::fs::canonicalize(f).is_ok_and(|c| c == canonical)
+            })
+    }
+
+    /// Every string `check` could match `exclude:` against for this buffer.
     ///
-    /// `None` for a buffer outside the project root entirely: no `check` invocation
-    /// from this root names it, so there is no spelling to match and it is left
-    /// alone.
-    fn check_spelling(&self, path: &Path) -> Option<PathBuf> {
+    /// Each of the buffer's three names ([`BufferPaths`]) is re-spelled under EVERY
+    /// configured root that contains it — not the first, because under overlapping
+    /// roots (`paths: [".", "lib"]`) discovery genuinely produces two spellings and
+    /// only one of them may be excluded. A name under no configured root falls back
+    /// to the project-root-relative spelling, which is what an explicit
+    /// `rigor check <that file>` from the project root receives.
+    ///
+    /// Duplicates are harmless (the caller only asks whether they are ALL excluded)
+    /// and common — the three names coincide whenever no symlink is involved.
+    fn check_spellings(&self, buf: &BufferPaths) -> Vec<String> {
+        let mut out = Vec::new();
+        for candidate in [&buf.decoded, &buf.named, &buf.canonical].into_iter().flatten() {
+            self.push_spellings(candidate, &mut out);
+        }
+        out
+    }
+
+    /// Append every spelling of one candidate path.
+    fn push_spellings(&self, path: &Path, out: &mut Vec<String>) {
+        let before = out.len();
         for p in &self.paths {
             let base = join_root(&self.root, p);
-            let Ok(canonical_base) = std::fs::canonicalize(&base) else {
-                continue; // a configured root that does not exist excludes nothing.
-            };
-            let Ok(rel) = path.strip_prefix(&canonical_base) else {
-                continue;
-            };
-            // `paths:` may name a FILE (`project_files` pushes the joined path as
-            // is); then `rel` is empty and the spelling is the root itself.
-            return Some(if rel.as_os_str().is_empty() { base } else { base.join(rel) });
+            // A root that does not resolve cannot spell anything. Both the literal
+            // and the canonical form are tried: the literal one catches a candidate
+            // spelled through the same alias the root is (`project_root` = "." with
+            // an absolute candidate never matches literally, but an injected
+            // absolute root does), the canonical one everything else.
+            let bases = [Some(base.clone()), std::fs::canonicalize(&base).ok()];
+            for prefix in bases.into_iter().flatten() {
+                let Ok(rel) = path.strip_prefix(&prefix) else { continue };
+                // `paths:` may name a FILE (`project_files` pushes the joined path
+                // as is); then `rel` is empty and the spelling is the root itself.
+                let spelled =
+                    if rel.as_os_str().is_empty() { base.clone() } else { base.join(rel) };
+                out.push(spelled.to_string_lossy().into_owned());
+            }
         }
-        let canonical_root = std::fs::canonicalize(&self.root).ok()?;
-        let rel = path.strip_prefix(&canonical_root).ok()?;
-        Some(join_root(&self.root, &rel.to_string_lossy()))
+        if out.len() > before {
+            return; // named by at least one configured root.
+        }
+        // Outside every `paths:` root: the only run that reports on this file is an
+        // explicit `rigor check <that file>` from the project root.
+        let Ok(canonical_root) = std::fs::canonicalize(&self.root) else { return };
+        if let Ok(rel) = path.strip_prefix(&canonical_root) {
+            out.push(join_root(&self.root, &rel.to_string_lossy()).to_string_lossy().into_owned());
+        }
     }
 }
 
@@ -687,8 +808,18 @@ fn build_core_index(root: &Path, cfg: &Config) -> CoreIndex {
 /// tests, which is what makes the overlay testable without mutating the process
 /// cwd.
 fn project_files(root: &Path, cfg: &Config) -> Vec<String> {
+    let mut out = discovery_spellings(root, &cfg.paths);
+    out.retain(|p| !cfg.is_excluded(p));
+    out
+}
+
+/// Bare-`check` discovery BEFORE `exclude:` — every path string stage 1 would be
+/// handed. Split out of [`project_files`] so [`ExcludeMatcher`] can consult the
+/// real walk (rather than a second re-derivation of it) when it needs to know
+/// whether ANOTHER spelling of one file survives the patterns.
+fn discovery_spellings(root: &Path, paths: &[String]) -> Vec<String> {
     let mut out = Vec::new();
-    for p in &cfg.paths {
+    for p in paths {
         let joined = join_root(root, p);
         if joined.is_dir() {
             let mut in_dir = Vec::new();
@@ -699,7 +830,6 @@ fn project_files(root: &Path, cfg: &Config) -> Vec<String> {
             out.push(joined.to_string_lossy().into_owned());
         }
     }
-    out.retain(|p| !cfg.is_excluded(p));
     out
 }
 
@@ -1779,14 +1909,15 @@ fn spawn_worker(uri: &Uri, text: String, version: i32, ctx: &ServerContext, st: 
     let tx = st.results_tx.clone();
     let uri = uri.clone();
     rayon::spawn(move || {
-        // The buffer's on-disk identity, resolved OFF the loop thread (S4b): it is
-        // what the overlay REPLACES in the held project ASTs. `None` (a non-`file:`
-        // or never-saved URI) ⇒ the buffer's AST is APPENDED instead — the same
-        // index `check` would build for the project files PLUS this one.
-        let path = uri_to_canonical_path(&uri);
+        // The buffer's on-disk identity, resolved OFF the loop thread (S4b). The
+        // CANONICAL form is what the overlay REPLACES in the held project ASTs
+        // (`None` — a non-`file:` or never-saved URI — appends instead, the same
+        // index `check` would build for the project files PLUS this one); the other
+        // two names are what the `exclude:` gate matches patterns against.
+        let paths = BufferPaths::for_uri(&uri);
         let (diags, overlay_build) = panic::catch_unwind(AssertUnwindSafe(|| {
             gate(version, generation); // test seam: may block (hold mid-flight) or panic.
-            compute_diagnostics(&project, path.as_deref(), &text)
+            compute_diagnostics(&project, &paths, &text)
         }))
         .unwrap_or_default();
         // Always send exactly one result (even empty on a caught panic), so the
@@ -2027,14 +2158,14 @@ fn send_diagnostics(
 /// its freshly-lowered AST ([`overlay_source_index`]) — so the editor sees the
 /// same cross-file facts `check` does, live, without a save. With the overlay off
 /// (scale guard tripped, or an empty/absent project) it falls back to today's
-/// single-file [`SourceIndex::build`]. `path` is the buffer's canonical on-disk
-/// path, or `None` for an unsaved/non-`file:` buffer.
+/// single-file [`SourceIndex::build`]. `buf` carries the buffer's on-disk names —
+/// all `None` for an unsaved/non-`file:` buffer.
 ///
 /// Returns the diagnostics plus the overlay `build_project` timing (the scale
 /// guard's sample, `None` when the overlay is off).
 fn compute_diagnostics(
     project: &ProjectContext,
-    path: Option<&Path>,
+    buf: &BufferPaths,
     text: &str,
 ) -> (Vec<Diagnostic>, Option<Duration>) {
     // STAGE-1 PARITY, in `check`'s order (`main.rs`): config `exclude:` FIRST —
@@ -2042,7 +2173,7 @@ fn compute_diagnostics(
     // the ERB-template skip. An excluded buffer yields an EMPTY set rather than no
     // publish at all, so the caller's publish CLEARS any markers the editor is
     // already showing for it (the same empty-publish `didClose` uses).
-    if project.exclude.excludes(path) {
+    if project.exclude.excludes(buf, project.overlay.as_ref()) {
         return (Vec::new(), None);
     }
     let bytes = text.as_bytes().to_vec();
@@ -2058,7 +2189,8 @@ fn compute_diagnostics(
         let result = parse(&bytes);
         let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
-        let (source, overlay_build) = overlay_source_index(project, path, &ast);
+        let (source, overlay_build) =
+            overlay_source_index(project, buf.canonical.as_deref(), &ast);
         let mut interner = Interner::new();
         let folder = project
             .folder
@@ -2517,7 +2649,7 @@ mod tests {
     #[test]
     fn diagnostics_flag_a_typo() {
         // `"hi".lenght` — undefined method, one diagnostic.
-        let (diags, _) = compute_diagnostics(&project(), None, "x = \"hi\"\nx.lenght\n");
+        let (diags, _) = compute_diagnostics(&project(), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert_eq!(diags.len(), 1, "one undefined-method diagnostic");
         let d = &diags[0];
         assert_eq!(d.source.as_deref(), Some("rigor"));
@@ -2532,13 +2664,13 @@ mod tests {
         // `check` (a bare `# rigor:disable` with no rule token is a no-op — it
         // needs a rule, matching the reference's `\s+(rules)` directive grammar).
         let diags =
-            compute_diagnostics(&project(), None, "x = \"hi\"\nx.lenght # rigor:disable undefined-method\n").0;
+            compute_diagnostics(&project(), &BufferPaths::default(), "x = \"hi\"\nx.lenght # rigor:disable undefined-method\n").0;
         assert!(diags.is_empty(), "inline disable suppresses the diagnostic");
     }
 
     #[test]
     fn diagnostics_clean_source_is_empty() {
-        let (diags, _) = compute_diagnostics(&project(), None, "x = \"hi\"\nx.upcase\n");
+        let (diags, _) = compute_diagnostics(&project(), &BufferPaths::default(), "x = \"hi\"\nx.upcase\n");
         assert!(diags.is_empty());
     }
 
@@ -2558,7 +2690,7 @@ mod tests {
             "test",
         );
         let (diags, _) =
-            compute_diagnostics(&project_with_config(&cfg), None, "x = \"hi\"\nx.lenght\n");
+            compute_diagnostics(&project_with_config(&cfg), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert!(diags.is_empty(), "an `off` resolution is DROPPED, not merely downgraded");
     }
 
@@ -2571,7 +2703,7 @@ mod tests {
             "test",
         );
         let (diags, _) =
-            compute_diagnostics(&project_with_config(&cfg), None, "x = \"hi\"\nx.lenght\n");
+            compute_diagnostics(&project_with_config(&cfg), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert_eq!(diags.len(), 1);
         assert_eq!(
             diags[0].severity,
@@ -2586,7 +2718,7 @@ mod tests {
     fn stage3_stamp_honours_a_family_override() {
         let cfg = Config::parse_or_warn("severity_overrides:\n  call: off\n", "test");
         let (diags, _) =
-            compute_diagnostics(&project_with_config(&cfg), None, "x = \"hi\"\nx.lenght\n");
+            compute_diagnostics(&project_with_config(&cfg), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert!(diags.is_empty(), "the `call` family override covers call.undefined-method");
     }
 
@@ -4041,7 +4173,7 @@ mod tests {
 
         // (c) …and today's single-file index MISSES it — so this test would fail
         // without the overlay. (Directly: the pre-S4b `compute_diagnostics` path.)
-        let (single_file, _) = compute_diagnostics(&project(), None, SUB_RB);
+        let (single_file, _) = compute_diagnostics(&project(), &BufferPaths::default(), SUB_RB);
         assert!(
             single_file.is_empty(),
             "a single-file index cannot see `Base`, so it finds nothing: {single_file:?}"
@@ -4696,17 +4828,24 @@ mod tests {
 
     #[test]
     fn exclude_gate_agrees_with_bare_check_discovery() {
-        // THE AGREEMENT INVARIANT. For every file bare-`check` discovery walks, the
-        // per-buffer gate must answer EXACTLY what discovery's own `exclude:` filter
-        // answered for it — same patterns, same path spelling. Anything else is a
-        // second divergence (the overlay and the analysed buffer disagreeing about
-        // which files are in the project), which is what a hand-rolled
-        // "relativize against the root" would have produced: under
-        // `paths: ["."]` discovery spells the file `./lib/a.rb`, not `lib/a.rb`.
+        // THE INVARIANT (PR #45 review): a buffer is excluded IFF EVERY discovery
+        // spelling of that file is excluded. `check` analyses a file if ANY name it
+        // was walked under survives `exclude:`, and one file can be walked under
+        // several names — a symlinked `.rb` under the LINK's name, an overlapping
+        // `paths:` pair under two roots. The first cut of this gate re-derived ONE
+        // canonical spelling and silently dropped three shapes `check` analyses
+        // (B1/B2/B3 in the note); this differential is what pins the invariant.
         //
-        // Driven across BOTH `paths:` shapes and BOTH root spellings, because the
-        // spelling is precisely what the gate has to reproduce.
-        for paths_yaml in ["paths:\n  - lib\n", "paths:\n  - \".\"\n"] {
+        // Driven across `paths:` shapes (incl. the OVERLAPPING multi-root case),
+        // pattern sets, root spellings, AND both gate tiers — with a symlinked `.rb`
+        // in every fixture, because the symlink and multi-root axes are exactly the
+        // two the original 24-run matrix lacked.
+        for paths_yaml in [
+            "paths:\n  - lib\n",
+            "paths:\n  - \".\"\n",
+            "paths:\n  - \".\"\n  - lib\n",
+            "paths:\n  - lib\n  - \".\"\n",
+        ] {
             for patterns in [
                 "exclude: []\n",
                 "exclude:\n  - \"**/vendor/**\"\n",
@@ -4714,15 +4853,34 @@ mod tests {
                 "exclude:\n  - \"**/*.rb\"\n",
                 "exclude:\n  - \"lib/a.rb\"\n",
                 "exclude:\n  - \"./lib/a.rb\"\n",
+                "exclude:\n  - \"./lib/**\"\n",
+                "exclude:\n  - \"lib/real.rb\"\n",
+                "exclude:\n  - \"vendor/**\"\n",
             ] {
                 for spelling in [RootSpelling::Absolute, RootSpelling::DotThroughSymlink] {
-                    exclude_agreement_run(paths_yaml, patterns, spelling);
+                    for overlay in [OverlayTier::Live, OverlayTier::Off] {
+                        exclude_agreement_run(paths_yaml, patterns, spelling, overlay);
+                    }
                 }
             }
         }
     }
 
-    fn exclude_agreement_run(paths_yaml: &str, patterns: &str, spelling: RootSpelling) {
+    /// Which tier of the gate a differential run exercises: with the overlay LIVE
+    /// the discovery-membership tier answers, with it OFF (the scale guard tripped)
+    /// the spelling fallback must reach the same verdict on its own.
+    #[derive(Clone, Copy, Debug)]
+    enum OverlayTier {
+        Live,
+        Off,
+    }
+
+    fn exclude_agreement_run(
+        paths_yaml: &str,
+        patterns: &str,
+        spelling: RootSpelling,
+        tier: OverlayTier,
+    ) {
         let yaml = format!("{paths_yaml}{patterns}");
         let cfg: Config = serde_yaml::from_str(&yaml).unwrap();
         // The same `paths:` with NO `exclude:` — the unfiltered discovery set, i.e.
@@ -4732,8 +4890,21 @@ mod tests {
         let p = TempProject::new("exclgate");
         p.write("a.rb", "class A\nend\n");
         p.write("b.rb", "class B\nend\n");
+        p.write("real.rb", "class Real\nend\n");
         std::fs::create_dir_all(p.root.join("lib/vendor")).unwrap();
         std::fs::write(p.root.join("lib/vendor/v.rb"), "class V\nend\n").unwrap();
+        // AXIS 1 (review N1): a symlinked `.rb` FILE inside `lib`, pointing OUT of
+        // `lib`. `collect_rb_files` includes it (matching `Dir.glob`), so discovery
+        // walks it under `lib/shared.rb` while its canonical path is
+        // `<root>/vendor/shared.rb` — the two names carry DIFFERENT `exclude:`
+        // verdicts, which is regression B1.
+        std::fs::create_dir_all(p.root.join("vendor")).unwrap();
+        std::fs::write(p.root.join("vendor/shared.rb"), "class Shared\nend\n").unwrap();
+        std::os::unix::fs::symlink(p.root.join("vendor/shared.rb"), p.root.join("lib/shared.rb"))
+            .unwrap();
+        // …and one pointing INSIDE `lib` (regression B2: `exclude: ["lib/real.rb"]`
+        // prunes the target's own spelling but not the link's).
+        std::os::unix::fs::symlink(p.root.join("lib/real.rb"), p.root.join("lib/link.rb")).unwrap();
 
         let alias = matches!(spelling, RootSpelling::DotThroughSymlink)
             .then(|| AliasLink::to(&p.root));
@@ -4742,28 +4913,84 @@ mod tests {
             Some(_) => PathBuf::from("."),
             None => p.root.clone(),
         };
+        // URIs are spelled the way the client would spell them — through the alias
+        // in the symlink case, and NEVER with the symlinked file resolved.
+        let uri_root = alias.as_ref().map_or_else(|| p.root.clone(), |a| a.path().to_path_buf());
 
         let all = project_files(&root, &unfiltered);
         let kept = project_files(&root, &cfg);
         let matcher = ExcludeMatcher::from_config(&root, &cfg);
+        // The tier-1 substrate: the post-`exclude:` discovery set, canonicalized —
+        // exactly what `build_overlay` holds. Built from `kept` directly so the test
+        // pins the MEMBERSHIP rule rather than re-testing the harvest.
+        let held = ProjectFiles {
+            files: kept
+                .iter()
+                .filter_map(|f| {
+                    Some((std::fs::canonicalize(f).ok()?, Arc::new(lower(&parse(b"")))))
+                })
+                .collect(),
+        };
+        let overlay = match tier {
+            OverlayTier::Live => Some(&held),
+            OverlayTier::Off => None,
+        };
+
+        // GROUND TRUTH: `check` analyses a file iff SOME discovery spelling of it
+        // survived `exclude:`. Keyed on the canonical path, because that is the
+        // file's identity — two spellings of one file share it.
+        let mut analysed: std::collections::HashMap<PathBuf, bool> =
+            std::collections::HashMap::new();
         for f in &all {
-            let canonical = std::fs::canonicalize(f).unwrap();
+            let Ok(canonical) = std::fs::canonicalize(f) else { continue };
+            *analysed.entry(canonical).or_insert(false) |= kept.contains(f);
+        }
+
+        for f in &all {
+            let Ok(canonical) = std::fs::canonicalize(f) else { continue };
+            // The buffer the editor would open for this discovery spelling: the URI
+            // names the file as DISCOVERY did (through the link, through the alias),
+            // which is what makes the symlink axis observable at all.
+            let rel = spelling_relative_to_root(f, &root);
+            let buf = BufferPaths::for_uri(
+                &format!("file://{}", uri_root.join(&rel).display())
+                    .parse::<Uri>()
+                    .unwrap(),
+            );
             assert_eq!(
-                matcher.excludes(Some(&canonical)),
-                !kept.contains(f),
-                "[{yaml:?} / {spelling:?}] the buffer gate and bare-`check` discovery \
-                 disagree about {f}"
+                matcher.excludes(&buf, overlay),
+                !analysed[&canonical],
+                "[{yaml:?} / {spelling:?} / {tier:?}] the buffer gate and bare-`check` \
+                 discovery disagree about {f}"
             );
         }
         // Non-vacuity of the loop itself: the `**/*.rb` case must prune everything
         // and the empty case nothing, so the comparison above is exercised on BOTH
         // answers somewhere in the matrix.
-        if patterns.contains("*.rb\"") {
+        if patterns.contains("**/*.rb\"") {
             assert!(kept.is_empty(), "[{yaml:?}] the catch-all pattern prunes the whole set");
         }
         if patterns == "exclude: []\n" {
             assert_eq!(kept.len(), all.len(), "[{yaml:?}] no patterns ⇒ nothing pruned");
         }
+        // N3 (review): under `RootSpelling::Absolute` the relative patterns
+        // (`lib/a.rb`, `./lib/**`, `vendor/**`) match nothing on EITHER side, so
+        // those cells agree vacuously. They are kept because they cost nothing and
+        // guard the absolute-root path against a future change that starts matching
+        // them; the discriminating cells are the `DotThroughSymlink` ones, which is
+        // the production root shape anyway.
+    }
+
+    /// A discovery spelling (`lib/a.rb`, `./lib/a.rb`, or an absolute one) reduced
+    /// to its path relative to the project root, so a client URI can be built for
+    /// it WITHOUT resolving any symlink on the way.
+    fn spelling_relative_to_root(spelling: &str, root: &Path) -> PathBuf {
+        let path = Path::new(spelling);
+        if let Ok(rel) = path.strip_prefix(root) {
+            return rel.to_path_buf();
+        }
+        // A relative spelling: strip a leading `./` and it is already root-relative.
+        path.strip_prefix("./").unwrap_or(path).to_path_buf()
     }
 
     #[test]
@@ -4777,15 +5004,26 @@ mod tests {
         let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/*.rb\"\n").unwrap();
         let matcher = ExcludeMatcher::from_config(&p.root, &cfg);
 
-        assert!(matcher.excludes(Some(&inside)), "the control: an in-project file IS excluded");
-        assert!(!matcher.excludes(None), "an untitled buffer has no path to match");
+        assert!(
+            matcher.excludes(&buffer_at(&inside), None),
+            "the control: an in-project file IS excluded"
+        );
+        assert!(
+            !matcher.excludes(&BufferPaths::default(), None),
+            "an untitled buffer has no name to match"
+        );
 
         let outside = TempProject::new("exclscope_other");
         let elsewhere = outside.write("a.rb", "class A\nend\n");
         assert!(
-            !matcher.excludes(Some(&elsewhere)),
+            !matcher.excludes(&buffer_at(&elsewhere), None),
             "a buffer outside the workspace is not `check`'s to exclude"
         );
+    }
+
+    /// The [`BufferPaths`] an editor would send for an existing on-disk `path`.
+    fn buffer_at(path: &Path) -> BufferPaths {
+        BufferPaths::for_uri(&format!("file://{}", path.display()).parse::<Uri>().unwrap())
     }
 
     #[test]
@@ -4808,18 +5046,96 @@ mod tests {
         // project, which is what makes a relative `exclude:` pattern meaningful.
         let _cwd = CwdGuard::enter(&p.root);
 
+        let buf = buffer_at(&spec);
         let matching: Config = serde_yaml::from_str("exclude:\n  - \"spec/**\"\n").unwrap();
         assert!(
-            ExcludeMatcher::from_config(&PathBuf::from("."), &matching).excludes(Some(&spec)),
+            ExcludeMatcher::from_config(&PathBuf::from("."), &matching).excludes(&buf, None),
             "an out-of-`paths:` buffer is excluded exactly when `rigor check \
              spec/x_spec.rb` from the project root would report nothing for it"
         );
         // The control: a pattern that does NOT cover it leaves it analysed, exactly
         // as today (the N5 divergence is untouched by this slice).
         let other: Config = serde_yaml::from_str("exclude:\n  - \"vendor/**\"\n").unwrap();
+        assert!(!ExcludeMatcher::from_config(&PathBuf::from("."), &other).excludes(&buf, None));
+    }
+
+    #[test]
+    fn exclude_gate_never_drops_a_symlinked_file_check_analyses() {
+        // Regressions B1/B2 at the matcher seam (the E2E versions live in
+        // `lsp_check_parity.rs`). `collect_rb_files` deliberately INCLUDES symlinked
+        // `.rb` files (`main.rs`, the 2026-07-06 audit correction matching
+        // `Dir.glob`), so discovery walks the LINK's name — and the link's name and
+        // the target's name can carry opposite `exclude:` verdicts.
+        let p = TempProject::new("exclsymlink");
+        std::fs::create_dir_all(p.root.join("vendor")).unwrap();
+        std::fs::write(p.root.join("vendor/shared.rb"), "class Shared\nend\n").unwrap();
+        std::os::unix::fs::symlink(p.root.join("vendor/shared.rb"), p.root.join("lib/shared.rb"))
+            .unwrap();
+        p.write("real.rb", "class Real\nend\n");
+        std::os::unix::fs::symlink(p.root.join("lib/real.rb"), p.root.join("lib/link.rb")).unwrap();
+        let _cwd = CwdGuard::enter(&p.root);
+        let root = PathBuf::from(".");
+
+        // B1: `lib/shared.rb` → `vendor/shared.rb`, excluded by `**/vendor/**`.
+        // Discovery keeps `lib/shared.rb`, so `check` analyses it.
+        let b1: Config = serde_yaml::from_str("exclude:\n  - \"**/vendor/**\"\n").unwrap();
+        assert!(project_files(&root, &b1).iter().any(|f| f.ends_with("lib/shared.rb")));
         assert!(
-            !ExcludeMatcher::from_config(&PathBuf::from("."), &other).excludes(Some(&spec))
+            !ExcludeMatcher::from_config(&root, &b1)
+                .excludes(&buffer_at(&p.root.join("lib/shared.rb")), None),
+            "B1: the link's own name survives `exclude:`, so `check` analyses the file"
         );
+        // The control: a pattern covering BOTH the link's name and the target's
+        // leaves no surviving spelling, so the same file IS excluded — proving the
+        // gate is live and that tier 3 rescues only a genuinely surviving name.
+        let both: Config =
+            serde_yaml::from_str("paths:\n  - \".\"\nexclude:\n  - \"**/shared.rb\"\n").unwrap();
+        assert!(
+            ExcludeMatcher::from_config(&root, &both)
+                .excludes(&buffer_at(&p.root.join("lib/shared.rb")), None),
+            "the control: with EVERY spelling excluded the same buffer is dropped"
+        );
+
+        // B2: `lib/link.rb` → `lib/real.rb`, excluded by `lib/real.rb`. Discovery
+        // keeps `lib/link.rb`, so `check` analyses the content under that name.
+        let b2: Config = serde_yaml::from_str("exclude:\n  - \"lib/real.rb\"\n").unwrap();
+        assert!(project_files(&root, &b2).iter().any(|f| f.ends_with("lib/link.rb")));
+        assert!(
+            !ExcludeMatcher::from_config(&root, &b2)
+                .excludes(&buffer_at(&p.root.join("lib/link.rb")), None),
+            "B2: the link's name is not excluded, so the buffer must be analysed"
+        );
+    }
+
+    #[test]
+    fn exclude_gate_needs_every_root_spelling_excluded() {
+        // Regression B3: under OVERLAPPING `paths:` roots one file is walked twice,
+        // and `check` analyses it as long as ONE spelling survives. Both root orders
+        // are driven, because the first cut returned on the first containing root
+        // and so gave an ORDER-DEPENDENT answer.
+        let p = TempProject::new("exclmultiroot");
+        p.write("a.rb", "class A\nend\n");
+        let _cwd = CwdGuard::enter(&p.root);
+        let root = PathBuf::from(".");
+        let buf = buffer_at(&p.root.join("lib/a.rb"));
+
+        for order in ["paths:\n  - \".\"\n  - lib\n", "paths:\n  - lib\n  - \".\"\n"] {
+            let cfg: Config =
+                serde_yaml::from_str(&format!("{order}exclude:\n  - \"./lib/**\"\n")).unwrap();
+            // Discovery yields `./lib/a.rb` (pruned) AND `lib/a.rb` (kept).
+            let kept = project_files(&root, &cfg);
+            assert!(kept.iter().any(|f| f == "lib/a.rb"), "[{order:?}] one spelling survives");
+            assert!(
+                !ExcludeMatcher::from_config(&root, &cfg).excludes(&buf, None),
+                "[{order:?}] B3: one surviving spelling means `check` analyses the file"
+            );
+        }
+        // The control: a pattern covering BOTH spellings does exclude it.
+        let both: Config =
+            serde_yaml::from_str("paths:\n  - \".\"\n  - lib\nexclude:\n  - \"**/a.rb\"\n")
+                .unwrap();
+        assert!(project_files(&root, &both).is_empty());
+        assert!(ExcludeMatcher::from_config(&root, &both).excludes(&buf, None));
     }
 
     #[test]
@@ -4829,16 +5145,16 @@ mod tests {
         let p = TempProject::new("exclcompute");
         let path = p.write("typo.rb", TYPO);
 
+        let buf = buffer_at(&path);
         let control = compute_diagnostics(
             &project_with_config_rooted(&Config::default(), &p.root),
-            Some(&path),
+            &buf,
             TYPO,
         );
         assert_eq!(control.0.len(), 1, "the control: the rule fires unconfigured");
 
         let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/typo.rb\"\n").unwrap();
-        let excluded =
-            compute_diagnostics(&project_with_config_rooted(&cfg, &p.root), Some(&path), TYPO);
+        let excluded = compute_diagnostics(&project_with_config_rooted(&cfg, &p.root), &buf, TYPO);
         assert!(
             excluded.0.is_empty(),
             "an `exclude:`d buffer publishes NOTHING, as `check` reports nothing: {:?}",
@@ -4857,9 +5173,10 @@ mod tests {
         // would feed, rather than claimed untested.
         let p = TempProject::new("exclswap");
         let path = p.write("a.rb", TYPO);
+        let buf = buffer_at(&path);
         let (ctx, mut st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
         assert!(
-            !st.project.exclude.excludes(Some(&path)),
+            !st.project.exclude.excludes(&buf, None),
             "the control: nothing is excluded under the starting config"
         );
 
@@ -4870,7 +5187,7 @@ mod tests {
         swap_project(&ctx, &mut st, index, overlay);
 
         assert!(
-            st.project.exclude.excludes(Some(&path)),
+            st.project.exclude.excludes(&buf, None),
             "the rebuilt context's gate follows `st.cfg` — no stale matcher survives"
         );
         assert_eq!(st.project.generation, 1, "and the swap bumped the generation as always");
