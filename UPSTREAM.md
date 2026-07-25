@@ -82,6 +82,19 @@ run.rb/snapshot.rb) and `harness/run_corpus.rb` use a fresh per-invocation
 persistent `cwd="/tmp"` (a stale `/tmp/.rigor/cache` could survive a pin bump
 and poison a re-baseline); it now uses a fresh temp cwd AND `--no-cache`.
 
+## Oracle invocation hazard 3: `REFERENCE_RIGOR_DIR` pointed off the pin
+
+`harness/lib.rb` lets `REFERENCE_RIGOR_DIR` override the oracle. Pointing it at
+a *working* rigor checkout (e.g. `/Users/megurine/repo/ruby/rigor`) silently
+compares against a DIFFERENT version: measured 2026-07-25 that tree was
+`2fd08368`, **56 commits ahead of the pin**, and `harness/run.rb` reported
+**213 unregistered FPs** where the pinned submodule reports **0**. The oracle
+is the PIN, not any local checkout. If a linked git worktree has an unpopulated
+submodule, run `git submodule update --init reference/rigor` there — never
+redirect the variable to another tree. (Failure is loud, not silent: it shows
+up as a red gate, so no past green result is suspect — but it can send you
+chasing a non-bug.)
+
 ## Bumping the pin (following upstream)
 
 1. Fetch + check out the new tag inside the submodule:
