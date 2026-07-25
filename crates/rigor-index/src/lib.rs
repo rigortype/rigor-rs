@@ -31,7 +31,7 @@ use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 pub mod plugins;
 mod rbs;
 
-pub use rbs::{ClassOrdering, OverloadSignature, RbsSource, RetainedParamType};
+pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
 
 /// The core classes this index registers, in a fixed order. The slice index of
 /// a name in this array IS its [`ClassId`] (see [`CoreIndex::class_id`]), so the
@@ -293,6 +293,34 @@ impl CoreIndex {
     /// `Date` so a chained AS-method typo witnesses (M2-GO slice 4).
     pub fn singleton_method_return(&self, class: &str, method: &str) -> Option<&'static str> {
         self.data.singleton_method_return(class, method)
+    }
+
+    /// The structured TUPLE return of `class#method` — the shape
+    /// [`Self::method_return`]'s `Option<&'static str>` structurally cannot
+    /// carry. `None` for every method whose RBS return is not a tuple, so this is
+    /// purely ADDITIVE: no existing return path changes. See
+    /// [`rbs::CoreData::method_tuple_return`].
+    pub fn method_tuple_return(&self, class: &str, method: &str) -> Option<&[RbsReturnShape]> {
+        self.data.method_tuple_return(class, method)
+    }
+
+    /// The singleton twin of [`Self::method_tuple_return`] — `Process.wait2`'s
+    /// `[Integer, Process::Status]`. See
+    /// [`rbs::CoreData::singleton_method_tuple_return`].
+    pub fn singleton_method_tuple_return(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<&[RbsReturnShape]> {
+        self.data.singleton_method_tuple_return(class, method)
+    }
+
+    /// Every class name reachable as an element of a tuple return in the loaded
+    /// RBS — the closed set the source registry pre-registers ids for, so a
+    /// `Nominal` can be minted for an RBS-only element class that the analyzed
+    /// source never names. See [`rbs::CoreData::tuple_return_class_names`].
+    pub fn tuple_return_class_names(&self) -> Vec<&'static str> {
+        self.data.tuple_return_class_names()
     }
 
     /// Whether `class#method`'s author-declared RBS return is `void` (ADR-100;
@@ -1019,5 +1047,73 @@ mod void_return_tests {
         assert!(!idx.singleton_method_is_void("Widget", "fire"));
         assert!(!idx.method_return_is_void("NoSuch", "fire"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+
+#[cfg(test)]
+mod tuple_return_tests {
+    use super::*;
+
+    /// MultiWrite substrate Slice 2: an RBS TUPLE return is retained as a
+    /// structured descriptor instead of collapsing to `None`. `Process.wait2:
+    /// (?Integer, ?Integer) -> [ Integer, Process::Status ]` (vendored
+    /// `core/process.rbs`) is the fixture-68 chain's first link.
+    #[test]
+    fn singleton_tuple_return_is_retained() {
+        let idx = CoreIndex::new();
+        assert_eq!(
+            idx.singleton_method_tuple_return("Process", "wait2"),
+            Some(
+                [
+                    RbsReturnShape::Class("Integer"),
+                    RbsReturnShape::Class("Process::Status"),
+                ]
+                .as_slice()
+            )
+        );
+        // The element name is the QUALIFIED spelling, so it resolves in the
+        // ADR-0042 qualified registry (the witness surface).
+        assert!(idx.knows_qualified_class("Process::Status"));
+        // BEHAVIOUR PRESERVED: the flat return path still declines on a tuple,
+        // so every pre-existing consumer sees exactly what it saw before.
+        assert_eq!(idx.singleton_method_return("Process", "wait2"), None);
+    }
+
+    /// The instance twin, plus the two decline paths.
+    #[test]
+    fn instance_tuple_return_and_declines() {
+        let idx = CoreIndex::new();
+        assert_eq!(
+            idx.method_tuple_return("String", "partition"),
+            Some(
+                [
+                    RbsReturnShape::Class("String"),
+                    RbsReturnShape::Class("String"),
+                    RbsReturnShape::Class("String"),
+                ]
+                .as_slice()
+            )
+        );
+        // A non-tuple return: no descriptor (the flat path owns it).
+        assert_eq!(idx.method_tuple_return("String", "upcase"), None);
+        assert_eq!(idx.method_return("String", "upcase"), Some("String"));
+        // An unknown class / method declines rather than panicking.
+        assert_eq!(idx.method_tuple_return("NoSuchClass", "wat"), None);
+        assert_eq!(idx.singleton_method_tuple_return("NoSuchClass", "wat"), None);
+    }
+
+    /// The id-registration seam: the element-class enumeration is sorted,
+    /// deduped, and contains the RBS-only class no source file ever names.
+    #[test]
+    fn tuple_element_class_names_are_enumerable() {
+        let idx = CoreIndex::new();
+        let names = idx.tuple_return_class_names();
+        assert!(names.contains(&"Process::Status"), "got {names:?}");
+        assert!(names.contains(&"String"), "got {names:?}");
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted, "must be sorted + deduped");
     }
 }

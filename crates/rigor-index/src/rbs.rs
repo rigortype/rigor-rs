@@ -122,6 +122,61 @@ pub enum RetainedParamType {
     Other(String),
 }
 
+/// A structured RBS **return** descriptor — the richer carrier the flat
+/// `Option<&'static str>` return path structurally cannot hold.
+///
+/// [`method_signature`]'s return slot is a single class name, so a `-> [ Integer,
+/// Process::Status ]` collapses to `None` (⇒ `Dynamic[top]`) and the per-position
+/// precision is lost. This descriptor is the rigor-rs analogue of the reference's
+/// `RbsTypeTranslator` (`rbs_type_translator.rb`), restricted to the two shapes a
+/// rigor-rs `Type` can carry losslessly today:
+///
+/// | RBS | reference | here |
+/// | --- | --- | --- |
+/// | `ClassInstance` (`String`, `Array[X]`, `Process::Status`) | `nominal_of` | [`Class`](Self::Class) |
+/// | `Tuple` (`[A, B]`) | `tuple_of` | [`Tuple`](Self::Tuple) (recursive) |
+/// | everything else (union / optional / literal / interface / variable / `untyped` / `void` / …) | its precise carrier | [`Unknown`](Self::Unknown) |
+///
+/// [`Unknown`](Self::Unknown) is deliberately the reference's `untyped`
+/// (`Dynamic[top]`) degrade rather than a decline: the reference's translator is
+/// total, so an element it models more precisely than we can (`String?` ⇒
+/// `String | nil`) must not delete the SIBLING elements' precision. A
+/// `Dynamic[top]` slot is silent in every rule, so the deviation only ever loses
+/// recall (never a false positive).
+///
+/// A [`Class`](Self::Class) name is the name as WRITTEN in the RBS reference —
+/// namespace path plus leaf (`Process::Status`), matching the key shape of the
+/// ADR-0042 qualified registry — with type arguments dropped (`Array[Integer]` ⇒
+/// `Class("Array")`), the same one-level discipline [`RetainedParamType`] and the
+/// flat return path already use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RbsReturnShape {
+    /// A concrete class instance, type arguments dropped, named as written
+    /// (`Integer`, `Process::Status`).
+    Class(&'static str),
+    /// An RBS tuple `[A, B]`, elements in declaration order.
+    Tuple(Vec<RbsReturnShape>),
+    /// A shape this descriptor does not model — the `Dynamic[top]` degrade.
+    Unknown,
+}
+
+impl RbsReturnShape {
+    /// Every [`Class`](Self::Class) name reachable in this shape (including
+    /// nested tuples), appended to `out`. Feeds the id-registration sweep that
+    /// gives an RBS-only element class (`Process::Status`) a registry identity.
+    fn collect_class_names(&self, out: &mut Vec<&'static str>) {
+        match self {
+            RbsReturnShape::Class(name) => out.push(name),
+            RbsReturnShape::Tuple(elems) => {
+                for e in elems {
+                    e.collect_class_names(out);
+                }
+            }
+            RbsReturnShape::Unknown => {}
+        }
+    }
+}
+
 /// One RBS overload's positional-parameter shape, retained per-overload (NOT
 /// merged into the arity envelope). The ATM substrate (Slice 1) keeps every
 /// overload separately — `Integer#+` has four, one per numeric operand type —
@@ -186,6 +241,16 @@ struct ClassEntry {
     /// by `call.possible-nil-receiver` via [`CoreData::method_return_nilable`];
     /// no existing rule reads it (return-class / arity stay as before).
     methods: HashMap<&'static str, (Option<&'static str>, Arity, bool)>,
+    /// `method name -> TUPLE return element shapes`, populated ONLY for instance
+    /// methods whose RBS return is a tuple (`String#partition: (...) -> [String,
+    /// String, String]`). ADDITIVE beside `methods`, whose flat return slot
+    /// collapses a tuple to `None`: the entries here are a strict extension of
+    /// what that path drops, so every existing consumer is unchanged. First write
+    /// wins on reopen, mirroring `methods`. See [`tuple_return`].
+    tuple_returns: HashMap<&'static str, Vec<RbsReturnShape>>,
+    /// The singleton twin of `tuple_returns` (`Process.wait2: (...) -> [Integer,
+    /// Process::Status]`).
+    singleton_tuple_returns: HashMap<&'static str, Vec<RbsReturnShape>>,
     /// Instance methods whose author-declared RBS return is `void` (ADR-100:
     /// the strongest "do not rely on this return" signal; the reference widens
     /// it to `top` and records a void origin). Meaningful only for keys present
@@ -1043,6 +1108,72 @@ impl CoreData {
         self.lookup_on_chain(&chain, method).and_then(|(ret, _, _)| ret)
     }
 
+    /// The structured TUPLE return of `class_name#method` — the descriptor
+    /// [`Self::method_return`] cannot carry (a tuple collapses to `None` there).
+    /// First-definer-wins over the flattened ancestor chain, the same walk
+    /// [`Self::method_return_is_void`] rides; aliases are NOT chased (an
+    /// under-emit, never a wrong answer). `None` ⇒ no tuple return ⇒ every
+    /// caller behaves exactly as before.
+    pub fn method_tuple_return(&self, class_name: &str, method: &str) -> Option<&[RbsReturnShape]> {
+        let (chain, _) = self.ancestors(class_name);
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if entry.methods.contains_key(method) {
+                    return entry.tuple_returns.get(method).map(|v| v.as_slice());
+                }
+            }
+        }
+        None
+    }
+
+    /// The singleton twin of [`Self::method_tuple_return`]
+    /// (`Process.wait2 -> [Integer, Process::Status]`), walked over the own
+    /// superclass chain like [`Self::singleton_method_return`]. Singleton aliases
+    /// are not chased (under-emit).
+    pub fn singleton_method_tuple_return(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<&[RbsReturnShape]> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let (&key, entry) = self.classes.get_key_value(name)?;
+            if !seen.insert(key) {
+                return None; // superclass cycle guard.
+            }
+            if entry.singleton_methods.contains_key(method) {
+                return entry.singleton_tuple_returns.get(method).map(|v| v.as_slice());
+            }
+            cur = entry.superclass;
+        }
+        None
+    }
+
+    /// Every class name reachable as an element of ANY tuple return in the loaded
+    /// RBS (instance + singleton, nested tuples included), sorted + deduped.
+    ///
+    /// The id-registration seam: a tuple element can name a class that never
+    /// appears as a constant in the analyzed source (`Process::Status` is reached
+    /// only THROUGH `Process.wait2`), so the source-side registry has no identity
+    /// to mint a `Nominal` against. Enumerating the closed set here lets the
+    /// registry pre-register exactly those names — declaration-driven, with no
+    /// name special-casing.
+    pub fn tuple_return_class_names(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        for entry in self.classes.values() {
+            for shapes in entry.tuple_returns.values().chain(entry.singleton_tuple_returns.values())
+            {
+                for shape in shapes {
+                    shape.collect_class_names(&mut out);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// The RETURN class of the CLASS method `class_name.method` (M2-GO slice 4)
     /// — the singleton counterpart of [`Self::method_return`], diagnostic-grade:
     /// the stored return is already collapsed under the all-overloads-agree
@@ -1746,6 +1877,10 @@ impl CoreData {
                     // substrate needs the real embedded RBS); empty keeps the
                     // `method_overloads` accessor inert under the fallback.
                     method_overloads: HashMap::new(),
+                    // The stub declares no tuple returns either, so the
+                    // structured return descriptor is inert under the fallback.
+                    tuple_returns: HashMap::new(),
+                    singleton_tuple_returns: HashMap::new(),
                     // The stub doesn't model block-form returns (no block-call
                     // result typing under the fallback); empty keeps it
                     // conservative ⇒ a block-bearing call stays Dynamic/silent.
@@ -2225,6 +2360,9 @@ impl Builder {
                     let mname = intern(md.name().as_str());
                     let (ret, arity, nilable, ret_instance, ret_void) = method_signature(&md);
                     let block_ret = block_overload_return(&md);
+                    // The structured TUPLE return the flat `ret` slot above
+                    // collapses to `None` (Slice 2 of the MultiWrite substrate).
+                    let tuple_ret = tuple_return(&md);
                     let kind = md.kind();
                     // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
                     // (BOTH a class method AND an instance method); a plain
@@ -2236,6 +2374,9 @@ impl Builder {
                     ) {
                         if ret_void && !entry.methods.contains_key(mname) {
                             entry.void_methods.insert(mname);
+                        }
+                        if let Some(shapes) = tuple_ret.clone() {
+                            entry.tuple_returns.entry(mname).or_insert(shapes);
                         }
                         entry.methods.entry(mname).or_insert((ret, arity, nilable));
                         if let Some(br) = block_ret {
@@ -2266,6 +2407,9 @@ impl Builder {
                     ) {
                         if ret_void && !entry.singleton_methods.contains_key(mname) {
                             entry.void_singleton_methods.insert(mname);
+                        }
+                        if let Some(shapes) = tuple_ret.clone() {
+                            entry.singleton_tuple_returns.entry(mname).or_insert(shapes);
                         }
                         entry.singleton_methods.entry(mname).or_insert((ret, arity, ret_instance));
                         // ATM substrate: retain the class-method per-overload
@@ -2374,6 +2518,15 @@ impl Builder {
                 slot.void_methods.insert(k);
             }
         }
+        // Tuple returns ride the same first-write-wins reopen discipline as
+        // `methods` (they are the same declaration's return, split across two
+        // maps).
+        for (k, v) in entry.tuple_returns {
+            slot.tuple_returns.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_tuple_returns {
+            slot.singleton_tuple_returns.entry(k).or_insert(v);
+        }
         for (k, v) in entry.method_overloads {
             slot.method_overloads.entry(k).or_insert(v);
         }
@@ -2464,6 +2617,15 @@ impl Builder {
             if newly && entry.void_methods.contains(k) {
                 slot.void_methods.insert(k);
             }
+        }
+        // Tuple returns ride the same first-write-wins reopen discipline as
+        // `methods` (they are the same declaration's return, split across two
+        // maps).
+        for (k, v) in entry.tuple_returns {
+            slot.tuple_returns.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_tuple_returns {
+            slot.singleton_tuple_returns.entry(k).or_insert(v);
         }
         for (k, v) in entry.method_overloads {
             slot.method_overloads.entry(k).or_insert(v);
@@ -2789,6 +2951,86 @@ fn method_signature(
     // instance method's `-> instance`/`-> self` stays untyped as before);
     // when set, `ret` is None, so every existing consumer is unchanged.
     (ret, arity, ret_nilable, ret_instance, ret_void)
+}
+
+/// The TUPLE return of a method definition, as an ordered element-shape list —
+/// the structured companion of [`method_signature`]'s flat return slot, which
+/// collapses a tuple to `None`.
+///
+/// `Some(elements)` only when EVERY overload's return type is a tuple AND all
+/// overloads agree on the element shapes — the same all-overloads-agree
+/// discipline the flat return path applies (never guess across a divergent
+/// signature). A non-tuple return, a mixed set, or no overload at all ⇒ `None`,
+/// which leaves the existing flat path (and its `Dynamic` recovery) untouched.
+///
+/// An `Optional` tuple (`-> [String, String]?`) is deliberately NOT unwrapped:
+/// the reference translates it to a `Tuple | nil` union, which this descriptor
+/// cannot carry, and inventing the non-nil half would be unsound.
+fn tuple_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<Vec<RbsReturnShape>> {
+    let mut agreed: Option<Vec<RbsReturnShape>> = None;
+    let mut seen = false;
+    for overload in md.overloads().iter() {
+        let Node::MethodDefinitionOverload(ov) = overload else {
+            continue;
+        };
+        let Node::MethodType(mt) = ov.method_type() else {
+            continue;
+        };
+        let Node::FunctionType(ft) = mt.type_() else {
+            continue;
+        };
+        let this = match ft.return_type() {
+            Node::TupleType(t) => Some(t.types().iter().map(|e| return_shape(&e)).collect()),
+            _ => None,
+        };
+        if !seen {
+            agreed = this;
+            seen = true;
+        } else if agreed != this {
+            return None;
+        }
+    }
+    agreed
+}
+
+/// Translate one RBS type node into an [`RbsReturnShape`] — the rigor-rs
+/// analogue of the reference's `RbsTypeTranslator.translate`
+/// (`rbs_type_translator.rb:63`), restricted to the two shapes the descriptor
+/// models. Everything else degrades to [`RbsReturnShape::Unknown`]
+/// (`Dynamic[top]`), exactly as the reference's translator falls back to
+/// `Type::Combinator.untyped` for a shape with no handler.
+fn return_shape(node: &Node) -> RbsReturnShape {
+    match node {
+        Node::ClassInstanceType(ci) => match written_type_name(&ci.name()) {
+            Some(name) => RbsReturnShape::Class(name),
+            None => RbsReturnShape::Unknown,
+        },
+        Node::TupleType(t) => {
+            RbsReturnShape::Tuple(t.types().iter().map(|e| return_shape(&e)).collect())
+        }
+        _ => RbsReturnShape::Unknown,
+    }
+}
+
+/// The name of a type REFERENCE as written: the `TypeNameNode`'s namespace path
+/// joined to its leaf (`Process::Status`), the same spelling
+/// [`qualified_name`] builds for a DECLARATION — so an element class name can be
+/// looked up in the ADR-0042 qualified registry. A bare reference (`Integer`)
+/// yields just the leaf, matching the short-key map. Leading `::` is dropped
+/// (the registry keys carry no root marker), mirroring [`qualified_name`].
+fn written_type_name(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
+    let leaf = type_name_str(tn)?;
+    let mut parts: Vec<String> = Vec::new();
+    for seg in tn.namespace().path().iter() {
+        if let Node::Symbol(sym) = seg {
+            parts.push(sym.as_str().to_string());
+        }
+    }
+    if parts.is_empty() {
+        return Some(leaf);
+    }
+    parts.push(leaf.to_string());
+    Some(intern(&parts.join("::")))
 }
 
 /// Retain the per-overload positional-parameter shapes of a method definition —
