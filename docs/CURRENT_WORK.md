@@ -9,23 +9,23 @@ one-line ledger of what landed**. The complete per-subsystem port map is
 ledger line here — verdict + numbers + link — and its detail goes to a dated
 note or ADR *first*. No status essays; this file has a hard byte budget.
 
-Last updated: 2026-07-19.
+Last updated: 2026-07-25.
 
 ## Now / Next
 
-**Track B (productization) 2026-07-19**: coverage precision mode SHIPPED (#33)
-+ **LSP §12 tier-1 COMPLETE** (S1–S4b). ▶ NEXT — pick one: (a) the stage-3
-parity tail the S4b review exposed (LSP skips ADR-8 `severity::resolve`, so a
-`severity_overrides: off` rule still shows markers — a PRESENCE mismatch vs
-`check` — plus no bleeding-edge plumbing); (b) LSP v4+ (`::` completion,
-union-receiver intersection, visibility filter, `rootUri` — S4b hardcodes
-cwd); (c) Option A (`Process::Status` tuple-return + destructuring,
-fixtures→100%), which also builds the `MultiWriteNode` arena lowering rigor-rs
-lacks — a substrate gap that surfaced 3× this session (destructuring, upstream
-ADR-58, coverage taint).
+**Track B (productization) 2026-07-19/25**: coverage precision mode SHIPPED
+(#33) + **LSP §12 COMPLETE** (S1–S4b) + **stage-3 parity tail** (#44: ADR-8
+SeverityStamp — an `off` rule no longer shows editor markers — + the
+bleeding-edge gate). ▶ IN FLIGHT: LSP `exclude:` parity (the same
+presence-mismatch class, for the open buffer); **MultiWriteNode substrate**
+— [spec](notes/20260725-multiwrite-substrate-spec.md), a measured LIVE `check`
+FP. ▶ THEN: slice 2 of that spec (`Process::Status` tuple-return →
+fixtures 100%), or LSP v4+ (`::` completion, union-receiver intersection,
+visibility filter, `rootUri` — the root is still the process cwd).
 - LSP §12 known limitation (reference-parity, ADR-0029): editing `.rigor.yml`
-  `disable:`/`plugins:`/`paths:` needs an LSP restart — `invalidate` re-reads
-  sig-dir CONTENT but not the parsed YAML (matches the reference's
+  `disable:`/`plugins:`/`paths:`/`severity_*`/`bleeding_edge:` needs an LSP
+  restart — `invalidate` re-reads sig-dir CONTENT but not the parsed YAML
+  (matches the reference's
   `ProjectContext#invalidate!`). Improving on the reference here is a future
   call, out of S4 scope.
 - Clippy verify MUST use `CARGO_TARGET_DIR=<fresh> cargo clippy --workspace --
@@ -51,8 +51,7 @@ parity-port arc has bottomed out — see Standing conclusions):
   Phase 3 DONE (1 ported / 1 absent / 1 deferred to `--bleeding-edge`) — the
   compat plan is exhausted; next work returns to the productization track
   (LSP §12, `--bleeding-edge` + CLI §7, re-pin at the v0.3.0 tag).
-- **LSP §12 two-tier** — tier-1 DONE (S1–S4, PRs #35–#38); only S4b
-  (cross-file overlay) left, needs a mini-spec.
+- **LSP §12 two-tier** — COMPLETE (S1–S4b) + the stage-3 parity tail (#44).
   [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
@@ -116,7 +115,9 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-07-19 LSP §12 two-tier COMPLETE (S1–S4b)** (PRs #35–#38/#42/#43 + `16bfb9e`; each slice design→implement→adversarial-review→merge) — `select!` loop + BufferTable; 200ms per-URI debounce; rayon workers with 3-axis (version/generation/open-epoch) stale-drop + one-in-flight/no-lost-update + shared sidecar; generation-counter `ProjectContext` invalidated synchronously on watched-files/config; cross-file overlay (tier-1 holds every project AST; each dispatch rebuilds `build_project` with the dirty buffer's AST REPLACED, under an asymmetric-hysteresis scale guard; incremental `.rb` re-harvest 111ms→0.2ms/save under a CONSERVATIVE rule — replace-in-place only on a held entry, else full rebuild). Harness 216/218 0 FP throughout. Refinements vs plan: generation moved S3→S4 (lands with its trigger); rebuild synchronous; guard hysteresis; the `paths:`-membership predicate DELETED after diverging 3 ways. Review found 8 real defects (3 live FPs) over 6 rounds; the mandated differential test (entries + ORDER + AST fingerprint vs a fresh build, across `paths:` shapes × root spellings) found a 4th divergence itself. [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md) / [S4b mini-spec](notes/20260719-lsp-s4b-overlay-mini-spec.md) / per-slice notes `20260719-lsp-s12-s{1,2,3,4,4b}.md`.
+- **2026-07-25 LSP stage-3 parity tail** (PR #44) — the LSP never applied the ADR-8 SeverityStamp: a rule resolved `off` still published markers `check` DROPS (PRESENCE mismatch), severities were authored not profile-resolved, bleeding-edge unplumbed. The stamp now rides `ProjectContext` beside `disable:` (rebuilt by `invalidate` under the S4 generation guard); composition order verified against `main.rs` statement-by-statement. 4 E2E tests vs real `check` output, each proven non-vacuous by re-breaking. Remaining divergences enumerated in the note. [note](notes/20260725-lsp-stage3-parity.md).
+
+- **2026-07-19 LSP §12 two-tier COMPLETE (S1–S4b)** (PRs #35–#38/#42/#43 + `16bfb9e`) — `select!` loop + BufferTable; 200ms debounce; rayon workers, 3-axis stale-drop, no-lost-update; generation-counter `ProjectContext` invalidation; cross-file overlay (swap-and-rebuild under a hysteresis scale guard; incremental `.rb` re-harvest 111ms→0.2ms under a conservative held-entry-only rule). Harness 216/218 0 FP throughout. 6 adversarial-review rounds found 8 real defects (3 live FPs); the mandated differential test (entries + ORDER + AST fingerprint × `paths:` shapes × root spellings) found a 4th itself. [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md) / [S4b spec](notes/20260719-lsp-s4b-overlay-mini-spec.md) / notes `20260719-lsp-s12-s{1..4,4b}.md`.
 
 - **2026-07-19 baseline drift/prune positional-roots + scope guard** (PR #41) — found via a real-product baseline check (conference-app, no `.rigor.yml`): drift/prune ignored positional roots (config `paths:` only), so `generate .` wrote 1956 diags but `drift .` silently reported all 98 buckets "Cleared" (a `prune`-acts-on-it footgun). Fix: (a) drift/prune honor positional roots like generate (additive; no-positional path unchanged); (b) `paths_explicitly_declared()` guard refuses a scope-less audit vs a non-empty baseline (exit 64). 4 regression tests, 0 FP. [note](notes/20260719-baseline-drift-roots-fix.md).
 - **2026-07-19 upstream tracking `e447cb86..ff6b6158`** (10 commits: ADR-58 constructor-massign ivar seeding `48a7af6c`; ADR-67 WD6 call-site parameter inference activated on the check walk `a84efcbd` + design/guard/perf; handoff docs) — hardened self-diff (both oracle hazards) **0 added / 0 dropped** on all four battery corpora (fixtures/gitlab lib/mastodon models/conference-app), runtimes symmetric (cache bypass confirmed). STILL no v0.3.0 tag (version pins 0.2.9; both clusters in `[Unreleased]`). Mechanism assessment: both clusters are substrate-blocked large arcs (need the ADR-0022 flow substrate + ivar-typing rigor-rs deliberately defers) AND precision-additive (protection coverage only, 0 new diagnostics; ADR-67 WD6 is off-by-default opt-in `parameter_inference:`). Pin `7a69f142` HELD, nothing to port.
