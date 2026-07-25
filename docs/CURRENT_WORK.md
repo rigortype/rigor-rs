@@ -17,10 +17,13 @@ Last updated: 2026-07-25.
 (#33) + **LSP §12 COMPLETE** (S1–S4b) + **stage-3 parity tail** (#44: ADR-8
 SeverityStamp — an `off` rule no longer shows editor markers — + the
 bleeding-edge gate) + **MultiWrite substrate slice 1** (#46: closed a measured
-live `check` FP) + **LSP `exclude:` parity** (#45). ▶ NEXT: MultiWrite slice 2
-(RBS tuple returns → `Process::Status` → fixtures 100%,
-[spec](notes/20260725-multiwrite-substrate-spec.md)), or LSP v4+ (`::`
-completion, union-receiver intersection, visibility filter, `rootUri`).
+live `check` FP) + **LSP `exclude:` parity** (#45) + **slice 2 → harness 0
+GAPS** (#47). ▶ NEXT: the RBS ingestion-surface asymmetry vs the reference
+(`vendored_gem_sigs` we lack / `BigMath` we have — the root of the remaining
+witness-gate restrictions, [note](notes/20260725-multiwrite-substrate-s2.md));
+LSP config reload (`.rigor.yml` is read once at startup — the highest-value
+remaining LSP item); or LSP v4+ (`::` completion, visibility filter,
+`rootUri`).
 - LSP §12 known limitation (reference-parity, ADR-0029): editing `.rigor.yml`
   `disable:`/`plugins:`/`paths:`/`severity_*`/`bleeding_edge:` needs an LSP
   restart — `invalidate` re-reads sig-dir CONTENT but not the parsed YAML
@@ -38,8 +41,8 @@ parity-port arc has bottomed out — see Standing conclusions):
 
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
   (PRs #31/#32, accepted) and the compat next-stage plan (Phases 0–3 done,
-  exhausted — [plan](notes/20260718-compat-next-stage-plan.md)). Their only
-  live remnant is fixture 68, now slice 2 of the MultiWrite spec.
+  exhausted — [plan](notes/20260718-compat-next-stage-plan.md)). Their last
+  remnant, fixture 68, closed in #47.
 - **LSP §12 two-tier** — COMPLETE (S1–S4b) + the stage-3 parity tail (#44).
   [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
@@ -52,8 +55,8 @@ parity-port arc has bottomed out — see Standing conclusions):
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
 
-State: harness **70 fixtures / 216 matched / 1 gap / 0 FP** (live + snapshot, vs
-pin `7a69f142`; the 1 gap = fixture 68 `Process::Status`); fp_audit 0 FP on
+State: harness **70 fixtures / 0 GAPS / 0 FP** (live + snapshot, vs pin
+`7a69f142`; 217/218 printed = fixture 48's dup `(rule,7,9)` key); fp_audit 0 FP on
 mastodon, gitlab-foss lib (UM gaps 145) + app/models, conference-app + survey
 (dependabot/rails at baseline); explain catalog 29 rules. Clippy: workspace
 `-D warnings`, verify in a FRESH `CARGO_TARGET_DIR`.
@@ -98,6 +101,7 @@ override seam.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-07-25 MultiWrite slice 2 — harness at 0 GAPS** (PR #47) — closed the last fixture gap (68: `_pid, status = Process.wait2; status.frobnicate`). RBS tuple returns survive as `RbsReturnShape{Class|Tuple|Unknown}` computed BESIDE an untouched `method_signature`, + Pass 2b mints ids for the 17 classes an RBS tuple names (declaration-driven, no `Process` special-case). **An FP found and fixed mid-build**: naive witness widening fired `Gem::Version#segments` where the oracle is silent — the reference ships `vendored_gem_sigs/` for 12 gems rigor-rs lacks, so its namespaced-gem surface is a strict SUBSET; gated the WITNESS on `is_declaration_only_class`. 14 corpora / 35,706 files: `check` **bit-identical**, 0 new FPs; corpus yield honestly ZERO. **Follow-up**: the ingestion-surface asymmetry cuts both ways (`vendored_gem_sigs` we lack / `BigMath` we have) — its own slice. [note](notes/20260725-multiwrite-substrate-s2.md).
 - **2026-07-25 LSP `exclude:` parity** (PR #45) — an excluded file opened in the editor published markers `check` never produces. Decision rule: a buffer is excluded iff EVERY discovery spelling of it is excluded, expressed as 3 tiers — overlay membership (fast path), all-roots × 3 name forms (decoded/named/canonical, `all` load-bearing), then a confirm pass over the SHARED `discovery_spellings` walk so it cannot drift from `project_files`. Review round 1 found 3 regressions (symlinked `.rb`, symlink whose target is excluded, overlapping roots — the first-match + canonicalize-only gate); matrix widened 24→144 runs (+ symlink and multi-root axes). `check` byte-identical under 3 configs incl. an invalid glob. [note](notes/20260725-lsp-exclude-parity.md).
 - **2026-07-25 MultiWriteNode substrate, slice 1** (PR #46) — `a, b = rhs` had NO arena lowering, so `collect_flow_writes` never saw the rebind: a MEASURED live `check` FP (`x = 5; x, _y = o, 2; if x` fired always-truthy where the reference is silent). Added `Node::MultiWrite` (+ `target_exprs` for locals embedded in non-local targets — an FP the harness, unit tests and 3 mandated corpora all missed) + a rule-for-rule port of the reference's `MultiTargetBinder` incl. `soften_optional_slot`. ~32k-file sweep: **2 removed** (a live corpus witness), **5 added** (oracle-verified), **0 new FPs**; harness unchanged; coverage/annotate/sig-gen now oracle-exact. Slice 2 (RBS tuple returns → fixture 68) next. [spec](notes/20260725-multiwrite-substrate-spec.md) / [results](notes/20260725-multiwrite-substrate-s1.md).
 
@@ -139,15 +143,7 @@ override seam.
 - **2026-07-11 coverage frontier re-measured** — bounded wins exhausted; next is deep-substrate or productization. [note](notes/20260711-coverage-frontier-remeasured.md).
 - **2026-07-10 pure-RBS bundle track CLOSED** — `activesupport-core-ext` is the only pure-RBS plugin and is byte-current. [note](notes/20260710-pure-rbs-bundle-track-closed.md).
 - **2026-07-10 MCP triage+annotate** (MERGED `c6c1094`); **ADR-72 Gemfile.lock auto-overlay** (MERGED `96d7f47`) — Rails projects auto-get the AS overlay, FP-safe by construction.
-- **2026-07-06 possible-nil/ivar expansion CONFIRMED zero-EV** — rigor-rs is at the FP-safe optimum for free (the ref's ADR-58 suppresses the 109 FPs ivar typing manufactures).
-- **2026-07-06 remaining-commands assessment** — trace/coverage/type-scan substrate-blocked or structurally divergent (sig-gen since built).
-- **2026-07-06 productization cluster, all merged** — triage hints (portable subset), case/if-union + tuple-projection precision slices, `annotate`, HashShape typing, type-display layer + value-pinned arrays (PR #12), `triage` (ADR-23), `diff`, config-audit (PR #8), ADR-22 baseline area complete (`regenerate`/`drift`/`prune`/`--baseline-strict`), `check <dir>` + config `paths:` ([ADR-0040](adr/0040-directory-path-argument-support.md)).
-- **2026-07-06 flow-substrate arc** — [ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md) Slice 1a landed; [ADR-0039](adr/0039-shape-typing-tier.md) Slice 1a landed, Tuple deferred by measurement; [ADR-0041](adr/0041-project-method-nilable-return.md) deferred by measurement (branch `tier-bc-nilable-return`). Strategic finding: no cheap FP-safe flow wins left. [note](notes/20260706-flow-frontier-exhausted.md).
-- **2026-07-06 coverage-gaps + fp-audit sweeps** — `fp_audit.py --gaps` added; parenthesized-receiver unwrap (+13, `b98c658`); ERB-template skip (~58 FPs, `00c8734`); **0 FP across the full surveyed corpus (~4000+ files, 20+ libs)**.
-- **2026-07-05 fp_audit tool + 4 real FP clusters fixed** (singleton-class bodies, `Kernel#gem`, `Regexp.compile` alias, singleton-def receiver) — 0 FP across 12 corpora; perf slices retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
-- **2026-07-05 sidecar arc COMPLETE** (merged `2aa5ce6`) — [ADR-0036](adr/0036-ruby-sidecar-default-reversal.md) full-fidelity-default + `--ruby` surface, transport/handshake/fold worker/exit-69 teeth, allowlisted parity-safe folds; measured delta flat ~0.06s, diagnostic sets identical.
-- **2026-07-05 RBS ingestion legs resolved** — project `sig/` ([ADR-0033](adr/0033-project-sig-ingestion.md)) + `rbs collection` ([ADR-0034](adr/0034-rbs-collection-ingestion.md)) implemented; gem-sig + inline RBS deferred with rationale ([ADR-0035](adr/0035-inline-rbs-deferred.md)); pin v0.2.6→v0.2.7 (no drift).
-- **2026-07-01 productization + rules** — rayon parallelism (~2.4×, byte-identical), LSP v1/v2 (diagnostics/hover/completion/symbols), MCP server, `flow.always-truthy-condition` + first ADR-0022 substrate, `call.unresolved-toplevel`, dead-assignment block-pass fix. Net-new-rule coverage exhausted by v0.2.6 tally.
+- **2026-07-01…07-06 foundation era (9 arcs, all closed — details in the linked notes/ADRs)** — sidecar COMPLETE ([ADR-0036](adr/0036-ruby-sidecar-default-reversal.md)) + perf slices retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)); RBS ingestion legs ([ADR-0033](adr/0033-project-sig-ingestion.md)/[0034](adr/0034-rbs-collection-ingestion.md), inline deferred [0035](adr/0035-inline-rbs-deferred.md)); `fp_audit` + 4 real FP clusters → **0 FP across ~4000 files / 20+ libs**; the productization cluster (triage/annotate/diff/config-audit/baseline area/`check <dir>`); the flow-substrate arc ([ADR-0038](adr/0038-flow-substrate-incremental-narrowing.md)/[0039](adr/0039-shape-typing-tier.md), [0041](adr/0041-project-method-nilable-return.md) deferred by measurement) with the standing finding **no cheap FP-safe flow wins left** ([note](notes/20260706-flow-frontier-exhausted.md)); possible-nil/ivar expansion CONFIRMED zero-EV; rayon (~2.4×) + LSP v1/v2 + MCP + `flow.always-truthy-condition`/`call.unresolved-toplevel`.
 - **2026-06-30 rustfmt stance recorded** ([ADR-0032](adr/0032-source-formatting-policy.md)) — hand-formatted, clippy is the blocking gate.
 - **2026-06-27 v0.0.1 release prep** — version/CI/gem/Homebrew wired, tag-gated on maintainer infra; musl/Windows targets wired pending a real tag run; clippy `-D warnings` blocking; snapshot-mode CI parity job.
 - **2026-06-26 leniency alignment + coverage passes** — undefined-method witnesses only RBS-known core-surface receivers (matches the ref's tier-4 leniency; 2 FPs fixed); lowering-traversal +54, interpolated strings, singleton witnessing + cross-file project index, block-overload return recovery; external design audit R1–R5 all addressed.
