@@ -109,6 +109,11 @@ When splitting work to subagents:
 - **Implement with Opus** on a NEW branch from a spec that names the
   誤実装しやすい pitfalls explicitly. Require gates in the prompt: full tests +
   clippy + both harnesses + **fresh-dir E2E parity probes** vs the reference.
+- **Open PRs as DRAFT** (`gh pr create --draft`); `gh pr ready` only once the
+  audit below passes. A non-draft PR means "reviewed, mergeable" — nothing else.
+  Push with an explicit refspec (`git push origin HEAD:refs/heads/<branch>`):
+  this repo's `push.default = tracking` + a branch cut from `origin/master`
+  resolves a bare `git push -u` to **master** (it happened, unreviewed, once).
 - **Audit before merge, always.** Re-run gates yourself, review the diff scope,
   and **byte-verify the subagent's parity claims with your own probes** — the
   implementer may resolve a spec-vs-oracle conflict toward the oracle (correct)
