@@ -1294,16 +1294,35 @@ fn overlay_source_index(
 }
 
 /// The canonical filesystem path a `file:` document URI names, or `None` for a
-/// non-`file:` URI or a path with no on-disk existence (canonicalization needs a
-/// real path). Canonical form is what makes the overlay's REPLACE lookup exact:
-/// tier 1 canonicalizes every project file too, so symlinks and `.`/`..` segments
-/// cannot smuggle the same file in twice under two spellings.
+/// non-`file:` URI or a path whose containing directory does not exist. Canonical
+/// form is what makes the overlay's REPLACE lookup exact: tier 1 canonicalizes
+/// every project file too, so symlinks and `.`/`..` segments cannot smuggle the
+/// same file in twice under two spellings.
+///
+/// **The file itself need not exist.** `fs::canonicalize` requires the whole path
+/// to resolve, so a buffer whose file was just deleted or renamed on disk (a
+/// `git checkout`, a `git stash`, an IDE rename) would fail it — and returning
+/// `None` there is NOT the same answer as for an untitled buffer: the tier-1
+/// overlay still holds that path's stale on-disk AST, so
+/// [`overlay_source_index`]'s append fallback would register the file TWICE (the
+/// stale disk version alongside the buffer's), which is exactly the double
+/// registration the REPLACE rule exists to prevent — a wrong type, i.e. a false
+/// positive. So resolve the PARENT directory and re-attach the file name; only a
+/// path whose parent is also unresolvable (a genuinely non-filesystem buffer) is
+/// `None`, and only that case appends.
 fn uri_to_canonical_path(uri: &Uri) -> Option<PathBuf> {
     let rest = uri.as_str().strip_prefix("file://")?;
     // Skip the (empty or `localhost`) authority component: `file:///a/b` → `/a/b`.
     let start = rest.find('/')?;
-    let decoded = percent_decode(&rest[start..]);
-    std::fs::canonicalize(decoded).ok()
+    let decoded = PathBuf::from(percent_decode(&rest[start..]));
+    if let Ok(canonical) = std::fs::canonicalize(&decoded) {
+        return Some(canonical);
+    }
+    // The file is gone (or not yet written) — canonicalize its directory instead,
+    // which yields the SAME path tier 1 recorded while the file still existed.
+    let name = decoded.file_name()?;
+    let parent = std::fs::canonicalize(decoded.parent()?).ok()?;
+    Some(parent.join(name))
 }
 
 /// Percent-decode a URI path component (`%20` → a space). Invalid escapes are
@@ -3259,6 +3278,59 @@ mod tests {
     }
 
     #[test]
+    fn integration_s4b_deleted_on_disk_file_still_replaces_never_appends() {
+        // REGRESSION (review B1): a buffer whose file is DELETED or RENAMED on
+        // disk while it stays open — a `git checkout`, a `git stash`, an IDE
+        // rename — must STILL replace tier-1's held AST for that path, not be
+        // appended alongside it. Appending double-registers the file: the stale
+        // on-disk `Api#fetch -> String` would keep typing the receiver and the
+        // rename-away would keep firing `undefined method 'lenght'` — the exact
+        // wrong-type FP the REPLACE rule exists to prevent.
+        //
+        // The trap was `fs::canonicalize` failing on a nonexistent path and the
+        // resulting `None` being read as "no on-disk identity" (an untitled
+        // buffer, where appending IS right). Resolving the PARENT distinguishes
+        // the two.
+        let p = TempProject::new("deleted");
+        p.write("other.rb", "class Other\nend\n");
+        let on_disk_text =
+            "class Api\n  def fetch\n    \"s\"\n  end\nend\n\nApi.new.fetch.lenght\n";
+        let main = p.write("main.rb", on_disk_text);
+        let mut h = Harness::start_project(
+            Duration::from_millis(10),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("main.rb"), on_disk_text, 1));
+        assert_eq!(
+            h.recv_diags().diagnostics.len(),
+            1,
+            "control: the saved buffer reproduces the on-disk finding"
+        );
+
+        // The file vanishes from disk; the buffer stays open and is edited.
+        std::fs::remove_file(&main).unwrap();
+        let renamed = "class Api\n  def grab\n    \"s\"\n  end\nend\n\nApi.new.fetch.lenght\n";
+        h.notify(
+            "textDocument/didChange",
+            serde_json::json!({
+                "textDocument": { "uri": p.uri("main.rb"), "version": 2 },
+                "contentChanges": [ { "text": renamed } ]
+            }),
+        );
+        let after = h.recv_diags();
+        assert!(
+            after.diagnostics.is_empty(),
+            "a deleted-on-disk buffer must REPLACE its stale held AST, not be appended \
+             next to it (double registration = a stale type = an FP): {:?}",
+            after.diagnostics
+        );
+        h.shutdown();
+    }
+
+    #[test]
     fn integration_s4b_scale_guard_falls_back_to_single_file_and_discloses() {
         // ACCEPTANCE 4: with the budget forced to zero the tier-1 `build_project`
         // is always over it, so the session DISABLES the overlay, DISCLOSES via
@@ -3385,11 +3457,22 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(uri_to_canonical_path(&uri).as_deref(), Some(canonical.as_path()));
-        // A never-saved / non-`file:` URI has no on-disk identity ⇒ `None` ⇒ the
-        // overlay APPENDS the buffer instead of replacing.
+        // A non-`file:` URI, or one whose DIRECTORY does not exist, has no on-disk
+        // identity ⇒ `None` ⇒ the overlay APPENDS the buffer instead of replacing.
         let untitled: Uri = "untitled:Untitled-1".parse().unwrap();
         assert!(uri_to_canonical_path(&untitled).is_none());
-        let missing: Uri = "file:///no/such/file/anywhere.rb".parse().unwrap();
+        let missing: Uri = "file:///no/such/directory/anywhere.rb".parse().unwrap();
         assert!(uri_to_canonical_path(&missing).is_none());
+
+        // But a file that is GONE from an EXISTING directory still resolves (review
+        // B1): it keeps the identity tier 1 recorded, so the REPLACE lookup hits.
+        let gone = p.write("gone.rb", "x = 1\n");
+        std::fs::remove_file(&gone).unwrap();
+        let gone_uri: Uri = p.uri("gone.rb").parse().unwrap();
+        assert_eq!(
+            uri_to_canonical_path(&gone_uri).as_deref(),
+            Some(gone.as_path()),
+            "a deleted file keeps its canonical identity via its parent directory"
+        );
     }
 }
