@@ -200,6 +200,96 @@ pub struct RescueClause {
     pub span: Span,
 }
 
+/// One target slot of a multiple assignment (`a, (b, c), *rest = rhs`).
+///
+/// Mirrors the target kinds the reference's `MultiTargetBinder` recognises
+/// (`reference/rigor/lib/rigor/inference/multi_target_binder.rb:29-46`):
+/// a `LocalVariableTargetNode` binds a name, a nested `MultiTargetNode`
+/// recurses, and every other target kind (`InstanceVariableTargetNode`,
+/// `ConstantTargetNode`, `IndexTargetNode`, `CallTargetNode`,
+/// `ConstantPathTargetNode`, `ImplicitRestNode`, an anonymous `*`) is silently
+/// skipped — it has no observable contribution to the local-variable scope.
+///
+/// A skipped target is still materialised as [`MultiTarget::Ignored`] so it
+/// keeps its POSITION: the tuple decomposition is positional, so dropping an
+/// ignorable slot would shift every later target onto the wrong element.
+#[derive(Clone, Debug)]
+pub enum MultiTarget {
+    /// A plain local target (`a`). `name_span` is the Prism
+    /// `LocalVariableTargetNode` location, which IS the name token — the
+    /// name-anchored span the enum's other write variants carry.
+    Local { name: String, name_span: Span },
+    /// A nested multi-target (`(b, c)` in `a, (b, c) = …`). The binder recurses
+    /// with this slot's type as the new right-hand side.
+    Nested(MultiTargets),
+    /// A target with no observable local binding (ivar / constant / index /
+    /// call / const-path target, an implicit rest `a, = …`, an anonymous `*`).
+    Ignored { span: Span },
+}
+
+impl MultiTarget {
+    /// The byte span of this target slot.
+    pub fn span(&self) -> Span {
+        match self {
+            MultiTarget::Local { name_span, .. } => *name_span,
+            MultiTarget::Nested(t) => t.span,
+            MultiTarget::Ignored { span } => *span,
+        }
+    }
+
+    /// Push every local name bound anywhere under this target (recursing into a
+    /// nested multi-target) onto `out`, with its name span.
+    pub fn collect_bound_names(&self, out: &mut Vec<(String, Span)>) {
+        match self {
+            MultiTarget::Local { name, name_span } => out.push((name.clone(), *name_span)),
+            MultiTarget::Nested(t) => t.collect_bound_names(out),
+            MultiTarget::Ignored { .. } => {}
+        }
+    }
+}
+
+/// The `lefts` / `rest` (splat) / `rights` target triple shared by Prism's
+/// `MultiWriteNode` (`a, b = rhs`) and `MultiTargetNode` (the nested `(b, c)`
+/// form) — the reference treats them uniformly for exactly this reason
+/// (`multi_target_binder.rb:20-22`).
+///
+/// A composite child-group struct in the style of [`RescueClause`].
+#[derive(Clone, Debug)]
+pub struct MultiTargets {
+    /// Targets before the splat (all of them when there is no splat).
+    pub lefts: Vec<MultiTarget>,
+    /// The `*rest` slot, when the target list has one. Its mere PRESENCE
+    /// changes the decomposition (the reference's `rest_present:`), so an
+    /// anonymous `*` and an implicit rest (`a, = …`) are recorded as
+    /// [`MultiTarget::Ignored`] rather than dropped.
+    pub rest: Option<Box<MultiTarget>>,
+    /// Targets after the splat.
+    pub rights: Vec<MultiTarget>,
+    pub span: Span,
+}
+
+impl MultiTargets {
+    /// Every local name bound by this target tree, in source order.
+    pub fn collect_bound_names(&self, out: &mut Vec<(String, Span)>) {
+        for t in &self.lefts {
+            t.collect_bound_names(out);
+        }
+        if let Some(r) = &self.rest {
+            r.collect_bound_names(out);
+        }
+        for t in &self.rights {
+            t.collect_bound_names(out);
+        }
+    }
+
+    /// Convenience: the bound names of this target tree.
+    pub fn bound_names(&self) -> Vec<(String, Span)> {
+        let mut out = Vec::new();
+        self.collect_bound_names(&mut out);
+        out
+    }
+}
+
 /// One owned node. Mirrors a minimal Prism subset (ADR-0012); every variant
 /// carries the byte [`Span`] needed to key a diagnostic (ADR-0030).
 #[derive(Clone, Debug)]
@@ -230,6 +320,36 @@ pub enum Node {
     /// (the reference's collector fires only on plain `LocalVariableWriteNode`).
     /// `value` is lowered for call reachability.
     LocalVariableOpWrite { name: String, value: NodeId, span: Span },
+    /// A multiple assignment (`a, b = rhs`, `a, (b, c), *rest = rhs`) — Prism's
+    /// `MultiWriteNode`. `targets` is the `lefts`/`rest`/`rights` triple; `value`
+    /// is the lowered right-hand side.
+    ///
+    /// Before this variant existed the node fell through
+    /// [`collect_recoverable_children`] into a `Statements` carrier (or
+    /// `Node::Other`) and the LHS names were DROPPED from the arena entirely, so
+    /// a multi-write rebind was invisible to `collect_flow_writes` and never
+    /// widened an earlier straight-line binding — a live `flow.always-truthy-
+    /// condition` false positive.
+    ///
+    /// The RHS stays a fully-lowered child, so reads/calls inside it remain
+    /// visible to the structural walks exactly as under the old carrier.
+    /// `flow.dead-assignment` and `static.value-use.void` both key on
+    /// `LocalVariableWrite`, so neither sees this variant — matching the
+    /// reference, which skips `MultiWriteNode` in both collectors.
+    ///
+    /// `target_exprs` holds the lowered EXPRESSIONS embedded in non-local
+    /// targets — `item` in `item[3], item[5] = info`, the receiver of a
+    /// `CallTargetNode`, an index argument. The reference's read-gathering
+    /// walks the real Prism tree, so those reads count; dropping them would
+    /// falsely make `item = …` a `flow.dead-assignment` candidate (measured on
+    /// netrc 0.11.0 `Netrc#[]=`). They live here so the structural walks find
+    /// them by span, exactly as under the old recovered-children carrier.
+    MultiWrite {
+        targets: MultiTargets,
+        value: NodeId,
+        target_exprs: Vec<NodeId>,
+        span: Span,
+    },
     /// A read of a previously-written local (`s`).
     LocalVariableRead { name: String, span: Span },
     /// A string literal (`"Hello"`); `value` is the unescaped contents.
@@ -581,6 +701,7 @@ impl Node {
             | Node::Statements { span, .. }
             | Node::LocalVariableWrite { span, .. }
             | Node::LocalVariableOpWrite { span, .. }
+            | Node::MultiWrite { span, .. }
             | Node::LocalVariableRead { span, .. }
             | Node::StringLit { span, .. }
             | Node::InterpolatedString { span, .. }
@@ -814,6 +935,33 @@ impl<'src> Builder<'src> {
                 name,
                 value,
                 span: span_of(&orw.location()),
+            });
+        }
+
+        // `a, b = rhs` / `a, (b, c), *rest = rhs`. The target tree is lowered
+        // structurally (NOT into the arena — targets bind names, they are not
+        // value expressions) and the RHS is lowered as a normal child.
+        if let Some(mw) = node.as_multi_write_node() {
+            let mut recovered = Vec::new();
+            let targets = lower_multi_targets(
+                &mw.lefts(),
+                mw.rest().as_ref(),
+                &mw.rights(),
+                span_of(&mw.location()),
+                &mut recovered,
+            );
+            // Lower the expressions embedded in non-local targets so the
+            // structural walks keep seeing those reads/calls — the old
+            // recovered-children carrier did, and `flow.dead-assignment`
+            // depends on it (netrc `item[3], item[5] = info`).
+            let target_exprs: Vec<NodeId> =
+                recovered.iter().map(|c| self.lower_node(c)).collect();
+            let value = self.lower_node(&mw.value());
+            return self.push(Node::MultiWrite {
+                targets,
+                value,
+                target_exprs,
+                span: span_of(&mw.location()),
             });
         }
 
@@ -2119,6 +2267,79 @@ fn span_of(loc: &ruby_prism::Location<'_>) -> Span {
     (loc.start_offset(), loc.end_offset())
 }
 
+/// Lower a Prism `lefts` / `rest` / `rights` target triple (shared by
+/// `MultiWriteNode` and the nested `MultiTargetNode`) into the owned
+/// [`MultiTargets`] group.
+///
+/// Targets are lowered STRUCTURALLY, not into the node arena: a target binds a
+/// name, it is not a value expression, so materialising one as an arena node
+/// would make it look like a read/write to the span-scanning structural walks.
+/// Every target that lowers to [`MultiTarget::Ignored`] contributes its
+/// RECOVERABLE descendants (local reads / writes / calls) to `recovered`, so the
+/// caller can lower them into the arena and keep them visible to the structural
+/// walks — the old recovered-children carrier did exactly this.
+fn lower_multi_targets<'pr>(
+    lefts: &ruby_prism::NodeList<'pr>,
+    rest: Option<&PrismNode<'pr>>,
+    rights: &ruby_prism::NodeList<'pr>,
+    span: Span,
+    recovered: &mut Vec<PrismNode<'pr>>,
+) -> MultiTargets {
+    MultiTargets {
+        lefts: lefts.iter().map(|t| lower_multi_target(&t, recovered)).collect(),
+        // `rest` is recorded whenever Prism reports one — an anonymous `*` and
+        // an implicit rest (`a, = xs`) become `Ignored`, because the reference's
+        // `rest_present:` keys on PRESENCE, not on bindability.
+        rest: rest.map(|t| Box::new(lower_multi_target(t, recovered))),
+        rights: rights.iter().map(|t| lower_multi_target(&t, recovered)).collect(),
+        span,
+    }
+}
+
+/// Lower one target slot. A `LocalVariableTargetNode` binds its name, a nested
+/// `MultiTargetNode` recurses, a `SplatNode` unwraps to its expression (so a
+/// `*rest` slot carries the inner local name), and everything else is
+/// [`MultiTarget::Ignored`] — exactly the reference's recognised set
+/// (`multi_target_binder.rb:29-46`).
+fn lower_multi_target<'pr>(
+    node: &PrismNode<'pr>,
+    recovered: &mut Vec<PrismNode<'pr>>,
+) -> MultiTarget {
+    if let Some(t) = node.as_local_variable_target_node() {
+        return MultiTarget::Local {
+            name: constant_string(t.name().as_slice()),
+            name_span: span_of(&t.location()),
+        };
+    }
+    if let Some(t) = node.as_multi_target_node() {
+        return MultiTarget::Nested(lower_multi_targets(
+            &t.lefts(),
+            t.rest().as_ref(),
+            &t.rights(),
+            span_of(&t.location()),
+            recovered,
+        ));
+    }
+    if let Some(s) = node.as_splat_node() {
+        // `*rest` — unwrap to the inner target. An anonymous `*` (no
+        // expression) or a non-local inner target stays `Ignored`.
+        return match s.expression() {
+            Some(e) => match lower_multi_target(&e, recovered) {
+                // A splat's expression is never a nested multi-target in valid
+                // Ruby; guard anyway so the binder's rest slot only ever sees
+                // the two shapes the reference's `bind_rest_target` handles.
+                MultiTarget::Nested(_) => MultiTarget::Ignored { span: span_of(&s.location()) },
+                other => other,
+            },
+            None => MultiTarget::Ignored { span: span_of(&s.location()) },
+        };
+    }
+    // A non-local target can still EMBED expressions that READ locals or CALL
+    // methods (`item[3] = …` reads `item`; `obj.foo, bar = …` calls `obj`).
+    recovered.extend(collect_recoverable_children(node));
+    MultiTarget::Ignored { span: span_of(&node.location()) }
+}
+
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
 /// node — a local read / write / operator-write / call — WITHOUT descending past
 /// one (so [`Builder::lower_node`] recurses into it once, normally). Used by the
@@ -2174,6 +2395,13 @@ fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             self.out.push(node.as_node());
         }
+        // A multi-write buried under an unhandled wrapper is recovered WHOLE
+        // (its own lowering re-lowers the RHS), so its target names still reach
+        // `collect_flow_writes`. Without this the wrapper's default recursion
+        // would recover only the RHS's reads/calls and drop the LHS names again.
+        fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+            self.out.push(node.as_node());
+        }
     }
     let mut out = Vec::new();
     let mut c = Collector { out: &mut out };
@@ -2209,6 +2437,85 @@ mod tests {
         assert_eq!(call.0, "lenght");
         let (start, end) = call.1;
         assert_eq!(&src[start..end], b"lenght");
+    }
+
+    /// The first `MultiWrite`'s target tree in `src`.
+    fn multi_targets(src: &[u8]) -> MultiTargets {
+        let result = crate::parse(src);
+        let ast = lower(&result);
+        ast.iter()
+            .find_map(|(_, n)| match n {
+                Node::MultiWrite { targets, .. } => Some(targets.clone()),
+                _ => None,
+            })
+            .expect("expected a MultiWrite node")
+    }
+
+    #[test]
+    fn lowers_multi_write_targets_and_rhs() {
+        let src = b"a, b = foo\n";
+        let result = crate::parse(src);
+        let ast = lower(&result);
+        let (targets, value) = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::MultiWrite { targets, value, .. } => Some((targets.clone(), *value)),
+                _ => None,
+            })
+            .expect("expected a MultiWrite node");
+        let names: Vec<String> = targets.bound_names().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["a", "b"]);
+        // The RHS is a fully lowered child, so calls inside it stay reachable.
+        assert!(matches!(ast.get(value), Node::Call { method, .. } if method == "foo"));
+        // Name spans point at the target tokens.
+        let (_, span_a) = targets.bound_names()[0].clone();
+        assert_eq!(&src[span_a.0..span_a.1], b"a");
+    }
+
+    #[test]
+    fn lowers_nested_splat_and_ignorable_multi_targets() {
+        // `a, (b, c), *r, @d = xs` — nested group, splat, and an ivar target
+        // that binds no local but must hold its position.
+        let t = multi_targets(b"a, (b, c), *r, @d = xs\n");
+        let names: Vec<String> = t.bound_names().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["a", "b", "c", "r"]);
+        assert!(matches!(t.lefts[1], MultiTarget::Nested(_)), "the `(b, c)` group");
+        assert!(matches!(t.rest.as_deref(), Some(MultiTarget::Local { .. })), "the `*r` splat");
+        assert!(matches!(t.rights[0], MultiTarget::Ignored { .. }), "the `@d` ivar target");
+    }
+
+    #[test]
+    fn lowers_expressions_embedded_in_ignorable_multi_targets() {
+        // `item[3], item[5] = info` binds no local, but READS `item` twice —
+        // those reads must reach the arena or `flow.dead-assignment` falsely
+        // flags an earlier `item = …` (netrc 0.11.0 `Netrc#[]=`).
+        let src = b"item = fetch\nitem[3], item[5] = info\n";
+        let result = crate::parse(src);
+        let ast = lower(&result);
+        let reads = ast
+            .iter()
+            .filter(|(_, n)| matches!(n, Node::LocalVariableRead { name, .. } if name == "item"))
+            .count();
+        assert_eq!(reads, 2, "both `item` receivers must be lowered");
+        let exprs = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::MultiWrite { target_exprs, .. } => Some(target_exprs.len()),
+                _ => None,
+            })
+            .expect("expected a MultiWrite node");
+        assert_eq!(exprs, 2);
+    }
+
+    #[test]
+    fn lowers_anonymous_and_implicit_rest_as_present_but_ignored() {
+        let t = multi_targets(b"a, *, z = xs\n");
+        assert!(t.bound_names().iter().all(|(n, _)| n != "*"));
+        assert!(matches!(t.rest.as_deref(), Some(MultiTarget::Ignored { .. })));
+        // `a, = xs` — Prism records an ImplicitRestNode; presence still matters.
+        let t = multi_targets(b"a, = xs\n");
+        assert!(t.rest.is_some(), "an implicit rest is a PRESENT rest slot");
+        assert!(matches!(t.rest.as_deref(), Some(MultiTarget::Ignored { .. })));
     }
 
     #[test]

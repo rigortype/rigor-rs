@@ -19,6 +19,7 @@
 
 pub mod folding;
 pub mod kernel_fold;
+pub mod multi_target_binder;
 pub mod source_index;
 
 use std::collections::{HashMap, HashSet};
@@ -285,6 +286,15 @@ impl<'i> Typer<'i> {
                 .get(name)
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
+            // `a, b = rhs` AS AN EXPRESSION is its right-hand side (Ruby: `(a, b
+            // = [1, 2])` evaluates to `[1, 2]`). The reference routes
+            // `Prism::MultiWriteNode` to `type_of_assignment_write`
+            // (`expression_typer.rb:125`), the same handler the single-target
+            // writes use.
+            Node::MultiWrite { value, .. } => {
+                let value = *value;
+                self.type_of(ast, value, env, interner)
+            }
             Node::Call { receiver: Some(r), method, args, block_body, .. } => {
                 let (r, method) = (*r, method.clone());
                 if !block_body.is_empty() {
@@ -526,8 +536,12 @@ impl<'i> Typer<'i> {
                     None => interner.intern(Type::Constant(Scalar::Nil)),
                 }
             }
+            // A multi-write evaluates to its RHS, exactly like the single-target
+            // writes: `(a, b = [1, 2])` is `[1, 2]` (reference
+            // `expression_typer.rb:119` / `eval_multi_write`).
             Node::LocalVariableWrite { value, .. }
             | Node::LocalVariableOpWrite { value, .. }
+            | Node::MultiWrite { value, .. }
             | Node::VariableWrite { value, .. }
             | Node::InstanceVariableWrite { value, .. }
             | Node::ConstantWrite { value, .. } => {
@@ -1602,20 +1616,41 @@ impl<'i> Typer<'i> {
     ) -> TypeEnv {
         let mut env = base.clone();
         // Collect writes in arena/source order so earlier binds feed later RHS.
-        let writes: Vec<(String, NodeId)> = ast
+        // A multi-write contributes ITS TARGET TREE (bound through the
+        // destructuring binder once the RHS type is known).
+        enum BodyWrite {
+            Single(String, NodeId),
+            Multi(rigor_parse::MultiTargets, NodeId),
+        }
+        let writes: Vec<BodyWrite> = ast
             .iter()
             .filter_map(|(_, n)| match n {
                 Node::LocalVariableWrite { name, value, span, .. }
                     if def_span.0 <= span.0 && span.1 <= def_span.1 =>
                 {
-                    Some((name.clone(), *value))
+                    Some(BodyWrite::Single(name.clone(), *value))
+                }
+                Node::MultiWrite { targets, value, span, .. }
+                    if def_span.0 <= span.0 && span.1 <= def_span.1 =>
+                {
+                    Some(BodyWrite::Multi(targets.clone(), *value))
                 }
                 _ => None,
             })
             .collect();
-        for (name, value) in writes {
-            let ty = self.type_of(ast, value, &env, interner);
-            env.insert(name, ty);
+        for w in writes {
+            match w {
+                BodyWrite::Single(name, value) => {
+                    let ty = self.type_of(ast, value, &env, interner);
+                    env.insert(name, ty);
+                }
+                BodyWrite::Multi(targets, value) => {
+                    let rhs = self.type_of(ast, value, &env, interner);
+                    for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                        env.insert(name, ty);
+                    }
+                }
+            }
         }
         env
     }
@@ -1734,6 +1769,21 @@ impl<'i> Typer<'i> {
                 let ty = self.type_of(ast, value, env, interner);
                 env.insert(name, ty);
             }
+            // `a, b = rhs` — destructure the RHS and rebind every target. This
+            // is the arm that closes the multi-write flow-write FP: without it
+            // an earlier `x = 5` survived the rebind and `if x` folded to a
+            // constant.
+            Node::MultiWrite { targets, value, .. } => {
+                let (targets, value) = (targets.clone(), *value);
+                // Same discipline as the single-target arm: the RHS may itself
+                // write other locals — widen those first, then bind.
+                let vspan = ast.get(value).span();
+                widen_flow_writes(writes, vspan, env, interner);
+                let rhs = self.type_of(ast, value, env, interner);
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    env.insert(name, ty);
+                }
+            }
             Node::LocalVariableOpWrite { name, .. } => {
                 // `x += 1` / `x ||= 5` reads-then-writes; the result is not a
                 // tracked constant in this slice — widen.
@@ -1835,6 +1885,13 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 let ty = self.type_of(ast, value, env, interner);
                 env.insert(name, ty);
+            }
+            Node::MultiWrite { targets, value, .. } => {
+                let (targets, value) = (targets.clone(), *value);
+                let rhs = self.type_of(ast, value, env, interner);
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    env.insert(name, ty);
+                }
             }
             Node::Statements { body, .. } => {
                 for s in body.clone() {
@@ -1970,6 +2027,22 @@ impl<'i> Typer<'i> {
                     None => {
                         nenv.remove(&name);
                     }
+                }
+            }
+            // `a, b = rhs` — record the RHS uses, then rebind every target to
+            // its destructured slot type and DROP the per-name nil / `Array.new`
+            // facts. Dropping is the FP-safe direction (a dropped `C | nil` fact
+            // can only silence `call.possible-nil-receiver`, never add a
+            // firing), and it is what the binder's `soften_optional_slot` says
+            // anyway: a destructured slot never carries a manufactured nil.
+            Node::MultiWrite { targets, value, .. } => {
+                let (targets, value) = (targets.clone(), *value);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                let rhs = self.type_of(ast, value, tenv, interner);
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    nenv.remove(&name);
+                    penv.remove(&name);
+                    tenv.insert(name, ty);
                 }
             }
             Node::LocalVariableOpWrite { name, .. } => {
@@ -2258,6 +2331,12 @@ const MUTATOR_METHODS: &[&str] = &[
 ///
 /// - local-variable rebinds (`LocalVariableWrite`/`LocalVariableOpWrite`) — the
 ///   assignment invalidates the prior binding;
+/// - **multi-write targets** (`a, (b, c), *rest = rhs`) — every local name the
+///   destructure binds, keyed by the WHOLE multi-write span (the same
+///   whole-statement key a single-target write uses). Before `Node::MultiWrite`
+///   existed these names were absent from the arena entirely, so a multi-write
+///   rebind never widened an earlier straight-line binding — a live
+///   `flow.always-truthy-condition` false positive;
 /// - **in-place content mutations** — a call `local.<mutator>(…)` whose receiver
 ///   is a bare local read and whose method is in [`MUTATOR_METHODS`], keyed by the
 ///   whole-call span. This is the port of the reference's `MutationWidening`
@@ -2269,18 +2348,23 @@ const MUTATOR_METHODS: &[&str] = &[
 ///   and widens through the catch-all/`If` arms.
 pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     ast.iter()
-        .filter_map(|(_, n)| match n {
+        .flat_map(|(_, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. } => Some((*span, name.clone())),
+            | Node::LocalVariableOpWrite { name, span, .. } => vec![(*span, name.clone())],
+            Node::MultiWrite { targets, span, .. } => targets
+                .bound_names()
+                .into_iter()
+                .map(|(name, _)| (*span, name))
+                .collect(),
             Node::Call { receiver: Some(r), method, span, .. }
                 if MUTATOR_METHODS.contains(&method.as_str()) =>
             {
                 match ast.get(*r) {
-                    Node::LocalVariableRead { name, .. } => Some((*span, name.clone())),
-                    _ => None,
+                    Node::LocalVariableRead { name, .. } => vec![(*span, name.clone())],
+                    _ => Vec::new(),
                 }
             }
-            _ => None,
+            _ => Vec::new(),
         })
         .collect()
 }

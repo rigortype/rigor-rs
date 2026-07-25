@@ -4355,10 +4355,30 @@ mod tests {
 
     #[test]
     fn dead_assignment_multi_write_is_silent() {
-        // `a, b = foo` lowers to `Node::Other` (no LocalVariableWrite) ⇒ never a
-        // candidate ⇒ silent, matching the reference (MultiWriteNode skipped).
+        // `a, b = foo` lowers to `Node::MultiWrite`, NOT `LocalVariableWrite`, so
+        // its targets are never dead-assignment candidates ⇒ silent, matching the
+        // reference (`DeadAssignmentCollector` skips `MultiWriteNode` — its write
+        // semantics are intertwined with a wider tuple binding). This is a PARITY
+        // GUARD: the multi-write arena lowering must not make destructured
+        // targets fireable.
         let diags = dead(b"def f\n  a, b = bar\n  77\nend\n");
         assert!(diags.is_empty(), "multi-write must be silent, got {diags:?}");
+        // Also silent for the splat / nested / ignorable target forms.
+        let diags = dead(b"def f\n  a, (b, c), *r = bar\n  77\nend\n");
+        assert!(diags.is_empty(), "multi-write forms must be silent, got {diags:?}");
+    }
+
+    #[test]
+    fn dead_assignment_reads_inside_multi_write_targets_count() {
+        // FP REGRESSION (netrc 0.11.0 `Netrc#[]=`, caught by the corpus sweep):
+        // a NON-LOCAL multi-write target embeds a local READ (`item` in
+        // `item[3], item[5] = info`). The reference gathers reads from the whole
+        // Prism subtree, so `item` is read and `item = …` is NOT dead. The arena
+        // must therefore carry those embedded expressions (`MultiWrite::
+        // target_exprs`) — dropping them made `item = …` fire.
+        let src = b"def setter(k, info)\n  if item = @data.detect { |d| d[1] == k }\n    item[3], item[5] = info\n  end\nend\n";
+        let diags = dead(src);
+        assert!(diags.is_empty(), "a read inside a multi-write target counts, got {diags:?}");
     }
 
     #[test]
@@ -4624,6 +4644,30 @@ mod tests {
         assert!(
             always_truthy(src).is_empty(),
             "a conditionally-reassigned local must NOT fold to a constant"
+        );
+    }
+
+    #[test]
+    fn always_truthy_multi_write_rebind_widens_silent() {
+        // FP REGRESSION (2026-07-25). `x = 5` then a MULTI-WRITE rebind
+        // `x, _y = other, 2` ⇒ `x` is the destructured `Dynamic[top]` slot, not
+        // `5`, so `if x` must be SILENT. Measured against the oracle before the
+        // `Node::MultiWrite` lowering: rigor-rs fired at 4:6, the reference was
+        // silent — the multi-write's target names never reached
+        // `collect_flow_writes`, so the earlier binding survived the rebind.
+        let src = b"def probe(other)\n  x = 5\n  x, _y = other, 2\n  if x\n    puts \"truthy\"\n  end\nend\n";
+        assert!(
+            always_truthy(src).is_empty(),
+            "a multi-write rebind must widen the earlier binding"
+        );
+        // Same at top level, and through a nested / splat target.
+        assert!(
+            always_truthy(b"x = 5\na, (x, c) = other\nif x\n  noop\nend\n").is_empty(),
+            "a NESTED multi-write target must widen the earlier binding"
+        );
+        assert!(
+            always_truthy(b"x = 5\na, *x = other\nif x\n  noop\nend\n").is_empty(),
+            "a SPLAT multi-write target must widen the earlier binding"
         );
     }
 
@@ -6244,5 +6288,15 @@ mod void_value_use_tests {
         assert!(void_diags("silent", b"w = Widget.new\nw.fire\n").is_empty());
         assert!(void_diags("silent", b"w = Widget.new\ny = w.spin\n").is_empty());
         assert!(void_diags("silent", b"y = unknown_thing.fire\n").is_empty());
+    }
+
+    /// PARITY GUARD: a MULTI-WRITE RHS is not a value context. The reference's
+    /// `VoidValueUseCollector::WRITE_NODE_CLASSES` deliberately excludes
+    /// `Prism::MultiWriteNode` ("its `value` is a container the void call would
+    /// have to be spread through, not a direct use"), so adding the
+    /// `Node::MultiWrite` arena lowering must not make it fire.
+    #[test]
+    fn void_multi_write_rhs_stays_silent() {
+        assert!(void_diags("multiwrite", b"w = Widget.new\na, b = w.fire\n").is_empty());
     }
 }

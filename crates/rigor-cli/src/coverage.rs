@@ -664,28 +664,21 @@ impl<'pr> Visit<'pr> for NodeCollector<'pr> {
 }
 
 /// PRISM-side local-rebind taints the arena cannot supply (PR #33 re-review
-/// BLOCKING-1): `MultiWriteNode` local targets (multi-writes have no arena
-/// lowering), `for x in …` index targets (the lowering drops the index), and
+/// BLOCKING-1): `for x in …` index targets (the lowering drops the index) and
 /// `rescue => x` captures. Each yields `(target span, name)` — same shape as
 /// the substrate `collect_flow_writes` entries the taint scan consumes.
+///
+/// The `MultiWriteNode` arm is RETIRED: `Node::MultiWrite` now carries the
+/// target tree, so [`rigor_infer::collect_flow_writes`] supplies exactly the
+/// same name set (keyed by the whole multi-write span rather than the target
+/// span — an equivalent taint key, since neither is ever a `straight_line`
+/// binding span and both sit inside precisely the same enclosing scopes).
 fn collect_prism_taints(root: &Node<'_>) -> Vec<((usize, usize), String)> {
     let mut collector = NodeCollector { nodes: Vec::new() };
     collector.visit(root);
     let mut out = Vec::new();
     for node in &collector.nodes {
         match node {
-            Node::MultiWriteNode { .. } => {
-                let n = node.as_multi_write_node().unwrap();
-                for t in n.lefts().iter() {
-                    collect_local_targets(&t, &mut out);
-                }
-                if let Some(t) = n.rest() {
-                    collect_local_targets(&t, &mut out);
-                }
-                for t in n.rights().iter() {
-                    collect_local_targets(&t, &mut out);
-                }
-            }
             Node::ForNode { .. } => {
                 collect_local_targets(&node.as_for_node().unwrap().index(), &mut out);
             }
@@ -2630,12 +2623,15 @@ mod rebind_taint_regressions {
     #[test]
     fn multi_write_if_invalidates_the_binding() {
         // `x = 5; x, y = frob, 2 if c; x` — the final read must NOT keep 5.
-        // Oracle: constant 3 (5, 2, and the write) / dynamic_top 8; the ref's
-        // three `shaped` nodes (if/multiwrite/rhs-array wrappers) are rs
-        // dynamic — an under-claim.
+        // Oracle: constant 3 (5, 2, and the write) / shaped 3 / dynamic_top 5.
+        // The three `shaped` nodes are the if-modifier, the multi-write and its
+        // RHS array — all three were rs `dynamic` (an UNDER-claim) while the
+        // multi-write had no arena lowering; `Node::MultiWrite` types to its
+        // RHS `Tuple`, so rigor-rs now matches the oracle exactly here.
         let r = scan_src("x = 5\nx, y = frob, 2 if c\nx\n");
         assert_eq!(r.tier(Tier::Constant), 3);
-        assert_eq!(r.tier(Tier::DynamicTop), 8);
+        assert_eq!(r.tier(Tier::Shaped), 3);
+        assert_eq!(r.tier(Tier::DynamicTop), 5);
     }
 
     #[test]
