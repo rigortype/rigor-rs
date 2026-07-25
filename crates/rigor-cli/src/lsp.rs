@@ -1076,8 +1076,18 @@ fn swap_project(st: &mut Session, index: Arc<CoreIndex>, overlay: Option<Project
 ///
 /// The fast path still covers the overwhelmingly common event — saving the file
 /// you are editing is a held entry, so it is a clone of a `Vec<(PathBuf, Arc<_>)>`
-/// plus one file's parse (measured 0.067 ms at 3 117 files, vs 111 ms for the full
+/// plus one file's parse (measured 0.21 ms at 3 117 files, vs 121 ms for the full
 /// rebuild it replaced).
+///
+/// **Known latency trade-off.** A file the index never holds — `exclude`d, an ERB
+/// template, or one the parser rejects — can never take the fast path, so EVERY
+/// save of one pays the full rebuild (121 ms on the loop thread at 3 117 files).
+/// That is correct, and harmless for the usual case (excluded trees are usually
+/// vendored and rarely edited), but it is a latency cliff for a repo that excludes
+/// a large tree it still actively edits. The fix, if it ever bites, is to remember
+/// the discovered-but-not-held paths so they can be recognised and skipped —
+/// deliberately not done here, because it reintroduces exactly the
+/// second-source-of-truth-about-discovery that this rewrite removed.
 ///
 /// Never rebuilds the `CoreIndex`: it depends on the plugin set and the signature
 /// dirs, neither of which a project `.rb` file can change.
@@ -1118,12 +1128,25 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
             })
             .unwrap_or_default();
         if held.is_empty() {
-            // Not held. Ignore ONLY if it also cannot be in project scope; anything
-            // that might be a new in-scope file gets the full rebuild.
-            if touches_configured_root(ctx, &st.cfg, canonical.as_deref(), &uri) {
-                return apply_full_overlay_build(ctx, st, index);
+            // Not held. Ignoring requires proving the event is out of project scope,
+            // which is a comparison of two path SPELLINGS — and that is only sound
+            // when the path RESOLVES, so both sides can be canonicalized.
+            //
+            // With no canonical form (review R-1: the deleted-DIRECTORY case) the
+            // URI's decoded spelling is the only candidate, and a client that
+            // reaches the workspace through a symlink spells it differently from the
+            // canonicalized root — `/tmp/proj/lib/...` vs `/private/tmp/proj/lib` on
+            // macOS, or any symlinked project/home dir. The comparison then says
+            // "out of scope" for an event a full rebuild WOULD have acted on, and
+            // the stale AST survives: B-1's symptom again.
+            //
+            // So an unresolvable path is NEVER ignored. The cost is one rebuild for
+            // an out-of-workspace delete whose parent is also gone — which a
+            // workspace-scoped watcher barely produces.
+            if watched_event_is_ignorable(ctx, &st.cfg, canonical.as_deref(), &uri) {
+                continue;
             }
-            continue;
+            return apply_full_overlay_build(ctx, st, index);
         }
         let path = canonical.expect("a held match implies a resolved path");
         if !path.exists() {
@@ -1150,26 +1173,59 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
 /// Whether a watched-file event could possibly concern a path the project index
 /// harvests — the second half of [`reharvest_sources`]'s ignore condition.
 ///
-/// Deliberately one-sided: it answers "is it safe to IGNORE this?", so every
-/// uncertainty (an unresolvable configured root, a path that resolves under either
-/// its decoded or its canonical spelling) answers `true` and costs at most one
-/// full rebuild. It is NOT a discovery predicate — it never decides that a file
-/// belongs in the index, only that an event is not obviously irrelevant.
-fn touches_configured_root(
+/// Whether a watched event for a path that is NOT currently held may be dropped
+/// without rebuilding — the complete ignore rule (review R-1), named so the
+/// implementation and its tests share one definition.
+///
+/// **An unresolvable path is never ignorable.** Ignoring requires PROVING the event
+/// is out of project scope, which is a comparison of path spellings, and that is
+/// only sound when the path resolves so both sides can be canonicalized. When it
+/// does not resolve — the deleted-DIRECTORY case — the URI's decoded spelling is
+/// the only candidate, and a client reaching the workspace through a symlink
+/// spells it differently from the canonicalized root (`/tmp/proj/...` vs
+/// `/private/tmp/proj/...` on macOS, or any symlinked project or home dir). The
+/// comparison then "proves" out-of-scope for an event a full rebuild WOULD have
+/// acted on, and a stale AST survives — the B-1 symptom.
+fn watched_event_is_ignorable(
     ctx: &ServerContext,
     cfg: &Config,
     canonical: Option<&Path>,
     uri: &Uri,
 ) -> bool {
+    canonical.is_some_and(|c| !touches_configured_root(ctx, cfg, c, uri))
+}
+
+/// **Only ever called with a RESOLVED path** (review R-1), so the configured roots
+/// and the candidate are compared canonical-to-canonical and no symlinked spelling
+/// can make an in-scope path look out of scope. An unresolvable path never reaches
+/// here — it takes the full rebuild unconditionally.
+///
+/// Deliberately one-sided: it answers "is it safe to IGNORE this?", so every
+/// uncertainty (an unresolvable configured root; a path in scope under EITHER its
+/// decoded or its canonical spelling) answers `true` and costs at most one full
+/// rebuild. Both spellings count because a NEW symlink inside `lib` pointing out of
+/// the tree is in scope by its decoded spelling while its canonical form is not —
+/// and bare-`check` discovery WOULD harvest it. It is NOT a discovery predicate —
+/// it never decides that a file belongs in the index, only that an event is not
+/// obviously irrelevant.
+///
+/// The configured roots are CANONICALIZED rather than compared literally: in
+/// production `ctx.project_root` is `.`, so `join_root` yields the relative
+/// `"lib"`, which no absolute candidate could ever match.
+fn touches_configured_root(
+    ctx: &ServerContext,
+    cfg: &Config,
+    canonical: &Path,
+    uri: &Uri,
+) -> bool {
     let decoded = uri_decoded_path(uri);
-    let candidates: Vec<&Path> = decoded.as_deref().into_iter().chain(canonical).collect();
+    let candidates: Vec<&Path> = decoded.as_deref().into_iter().chain([canonical]).collect();
     cfg.paths.iter().any(|p| {
-        let joined = join_root(&ctx.project_root, p);
         // An unresolvable configured root cannot rule anything out.
-        let Ok(canon_root) = std::fs::canonicalize(&joined) else { return true };
-        candidates
-            .iter()
-            .any(|c| c.starts_with(&canon_root) || c.starts_with(&joined))
+        let Ok(canon_root) = std::fs::canonicalize(join_root(&ctx.project_root, p)) else {
+            return true;
+        };
+        candidates.iter().any(|c| c.starts_with(&canon_root))
     })
 }
 
@@ -3970,6 +4026,61 @@ mod tests {
     /// `build_overlay` is the strong form of N3's invariant — not just "the same
     /// files" but the same ASTs in the same positions, which is what
     /// `build_project`'s order-sensitive multi-pass harvest actually consumes.
+    /// A symlink alias for a project root, removed on drop — the "workspace
+    /// reached through a symlink" shape (the normal macOS `/tmp` → `/private/tmp`
+    /// case, a symlinked project dir, a symlinked home).
+    struct AliasLink(PathBuf);
+
+    impl AliasLink {
+        fn to(root: &Path) -> Self {
+            let alias = root.parent().unwrap().join(format!(
+                "{}_alias",
+                root.file_name().unwrap().to_string_lossy()
+            ));
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(root, &alias).unwrap();
+            Self(alias)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for AliasLink {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// Enter a directory for the duration of a scope, restoring the previous cwd on
+    /// drop — INCLUDING on a panic, so a failing assertion cannot leave the rest of
+    /// the suite in the wrong directory.
+    ///
+    /// The process cwd is global, so this also serialises every test that needs it
+    /// behind one mutex. Only the `project_root = "."` (production-shape) tests take
+    /// it; every other test injects an absolute root precisely to avoid this.
+    struct CwdGuard {
+        prev: PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl CwdGuard {
+        fn enter(dir: &Path) -> Self {
+            static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = CWD.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(dir).unwrap();
+            Self { prev, _lock: lock }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.prev);
+        }
+    }
+
     fn overlay_fingerprint(files: &ProjectFiles) -> Vec<(String, String)> {
         files
             .files
@@ -4010,6 +4121,19 @@ mod tests {
         (ctx, st)
     }
 
+    /// How the project root is SPELLED to the server — the axis review R-1 hid
+    /// behind. Every other test injects an absolute temp dir; production passes
+    /// `"."` and the workspace is routinely reached through a symlink, where the
+    /// URI spelling and the canonicalized root differ.
+    #[derive(Clone, Copy, Debug)]
+    enum RootSpelling {
+        /// `project_root` = the absolute canonical temp dir (what tests inject).
+        Absolute,
+        /// `project_root` = `"."` with the cwd entered through a SYMLINK to the
+        /// project, and URIs spelled through that symlink — the production shape.
+        DotThroughSymlink,
+    }
+
     #[test]
     fn incremental_reharvest_is_byte_identical_to_a_full_rebuild() {
         // THE N3 INVARIANT (adversarial review of PR #43): after ANY sequence of
@@ -4018,89 +4142,107 @@ mod tests {
         //
         // The first implementation decided membership with a `ProjectScope`
         // predicate that re-derived bare-`check`'s discovery rule, and diverged from
-        // it on a deleted DIRECTORY, a symlinked `.rb` (held under its out-of-root
-        // canonical path), and `paths: ["."]`. This test drives all three, plus the
-        // ordinary transitions, and compares against the ground truth each time —
-        // so it fails on ANY divergence, not just the three that were found.
+        // it four ways (a deleted DIRECTORY, a symlinked `.rb` held under its
+        // out-of-root canonical path, `paths: ["."]`, and the same canonical path
+        // held twice). This test drives all of them plus the ordinary transitions,
+        // across BOTH `paths:` shapes and BOTH root spellings, comparing against the
+        // ground truth each time — so it fails on ANY divergence, not only the ones
+        // that were found.
         for paths_yaml in ["paths:\n  - lib\n", "paths:\n  - \".\"\n"] {
-            let cfg: Config = serde_yaml::from_str(paths_yaml).unwrap();
-            let cfg2: Config = serde_yaml::from_str(paths_yaml).unwrap();
-            let p = TempProject::new("differential");
-            p.write("a.rb", "class A\nend\n");
-            p.write("b.rb", BASE_RB);
-            std::fs::create_dir_all(p.root.join("lib/nested")).unwrap();
-            std::fs::write(p.root.join("lib/nested/c.rb"), "class C\nend\n").unwrap();
-            // A symlinked `.rb` FILE: bare-`check` discovery harvests it (a symlink
-            // to a file matches `Dir.glob`), and it is held under its CANONICAL,
-            // out-of-`lib` path.
-            std::fs::create_dir_all(p.root.join("shared")).unwrap();
-            std::fs::write(p.root.join("shared/linked.rb"), "class Linked\nend\n").unwrap();
-            std::os::unix::fs::symlink(
-                p.root.join("shared/linked.rb"),
-                p.root.join("lib/linked.rb"),
-            )
+            for spelling in [RootSpelling::Absolute, RootSpelling::DotThroughSymlink] {
+                differential_run(paths_yaml, spelling);
+            }
+        }
+    }
+
+    fn differential_run(paths_yaml: &str, spelling: RootSpelling) {
+        let cfg: Config = serde_yaml::from_str(paths_yaml).unwrap();
+        let cfg2: Config = serde_yaml::from_str(paths_yaml).unwrap();
+        let p = TempProject::new("differential");
+        p.write("a.rb", "class A\nend\n");
+        p.write("b.rb", BASE_RB);
+        std::fs::create_dir_all(p.root.join("lib/nested")).unwrap();
+        std::fs::write(p.root.join("lib/nested/c.rb"), "class C\nend\n").unwrap();
+        // A symlinked `.rb` FILE: bare-`check` discovery harvests it (a symlink to a
+        // file matches `Dir.glob`), and it is held under its CANONICAL, out-of-`lib`
+        // path. Under `paths: ["."]` BOTH it and its target are walked, so the same
+        // canonical path is held twice.
+        std::fs::create_dir_all(p.root.join("shared")).unwrap();
+        std::fs::write(p.root.join("shared/linked.rb"), "class Linked\nend\n").unwrap();
+        std::os::unix::fs::symlink(p.root.join("shared/linked.rb"), p.root.join("lib/linked.rb"))
             .unwrap();
 
-            let (ctx, mut st) = session_for(&p.root, cfg2, OVERLAY_BUILD_BUDGET_DEFAULT);
-            let index = Arc::new(CoreIndex::new());
-            let check = |st: &Session, label: &str| {
-                let truth = build_overlay(&p.root, &cfg, &index);
-                let held = st.project.overlay.as_ref().expect("overlay stays live");
-                assert_eq!(
-                    overlay_fingerprint(held),
-                    overlay_fingerprint(&truth.files),
-                    "[{paths_yaml:?} / {label}] incremental state diverged from a full rebuild"
-                );
-            };
-            check(&st, "initial");
+        // The root as the SERVER sees it, and the prefix URIs are spelled with.
+        let alias = matches!(spelling, RootSpelling::DotThroughSymlink)
+            .then(|| AliasLink::to(&p.root));
+        let _cwd = alias.as_ref().map(|a| CwdGuard::enter(a.path()));
+        let ctx_root = match &alias {
+            Some(_) => PathBuf::from("."),
+            None => p.root.clone(),
+        };
+        // URIs are spelled through the alias in the symlink case — the whole point:
+        // the decoded spelling then differs from every canonical form.
+        let uri_root = alias.as_ref().map_or_else(|| p.root.clone(), |a| a.path().to_path_buf());
+        let uri = |name: &str| format!("file://{}", uri_root.join("lib").join(name).display());
 
-            // (1) EDIT a held file — the fast path (replace in place).
-            p.write("a.rb", "class A\n  def extra\n  end\nend\n");
-            reharvest_sources(&ctx, &mut st, &[p.uri("a.rb")]);
-            check(&st, "edit held file");
-
-            // (2) EDIT through the SYMLINK's path. The event names lib/linked.rb;
-            // the held entry is shared/linked.rb. Canonicalization is what makes
-            // these the same entry — the scope predicate got this wrong (probe C).
-            std::fs::write(p.root.join("shared/linked.rb"), "class Linked\n  def x\n  end\nend\n")
-                .unwrap();
-            reharvest_sources(&ctx, &mut st, &[p.uri("linked.rb")]);
-            check(&st, "edit via symlink path");
-
-            // (3) DELETE a held file whose parent still exists — removed in place.
-            std::fs::remove_file(p.root.join("lib/b.rb")).unwrap();
-            reharvest_sources(&ctx, &mut st, &[p.uri("b.rb")]);
-            check(&st, "delete file");
-
-            // (4) CREATE a new file — not held ⇒ full rebuild ⇒ correct ORDER
-            //     (an append would put it last; `build_overlay` sorts).
-            p.write("aa.rb", "class Aa\nend\n");
-            reharvest_sources(&ctx, &mut st, &[p.uri("aa.rb")]);
-            check(&st, "create file");
-
-            // (5) DELETE A DIRECTORY — the path no longer resolves even via its
-            //     parent, so it is not decidable incrementally (probe A).
-            std::fs::remove_dir_all(p.root.join("lib/nested")).unwrap();
-            let gone = format!("file://{}", p.root.join("lib/nested/c.rb").display());
-            reharvest_sources(&ctx, &mut st, &[gone]);
-            check(&st, "delete directory");
-
-            // (6) An out-of-project `.rb` event: ignored (or full-rebuilt) — either
-            //     way the state must still match the ground truth.
-            reharvest_sources(&ctx, &mut st, &["file:///nowhere/at/all/x.rb".to_string()]);
-            check(&st, "unrelated file");
-
-            // (7) A BATCH mixing an edit, a delete and a creation in one payload.
-            p.write("a.rb", "class A\nend\n");
-            std::fs::remove_file(p.root.join("lib/aa.rb")).unwrap();
-            p.write("z.rb", "class Z\nend\n");
-            reharvest_sources(
-                &ctx,
-                &mut st,
-                &[p.uri("a.rb"), p.uri("aa.rb"), p.uri("z.rb")],
+        let (ctx, mut st) = session_for(&ctx_root, cfg2, OVERLAY_BUILD_BUDGET_DEFAULT);
+        let index = Arc::new(CoreIndex::new());
+        let check = |st: &Session, label: &str| {
+            // Ground truth: a full rebuild under the SAME root spelling.
+            let truth = build_overlay(&ctx_root, &cfg, &index);
+            let held = st.project.overlay.as_ref().expect("overlay stays live");
+            assert_eq!(
+                overlay_fingerprint(held),
+                overlay_fingerprint(&truth.files),
+                "[{paths_yaml:?} / {spelling:?} / {label}] incremental state diverged \
+                 from a full rebuild"
             );
-            check(&st, "mixed batch");
-        }
+        };
+        check(&st, "initial");
+
+        // (1) EDIT a held file — the fast path (replace in place).
+        p.write("a.rb", "class A\n  def extra\n  end\nend\n");
+        reharvest_sources(&ctx, &mut st, &[uri("a.rb")]);
+        check(&st, "edit held file");
+
+        // (2) EDIT through the SYMLINK's path. The event names lib/linked.rb; the
+        // held entry is shared/linked.rb. Canonicalization is what makes these the
+        // same entry — the scope predicate got this wrong (probe C).
+        std::fs::write(p.root.join("shared/linked.rb"), "class Linked\n  def x\n  end\nend\n")
+            .unwrap();
+        reharvest_sources(&ctx, &mut st, &[uri("linked.rb")]);
+        check(&st, "edit via symlink path");
+
+        // (3) DELETE a held file whose parent still exists — removed in place.
+        std::fs::remove_file(p.root.join("lib/b.rb")).unwrap();
+        reharvest_sources(&ctx, &mut st, &[uri("b.rb")]);
+        check(&st, "delete file");
+
+        // (4) CREATE a new file — not held ⇒ full rebuild ⇒ correct ORDER (an
+        //     append would put it last; `build_overlay` sorts).
+        p.write("aa.rb", "class Aa\nend\n");
+        reharvest_sources(&ctx, &mut st, &[uri("aa.rb")]);
+        check(&st, "create file");
+
+        // (5) DELETE A DIRECTORY — the path no longer resolves even via its parent,
+        //     so it is not decidable incrementally (probes A / E / F). Under the
+        //     symlinked spelling this is exactly R-1: the decoded path cannot be
+        //     compared soundly against a canonical root, so it must NOT be ignored.
+        std::fs::remove_dir_all(p.root.join("lib/nested")).unwrap();
+        reharvest_sources(&ctx, &mut st, &[uri("nested/c.rb")]);
+        check(&st, "delete directory");
+
+        // (6) An out-of-project `.rb` event: ignored (or full-rebuilt) — either way
+        //     the state must still match the ground truth.
+        reharvest_sources(&ctx, &mut st, &["file:///nowhere/at/all/x.rb".to_string()]);
+        check(&st, "unrelated file");
+
+        // (7) A BATCH mixing an edit, a delete and a creation in one payload.
+        p.write("a.rb", "class A\nend\n");
+        std::fs::remove_file(p.root.join("lib/aa.rb")).unwrap();
+        p.write("z.rb", "class Z\nend\n");
+        reharvest_sources(&ctx, &mut st, &[uri("a.rb"), uri("aa.rb"), uri("z.rb")]);
+        check(&st, "mixed batch");
     }
 
     #[test]
@@ -4322,6 +4464,105 @@ mod tests {
         assert!(
             msg.contains("re-enabled") && msg.contains("2 files"),
             "the disclosure reports the NEW overlay's count, not the emptied one: {msg}"
+        );
+    }
+
+
+    /// PROBE E [BLOCKING]: `touches_configured_root` compares the URI's DECODED
+    /// spelling against the CANONICALIZED configured root. When the two spellings
+    /// differ — a workspace reached through a symlink, the normal macOS shape
+    /// (`/tmp` -> `/private/tmp`) — and the path cannot be canonicalized (a DELETED
+    /// DIRECTORY, the only case where the decoded spelling is the sole candidate),
+    /// the predicate answers "ignore" for an event a full rebuild WOULD have acted
+    /// on, and the stale AST survives. B-1's residue.
+    #[test]
+    fn probe_e_alias_spelled_uri_for_a_deleted_directory_is_wrongly_ignored() {
+        let p = TempProject::new("probe_e");
+        p.write("a.rb", "class A\nend\n");
+        std::fs::create_dir_all(p.root.join("lib/nested")).unwrap();
+        std::fs::write(p.root.join("lib/nested/c.rb"), "class C\nend\n").unwrap();
+        let alias = p.root.parent().unwrap().join(format!(
+            "{}_alias",
+            p.root.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&p.root, &alias).unwrap();
+
+        let cfg = Config::default(); // paths: ["lib"]
+        let cfg2 = Config::default();
+        let (ctx, mut st) = session_for(&p.root, cfg2, OVERLAY_BUILD_BUDGET_DEFAULT);
+        let index = Arc::new(CoreIndex::new());
+        assert_eq!(st.project.overlay.as_ref().unwrap().files.len(), 2, "a.rb + nested/c.rb");
+
+        // rm -rf lib/nested, announced under the ALIAS spelling.
+        std::fs::remove_dir_all(p.root.join("lib/nested")).unwrap();
+        let gone = format!("file://{}", alias.join("lib/nested/c.rb").display());
+        let uri: Uri = gone.parse().unwrap();
+        assert!(
+            uri_to_canonical_path(&uri).is_none(),
+            "precondition: a deleted directory leaves no canonical form"
+        );
+        assert!(
+            !watched_event_is_ignorable(&ctx, &st.cfg, None, &uri),
+            "PROBE E FAILED (rule): the event is treated as ignorable although a full \
+             rebuild would act on it, so the stale entry is never dropped"
+        );
+
+        reharvest_sources(&ctx, &mut st, &[gone]);
+        let truth = build_overlay(&p.root, &cfg, &index);
+        let held = st.project.overlay.as_ref().unwrap();
+        let _ = std::fs::remove_file(&alias);
+        assert_eq!(
+            overlay_fingerprint(held),
+            overlay_fingerprint(&truth.files),
+            "PROBE E FAILED (state): incremental kept a stale AST for a file in a \
+             deleted directory"
+        );
+    }
+
+    /// PROBE F [BLOCKING]: the LITERAL production shape — `project_root = "."`, so
+    /// `join_root` yields the RELATIVE "lib" and the `c.starts_with(&joined)` arm of
+    /// `touches_configured_root` is DEAD (an absolute path never starts with a
+    /// relative one). Production therefore depends entirely on the canonicalized arm.
+    /// The differential test never sees this because its roots are absolute temp
+    /// dirs, where the dead arm silently rescues every case.
+    #[test]
+    fn probe_f_production_root_shape_has_a_dead_arm_and_ignores_a_symlinked_spelling() {
+        let p = TempProject::new("probe_f");
+        p.write("a.rb", "class A\nend\n");
+        std::fs::create_dir_all(p.root.join("lib/nested")).unwrap();
+        std::fs::write(p.root.join("lib/nested/c.rb"), "class C\nend\n").unwrap();
+        let alias = p.root.parent().unwrap().join(format!(
+            "{}_alias",
+            p.root.file_name().unwrap().to_string_lossy()
+        ));
+        let _ = std::fs::remove_file(&alias);
+        std::os::unix::fs::symlink(&p.root, &alias).unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        // Enter the workspace through the SYMLINK, as an editor launched from the
+        // user-visible path does.
+        std::env::set_current_dir(&alias).unwrap();
+        let ctx = ServerContext {
+            debounce: Duration::from_secs(30),
+            worker_gate: production_gate(),
+            watched_files_dynamic_registration: false,
+            project_root: PathBuf::from("."), // <- production
+            overlay_budget: OVERLAY_BUILD_BUDGET_DEFAULT,
+        };
+        let cfg = Config::default();
+        std::fs::remove_dir_all(p.root.join("lib/nested")).unwrap();
+        let gone = format!("file://{}", alias.join("lib/nested/c.rb").display());
+        let uri: Uri = gone.parse().unwrap();
+        let canonical = uri_to_canonical_path(&uri);
+        let verdict = !watched_event_is_ignorable(&ctx, &cfg, canonical.as_deref(), &uri);
+        std::env::set_current_dir(prev).unwrap();
+        let _ = std::fs::remove_file(&alias);
+        assert!(canonical.is_none(), "precondition: deleted directory");
+        assert!(
+            verdict,
+            "PROBE F FAILED: under the production root shape a deleted-directory \
+             event spelled through the workspace symlink is IGNORED"
         );
     }
 
