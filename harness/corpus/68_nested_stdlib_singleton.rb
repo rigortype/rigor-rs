@@ -42,3 +42,11 @@ status.frobnicate
 # Bare short name `Status` resolves to nothing (both engines silent).
 Status.new
 Status.absent
+
+# DO NOT write `Process::Status` (or any nested bundled-RBS class name) as a
+# CONSTANT anywhere in this file. The line-40 witness rides
+# `SourceIndex::is_declaration_only_class`: naming the constant registers it in
+# the ConstantRead pass, the class stops being declaration-only, and the
+# diagnostic silently disappears (harness would report it as a coverage gap, not
+# a failure). Appending below is safe — do not insert above, the expectations are
+# line-anchored.

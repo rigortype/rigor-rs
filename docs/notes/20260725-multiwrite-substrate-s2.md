@@ -140,14 +140,35 @@ Two fixes were built and one was measured out:
 
 Residual surface, audited: a tuple return only resolves for a TOP-LEVEL receiver
 (both lookups ride the SHORT-key map, which holds no qualified keys), so of the
-four QUALIFIED element classes — `Process::Status`, `Gem::Version`,
-`Resolv::DNS::{Message,Name,Resource}` — only `Process::Status` (from `Process`)
-is reachable at all; `Gem::Version` comes solely from `Gem::Requirement.parse`
-and the `Resolv::DNS::*` ones solely from `Resolv::DNS::*` methods, all qualified
-receivers. The restriction should be lifted when rigor-rs vendors the extras
-bundle (its own slice — it changes `knows_class`, arity and ATM surfaces too).
+**five** QUALIFIED element classes — `Process::Status`, `Gem::Version`,
+`Resolv::DNS::Message`, `Resolv::DNS::Name`, `Resolv::DNS::Resource` — only
+`Process::Status` is reachable at all, from `Process.{wait2,waitpid2}` **and
+`Open3.{capture2,capture2e,capture3}`** (`[String, Process::Status]` /
+`[String, String, Process::Status]`; probed, byte-identical to the oracle on both
+slots). `Gem::Version` comes solely from `Gem::Requirement.parse` and the
+`Resolv::DNS::*` ones solely from `Resolv::DNS::*` methods — all qualified
+receivers, none of which resolve. The restriction should be lifted when rigor-rs
+vendors the extras bundle (its own slice — it changes `knows_class`, arity and
+ATM surfaces too).
 
 The FP is pinned by `a_source_named_qualified_gem_class_stays_lenient`.
+
+### The gate is PROJECT-WIDE — a fragility to know about
+
+`is_declaration_only_class` is computed over the whole analysed file set, so a
+SINGLE mention of the constant anywhere silences the witness:
+
+```ruby
+FOO = Process::Status            # anywhere in the file set …
+_pid, status = Process.wait2
+status.frobnicate                # … and rigor-rs goes silent (oracle still fires)
+```
+
+That is the FP-safe direction (an under-emit), and it is the price of not
+witnessing over a surface that may be weaker than the oracle's. But it means
+**fixture 68 depends on never naming `Process::Status` in code** — the fixture
+carries a comment saying so, so a later edit does not quietly turn the diagnostic
+off while the harness still passes as a "coverage gap".
 
 ## Existing callers — none shift
 
@@ -171,23 +192,49 @@ answers. The four call sites that consult it:
 | singleton SCALAR return mint | **one case** | see below |
 
 The scalar-return mint is the only place a name can be needed WITHOUT being read
-in source. Enumerating the vendored RBS for a `def self.…` whose return is one of
-the 17 gives 12 declarations, and 11 of them return their OWN receiver class
-(`Pathname.pwd -> Pathname`, `Complex.rect -> Complex`, `Addrinfo.ip -> Addrinfo`,
-`BigDecimal._load -> BigDecimal`, `Socket.unix_server_socket -> Socket`) — the
-receiver constant must be read to make the call, so those were already registered
-and already fired on the OLD binary (verified by probe). The twelfth is
-`Delegator.delegating_block: (Symbol) -> Proc`. Probed:
+in source. Most `def self.…` declarations returning one of the 17 return their
+OWN receiver class (`Pathname.pwd -> Pathname`, `Complex.rect -> Complex`,
+`Addrinfo.ip -> Addrinfo`, `BigDecimal._load -> BigDecimal`,
+`Socket.unix_server_socket -> Socket`) — the receiver constant must be read to
+make the call, so those were already registered and already fired on the OLD
+binary (verified by probe). The interesting set is the declarations whose RETURN
+class differs from their RECEIVER, since only those can need a name the source
+never writes. Enumerated and probed, all four families:
 
-| | old | new | oracle |
-| --- | --- | --- | --- |
-| `Delegator.delegating_block(:m).frobnicate` | *silent* | `5:32 undefined method 'frobnicate' for Proc` | **byte-identical** to new |
+| declaration family | new vs old | vs oracle |
+| --- | --- | --- |
+| `Delegator.delegating_block: (Symbol) -> Proc` | NEW fires (`… for Proc`) | **byte-identical** — coverage gain |
+| `Kernel.BigDecimal(…) -> BigDecimal`, `Kernel.Pathname(…) -> Pathname` | NEW fires | **byte-identical** — coverage gain |
+| `Kernel.{at_exit,lambda,proc} -> Proc` | still silent | oracle FIRES — an under-emit, unchanged by this slice |
+| `BigMath.{E,PI,sqrt,log,exp,…} -> BigDecimal` (~24 decls) | **NEW fires, oracle SILENT** | see below |
 
-A coverage GAIN matching the oracle exactly. The instance-side scalar path
-(`Tier 3`) mints only through `CoreIndex::class_id` (the 9 core names) and never
-consults the registry, so it cannot shift at all.
+**The `BigMath` family is a divergence, and it is NOT a new FP class** — it
+extends a PRE-EXISTING one by one expression position:
 
-**`analyze` composition / rule set:** untouched.
+```ruby
+require "bigdecimal/math"
+BigMath.sqrt(BigDecimal("2"), 10).frobnicate   # OLD silent, NEW fires, oracle SILENT
+BigMath.frobnicate(1)                          # OLD *and* NEW fire, oracle SILENT
+```
+
+The second line is the root cause: **the oracle does not model `BigMath` at all**,
+so it is silent on ANY call to it, while rigor-rs's index has the class and
+already witnessed class-method typos on it before this slice. Pass 2b only
+removes the "the constant must be READ in source" precondition — the same
+diagnostic is reachable on the OLD binary by naming the constant (`X = BigDecimal`
+makes OLD fire identically). `BigDecimal`'s RBS is the same rbs-4.0.3 in both
+engines (there is no `vendored_gem_sigs` entry for it), so the diagnostic itself
+is semantically CORRECT; the divergence is an INGESTION-SURFACE asymmetry, not a
+typing error. Zero movement across the sweep even though `BigMath.` appears in 12
+swept `.rb` files (vendored `bigdecimal` copies) — the shape needs a chained call
+on the result.
+
+The instance-side scalar path (`Tier 3`) mints only through
+`CoreIndex::class_id` (the 9 core names) and never consults the registry, so it
+cannot shift at all.
+
+**`analyze` composition / rule set:** untouched. The `crates/rigor-rules` diff is
+the one gate disjunct plus tests.
 
 ## Fixture 68 and the harness
 
@@ -209,8 +256,9 @@ fixture's expectation moved.
 | `CARGO_TARGET_DIR=$(mktemp -d) cargo clippy --workspace --all-targets -- -D warnings` | clean |
 
 (The summary prints `217/218` because the harness keys diagnostics by
-`(rule, line, column)` and one fixture has two diagnostics sharing a key — the
-same arithmetic Slice 1 recorded. The gate is `Coverage gaps: 0`.)
+`(rule, line, column)` — fixture 48 has two `suppression.unknown-rule` rows
+sharing `(rule, 7, 9)`, which the Set collapses. Same arithmetic Slice 1
+recorded. The gate is `Coverage gaps: 0`.)
 
 ## `fp_audit --gaps` — 0 new FPs, and 0 delta on the mandated corpora
 
@@ -256,12 +304,23 @@ no real-corpus diagnostic in either direction. The whole-repo corpora (haml /
 liquid / faraday include their `vendor/bundle`, which is where Slice 1's reviewer
 found its only real-corpus witness) were swept for exactly that reason.
 
-Why nothing moved, mechanically: the instance tuple path needs a receiver whose
-class the index resolves, and in real code `partition` / `divmod` receivers are
-overwhelmingly untyped parameters (`line.to_s.partition(":")` — probed, both
-engines silent, before and after); the singleton path needs a tuple-returning
-class method, and `Process.wait2` / `Process.waitpid2` do not occur. The gain is
-therefore fixture 68 plus the probe-verified shapes below — not a corpus number.
+Why nothing moved, mechanically — and NOT because the shapes are absent:
+
+- The instance tuple path needs a receiver whose class the index resolves, and in
+  real code `partition` / `divmod` receivers are overwhelmingly untyped
+  parameters (`line.to_s.partition(":")` — probed, both engines silent, before
+  and after).
+- `Process.wait2` / `waitpid2` DO occur — 11 swept files (rails ×2, redmine ×2,
+  the vendored `activesupport` / `parser` copies under haml / liquid / redmine,
+  dependabot-core). Every one of them destructures into a value used only with
+  REAL methods (`status.success?`, `status.exitstatus`, or an immediate
+  `return status, …`), which the qualified surface resolves ⇒ silent in both
+  engines. The diagnostic needs a MISS on the slot, which no corpus site has.
+- `BigMath.` appears in 12 swept files, all inside vendored `bigdecimal` copies,
+  and none chains a call onto a `BigMath` return.
+
+The gain is therefore fixture 68 plus the probe-verified shapes below — not a
+corpus number.
 
 ## Oracle-checked additions (synthetic probes)
 
@@ -279,6 +338,23 @@ invocation (pinned `rigor-rbs-inline` plugin path, fresh cwd, `--no-cache`):
 | `r, w = IO.pipe` ⇒ `r.frobnicate` | silent | silent | oracle FIRES (`for IO`) — a remaining gap, see below |
 | `g = Gem::Version.new("1.0")` ⇒ `g.segments` | silent | silent | oracle silent — the FP above, closed |
 | `Gem::Version.new("1.0").frobnicate` | silent | silent | oracle FIRES — the price of that guard (FP-safe) |
+| `out, status = Open3.capture2("ls")` ⇒ `out.frobnicate` / `status.frobnicate` | silent | `… for String` / `… for Process::Status` | **identical** on both slots |
+| `q, r = 7.divmod(2)` ⇒ `q.frobnicate` | silent | silent | oracle FIRES (`for 3`) — see below |
+| `a, b, c = "x-y".partition("-")` ⇒ `a.Nokogiri` | silent | `… for String` | oracle SILENT — see below |
+| `BigMath.sqrt(BigDecimal("2"), 10).frobnicate` | silent | `… for BigDecimal` | oracle SILENT — see the caller audit |
+
+**Coverage from this mechanism is NOT uniform.** `Integer#divmod`'s RBS overloads
+disagree, so the all-overloads-agree collapse declines it and the slots stay
+`Dynamic[top]` while the oracle (which folds `7.divmod(2)` to a pinned tuple)
+fires on both. Under-emit, FP-safe — but "tuple returns now type" must not be
+read as "every tuple return now types".
+
+**`a.Nokogiri` is the `BigMath` divergence again, in the instance path.** The
+unvendored `nokogiri` extras add `Object#Nokogiri` to the ORACLE's surface, not
+to rigor-rs's, so rigor-rs witnesses it as undefined. Pre-existing:
+`"abc".Nokogiri` fires on the OLD binary and is silent in the oracle. The tuple
+typing merely carries the same pre-existing divergence into a new expression
+position; it is not a new FP class, and the sweep moved nothing.
 
 The two `partition` rows are the only message-text divergence: the reference's
 ConstantFolding pins `"x-y".partition("-")` to the literal tuple `["x", "-", "y"]`
@@ -297,9 +373,13 @@ selection flips it visibly.
 
 ## `sig-gen` / `annotate` — user-visible output improved (oracle-exact)
 
+`sig-gen` only emits for methods inside a `class` / `module` body, so the probe
+below wraps the def (`class Waiter; def reap; Process.wait2; end; end`) — a
+TOP-LEVEL `def reap` prints `No candidates` on old AND new and proves nothing.
+
 | | old | new | oracle |
 | --- | --- | --- | --- |
-| `sig-gen --print`, `def reap; Process.wait2; end` | `No candidates` | `def reap: () -> [Integer, Process::Status]` | **byte-identical** |
+| `sig-gen --print`, `class Waiter; def reap; Process.wait2; end; end` | `No candidates` | `def reap: () -> [Integer, Process::Status]` | **byte-identical** |
 | `annotate`, the same body | `#=> Dynamic[top]` | `#=> [Integer, Process::Status]` | **byte-identical** |
 | `sig-gen --print`, `def version; Gem::Version.new("1.0"); end` | `-> Gem::Version` | `-> Gem::Version` | **byte-identical** (the rejected `type_dot_new` guard would have lost this) |
 
@@ -319,11 +399,32 @@ selection flips it visibly.
 2. **The id-minting problem is broader than the spec's framing.** The spec named
    the missing registry id, but not that the fix must also be enumerable: the
    registry is shared, so registering a name changes `class_id` for every
-   consumer. The enumeration table above is the audit that makes it safe, and it
-   is the reason the slice's blast radius is one extra oracle-verified diagnostic
-   shape (`Delegator.delegating_block`).
+   consumer. The caller table above is the audit that makes it safe, and it is
+   what surfaced the two coverage gains (`Delegator.delegating_block`,
+   `Kernel.BigDecimal` / `Kernel.Pathname`) and the one divergent family
+   (`BigMath`).
 3. **The spec implied a single wiring point.** `method_signature` serves BOTH the
    instance and the singleton path, so the descriptor is inherently both. Fixture
    68 needs only the singleton half; the instance half (`String#partition` &c.)
    was wired too because suppressing it would encode a gap rather than a design
    boundary — and it measured at 0 new FPs across every corpus swept.
+
+## Follow-up (its own slice): why is rigor-rs's RBS surface not the oracle's?
+
+This slice ran into the SAME asymmetry from both directions, and it is the real
+divergence — the slice merely made one more expression position reachable:
+
+- rigor-rs knows LESS: the reference's `data/vendored_gem_sigs/` (twelve gems)
+  adds methods rigor-rs never sees ⇒ witnessing absence over those classes is
+  unsound (`Gem::Version#segments` — the FP this slice had to guard against).
+- rigor-rs knows MORE: `BigMath` is in rigor-rs's index and NOT in the oracle's
+  (`BigMath.frobnicate(1)` fires on rigor-rs, old and new; the oracle is silent),
+  and `Object#Nokogiri` is in the ORACLE's and not rigor-rs's, which inverts to
+  the same shape (`"abc".Nokogiri` fires on rigor-rs, old and new).
+
+Both directions are INGESTION-surface differences, not typing differences, and
+both are pre-existing. The work is: diff the two engines' loaded class/method
+surfaces (which libraries each auto-loads, plus the extras bundle) and decide
+per-family whether to vendor, to skip, or to gate. That would also let the
+declaration-only restriction above be lifted. It needs its own measurement —
+vendoring the extras changes `knows_class`, arity and ATM surfaces at once.
