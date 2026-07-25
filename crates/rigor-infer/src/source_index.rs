@@ -416,6 +416,28 @@ impl SourceIndex {
             }
         }
 
+        // Pass 2b (MultiWrite substrate Slice 2): register an id for every class
+        // an RBS TUPLE return names as an element. Pass 2 above can only see
+        // classes the SOURCE mentions, but a tuple element is reached THROUGH a
+        // call — `Process.wait2 : [Integer, Process::Status]` names
+        // `Process::Status` in no source file — so without this the element has
+        // no registry identity and its `Nominal` cannot be minted (the slot would
+        // silently degrade to `Dynamic[top]`).
+        //
+        // Declaration-driven, not name-driven: the set is whatever the loaded RBS
+        // declares (see `CoreIndex::tuple_return_class_names`), so no class name
+        // is special-cased here. A name that is already a source class keeps the
+        // source registration (the project's own class wins, as everywhere else),
+        // and an element the loaded RBS does not model is skipped — an
+        // unregistered name simply leaves that slot `Dynamic[top]` (silent).
+        for name in core.tuple_return_class_names() {
+            if !idx.classes.contains_key(name)
+                && (core.knows_class(name) || core.knows_qualified_class(name))
+            {
+                idx.register(name);
+            }
+        }
+
         // Pass 3 (ADR-0023 tier-4b): infer per-method RETURN types. Runs AFTER the
         // source/registry maps are complete (so a Typer over `&idx` sees every
         // project class), and produces a fresh map that is then assigned — we must

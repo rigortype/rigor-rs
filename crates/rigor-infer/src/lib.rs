@@ -586,6 +586,54 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// Intern one RBS return-shape descriptor (`rigor_index::RbsReturnShape`)
+    /// as a rigor-rs type — the rigor-rs half of the reference's
+    /// `RbsTypeTranslator` (`rbs_type_translator.rb:162`, `translate_tuple`).
+    ///
+    /// A `Class` resolves its id the way every other RBS-return mint does: the
+    /// core (CORE_CLASSES) id first, else the source-registry id (which Pass 2b
+    /// of [`SourceIndex`] pre-registers for exactly the tuple-element classes).
+    /// A `Tuple` recurses into a [`Type::Tuple`]. Anything else — and any name
+    /// with no registry identity — becomes `Dynamic[top]`, matching the
+    /// reference's total translator, whose unmodeled shapes degrade to `untyped`.
+    /// A `Dynamic[top]` slot is silent in every rule, so the degrade can only
+    /// lose recall.
+    fn intern_rbs_shape(
+        &self,
+        shape: &rigor_index::RbsReturnShape,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match shape {
+            rigor_index::RbsReturnShape::Class(name) => {
+                if let Some(class) = self.index.class_id(name) {
+                    return interner.intern(Type::Nominal { class, args: vec![] });
+                }
+                if let Some(class) = self.source.class_id(name) {
+                    return interner.intern(Type::Nominal { class, args: vec![] });
+                }
+                interner.untyped()
+            }
+            rigor_index::RbsReturnShape::Tuple(elems) => {
+                let ids: Vec<TypeId> =
+                    elems.iter().map(|e| self.intern_rbs_shape(e, interner)).collect();
+                interner.intern(Type::Tuple(ids))
+            }
+            rigor_index::RbsReturnShape::Unknown => interner.untyped(),
+        }
+    }
+
+    /// Intern an RBS TUPLE return (`[Integer, Process::Status]`) as a
+    /// [`Type::Tuple`] of interned element shapes. See [`Self::intern_rbs_shape`].
+    fn intern_rbs_tuple(
+        &self,
+        shapes: &[rigor_index::RbsReturnShape],
+        interner: &mut Interner,
+    ) -> TypeId {
+        let ids: Vec<TypeId> =
+            shapes.iter().map(|s| self.intern_rbs_shape(s, interner)).collect();
+        interner.intern(Type::Tuple(ids))
+    }
+
     /// Build a value-pinned [`Type::HashShape`] from an all-assoc hash literal's
     /// flat `[k, v, k, v, …]` element list (guaranteed even by `all_assoc`), or
     /// fall back to the bare `Hash` nominal. A faithful port of the reference's
@@ -1339,6 +1387,14 @@ impl<'i> Typer<'i> {
         if let Type::Singleton(class) = interner.get(recv_ty) {
             let class = *class;
             if let Some(class_name) = self.source.class_name_for_id(class) {
+                // A TUPLE return (`Process.wait2 : [Integer, Process::Status]`)
+                // types to a `Type::Tuple` of its element classes — the shape the
+                // flat `singleton_method_return` slot collapses to `None`. Same
+                // all-overloads-agree discipline (the index declines a divergent
+                // set), so this only ever REPLACES a `Dynamic[top]` result.
+                if let Some(shapes) = self.index.singleton_method_tuple_return(class_name, method) {
+                    return self.intern_rbs_tuple(shapes, interner);
+                }
                 if let Some(ret) = self.index.singleton_method_return(class_name, method) {
                     // Mint the return instance with the type_dot_new id
                     // resolution: a core (CORE_CLASSES) nominal id when
@@ -1405,6 +1461,12 @@ impl<'i> Typer<'i> {
 
         // Tier 3 (-ish): resolve receiver class -> method return class.
         if let Some(class_name) = self.index.class_name_of(interner, recv_ty) {
+            // The instance twin of the singleton tuple arm above
+            // (`"a-b".partition("-") : [String, String, String]`): a tuple return
+            // types per-position instead of collapsing to `Dynamic[top]`.
+            if let Some(shapes) = self.index.method_tuple_return(class_name, method) {
+                return self.intern_rbs_tuple(shapes, interner);
+            }
             if let Some(ret_class) = self.index.method_return(class_name, method) {
                 if let Some(class_id) = self.index.class_id(ret_class) {
                     return interner.intern(Type::Nominal {
@@ -3968,5 +4030,77 @@ mod meta_new_lift_tests {
         assert!(new_ty(b"v = Pathname.new(:sym)\n").starts_with("Class<"));
         assert!(new_ty(b"def f(x)\n  $g = Pathname.new(x)\nend\nv = Time.new\n").starts_with("Class<"));
         assert!(new_ty(b"v = StringIO.new\n").starts_with("Class<"));
+    }
+}
+
+#[cfg(test)]
+mod rbs_tuple_return_tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    /// The rendered type of the LAST receiver-bearing call in `src`.
+    fn last_call_ty(src: &[u8]) -> String {
+        let ast = lower(&parse(src));
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = TypeEnv::new();
+        let call_id = ast
+            .iter()
+            .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+            .last()
+            .unwrap();
+        let ty = typer.type_of(&ast, call_id, &env, &mut i);
+        rigor_types::describe(&i, ty)
+    }
+
+    /// MultiWrite substrate Slice 2: a SINGLETON RBS tuple return types
+    /// per-position (`Process.wait2 : [Integer, Process::Status]`) instead of
+    /// collapsing to `Dynamic[top]`. `Integer` is a core id (`Class<1>`); the
+    /// RBS-only `Process::Status` carries a source-registry id (`Class<1_000_xxx>`),
+    /// minted by `SourceIndex`'s tuple-element pre-registration — no source file
+    /// here names `Process::Status`.
+    #[test]
+    fn singleton_tuple_return_types_per_position() {
+        let rendered = last_call_ty(b"_pid, status = Process.wait2\n");
+        assert!(
+            rendered.starts_with("Tuple[Class<1>, Class<"),
+            "expected a 2-element tuple, got {rendered}"
+        );
+    }
+
+    /// The instance twin (`String#partition -> [String, String, String]`), and
+    /// the element ids are the CORE String id.
+    #[test]
+    fn instance_tuple_return_types_per_position() {
+        assert_eq!(
+            last_call_ty(b"x = \"a-b\".partition(\"-\")\n"),
+            "Tuple[Class<0>, Class<0>, Class<0>]"
+        );
+    }
+
+    /// The Slice-1 binder distributes the tuple across the multi-write targets,
+    /// so `status` binds to the `Process::Status` nominal — the link fixture 68
+    /// needs. Compared against the SAME id the typer mints for the tuple slot.
+    #[test]
+    fn multi_write_binds_a_tuple_slot_to_its_rbs_class() {
+        let ast = lower(&parse(b"_pid, status = Process.wait2\nstatus\n"));
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_env(&ast, &mut i);
+        let status = *env.get("status").expect("status must be bound");
+        let name = source.class_name_for_id_of(&i, status);
+        assert_eq!(name, Some("Process::Status"), "got {:?}", i.get(status));
+    }
+
+    /// An RBS return this descriptor does not model stays exactly as before
+    /// (`Dynamic[top]`): `IO.pipe`'s overloads disagree (a block overload
+    /// returns the block's value), so the all-overloads-agree collapse declines.
+    #[test]
+    fn divergent_overloads_stay_dynamic() {
+        assert_eq!(last_call_ty(b"r, w = IO.pipe\n"), "Dynamic[top]");
     }
 }

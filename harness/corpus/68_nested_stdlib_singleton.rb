@@ -2,9 +2,9 @@
 # nested-stdlib names. Slice 2 CLOSED the SINGLETON cases — `ERB::Util` /
 # `CGI::Util` class-method witnessing now matches the oracle byte-for-byte,
 # including the short-key MERGE-collision split (no cross-contamination). The
-# non-nested CGI contrast stays matching. Still open (later slice): the nested
-# stdlib CLASS INSTANCE (`Process::Status` via `Process.wait2`, line ~38) —
-# an instance-path witness through a qualified-class-typed value.
+# non-nested CGI contrast stays matching. The nested stdlib CLASS INSTANCE
+# (`Process::Status` via `Process.wait2`, line ~38) — an instance-path witness
+# through a qualified-class-typed value — is CLOSED by the MultiWrite slice 2.
 # Byte-for-byte against the oracle on (rule, line, column).
 
 require "erb"
