@@ -55,6 +55,20 @@ impl Drop for TempDir {
 const BASE_RB: &str = "class Base\n  def helper\n  end\nend\n";
 const SUB_RB: &str = "class Sub < Base\n  private\n\n  def helper\n  end\nend\n";
 
+/// A Rails-shaped `Gemfile.lock`: activesupport locked as a direct spec, which
+/// ADR-72's `bundler.auto_detect` turns into the `activesupport-core-ext` plugin
+/// overlay. `check` has always applied it (`Config::effective_plugins`); review N1
+/// found the LSP building its `CoreIndex` from the bare `plugins:` instead.
+const GEMFILE_LOCK: &str = "GEM\n  remote: https://rubygems.org/\n  specs:\n    \
+                            activesupport (7.1.3)\n      concurrent-ruby (~> 1.0)\n    \
+                            concurrent-ruby (1.2.3)\n\nPLATFORMS\n  ruby\n\n\
+                            DEPENDENCIES\n  activesupport\n\nBUNDLED WITH\n   2.5.6\n";
+
+/// `blank?` is an activesupport core-ext on `String` — undefined in plain core
+/// RBS. With the overlay applied it resolves; without it, it is an
+/// `undefined method` error.
+const BLANK_RB: &str = "s = \"hello\"\ns.blank?\n";
+
 /// Run `rigor <args>` in `cwd` under the hermetic Ruby-free posture, returning
 /// stdout.
 fn rigor_check(cwd: &Path, args: &[&str]) -> String {
@@ -194,8 +208,50 @@ fn lsp_saved_buffer_diagnostics_equal_project_check_diagnostics() {
     assert_eq!(expected.len(), 1, "project `check` reports the cross-file finding: {project}");
 
     // (3) The LSP's answer for the same, SAVED (never edited) buffer.
-    let uri = format!("file://{}", dir.path().join("lib/sub.rb").display());
-    let mut lsp = LspChild::spawn(dir.path());
+    let actual = lsp_findings(dir.path(), "lib/sub.rb", SUB_RB);
+
+    assert_eq!(
+        actual, expected,
+        "LSP diagnostics for a saved buffer must equal `rigor check`'s project-wide \
+         diagnostics for that file (line, column, severity, message)"
+    );
+}
+
+#[test]
+fn lsp_applies_the_same_gemfile_lock_plugin_overlays_as_check() {
+    // Review N1: `check` builds its `CoreIndex` from `Config::effective_plugins`
+    // (config `plugins:` PLUS the ADR-72 `Gemfile.lock`-gated auto-detected
+    // overlays); the LSP passed the bare `cfg.plugins`. On the most common Ruby
+    // project shape — a Gemfile.lock with activesupport — the editor therefore
+    // fired `undefined method 'blank?' for "hello"` on code `rigor check` accepts.
+    // A per-keystroke false positive, and a direct contradiction of the S4b parity
+    // headline, so it is pinned end to end like the headline itself.
+    let dir = TempDir::new("lsp-plugins");
+    fs::write(dir.path().join("Gemfile.lock"), GEMFILE_LOCK).unwrap();
+    fs::write(dir.path().join("lib/blank.rb"), BLANK_RB).unwrap();
+
+    // `check` is silent: the activesupport overlay reopens `String` with `blank?`.
+    let project = rigor_check(dir.path(), &["check", "lib"]);
+    let expected = check_findings(&project, "lib/blank.rb");
+    assert!(
+        expected.is_empty(),
+        "`check` resolves `blank?` via the Gemfile.lock overlay: {project}"
+    );
+
+    // The LSP must agree — and, as everywhere in this file, the comparison is an
+    // equality against `check`, not a hardcoded expectation.
+    let actual = lsp_findings(dir.path(), "lib/blank.rb", BLANK_RB);
+    assert_eq!(
+        actual, expected,
+        "the LSP must apply the same Gemfile.lock plugin overlays `check` does"
+    );
+}
+
+/// Boot `rigor lsp` in `root`, `didOpen` `rel` with `text`, and return its
+/// published diagnostics in the same comparable shape [`check_findings`] yields.
+fn lsp_findings(root: &Path, rel: &str, text: &str) -> Vec<Finding> {
+    let uri = format!("file://{}", root.join(rel).display());
+    let mut lsp = LspChild::spawn(root);
     lsp.send(serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "initialize",
         "params": { "capabilities": {} }
@@ -207,11 +263,11 @@ fn lsp_saved_buffer_diagnostics_equal_project_check_diagnostics() {
     lsp.send(serde_json::json!({
         "jsonrpc": "2.0", "method": "textDocument/didOpen",
         "params": { "textDocument": {
-            "uri": uri, "languageId": "ruby", "version": 1, "text": SUB_RB
+            "uri": uri, "languageId": "ruby", "version": 1, "text": text
         }}
     }));
     let diags = lsp.recv_diagnostics(&uri);
-    let actual: Vec<Finding> = diags
+    let findings = diags
         .iter()
         .map(|d| {
             let line = d["range"]["start"]["line"].as_u64().unwrap() as u32 + 1;
@@ -224,11 +280,6 @@ fn lsp_saved_buffer_diagnostics_equal_project_check_diagnostics() {
             (line, col, sev.to_string(), d["message"].as_str().unwrap().to_string())
         })
         .collect();
-
-    assert_eq!(
-        actual, expected,
-        "LSP diagnostics for a saved buffer must equal `rigor check`'s project-wide \
-         diagnostics for that file (line, column, severity, message)"
-    );
     lsp.shutdown();
+    findings
 }
