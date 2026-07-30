@@ -31,6 +31,35 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
     manifest dependencies (e.g. `yaml` ⇒ `psych`, `csv` ⇒ no new, `pstore` ⇒
     `digest`/`pstore` deps, `resolv` ⇒ `socket`).
 
+- `overlay/` — **not from the rbs gem**. The reference's own supplementary
+  signatures, copied from `reference/rigor/data/`:
+  - `overlay/core_overlay/` ⇐ `data/core_overlay/` (5 files) — reopens core
+    classes to add methods upstream RBS omits but every concrete value answers
+    (`Numeric#to_f`, `Pathname`, `CSV`, `Psych`, `StringScanner`).
+  - `overlay/vendored_gem_sigs/<gem>/` ⇐ `data/vendored_gem_sigs/<gem>/`
+    (12 gems) — signatures for gems whose own RBS is missing or incomplete
+    (`ast bcrypt bundler cgi did_you_mean idn-ruby mysql2 nokogiri pg redis
+    rubygems`, plus the `*_extras.rbs` supplements).
+
+  The reference loads BOTH unconditionally in every run (`rbs_loader.rb`:
+  `vendored_gem_sig_paths` then `core_overlay_sig_paths`, after the upstream
+  set), so anything they declare is part of the ORACLE's surface. Not vendoring
+  them made rigor-rs's surface strictly weaker than the oracle's and produced
+  false positives on methods the oracle resolves — measured on rigor-survey:
+  `::DidYouMean.formatter`, which `data/vendored_gem_sigs/did_you_mean/` adds
+  and upstream RBS does not declare. `ingest_embedded` loads `overlay/` LAST,
+  mirroring the reference's order so an upstream declaration always wins.
+
+  **`prism` is deliberately EXCLUDED** from the copy. Its file is a *supplement*
+  (`prism_supplement.rbs`) to the prism gem's own `sig/`, which the reference
+  loads via `DEFAULT_LIBRARIES` but this tree does not vendor (prism ships RBS
+  with its own gem — see the note above). Loading the supplement alone declares
+  `module Prism` without the gem's `Prism.parse`, which turns a class rigor-rs
+  used to be silent about into a witnessed-absent one: 8 fresh
+  `call.undefined-method` false positives on `Prism.parse` across
+  rigor-survey `dependabot-core` and `rdoc-7.2.0` when it was included. A
+  supplement is only safe here when the set it supplements is also vendored.
+
 ## Regenerate
 
 The closure is computed exactly as `CoreData::load()` does (whole `core/` +

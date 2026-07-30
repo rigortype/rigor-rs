@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/71_multibyte_columns.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 14,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"ex\\u00E4mple\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 16,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"\\u30DF\\u30B1\\u30EB\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 18,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"\\u{1F48C}\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"\\u00E4\\u{1F48C}\""
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 25,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `undefined_toplevel_thing`. If a project file defines `undefined_toplevel_thing` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 25,
+      "column": 39,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `another_missing_call`. If a project file defines `another_missing_call` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

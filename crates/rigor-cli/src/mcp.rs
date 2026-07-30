@@ -481,25 +481,11 @@ fn outline_json(s: &crate::outline::SymNode, source: &str) -> Value {
     obj
 }
 
-/// 1-based `(line, column)` from a byte offset (columns in Unicode scalars), the
-/// same mapping the text/json reporters use.
+/// 1-based `(line, column)` from a byte offset — the same mapping the text/json
+/// reporters use. Delegates rather than re-deriving: a second copy of the column
+/// unit is a second place for it to drift away from the reference's byte columns.
 fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
-    if source.is_empty() {
-        return (1, 1);
-    }
-    let clamped = byte_offset.min(source.len());
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    for (i, b) in source.as_bytes().iter().enumerate() {
-        if i >= clamped {
-            break;
-        }
-        if *b == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        }
-    }
-    (line, source[line_start..clamped].chars().count() + 1)
+    crate::line_col(source, byte_offset)
 }
 
 #[cfg(test)]

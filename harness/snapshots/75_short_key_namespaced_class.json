@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/75_short_key_namespaced_class.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `totally_bogus_name' for singleton(DidYouMean)"
+    }
+  ]
+}

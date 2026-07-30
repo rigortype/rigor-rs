@@ -456,6 +456,30 @@ pub enum Node {
         /// A non-self receiver (`def obj.x`) leaves this `None` (a per-object
         /// singleton, out of scope).
         singleton_name: Option<String>,
+        /// The method name for a def with a NON-`self` explicit receiver
+        /// (`def IO.console_size` -> `Some("console_size")`), else `None`.
+        /// Complementary to `singleton_name` (which covers `def self.x` only),
+        /// and kept out of `name` for the same reason it is: this is never an
+        /// instance method, so the tier-4b harvest must not see it.
+        ///
+        /// Read by the toplevel-def registry: the reference records a def whose
+        /// LEXICAL PREFIX is empty under its `<toplevel>` key unless the receiver
+        /// is `self` (or names the enclosing class, which an empty prefix makes
+        /// impossible), so a toplevel `def Foo.bar` resolves a later bare `bar`
+        /// there — and `call.unresolved-toplevel` must match.
+        receiver_def_name: Option<String>,
+        /// The span of the method's PARAMETER LIST (Prism `DefNode#parameters`),
+        /// or `None` when the def takes no parameters.
+        ///
+        /// Parameter DEFAULT-VALUE expressions are lowered as arena nodes (so the
+        /// call rules reach a `def f(t = Time.current)`), which puts any write
+        /// inside a default — `def in_range(start, limit = (not_set = true))` —
+        /// inside the def's span. The reference's `DeadAssignmentCollector`
+        /// gathers writes from `def_node.body` ONLY, so a default's write is not
+        /// a dead-assignment candidate there; this span is how the span-scanning
+        /// port excludes the same region (rigor-survey
+        /// `rspec-benchmark-0.6.0/lib/rspec/benchmark/complexity_matcher.rb:50`).
+        param_span: Option<Span>,
         has_explicit_return: bool,
         /// The method's PLAIN-POSITIONAL param names in order, or `None` to
         /// decline tier-4b param binding (splat/post/kwargs/block/optional
@@ -1192,10 +1216,17 @@ impl<'src> Builder<'src> {
                 .receiver()
                 .filter(|r| r.as_self_node().is_some())
                 .map(|_| constant_string(def.name().as_slice()));
+            // The mirror for a NON-self receiver (`def IO.console_size`).
+            let receiver_def_name = def
+                .receiver()
+                .filter(|r| r.as_self_node().is_none())
+                .map(|_| constant_string(def.name().as_slice()));
             return self.push(Node::Definition {
                 name,
                 is_singleton_class: false,
                 singleton_name,
+                receiver_def_name,
+                param_span: def.parameters().as_ref().map(|p| span_of(&p.location())),
                 has_explicit_return,
                 params,
                 param_shape,
@@ -1284,6 +1315,8 @@ impl<'src> Builder<'src> {
                 name: None, // `class << self` has no single method name.
                 is_singleton_class: true, // a CLASS scope, not a method def.
                 singleton_name: None, // the BODY's inner defs are the singletons.
+                receiver_def_name: None,
+                param_span: None,
                 has_explicit_return: false,
                 params: None,    // no single method ⇒ no param binding.
                 param_shape: ParamShape::default(),

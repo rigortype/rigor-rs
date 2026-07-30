@@ -584,6 +584,16 @@ impl CoreData {
             }
         }
 
+        // 3) The rigor-owned overlay tree (`<root>/overlay/**`), loaded LAST for
+        //    the same reason the embedded path loads it last: it only fills holes
+        //    upstream RBS leaves, so upstream must win on any conflict. Keeping
+        //    the override seam in step with the embedded default is what stops a
+        //    `RIGOR_RBS_CORE_DIR` refresh from silently re-opening the
+        //    `DidYouMean.formatter` class of false positive.
+        if let Some(root) = dir.parent() {
+            ingest_rbs_dir(builder, &root.join("overlay"));
+        }
+
         // "Usable" means the core dir yielded at least one class. The builder may
         // already hold classes from a prior fold, but the override is only ever
         // ingested into a FRESH builder, so non-empty ⇒ this dir parsed.
@@ -2759,9 +2769,23 @@ fn ingest_rbs_source(builder: &mut Builder, _name: &str, contents: &str) {
 /// set is the whole `core/` ⊕ the `DEFAULT_LIBRARIES` stdlib closure already
 /// resolved at vendoring time, so no `manifest.yaml` walk is needed here.
 fn ingest_embedded(builder: &mut Builder) {
-    for (name, contents) in EMBEDDED_RBS {
+    // Upstream rbs (`core/`, `stdlib/`) first, the rigor-owned overlay LAST —
+    // the reference's own load order (`rbs_loader.rb` adds `vendored_gem_sigs/`
+    // then `core_overlay/` after the upstream set) so an upstream declaration
+    // always wins on conflict. The sorted embed order would otherwise interleave
+    // `overlay/` between `core/` and `stdlib/`.
+    for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| !is_overlay(n)) {
         ingest_rbs_source(builder, name, contents);
     }
+    for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)) {
+        ingest_rbs_source(builder, name, contents);
+    }
+}
+
+/// Whether an embedded entry belongs to the rigor-owned overlay tree
+/// (`vendor/rbs/overlay/…`) rather than the upstream rbs gem's `core`/`stdlib`.
+fn is_overlay(rel_path: &str) -> bool {
+    rel_path.starts_with("overlay/")
 }
 
 /// Parse the `dependencies:` list out of an RBS stdlib `manifest.yaml`, returning
@@ -3264,6 +3288,34 @@ mod embedded_tests {
         // Method existence parity for a known method, and absence for a typo.
         assert!(idx.class_has_method("String", "upcase"));
         assert!(!idx.class_has_method("String", "lenght"));
+    }
+
+    /// The rigor-owned `overlay/` tree is embedded and ingested — the
+    /// reference's `data/vendored_gem_sigs/` and `data/core_overlay/`, which it
+    /// loads in EVERY run. Without them rigor-rs's surface is strictly weaker
+    /// than the oracle's and reports methods the oracle resolves — measured on
+    /// rigor-survey as `::DidYouMean.formatter`.
+    #[test]
+    fn embedded_overlay_is_loaded() {
+        assert!(
+            EMBEDDED_RBS.iter().any(|(p, _)| p.starts_with("overlay/")),
+            "overlay tree not embedded"
+        );
+        let idx = CoreData::load();
+        // `data/vendored_gem_sigs/did_you_mean/did_you_mean_extras.rbs` — the
+        // upstream rbs `stdlib/did_you_mean` declares neither.
+        assert!(idx.class_has_singleton_method("DidYouMean", "formatter"));
+        assert!(idx.class_has_singleton_method("DidYouMean", "correct_error"));
+        // A genuine typo on the same module still witnesses absent.
+        assert!(!idx.class_has_singleton_method("DidYouMean", "totally_bogus_name"));
+        // `prism` is deliberately NOT copied: its file supplements the prism
+        // gem's own sig/, which this tree does not vendor, so loading it alone
+        // would declare `module Prism` WITHOUT `Prism.parse` and witness a false
+        // absence there. See vendor/rbs/PROVENANCE.md.
+        assert!(
+            !EMBEDDED_RBS.iter().any(|(p, _)| p.contains("overlay/vendored_gem_sigs/prism")),
+            "prism supplement must stay out of the overlay"
+        );
     }
 
     /// Step 1 (nilable-RBS-return): an `Optional` return (`String?`) is

@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/74_core_class_reopen.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"a\""
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 73,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `rigor_self_only`. If a project file defines `rigor_self_only` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

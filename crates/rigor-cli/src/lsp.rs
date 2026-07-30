@@ -784,7 +784,16 @@ fn harvest_one(path: &str) -> Option<LoweredAst> {
     if rigor_parse::looks_like_erb_template(&source) {
         return None;
     }
-    panic::catch_unwind(AssertUnwindSafe(|| lower(&parse(&source)))).ok()
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        let result = parse(&source);
+        // A file with parse errors contributes nothing to the index, the same
+        // answer `check` gives it (`main.rs` stage 1) and the reference's
+        // dependency walker gives it: Prism's recovery invents bindings, so
+        // indexing the wreckage is worse than not indexing the file.
+        (result.errors().next().is_none()).then(|| lower(&result))
+    }))
+    .ok()
+    .flatten()
 }
 
 /// The tier-1 `CoreIndex`, built EXACTLY as `check`'s `analyze_files` builds it
@@ -2187,6 +2196,16 @@ fn compute_diagnostics(
     }
     let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
         let result = parse(&bytes);
+        // A buffer Prism could not parse gets no semantic diagnostics, matching
+        // `check` (`main.rs` stage 1) and the reference, which returns its parse
+        // diagnostics without ever reaching the typing pass. Mid-keystroke the
+        // buffer is routinely unparseable; running the rules over Prism's
+        // recovered AST publishes invented findings that vanish on the next
+        // keystroke. `None` here clears the file's diagnostics, as `didClose`
+        // and the ERB skip above already do.
+        if result.errors().next().is_some() {
+            return None;
+        }
         let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
         let (source, overlay_build) =
@@ -2212,12 +2231,12 @@ fn compute_diagnostics(
                 &source,
             ));
         }
-        (diags, comments, overlay_build)
+        Some((diags, comments, overlay_build))
     }));
 
     let (mut diags, comments, overlay_build) = match analysed {
-        Ok(triple) => triple,
-        Err(_) => return (Vec::new(), None),
+        Ok(Some(triple)) => triple,
+        Ok(None) | Err(_) => return (Vec::new(), None),
     };
     // Suppression-marker surveillance, before `filter_suppressed` (self-suppressible).
     diags.extend(rigor_rules::suppression_marker_diagnostics(&comments));
