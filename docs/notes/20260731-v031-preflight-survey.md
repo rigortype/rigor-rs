@@ -1,5 +1,11 @@
 # v0.3.1 pre-flight survey — what the next pin costs (2026-07-31)
 
+> **Superseded by the arc itself**
+> ([`20260731-upstream-pin-v031-rbs41.md`](20260731-upstream-pin-v031-rbs41.md)),
+> which landed the bump and corrects one method flaw below: the Axis-C mirror
+> omitted `overlay/`, so its class count (539) was not comparable to the
+> embedded set's (660). The finding held; the measurement was confounded.
+
 `UPSTREAM.md` gates `v0.3.1` on the vendored-RBS bump (upstream follows
 rbs 4.1.0; the port vendors rbs-4.0.3). This is the measurement that sizes that
 arc **before** committing to it. Nothing here is landed — the pin stays on

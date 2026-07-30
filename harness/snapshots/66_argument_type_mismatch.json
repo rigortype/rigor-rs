@@ -20,7 +20,7 @@
       "line": 20,
       "column": 17,
       "severity": "error",
-      "message": "argument type mismatch at `fetch' on Array: expected int, got \"x\""
+      "message": "argument type mismatch at `fetch' on Array: expected int | _ToInt, got \"x\""
     },
     {
       "rule": "call.argument-type-mismatch",

@@ -6260,8 +6260,11 @@ mod tests {
 
     #[test]
     fn atm_nonnil_channel_multi_overload_fires_on_wrong_class() {
-        // `[1, 2, 3].fetch("x")` — Array#fetch index param `int`; a concrete
-        // String argument is rejected by every overload (non-coerce method).
+        // `[1, 2, 3].fetch("x")` — Array#fetch index params reject a concrete
+        // String on every overload (non-coerce method). Since rbs 4.1 the block
+        // overload spells its index as a BOUNDED type parameter (`[I < _ToInt,
+        // T] (I index)`), so the label carries the bound alongside the plain
+        // `int` of the other two — byte-parity with the oracle.
         let src = b"[1, 2, 3].fetch(\"x\")\n";
         let d = atm_diags(src);
         assert_eq!(d.len(), 1, "{d:?}");
@@ -6269,7 +6272,7 @@ mod tests {
         assert_eq!(d[0].receiver_type.as_deref(), Some("Array"));
         assert_eq!(
             d[0].message,
-            "argument type mismatch at `fetch' on Array: expected int, got \"x\""
+            "argument type mismatch at `fetch' on Array: expected int | _ToInt, got \"x\""
         );
     }
 

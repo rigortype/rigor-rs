@@ -212,13 +212,26 @@ pub struct OverloadSignature {
     pub has_trailing_positionals: bool,
 }
 
-/// Sentinel stored in [`ClassEntry::block_returns`] for a block overload whose
-/// RBS return type is `self` (e.g. `Array#each { } -> self`, `Kernel#tap { } ->
-/// self`). At lookup time it resolves to the RECEIVER's own class name (the
-/// value `method_return_with_block` was queried with), so `x.tap { } : x` and
-/// `arr.each { } : arr`. A distinct value (not a real class name) so it can
-/// never collide with an actual `ClassInstanceType` return.
+/// Sentinel for a return type that is only knowable at the CALL SITE: a block
+/// overload declaring `self` (`Array#each { } -> self`, `Kernel#tap { } ->
+/// self`, stored in [`ClassEntry::block_returns`]) or an instance method
+/// declaring `instance` (`Hash#compact: () -> instance` since rbs 4.1, stored in
+/// [`ClassEntry::methods`]). At lookup time it resolves to the RECEIVER's own
+/// class name — the value the accessor was queried with — so `x.tap { } : x`,
+/// `arr.each { } : arr` and `h.compact : h`'s class. Resolving to the RECEIVER
+/// rather than the declaring class is what makes it right under inheritance:
+/// `my_hash.compact` is a `MyHash`, not a `Hash`. A distinct value (not a real
+/// class name) so it can never collide with an actual `ClassInstanceType`
+/// return.
 const SELF_RETURN: &str = "\0self";
+
+/// Drop a [`SELF_RETURN`] sentinel to `None` (⇒ Dynamic) for a lookup whose
+/// receiver the flat return slot cannot name — the singleton paths that read an
+/// INSTANCE method's return through an `extend` or a base class. Declining is
+/// always sound; the sentinel must never escape as a class name.
+fn drop_call_site_return(ret: Option<&'static str>) -> Option<&'static str> {
+    ret.filter(|r| *r != SELF_RETURN)
+}
 
 /// The closed set of class names whose instance type admits a `nil` argument —
 /// a faithful copy of the reference `NIL_COMPATIBLE_CLASS_NAMES`
@@ -1115,7 +1128,24 @@ impl CoreData {
     /// return is not a known concrete class (or the method is unknown).
     pub fn method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
         let (chain, _) = self.ancestors(class_name);
-        self.lookup_on_chain(&chain, method).and_then(|(ret, _, _)| ret)
+        let ret = self.lookup_on_chain(&chain, method).and_then(|(ret, _, _)| ret);
+        self.resolve_call_site_return(ret, class_name)
+    }
+
+    /// Resolve the [`SELF_RETURN`] sentinel against the class the lookup was
+    /// QUERIED with (the receiver), yielding that class's interned key so the
+    /// result round-trips to a Nominal the rules can witness against. A receiver
+    /// the index does not model resolves to `None` (⇒ Dynamic), never to the
+    /// sentinel string itself. Every other return passes through untouched.
+    fn resolve_call_site_return(
+        &self,
+        ret: Option<&'static str>,
+        receiver: &str,
+    ) -> Option<&'static str> {
+        match ret {
+            Some(r) if r == SELF_RETURN => self.classes.get_key_value(receiver).map(|(&k, _)| k),
+            other => other,
+        }
     }
 
     /// The structured TUPLE return of `class_name#method` — the descriptor
@@ -1289,7 +1319,9 @@ impl CoreData {
     ) -> Option<(&'static str, bool)> {
         let (chain, _) = self.ancestors(class_name);
         self.lookup_on_chain(&chain, method)
-            .and_then(|(ret, _, nilable)| ret.map(|c| (c, nilable)))
+            .and_then(|(ret, _, nilable)| {
+                self.resolve_call_site_return(ret, class_name).map(|c| (c, nilable))
+            })
     }
 
     /// Resolve the RETURN class of `class_name#method` **when called with a
@@ -1655,7 +1687,7 @@ impl CoreData {
         }
         let (chain, complete) = self.ancestors(class);
         match self.lookup_on_chain(&chain, method) {
-            Some((ret, _, _)) => Some(ret),
+            Some((ret, _, _)) => Some(self.resolve_call_site_return(ret, class)),
             None if complete => None,
             None => Some(None),
         }
@@ -1738,7 +1770,12 @@ impl CoreData {
                     if self.classes.contains_key(module) {
                         let (mod_chain, _) = self.ancestors(module);
                         if let Some((ret, _, _)) = self.lookup_on_chain(&mod_chain, method) {
-                            return (ret, true, complete);
+                            // A call-site `instance` return means "an instance
+                            // of the receiver" — through an `extend`, the
+                            // receiver is the class OBJECT, which this flat slot
+                            // cannot spell. Decline to Dynamic rather than
+                            // guess.
+                            return (drop_call_site_return(ret), true, complete);
                         }
                     }
                 }
@@ -1769,7 +1806,9 @@ impl CoreData {
             }
             let (chain, _) = self.ancestors(base);
             if let Some((ret, _, _)) = self.lookup_on_chain(&chain, method) {
-                return (ret, true, loaded);
+                // Same as the `extend` path: the receiver here is a class
+                // object, so a call-site `instance` return declines.
+                return (drop_call_site_return(ret), true, loaded);
             }
         }
         (None, false, loaded)
@@ -2264,7 +2303,7 @@ impl Builder {
         let Some(name) = type_name_str(&ta.name()) else {
             return;
         };
-        let rhs = retained_param_type(&ta.type_(), code);
+        let rhs = retained_param_type(&ta.type_(), code, &[]);
         self.type_alias_defs.entry(name).or_insert(rhs);
     }
 
@@ -2388,7 +2427,19 @@ impl Builder {
                         if let Some(shapes) = tuple_ret.clone() {
                             entry.tuple_returns.entry(mname).or_insert(shapes);
                         }
-                        entry.methods.entry(mname).or_insert((ret, arity, nilable));
+                        // `-> instance` on an INSTANCE method means "an instance
+                        // of the receiver's class" (rbs 4.1 rewrote several core
+                        // returns this way, e.g. `Hash#compact: () -> ::Hash[K,
+                        // V]` became `() -> instance`). The declaring class is
+                        // the wrong answer under inheritance, so it rides the
+                        // call-site sentinel like a `self` block return. The
+                        // singleton path keeps its own `ret_instance` flag.
+                        let instance_ret = if ret.is_none() && ret_instance {
+                            Some(SELF_RETURN)
+                        } else {
+                            ret
+                        };
+                        entry.methods.entry(mname).or_insert((instance_ret, arity, nilable));
                         if let Some(br) = block_ret {
                             entry.block_returns.entry(mname).or_insert(br);
                         }
@@ -3080,15 +3131,25 @@ fn method_overloads(
         let Node::FunctionType(ft) = mt.type_() else {
             continue;
         };
+        // A method type may bind its own type parameters, and rbs 4.1 started
+        // using BOUNDED ones in core signatures (`def fetch: … | [I < _ToInt,
+        // T] (I index) { (I index) -> T } -> (E | T)`). A bare variable is an
+        // opaque `Other` leaf, which the acceptance walk admits — so the whole
+        // overload would accept any argument and silence the mismatch every
+        // other overload reports. The declared upper bound IS the constraint
+        // (the reference renders exactly it: `expected int | _ToInt`), so a
+        // bounded variable resolves to its bound. An UNbounded variable stays
+        // opaque — genuinely unconstrained, genuinely admits everything.
+        let bounds = method_type_param_bounds(&mt, code);
         let required_positionals = ft
             .required_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code))
+            .map(|p| param_node_type(&p, code, &bounds))
             .collect();
         let optional_positionals = ft
             .optional_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code))
+            .map(|p| param_node_type(&p, code, &bounds))
             .collect();
         let required_positional_names = ft
             .required_positionals()
@@ -3115,11 +3176,44 @@ fn method_overloads(
     out
 }
 
+/// The upper bounds a method type declares for its own type parameters, as
+/// `(variable name, bound)` pairs — `[I < _ToInt, T]` yields one entry for `I`
+/// and none for `T`. A `Vec` rather than a map: a method type binds a handful of
+/// parameters at most, so a linear scan beats hashing.
+type TypeParamBounds = [(&'static str, RetainedParamType)];
+
+/// Collect the bounded type parameters of one method type (see the call site in
+/// [`method_overloads`]). Unbounded parameters are omitted entirely, so a lookup
+/// miss means "genuinely unconstrained".
+fn method_type_param_bounds(
+    mt: &ruby_rbs::node::MethodTypeNode,
+    code: &str,
+) -> Vec<(&'static str, RetainedParamType)> {
+    mt.type_params()
+        .iter()
+        .filter_map(|tp| {
+            let Node::TypeParam(p) = tp else {
+                return None;
+            };
+            let bound = p.upper_bound()?;
+            let sym = p.name();
+            let name = sym.as_str();
+            if name.is_empty() {
+                return None;
+            }
+            // The bound is resolved with NO bounds in scope: a bound that
+            // itself mentions a sibling variable is not a shape rbs core uses,
+            // and resolving it would need fixpoint ordering for no gain.
+            Some((intern(name), retained_param_type(&bound, code, &[])))
+        })
+        .collect()
+}
+
 /// Resolve a positional-parameter node (`RBS::Types::Function::Param`, whose
 /// `.type_()` is the parameter's type) into a one-level [`RetainedParamType`].
-fn param_node_type(param: &Node, code: &str) -> RetainedParamType {
+fn param_node_type(param: &Node, code: &str, bounds: &TypeParamBounds) -> RetainedParamType {
     match param {
-        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code),
+        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, bounds),
         // Defensive: a positional that isn't a FunctionParam node (shouldn't
         // occur) is retained verbatim as an `Other` leaf.
         other => RetainedParamType::Other(node_written_form(other, code)),
@@ -3142,8 +3236,19 @@ fn param_node_name(param: &Node) -> Option<&'static str> {
 /// other shape collapses to [`RetainedParamType::Other`] carrying the verbatim
 /// written form sliced from `code`. Only `Union`/`Optional` recurse (they are
 /// meaningless as opaque leaves); a `ClassInstance` drops its type arguments.
-fn retained_param_type(node: &Node, code: &str) -> RetainedParamType {
+///
+/// `bounds` carries the enclosing method type's bounded type parameters: a
+/// variable listed there resolves to its upper bound instead of collapsing to an
+/// (admit-everything) `Other` leaf.
+fn retained_param_type(node: &Node, code: &str, bounds: &TypeParamBounds) -> RetainedParamType {
     match node {
+        Node::VariableType(v) => {
+            let name = v.name();
+            match bounds.iter().find(|(n, _)| *n == name.as_str()) {
+                Some((_, bound)) => bound.clone(),
+                None => RetainedParamType::Other(node_written_form(node, code)),
+            }
+        }
         Node::ClassInstanceType(ci) => match type_name_str(&ci.name()) {
             Some(name) => RetainedParamType::ClassInstance(name),
             None => RetainedParamType::Other(node_written_form(node, code)),
@@ -3157,11 +3262,13 @@ fn retained_param_type(node: &Node, code: &str) -> RetainedParamType {
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::UnionType(u) => RetainedParamType::Union(
-            u.types().iter().map(|t| retained_param_type(&t, code)).collect(),
+            u.types().iter().map(|t| retained_param_type(&t, code, bounds)).collect(),
         ),
-        Node::OptionalType(o) => {
-            RetainedParamType::Optional(Box::new(retained_param_type(&o.type_(), code)))
-        }
+        Node::OptionalType(o) => RetainedParamType::Optional(Box::new(retained_param_type(
+            &o.type_(),
+            code,
+            bounds,
+        ))),
         other => RetainedParamType::Other(node_written_form(other, code)),
     }
 }
@@ -3347,6 +3454,50 @@ mod embedded_tests {
         // The existing non-nil accessors are unchanged by the new bit.
         assert_eq!(idx.method_return("String", "upcase"), Some("String"));
         assert_eq!(idx.method_return("String", "byteslice"), Some("String"));
+    }
+
+    /// rbs 4.1 rewrote several core returns from a spelled-out generic to the
+    /// late-bound `instance` (`Hash#compact: () -> ::Hash[K, V]` became `() ->
+    /// instance`). On an INSTANCE method that means "an instance of the
+    /// receiver's class", so the return must still resolve to a concrete class —
+    /// otherwise a chained call (`h.compact.presence`) types Dynamic and every
+    /// rule that rides the receiver type goes silent.
+    #[test]
+    fn instance_return_resolves_to_the_receiver_class() {
+        let idx = CoreData::load();
+        assert_eq!(
+            idx.method_return("Hash", "compact"),
+            Some("Hash"),
+            "`-> instance` on Hash#compact must resolve to the receiver class"
+        );
+        // The sentinel must never escape as a class name, on any accessor.
+        assert_eq!(idx.method_return_nilable("Hash", "compact"), Some(("Hash", false)));
+        assert_eq!(idx.declared_instance_return("Hash", "compact"), Some(Some("Hash")));
+        // A receiver the index does not model declines to None (⇒ Dynamic).
+        assert_eq!(idx.method_return("NoSuchClassZzz", "compact"), None);
+    }
+
+    /// rbs 4.1 also started using BOUNDED method type parameters in core
+    /// signatures (`Array#fetch`'s block overload spells its index `[I < _ToInt,
+    /// T] (I index)`). A bare variable is an opaque `Other` leaf that admits
+    /// every argument, which would silence the mismatch the other overloads
+    /// report — so a bounded variable must resolve to its declared bound.
+    #[test]
+    fn bounded_method_type_param_resolves_to_its_upper_bound() {
+        let idx = CoreData::load();
+        let overloads = idx.method_overloads("Array", "fetch").expect("Array#fetch");
+        let params: Vec<&RetainedParamType> = overloads
+            .iter()
+            .filter_map(|o| o.required_positionals.first())
+            .collect();
+        assert!(
+            params.iter().any(|p| matches!(p, RetainedParamType::Interface("_ToInt"))),
+            "the bounded `I < _ToInt` index param must carry its bound: {params:?}"
+        );
+        assert!(
+            !params.iter().any(|p| matches!(p, RetainedParamType::Other(s) if s == "I")),
+            "no overload may keep the bare variable as an admit-everything leaf: {params:?}"
+        );
     }
 
     /// ADR-0033: an empty `sig_dirs` is byte-identical to `load_with_plugins`

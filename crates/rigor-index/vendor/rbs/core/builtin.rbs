@@ -170,20 +170,20 @@ interface _Inspect
   def inspect: () -> String
 end
 
-interface _Each[out E, out R = void]
-  def each: () { (E) -> void } -> R
+interface _Each[out T, out R = void]
+  def each: () { (T) -> void } -> R
 end
 
-interface _EachEntry[out E]
-  def each_entry: () { (E) -> void } -> self
+interface _EachEntry[out T]
+  def each_entry: () { (T) -> void } -> self
 end
 
 interface _Reader
-  def read: (?int? length, ?string outbuf) -> String?
+  def read: (?int? length, ?string? outbuf) -> String?
 end
 
 interface _ReaderPartial
-  def readpartial: (int maxlen, ?string outbuf) -> String
+  def readpartial: (int maxlen, ?string? outbuf) -> String
 end
 
 interface _Writer
@@ -225,6 +225,7 @@ type int = Integer | _ToInt
 
 # Represents a `Float`, or a type convertible to it (via `.to_f`).
 #
+%a{deprecated: Use `_ToF` directly}
 type float = Float | _ToF
 
 # Represents a `Range[T]`, or a type that acts like it (via `.begin`, `.end`, and `.exclude_end?`).
