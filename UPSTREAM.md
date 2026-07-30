@@ -15,18 +15,24 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **v0.3.0 release candidate** (post-`v0.2.9` master; `--version` still prints 0.2.9) |
-| Commit | `7a69f142` (Merge PR #188) |
+| **Pinned ref** | **`v0.3.0`** (tag, released 2026-07-19) |
+| Commit | `5802c990` (Merge PR #206) |
 
-> The pin is a **commit, not a tag**: upstream is at the v0.3.0
-> release-candidate stage and the port tracks the RC's gap set ahead of the
-> tag. Re-pin to the real `v0.3.0` tag when it lands. Previous pin: `47ec8625`
-> (Merge PR #109); the `47ec8625 → 7a69f142` bump (80 commits) landed two new
-> parity divergences — `suppression.unknown-marker` (a new rule) and the Kernel
-> intrinsic explicit-`Kernel.`-receiver fold — both closed with 0 FP; the rest
-> of the RC's inference precision (void→top, `(?)` return, `Array#join` /
-> `Data.define` / `Struct` folds, regex-match narrowing) only widens coverage
-> gaps (reference-only), which stay FP-safe and shrink as the port progresses.
+> Previous pin: `7a69f142` (the v0.3.0 RC). The `7a69f142 → v0.3.0` bump
+> (42 commits, 2026-07-31) is **behaviour-neutral in every shipped profile**:
+> snapshots byte-identical, 0 FP, 0 regressions, and the only measured delta on
+> ~9200 corpus files is 4 reference-only diagnostics traced by bisect to
+> `861b08b9` (ADR-93 auto-wire of `rigor-rbs-inline` — inline `#:` annotations
+> are now read by default, so the port's inline-RBS deferral
+> [ADR-0035](docs/adr/0035-inline-rbs-deferred.md) becomes measurable as
+> coverage gaps). The RC's own inference additions stay off by default:
+> `parameter_inference:` (ADR-67 WD6) is opt-in, `static.value-use.void` is
+> bleeding-edge. [note](docs/notes/20260731-upstream-bump-7a69f142-v030.md).
+
+> **Do not bump to `v0.3.1` alone.** `v0.3.1` follows **rbs 4.1.0** (core
+> signature rewrite + in-object hash cache); the vendored RBS below is
+> **4.0.3**, which matches `v0.3.0` exactly. Following `v0.3.1` means bumping
+> the vendored RBS in the same arc.
 
 The differential harness (`harness/run.rb`, `harness/snapshot.rb`) defaults
 `REFERENCE_RIGOR_DIR` to this submodule (`harness/lib.rb`). The reference-free
@@ -36,15 +42,15 @@ from this exact reference version.
 
 Note: the vendored RBS (`crates/rigor-index/vendor/rbs`, **rbs-4.0.3**) is pinned
 **independently** of the reference tag — see its `PROVENANCE.md`. The reference
-bundles rbs-4.0.3 from `v0.2.7` through the current v0.3.0-RC pin, so the two
-pins match exactly.
+bundles rbs-4.0.3 from `v0.2.7` through the current `v0.3.0` pin, so the two
+pins match exactly. (`v0.3.1` moves upstream to rbs-4.1.0 — see the pin table.)
 
 ## First-time setup
 
 ```sh
 git submodule update --init reference/rigor
 # The reference is plain Ruby run in place — no build step:
-ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.2.9 (v0.3.0 RC)
+ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.3.0
 ```
 
 ## Oracle invocation hazard: stale-gem plugin hijack (issue rigortype/rigor#194)
@@ -62,8 +68,9 @@ ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
   reference/rigor/exe/rigor check <path>
 ```
 
-`harness/lib.rb` and `harness/fp_audit.py` do this unconditionally (harmless at
-pre-auto-wire pins). Ad-hoc probes must too.
+`harness/lib.rb` and `harness/fp_audit.py` do this unconditionally. Ad-hoc
+probes must too — and since the `v0.3.0` pin is **post-**auto-wire, this is now
+load-bearing rather than defensive.
 
 ## Oracle invocation hazard 2: cross-checkout result-cache hits
 
