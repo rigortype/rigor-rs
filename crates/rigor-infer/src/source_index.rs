@@ -240,6 +240,46 @@ pub struct SourceIndex {
     /// lookup, matching the reference's `lexical_constant_candidates`. Elsewhere
     /// the read RELAXES so the core-RBS singleton is witnessed (the C1 fix).
     nested_constant_namespaces: HashMap<String, Vec<Vec<String>>>,
+    /// PROJECT-WIDE `qualified class/module name -> instance-method names the
+    /// project itself declares on it`, harvested from EVERY receiver-less `def`
+    /// lexically inside the body — including one nested in a block or a
+    /// conditional (`rake_extension("ext") { def ext; end }`, `if
+    /// defined?(X); def call; end; else; def call; end; end`).
+    ///
+    /// This is the port of the reference's `Scope#discovered_method?` gate, which
+    /// `undefined_method_diagnostic` consults BEFORE it reaches the RBS surface:
+    /// a project reopening of a CORE class contributes methods RBS cannot know
+    /// about, and witnessing their absence against RBS alone is a false positive
+    /// (rigor-survey `rake-13.4.2/lib/rake/ext/string.rb` — `class String` gains
+    /// `#ext` / `#pathmap_explode` and both were reported undefined).
+    ///
+    /// Deliberately SEPARATE from `classes[..].methods` (direct children only,
+    /// which mirrors the reference's `direct_method_names` and feeds the source
+    /// chain walk and tier-4b harvest): this map is a pure SILENCER — it is only
+    /// ever read to suppress, never to witness absence — so widening it to nested
+    /// defs cannot manufacture a diagnostic.
+    discovered_methods: HashMap<String, HashSet<String>>,
+    /// PROJECT-WIDE `method name -> the POSITIONAL PARAMETER INDICES its body
+    /// mutates in place`. A parameter is "mutated" when the body calls a
+    /// [`crate::MUTATOR_METHODS`] method on a bare read of it (`def fill(a); a <<
+    /// 1; end` records `fill -> {0}`).
+    ///
+    /// The caller-side half of `MutationWidening`: the reference widens a
+    /// value-pinned local passed as an ARGUMENT to a method that mutates the
+    /// matching parameter, and only then. Probed against the oracle: `def
+    /// m(x, a); a << 1; end` widens `m(5, xs)` but NOT `m(xs, 5)`; a mutator on
+    /// a DIFFERENT local inside the callee widens nothing; an unresolved callee
+    /// widens nothing. Without it, `xs = []; fill xs; if xs.length == 1` folded
+    /// to a constant and fired `flow.always-truthy-condition` (rigor-survey
+    /// `rspec-core-3.13.6/lib/rspec/core/world.rb:179`, where
+    /// `announce_inclusion_filter` shovels into the array it is handed).
+    ///
+    /// Keyed by NAME alone, cross-file, with no owner resolution: widening only
+    /// FORGETS a fact, so over-widening costs coverage and can never add a
+    /// diagnostic. Only defs whose parameter list is plain-positional
+    /// (`MethodBody::params`) contribute — a splat/kwarg signature has no stable
+    /// index-to-name map, so it records nothing.
+    mutated_params: HashMap<String, HashSet<usize>>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
@@ -359,12 +399,91 @@ impl SourceIndex {
                     {
                         idx.toplevel_defs.insert(nm.clone());
                     }
+                    // A TOPLEVEL receiver-bearing `def Foo.bar` registers `bar`
+                    // as a toplevel name too. That is not Ruby's runtime
+                    // semantics — `bar` is on `Foo`'s singleton — but it is the
+                    // reference's: `ScopeIndexer#record_def_node` keys a def
+                    // under `<toplevel>` whenever its lexical prefix is empty,
+                    // and `def_singleton?` excludes only a `self` receiver and a
+                    // receiver naming the lexically enclosing class (impossible
+                    // with an empty prefix). Parity is the contract, so rigor-rs
+                    // matches it: rigor-survey `io-console-0.8.2`'s `size.rb`
+                    // calls `default_console_size` from inside `def
+                    // IO.console_size`, where the reference is silent.
+                    // `def self.x` at toplevel is NOT registered (the reference
+                    // excludes it, and so does this arm — a self receiver leaves
+                    // `receiver_def_name` `None`, see the lowering).
+                    Node::Definition { receiver_def_name: Some(nm), span, .. }
+                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
+                    {
+                        idx.toplevel_defs.insert(nm.clone());
+                    }
                     Node::ClassDef { name, methods, .. } | Node::ModuleDef { name, methods, .. }
                         if matches!(name.as_str(), "Object" | "Kernel" | "BasicObject") =>
                     {
                         idx.toplevel_defs.extend(methods.iter().cloned());
                     }
                     _ => {}
+                }
+            }
+        }
+
+        // Pass 1d: the project's own instance-method declarations per QUALIFIED
+        // class/module (`discovered_methods`), the port of the reference's
+        // `Scope#discovered_method?` suppression gate. A def counts for the
+        // INNERMOST lexical class/module whose span contains it, so a def in a
+        // block or a conditional inside the body still lands on the right class
+        // and a def in a nested class does not leak to the outer one.
+        for ast in asts {
+            let scopes = lexical_scopes(ast);
+            for (_, node) in ast.iter() {
+                let Node::Definition { name: Some(nm), span, .. } = node else {
+                    continue;
+                };
+                let innermost = scopes
+                    .iter()
+                    .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
+                    .min_by_key(|(s, _)| s.1 - s.0);
+                if let Some((_, segs)) = innermost {
+                    idx.discovered_methods
+                        .entry(segs.join("::"))
+                        .or_default()
+                        .insert(nm.clone());
+                }
+            }
+        }
+
+        // Pass 1e: the caller-side half of `MutationWidening` — which positional
+        // parameter of each project method the method mutates in place. See
+        // `mutated_params`.
+        for ast in asts {
+            for (_, node) in ast.iter() {
+                let Node::Definition { params: Some(names), span, .. } = node else {
+                    continue;
+                };
+                if names.is_empty() {
+                    continue;
+                }
+                for (_, inner) in ast.iter() {
+                    let Node::Call { receiver: Some(r), method, span: cspan, .. } = inner else {
+                        continue;
+                    };
+                    if !(span.0 <= cspan.0 && cspan.1 <= span.1) {
+                        continue; // not inside this def.
+                    }
+                    if !crate::MUTATOR_METHODS.contains(&method.as_str()) {
+                        continue;
+                    }
+                    let Node::LocalVariableRead { name: recv_name, .. } = ast.get(*r) else {
+                        continue;
+                    };
+                    if let Some(i) = names.iter().position(|p| p == recv_name) {
+                        // The def's NAME: a receiver-bearing def carries it in
+                        // `receiver_def_name` / `singleton_name` instead.
+                        for key in def_names(node) {
+                            idx.mutated_params.entry(key).or_default().insert(i);
+                        }
+                    }
                 }
             }
         }
@@ -478,6 +597,23 @@ impl SourceIndex {
     /// Whether `name` is a PROJECT-WIDE toplevel method (a toplevel `def` in any
     /// analyzed file, or an in-source Object/Kernel/BasicObject reopen method) —
     /// the `call.unresolved-toplevel` cross-file suppression surface.
+    /// Whether the PROJECT declares instance method `method` on `class_name`
+    /// (qualified) with an in-source `def` — including a def nested in a block or
+    /// a conditional inside the class body. See [`Self::discovered_methods`].
+    ///
+    /// A pure SILENCER: `true` means "do not witness absence here". It is never
+    /// consulted to prove a method exists for any positive inference, so a false
+    /// `true` costs coverage, never correctness.
+    pub fn project_declares_method(&self, class_name: &str, method: &str) -> bool {
+        self.discovered_methods.get(class_name).is_some_and(|m| m.contains(method))
+    }
+
+    /// Whether SOME project method named `method` mutates its positional
+    /// parameter at `index` in place. See [`Self::mutated_params`].
+    pub fn method_mutates_param(&self, method: &str, index: usize) -> bool {
+        self.mutated_params.get(method).is_some_and(|s| s.contains(&index))
+    }
+
     pub fn is_toplevel_def(&self, name: &str) -> bool {
         self.toplevel_defs.contains(name)
     }
@@ -1478,6 +1614,18 @@ fn qualify(prefix: &[String], name: &str) -> String {
     }
 }
 
+/// Every name a `Definition` node is callable under: its instance name, or the
+/// method name of a `def self.x` / `def Recv.x` singleton. Empty for anything
+/// else (a `class << X` body).
+fn def_names(node: &Node) -> Vec<String> {
+    match node {
+        Node::Definition { name, singleton_name, receiver_def_name, .. } => {
+            [name, singleton_name, receiver_def_name].into_iter().flatten().cloned().collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
 /// Split a qualified name into its segment vector (`"A::B" -> ["A", "B"]`), used
 /// as the child lexical prefix when recursing into a class/module body.
 fn split_qualified(qualified: &str) -> Vec<String> {
@@ -1496,6 +1644,31 @@ pub fn lexical_scopes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Vec<String>)>
     let mut out = Vec::new();
     collect_lexical_scopes(ast, ast.root(), &[], &mut out);
     out
+}
+
+/// The span of every METHOD body in the file (`def x` / `def self.x`), excluding
+/// `class << X` bodies (which are class scopes, not method scopes).
+///
+/// A Ruby method body is an independent LOCAL scope: it never sees the enclosing
+/// file's locals. Prism already encodes that for a bare name — `s` inside a `def`
+/// lowers to a CALL, not a `LocalVariableRead`, when the def does not bind `s` —
+/// so the only reads that survive into a body are its own parameters and writes.
+/// The flat top-level env is keyed by NAME alone, though, so a parameter that
+/// happens to share a name with a top-level local (`s = 'a'` at file scope,
+/// `def go(s)` below it) used to read the top-level local's TYPE. That is what
+/// produced the `wrong-arity`/`undefined-method` FPs on rigor-survey
+/// `Ruby/data_structures/hash_table/anagram_checker.rb`.
+///
+/// Callers use these spans to withhold the top-level env from a use site inside
+/// a method body. Span-containment (not a structural walk) is orphan-proof — the
+/// same discipline as [`lexical_scopes`] and the dead-assignment collector.
+pub fn method_body_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+    ast.iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { is_singleton_class: false, span, .. } => Some(*span),
+            _ => None,
+        })
+        .collect()
 }
 
 fn collect_lexical_scopes(
@@ -2582,5 +2755,79 @@ mod tests {
         assert!(quals.contains(&seg(&["A", "B", "C"])));
         // Innermost scope has the narrowest span (nested last).
         assert_eq!(scopes.len(), 3);
+    }
+
+    #[test]
+    fn method_body_spans_are_method_defs_only() {
+        // Every `def` body (instance and singleton) contributes a span; a
+        // `class << self` body does not (it is a CLASS scope, not a method one).
+        let ast = lower_src(
+            b"class K\n  def a; 1; end\n  def self.b; 2; end\n  class << self\n    def c; 3; end\n  end\nend\n",
+        );
+        // `a`, `self.b`, and the `c` inside `class << self` = 3 method defs; the
+        // singleton-class body itself is excluded.
+        assert_eq!(method_body_spans(&ast).len(), 3);
+        assert!(method_body_spans(&lower_src(b"x = 1\n")).is_empty());
+    }
+
+    #[test]
+    fn project_declares_method_sees_nested_defs() {
+        // A reopened CORE class contributes methods RBS cannot know about, and a
+        // def nested in a block or a conditional counts — the reference's
+        // `Scope#discovered_method?` is keyed by qualified class over every def
+        // in the body, not just its direct children.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class String\n  def direct; 1; end\n  [1].each do\n    def in_block; 2; end\n  end\n  if true\n    def in_if; 3; end\n  end\nend\n",
+            &core,
+        );
+        assert!(idx.project_declares_method("String", "direct"));
+        assert!(idx.project_declares_method("String", "in_block"));
+        assert!(idx.project_declares_method("String", "in_if"));
+        assert!(!idx.project_declares_method("String", "never_defined"));
+        // Keyed by the QUALIFIED name — a nested class does not leak outward.
+        let (_b, idx2) = build_one(
+            b"module Outer\n  class Inner\n    def only_here; 1; end\n  end\nend\n",
+            &core,
+        );
+        assert!(idx2.project_declares_method("Outer::Inner", "only_here"));
+        assert!(!idx2.project_declares_method("Outer", "only_here"));
+        assert!(!idx2.project_declares_method("Inner", "only_here"));
+    }
+
+    #[test]
+    fn mutated_params_are_position_aware() {
+        // `def m(x, a); a << 1; end` records index 1 ONLY: passing a local at
+        // position 0 must not widen it (probed against the oracle).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(b"def m(x, a)\n  a << 1\nend\n", &core);
+        assert!(idx.method_mutates_param("m", 1));
+        assert!(!idx.method_mutates_param("m", 0));
+        // A mutator on a DIFFERENT local records nothing.
+        let (_b, idx2) = build_one(b"def n(a)\n  b = []\n  b << 1\n  a.size\nend\n", &core);
+        assert!(!idx2.method_mutates_param("n", 0));
+        // A non-mutating call on the param records nothing.
+        let (_c, idx3) = build_one(b"def p(a)\n  a.size\nend\n", &core);
+        assert!(!idx3.method_mutates_param("p", 0));
+        // An unknown method name is never mutating.
+        assert!(!idx.method_mutates_param("totally_unknown", 0));
+    }
+
+    #[test]
+    fn toplevel_defs_include_receiver_bearing_defs() {
+        // The reference keys a def with an EMPTY lexical prefix under its
+        // `<toplevel>` table unless the receiver is `self`, so `def IO.foo`
+        // resolves a later bare `foo` and `def self.bar` does not.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"def IO.recv_def; 1; end\ndef self.self_def; 2; end\ndef plain_def; 3; end\n",
+            &core,
+        );
+        assert!(idx.is_toplevel_def("recv_def"));
+        assert!(idx.is_toplevel_def("plain_def"));
+        assert!(!idx.is_toplevel_def("self_def"));
+        // Inside a class body the lexical prefix is non-empty ⇒ not toplevel.
+        let (_b, idx2) = build_one(b"class K\n  def self.klass_singleton; 1; end\nend\n", &core);
+        assert!(!idx2.is_toplevel_def("klass_singleton"));
     }
 }

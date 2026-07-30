@@ -182,9 +182,10 @@ fn decode_position<'a>(file: &'a str, line: &str, column: &str) -> Option<(&'a s
 // ---------------------------------------------------------------------------
 
 /// Resolve a 1-based `(line, column)` to a 0-based byte offset into `source`.
-/// The column is 1-based and counted in Unicode scalar values, the inverse of
-/// the presenter's [`crate::line_col`]-style mapping. An out-of-range line or
-/// column yields an `Err` with the reference's wording.
+/// The column is 1-based and counted in BYTES within the line — the inverse of
+/// [`crate::line_col`], and the same unit the reference's `NodeLocator` documents
+/// (`position_to_offset` there is literally `line_offset + (column - 1)`). An
+/// out-of-range line or column yields an `Err` with the reference's wording.
 pub(crate) fn position_to_offset(source: &str, line: usize, column: usize) -> Result<usize, String> {
     if line == 0 || column == 0 {
         return Err("line and column are 1-based".to_string());
@@ -212,17 +213,21 @@ pub(crate) fn position_to_offset(source: &str, line: usize, column: usize) -> Re
         .unwrap_or(source.len());
     let line_text = &source[line_start..line_end];
 
-    // Advance `column - 1` Unicode scalars into the line.
-    let mut col_offset = 0usize;
-    for (idx, _) in line_text.char_indices() {
-        if col_offset == column - 1 {
-            return Ok(line_start + idx);
+    // Advance `column - 1` BYTES into the line. A column that lands inside a
+    // multi-byte character is not a position any producer emits, so it is an
+    // error rather than a silent snap to a neighbouring boundary.
+    let col_offset = column - 1;
+    if col_offset < line_text.len() {
+        if !line_text.is_char_boundary(col_offset) {
+            return Err(format!(
+                "column {column} is inside a multi-byte character on line {line}"
+            ));
         }
-        col_offset += 1;
+        return Ok(line_start + col_offset);
     }
-    // Column at the line's end-of-text (one past the last char) is valid and
+    // Column at the line's end-of-text (one past the last byte) is valid and
     // points at the newline / EOF byte.
-    if column - 1 == col_offset {
+    if col_offset == line_text.len() {
         return Ok(line_end);
     }
     Err(format!(

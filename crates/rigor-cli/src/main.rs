@@ -722,11 +722,26 @@ fn analyze_files(
             let source_bytes = source.as_bytes().to_vec();
             let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
                 let result = parse(&source_bytes);
+                // A file Prism could not parse is analysed by NEITHER tool. The
+                // reference's `analyze_file_body` returns its parse diagnostics
+                // and never reaches `ScopeIndexer.index`, so every semantic rule
+                // is off for that file; Prism's error recovery invents bindings
+                // (`def f int a, int b` recovers as a body referencing a
+                // never-bound `b`) that the rules then over-fire on. Skipping
+                // the file entirely — index included, matching the reference's
+                // dependency walker — is the FP-safe match. rigor-rs emits no
+                // parse diagnostics of its own, so the file falls silent: a
+                // coverage gap against the reference's `rule: null` errors, not
+                // a false positive.
+                if result.errors().next().is_some() {
+                    return None;
+                }
                 let comments = rigor_parse::comment_lines(&result, &source_bytes);
-                (lower(&result), comments)
+                Some((lower(&result), comments))
             }));
             match lowered {
-                Ok((ast, comments)) => Stage1::Prepared(Prepared {
+                Ok(None) => Stage1::Excluded,
+                Ok(Some((ast, comments))) => Stage1::Prepared(Prepared {
                     order,
                     path: path.to_string(),
                     source,
@@ -1866,10 +1881,13 @@ fn push_kv_num(buf: &mut String, key: &str, value: usize) {
 // ---------------------------------------------------------------------------
 
 /// Compute 1-based (line, column) from a UTF-8 byte offset into `source`.
-/// Columns are counted in Unicode scalar values for the line, which matches the
-/// reference's column semantics closely enough for the tracer bullet.
-// TODO(spec): align column counting with the reference's exact unit (it adds 1
-// to Prism's 0-based byte/char column) once a parity fixture pins it.
+/// Columns are counted in BYTES within the line, which is the reference's unit:
+/// it reports `Prism::Location#start_column + 1`, and Prism's `start_column` is a
+/// byte index into the line (`reference/rigor/lib/rigor/source/node_locator.rb`
+/// documents the same convention for the inverse mapping). Counting Unicode
+/// scalars instead shifted every column right of a multi-byte character, which on
+/// real corpora reported the same diagnostic at a different column than the
+/// reference — a parity break on 8 of the 24 survey FP candidates.
 fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     if source.is_empty() {
         return (1, 1);
@@ -1886,9 +1904,8 @@ fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
             line_start = i + 1;
         }
     }
-    // Column = char count between the line start and the offset, plus 1.
-    let col = source[line_start..clamped].chars().count() + 1;
-    (line, col)
+    // Column = byte count between the line start and the offset, plus 1.
+    (line, clamped - line_start + 1)
 }
 
 /// Build the synthetic `internal-error` diagnostic emitted when a file panics
@@ -2042,6 +2059,35 @@ mod tests {
         let off = src.find("lenght").unwrap();
         let d = Diagnostic { start_offset: off, ..diag("r", Severity::Error, "m") };
         assert_eq!(gh_line("f.rb", src, &d), "::error file=f.rb,line=2,col=3::m");
+    }
+
+    #[test]
+    fn line_col_counts_bytes_not_scalars() {
+        // The reference reports `Prism start_column + 1`, and Prism's column is a
+        // BYTE index into the line. Scalar counting agrees on ASCII and drifts
+        // left of the oracle once a wider character precedes the token.
+        let src = "\"ex\u{e4}mple\".lenght\n"; // ä = 2 bytes
+        let off = src.find("lenght").unwrap();
+        assert_eq!(line_col(src, off), (1, off + 1));
+        assert_eq!(line_col(src, off).1, 12);
+
+        // 4-byte scalar, and a second line so the line walk is exercised too.
+        let src = "x = 1\n\"\u{1f48c}\".lenght\n";
+        let off = src.find("lenght").unwrap();
+        let line_start = src.find('\n').unwrap() + 1;
+        assert_eq!(line_col(src, off), (2, off - line_start + 1));
+        assert_eq!(line_col(src, off).1, 8);
+    }
+
+    #[test]
+    fn line_col_start_of_line_and_eof() {
+        let src = "\u{1f48c}\nb\n";
+        assert_eq!(line_col(src, 0), (1, 1));
+        // Start of line 2 is column 1 regardless of line 1's byte width.
+        assert_eq!(line_col(src, src.find('b').unwrap()), (2, 1));
+        // An offset past the buffer clamps to its end rather than panicking.
+        assert_eq!(line_col(src, 9_999), (3, 1));
+        assert_eq!(line_col("", 7), (1, 1));
     }
 
     /// Capture github output for a slice of findings without spawning a process.

@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/73_def_body_local_scope.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"anagram\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 32,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"anagram\""
+    }
+  ]
+}

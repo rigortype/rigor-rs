@@ -31,7 +31,8 @@ use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
 pub use source_index::{
-    lexical_scopes, ConstLit, DefKind, ParamBoundReturn, SourceIndex, SOURCE_CLASS_BASE,
+    lexical_scopes, method_body_spans, ConstLit, DefKind, ParamBoundReturn, SourceIndex,
+    SOURCE_CLASS_BASE,
 };
 
 /// A process-wide empty [`SourceIndex`], used as the default `source` for a
@@ -216,7 +217,7 @@ impl<'i> Typer<'i> {
     /// C1: the use-site lexical prefix (enclosing class/module qualified segments)
     /// for a node at `span` — the INNERMOST enclosing scope by span containment,
     /// or an empty slice at toplevel / when no scopes are attached.
-    fn enclosing_prefix(&self, span: rigor_parse::Span) -> &[String] {
+    pub fn enclosing_prefix(&self, span: rigor_parse::Span) -> &[String] {
         let mut best: Option<&(rigor_parse::Span, Vec<String>)> = None;
         for sc in self.lexical_scopes {
             if sc.0 .0 <= span.0 && span.1 <= sc.0 .1 {
@@ -1756,7 +1757,8 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> HashMap<NodeId, TypeId> {
         let mut out = HashMap::new();
-        let writes = collect_flow_writes(ast);
+        let mut writes = collect_flow_writes(ast);
+        writes.extend(indexed_flow_writes(ast, self.source));
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
@@ -2018,7 +2020,8 @@ impl<'i> Typer<'i> {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
         };
-        let writes = collect_flow_writes(ast);
+        let mut writes = collect_flow_writes(ast);
+        writes.extend(indexed_flow_writes(ast, self.source));
         let mut tenv = TypeEnv::new();
         let mut nenv: HashMap<String, &'static str> = HashMap::new();
         let mut penv: HashSet<String> = HashSet::new();
@@ -2429,6 +2432,74 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             _ => Vec::new(),
         })
         .collect()
+}
+
+/// The flow writes that need the project index or a cross-node lookup, appended
+/// to [`collect_flow_writes`]'s per-node set. Two kinds, both pure widening:
+///
+/// - **argument-position mutation** — a call `f(…, local, …)` whose callee
+///   mutates the matching POSITIONAL parameter in place
+///   (`SourceIndex::method_mutates_param`). Keyed by the whole-call span, like
+///   the receiver-side mutator entry, so the enclosing construct widens `local`.
+///   This is the caller-side half of the reference's `MutationWidening`;
+///   `xs = []; fill xs; if xs.length == 1` must not fold (rigor-survey
+///   `rspec-core/lib/rspec/core/world.rb:179`).
+/// - **block-scoped rescue binding** — a `rescue => e` clause inside a BLOCK
+///   body writes `e` in the enclosing method's scope when `e` is already a local
+///   there, and a block runs an unknown number of times, so the binding must
+///   widen. `RescueClause::bound_name` is not a `LocalVariableWrite` node, so
+///   the per-node scan cannot see it. Keyed by the enclosing BLOCK CALL's span,
+///   NOT the clause's: a method-level `begin … rescue => e; end` must keep
+///   folding, because the reference keeps folding it (probed both ways), and
+///   keying on the clause would widen that case too — a coverage loss, not a
+///   false positive, but a needless one. rigor-survey
+///   `net-imap-0.6.4.1/lib/net/imap.rb:1470`.
+fn indexed_flow_writes(
+    ast: &LoweredAst,
+    source: &SourceIndex,
+) -> Vec<(rigor_parse::Span, String)> {
+    let mut out = Vec::new();
+
+    for (_, n) in ast.iter() {
+        if let Node::Call { method, args, span, .. } = n {
+            for (i, &arg) in args.iter().enumerate() {
+                if !source.method_mutates_param(method, i) {
+                    continue;
+                }
+                if let Node::LocalVariableRead { name, .. } = ast.get(arg) {
+                    out.push((*span, name.clone()));
+                }
+            }
+        }
+    }
+
+    // Spans of every call that carries a block, innermost-first per clause.
+    let block_calls: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call { block_body, span, .. } if !block_body.is_empty() => Some(*span),
+            _ => None,
+        })
+        .collect();
+    for (_, n) in ast.iter() {
+        let Node::BeginRescue { clauses, .. } = n else {
+            continue;
+        };
+        for clause in clauses {
+            let Some(name) = &clause.bound_name else {
+                continue;
+            };
+            let enclosing = block_calls
+                .iter()
+                .filter(|b| b.0 <= clause.span.0 && clause.span.1 <= b.1)
+                .min_by_key(|b| b.1 - b.0);
+            if let Some(b) = enclosing {
+                out.push((*b, name.clone()));
+            }
+        }
+    }
+
+    out
 }
 
 /// Extend a lexical self-qualified name with a nested class/module `name`,

@@ -513,7 +513,7 @@ pub fn analyze_with_source_and_folder(
     // containment) and applies the precise constant-shadow gate.
     let scopes = rigor_infer::lexical_scopes(ast);
     let typer = Typer::with_source_and_folder(index, source, folder).with_lexical_scopes(&scopes);
-    let env = typer.build_toplevel_env(ast, interner);
+    let env = ScopedEnv::build(&typer, ast, interner);
     // ADR-0038 Slice 1: the per-call nil-receiver snapshot map (call node id ->
     // non-nil core arm), computed ONCE over the whole program via the threaded
     // flow-eval. `check_nil_receiver` fires from it (block / top-level scopes,
@@ -556,16 +556,19 @@ pub fn analyze_with_source_and_folder(
         //   3. possible-nil-receiver (union receiver with a nil arm)
         // The reference emits exactly one of these per call; we mirror that by
         // returning the first that fires.
-        let diag = check_call(ast, recv, &method, message_span, &env, &typer, interner, index)
+        // Ruby method bodies are independent local scopes, so a use site inside a
+        // `def` never reads the file's top-level locals (`ScopedEnv::at`).
+        let env = env.at(message_span);
+        let diag = check_call(ast, recv, &method, message_span, env, &typer, interner, index)
             .or_else(|| {
-                check_wrong_arity(ast, recv, &method, &args, has_block, message_span, &env, &typer, interner, index)
+                check_wrong_arity(ast, recv, &method, &args, has_block, message_span, env, &typer, interner, index)
             })
             .or_else(|| {
                 check_nil_receiver(call_id, &method, message_span, safe_nav, &nil_snaps, index)
             })
             .or_else(|| {
                 check_always_raises(
-                    ast, recv, &method, &args, has_block, message_span, &env, &typer, interner,
+                    ast, recv, &method, &args, has_block, message_span, env, &typer, interner,
                     index,
                 )
             });
@@ -585,7 +588,7 @@ pub fn analyze_with_source_and_folder(
             &method,
             &args,
             args_all_plain,
-            &env,
+            env,
             &typer,
             interner,
             index,
@@ -612,10 +615,11 @@ pub fn analyze_with_source_and_folder(
             name: Some(def_name),
             body,
             span,
+            param_span,
             ..
         } = node
         {
-            dead_assignments_in_def(ast, def_id, def_name, body, *span, &mut out);
+            dead_assignments_in_def(ast, def_id, def_name, body, *span, *param_span, &mut out);
         }
     }
 
@@ -1270,7 +1274,24 @@ fn check_call(
             // `Gem::Version.new("1.0").segments` fired here while the oracle
             // stayed silent. See `SourceIndex::is_declaration_only_class` for
             // the full argument and the audit of what remains reachable.
-            if (index.knows_toplevel_class(name)
+            // A project class carries only its SHORT key here, so a bundled RBS
+            // class of the same bare name is a DIFFERENT class and its method
+            // table is the wrong surface to witness against — WHEREVER Ruby's
+            // lexical lookup would reach the project one. The reference resolves
+            // the constant lexically and stays silent there
+            // (`RSpec::Core::DidYouMean#call` vs stdlib's `module DidYouMean`).
+            // The gate is the SAME lexical predicate the C1 constant-shadow gate
+            // uses, not a global "the project defines this name somewhere": a
+            // gitlab-foss `Gitlab::Database::Partitioning::Time` must not silence
+            // `Time.parse(x).in_time_zone` over in `Gitlab::GithubImport`, where
+            // the project `Time` is not visible and the oracle does fire.
+            // The shadow test applies ONLY to the bundled-RBS arm. A project
+            // SIG class is authoritative for its own name (fixture 70), and the
+            // declaration-only arm is already isolated by its qualified key.
+            let use_prefix = typer.enclosing_prefix(message_span);
+            let bundled_toplevel = index.knows_toplevel_class(name)
+                && !typer.source().constant_shadowed(name, use_prefix);
+            if (bundled_toplevel
                 || index.is_qualified_project_sig_class(name)
                 || (index.knows_qualified_class(name)
                     && typer.source().is_declaration_only_class(name)))
@@ -1304,6 +1325,15 @@ fn check_call(
         return None;
     }
     if index.class_has_method(class_name, method) {
+        return None;
+    }
+    // The project's OWN declaration of the method on this class wins over the RBS
+    // surface, exactly as the reference's `source_declared_method?` gate does
+    // (checked before it reaches `Reflection.rbs_class_known?`). A reopened core
+    // class contributes methods RBS cannot know about — rake's `class String`
+    // adds `#ext` and `#pathmap_explode` — and witnessing their absence against
+    // RBS alone is a false positive.
+    if typer.source().project_declares_method(class_name, method) {
         return None;
     }
 
@@ -1972,7 +2002,7 @@ fn raise_non_exception_diagnostics(
     index: &CoreIndex,
     source: &rigor_infer::SourceIndex,
     typer: &Typer,
-    env: &rigor_infer::TypeEnv,
+    env: &ScopedEnv,
     interner: &mut Interner,
     out: &mut Vec<Diagnostic>,
 ) {
@@ -2005,7 +2035,7 @@ fn raise_non_exception_diagnostics(
         if raise_redefined_in_scope(ast, source, call_id, &method) {
             continue;
         }
-        let operand_ty = typer.type_of(ast, arg, env, interner);
+        let operand_ty = typer.type_of(ast, arg, env.at(message_span), interner);
         if raise_operand_verdict(interner, index, source, operand_ty) != RaiseVerdict::Illegal {
             continue;
         }
@@ -2382,6 +2412,7 @@ fn dead_assignments_in_def(
     def_name: &str,
     body: &[rigor_parse::NodeId],
     def_span: rigor_parse::Span,
+    param_span: Option<rigor_parse::Span>,
     out: &mut Vec<Diagnostic>,
 ) {
     // Spans of nested definition units WITHIN this def (the write barrier). A
@@ -2422,8 +2453,16 @@ fn dead_assignments_in_def(
                 // An op-write READS its target (reference `reading_assignment?`).
                 reads.insert(name.clone());
             }
+            // The PARAMETER LIST is excluded: the reference gathers writes from
+            // `def_node.body` only, so a write in a default value (`def f(a, b =
+            // (not_set = true))`) is not a candidate there. Parameter defaults
+            // are lowered into the arena for the call rules, which is what puts
+            // them inside `def_span` at all. Reads are NOT excluded — keeping the
+            // extra read names only suppresses more, which stays inside the
+            // reference's witness set.
             Node::LocalVariableWrite { span, .. }
                 if span_within(*span, def_span)
+                    && !param_span.is_some_and(|ps| span_within(*span, ps))
                     && !nested_spans.iter().any(|ns| span_within(*span, *ns)) =>
             {
                 writes.push(id);
@@ -2474,6 +2513,51 @@ fn dead_assignments_in_def(
 /// `inner.end <= outer.end`). Half-open byte spans; equal spans count as within.
 fn span_within(inner: rigor_parse::Span, outer: rigor_parse::Span) -> bool {
     outer.0 <= inner.0 && inner.1 <= outer.1
+}
+
+/// The file's top-level local env, plus the method-body spans it must NOT reach
+/// into.
+///
+/// The rules walk types every use site against ONE flat env keyed by name, built
+/// from the file's TOP-LEVEL writes (`build_toplevel_env` does not descend into
+/// `def` bodies). A Ruby method body is an independent local scope, so a name
+/// inside a `def` is that def's parameter or its own write — never the top-level
+/// local of the same name. Reading the flat env there types the wrong value:
+/// rigor-survey `Ruby/data_structures/hash_table/anagram_checker.rb` closes a
+/// `s = 'a'` / `t = 'ab'` driver section and then reopens `def is_anagram(s, t)`,
+/// and the parameters were typed as those two driver strings — two
+/// `call.wrong-arity` and two `call.undefined-method` false positives.
+///
+/// [`Self::at`] therefore hands a use site inside a method body an EMPTY env.
+/// That is a strict loss of information and so cannot add a diagnostic; the
+/// bindings it withholds were all wrong. Method-body locals are not typed by
+/// this walk at all today (they are absent from the flat env), so nothing that
+/// used to fire correctly stops firing.
+struct ScopedEnv {
+    top: rigor_infer::TypeEnv,
+    empty: rigor_infer::TypeEnv,
+    method_bodies: Vec<rigor_parse::Span>,
+}
+
+impl ScopedEnv {
+    fn build(typer: &Typer, ast: &LoweredAst, interner: &mut Interner) -> Self {
+        ScopedEnv {
+            top: typer.build_toplevel_env(ast, interner),
+            empty: rigor_infer::TypeEnv::new(),
+            method_bodies: rigor_infer::method_body_spans(ast),
+        }
+    }
+
+    /// The env a use site at `span` may read: the top-level env at file scope (or
+    /// inside a block, which DOES capture the enclosing locals), an empty env
+    /// inside any method body.
+    fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
+        if self.method_bodies.iter().any(|d| span_within(span, *d)) {
+            &self.empty
+        } else {
+            &self.top
+        }
+    }
 }
 
 /// The trailing statement of a method body: the last id in `body`, descending
@@ -3030,21 +3114,25 @@ pub fn void_value_use_diagnostics(
 ) -> Vec<Diagnostic> {
     let scopes = rigor_infer::lexical_scopes(ast);
     let typer = Typer::with_source(index, source).with_lexical_scopes(&scopes);
-    let env = typer.build_toplevel_env(ast, interner);
+    // Same local-scope discipline as the main walk: a use site inside a method
+    // body does not read the file's top-level locals.
+    let env = ScopedEnv::build(&typer, ast, interner);
     let mut out = Vec::new();
     for (_id, node) in ast.iter() {
+        let span = node.span();
+        let scoped = env.at(span);
         match node {
             Node::LocalVariableWrite { value, .. }
             | Node::InstanceVariableWrite { value, .. }
             | Node::ConstantWrite { value, .. } => {
-                check_void_value_use(ast, *value, &env, &typer, interner, index, &mut out);
+                check_void_value_use(ast, *value, scoped, &typer, interner, index, &mut out);
             }
             Node::Call { receiver, args, .. } => {
                 if let Some(recv) = receiver {
-                    check_void_value_use(ast, *recv, &env, &typer, interner, index, &mut out);
+                    check_void_value_use(ast, *recv, scoped, &typer, interner, index, &mut out);
                 }
                 for &arg in args {
-                    check_void_value_use(ast, arg, &env, &typer, interner, index, &mut out);
+                    check_void_value_use(ast, arg, scoped, &typer, interner, index, &mut out);
                 }
             }
             _ => {}

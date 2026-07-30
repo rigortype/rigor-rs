@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/72_parse_error_no_rules.rb",
+  "diagnostics": [
+    {
+      "rule": null,
+      "line": 14,
+      "column": 22,
+      "severity": "error",
+      "message": "expected a delimiter to close the parameters"
+    },
+    {
+      "rule": null,
+      "line": 14,
+      "column": 23,
+      "severity": "error",
+      "message": "unexpected write target"
+    },
+    {
+      "rule": null,
+      "line": 14,
+      "column": 32,
+      "severity": "error",
+      "message": "unexpected local variable or method, expecting end-of-input"
+    }
+  ]
+}

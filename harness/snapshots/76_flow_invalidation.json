@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/76_flow_invalidation.rb",
+  "diagnostics": [
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 50,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 60,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 94,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.dead-assignment",
+      "line": 17,
+      "column": 3,
+      "severity": "warning",
+      "message": "local `unused_here' assigned in `body_dead_write' but never read"
+    }
+  ]
+}
