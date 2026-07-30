@@ -154,8 +154,10 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   `x` — `.nil?`, an `if`/`unless`/`while`/`until`/ternary predicate, a `&&`/`||` operand, safe-nav,
   any op-write (`||=`), or `present?`/`blank?`/`presence` (the reference does NOT narrow on the
   last three, so declining only loses recall — never an FP). A scoped per-method-body local env
-  (`Typer::build_method_body_env`, used ONLY by this rule) types the nil-source RHS receiver
-  without perturbing the top-level-only typing of the other rules. Substrate added: RBS `Optional`
+  (used ONLY by this rule) types the nil-source RHS receiver without perturbing the
+  top-level-only typing of the other rules — later SUPERSEDED by
+  `Typer::nilable_receiver_snapshots`, which threads the fact through block bodies too, so the
+  helper it names (`build_method_body_env`) is gone. Substrate added: RBS `Optional`
   return preserved as `(class, nilable)` (`method_return_nilable`, was discarded → Dynamic) +
   `Node::Call.safe_nav`. **+0 net corpus matched** (637 → 637, 0 FP) — accepted: the corpus
   nil-sources are params / `@ivar = nil` seeds / project-method returns, all DEFERRED here; the
