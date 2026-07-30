@@ -223,12 +223,14 @@ survey corpora used here are worth adding to the standing sweep.
 
 ## Open
 
+(`Typer::build_method_body_env` was the third item here — dead since
+`nilable_receiver_snapshots` superseded it, and it started from the top-level env
+so it carried exactly the leak defect 3 fixed. Deleted rather than left as a trap
+for the next caller.)
+
 * rigor-rs still emits no parse diagnostics (`rule: null`). 9 such gaps on survey
   `Ruby`, 3 in fixture 72. Adding them is coverage, and would need its own
   column/message parity work.
-* `SourceIndex::build_method_body_env` has no callers — superseded by
-  `nilable_receiver_snapshots` (ADR-0038 slice 1). It starts from the top-level
-  env and so carries the same leak defect 3 fixed; dead, but worth deleting.
 * The overlay vendoring closes the `vendored_gem_sigs` half of the ingestion
   asymmetry. The other half (`BigMath` — signatures rigor-rs has that the
   reference does not) is untouched.

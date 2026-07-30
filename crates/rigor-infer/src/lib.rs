@@ -1658,66 +1658,6 @@ impl<'i> Typer<'i> {
         env
     }
 
-    /// Build a SCOPED method-body env for ONE `def`, used by
-    /// `call.possible-nil-receiver` to type a method-local's nil-source RHS
-    /// receiver (`s = String.new; s.byteslice(..)`). Starts from `base` (the
-    /// top-level env) and binds every plain `LocalVariableWrite` whose span lies
-    /// within `def_span`, in arena (source) order — so `s` is typed before
-    /// `x = s.byteslice`. Span-scan (not structural) is orphan-proof, matching
-    /// the dead-assignment collector.
-    ///
-    /// Deliberately NON-flow-sensitive and SCOPED to this rule's call path: it
-    /// does NOT mutate the shared top-level env and is never consumed by the
-    /// undefined-method / arity / chaining rules, so existing behaviour and the
-    /// corpus baseline are unperturbed (ADR-0022 full scoping is deferred).
-    pub fn build_method_body_env(
-        &self,
-        ast: &LoweredAst,
-        def_span: rigor_parse::Span,
-        base: &TypeEnv,
-        interner: &mut Interner,
-    ) -> TypeEnv {
-        let mut env = base.clone();
-        // Collect writes in arena/source order so earlier binds feed later RHS.
-        // A multi-write contributes ITS TARGET TREE (bound through the
-        // destructuring binder once the RHS type is known).
-        enum BodyWrite {
-            Single(String, NodeId),
-            Multi(rigor_parse::MultiTargets, NodeId),
-        }
-        let writes: Vec<BodyWrite> = ast
-            .iter()
-            .filter_map(|(_, n)| match n {
-                Node::LocalVariableWrite { name, value, span, .. }
-                    if def_span.0 <= span.0 && span.1 <= def_span.1 =>
-                {
-                    Some(BodyWrite::Single(name.clone(), *value))
-                }
-                Node::MultiWrite { targets, value, span, .. }
-                    if def_span.0 <= span.0 && span.1 <= def_span.1 =>
-                {
-                    Some(BodyWrite::Multi(targets.clone(), *value))
-                }
-                _ => None,
-            })
-            .collect();
-        for w in writes {
-            match w {
-                BodyWrite::Single(name, value) => {
-                    let ty = self.type_of(ast, value, &env, interner);
-                    env.insert(name, ty);
-                }
-                BodyWrite::Multi(targets, value) => {
-                    let rhs = self.type_of(ast, value, &env, interner);
-                    for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
-                        env.insert(name, ty);
-                    }
-                }
-            }
-        }
-        env
-    }
-
     /// Flow-sensitive local CONSTANT propagation (ADR-0022 first substrate
     /// slice). For every `if`/`unless`/ternary predicate NOT lexically inside a
     /// loop / block, record the [`TypeId`] the predicate folds to under the
@@ -1750,7 +1690,7 @@ impl<'i> Typer<'i> {
     ///
     /// Writes are collected once (span-keyed) and widening filters that list by
     /// span-containment — orphan-proof, the same discipline as
-    /// [`Self::build_method_body_env`] and the dead-assignment collector.
+    /// the dead-assignment collector.
     pub fn always_truthy_snapshots(
         &self,
         ast: &LoweredAst,
