@@ -13,24 +13,20 @@ Last updated: 2026-07-31.
 
 ## Now / Next
 
-**Track B (productization) 2026-07-19/25**: coverage precision mode SHIPPED
-(#33) + **LSP §12 COMPLETE** (S1–S4b) + **stage-3 parity tail** (#44: ADR-8
-SeverityStamp — an `off` rule no longer shows editor markers — + the
-bleeding-edge gate) + **MultiWrite substrate slice 1** (#46: closed a measured
-live `check` FP) + **LSP `exclude:` parity** (#45) + **slice 2 → harness 0
-GAPS** (#47). ▶ NEXT: **add the survey corpora to the standing FP sweep set** — they
-carried 24 pre-existing FPs the sweep set could not see
-([note](notes/20260731-survey-fp-triage-24.md)); the `BigMath` half of the RBS
-ingestion asymmetry (`vendored_gem_sigs` is now vendored,
-[note](notes/20260725-multiwrite-substrate-s2.md)); LSP config reload (`.rigor.yml` is read once at startup — the highest-value
-remaining LSP item); or LSP v4+ (`::` completion, visibility filter,
-`rootUri`).
+**Track B (productization) 2026-07-19/25** — all in the ledger: coverage
+precision mode (#33), LSP §12 COMPLETE (S1–S4b) + stage-3 parity tail (#44),
+MultiWrite substrate (#46/#47), LSP `exclude:` parity (#45). ▶ NEXT: the `BigMath` half of the RBS ingestion asymmetry
+(`vendored_gem_sigs` is now vendored,
+[note](notes/20260725-multiwrite-substrate-s2.md)); LSP config reload
+(`.rigor.yml` is read once at startup — the highest-value remaining LSP item);
+LSP v4+ (`::` completion, visibility filter, `rootUri`); or `-> self` on an
+INSTANCE method (only block returns resolve it; the `SELF_RETURN` sentinel makes
+it small — measure first). The sweep set is now CODIFIED
+(`harness/sweep-corpora.yml` + `fp_audit.py --sweep`).
 - LSP §12 known limitation (reference-parity, ADR-0029): editing `.rigor.yml`
-  `disable:`/`plugins:`/`paths:`/`severity_*`/`bleeding_edge:` needs an LSP
-  restart — `invalidate` re-reads sig-dir CONTENT but not the parsed YAML
-  (matches the reference's
-  `ProjectContext#invalidate!`). Improving on the reference here is a future
-  call, out of S4 scope.
+  needs an LSP restart — `invalidate` re-reads sig-dir CONTENT, not the parsed
+  YAML (matches `ProjectContext#invalidate!`). Beating the reference here is a
+  future call.
 - Clippy verify MUST use `CARGO_TARGET_DIR=<fresh> cargo clippy --workspace --
   -D warnings` (the incremental cache hides `only_used_in_recursion` etc. —
   cost a CI red on PR #32).
@@ -50,17 +46,18 @@ parity-port arc has bottomed out — see Standing conclusions):
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
   inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
   deferred by [scoping call](notes/20260719-coverage-command-scoping.md).
-- **Re-pin at the v0.3.0 tag** when upstream tags it (`UPSTREAM.md`, all THREE
-  oracle hazards). Pin `7a69f142`; tip `ff6b6158` self-diff 0/0, still no tag.
+- **Pin is `v0.3.1`** (+ vendored rbs 4.1.0). Upstream master is +49 with no tag
+  and a measured delta of ONE diagnostic, so the next re-pin waits for a tag
+  (`UPSTREAM.md`, all THREE oracle hazards).
 - Deferred RC deltas (documented): interprocedural mutation floor (P6),
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
 
-State: harness **70 fixtures / 0 GAPS / 0 FP** (live + snapshot, vs pin
-`7a69f142`; 217/218 printed = fixture 48's dup `(rule,7,9)` key); fp_audit 0 FP on
-mastodon, gitlab-foss lib (UM gaps 145) + app/models, conference-app + survey
-(dependabot/rails at baseline); explain catalog 29 rules. Clippy: workspace
-`-D warnings`, verify in a FRESH `CARGO_TARGET_DIR`.
+State: harness **76 fixtures / 0 FP / 3 gaps** (live + snapshot, vs pin
+`v0.3.1`; the 3 are fixture 72's `rule: null` parse diagnostics). Standing sweep
+`fp_audit.py --gaps --sweep`: **0 FP across 9204 files**, 8 corpora, baselines in
+`harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. Clippy:
+workspace `-D warnings`, verify in a FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
@@ -89,25 +86,25 @@ mastodon, gitlab-foss lib (UM gaps 145) + app/models, conference-app + survey
 cargo build --offline && cargo test --offline        # workspace tests
 ruby harness/run.rb                                  # live differential gate (0 FP)
 ruby harness/run_snapshot.rb                         # reference-free gate (CI parity job)
-ruby harness/run_corpus.rb <dir...>                  # scaled real-corpus gate
-python3 harness/fp_audit.py --gaps <project-dir>     # survey-corpus FP/coverage audit
+ruby harness/run_corpus.rb                           # scaled real-corpus gate
+python3 harness/fp_audit.py --gaps --sweep           # STANDING sweep set (0 FP bar)
 python3 harness/docs_check.py                        # docs budget gate
 ```
 
-Reference oracle: pinned git submodule `reference/rigor` (see `UPSTREAM.md`).
-`ruby -I reference/rigor/lib reference/rigor/exe/rigor check <path> --format json`
-from a clean temp cwd. Survey corpora live under `/Users/megurine/repo/ruby/`.
-RBS is vendored + embedded at build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the
-override seam.
+Reference oracle: pinned git submodule `reference/rigor` (see `UPSTREAM.md`);
+run from a clean temp cwd. Sweep membership: `harness/sweep-corpora.yml`
+(corpora under `/Users/megurine/repo/ruby/`). RBS is vendored + embedded at
+build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
+`harness/vendor_rbs.py` regenerates the tree.
 
 ## Ledger (newest first; one line per arc/slice)
 
 - **2026-07-31 survey FP triage — 24 → 0, nine root causes** — the pin bump's side finding, closed. Six of the nine are scoping/unit bugs an all-ASCII well-formed fixture corpus structurally cannot see: **columns counted in scalars, not Prism's BYTES** (8 FPs — same diagnostic, wrong column, on every emoji/kana spec line; a standing `TODO(spec)`); **semantic rules ran on Prism's RECOVERED tree** for unparseable files (4; the reference bails before `ScopeIndexer`); **top-level locals leaked into `def` bodies** via the flat name-keyed env (4; a driver `s = 'a'` typed a later `def is_anagram(s, t)`'s parameter); project reopenings of CORE classes invisible + top-level `def IO.foo` not registered (3); a namespaced project class losing to a same-named RBS class (1); dead-assignment reaching into the PARAMETER list (1); and two flow facts the reference invalidates — an argument the callee mutates, and `rescue => e` inside a block (2). Also **vendored the reference's `data/vendored_gem_sigs/` + `data/core_overlay/`** (1 FP — the ingestion-surface follow-up) — `prism` EXCLUDED: supplementing a sig set we do not vendor added 8 fresh `Prism.parse` FPs. 7 corpora / ~9150 files **0 FP at BOTH pins**, sweep-set output diff EMPTY both directions, harness 76 fixtures / 232 matched / 0 FP. [note](notes/20260731-survey-fp-triage-24.md).
+- **2026-07-31 standing FP sweep set CODIFIED** — `harness/sweep-corpora.yml` is the single membership list for BOTH `fp_audit.py --sweep` and `run_corpus.rb` (each entry carries the `why:` it earns its place with; an absent corpus reports SKIPPED, never drops silently). Closes the ▶NEXT item the 24-FP triage left. Also fixed `run_corpus.rb`'s `REFERENCE_RIGOR_DIR` default — it pointed at the WORKING checkout, hazard 3 baked into a gate. Baseline **0 FP / 9204 files / 8 corpora** ([CORPUS.md](../harness/CORPUS.md)).
 - **2026-07-31 upstream HEAD survey (`v0.3.1`→`ece06a0d`, 49 commits) + Tuple set-op folds** — the whole delta moves **1 diagnostic** on 9204 files, one rigor-rs never emitted; pin STAYS at `v0.3.1` (no tag past it). Ported the one real item (#121 `a2867efd`): set ops fold on the pinned Tuple with `eql?` not `==` (`[1] & [1.0]` is EMPTY); NaN + OOB `at` decline. **0 FP / 9204 files**; no fixture until the pin passes `a2867efd`. [note](notes/20260731-head-survey-and-set-op-folds.md).
 - **2026-07-31 upstream pin `v0.3.0 → v0.3.1` + vendored rbs `4.0.3 → 4.1.0`** (one commit — an oracle on other core signatures than the port reads is not an oracle; same day, via an intermediate `7a69f142 → v0.3.0` tag bump that was behaviour-neutral bar the ADR-93 inline-RBS auto-wire, [note](notes/20260731-upstream-bump-7a69f142-v030.md)) — **0 FP / 9153 files, gaps net −2** (mastodon 49→48, gitlab 330→329, concurrent 87→86). 4.1.0's rewritten signatures broke two things, both FIXED rather than accepted as the survey assumed: bounded method type params (`Array#fetch`'s `[I < _ToInt] (I index)` admitted everything) now resolve to their bound, and `-> instance` on an INSTANCE method (`Hash#compact`) now resolves to the receiver's class via the `SELF_RETURN` call-site sentinel. New `harness/vendor_rbs.py` makes the vendoring recipe executable — proven by reproducing the committed 4.0.3 tree byte-for-byte before writing 4.1.0. Upstream logic delta itself: ZERO. [note](notes/20260731-upstream-pin-v031-rbs41.md) / [survey](notes/20260731-v031-preflight-survey.md).
-- **2026-07-25 MultiWrite slice 2 — harness at 0 GAPS** (PR #47) — closed the last fixture gap (68: `_pid, status = Process.wait2; status.frobnicate`). RBS tuple returns survive as `RbsReturnShape{Class|Tuple|Unknown}` computed BESIDE an untouched `method_signature`, + Pass 2b mints ids for the 17 classes an RBS tuple names (declaration-driven, no `Process` special-case). **An FP found and fixed mid-build**: naive witness widening fired `Gem::Version#segments` where the oracle is silent — the reference ships `vendored_gem_sigs/` for 12 gems rigor-rs lacks, so its namespaced-gem surface is a strict SUBSET; gated the WITNESS on `is_declaration_only_class`. 14 corpora / 35,706 files: `check` **bit-identical**, 0 new FPs; corpus yield honestly ZERO. **Follow-up**: the ingestion-surface asymmetry cuts both ways (`vendored_gem_sigs` we lack / `BigMath` we have) — its own slice. [note](notes/20260725-multiwrite-substrate-s2.md).
+- **2026-07-25 MultiWrite substrate, slices 1+2** (PRs #46/#47) — `a, b = rhs` had NO arena lowering, so `collect_flow_writes` never saw the rebind: a MEASURED live `check` FP. Added `Node::MultiWrite` (+ `target_exprs` for locals inside non-local targets — an FP the harness, unit tests and 3 corpora all missed) + a rule-for-rule port of `MultiTargetBinder`; ~32k-file sweep 2 removed / 5 added / 0 new FPs. Slice 2 then closed the LAST fixture gap (68) by surviving RBS tuple returns as `RbsReturnShape{Class|Tuple|Unknown}` beside an untouched `method_signature`, + Pass 2b minting ids for the 17 classes an RBS tuple names. **An FP found and fixed mid-build**: naive witness widening fired `Gem::Version#segments` where the oracle is silent — gated the WITNESS on `is_declaration_only_class`. 14 corpora / 35,706 files bit-identical. [spec](notes/20260725-multiwrite-substrate-spec.md) / [s1](notes/20260725-multiwrite-substrate-s1.md) / [s2](notes/20260725-multiwrite-substrate-s2.md).
 - **2026-07-25 LSP `exclude:` parity** (PR #45) — an excluded file opened in the editor published markers `check` never produces. Decision rule: a buffer is excluded iff EVERY discovery spelling of it is excluded, expressed as 3 tiers — overlay membership (fast path), all-roots × 3 name forms (decoded/named/canonical, `all` load-bearing), then a confirm pass over the SHARED `discovery_spellings` walk so it cannot drift from `project_files`. Review round 1 found 3 regressions (symlinked `.rb`, symlink whose target is excluded, overlapping roots — the first-match + canonicalize-only gate); matrix widened 24→144 runs (+ symlink and multi-root axes). `check` byte-identical under 3 configs incl. an invalid glob. [note](notes/20260725-lsp-exclude-parity.md).
-- **2026-07-25 MultiWriteNode substrate, slice 1** (PR #46) — `a, b = rhs` had NO arena lowering, so `collect_flow_writes` never saw the rebind: a MEASURED live `check` FP (`x = 5; x, _y = o, 2; if x` fired always-truthy where the reference is silent). Added `Node::MultiWrite` (+ `target_exprs` for locals embedded in non-local targets — an FP the harness, unit tests and 3 mandated corpora all missed) + a rule-for-rule port of the reference's `MultiTargetBinder` incl. `soften_optional_slot`. ~32k-file sweep: **2 removed** (a live corpus witness), **5 added** (oracle-verified), **0 new FPs**; harness unchanged; coverage/annotate/sig-gen now oracle-exact. Slice 2 (RBS tuple returns → fixture 68) next. [spec](notes/20260725-multiwrite-substrate-spec.md) / [results](notes/20260725-multiwrite-substrate-s1.md).
 
 - **2026-07-25 LSP stage-3 parity tail** (PR #44) — the LSP never applied the ADR-8 SeverityStamp: a rule resolved `off` still published markers `check` DROPS (PRESENCE mismatch), severities were authored not profile-resolved, bleeding-edge unplumbed. The stamp now rides `ProjectContext` beside `disable:` (rebuilt by `invalidate` under the S4 generation guard); composition order verified against `main.rs` statement-by-statement. 4 E2E tests vs real `check` output, each proven non-vacuous by re-breaking. Remaining divergences enumerated in the note. [note](notes/20260725-lsp-stage3-parity.md).
 

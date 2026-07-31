@@ -140,3 +140,27 @@ Each entry must:
 Entries are removed once the upstream fix lands and the pinned reference is
 bumped. The registry is expected to trend toward empty as both implementations
 converge.
+
+## Real-corpus false-positive sweep
+
+`harness/run.rb` gates on 76 hand-built fixtures; real code finds what fixtures
+structurally cannot (an all-ASCII, well-formed corpus cannot contain an encoding
+or scoping bug — [note](../docs/notes/20260731-survey-fp-triage-24.md)). Two
+tools sweep real corpora, and **both read the same membership list**,
+`harness/sweep-corpora.yml`:
+
+```sh
+python3 harness/fp_audit.py --gaps --sweep   # the standing set, per-rule gap map
+ruby harness/run_corpus.rb                   # same set + the reference's own trees
+```
+
+`--sweep` exists so the sweep set is a committed, reviewable thing instead of
+whatever directories the last session typed. That drift is not hypothetical: the
+survey corpora sat outside the hand-typed set and carried 24 false positives
+nobody was measuring. A manifest entry that is absent on this machine is
+reported as `SKIPPED` by both tools — a partial sweep must never read as a full
+one.
+
+Both run each side from a clean cwd (core+stdlib only), so **no project-`sig/`
+behaviour is measured by either**. That surface needs a hand-built project; see
+[note](../docs/notes/20260731-head-survey-and-set-op-folds.md).

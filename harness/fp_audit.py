@@ -14,9 +14,14 @@ Both run core+stdlib only for a fair comparison: the reference from a clean cwd
 (so it auto-loads no project config / bundle), rigor-rs from the repo (which
 ships no `sig/` or `rbs_collection`). Parity severities only (error/warning).
 
-Usage:  python3 harness/fp_audit.py [--gaps] <dir-of-.rb> [<dir> ...]
-        --gaps also aggregates coverage gaps (reference-only) by rule — the map
-        of where to spend coverage effort.
+Usage:  python3 harness/fp_audit.py [--gaps] [--sweep] [<dir-of-.rb> ...]
+        --gaps  also aggregates coverage gaps (reference-only) by rule — the map
+                of where to spend coverage effort.
+        --sweep runs the STANDING sweep set (`harness/sweep-corpora.yml`) instead
+                of a hand-typed directory list. Extra directories may still be
+                passed; they run after the standing set. A listed corpus that is
+                not present on this machine is reported as SKIPPED, never
+                silently dropped.
 Env:    RIGOR_RS_BIN (default target/release/rigor), REFERENCE_RIGOR_DIR
         (default reference/rigor).
 """
@@ -122,14 +127,47 @@ def audit(tgt, show=12, show_gaps=False, gap_rules=None):
     return len(fp)
 
 
+SWEEP_MANIFEST = os.environ.get(
+    "SWEEP_CORPORA", os.path.join(REPO, "harness", "sweep-corpora.yml")
+)
+
+
+def sweep_targets():
+    """The standing sweep set's present directories, plus the absent ones.
+
+    Membership lives in `harness/sweep-corpora.yml` so the sweep is a
+    reproducible set rather than whatever directories the last session happened
+    to type. Absent corpora are RETURNED, not dropped — the caller reports them,
+    because a sweep that quietly measured half its set reads as a green gate.
+    """
+    import yaml  # local: only --sweep needs it, so a plain run has no dependency
+
+    with open(SWEEP_MANIFEST, encoding="utf-8") as f:
+        entries = yaml.safe_load(f).get("corpora", [])
+    present, absent = [], []
+    for e in entries:
+        (present if os.path.isdir(e["path"]) else absent).append(e)
+    return present, absent
+
+
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--gaps"]
+    flags = {"--gaps", "--sweep"}
+    args = [a for a in sys.argv[1:] if a not in flags]
     show_gaps = "--gaps" in sys.argv  # also report coverage-gap breakdown by rule
+    absent = []
+    if "--sweep" in sys.argv:
+        present, absent = sweep_targets()
+        print(f"Standing sweep set ({SWEEP_MANIFEST}): "
+              f"{len(present)} present, {len(absent)} absent")
+        args = [e["path"] for e in present] + args
     if not args:
         print(__doc__)
         sys.exit(2)
     gap_rules = Counter() if show_gaps else None
     total = sum(audit(t, show_gaps=show_gaps, gap_rules=gap_rules) for t in args)
+    for e in absent:
+        print(f"\n=== {e['label']} — SKIPPED: {e['path']} is not on this machine "
+              f"(the sweep set is INCOMPLETE for this run) ===")
     print(f"\nTOTAL FP candidates: {total}")
     if show_gaps:
         print("TOTAL coverage gaps by rule (where to spend coverage effort):")

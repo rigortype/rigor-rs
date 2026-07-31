@@ -13,8 +13,10 @@
 #
 # Env vars:
 #   CORPUS_LIMIT          max .rb files to sample per corpus dir (default: 80)
-#   REFERENCE_RIGOR_DIR   path to Ruby rigor checkout
-#                         (default: /Users/megurine/repo/ruby/rigor)
+#   REFERENCE_RIGOR_DIR   path to the reference checkout
+#                         (default: reference/rigor — the PINNED submodule).
+#                         Pointing this at a working checkout compares against a
+#                         DIFFERENT version — see UPSTREAM.md hazard 3.
 #   RIGOR_RS_BIN          path to rigor-rs binary
 #                         (default: target/debug/rigor in repo root)
 #
@@ -35,9 +37,12 @@ require "set"
 
 REPO_ROOT = File.expand_path("..", __dir__)
 
-REFERENCE_RIGOR_DIR = ENV.fetch(
-  "REFERENCE_RIGOR_DIR",
-  "/Users/megurine/repo/ruby/rigor"
+# The oracle is the PIN, not any local checkout (UPSTREAM.md hazard 3): this
+# used to default to a working `~/repo/ruby/rigor`, which silently compared
+# against a tree dozens of commits off the pin. Matches `harness/lib.rb`.
+REFERENCE_RIGOR_DIR = File.expand_path(
+  ENV.fetch("REFERENCE_RIGOR_DIR", "reference/rigor"),
+  REPO_ROOT
 )
 REFERENCE_LIB = File.join(REFERENCE_RIGOR_DIR, "lib")
 REFERENCE_EXE = File.join(REFERENCE_RIGOR_DIR, "exe", "rigor")
@@ -53,8 +58,27 @@ CORPUS_LIMIT = (ENV["CORPUS_LIMIT"] || "80").to_i
 # Severity levels that count for parity
 PARITY_SEVERITIES = %w[error warning].freeze
 
-# Built-in corpus list (order = run order)
-DEFAULT_CORPORA = [
+# Built-in corpus list (order = run order). The reference's own trees come from
+# the PINNED submodule; the rest is the STANDING sweep set
+# (`harness/sweep-corpora.yml`), so this script and `fp_audit.py --sweep` cannot
+# drift apart on WHICH corpora are measured. A listed corpus that is absent on
+# this machine is dropped here and reported by `run_corpora_report`.
+SWEEP_MANIFEST = File.expand_path(
+  ENV.fetch("SWEEP_CORPORA", "harness/sweep-corpora.yml"),
+  REPO_ROOT
+)
+
+def sweep_corpora
+  require "yaml"
+  YAML.load_file(SWEEP_MANIFEST).fetch("corpora", [])
+rescue StandardError => e
+  warn "WARNING: could not load sweep manifest #{SWEEP_MANIFEST}: #{e.message}"
+  []
+end
+
+MISSING_CORPORA = sweep_corpora.reject { |c| Dir.exist?(c["path"]) }.freeze
+
+DEFAULT_CORPORA = ([
   {
     label:   "rigor/examples",
     dir:     File.join(REFERENCE_RIGOR_DIR, "examples"),
@@ -64,13 +88,10 @@ DEFAULT_CORPORA = [
     label:   "rigor/lib/rigor/type",
     dir:     File.join(REFERENCE_RIGOR_DIR, "lib", "rigor", "type"),
     limit:   CORPUS_LIMIT
-  },
-  {
-    label:   "mastodon/app/models",
-    dir:     "/Users/megurine/repo/ruby/mastodon/app/models",
-    limit:   60   # explicit cap for the Rails corpus
   }
-].freeze
+] + sweep_corpora.select { |c| Dir.exist?(c["path"]) }.map do |c|
+  { label: c["label"], dir: c["path"], limit: CORPUS_LIMIT }
+end).freeze
 
 # ─── Build rigor-rs if needed ─────────────────────────────────────────────────
 
@@ -366,6 +387,11 @@ def main
   puts "  rigor-rs:  #{RIGOR_RS_BIN}"
   puts "  Corpora:   #{corpora.size}"
   puts "  Limit:     #{CORPUS_LIMIT} files/corpus (overridden per-corpus where noted)"
+  # A member of the standing sweep set that is absent on this machine is named,
+  # never dropped in silence: a partial sweep must not read as a full one.
+  MISSING_CORPORA.each do |c|
+    puts "  SKIPPED:   #{c["label"]} — #{c["path"]} is not on this machine"
+  end unless ARGV.any?
   puts
 
   all_results = corpora.map do |corpus|
