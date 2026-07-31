@@ -5,9 +5,10 @@ into the repo so the analyzer is standalone (no runtime dependency on a local
 `rbs` gem). It is embedded at build time by `crates/rigor-index/build.rs` and
 ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset.
 
-- **Source gem:** `rbs-4.0.3`
-- **Source path:** `/Users/megurine/.local/share/mise/installs/ruby/4.0.5/lib/ruby/gems/4.0.0/gems/rbs-4.0.3`
-- **Vendored:** 2026-06-26
+- **Source gem:** `rbs-4.1.0`
+- **Source path:** `/Users/megurine/.local/share/mise/installs/ruby/4.0.5/lib/ruby/gems/4.0.0/gems/rbs-4.1.0`
+- **Vendored:** 2026-07-31 (was `rbs-4.0.3`, 2026-06-26 — bumped with the
+  reference pin to `v0.3.1`, which follows rbs 4.1.0; the two pins must match)
 - **What the set is:** the WHOLE `core/` directory ⊕ the `DEFAULT_LIBRARIES`
   stdlib set (`src/rbs.rs`) transitively closed over each lib's
   `manifest.yaml` `dependencies:` — i.e. byte-for-byte the set the old runtime
@@ -15,8 +16,10 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
 
 ## Contents
 
-- `core/` — all 86 `.rbs` from `…/rbs-4.0.3/core` (62 top-level + nested under
-  `io/`, `enumerator/`, `object_space/`, `rbs/`, `rbs/unnamed/`, `rubygems/`).
+- `core/` — all 89 `.rbs` from `…/rbs-4.1.0/core` (nested under `io/`,
+  `enumerator/`, `object_space/`, `rbs/`, `rbs/unnamed/`, `rubygems/`). 4.1.0
+  added three: `file_constants.rbs` and `file_stat.rbs` (`File` split out) and
+  `rbs/ops.rbs`.
 - `stdlib/<lib>/0/…` — 49 libs (the resolved transitive closure), 85 `.rbs`
   total, each with its `manifest.yaml` preserved for auditability:
   `abbrev base64 benchmark bigdecimal bigdecimal-math cgi cgi-escape csv date
@@ -62,13 +65,26 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
 
 ## Regenerate
 
-The closure is computed exactly as `CoreData::load()` does (whole `core/` +
-`DEFAULT_LIBRARIES` transitive `manifest.yaml` closure). To refresh against a new
-rbs gem version, point a script at the gem's `core/` + `stdlib/`, walk
-`DEFAULT_LIBRARIES` (from `src/rbs.rs`) closing over each
-`stdlib/<lib>/0/manifest.yaml`'s `dependencies:`, and copy each present
-`core/` tree and `stdlib/<lib>/0/` dir here, preserving structure and the
-`manifest.yaml` files. Then update this file's source version/path/date.
+`harness/vendor_rbs.py` IS the recipe — the prose version below used to be
+executed by hand, which is how a refresh silently drifts:
+
+```sh
+python3 harness/vendor_rbs.py <rbs-gem-root>            # rewrite this tree
+python3 harness/vendor_rbs.py <rbs-gem-root> --check    # verify, write nothing
+```
+
+It reads `DEFAULT_LIBRARIES` out of `src/rbs.rs` (one source of truth), copies
+the whole `core/`, closes the library set transitively over each
+`stdlib/<lib>/0/manifest.yaml`'s `dependencies:`, and carries `overlay/` +
+this file across untouched. `--check` regenerates into a temp dir and diffs
+against the committed tree — run it against the source gem named above and it
+must report an exact match. Update this file's source version/path/date by hand
+after a real bump.
+
+The closure is computed exactly as `CoreData::load()` does. Note that the
+manifest set is NOT stable across rbs versions (4.1.0 gave `tempfile` its first
+`manifest.yaml`), so a refresh must recompute the closure rather than copy the
+previous file list.
 
 At runtime the *resolved file list* is embedded directly (see `build.rs` →
 `$OUT_DIR/embedded_rbs.rs`), so the `manifest.yaml` files here are for
