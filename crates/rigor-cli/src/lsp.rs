@@ -2384,17 +2384,36 @@ fn hover(
 /// to be a valid, collision-unlikely lowercase identifier.
 const COMPLETION_STUB: &str = "rigorCompletionHole";
 
+/// The CONSTANT-shaped twin of [`COMPLETION_STUB`], spliced after `::` when the
+/// cursor is in a namespace position. It MUST start with an uppercase letter:
+/// `Foo::rigorCompletionHole` parses as a method call, not a constant path.
+const COMPLETION_STUB_CONST: &str = "RigorCompletionHole";
+
 /// Answer `textDocument/completion`: if the cursor sits after a `.`/`::` member
 /// access, resolve the receiver's type and return its callable methods. Returns
 /// `None` (a null completion) when the cursor isn't in a member-access context,
 /// the buffer is unknown, or the receiver type is unresolved.
 ///
-/// Robust to incomplete input via **placeholder injection**: a stub method name
-/// is spliced in right after the separator (replacing any half-typed name), so
-/// the parser yields a `Call { receiver, method: <stub> }` regardless of what the
-/// user has typed. The receiver node is typed with the same `Typer` `hover`/`check`
-/// use; its class drives instance- vs singleton-method enumeration. The half-typed
-/// prefix is intentionally dropped — the client filters the full set by it.
+/// Robust to incomplete input via **placeholder injection**: a stub name is
+/// spliced in right after the separator (replacing any half-typed name), so the
+/// parser yields a well-formed node regardless of what the user has typed. The
+/// half-typed prefix is intentionally dropped — the client filters by it.
+///
+/// Two shapes share that machinery, split exactly where Ruby splits them — on
+/// the CASE of the name being typed after `::` (LSP v4):
+///
+/// - `Foo::|` / `Foo::Ba|` — a NAMESPACE position. Yields the nested
+///   constants (classes/modules) under `Foo`.
+/// - `x.|`, `x.up|`, `Foo::ba|` — a METHOD position. The receiver node is typed
+///   with the same `Typer` `hover`/`check` use; its class drives instance- vs
+///   singleton-method enumeration.
+///
+/// The reference reaches the same split differently: it feeds the raw buffer to
+/// Prism first and dispatches on the located node's class (`ConstantPathNode` ⇒
+/// constants, `CallNode` ⇒ methods), falling back to an uppercase / lowercase
+/// sentinel only when the buffer does not parse. Since Ruby's own rule for
+/// "constant or method call after `::`" IS the first character's case, deciding
+/// on the prefix directly is the same decision without the double parse.
 fn completion(
     project: &ProjectContext,
     buffers: &BufferTable,
@@ -2412,12 +2431,18 @@ fn completion(
     }
     // The separator must sit immediately before the (possibly empty) identifier:
     // `::` (constant/class scope) or a plain `.` (not part of a `..`/`...` range).
-    let is_member_access = (ident_start >= 2 && &text[ident_start - 2..ident_start] == "::")
-        || (ident_start >= 1
-            && bytes[ident_start - 1] == b'.'
-            && !(ident_start >= 2 && bytes[ident_start - 2] == b'.'));
-    if !is_member_access {
+    let scope_sep = ident_start >= 2 && &text[ident_start - 2..ident_start] == "::";
+    let dot_sep = ident_start >= 1
+        && bytes[ident_start - 1] == b'.'
+        && !(ident_start >= 2 && bytes[ident_start - 2] == b'.');
+    if !scope_sep && !dot_sep {
         return None; // not a member-access completion context.
+    }
+    // `Foo::` with nothing typed yet, or an uppercase-initial partial, is a
+    // constant the user is writing; a lowercase-initial one is a class-method
+    // call (`Foo::parse`), which stays on the method path.
+    if scope_sep && !bytes[ident_start..offset].first().is_some_and(u8::is_ascii_lowercase) {
+        return namespace_completion(project, text, ident_start, offset);
     }
     let stub_at = ident_start; // where the stub name begins (right after the sep).
 
@@ -2455,11 +2480,71 @@ fn completion(
     Some(CompletionResponse::Array(items))
 }
 
+/// LSP v4 — `Foo::|` namespace completion: the nested constants (classes and
+/// modules) declared under the namespace the cursor is qualifying. Returns
+/// `None` (a null completion) when the parent isn't a constant path, or names
+/// no known namespace with children.
+///
+/// The parent FQN comes from the AST, not a backwards text scan, so an
+/// expression-shaped left side (`foo()::Bar`, `[1, 2]::Bar`) resolves to no
+/// constant path and correctly yields nothing.
+///
+/// Like the reference's `enumerate_constant_children`, this sees only the RBS
+/// surface (core / stdlib / plugins / project `sig/`) — a class defined in the
+/// edited buffer is NOT offered. That is the S4b "hover / completion keep the
+/// single-file index" carve-out and the reference's own scope, not an oversight.
+fn namespace_completion(
+    project: &ProjectContext,
+    text: &str,
+    ident_start: usize,
+    offset: usize,
+) -> Option<CompletionResponse> {
+    let synth = format!("{}{}{}", &text[..ident_start], COMPLETION_STUB_CONST, &text[offset..]);
+    let suffix = format!("::{COMPLETION_STUB_CONST}");
+
+    let parent = panic::catch_unwind(AssertUnwindSafe(|| {
+        // A constant path lowers to a single `ConstantRead` carrying the dotted
+        // name (`Foo::Bar::<stub>`), so the enclosing namespace is the name with
+        // the stub segment removed. A stub with no `::` before it is `::Stub`,
+        // a TOP-LEVEL reference with no parent — nothing to enumerate, which is
+        // also what the reference returns for a parent-less path.
+        lower(&parse(synth.as_bytes())).iter().find_map(|(_, n)| match n {
+            Node::ConstantRead { name, .. } => {
+                name.strip_suffix(suffix.as_str()).map(str::to_string)
+            }
+            _ => None,
+        })
+    }))
+    .ok()??;
+
+    let children = project.index.namespace_children(&parent);
+    if children.is_empty() {
+        return None;
+    }
+    let items: Vec<CompletionItem> = children
+        .into_iter()
+        .map(|(name, is_module)| CompletionItem {
+            label: name.to_string(),
+            // The reference labels every child `Class` with a "may distinguish
+            // Module later" note; the qualified registry already knows which is
+            // which, so render it. Same SET, more accurate icon.
+            kind: Some(if is_module {
+                CompletionItemKind::MODULE
+            } else {
+                CompletionItemKind::CLASS
+            }),
+            detail: Some(format!("{parent}::{name}")),
+            ..Default::default()
+        })
+        .collect();
+    Some(CompletionResponse::Array(items))
+}
+
 /// Resolve the receiver type to the set of callable method names: singleton
 /// (class-object) methods for a `Type::Singleton` receiver (a bare class
-/// constant), else instance methods on the receiver's concrete core class. Empty
-/// when the class isn't resolvable (a `Dynamic`/project/unknown receiver ⇒ no
-/// completion, never a guess).
+/// constant), the per-arm INTERSECTION for a union, else instance methods on the
+/// receiver's concrete core class. Empty when the class isn't resolvable (a
+/// `Dynamic`/project/unknown receiver ⇒ no completion, never a guess).
 fn method_names_for(
     index: &CoreIndex,
     typer: &Typer<'_>,
@@ -2471,6 +2556,24 @@ fn method_names_for(
             Some(name) => index.singleton_method_names(name),
             None => Vec::new(),
         };
+    }
+    // LSP v4 item 3 — a union receiver offers only what dispatches on EVERY arm.
+    // Conservative in the direction that matters for a popup: `s.upcase` must not
+    // be suggested on a `String | Integer`, where half the values raise. Arms the
+    // index cannot resolve are SKIPPED rather than treated as the empty set,
+    // matching the reference's `filter_map` in `intersect_member_methods` — an
+    // unknown arm is no information, not a veto.
+    if let Type::Union(members) = interner.get(ty) {
+        let sets: Vec<Vec<&'static str>> = members
+            .iter()
+            .map(|&m| method_names_for(index, typer, interner, m))
+            .filter(|s| !s.is_empty())
+            .collect();
+        let Some((first, rest)) = sets.split_first() else {
+            return Vec::new();
+        };
+        // Each arm's set is already sorted + deduped, so the filtered result is.
+        return first.iter().copied().filter(|n| rest.iter().all(|s| s.contains(n))).collect();
     }
     match index.class_name_of(interner, ty) {
         Some(name) => index.instance_method_names(name),
@@ -2863,6 +2966,81 @@ mod tests {
         // so completion offers class (singleton) methods like `now`.
         let labels = complete("Time.\n", 0, 5);
         assert!(labels.contains(&"now".to_string()), "has Time.now: {labels:?}");
+    }
+
+    /// LSP v4 item 1: `Process::` offers the NESTED CONSTANTS, not the singleton
+    /// methods it used to return.
+    #[test]
+    fn completion_namespace_children_on_scope_operator() {
+        let labels = complete("Process::\n", 0, 9);
+        assert!(labels.contains(&"Status".to_string()), "nested class: {labels:?}");
+        assert!(labels.contains(&"UID".to_string()), "nested module: {labels:?}");
+        assert!(!labels.contains(&"wait".to_string()), "not a singleton method: {labels:?}");
+    }
+
+    /// An uppercase-initial partial is still a constant position; the prefix is
+    /// dropped and the full child set returned (the client filters).
+    #[test]
+    fn completion_namespace_children_with_uppercase_partial() {
+        let labels = complete("Process::St\n", 0, 11);
+        assert!(labels.contains(&"Status".to_string()), "{labels:?}");
+    }
+
+    /// …but a LOWERCASE partial after `::` is a class-method call, which keeps
+    /// the singleton-method behaviour (this is where the reference keeps it too).
+    #[test]
+    fn completion_lowercase_after_scope_operator_stays_on_methods() {
+        let labels = complete("Time::no\n", 0, 8);
+        assert!(labels.contains(&"now".to_string()), "singleton method: {labels:?}");
+        assert!(!labels.contains(&"Status".to_string()), "{labels:?}");
+    }
+
+    /// A namespace with no children (and an unknown one) yields a null
+    /// completion rather than an empty list — matching the reference's
+    /// `return nil if children.empty?`.
+    #[test]
+    fn completion_namespace_without_children_is_empty() {
+        assert!(complete("Symbol::\n", 0, 8).is_empty());
+        assert!(complete("NoSuchThing::\n", 0, 13).is_empty());
+    }
+
+    /// The parent comes from the AST, so a non-constant left side offers nothing
+    /// (`[1, 2]::Foo` is not a namespace).
+    #[test]
+    fn completion_namespace_on_non_constant_parent_is_empty() {
+        assert!(complete("[1, 2]::\n", 0, 8).is_empty());
+    }
+
+    /// LSP v4 item 2: a PRIVATE method is never offered on an explicit receiver.
+    #[test]
+    fn completion_excludes_private_methods() {
+        let labels = complete("s = \"hi\"\ns.\n", 1, 2);
+        assert!(!labels.contains(&"respond_to_missing?".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"method_missing".to_string()), "{labels:?}");
+        assert!(labels.contains(&"upcase".to_string()), "public still offered: {labels:?}");
+    }
+
+    /// …including on a class object, whose surface folds in `Module`'s private
+    /// reflection methods.
+    #[test]
+    fn completion_excludes_private_methods_on_a_class_object() {
+        let labels = complete("Time.\n", 0, 5);
+        assert!(!labels.contains(&"module_function".to_string()), "{labels:?}");
+        assert!(!labels.contains(&"refine".to_string()), "{labels:?}");
+        assert!(labels.contains(&"now".to_string()), "{labels:?}");
+    }
+
+    /// LSP v4 item 3: a union receiver offers only the methods present on EVERY
+    /// arm — `upcase` (String-only) and `times` (Integer-only) are both out,
+    /// while the shared `Object`/`Kernel` surface remains.
+    #[test]
+    fn completion_on_a_union_receiver_intersects_the_arms() {
+        let src = "x = ARGV.empty? ? \"hi\" : 3\nx.\n";
+        let labels = complete(src, 1, 2);
+        assert!(!labels.is_empty(), "a union receiver still completes: {labels:?}");
+        assert!(!labels.contains(&"upcase".to_string()), "String-only: {labels:?}");
+        assert!(!labels.contains(&"times".to_string()), "Integer-only: {labels:?}");
+        assert!(labels.contains(&"frozen?".to_string()), "shared surface: {labels:?}");
     }
 
     #[test]
