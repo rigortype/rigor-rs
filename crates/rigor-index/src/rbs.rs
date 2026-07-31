@@ -2407,7 +2407,8 @@ impl Builder {
             match member {
                 Node::MethodDefinition(md) => {
                     let mname = intern(md.name().as_str());
-                    let (ret, arity, nilable, ret_instance, ret_void) = method_signature(&md);
+                    let (ret, arity, nilable, ret_instance, ret_self, ret_void) =
+                        method_signature(&md);
                     let block_ret = block_overload_return(&md);
                     // The structured TUPLE return the flat `ret` slot above
                     // collapses to `None` (Slice 2 of the MultiWrite substrate).
@@ -2434,7 +2435,7 @@ impl Builder {
                         // the wrong answer under inheritance, so it rides the
                         // call-site sentinel like a `self` block return. The
                         // singleton path keeps its own `ret_instance` flag.
-                        let instance_ret = if ret.is_none() && ret_instance {
+                        let instance_ret = if ret.is_none() && (ret_instance || ret_self) {
                             Some(SELF_RETURN)
                         } else {
                             ret
@@ -2936,7 +2937,7 @@ fn qualified_name(enclosing: &[&'static str], tn: &ruby_rbs::node::TypeNameNode)
 /// conservative here only loses recall in `possible-nil-receiver`, never an FP).
 fn method_signature(
     md: &ruby_rbs::node::MethodDefinitionNode,
-) -> (Option<&'static str>, Arity, bool, bool, bool) {
+) -> (Option<&'static str>, Arity, bool, bool, bool, bool) {
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = Some(0);
     let mut variadic = false;
@@ -2946,6 +2947,7 @@ fn method_signature(
     let mut ret: Option<&'static str> = None;
     let mut ret_nilable = false;
     let mut ret_instance = false;
+    let mut ret_self = false;
     let mut ret_void = false;
     let mut ret_seen = false;
 
@@ -2979,34 +2981,42 @@ fn method_signature(
         // knows). Across overloads, only adopt a return if ALL resolvable
         // overloads agree on class, nil bit AND instance-ness; any
         // disagreement ⇒ leave None (never guess).
-        let (this_ret, this_nilable, this_instance, this_void) = match ft.return_type() {
-            Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), false, false, false),
+        let (this_ret, this_nilable, this_instance, this_self, this_void) = match ft.return_type() {
+            Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), false, false, false, false),
             // `-> instance` (M2-GO slice 4): the receiver-class instance.
-            Node::InstanceType(_) => (None, false, true, false),
+            Node::InstanceType(_) => (None, false, true, false, false),
+            // `-> self` — the RECEIVER itself (`String#force_encoding`,
+            // `Array#push`, `Object#freeze`). Tracked apart from `instance`
+            // because the two differ on the SINGLETON path: `def self.x: ()
+            // -> self` returns the class OBJECT, which the flat return slot
+            // cannot spell, while `-> instance` there means an instance.
+            Node::SelfType(_) => (None, false, false, true, false),
             // `-> void` (ADR-100): tracked as a flag for
             // `static.value-use.void`; the merged return stays None (the
             // engine's Dynamic recovery), so every existing consumer is
             // unchanged.
-            Node::VoidType(_) => (None, false, false, true),
+            Node::VoidType(_) => (None, false, false, false, true),
             // `String?` lowers to `OptionalType(ClassInstanceType String)`.
             // Recurse into the inner type; a nested optional/union/generic
             // inside the optional is not a single concrete class ⇒ None.
             Node::OptionalType(opt) => match opt.type_() {
-                Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), true, false, false),
-                Node::InstanceType(_) => (None, true, true, false),
-                _ => (None, false, false, false),
+                Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), true, false, false, false),
+                Node::InstanceType(_) => (None, true, true, false, false),
+                _ => (None, false, false, false, false),
             },
-            _ => (None, false, false, false),
+            _ => (None, false, false, false, false),
         };
         if !ret_seen {
             ret = this_ret;
             ret_nilable = this_nilable;
             ret_instance = this_instance;
+            ret_self = this_self;
             ret_void = this_void;
             ret_seen = true;
         } else if ret != this_ret
             || ret_nilable != this_nilable
             || ret_instance != this_instance
+            || ret_self != this_self
             || ret_void != this_void
         {
             // Disagreement on class, nilability, instance-ness or void-ness ⇒
@@ -3015,6 +3025,7 @@ fn method_signature(
             ret = None;
             ret_nilable = false;
             ret_instance = false;
+            ret_self = false;
             ret_void = false;
         }
     }
@@ -3022,10 +3033,12 @@ fn method_signature(
     let arity = (min.unwrap_or(0), if variadic { None } else { max });
     // `ret_nilable` is only meaningful when `ret` is Some; callers read it via
     // `method_return_nilable`, which gates on `ret` being present.
-    // `ret_instance` is meaningful only on the SINGLETON insert path (an
-    // instance method's `-> instance`/`-> self` stays untyped as before);
-    // when set, `ret` is None, so every existing consumer is unchanged.
-    (ret, arity, ret_nilable, ret_instance, ret_void)
+    // `ret_instance` / `ret_self` are call-site-late: they say "the receiver",
+    // which only the LOOKUP knows. The instance insert path turns either into
+    // the `SELF_RETURN` sentinel; the singleton path reads `ret_instance` alone
+    // (a singleton `-> self` is the class OBJECT, unspellable here ⇒ declines).
+    // When either is set, `ret` is None, so no other consumer changes.
+    (ret, arity, ret_nilable, ret_instance, ret_self, ret_void)
 }
 
 /// The TUPLE return of a method definition, as an ordered element-shape list —
@@ -3475,6 +3488,26 @@ mod embedded_tests {
         assert_eq!(idx.declared_instance_return("Hash", "compact"), Some(Some("Hash")));
         // A receiver the index does not model declines to None (⇒ Dynamic).
         assert_eq!(idx.method_return("NoSuchClassZzz", "compact"), None);
+    }
+
+    /// `-> self` on an INSTANCE method is the receiver itself — the spelling
+    /// core uses for the mutating and re-tagging families. It was tracked only
+    /// on the singleton path, so an instance method's `-> self` collapsed to
+    /// `Dynamic` and broke every chain running through it (measured: gitlab-foss
+    /// `[error.message].concat(error.backtrace).join("\n").truncate(N)`).
+    #[test]
+    fn self_return_on_an_instance_method_resolves_to_the_receiver() {
+        let idx = CoreData::load();
+        assert_eq!(idx.method_return("Array", "concat"), Some("Array"));
+        assert_eq!(idx.method_return("Array", "push"), Some("Array"));
+        assert_eq!(idx.method_return("String", "force_encoding"), Some("String"));
+        // Resolved against the RECEIVER, so a subclass keeps its own type
+        // rather than widening to the class that declared the method.
+        assert_eq!(idx.method_return("Symbol", "freeze"), Some("Symbol"));
+        // A singleton `-> self` is the class OBJECT, which this flat slot
+        // cannot spell — it must keep declining instead of being folded like
+        // the instance case.
+        assert_eq!(idx.singleton_method_return("Struct", "new"), None);
     }
 
     /// rbs 4.1 also started using BOUNDED method type parameters in core

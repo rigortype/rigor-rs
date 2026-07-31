@@ -19,9 +19,8 @@ MultiWrite substrate (#46/#47), LSP `exclude:` parity (#45). ▶ NEXT: the `BigM
 (`vendored_gem_sigs` is now vendored,
 [note](notes/20260725-multiwrite-substrate-s2.md)); LSP config reload
 (`.rigor.yml` is read once at startup — the highest-value remaining LSP item);
-LSP v4+ (`::` completion, visibility filter, `rootUri`); or `-> self` on an
-INSTANCE method (only block returns resolve it; the `SELF_RETURN` sentinel makes
-it small — measure first). The sweep set is now CODIFIED
+or LSP v4+ (`::` completion, visibility filter, `rootUri`). The sweep set is
+now CODIFIED
 (`harness/sweep-corpora.yml` + `fp_audit.py --sweep`).
 - LSP §12 known limitation (reference-parity, ADR-0029): editing `.rigor.yml`
   needs an LSP restart — `invalidate` re-reads sig-dir CONTENT, not the parsed
@@ -53,7 +52,7 @@ parity-port arc has bottomed out — see Standing conclusions):
   plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
   remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
 
-State: harness **76 fixtures / 0 FP / 3 gaps** (live + snapshot, vs pin
+State: harness **77 fixtures / 0 FP / 3 gaps** (live + snapshot, vs pin
 `v0.3.1`; the 3 are fixture 72's `rule: null` parse diagnostics). Standing sweep
 `fp_audit.py --gaps --sweep`: **0 FP across 9204 files**, 8 corpora, baselines in
 `harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. Clippy:
@@ -100,6 +99,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 ## Ledger (newest first; one line per arc/slice)
 
 - **2026-07-31 survey FP triage — 24 → 0, nine root causes** — the pin bump's side finding, closed. Six of the nine are scoping/unit bugs an all-ASCII well-formed fixture corpus structurally cannot see: **columns counted in scalars, not Prism's BYTES** (8 FPs — same diagnostic, wrong column, on every emoji/kana spec line; a standing `TODO(spec)`); **semantic rules ran on Prism's RECOVERED tree** for unparseable files (4; the reference bails before `ScopeIndexer`); **top-level locals leaked into `def` bodies** via the flat name-keyed env (4; a driver `s = 'a'` typed a later `def is_anagram(s, t)`'s parameter); project reopenings of CORE classes invisible + top-level `def IO.foo` not registered (3); a namespaced project class losing to a same-named RBS class (1); dead-assignment reaching into the PARAMETER list (1); and two flow facts the reference invalidates — an argument the callee mutates, and `rescue => e` inside a block (2). Also **vendored the reference's `data/vendored_gem_sigs/` + `data/core_overlay/`** (1 FP — the ingestion-surface follow-up) — `prism` EXCLUDED: supplementing a sig set we do not vendor added 8 fresh `Prism.parse` FPs. 7 corpora / ~9150 files **0 FP at BOTH pins**, sweep-set output diff EMPTY both directions, harness 76 fixtures / 232 matched / 0 FP. [note](notes/20260731-survey-fp-triage-24.md).
+- **2026-07-31 `-> self` on INSTANCE methods** — resolved only for SINGLETONs and BLOCK overloads before, so an instance method's `-> self` collapsed to Dynamic and killed the chain. Now rides the `SELF_RETURN` sentinel → the RECEIVER's class; a SINGLETON `-> self` is the class OBJECT and keeps declining (fixture 77 pins that as a negative control). **1 gap closed, 0 FP / 9204 files** (gitlab 329→328). The textual prediction was NEGATIVE and wrong: a chain breaks at its FIRST unresolved link. [note](notes/20260731-self-return-instance-methods.md).
 - **2026-07-31 standing FP sweep set CODIFIED** — `harness/sweep-corpora.yml` is the single membership list for BOTH `fp_audit.py --sweep` and `run_corpus.rb` (each entry carries the `why:` it earns its place with; an absent corpus reports SKIPPED, never drops silently). Closes the ▶NEXT item the 24-FP triage left. Also fixed `run_corpus.rb`'s `REFERENCE_RIGOR_DIR` default — it pointed at the WORKING checkout, hazard 3 baked into a gate. Baseline **0 FP / 9204 files / 8 corpora** ([CORPUS.md](../harness/CORPUS.md)).
 - **2026-07-31 upstream HEAD survey (`v0.3.1`→`ece06a0d`, 49 commits) + Tuple set-op folds** — the whole delta moves **1 diagnostic** on 9204 files, one rigor-rs never emitted; pin STAYS at `v0.3.1` (no tag past it). Ported the one real item (#121 `a2867efd`): set ops fold on the pinned Tuple with `eql?` not `==` (`[1] & [1.0]` is EMPTY); NaN + OOB `at` decline. **0 FP / 9204 files**; no fixture until the pin passes `a2867efd`. [note](notes/20260731-head-survey-and-set-op-folds.md).
 - **2026-07-31 upstream pin `v0.3.0 → v0.3.1` + vendored rbs `4.0.3 → 4.1.0`** (one commit — an oracle on other core signatures than the port reads is not an oracle; same day, via an intermediate `7a69f142 → v0.3.0` tag bump that was behaviour-neutral bar the ADR-93 inline-RBS auto-wire, [note](notes/20260731-upstream-bump-7a69f142-v030.md)) — **0 FP / 9153 files, gaps net −2** (mastodon 49→48, gitlab 330→329, concurrent 87→86). 4.1.0's rewritten signatures broke two things, both FIXED rather than accepted as the survey assumed: bounded method type params (`Array#fetch`'s `[I < _ToInt] (I index)` admitted everything) now resolve to their bound, and `-> instance` on an INSTANCE method (`Hash#compact`) now resolves to the receiver's class via the `SELF_RETURN` call-site sentinel. New `harness/vendor_rbs.py` makes the vendoring recipe executable — proven by reproducing the committed 4.0.3 tree byte-for-byte before writing 4.1.0. Upstream logic delta itself: ZERO. [note](notes/20260731-upstream-pin-v031-rbs41.md) / [survey](notes/20260731-v031-preflight-survey.md).
