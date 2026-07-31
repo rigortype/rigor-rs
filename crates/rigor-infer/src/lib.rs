@@ -819,6 +819,59 @@ impl<'i> Typer<'i> {
             "empty?" if args.is_empty() => {
                 Some(interner.intern(Type::Constant(Scalar::Bool(elems.is_empty()))))
             }
+            // `at(n)` — the STRICT single-Integer accessor. Deliberately not an
+            // alias of `[]`: that one also takes a Range or a `(start, length)`
+            // pair, while `Array#at` raises `ArgumentError` on anything else,
+            // and a fold must never invent a value for a call that raises.
+            // An out-of-range index DECLINES rather than folding to nil: Ruby
+            // does return nil there, but proving nil on a receiver the RBS tier
+            // types as `Elem?` newly SURFACES diagnostics, which is a different
+            // decision from removing a Dynamic (upstream #121).
+            "at" if args.len() == 1 => {
+                let idx_ty = self.type_of(ast, args[0], env, interner);
+                let Type::Constant(Scalar::Int(i)) = interner.get(idx_ty) else {
+                    return None;
+                };
+                let (i, len) = (*i, elems.len() as i64);
+                let real = if i < 0 { len + i } else { i };
+                (0..len).contains(&real).then(|| elems[real as usize])
+            }
+            // `deconstruct` hands back the receiver itself (pattern matching's
+            // array view of an Array is the Array).
+            "deconstruct" if args.is_empty() => Some(recv_ty),
+            // The set-operation family. Both sides must be value-pinned, and
+            // membership is decided by `Scalar`'s equality — which is Ruby's
+            // `eql?`, not `==`: `[1] & [1.0]` is EMPTY even though `1 == 1.0`.
+            // (`Scalar` compares floats by raw bits and never across variants,
+            // so the distinction falls out; NaN is excluded separately below,
+            // where the two relations genuinely differ.)
+            "&" | "intersection" => self
+                .tuple_set_operation(&elems, args, ast, env, interner, set_intersection)
+                .map(|r| interner.intern(Type::Tuple(r))),
+            "|" | "union" => self
+                .tuple_set_operation(&elems, args, ast, env, interner, set_union)
+                .map(|r| interner.intern(Type::Tuple(r))),
+            "-" | "difference" => self
+                .tuple_set_operation(&elems, args, ast, env, interner, set_difference)
+                .map(|r| interner.intern(Type::Tuple(r))),
+            // The predicate form of `&`. Folds to a pinned bool, so it can prove
+            // a condition constant (`if %w[a].intersect?(%w[b])` is falsey).
+            "intersect?" => {
+                let r =
+                    self.tuple_set_operation(&elems, args, ast, env, interner, set_intersection)?;
+                Some(interner.intern(Type::Constant(Scalar::Bool(!r.is_empty()))))
+            }
+            // `one?` with no block and no pattern — "exactly one TRUTHY element".
+            // Only pinned elements have decidable truthiness; the block form
+            // never reaches here (block calls route to `type_block_call`).
+            "one?" if args.is_empty() => {
+                let values = tuple_constant_values(&elems, interner)?;
+                let truthy = values
+                    .iter()
+                    .filter(|s| !matches!(s, Scalar::Nil | Scalar::Bool(false)))
+                    .count();
+                Some(interner.intern(Type::Constant(Scalar::Bool(truthy == 1))))
+            }
             // `t[n]` — a constant integer index (Ruby negative-from-end);
             // out-of-bounds folds to `nil`. A non-constant index declines.
             "[]" if args.len() == 1 => {
@@ -836,6 +889,48 @@ impl<'i> Typer<'i> {
             }
             _ => None,
         }
+    }
+
+    /// Shared body for the Tuple set operations (`&` / `|` / `-` and their named
+    /// spellings): unwrap the receiver and EVERY argument to pinned scalars, run
+    /// `op` left-to-right over the argument list, and hand back the resulting
+    /// element list ready to re-intern as a `Tuple`.
+    ///
+    /// Declines unless every element on both sides is pinned (an unknown element
+    /// makes membership undecidable) and every argument is itself a `Tuple` —
+    /// `Array#&` also accepts anything answering `to_ary`, which a shape cannot
+    /// prove. Arity and result width are capped so the fold can never materialise
+    /// an unbounded Tuple, the same discipline the other shape folds keep.
+    fn tuple_set_operation(
+        &self,
+        elems: &[TypeId],
+        args: &[NodeId],
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        interner: &mut Interner,
+        op: fn(&[Scalar], &[Scalar]) -> Vec<Scalar>,
+    ) -> Option<Vec<TypeId>> {
+        /// Longer argument lists decline rather than folding.
+        const MAX_SET_OPERATION_ARITY: usize = 8;
+        /// Wider results decline rather than materialising a huge Tuple.
+        const MAX_SET_OPERATION_SIZE: usize = 64;
+
+        if args.is_empty() || args.len() > MAX_SET_OPERATION_ARITY {
+            return None;
+        }
+        let mut acc = tuple_constant_values(elems, interner)?;
+        for &arg in args {
+            let arg_ty = self.type_of(ast, arg, env, interner);
+            let Type::Tuple(other_elems) = interner.get(arg_ty) else {
+                return None;
+            };
+            let other = tuple_constant_values(&other_elems.clone(), interner)?;
+            acc = op(&acc, &other);
+        }
+        if acc.len() > MAX_SET_OPERATION_SIZE {
+            return None;
+        }
+        Some(acc.into_iter().map(|s| interner.intern(Type::Constant(s))).collect())
     }
 
     /// The value-pinned scalar key an ARGUMENT node denotes, resolved through its
@@ -2506,6 +2601,56 @@ fn join_flow_envs(a: &TypeEnv, b: &TypeEnv, interner: &mut Interner) -> TypeEnv 
     out
 }
 
+/// Unwrap a `Tuple`'s elements to their pinned scalars, or `None` if ANY element
+/// is not value-pinned — membership in a set operation is undecidable the moment
+/// one element is unknown.
+///
+/// A `NaN` element also declines. Everywhere else `Scalar`'s equality coincides
+/// with Ruby's `eql?` (never across variants, floats by raw bits), which is what
+/// `Array#&` / `#|` / `#-` use — but Ruby's `Float::NAN.eql?(Float::NAN)` is
+/// FALSE while identical bits compare equal here, so a NaN would be the one
+/// value this fold could get wrong.
+fn tuple_constant_values(elems: &[TypeId], interner: &Interner) -> Option<Vec<Scalar>> {
+    elems
+        .iter()
+        .map(|&id| match interner.get(id) {
+            Type::Constant(Scalar::Float(f)) if f.is_nan() => None,
+            Type::Constant(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `a & b` — the elements of `a` that are also in `b`, de-duplicated, in `a`'s
+/// order (Ruby `Array#&`).
+fn set_intersection(a: &[Scalar], b: &[Scalar]) -> Vec<Scalar> {
+    let mut out: Vec<Scalar> = Vec::new();
+    for s in a {
+        if b.contains(s) && !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+/// `a | b` — `a` then `b`, de-duplicated, first occurrence wins (Ruby `Array#|`).
+fn set_union(a: &[Scalar], b: &[Scalar]) -> Vec<Scalar> {
+    let mut out: Vec<Scalar> = Vec::new();
+    for s in a.iter().chain(b.iter()) {
+        if !out.contains(s) {
+            out.push(s.clone());
+        }
+    }
+    out
+}
+
+/// `a - b` — the elements of `a` absent from `b`. NOT de-duplicated: Ruby's
+/// `Array#-` removes every occurrence of a matching value but keeps the repeats
+/// of the ones that survive (`[1, 1, 2] - [2] == [1, 1]`).
+fn set_difference(a: &[Scalar], b: &[Scalar]) -> Vec<Scalar> {
+    a.iter().filter(|s| !b.contains(s)).cloned().collect()
+}
+
 /// Type an owned-AST node against the current `env`. Free-function wrapper kept
 /// source-compatible for callers (e.g. rigor-rules) that predate [`Typer`]; it
 /// runs over an *empty* index, so a `Call` receiver types via folding only and
@@ -4113,5 +4258,69 @@ mod rbs_tuple_return_tests {
     #[test]
     fn divergent_overloads_stay_dynamic() {
         assert_eq!(last_call_ty(b"r, w = IO.pipe\n"), "Dynamic[top]");
+    }
+
+    /// Upstream #121: an array of statically known values kept its precision
+    /// through concatenation and slicing but lost it at a set operation. Each
+    /// result below is the answer real Ruby gives for the same expression.
+    #[test]
+    fn tuple_set_operations_fold() {
+        assert_eq!(last_call_ty(b"[1, 2] & [2]\n"), "Tuple[Constant[2]]");
+        assert_eq!(
+            last_call_ty(b"[1] | [2]\n"),
+            "Tuple[Constant[1], Constant[2]]"
+        );
+        // `-` does NOT de-duplicate what survives: `[1, 1, 2] - [2] == [1, 1]`.
+        assert_eq!(
+            last_call_ty(b"[1, 1, 2] - [2]\n"),
+            "Tuple[Constant[1], Constant[1]]"
+        );
+        // The named spellings take several arguments, reduced left to right.
+        assert_eq!(
+            last_call_ty(b"[1, 2].intersection([2, 3], [2])\n"),
+            "Tuple[Constant[2]]"
+        );
+        assert_eq!(last_call_ty(b"[1, 2].intersect?([3])\n"), "Constant[false]");
+        assert_eq!(last_call_ty(b"[1, 2].intersect?([2])\n"), "Constant[true]");
+    }
+
+    /// Membership is `eql?`, not `==` — `[1] & [1.0]` is EMPTY at runtime even
+    /// though `1 == 1.0`. Getting this wrong is the whole reason upstream ran
+    /// Ruby's own operator instead of reimplementing membership.
+    #[test]
+    fn tuple_set_operations_use_eql_not_equality() {
+        assert_eq!(last_call_ty(b"[1] & [1.0]\n"), "Tuple[]");
+        // Both survive the union because they are not `eql?` — the rendering
+        // of `Constant[1.0]` as `1` is `describe`'s float formatting, not a
+        // collapse (the intersection above proves they are distinct values).
+        assert_eq!(
+            last_call_ty(b"[1] | [1.0]\n"),
+            "Tuple[Constant[1], Constant[1]]"
+        );
+    }
+
+    /// `one?` (no block) counts TRUTHY elements, so `nil` / `false` do not
+    /// count; `at` folds an in-range constant index.
+    #[test]
+    fn tuple_one_and_at_fold() {
+        assert_eq!(last_call_ty(b"[nil, false, 3].one?\n"), "Constant[true]");
+        assert_eq!(last_call_ty(b"[nil, 2, 3].one?\n"), "Constant[false]");
+        assert_eq!(last_call_ty(b"[1, 2, 3].at(1)\n"), "Constant[2]");
+        assert_eq!(last_call_ty(b"[1, 2, 3].at(-1)\n"), "Constant[3]");
+    }
+
+    /// The declines. An out-of-range `at` does NOT fold to nil — proving nil on
+    /// a receiver the RBS tier calls optional would newly SURFACE diagnostics,
+    /// a different decision from removing a Dynamic. An argument that is not a
+    /// pinned Tuple, or an element that is not pinned, leaves the RBS tier to
+    /// widen.
+    #[test]
+    fn tuple_set_operations_decline_when_undecidable() {
+        assert_eq!(last_call_ty(b"[1, 2, 3].at(9)\n"), "Dynamic[top]");
+        // `Class<4>` is core `Array` — the RBS tier's widened answer.
+        assert_eq!(last_call_ty(b"[1, 2] & unknown_thing\n"), "Class<4>");
+        assert_eq!(last_call_ty(b"[1, unknown_thing] & [1]\n"), "Class<4>");
+        // No argument at all is not a set operation; the RBS tier answers.
+        assert_eq!(last_call_ty(b"[1, 2].intersection\n"), "Class<4>");
     }
 }
