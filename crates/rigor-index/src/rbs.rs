@@ -52,7 +52,8 @@ const DEFAULT_LIBRARIES: &[&str] = &[
 ];
 
 /// Classes the REFERENCE loads a declaration for but whose DEFINITION it cannot
-/// build — `RBS::DefinitionBuilder#build_instance` / `#build_singleton` raise, so
+/// build **as it loads in this project's dev environment** —
+/// `RBS::DefinitionBuilder#build_instance` / `#build_singleton` raise, so
 /// `RbsLoader#instance_definition` / `#singleton_definition` fail-soft to `nil`
 /// and the dispatcher degrades EVERY call on them to `Dynamic[Top]`. The oracle
 /// is therefore silent on any method of these classes — real or misspelled — and
@@ -61,25 +62,45 @@ const DEFAULT_LIBRARIES: &[&str] = &[
 /// and `Bundler.frobnicate` both fired here while the pinned oracle stayed
 /// silent (`docs/notes/20260731-bigmath-ingestion-asymmetry.md`).
 ///
+/// **This set is keyed to (pin × rbs version × THE HOST'S INSTALLED GEMS), not
+/// to the pin alone**, because `RBS::EnvironmentLoader#add(library:)` prefers an
+/// installed gem's own `sig/` over `rbs`'s `stdlib/<lib>/` copy — so *which*
+/// signature files are in the room depends on what is installed. Measured A/B
+/// (see the note): with the `bigdecimal` gem absent from `GEM_PATH`, the same
+/// pinned reference BUILDS `BigMath` and FIRES on both probe shapes, and the set
+/// shrinks to 11. Of the twelve entries exactly one — `BigMath` — has an
+/// environment-supplied ingredient; the other eleven are collisions between the
+/// reference's own `data/vendored_gem_sigs/` and the `rbs` gem, whose version the
+/// reference's `Gemfile.lock` locks to the pin. So on a host without that gem
+/// rigor-rs is *more silent* than the oracle: a coverage gap, FP-safe, and drift
+/// keyed to an environment rather than to the pin. That is accepted because the
+/// FP this removes is real in the environment the gates are actually measured in.
+/// `harness/unbuildable_classes.rb` tags each entry's sources `[env]` / `[pin]`
+/// and MUST be run where the gates run.
+///
 /// The failures are all SOURCE COLLISIONS inside the reference's own load set,
 /// and every one of them involves a signature source rigor-rs deliberately does
 /// NOT vendor, which is why rigor-rs's index builds cleanly instead:
 ///
-/// - `BigMath` — `DEFAULT_LIBRARIES` lists BOTH `bigdecimal` and
-///   `bigdecimal-math`. `RBS::EnvironmentLoader` resolves `bigdecimal` to the
-///   INSTALLED GEM's `sig/` (a gem's own signatures win over `rbs`'s `stdlib/`
-///   copy), and that directory ships `big_math.rbs` — the same `module BigMath`
-///   that `rbs`'s `stdlib/bigdecimal-math/0/big_math.rbs` declares. Two sources,
-///   same methods ⇒ `DuplicatedMethodDefinitionError`. rigor-rs vendors only the
-///   `rbs` stdlib copy (`vendor/rbs/PROVENANCE.md`), so it has exactly one.
-/// - `Bundler*` / `Gem::*` — the `rbs` GEM's own `sig/shims/{bundler,rubygems}.rbs`
-///   (reached because `rbs` is in `DEFAULT_LIBRARIES`) against the reference's
-///   `data/vendored_gem_sigs/{bundler,rubygems}/`. rigor-rs vendors the latter as
+/// - `BigMath` — **the one ENVIRONMENT-supplied entry.** `DEFAULT_LIBRARIES`
+///   lists BOTH `bigdecimal` and `bigdecimal-math`. `RBS::EnvironmentLoader`
+///   resolves `bigdecimal` to the INSTALLED GEM's `sig/` (a gem's own signatures
+///   win over `rbs`'s `stdlib/` copy), and that directory ships `big_math.rbs` —
+///   the same `module BigMath` that `rbs`'s `stdlib/bigdecimal-math/0/big_math.rbs`
+///   declares. Two sources, same methods ⇒ `DuplicatedMethodDefinitionError`.
+///   rigor-rs vendors only the `rbs` stdlib copy (`vendor/rbs/PROVENANCE.md`), so
+///   it has exactly one. Remove the `bigdecimal` gem and this entry disappears.
+/// - `Bundler*` / `Gem::*` — PIN-determined. The `rbs` GEM's own
+///   `sig/shims/{bundler,rubygems}.rbs` (reached because `rbs` is in
+///   `DEFAULT_LIBRARIES`) against the reference's
+///   `data/vendored_gem_sigs/{bundler,rubygems}/`. Both sides move with the pin —
+///   the `data/` tree is the reference's own, and the rbs version is locked by its
+///   `Gemfile.lock`. rigor-rs vendors the `data/` half as
 ///   `overlay/vendored_gem_sigs/` but NOT the `rbs` gem's `sig/`, so again one
 ///   source only.
 /// - `Gem::SourceList` (`NoTypeFoundError`) and `Nokogiri::CSS::Parser`
-///   (`NoSuperclassFoundError: Racc::Parser`) — dangling references inside
-///   `vendored_gem_sigs` itself.
+///   (`NoSuperclassFoundError: Racc::Parser`) — PIN-determined too: dangling
+///   references inside `vendored_gem_sigs` itself.
 ///
 /// **Why a table and not a derivation.** rigor-rs cannot compute this set from
 /// its own tree: the colliding declaration is precisely the one it does not
@@ -89,9 +110,10 @@ const DEFAULT_LIBRARIES: &[&str] = &[
 /// `prism` supplement (8 fresh FPs). So the set is DATA, on the same footing as
 /// the vendored signatures themselves, and it is regenerated from the pinned
 /// oracle by `harness/unbuildable_classes.rb` (`--check` verifies this list
-/// against the reference and is part of the pin-bump ritual). If upstream fixes a
-/// collision, regeneration drops the entry and rigor-rs starts witnessing again —
-/// the table converges rather than freezing a gap.
+/// against the reference and is part of the pin-bump ritual — run it where the
+/// gates run, per the environment caveat above). If upstream fixes a collision,
+/// regeneration drops the entry and rigor-rs starts witnessing again — the table
+/// converges rather than freezing a gap.
 ///
 /// Names are FULLY QUALIFIED. A top-level name is applied to both the short-key
 /// `classes` map and the qualified registry; a NAMESPACED name is applied to the

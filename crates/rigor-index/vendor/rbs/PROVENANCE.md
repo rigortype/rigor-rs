@@ -24,7 +24,10 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
   reference unable to build the definition at all. `UNBUILDABLE_DEFINITIONS` in
   `src/rbs.rs` is how that (and the same collision for `Bundler` / `Gem::*`) is
   mirrored; regenerate it with `harness/unbuildable_classes.rb --check` whenever
-  this tree, the reference pin, or the host Ruby moves.
+  this tree, the reference pin, or the host Ruby moves — **in the environment the
+  gates run in**, since the `bigdecimal` half of that set depends on the host
+  having the gem installed at all (measured: without it the reference builds
+  `BigMath` and the set drops from 12 entries to 11).
   [note](../../../../docs/notes/20260731-bigmath-ingestion-asymmetry.md)
 
 ## Contents

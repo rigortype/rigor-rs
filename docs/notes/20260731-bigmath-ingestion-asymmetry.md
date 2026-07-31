@@ -66,6 +66,71 @@ It is worth being precise about the direction: this is **not** rigor-rs knowing
 more than the oracle in any useful sense. Both engines hold the same signatures.
 The oracle holds them TWICE and is thereby blinded.
 
+## The oracle's silence is ENVIRONMENT-dependent, not a property of the pin
+
+Step 2 above turns on "the installed `bigdecimal` gem ships `sig/`", which is a
+fact about the host, not about the pin. Take the gem away and the same pinned
+reference behaves like an entirely different oracle. Measured — same submodule
+commit, same file, only `GEM_HOME`/`GEM_PATH` differing:
+
+```console
+$ cat bm.rb
+require "bigdecimal/math"
+BigMath.sqrt(BigDecimal("2"), 10).frobnicate
+BigMath.frobnicate(1)
+
+# arm A — ambient dev environment (bigdecimal-4.1.2 installed, sig/ ships big_math.rbs)
+$ ruby -I reference/rigor/lib -I …/rigor-rbs-inline/lib \
+    reference/rigor/exe/rigor check --no-cache bm.rb
+No diagnostics
+
+# arm B — GEM_HOME/GEM_PATH pointed at the same gem set MINUS the bigdecimal gem
+$ GEM_HOME=/tmp/bm-gems-nobd GEM_PATH=/tmp/bm-gems-nobd ruby -I … check --no-cache bm.rb
+bm.rb:2:35: error: undefined method `frobnicate' for BigDecimal
+bm.rb:3:9:  error: undefined method `frobnicate' for singleton(BigMath)
+```
+
+(Arm B's `GEM_HOME` is a symlink farm of the ambient gem set with the
+`bigdecimal-*` entries omitted, so nothing but that gem's presence changes. The
+loaded class count is 1356 in BOTH arms — the class *set* is identical; only the
+duplicate declaration differs.)
+
+Arm B fires on **both** shapes, byte-identical to what rigor-rs emitted before
+this change. So the pre-change rigor-rs was exactly right in arm B and exactly
+wrong in arm A.
+
+Re-deriving the whole set under arm B: **11 classes instead of 12 — `BigMath` is
+the only entry that leaves.** That is the precise split, and it is worth stating
+as the durable fact:
+
+| entries | ingredients | moves with |
+| --- | --- | --- |
+| `BigMath` (1) | the **installed `bigdecimal` gem's** `sig/big_math.rbs` × `rbs`'s `stdlib/bigdecimal-math` | **the host's gem set** |
+| the other 11 | the reference's own `data/vendored_gem_sigs/` × the `rbs` gem's `sig/shims/` + `core/rubygems/` | the pin (the `data/` tree is the reference's; the rbs version is locked by its `Gemfile.lock`) |
+
+Three consequences, all of which the design has to own rather than hide:
+
+1. **On a host without that gem's `sig/`, the oracle FIRES and rigor-rs (with the
+   table) stays silent** — a coverage gap rather than a false positive. FP-safe,
+   so the change is still correct under ADR-0002, but it is drift keyed to an
+   environment rather than to the pin, which no other part of this port is.
+2. **The false positive this removes exists only in environments like this
+   project's dev machine** — which is the environment the gates are measured in.
+   Removing it is therefore right on this project's own terms; a project pinning
+   a gem-free environment would want the opposite entry.
+3. **`harness/unbuildable_classes.rb --check` inherits the dependence.** Run
+   outside the gate environment it will legitimately disagree, and the
+   disagreement is a fact about the two environments, not a bug in either. The
+   script therefore tags every colliding source `[env]` (host-installed gem) or
+   `[pin]` (the reference's own tree, or the version-locked rbs gem) so a diff
+   reads as "your bigdecimal gem changed" rather than "upstream changed":
+
+   ```
+   ("BigMath",  true,  true), // build_instance=DuplicatedMethodDefinitionError, …
+   //     [env] bigdecimal-4.1.2/sig/big_math.rbs
+   //     [pin] rbs-4.1.0/stdlib/bigdecimal-math/0/big_math.rbs
+   ```
+
 ## Sibling sweep — the mechanism reaches 12 classes, 2 of them observably
 
 `harness/unbuildable_classes.rb` builds the reference's configless env and probes
@@ -172,12 +237,15 @@ synthetic probe against the oracle.
   on the ORACLE's surface and not rigor-rs's, so `"abc".Nokogiri` fires here and
   is silent there. That is a genuine ingestion gap (rigor-rs knows LESS), needs a
   vendoring decision rather than a surface mask, and is unaffected by this change.
-- **The `UNBUILDABLE_DEFINITIONS` set is host-sensitive in principle.** It is a
-  property of (reference pin × rbs version × installed gem set): the `BigMath`
-  collision requires the `bigdecimal` gem to ship `sig/`, which every supported
-  Ruby currently does, and the `Bundler`/`Gem::*` ones require the `rbs` gem's
-  `sig/shims/`. Re-run `--check` on any pin, rbs, or Ruby bump; a `STALE` line
-  means upstream fixed something and rigor-rs should resume witnessing.
+- **The environment dependence is a standing property, not a one-off.** It is
+  measured above rather than hypothesised, and it is the one axis of this table
+  that is not pinned. Re-run `--check` in the gate environment on any pin, rbs,
+  Ruby *or gem* bump; read the `[env]` / `[pin]` tags before concluding upstream
+  changed. Whether the port should eventually pin the oracle's gem environment
+  outright (a `Gemfile`/`bundle exec` wrapper around every oracle invocation, so
+  the set is a pure function of the pin) is a real follow-up question this note
+  deliberately leaves open — it would touch every harness entry point, and the
+  measurement here shows the blast radius is currently one class.
 - **The reference has a real bug here**, whether or not this port registers it:
   `bigdecimal-math` in `DEFAULT_LIBRARIES` is self-defeating — it is the entry
   that destroys `BigMath` rather than the entry that supplies it. Worth an
