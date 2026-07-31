@@ -1,0 +1,4 @@
+{
+  "fixture": "harness/corpus/79_sig_undeclared_type_ref.rb",
+  "diagnostics": []
+}
