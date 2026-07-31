@@ -67,7 +67,7 @@ sound-subset side of ADR-0002 and are expected:
 | corpus | files | coverage gaps |
 |---|---|---|
 | mastodon/app | 1236 | 48 |
-| gitlab-foss/lib | 4676 | 329 |
+| gitlab-foss/lib | 4676 | 328 |
 | survey/mail | 874 | 540 |
 | survey/Ruby | 192 | 30 |
 | survey/dependabot-core | 1650 | 81 |

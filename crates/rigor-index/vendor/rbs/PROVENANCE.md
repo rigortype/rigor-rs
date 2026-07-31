@@ -13,6 +13,19 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
   stdlib set (`src/rbs.rs`) transitively closed over each lib's
   `manifest.yaml` `dependencies:` — i.e. byte-for-byte the set the old runtime
   path ingested. **Not** the entire `stdlib/` tree; only the loaded closure.
+- **This is NOT byte-for-byte what the REFERENCE loads**, and the difference is
+  load-bearing. `RBS::EnvironmentLoader#add(library:)` prefers an installed
+  GEM's own `sig/` over `rbs`'s `stdlib/<lib>/` copy, so on a current Ruby the
+  reference reads `bigdecimal-*/sig`, `base64-*/sig`, `mutex_m-*/sig`,
+  `prism-*/sig` and `rbs-*/sig` where this tree carries the `rbs` stdlib copy
+  (or nothing). Mostly that is harmless duplication of the same signatures, but
+  for `bigdecimal` it makes the reference load `BigMath` TWICE — once from the
+  gem, once from `stdlib/bigdecimal-math` — which collides and leaves the
+  reference unable to build the definition at all. `UNBUILDABLE_DEFINITIONS` in
+  `src/rbs.rs` is how that (and the same collision for `Bundler` / `Gem::*`) is
+  mirrored; regenerate it with `harness/unbuildable_classes.rb --check` whenever
+  this tree, the reference pin, or the host Ruby moves.
+  [note](../../../../docs/notes/20260731-bigmath-ingestion-asymmetry.md)
 
 ## Contents
 

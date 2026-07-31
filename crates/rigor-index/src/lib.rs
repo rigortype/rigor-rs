@@ -974,6 +974,83 @@ mod tests {
         assert!(!idx.is_module("NotAClass_xyz"));
     }
 
+    /// The classes the REFERENCE cannot build a definition for
+    /// (`UNBUILDABLE_DEFINITIONS`): still KNOWN — so a constant read resolves and
+    /// no `call.unresolved-toplevel` appears — but with no method surface at all,
+    /// so every existence query answers "assume present ⇒ stay silent" and no
+    /// return type resolves. `BigMath` is the measured case
+    /// (`BigMath.frobnicate(1)` fired here while the pinned oracle was silent).
+    #[test]
+    fn unbuildable_definitions_are_known_but_surfaceless() {
+        let idx = CoreIndex::new();
+        if !idx.knows_class("BigMath") {
+            return; // stub fallback — no stdlib in the index.
+        }
+        // Known: the reference's `class_known?` reads `class_decls`, which a
+        // failed DEFINITION build does not remove.
+        assert!(idx.knows_class("BigMath"));
+        assert!(idx.knows_toplevel_class("BigMath"));
+        assert!(idx.knows_qualified_class("BigMath"));
+        // Surfaceless: a real method and a typo are indistinguishable, both silent.
+        assert!(idx.class_has_singleton_method("BigMath", "sqrt"));
+        assert!(idx.class_has_singleton_method("BigMath", "frobnicate"));
+        assert!(idx.class_has_method("BigMath", "frobnicate"));
+        assert!(idx.qualified_class_has_method("BigMath", "frobnicate"));
+        // No return type: `BigMath.sqrt(x, 10)` must NOT type as BigDecimal, or
+        // the chained `.frobnicate` fires where the oracle is silent.
+        assert_eq!(idx.singleton_method_return("BigMath", "sqrt"), None);
+        assert_eq!(idx.method_return("BigMath", "sqrt"), None);
+        // Its OWN declared methods are gone. The advisory enumerations still
+        // report what a module object inherits (`Module#name`, `Class#new`, …),
+        // which is true at runtime and only feeds LSP completion, never a
+        // diagnostic — the emptied tables are what the gates above read.
+        assert!(!idx.singleton_method_names("BigMath").contains(&"sqrt"));
+        assert!(!idx.instance_method_names("BigMath").contains(&"sqrt"));
+        // Same treatment for the namespaced siblings, via the qualified registry.
+        assert!(idx.qualified_class_has_method("Gem::Specification", "frobnicate"));
+        assert!(idx.qualified_class_has_method("Nokogiri::CSS::Parser", "frobnicate"));
+    }
+
+    /// The two definitions fail INDEPENDENTLY in the reference, and the split
+    /// must be preserved: `Bundler`'s instance definition builds fine and only
+    /// its SINGLETON raises, so the oracle still witnesses `Bundler` INSTANCE
+    /// methods. Collapsing both sides onto one flag would be FP-safe but would
+    /// stop witnessing where the oracle speaks.
+    #[test]
+    fn unbuildable_sides_are_tracked_independently() {
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Bundler") {
+            return; // stub fallback.
+        }
+        // Singleton side blinded (the measured FP: `Bundler.frobnicate`).
+        assert!(idx.class_has_singleton_method("Bundler", "frobnicate"));
+        assert_eq!(idx.singleton_method_return("Bundler", "root"), None);
+        // Instance side intact: the ancestor chain is still COMPLETE (nothing
+        // truncated it), so an absent instance method is still witnessed and an
+        // inherited one still resolves. Had the flags been conflated, both of
+        // these would flip to the conservative "assume present".
+        assert!(!idx.class_has_method("Bundler", "frobnicate"));
+        assert!(!idx.qualified_class_has_method("Bundler", "frobnicate"));
+        assert!(idx.class_has_method("Bundler", "instance_variable_get"));
+    }
+
+    /// Negative control for the above: a class the reference DOES build keeps its
+    /// full surface. `BigDecimal` is the sharp case — it lives in the same
+    /// `bigdecimal` signature set as `BigMath` and is deliberately NOT neutralised
+    /// (the oracle fires `undefined method 'frobnicate' for BigDecimal`).
+    #[test]
+    fn buildable_neighbours_keep_their_surface() {
+        let idx = CoreIndex::new();
+        if !idx.knows_class("BigDecimal") {
+            return; // stub fallback.
+        }
+        assert!(idx.class_has_method("BigDecimal", "sqrt"));
+        assert!(!idx.class_has_method("BigDecimal", "frobnicate"));
+        assert!(idx.class_has_singleton_method("Math", "sqrt"));
+        assert!(!idx.class_has_singleton_method("Math", "frobnicate"));
+        assert_eq!(idx.singleton_method_return("Math", "sqrt"), Some("Float"));
+    }
+
     #[test]
     fn knows_toplevel_class_under_stub() {
         // Under the stub fallback (no RBS dir), a curated class is top-level and

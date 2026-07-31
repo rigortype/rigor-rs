@@ -133,6 +133,17 @@ chasing a non-bug.)
    Also re-sync `vendor/rbs/overlay/` from the reference's own `data/`
    (`data/core_overlay/`, `data/vendored_gem_sigs/` — see `PROVENANCE.md`; those
    track the reference pin, not the rbs version).
+   Then re-derive the classes whose DEFINITION the reference cannot build —
+   `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`
+   directories collide, and a collision blinds the oracle on that whole class:
+   ```sh
+   ruby harness/unbuildable_classes.rb --check   # else: paste the printed table
+   ```
+   A `MISSING` line is a false positive rigor-rs will now emit; a `STALE` line
+   means upstream fixed a collision and rigor-rs should resume witnessing. Both
+   need the `UNBUILDABLE_DEFINITIONS` table in `crates/rigor-index/src/rbs.rs`
+   updated in the same commit
+   ([note](docs/notes/20260731-bigmath-ingestion-asymmetry.md)).
 4. **Re-baseline the harness** against the new reference:
    ```sh
    ruby harness/snapshot.rb        # regenerate harness/snapshots/*.json
