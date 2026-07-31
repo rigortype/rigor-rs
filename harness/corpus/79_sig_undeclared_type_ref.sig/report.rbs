@@ -1,0 +1,7 @@
+class Report
+  @sink: _Writable
+
+  def initialize: (_Writable sink) -> void
+  def emit: (String text) -> void
+  def totals: () -> serialized_node
+end
