@@ -32,34 +32,59 @@ ruby harness/run_corpus.rb /path/to/dir1 /path/to/dir2
 | Variable              | Default                                     | Purpose                                |
 |-----------------------|---------------------------------------------|----------------------------------------|
 | `CORPUS_LIMIT`        | `80`                                        | Max .rb files sampled per corpus dir   |
-| `REFERENCE_RIGOR_DIR` | `/Users/megurine/repo/ruby/rigor`           | Path to the Ruby rigor checkout        |
+| `REFERENCE_RIGOR_DIR` | `reference/rigor` (the PINNED submodule)    | The oracle. Pointing this at a working checkout compares against a different version — UPSTREAM.md hazard 3 |
+| `SWEEP_CORPORA`       | `harness/sweep-corpora.yml`                 | The standing sweep set's manifest      |
 | `RIGOR_RS_BIN`        | `target/debug/rigor` (under repo root)      | Path to the rigor-rs binary            |
 
 The binary is auto-built if absent (`cargo build --offline -p rigor-cli`).
 
-## Corpora (built-in)
+## Corpora
 
-| # | Label                    | Directory                                           | Cap |
-|---|--------------------------|-----------------------------------------------------|-----|
-| 1 | `rigor/examples`         | `/…/ruby/rigor/examples`                            | 80  |
-| 2 | `rigor/lib/rigor/type`   | `/…/ruby/rigor/lib/rigor/type`                      | 80  |
-| 3 | `mastodon/app/models`    | `/…/ruby/mastodon/app/models`                       | 60  |
+Two sources, one list:
 
-### Corpus 1 — rigor/examples (32 files)
-The reference implementation's own demo projects (`rigor-web`, `rigor-units`,
-`rigor-deprecations`, `rigor-pattern`, `rigor-routes`, `rigor-lisp-eval`).
-These are real idiomatic Ruby that exercises the public Rigor plugin API.
+1. The reference's own trees (`examples/`, `lib/rigor/type/`) — taken from the
+   **pinned submodule**, so they move with the pin.
+2. The **standing sweep set**, read from `harness/sweep-corpora.yml`. That file
+   is the single membership list for both this script and
+   `harness/fp_audit.py --sweep`, so the two cannot drift apart on *which*
+   corpora are measured — the drift that let 24 false positives sit unmeasured
+   on corpora nobody had typed into a command line
+   ([note](../docs/notes/20260731-survey-fp-triage-24.md)).
 
-### Corpus 2 — rigor/lib/rigor/type (23 files)
-The reference's own type-carrier source code.  Clean, zero-diagnostic Ruby — a
-strong false-positive stress test.
+Each entry carries a `why:` recording what that corpus caught that no other
+member catches. Add one only with such a reason; do not remove one because it is
+currently quiet. A member absent on this machine is reported as `SKIPPED` by both
+tools — a partial sweep must never read as a full one.
 
-### Corpus 3 — mastodon/app/models (60 files)
-The first 60 `*.rb` files (alphabetical) from Mastodon, a production Rails
-application.  Real-world mixed-paradigm Ruby (ActiveRecord, ActiveSupport,
-modules, concerns, etc.).
+Custom directories passed as positional arguments replace the whole list.
 
-## Run results (2026-06-26)
+## Standing sweep-set baseline (2026-07-31)
+
+`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.1`,
+vendored rbs 4.1.0. **9204 files, 0 FP candidates.** Coverage gaps are the
+sound-subset side of ADR-0002 and are expected:
+
+| corpus | files | coverage gaps |
+|---|---|---|
+| mastodon/app | 1236 | 48 |
+| gitlab-foss/lib | 4676 | 329 |
+| survey/mail | 874 | 540 |
+| survey/Ruby | 192 | 30 |
+| survey/dependabot-core | 1650 | 81 |
+| survey/concurrent-ruby | 345 | 86 |
+| survey/net-ssh | 180 | 75 |
+| survey/haml/lib | 51 | 5 |
+
+Note what this measurement CANNOT see: both sides run from a clean cwd
+(core+stdlib only), so no project-`sig/` behaviour is exercised. Use a
+hand-built project for that — see
+[note](../docs/notes/20260731-head-survey-and-set-op-folds.md).
+
+## Historical run results (2026-06-26, Audit R4)
+
+The original three-corpus run that commissioned this harness. Kept as the record
+of what it was built to prove; the live numbers are the baseline above.
+
 
 ### Corpus 1 — rigor/examples
 | Metric                    | Value |

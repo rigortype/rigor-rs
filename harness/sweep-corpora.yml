@@ -1,0 +1,74 @@
+# The STANDING false-positive sweep set.
+#
+# `harness/fp_audit.py --sweep` runs exactly this list, so "the sweep" is a
+# reproducible thing rather than a hand-typed set of directories that drifts
+# between sessions. It exists because the hand-typed version DID drift: the
+# survey corpora below were outside it and carried 24 pre-existing false
+# positives nobody was measuring (2026-07-31,
+# `docs/notes/20260731-survey-fp-triage-24.md`).
+#
+# Membership rule: a corpus earns a place by having caught something no other
+# member catches. `why:` records what — do not add a corpus without one, and do
+# not remove a corpus because it is currently quiet.
+#
+# Paths are absolute and machine-specific (these are large OSS checkouts, not
+# vendored). A corpus that is not present is SKIPPED LOUDLY, never silently:
+# a sweep that quietly measured half the set would read as a green gate.
+#
+# Baselines (gap counts per corpus) live in `harness/CORPUS.md`, dated — not
+# here, so the manifest stays a membership list and not a number to maintain.
+
+corpora:
+  - label: mastodon/app
+    path: /Users/megurine/repo/ruby/mastodon/app
+    why: >-
+      Rails application code (ActiveRecord, concerns, ActiveSupport idiom). The
+      original application-shaped corpus; the possible-nil / undefined-method
+      gap map is measured here.
+
+  - label: gitlab-foss/lib
+    path: /Users/megurine/repo/ruby/gitlab-foss/lib
+    why: >-
+      Large library-shaped Rails code. Caught what mastodon did not on the
+      v0.3.0 arc (the MutationWidening always-truthy FPs), and is where the
+      `Hash#presence` / `with_indifferent_access` witnesses regressed under the
+      rbs 4.1 bump.
+
+  - label: survey/mail
+    path: /Users/megurine/repo/ruby/rigor-survey/mail
+    why: >-
+      A gem with a vendored bundle — so it also sweeps rdoc, rspec and friends.
+      Carried 14 of the 24 FPs the sweep set could not see, and is the corpus
+      where inline-RBS annotations (rdoc's `#:` comments) actually occur.
+
+  - label: survey/Ruby
+    path: /Users/megurine/repo/ruby/rigor-survey/Ruby
+    why: >-
+      Small hand-written algorithm scripts — top-level code, no project
+      structure, non-idiomatic. Carried 8 FPs (mostly `unresolved-toplevel`)
+      that library-shaped corpora structurally cannot contain.
+
+  - label: survey/dependabot-core
+    path: /Users/megurine/repo/ruby/rigor-survey/dependabot-core
+    why: >-
+      Multi-package repo with a very large spec suite — the RSpec DSL surface,
+      and by volume the biggest diagnostic count in the set.
+
+  - label: survey/concurrent-ruby
+    path: /Users/megurine/repo/ruby/rigor-survey/concurrent-ruby
+    why: >-
+      Metaprogramming-heavy, low-dependency library code; exercises arity and
+      argument-type checks the Rails corpora barely reach.
+
+  - label: survey/net-ssh
+    path: /Users/megurine/repo/ruby/rigor-survey/net-ssh
+    why: >-
+      Protocol/IO code with a high possible-nil density per file — the densest
+      gap-per-file corpus in the set.
+
+  - label: survey/haml/lib
+    path: /Users/megurine/repo/ruby/rigor-survey/haml/lib
+    why: >-
+      The upstream #239 instance/class same-name defect (`ScriptCompiler
+      .find_and_preserve`) is a real instance here — a shape worth keeping
+      under measurement.

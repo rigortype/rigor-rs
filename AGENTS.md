@@ -23,7 +23,11 @@ session. Read before doing coverage/parity or productization work.
 
 - **The zero-FP bar is measured against the oracle, not argued.** A slice is
   gated by `harness/run.rb` + `harness/run_snapshot.rb` (fixtures, 0 unregistered
-  FP) AND `harness/fp_audit.py --gaps` across the survey corpora.
+  FP) AND `python3 harness/fp_audit.py --gaps --sweep` — the STANDING sweep set
+  (`harness/sweep-corpora.yml`), not a hand-typed directory list. The hand-typed
+  version drifted and left 24 FPs unmeasured; `--sweep` is why that cannot
+  recur. Neither tool sees project-`sig/` behaviour (both run core+stdlib only) —
+  probe that with a hand-built project.
 - **Do NOT build a coverage slice without a valid-mode `fp_audit --gaps` count
   predicting it closes gaps.** Three consecutive FP-safe flow slices closed 0
   survey gaps this session (shape `Type::Tuple`, project-method nilable-return) —
