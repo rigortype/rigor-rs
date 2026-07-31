@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/77_self_return_chain.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Array"
+    }
+  ]
+}
