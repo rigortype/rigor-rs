@@ -567,11 +567,19 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   (`client/registerCapability`, degrades gracefully). Sidecar shared as `Arc` behind its Mutex
   (the check pipeline's pattern). Known limit: invalidate re-reads sig CONTENT, not parsed
   `.rigor.yml` (reference-parity). [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
+- ✅ **LSP v4 completion slice landed (2026-07-31).** `Foo::` now offers the NESTED CONSTANTS
+  (`namespace_children` over the ADR-0042 qualified registry, immediate children only, Class vs
+  Module kinds) instead of singleton methods — the split is the case of the name typed after `::`,
+  which is Ruby's own rule and the same answer the reference reaches by dispatching on the parsed
+  node class. Private RBS declarations (per-`def` AND bare `private` section) are excluded from
+  member completion; the DIAGNOSTIC predicates deliberately still see them (a private method is
+  present — witnessing its absence would be an FP), so the sweep is byte-unchanged. Union
+  receivers complete the per-arm INTERSECTION, unresolvable arms skipped (reference `filter_map`).
+  [note](notes/20260731-lsp-v4-const-completion-visibility.md).
 - ⬜ **Deferred:** **S4b cross-file project context for open buffers** (the last tier-1 item — a
   dirty-buffer overlay over the file's indexed contribution; needs a mini-spec). Plus LSP v4+:
-  `::` constant/namespace completion (currently `::` yields singleton methods, not nested
-  constants); Union-receiver method intersection + private-method visibility filter; temp-file
-  `BufferBinding`; incremental UTF-16 `didChange` sync; `--log` wiring; TCP/socket transport.
+  `rootUri`; temp-file `BufferBinding`; incremental UTF-16 `didChange` sync; `--log` wiring;
+  TCP/socket transport. (`Type::Intersection` completion has no carrier in this type model.)
 - ✅ **MCP server landed (2026-07-01) — `rigor mcp`.** A read-only Model Context Protocol server
   over stdio so an AI agent can analyse Ruby with rigor as a tool. **Transport hand-rolled on
   `serde_json`** (MCP stdio = newline-delimited JSON-RPC 2.0, one message per line — simpler than

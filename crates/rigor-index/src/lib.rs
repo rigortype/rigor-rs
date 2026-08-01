@@ -259,9 +259,11 @@ impl CoreIndex {
         self.data.declared_singleton_return(class, method)
     }
 
-    /// Enumerate every INSTANCE method callable on `class_name` over its ancestor
-    /// chain (own + inherited + module + aliases), sorted + deduped. Empty for an
-    /// unknown class. Advisory (no completeness gate) — for LSP completion (§12).
+    /// Enumerate every PUBLIC INSTANCE method callable on `class_name` over its
+    /// ancestor chain (own + inherited + module + aliases), sorted + deduped.
+    /// Empty for an unknown class. Advisory (no completeness gate) — for LSP
+    /// completion (§12). Private methods are excluded (LSP v4); see
+    /// [`rbs::CoreData::instance_method_names`].
     pub fn instance_method_names(&self, class_name: &str) -> Vec<&'static str> {
         self.data.instance_method_names(class_name)
     }
@@ -273,6 +275,13 @@ impl CoreIndex {
     /// completion on a `Singleton` receiver (§12).
     pub fn singleton_method_names(&self, class_name: &str) -> Vec<&'static str> {
         self.data.singleton_method_names(class_name)
+    }
+
+    /// The immediate child namespaces of the fully-qualified `parent_fqn`, as
+    /// `(leaf name, is_module)` pairs. Advisory — for LSP `Foo::|` constant
+    /// completion (LSP v4). See [`rbs::CoreData::namespace_children`].
+    pub fn namespace_children(&self, parent_fqn: &str) -> Vec<(&'static str, bool)> {
+        self.data.namespace_children(parent_fqn)
     }
 
     /// The RETURN class name of a core method, resolved over the receiver class's
@@ -675,6 +684,55 @@ mod tests {
         assert!(m.contains(&"now"), "Time.now class method");
         assert!(m.contains(&"new"), "Time.new via Class instance surface");
         assert!(idx.singleton_method_names("MyWidget").is_empty());
+    }
+
+    /// LSP v4: a PRIVATE RBS declaration is not enumerable on an explicit
+    /// receiver. Both forms must be honoured — the per-`def` `private def x:`
+    /// (`Kernel#respond_to_missing?`) and the bare `private` SECTION modifier
+    /// (`BasicObject#method_missing`, everything after `private` in its body).
+    #[test]
+    fn instance_method_names_exclude_private_declarations() {
+        let idx = CoreIndex::new();
+        let m = idx.instance_method_names("String");
+        assert!(!m.contains(&"respond_to_missing?"), "private def in Kernel");
+        assert!(!m.contains(&"method_missing"), "bare `private` section in BasicObject");
+        assert!(m.contains(&"upcase"), "public methods are untouched");
+    }
+
+    /// The same filter reaches the SINGLETON surface through the "a class object
+    /// is an instance of `Class`/`Module`/…" fold: `Module`'s reflection methods
+    /// are private instance methods, so `Time.` must not offer `private` /
+    /// `refine` / `module_function` — none of which is callable on a receiver.
+    #[test]
+    fn singleton_method_names_exclude_private_module_surface() {
+        let idx = CoreIndex::new();
+        let m = idx.singleton_method_names("Time");
+        for name in ["private", "public", "refine", "using", "module_function", "included"] {
+            assert!(!m.contains(&name), "Module#{name} is private");
+        }
+        assert!(m.contains(&"name"), "public Module methods still offered");
+    }
+
+    /// LSP v4 `Foo::|`: the immediate children of a namespace, with `is_module`
+    /// so the popup can render Class vs Module. Grandchildren and unknown
+    /// namespaces are excluded.
+    #[test]
+    fn namespace_children_lists_immediate_children_only() {
+        let idx = CoreIndex::new();
+        let kids = idx.namespace_children("Process");
+        assert!(kids.contains(&("Status", false)), "Process::Status is a class");
+        assert!(kids.contains(&("UID", true)), "Process::UID is a module");
+        assert!(kids.windows(2).all(|w| w[0].0 <= w[1].0), "sorted");
+        // Immediate children only: `Thread::Backtrace::Location` is a
+        // GRANDchild of `Thread` and is not writable at a `Thread::|` cursor.
+        let thread_kids = idx.namespace_children("Thread");
+        assert!(thread_kids.contains(&("Backtrace", false)), "{thread_kids:?}");
+        assert!(thread_kids.iter().all(|(n, _)| !n.contains("::")), "{thread_kids:?}");
+        assert!(idx.namespace_children("Thread::Backtrace").contains(&("Location", false)));
+        // A leaf namespace and an unknown one both yield nothing (the LSP maps
+        // an empty set to a null completion, like the reference).
+        assert!(idx.namespace_children("Symbol").is_empty());
+        assert!(idx.namespace_children("NoSuchNamespace").is_empty());
     }
 
     #[test]

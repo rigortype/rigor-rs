@@ -19,8 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ruby_rbs::node::{
-    parse, AliasKind, ClassNode, InterfaceNode, MethodDefinitionKind, ModuleNode,
-    Node, TypeAliasNode,
+    parse, AliasKind, ClassNode, InterfaceNode, MethodDefinitionKind,
+    MethodDefinitionVisibility, ModuleNode, Node, TypeAliasNode,
 };
 
 // The build-time-embedded RBS signature set: `EMBEDDED_RBS: &[(&str, &str)]`,
@@ -415,6 +415,15 @@ struct ClassEntry {
     void_methods: HashSet<&'static str>,
     /// The singleton twin of `void_methods` (`def self.x: () -> void`).
     void_singleton_methods: HashSet<&'static str>,
+    /// Instance methods this declaration marks PRIVATE — either per-`def`
+    /// (`private def respond_to_missing?: ...`) or by falling under a bare
+    /// `private` section modifier. Rides the same first-write-wins reopen
+    /// discipline as `void_methods` (it is the same definition's visibility).
+    /// Read ONLY by [`CoreData::instance_method_names`], i.e. LSP completion:
+    /// the DIAGNOSTIC predicates deliberately ignore it, because a private
+    /// method is still *present* and witnessing its absence would be a false
+    /// positive (`send(:foo)` and implicit-self calls both dispatch to it).
+    private_methods: HashSet<&'static str>,
     /// `method name -> per-overload positional shapes`, the ATM substrate
     /// (Slice 1). ADDITIVE alongside `methods`: the merged arity/return path
     /// above is untouched; this retains the per-overload, per-parameter detail
@@ -1070,12 +1079,19 @@ impl CoreData {
         }
     }
 
-    /// Enumerate every INSTANCE method name callable on `class_name` — its own
-    /// methods plus those inherited over the flattened ancestor chain (superclass
-    /// and included modules), plus instance `alias` names. Sorted and deduped.
-    /// Empty when the class is unknown. Used by LSP completion (§12); unlike the
-    /// diagnostic predicates this is advisory, so it enumerates the full known
-    /// surface without a completeness gate.
+    /// Enumerate every PUBLIC INSTANCE method name callable on `class_name` — its
+    /// own methods plus those inherited over the flattened ancestor chain
+    /// (superclass and included modules), plus instance `alias` names. Sorted and
+    /// deduped. Empty when the class is unknown. Used by LSP completion (§12);
+    /// unlike the diagnostic predicates this is advisory, so it enumerates the
+    /// full known surface without a completeness gate.
+    ///
+    /// Private methods are EXCLUDED (LSP v4, matching the reference
+    /// `CompletionProvider#method_completions`' `next nil unless method.public?`):
+    /// a completion popup answers "what may I write after this receiver", and
+    /// `"x".respond_to_missing?` is a NoMethodError. Visibility is judged
+    /// per-declaring-ancestor, so a subclass that redefines an inherited private
+    /// method publicly still offers it.
     pub fn instance_method_names(&self, class_name: &str) -> Vec<&'static str> {
         if !self.classes.contains_key(class_name) {
             return Vec::new();
@@ -1084,7 +1100,12 @@ impl CoreData {
         let mut set: std::collections::BTreeSet<&'static str> = std::collections::BTreeSet::new();
         for &anc in &chain {
             if let Some(entry) = self.classes.get(anc) {
-                set.extend(entry.methods.keys().copied());
+                set.extend(
+                    entry.methods.keys().copied().filter(|m| !entry.private_methods.contains(m)),
+                );
+                // An `alias` member carries no visibility of its own in the RBS
+                // AST, so it stays public — the conservative direction for an
+                // advisory list (offering one extra name, never hiding a real one).
                 set.extend(entry.aliases.keys().copied());
             }
         }
@@ -1131,6 +1152,32 @@ impl CoreData {
             for m in self.instance_method_names(base) {
                 set.insert(m);
             }
+        }
+        set.into_iter().collect()
+    }
+
+    /// LSP v4 `Foo::|` completion: the immediate child namespaces of `parent_fqn`
+    /// in the qualified registry, as `(leaf name, is_module)` pairs, sorted and
+    /// deduped. `"Process"` yields `[("Status", false), ("UID", true), …]`.
+    ///
+    /// Immediate children only — a leaf still containing `::` is a grandchild and
+    /// is not writable at this cursor. Mirrors the reference's
+    /// `enumerate_constant_children`, which walks `RbsLoader#known_class_names_set`
+    /// for `parent::<one segment>`; the qualified registry (ADR-0042) is this
+    /// port's equivalent surface, so like the reference this sees RBS-declared and
+    /// project-`sig/` namespaces, NOT constants defined in the edited buffer.
+    pub fn namespace_children(&self, parent_fqn: &str) -> Vec<(&'static str, bool)> {
+        let prefix = format!("{parent_fqn}::");
+        let mut set: std::collections::BTreeMap<&'static str, bool> =
+            std::collections::BTreeMap::new();
+        for (&qual, entry) in &self.qualified {
+            let Some(leaf) = qual.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            if leaf.is_empty() || leaf.contains("::") {
+                continue;
+            }
+            set.insert(leaf, entry.is_module);
         }
         set.into_iter().collect()
     }
@@ -2121,6 +2168,8 @@ impl CoreData {
                     // The stub declares no `-> void` returns.
                     void_methods: HashSet::new(),
                     void_singleton_methods: HashSet::new(),
+                    // The stub declares everything public.
+                    private_methods: HashSet::new(),
                     // The stub models no per-overload param shapes (the ATM
                     // substrate needs the real embedded RBS); empty keeps the
                     // `method_overloads` accessor inert under the fallback.
@@ -2597,8 +2646,10 @@ impl Builder {
     }
 
     /// Fold method definitions and `include` directives from a member list into
-    /// `entry`. Only instance, public methods are recorded (the existence check
-    /// is about instance dispatch; private/singleton are out of scope here).
+    /// `entry`. Every instance method is recorded regardless of visibility (the
+    /// existence check is about dispatch, and a private method still dispatches);
+    /// visibility is recorded ASIDE in `private_methods` for the completion
+    /// surface, which is the only consumer that must hide it.
     fn collect_members<'a>(
         &mut self,
         members: impl Iterator<Item = Node<'a>>,
@@ -2606,6 +2657,11 @@ impl Builder {
         enclosing: &[&'static str],
         code: &str,
     ) {
+        // A bare `private` / `public` member is a SECTION modifier: it applies to
+        // every subsequent `def` in this body that does not carry its own
+        // visibility. Body-local by construction — a nested class/module recurses
+        // through `ingest_class`/`ingest_module`, which start a fresh loop.
+        let mut section_private = false;
         for member in members {
             match member {
                 Node::MethodDefinition(md) => {
@@ -2616,6 +2672,13 @@ impl Builder {
                     // The structured TUPLE return the flat `ret` slot above
                     // collapses to `None` (Slice 2 of the MultiWrite substrate).
                     let tuple_ret = tuple_return(&md);
+                    // An explicit per-`def` visibility overrides the section
+                    // modifier in force; `Unspecified` inherits it.
+                    let is_private = match md.visibility() {
+                        MethodDefinitionVisibility::Private => true,
+                        MethodDefinitionVisibility::Public => false,
+                        MethodDefinitionVisibility::Unspecified => section_private,
+                    };
                     let kind = md.kind();
                     // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
                     // (BOTH a class method AND an instance method); a plain
@@ -2627,6 +2690,12 @@ impl Builder {
                     ) {
                         if ret_void && !entry.methods.contains_key(mname) {
                             entry.void_methods.insert(mname);
+                        }
+                        // Visibility rides the same first-write-wins gate as
+                        // `void_methods`: it belongs to the definition being
+                        // recorded, so a later reopen must not restate it.
+                        if is_private && !entry.methods.contains_key(mname) {
+                            entry.private_methods.insert(mname);
                         }
                         if let Some(shapes) = tuple_ret.clone() {
                             entry.tuple_returns.entry(mname).or_insert(shapes);
@@ -2728,6 +2797,10 @@ impl Builder {
                         }
                     }
                 }
+                // Bare section modifiers. They carry no members of their own —
+                // they flip the default visibility for what follows in this body.
+                Node::Private(_) => section_private = true,
+                Node::Public(_) => section_private = false,
                 // A NESTED class/module declaration (e.g. `module PP; module
                 // ObjectMixin; end; end`) must be registered too, by its simple
                 // name — otherwise an `include` that references it leaves the
@@ -2781,6 +2854,9 @@ impl Builder {
             slot.methods.entry(k).or_insert(v);
             if newly && entry.void_methods.contains(k) {
                 slot.void_methods.insert(k);
+            }
+            if newly && entry.private_methods.contains(k) {
+                slot.private_methods.insert(k);
             }
         }
         // Tuple returns ride the same first-write-wins reopen discipline as
@@ -2881,6 +2957,9 @@ impl Builder {
             slot.methods.entry(k).or_insert(v);
             if newly && entry.void_methods.contains(k) {
                 slot.void_methods.insert(k);
+            }
+            if newly && entry.private_methods.contains(k) {
+                slot.private_methods.insert(k);
             }
         }
         // Tuple returns ride the same first-write-wins reopen discipline as
