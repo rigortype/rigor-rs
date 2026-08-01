@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/80_object_level_conversion_functions.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `Zzzzz' for \"abc\""
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 37,
+      "column": 7,
+      "severity": "error",
+      "message": "wrong number of arguments to `Array' on String (given 0, expected 1)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 38,
+      "column": 7,
+      "severity": "error",
+      "message": "wrong number of arguments to `Hash' on String (given 0, expected 1)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 39,
+      "column": 7,
+      "severity": "error",
+      "message": "wrong number of arguments to `String' on String (given 0, expected 1)"
+    }
+  ]
+}

@@ -208,6 +208,27 @@ lib/ruby/gems/4.0.0/gems/rbs-4.0.3/core";
 /// positional rest, else the largest required+optional count.
 type Arity = (usize, Option<usize>);
 
+/// An arity envelope that may be UNMODELLED — the reference's `arity_eligible?`
+/// gate (`analysis/check_rules.rb`), ported.
+///
+/// `compute_arity_envelope` there returns nil — no arity check at all, in either
+/// direction — as soon as ANY overload of the method declares a required keyword
+/// or a trailing positional, or is an `UntypedFunction` (`(?) -> untyped`, which
+/// exposes no arity accessors). The stated reason is that the rule's own
+/// plain-positional pre-check cannot see a required keyword the caller must
+/// pass, so the positional envelope alone is not a safe thing to fire on.
+///
+/// This is not a corner: 507 of the 11,115 methods in the oracle's configless
+/// universe are ineligible, and four of them are `Kernel`'s numeric conversion
+/// functions (`Integer` / `Float` / `Rational` / `Complex`, each carrying an
+/// `(…, exception: bool) -> …` overload). rigor-rs used to compute the
+/// positional envelope for those regardless and fired
+/// `call.wrong-arity` where the oracle is silent — a measured ADR-0002 false
+/// positive. Their keyword-free siblings (`Array` / `Hash` / `String`) stay
+/// eligible and keep firing, which is what makes the gate per-method rather than
+/// a retreat from the family.
+type ArityEnvelope = Option<Arity>;
+
 /// The subtyping relation of two class names, mirroring the reference's
 /// `class_ordering` result atoms (`:equal` / `:subclass` / `:superclass` /
 /// `:disjoint` / `:unknown`). See [`CoreData::class_ordering`].
@@ -396,7 +417,7 @@ struct ClassEntry {
     /// return collapses to Dynamic and carries no nilability). Consumed solely
     /// by `call.possible-nil-receiver` via [`CoreData::method_return_nilable`];
     /// no existing rule reads it (return-class / arity stay as before).
-    methods: HashMap<&'static str, (Option<&'static str>, Arity, bool)>,
+    methods: HashMap<&'static str, (Option<&'static str>, ArityEnvelope, bool)>,
     /// `method name -> TUPLE return element shapes`, populated ONLY for instance
     /// methods whose RBS return is a tuple (`String#partition: (...) -> [String,
     /// String, String]`). ADDITIVE beside `methods`, whose flat return slot
@@ -471,7 +492,7 @@ struct ClassEntry {
     /// bare concrete `ClassInstanceType` ⇒ `Some(name)`, else `None`) and is read
     /// ONLY by the sig-gen-only [`Self::declared_singleton_return`]; the existence
     /// check ([`Self::class_has_singleton_method`]) uses just the key set.
-    singleton_methods: HashMap<&'static str, (Option<&'static str>, Arity, bool)>,
+    singleton_methods: HashMap<&'static str, (Option<&'static str>, ArityEnvelope, bool)>,
     /// Instance-method aliases `new_name -> old_name` (RBS `alias size length`).
     /// The alias target is resolved at lookup time so `new_name` inherits
     /// `old_name`'s existence / return type / arity (the old name may live on
@@ -1620,10 +1641,14 @@ impl CoreData {
 
     /// Resolve a method's arity envelope over the ancestor chain (first defining
     /// ancestor wins), resolving through `alias` definitions. `None` if the
-    /// method is unknown on the chain.
+    /// method is unknown on the chain — OR if it is known but its envelope is
+    /// UNMODELLED (see [`ArityEnvelope`]: a required keyword or trailing
+    /// positional in any overload). The two collapse to the same answer on
+    /// purpose: both mean "do not arity-check this call", which is exactly what
+    /// the reference's `compute_arity_envelope` returning nil means.
     pub fn method_arity(&self, class_name: &str, method: &str) -> Option<Arity> {
         let (chain, _) = self.ancestors(class_name);
-        self.lookup_on_chain(&chain, method).map(|(_, arity, _)| arity)
+        self.lookup_on_chain(&chain, method).and_then(|(_, arity, _)| arity)
     }
 
     // -- ATM shared-substrate accessors (Slice 1, retention only) --------------
@@ -2061,7 +2086,7 @@ impl CoreData {
         &self,
         chain: &[&'static str],
         method: &str,
-    ) -> Option<(Option<&'static str>, Arity, bool)> {
+    ) -> Option<(Option<&'static str>, ArityEnvelope, bool)> {
         self.lookup_on_chain_depth(chain, method, 0)
     }
 
@@ -2070,7 +2095,7 @@ impl CoreData {
         chain: &[&'static str],
         method: &str,
         depth: usize,
-    ) -> Option<(Option<&'static str>, Arity, bool)> {
+    ) -> Option<(Option<&'static str>, ArityEnvelope, bool)> {
         // A direct definition anywhere on the chain wins.
         for anc in chain {
             if let Some(entry) = self.classes.get(anc) {
@@ -2154,12 +2179,15 @@ impl CoreData {
                        superclass: Option<&'static str>,
                        includes: Vec<&'static str>,
                        methods: &[(&'static str, Option<&'static str>, Arity)]| {
-            let mut m: HashMap<&'static str, (Option<&'static str>, Arity, bool)> = HashMap::new();
+            let mut m: HashMap<&'static str, (Option<&'static str>, ArityEnvelope, bool)> =
+                HashMap::new();
             for (n, ret, ar) in methods {
                 // The stub never models nilable returns (no `?` shapes here) ⇒
                 // `false` keeps the fallback conservative: nothing mints
                 // `T | nil`, so `possible-nil-receiver` stays silent under it.
-                m.insert(n, (*ret, *ar, false));
+                // Every stub entry is arity-ELIGIBLE (the stub declares no
+                // keyword parameters at all), so the envelope is always `Some`.
+                m.insert(n, (*ret, Some(*ar), false));
             }
             classes.insert(
                 name,
@@ -3219,10 +3247,13 @@ fn qualified_name(enclosing: &[&'static str], tn: &ruby_rbs::node::TypeNameNode)
 /// conservative here only loses recall in `possible-nil-receiver`, never an FP).
 fn method_signature(
     md: &ruby_rbs::node::MethodDefinitionNode,
-) -> (Option<&'static str>, Arity, bool, bool, bool, bool) {
+) -> (Option<&'static str>, ArityEnvelope, bool, bool, bool, bool) {
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = Some(0);
     let mut variadic = false;
+    // The reference's `arity_eligible?`: ONE ineligible overload disqualifies the
+    // whole method, so this latches and is never cleared.
+    let mut arity_ineligible = false;
     // The agreed `(class, nilable)` pair across overloads. `ret` carries the
     // class (as before); `ret_nilable` carries the matching nil bit. They move
     // together so a disagreement on EITHER collapses the return to `None`.
@@ -3241,12 +3272,33 @@ fn method_signature(
             continue;
         };
         let Node::FunctionType(ft) = mt.type_() else {
+            // `(?) -> untyped` parses as an `UntypedFunctionType`, which exposes
+            // no per-arity accessors. The reference's `arity_eligible?` calls
+            // that ineligible ("an untyped function has no static arity to
+            // enforce") and so disqualifies the whole method; skipping the
+            // overload silently — as this arm used to — would instead leave the
+            // envelope of the REMAINING overloads standing and arity-check
+            // against it.
+            arity_ineligible = true;
             continue;
         };
 
         let required = ft.required_positionals().iter().count();
         let optional = ft.optional_positionals().iter().count();
         let has_rest = ft.rest_positionals().is_some();
+
+        // `arity_eligible?` (`analysis/check_rules.rb`) — a REQUIRED keyword
+        // must be passed at the call site but is invisible to a positional
+        // count, and a trailing positional (`(Integer, *String, Integer)`)
+        // makes the envelope non-contiguous. Either one and the reference
+        // computes no envelope at all. `optional_keywords` / `rest_keywords`
+        // deliberately do NOT disqualify: they cannot change what a caller
+        // must pass positionally.
+        if ft.required_keywords().iter().next().is_some()
+            || ft.trailing_positionals().iter().next().is_some()
+        {
+            arity_ineligible = true;
+        }
 
         min = Some(min.map_or(required, |m| m.min(required)));
         if has_rest {
@@ -3312,7 +3364,11 @@ fn method_signature(
         }
     }
 
-    let arity = (min.unwrap_or(0), if variadic { None } else { max });
+    let arity = if arity_ineligible {
+        None
+    } else {
+        Some((min.unwrap_or(0), if variadic { None } else { max }))
+    };
     // `ret_nilable` is only meaningful when `ret` is Some; callers read it via
     // `method_return_nilable`, which gates on `ret` being present.
     // `ret_instance` / `ret_self` are call-site-late: they say "the receiver",

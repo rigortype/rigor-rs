@@ -69,6 +69,15 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
   and upstream RBS does not declare. `ingest_embedded` loads `overlay/` LAST,
   mirroring the reference's order so an upstream declaration always wins.
 
+  **`nokogiri/nokogiri.rbs` opens with a `class Object` REOPEN** (`def
+  Nokogiri:`) — the only one in the whole `data/` tree, and the load-bearing
+  reason the copy is not optional: it puts the method on EVERY receiver, so
+  deleting it costs three `call.undefined-method` false positives (`"abc"`, `1`,
+  `Object.new`) plus a `call.unresolved-toplevel` on the bare `Nokogiri(…)`
+  form. Fixture 80 guards it; the whole `Object#`-level conversion-function
+  family is swept in
+  [this note](../../../../docs/notes/20260801-nokogiri-ingestion-asymmetry-closed.md).
+
   **`prism` is deliberately EXCLUDED** from the copy. Its file is a *supplement*
   (`prism_supplement.rbs`) to the prism gem's own `sig/`, which the reference
   loads via `DEFAULT_LIBRARIES` but this tree does not vendor (prism ships RBS
