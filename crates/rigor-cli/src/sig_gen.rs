@@ -49,17 +49,29 @@
 //! (span) pass so a nested class declared before the outer's own methods groups
 //! ahead of its parent (reference walk order).
 //!
+//! ## Value classes (`Data.define` / `Struct.new`) — upstream rigor#227
+//!
+//! Both spellings (`Point = Data.define(:x, :y)` and
+//! `class Point < Data.define(:x, :y)`) generate a full declaration: the member
+//! readers, a Struct's writers, a `.new` / `.[]` pair matching the constructor
+//! forms the class actually accepts, and the `::Data` / `::Struct[untyped]`
+//! ancestry ([`meta_class`]). A `do ... end` block's defs bind on the NEW class,
+//! not the enclosing namespace, and every printed group carries the source's own
+//! `class` / `module` keyword ([`declaration_header`]) — hard-coding `class`
+//! turned a module into a `DuplicatedDeclarationError` the moment it held an
+//! emittable method. The member types stay `untyped` (upstream types them from
+//! `--params=observed`, deferred below), so the emit is byte-identical to
+//! upstream master here.
+//!
 //! ## Deferred (later slices, each its own gate)
 //!
 //! - `--params=observed` (the `ObservationCollector`) — params stay `untyped`.
 //!   NOTE: this is what makes the `--overwrite` `NEW_METHOD`-tightens-`untyped`
 //!   replacement path (ported faithfully) actually fire — until it lands, that
 //!   path is dead for BOTH tools (an initialize stub stays `(untyped) -> void`),
-//!   so its absence is parity-safe;
-//! - `Const = Data.define(...)` / `Struct.new(...)` empty CLASS SHELLS (the
-//!   reference `--write`s a `class Selector\nend` decl for the constant; rigor-rs
-//!   qualifies RETURNS of it but does not yet generate the shell — an under-emit,
-//!   a valid RBS subset), `attr_*` reader generation;
+//!   so its absence is parity-safe. It ALSO types a value class's members, so
+//!   until then [`meta_class`] renders every member `untyped`;
+//! - `attr_*` reader generation;
 //! - `TypeElaborator`'s generic-arity fill (`Array` → `Array[untyped]`);
 //! - `Struct.new` / non-core-named `Data.define` constant RECEIVER typing — a
 //!   `Const.new` types to a source class (⇒ qualified) only when `Const` collides
@@ -77,7 +89,9 @@ use rigor_infer::{SourceIndex, TypeEnv, Typer};
 use rigor_parse::{lower, parse, LoweredAst, Node, NodeId, ParamShape, Visibility};
 use rigor_types::{ClassId, Interner, Type, TypeId};
 
+mod meta_class;
 mod sig_env;
+use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
 
 /// A collected method to consider (instance or singleton) — the fields
@@ -122,6 +136,13 @@ struct Candidate {
     /// `# [tighter, was: X]` tag / `- def …` diff line / JSON `declared_return_rbs`);
     /// `None` for a `new_method`.
     declared_return_rbs: Option<String>,
+    /// The `--print` declaration line for this candidate's class group
+    /// (`module Geometry`, `class Geometry::Pair < ::Data`) — see
+    /// [`declaration_header`]. Stamped once the whole file's [`NamespaceInfo`] is
+    /// known, so every candidate of a group carries the same string and the
+    /// renderer can take the group's first (reference `declaration_header`, which
+    /// reads the same per-file maps off `methods.first`).
+    decl_header: String,
 }
 
 /// `rigor sig-gen [--print] [--format text|json] [--include-private] [--config PATH] [paths]`.
@@ -241,16 +262,16 @@ struct NamespaceInfo {
     kinds: std::collections::HashMap<String, &'static str>,
     /// qualified name → written superclass path (reference `superclass_suffix`).
     supers: std::collections::HashMap<String, String>,
-    /// FQNs of `Const = Data.define(...)` / `Struct.new(...)` constants, in source
-    /// order — the reference `--write`s an empty `class Const\nend` SHELL for each
-    /// so a qualified return type of it resolves (reference `@class_shells`).
+    /// FQNs of the file's `Data.define` / `Struct.new` classes, in layout order —
+    /// the reference `--write`s an empty `class Const\nend` SHELL for each so the
+    /// class exists even when every member candidate is suppressed as
+    /// already-declared (reference `@class_shells`).
     shells: Vec<String>,
 }
 
 /// Record each class/module declaration's keyword + superclass into `info`,
 /// keyed by qualified name (reference `build_namespace_kinds` /
-/// `build_superclasses`), and each `Data.define`/`Struct.new` constant as a
-/// class SHELL (reference `register_data_struct_shell`).
+/// `build_superclasses`).
 fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
     let (name, body, kind, superclass): (&String, &[NodeId], &'static str, Option<&String>) =
         match ast.get(id) {
@@ -258,17 +279,6 @@ fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info:
                 (name, body, "class", superclass_path.as_ref())
             }
             Node::ModuleDef { name, body, .. } => (name, body, "module", None),
-            // A `Const = Data.define(...)` / `Struct.new(...)` at this level is a
-            // shell: record its FQN + mark its kind `class` (so the leaf renders
-            // `class`, not the intermediate-segment `module` default).
-            Node::ConstantWrite { name, value, .. }
-                if !name.is_empty() && is_class_defining_call(ast, *value) =>
-            {
-                let q = qualify_join(prefix, name);
-                info.kinds.insert(q.clone(), "class");
-                info.shells.push(q);
-                return;
-            }
             _ => return,
         };
     let mut qualified = prefix.to_vec();
@@ -300,7 +310,13 @@ fn generate_file_with_info(
     let Ok(source) = std::fs::read_to_string(path) else {
         return (Vec::new(), NamespaceInfo::default());
     };
-    let ast = lower(&parse(source.as_bytes()));
+    let parsed = parse(source.as_bytes());
+    // Every `Data.define` / `Struct.new` class in the file, keyed by FQN. Read
+    // BEFORE the walks: it decides which constant writes are namespaces (their
+    // `do ... end` block's defs bind on the new class) and which classes carry a
+    // synthesised member surface.
+    let layouts = meta_class::collect(&parsed);
+    let ast = lower(&parsed);
     // Core index for typing / erasure AND the declared-return ancestor tail the
     // [`SigEnv`] delegates to (`declared_instance_return` / `_singleton_return`).
     let index = CoreIndex::new();
@@ -325,7 +341,10 @@ fn generate_file_with_info(
         }
     }
 
-    let mut out = Vec::new();
+    // Meta members LEAD the candidate order (reference `collect_candidates`): a
+    // value class's members and constructors read first, ahead of the methods its
+    // block body or its `class ... end` body defines.
+    let mut out = collect_meta_candidates(path, &layouts, sig_env);
     let mut info = NamespaceInfo::default();
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
@@ -340,13 +359,92 @@ fn generate_file_with_info(
                 &env,
                 &fqns,
                 sig_env,
+                &layouts,
                 &mut interner,
                 &mut out,
             );
             collect_namespace_info(&ast, child, &[], &mut info);
         }
     }
+    register_meta_classes(&layouts, &mut info);
+    // The print header depends on the WHOLE file's namespace metadata, so it is
+    // stamped once the walks are done rather than at construction.
+    for c in &mut out {
+        c.decl_header = declaration_header(&info, &c.class_name);
+    }
     (out, info)
+}
+
+/// Declare every layout-carrying class in `info`: the `class` keyword (so the
+/// leaf wins over the intermediate-segment `module` default), its `::Data` /
+/// `::Struct[untyped]` ancestry, and a shell entry so `--write` declares the
+/// class even when every member candidate is suppressed as already-declared.
+///
+/// The named-subclass form (`class Point < Data.define(:x, :y)`) is registered
+/// too: its `class` keyword is not in question, but its COMPUTED superclass is
+/// exactly what [`collect_namespace_info`] refuses to guess at.
+fn register_meta_classes(layouts: &MetaLayouts, info: &mut NamespaceInfo) {
+    for (class_name, layout) in layouts.iter() {
+        info.kinds.insert(class_name.to_string(), "class");
+        info.supers.insert(class_name.to_string(), layout.kind.superclass().to_string());
+        if !info.shells.contains(&class_name.to_string()) {
+            info.shells.push(class_name.to_string());
+        }
+    }
+}
+
+/// One candidate per member accessor and constructor each layout-carrying class
+/// synthesises. These are the members no `def` / `attr_*` in the source declares,
+/// so nothing else in sig-gen can find them — and once the class is DECLARED, an
+/// undeclared member reads as a missing one.
+fn collect_meta_candidates(path: &str, layouts: &MetaLayouts, sig_env: &SigEnv) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    for (class_name, layout) in layouts.iter() {
+        for member in meta_class::member_decls(layout) {
+            // Suppression is gated on the declaration sitting on THIS class, not
+            // on the lookup merely succeeding: `::Data.new: () -> bot` and
+            // `::Struct`'s factory answer the `.new` lookup for every value class,
+            // and deferring to them is exactly what would leave the inherited-arity
+            // false positive in place (reference `declared_on_class_itself?`).
+            if sig_env.declares_directly(class_name, &member.method_name, member.kind) {
+                continue;
+            }
+            out.push(meta_candidate(path, class_name, &member));
+        }
+    }
+    out
+}
+
+/// Build the [`Candidate`] for one synthesised member. Always `new_method`: a
+/// synthesised member has no source `def` whose declared return could be tightened.
+fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidate {
+    Candidate {
+        file: path.to_string(),
+        class_name: class_name.to_string(),
+        method_name: member.method_name.clone(),
+        kind: member.kind,
+        rbs: member.rbs.clone(),
+        inferred_return: "untyped".to_string(),
+        classification: "new_method",
+        declared_return_rbs: None,
+        decl_header: String::new(),
+    }
+}
+
+/// The `--print` declaration line for a class group (reference
+/// `declaration_header`). Print mode used to hard-code `class`, which turned a
+/// MODULE into a class the moment it held an emittable method — output that
+/// raises `RBS::DuplicatedDeclarationError` on load if the real `module` is
+/// declared anywhere else (rigor#227). Defaulting to `class` when the map has no
+/// entry keeps the pre-existing spelling for a leaf class.
+fn declaration_header(info: &NamespaceInfo, class_name: &str) -> String {
+    if info.kinds.get(class_name) == Some(&"module") {
+        return format!("module {class_name}");
+    }
+    match info.supers.get(class_name) {
+        Some(superclass) => format!("class {class_name} < {superclass}"),
+        None => format!("class {class_name}"),
+    }
 }
 
 /// Collect every declared source-class FULLY-QUALIFIED name in the file: each
@@ -506,15 +604,29 @@ fn walk_namespace(
     env: &TypeEnv,
     fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
+    layouts: &MetaLayouts,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
 ) {
-    let (name, method_bodies, visibilities, body) = match ast.get(id) {
-        Node::ClassDef { name, method_bodies, method_visibilities, body, .. } => {
-            (name, method_bodies, method_visibilities, body)
+    let (name, visibilities, body) = match ast.get(id) {
+        Node::ClassDef { name, method_visibilities, body, .. } => {
+            (name, method_visibilities.clone(), body.as_slice())
         }
-        Node::ModuleDef { name, method_bodies, method_visibilities, body, .. } => {
-            (name, method_bodies, method_visibilities, body)
+        Node::ModuleDef { name, method_visibilities, body, .. } => {
+            (name, method_visibilities.clone(), body.as_slice())
+        }
+        // A `Const = Data.define(...) do ... end` block is the new class's own
+        // body: the runtime `class_eval`s it into the anonymous class it just
+        // stamped, so its defs bind on `Const`, NOT on the enclosing namespace.
+        // Attributing them outward is what made upstream report a member against
+        // the enclosing MODULE and then redeclare that module as a class (#227).
+        // Only a layout-carrying constant qualifies — a `Class.new do ... end`
+        // stays unrecognised, as it is upstream.
+        Node::ConstantWrite { name, value, .. }
+            if layouts.get(&qualify_join(prefix, name)).is_some() =>
+        {
+            let Node::Call { block_body, .. } = ast.get(*value) else { return };
+            (name, block_visibilities(ast, block_body), block_body.as_slice())
         }
         _ => return,
     };
@@ -536,7 +648,6 @@ fn walk_namespace(
     // call stays a plain instance method. The `module_function :sym` ARGS form does
     // NOT flip the mode (oracle-probed) and is ignored. It applies in a CLASS body
     // too (rule_catalog.rb), not just a module.
-    let _ = (method_bodies, visibilities); // superseded by the body walk below
     let mut mf_active = false;
     let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
     for &child in body {
@@ -598,7 +709,7 @@ fn walk_namespace(
         items.push((*span, Emit::Method(sig, *vis)));
     }
     for &child in body {
-        if matches!(ast.get(child), Node::ClassDef { .. } | Node::ModuleDef { .. }) {
+        if is_namespace_node(ast, child, &qualified, layouts) {
             items.push((ast.get(child).span().0, Emit::Nested(child)));
         }
     }
@@ -634,10 +745,77 @@ fn walk_namespace(
                 env,
                 fqns,
                 sig_env,
+                layouts,
                 interner,
                 out,
             ),
         }
+    }
+}
+
+/// Whether `id` opens a namespace [`walk_namespace`] descends into: a real
+/// `class`/`module`, or a layout-carrying constant write whose block body is the
+/// new class's own body.
+fn is_namespace_node(
+    ast: &LoweredAst,
+    id: NodeId,
+    prefix: &[String],
+    layouts: &MetaLayouts,
+) -> bool {
+    match ast.get(id) {
+        Node::ClassDef { .. } | Node::ModuleDef { .. } => true,
+        Node::ConstantWrite { name, value, .. } => {
+            layouts.get(&qualify_join(prefix, name)).is_some()
+                && matches!(ast.get(*value), Node::Call { .. })
+        }
+        _ => false,
+    }
+}
+
+/// The instance-method visibility table of a `do ... end` class body, read from
+/// the LOWERED statements (a block body carries no `ClassDef.method_visibilities`).
+/// Mirrors the reference's discovery: a BARE `private` / `protected` / `public`
+/// flips the running default for every SUBSEQUENT def, while the
+/// `private :foo` args form back-patches the named method and leaves the default
+/// alone. A `private def foo` records at the unchanged running default — the
+/// reference's own tracking gap, preserved.
+fn block_visibilities(ast: &LoweredAst, body: &[NodeId]) -> Vec<(String, Visibility)> {
+    let mut current = Visibility::Public;
+    let mut out: Vec<(String, Visibility)> = Vec::new();
+    for &child in body {
+        match ast.get(child) {
+            Node::Definition { name: Some(n), .. } => out.push((n.clone(), current)),
+            Node::Call { method, receiver: None, args, .. } => {
+                let Some(modifier) = visibility_of_modifier(method) else { continue };
+                if args.is_empty() {
+                    current = modifier;
+                    continue;
+                }
+                for &arg in args {
+                    let (Node::SymbolLit { value, .. } | Node::StringLit { value, .. }) =
+                        ast.get(arg)
+                    else {
+                        continue;
+                    };
+                    if let Some(slot) = out.iter_mut().rev().find(|(n, _)| n == value) {
+                        slot.1 = modifier;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Map a receiver-less call name to its visibility, or `None` when it is not one
+/// of the three modifiers.
+fn visibility_of_modifier(name: &str) -> Option<Visibility> {
+    match name {
+        "public" => Some(Visibility::Public),
+        "protected" => Some(Visibility::Protected),
+        "private" => Some(Visibility::Private),
+        _ => None,
     }
 }
 
@@ -708,6 +886,7 @@ fn method_candidate(
             // path exactly as-is, before any classification.
             classification: "new_method",
             declared_return_rbs: None,
+            decl_header: String::new(),
         });
     }
 
@@ -833,6 +1012,7 @@ fn method_candidate(
         inferred_return: erased,
         classification,
         declared_return_rbs,
+        decl_header: String::new(),
     })
 }
 
@@ -1144,7 +1324,15 @@ fn render_text(candidates: &[Candidate]) {
             }
         }
         for class in classes {
-            println!("class {class}");
+            // The group's declaration line — its own `class` / `module` keyword and
+            // any ancestry. Every candidate of a group carries the same string, so
+            // the first is the group's (reference reads `methods.first`).
+            let header = items
+                .iter()
+                .find(|c| c.class_name == class)
+                .map(|c| c.decl_header.clone())
+                .unwrap_or_else(|| format!("class {class}"));
+            println!("{header}");
             for c in items.iter().filter(|c| c.class_name == class) {
                 println!("  # {}", candidate_tag(c));
                 println!("  {}", c.rbs);
@@ -1446,6 +1634,7 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         inferred_return: c.inferred_return.clone(),
         classification: c.classification,
         declared_return_rbs: c.declared_return_rbs.clone(),
+        decl_header: c.decl_header.clone(),
     }
 }
 
@@ -2551,8 +2740,155 @@ mod tests {
         // logic is what this asserts.
         let src = "module Rigor\n  class Triage\n    Selector = Data.define(:a)\n    def make\n      Selector.new(a: 1)\n    end\n  end\nend\n";
         let cs = candidates_tagged("datadef", src, false);
-        assert_eq!(cs.len(), 1, "{cs:?}");
-        assert_eq!(cs[0].rbs, "def make: () -> Rigor::Triage::Selector");
+        let make = cs.iter().find(|c| c.method_name == "make").expect("make emitted");
+        assert_eq!(make.rbs, "def make: () -> Rigor::Triage::Selector");
+    }
+
+    /// The RBS lines a source generates, as `<class> <kind> <rbs>` rows — the
+    /// shape the meta-class assertions below read.
+    fn rows(cs: &[Candidate]) -> Vec<String> {
+        cs.iter().map(|c| format!("{} {} {}", c.class_name, c.kind, c.rbs)).collect()
+    }
+
+    #[test]
+    fn data_define_constant_emits_readers_and_both_constructor_forms() {
+        // `::Data.new` is declared `() -> bot`, so an undeclared `.new` on the
+        // subclass would make every construction an arity error; `.[]` is absent
+        // from `::Data`'s RBS entirely. Every Data member is required (no `?`).
+        let src = "module Geo\n  Pair = Data.define(:left, :right)\nend\n";
+        let cs = candidates_tagged("metadata", src, false);
+        assert_eq!(
+            rows(&cs),
+            vec![
+                "Geo::Pair instance def left: () -> untyped",
+                "Geo::Pair instance def right: () -> untyped",
+                "Geo::Pair singleton def self.new: (left: untyped, right: untyped) -> instance | (untyped left, untyped right) -> instance",
+                "Geo::Pair singleton def self.[]: (left: untyped, right: untyped) -> instance | (untyped left, untyped right) -> instance",
+            ]
+        );
+        assert_eq!(cs[0].decl_header, "class Geo::Pair < ::Data");
+    }
+
+    #[test]
+    fn struct_new_adds_writers_and_optional_positions() {
+        // A Struct's members are mutable (writers) and an omitted one fills with
+        // `nil` (every position optional). `::Struct` is generic, so the emitted
+        // ancestry must carry an explicit type argument.
+        let src = "Point = Struct.new(:x, :y)\n";
+        let cs = candidates_tagged("metastruct", src, false);
+        assert_eq!(
+            rows(&cs),
+            vec![
+                "Point instance def x: () -> untyped",
+                "Point instance def y: () -> untyped",
+                "Point instance def x=: (untyped) -> untyped",
+                "Point instance def y=: (untyped) -> untyped",
+                "Point singleton def self.new: (?x: untyped, ?y: untyped) -> instance | (?untyped x, ?untyped y) -> instance",
+                "Point singleton def self.[]: (?x: untyped, ?y: untyped) -> instance | (?untyped x, ?untyped y) -> instance",
+            ]
+        );
+        assert_eq!(cs[0].decl_header, "class Point < ::Struct[untyped]");
+    }
+
+    #[test]
+    fn struct_keyword_init_true_drops_the_positional_overload() {
+        // Only a LITERAL `keyword_init: true` narrows to keywords: a `false` flag
+        // means "absent or literal false", and since Ruby 3.2 the absent case
+        // accepts both forms, so both are emitted.
+        let cs = candidates_tagged("metakw", "Keyed = Struct.new(:a, keyword_init: true)\n", false);
+        let ctor = cs.iter().find(|c| c.method_name == "new").expect("ctor emitted");
+        assert_eq!(ctor.rbs, "def self.new: (?a: untyped) -> instance");
+        let cs = candidates_tagged("metakwf", "Loose = Struct.new(:a, keyword_init: false)\n", false);
+        let ctor = cs.iter().find(|c| c.method_name == "new").expect("ctor emitted");
+        assert_eq!(ctor.rbs, "def self.new: (?a: untyped) -> instance | (?untyped a) -> instance");
+    }
+
+    #[test]
+    fn named_subclass_and_qualified_receiver_forms_are_recognised() {
+        // `class Point < Data.define(...)` is the second spelling, and its
+        // COMPUTED superclass is exactly the one the class walk refuses to guess
+        // at; `::Data` is the same constant as `Data`. The class's own defs follow
+        // the synthesised members.
+        let src = "module Geo\n  class Named < Data.define(:tag)\n    def shout\n      \"hi\"\n    end\n  end\n  Aliased = ::Data.define(:only)\nend\n";
+        let cs = candidates_tagged("metanamed", src, false);
+        assert_eq!(
+            rows(&cs),
+            vec![
+                "Geo::Named instance def tag: () -> untyped",
+                "Geo::Named singleton def self.new: (tag: untyped) -> instance | (untyped tag) -> instance",
+                "Geo::Named singleton def self.[]: (tag: untyped) -> instance | (untyped tag) -> instance",
+                "Geo::Aliased instance def only: () -> untyped",
+                "Geo::Aliased singleton def self.new: (only: untyped) -> instance | (untyped only) -> instance",
+                "Geo::Aliased singleton def self.[]: (only: untyped) -> instance | (untyped only) -> instance",
+                "Geo::Named instance def shout: () -> \"hi\"",
+            ]
+        );
+        assert_eq!(cs[0].decl_header, "class Geo::Named < ::Data");
+    }
+
+    #[test]
+    fn meta_block_defs_bind_on_the_new_class_and_leave_the_module_a_module() {
+        // The runtime `class_eval`s the block into the class it just stamped, so
+        // `describe` is `Geo::Blocked#describe`, NOT `Geo#describe` — and `Geo`
+        // must still print as a `module` (a method-bearing leaf otherwise defaults
+        // to `class`, which raises DuplicatedDeclarationError beside the real
+        // module). `private` inside the block still hides a def.
+        let src = "module Geo\n  Blocked = Data.define(:label) do\n    def describe\n      \"d\"\n    end\n\n    private\n\n    def hidden\n      \"h\"\n    end\n  end\n\n  def self.origin\n    \"0,0\"\n  end\nend\n";
+        let cs = candidates_tagged("metablock", src, false);
+        assert_eq!(
+            rows(&cs),
+            vec![
+                "Geo::Blocked instance def label: () -> untyped",
+                "Geo::Blocked singleton def self.new: (label: untyped) -> instance | (untyped label) -> instance",
+                "Geo::Blocked singleton def self.[]: (label: untyped) -> instance | (untyped label) -> instance",
+                "Geo::Blocked instance def describe: () -> \"d\"",
+                "Geo singleton def self.origin: () -> \"0,0\"",
+            ]
+        );
+        let module_row = cs.iter().find(|c| c.class_name == "Geo").unwrap();
+        assert_eq!(module_row.decl_header, "module Geo");
+        // `--include-private` recovers the hidden def, proving the skip above is
+        // the visibility scan and not the block walk missing the def entirely.
+        let all = candidates_tagged("metablockp", src, true);
+        assert!(all.iter().any(|c| c.method_name == "hidden" && c.class_name == "Geo::Blocked"));
+    }
+
+    #[test]
+    fn degenerate_meta_forms_declare_nothing() {
+        // A layout needs at least one LITERAL Symbol member: a member-less
+        // `Data.define`, the `Struct.new("Legacy", :a)` named-factory form, and a
+        // splatted member list are all un-describable, so no class is declared for
+        // them at all (declaring one without members is worse than not declaring it).
+        for (tag, src) in [
+            ("metaempty", "Empty = Data.define\n"),
+            ("metalegacy", "NamedStruct = Struct.new(\"Legacy\", :a)\n"),
+            ("metasplat", "Dyn = Data.define(*MEMBERS)\n"),
+        ] {
+            assert!(candidates_tagged(tag, src, false).is_empty(), "{src}");
+        }
+    }
+
+    #[test]
+    fn meta_member_declared_on_the_class_itself_is_suppressed_but_inherited_is_not() {
+        // Suppression is gated on the declaration sitting on THIS class: `left` is
+        // declared here and drops, while `right` / `.new` / `.[]` survive — the
+        // inherited `::Data.new` must NOT count as the user's own, or the arity
+        // false positive it causes stays.
+        let cs = candidates_with_sig(
+            "metaown",
+            "Pair = Data.define(:left, :right)\n",
+            "class Pair < ::Data\n  def left: () -> Integer\nend\n",
+        );
+        let names: Vec<&str> = cs.iter().map(|c| c.method_name.as_str()).collect();
+        assert_eq!(names, vec!["right", "new", "[]"], "{cs:?}");
+    }
+
+    #[test]
+    fn plain_subclass_group_prints_its_written_ancestry() {
+        // The print header carries the source's own superclass too (upstream
+        // `declaration_header` reads the same per-file map the writer does).
+        let cs = candidates_tagged("hdrsuper", "class Foo < Bar\n  def m\n    \"m\"\n  end\nend\n", false);
+        assert_eq!(cs[0].decl_header, "class Foo < Bar");
     }
 
     #[test]
@@ -2652,6 +2988,7 @@ mod tests {
             inferred_return: String::new(),
             classification: "new_method",
             declared_return_rbs: None,
+            decl_header: String::new(),
         };
         let cands = [
             c("Foo", "greeting", "def greeting: () -> \"h\""),
@@ -2704,6 +3041,7 @@ mod tests {
             inferred_return: String::new(),
             classification: "new_method",
             declared_return_rbs: None,
+            decl_header: String::new(),
         };
         let mut info = NamespaceInfo::default();
         info.kinds.insert("Outer".into(), "module");
@@ -2726,6 +3064,7 @@ mod tests {
             inferred_return: String::new(),
             classification: "new_method",
             declared_return_rbs: None,
+            decl_header: String::new(),
         };
         let mut info = NamespaceInfo::default();
         info.kinds.insert("Host".into(), "class");
@@ -2763,6 +3102,7 @@ mod tests {
             inferred_return: String::new(),
             classification: "new_method",
             declared_return_rbs: None,
+            decl_header: String::new(),
         };
         // No kinds recorded → a leaf with methods defaults to `class`.
         let out = render_new_file(&[cand], &[], &NamespaceInfo::default());
@@ -2858,6 +3198,7 @@ mod tests {
             inferred_return: String::new(),
             classification: "new_method",
             declared_return_rbs: None,
+            decl_header: String::new(),
         }
     }
 

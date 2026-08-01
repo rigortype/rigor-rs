@@ -170,6 +170,24 @@ impl SigEnv {
         self.decls.contains_key(class_fqn) || core.knows_toplevel_class(class_fqn)
     }
 
+    /// Whether the project's own RBS declares `method` DIRECTLY on `class_fqn` —
+    /// no ancestor walk, no core tail. This is deliberately NOT [`Self::lookup`]:
+    /// the synthesised-member suppression it gates must not defer to an INHERITED
+    /// declaration, because `::Data.new: () -> bot` and `::Struct`'s factory
+    /// answer the `.new` lookup for every value class, and treating those as the
+    /// user's own is exactly what leaves the arity false positive in place
+    /// (reference `declared_on_class_itself?`, which tests `defined_in`).
+    ///
+    /// `kind` is `"instance"` or `"singleton"`; any other value never matches.
+    pub fn declares_directly(&self, class_fqn: &str, method: &str, kind: &str) -> bool {
+        let Some(decl) = self.decls.get(class_fqn) else { return false };
+        match kind {
+            "instance" => decl.instance.contains_key(method),
+            "singleton" => decl.singleton.contains_key(method),
+            _ => false,
+        }
+    }
+
     /// Resolve `(class_fqn, method)` for a given `kind` against the project env,
     /// delegating the core/stdlib ancestor tail to `core`. See the module docs.
     pub fn lookup(
