@@ -51,6 +51,149 @@ const DEFAULT_LIBRARIES: &[&str] = &[
     "prism", "rbs",
 ];
 
+/// Classes the REFERENCE loads a declaration for but whose DEFINITION it cannot
+/// build **as it loads in this project's dev environment** —
+/// `RBS::DefinitionBuilder#build_instance` / `#build_singleton` raise, so
+/// `RbsLoader#instance_definition` / `#singleton_definition` fail-soft to `nil`
+/// and the dispatcher degrades EVERY call on them to `Dynamic[Top]`. The oracle
+/// is therefore silent on any method of these classes — real or misspelled — and
+/// witnessing absence over rigor-rs's (buildable) copy of the same signatures is
+/// a false positive by ADR-0002. Measured, not theorised: `BigMath.frobnicate(1)`
+/// and `Bundler.frobnicate` both fired here while the pinned oracle stayed
+/// silent (`docs/notes/20260731-bigmath-ingestion-asymmetry.md`).
+///
+/// **This set is keyed to (pin × rbs version × THE HOST'S INSTALLED GEMS), not
+/// to the pin alone**, because `RBS::EnvironmentLoader#add(library:)` prefers an
+/// installed gem's own `sig/` over `rbs`'s `stdlib/<lib>/` copy — so *which*
+/// signature files are in the room depends on what is installed. Measured A/B
+/// (see the note): with the `bigdecimal` gem absent from `GEM_PATH`, the same
+/// pinned reference BUILDS `BigMath` and FIRES on both probe shapes, and the set
+/// shrinks to 11. Of the twelve entries exactly one — `BigMath` — has an
+/// environment-supplied ingredient; the other eleven are collisions between the
+/// reference's own `data/vendored_gem_sigs/` and the `rbs` gem, whose version the
+/// reference's `Gemfile.lock` locks to the pin. So on a host without that gem
+/// rigor-rs is *more silent* than the oracle: a coverage gap, FP-safe, and drift
+/// keyed to an environment rather than to the pin. That is accepted because the
+/// FP this removes is real in the environment the gates are actually measured in.
+/// `harness/unbuildable_classes.rb` tags each entry's sources `[env]` / `[pin]`
+/// and MUST be run where the gates run.
+///
+/// The failures are all SOURCE COLLISIONS inside the reference's own load set,
+/// and every one of them involves a signature source rigor-rs deliberately does
+/// NOT vendor, which is why rigor-rs's index builds cleanly instead:
+///
+/// - `BigMath` — **the one ENVIRONMENT-supplied entry.** `DEFAULT_LIBRARIES`
+///   lists BOTH `bigdecimal` and `bigdecimal-math`. `RBS::EnvironmentLoader`
+///   resolves `bigdecimal` to the INSTALLED GEM's `sig/` (a gem's own signatures
+///   win over `rbs`'s `stdlib/` copy), and that directory ships `big_math.rbs` —
+///   the same `module BigMath` that `rbs`'s `stdlib/bigdecimal-math/0/big_math.rbs`
+///   declares. Two sources, same methods ⇒ `DuplicatedMethodDefinitionError`.
+///   rigor-rs vendors only the `rbs` stdlib copy (`vendor/rbs/PROVENANCE.md`), so
+///   it has exactly one. Remove the `bigdecimal` gem and this entry disappears.
+/// - `Bundler*` / `Gem::*` — PIN-determined. The `rbs` GEM's own
+///   `sig/shims/{bundler,rubygems}.rbs` (reached because `rbs` is in
+///   `DEFAULT_LIBRARIES`) against the reference's
+///   `data/vendored_gem_sigs/{bundler,rubygems}/`. Both sides move with the pin —
+///   the `data/` tree is the reference's own, and the rbs version is locked by its
+///   `Gemfile.lock`. rigor-rs vendors the `data/` half as
+///   `overlay/vendored_gem_sigs/` but NOT the `rbs` gem's `sig/`, so again one
+///   source only.
+/// - `Gem::SourceList` (`NoTypeFoundError`) and `Nokogiri::CSS::Parser`
+///   (`NoSuperclassFoundError: Racc::Parser`) — PIN-determined too: dangling
+///   references inside `vendored_gem_sigs` itself.
+///
+/// **Why a table and not a derivation.** rigor-rs cannot compute this set from
+/// its own tree: the colliding declaration is precisely the one it does not
+/// carry. Mirroring the reference's real load set instead (vendoring the
+/// `bigdecimal` and `rbs` gems' `sig/`) would drag those gems' whole class
+/// surface into `knows_class` — the failure mode `PROVENANCE.md` records for the
+/// `prism` supplement (8 fresh FPs). So the set is DATA, on the same footing as
+/// the vendored signatures themselves, and it is regenerated from the pinned
+/// oracle by `harness/unbuildable_classes.rb` (`--check` verifies this list
+/// against the reference and is part of the pin-bump ritual — run it where the
+/// gates run, per the environment caveat above). If upstream fixes a collision,
+/// regeneration drops the entry and rigor-rs starts witnessing again — the table
+/// converges rather than freezing a gap.
+///
+/// Names are FULLY QUALIFIED. A top-level name is applied to both the short-key
+/// `classes` map and the qualified registry; a NAMESPACED name is applied to the
+/// qualified registry ONLY, because the short map deliberately collapses
+/// `Bundler::Definition` onto the shared leaf `"Definition"` and blanking that
+/// would silence unrelated classes.
+///
+/// Each entry is `(name, instance_fails, singleton_fails)`. The reference builds
+/// the two definitions independently and they fail independently — `Bundler` and
+/// `Gem::Requirement` build their INSTANCE definition cleanly and only raise on
+/// the singleton — so the two sides are tracked apart. Collapsing them into one
+/// flag would still be FP-safe (more silence, never more noise) but would drop
+/// instance-method witnessing the oracle actually performs.
+const UNBUILDABLE_DEFINITIONS: &[(&str, bool, bool)] = &[
+    ("BigMath", true, true),
+    ("Bundler", false, true),
+    ("Bundler::Definition", true, true),
+    ("Bundler::Dependency", true, true),
+    ("Bundler::LazySpecification", true, true),
+    ("Bundler::LockfileParser", true, true),
+    ("Gem::Dependency", true, true),
+    ("Gem::DependencyInstaller", true, true),
+    ("Gem::Requirement", false, true),
+    ("Gem::SourceList", true, true),
+    ("Gem::Specification", true, true),
+    ("Nokogiri::CSS::Parser", true, true),
+];
+
+/// Apply [`UNBUILDABLE_DEFINITIONS`] to a finished index: empty the affected
+/// entries' method tables (so no return type, arity or overload resolves — the
+/// reference's `definition == nil`) and flag them so the existence gates answer
+/// "assume present ⇒ stay silent" instead of witnessing absence over an empty
+/// surface. `knows_class` / `knows_toplevel_class` are deliberately UNTOUCHED:
+/// the reference's `class_known?` reads `class_decls`, which the failed build
+/// does not remove, so `BigMath` still resolves as a constant there and must here
+/// (dropping the class instead would trade this FP for a
+/// `call.unresolved-toplevel` one).
+///
+/// A name absent from the index is skipped silently: the set is pinned to the
+/// reference, and a `sig_dirs` / plugin-free load or a future vendoring change
+/// may simply not carry one of these classes.
+fn mark_unbuildable_definitions(
+    classes: &mut HashMap<&'static str, ClassEntry>,
+    qualified: &mut HashMap<&'static str, ClassEntry>,
+) {
+    fn blank(entry: &mut ClassEntry, instance: bool, singleton: bool) {
+        if instance {
+            entry.instance_unbuildable = true;
+            entry.methods.clear();
+            entry.tuple_returns.clear();
+            entry.method_overloads.clear();
+            entry.overloading_method_overloads.clear();
+            entry.block_returns.clear();
+            entry.void_methods.clear();
+            entry.aliases.clear();
+        }
+        if singleton {
+            entry.singleton_unbuildable = true;
+            entry.singleton_methods.clear();
+            entry.singleton_tuple_returns.clear();
+            entry.singleton_method_overloads.clear();
+            entry.overloading_singleton_overloads.clear();
+            entry.void_singleton_methods.clear();
+            entry.singleton_aliases.clear();
+        }
+    }
+    for &(name, instance, singleton) in UNBUILDABLE_DEFINITIONS {
+        if let Some(entry) = qualified.get_mut(name) {
+            blank(entry, instance, singleton);
+        }
+        // Short-key map: only for a genuinely top-level name (see the constant's
+        // doc — a nested name's short key is a merge of unrelated classes).
+        if !name.contains("::") {
+            if let Some(entry) = classes.get_mut(name) {
+                blank(entry, instance, singleton);
+            }
+        }
+    }
+}
+
 /// The original runtime core-RBS directory (rbs-4.0.3 gem under mise). ADR-0007
 /// replaced this default with the vendored, build-time-[`EMBEDDED_RBS`] set, so
 /// it is no longer on the default load path — kept only as documentation of the
@@ -347,6 +490,21 @@ struct ClassEntry {
     /// class object gains them as class methods — e.g. `SecureRandom` does
     /// `extend Random::Formatter`, so `SecureRandom.hex` is a real class method).
     extends: Vec<&'static str>,
+    /// `true` when the REFERENCE cannot build this class's INSTANCE definition —
+    /// `RbsLoader#instance_definition` fail-softs to `nil`, so every instance
+    /// call on it degrades to `Dynamic[Top]` and the oracle is silent about it.
+    /// See [`UNBUILDABLE_DEFINITIONS`] for the mechanism and the provenance of
+    /// the set. Set post-`finish` by [`mark_unbuildable_definitions`], which also
+    /// EMPTIES the instance-side tables so no return type resolves either — the
+    /// two halves together are what "the definition is nil" means.
+    instance_unbuildable: bool,
+    /// The singleton twin of [`Self::instance_unbuildable`]. Tracked SEPARATELY
+    /// because the reference builds the two sides independently and they fail
+    /// independently: `Bundler` and `Gem::Requirement` build their instance
+    /// definition fine and only their SINGLETON build raises, so the oracle still
+    /// witnesses their instance methods. Conflating the two would be FP-safe but
+    /// would silence rigor-rs where the oracle speaks.
+    singleton_unbuildable: bool,
 }
 
 /// Which signature source the loaded [`CoreData`] was built from. Surfaced by
@@ -526,13 +684,19 @@ impl CoreData {
             .collect();
 
         let (
-            classes,
+            mut classes,
             toplevel_classes,
             type_alias_defs,
             interface_method_names,
-            qualified,
+            mut qualified,
             short_to_qualified,
         ) = builder.finish();
+        // 4) Neutralise the classes whose definition the REFERENCE cannot build
+        //    (see `UNBUILDABLE_DEFINITIONS`). Applied LAST, after project `sig/`
+        //    and plugins: the reference's collision is in its bundled load set, so
+        //    a project reopening one of these classes does not repair the build
+        //    there either — it still resolves `Dynamic[Top]`.
+        mark_unbuildable_definitions(&mut classes, &mut qualified);
         if !classes.is_empty() {
             return Self {
                 source,
@@ -689,6 +853,12 @@ impl CoreData {
         let Some(entry) = self.qualified.get(qname) else {
             return true; // unknown ⇒ silent
         };
+        // See `qualified_class_has_method`, singleton side: an unbuildable
+        // singleton definition has no known surface, and its emptied tables must
+        // not read as proven-absent.
+        if entry.singleton_unbuildable {
+            return true;
+        }
         // Measure-first scope (ADR-0042 Slice 2): witness a qualified-singleton
         // absence ONLY for a MODULE, whose class-object surface is its own
         // `module_function`s + `extend`s + the base-object surface — fully
@@ -794,6 +964,13 @@ impl CoreData {
         let Some(entry) = self.qualified.get(qname) else {
             return true; // unknown ⇒ silent
         };
+        // The reference cannot build this INSTANCE definition ⇒ no known surface
+        // ⇒ silent (`UNBUILDABLE_DEFINITIONS`). Checked before the leaf lookup
+        // because the tables were emptied, which would otherwise read as
+        // proven-absent.
+        if entry.instance_unbuildable {
+            return true;
+        }
         // Leaf's own instance methods + instance aliases.
         if entry.methods.contains_key(method) || Self::instance_alias_resolves(entry, method) {
             return true;
@@ -1062,9 +1239,22 @@ impl CoreData {
             if !seen.insert(key) {
                 break; // Defensive: cycle guard.
             }
+            // Same reason as `collect`, singleton side: an unbuildable singleton
+            // definition contributes no KNOWN class-method surface, so the chain
+            // must read as truncated.
+            if entry.singleton_unbuildable {
+                complete = false;
+            }
             chain.push(key);
             for &module in &entry.extends {
-                if !self.classes.contains_key(module) {
+                // `extend M` folds M's INSTANCE methods into this class object,
+                // so an M whose instance definition does not build truncates the
+                // singleton surface just as an unloaded M does.
+                if self
+                    .classes
+                    .get(module)
+                    .is_none_or(|m| m.instance_unbuildable)
+                {
                     complete = false;
                 }
             }
@@ -1887,6 +2077,15 @@ impl CoreData {
         if !seen.insert(key) {
             return;
         }
+        // A class whose INSTANCE definition the reference cannot build has NO
+        // known instance surface (its tables were emptied), so a chain passing
+        // through it is incomplete — otherwise the empty entry would read as
+        // "definitively has nothing" and witness absence both on the class itself
+        // and on anything inheriting from or including it. This walk is the
+        // instance-side chain, so only the instance flag applies.
+        if entry.instance_unbuildable {
+            *complete = false;
+        }
         order.push(key);
         // Included modules sit between the class and its superclass in Ruby's
         // method resolution order; for *existence* the order doesn't matter.
@@ -1956,6 +2155,10 @@ impl CoreData {
                     // The stub models no `extend` directives (no class-method
                     // surface under the fallback); empty keeps it conservative.
                     extends: Vec::new(),
+                    // The stub carries none of the `UNBUILDABLE_DEFINITIONS`
+                    // classes, so the flags are inert under the fallback.
+                    instance_unbuildable: false,
+                    singleton_unbuildable: false,
                 },
             );
         };

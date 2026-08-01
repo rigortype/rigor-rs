@@ -133,6 +133,28 @@ chasing a non-bug.)
    Also re-sync `vendor/rbs/overlay/` from the reference's own `data/`
    (`data/core_overlay/`, `data/vendored_gem_sigs/` — see `PROVENANCE.md`; those
    track the reference pin, not the rbs version).
+   Then re-derive the classes whose DEFINITION the reference cannot build —
+   `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`
+   directories collide, and a collision blinds the oracle on that whole class:
+   ```sh
+   ruby harness/unbuildable_classes.rb --check   # else: paste the printed table
+   ```
+   A `MISSING` line is a false positive rigor-rs will now emit; a `STALE` line
+   means the collision is gone and rigor-rs should resume witnessing. Both need
+   the `UNBUILDABLE_DEFINITIONS` table in `crates/rigor-index/src/rbs.rs` updated
+   in the same commit.
+
+   **Run this in the project's normal dev environment — the same one the gates
+   run in.** Unlike everything else in this ritual, the answer is NOT a pure
+   function of the pin: `RBS::EnvironmentLoader` prefers an installed gem's own
+   `sig/` over `rbs`'s `stdlib/` copy, so *which* signatures collide depends on
+   the host's gem set. Measured: with the `bigdecimal` gem absent, the same
+   pinned reference builds `BigMath` and the set shrinks from 12 to 11. So **a
+   diff here can mean a GEM changed rather than upstream changing** — the script
+   tags each colliding source `[env]` (host-installed gem) or `[pin]` (the
+   reference's own `data/` tree, or the version-locked rbs gem); check those tags
+   before concluding anything about upstream
+   ([note](docs/notes/20260731-bigmath-ingestion-asymmetry.md)).
 4. **Re-baseline the harness** against the new reference:
    ```sh
    ruby harness/snapshot.rb        # regenerate harness/snapshots/*.json

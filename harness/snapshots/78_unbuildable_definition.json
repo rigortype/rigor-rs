@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/78_unbuildable_definition.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for singleton(Math)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 46,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for 1.4142135623730951"
+    }
+  ]
+}
