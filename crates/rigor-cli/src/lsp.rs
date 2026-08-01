@@ -135,9 +135,35 @@ fn run_stdio() -> Result<(), String> {
         .map_err(|e| format!("initialize handshake failed: {e}"))?;
     let watched_files_dynamic_registration = client_supports_watched_files_registration(&init_params);
 
-    // Two-tier essence: the RBS environment + config are built ONCE and reused
-    // for the whole session (the per-keystroke path never pays the RBS-load floor).
-    let cfg = Config::load(None);
+    // N4 (deferred, recorded in the S4b note): the root is the server's cwd — the
+    // `initialize` params' `rootUri` / `workspaceFolders` are not consulted yet, so
+    // a server launched from the wrong directory discovers zero project files.
+    let root = PathBuf::from(".");
+
+    // Two-tier essence: the RBS environment is built ONCE and reused for the whole
+    // session (the per-keystroke path never pays the RBS-load floor). The CONFIG is
+    // read here and re-read by every structural [`invalidate`] — through the SAME
+    // [`read_project_config`] call, so startup and reload can never disagree about
+    // which file is the project config or how a broken one is handled.
+    //
+    // `root.join(".rigor.yml")` is `./.rigor.yml` in production — byte-identical to
+    // the `Config::load(None)` cwd discovery this replaces; the join is what lets a
+    // test drive a real config file under an injected root.
+    //
+    // A config broken AT STARTUP has no "last good" to fall back on, so it takes
+    // the same defaults `check` would and discloses — but it still records
+    // `config_broken`, so fixing the file publishes the recovery notice rather
+    // than landing silently.
+    let config_read = read_project_config(&root);
+    let config_broken = config_read.is_err();
+    if let Err(reason) = &config_read {
+        send_show_message(
+            &connection,
+            MessageType::WARNING,
+            config_broken_at_startup_message(reason),
+        )?;
+    }
+    let cfg = config_read.unwrap_or_default();
 
     // ADR-0036 / ADR-0008: `rigor lsp` defaults to `auto` and NEVER hard-errors
     // (an editor's Ruby env is structurally fragile — GUI apps don't source shell
@@ -180,10 +206,6 @@ fn run_stdio() -> Result<(), String> {
     // the S4b cross-file overlay substrate, stamped with generation 0. Loop-owned
     // (swapped on `invalidate`), so it is built here and MOVED into `main_loop`
     // rather than held in the immutable `ServerContext`.
-    // N4 (deferred, recorded in the S4b note): the root is the server's cwd — the
-    // `initialize` params' `rootUri` / `workspaceFolders` are not consulted yet, so
-    // a server launched from the wrong directory discovers zero project files.
-    let root = PathBuf::from(".");
     let index = Arc::new(build_core_index(&root, &cfg));
     let build = build_overlay(&root, &cfg, &index);
     // The startup build is the guard's FIRST sample. With hysteresis it can never
@@ -221,7 +243,7 @@ fn run_stdio() -> Result<(), String> {
     // `--workers` flag is added.
     rayon::spawn(|| {});
 
-    main_loop(&connection, &ctx, project, cfg, guard)?;
+    main_loop(&connection, &ctx, project, cfg, guard, config_broken)?;
 
     // Drop the connection BEFORE joining: the writer IO thread only terminates
     // when its channel disconnects, i.e. when the `Connection` (which owns the
@@ -978,9 +1000,17 @@ struct Session {
     epochs: HashMap<String, u64>,
     /// The current tier-1 [`ProjectContext`], swapped by [`invalidate`] (S4).
     project: Arc<ProjectContext>,
-    /// The loaded config, retained so [`invalidate`] can rebuild the index from
-    /// its plugin list + signature dirs.
+    /// The session config. Re-read from `<root>/.rigor.yml` by [`reload_config`]
+    /// on every structural [`invalidate`], and the source every context rebuild
+    /// derives from (index plugins + signature dirs, overlay `paths:`/`exclude:`,
+    /// `disable:`, the severity stamp).
     cfg: Config,
+    /// Whether the LAST `.rigor.yml` read failed — the hysteresis bit that makes
+    /// the disclosure fire on the usable⇄broken TRANSITION rather than on every
+    /// save of a file the user is still fixing. Seeded from the startup read, so a
+    /// session that booted on a broken config announces the recovery when the file
+    /// finally parses.
+    config_broken: bool,
     /// The worker-results sender, cloned into each worker (S3). The matching
     /// receiver stays local to [`main_loop`]'s `select!`.
     results_tx: crossbeam_channel::Sender<Computed>,
@@ -1217,6 +1247,7 @@ fn main_loop(
     project: Arc<ProjectContext>,
     cfg: Config,
     guard: OverlayGuard,
+    config_broken: bool,
 ) -> Result<(), String> {
     // The worker-results channel (ADR-0029 single-writer seam). `results_tx` is
     // cloned into each rayon worker closure, which pushes its `Computed` from
@@ -1231,6 +1262,7 @@ fn main_loop(
         epochs: HashMap::new(),
         project,
         cfg,
+        config_broken,
         results_tx,
         guard,
     };
@@ -1314,26 +1346,128 @@ fn main_loop(
 /// keeps serving the old context until the stamped replacement lands.
 ///
 /// The sidecar folder is PRESERVED (its `Arc` is cloned into the new context), so
-/// the Ruby VM is not respawned. The config file is not re-parsed here (matching
-/// the reference `ProjectContext#invalidate!`, which rebuilds from the same
-/// `@configuration`); the rebuild re-reads the signature dirs from disk, so
-/// changed `sig/**/*.rbs` content is picked up. In-flight workers holding the OLD
-/// `Arc` finish against it and are generation-dropped in [`handle_result`].
+/// the Ruby VM is not respawned. In-flight workers holding the OLD `Arc` finish
+/// against it and are generation-dropped in [`handle_result`].
+///
+/// **The config file IS re-parsed here** ([`reload_config`], first, so the
+/// `CoreIndex` and the overlay are both built from the NEW config) — deliberately
+/// beating the reference, whose `ProjectContext#invalidate!` rebuilds from the
+/// same retained `@configuration` and so needs an editor restart to see an edited
+/// `.rigor.yml`. The LSP has no diagnostic-set parity obligation (it is not the
+/// `check` pipeline), and the alternative was strictly worse than doing nothing:
+/// the watcher already fired, the rebuild already ran, and it republished the same
+/// stale answer — which reads to a user as "rigor ignored my config" rather than
+/// as "restart me". See `docs/notes/20260801-lsp-config-reload.md`.
 ///
 /// **S4b**: the rebuild also re-harvests the cross-file overlay substrate and
 /// re-times its `build_project`, feeding the sample to the hysteresis
-/// [`OverlayGuard`]. Returns the `window/showMessage` disclosure text on a guard
-/// posture flip (the caller sends it), or `None`.
+/// [`OverlayGuard`]. Returns every `window/showMessage` disclosure the rebuild
+/// owes the user (config reload state, then a guard posture flip) for the caller
+/// to send — a `Vec` because one invalidation can genuinely owe both.
 ///
 /// **This is now the STRUCTURAL path only** (review N3): `.rigor.yml` /
 /// `Gemfile.lock` / `sig/**/*.rbs`. A plain project `.rb` save goes to
 /// [`reharvest_sources`] instead, which touches one AST entry rather than
 /// re-parsing the project on the loop thread.
-fn invalidate(ctx: &ServerContext, st: &mut Session) -> Option<String> {
+fn invalidate(ctx: &ServerContext, st: &mut Session) -> Vec<(MessageType, String)> {
+    let mut disclosures = Vec::new();
+    // FIRST: everything below reads `st.cfg`. `build_core_index` consumes
+    // `plugins:` + `signature_paths:`, `build_overlay` consumes `paths:` +
+    // `exclude:`, and `swap_project` consumes `disable:` + the severity axes — so
+    // a reload placed anywhere later would ship a context built half from each.
+    if let Some(msg) = reload_config(ctx, st) {
+        disclosures.push(msg);
+    }
     // The sidecar is PRESERVED (its `Arc` is cloned into the new context by
     // `swap_project`), so the Ruby VM is not respawned.
     let index = Arc::new(build_core_index(&ctx.project_root, &st.cfg));
-    apply_full_overlay_build(ctx, st, index)
+    if let Some(msg) = apply_full_overlay_build(ctx, st, index) {
+        disclosures.push((MessageType::WARNING, msg));
+    }
+    disclosures
+}
+
+/// Read the project's `.rigor.yml` and, when it is usable, install it as the
+/// session config. Returns a `window/showMessage` disclosure on a STATE CHANGE
+/// only (usable ⇄ broken), never per save.
+///
+/// **A broken config keeps the last good one.** This is the case the feature
+/// lives or dies on: an editor writes `.rigor.yml` on every save, so the server
+/// sees half-written YAML constantly, and [`Config::load`]'s one-shot answer —
+/// silently substitute [`Config::default`] — would drop the user's whole
+/// `disable:` list mid-keystroke and flood the buffer with markers that vanish
+/// again when the file parses. Defaults are a configuration the user did not
+/// write; the last good one is. Deleting `.rigor.yml` is NOT that case and is
+/// honoured immediately: absent means the defaults genuinely ARE the config,
+/// which is why [`ConfigRead`] separates the two.
+///
+/// **Disclosure is `window/showMessage`, not a diagnostic on the YAML file.** A
+/// diagnostic would need a range this loader does not compute (serde_yaml's error
+/// carries a location, but the LSP would then own publishing and CLEARING markers
+/// on a non-Ruby URI that may not even be open), and `showMessage` is already
+/// this server's disclosure channel for the sidecar posture and the overlay
+/// guard. Rejected, not overlooked.
+///
+/// Only the transition messages: a user fighting a broken file saves it many
+/// times, and one modal per save is worse than the staleness this fixes.
+fn reload_config(ctx: &ServerContext, st: &mut Session) -> Option<(MessageType, String)> {
+    match read_project_config(&ctx.project_root) {
+        Ok(cfg) => {
+            st.cfg = cfg;
+            // Only announce the recovery — a config that was fine and stayed fine
+            // is the overwhelmingly common case and says nothing worth a popup.
+            std::mem::replace(&mut st.config_broken, false).then(|| {
+                (
+                    MessageType::INFO,
+                    "rigor: .rigor.yml reloaded — the earlier error is resolved".to_string(),
+                )
+            })
+        }
+        Err(reason) => {
+            // `st.cfg` is deliberately left alone: the last good config keeps
+            // serving until the file parses again.
+            (!std::mem::replace(&mut st.config_broken, true))
+                .then(|| (MessageType::WARNING, config_broken_message(&reason)))
+        }
+    }
+}
+
+/// Read `<root>/.rigor.yml` into the session's answer for "what is the config".
+/// `Ok` = usable (parsed, or the defaults because there is no file); `Err(reason)`
+/// = the file is THERE but unusable, and the caller must decide what to serve
+/// instead — [`reload_config`] keeps the last good config, startup falls back to
+/// defaults because it has none.
+fn read_project_config(root: &Path) -> Result<Config, String> {
+    match Config::read(&root.join(".rigor.yml")) {
+        crate::config::ConfigRead::Parsed(cfg) => Ok(*cfg),
+        // No file is a valid configuration — the defaults, exactly as a project
+        // that never wrote one gets. Reloading to defaults after a DELETE is
+        // correct for the same reason.
+        crate::config::ConfigRead::Absent(_) => Ok(Config::default()),
+        crate::config::ConfigRead::Unreadable(e) | crate::config::ConfigRead::Malformed(e) => {
+            Err(e)
+        }
+    }
+}
+
+/// The user-facing text for a `.rigor.yml` that will not parse. Names WHICH
+/// config is now in force, because that is the question a user staring at
+/// unexpected markers is really asking — and the answer differs by when it broke:
+/// a reload keeps the last good config, but a session that booted on a broken
+/// file never had one and is running on defaults.
+fn config_broken_message(reason: &str) -> String {
+    format!(
+        "rigor: .rigor.yml could not be read ({reason}) — keeping the last good \
+         configuration; fix and save the file to reload it"
+    )
+}
+
+/// …the startup variant, where there is no last good configuration to keep.
+fn config_broken_at_startup_message(reason: &str) -> String {
+    format!(
+        "rigor: .rigor.yml could not be read ({reason}) — analyzing with DEFAULT \
+         settings; fix and save the file to reload it"
+    )
 }
 
 /// Re-harvest the WHOLE overlay against `index`, feed the `build_project` timing
@@ -1378,16 +1512,14 @@ fn swap_project(
         disable: st.cfg.disable_matcher(),
         folder: st.project.folder.clone(), // reuse the live sidecar; no respawn.
         // Config-derived exactly like `disable`, and rebuilt from `st.cfg` on the
-        // same schedule. `invalidate` does NOT re-parse `.rigor.yml` (matching the
-        // reference `ProjectContext#invalidate!`, which rebuilds from the same
-        // `@configuration`), so today this reproduces the startup stamp — it is
-        // written this way so the stamp follows `st.cfg` the moment a future slice
-        // makes the config reloadable, rather than silently going stale.
+        // same schedule. Since `invalidate` re-parses `.rigor.yml` into `st.cfg`
+        // first, an edited `severity_profile:` / `severity_overrides:` /
+        // `bleeding_edge:` lands on the very next publish — the stamp was written
+        // to follow `st.cfg` for exactly this day.
         stamp: SeverityStamp::from_config(&st.cfg),
         // Same provenance, same schedule: rebuilt from `st.cfg` (and the immutable
-        // session root) on every context swap, so the day `.rigor.yml` becomes
-        // reloadable a newly-added `exclude:` entry takes effect on the very next
-        // publish instead of going stale.
+        // session root) on every context swap, so a newly-added `exclude:` entry
+        // takes effect on the next publish.
         exclude: ExcludeMatcher::from_config(&ctx.project_root, &st.cfg),
         overlay,
     });
@@ -1783,8 +1915,8 @@ fn handle_message(
                         reanalyze_open_buffers(ctx, st);
                     }
                     WatchedChange::Structural => {
-                        if let Some(msg) = invalidate(ctx, st) {
-                            send_show_message(connection, MessageType::WARNING, msg)?;
+                        for (typ, msg) in invalidate(ctx, st) {
+                            send_show_message(connection, typ, msg)?;
                         }
                         reanalyze_open_buffers(ctx, st);
                     }
@@ -1792,10 +1924,12 @@ fn handle_message(
             }
             "workspace/didChangeConfiguration" => {
                 // Configuration refresh (S4): always invalidate + re-analyse open
-                // buffers (the payload shape is client-specific; v1 ignores it and
-                // rebuilds so the next publish observes any external config change).
-                if let Some(msg) = invalidate(ctx, st) {
-                    send_show_message(connection, MessageType::WARNING, msg)?;
+                // buffers. The payload shape is client-specific and still ignored —
+                // but `invalidate` now RE-READS `.rigor.yml`, so this notification
+                // finally does what its name promises for the config that actually
+                // governs rigor, instead of rebuilding from the startup parse.
+                for (typ, msg) in invalidate(ctx, st) {
+                    send_show_message(connection, typ, msg)?;
                 }
                 reanalyze_open_buffers(ctx, st);
             }
@@ -3311,10 +3445,18 @@ mod tests {
         /// Spawn the server loop over a real on-disk project `root` with an
         /// injected overlay scale-guard `budget` (S4b). This is the authentic
         /// production boot: the tier-1 overlay is built by the SAME
-        /// [`build_overlay`] call `run_stdio` makes, the guard is evaluated the
-        /// same way, and its `window/showMessage` disclosure goes out on the same
-        /// connection — only the root and the budget are injected, so no test has
-        /// to mutate the process-global cwd or race a wall clock.
+        /// [`build_overlay`] call `run_stdio` makes, the config comes from
+        /// `<root>/.rigor.yml` through the SAME [`read_project_config`], the guard
+        /// is evaluated the same way, and both `window/showMessage` disclosures go
+        /// out on the same connection — only the root and the budget are injected,
+        /// so no test has to mutate the process-global cwd or race a wall clock.
+        ///
+        /// The pre-reload harness took a PARSED `Config` and injected it, which was
+        /// "the same thing minus the file" only while the config was read exactly
+        /// once. It is not any more: an injected config has no file behind it, so
+        /// the first structural invalidation would reload it away — a divergence
+        /// from production that the assertions could not have seen. Tests now write
+        /// the YAML a user would write.
         fn start_project(
             debounce: Duration,
             worker_gate: Arc<WorkerGate>,
@@ -3322,35 +3464,23 @@ mod tests {
             root: PathBuf,
             overlay_budget: Duration,
         ) -> Self {
-            Self::start_project_with_config(
-                debounce,
-                worker_gate,
-                client_caps,
-                root,
-                overlay_budget,
-                Config::default(),
-            )
-        }
-
-        /// …and with an injected `.rigor.yml` equivalent. Production reads the
-        /// config from disk once at startup (`Config::load`); injecting the parsed
-        /// value is the same thing minus the file, and it is what the `exclude:`
-        /// tests drive — the whole point being that the gate is CONFIG-derived and
-        /// carried on the context, never re-read per dispatch.
-        fn start_project_with_config(
-            debounce: Duration,
-            worker_gate: Arc<WorkerGate>,
-            client_caps: serde_json::Value,
-            root: PathBuf,
-            overlay_budget: Duration,
-            cfg: Config,
-        ) -> Self {
             let (server_conn, client) = Connection::memory();
             let handle = thread::spawn(move || {
                 let caps = serde_json::to_value(server_capabilities()).unwrap();
                 // The authentic path: read the client's capabilities from the
                 // InitializeParams the handshake returns (not discarded).
                 let init_params = server_conn.initialize(caps).unwrap();
+                let config_read = read_project_config(&root);
+                let config_broken = config_read.is_err();
+                if let Err(reason) = &config_read {
+                    send_show_message(
+                        &server_conn,
+                        MessageType::WARNING,
+                        config_broken_at_startup_message(reason),
+                    )
+                    .unwrap();
+                }
+                let cfg = config_read.unwrap_or_default();
                 let ctx = ServerContext {
                     debounce,
                     worker_gate,
@@ -3379,7 +3509,7 @@ mod tests {
                     exclude: ExcludeMatcher::from_config(&root, &cfg),
                     overlay,
                 });
-                main_loop(&server_conn, &ctx, project, cfg, guard).unwrap();
+                main_loop(&server_conn, &ctx, project, cfg, guard, config_broken).unwrap();
             });
             // Client-side handshake: initialize request → response → initialized.
             client
@@ -3433,6 +3563,18 @@ mod tests {
         /// debounced publish does NOT arrive before its interval elapses.
         fn try_recv(&self, dur: Duration) -> Option<Message> {
             self.client.receiver.recv_timeout(dur).ok()
+        }
+
+        /// The next message, asserted to be a `window/showMessage`, parsed. The
+        /// disclosure channel for the sidecar posture, the overlay guard, and the
+        /// config-reload state.
+        fn recv_show_message(&self) -> ShowMessageParams {
+            match self.recv() {
+                Message::Notification(n) if n.method == "window/showMessage" => {
+                    serde_json::from_value(n.params).unwrap()
+                }
+                other => panic!("expected window/showMessage, got {other:?}"),
+            }
         }
 
         /// The next message, asserted to be a `publishDiagnostics`, parsed.
@@ -4252,6 +4394,25 @@ mod tests {
             Self { root }
         }
 
+        /// Write (or overwrite) the project's `.rigor.yml`. The server reads it
+        /// through the production loader, so a test drives config exactly as a user
+        /// does — including a `yaml` that does not parse.
+        fn write_config(&self, yaml: &str) {
+            std::fs::write(self.root.join(".rigor.yml"), yaml).unwrap();
+        }
+
+        /// Delete the project's `.rigor.yml` (the "user removed their config" case,
+        /// which reloads to DEFAULTS rather than keeping the last good one).
+        fn remove_config(&self) {
+            std::fs::remove_file(self.root.join(".rigor.yml")).unwrap();
+        }
+
+        /// The `file:` URI of the project's `.rigor.yml` — what a client names in
+        /// the `didChangeWatchedFiles` payload after the editor saves it.
+        fn config_uri(&self) -> String {
+            format!("file://{}", self.root.join(".rigor.yml").display())
+        }
+
         /// Write (or overwrite) `lib/<name>` and return its canonical path.
         fn write(&self, name: &str, text: &str) -> PathBuf {
             let p = self.root.join("lib").join(name);
@@ -4838,6 +4999,7 @@ mod tests {
                 overlay: Some(build.files),
             }),
             cfg,
+            config_broken: false,
             results_tx,
             guard: OverlayGuard::new(),
         };
@@ -5399,14 +5561,13 @@ mod tests {
         let p = TempProject::new("exclloop");
         p.write("skipped.rb", TYPO);
         p.write("kept.rb", TYPO);
-        let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/skipped.rb\"\n").unwrap();
-        let mut h = Harness::start_project_with_config(
+        p.write_config("exclude:\n  - \"**/skipped.rb\"\n");
+        let mut h = Harness::start_project(
             Duration::from_secs(30),
             production_gate(),
             serde_json::json!({}),
             p.root.clone(),
             OVERLAY_BUILD_BUDGET_DEFAULT,
-            cfg,
         );
 
         h.notify("textDocument/didOpen", open_params(&p.uri("skipped.rb"), TYPO, 1));
@@ -5440,6 +5601,324 @@ mod tests {
         }
         assert_eq!(seen.get(&p.uri("skipped.rb")), Some(&0), "still empty after invalidate");
         assert_eq!(seen.get(&p.uri("kept.rb")), Some(&1), "and the sibling still fires");
+        h.shutdown();
+    }
+
+    // ---------------------------------------------------------------------
+    // Config reload (2026-08-01) — `.rigor.yml` is re-parsed by every structural
+    // `invalidate`, so an edit takes effect without restarting the server. Driven
+    // end to end: a real file on disk, the real watched-files notification, and
+    // assertions on what the server PUBLISHES — a unit test on `reload_config`
+    // alone would miss every ordering property below.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn integration_config_reload_disable_takes_effect_without_a_restart() {
+        // THE HEADLINE: editing `.rigor.yml` changes the published set in the SAME
+        // session. Before this slice the watcher fired, the context rebuilt, and the
+        // republished answer was byte-identical to the stale one.
+        let p = TempProject::new("cfgreload");
+        p.write("t.rb", TYPO);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        assert_eq!(
+            h.recv_diags().diagnostics.len(),
+            1,
+            "no config yet: the typo fires"
+        );
+
+        // The user adds a `disable:` and saves. The editor's watcher names the file.
+        p.write_config("disable:\n  - call.undefined-method\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "the NEW `disable:` is honoured on the next publish — no restart"
+        );
+
+        // …and removing it again restores the diagnostic (the reload is a re-read,
+        // not a one-way accumulation of rules).
+        p.write_config("paths:\n  - lib\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        assert_eq!(
+            h.recv_diags().diagnostics.len(),
+            1,
+            "dropping `disable:` brings the diagnostic back"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_config_reload_honours_a_deleted_config_as_defaults() {
+        // DELETING `.rigor.yml` is NOT the broken-file case: absent means the
+        // defaults genuinely ARE the configuration, so it reloads to them
+        // immediately and says nothing. This is the discriminator that forced
+        // `ConfigRead` to separate `Absent` from `Malformed`.
+        let p = TempProject::new("cfgdelete");
+        p.write("t.rb", TYPO);
+        p.write_config("disable:\n  - call.undefined-method\n");
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "the on-disk `disable:` is read at STARTUP too"
+        );
+
+        p.remove_config();
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        // The very next message is the publish — no `window/showMessage`, because a
+        // missing config is not an error to disclose.
+        assert_eq!(
+            h.recv_diags().diagnostics.len(),
+            1,
+            "a deleted config reloads to DEFAULTS (not 'keep the last good one')"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_malformed_config_keeps_the_last_good_one_and_warns_once() {
+        // The case the feature lives or dies on: an editor writes `.rigor.yml` on
+        // every save, so the server sees half-written YAML constantly.
+        //
+        // (a) a broken file keeps the LAST GOOD config — `Config::load`'s one-shot
+        //     answer (silently substitute the defaults) would drop the user's whole
+        //     `disable:` list and flood the buffer mid-keystroke;
+        // (b) the warning fires on the TRANSITION, not per save;
+        // (c) fixing the file reloads it and says so.
+        let p = TempProject::new("cfgbroken");
+        p.write("t.rb", TYPO);
+        p.write_config("disable:\n  - call.undefined-method\n");
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        assert!(h.recv_diags().diagnostics.is_empty(), "the good config suppresses it");
+
+        // Save 1 of a half-written file.
+        p.write_config("disable: [call.undefined-method\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        let msg = h.recv_show_message();
+        assert_eq!(msg.typ, MessageType::WARNING);
+        assert!(
+            msg.message.contains("keeping the last good configuration"),
+            "the disclosure names which config is in force: {}",
+            msg.message
+        );
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "(a) the last good `disable:` still suppresses the typo — the defaults \
+             would have published it"
+        );
+
+        // Save 2, still broken. No second popup: the next message is the publish.
+        p.write_config("disable: [call.undefined-method, still-unterminated\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "(b) a second broken save re-publishes but does NOT warn again"
+        );
+
+        // Fixed — and the fix drops `disable:`, so the diagnostic comes back.
+        p.write_config("paths:\n  - lib\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        let msg = h.recv_show_message();
+        assert_eq!(msg.typ, MessageType::INFO);
+        assert!(
+            msg.message.contains("reloaded"),
+            "(c) recovery is announced: {}",
+            msg.message
+        );
+        assert_eq!(
+            h.recv_diags().diagnostics.len(),
+            1,
+            "and the fixed config is the one now in force"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_config_broken_at_startup_falls_back_to_defaults_and_says_so() {
+        // A session that BOOTS on a broken config has no last good one to keep, so
+        // it takes the defaults `check` would — but it still records the broken
+        // state, so the eventual fix announces itself rather than landing silently.
+        let p = TempProject::new("cfgbootbroken");
+        p.write("t.rb", TYPO);
+        p.write_config("disable: [call.undefined-method\n");
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        let msg = h.recv_show_message();
+        assert_eq!(msg.typ, MessageType::WARNING);
+        assert!(
+            msg.message.contains("DEFAULT settings"),
+            "startup says DEFAULTS, not 'last good' — there was never a good one: {}",
+            msg.message
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        assert_eq!(h.recv_diags().diagnostics.len(), 1, "defaults ⇒ the typo fires");
+
+        p.write_config("disable:\n  - call.undefined-method\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        let msg = h.recv_show_message();
+        assert_eq!(msg.typ, MessageType::INFO, "the broken-at-boot state recovers: {msg:?}");
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "and the now-readable config takes effect"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_config_reload_beats_a_worker_already_in_flight() {
+        // THE ORDERING PROPERTY. A worker dispatched under the OLD config is in
+        // flight when the config changes. Its answer is now wrong, and it is the
+        // NEWER message — so publishing it would leave the editor showing markers
+        // the user's saved config forbids, permanently (nothing re-dispatches after
+        // it). The generation guard the S4 slice built is what covers this: the
+        // reload happens inside `invalidate`, which bumps the generation, so the
+        // in-flight result is stale on the generation axis exactly as it would be
+        // for an index rebuild. No second invalidation mechanism, no new race.
+        let p = TempProject::new("cfgflight");
+        p.write("t.rb", TYPO);
+        let g = gate_recording_hold_gen0();
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            g.gate.clone(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        // didOpen → a gen-0 worker spawns and blocks in the gate, having read the
+        // config that has no `disable:`.
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        hover_sync(&h, 100, &p.uri("t.rb")); // barrier: the gen-0 worker is in flight.
+
+        p.write_config("disable:\n  - call.undefined-method\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        hover_sync(&h, 101, &p.uri("t.rb")); // barrier: the reload is processed.
+
+        g.release_gen0.send(()).unwrap();
+        let d = h.recv_diags();
+        assert!(
+            d.diagnostics.is_empty(),
+            "the in-flight gen-0 result (computed under the OLD config, so carrying \
+             the diagnostic) is DROPPED, and the re-dispatch publishes under the new \
+             config: {:?}",
+            d.diagnostics
+        );
+        hover_sync(&h, 102, &p.uri("t.rb")); // exactly one publish — no stale follow-up.
+        let calls = g.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|&(_, genr)| genr == 1),
+            "a worker ran under the post-reload generation (proves the drop + \
+             re-dispatch, not a lucky publish): {calls:?}"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_config_reload_picks_up_a_new_exclude_for_an_open_buffer() {
+        // `exclude:` is STAGE-1 in `check` (the file is never analysed), and the LSP
+        // reproduces it as an empty publish. It is rebuilt by `swap_project` from
+        // `st.cfg`, so it rides the reload with no extra wiring — asserted because
+        // "rides for free" is exactly the kind of claim that silently stops being
+        // true.
+        let p = TempProject::new("cfgexclude");
+        p.write("t.rb", TYPO);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        assert_eq!(h.recv_diags().diagnostics.len(), 1);
+
+        p.write_config("exclude:\n  - \"**/t.rb\"\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "a newly-excluded open buffer publishes EMPTY (clearing its markers)"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_did_change_configuration_also_re_reads_the_file() {
+        // `workspace/didChangeConfiguration` still ignores its client-specific
+        // payload, but it no longer rebuilds from the startup parse — it re-reads
+        // `.rigor.yml` like any structural invalidation. A client that sends this
+        // instead of a watched-file event (several do) gets the same answer.
+        let p = TempProject::new("cfgdidchange");
+        p.write("t.rb", TYPO);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        assert_eq!(h.recv_diags().diagnostics.len(), 1);
+
+        p.write_config("disable:\n  - call.undefined-method\n");
+        h.notify("workspace/didChangeConfiguration", serde_json::json!({ "settings": {} }));
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "didChangeConfiguration re-reads the file, not just the context"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn integration_config_reload_is_not_triggered_by_a_source_save() {
+        // A `.rb` save takes the CHEAP `reharvest_sources` path (review N3), which
+        // deliberately does not touch the config — a source file cannot change it.
+        // Proven by making the on-disk config disagree with the live one: if a
+        // source save reloaded, the still-firing diagnostic would vanish.
+        let p = TempProject::new("cfgsrcsave");
+        p.write("t.rb", TYPO);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("t.rb"), TYPO, 1));
+        assert_eq!(h.recv_diags().diagnostics.len(), 1);
+
+        p.write_config("disable:\n  - call.undefined-method\n");
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.uri("t.rb")));
+        assert_eq!(
+            h.recv_diags().diagnostics.len(),
+            1,
+            "a source save re-harvests ASTs only — the config surface is untouched"
+        );
+        // …and the config-file event that follows the save does apply it.
+        h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
+        assert!(h.recv_diags().diagnostics.is_empty());
         h.shutdown();
     }
 
@@ -5609,7 +6088,14 @@ mod tests {
         // A structural invalidation under a generous budget: ONE under-budget
         // sample restores the overlay.
         ctx.overlay_budget = Duration::from_secs(30);
-        let msg = invalidate(&ctx, &mut st).expect("a posture flip discloses");
+        // `invalidate` can owe more than one disclosure now (a config-reload state
+        // change, then the guard flip); pick the guard's out of the batch.
+        let disclosures = invalidate(&ctx, &mut st);
+        let msg = disclosures
+            .iter()
+            .map(|(_, m)| m.clone())
+            .find(|m| m.contains("re-enabled"))
+            .unwrap_or_else(|| panic!("a posture flip discloses: {disclosures:?}"));
         assert!(st.guard.enabled, "one under-budget rebuild re-enables");
         let restored = st.project.overlay.as_ref().expect("the overlay is re-installed");
         assert_eq!(restored.files.len(), 2, "with the freshly harvested ASTs");

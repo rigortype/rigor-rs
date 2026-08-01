@@ -565,8 +565,13 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   synchronously on `didChangeWatchedFiles`(`.rigor.yml`/`Gemfile.lock`/`*.rb`/`sig/**/*.rbs`) +
   `didChangeConfiguration` (never on buffer `didChange`); LSP dynamic registration
   (`client/registerCapability`, degrades gracefully). Sidecar shared as `Arc` behind its Mutex
-  (the check pipeline's pattern). Known limit: invalidate re-reads sig CONTENT, not parsed
-  `.rigor.yml` (reference-parity). [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
+  (the check pipeline's pattern). [plan](notes/20260719-lsp-s12-two-tier-impl-plan.md).
+- ✅ **Config reload landed (2026-08-01) — the S4 known limit CLOSED.** A structural `invalidate`
+  now re-parses `.rigor.yml` (first, so index + overlay + stamp all build from the NEW config)
+  instead of rebuilding from the startup parse, deliberately beating the reference's
+  `ProjectContext#invalidate!`. A BROKEN file keeps the last good config and warns once on the
+  transition; a DELETED one reloads to defaults (`Config::read` → `ConfigRead`). Rides the S4
+  generation bump, so no new concurrency reasoning. [note](notes/20260801-lsp-config-reload.md).
 - ✅ **LSP v4 completion slice landed (2026-07-31).** `Foo::` now offers the NESTED CONSTANTS
   (`namespace_children` over the ADR-0042 qualified registry, immediate children only, Class vs
   Module kinds) instead of singleton methods — the split is the case of the name typed after `::`,

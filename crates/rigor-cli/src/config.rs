@@ -231,7 +231,51 @@ fn top_level_keys(text: &str) -> std::collections::BTreeSet<String> {
     }
 }
 
+/// What reading a `.rigor.yml` actually found — the four outcomes
+/// [`Config::load`] deliberately collapses into [`Config::default`].
+///
+/// The collapse is right for a ONE-SHOT `check`: the run is about to end, so
+/// "absent" and "you typo'd the YAML" both mean "analyze with defaults and warn
+/// on stderr". It is wrong for a LONG-LIVED reader (the LSP), which must tell
+/// **absent** — where the defaults genuinely ARE the configuration — apart from
+/// **broken**, where the defaults are a config the user never wrote and adopting
+/// them would silently drop their `disable:` list mid-edit. Hence this enum: the
+/// distinction lives in one loader both callers share, not in a second parse
+/// path that could drift from `load`'s.
+pub enum ConfigRead {
+    /// Read and parsed.
+    Parsed(Box<Config>),
+    /// Nothing at that path. `.rigor.yml` is optional, so this is the normal
+    /// case. Carries the OS's own words for it so a caller that DID name the
+    /// path explicitly can report them verbatim.
+    Absent(String),
+    /// The path exists but could not be read (permissions, a directory, IO).
+    /// Carries the error text for the caller's warning.
+    Unreadable(String),
+    /// Read, but not valid YAML / not the schema. Carries the parse error text.
+    Malformed(String),
+}
+
 impl Config {
+    /// Read the config at `path` WITHOUT deciding what to do about a failure —
+    /// the shared loader behind [`Config::load`] (which warns + defaults) and the
+    /// LSP's reload (which keeps the last good config on a parse error). Prints
+    /// nothing itself, so the caller owns the channel and the wording.
+    #[must_use]
+    pub fn read(path: &Path) -> ConfigRead {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match serde_yaml::from_str::<Config>(&text) {
+                Ok(mut cfg) => {
+                    cfg.present_keys = top_level_keys(&text);
+                    ConfigRead::Parsed(Box::new(cfg))
+                }
+                Err(e) => ConfigRead::Malformed(e.to_string()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigRead::Absent(e.to_string()),
+            Err(e) => ConfigRead::Unreadable(e.to_string()),
+        }
+    }
+
     /// Load the config. With `explicit = Some(path)` read exactly that file;
     /// otherwise auto-discover `.rigor.yml` in the current working directory.
     /// Returns [`Config::default`] on ANY problem (missing file, read error,
@@ -239,26 +283,24 @@ impl Config {
     /// exists but cannot be parsed. Never panics.
     #[must_use]
     pub fn load(explicit: Option<&Path>) -> Config {
-        match explicit {
-            Some(path) => {
-                // An explicit path the user asked for: a read/parse failure is
-                // worth a warning, but still degrades to default rather than
-                // aborting the run.
-                match std::fs::read_to_string(path) {
-                    Ok(text) => Config::parse_or_warn(&text, &path.display().to_string()),
-                    Err(e) => {
-                        eprintln!("rigor: cannot read config {}: {e}", path.display());
-                        Config::default()
-                    }
-                }
+        let (path, label): (&Path, String) = match explicit {
+            Some(p) => (p, p.display().to_string()),
+            None => (Path::new(".rigor.yml"), ".rigor.yml".to_string()),
+        };
+        match Config::read(path) {
+            ConfigRead::Parsed(cfg) => *cfg,
+            ConfigRead::Malformed(e) => {
+                eprintln!("rigor: ignoring malformed config {label}: {e}");
+                Config::default()
             }
-            None => {
-                // Auto-discovery: a missing `.rigor.yml` in cwd is the normal
-                // case (no warning); only warn if it exists but is malformed.
-                match std::fs::read_to_string(".rigor.yml") {
-                    Ok(text) => Config::parse_or_warn(&text, ".rigor.yml"),
-                    Err(_) => Config::default(),
+            // An explicit path the user ASKED for and we could not read is worth a
+            // warning; an absent auto-discovered `.rigor.yml` is the normal case
+            // and stays silent. Both still degrade to default rather than aborting.
+            ConfigRead::Absent(e) | ConfigRead::Unreadable(e) => {
+                if explicit.is_some() {
+                    eprintln!("rigor: cannot read config {label}: {e}");
                 }
+                Config::default()
             }
         }
     }
@@ -266,6 +308,11 @@ impl Config {
     /// Parse YAML text, warning and falling back to default on a parse error.
     /// Records the file's top-level keys ([`Config::present_keys`]) so the config
     /// audit can tell an explicitly-configured key from a defaulted one.
+    ///
+    /// **Test-only** since [`Config::read`] took the load path over: production
+    /// reads a PATH (only there can absent be told from malformed) and owns its
+    /// own warning channel — the LSP's is `window/showMessage`, not stderr.
+    #[cfg(test)]
     pub(crate) fn parse_or_warn(text: &str, label: &str) -> Config {
         match serde_yaml::from_str::<Config>(text) {
             Ok(mut cfg) => {
@@ -647,6 +694,45 @@ mod tests {
         let cfg = Config::parse_or_warn("disable: [unterminated\n", "test");
         assert!(cfg.disable.is_empty());
         assert!(cfg.exclude.is_empty());
+    }
+
+    #[test]
+    fn read_separates_absent_from_malformed() {
+        // The distinction `load` collapses and the LSP reload depends on: a MISSING
+        // config means "the defaults are the configuration" (adopt them), a BROKEN
+        // one means "I don't know what the configuration is" (keep the last good).
+        // Collapsing them is what would drop a user's `disable:` list on the save
+        // of a half-written file.
+        let dir = std::env::temp_dir()
+            .join(format!("rigor_cfg_read_{}_{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".rigor.yml");
+
+        assert!(matches!(Config::read(&path), ConfigRead::Absent(_)), "no file");
+
+        std::fs::write(&path, "disable: [unterminated\n").unwrap();
+        assert!(matches!(Config::read(&path), ConfigRead::Malformed(_)), "broken YAML");
+
+        std::fs::write(&path, "disable:\n  - call.undefined-method\n").unwrap();
+        match Config::read(&path) {
+            ConfigRead::Parsed(cfg) => {
+                assert_eq!(cfg.disable, vec!["call.undefined-method".to_string()]);
+                // `present_keys` must survive the new loader — the config audit
+                // tells an explicitly-set key from a defaulted one through it.
+                assert_eq!(cfg.unknown_keys(), Vec::<&str>::new());
+                assert!(cfg.present_keys.contains("disable"));
+            }
+            _ => panic!("valid YAML must parse"),
+        }
+
+        // A DIRECTORY at the config path is neither absent nor malformed: it is
+        // there and unreadable, and the LSP treats it like broken (keep the last
+        // good config) rather than like a delete.
+        let as_dir = dir.join("dir.yml");
+        std::fs::create_dir_all(&as_dir).unwrap();
+        assert!(matches!(Config::read(&as_dir), ConfigRead::Unreadable(_)));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
