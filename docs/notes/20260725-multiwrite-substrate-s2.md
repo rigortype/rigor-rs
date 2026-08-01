@@ -349,7 +349,9 @@ disagree, so the all-overloads-agree collapse declines it and the slots stay
 fires on both. Under-emit, FP-safe — but "tuple returns now type" must not be
 read as "every tuple return now types".
 
-**`a.Nokogiri` is the `BigMath` divergence again, in the instance path.** The
+**`a.Nokogiri` is the `BigMath` divergence again, in the instance path.**
+(CORRECTED 2026-08-01 — closed by the vendored overlay; see the end of this note.)
+The
 unvendored `nokogiri` extras add `Object#Nokogiri` to the ORACLE's surface, not
 to rigor-rs's, so rigor-rs witnesses it as undefined. Pre-existing:
 `"abc".Nokogiri` fires on the OLD binary and is silent in the oracle. The tuple
@@ -428,3 +430,23 @@ surfaces (which libraries each auto-loads, plus the extras bundle) and decide
 per-family whether to vendor, to skip, or to gate. That would also let the
 declaration-only restriction above be lifted. It needs its own measurement —
 vendoring the extras changes `knows_class`, arity and ATM surfaces at once.
+
+## Correction (2026-08-01): both directions of the follow-up are now CLOSED
+
+The two claims above about `Object#Nokogiri` (here and in the `a.Nokogiri` row of
+the divergence table) were accurate on 2026-07-25 and are no longer. `800b3a1`
+(2026-07-31) vendored the reference's `data/vendored_gem_sigs/` — the `class
+Object` reopen included — so `Object#Nokogiri` is on BOTH surfaces and neither
+engine fires. The vendoring landed as a side item of the 24-FP survey triage
+rather than as this follow-up, which is why the item outlived its own closure.
+
+The `BigMath` direction closed separately, and NOT for the reason this note gave:
+the oracle does load `module BigMath`; it loads it twice and cannot build the
+definition
+([note](20260731-bigmath-ingestion-asymmetry.md)).
+
+The remaining framing above — that this is an ingestion-surface question needing a
+per-family decision rather than a typing fix — held up. Answering it for the whole
+`Object#`-level conversion-function family (14 names) found the family at parity
+and turned up one live divergence in a NEIGHBOURING rule, `call.wrong-arity`:
+[20260801-nokogiri-ingestion-asymmetry-closed.md](20260801-nokogiri-ingestion-asymmetry-closed.md).

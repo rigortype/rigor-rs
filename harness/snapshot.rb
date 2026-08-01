@@ -42,7 +42,13 @@ def main
     json = snapshot_json(fixture_path, ref_diags)
     path = snapshot_path(fixture_path)
 
-    existing = File.exist?(path) ? File.read(path) : nil
+    # Read as UTF-8 explicitly. `snapshot_json` is UTF-8 and several reference
+    # messages carry non-ASCII (`—`, `’`); under a non-UTF-8 default external
+    # encoding a byte-identical file compares UNEQUAL, so `--check` reported
+    # permanent phantom drift on exactly those fixtures (48, 54) while the write
+    # path rewrote them to identical bytes. Same trap `unbuildable_classes.rb`
+    # documents for `rbs.rs`.
+    existing = File.exist?(path) ? File.read(path, encoding: "UTF-8") : nil
 
     if existing == json
       puts "up-to-date (#{ref_diags.size} diag#{ref_diags.size == 1 ? "" : "s"})"

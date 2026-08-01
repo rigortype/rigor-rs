@@ -237,6 +237,7 @@ synthetic probe against the oracle.
   on the ORACLE's surface and not rigor-rs's, so `"abc".Nokogiri` fires here and
   is silent there. That is a genuine ingestion gap (rigor-rs knows LESS), needs a
   vendoring decision rather than a surface mask, and is unaffected by this change.
+  — **WRONG WHEN WRITTEN; see the correction below.**
 - **The environment dependence is a standing property, not a one-off.** It is
   measured above rather than hypothesised, and it is the one axis of this table
   that is not pinned. Re-run `--check` in the gate environment on any pin, rbs,
@@ -251,3 +252,24 @@ synthetic probe against the oracle.
   that destroys `BigMath` rather than the entry that supplies it. Worth an
   upstream issue; not a blocker for this change, which is about matching observed
   behaviour, not endorsing it.
+
+## Correction (2026-08-01): the `Object#Nokogiri` bullet was wrong when written
+
+The first bullet above is false, and was already false when this note was
+committed. `800b3a1` (2026-07-31 04:52, the 24-FP survey triage — the same
+commit this note's ledger line credits) vendored the reference's whole
+`data/vendored_gem_sigs/` tree, including the `class Object` reopen that declares
+`def Nokogiri:`. Both engines are silent on `"abc".Nokogiri` and on
+`Nokogiri("<p/>")` at this pin; there is no vendoring decision left to take.
+
+The bullet was inherited verbatim from the slice-2 note (where it was TRUE, six
+days earlier) instead of re-measured — the exact discipline this note applies to
+its own subject in §"Reproduction" ("this was re-measured, not assumed"), not
+extended to the open item it hands on. Measurement, ablation, the sibling sweep
+over the whole `Object#`-level conversion-function family, and the guard fixture
+are in
+[20260801-nokogiri-ingestion-asymmetry-closed.md](20260801-nokogiri-ingestion-asymmetry-closed.md).
+
+The rest of this note stands unamended: the `BigMath` finding, the
+environment-dependence measurement, and the `UNBUILDABLE_DEFINITIONS` design were
+all measured here and reproduce.

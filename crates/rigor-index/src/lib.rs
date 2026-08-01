@@ -830,6 +830,36 @@ mod tests {
         assert_eq!(method_arity("String", "unmodeled_xyz"), None);
     }
 
+    /// The reference's `arity_eligible?` gate: a method with a REQUIRED KEYWORD
+    /// in any overload has no arity envelope at all, so `call.wrong-arity` never
+    /// fires on it. `Kernel#Integer` carries `(…, exception: bool) -> Integer?`;
+    /// its keyword-free sibling `Kernel#Array` does not, and must keep its
+    /// envelope — the gate is per-method, not a retreat from the family.
+    #[test]
+    fn required_keyword_overload_suppresses_the_arity_envelope() {
+        // Both are reached on String's chain through Kernel, and BOTH are
+        // present: suppressing the envelope must not make the method look
+        // absent, or `call.undefined-method` would fire instead.
+        assert!(global().class_has_method("String", "Integer"));
+        assert!(global().class_has_method("String", "Array"));
+
+        for ineligible in ["Integer", "Float", "Rational", "Complex"] {
+            assert_eq!(
+                method_arity("String", ineligible),
+                None,
+                "`Kernel#{ineligible}` has an `exception:` required-keyword overload"
+            );
+        }
+        for eligible in [("Array", 1usize), ("Hash", 1), ("String", 1)] {
+            assert_eq!(
+                method_arity("String", eligible.0),
+                Some((eligible.1, Some(eligible.1))),
+                "`Kernel#{}` declares no required keyword",
+                eligible.0
+            );
+        }
+    }
+
     #[test]
     fn singleton_methods_resolve() {
         // Class-method (singleton) resolution. Guarded on the real RBS being
@@ -1067,6 +1097,27 @@ mod tests {
         // Same treatment for the namespaced siblings, via the qualified registry.
         assert!(idx.qualified_class_has_method("Gem::Specification", "frobnicate"));
         assert!(idx.qualified_class_has_method("Nokogiri::CSS::Parser", "frobnicate"));
+    }
+
+    /// The `Object#`-level conversion-function surface. The reference loads
+    /// `data/vendored_gem_sigs/` unconditionally, so a `class Object` reopen in
+    /// that tree (`def Nokogiri:`) is on the ORACLE's surface; rigor-rs carries
+    /// the same tree under `vendor/rbs/overlay/`, so the two agree and neither
+    /// witnesses `"abc".Nokogiri`. Without the overlay this shape is an FP on
+    /// every receiver plus a `call.unresolved-toplevel` on the bare form.
+    #[test]
+    fn object_level_reopen_from_the_vendored_overlay_is_on_the_surface() {
+        let idx = CoreIndex::new();
+        if !idx.knows_class("String") {
+            return; // stub fallback: nothing to assert
+        }
+        // Declared on `Object`, so EVERY receiver inherits it.
+        assert!(idx.class_has_method("Object", "Nokogiri"));
+        assert!(idx.class_has_method("String", "Nokogiri"));
+        assert!(idx.class_has_method("Integer", "Nokogiri"));
+        // The negative control: a capitalized method nobody declares is still
+        // witnessed absent. Nothing may be blanket-silenced by name shape.
+        assert!(!idx.class_has_method("String", "Zzzzz"));
     }
 
     /// The two definitions fail INDEPENDENTLY in the reference, and the split
