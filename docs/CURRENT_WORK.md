@@ -13,12 +13,15 @@ Last updated: 2026-08-08.
 
 ## Now / Next
 
-▶ **NEXT (measured, 2026-08-08):** finish the narrowing arc — stage 3b-1
-(unmodeled statement forms, ≤27 rows) then 3a-1/3a-2/3a-3, in the
-[spec](notes/20260807-narrowing-stage3-spec.md)'s order; then collection-shape
-stage 2 ([spec](notes/20260807-collection-shape-slice-spec.md)). Adjudicate the
-`Object` bucket (26) before treating it as actionable; do NOT build global
-typing for the OpenStruct rows
+▶ **NEXT (measured, 2026-08-08):** the narrowing-limited residue is CLOSE TO
+EXHAUSTED (3a-1's 27-candidate re-scan,
+[spec](notes/20260807-narrowing-stage3-spec.md)) — re-measure 3a-2/3a-3 windows
+against the 1137 census before building; the one cheap measured slice is
+`branch_terminates` accepting `next`/`break` (~2 rows, block semantics
+UNPROBED). The 2d/2e rows sit behind ONE new mechanism: partially-dynamic
+constant-value harvesting (mini-spec first — project-wide FP surface).
+Adjudicate the `Object` bucket (26) before acting on it; no global typing for
+the OpenStruct rows
 ([why](notes/20260808-bare-class-bucket-characterisation.md)). Off the gap
 track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 
@@ -37,9 +40,10 @@ track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-08-08 on merged master): harness **86 fixtures / 0
-unregistered extras / 17 gaps / 1 registered divergence**, coverage 292/310;
-standing sweep **0 FP / 9204 files / 1142 gaps**, 8 corpora, baselines in
+State (verified 2026-08-08 on merged master, post PRs #74/#75): harness **88
+fixtures / 0 unregistered extras / 22 gaps / 1 registered divergence**,
+coverage 319/342; standing sweep **0 FP / 9204 files / 1137 gaps**, 8 corpora,
+baselines in
 `harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. EVERY
 tool that grades the port now prints its binary's path + build time and
 REFUSES one older than `crates/` — corpus tools on release, the fixture
@@ -98,11 +102,12 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-08-08 collection-shape stage 2: chain ROOTS** (PR #75) — `Dir.glob`/`String#split` are ONE mechanism (a BLOCK overload breaks all-overloads-agree; block-free return slot), `ENV` object-constant ingestion (nilable returns REFUSED — 13/15 first-cut FPs), `::`-qualified C5 paths (0 yield). 2d DROPPED: blocked on partially-dynamic constant harvesting. **1141→1137: 4 closed, 0 opened, 0 FP / 9204.** [spec §7c](notes/20260807-collection-shape-slice-spec.md).
+- **2026-08-08 narrowing stage 3a-1: compound predicates** (PR #74) — `&&`/`||`/`!` recursion + falsey edge + both-direction termination; `Logical.is_and` arena split. Gap yield **1 row** (the c1/c4 windows measured proximity, not mechanism); the value is **eleven master FP shapes closed** (PR #73's Bot collapse reached through `!`/`&&`/`||`/`nil?`/`===`). THREE probe-forced spec corrections, incl. "b wins a collision" = live FP and non-guard conjuncts pinning classes via exactly 3 non-mintable-fact mechanisms. [spec BUILT section](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-08 collection-shape receiver survival, stage 1** (PR #70) — a literal-seeded local keeps its collection NOMINAL through `<<`/`push`/`[]=`/block mutation instead of widening to Dynamic, so the chained call is witnessed. **1167→1145: 22 rows closed (9 predicted + 13 same-mechanism), 0 opened, 0 FP / 9204 files.** The FP boundary is the join: a branch-contained mutation on an UNWIDENED seed must stay silent (the reference's `Scope#join` leaves a union its dispatcher declines) — reviewer-probed both ways. Deviation found mid-build and oracle-re-probed: `widen_after_block` is a SYNTACTIC walk, not a scope join. [spec+outcome](notes/20260807-collection-shape-slice-spec.md).
-- **2026-08-07/08 the class-narrowing ARC** (PRs #63, #68, #71, #72, #73) — ported `narrow_class_other` (Dynamic→`Nominal[C]`, truthy edge only) as a per-call snapshot pass + a `Node::When` arena split, then stage 3b-1's descent into unmodeled statement forms: **17 gap closures**, including both census archetypes. The arc's lasting lesson is that its FP-safety argument was WRONG THREE TIMES, each caught only by probing the reference rather than reasoning about it: the safe-nav decline picked the wrong AXIS (the real rule is positional — block bodies and `case` clauses narrow only in statement position or a local-write RHS; **10 live FP shapes**); the Dynamic-only gate picked the wrong CARRIER (we collapse `a || b`, `(1..2)`, `proc {}`, `__method__`, `defined?` and 14 more to `Dynamic[top]` where the reference keeps a union or a real type — **19 live FP carriers**, fixed by an ALLOW-list because a deny-list is arena-indistinguishable); and a disjoint guard (`h = [1,2]` then `is_a?(Hash)`) is a call the reference silences via `narrow_shape_to_class`→`Bot` and we did not. 0 FP / 9204 at every step; total coverage cost 3 rows. **Before accepting "we do strictly less than the reference", check every term means the same thing in both engines.** [position](notes/20260807-block-narrowing-position-rule.md) / [carriers](notes/20260808-narrowing-carrier-fidelity-fp.md) / [stage3](notes/20260807-narrowing-stage3-spec.md) / [spec](notes/20260807-class-narrowing-slice-spec.md).
+- **2026-08-07/08 the class-narrowing ARC** (PRs #63, #68, #71, #72, #73) — ported `narrow_class_other` (Dynamic→`Nominal[C]`, truthy edge only) as a per-call snapshot pass + a `Node::When` arena split, then stage 3b-1's descent into unmodeled statement forms: **17 gap closures**, including both census archetypes. Lasting lesson: the FP-safety argument was WRONG THREE TIMES, each caught only by PROBING the reference — the safe-nav decline picked the wrong AXIS (the real rule is positional; **10 live FP shapes**), the Dynamic-only gate the wrong CARRIER (we collapse `a || b` and 18 more to `Dynamic[top]` where the reference keeps more — fixed by an ALLOW-list), and a disjoint guard collapses to `Bot` (reference-silent) where we fired. 0 FP / 9204 at every step; coverage cost 3 rows. **Before accepting "we do strictly less than the reference", check every term means the same thing in both engines.** [position](notes/20260807-block-narrowing-position-rule.md) / [carriers](notes/20260808-narrowing-carrier-fidelity-fp.md) / [stage3](notes/20260807-narrowing-stage3-spec.md) / [spec](notes/20260807-class-narrowing-slice-spec.md).
 - **2026-08-08 harness integrity: the 0-FP gate could pass VACUOUSLY** (PR #65) — `fp_audit`/`gap_census` measured `target/release/rigor` while `cargo build` writes debug (a 6-day-old binary made PRs #63/#64 read as "closed nothing"), and `run_rs` swallowed every failure into `[]`, so a panicking port binary scored 0 FP. `run_corpus.rb` carried BOTH defects; the reference side was only half-hardened (a SKIPPED oracle still exited 0). Now: auto-build, STALE-binary refusal vs newest `crates/` file, path+mtime in the header, `None`-not-`[]` on failure, INVALID corpora fail the run. Review killed an exit-code-vs-emptiness check that false-fired on warning-only batches. [note](notes/20260807-fp-audit-port-side-blind-spots.md).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup routing** (PR #64, MERGED) — the 8-member return family routes namespaced receivers via the qualified registry (refs AS WRITTEN + lexical ctx; ambiguity DECLINES); **14 closures (→1179), 0 FP / 9204**; fixture 82 pins the Tier-3 instance boundary (gaps 3→4 on merge). [spec+outcome](notes/20260807-adr0042-s5-return-lookup-spec.md).
-- **2026-08-07 `is_a?`/`case-when` class narrowing** (PR #63, MERGED) — snapshot-pass port of `narrow_class_other` + `Node::When` arena split; **11 closures (1193→1182 verified), 0 FP / 9204**; 3 unprobed edges declined on review; `to_s` slice REFUTED. Its safe-nav decline was the WRONG AXIS — the real rule is positional and 8 FP shapes shipped with it: [position rule](notes/20260807-block-narrowing-position-rule.md). [spec+outcome](notes/20260807-class-narrowing-slice-spec.md).
 - **2026-08-07 upstream feedback batch 2** — 3 reference-side defects with paste-ready repros: the `c7f28da1` (#271) master FP, the `Dynamic|nil` possible-nil FP class, the fail-soft definition build blinding 12 classes. [note](notes/20260807-upstream-feedback-batch2.md).
 - **2026-08-07 coverage-gap CENSUS — gaps are six MECHANISMS, not one number** — `harness/gap_census.py` buckets every gap by the mechanism in the reference's own message; the per-rule histogram hides which. Half the set sits behind decisions already made (possible-nil Tier B/C, always-truthy flow frontier), so quoting the total invites re-litigating them. The actionable pool is `undefined-method`, dominated by receiver typing on CORE classes where the port HAS the signature. Two of its three named slices survived probing; `X.to_s` → String was REFUTED. [note](notes/20260807-gap-census.md).
 - **2026-08-01 two 08-01 slices** — the `Object#Nokogiri` asymmetry was already CLOSED, but the sibling conversion-family sweep exposed a `call.wrong-arity` FP: **`arity_eligible?` was never ported** (507 of 11,115 methods); fixture 80 pins it. And LSP config reload: `.rigor.yml` is re-parsed by every structural `invalidate` — a deliberate decision to BEAT the reference, which never re-reads it; a broken file keeps the LAST GOOD config, a deleted one reloads defaults. [nokogiri](notes/20260801-nokogiri-ingestion-asymmetry-closed.md) / [lsp](notes/20260801-lsp-config-reload.md).
