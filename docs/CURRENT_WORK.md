@@ -13,24 +13,20 @@ Last updated: 2026-08-08.
 
 ## Now / Next
 
-**Track B (productization) 2026-07-19/25** — all in the ledger: coverage
-precision mode (#33), LSP §12 COMPLETE (S1–S4b) + stage-3 parity tail (#44),
-MultiWrite substrate (#46/#47), LSP `exclude:` parity (#45), the RBS ingestion
-asymmetry (**BOTH halves closed**). ▶ NEXT: LSP v4+ (`rootUri`, UTF-16 incremental
-sync); or the next upstream tag when it lands. Sweep
-set CODIFIED (`sweep-corpora.yml` + `--sweep`).
-- Clippy verify MUST use `CARGO_TARGET_DIR=<fresh> cargo clippy --workspace --
-  -D warnings` (the incremental cache hides `only_used_in_recursion` etc. —
-  cost a CI red on PR #32).
+▶ **NEXT (measured, 2026-08-08):** finish the narrowing arc — stage 3b-1
+(unmodeled statement forms, ≤27 rows) then 3a-1/3a-2/3a-3, in the
+[spec](notes/20260807-narrowing-stage3-spec.md)'s order; then collection-shape
+stage 2 ([spec](notes/20260807-collection-shape-slice-spec.md)). Adjudicate the
+`Object` bucket (26) before treating it as actionable; do NOT build global
+typing for the OpenStruct rows
+([why](notes/20260808-bare-class-bucket-characterisation.md)). Off the gap
+track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 - Coverage-tool parity lesson (binding for measurement tools): audit at NODE
   granularity — per-file histograms net over-claims out against under-claims.
 
-Default track is **productization** (measurement-proven highest ROI; the
-parity-port arc has bottomed out — see Standing conclusions):
-
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
-  (PRs #31/#32, accepted) and the compat next-stage plan (Phases 0–3 done,
-  exhausted — [plan](notes/20260718-compat-next-stage-plan.md)).
+  (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
+  [plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface from the v0.3.0 RC** — `--bleeding-edge` + severity
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
   inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
@@ -38,9 +34,8 @@ parity-port arc has bottomed out — see Standing conclusions):
 - **Pin is `v0.3.1`** (+ vendored rbs 4.1.0). Upstream master is +150 with no
   tag, a measured delta of TWO diagnostics and an rbs bump that moves no
   signature, so the re-pin waits for a tag (`UPSTREAM.md`, all THREE hazards).
-- Deferred RC deltas (documented): interprocedural mutation floor (P6),
-  plugin-only changes (no plugin engine). The UM-residual INVESTIGATION and the
-  remaining RC inference deltas are absorbed into the compat plan (M2 / Phase 2).
+- Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
+  (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
 State: harness **84 fixtures / 0 unregistered extras / 8 gaps / 1 registered
 divergence** (live + snapshot, vs pin `v0.3.1`; the gaps are deliberate,
@@ -67,8 +62,12 @@ and REFUSES a binary older than `crates/` (PR #65). Clippy: workspace
 - **Five consecutive FP-safe flow slices closed 0 survey gaps** — never build a
   coverage slice without a valid-mode `fp_audit --gaps` prediction (AGENTS.md;
   [flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
-- **undefined-method receiver-typing lever is exhausted**; pick new rules by
-  measured corpus rule-frequency, not plausibility.
+- **The receiver-typing lever is NOT exhausted — that 2026-07 conclusion is
+  RETIRED.** The 2026-08-07 census re-opened it by asking which MECHANISM each
+  gap is (not which rule), and the four slices that followed closed **47 rows**
+  on shapes the port already had signatures for. Pick slices from the census's
+  mechanism buckets, and re-run `gap_census.py --sweep` after each — the gap
+  set's SHAPE moves even when its total barely does.
 - **sig-gen arc is closed** — byte-mismatch surface 0, `--write` sound;
   remaining items are thin coverage-only. Parity model: sound-superset
   (AGENTS.md "Generative-tool parity").
