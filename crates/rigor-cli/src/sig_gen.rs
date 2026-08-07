@@ -1155,11 +1155,11 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
     let mut barriers: Vec<(usize, usize)> = Vec::new();
     for (_, node) in ast.iter() {
         match node {
-            Node::Call { block_body, span, .. } if !block_body.is_empty() => {
-                if within(*span, &regions) {
-                    for &b in block_body {
-                        barriers.push(ast.get(b).span());
-                    }
+            Node::Call { block_body, span, .. }
+                if !block_body.is_empty() && within(*span, &regions) =>
+            {
+                for &b in block_body {
+                    barriers.push(ast.get(b).span());
                 }
             }
             Node::Definition { span, .. }
