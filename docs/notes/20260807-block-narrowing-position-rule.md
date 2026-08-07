@@ -31,16 +31,44 @@ different position); the narrowed call is `v.frobnicate_zzz` guarded by
 | s9 | `g(h.transform_values { … })` | call argument | 0 | **1** | **FALSE POSITIVE** |
 | s10 | `h.transform_values { … }` then `nil` | statement, discarded | 1 | 1 | agree |
 | s11 | `h.transform_values { … }.compact.to_a` | receiver (2 deep) | 0 | **1** | **FALSE POSITIVE** (same as s7) |
+| s12 | `return h.transform_values { … }` | `return` operand | 0 | **1** | **FALSE POSITIVE** |
+| s13 | `x = g(h.transform_values { … })` | argument (assigned) | 0 | **1** | **FALSE POSITIVE** |
+
+The same rule governs `case`/`when` narrowing, and `if`/ternary is the
+exception that proves it:
+
+| # | shape | position | ref | rigor-rs | verdict |
+|---|---|---|:--:|:--:|---|
+| p6 | `case v when Hash then v.zzz end` | tail statement | 1 | 1 | agree |
+| p1 | `x = case v when Hash … end` | assignment RHS | 1 | 1 | agree |
+| p2 | `g(case v when Hash … end)` | call argument | 0 | **1** | **FALSE POSITIVE** |
+| p3 | `(case v when Hash … end).to_s` | receiver | 0 | **1** | **FALSE POSITIVE** |
+| p7 | `return case v when Hash … end` | `return` operand | 0 | **1** | **FALSE POSITIVE** |
+| p4 | `g(v.is_a?(Hash) ? v.zzz : v)` | ternary as argument | 1 | 1 | agree — `if` narrows here |
+| p8 | `(v.is_a?(Hash) ? v.zzz : v).to_s` | ternary as receiver | 1 | 1 | agree — `if` narrows here |
+| p5 | guard in a block nested in a block | statement | 1 | 1 | agree |
 
 Probes live in the session scratchpad (`snprobe/`); they are trivial to
-recreate from the table.
+recreate from the tables.
 
 ## The rule the reference actually implements
 
-A block body's class narrowing survives when the block-bearing call sits in
-**statement position or an assignment RHS** (s1, s2, s3, s4, s8, s10), and is
-LOST when the call's value is consumed as a **receiver of a further call**
-(s5, s6, s7, s11) or as an **argument to another call** (s9).
+For **block bodies and `case`/`when` clauses**, class narrowing survives only
+when the construct sits in **statement position or as the direct RHS of a
+local-variable write** (s1–s4, s8, s10, p1, p6). It is LOST when the value is
+consumed as a **receiver** (s5–s7, s11, p3), as an **argument** (s9, s13 —
+even when the outer call is itself assigned), or as a **`return` operand**
+(s12, p7).
+
+For **`if`/ternary**, branch-internal narrowing happens in EVERY position
+(p4 argument, p8 receiver both fire) — `scope_indexer.rb`'s
+`propagate_if_branches` gives expression-position conditionals their own
+treatment, which `case` and block bodies never got. Only the *early-return
+propagation past* an `if` is statement-only, which the PR #63 review already
+closed as finding R2.
+
+Eight false-positive shapes in total: five for blocks (s7, s9, s11, s12, s13)
+and three for `case` (p2, p3, p7).
 
 That is the same statement-vs-expression asymmetry this project already found
 in the reference's `if` handling: `StatementEvaluator#eval_if` threads narrowed
@@ -63,11 +91,19 @@ us nothing to mirror. Worth carrying into the next upstream feedback batch.
 2. **Descend into a block body only from statement position** — a statement in
    a scope's statement list, or a local-variable-write RHS — mirroring the
    `stmt_position` flag review finding R2 already introduced for
-   `class_flow_if`. A block-bearing call reached as a receiver or as an
-   argument records nothing inside its block.
+   `class_flow_if`. A block-bearing call reached as a receiver, as an
+   argument, or as a `return` operand records nothing inside its block.
+3. **Apply the same positional gate to `class_flow_case`.** A `case` reached
+   as a receiver, an argument or a `return` operand must not narrow its
+   clauses. Note `class_flow_stmt`'s `Node::Return` arm currently evaluates
+   the returned values with the CURRENT facts — correct for reading an outer
+   narrowing, but it must pass expression (non-statement) position downward,
+   or s12/p7 stay broken.
+4. **Leave `if`/ternary alone**: it narrows in every position (p4, p8), and
+   its statement-only early-return propagation is already gated.
 
-Declining by position is a strict subset of the reference in every row of the
-matrix, which is the FP-safety argument.
+Declining by position is a strict subset of the reference in every row of both
+matrices, which is the FP-safety argument.
 
 ## Why the sweep did not catch it
 
