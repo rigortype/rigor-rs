@@ -166,3 +166,93 @@ The solo census diff is EMPTY in both directions — the stop-the-line risk the
 spec flagged (PR #64's return routing starting to resolve depth-≥3 receivers)
 did not materialise on the sweep corpora. S0 pays nothing by itself, exactly as
 predicted; it is the enabler the 7 blocked rows need from S2.
+
+### S1 — ancestor soundness (PR B, commit 1)
+
+Two measured causes, not one. The probes note attributed the whole under-report
+to the SHORT-key ancestor walk; that is only half of it.
+
+1. **The written-chain half, as specced.** `qualified_class_has_method` now also
+   consults `qualified_ancestors` — the PR #64 `collect_qualified` /
+   `resolve_written_ref` walk — as an ADDITIONAL present-source, with a
+   truncated walk (`complete == false`) reading as PRESENT. That is the spec's
+   "residual ambiguity ⇒ treat the method as present" rule, and it closes
+   `Digest::SHA256#hexdigest`/`#digest` (both chain links are ambiguous leaves:
+   `Base` ∈ {`Random::Base`, `Digest::Base`}, `Class` ∈ {`::Class`,
+   `Digest::Class`}). The short-key result is left untouched, so this can only
+   ever REMOVE an absence witness.
+
+2. **NEW, not in the spec: rigor-rs never ingested RBS ATTRIBUTE members.**
+   `URI::Generic#host` is `attr_reader host: String?`
+   (`stdlib/uri/0/generic.rbs:245`), not a `def` — so probes v1/v3 were not an
+   ancestor-walk failure at all, they were a hole in `collect_members`, which
+   matched `Node::MethodDefinition` / `Include` / `Extend` / `Alias` and
+   silently dropped every `Node::AttrReader` / `AttrWriter` / `AttrAccessor`.
+   47 such members in the vendored stdlib, 58 in the overlay;
+   `Gem::Specification` and `Bundler::Source::Git` are almost entirely
+   attributes. Shipping S2 on top of this would have been a live FP on any of
+   them.
+
+   Fix: `ClassEntry::attr_methods` / `singleton_attr_methods` — reader ⇒ `x`,
+   writer ⇒ `x=`, accessor ⇒ both — recorded as bare EXISTENCE and deliberately
+   kept OUT of `methods` (that map feeds return typing, arity envelopes, the ATM
+   overload substrate and sig-gen, none of which this slice measured for
+   attributes). Consulted by `class_has_method`, `qualified_class_has_method`,
+   both singleton paths and `instance_method_names`. It can only ever remove a
+   diagnostic: the reference models attributes, so it never fires on one.
+
+3. **NEW, oracle-driven: a MODULE gets `Object`'s surface.** RBS gives a module
+   declaration an implicit self-type of `::Object`, so the pre-S1
+   `!entry.is_module` guard on the implicit-superclass default made every Object
+   method on a module guard target read as proven-absent. Measured on the pinned
+   reference: `is_a?(Digest::Instance)` then `v.frozen?` is SILENT while the same
+   shape with a typo FIRES (probe q5). Without this, S2 would have FP'd on every
+   `frozen?`/`inspect`/`respond_to?` after a module guard.
+
+| gate | result |
+|---|---|
+| `cargo test --offline` | 1065 pass / 0 fail (4 new soundness tests) |
+| `ruby harness/run.rb` | PASS — 0 unregistered extras |
+| `ruby harness/run_snapshot.rb` | PASS |
+| `fp_audit.py --gaps --sweep` | **0 FP** |
+| `docs_check.py` (bare) | PASS, exit 0 |
+| clippy `-D warnings`, fresh target dir | clean |
+| gap census | 1136 → **1136**; 0 closed, 0 new |
+
+S1 is pure leniency, so it closes nothing — and, measurably, costs nothing
+either: the extra "assume present" answers did not silence a single row the
+reference emits.
+
+### S3 collapse condition — PROBED, and it is not what the spec guessed
+
+`narrow_shape_to_class` (`narrowing.rb:2403`) is one line: the shape survives
+iff `subclass_of?(projected_class, class_name)`, and `subclass_of?` is
+`class_ordering(lhs, rhs)` in `{:subclass, :equal}` — so `:unknown` COLLAPSES.
+The collapse does NOT require the guard class to resolve, exactly as r1d/r1e
+suggested. Discriminating probe (pinned reference, fresh cwd, `--no-cache`), an
+`[1, 2]` / `{a: 1}` carrier under six guards:
+
+| guard | `class_ordering(carrier, guard)` | ref | rs (S0+S1) |
+|---|---|:--:|:--:|
+| `Enumerable` | subclass | **1** ``… for [1, 2]`` | 1 |
+| `Object` | subclass | **1** | 1 |
+| `Array` | equal | **1** | 1 |
+| `File::Stat` | unknown in rigor-rs | 0 | **1 — FP** |
+| `Foo::Bar::Baz` | unknown | 0 | **1 — FP** |
+| `Enumerable`, Hash carrier | subclass | **1** ``… for { a: 1 }`` | 1 |
+
+So the rule to mirror is per-CARRIER-KIND, not per-ordering-value: for
+`Constant`/`Tuple`/`HashShape` the shape survives ONLY on `Subclass`/`Equal`
+(everything else, `Unknown` included, is `Bot`), while for `Nominal` the
+reference keeps its `Disjoint`-only collapse (`narrow_nominal_to_class`
+preserves the bound on `:subclass` and stays conservative on `:unknown`).
+
+**Deviation from the spec, with its evidence.** The spec additionally asked for
+a qualified-aware `class_ordering`. Under the measured condition that buys
+nothing for the r1 family — `ordering(Array, File::Stat) = Unknown` already
+collapses — and `class_ordering` is also read by `call.raise-non-exception`,
+where widening it from `Unknown` to real answers is an unprobed behaviour change
+on an unrelated rule. It is therefore NOT part of this slice. The Nominal path
+with a qualified guard, the only place the ordering would matter, cannot produce
+a narrowing FP anyway: `check_narrowed_call` gate (3) declines any use site whose
+receiver is already a concrete carrier.

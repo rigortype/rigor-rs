@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use ruby_rbs::node::{
-    parse, AliasKind, ClassNode, InterfaceNode, MethodDefinitionKind,
+    parse, AliasKind, AttributeKind, ClassNode, InterfaceNode, MethodDefinitionKind,
     MethodDefinitionVisibility, ModuleNode, Node, TypeAliasNode,
 };
 
@@ -452,6 +452,26 @@ struct ClassEntry {
     /// method is still *present* and witnessing its absence would be a false
     /// positive (`send(:foo)` and implicit-self calls both dispatch to it).
     private_methods: HashSet<&'static str>,
+    /// INSTANCE methods contributed by RBS ATTRIBUTE members — `attr_reader x`
+    /// ⇒ `x`, `attr_writer x` ⇒ `x=`, `attr_accessor x` ⇒ both — recorded as
+    /// bare EXISTENCE, deliberately separate from `methods`.
+    ///
+    /// Measured 2026-08-08 (qualified-witnessing S1): rigor-rs's ingestion
+    /// simply DROPPED every `Node::Attr*` member, so `URI::Generic#host`
+    /// (`stdlib/uri/0/generic.rbs:245`, an `attr_reader`) and
+    /// `Gem::Specification#version` read as PROVEN ABSENT. Nothing exercised
+    /// that until the class-narrowing witness started resolving qualified guard
+    /// classes, at which point it is a live false positive. 47 attribute members
+    /// in the vendored stdlib, 58 in the overlay.
+    ///
+    /// Kept out of `methods` on purpose: that map feeds return typing, arity
+    /// envelopes, the ATM overload substrate and sig-gen, none of which this
+    /// slice measured for attributes. Existence-only is the whole fix and can
+    /// only ever REMOVE a diagnostic (the reference models attributes, so it
+    /// never fires on one).
+    attr_methods: HashSet<&'static str>,
+    /// The SINGLETON twin of [`Self::attr_methods`] (`attr_reader self.x`).
+    singleton_attr_methods: HashSet<&'static str>,
     /// `method name -> per-overload positional shapes`, the ATM substrate
     /// (Slice 1). ADDITIVE alongside `methods`: the merged arity/return path
     /// above is untouched; this retains the per-overload, per-parameter detail
@@ -974,6 +994,7 @@ impl CoreData {
         //     FPs on `ERB::Util.h`). Bounded one hop is enough for the aliases
         //     seen; a target that is itself an alias resolves via recursion.
         if entry.singleton_methods.contains_key(method)
+            || entry.singleton_attr_methods.contains(method)
             || self.qualified_singleton_alias_resolves(qname, method, 0)
         {
             return true;
@@ -991,7 +1012,9 @@ impl CoreData {
             match resolved {
                 Some(m) => {
                     let (chain, _) = self.ancestors(m);
-                    if self.lookup_on_chain(&chain, method).is_some() {
+                    if self.lookup_on_chain(&chain, method).is_some()
+                        || self.attr_on_chain(&chain, method)
+                    {
                         return true;
                     }
                 }
@@ -1041,9 +1064,30 @@ impl CoreData {
         if self.lookup_on_chain(&chain, method).is_some() {
             return true;
         }
+        // S1: an RBS ATTRIBUTE member (`attr_reader host: String?`) defines a
+        // real method the `methods` table does not carry. See
+        // `ClassEntry::attr_methods`.
+        if self.attr_on_chain(&chain, method) {
+            return true;
+        }
         // Not found across the chain. Only witness absence if the chain is
         // fully loaded; otherwise assume present (zero false positive).
         !complete
+    }
+
+    /// Whether any class on a SHORT-key ancestor `chain` declares `method` as
+    /// an RBS attribute member.
+    fn attr_on_chain(&self, chain: &[&'static str], method: &str) -> bool {
+        chain
+            .iter()
+            .any(|a| self.classes.get(a).is_some_and(|e| e.attr_methods.contains(method)))
+    }
+
+    /// The QUALIFIED-registry twin of [`Self::attr_on_chain`].
+    fn qualified_attr_on_chain(&self, chain: &[&'static str], method: &str) -> bool {
+        chain
+            .iter()
+            .any(|a| self.qualified.get(a).is_some_and(|e| e.attr_methods.contains(method)))
     }
 
     /// ADR-0042 Slice 3: the qualified-registry analogue of
@@ -1082,8 +1126,16 @@ impl CoreData {
         for inc in &entry.includes {
             self.collect(inc, &mut order, &mut seen, &mut complete);
         }
+        // A MODULE gets `Object` here too. RBS gives a module declaration an
+        // implicit self-type of `::Object` when it declares none, so a value
+        // that satisfies `is_a?(Digest::Instance)` carries Object's surface —
+        // oracle-verified 2026-08-08: the reference is SILENT on
+        // `Digest::Instance#frozen?` while it FIRES on a typo (probe q5). The
+        // pre-S1 `!entry.is_module` guard made every Object method on a module
+        // guard target read as proven-absent, which S2 would have turned into a
+        // live false positive.
         let sup = entry.superclass.or({
-            if !entry.is_module && qname != "BasicObject" {
+            if qname != "BasicObject" {
                 Some("Object")
             } else {
                 None
@@ -1092,7 +1144,30 @@ impl CoreData {
         if let Some(s) = sup {
             self.collect(s, &mut order, &mut seen, &mut complete);
         }
-        if self.lookup_on_chain(&order, method).is_some() {
+        if self.lookup_on_chain(&order, method).is_some() || self.attr_on_chain(&order, method) {
+            return true;
+        }
+        // S1 (2026-08-08): the SHORT-key ancestor walk above under-reports
+        // inherited methods for a namespaced entry, because a nested
+        // superclass/include is stored LEAF-only and the leaf may be the wrong
+        // class or a merged composite. Measured "proven absent" while the
+        // reference is SILENT: `Digest::SHA256#hexdigest` / `#digest`
+        // (`Digest::Base → Digest::Class → include Digest::Instance`, whose
+        // leaves `Base`/`Class` are both ambiguous), probes v1/v2/v3/p7b.
+        //
+        // The PR #64 machinery already resolves those references AS WRITTEN
+        // against their recorded lexical context (`collect_qualified` →
+        // `resolve_written_ref`), so consult that chain too. It is an
+        // additional PRESENT source, never a new absence witness: the
+        // short-key result above is left untouched, and a walk that could not
+        // resolve every link (`complete == false`) reads as PRESENT — the safe
+        // direction for an absence witness, and exactly the spec's
+        // "residual ambiguity ⇒ treat the method as present" rule.
+        let (qchain, qcomplete) = self.qualified_ancestors(qname);
+        if !qcomplete
+            || self.qualified_lookup_on_chain(&qchain, method, 0).is_some()
+            || self.qualified_attr_on_chain(&qchain, method)
+        {
             return true;
         }
         // Absent across the leaf + its resolvable ancestry: witness only when
@@ -1195,6 +1270,8 @@ impl CoreData {
                 // AST, so it stays public — the conservative direction for an
                 // advisory list (offering one extra name, never hiding a real one).
                 set.extend(entry.aliases.keys().copied());
+                // S1: attribute-generated methods are real completions too.
+                set.extend(entry.attr_methods.iter().copied());
             }
         }
         set.into_iter().collect()
@@ -1404,10 +1481,14 @@ impl CoreData {
     /// `extend`ed module, or a singleton ALIAS resolving (bounded) to one of
     /// those. Existence-only; completeness is computed by the caller.
     fn singleton_on_chain(&self, chain: &[&'static str], method: &str, depth: usize) -> bool {
-        // (1) A direct singleton method on any class in the chain.
+        // (1) A direct singleton method on any class in the chain — including
+        //     one generated by a SINGLETON attribute member (`attr_reader
+        //     self.x`), S1.
         for &anc in chain {
             if let Some(entry) = self.classes.get(anc) {
-                if entry.singleton_methods.contains_key(method) {
+                if entry.singleton_methods.contains_key(method)
+                    || entry.singleton_attr_methods.contains(method)
+                {
                     return true;
                 }
             }
@@ -1419,7 +1500,9 @@ impl CoreData {
                 for &module in &entry.extends {
                     if self.classes.contains_key(module) {
                         let (mod_chain, _) = self.ancestors(module);
-                        if self.lookup_on_chain(&mod_chain, method).is_some() {
+                        if self.lookup_on_chain(&mod_chain, method).is_some()
+                            || self.attr_on_chain(&mod_chain, method)
+                        {
                             return true;
                         }
                     }
@@ -1979,14 +2062,22 @@ impl CoreData {
     /// inconclusive (the caller's `None`/`false` fallthrough is the
     /// conservative answer either way).
     fn qualified_ancestors_prefix(&self, qname: &str) -> Vec<&'static str> {
+        self.qualified_ancestors(qname).0
+    }
+
+    /// [`Self::qualified_ancestors_prefix`] plus the COMPLETENESS bit its
+    /// callers discard: `false` when the walk stopped early (an unresolvable
+    /// reference or an unbuildable entry), so the chain is a prefix and a MISS
+    /// on it is inconclusive. S1's absence witness needs the bit.
+    fn qualified_ancestors(&self, qname: &str) -> (Vec<&'static str>, bool) {
         let mut order: Vec<&'static str> = Vec::new();
         let Some((&start, _)) = self.qualified.get_key_value(qname) else {
-            return order;
+            return (order, false);
         };
         let mut seen: HashSet<&'static str> = HashSet::new();
         let mut ok = true;
         self.collect_qualified(start, &mut order, &mut seen, &mut ok);
-        order
+        (order, ok)
     }
 
     fn collect_qualified(
@@ -2827,6 +2918,9 @@ impl CoreData {
                     void_singleton_methods: HashSet::new(),
                     // The stub declares everything public.
                     private_methods: HashSet::new(),
+                    // The stub declares no attribute members.
+                    attr_methods: HashSet::new(),
+                    singleton_attr_methods: HashSet::new(),
                     // The stub models no per-overload param shapes (the ATM
                     // substrate needs the real embedded RBS); empty keeps the
                     // `method_overloads` accessor inert under the fallback.
@@ -3356,6 +3450,28 @@ impl Builder {
         self.merge(name, entry, authoritative);
     }
 
+    /// Record one RBS attribute member's generated method name(s) on `entry`.
+    /// `reader`/`writer` say which halves the member declares; `kind` routes
+    /// them to the instance or the singleton set.
+    fn record_attr(
+        entry: &mut ClassEntry,
+        kind: AttributeKind,
+        name: &'static str,
+        reader: bool,
+        writer: bool,
+    ) {
+        let set = match kind {
+            AttributeKind::Singleton => &mut entry.singleton_attr_methods,
+            _ => &mut entry.attr_methods,
+        };
+        if reader {
+            set.insert(name);
+        }
+        if writer {
+            set.insert(intern(&format!("{name}=")));
+        }
+    }
+
     /// ADR-0042 Slice 1: record `qual` under `short`'s qualified-key list,
     /// deduplicated (a reopen ingests the same qualified key more than once).
     fn short_to_qualified_push(&mut self, short: &'static str, qual: &'static str) {
@@ -3492,6 +3608,23 @@ impl Builder {
                                 .or_insert_with(|| method_overloads(&md, code));
                         }
                     }
+                }
+                // ATTRIBUTE members (`attr_reader host: String?`). Existence
+                // only — see `ClassEntry::attr_methods` for why they are not
+                // folded into `methods`. A reader contributes `x`, a writer
+                // `x=`, an accessor both; `kind()` splits instance from
+                // singleton (`attr_reader self.x`).
+                Node::AttrReader(a) => {
+                    let name = intern(a.name().as_str());
+                    Self::record_attr(entry, a.kind(), name, true, false);
+                }
+                Node::AttrWriter(a) => {
+                    let name = intern(a.name().as_str());
+                    Self::record_attr(entry, a.kind(), name, false, true);
+                }
+                Node::AttrAccessor(a) => {
+                    let name = intern(a.name().as_str());
+                    Self::record_attr(entry, a.kind(), name, true, true);
                 }
                 Node::Include(inc) => {
                     if let Some(modname) = type_name_str(&inc.name()) {
@@ -3670,6 +3803,9 @@ impl Builder {
         for (new_name, old_name) in entry.singleton_aliases {
             slot.singleton_aliases.entry(new_name).or_insert(old_name);
         }
+        // Attribute members are pure existence, so a reopen simply unions them.
+        slot.attr_methods.extend(entry.attr_methods);
+        slot.singleton_attr_methods.extend(entry.singleton_attr_methods);
         for inc in entry.includes {
             if !slot.includes.contains(&inc) {
                 slot.includes.push(inc);
@@ -3788,6 +3924,9 @@ impl Builder {
         for (new_name, old_name) in entry.singleton_aliases {
             slot.singleton_aliases.entry(new_name).or_insert(old_name);
         }
+        // Attribute members are pure existence, so a reopen simply unions them.
+        slot.attr_methods.extend(entry.attr_methods);
+        slot.singleton_attr_methods.extend(entry.singleton_attr_methods);
         for inc in entry.includes {
             if !slot.includes.contains(&inc) {
                 slot.includes.push(inc);
@@ -5358,6 +5497,96 @@ mod qualified_registry_tests {
         if idx.knows_class("Nokogiri") {
             assert!(idx.knows_qualified_class("Nokogiri::CSS::Parser"));
             assert!(!idx.knows_qualified_class("Nokogiri::Nokogiri::CSS::Parser"));
+        }
+    }
+}
+
+/// S1 (2026-08-08): `qualified_class_has_method` must never witness the absence
+/// of a method the reference finds. Two measured causes, both fixed here:
+/// inherited methods reached only through the AS-WRITTEN ancestor chain, and
+/// methods generated by RBS ATTRIBUTE members (which ingestion dropped
+/// entirely). Each row below is a probe from
+/// `docs/notes/20260808-qualified-witnessing-probes.md` §7.
+#[cfg(test)]
+mod qualified_ancestor_soundness_tests {
+    use super::*;
+
+    /// Probes v1/v3: `URI::HTTP#host` and `URI::Generic#host`. `host` is an
+    /// `attr_reader` on `URI::Generic` (`stdlib/uri/0/generic.rbs:245`), so
+    /// this row needs BOTH halves: attribute ingestion, and the written
+    /// superclass walk `URI::HTTP < Generic` that reaches `URI::Generic`
+    /// (its short-key leaf `Generic` is the wrong surface).
+    #[test]
+    fn uri_attr_reader_host_is_present_on_the_subclass() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("URI::HTTP") {
+            return;
+        }
+        assert!(idx.qualified_class_has_method("URI::Generic", "host"));
+        assert!(idx.qualified_class_has_method("URI::HTTP", "host"));
+        // Writers too (`attr_accessor` halves are separate names).
+        assert!(idx.qualified_class_has_method("URI::Generic", "scheme"));
+        // The control: a genuine typo is still witnessed as absent.
+        assert!(!idx.qualified_class_has_method("URI::HTTP", "frobnicate_zzz"));
+    }
+
+    /// Probes p7b/v2: `Digest::SHA256#hexdigest` / `#digest`, inherited over
+    /// `Digest::Base → Digest::Class → include ::Digest::Instance`. BOTH links
+    /// are ambiguous leaves (`Base` ∈ {`Random::Base`, `Digest::Base`},
+    /// `Class` ∈ {`::Class`, `Digest::Class`}), which is why the short-key walk
+    /// lost them; the written chain resolves them exactly.
+    #[test]
+    fn digest_inherited_methods_resolve_through_the_written_chain() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("Digest::SHA256") {
+            return;
+        }
+        assert!(idx.qualified_class_has_method("Digest::SHA256", "hexdigest"));
+        assert!(idx.qualified_class_has_method("Digest::SHA256", "digest"));
+        // q4b: own method on the declaring class.
+        assert!(idx.qualified_class_has_method("Digest::Class", "digest"));
+        // q5b: a MODULE's own method.
+        assert!(idx.qualified_class_has_method("Digest::Instance", "hexdigest"));
+    }
+
+    /// The must-STILL-FIRE side. q4 pins that a qualified name gets NO
+    /// leaf-fallback: `Digest::Class` must not see `::Class#superclass`. q4c
+    /// pins that an ambiguous leaf (`Base`) is no obstacle, and q5 that a
+    /// qualified MODULE is a witnessable target.
+    #[test]
+    fn absence_is_still_witnessed_without_leaf_fallback() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("Digest::Class") {
+            return;
+        }
+        // q4: `superclass` is a `::Class` instance method, NOT on Digest::Class.
+        assert!(!idx.qualified_class_has_method("Digest::Class", "superclass"));
+        // q4c: `Random::Base` shares its leaf with `Digest::Base`.
+        assert!(!idx.qualified_class_has_method("Random::Base", "frobnicate_zzz"));
+        // q5: a module target witnesses absence.
+        assert!(!idx.qualified_class_has_method("Digest::Instance", "frobnicate_zzz"));
+        // Object-level methods stay present (p7c).
+        assert!(idx.qualified_class_has_method("Digest::Instance", "frozen?"));
+    }
+
+    /// Attribute ingestion on the SHORT-key surface too (`class_has_method` is
+    /// the same hole), and on an overlay gem class whose whole surface is
+    /// attributes (`Gem::Specification`, `rubygems_extras.rbs:114`).
+    #[test]
+    fn attribute_members_are_present_on_both_surfaces() {
+        let idx = CoreData::load();
+        // `Bundler::Source::Git` (`bundler.rbs:182`) declares ONE `def` and
+        // seven `attr_accessor`s — before S1 every one of those seven read as
+        // proven absent. (`Gem::Specification`, the other all-attribute overlay
+        // class, is in `UNBUILDABLE_DEFINITIONS` and is silent for that reason
+        // instead, so it cannot serve as the row here.)
+        if idx.knows_qualified_class("Bundler::Source::Git") {
+            assert!(idx.qualified_class_has_method("Bundler::Source::Git", "uri"));
+            assert!(idx.qualified_class_has_method("Bundler::Source::Git", "uri="));
+            assert!(!idx.qualified_class_has_method("Bundler::Source::Git", "frobnicate_zzz"));
+        }
+        if idx.knows_class("Generic") {
+            assert!(idx.class_has_method("Generic", "host"));
         }
     }
 }
