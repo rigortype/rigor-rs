@@ -2560,7 +2560,7 @@ impl<'i> Typer<'i> {
                 }
             }
             Node::If { .. } => {
-                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out);
+                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out, true);
             }
             Node::Case { .. } => {
                 self.class_flow_case(ast, id, tenv, cenv, writes, interner, out);
@@ -2666,11 +2666,44 @@ impl<'i> Typer<'i> {
                 self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out);
                 self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out);
             }
+            // A write in EXPRESSION position (`f(value = x, value.frobnicate)`)
+            // must thread its rebind IMMEDIATELY: Ruby evaluates arguments
+            // left-to-right and the reference threads scope through them, so a
+            // use AFTER the rebind reads the new binding — the post-call
+            // `kill_cenv_writes` alone would leave the stale fact live for the
+            // remaining sibling arguments (adversarial-review R1). Mirrors the
+            // statement arms.
+            Node::LocalVariableWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                let vty = self.type_of(ast, value, tenv, interner);
+                tenv.insert(name.clone(), vty);
+                cenv.remove(&name);
+            }
+            Node::MultiWrite { targets, value, .. } => {
+                let (targets, value) = (targets.clone(), *value);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                let rhs = self.type_of(ast, value, tenv, interner);
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    cenv.remove(&name);
+                    tenv.insert(name, ty);
+                }
+            }
+            Node::LocalVariableOpWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                cenv.remove(&name);
+                let u = interner.untyped();
+                tenv.insert(name, u);
+            }
             // A ternary is an expression-position `Node::If` (Prism parses it as
             // an IfNode); `propagate_if_branches` (`scope_indexer.rb:2742`)
-            // gives it the same treatment as a statement `if`.
+            // gives it the same treatment as a statement `if` — EXCEPT the
+            // early-return propagation, which is a STATEMENT-evaluator behavior
+            // (`eval_if:481`) and unprobed for expression position (R2), so it
+            // is gated off here.
             Node::If { .. } => {
-                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out);
+                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out, false);
             }
             // An expression-position `case` (`x = case value … end`) narrows its
             // clause bodies the same way a statement `case` does.
@@ -2681,8 +2714,15 @@ impl<'i> Typer<'i> {
         }
     }
 
-    /// Narrow through one `if`/`unless`/ternary node (statement or expression
-    /// position). See [`Typer::class_narrowing_snapshots`] for the envelope.
+    /// Narrow through one `if`/`unless`/ternary node. `stmt_position` is `true`
+    /// only when the node is a direct STATEMENT (reached via
+    /// [`Typer::class_flow_stmt`]): the early-return propagation is the
+    /// statement evaluator's behavior (`eval_if:481`) and is unprobed for an
+    /// expression-position conditional (`f(x.is_a?(C) ? x : raise)` —
+    /// `propagate_if_branches` types the expression's branches, nothing shows
+    /// the falsey edge propagating past it), so an expression-position `if`
+    /// narrows its branches but never the statements after it (review R2).
+    /// See [`Typer::class_narrowing_snapshots`] for the envelope.
     #[allow(clippy::too_many_arguments)]
     fn class_flow_if(
         &self,
@@ -2693,6 +2733,7 @@ impl<'i> Typer<'i> {
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
+        stmt_position: bool,
     ) {
         let Node::If { predicate, then_body, else_body, is_unless, span } = ast.get(id) else {
             return;
@@ -2710,6 +2751,15 @@ impl<'i> Typer<'i> {
                 Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
             }
         });
+        // Review R3: a guard CONFLICTING with an existing DIFFERENT-class fact
+        // is out of the envelope — at that point the reference's carrier is
+        // `Nominal[C1]`, not Dynamic (`narrow_nominal_to_class` on a disjoint
+        // class yields Bot), and neither edge's verdict is probed. The stale
+        // fact is dropped and the new one never inserted. A SAME-class re-guard
+        // keeps the fact (a no-op re-narrowing).
+        let conflict = narrow.as_ref().is_some_and(|(local, class)| {
+            cenv.get(local).is_some_and(|existing| existing != class)
+        });
         // Truthy edge: then-branch for `if`/ternary, else-branch for `unless`.
         let (truthy, falsey) =
             if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
@@ -2717,7 +2767,11 @@ impl<'i> Typer<'i> {
             let mut t = tenv.clone();
             let mut c = cenv.clone();
             if let Some((local, class)) = &narrow {
-                c.insert(local.clone(), class.clone());
+                if conflict {
+                    c.remove(local);
+                } else {
+                    c.insert(local.clone(), class.clone());
+                }
             }
             self.class_flow_scope(ast, truthy, &mut t, &mut c, writes, interner, out);
         }
@@ -2734,15 +2788,16 @@ impl<'i> Typer<'i> {
         cenv.clear();
         // … EXCEPT the early-return propagation (`eval_if:481-493`, probe a5):
         // when the branch bound to the OPPOSITE (falsey) edge terminates, the
-        // truthy fact applies to the statements after the conditional — unless
-        // any write to the local landed inside the conditional's span.
+        // truthy fact applies to the statements after the conditional — only in
+        // STATEMENT position (R2), never on a conflicted guard (R3), and not
+        // when any write to the local landed inside the conditional's span.
         if let Some((local, class)) = narrow {
             let opposite_terminates =
                 !falsey.is_empty() && branch_terminates(ast, falsey);
             let rewritten = writes
                 .iter()
                 .any(|(ws, n)| n == &local && if_span.0 <= ws.0 && ws.1 <= if_span.1);
-            if opposite_terminates && !rewritten {
+            if stmt_position && !conflict && opposite_terminates && !rewritten {
                 cenv.insert(local, class);
             }
         }
@@ -2866,7 +2921,15 @@ impl<'i> Typer<'i> {
             }
             if let (Some(local), [only]) = (&subject, conditions.as_slice()) {
                 if let Some(class) = self.resolved_static_constant(ast, *only, case_span) {
-                    c.insert(local.clone(), class);
+                    // Review R3: a clause conflicting with an existing
+                    // DIFFERENT-class fact for the subject drops the stale fact
+                    // and never inserts (the reference's carrier is a Nominal
+                    // there, out of the Dynamic-only envelope). Same class keeps.
+                    if c.get(local).is_some_and(|existing| existing != &class) {
+                        c.remove(local);
+                    } else {
+                        c.insert(local.clone(), class);
+                    }
                 }
             }
             self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out);
@@ -5007,6 +5070,57 @@ mod class_narrowing_tests {
             b"def f(value)\n  if value.is_a?(Hash)\n    value.merge!(a: 1)\n    value.frobnicate_zzz\n  end\nend\n",
         );
         assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// R1 decline: an expression-position rebind in an argument list threads
+    /// IMMEDIATELY — `f(value = x, value.frobnicate_zzz)` inside an `is_a?`
+    /// branch must record nothing (Ruby evaluates arguments left-to-right, so
+    /// the second argument reads the rebound local).
+    #[test]
+    fn class_narrowing_arg_position_rebind_invalidates_sibling_use() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value, x)\n  if value.is_a?(Hash)\n    g(value = x, value.frobnicate_zzz)\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// R2 decline: early-return propagation is STATEMENT-position only — an
+    /// expression-position conditional with a terminating falsey arm
+    /// (`f(value.is_a?(Hash) ? value : raise)`) must NOT narrow the statements
+    /// after it (unprobed oracle behavior). The statement-position a5 idiom
+    /// (its own test above) keeps propagating.
+    #[test]
+    fn class_narrowing_expression_position_if_never_propagates() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  g(value.is_a?(Hash) ? value : raise)\n  value.frobnicate_zzz\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+        // Assignment-RHS position is expression position too.
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  y = value.is_a?(Hash) ? value : raise\n  value.frobnicate_zzz\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// R3 decline: a nested guard CONFLICTING with the outer fact
+    /// (`if v.is_a?(Hash)` then inner `if v.is_a?(String)`) narrows nothing —
+    /// the reference's carrier is `Nominal[Hash]` at the inner guard (Bot on a
+    /// disjoint re-narrow), out of the Dynamic-only envelope. A SAME-class
+    /// re-guard keeps the fact.
+    #[test]
+    fn class_narrowing_nested_conflicting_guard_declines() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash)\n    if value.is_a?(String)\n      value.frobnicate_zzz\n    end\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+        // Same-class re-guard: the fact survives (a no-op re-narrowing).
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash)\n    if value.is_a?(Hash)\n      value.frobnicate_zzz\n    end\n  end\nend\n",
+        );
+        assert_eq!(
+            snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str),
+            Some("Hash")
+        );
     }
 
     /// Decline: a block attached to a SAFE-NAV call is never descended — the
