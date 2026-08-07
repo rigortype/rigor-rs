@@ -1422,11 +1422,13 @@ fn check_call(
 ///    only ever REPLACES a Dynamic/Top carrier — `narrow_class_other`
 ///    semantics; any concrete carrier means the ordinary [`check_call`] path
 ///    owns the site and has already declined).
-/// 4. The witnessing tail mirrors [`check_call`]'s core path over `Nominal[C]`:
-///    `C` is a genuine TOP-LEVEL RBS class (`knows_toplevel_class` — the
-///    defect-2-safe surface, stricter than `knows_class`), the method is
-///    certainly ABSENT on it, and the project does not reopen `C` with the
-///    method (`project_declares_method`).
+/// 4. The witnessing tail mirrors [`check_call`]'s QUALIFIED path over
+///    `Nominal[C]`: `C` resolves on one of the three accepted surfaces (a
+///    genuine top-level RBS class, a project-`sig/` class, or the bundled
+///    qualified registry), the method is certainly ABSENT on its ISOLATED
+///    qualified surface, and the project does not reopen `C` with the method
+///    (`project_declares_method`). `C` arrives already resolved to a qualified
+///    key — see `Typer::resolve_constant_as_written`.
 #[allow(clippy::too_many_arguments)]
 fn check_narrowed_call(
     call_id: rigor_parse::NodeId,
@@ -1452,21 +1454,53 @@ fn check_narrowed_call(
     if !matches!(interner.get(rty), Type::Dynamic(_) | Type::Top) {
         return None;
     }
-    // (4) Witness absence over the core surface, exactly as `check_call`'s tail.
-    if !index.knows_toplevel_class(class_name) {
+    // (4) Witness absence over the RESOLVED surface, exactly as `check_call`'s
+    // qualified tail. S2 (2026-08-08) replaced the old pair of gates —
+    // `knows_toplevel_class` AND `CoreIndex::class_id` — with ONE resolution
+    // path. Each was an independent blocker:
+    //   * `knows_toplevel_class` refuses EVERY namespaced name (the defect-2
+    //     rule, which stays in force for every other consumer — this slice adds
+    //     a path, it does not invert the gate);
+    //   * `class_id` interns over `CORE_CLASSES`, a NINE-element array, so the
+    //     witness fired for those nine names only. `Time`/`Range`/`Struct`/
+    //     `Pathname` guards are reference-firing and were rigor-rs-silent
+    //     (probes u1/u2/u4/u5) despite passing `knows_toplevel_class`.
+    // The name arrives already resolved to a qualified key
+    // (`Typer::resolve_constant_as_written`, at mint time where the use site's
+    // lexical prefix is available), so all three spellings of a class — bare,
+    // qualified, `::`-absolute — reach the same surface and the same rendering.
+    //
+    // Accepted surfaces: the existing top-level one, the project's own `sig/`
+    // (nested included — probes q2/q3/q8), and the bundled qualified registry.
+    // Everything else DECLINES, which is free: an unresolvable name (p2/p2b)
+    // and an in-source-only project class (ADR-0033 provenance, p5/q1) are both
+    // reference-silent.
+    if !index.knows_toplevel_class(class_name)
+        && !index.is_qualified_project_sig_class(class_name)
+        && !index.knows_qualified_class(class_name)
+    {
         return None;
     }
-    if index.class_has_method(class_name, method) {
+    // The ISOLATED qualified surface, as ADR-0042 Slice 3 established for
+    // `check_call`: a project class named `Status` must not inherit stdlib
+    // `Process::Status`'s methods. For a top-level name the qualified key IS the
+    // short key, so this is the same surface the old `class_has_method` read,
+    // minus the short-key merge.
+    if index.qualified_class_has_method(class_name, method) {
         return None;
     }
+    // A project reopen MERGES with the RBS surface rather than replacing it
+    // (probe q6): the reopened method silences, the still-absent one still
+    // fires. Keyed as written, so `Proj::Thing` matches.
     if typer.source().project_declares_method(class_name, method) {
         return None;
     }
-    // Render the narrowed receiver as the reference does: the plain class name
-    // of `Nominal[C]` ("undefined method `deep_transform_keys!' for Hash").
-    let class = index.class_id(class_name)?;
-    let recv_ty = interner.intern(Type::Nominal { class, args: vec![] });
-    let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
+    // Render the narrowed receiver as the reference does — the FULL resolved
+    // path ("undefined method `frobnicate_zzz' for URI::HTTP", probes §1/§3),
+    // which for a core name is the same plain class name `Nominal[C]` rendered
+    // before ("… for Hash"). No `ClassId` is needed: `render_receiver` on a
+    // `Nominal` yields exactly its class name.
+    let receiver_render = class_name.to_string();
     let message = format!("undefined method `{method}' for {receiver_render}");
     let severity = catalog(CALL_UNDEFINED_METHOD)
         .map(|e| e.default_severity)
@@ -4129,6 +4163,142 @@ mod tests {
         }
     }
 
+    // --- S2: qualified-name class-narrowing witnessing -----------------------
+    // docs/notes/20260808-qualified-witnessing-mini-spec.md. Every row was
+    // measured against the pinned reference (fresh cwd, `--no-cache`, plugin
+    // path pinned); the probe id in each comment is the row in
+    // 20260808-qualified-witnessing-probes.md.
+
+    /// The witness now fires for a guard class that is NAMESPACED, or top-level
+    /// but outside the nine-name `CORE_CLASSES` array — the two independent
+    /// blockers S2 removed. The message renders the FULL resolved path.
+    #[test]
+    fn qualified_guard_class_witnesses_absence() {
+        for (src, method, expect) in [
+            // p1a/p1c/p1d/p1f — vendored core+stdlib namespaced classes
+            (&b"def f(v)\n  return unless v.is_a?(File::Stat)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "File::Stat"),
+            (&b"def f(v)\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "URI::HTTP"),
+            (&b"def f(v)\n  return unless v.is_a?(Encoding::Converter)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Encoding::Converter"),
+            (&b"def f(v)\n  return unless v.is_a?(Enumerator::Lazy)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Enumerator::Lazy"),
+            // r8/v4 — a DEPTH-3 decl, the S0 fix's payoff
+            (&b"def f(v)\n  return unless v.is_a?(Bundler::Source::Git)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Bundler::Source::Git"),
+            (&b"def f(v)\n  return unless v.is_a?(Bundler::Source::Rubygems)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Bundler::Source::Rubygems"),
+            // q5/q4c — a qualified MODULE, and an ambiguous LEAF
+            (&b"def f(v)\n  return unless v.is_a?(Digest::Instance)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Digest::Instance"),
+            (&b"def f(v)\n  return unless v.is_a?(Random::Base)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Random::Base"),
+            // q4 — NO leaf fallback: `superclass` is a `::Class` method, and
+            // `Digest::Class` must not inherit it
+            (&b"def f(v)\n  return unless v.is_a?(Digest::Class)\n  v.superclass\nend\n"[..], "superclass", "Digest::Class"),
+            // u1/u2/u4/u5 — top-level, outside CORE_CLASSES
+            (&b"def f(v)\n  return unless v.is_a?(Time)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Time"),
+            (&b"def f(v)\n  return unless v.is_a?(Range)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Range"),
+            (&b"def f(v)\n  return unless v.is_a?(Struct)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Struct"),
+            (&b"def f(v)\n  return unless v.is_a?(Pathname)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Pathname"),
+            // p3c — a leading `::` is stripped, rendering the bare path
+            (&b"def f(v)\n  return unless v.is_a?(::File::Stat)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "File::Stat"),
+            // p1g/p9a/r4/r5/r3 — every composition the top-level narrowing
+            // already supported behaves identically with a qualified class
+            (&b"def f(v)\n  if v.is_a?(File::Stat)\n    v.frobnicate_zzz\n  end\nend\n"[..], "frobnicate_zzz", "File::Stat"),
+            (&b"def f(v)\n  return unless v.instance_of?(File::Stat)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "File::Stat"),
+            (&b"def f(v, c)\n  return unless c && v.is_a?(File::Stat)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "File::Stat"),
+            (&b"def f(v)\n  case v\n  when File::Stat then v.frobnicate_zzz\n  end\nend\n"[..], "frobnicate_zzz", "File::Stat"),
+            // p1e/p1f — a CHAIN address (stage 3a-3) takes the same routing
+            (&b"def f(h)\n  return unless h.last.is_a?(File::Stat)\n  h.last.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "File::Stat"),
+        ] {
+            let diags = run(src);
+            assert_eq!(
+                diags.len(),
+                1,
+                "expected one undefined-method for {:?}, got {diags:?}",
+                String::from_utf8_lossy(src)
+            );
+            assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+            assert_eq!(
+                diags[0].message,
+                format!("undefined method `{method}' for {expect}")
+            );
+            assert_eq!(diags[0].receiver_type.as_deref(), Some(expect));
+        }
+    }
+
+    /// The must-STAY-SILENT half. Every row is measured silent on BOTH engines;
+    /// each would be a false positive if the matching gate were dropped.
+    #[test]
+    fn qualified_guard_witness_declines() {
+        for src in [
+            // p7a — the class's OWN method
+            &b"def f(v)\n  return unless v.is_a?(File::Stat)\n  v.directory?\nend\n"[..],
+            // p7c — an Object method
+            &b"def f(v)\n  return unless v.is_a?(File::Stat)\n  v.frozen?\nend\n"[..],
+            // q5b — an Object method on a MODULE target (RBS's implicit
+            // `::Object` self-type; S1)
+            &b"def f(v)\n  return unless v.is_a?(Digest::Instance)\n  v.frozen?\nend\n"[..],
+            // p7b/v2 — inherited over the AS-WRITTEN chain, through two
+            // ambiguous leaves (S1)
+            &b"def f(v)\n  return unless v.is_a?(Digest::SHA256)\n  v.hexdigest\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Digest::SHA256)\n  v.digest\nend\n"[..],
+            // v1/v3 — an `attr_reader` on `URI::Generic`, own and inherited (S1)
+            &b"def f(v)\n  return unless v.is_a?(URI::Generic)\n  v.host\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(URI::HTTP)\n  v.host\nend\n"[..],
+            // q4b/v5 — own methods on a declaring class and on a gem class
+            &b"def f(v)\n  return unless v.is_a?(Digest::Class)\n  v.digest\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Gem::Version)\n  v.segments\nend\n"[..],
+            // p2/p2b — a class that exists nowhere, qualified and bare
+            &b"def f(v)\n  return unless v.is_a?(Foo::Bar::Baz)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Zorkmid)\n  v.frobnicate_zzz\nend\n"[..],
+            // p5/q1 — an IN-SOURCE-only project class (ADR-0033 provenance),
+            // namespaced and top-level
+            &b"module Proj\n  class Thing\n  end\nend\ndef f(v)\n  return unless v.is_a?(Proj::Thing)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"class Thing\nend\ndef f(v)\n  return unless v.is_a?(Thing)\n  v.frobnicate_zzz\nend\n"[..],
+            // q6 — a project REOPEN merges: its own method silences
+            &b"module URI\n  class HTTP\n    def mine_zzz\n      1\n    end\n  end\nend\ndef f(v)\n  return unless v.is_a?(URI::HTTP)\n  v.mine_zzz\nend\n"[..],
+            // r2 — the ELSE edge of a positive guard
+            &b"def f(v)\n  if v.is_a?(File::Stat)\n    0\n  else\n    v.frobnicate_zzz\n  end\nend\n"[..],
+            // r7 — a sequential DISJOINT re-guard. The reference carries the
+            // first guard's `Nominal[File::Stat]` into the second, which
+            // collapses it to `Bot`. rigor-rs reproduces the silence through
+            // R3: the early-return propagation now re-seeds the PRE-JOIN local
+            // fact, so the conflicting re-guard drops it instead of minting
+            // against a wiped env.
+            &b"def f(v)\n  return unless v.is_a?(File::Stat)\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n"[..],
+            // The same shape on two CORE names — a PRE-EXISTING false positive
+            // (`s1_two_returns_sequential` in the next/break build note) that
+            // the same re-seed closes.
+            &b"def f(v)\n  return unless v.is_a?(Hash)\n  return unless v.is_a?(String)\n  v.frobnicate_zzz\nend\n"[..],
+            // r3 — a SUBCLASS re-guard. The reference narrows DOWN
+            // (`narrow_nominal_to_class`'s `:superclass` arm) and FIRES
+            // ``… for Digest::SHA256``; rigor-rs's R3 is coarser (any
+            // class change drops the fact), so this is a DECLINE — a coverage
+            // gap, not a divergence in the FP direction. Recovering it needs a
+            // qualified-aware `class_ordering`, deliberately out of scope (see
+            // the S3 section of the mini-spec note).
+            &b"def f(v)\n  return unless v.is_a?(Digest::Base)\n  return unless v.is_a?(Digest::SHA256)\n  v.frobnicate_zzz\nend\n"[..],
+            // safe-nav is outside the envelope
+            &b"def f(v)\n  return unless v.is_a?(File::Stat)\n  v&.frobnicate_zzz\nend\n"[..],
+        ] {
+            let diags = run(src);
+            assert!(
+                diags.is_empty(),
+                "expected silence for {:?}, got {diags:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    /// p6 — the other half of q6: a project reopen ADDS to the RBS surface
+    /// instead of replacing it, so a still-absent method still fires and
+    /// `constant_shadowed` must NOT be widened to reopens.
+    #[test]
+    fn project_reopen_of_a_gem_namespace_still_witnesses() {
+        let src = &b"module URI\n  class HTTP\n    def mine_zzz\n      1\n    end\n  end\nend\ndef f(v)\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n"[..];
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            "undefined method `frobnicate_zzz' for URI::HTTP"
+        );
+    }
+
     // --- disjoint-guard suppression -----------------------------------------
     // docs/notes/20260808-disjoint-guard-suppression.md. Every row below was
     // measured against the pinned reference (`--no-cache`, fresh cwd); the
@@ -4195,6 +4365,30 @@ mod tests {
             &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    while false\n      0\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
             &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    begin\n      0\n    rescue\n      0\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
             &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h.push(3)\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            // S3 (2026-08-08): a SHAPED carrier collapses under any guard the
+            // ordering does not make it a subclass of — `Unknown` included,
+            // because `narrow_shape_to_class` asks `subclass_of?` rather than
+            // `disjoint?`. These five were LIVE false positives before S3
+            // (probes r1/r1b/r1f/r1d/r1e/r1g): a resolvable-disjoint qualified
+            // guard, the Hash-shaped carrier, the `if` form, an unresolvable
+            // top-level name, an unresolvable qualified name, and an in-source
+            // project class (which the mint declines to NARROW to but must
+            // still SEE — that is what `mintable: false` carries).
+            &b"def f\n  v = [1, 2]\n  return unless v.is_a?(File::Stat)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  v = { a: 1 }\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  v = [1, 2]\n  if v.is_a?(File::Stat)\n    v.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f\n  v = [1, 2]\n  return unless v.is_a?(Zorkmid)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  v = [1, 2]\n  return unless v.is_a?(Foo::Bar::Baz)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"module Proj\n  class Thing\n  end\nend\ndef f\n  v = [1, 2]\n  return unless v.is_a?(Proj::Thing)\n  v.frobnicate_zzz\nend\n"[..],
+            // A DECLINE S3 costs, measured and accepted: `h = []` then
+            // `h << 1` under an unresolvable guard. The reference widens that
+            // carrier to a NOMINAL `Array[Dynamic[top]]` and so stays
+            // conservative and FIRES, while rigor-rs keeps the more precise
+            // SHAPE carrier, which now collapses. Silence, not a false
+            // positive — the fixture-85 carrier-fidelity family, out of scope
+            // here. (`Array.new` and `h = *spec` widen to a nominal on BOTH
+            // engines and are pinned as must-fire above.)
+            &b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
         ] {
             let diags = run(src);
             assert!(
@@ -4224,14 +4418,21 @@ mod tests {
             (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "Array"),
             (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
             (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Hash"),
-            // a guard class the core hierarchy cannot RESOLVE — the declined
-            // `ClassOrdering::Unknown` arm. The reference collapses a SHAPE
-            // carrier here and we do not, so this is a documented residual FP
-            // for a Tuple; on a NOMINAL carrier the reference fires too, and
-            // that is the row this control pins (probes isa_nominal_unknown,
-            // x_arr_new_unk, x_arr_push_unk, x_splat_unk).
+            // a guard class the core hierarchy cannot RESOLVE — the
+            // `ClassOrdering::Unknown` arm, which S3 split by carrier kind. On
+            // a NOMINAL carrier the reference stays conservative and FIRES, and
+            // that is what these rows pin (probes isa_nominal_unknown,
+            // x_arr_new_unk, x_arr_push_unk, x_splat_unk). The SHAPE carrier's
+            // twin of this row is the opposite — collapsed — and lives in the
+            // silence test above.
             (&b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
-            (&b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            (&b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            // S3 anti-over-suppression: a SHAPED carrier under a guard it IS a
+            // subclass of survives and still witnesses. All three measured
+            // firing on the reference (`… for [1, 2]` / `… for { a: 1 }`).
+            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
+            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Object)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
+            (&b"def f\n  v = { a: 1 }\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Hash"),
             // the FALSEY edge of a disjoint guard is NOT narrowed
             // (`narrow_nominal_not_class` preserves it) — probes s_unless_body,
             // s_negated_if, s_case_when_else_branch

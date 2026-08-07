@@ -3413,6 +3413,8 @@ impl<'i> Typer<'i> {
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
         // the propagation's R3 conflict check below (see there for why).
         let pre_join_chains = cenv.chains.clone();
+        // S2: the LOCAL twin of the same snapshot. See the re-seed below.
+        let pre_join_locals = cenv.locals.clone();
         join_cenv(cenv, &[truthy_edge.locals, falsey_edge.locals]);
         // … EXCEPT the early-return propagation (`eval_if:486`/`:495`), which
         // 3a-1 runs in BOTH directions: a terminating FALSEY branch propagates
@@ -3449,11 +3451,31 @@ impl<'i> Typer<'i> {
             // narrow re-seed fixes it for chains without touching that ordering.
             // Only the touched addresses are restored, so an untouched chain
             // fact still dies at the join (probe `n_escape_after_if`).
+            //
+            // S2 (2026-08-08) closes the LOCAL side of exactly that defect, on
+            // the same narrow re-seed. `return unless v.is_a?(File::Stat)` then
+            // `return unless v.is_a?(URI::HTTP)` is reference-SILENT (its scope
+            // carries `File::Stat` into the second guard, which collapses it to
+            // `Bot`), while rigor-rs minted `URI::HTTP` against the wiped env and
+            // witnessed — probe r7. The same shape on two CORE names
+            // (`Hash` then `String`) was already firing before this slice: the
+            // pre-existing FP the `next`/`break` build note recorded as
+            // `s1_two_returns_sequential`. Re-seeding lets R3 see the prior fact,
+            // conflict, and drop it — silence on both spellings. Only the locals
+            // this map touches are restored, so an untouched fact still dies at
+            // the join.
             for (t, _) in &carried {
-                if let GuardTarget::Chain(root, m) = t {
-                    let addr: ChainAddr = (root.clone(), m.clone());
-                    if let Some(class) = pre_join_chains.get(&addr) {
-                        cenv.chains.insert(addr, class.clone());
+                match t {
+                    GuardTarget::Chain(root, m) => {
+                        let addr: ChainAddr = (root.clone(), m.clone());
+                        if let Some(class) = pre_join_chains.get(&addr) {
+                            cenv.chains.insert(addr, class.clone());
+                        }
+                    }
+                    GuardTarget::Local(name) => {
+                        if let Some(fact) = pre_join_locals.get(name) {
+                            cenv.locals.insert(name.clone(), fact.clone());
+                        }
                     }
                 }
             }
@@ -3715,7 +3737,16 @@ impl<'i> Typer<'i> {
         };
         match (method.as_str(), args.len()) {
             ("is_a?" | "kind_of?" | "instance_of?", 1) => {
-                let class = self.resolved_static_constant(ast, args[0], *span)?;
+                // S3: a guard on a name the PROJECT declares is not mintable
+                // (this slice never narrows to a project nominal), but it must
+                // still be SEEN — the reference resolves it and collapses a
+                // shaped carrier against it (`v = [1, 2]` guarded by an
+                // in-source `Proj::Thing` is reference-SILENT, probe r1g).
+                // Declining the whole predicate, as this arm did before, left
+                // that as a live false positive. `mintable: false` is the
+                // existing carrier for "assert but do not narrow" (`===`,
+                // `nil?`).
+                let (class, mintable) = self.guard_constant(ast, args[0], *span)?;
                 let exact = method == "instance_of?";
                 // Stage 3a-3: the operand is EITHER a bare local (stages 1-2)
                 // OR a stable single-hop chain address off a local root
@@ -3738,7 +3769,7 @@ impl<'i> Typer<'i> {
                 let g = (target, GuardFact {
                     classes: vec![class],
                     exact,
-                    mintable: true,
+                    mintable,
                     chain_call,
                 });
                 Some((vec![g], Vec::new()))
@@ -3778,7 +3809,9 @@ impl<'i> Typer<'i> {
     /// Whether guarding `local` with `class_name` yields `Bot` in the reference.
     ///
     /// Three ways, and no fourth (see [`Typer::class_narrowing_pass`] for why
-    /// the `ClassOrdering::Unknown` arm is declined):
+    /// the `ClassOrdering::Unknown` arm is declined FOR A NOMINAL CARRIER — S3
+    /// measured that a Constant/Tuple/HashShape carrier collapses on `Unknown`
+    /// too, because its helper asks `subclass_of?` rather than `disjoint?`):
     /// 1. the local is ALREADY `Bot` — `narrow_class_other` / `narrow_other_class`
     ///    return `Bot` unchanged on both polarities, so a further guard cannot
     ///    revive it (probes `bot_then_match`, `bot_then_neg`);
@@ -3825,7 +3858,33 @@ impl<'i> Typer<'i> {
         if exact {
             return carrier != class_name;
         }
-        self.index.class_ordering(carrier, class_name) == ClassOrdering::Disjoint
+        // S3 (2026-08-08): the collapse condition is per-CARRIER-KIND, and it is
+        // NOT the same predicate for all of them — reading `narrow_class_dispatch`
+        // (`narrowing.rb:2311`) and probing the oracle both say so.
+        //
+        // * `narrow_shape_to_class` (`:2403`) and `narrow_constant_to_class`
+        //   (`:2364`) keep the carrier iff `subclass_of?(carrier, class_name)`,
+        //   i.e. iff the ordering is `Subclass`/`Equal`. `Unknown` therefore
+        //   COLLAPSES: a shaped carrier does not need the guard class to resolve.
+        // * `narrow_nominal_to_class` (`:2381`) is different — it PRESERVES the
+        //   bound on `Subclass` and stays conservative on `Unknown`, collapsing
+        //   only on `Disjoint`.
+        //
+        // Treating every carrier as the Nominal case (the pre-S3 code) left a
+        // live false positive: `v = [1, 2]; return unless v.is_a?(File::Stat);
+        // v.frobnicate_zzz` fired `for Array` where the reference is silent, and
+        // it fired for an UNRESOLVABLE guard too. Measured against the pinned
+        // reference on `[1, 2]` / `{a: 1}` carriers: `Enumerable`, `Object` and
+        // `Array` guards all FIRE (subclass/equal ⇒ the shape survives) while
+        // `File::Stat` and `Foo::Bar::Baz` are SILENT — which pins the condition
+        // as `subclass_of?`, not as "any shaped carrier collapses".
+        match interner.get(ty) {
+            Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) => !matches!(
+                self.index.class_ordering(carrier, class_name),
+                ClassOrdering::Subclass | ClassOrdering::Equal
+            ),
+            _ => self.index.class_ordering(carrier, class_name) == ClassOrdering::Disjoint,
+        }
     }
 
     /// The statically-known name of a `ConstantRead`/`ConstantPath` node (both
@@ -3833,6 +3892,14 @@ impl<'i> Typer<'i> {
     /// or `None` when the node is not a static constant OR a project
     /// declaration shadows the name ([`SourceIndex::constant_shadowed`] —
     /// decline entirely; this slice never narrows to a project nominal).
+    ///
+    /// S2 (2026-08-08): the name is additionally resolved to a QUALIFIED KEY
+    /// here, at MINT time, because this is where the use site's lexical
+    /// `enclosing_prefix` is available — the class-narrowing fact then carries
+    /// a resolved key rather than the verbatim source spelling. Three spellings
+    /// of the same class must reach the same key (probes p3a–p3d): a relative
+    /// `HTTP` inside `module URI`, a qualified `URI::HTTP`, and an absolute
+    /// `::URI::HTTP` all render `for URI::HTTP` on the reference.
     fn resolved_static_constant(
         &self,
         ast: &LoweredAst,
@@ -3849,7 +3916,67 @@ impl<'i> Typer<'i> {
         if self.source.constant_shadowed(name, prefix) {
             return None;
         }
-        Some(name.clone())
+        Some(self.resolve_constant_as_written(name, prefix))
+    }
+
+    /// [`Typer::resolved_static_constant`] for the `is_a?`/`instance_of?` arm,
+    /// which needs the SHADOWED case as a fact rather than as a decline:
+    /// `(resolved qualified key, mintable)`. `mintable` is `false` exactly when
+    /// the project declares the name in a lexically visible scope — the same
+    /// predicate `resolved_static_constant` declines on — so the guard can
+    /// collapse a precise carrier without ever narrowing TO a project nominal.
+    fn guard_constant(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        use_span: rigor_parse::Span,
+    ) -> Option<(String, bool)> {
+        let Node::ConstantRead { name, .. } = ast.get(id) else {
+            return None;
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let prefix = self.enclosing_prefix(use_span);
+        let shadowed = self.source.constant_shadowed(name, prefix);
+        Some((self.resolve_constant_as_written(name, prefix), !shadowed))
+    }
+
+    /// Resolve a guard constant's SOURCE SPELLING to the qualified key it names,
+    /// by Ruby's (and RBS's) own rule: an ABSOLUTE reference (`::File::Stat`)
+    /// drops its root marker and is looked up as written; a relative one is
+    /// tried against each enclosing lexical scope innermost-outward, then at the
+    /// root. The first scope that KNOWS the name wins — deterministic, so there
+    /// is no residual ambiguity to decline on (the reference resolves the same
+    /// way, probes q9/q9b).
+    ///
+    /// A name nothing knows is returned as written (minus the root marker): the
+    /// witness gate declines it anyway (probes p2/p2b are reference-silent), and
+    /// leaving it verbatim keeps `guard_collapses` seeing exactly what it saw
+    /// before this slice.
+    fn resolve_constant_as_written(&self, name: &str, prefix: &[String]) -> String {
+        let (bare, absolute) = match name.strip_prefix("::") {
+            Some(rest) => (rest, true),
+            None => (name, false),
+        };
+        if !absolute {
+            for depth in (1..=prefix.len()).rev() {
+                let cand = format!("{}::{bare}", prefix[..depth].join("::"));
+                if self.constant_names_a_known_class(&cand) {
+                    return cand;
+                }
+            }
+        }
+        bare.to_string()
+    }
+
+    /// Whether `qname` names a class/module some AUTHORITATIVE surface knows —
+    /// the bundled RBS qualified registry or the project's own `sig/`. In-source
+    /// declarations are deliberately NOT consulted: the reference is silent on
+    /// them for the ADR-0033 provenance reason (probes p4a/p4b/p5), so resolving
+    /// to one could only ever change which name a declined witness carries.
+    fn constant_names_a_known_class(&self, qname: &str) -> bool {
+        self.index.knows_qualified_class(qname) || self.index.is_qualified_project_sig_class(qname)
     }
 
     /// Narrow through one `case`/`when` node (statement or expression
