@@ -21,9 +21,9 @@ stage 2 ([spec](notes/20260807-collection-shape-slice-spec.md)). Adjudicate the
 typing for the OpenStruct rows
 ([why](notes/20260808-bare-class-bucket-characterisation.md)). Off the gap
 track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
+
 - Coverage-tool parity lesson (binding for measurement tools): audit at NODE
   granularity — per-file histograms net over-claims out against under-claims.
-
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
   (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
   [plan](notes/20260718-compat-next-stage-plan.md)).
