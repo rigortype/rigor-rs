@@ -2631,11 +2631,23 @@ impl<'i> Typer<'i> {
                     // fact env + inherited (cloned) `tenv`; afterwards clear ALL
                     // outer facts (a capture may invisibly reassign a local) and
                     // widen `tenv` for locals the block visibly writes.
-                    let mut btenv = tenv.clone();
-                    let mut bcenv: HashMap<String, String> = HashMap::new();
-                    self.class_flow_scope(
-                        ast, &block_body, &mut btenv, &mut bcenv, writes, interner, out,
-                    );
+                    //
+                    // SAFE-NAV block calls do NOT descend (oracle-probed
+                    // 2026-08-07, sweep FP gitlab-foss relation_tree_restorer
+                    // .rb:215): the reference stays SILENT on a guard narrowed
+                    // INSIDE a block attached to `x&.m do … end` (`h&.
+                    // transform_values do |v| v.is_a?(String) ? v.presence : v
+                    // end&.compact` — silent), while the identical plain-call
+                    // form fires. Skipping the descent drops every narrowed
+                    // recording inside such a block — pure coverage loss, never
+                    // an FP; the conservative clear/widen effects still apply.
+                    if !safe_nav {
+                        let mut btenv = tenv.clone();
+                        let mut bcenv: HashMap<String, String> = HashMap::new();
+                        self.class_flow_scope(
+                            ast, &block_body, &mut btenv, &mut bcenv, writes, interner, out,
+                        );
+                    }
                     cenv.clear();
                     widen_flow_writes(writes, call_span, tenv, interner);
                 }
@@ -4995,6 +5007,27 @@ mod class_narrowing_tests {
             b"def f(value)\n  if value.is_a?(Hash)\n    value.merge!(a: 1)\n    value.frobnicate_zzz\n  end\nend\n",
         );
         assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// Decline: a block attached to a SAFE-NAV call is never descended — the
+    /// reference stays silent on a guard narrowed inside `x&.m do … end`
+    /// (oracle-probed; the sweep FP at gitlab-foss relation_tree_restorer
+    /// .rb:215), while the identical plain-call block DOES narrow.
+    #[test]
+    fn class_narrowing_safe_nav_block_body_declines() {
+        let (ast, snaps) = class_snaps(
+            b"def f(h)\n  h&.transform_values do |value|\n    value.is_a?(String) ? value.frobnicate_zzz : value\n  end&.compact\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+        // Plain-call control: the same guard inside a non-safe-nav block
+        // narrows (the reference fires here — probe f5).
+        let (ast, snaps) = class_snaps(
+            b"def f(h)\n  h.transform_values do |value|\n    value.is_a?(String) ? value.frobnicate_zzz : value\n  end\nend\n",
+        );
+        assert_eq!(
+            snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str),
+            Some("String")
+        );
     }
 
     /// Decline: safe-nav dispatch on the narrowed local never records.
