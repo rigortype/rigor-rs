@@ -109,6 +109,17 @@ file under `crates/` is REFUSED with exit 2 — nothing is measured. An explicit
 `RIGOR_RS_BIN` outside the repo is honoured as deliberate but must exist, and
 the header says its staleness was not checked.
 
+## It caught a real invalid run within the hour
+
+First use after merging: re-verifying PR #68's sweep in a scratch worktree, the
+hardened `gap_census` reported `INVALID (unparseable reference output)` for all
+eight corpora and exited 1 — the worktree's `reference/rigor` submodule had
+never been initialised, so the ORACLE was missing. Under the old harness that
+run would have printed a green `TOTAL FP candidates: 0`: no reference
+diagnostics means no gaps and no FPs, which is indistinguishable from perfect
+parity. The failure was invisible by construction and is now impossible to
+miss.
+
 Not covered: a binary built from *committed* sources that differ from HEAD in
 some way mtimes cannot see (e.g. a `git checkout` that rewinds source files to
 older mtimes than the binary). The mtime gate catches the observed failure —
