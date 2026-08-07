@@ -2405,6 +2405,402 @@ impl<'i> Typer<'i> {
             _ => None,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // `is_a?` / `case-when` class narrowing (census mechanism 1, spec
+    // docs/notes/20260807-class-narrowing-slice-spec.md)
+    // -----------------------------------------------------------------------
+
+    /// Compute the per-call-node class-narrowing snapshot map: `call node id ->
+    /// narrowed class name C` for every bare-local receiver whose local was
+    /// narrowed from `Dynamic`/`Top` to `Nominal[C]` by an `is_a?`/`kind_of?`/
+    /// `instance_of?` guard (`if`/`elsif`/`unless`/ternary — mirror of the
+    /// reference's `narrow_class_other`, `narrowing.rb:2425`) or a single-
+    /// static-constant `case`/`when` clause (`case_when_scopes`,
+    /// `narrowing.rb:374`). The rules layer's `check_narrowed_call` fires
+    /// `call.undefined-method` from this map — and ONLY that rule (spec pitfall
+    /// 7: wiring more rules over a narrowed receiver is out of slice).
+    ///
+    /// ## FP-safety envelope (every decline load-bearing)
+    ///
+    /// Strict subset of the reference's preconditions, so every recorded use is
+    /// one the reference also narrows:
+    /// - **Predicate shape**: the WHOLE predicate is `local.is_a?(C)` (or
+    ///   `kind_of?`/`instance_of?`) — bare `LocalVariableRead` receiver, no
+    ///   safe-nav, no block, exactly one `ConstantRead` argument. `&&`/`||`,
+    ///   negation, chains, ivars ⇒ no narrowing (ADR-0038 "unmodeled ⇒
+    ///   decline"); a `Logical` in expression context clears ALL facts.
+    /// - **Lexical constant resolution**: `C` resolves at the predicate's
+    ///   lexical prefix; a project declaration shadowing `C`
+    ///   ([`SourceIndex::constant_shadowed`]) declines entirely — we never
+    ///   narrow to a project nominal in this slice.
+    /// - **Dynamic/Top carriers only** (`narrow_class_other`): the local's type
+    ///   in the threaded env must be `Dynamic`/`Top` (or unbound ⇒ untyped).
+    ///   `Nominal`/union/scalar carriers are untouched.
+    /// - **Truthy edge only**: the then-branch for `if`/ternary, the
+    ///   else-branch for `unless`; the falsey edge is NEVER narrowed. A
+    ///   `case`/`when` clause narrows only under its own single-constant
+    ///   condition (multi-condition unions decline; no falsey threading
+    ///   between clauses).
+    /// - **Early-return propagation** (`eval_if:481`): when the branch bound
+    ///   to the OPPOSITE edge terminates (final statement `return`/`raise` — a
+    ///   conservative approximation), the truthy fact applies to the
+    ///   statements after the conditional — declined if ANY write to the local
+    ///   lands inside the conditional's span.
+    /// - **Invalidation**: any write to the local (`LocalVariableWrite`/
+    ///   `OpWrite`/`MultiWrite` target), a [`MUTATOR_METHODS`] receiver call,
+    ///   or a mutated-argument position (the [`collect_flow_writes`]/
+    ///   [`indexed_flow_writes`] span machinery) kills the fact; any unmodeled
+    ///   statement clears ALL facts (decline backstop).
+    /// - **Block bodies**: facts do NOT enter a `block_body` (fresh fact env,
+    ///   ADR-0038 §3) — the archetype's `value.deep_transform_keys! { … }`
+    ///   receiver sits OUTSIDE the block and is recorded before descent; after
+    ///   a block descent all outer facts are cleared (a capture may invisibly
+    ///   reassign a local).
+    pub fn class_narrowing_snapshots(
+        &self,
+        ast: &LoweredAst,
+        interner: &mut Interner,
+    ) -> HashMap<NodeId, String> {
+        let mut out = HashMap::new();
+        let body = match ast.get(ast.root()) {
+            Node::Program { body, .. } => body.clone(),
+            _ => return out,
+        };
+        let mut writes = collect_flow_writes(ast);
+        writes.extend(indexed_flow_writes(ast, self.source));
+        let mut tenv = TypeEnv::new();
+        let mut cenv: HashMap<String, String> = HashMap::new();
+        self.class_flow_scope(ast, &body, &mut tenv, &mut cenv, &writes, interner, &mut out);
+        out
+    }
+
+    /// Thread `(tenv, cenv)` through a scope's statements in source order.
+    #[allow(clippy::too_many_arguments)]
+    fn class_flow_scope(
+        &self,
+        ast: &LoweredAst,
+        stmts: &[NodeId],
+        tenv: &mut TypeEnv,
+        cenv: &mut HashMap<String, String>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, String>,
+    ) {
+        for &s in stmts {
+            self.class_flow_stmt(ast, s, tenv, cenv, writes, interner, out);
+        }
+    }
+
+    /// Apply one statement's effect on `(tenv, cenv)` and record narrowed uses.
+    #[allow(clippy::too_many_arguments)]
+    fn class_flow_stmt(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        cenv: &mut HashMap<String, String>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, String>,
+    ) {
+        match ast.get(id) {
+            Node::Statements { body, .. } => {
+                let body = body.clone();
+                self.class_flow_scope(ast, &body, tenv, cenv, writes, interner, out);
+            }
+            Node::LocalVariableWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                // Record uses in the RHS BEFORE rebinding — the RHS reads the
+                // pre-write fact (`value = value.frobnicate if value.is_a?(…)`).
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                let vty = self.type_of(ast, value, tenv, interner);
+                tenv.insert(name.clone(), vty);
+                // Rebinding invalidates the narrowing (probe a4; `scope.rb:194`).
+                cenv.remove(&name);
+            }
+            Node::MultiWrite { targets, value, .. } => {
+                let (targets, value) = (targets.clone(), *value);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                let rhs = self.type_of(ast, value, tenv, interner);
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    cenv.remove(&name);
+                    tenv.insert(name, ty);
+                }
+            }
+            Node::LocalVariableOpWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                cenv.remove(&name);
+                let u = interner.untyped();
+                tenv.insert(name, u);
+            }
+            Node::Call { .. } => {
+                self.class_flow_expr(ast, id, tenv, cenv, writes, interner, out);
+            }
+            // A `return E` evaluates its values in the current facts (`return
+            // value.frobnicate if …` must witness). No fact effect: statements
+            // after a `return` in the same list are unreachable, and the
+            // reference's evaluator threads the same scope past them.
+            Node::Return { values, .. } => {
+                let values = values.clone();
+                for v in values {
+                    self.class_flow_expr(ast, v, tenv, cenv, writes, interner, out);
+                }
+            }
+            Node::If { .. } => {
+                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out);
+            }
+            Node::Definition { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => {
+                // Independent scope: fresh envs, no effect on the enclosing one.
+                let body = body.clone();
+                let mut t = TypeEnv::new();
+                let mut c: HashMap<String, String> = HashMap::new();
+                self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out);
+            }
+            // Any other statement (`while`/`case`/`begin`/logical/ivar-write/…)
+            // is UNMODELED: widen `tenv` for the locals it writes and CLEAR ALL
+            // facts (decline backstop). No descent.
+            other => {
+                let span = other.span();
+                widen_flow_writes(writes, span, tenv, interner);
+                cenv.clear();
+            }
+        }
+    }
+
+    /// Evaluate an expression for narrowed-local USES: record `call -> C` for a
+    /// bare-local receiver in `cenv`, descend a block body with a FRESH fact
+    /// env, and kill facts a call's contained writes/mutations invalidate.
+    #[allow(clippy::too_many_arguments)]
+    fn class_flow_expr(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        cenv: &mut HashMap<String, String>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, String>,
+    ) {
+        match ast.get(id) {
+            Node::Call { receiver, method: _, args, block_body, safe_nav, span, .. } => {
+                let receiver = *receiver;
+                let args = args.clone();
+                let block_body = block_body.clone();
+                let safe_nav = *safe_nav;
+                let call_span = *span;
+                // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
+                if let Some(r) = receiver {
+                    self.class_flow_expr(ast, r, tenv, cenv, writes, interner, out);
+                }
+                // Record the use: a plain (not safe-nav) call on a bare local
+                // currently narrowed to `C`. Recorded BEFORE any invalidation
+                // below — the receiver read happens before the call's effects
+                // (`value.deep_transform_keys! { … }` must witness).
+                if let Some(r) = receiver {
+                    if !safe_nav {
+                        if let Node::LocalVariableRead { name, .. } = ast.get(r) {
+                            if let Some(c) = cenv.get(name) {
+                                out.insert(id, c.clone());
+                            }
+                        }
+                    }
+                }
+                for a in &args {
+                    self.class_flow_expr(ast, *a, tenv, cenv, writes, interner, out);
+                }
+                if !block_body.is_empty() {
+                    // Block-scope discipline (ADR-0038 §3): descend with a FRESH
+                    // fact env + inherited (cloned) `tenv`; afterwards clear ALL
+                    // outer facts (a capture may invisibly reassign a local) and
+                    // widen `tenv` for locals the block visibly writes.
+                    let mut btenv = tenv.clone();
+                    let mut bcenv: HashMap<String, String> = HashMap::new();
+                    self.class_flow_scope(
+                        ast, &block_body, &mut btenv, &mut bcenv, writes, interner, out,
+                    );
+                    cenv.clear();
+                    widen_flow_writes(writes, call_span, tenv, interner);
+                }
+                // Invalidation: kill the fact of every local with a recorded
+                // write/mutation span INSIDE this call — covers a
+                // `MUTATOR_METHODS` receiver (`value.merge!(…)`), a mutated
+                // positional argument (`fill(value)`), and a write nested in an
+                // argument (`f(value = x)`).
+                kill_cenv_writes(writes, call_span, cenv);
+            }
+            Node::Logical { left, right, .. } => {
+                // `&&`/`||` — unmodeled narrowing. Clear all facts (decline),
+                // then recurse for block/call reachability.
+                let (left, right) = (*left, *right);
+                cenv.clear();
+                self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out);
+            }
+            // A ternary is an expression-position `Node::If` (Prism parses it as
+            // an IfNode); `propagate_if_branches` (`scope_indexer.rb:2742`)
+            // gives it the same treatment as a statement `if`.
+            Node::If { .. } => {
+                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Narrow through one `if`/`unless`/ternary node (statement or expression
+    /// position). See [`Typer::class_narrowing_snapshots`] for the envelope.
+    #[allow(clippy::too_many_arguments)]
+    fn class_flow_if(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        cenv: &mut HashMap<String, String>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, String>,
+    ) {
+        let Node::If { predicate, then_body, else_body, is_unless, span } = ast.get(id) else {
+            return;
+        };
+        let (predicate, is_unless, if_span) = (*predicate, *is_unless, *span);
+        let (then_body, else_body) = (then_body.clone(), else_body.clone());
+        // The predicate is evaluated first, in the current facts (its own calls
+        // may read an OUTER narrowing).
+        self.class_flow_expr(ast, predicate, tenv, cenv, writes, interner, out);
+        // Recognise the guard, gated on the local currently being Dynamic/Top
+        // (`narrow_class_other`: every other carrier is out of scope).
+        let narrow = self.class_check_predicate(ast, predicate).filter(|(local, _)| {
+            match tenv.get(local) {
+                None => true, // unbound ⇒ untyped (Dynamic[top])
+                Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
+            }
+        });
+        // Truthy edge: then-branch for `if`/ternary, else-branch for `unless`.
+        let (truthy, falsey) =
+            if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
+        {
+            let mut t = tenv.clone();
+            let mut c = cenv.clone();
+            if let Some((local, class)) = &narrow {
+                c.insert(local.clone(), class.clone());
+            }
+            self.class_flow_scope(ast, truthy, &mut t, &mut c, writes, interner, out);
+        }
+        {
+            // The falsey edge is NEVER narrowed (`narrow_class_other`: unchanged).
+            let mut t = tenv.clone();
+            let mut c = cenv.clone();
+            self.class_flow_scope(ast, falsey, &mut t, &mut c, writes, interner, out);
+        }
+        // Conservative join: widen every local written inside the conditional
+        // and clear ALL facts (a fact never survives a branch merge in this
+        // slice) …
+        widen_flow_writes(writes, if_span, tenv, interner);
+        cenv.clear();
+        // … EXCEPT the early-return propagation (`eval_if:481-493`, probe a5):
+        // when the branch bound to the OPPOSITE (falsey) edge terminates, the
+        // truthy fact applies to the statements after the conditional — unless
+        // any write to the local landed inside the conditional's span.
+        if let Some((local, class)) = narrow {
+            let opposite_terminates =
+                !falsey.is_empty() && branch_terminates(ast, falsey);
+            let rewritten = writes
+                .iter()
+                .any(|(ws, n)| n == &local && if_span.0 <= ws.0 && ws.1 <= if_span.1);
+            if opposite_terminates && !rewritten {
+                cenv.insert(local, class);
+            }
+        }
+    }
+
+    /// Recognise the accepted guard shape: the WHOLE predicate is
+    /// `local.is_a?(C)` / `local.kind_of?(C)` / `local.instance_of?(C)` — a bare
+    /// `LocalVariableRead` receiver, no safe-nav, no block, exactly one argument
+    /// which is a `ConstantRead`/`ConstantPath` (both lower to `ConstantRead`)
+    /// with a statically known name (reference `analyse_class_predicate`,
+    /// `narrowing.rb:1761`; stable single-hop chains are out of slice). The
+    /// constant resolves lexically at the predicate's prefix; a project
+    /// declaration shadowing it declines entirely (FP-safe — this slice never
+    /// narrows to a project nominal).
+    fn class_check_predicate(
+        &self,
+        ast: &LoweredAst,
+        pred: NodeId,
+    ) -> Option<(String, String)> {
+        let Node::Call { receiver: Some(r), method, args, block_body, safe_nav, span, .. } =
+            ast.get(pred)
+        else {
+            return None;
+        };
+        if *safe_nav || !block_body.is_empty() || args.len() != 1 {
+            return None;
+        }
+        if !matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?") {
+            return None;
+        }
+        let Node::LocalVariableRead { name: local, .. } = ast.get(*r) else {
+            return None;
+        };
+        let Node::ConstantRead { name: cname, .. } = ast.get(args[0]) else {
+            return None;
+        };
+        if cname.is_empty() {
+            return None;
+        }
+        let prefix = self.enclosing_prefix(*span);
+        if self.source.constant_shadowed(cname, prefix) {
+            return None;
+        }
+        Some((local.clone(), cname.clone()))
+    }
+}
+
+/// Whether a branch body's final statement terminates the enclosing method — a
+/// `return` or a receiverless `raise` (a conservative approximation of the
+/// reference's terminator analysis in `eval_if:481`; missing a termination only
+/// loses narrowing, never adds one). Descends the pure statement carriers
+/// (`Statements`, and a `BeginRescue` with no rescue clauses and no ensure —
+/// the lowered `else`-clause / parenthesized-group shape; a real
+/// `begin`/`rescue` declines, its tail `return` may be skipped by a raise
+/// before it).
+fn branch_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
+    match body.last() {
+        Some(&last) => stmt_terminates(ast, last),
+        None => false,
+    }
+}
+
+fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::Return { .. } => true,
+        Node::Call { receiver: None, method, .. } if method == "raise" => true,
+        Node::BeginRescue { body, ensure_body, clauses, .. }
+            if clauses.is_empty() && ensure_body.is_empty() =>
+        {
+            branch_terminates(ast, body)
+        }
+        Node::Statements { body, .. } => branch_terminates(ast, body),
+        _ => false,
+    }
+}
+
+/// Kill the class-narrowing fact of every local whose recorded write/mutation
+/// span is contained in `span` — the `cenv` counterpart of
+/// [`widen_flow_writes`].
+fn kill_cenv_writes(
+    writes: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+    cenv: &mut HashMap<String, String>,
+) {
+    for (wspan, name) in writes {
+        if span.0 <= wspan.0 && wspan.1 <= span.1 {
+            cenv.remove(name);
+        }
+    }
 }
 
 /// In-place mutator methods that invalidate a value-pinned literal-shape carrier
@@ -4322,5 +4718,191 @@ mod rbs_tuple_return_tests {
         assert_eq!(last_call_ty(b"[1, unknown_thing] & [1]\n"), "Class<4>");
         // No argument at all is not a set operation; the RBS tier answers.
         assert_eq!(last_call_ty(b"[1, 2].intersection\n"), "Class<4>");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `is_a?` / `case-when` class narrowing (census mechanism 1) — the oracle
+// probe matrix a1–a6 + the load-bearing declines
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod class_narrowing_tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    fn lower_src(src: &[u8]) -> LoweredAst {
+        lower(&parse(src))
+    }
+
+    /// The class-narrowing snapshot map for `src`, wired exactly as the analyze
+    /// pass wires it (per-file source index + lexical scopes, so the shadow
+    /// gate is live).
+    fn class_snaps(src: &[u8]) -> (LoweredAst, HashMap<NodeId, String>) {
+        let ast = lower_src(src);
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let scopes = lexical_scopes(&ast);
+        let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let snaps = typer.class_narrowing_snapshots(&ast, &mut i);
+        (ast, snaps)
+    }
+
+    /// The node id of the first call named `method`, or panic.
+    fn call_named(ast: &LoweredAst, method: &str) -> NodeId {
+        ast.iter()
+            .find_map(|(id, n)| match n {
+                Node::Call { method: m, .. } if m == method => Some(id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("call `{method}` present"))
+    }
+
+    /// a1: `if value.is_a?(Hash)` narrows the branch use; the use AFTER the
+    /// `if` (no terminating opposite branch) stays un-narrowed.
+    #[test]
+    fn class_narrowing_if_branch_narrows_use_after_does_not() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash)\n    value.frobnicate_zzz\n  end\n  value.after_zzz\nend\n",
+        );
+        assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Hash"));
+        assert!(!snaps.contains_key(&call_named(&ast, "after_zzz")));
+    }
+
+    /// a2: a ternary narrows its truthy arm only (the falsey arm is UNCHANGED).
+    #[test]
+    fn class_narrowing_ternary_truthy_arm_only() {
+        let (ast, snaps) = class_snaps(
+            b"def f(rule)\n  rule.is_a?(Hash) ? rule.frobnicate_zzz : rule.other_zzz\nend\n",
+        );
+        assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Hash"));
+        assert!(!snaps.contains_key(&call_named(&ast, "other_zzz")));
+    }
+
+    /// a4: rebinding the local inside the branch invalidates the narrowing for
+    /// subsequent uses (`scope.rb:194`).
+    #[test]
+    fn class_narrowing_rebind_in_branch_invalidates() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value, other)\n  if value.is_a?(Hash)\n    value = other\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// a5: a TERMINATING opposite branch propagates the truthy edge past the
+    /// guard (`eval_if:481` early-return narrowing) — both the `return` and the
+    /// `raise` idiom.
+    #[test]
+    fn class_narrowing_early_return_propagates() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  return unless value.is_a?(Hash)\n  value.frobnicate_zzz\nend\n",
+        );
+        assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Hash"));
+
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  raise ArgumentError unless value.is_a?(Hash)\n  value.frobnicate_zzz\nend\n",
+        );
+        assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Hash"));
+    }
+
+    /// a5 counterpart: a rebind AFTER the propagated guard kills the fact.
+    #[test]
+    fn class_narrowing_rebind_after_guard_invalidates() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value, other)\n  return unless value.is_a?(Hash)\n  value = other\n  value.frobnicate_zzz\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// `kind_of?` and `instance_of?` route identically (`narrowing.rb:979`).
+    #[test]
+    fn class_narrowing_kind_of_and_instance_of_narrow() {
+        for method in ["kind_of?", "instance_of?"] {
+            let src = format!(
+                "def f(value)\n  if value.{method}(Hash)\n    value.frobnicate_zzz\n  end\nend\n"
+            );
+            let (ast, snaps) = class_snaps(src.as_bytes());
+            assert_eq!(
+                snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str),
+                Some("Hash"),
+                "{method} must narrow"
+            );
+        }
+    }
+
+    /// Decline: facts do NOT enter a block body (ADR-0038 §3) — but the
+    /// receiver of the block-bearing call itself, OUTSIDE the block, records.
+    #[test]
+    fn class_narrowing_block_body_declines_receiver_outside_records() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash)\n    value.deep_frobnicate_zzz { |k| value.inner_zzz }\n  end\nend\n",
+        );
+        assert_eq!(
+            snaps.get(&call_named(&ast, "deep_frobnicate_zzz")).map(String::as_str),
+            Some("Hash")
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "inner_zzz")));
+    }
+
+    /// Decline: an `&&`/`||` predicate is unmodeled — the whole conditional
+    /// narrows nothing.
+    #[test]
+    fn class_narrowing_logical_predicate_declines() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash) && value.foo\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// Decline: a project declaration shadowing the constant kills the
+    /// narrowing entirely (never narrow to the project nominal in this slice).
+    #[test]
+    fn class_narrowing_shadowed_constant_declines() {
+        let (ast, snaps) = class_snaps(
+            b"class Hash\nend\ndef f(value)\n  if value.is_a?(Hash)\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// Decline: a local with a concrete (non-Dynamic/Top) carrier is untouched
+    /// (`narrow_class_other` narrows Dynamic/Top ONLY).
+    #[test]
+    fn class_narrowing_non_dynamic_local_declines() {
+        let (ast, snaps) = class_snaps(
+            b"value = \"str\"\nif value.is_a?(Hash)\n  value.frobnicate_zzz\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// Decline: a mutator call on the local kills the fact for SUBSEQUENT uses
+    /// (the mutator call itself still records — its receiver read precedes the
+    /// mutation).
+    #[test]
+    fn class_narrowing_mutator_call_invalidates_subsequent_uses() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash)\n    value.merge!(a: 1)\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// Decline: safe-nav dispatch on the narrowed local never records.
+    #[test]
+    fn class_narrowing_safe_nav_declines() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash)\n    value&.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// `elsif` chains narrow each truthy arm independently (the chained `If`
+    /// lowers into the else branch).
+    #[test]
+    fn class_narrowing_elsif_arms_narrow_independently() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash)\n    value.frobnicate_zzz\n  elsif value.is_a?(String)\n    value.other_zzz\n  end\nend\n",
+        );
+        assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Hash"));
+        assert_eq!(snaps.get(&call_named(&ast, "other_zzz")).map(String::as_str), Some("String"));
     }
 }
