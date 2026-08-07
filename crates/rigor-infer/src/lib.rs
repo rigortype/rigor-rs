@@ -2562,6 +2562,9 @@ impl<'i> Typer<'i> {
             Node::If { .. } => {
                 self.class_flow_if(ast, id, tenv, cenv, writes, interner, out);
             }
+            Node::Case { .. } => {
+                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out);
+            }
             Node::Definition { body, .. }
             | Node::ClassDef { body, .. }
             | Node::ModuleDef { body, .. } => {
@@ -2656,6 +2659,11 @@ impl<'i> Typer<'i> {
             // gives it the same treatment as a statement `if`.
             Node::If { .. } => {
                 self.class_flow_if(ast, id, tenv, cenv, writes, interner, out);
+            }
+            // An expression-position `case` (`x = case value … end`) narrows its
+            // clause bodies the same way a statement `case` does.
+            Node::Case { .. } => {
+                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out);
             }
             _ => {}
         }
@@ -2756,17 +2764,109 @@ impl<'i> Typer<'i> {
         let Node::LocalVariableRead { name: local, .. } = ast.get(*r) else {
             return None;
         };
-        let Node::ConstantRead { name: cname, .. } = ast.get(args[0]) else {
+        let local = local.clone();
+        let cname = self.resolved_static_constant(ast, args[0], *span)?;
+        Some((local, cname))
+    }
+
+    /// The statically-known name of a `ConstantRead`/`ConstantPath` node (both
+    /// lower to `ConstantRead`), resolved lexically at `use_span`'s prefix —
+    /// or `None` when the node is not a static constant OR a project
+    /// declaration shadows the name ([`SourceIndex::constant_shadowed`] —
+    /// decline entirely; this slice never narrows to a project nominal).
+    fn resolved_static_constant(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        use_span: rigor_parse::Span,
+    ) -> Option<String> {
+        let Node::ConstantRead { name, .. } = ast.get(id) else {
             return None;
         };
-        if cname.is_empty() {
+        if name.is_empty() {
             return None;
         }
-        let prefix = self.enclosing_prefix(*span);
-        if self.source.constant_shadowed(cname, prefix) {
+        let prefix = self.enclosing_prefix(use_span);
+        if self.source.constant_shadowed(name, prefix) {
             return None;
         }
-        Some((local.clone(), cname.clone()))
+        Some(name.clone())
+    }
+
+    /// Narrow through one `case`/`when` node (statement or expression
+    /// position) — reference `case_when_scopes` (`narrowing.rb:374`), the
+    /// strict-subset envelope:
+    /// - the subject is a bare `LocalVariableRead` whose type is Dynamic/Top;
+    /// - a clause narrows ONLY when it has EXACTLY ONE condition and that
+    ///   condition is a static constant, resolved lexically, unshadowed
+    ///   (multi-condition unions — probe a6 — decline, FP-safe);
+    /// - clause bodies only; NO falsey threading between clauses (we never
+    ///   narrow negative edges), no propagation past the `case`;
+    /// - a `case`/`in` pattern branch (a `BeginRescue` carrier, not a `When`)
+    ///   is unmodeled — no descent, matching the pre-slice behavior;
+    /// - after the `case`: widen written locals, clear ALL facts (the same
+    ///   conservative join every conditional gets).
+    #[allow(clippy::too_many_arguments)]
+    fn class_flow_case(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        cenv: &mut HashMap<String, String>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, String>,
+    ) {
+        let Node::Case { predicate, branches, else_body, span } = ast.get(id) else {
+            return;
+        };
+        let (predicate, case_span) = (*predicate, *span);
+        let (branches, else_body) = (branches.clone(), else_body.clone());
+        // The subject evaluates first, in the current facts.
+        if let Some(p) = predicate {
+            self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out);
+        }
+        // The narrowing subject: a bare local currently Dynamic/Top.
+        let subject = predicate
+            .and_then(|p| match ast.get(p) {
+                Node::LocalVariableRead { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .filter(|local| match tenv.get(local) {
+                None => true, // unbound ⇒ untyped (Dynamic[top])
+                Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
+            });
+        for br in branches {
+            let Node::When { conditions, body, .. } = ast.get(br) else {
+                // A `case`/`in` pattern carrier — unmodeled, no descent
+                // (pre-slice behavior; the trailing clear-all covers effects).
+                continue;
+            };
+            let (conditions, body) = (conditions.clone(), body.clone());
+            // Each clause runs on a clone of the PRE-`case` facts: clauses are
+            // alternatives, and we never thread a falsey edge between them.
+            let mut t = tenv.clone();
+            let mut c = cenv.clone();
+            // Conditions evaluate under the un-narrowed facts (they decide the
+            // edge; a call condition still records its own uses).
+            for &cond in &conditions {
+                self.class_flow_expr(ast, cond, &mut t, &mut c, writes, interner, out);
+            }
+            if let (Some(local), [only]) = (&subject, conditions.as_slice()) {
+                if let Some(class) = self.resolved_static_constant(ast, *only, case_span) {
+                    c.insert(local.clone(), class);
+                }
+            }
+            self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out);
+        }
+        {
+            // The `else` body is a NEGATIVE edge — never narrowed.
+            let mut t = tenv.clone();
+            let mut c = cenv.clone();
+            self.class_flow_scope(ast, &else_body, &mut t, &mut c, writes, interner, out);
+        }
+        widen_flow_writes(writes, case_span, tenv, interner);
+        cenv.clear();
     }
 }
 
@@ -4915,5 +5015,65 @@ mod class_narrowing_tests {
         );
         assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Hash"));
         assert_eq!(snaps.get(&call_named(&ast, "other_zzz")).map(String::as_str), Some("String"));
+    }
+
+    /// a3: `case value / when Hash / when String` narrows per clause; the
+    /// `else` body (a negative edge) is never narrowed.
+    #[test]
+    fn class_narrowing_case_when_narrows_per_clause() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  case value\n  when Hash\n    value.frobnicate_zzz\n  when String\n    value.frobnicate_yyy\n  else\n    value.else_zzz\n  end\nend\n",
+        );
+        assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Hash"));
+        assert_eq!(
+            snaps.get(&call_named(&ast, "frobnicate_yyy")).map(String::as_str),
+            Some("String")
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "else_zzz")));
+    }
+
+    /// a6 decline: a multi-condition clause (`when Hash, String` — a union in
+    /// the reference) narrows NOTHING in this slice.
+    #[test]
+    fn class_narrowing_multi_condition_when_declines() {
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  case value\n  when Hash, String\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// Decline: a non-local subject, a non-constant condition, and a rebind
+    /// inside the clause body all narrow nothing.
+    #[test]
+    fn class_narrowing_case_declines() {
+        // Subject is a call, not a bare local.
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  case value.foo\n  when Hash\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+        // Condition is a literal, not a static constant.
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  case value\n  when 1\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+        // Rebind inside the clause body invalidates subsequent uses.
+        let (ast, snaps) = class_snaps(
+            b"def f(value, other)\n  case value\n  when Hash\n    value = other\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// Decline: a shadowed constant in a `when` condition narrows nothing, and
+    /// facts do not enter a block body inside a clause.
+    #[test]
+    fn class_narrowing_case_shadow_and_block_declines() {
+        let (ast, snaps) = class_snaps(
+            b"class Hash\nend\ndef f(value)\n  case value\n  when Hash\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  case value\n  when Hash\n    [1].each { |_i| value.frobnicate_zzz }\n  end\nend\n",
+        );
+        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
     }
 }
