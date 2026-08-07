@@ -660,3 +660,119 @@ the offending shape into the decline set rather than patching around it.
 - **The falsey edge is not categorically unnarrowed** once `!` lands (c4d) —
   the stage-1/2 doc comment's "truthy edge only" invariant must be reworded
   when 3a-1 ships.
+
+## `next` / `break` termination — BUILT 2026-08-08 (PR — `crates/rigor-{parse,infer}/src/lib.rs` + `ast.rs`, fixture `harness/corpus/89_next_break_termination.rb`)
+
+The 3a-1 build's shortfall analysis named this as a cheap follow-up worth ~2
+rows and would not fold it in because "the block-boundary semantics of `next`
+are unprobed". They are probed now. **Verdict: GO** — the reference's
+`branch_unconditionally_exits?` (`statement_evaluator.rb:2836`) accepts
+`Prism::NextNode`/`BreakNode` beside `ReturnNode`, **unconditionally**: no
+in-block gate, no loop-body special case, and no re-entry analysis. Every FP
+hazard the brief listed is either measured absent on the reference or already
+killed by machinery this pass has.
+
+### Probe matrix (pin `v0.3.1`, fresh temp cwd, `--no-cache`, plugin path pinned)
+
+`ref`/`rs` are diagnostic counts on `v.frobnicate_zzz` under the guard;
+`rs` is AFTER the build (all rows were `rs=0` on master except the `h*`
+harness controls, `p4`, and the reference-silent controls).
+
+| # | shape | ref | rs | outcome |
+|---|---|:--:|:--:|---|
+| h0 | `return unless G` inside a block (harness control) | 1 | 1 | the matrix reproduces the known-good case |
+| h1 | `return unless G` at def top level | 1 | 1 | ditto |
+| **p1** | `xs.each { next unless G; USE }` | **1** | **1** | **the archetype — reference narrows past a block `next`** |
+| **p2** | same with `break` | **1** | **1** | identical treatment |
+| p3 / p3b | guard on the BLOCK PARAMETER, `next` / `break` | 1 | 1 | both carriers narrow |
+| p11 | `next if !G` | 1 | 1 | the 3a-1 `!` swap reaches the propagation |
+| p17 | `next unless w && G` | 1 | 1 | the real census predicate shape |
+| q13 | `next if !G \|\| v.empty?` | 1 | 1 | `\|\|` falsey concatenation |
+| r9 / r10 | `kind_of?` / `instance_of?` | 1 | 1 | guard family unchanged |
+| q6 | the jump is the branch's LAST statement, after a log call | 1 | 1 | `.last` is the right test |
+| q15 / q16 / r2 / q18 | `lambda` / `define_method` / `loop` / `3.times` | 1 | 1 | recognition is syntactic — the block need not iterate |
+| r1 | carrier bound from an `@ivar` | 1 | 1 | allow-list member |
+| r3 | the guard inside a `begin`/`rescue` in the block | 1 | 1 | — |
+| r5 / p7a | the reduced gitlab-foss `cron_jobs.rb:58` row | 1 | 1 | **the census row** |
+| q2 | brace-block one-liner | 1 | 1 | — |
+| q9 / q22 | use inside the same inner `if` / inner block | 1 | 1 | — |
+| **p6 / r11** | **loop-carried rebind AFTER the use** (`next unless G; USE; v = w`) | **1** | **1** | **the 3b-1 hazard class — the reference fires anyway, in a block AND in a `while`** |
+| p4 | CONTROL: use BEFORE the guard | 0 | 0 | — |
+| p10 | CONTROL: `next if G` (truthy edge terminates) | 0 | 0 | an atomic guard's falsey map is empty |
+| q3 | CONTROL: rebind inside the conditional's span | 0 | 0 | the `rewritten` filter |
+| q17 | CONTROL: rebind between the guard and the use | 0 | 0 | source-order walk kills it |
+| **p9 / p9b / p13 / q10 / r13** | **CONTROL: use AFTER the block / nested block / inner `if` / inner `while`** | **0** | **0** | **`join_cenv` keeps only `Bot`, so a minted fact cannot escape a block — the leak hazard is already closed** |
+| r7 | CONTROL: the block is in ARGUMENT position | 0 | 0 | the block position gate |
+| q7 | CONTROL: `next` followed by dead code in the branch | 0 | 0 | `.last` is not the jump; ref agrees |
+| q1 / q1b | CONTROL: `next`/`break` at def top level | syntax error | 0 | not valid Ruby — no hazard |
+| q5 | CONTROL: `v = 1` then `next unless G` (Bot collapse) | 0 | 0 | — |
+| r0 / r0b / r0c / q8 | CONTROL: the guard is on an `@ivar`/`$gvar` | 0 | 0 | the reference narrows no ivar at all, anywhere |
+| p5 / p5b / p5c / p6b / r12 | DECLINE: `next`/`break` in a `while`/`until` BODY | 1 | 0 | `Node::Loop` bodies are never descended (3b-2) |
+| p16 / p16b / q21 | DECLINE: `next 0` / `break 0` (jump WITH a value) | 1 | 0 | keeps the recovered-children carrier; not tagged |
+| p15 / p15b / p15c / p15d | DECLINE: `throw` / `fail` / `exit` / `abort` | 1 | 0 | the reference's `EXIT_CALL_NAMES`; only `raise` is ported |
+| p8 | DECLINE: `redo` | 1 | 0 | not in the exit set — the reference reaches it via the `Bot`-branch arm of `branch_terminates?` |
+| p8b | DECLINE: `retry` | n/a | 0 | the reference emits an unrelated non-rule diagnostic; not trivial, declined per the brief |
+| p12 / q19 / q20 | DECLINE: BOTH branches jump | 1 | 0 | `eval_if:495` needs only a PRESENT then-branch, so the reference propagates the truthy map; our `truthy_terminates != falsey_terminates` is the subset rule |
+| q11 | DECLINE: a `case`/`when` clause ending in `next` | 1 | 0 | `class_flow_case` has no termination propagation (3a-4) |
+| q4 | DECLINE: coarse carrier (`v = a \|\| b`) | 1 | 0 | the PR #72 allow-list, per local |
+| r6 | DECLINE: a MUTATOR call between the guard and the use | 1 | 0 | `kill_cenv_narrowed` (carried from stage 1-2) |
+| q5b / r4 | DECLINE: `1.frobnicate_zzz` (unrelated carrier gap) | 1 | 0 | pre-existing, orthogonal |
+
+### The arena change (additive, one bit)
+
+`next`/`break` have no owned variant: prism's `NextNode`/`BreakNode` fall
+through to the recovery path, and an argument-less one recovers nothing, so it
+lands as `Node::Other` — indistinguishable from every other unmodeled leaf.
+`Node::Other` gained `jump: Option<JumpKind>`, set ONLY at the two new
+interception sites. That is the entire arena diff: `Other` carries no children,
+so no child walk, typer arm or rule changes at all (a real owned `Jump` variant
+would have to be wired into `child_ids`, the coverage walk and `type_of` for no
+measured gain, and dropping its children would be a `flow.dead-assignment` FP
+source).
+
+A jump **with an argument** deliberately keeps the recovered-children
+`Statements` carrier and stays `jump: None` — its value must remain reachable to
+the rule walk. That is the `p16`/`p16b`/`q21` decline.
+
+### The two named census rows — one closes, the other was misattributed
+
+`gap_census.py --sweep --dump`, release binary both sides: **1137 → 1136**.
+
+| corpus | row | outcome |
+|---|---|---|
+| gitlab-foss | `lib/gitlab/sidekiq_config/cron_jobs.rb:58` `Hash#stringify_keys` | **CLOSED** — `next unless job && overrides.is_a?(Hash)` |
+| gitlab-foss | `lib/api/internal/base.rb:266` | NOT this mechanism — it is `call.possible-nil-receiver`, produced by the reference's NIL-flow narrowing, not by class narrowing. `branch_terminates` has exactly one caller (`class_flow_if`), so no `next`/`break` change can reach it. The 3a-1 note's "both terminate the guard branch with `next`" was right about the syntax and wrong about the pass. |
+
+**Zero rows opened**, which is the load-bearing half.
+
+### A PRE-EXISTING FP the slice REACHES but did not create
+
+`return unless v.is_a?(String)` followed by `return unless v.is_a?(Hash)` (two
+SEPARATE statements, disjoint classes) is reference-SILENT — its scope carries
+`String` into the second guard and collapses to `Bot` — and rigor-rs witnesses
+`for Hash`. Measured on the MASTER binary (`s1_two_returns_sequential`,
+`s2_two_raise_sequential`), so it predates this slice; the `next` spelling
+(`r8_two_guards_sequential`) is a third way in.
+
+Root cause: `class_flow_if` runs `join_cenv` (which retains only `Bot`) BEFORE
+the termination propagation, so `apply_guards` sees an EMPTY `cenv` and the
+review-R3 conflict rule has no incoming fact to conflict with. The obvious fix —
+apply the carried map against the PRE-JOIN snapshot — also newly declines
+`s7_two_returns_subclass` (`Numeric` then `Integer`), which the reference FIRES
+and rigor-rs currently MATCHES, so a correct fix needs the disjoint-vs-refinement
+distinction rather than R3's blanket drop. Out of scope here, and not urgent:
+the shape is effectively dead code (the second guard can never pass) and the
+standing sweep is **0 FP over 9204 files** with the `next` spelling live.
+
+### Gates
+
+`cargo build --offline && cargo test --offline` (14 suites green; the new
+`class_narrowing_next_break_termination_matrix` carries 30 rows);
+`ruby harness/run.rb` **89 fixtures, 0 unregistered extras** (326/354 matched,
+27 gaps, 1 registered); `ruby harness/snapshot.rb` + `ruby harness/run_snapshot.rb`;
+`python3 harness/docs_check.py`; clippy `-D warnings` in a fresh
+`CARGO_TARGET_DIR`; `python3 harness/fp_audit.py --gaps --sweep` on a freshly
+built release binary — **TOTAL FP candidates: 0**, 8 corpora / 9204 files.
+
+Fixture 89 carries 7 firing rows (each oracle-verified per line) and 5 measured
+declines; its controls emit nothing on either engine.

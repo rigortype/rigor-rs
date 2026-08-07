@@ -736,7 +736,34 @@ pub enum Node {
     // synthetic-node variants (plugin/macro-generated definitions with no
     // source text) per ADR-0012 / ADR-0013. No plugins yet, so no synthetic
     // variant is materialized in this slice.
-    Other { span: Span },
+    /// An UNMODELED construct, with an optional control-flow-jump
+    /// discriminator.
+    ///
+    /// `jump` is `Some` for an ARGUMENT-LESS `next` / `break` and `None` for
+    /// everything else. Prism models those as `NextNode`/`BreakNode`, which
+    /// recover no children and would otherwise be indistinguishable from any
+    /// other unmodeled leaf — yet the reference's
+    /// `branch_unconditionally_exits?` treats them exactly like a `return`, so
+    /// the class-narrowing pass's early-termination propagation needs to see
+    /// them ([`Node::Other`] carries no children, so a one-bit discriminator is
+    /// the whole change; a real owned `Jump` variant would have to be wired
+    /// into every child walk for no measured gain).
+    ///
+    /// `next e` / `break e` deliberately stay `jump: None`: they carry a value
+    /// that must remain reachable to the rule walk, which today happens through
+    /// the recovered-children `Statements` carrier. Recognising them is a
+    /// recorded DECLINE (probes `p16_next_with_value` / `p16b_break_with_value`
+    /// — the reference narrows through them), not an oversight.
+    Other { span: Span, jump: Option<JumpKind> },
+}
+
+/// Which control-flow jump an argument-less [`Node::Other`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JumpKind {
+    /// `next` — skip to the next iteration of the enclosing block / loop.
+    Next,
+    /// `break` — leave the enclosing block / loop.
+    Break,
 }
 
 impl Node {
@@ -779,7 +806,7 @@ impl Node {
             | Node::ConstantWrite { span, .. }
             | Node::SelfExpr { span }
             | Node::Return { span, .. }
-            | Node::Other { span } => *span,
+            | Node::Other { span, .. } => *span,
         }
     }
 }
@@ -1848,6 +1875,25 @@ impl<'src> Builder<'src> {
             return self.push(Node::Return { values, span });
         }
 
+        // An ARGUMENT-LESS `next` / `break`: still an unmodeled leaf (it binds
+        // nothing, reads nothing, and the typer's catch-all types it
+        // `Dynamic[top]` exactly as before), but tagged so the class-narrowing
+        // pass's early-termination propagation can see it — the reference's
+        // `branch_unconditionally_exits?` (statement_evaluator.rb:2836) accepts
+        // `NextNode`/`BreakNode` beside `ReturnNode`. With an argument the node
+        // falls through to the recovery below UNCHANGED, so its value stays
+        // reachable to the rule walk; that shape is a recorded decline.
+        if let Some(n) = node.as_next_node() {
+            if n.arguments().is_none() {
+                return self.push(Node::Other { span, jump: Some(JumpKind::Next) });
+            }
+        }
+        if let Some(n) = node.as_break_node() {
+            if n.arguments().is_none() {
+                return self.push(Node::Other { span, jump: Some(JumpKind::Break) });
+            }
+        }
+
         // Anything outside the handled subset: RECOVER any meaningful descendant
         // nodes (local reads / op-writes / calls) so structural walks see them.
         //
@@ -1863,7 +1909,7 @@ impl<'src> Builder<'src> {
         // wrapper reachable for the existing call rules — a strict improvement.
         let recovered = collect_recoverable_children(node);
         if recovered.is_empty() {
-            return self.push(Node::Other { span });
+            return self.push(Node::Other { span, jump: None });
         }
         let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
         self.push(Node::Statements { body, span })
