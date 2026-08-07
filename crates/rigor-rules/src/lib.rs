@@ -519,6 +519,12 @@ pub fn analyze_with_source_and_folder(
     // flow-eval. `check_nil_receiver` fires from it (block / top-level scopes,
     // not only inside a named `def`).
     let nil_snaps = typer.nilable_receiver_snapshots(ast, interner);
+    // Class-narrowing snapshot map (census mechanism 1): call node id -> class
+    // name `C` the receiver local was `is_a?`/`case-when` narrowed to (from
+    // `Dynamic`/`Top` only). `check_narrowed_call` fires `call.undefined-method`
+    // from it — and ONLY that rule (spec pitfall 7: a narrowed receiver must not
+    // become witnessable by wrong-arity/ATM in this slice).
+    let class_snaps = typer.class_narrowing_snapshots(ast, interner);
     let mut out = Vec::new();
 
     // Visit nodes in id order, which is source-discovery order, so diagnostics
@@ -560,6 +566,12 @@ pub fn analyze_with_source_and_folder(
         // `def` never reads the file's top-level locals (`ScopedEnv::at`).
         let env = env.at(message_span);
         let diag = check_call(ast, recv, &method, message_span, env, &typer, interner, index)
+            .or_else(|| {
+                check_narrowed_call(
+                    call_id, ast, recv, &method, message_span, safe_nav, env, &typer, interner,
+                    index, &class_snaps,
+                )
+            })
             .or_else(|| {
                 check_wrong_arity(ast, recv, &method, &args, has_block, message_span, env, &typer, interner, index)
             })
@@ -1351,6 +1363,81 @@ fn check_call(
     // for a Constant receiver it is the rendered value (e.g. `"\"Hello\""` for
     // a String literal, `"nil"` for nil), not the bare class name. This matches
     // the reference's JSON output which sets `receiver_type` to `"\"Hello\""`.
+    Some(Diagnostic {
+        rule_id: CALL_UNDEFINED_METHOD,
+        start_offset: message_span.0,
+        end_offset: message_span.1,
+        message,
+        severity,
+        source_family: "builtin",
+        receiver_type: Some(receiver_render),
+        method_name: Some(method.to_string()),
+    })
+}
+
+/// Apply `call.undefined-method` to a call whose bare-local receiver was
+/// class-narrowed by the flow pass (census mechanism 1) — the `is_a?`/
+/// `case-when` counterpart of [`check_call`], firing from the precomputed
+/// [`rigor_infer::Typer::class_narrowing_snapshots`] map.
+///
+/// The FP-delicate flow reasoning (which guard shapes narrow, truthy-edge-only,
+/// invalidation, block-scope discipline) lives in the snapshot pass; here we
+/// apply the residual gates, each `None` FP-safe:
+/// 1. NOT a safe-nav call (belt-and-braces — the pass also skips them).
+/// 2. The call node is in the snapshot map with a class name `C`.
+/// 3. The receiver still types `Dynamic`/`Top` at the use site (the narrowing
+///    only ever REPLACES a Dynamic/Top carrier — `narrow_class_other`
+///    semantics; any concrete carrier means the ordinary [`check_call`] path
+///    owns the site and has already declined).
+/// 4. The witnessing tail mirrors [`check_call`]'s core path over `Nominal[C]`:
+///    `C` is a genuine TOP-LEVEL RBS class (`knows_toplevel_class` — the
+///    defect-2-safe surface, stricter than `knows_class`), the method is
+///    certainly ABSENT on it, and the project does not reopen `C` with the
+///    method (`project_declares_method`).
+#[allow(clippy::too_many_arguments)]
+fn check_narrowed_call(
+    call_id: rigor_parse::NodeId,
+    ast: &LoweredAst,
+    receiver: rigor_parse::NodeId,
+    method: &str,
+    message_span: (usize, usize),
+    safe_nav: bool,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    snapshots: &std::collections::HashMap<rigor_parse::NodeId, String>,
+) -> Option<Diagnostic> {
+    // (1) Safe-nav dispatch is out of the narrowed envelope.
+    if safe_nav {
+        return None;
+    }
+    // (2) The flow pass must have narrowed this exact call's receiver.
+    let class_name = snapshots.get(&call_id)?.as_str();
+    // (3) Dynamic/Top-only: any concrete carrier at the use site declines.
+    let rty = typer.type_of(ast, receiver, env, interner);
+    if !matches!(interner.get(rty), Type::Dynamic(_) | Type::Top) {
+        return None;
+    }
+    // (4) Witness absence over the core surface, exactly as `check_call`'s tail.
+    if !index.knows_toplevel_class(class_name) {
+        return None;
+    }
+    if index.class_has_method(class_name, method) {
+        return None;
+    }
+    if typer.source().project_declares_method(class_name, method) {
+        return None;
+    }
+    // Render the narrowed receiver as the reference does: the plain class name
+    // of `Nominal[C]` ("undefined method `deep_transform_keys!' for Hash").
+    let class = index.class_id(class_name)?;
+    let recv_ty = interner.intern(Type::Nominal { class, args: vec![] });
+    let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
+    let message = format!("undefined method `{method}' for {receiver_render}");
+    let severity = catalog(CALL_UNDEFINED_METHOD)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
     Some(Diagnostic {
         rule_id: CALL_UNDEFINED_METHOD,
         start_offset: message_span.0,
@@ -3070,6 +3157,13 @@ fn node_children(node: &Node) -> Vec<NodeId> {
             out.extend(branches.iter().copied());
             out.extend(else_body.iter().copied());
         }
+        // A `when` clause's children are its conditions then its body — the
+        // same id set (and order) the pre-split `BeginRescue` carrier held
+        // concatenated in `body`.
+        Node::When { conditions, body, .. } => {
+            out.extend(conditions.iter().copied());
+            out.extend(body.iter().copied());
+        }
         Node::Loop { predicate, body, .. } => {
             if let Some(p) = predicate {
                 out.push(*p);
@@ -3824,6 +3918,39 @@ mod tests {
         assert_eq!(d.method_name.as_deref(), Some("lenght"));
         // The span must cover exactly `lenght`.
         assert_eq!(&src[d.start_offset..d.end_offset], b"lenght");
+    }
+
+    /// Census mechanism 1: an `is_a?`-narrowed Dynamic local witnesses
+    /// `call.undefined-method` against the narrowed class, rendered as the
+    /// plain class name (`for Hash`) — and ONLY undefined-method (a narrowed
+    /// receiver never feeds wrong-arity/ATM in this slice).
+    #[test]
+    fn narrowed_local_witnesses_undefined_method() {
+        let src =
+            b"def f(value)\n  if value.is_a?(Hash)\n    value.frobnicate_zzz\n  end\nend\n";
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(d.message, "undefined method `frobnicate_zzz' for Hash");
+        assert_eq!(d.receiver_type.as_deref(), Some("Hash"));
+        assert_eq!(&src[d.start_offset..d.end_offset], b"frobnicate_zzz");
+    }
+
+    /// The narrowed witness stays SILENT when the method exists on the
+    /// narrowed class, and for every declined shape (`&&`, use-after-if).
+    #[test]
+    fn narrowed_local_silent_on_existing_method_and_declines() {
+        assert!(run(b"def f(value)\n  if value.is_a?(Hash)\n    value.merge!(a: 1)\n  end\nend\n")
+            .is_empty());
+        assert!(run(
+            b"def f(value)\n  if value.is_a?(Hash) && value.foo\n    value.frobnicate_zzz\n  end\nend\n"
+        )
+        .is_empty());
+        assert!(run(
+            b"def f(value)\n  if value.is_a?(Hash)\n  end\n  value.frobnicate_zzz\nend\n"
+        )
+        .is_empty());
     }
 
     #[test]

@@ -1913,6 +1913,7 @@ fn is_branch_carrier(node: &Node) -> bool {
         node,
         Node::If { .. }
             | Node::Case { .. }
+            | Node::When { .. }
             | Node::Loop { .. }
             | Node::Logical { .. }
             | Node::BeginRescue { .. }

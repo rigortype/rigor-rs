@@ -1196,6 +1196,7 @@ impl<'a> FileScanner<'a> {
             self.ast.get(value),
             rigor_parse::Node::If { .. }
                 | rigor_parse::Node::Case { .. }
+                | rigor_parse::Node::When { .. }
                 | rigor_parse::Node::Loop { .. }
                 | rigor_parse::Node::BeginRescue { .. }
                 | rigor_parse::Node::Logical { .. }

@@ -234,6 +234,12 @@ fn push_statement_children(node: &Node, out: &mut Vec<NodeId>) {
             out.extend(then_body.iter().copied());
             out.extend(else_body.iter().copied());
         }
+        // A `when` clause: conditions then body — the same statement-children
+        // set the pre-split `BeginRescue` carrier contributed via `body`.
+        Node::When { conditions, body, .. } => {
+            out.extend(conditions.iter().copied());
+            out.extend(body.iter().copied());
+        }
         _ => {}
     }
 }

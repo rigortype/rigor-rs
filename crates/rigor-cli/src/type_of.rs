@@ -307,6 +307,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::ModuleDef { .. } => "ModuleDef",
         Node::If { .. } => "If",
         Node::Case { .. } => "Case",
+        Node::When { .. } => "When",
         Node::Loop { .. } => "Loop",
         Node::BeginRescue { .. } => "BeginRescue",
         Node::Lambda { .. } => "Lambda",

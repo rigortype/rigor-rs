@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/81_class_narrowing.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 39,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_yyy' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 69,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 78,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash | String"
+    }
+  ]
+}
