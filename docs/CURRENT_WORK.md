@@ -37,13 +37,15 @@ track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State: harness **84 fixtures / 0 unregistered extras / 8 gaps / 1 registered
-divergence** (live + snapshot, vs pin `v0.3.1`; the gaps are deliberate,
-documented per fixture). Standing sweep: **0 FP / 9204
-files / 1145 gaps**, 8 corpora, baselines in `harness/CORPUS.md`. Neither sweep
-tool sees project-`sig/` behaviour. The sweep measures `target/release/rigor`
-and REFUSES a binary older than `crates/` (PR #65). Clippy: workspace
-`-D warnings`, verify in a FRESH `CARGO_TARGET_DIR`.
+State (verified 2026-08-08 on merged master): harness **86 fixtures / 0
+unregistered extras / 17 gaps / 1 registered divergence**, coverage 292/310;
+standing sweep **0 FP / 9204 files / 1142 gaps**, 8 corpora, baselines in
+`harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. EVERY
+tool that grades the port now prints its binary's path + build time and
+REFUSES one older than `crates/` — corpus tools on release, the fixture
+harness on debug (PR #65 + the 08-08 follow-up; a stale debug binary reported
+18 phantom FPs before the guard). Clippy: workspace `-D warnings`, verify in a
+FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
