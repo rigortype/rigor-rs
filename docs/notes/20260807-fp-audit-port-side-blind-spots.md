@@ -120,6 +120,20 @@ diagnostics means no gaps and no FPs, which is indistinguishable from perfect
 parity. The failure was invisible by construction and is now impossible to
 miss.
 
+## Follow-up: the fixture harness had the same hole (2026-08-08)
+
+The fix above covered the three CORPUS-scale tools and deliberately left
+`harness/run.rb` / `lib.rb` on debug — but left them without the staleness
+guard too. Hours later, on merged master, `run.rb` reported **18 unregistered
+false positives**: its debug binary was three hours behind, so it was grading
+FPs that four merged PRs had already fixed. A full false alarm, and the second
+time the same hazard bit in one session (release binary, then debug).
+
+`ensure_rigor_rs_binary!` now prints the resolved path and build time and
+ABORTS when any file under `crates/` is newer, exactly as `resolve_rs` does.
+The lesson generalises past this repo: the unit that needs the guard is
+"every tool that grades the port", not "the file where the bug was found".
+
 Not covered: a binary built from *committed* sources that differ from HEAD in
 some way mtimes cannot see (e.g. a `git checkout` that rewinds source files to
 older mtimes than the binary). The mtime gate catches the observed failure —

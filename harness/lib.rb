@@ -153,19 +153,53 @@ module RigorHarness
   # Build rigor-rs if binary is absent
   # -------------------------------------------------------------------------
 
+  # Resolve, REPORT and validate the binary — the fixture-harness twin of
+  # `fp_audit.py`'s `resolve_rs`. A stale binary does not fail loudly on its
+  # own: it reports diagnostics from code that is not this working tree, which
+  # here reads as false positives (measured 2026-08-08 — a debug build three
+  # hours behind master reported 18 "unregistered extras" for FPs that had
+  # already been fixed, a full false alarm). The corpus tools got this guard in
+  # PR #65; the fixture harness was left on debug and did NOT, which is the
+  # hole this closes.
   def ensure_rigor_rs_binary!
-    return if File.executable?(RIGOR_RS_BIN)
-
-    puts "rigor-rs binary not found at #{RIGOR_RS_BIN}; building..."
-    Dir.chdir(REPO_ROOT) do
-      system("cargo build --offline -p rigor-cli") or
-        abort("ERROR: cargo build failed — cannot continue")
-    end
-
     unless File.executable?(RIGOR_RS_BIN)
-      abort("ERROR: binary still missing after build: #{RIGOR_RS_BIN}")
+      puts "rigor-rs binary not found at #{RIGOR_RS_BIN}; building..."
+      Dir.chdir(REPO_ROOT) do
+        system("cargo build --offline -p rigor-cli") or
+          abort("ERROR: cargo build failed — cannot continue")
+      end
+      unless File.executable?(RIGOR_RS_BIN)
+        abort("ERROR: binary still missing after build: #{RIGOR_RS_BIN}")
+      end
     end
-    puts "Build OK: #{RIGOR_RS_BIN}"
+
+    built = File.mtime(RIGOR_RS_BIN)
+    puts "rigor-rs binary: #{RIGOR_RS_BIN}"
+    puts "  built: #{built.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    # Everything under crates/ counts, not just *.rs: the vendored RBS the
+    # index loads is an input to the diagnostics exactly as the Rust is.
+    newest_path = nil
+    newest_time = Time.at(0)
+    Dir.glob(File.join(REPO_ROOT, "crates", "**", "*"), File::FNM_DOTMATCH).each do |p|
+      next unless File.file?(p)
+
+      m = File.mtime(p)
+      next unless m > newest_time
+
+      newest_time = m
+      newest_path = p
+    end
+    return if newest_path.nil? || newest_time <= built
+
+    rel = newest_path.sub("#{REPO_ROOT}/", "")
+    puts "  newest crates/ source: #{newest_time.strftime('%Y-%m-%d %H:%M:%S')}  (#{rel})"
+    abort(<<~MSG)
+      ERROR: STALE BINARY — #{RIGOR_RS_BIN} was built #{built.strftime('%Y-%m-%d %H:%M:%S')} but
+             #{rel} changed #{newest_time.strftime('%Y-%m-%d %H:%M:%S')}.
+             The run would grade a binary that is not this working tree. Rebuild first:
+               cargo build --offline -p rigor-cli
+    MSG
   end
 
   # -------------------------------------------------------------------------
