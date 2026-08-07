@@ -316,3 +316,66 @@ The 9 closures, each oracle-spot-checked:
 | concurrent-ruby | `nan?` for `Numeric` | bonus, same cause |
 
 Zero new rows.
+
+### S3 — shaped-carrier collapse parity (PR B, commit 3)
+
+Implements the measured condition from the section above: in `guard_collapses`,
+a `Constant`/`Tuple`/`HashShape` carrier now survives ONLY on
+`Subclass`/`Equal`, while a `Nominal` keeps its `Disjoint`-only collapse. The
+whole r1 family goes silent, including the two rows a `class_ordering` fix could
+never have reached (r1d/r1e, unresolvable guards).
+
+r1g needed a second, smaller change. An in-source project class made
+`resolved_static_constant` decline the WHOLE predicate (`constant_shadowed`), so
+there was no fact to collapse against and the FP survived. The `is_a?` arm now
+takes the shadowed case as a NON-MINTABLE fact instead — the existing carrier for
+"assert but do not narrow", already used by `===` and `nil?`. rigor-rs still
+never narrows to a project nominal; it just stops pretending the guard was not
+written.
+
+Fixture `harness/corpus/91_qualified_witnessing.rb` (91 was free) carries the
+whole arc: 9 positives (p1a/p1c/r8/q5/u1/u2/p3c/p1e/p9a), 4 present-method
+controls (p7a/p7b/v1/q4b), 3 unwitnessable-guard controls (p2/p2b/p5), the 6
+collapsed shape rows (r1/r1b/r1f/r1d/r1e/r1g) as ABSENT lines, and 2
+anti-over-suppression rows. Every line was measured on the pinned reference
+first; live diff after S3 is byte-identical on all 11 diagnostics (line AND
+column), 0 gaps, 0 extras. Snapshot regenerated.
+
+| gate | result |
+|---|---|
+| `cargo test --offline` | 1068 pass / 0 fail |
+| `ruby harness/run.rb` | PASS — 0 unregistered extras; 350/379 (was 339/368) |
+| `ruby harness/run_snapshot.rb` | PASS |
+| `fp_audit.py --gaps --sweep` | **0 FP** |
+| `docs_check.py` (bare) | PASS, exit 0 |
+| clippy `-D warnings`, fresh target dir | clean |
+| gap census | 1127 → **1127**; 0 closed, 0 new |
+
+The r1 family is sweep-invisible (the shape does not occur in the corpora), so
+the census standing still is the expected result; the fix is proven by the unit
+and fixture rows.
+
+**One decline S3 costs, measured and accepted.** `h = []` then `h << 1` under an
+UNRESOLVABLE guard: the reference widens that carrier to a NOMINAL
+`Array[Dynamic[top]]` and therefore stays conservative and FIRES, while rigor-rs
+keeps the more precise SHAPE carrier, which now collapses. Silence, never a false
+positive — the fixture-85 carrier-fidelity family, out of scope here. The
+neighbouring `Array.new` and `h = *spec` spellings widen to a nominal on BOTH
+engines and stay pinned as must-fire. Zero census rows moved, so it costs nothing
+measurable.
+
+## Arc result
+
+| slice | census | sweep | notes |
+|---|---|---|---|
+| baseline (master `7d7ac1b`) | 1136 | 0 FP | |
+| S0 registry depth fix | 1136 | 0 FP | 0 closed, 0 new — the enabler |
+| S1 ancestor + attribute soundness | 1136 | 0 FP | 0 closed, 0 new — pure leniency |
+| S2 witness routing | **1127** | 0 FP | **9 closed, 0 new** |
+| S3 shaped-carrier collapse | 1127 | 0 FP | 0 closed, 0 new; fixes 6 FP shapes |
+
+Zero new gap rows at every step, sweep 0 FP at every step. The 7 blocked
+dependabot rows closed, plus 2 oracle-verified bonuses, and three FP families
+were removed on the way: the r1 shaped-carrier family (6 shapes), the sequential
+disjoint re-guard (pre-existing, both spellings), and the latent attribute /
+module-Object holes S1 closed before S2 could turn them into live ones.

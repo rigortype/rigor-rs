@@ -1,0 +1,82 @@
+{
+  "fixture": "harness/corpus/91_qualified_witnessing.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for File::Stat"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for URI::HTTP"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Bundler::Source::Git"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Digest::Instance"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 48,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Time"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Range"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 59,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for File::Stat"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 65,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for File::Stat"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 71,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for File::Stat"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 186,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 192,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1, 2]"
+    }
+  ]
+}

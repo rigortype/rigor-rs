@@ -3737,7 +3737,16 @@ impl<'i> Typer<'i> {
         };
         match (method.as_str(), args.len()) {
             ("is_a?" | "kind_of?" | "instance_of?", 1) => {
-                let class = self.resolved_static_constant(ast, args[0], *span)?;
+                // S3: a guard on a name the PROJECT declares is not mintable
+                // (this slice never narrows to a project nominal), but it must
+                // still be SEEN — the reference resolves it and collapses a
+                // shaped carrier against it (`v = [1, 2]` guarded by an
+                // in-source `Proj::Thing` is reference-SILENT, probe r1g).
+                // Declining the whole predicate, as this arm did before, left
+                // that as a live false positive. `mintable: false` is the
+                // existing carrier for "assert but do not narrow" (`===`,
+                // `nil?`).
+                let (class, mintable) = self.guard_constant(ast, args[0], *span)?;
                 let exact = method == "instance_of?";
                 // Stage 3a-3: the operand is EITHER a bare local (stages 1-2)
                 // OR a stable single-hop chain address off a local root
@@ -3760,7 +3769,7 @@ impl<'i> Typer<'i> {
                 let g = (target, GuardFact {
                     classes: vec![class],
                     exact,
-                    mintable: true,
+                    mintable,
                     chain_call,
                 });
                 Some((vec![g], Vec::new()))
@@ -3800,7 +3809,9 @@ impl<'i> Typer<'i> {
     /// Whether guarding `local` with `class_name` yields `Bot` in the reference.
     ///
     /// Three ways, and no fourth (see [`Typer::class_narrowing_pass`] for why
-    /// the `ClassOrdering::Unknown` arm is declined):
+    /// the `ClassOrdering::Unknown` arm is declined FOR A NOMINAL CARRIER — S3
+    /// measured that a Constant/Tuple/HashShape carrier collapses on `Unknown`
+    /// too, because its helper asks `subclass_of?` rather than `disjoint?`):
     /// 1. the local is ALREADY `Bot` — `narrow_class_other` / `narrow_other_class`
     ///    return `Bot` unchanged on both polarities, so a further guard cannot
     ///    revive it (probes `bot_then_match`, `bot_then_neg`);
@@ -3847,7 +3858,33 @@ impl<'i> Typer<'i> {
         if exact {
             return carrier != class_name;
         }
-        self.index.class_ordering(carrier, class_name) == ClassOrdering::Disjoint
+        // S3 (2026-08-08): the collapse condition is per-CARRIER-KIND, and it is
+        // NOT the same predicate for all of them — reading `narrow_class_dispatch`
+        // (`narrowing.rb:2311`) and probing the oracle both say so.
+        //
+        // * `narrow_shape_to_class` (`:2403`) and `narrow_constant_to_class`
+        //   (`:2364`) keep the carrier iff `subclass_of?(carrier, class_name)`,
+        //   i.e. iff the ordering is `Subclass`/`Equal`. `Unknown` therefore
+        //   COLLAPSES: a shaped carrier does not need the guard class to resolve.
+        // * `narrow_nominal_to_class` (`:2381`) is different — it PRESERVES the
+        //   bound on `Subclass` and stays conservative on `Unknown`, collapsing
+        //   only on `Disjoint`.
+        //
+        // Treating every carrier as the Nominal case (the pre-S3 code) left a
+        // live false positive: `v = [1, 2]; return unless v.is_a?(File::Stat);
+        // v.frobnicate_zzz` fired `for Array` where the reference is silent, and
+        // it fired for an UNRESOLVABLE guard too. Measured against the pinned
+        // reference on `[1, 2]` / `{a: 1}` carriers: `Enumerable`, `Object` and
+        // `Array` guards all FIRE (subclass/equal ⇒ the shape survives) while
+        // `File::Stat` and `Foo::Bar::Baz` are SILENT — which pins the condition
+        // as `subclass_of?`, not as "any shaped carrier collapses".
+        match interner.get(ty) {
+            Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) => !matches!(
+                self.index.class_ordering(carrier, class_name),
+                ClassOrdering::Subclass | ClassOrdering::Equal
+            ),
+            _ => self.index.class_ordering(carrier, class_name) == ClassOrdering::Disjoint,
+        }
     }
 
     /// The statically-known name of a `ConstantRead`/`ConstantPath` node (both
@@ -3880,6 +3917,29 @@ impl<'i> Typer<'i> {
             return None;
         }
         Some(self.resolve_constant_as_written(name, prefix))
+    }
+
+    /// [`Typer::resolved_static_constant`] for the `is_a?`/`instance_of?` arm,
+    /// which needs the SHADOWED case as a fact rather than as a decline:
+    /// `(resolved qualified key, mintable)`. `mintable` is `false` exactly when
+    /// the project declares the name in a lexically visible scope — the same
+    /// predicate `resolved_static_constant` declines on — so the guard can
+    /// collapse a precise carrier without ever narrowing TO a project nominal.
+    fn guard_constant(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        use_span: rigor_parse::Span,
+    ) -> Option<(String, bool)> {
+        let Node::ConstantRead { name, .. } = ast.get(id) else {
+            return None;
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let prefix = self.enclosing_prefix(use_span);
+        let shadowed = self.source.constant_shadowed(name, prefix);
+        Some((self.resolve_constant_as_written(name, prefix), !shadowed))
     }
 
     /// Resolve a guard constant's SOURCE SPELLING to the qualified key it names,

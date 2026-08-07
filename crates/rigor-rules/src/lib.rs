@@ -4365,6 +4365,30 @@ mod tests {
             &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    while false\n      0\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
             &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    begin\n      0\n    rescue\n      0\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
             &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h.push(3)\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            // S3 (2026-08-08): a SHAPED carrier collapses under any guard the
+            // ordering does not make it a subclass of — `Unknown` included,
+            // because `narrow_shape_to_class` asks `subclass_of?` rather than
+            // `disjoint?`. These five were LIVE false positives before S3
+            // (probes r1/r1b/r1f/r1d/r1e/r1g): a resolvable-disjoint qualified
+            // guard, the Hash-shaped carrier, the `if` form, an unresolvable
+            // top-level name, an unresolvable qualified name, and an in-source
+            // project class (which the mint declines to NARROW to but must
+            // still SEE — that is what `mintable: false` carries).
+            &b"def f\n  v = [1, 2]\n  return unless v.is_a?(File::Stat)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  v = { a: 1 }\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  v = [1, 2]\n  if v.is_a?(File::Stat)\n    v.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f\n  v = [1, 2]\n  return unless v.is_a?(Zorkmid)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  v = [1, 2]\n  return unless v.is_a?(Foo::Bar::Baz)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"module Proj\n  class Thing\n  end\nend\ndef f\n  v = [1, 2]\n  return unless v.is_a?(Proj::Thing)\n  v.frobnicate_zzz\nend\n"[..],
+            // A DECLINE S3 costs, measured and accepted: `h = []` then
+            // `h << 1` under an unresolvable guard. The reference widens that
+            // carrier to a NOMINAL `Array[Dynamic[top]]` and so stays
+            // conservative and FIRES, while rigor-rs keeps the more precise
+            // SHAPE carrier, which now collapses. Silence, not a false
+            // positive — the fixture-85 carrier-fidelity family, out of scope
+            // here. (`Array.new` and `h = *spec` widen to a nominal on BOTH
+            // engines and are pinned as must-fire above.)
+            &b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
         ] {
             let diags = run(src);
             assert!(
@@ -4394,14 +4418,21 @@ mod tests {
             (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "Array"),
             (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
             (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Hash"),
-            // a guard class the core hierarchy cannot RESOLVE — the declined
-            // `ClassOrdering::Unknown` arm. The reference collapses a SHAPE
-            // carrier here and we do not, so this is a documented residual FP
-            // for a Tuple; on a NOMINAL carrier the reference fires too, and
-            // that is the row this control pins (probes isa_nominal_unknown,
-            // x_arr_new_unk, x_arr_push_unk, x_splat_unk).
+            // a guard class the core hierarchy cannot RESOLVE — the
+            // `ClassOrdering::Unknown` arm, which S3 split by carrier kind. On
+            // a NOMINAL carrier the reference stays conservative and FIRES, and
+            // that is what these rows pin (probes isa_nominal_unknown,
+            // x_arr_new_unk, x_arr_push_unk, x_splat_unk). The SHAPE carrier's
+            // twin of this row is the opposite — collapsed — and lives in the
+            // silence test above.
             (&b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
-            (&b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            (&b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            // S3 anti-over-suppression: a SHAPED carrier under a guard it IS a
+            // subclass of survives and still witnesses. All three measured
+            // firing on the reference (`… for [1, 2]` / `… for { a: 1 }`).
+            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
+            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Object)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
+            (&b"def f\n  v = { a: 1 }\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Hash"),
             // the FALSEY edge of a disjoint guard is NOT narrowed
             // (`narrow_nominal_not_class` preserves it) — probes s_unless_body,
             // s_negated_if, s_case_when_else_branch
