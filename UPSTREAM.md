@@ -28,6 +28,17 @@ submodule rather than tracked against a drifting local checkout.
 > instance method resolves to the receiver's class.
 > [note](docs/notes/20260731-upstream-pin-v031-rbs41.md).
 
+> **Held at `v0.3.1` as of 2026-08-07**, upstream master `80aaf9bc` (+150,
+> still no tag). Measured: the 150 commits move **2 diagnostics on 9204 files**
+> (a drop, upstream #239; an add bisected to `c7f28da1`/#271 that is a new
+> upstream FP) and rigor-rs is silent at both — 0 FP / 1193 gaps against either
+> oracle. The tip's rbs 4.1.0 → 4.1.1 bump ships **byte-identical** `core/` +
+> `stdlib/`, so step 3's re-vendor would be a no-op and
+> `UNBUILDABLE_DEFINITIONS` does not move. When a tag lands, the bump's only
+> real repo work is deleting fixture 79 + its registry entry (master is past
+> `9515c8f8`) and copying `data/core_overlay/resolv.rbs` into the overlay.
+> [survey](docs/notes/20260807-upstream-survey-v031-to-master.md).
+
 > Previous pin: `v0.3.0` (`5802c990`). Before it, `7a69f142` (the v0.3.0 RC);
 > that 42-commit bump was behaviour-neutral in every shipped profile, its only
 > delta being 4 reference-only diagnostics traced by bisect to `861b08b9`
