@@ -2502,7 +2502,10 @@ impl<'i> Typer<'i> {
         writes.extend(indexed_flow_writes(ast, self.source));
         let mut tenv = TypeEnv::new();
         let mut cenv: HashMap<String, String> = HashMap::new();
-        self.class_flow_scope(ast, &body, &mut tenv, &mut cenv, &writes, interner, &mut out, true);
+        let coarse = coarse_locals(ast, &body);
+        self.class_flow_scope(
+            ast, &body, &mut tenv, &mut cenv, &coarse, &writes, interner, &mut out, true,
+        );
         out
     }
 
@@ -2518,13 +2521,14 @@ impl<'i> Typer<'i> {
         stmts: &[NodeId],
         tenv: &mut TypeEnv,
         cenv: &mut HashMap<String, String>,
+        coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
         stmt_position: bool,
     ) {
         for &s in stmts {
-            self.class_flow_stmt(ast, s, tenv, cenv, writes, interner, out, stmt_position);
+            self.class_flow_stmt(ast, s, tenv, cenv, coarse, writes, interner, out, stmt_position);
         }
     }
 
@@ -2536,6 +2540,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         tenv: &mut TypeEnv,
         cenv: &mut HashMap<String, String>,
+        coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
@@ -2544,7 +2549,7 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::Statements { body, .. } => {
                 let body = body.clone();
-                self.class_flow_scope(ast, &body, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_scope(ast, &body, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             // An assignment RHS keeps the statement's own position (oracle
             // probes s8/p1 for `=`, x3 for a multi-write, x4 for an op-write:
@@ -2553,7 +2558,7 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 // Record uses in the RHS BEFORE rebinding — the RHS reads the
                 // pre-write fact (`value = value.frobnicate if value.is_a?(…)`).
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
                 // Rebinding invalidates the narrowing (probe a4; `scope.rb:194`).
@@ -2561,7 +2566,7 @@ impl<'i> Typer<'i> {
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     cenv.remove(&name);
@@ -2570,13 +2575,13 @@ impl<'i> Typer<'i> {
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 cenv.remove(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
             Node::Call { .. } => {
-                self.class_flow_expr(ast, id, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_expr(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             // A `return E` evaluates its values in the current facts (`return
             // value.frobnicate if …` must witness). No fact effect: statements
@@ -2590,23 +2595,28 @@ impl<'i> Typer<'i> {
             Node::Return { values, .. } => {
                 let values = values.clone();
                 for v in values {
-                    self.class_flow_expr(ast, v, tenv, cenv, writes, interner, out, false);
+                    self.class_flow_expr(ast, v, tenv, cenv, coarse, writes, interner, out, false);
                 }
             }
             Node::If { .. } => {
-                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_if(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             Node::Case { .. } => {
-                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_case(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             Node::Definition { body, .. }
             | Node::ClassDef { body, .. }
             | Node::ModuleDef { body, .. } => {
-                // Independent scope: fresh envs, no effect on the enclosing one.
+                // Independent scope: fresh envs (INCLUDING a freshly computed
+                // coarse-carrier set — local NAMES do not cross a `def`/`class`
+                // boundary), no effect on the enclosing one.
                 let body = body.clone();
                 let mut t = TypeEnv::new();
                 let mut c: HashMap<String, String> = HashMap::new();
-                self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out, true);
+                let inner = coarse_locals(ast, &body);
+                self.class_flow_scope(
+                    ast, &body, &mut t, &mut c, &inner, writes, interner, out, true,
+                );
             }
             // ---- stage 3b-1 (docs/notes/20260807-narrowing-stage3-spec.md) ----
             // Every arm below either DESCENDS to record uses under facts the
@@ -2688,7 +2698,7 @@ impl<'i> Typer<'i> {
                 for name in &bound {
                     cenv.remove(name);
                 }
-                self.class_flow_scope(ast, &body, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_scope(ast, &body, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 widen_flow_writes(writes, span, tenv, interner);
                 cenv.clear();
             }
@@ -2709,7 +2719,7 @@ impl<'i> Typer<'i> {
             Node::Loop { predicate, span, .. } => {
                 let (predicate, span) = (*predicate, *span);
                 if let Some(p) = predicate {
-                    self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out, false);
+                    self.class_flow_expr(ast, p, tenv, cenv, coarse, writes, interner, out, false);
                 }
                 widen_flow_writes(writes, span, tenv, interner);
                 cenv.clear();
@@ -2726,8 +2736,8 @@ impl<'i> Typer<'i> {
             // keeps it).
             Node::Logical { left, right, span, .. } => {
                 let (left, right, span) = (*left, *right, *span);
-                self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out, false);
-                self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out, false);
+                self.class_flow_expr(ast, left, tenv, cenv, coarse, writes, interner, out, false);
+                self.class_flow_expr(ast, right, tenv, cenv, coarse, writes, interner, out, false);
                 widen_flow_writes(writes, span, tenv, interner);
                 kill_cenv_writes(writes, span, cenv);
             }
@@ -2760,6 +2770,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         tenv: &mut TypeEnv,
         cenv: &mut HashMap<String, String>,
+        coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
@@ -2775,7 +2786,7 @@ impl<'i> Typer<'i> {
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
                 // A receiver is EXPRESSION position (probes s5-s7, s11, p3).
                 if let Some(r) = receiver {
-                    self.class_flow_expr(ast, r, tenv, cenv, writes, interner, out, false);
+                    self.class_flow_expr(ast, r, tenv, cenv, coarse, writes, interner, out, false);
                 }
                 // Record the use: a plain (not safe-nav) call on a bare local
                 // currently narrowed to `C`. Recorded BEFORE any invalidation
@@ -2792,7 +2803,7 @@ impl<'i> Typer<'i> {
                 }
                 // An argument is EXPRESSION position (probes s9, s13, p2).
                 for a in &args {
-                    self.class_flow_expr(ast, *a, tenv, cenv, writes, interner, out, false);
+                    self.class_flow_expr(ast, *a, tenv, cenv, coarse, writes, interner, out, false);
                 }
                 if !block_body.is_empty() {
                     // Block-scope discipline (ADR-0038 §3): descend with a FRESH
@@ -2816,7 +2827,7 @@ impl<'i> Typer<'i> {
                         let mut btenv = tenv.clone();
                         let mut bcenv: HashMap<String, String> = HashMap::new();
                         self.class_flow_scope(
-                            ast, &block_body, &mut btenv, &mut bcenv, writes, interner, out, true,
+                            ast, &block_body, &mut btenv, &mut bcenv, coarse, writes, interner, out, true,
                         );
                     }
                     cenv.clear();
@@ -2839,8 +2850,8 @@ impl<'i> Typer<'i> {
                 // conditionally-executed rebind inside the operands is killed
                 // by span, exactly as the `Call` arm does.
                 let (left, right, span) = (*left, *right, *span);
-                self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out, false);
-                self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out, false);
+                self.class_flow_expr(ast, left, tenv, cenv, coarse, writes, interner, out, false);
+                self.class_flow_expr(ast, right, tenv, cenv, coarse, writes, interner, out, false);
                 kill_cenv_writes(writes, span, cenv);
             }
             // A write in EXPRESSION position (`f(value = x, value.frobnicate)`)
@@ -2852,14 +2863,14 @@ impl<'i> Typer<'i> {
             // statement arms.
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, false);
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
                 cenv.remove(&name);
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, false);
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     cenv.remove(&name);
@@ -2868,7 +2879,7 @@ impl<'i> Typer<'i> {
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, false);
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 cenv.remove(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
@@ -2880,7 +2891,7 @@ impl<'i> Typer<'i> {
             // (`eval_if:481`) and unprobed for expression position (R2), so it
             // is gated off here.
             Node::If { .. } => {
-                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out, false);
+                self.class_flow_if(ast, id, tenv, cenv, coarse, writes, interner, out, false);
             }
             // A `case` in an ASSIGNMENT RHS narrows its clause bodies like a
             // statement `case` (probe p1) — hence `stmt_position` rather than a
@@ -2889,7 +2900,7 @@ impl<'i> Typer<'i> {
             // p7). Unlike `if`/ternary, which narrows its branches in EVERY
             // position (p4, p8) and so is left alone.
             Node::Case { .. } => {
-                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_case(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             // ---- stage 3b-1: pure-descent expression containers ------------
             // Recording a narrowed use is position-INDEPENDENT (probe f3), so
@@ -2903,13 +2914,13 @@ impl<'i> Typer<'i> {
             Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
                 let elements = elements.clone();
                 for e in elements {
-                    self.class_flow_expr(ast, e, tenv, cenv, writes, interner, out, false);
+                    self.class_flow_expr(ast, e, tenv, cenv, coarse, writes, interner, out, false);
                 }
             }
             Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
                 let parts = parts.clone();
                 for p in parts {
-                    self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out, false);
+                    self.class_flow_expr(ast, p, tenv, cenv, coarse, writes, interner, out, false);
                 }
             }
             // A `Statements` carrier (the `collect_recoverable_children`
@@ -2920,7 +2931,7 @@ impl<'i> Typer<'i> {
             // d25/g6/d20). The `BeginRescue` arm's bound-name kill and its
             // post-clear apply here too.
             Node::Statements { .. } | Node::BeginRescue { .. } => {
-                self.class_flow_stmt(ast, id, tenv, cenv, writes, interner, out, stmt_position);
+                self.class_flow_stmt(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             _ => {}
         }
@@ -2942,6 +2953,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         tenv: &mut TypeEnv,
         cenv: &mut HashMap<String, String>,
+        coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
@@ -2954,15 +2966,20 @@ impl<'i> Typer<'i> {
         let (then_body, else_body) = (then_body.clone(), else_body.clone());
         // The predicate is evaluated first, in the current facts (its own calls
         // may read an OUTER narrowing) — EXPRESSION position.
-        self.class_flow_expr(ast, predicate, tenv, cenv, writes, interner, out, false);
+        self.class_flow_expr(ast, predicate, tenv, cenv, coarse, writes, interner, out, false);
         // Recognise the guard, gated on the local currently being Dynamic/Top
-        // (`narrow_class_other`: every other carrier is out of scope).
-        let narrow = self.class_check_predicate(ast, predicate).filter(|(local, _)| {
-            match tenv.get(local) {
+        // (`narrow_class_other`: every other carrier is out of scope) AND on
+        // the local's BINDING being a carrier both engines type Dynamic/Top
+        // ([`coarse_locals`] — docs/notes/20260808-narrowing-carrier-fidelity-fp
+        // .md: our Dynamic is coarser than theirs, so "Dynamic-only" is a
+        // subset rule only over the measured-agreeing carriers).
+        let narrow = self
+            .class_check_predicate(ast, predicate)
+            .filter(|(local, _)| !coarse.contains(local))
+            .filter(|(local, _)| match tenv.get(local) {
                 None => true, // unbound ⇒ untyped (Dynamic[top])
                 Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
-            }
-        });
+            });
         // Review R3: a guard CONFLICTING with an existing DIFFERENT-class fact
         // is out of the envelope — at that point the reference's carrier is
         // `Nominal[C1]`, not Dynamic (`narrow_nominal_to_class` on a disjoint
@@ -2990,13 +3007,13 @@ impl<'i> Typer<'i> {
             // (probe x2), while a statement `if`'s branches stay statement
             // position (probe x5). The branch-internal narrowing itself is
             // never position-gated (p4, p8).
-            self.class_flow_scope(ast, truthy, &mut t, &mut c, writes, interner, out, stmt_position);
+            self.class_flow_scope(ast, truthy, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
         }
         {
             // The falsey edge is NEVER narrowed (`narrow_class_other`: unchanged).
             let mut t = tenv.clone();
             let mut c = cenv.clone();
-            self.class_flow_scope(ast, falsey, &mut t, &mut c, writes, interner, out, stmt_position);
+            self.class_flow_scope(ast, falsey, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
         }
         // Conservative join: widen every local written inside the conditional
         // and clear ALL facts (a fact never survives a branch merge in this
@@ -3103,6 +3120,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         tenv: &mut TypeEnv,
         cenv: &mut HashMap<String, String>,
+        coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
@@ -3116,7 +3134,7 @@ impl<'i> Typer<'i> {
         // The subject evaluates first, in the current facts — EXPRESSION
         // position (it is the `case`'s operand, not a statement).
         if let Some(p) = predicate {
-            self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out, false);
+            self.class_flow_expr(ast, p, tenv, cenv, coarse, writes, interner, out, false);
         }
         // The narrowing subject: a bare local currently Dynamic/Top — and only
         // in statement position / on an assignment RHS (p2, p3, p7 decline).
@@ -3126,6 +3144,7 @@ impl<'i> Typer<'i> {
                 Node::LocalVariableRead { name, .. } => Some(name.clone()),
                 _ => None,
             })
+            .filter(|local| !coarse.contains(local))
             .filter(|local| match tenv.get(local) {
                 None => true, // unbound ⇒ untyped (Dynamic[top])
                 Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
@@ -3144,7 +3163,7 @@ impl<'i> Typer<'i> {
             // Conditions evaluate under the un-narrowed facts (they decide the
             // edge; a call condition still records its own uses).
             for &cond in &conditions {
-                self.class_flow_expr(ast, cond, &mut t, &mut c, writes, interner, out, false);
+                self.class_flow_expr(ast, cond, &mut t, &mut c, coarse, writes, interner, out, false);
             }
             if let (Some(local), [only]) = (&subject, conditions.as_slice()) {
                 if let Some(class) = self.resolved_static_constant(ast, *only, case_span) {
@@ -3161,14 +3180,14 @@ impl<'i> Typer<'i> {
             }
             // Clause bodies INHERIT the `case`'s position: a block inside an
             // expression-position clause narrows nothing (probe x1).
-            self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out, stmt_position);
+            self.class_flow_scope(ast, &body, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
         }
         {
             // The `else` body is a NEGATIVE edge — never narrowed.
             let mut t = tenv.clone();
             let mut c = cenv.clone();
             self.class_flow_scope(
-                ast, &else_body, &mut t, &mut c, writes, interner, out, stmt_position,
+                ast, &else_body, &mut t, &mut c, coarse, writes, interner, out, stmt_position,
             );
         }
         widen_flow_writes(writes, case_span, tenv, interner);
@@ -3775,6 +3794,133 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         Node::Statements { body, .. } => branch_terminates(ast, body),
         _ => false,
     }
+}
+
+/// Is `id` a binding VALUE whose carrier BOTH engines type `Dynamic`/`Top`?
+///
+/// The allow-list half of the carrier-fidelity fix
+/// (docs/notes/20260808-narrowing-carrier-fidelity-fp.md). `narrow_class_other`
+/// narrows a `Dynamic`/`Top` carrier only, so "we narrow only Dynamic" is a
+/// SUBSET rule exactly while `Dynamic` means the same thing in both engines —
+/// and it does not: rigor-rs collapses to `Dynamic[top]` a long tail of
+/// carriers the reference types precisely (a `Logical` union, a `Range`, a
+/// `Proc`, `self`, a `case`/`if` union, `defined?`, a loop's `nil`, …). On each
+/// of those our gate fires where theirs declines — a live false positive.
+///
+/// Enumerating the coarse carriers is a losing game (`__method__`, `proc { }`,
+/// `binding` and `defined?` all hide inside the same `Call`/`Statements`
+/// carriers as the safe shapes), so the gate is an ALLOW-list instead, and every
+/// member is oracle-measured as FIRING on the reference:
+///
+/// - a bare local that is itself narrowable (a parameter, or bound to a member
+///   of this list) — `ctrl_param`, `ctrl_unbound`, `blockparam`, `allow_kwarg`,
+///   `allow_optarg`, `allow_restarg`, `allow_block_arg`;
+/// - an `@ivar` / `@@cvar` / `$gvar` read — the reference types none of them
+///   (`ivar_read`, `gvar_read`, `cvar_read`);
+/// - a call THROUGH such a receiver: an untyped receiver resolves no method on
+///   either side, so the result is untyped on both (`plain_call_dyn`,
+///   `index_read`, `safenav`, `block_call_dyn`, `call_chain`, `call_ivar_recv`,
+///   `call_gvar_recv`, `allow_param_index`). `self` is deliberately NOT a
+///   narrowable receiver — the reference resolves an in-source method through
+///   it and gets that method's real return (`call_self_recv` is an FP), and
+///   neither is a `ConstantRead` (`recv_const_float`).
+///
+/// Everything else declines. That costs coverage on carriers the reference does
+/// narrow (`yield`, `super`, an implicit-self call, a `begin`/`ensure` value, a
+/// `case` with no `else`, a constant receiver) — a strict subset, never an FP.
+fn narrowable_binding(ast: &LoweredAst, id: NodeId, coarse: &HashSet<String>, depth: u32) -> bool {
+    if depth == 0 {
+        return false;
+    }
+    match ast.get(id) {
+        Node::LocalVariableRead { name, .. } => !coarse.contains(name),
+        Node::VariableRead { .. } => true,
+        Node::Call { receiver: Some(r), .. } => {
+            narrowable_binding(ast, *r, coarse, depth - 1)
+        }
+        _ => false,
+    }
+}
+
+/// The local names in ONE scope whose binding is not a [`narrowable_binding`] —
+/// the set the `is_a?`/`case-when` gate refuses to narrow.
+///
+/// Scope-wide rather than flow-sensitive: a name coarse at ANY binding site in
+/// the scope is coarse throughout it. That is deliberately conservative (a
+/// rebind never resurrects narrowability) and needs no extra env threading.
+/// The scope is delimited by its statements' byte range MINUS the range of every
+/// nested `def`/`class`/`module`, whose locals are their own scope's business
+/// (each gets its own `coarse_locals` call).
+///
+/// Three binding kinds enter the set:
+/// - a `LocalVariableWrite` whose value is not a narrowable carrier;
+/// - EVERY `LocalVariableOpWrite` (`h ||= {}` is a union on the reference —
+///   probe `logical_orassign` — and our op-write arm types it `Dynamic[top]`);
+/// - every `rescue => e` capture (the reference binds the exception CLASS).
+///
+/// `MultiWrite` targets are deliberately absent: destructuring loses precision
+/// on both sides, and all three measured shapes (`multiwrite`, `mw_from_call`,
+/// `mw_from_logical`) fire on the reference.
+fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
+    let mut coarse: HashSet<String> = HashSet::new();
+    let Some(lo) = body.iter().map(|&s| ast.get(s).span().0).min() else {
+        return coarse;
+    };
+    let hi = body.iter().map(|&s| ast.get(s).span().1).max().unwrap_or(lo);
+    let nested: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter(|(_, n)| {
+            matches!(
+                n,
+                Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. }
+            )
+        })
+        .map(|(_, n)| n.span())
+        .filter(|s| lo <= s.0 && s.1 <= hi)
+        .collect();
+    let inside = |sp: rigor_parse::Span| {
+        lo <= sp.0 && sp.1 <= hi && !nested.iter().any(|n| n.0 <= sp.0 && sp.1 <= n.1)
+    };
+    // (name, Some(value)) — narrowable iff the value is; (name, None) —
+    // unconditionally coarse.
+    let mut bindings: Vec<(String, Option<NodeId>)> = Vec::new();
+    for (_, n) in ast.iter() {
+        match n {
+            Node::LocalVariableWrite { name, value, span, .. } if inside(*span) => {
+                bindings.push((name.clone(), Some(*value)));
+            }
+            Node::LocalVariableOpWrite { name, span, .. } if inside(*span) => {
+                bindings.push((name.clone(), None));
+            }
+            Node::BeginRescue { clauses, span, .. } if inside(*span) => {
+                for c in clauses {
+                    if let Some(b) = &c.bound_name {
+                        bindings.push((b.clone(), None));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Fixpoint: a name whose value reads a name that just became coarse is
+    // itself coarse. Monotone (the set only grows), so it terminates.
+    loop {
+        let mut changed = false;
+        for (name, value) in &bindings {
+            if coarse.contains(name) {
+                continue;
+            }
+            let ok = value.is_some_and(|v| narrowable_binding(ast, v, &coarse, 32));
+            if !ok {
+                coarse.insert(name.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    coarse
 }
 
 /// Kill the class-narrowing fact of every local whose recorded write/mutation
@@ -5980,6 +6126,199 @@ mod class_narrowing_tests {
         }
     }
 
+    /// CARRIER FIDELITY (docs/notes/20260808-narrowing-carrier-fidelity-fp.md):
+    /// the `narrow_class_other` Dynamic-only gate is a SUBSET rule only over
+    /// carriers both engines type `Dynamic`/`Top`. rigor-rs collapses a long
+    /// tail of carriers to `Dynamic[top]` that the reference types precisely, so
+    /// on those our gate fires where theirs declines. [`coarse_locals`] +
+    /// [`narrowable_binding`] turn the gate into an ALLOW-list; this matrix pins
+    /// every measured member and every measured decline.
+    ///
+    /// Every row is oracle-measured against the pinned reference from a fresh
+    /// cwd with `--no-cache`. `Some(c)` — the reference FIRES and rigor-rs must
+    /// record `c`. `None` — rigor-rs must record NOTHING, either because the
+    /// reference is SILENT (a would-be false positive: the `fp*` rows) or
+    /// because the decline costs coverage the reference has (the `cost*` rows,
+    /// a strict subset).
+    #[test]
+    fn class_narrowing_carrier_fidelity_matrix() {
+        // The guard/use tail every row shares. `if`/ternary narrows in every
+        // position (p4/p8), so the row's whole point is the local's BINDING.
+        const G: &str = "  h.is_a?(Hash) ? h.frobnicate_zzz : h\n";
+        let bound = |expr: &str| format!("def f(spec, list, cond)\n  h = {expr}\n{G}end\n");
+        let rows: Vec<(&str, String, Option<&str>)> = vec![
+            // ---- ALLOW-list: measured Dynamic on BOTH engines ---------------
+            // A method / block / keyword / optional / rest / block parameter.
+            ("ok_param", format!("def f(h)\n{G}end\n"), Some("Hash")),
+            ("ok_kwarg", format!("def f(k: nil)\n  h = k\n{G}end\n"), Some("Hash")),
+            ("ok_optarg", format!("def f(o = nil)\n  h = o\n{G}end\n"), Some("Hash")),
+            ("ok_restarg", format!("def f(*a)\n  h = a\n{G}end\n"), Some("Hash")),
+            ("ok_blockarg", format!("def f(&blk)\n  h = blk\n{G}end\n"), Some("Hash")),
+            // `@ivar` / `$gvar` / `@@cvar` reads — the reference types none.
+            ("ok_ivar", bound("@x"), Some("Hash")),
+            ("ok_gvar", bound("$gx"), Some("Hash")),
+            (
+                "ok_cvar",
+                format!("class C\n  def f\n    h = @@cx\n  {G}  end\nend\n"),
+                Some("Hash"),
+            ),
+            // A call THROUGH a narrowable receiver (an untyped receiver resolves
+            // no method on either side), incl. safe-nav, a block, `[]`, chains.
+            ("ok_call", bound("spec.unknown_zzz"), Some("Hash")),
+            ("ok_call_chain", bound("spec.foo_zzz.bar_zzz"), Some("Hash")),
+            ("ok_call_index", bound("spec[0]"), Some("Hash")),
+            ("ok_call_safenav", bound("spec&.dup"), Some("Hash")),
+            ("ok_call_block", bound("spec.map { |x| x }"), Some("Hash")),
+            ("ok_call_ivar_recv", bound("@obj.foo_zzz"), Some("Hash")),
+            ("ok_call_gvar_recv", bound("$gobj.foo_zzz"), Some("Hash")),
+            // Destructuring loses precision on BOTH sides — even from a Logical.
+            ("ok_multiwrite", format!("def f(spec)\n  a, h = spec\n{G}end\n"), Some("Hash")),
+            (
+                "ok_multiwrite_logical",
+                format!("def f(spec)\n  a, h = (spec || {{}})\n{G}end\n"),
+                Some("Hash"),
+            ),
+            // ---- DECLINES that close a live FP (reference SILENT) -----------
+            // `Logical`: the measured archetype. `analyse_or` builds a UNION.
+            ("fp_or", bound("spec || {}"), None),
+            ("fp_and", bound("spec && {}"), None),
+            ("fp_or_nested", bound("(spec || other_zzz) || {}"), None),
+            ("fp_paren", bound("(spec || {})"), None),
+            ("fp_opwrite", format!("def f(spec)\n  h = spec\n  h ||= {{}}\n{G}end\n"), None),
+            // A project method whose return TAIL is a `Logical` — reached
+            // through an implicit-self call and through `self.`.
+            (
+                "fp_insource_logical",
+                format!("def mk\n  unknown_zzz || {{}}\nend\n\ndef f\n  h = mk\n{G}end\n"),
+                None,
+            ),
+            (
+                "fp_self_insource_logical",
+                format!(
+                    "class C\n  def f\n    h = self.mk\n  {G}  end\n\n  def mk\n    unknown_zzz || {{}}\n  end\nend\n"
+                ),
+                None,
+            ),
+            (
+                "fp_recv_insource_logical",
+                format!(
+                    "class D\n  def mk\n    unknown_zzz || {{}}\n  end\nend\n\ndef f\n  d = D.new\n  h = d.mk\n{G}end\n"
+                ),
+                None,
+            ),
+            // A loop's value (`nil` on the reference).
+            ("fp_while", format!("def f(cond)\n  h = while cond\n    break({{}})\n  end\n{G}end\n"), None),
+            ("fp_for", format!("def f(list)\n  h = for i in list\n    nil\n  end\n{G}end\n"), None),
+            // `begin`/`rescue` and the `rescue` modifier — a UNION.
+            (
+                "fp_beginrescue",
+                format!("def f(spec)\n  h = begin\n    spec\n  rescue StandardError\n    {{}}\n  end\n{G}end\n"),
+                None,
+            ),
+            ("fp_rescue_mod", bound("(spec rescue {})"), None),
+            // A `rescue => e` capture: the reference binds the exception CLASS.
+            (
+                "fp_rescue_bind",
+                format!("def f\n  begin\n    nil\n  rescue StandardError => h\n  {G}  end\nend\n"),
+                None,
+            ),
+            // `case`/`in` and `if`/ternary AS EXPRESSIONS — a UNION the
+            // reference keeps and our `Algebra::join` collapses into Dynamic.
+            (
+                "fp_case",
+                format!("def f(cond, spec)\n  h = case cond\n  when 1 then spec\n  else {{}}\n  end\n{G}end\n"),
+                None,
+            ),
+            (
+                "fp_case_in",
+                format!("def f(cond, spec)\n  h = case cond\n  in Integer then spec\n  else {{}}\n  end\n{G}end\n"),
+                None,
+            ),
+            ("fp_ternary", bound("cond ? spec : {}"), None),
+            (
+                "fp_if",
+                format!("def f(cond, spec)\n  h = if cond\n    spec\n  else\n    {{}}\n  end\n{G}end\n"),
+                None,
+            ),
+            // `Range`, `self`, a lambda/proc — all precisely typed by the
+            // reference, all `Dynamic[top]` here.
+            ("fp_range_lit", bound("(1..2)"), None),
+            ("fp_range_dyn", bound("(spec..spec)"), None),
+            ("fp_self", format!("class C\n  def f\n    h = self\n  {G}  end\nend\n"), None),
+            ("fp_lambda", bound("->(x) { x }"), None),
+            ("fp_proc", bound("proc { |x| x }"), None),
+            // Kernel methods with a precise RBS return, reached receiverless —
+            // the reason an implicit-self call cannot be allow-listed.
+            ("fp_method_ref", bound("__method__"), None),
+            ("fp_binding", bound("binding"), None),
+            ("fp_caller", bound("caller"), None),
+            ("fp_block_given", bound("block_given?"), None),
+            // `defined?` (`String?`), a `*splat` (`Array`), a `return` operand.
+            ("fp_defined", bound("defined?(spec)"), None),
+            ("fp_splat", bound("*spec"), None),
+            ("fp_return", bound("(return {} if cond)"), None),
+            // A receiver the reference types precisely enough to resolve the
+            // method on: `self`, a constant.
+            ("fp_const_recv", bound("Float::INFINITY.abs"), None),
+            // ---- DECLINES that COST coverage (reference FIRES) --------------
+            ("cost_yield", format!("def f\n  h = yield\n{G}end\n"), None),
+            ("cost_super", format!("class C\n  def f\n    h = super\n  {G}  end\nend\n"), None),
+            ("cost_implicit_self", bound("unknown_zzz"), None),
+            (
+                "cost_implicit_self_insource",
+                format!("def mk\n  unknown_zzz\nend\n\ndef f\n  h = mk\n{G}end\n"),
+                None,
+            ),
+            ("cost_const_read", bound("XCONST_ZZZ"), None),
+            ("cost_const_recv", bound("File.foo_zzz"), None),
+            ("cost_str_recv", bound("\"s\".foo_zzz"), None),
+            ("cost_self_recv", format!("class C\n  def f\n    h = self.unknown_zzz\n  {G}  end\nend\n"), None),
+            (
+                "cost_call_on_coarse",
+                format!("def f(spec)\n  a = spec || {{}}\n  h = a.dup\n{G}end\n"),
+                None,
+            ),
+            (
+                "cost_case_noelse",
+                format!("def f(cond, spec)\n  h = case cond\n  when 1 then spec\n  end\n{G}end\n"),
+                None,
+            ),
+            (
+                "cost_begin_ensure",
+                format!("def f(spec)\n  h = begin\n    spec\n  ensure\n    nil\n  end\n{G}end\n"),
+                None,
+            ),
+        ];
+        for (row, src, expected) in &rows {
+            let (ast, snaps) = class_snaps(src.as_bytes());
+            let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
+            assert_eq!(got, *expected, "carrier-fidelity row {row}");
+        }
+    }
+
+    /// The coarse-carrier decline is SCOPED: a name made coarse in one `def`
+    /// must not disable narrowing for the same name in another `def` (a
+    /// whole-file set would silence common names like `h`/`value` project-wide).
+    #[test]
+    fn class_narrowing_coarse_set_is_per_scope() {
+        let src = b"def a(spec)\n  h = spec || {}\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n\ndef b(h)\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n";
+        let (ast, snaps) = class_snaps(src);
+        let calls: Vec<NodeId> = ast
+            .iter()
+            .filter_map(|(id, n)| match n {
+                Node::Call { method, .. } if method == "frobnicate_zzz" => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(snaps.get(&calls[0]), None, "the Logical-bound `h` must decline");
+        assert_eq!(
+            snaps.get(&calls[1]).map(String::as_str),
+            Some("Hash"),
+            "the parameter `h` in another def must still narrow"
+        );
+    }
+
     /// STAGE 3b-1 (docs/notes/20260807-narrowing-stage3-spec.md § "3b-1"): the
     /// unmodeled-statement-form decision table. Every row was measured against
     /// the pinned reference from a fresh cwd with `--no-cache` — `Some(c)` means
@@ -6011,14 +6350,19 @@ mod class_narrowing_tests {
                 "v = $stdin\nif v.is_a?(String)\n  XCONST_ZZZ = v.frobnicate_zzz\nend\n".to_string(),
                 None,
             ),
-            // The two SWEEP FPs the d4-d7 decline retires, reduced. Both are
-            // `narrow_class_other` carrier gaps: rigor-rs types a `Logical`
+            // The two SWEEP FPs that forced the d4-d7 decline, reduced. Both
+            // are `narrow_class_other` carrier gaps: rigor-rs typed a `Logical`
             // (fp1) and a project-method return ending in one (fp2) as
             // `Dynamic[top]` where the reference produces a union, so the
-            // reference's Dynamic-only gate declines and ours would not.
-            // MASTER emits both for a bare-statement use — the gap is
-            // orthogonal to this slice, and these rows fail loudly if d4-d7 is
-            // ever re-enabled without closing it first.
+            // reference's Dynamic-only gate declined and ours did not.
+            //
+            // The gap is CLOSED as of the carrier-fidelity fix
+            // (docs/notes/20260808-narrowing-carrier-fidelity-fp.md): both
+            // shapes now decline on the CARRIER, at the guard, in every
+            // statement form — see `class_narrowing_carrier_fidelity_matrix`
+            // and the rules-layer `coarse_carrier_narrowing_is_silent_end_to_end`.
+            // These rows stay pinned here as the d4-d7 regression tripwire;
+            // re-enabling that arm is its own slice and its own gate run.
             (
                 "fp1",
                 "def f(spec)\n  h = spec || {}\n  @spec = h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"

@@ -1,0 +1,138 @@
+{
+  "fixture": "harness/corpus/85_narrowing_carrier_fidelity.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 24,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `frobnicate_aaa' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_bbb' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ccc' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ddd' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_eee' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 55,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_fff' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 60,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ggg' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 65,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_hhh' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 70,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_iii' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 75,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_jjj' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 81,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_kkk' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 86,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_lll' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 93,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate_mmm' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 218,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 239,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 246,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 255,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 132,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `fetch_options_zzz`. If a project file defines `fetch_options_zzz` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 245,
+      "column": 7,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `totally_unknown_zzz`. If a project file defines `totally_unknown_zzz` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

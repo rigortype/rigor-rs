@@ -4021,6 +4021,93 @@ mod tests {
         assert_eq!(&src[d.start_offset..d.end_offset], b"frobnicate_zzz");
     }
 
+    /// CARRIER FIDELITY (docs/notes/20260808-narrowing-carrier-fidelity-fp.md),
+    /// END TO END. `narrow_class_other` narrows a `Dynamic`/`Top` carrier only,
+    /// so "we narrow only Dynamic" is a subset rule exactly while `Dynamic`
+    /// means the same thing on both engines — and it does not. Every source
+    /// below is oracle-measured SILENT on the pinned reference (fresh cwd,
+    /// `--no-cache`) and emitted `undefined method 'frobnicate_zzz' for Hash`
+    /// on master: a live violation of the sound-subset contract (ADR-0002).
+    #[test]
+    fn coarse_carrier_narrowing_is_silent_end_to_end() {
+        // fp1 — the note's archetype (gitlab-foss `spec_hash = spec || {}`),
+        // in the bare-statement form and in the ivar-write form.
+        assert!(run(b"def f(spec)\n  h = spec || {}\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n")
+            .is_empty());
+        assert!(run(
+            b"def f(spec)\n  h = spec || {}\n  @spec = h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"
+        )
+        .is_empty());
+        // fp1' — the `raise`-guard early-return form of the same carrier.
+        assert!(run(
+            b"def f(spec)\n  h = spec || {}\n  raise ArgumentError unless h.is_a?(Hash)\n\n  h.frobnicate_zzz\nend\n"
+        )
+        .is_empty());
+        // fp2 — a project method whose return TAIL is a `Logical`.
+        assert!(run(
+            b"class C\n  def config\n    c = mk\n    raise ArgumentError unless c.is_a?(Hash)\n\n    @config = c.frobnicate_zzz\n  end\n\n  def mk\n    unknown_zzz || {}\n  end\nend\n"
+        )
+        .is_empty());
+        // The rest of the audited carriers the reference types precisely.
+        for src in [
+            &b"def f(cond)\n  h = while cond\n    break({})\n  end\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(spec)\n  h = begin\n    spec\n  rescue StandardError\n    {}\n  end\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(cond, spec)\n  h = case cond\n  when 1 then spec\n  else {}\n  end\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(cond, spec)\n  h = cond ? spec : {}\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f\n  h = (1..2)\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"class C\n  def f\n    h = self\n    h.is_a?(Hash) ? h.frobnicate_zzz : h\n  end\nend\n"[..],
+            &b"def f\n  h = proc { |x| x }\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f\n  h = __method__\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(spec)\n  h = defined?(spec)\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+        ] {
+            assert!(run(src).is_empty(), "expected silence for {:?}", String::from_utf8_lossy(src));
+        }
+    }
+
+    /// The carrier-fidelity decline is NOT a blanket silencing: the ordinary
+    /// Dynamic-parameter narrowing — and every allow-listed carrier — still
+    /// witnesses. A decline that silenced everything would pass an FP gate too,
+    /// so these positive controls are what makes the gate meaningful.
+    #[test]
+    fn narrowable_carriers_still_witness_end_to_end() {
+        for src in [
+            // a method parameter, and a block parameter
+            &b"def f(h)\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(o)\n  o.each { |h| h.is_a?(Hash) ? h.frobnicate_zzz : h }\nend\n"[..],
+            // keyword / optional / rest / block parameters
+            &b"def f(k: nil)\n  h = k\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(o = nil)\n  h = o\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(*a)\n  h = a\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            // `@ivar` / `$gvar` reads
+            &b"def f\n  h = @x\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f\n  h = $gx\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            // a call through a narrowable receiver (plain, chained, `[]`,
+            // safe-nav, block-bearing, ivar receiver)
+            &b"def f(spec)\n  h = spec.unknown_zzz\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(spec)\n  h = spec.foo_zzz.bar_zzz\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(spec)\n  h = spec[0]\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(spec)\n  h = spec&.dup\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(spec)\n  h = spec.map { |x| x }\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f\n  h = @obj.foo_zzz\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            // destructuring — even off a `Logical` RHS (measured: both fire)
+            &b"def f(spec)\n  a, h = spec\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f(spec)\n  a, h = (spec || {})\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            // `case`/`when` and the `raise`-guard early-return form
+            &b"def f(v)\n  case v\n  when Hash\n    v.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f(spec)\n  raise ArgumentError unless spec.is_a?(Hash)\n\n  spec.frobnicate_zzz\nend\n"[..],
+        ] {
+            let diags = run(src);
+            assert_eq!(
+                diags.len(),
+                1,
+                "expected one undefined-method for {:?}, got {diags:?}",
+                String::from_utf8_lossy(src)
+            );
+            assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+            assert_eq!(diags[0].message, "undefined method `frobnicate_zzz' for Hash");
+        }
+    }
+
     /// The narrowed witness stays SILENT when the method exists on the
     /// narrowed class, and for every declined shape (`&&`, use-after-if).
     #[test]
