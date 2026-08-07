@@ -16,9 +16,8 @@ Last updated: 2026-08-08.
 ▶ **NEXT (measured, 2026-08-08):** the narrowing-limited residue is CLOSE TO
 EXHAUSTED (3a-1's 27-candidate re-scan,
 [spec](notes/20260807-narrowing-stage3-spec.md)) — re-measure 3a-2/3a-3 windows
-against the 1137 census before building; the one cheap measured slice is
-`branch_terminates` accepting `next`/`break` (~2 rows, block semantics
-UNPROBED). The 2d/2e rows sit behind ONE new mechanism: partially-dynamic
+against the 1136 census before building (the `next`/`break` slice is DONE, PR
+#76). The 2d/2e rows sit behind ONE new mechanism: partially-dynamic
 constant-value harvesting (mini-spec first — project-wide FP surface).
 Adjudicate the `Object` bucket (26) before acting on it; no global typing for
 the OpenStruct rows
@@ -40,9 +39,9 @@ track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-08-08 on merged master, post PRs #74/#75): harness **88
-fixtures / 0 unregistered extras / 22 gaps / 1 registered divergence**,
-coverage 319/342; standing sweep **0 FP / 9204 files / 1137 gaps**, 8 corpora,
+State (verified 2026-08-08 on merged master, post PRs #74/#75/#76): harness
+**89 fixtures / 0 unregistered extras / 27 gaps / 1 registered divergence**,
+coverage 326/354; standing sweep **0 FP / 9204 files / 1136 gaps**, 8 corpora,
 baselines in
 `harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. EVERY
 tool that grades the port now prints its binary's path + build time and
@@ -102,6 +101,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-08-08 `next`/`break` termination** (PR #76) — probe-first GO: ~70-row matrix showed block-`next`/`break` terminate exactly like `return` for the reference (loop-carried rebind included — the guard re-runs each iteration), so `Node::Other` gained `jump` (argless jumps only) and `stmt_terminates` one arm. **1137→1136, 0 opened, 0 FP / 9204.** The 2nd predicted row was MISATTRIBUTED (possible-nil, a different pass). Probe side-find: sequential DISJOINT guards are a pre-existing master FP (dead-code shape, 0 sweep hits) — needs a disjoint-vs-refinement rule, follow-up filed. [spec section](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-08 collection-shape stage 2: chain ROOTS** (PR #75) — `Dir.glob`/`String#split` are ONE mechanism (a BLOCK overload breaks all-overloads-agree; block-free return slot), `ENV` object-constant ingestion (nilable returns REFUSED — 13/15 first-cut FPs), `::`-qualified C5 paths (0 yield). 2d DROPPED: blocked on partially-dynamic constant harvesting. **1141→1137: 4 closed, 0 opened, 0 FP / 9204.** [spec §7c](notes/20260807-collection-shape-slice-spec.md).
 - **2026-08-08 narrowing stage 3a-1: compound predicates** (PR #74) — `&&`/`||`/`!` recursion + falsey edge + both-direction termination; `Logical.is_and` arena split. Gap yield **1 row** (the c1/c4 windows measured proximity, not mechanism); the value is **eleven master FP shapes closed** (PR #73's Bot collapse reached through `!`/`&&`/`||`/`nil?`/`===`). THREE probe-forced spec corrections, incl. "b wins a collision" = live FP and non-guard conjuncts pinning classes via exactly 3 non-mintable-fact mechanisms. [spec BUILT section](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-08 collection-shape receiver survival, stage 1** (PR #70) — a literal-seeded local keeps its collection NOMINAL through `<<`/`push`/`[]=`/block mutation instead of widening to Dynamic, so the chained call is witnessed. **1167→1145: 22 rows closed (9 predicted + 13 same-mechanism), 0 opened, 0 FP / 9204 files.** The FP boundary is the join: a branch-contained mutation on an UNWIDENED seed must stay silent (the reference's `Scope#join` leaves a union its dispatcher declines) — reviewer-probed both ways. Deviation found mid-build and oracle-re-probed: `widen_after_block` is a SYNTACTIC walk, not a scope join. [spec+outcome](notes/20260807-collection-shape-slice-spec.md).
