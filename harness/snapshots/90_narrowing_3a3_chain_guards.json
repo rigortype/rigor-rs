@@ -1,0 +1,103 @@
+{
+  "fixture": "harness/corpus/90_narrowing_3a3_chain_guards.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_aaa' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 35,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_bbb' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ccc' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 43,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ddd' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_eee' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 62,
+      "column": 26,
+      "severity": "error",
+      "message": "undefined method `frobnicate_fff' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 68,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ggg' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 76,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_hhh' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 86,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_iii' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 95,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_jjj' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 102,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `frobnicate_kkk' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 111,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_lll' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 119,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_mmm' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 140,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ooo' for nil"
+    }
+  ]
+}
