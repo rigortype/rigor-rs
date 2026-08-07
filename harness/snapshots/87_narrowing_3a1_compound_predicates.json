@@ -1,0 +1,166 @@
+{
+  "fixture": "harness/corpus/87_narrowing_3a1_compound_predicates.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_aaa' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 31,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_bbb' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ccc' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 44,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ddd' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_eee' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_fff' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 63,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ggg' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 71,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_hhh' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 79,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_iii' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 89,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_jjj' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 100,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_kkk' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 106,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_lll' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 113,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_mmm' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 121,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_nnn' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 129,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ooo' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 138,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ppp' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 190,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 199,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 219,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_qqq' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 236,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_rrr' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 263,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_sss' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 279,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 286,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ttt' for String"
+    }
+  ]
+}

@@ -4300,15 +4300,18 @@ mod tests {
     }
 
     /// The narrowed witness stays SILENT when the method exists on the
-    /// narrowed class, and for every declined shape (`&&`, use-after-if).
+    /// narrowed class, and for the use-after-`if` decline. The `&&` predicate
+    /// that used to sit here now WITNESSES (stage 3a-1, probe c1a — the
+    /// reference fires); its falsey-edge control lives in the infer matrix.
     #[test]
     fn narrowed_local_silent_on_existing_method_and_declines() {
         assert!(run(b"def f(value)\n  if value.is_a?(Hash)\n    value.merge!(a: 1)\n  end\nend\n")
             .is_empty());
-        assert!(run(
-            b"def f(value)\n  if value.is_a?(Hash) && value.foo\n    value.frobnicate_zzz\n  end\nend\n"
-        )
-        .is_empty());
+        assert_eq!(
+            run(b"def f(value)\n  if value.is_a?(Hash) && value.foo\n    value.frobnicate_zzz\n  end\nend\n")
+                .len(),
+            1
+        );
         assert!(run(
             b"def f(value)\n  if value.is_a?(Hash)\n  end\n  value.frobnicate_zzz\nend\n"
         )

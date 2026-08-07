@@ -639,7 +639,13 @@ pub enum Node {
     /// `&&` / `||` / `and` / `or`. Both operands are lowered (so a call on
     /// either side is analysed). Typed `Dynamic[top]` — the result is one of the
     /// two operand types, which we don't union here.
-    Logical { left: NodeId, right: NodeId, span: Span },
+    ///
+    /// `is_and` discriminates the CONJUNCTION (`&&`/`and`) from the disjunction
+    /// (`||`/`or`). Prism has two node kinds and the lowering collapsed them;
+    /// the compound-predicate narrowing (stage 3a-1,
+    /// docs/notes/20260807-narrowing-stage3-spec.md) needs the operator because
+    /// `&&` and `||` swap which edge concatenates and which joins.
+    Logical { left: NodeId, right: NodeId, is_and: bool, span: Span },
     /// An array literal (`[a, b]`). Elements are lowered. Typed `Nominal Array`
     /// so a typo'd method on an array literal flags via the real Array RBS.
     // TODO(spec): Tuple precision (element types) per ADR-0023.
@@ -1579,6 +1585,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::Logical {
                 left,
                 right,
+                is_and: true,
                 span: span_of(&and_node.location()),
             });
         }
@@ -1589,6 +1596,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::Logical {
                 left,
                 right,
+                is_and: false,
                 span: span_of(&or_node.location()),
             });
         }

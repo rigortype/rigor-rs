@@ -323,6 +323,171 @@ lands inside the conditional span.
 
 `class_flow_case` keeps its single-static-constant clause rule until 3a-4.
 
+#### BUILT 2026-08-08 (PR — `crates/rigor-{parse,infer,rules}/src/lib.rs`,
+#### fixture `harness/corpus/87_narrowing_3a1_compound_predicates.rb`)
+
+Shipped, with **three spec corrections and one arena change**, all forced by
+probes. The arena change is additive and lands in the same commit:
+`Node::Logical` gained `is_and: bool` — the lowering collapsed prism's `AndNode`
+and `OrNode` into one variant, and `&&` and `||` swap which edge concatenates
+and which joins, so the operator is not recoverable otherwise. Every existing
+consumer matched with `..`; only the two construction sites changed.
+
+##### Correction 1 — "b wins a same-local collision" is a live FP
+
+`analyse_and` evaluates the right conjunct's truthy scope UNDER the left's, so
+`v.is_a?(String) && v.is_a?(Hash)` re-narrows `Nominal[String]` to Hash and
+reaches `Bot`: probe `a_same_local_disjoint_then` measures the reference
+**silent**, where the spec's rule would have witnessed `for Hash`. The build
+applies each edge's guards SEQUENTIALLY against the working fact env, so the
+existing review-R3 conflict rule resolves the collision by DROPPING the local.
+Same evidence retires the subclass case as a decline: `v.is_a?(Numeric) &&
+v.is_a?(Integer)` narrows to the more specific class on the reference (`for
+Integer`, either order) and to nothing here.
+
+##### Correction 2 — the `&&` falsey join DOES keep a same-class fact
+
+Probe (b) as written in the task brief (`v.is_a?(String) && v.is_a?(String)`
+… `else USE`) is reference-silent, but it does not test the rule: an atomic
+class guard contributes an EMPTY falsey map, so that join is empty for the
+trivial reason. The rule's real form is `!v.is_a?(String) && !v.is_a?(String)`
+… `else USE`, and there the reference **fires** `for String`
+(`b2_and_bang_same`). Keep-when-same-class stands. Different classes join to a
+real union (`Hash | String`, `b2_and_bang_diff`) — declined until 3a-4.
+
+##### Correction 3 — a compound predicate's OTHER conjuncts can pin a class
+
+The one genuinely new FP surface, and the spec did not have it. `analyse_and`'s
+sequencing means any conjunct the reference recognises and we do not can leave
+the local at a concrete type, against which our guard class is disjoint. A
+54-row battery (`X && guard` and `guard && X` over 27 shapes for `X`, then a
+second 40-row pass over the rest of `dispatch_call_simple`) found the exposure
+is **exactly three mechanisms**, not the open-ended set the shape of the risk
+suggests:
+
+| mechanism | probes | fix |
+|---|---|---|
+| `local.nil?` on the same local — `analyse_nil_predicate` pins `NilClass` | `L_nilq`, `R_nilq`, `mid_nilq` (all ref=0) | recognise `nil?` as a NON-mintable `NilClass` fact so R3 drops the collision |
+| `local == nil` after a guard — `analyse_equality_predicate` meets with `Constant[nil]` | `R_eq_nil` (ref=0); `L_eq_nil` fires, so declining it costs coverage | same fact, on the truthy edge (`!=` swaps) |
+| `C === local` beside a different `is_a?(D)` | `L_caseeq`, `R_caseeq` (ref=0) | `===` was already recognised non-mintably; the collision now needs a WITHIN-MAP assertion tracker, because a non-mintable fact writes nothing to the env |
+
+Everything else is inert and measured firing on BOTH engines, and is pinned as
+a POSITIVE row so a future over-broad interference rule cannot delete it:
+`v.length > 2`, `v.frozen?`, a bare `v`/`w`, `v.respond_to?`, `v.empty?`,
+`v.any?`, `v.none?`, `v.key?`, `v >= 2`, `v > 2`, `v.between?`,
+`v.start_with?`, `v.match?`, `v =~ /a/`, `v.zero?`, `v.present?`, `v.blank?`,
+`v&.foo`, `v[0]`, `v.foo.bar`, `w.include?(v)`, `v == 1`, `v != nil`,
+`!v.nil?`, `w.nil?`, `(v = w)`, `String === v` with the SAME class. Note
+`!v.nil? && v.is_a?(String)` keeps narrowing: the `!` swap puts the `NilClass`
+fact on the edge the `&&` does not concatenate, which is why modelling `nil?`
+beat poisoning every local an unrecognised conjunct mentions.
+
+A fourth, arena-level hazard: `/(?<v>a)/ =~ s` BINDS `v` to `String` in the
+reference and to nothing here (prism's `MatchWriteNode` has no lowering, so `v`
+reads as an unbound untyped local). Probe `matchwrite` is a measured FP. The
+binding is arena-invisible, so a compound predicate containing a `=~` whose
+RECEIVER is not a bare variable read declines entirely; `v =~ /a/` binds nothing
+and still narrows (`matchop_keep`, fires on both).
+
+##### The task brief's five mandatory probes
+
+| # | shape | ref | rs (built) | outcome |
+|---|---|:--:|:--:|---|
+| a1 | `if v.is_a?(String) && v.is_a?(Hash) … else USE end` | 0 | 0 | falsey join drops on mismatch — as specced |
+| a2 | `if v.is_a?(String) && w.is_a?(Hash) … else USE end` | 0 | 0 | atomic guards have empty falsey maps; join over disjoint locals is empty |
+| a3 | same-local disjoint `&&`, **truthy** side | **0** | 0 | **correction 1** — the spec rule would have fired |
+| b1 | `if v.is_a?(String) && v.is_a?(String) … else USE end` | 0 | 0 | not a test of the rule (empty ∧ empty) |
+| b2 | `if !v.is_a?(String) && !v.is_a?(String) … else USE end` | **1** | 1 | **keep-when-same-class CONFIRMED** (correction 2) |
+| c1 | `v = [1,2]`; `if !v.is_a?(Hash); v.zzz; end` | 1 | 1 | truthy edge of `!guard` carries nothing — must-still-fire, held |
+| c2 | `v = [1,2]`; `return if !v.is_a?(Hash)`; `v.zzz` | 0 | 0 (was **1**) | the falsey map + termination reaches the collapse — a live FP on master, now closed |
+| d1 | `v = a \|\| b`; `if !v.is_a?(String) … else USE end` | 1 | 0 | carrier ALLOW-list declines PER LOCAL — coverage cost, as required |
+| d2 | same on a PARAMETER | 1 | 1 | the control: the gate is per-local, not per-shape |
+| e/c1a | `USE if v.is_a?(String) && v.length > 2` | 1 | 1 | harness reproduces the matrix |
+| e/c4d | `if !guard … else USE end` | 1 | 1 | reproduced |
+| e/f12 | `if guard \|\| guard \|\| cond` | 0 | 0 | reproduced |
+
+##### Pre-existing FPs this slice closes (each measured on master)
+
+`c_bang_return`, `e3_case_eq_bot`, `p_bang_and_precise`, `k_bot_and_cond`,
+`k_bot_or_bot`, `k_bot_or_same`, `p_and_collide_precise` (+ reversed),
+`nilq_bot_then`, `nilq_bot_return`, `eqnil_bot_then`, `nilq_bot_and` — eleven
+shapes where rigor-rs witnessed a precise carrier the reference had already
+collapsed to `Bot`. PR #73 built the collapse; 3a-1 is what reaches it through
+`!`, `&&`, `||`, `nil?` and `===`. Their must-still-fire twins
+(`must_fire_or_cond`, `must_fire_bang_then`, `must_fire_else_of_and`,
+`must_fire_bang_and_else`, `must_fire_nilq_else`) are pinned in the same matrix.
+
+##### Declines added to the set
+
+- `C === local` never MINTS (the reference narrows through it — `e3_case_eq_bang`
+  fires — but that is new coverage 3a-1 does not claim).
+- `local == nil` on the LEFT of a guard (`L_eq_nil`, ref fires).
+- A same-local `&&` collision in a SUBCLASS relation (`s_num_then_int` /
+  `s_int_then_num`, ref narrows to the more specific class).
+- An `||` of DIFFERENT classes, on either edge (`x_or_diff_class`,
+  `b2_and_bang_diff` — a real union, stage 3a-4).
+- A compound predicate containing a regex-binding `=~` (`matchwrite_str`, ref
+  fires).
+- BOTH branches terminating: no propagation at all. `t_both_terminate` measures
+  the reference silent, so propagating either map would be a live FP.
+- A write to the local inside the conditional's span still declines the
+  propagation (`t_write_in_span`, ref fires — carried from stage 1-2).
+
+`class_flow_case` is untouched, as specced.
+
+##### Gates
+
+`cargo build --offline && cargo test --offline` (14 suites green; the 3a-1
+matrix carries 78 rows and the Bot-composition matrix 17); `ruby harness/run.rb`
+**87 fixtures, 0 unregistered extras** (312/333 matched, 20 gaps, 1 registered);
+`ruby harness/run_snapshot.rb`; `python3 harness/docs_check.py`; clippy
+`-D warnings` in a fresh `CARGO_TARGET_DIR`; `python3 harness/fp_audit.py --gaps
+--sweep` on a freshly built release binary — **TOTAL FP candidates: 0**, 8
+corpora / 9204 files.
+
+##### Gap diff — 1 row closed, 0 opened (a SHORTFALL, and why)
+
+`gap_census.py --sweep`, release binary both sides: **1142 → 1141**.
+
+| corpus | row | closed by |
+|---|---|---|
+| app | mastodon `app/models/content_retention_policy.rb:23` `positive-int#days` | c1a — `value.days if value.is_a?(Integer) && value.positive?` |
+
+Zero rows opened, which is the load-bearing half: the slice adds narrowing AND
+suppression, and neither regressed a matched diagnostic.
+
+One row against a ≤22 window is a large shortfall and worth naming precisely.
+Re-scanning the 1141 remaining rows for a compound `is_a?`/`kind_of?` within the
+same 8-line window that produced the 12+10 estimate leaves **27 candidates**,
+and reading them shows the window was measuring the wrong thing — the guard is
+present but the gap is a different mechanism:
+
+- Rails/ActiveSupport methods the bundled RBS does not carry (`present?`,
+  `presence`, `blank?`, `stringify_keys`, `starts_with?`) — 9 rows, an RBS
+  ingestion gap, not a narrowing one;
+- `call.possible-nil-receiver` rows — 5, a different rule entirely;
+- project monkey-patches the reference applies cross-file and we do not (rdoc,
+  Bundler) — 6;
+- the carrier ALLOW-list decline from PR #72 (gitlab-foss `auth_hash.rb:44`
+  ×2, `normalizer.rb:29`) — 3, already recorded as its measured price;
+- the remainder are shapes 3a-1 explicitly declines (a `||` union, a chain
+  receiver — 3a-3/3a-4).
+
+Two rows have a concrete, cheap follow-up: gitlab-foss
+`sidekiq_config/cron_jobs.rb:58` (`next unless job && overrides.is_a?(Hash)`)
+and `api/internal/base.rb:266` both terminate the guard branch with **`next`**,
+which `branch_terminates` does not recognise — it accepts only `return` and
+`raise`. Extending it to `next`/`break` inside a block body is a small, separate
+slice worth ~2 rows; it is NOT folded in here because the block-boundary
+semantics of `next` are unprobed.
+
+The honest read: the c1/c4 buckets were an upper bound over an 8-line window
+that cannot distinguish "the reference narrowed through a compound guard" from
+"a compound guard happens to be nearby", and the real narrowing-limited residue
+in these corpora is close to exhausted. The slice's measured value is
+overwhelmingly on the FP side — eleven reference-silent shapes rigor-rs was
+witnessing — not on the coverage side.
+
 ### 3a-2 — `Logical` minting in statement / LV-write-RHS position
 
 For a `Node::Logical` that is a statement or the direct RHS of a

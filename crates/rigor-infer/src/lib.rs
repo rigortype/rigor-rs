@@ -141,6 +141,32 @@ enum ClassFact {
     Bot,
 }
 
+/// One local's class assertion on ONE edge of a predicate, before any gate is
+/// applied — the raw syntactic output of [`Typer::analyse_predicate`], stage
+/// 3a-1. The gates (carrier ALLOW-list, `Dynamic`/`Top`, disjoint collapse,
+/// review R3) are applied per-local by [`Typer::apply_guards`], which is why
+/// this stays a pure syntactic fact.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct GuardFact {
+    /// The class names the edge asserts the local is one OF. Length 1 for an
+    /// atomic guard; longer only after an `||` truthy join, where the reference
+    /// narrows to a UNION (`Hash | String`) that this slice cannot represent —
+    /// so a multi-class fact never MINTS, and only ever feeds the `Bot`
+    /// collapse, which needs every member to collapse (probes `k_bot_or_bot`,
+    /// `k_bot_or_same` vs the must-still-fire `k_bot_or_cond`).
+    classes: Vec<String>,
+    /// `instance_of?` — the reference's `exact:` path, whose collapse condition
+    /// is a bare name mismatch rather than a proven-disjoint pair.
+    exact: bool,
+    /// May this fact mint a [`ClassFact::Narrowed`]? `false` for `===`.
+    mintable: bool,
+}
+
+/// One edge's guard facts in SOURCE ORDER. A `Vec` rather than a map because
+/// [`Typer::apply_guards`] must apply a same-local collision sequentially to
+/// reproduce the reference's nested scopes (see its doc comment).
+type GuardMap = Vec<(String, GuardFact)>;
+
 /// The output of [`Typer::class_narrowing_pass`] — the two per-call-node
 /// snapshot sets the rules layer consumes.
 #[derive(Default, Debug)]
@@ -2468,14 +2494,15 @@ impl<'i> Typer<'i> {
     ///
     /// Strict subset of the reference's preconditions, so every recorded use is
     /// one the reference also narrows:
-    /// - **Predicate shape**: the WHOLE predicate is `local.is_a?(C)` (or
-    ///   `kind_of?`/`instance_of?`) — bare `LocalVariableRead` receiver, no
-    ///   safe-nav, no block, exactly one `ConstantRead` argument. `&&`/`||`,
-    ///   negation, chains, ivars ⇒ no narrowing (ADR-0038 "unmodeled ⇒
-    ///   decline"). A `Logical` MINTS nothing in any position (stage 3a-2);
-    ///   since stage 3b-1 it no longer clears facts either — its operands are
-    ///   descended so an OUTER fact's uses are recorded, and only a rebind in
-    ///   its span kills.
+    /// - **Predicate shape**: an atomic guard is `local.is_a?(C)` (or
+    ///   `kind_of?`/`instance_of?`/`C === local`) — bare `LocalVariableRead`
+    ///   operand, no safe-nav, no block, exactly one `ConstantRead` argument.
+    ///   Since stage 3a-1 those compose through `&&`, `||` and `!`
+    ///   ([`Typer::analyse_predicate`]); chains and ivar receivers still
+    ///   decline (ADR-0038 "unmodeled ⇒ decline"). A `Logical` in a VALUE
+    ///   position still MINTS nothing (stage 3a-2); since stage 3b-1 it no
+    ///   longer clears facts either — its operands are descended so an OUTER
+    ///   fact's uses are recorded, and only a rebind in its span kills.
     /// - **Lexical constant resolution**: `C` resolves at the predicate's
     ///   lexical prefix; a project declaration shadowing `C`
     ///   ([`SourceIndex::constant_shadowed`]) declines entirely — we never
@@ -2483,16 +2510,22 @@ impl<'i> Typer<'i> {
     /// - **Dynamic/Top carriers only** (`narrow_class_other`): the local's type
     ///   in the threaded env must be `Dynamic`/`Top` (or unbound ⇒ untyped).
     ///   `Nominal`/union/scalar carriers are untouched.
-    /// - **Truthy edge only**: the then-branch for `if`/ternary, the
-    ///   else-branch for `unless`; the falsey edge is NEVER narrowed. A
-    ///   `case`/`when` clause narrows only under its own single-constant
-    ///   condition (multi-condition unions decline; no falsey threading
-    ///   between clauses).
-    /// - **Early-return propagation** (`eval_if:481`): when the branch bound
-    ///   to the OPPOSITE edge terminates (final statement `return`/`raise` — a
-    ///   conservative approximation), the truthy fact applies to the
-    ///   statements after the conditional — declined if ANY write to the local
-    ///   lands inside the conditional's span.
+    /// - **Per-edge guard maps** (stage 3a-1 reworded this invariant): an
+    ///   atomic guard still narrows the TRUTHY edge only — the then-branch for
+    ///   `if`/ternary, the else-branch for `unless`. The falsey edge is no
+    ///   longer categorically unnarrowed: `!`, and the `&&`/`||` edge algebra
+    ///   above it, can SWAP a fact onto it (`if !v.is_a?(C) … else USE end`
+    ///   fires on the reference). A `case`/`when` clause is UNCHANGED — it
+    ///   narrows only under its own single-constant condition (multi-condition
+    ///   unions decline; no falsey threading between clauses).
+    /// - **Early-return propagation** (`eval_if:486`/`:495`), stage 3a-1 runs
+    ///   it in BOTH directions: when exactly one branch terminates (final
+    ///   statement `return`/`raise` — a conservative approximation), the
+    ///   OPPOSITE edge's guard map applies to the statements after the
+    ///   conditional; per local it is declined if ANY write to that local lands
+    ///   inside the conditional's span, and it is skipped entirely when BOTH
+    ///   branches terminate (the code after is unreachable and the reference
+    ///   emits nothing there).
     /// - **Invalidation**: any write to the local (`LocalVariableWrite`/
     ///   `OpWrite`/`MultiWrite` target), a [`MUTATOR_METHODS`] receiver call,
     ///   or a mutated-argument position (the [`collect_flow_writes`]/
@@ -3097,51 +3130,18 @@ impl<'i> Typer<'i> {
         // The predicate is evaluated first, in the current facts (its own calls
         // may read an OUTER narrowing) — EXPRESSION position.
         self.class_flow_expr(ast, predicate, tenv, cenv, coarse, writes, interner, out, false);
-        // Recognise the guard, gated on the local currently being Dynamic/Top
-        // (`narrow_class_other`: every other carrier is out of scope) AND on
-        // the local's BINDING being a carrier both engines type Dynamic/Top
-        // ([`coarse_locals`] — docs/notes/20260808-narrowing-carrier-fidelity-fp
-        // .md: our Dynamic is coarser than theirs, so "Dynamic-only" is a
-        // subset rule only over the measured-agreeing carriers).
-        let narrow = self
-            .class_check_predicate(ast, predicate)
-            .filter(|(local, _)| !coarse.contains(local))
-            .filter(|(local, _)| match tenv.get(local) {
-                None => true, // unbound ⇒ untyped (Dynamic[top])
-                Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
-            });
-        // Review R3: a guard CONFLICTING with an existing DIFFERENT-class fact
-        // is out of the envelope — at that point the reference's carrier is
-        // `Nominal[C1]`, not Dynamic (`narrow_nominal_to_class` on a disjoint
-        // class yields Bot), and neither edge's verdict is probed. The stale
-        // fact is dropped and the new one never inserted. A SAME-class re-guard
-        // keeps the fact (a no-op re-narrowing).
-        let conflict = narrow.as_ref().is_some_and(|(local, class)| {
-            cenv.get(local).is_some_and(|existing| existing != &ClassFact::Narrowed(class.clone()))
-        });
-        // The OPPOSITE-direction fact: a guard whose class is disjoint from the
-        // local's PRECISE carrier collapses it to `Bot` on the truthy edge
-        // (`narrow_nominal_to_class` / `narrow_shape_to_class`). Mutually
-        // exclusive with `narrow`, which requires a Dynamic/Top carrier.
-        let bot_local = self
-            .bot_guard_local(ast, predicate, tenv, cenv, interner)
-            .filter(|_| narrow.is_none());
+        // Stage 3a-1: the predicate yields a guard map for EACH edge (`&&`/`||`
+        // /`!` recursion — [`Typer::analyse_predicate`]). A plain class guard
+        // still yields facts on the truthy edge only, so the pre-3a-1 behavior
+        // is the `(vec![g], vec![])` case of this.
+        let (truthy_g, falsey_g) = self.analyse_predicate(ast, predicate, 64).unwrap_or_default();
         // Truthy edge: then-branch for `if`/ternary, else-branch for `unless`.
         let (truthy, falsey) =
             if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
         let truthy_edge = {
             let mut t = tenv.clone();
             let mut c = cenv.clone();
-            if let Some((local, class)) = &narrow {
-                if conflict {
-                    c.remove(local);
-                } else {
-                    c.insert(local.clone(), ClassFact::Narrowed(class.clone()));
-                }
-            }
-            if let Some(local) = &bot_local {
-                c.insert(local.clone(), ClassFact::Bot);
-            }
+            self.apply_guards(&truthy_g, tenv, &mut c, coarse, interner);
             // The branch bodies INHERIT the conditional's own position: a block
             // inside an expression-position ternary branch narrows nothing
             // (probe x2), while a statement `if`'s branches stay statement
@@ -3151,9 +3151,15 @@ impl<'i> Typer<'i> {
             c
         };
         let falsey_edge = {
-            // The falsey edge is NEVER narrowed (`narrow_class_other`: unchanged).
+            // 3a-1: the falsey edge is no longer categorically unnarrowed. It
+            // carries facts exactly when the predicate SWAPPED one onto it —
+            // `!guard` (probes c4d/c4f), an `||` whose disjuncts' falsey maps
+            // concatenate (`x_or_falsey_bang`), or an `&&` whose falsey maps
+            // join on the SAME class (`b2_and_bang_same`). A bare
+            // `local.is_a?(C)` still contributes NOTHING here (`c1g`).
             let mut t = tenv.clone();
             let mut c = cenv.clone();
+            self.apply_guards(&falsey_g, tenv, &mut c, coarse, interner);
             self.class_flow_scope(ast, falsey, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
             c
         };
@@ -3163,74 +3169,251 @@ impl<'i> Typer<'i> {
         // edge rebound the local) …
         widen_flow_writes(writes, if_span, tenv, interner);
         join_cenv(cenv, &[truthy_edge, falsey_edge]);
-        // … EXCEPT the early-return propagation (`eval_if:481-493`, probe a5):
-        // when the branch bound to the OPPOSITE (falsey) edge terminates, the
-        // truthy fact applies to the statements after the conditional — only in
-        // STATEMENT position (R2), never on a conflicted guard (R3), and not
-        // when any write to the local landed inside the conditional's span.
-        let opposite_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
+        // … EXCEPT the early-return propagation (`eval_if:486`/`:495`), which
+        // 3a-1 runs in BOTH directions: a terminating FALSEY branch propagates
+        // the truthy map (the `return unless guard` idiom a5/c1d), a
+        // terminating TRUTHY branch the falsey map (`return if !guard` —
+        // c4a/c4b/f22/t_c1d_or). Only in STATEMENT position (review R2), never
+        // for a local rewritten inside the conditional's span, and never when
+        // BOTH branches terminate: the statements after are then unreachable
+        // and the reference emits nothing there (probe `t_both_terminate` — a
+        // measured would-be FP).
+        let truthy_terminates = !truthy.is_empty() && branch_terminates(ast, truthy);
+        let falsey_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
         let rewritten = |local: &str| {
             writes.iter().any(|(ws, n)| n == local && if_span.0 <= ws.0 && ws.1 <= if_span.1)
         };
-        if let Some((local, class)) = narrow {
-            if stmt_position && !conflict && opposite_terminates && !rewritten(&local) {
-                cenv.insert(local, ClassFact::Narrowed(class));
-            }
+        if stmt_position && truthy_terminates != falsey_terminates {
+            let carried = if falsey_terminates { &truthy_g } else { &falsey_g };
+            let carried: GuardMap =
+                carried.iter().filter(|(l, _)| !rewritten(l)).cloned().collect();
+            self.apply_guards(&carried, tenv, cenv, coarse, interner);
         }
-        // The same propagation for the `Bot` fact — the `return 0 unless
-        // h.is_a?(Hash)` / `raise unless …` shape, where the reference carries
-        // `Bot` past the guard and is silent on every later use.
-        if let Some(local) = bot_local {
-            if stmt_position && opposite_terminates && !rewritten(&local) {
-                cenv.insert(local, ClassFact::Bot);
+    }
+
+    /// Apply one edge's guard map to the fact env `c`, IN SOURCE ORDER.
+    ///
+    /// Sequencing is load-bearing: the reference's `analyse_and` evaluates the
+    /// right conjunct's truthy scope UNDER the left's, so `v.is_a?(String) &&
+    /// v.is_a?(Hash)` re-narrows an already-`Nominal[String]` carrier and
+    /// reaches `Bot` — the reference is SILENT in that branch (probe
+    /// `a_same_local_disjoint_then`). Applying the entries one at a time
+    /// against the WORKING env reproduces that through the R3 conflict rule
+    /// below, where the spec's "b wins a same-local collision" would have been
+    /// a live false positive.
+    ///
+    /// Per local, in order:
+    /// 1. **`Bot`** (PR #73) when EVERY class in the fact's union collapses the
+    ///    local's precise carrier ([`Typer::guard_collapses`]). Tested first and
+    ///    against `c`, so an earlier conjunct's `Bot` sticks.
+    /// 2. **`Narrowed`** when the fact is mintable (not `===`), carries exactly
+    ///    ONE class (an `||` union is stage 3a-4 — the reference narrows to
+    ///    `Hash | String` and we decline), the local passes the carrier
+    ///    ALLOW-list (`coarse`, PR #72) and its current type is `Dynamic`/`Top`
+    ///    (`narrow_class_other`). Both gates are PER-LOCAL: a compound predicate
+    ///    may narrow one local and decline another (probe `a_two_locals_then`).
+    /// 3. **Review R3**: a mintable guard conflicting with an existing
+    ///    DIFFERENT fact drops the stale fact and inserts nothing. A SAME-class
+    ///    re-guard is a no-op re-narrowing and keeps it.
+    fn apply_guards(
+        &self,
+        guards: &GuardMap,
+        tenv: &TypeEnv,
+        c: &mut HashMap<String, ClassFact>,
+        coarse: &HashSet<String>,
+        interner: &Interner,
+    ) {
+        // The classes each local was already asserted to EARLIER IN THIS MAP.
+        // Needed because a NON-mintable assertion (`===`, `nil?`) writes nothing
+        // to `c`, yet the reference's carrier at the next conjunct is that class
+        // — `String === v && v.is_a?(Hash)` and `v.nil? && v.is_a?(String)` are
+        // both measured reference-silent and would otherwise witness.
+        let mut asserted: HashMap<&str, &[String]> = HashMap::new();
+        for (local, g) in guards {
+            let collapses = !g.classes.is_empty()
+                && g.classes.iter().all(|class| {
+                    self.guard_collapses(local, class, g.exact, tenv, c, interner)
+                });
+            let prior = asserted.insert(local.as_str(), &g.classes);
+            if collapses {
+                c.insert(local.clone(), ClassFact::Bot);
+                continue;
+            }
+            if prior.is_some_and(|p| p != g.classes.as_slice()) {
+                c.remove(local);
+                continue;
+            }
+            let mintable = g.mintable
+                && g.classes.len() == 1
+                && !coarse.contains(local)
+                && match tenv.get(local) {
+                    None => true, // unbound ⇒ untyped (Dynamic[top])
+                    Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
+                };
+            if !mintable {
+                continue;
+            }
+            let fact = ClassFact::Narrowed(g.classes[0].clone());
+            if c.get(local).is_some_and(|existing| *existing != fact) {
+                c.remove(local);
+            } else {
+                c.insert(local.clone(), fact);
             }
         }
     }
 
-    /// The local a predicate collapses to `Bot`, or `None`.
+    /// Analyse a whole predicate into its `(truthy, falsey)` guard maps — the
+    /// port of the reference's `predicate_scopes` dispatch (`narrowing.rb:344`)
+    /// for the three compound forms, stage 3a-1.
     ///
-    /// Recognises the same predicate shapes [`Typer::class_check_predicate`]
-    /// does PLUS the case-equality form `C === local` (the reference routes it
-    /// through the very same `class_predicate_scopes`,
-    /// `analyse_case_equality_receiver`, `narrowing.rb:1953`), then applies
-    /// [`Typer::guard_collapses`].
+    /// - a class guard on a local → `([g], [])` (`analyse_class_predicate`,
+    ///   `:1761`);
+    /// - `!x` — a no-arg, no-block, non-safe-nav `Call` named `"!"`, which is
+    ///   how prism lowers both `!` and `not` → the operand's pair SWAPPED
+    ///   (`dispatch_unary_predicate`, `:1555`: `analyse(receiver)&.reverse`);
+    /// - `&&` → truthy CONCATENATES (left then right, applied sequentially),
+    ///   falsey JOINS (`analyse_and`, `:2631`);
+    /// - `||` → truthy JOINS, falsey concatenates (`analyse_or`, `:2640`);
+    /// - anything else → `None`, a whole-predicate decline.
     ///
-    /// `===` is accepted here but NOT in `class_check_predicate`: minting a
-    /// `Narrowed` fact from it would be a new, unprobed COVERAGE claim, while
-    /// collapsing to `Bot` only ever removes output.
-    fn bot_guard_local(
+    /// An UNRECOGNISED operand of `&&`/`||` contributes empty maps rather than
+    /// killing the whole analysis — which is exactly the reference's behaviour:
+    /// its truthy fallback is the other conjunct's scope (so any one recognised
+    /// conjunct narrows, c1a–c1c) while its falsey JOIN against the unchanged
+    /// scope yields nothing (c1g, f12, `u_and_or_falsey`). `depth` bounds the
+    /// recursion; a predicate deeper than that declines.
+    fn analyse_predicate(
         &self,
         ast: &LoweredAst,
         pred: NodeId,
-        tenv: &TypeEnv,
-        cenv: &HashMap<String, ClassFact>,
-        interner: &Interner,
-    ) -> Option<String> {
+        depth: u32,
+    ) -> Option<(GuardMap, GuardMap)> {
+        if depth == 0 {
+            return None;
+        }
+        match ast.get(pred) {
+            Node::Logical { left, right, is_and, .. } => {
+                let (left, right, is_and) = (*left, *right, *is_and);
+                // A named-capture `=~` (`/(?<v>a)/ =~ s`) BINDS `v` to `String`
+                // in the reference and to nothing at all in the arena — prism's
+                // `MatchWriteNode` has no lowering here, so the local reads as
+                // an unbound (untyped) name and our gate would narrow it. That
+                // is a measured FP (probe `matchwrite`), and the binding is
+                // invisible, so the whole compound predicate declines. Only a
+                // regex on the LEFT of `=~` binds; `v =~ /a/` (a local or ivar
+                // receiver) does not and still narrows (`matchop_keep`).
+                if regex_binding_match(ast, left, depth) || regex_binding_match(ast, right, depth)
+                {
+                    return None;
+                }
+                let a = self.analyse_predicate(ast, left, depth - 1);
+                let b = self.analyse_predicate(ast, right, depth - 1);
+                if a.is_none() && b.is_none() {
+                    return None;
+                }
+                let (at, af) = a.unwrap_or_default();
+                let (bt, bf) = b.unwrap_or_default();
+                Some(if is_and {
+                    ([at, bt].concat(), join_guards(&af, &bf))
+                } else {
+                    (join_guards(&at, &bt), [af, bf].concat())
+                })
+            }
+            Node::Call { receiver: Some(r), method, args, block_body, safe_nav, .. }
+                if method == "!" && args.is_empty() && block_body.is_empty() && !*safe_nav =>
+            {
+                let r = *r;
+                self.analyse_predicate(ast, r, depth - 1).map(|(t, f)| (f, t))
+            }
+            _ => self.guard_predicate(ast, pred),
+        }
+    }
+
+    /// Recognise ONE atomic predicate on a bare local, as the reference's
+    /// `dispatch_call_simple` (`narrowing.rb:976`) does, and return its
+    /// `(truthy, falsey)` guard maps.
+    ///
+    /// Four shapes, three of them NON-mintable — they exist so that a compound
+    /// predicate knows the local was already pinned to a class, which is where
+    /// the false positives live:
+    /// - `local.is_a?(C)` / `kind_of?(C)` / `instance_of?(C)` — the mintable
+    ///   guard (`analyse_class_predicate`, `:1761`). Bare `LocalVariableRead`
+    ///   receiver, no safe-nav, no block, one `ConstantRead` argument with a
+    ///   statically known, unshadowed name. Chains are stage 3a-3.
+    /// - `C === local` — the reference narrows through it too (probe
+    ///   `e3_case_eq_bang` fires `for String`), but minting would be new
+    ///   coverage this slice does not claim. Recognising it non-mintably is
+    ///   load-bearing anyway: `String === v && v.is_a?(Hash)` reaches `Bot` on
+    ///   the reference and would otherwise witness `for Hash` (probe
+    ///   `L_caseeq`, a measured FP), and `Hash === v` on an Array carrier feeds
+    ///   the collapse (`e3_case_eq_bot`).
+    /// - `local.nil?` — `analyse_nil_predicate` (`:2453`) pins `NilClass` on the
+    ///   truthy edge (`narrow_nil_other`: a `Dynamic` carrier becomes
+    ///   `Constant[nil]`, every precise one becomes `Bot`) and leaves the falsey
+    ///   edge unchanged. Without it `v.nil? && v.is_a?(String)` witnesses
+    ///   `for String` where the reference reaches `Bot` — measured FP `L_nilq`,
+    ///   in BOTH conjunct orders and in the middle of a chain (`mid_nilq`).
+    ///   `!v.nil? && v.is_a?(String)` keeps narrowing, because the swap puts the
+    ///   `NilClass` fact on the edge the `&&` does not concatenate.
+    /// - `local == nil` / `nil == local` (and `!=`, which swaps the pair) —
+    ///   `analyse_equality_predicate` (`:1568`) meets the carrier with
+    ///   `Constant[nil]`; on `Dynamic` that is a no-op (probe `L_eq_nil` fires,
+    ///   so declining it costs coverage) but on an already-narrowed carrier it
+    ///   is `Bot` (`R_eq_nil`, a measured FP). Equality against a NON-nil
+    ///   literal attaches a relational fact and never pins a class (`L_eq_one`
+    ///   / `R_eq_one` both fire) — not recognised, and measured safe.
+    fn guard_predicate(&self, ast: &LoweredAst, pred: NodeId) -> Option<(GuardMap, GuardMap)> {
         let Node::Call { receiver: Some(r), method, args, block_body, safe_nav, span, .. } =
             ast.get(pred)
         else {
             return None;
         };
-        if *safe_nav || !block_body.is_empty() || args.len() != 1 {
+        if *safe_nav || !block_body.is_empty() {
             return None;
         }
-        let (local, cname, exact) = match method.as_str() {
-            "is_a?" | "kind_of?" | "instance_of?" => {
-                let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
-                let cname = self.resolved_static_constant(ast, args[0], *span)?;
-                (name.clone(), cname, method == "instance_of?")
-            }
-            // `C === local`: the receiver is the CONSTANT and the local is the
-            // sole argument. A non-constant receiver (`(1..10) === x`, `/re/ ===
-            // x`) narrows to Numeric/String in the reference and never to `Bot`.
-            "===" => {
-                let Node::LocalVariableRead { name, .. } = ast.get(args[0]) else { return None };
-                let cname = self.resolved_static_constant(ast, *r, *span)?;
-                (name.clone(), cname, false)
-            }
-            _ => return None,
+        let nil_fact = |name: &str| {
+            (name.to_string(), GuardFact {
+                classes: vec!["NilClass".to_string()],
+                exact: false,
+                mintable: false,
+            })
         };
-        self.guard_collapses(&local, &cname, exact, tenv, cenv, interner).then_some(local)
+        match (method.as_str(), args.len()) {
+            ("is_a?" | "kind_of?" | "instance_of?", 1) => {
+                let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
+                let class = self.resolved_static_constant(ast, args[0], *span)?;
+                let exact = method == "instance_of?";
+                let g = (name.clone(), GuardFact { classes: vec![class], exact, mintable: true });
+                Some((vec![g], Vec::new()))
+            }
+            ("===", 1) => {
+                let Node::LocalVariableRead { name, .. } = ast.get(args[0]) else { return None };
+                let class = self.resolved_static_constant(ast, *r, *span)?;
+                let g = (
+                    name.clone(),
+                    GuardFact { classes: vec![class], exact: false, mintable: false },
+                );
+                Some((vec![g], Vec::new()))
+            }
+            ("nil?", 0) => {
+                let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
+                Some((vec![nil_fact(name)], Vec::new()))
+            }
+            ("==" | "!=", 1) => {
+                let name = match (ast.get(*r), ast.get(args[0])) {
+                    (Node::LocalVariableRead { name, .. }, Node::NilLit { .. }) => name,
+                    (Node::NilLit { .. }, Node::LocalVariableRead { name, .. }) => name,
+                    _ => return None,
+                };
+                let g = nil_fact(name);
+                Some(if method == "==" {
+                    (vec![g], Vec::new())
+                } else {
+                    (Vec::new(), vec![g])
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Whether guarding `local` with `class_name` yields `Bot` in the reference.
@@ -3284,39 +3467,6 @@ impl<'i> Typer<'i> {
             return carrier != class_name;
         }
         self.index.class_ordering(carrier, class_name) == ClassOrdering::Disjoint
-    }
-
-    /// Recognise the accepted guard shape: the WHOLE predicate is
-    /// `local.is_a?(C)` / `local.kind_of?(C)` / `local.instance_of?(C)` — a bare
-    /// `LocalVariableRead` receiver, no safe-nav, no block, exactly one argument
-    /// which is a `ConstantRead`/`ConstantPath` (both lower to `ConstantRead`)
-    /// with a statically known name (reference `analyse_class_predicate`,
-    /// `narrowing.rb:1761`; stable single-hop chains are out of slice). The
-    /// constant resolves lexically at the predicate's prefix; a project
-    /// declaration shadowing it declines entirely (FP-safe — this slice never
-    /// narrows to a project nominal).
-    fn class_check_predicate(
-        &self,
-        ast: &LoweredAst,
-        pred: NodeId,
-    ) -> Option<(String, String)> {
-        let Node::Call { receiver: Some(r), method, args, block_body, safe_nav, span, .. } =
-            ast.get(pred)
-        else {
-            return None;
-        };
-        if *safe_nav || !block_body.is_empty() || args.len() != 1 {
-            return None;
-        }
-        if !matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?") {
-            return None;
-        }
-        let Node::LocalVariableRead { name: local, .. } = ast.get(*r) else {
-            return None;
-        };
-        let local = local.clone();
-        let cname = self.resolved_static_constant(ast, args[0], *span)?;
-        Some((local, cname))
     }
 
     /// The statically-known name of a `ConstantRead`/`ConstantPath` node (both
@@ -4228,6 +4378,83 @@ fn join_cenv(cenv: &mut HashMap<String, ClassFact>, edges: &[HashMap<String, Cla
         *fact == ClassFact::Bot
             && edges.iter().all(|edge| edge.get(name) == Some(&ClassFact::Bot))
     });
+}
+
+/// Does this predicate operand's subtree contain a `=~` whose RECEIVER is not a
+/// bare variable read — i.e. the `/(?<name>…)/ =~ str` shape, which binds every
+/// named capture group as a local?
+///
+/// Prism models it as a `MatchWriteNode`; the arena has no lowering for one, so
+/// the bound locals appear only as unbound reads and the narrowing gate treats
+/// them as untyped. The reference binds them to `String`, so a following
+/// `v.is_a?(Hash)` reaches `Bot` there and witnesses nothing (probe
+/// `matchwrite`). The binding is arena-INVISIBLE, so the only safe answer is to
+/// decline the whole compound predicate. `v =~ /a/` — a variable receiver —
+/// binds nothing and is deliberately excluded (`matchop_keep` fires on both
+/// engines).
+fn regex_binding_match(ast: &LoweredAst, id: NodeId, depth: u32) -> bool {
+    if depth == 0 {
+        return true; // out of budget ⇒ answer conservatively
+    }
+    match ast.get(id) {
+        Node::Call { receiver, method, args, .. } => {
+            if method == "=~"
+                && !matches!(
+                    receiver.map(|r| ast.get(r)),
+                    Some(Node::LocalVariableRead { .. } | Node::VariableRead { .. })
+                )
+            {
+                return true;
+            }
+            receiver.is_some_and(|r| regex_binding_match(ast, r, depth - 1))
+                || args.iter().any(|&a| regex_binding_match(ast, a, depth - 1))
+        }
+        Node::Logical { left, right, .. } => {
+            regex_binding_match(ast, *left, depth - 1)
+                || regex_binding_match(ast, *right, depth - 1)
+        }
+        Node::Statements { body, .. } => {
+            body.iter().any(|&s| regex_binding_match(ast, s, depth - 1))
+        }
+        _ => false,
+    }
+}
+
+/// The JOIN of two edges' guard maps — the reference's `Scope#join`, which
+/// unions the two scopes' types per local (`analyse_and`'s falsey edge,
+/// `analyse_or`'s truthy edge; `narrowing.rb:2631,2640`).
+///
+/// A local absent from EITHER side carries its unchanged (un-narrowed) type
+/// there, and a union with the unchanged type is the unchanged type — so the
+/// join keeps only locals present on BOTH sides (probes `c1g`, `f12`,
+/// `a_two_locals_else`, `b2_and_bang_two_locals`, `u_and_or_falsey`, all
+/// reference-silent). Class names union: identical on both sides the fact
+/// survives intact and MINTS (`b2_and_bang_same`, `x_or_same_class` both fire
+/// on the reference); different, the reference narrows to a real union
+/// (`Hash | String` — `b2_and_bang_diff`, `x_or_diff_class`) which stage 3a-4
+/// would represent and this slice declines by keeping the fact un-mintable.
+/// `exact` weakens to `is_a?` semantics (the STRONGER collapse requirement, so
+/// the join never suppresses more than either side alone).
+fn join_guards(a: &GuardMap, b: &GuardMap) -> GuardMap {
+    let mut out: GuardMap = Vec::new();
+    for (local, ga) in a {
+        let Some((_, gb)) = b.iter().find(|(n, _)| n == local) else { continue };
+        let mut classes = ga.classes.clone();
+        for class in &gb.classes {
+            if !classes.contains(class) {
+                classes.push(class.clone());
+            }
+        }
+        out.push((
+            local.clone(),
+            GuardFact {
+                classes,
+                exact: ga.exact && gb.exact,
+                mintable: ga.mintable && gb.mintable,
+            },
+        ));
+    }
+    out
 }
 
 /// Kill the class-narrowing fact of every local whose recorded write/mutation
@@ -6309,12 +6536,22 @@ mod class_narrowing_tests {
         assert!(!snaps.contains_key(&call_named(&ast, "inner_zzz")));
     }
 
-    /// Decline: an `&&`/`||` predicate is unmodeled — the whole conditional
-    /// narrows nothing.
+    /// Stage 3a-1 REPLACED the blanket `&&`/`||` decline: one recognised
+    /// conjunct now narrows the truthy edge (probe c1a, reference fires), while
+    /// the falsey edge of the same predicate still narrows nothing (c1g). The
+    /// full matrix lives in
+    /// [`class_narrowing_tests::class_narrowing_stage3a1_compound_predicate_matrix`].
     #[test]
-    fn class_narrowing_logical_predicate_declines() {
+    fn class_narrowing_logical_predicate_narrows_truthy_only() {
         let (ast, snaps) = class_snaps(
             b"def f(value)\n  if value.is_a?(Hash) && value.foo\n    value.frobnicate_zzz\n  end\nend\n",
+        );
+        assert_eq!(
+            snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str),
+            Some("Hash")
+        );
+        let (ast, snaps) = class_snaps(
+            b"def f(value)\n  if value.is_a?(Hash) && value.foo\n    1\n  else\n    value.frobnicate_zzz\n  end\nend\n",
         );
         assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
     }
@@ -6847,6 +7084,319 @@ mod class_narrowing_tests {
             let (ast, snaps) = class_snaps(src.as_bytes());
             let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
             assert_eq!(got, *expected, "stage 3b-1 matrix row {row}\n--- source ---\n{src}");
+        }
+    }
+
+    /// STAGE 3a-1 — compound predicate analysis (`&&` / `||` / `!`) and the
+    /// both-direction termination propagation
+    /// (docs/notes/20260807-narrowing-stage3-spec.md).
+    ///
+    /// Every row is oracle-measured against the pinned reference `v0.3.1` from
+    /// a fresh cwd with `--no-cache` and the checkout plugin path pinned.
+    /// `Some(c)` — the reference FIRES and rigor-rs must record `c`. `None` —
+    /// rigor-rs must record nothing, either because the reference is SILENT
+    /// (a would-be false positive — the control rows) or because the decline
+    /// costs coverage the reference has (a strict subset). The row name is the
+    /// probe name; see the note's "3a-1 BUILT" outcome table.
+    #[test]
+    fn class_narrowing_stage3a1_compound_predicate_matrix() {
+        const USE: &str = "v.frobnicate_zzz";
+        const G: &str = "v.is_a?(String)";
+        let f = |body: &str| format!("def f(v, w, a, b)\n{body}\nend\n");
+        let mut rows: Vec<(&str, String, Option<&str>)> = vec![
+            // ---- c1: one recognised conjunct narrows the TRUTHY edge --------
+            ("c1a", f(&format!("  {USE} if {G} && v.length > 2")), Some("String")),
+            ("c1b", f(&format!("  if v.frozen? && {G}\n    {USE}\n  end")), Some("String")),
+            (
+                "c1c",
+                f(&format!("  if v.frozen? && {G} && v.length > 2\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            ("x_and_kw", f(&format!("  if {G} and v.length > 2\n    {USE}\n  end")), Some("String")),
+            // c1g control: the falsey edge of a plain `&&` stays UNNARROWED.
+            (
+                "c1g",
+                f(&format!("  if {G} && v.length > 2\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            // f12 control: an unrecognised `||` disjunct kills the truthy join.
+            ("f12", f(&format!("  if {G} || {G} || v.nil?\n    {USE}\n  end")), None),
+            // ---- c4: `!` swaps the edges ------------------------------------
+            ("c4d", f(&format!("  if !{G}\n    1\n  else\n    {USE}\n  end")), Some("String")),
+            ("c4f", f(&format!("  unless !{G}\n    {USE}\n  end")), Some("String")),
+            ("x_not_kw", f(&format!("  if not {G}\n    1\n  else\n    {USE}\n  end")), Some("String")),
+            ("x_double_bang", f(&format!("  if !!{G}\n    {USE}\n  end")), Some("String")),
+            (
+                "x_bang_of_and",
+                f(&format!("  if !({G} && v.length > 2)\n    1\n  else\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            ("u_bang_nonguard", f(&format!("  if !v.nil?\n    {USE}\n  end")), None),
+            // ---- termination propagation, BOTH directions -------------------
+            ("c4a", f(&format!("  return if !{G}\n  {USE}")), Some("String")),
+            ("c4b", f(&format!("  if !{G}\n    return\n  end\n  {USE}")), Some("String")),
+            ("f22", f(&format!("  raise \"x\" if !{G}\n  {USE}")), Some("String")),
+            ("f16", f(&format!("  if {G}\n    1\n  else\n    return\n  end\n  {USE}")), Some("String")),
+            ("t_c1d", f(&format!("  return unless {G} && v.length > 2\n  {USE}")), Some("String")),
+            ("t_c1d_or", f(&format!("  return if !{G} || v.nil?\n  {USE}")), Some("String")),
+            (
+                "t_unless_and",
+                f(&format!("  unless {G} && v.length > 2\n    return\n  end\n  {USE}")),
+                Some("String"),
+            ),
+            // CONTROL, measured reference-silent: both branches terminate, so
+            // the statements after are unreachable. Propagating either map here
+            // would be a live FP.
+            ("t_both_terminate", f(&format!("  if !{G}\n    return\n  else\n    return\n  end\n  {USE}")), None),
+            // A write inside the conditional's span declines the propagation
+            // (the reference still narrows — coverage cost, not an FP).
+            ("t_write_in_span", f(&format!("  if !{G}\n    v = 1\n    return\n  end\n  {USE}")), None),
+            // A rebind AFTER the propagated guard kills the fact (the reference
+            // fires a DIFFERENT diagnostic there, `for 1`).
+            ("t_write_after_guard", f(&format!("  return if !{G}\n  v = 1\n  {USE}")), None),
+            ("t_elsif", f(&format!("  if v.nil?\n    1\n  elsif !{G}\n    2\n  else\n    {USE}\n  end")), Some("String")),
+            // ---- (a) `&&` falsey JOIN with two guards -----------------------
+            (
+                "a_same_local_disjoint_else",
+                f(&format!("  if {G} && v.is_a?(Hash)\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            (
+                "a_two_locals_else",
+                f(&format!("  if {G} && w.is_a?(Hash)\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            // The SPEC CORRECTION: "b wins a same-local collision" would fire
+            // `for Hash` here; the reference reaches `Bot` and is SILENT.
+            (
+                "a_same_local_disjoint_then",
+                f(&format!("  if {G} && v.is_a?(Hash)\n    {USE}\n  end")),
+                None,
+            ),
+            // ---- (b) `&&` falsey join, SAME class both sides ----------------
+            (
+                "b2_and_bang_same",
+                f(&format!("  if !{G} && !{G}\n    1\n  else\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            // Different classes join to a UNION in the reference (`Hash |
+            // String`) — declined until 3a-4, coverage cost only.
+            (
+                "b2_and_bang_diff",
+                f(&format!("  if !{G} && !v.is_a?(Hash)\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            (
+                "b2_and_bang_two_locals",
+                f(&format!("  if !{G} && !w.is_a?(Hash)\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            ("b_same_class_then", f(&format!("  if {G} && {G}\n    {USE}\n  end")), Some("String")),
+            ("b_same_class_else", f(&format!("  if {G} && {G}\n    1\n  else\n    {USE}\n  end")), None),
+            // ---- `||` edge algebra ------------------------------------------
+            ("x_or_same_class", f(&format!("  if {G} || {G}\n    {USE}\n  end")), Some("String")),
+            // A `||` of DIFFERENT classes is a union in the reference — 3a-4.
+            ("x_or_diff_class", f(&format!("  if {G} || v.is_a?(Hash)\n    {USE}\n  end")), None),
+            (
+                "x_or_falsey_bang",
+                f(&format!("  if !{G} || v.nil?\n    1\n  else\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            (
+                "o_or_none_then_bang",
+                f(&format!("  if v.nil? || !{G}\n    1\n  else\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            (
+                "o_or_bang_bang_diff",
+                f(&format!("  if !{G} || !v.is_a?(Hash)\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            (
+                "o_and_bang_then_cond",
+                f(&format!("  if !{G} && v.nil?\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            (
+                "u_and_nested_or",
+                f(&format!("  if ({G} || v.is_a?(Hash)) && v.length > 2\n    {USE}\n  end")),
+                None,
+            ),
+            ("u_or_nested_and", f(&format!("  if ({G} && v.length > 2) || v.nil?\n    {USE}\n  end")), None),
+            (
+                "u_and_or_falsey",
+                f(&format!("  if !{G} && (v.nil? || v.frozen?)\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            ("n_unless_bang", f(&format!("  unless !{G}\n    {USE}\n  end")), Some("String")),
+            (
+                "n_unless_and_else",
+                f(&format!("  unless {G} && v.length > 2\n    1\n  else\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            (
+                "n_unless_or_bang",
+                f(&format!("  unless !{G} || v.nil?\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            // Two locals, both narrowed by the same compound predicate.
+            (
+                "a_two_locals_then",
+                f(&format!("  if {G} && w.is_a?(Hash)\n    {USE}\n    w.other_zzz\n  end")),
+                Some("String"),
+            ),
+            // ---- position: `if`/ternary narrows in EVERY position -----------
+            ("q_ternary_bang", f(&format!("  g(!{G} ? 1 : {USE})")), Some("String")),
+            ("q_ternary_and", f(&format!("  g({G} && v.length > 2 ? {USE} : 1)")), Some("String")),
+            // ---- DECLINES, each measured reference-FIRING (coverage cost) ---
+            // `===` narrows in the reference; this slice keeps it Bot-only.
+            ("e3_case_eq_bang", f(&format!("  if !(String === v)\n    1\n  else\n    {USE}\n  end")), None),
+            // A same-local `&&` collision in a SUBCLASS relation: the reference
+            // keeps the more specific class; review R3 drops the fact.
+            ("s_num_then_int", f("  if v.is_a?(Numeric) && v.is_a?(Integer)\n    v.frobnicate_zzz\n  end"), None),
+            ("s_int_then_num", f("  if v.is_a?(Integer) && v.is_a?(Numeric)\n    v.frobnicate_zzz\n  end"), None),
+            // (d) the carrier ALLOW-list gate stays in force PER LOCAL: a local
+            // bound from a `Logical` declines even on the new falsey edge.
+            (
+                "d_logical_carrier",
+                f("  v2 = a || b\n  if !v2.is_a?(String)\n    1\n  else\n    v2.frobnicate_zzz\n  end"),
+                None,
+            ),
+            // …and its control: the same shape on a PARAMETER narrows.
+            ("d_param_control", f(&format!("  if !{G}\n    1\n  else\n    {USE}\n  end")), Some("String")),
+            // A conjunct narrowing only the OTHER local leaves this one alone.
+            (
+                "x_and_two_locals_falsey_only_v",
+                f(&format!("  if {G} && w.is_a?(String)\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            // ---- the CONJUNCT-INTERFERENCE battery -------------------------
+            // 54 measured `X && guard` / `guard && X` rows (probes4/probes5)
+            // found exactly three FP mechanisms; everything else is inert. The
+            // inert representatives are pinned as POSITIVES so a future
+            // over-broad interference rule cannot quietly delete them.
+            ("L_len_cmp", f(&format!("  if v.length > 2 && {G}\n    {USE}\n  end")), Some("String")),
+            ("L_frozen", f(&format!("  if v.frozen? && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_frozen", f(&format!("  if {G} && v.frozen?\n    {USE}\n  end")), Some("String")),
+            ("L_bare_v", f(&format!("  if v && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_bare_v", f(&format!("  if {G} && v\n    {USE}\n  end")), Some("String")),
+            ("L_bare_w", f(&format!("  if w && {G}\n    {USE}\n  end")), Some("String")),
+            ("L_respond", f(&format!("  if v.respond_to?(:foo) && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_respond", f(&format!("  if {G} && v.respond_to?(:foo)\n    {USE}\n  end")), Some("String")),
+            ("L_empty", f(&format!("  if v.empty? && {G}\n    {USE}\n  end")), Some("String")),
+            ("L_cmp_ge", f(&format!("  if v >= 2 && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_cmp_ge", f(&format!("  if {G} && v >= 2\n    {USE}\n  end")), Some("String")),
+            ("L_between", f(&format!("  if v.between?(1, 3) && {G}\n    {USE}\n  end")), Some("String")),
+            ("L_startwith", f(&format!("  if v.start_with?(\"a\") && {G}\n    {USE}\n  end")), Some("String")),
+            ("L_call_arg", f(&format!("  if w.include?(v) && {G}\n    {USE}\n  end")), Some("String")),
+            ("L_eq_one", f(&format!("  if v == 1 && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_eq_one", f(&format!("  if {G} && v == 1\n    {USE}\n  end")), Some("String")),
+            ("L_bang_nilq", f(&format!("  if !v.nil? && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_bang_nilq", f(&format!("  if {G} && !v.nil?\n    {USE}\n  end")), Some("String")),
+            ("L_neq_nil", f(&format!("  if v != nil && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_neq_nil", f(&format!("  if {G} && v != nil\n    {USE}\n  end")), Some("String")),
+            ("other_nilq", f(&format!("  if w.nil? && {G}\n    {USE}\n  end")), Some("String")),
+            ("matchop_keep", f(&format!("  if v =~ /a/ && {G}\n    {USE}\n  end")), Some("String")),
+            ("R_caseeq_same", f(&format!("  if String === v && {G}\n    {USE}\n  end")), Some("String")),
+            // …and the three FP mechanisms, each measured reference-SILENT.
+            ("L_nilq", f(&format!("  if v.nil? && {G}\n    {USE}\n  end")), None),
+            ("R_nilq", f(&format!("  if {G} && v.nil?\n    {USE}\n  end")), None),
+            ("mid_nilq", f(&format!("  if v.frozen? && v.nil? && {G}\n    {USE}\n  end")), None),
+            ("R_eq_nil", f(&format!("  if {G} && v == nil\n    {USE}\n  end")), None),
+            // `== nil` on the LEFT is reference-FIRING; declining it is the
+            // coverage price of the one rule that closes `R_eq_nil`.
+            ("L_eq_nil", f(&format!("  if v == nil && {G}\n    {USE}\n  end")), None),
+            ("L_caseeq", f(&format!("  if String === v && v.is_a?(Hash)\n    {USE}\n  end")), None),
+            ("R_caseeq", f(&format!("  if v.is_a?(Hash) && String === v\n    {USE}\n  end")), None),
+            // A named-capture `=~` binds `v` invisibly: decline the predicate.
+            (
+                "matchwrite",
+                "def f(s)\n  if /(?<v>a)/ =~ s && v.is_a?(Hash)\n    v.frobnicate_zzz\n  end\nend\n".to_string(),
+                None,
+            ),
+            // …including when the reference AGREES with the narrowing — the
+            // decline is uniform because the binding is arena-invisible.
+            (
+                "matchwrite_str",
+                "def f(s)\n  if /(?<v>a)/ =~ s && v.is_a?(String)\n    v.frobnicate_zzz\n  end\nend\n".to_string(),
+                None,
+            ),
+            // A `||` whose disjuncts pin different classes joins to a union.
+            ("or_nilq", f(&format!("  if v.nil? || {G}\n    {USE}\n  end")), None),
+            (
+                "bang_nilq_falsey",
+                f(&format!("  if !v.nil? && !{G}\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+            (
+                "nilq_falsey",
+                f(&format!("  if v.nil? && !{G}\n    1\n  else\n    {USE}\n  end")),
+                None,
+            ),
+        ];
+        rows.sort_by_key(|(row, _, _)| *row);
+        for (row, src, expected) in &rows {
+            let (ast, snaps) = class_snaps(src.as_bytes());
+            let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
+            assert_eq!(got, *expected, "stage 3a-1 matrix row {row}\n--- source ---\n{src}");
+        }
+    }
+
+    /// STAGE 3a-1 × PR #73: the disjoint-guard `Bot` collapse composes with the
+    /// new compound-predicate edges. `true` — the call site must be DEAD (the
+    /// reference is silent because its carrier collapsed to `Bot`); `false` —
+    /// it must stay live (the reference FIRES, so suppressing would lose a real
+    /// diagnostic). Every row is a live false positive on master except the
+    /// `must_fire_*` controls, which pin the anti-over-suppression half.
+    #[test]
+    fn class_narrowing_stage3a1_bot_composition_matrix() {
+        let rows: &[(&str, &str, bool)] = &[
+            // `!guard` + termination: the falsey map carries the guard past the
+            // `return`, and the Array carrier collapses against Hash.
+            ("c_bang_return", "def f\n  v = [1, 2]\n  return if !v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", true),
+            // `===` under `!`, same shape.
+            ("e3_case_eq_bot", "def f\n  v = [1, 2]\n  return if !(Hash === v)\n  v.frobnicate_zzz\nend\n", true),
+            // A `&&` whose recognised conjunct collapses.
+            ("k_bot_and_cond", "def f\n  v = [1, 2]\n  if v.is_a?(Hash) && v.frozen?\n    v.frobnicate_zzz\n  end\nend\n", true),
+            // An `||` truthy JOIN where BOTH disjuncts collapse — the union
+            // `Hash | String` is `Bot | Bot`.
+            ("k_bot_or_bot", "def f\n  v = [1, 2]\n  if v.is_a?(Hash) || v.is_a?(String)\n    v.frobnicate_zzz\n  end\nend\n", true),
+            ("k_bot_or_same", "def f\n  v = [1, 2]\n  if v.is_a?(Hash) || v.is_a?(Hash)\n    v.frobnicate_zzz\n  end\nend\n", true),
+            // A same-local `&&` collision on a PRECISE carrier: the second
+            // conjunct collapses what the first left alone, in either order.
+            ("p_and_collide_precise", "def f\n  v = [1, 2]\n  if v.is_a?(Array) && v.is_a?(Hash)\n    v.frobnicate_zzz\n  end\nend\n", true),
+            ("p_and_collide_precise2", "def f\n  v = [1, 2]\n  if v.is_a?(Hash) && v.is_a?(Array)\n    v.frobnicate_zzz\n  end\nend\n", true),
+            ("p_bang_and_precise", "def f\n  v = [1, 2]\n  return if !(v.is_a?(Hash) && v.nil?)\n  v.frobnicate_zzz\nend\n", true),
+            // ---- must-still-fire controls (reference FIRES) -----------------
+            // An unrecognised disjunct empties the `||` truthy join.
+            ("must_fire_or_cond", "def f\n  v = [1, 2]\n  if v.is_a?(Hash) || v.frozen?\n    v.frobnicate_zzz\n  end\nend\n", false),
+            // The truthy edge of `!guard` carries NOTHING.
+            ("must_fire_bang_then", "def f\n  v = [1, 2]\n  if !v.is_a?(Hash)\n    v.frobnicate_zzz\n  end\nend\n", false),
+            // The falsey edge of a plain `&&` carries nothing either.
+            ("must_fire_else_of_and", "def f\n  v = [1, 2]\n  if v.is_a?(Hash) && v.frozen?\n    1\n  else\n    v.frobnicate_zzz\n  end\nend\n", false),
+            // An `&&` falsey join that drops leaves the else edge un-collapsed.
+            ("must_fire_bang_and_else", "def f\n  v = [1, 2]\n  if !v.is_a?(Hash) && v.frozen?\n    1\n  else\n    v.frobnicate_zzz\n  end\nend\n", false),
+            // ---- the `nil?` / `== nil` collapse -----------------------------
+            // `narrow_nil` (`narrowing.rb:90`) sends every precise carrier to
+            // `Bot`, so a nil test on an Array-literal local silences its calls.
+            ("nilq_bot_then", "def f\n  v = [1, 2]\n  if v.nil?\n    v.frobnicate_zzz\n  end\nend\n", true),
+            ("nilq_bot_return", "def f\n  v = [1, 2]\n  return unless v.nil?\n  v.frobnicate_zzz\nend\n", true),
+            ("eqnil_bot_then", "def f\n  v = [1, 2]\n  if v == nil\n    v.frobnicate_zzz\n  end\nend\n", true),
+            ("nilq_bot_and", "def f\n  v = [1, 2]\n  if v.nil? && v.frozen?\n    v.frobnicate_zzz\n  end\nend\n", true),
+            // …and its must-still-fire twin: the FALSEY edge of `nil?` is
+            // `narrow_non_nil`, which leaves a precise carrier alone.
+            ("must_fire_nilq_else", "def f\n  v = [1, 2]\n  if v.nil?\n    1\n  else\n    v.frobnicate_zzz\n  end\nend\n", false),
+        ];
+        for (row, src, dead) in rows {
+            let ast = lower_src(src.as_bytes());
+            let index = CoreIndex::new();
+            let source = SourceIndex::build(&ast, &index);
+            let scopes = lexical_scopes(&ast);
+            let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+            let mut i = Interner::new();
+            let pass = typer.class_narrowing_pass(&ast, &mut i);
+            let call = call_named(&ast, "frobnicate_zzz");
+            assert_eq!(pass.dead.contains(&call), *dead, "3a-1 Bot row {row}");
         }
     }
 
