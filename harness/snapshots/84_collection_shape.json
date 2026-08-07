@@ -1,0 +1,68 @@
+{
+  "fixture": "harness/corpus/84_collection_shape.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 61,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash[Dynamic[top], Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 73,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 81,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 82,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_yyy' for []"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 143,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 158,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash[Dynamic[top], Dynamic[top]]"
+    }
+  ]
+}

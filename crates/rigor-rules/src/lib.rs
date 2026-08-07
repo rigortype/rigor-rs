@@ -525,6 +525,12 @@ pub fn analyze_with_source_and_folder(
     // from it — and ONLY that rule (spec pitfall 7: a narrowed receiver must not
     // become witnessable by wrong-arity/ATM in this slice).
     let class_snaps = typer.class_narrowing_snapshots(ast, interner);
+    // Collection-shape snapshot map (collection-shape slice, stage 1): call node
+    // id -> "Array"/"Hash", the class a bare-local receiver's collection carrier
+    // (literal seed, mutator-widened kept nominal, or tier-folded chain result)
+    // dispatches on. `check_collection_call` fires `call.undefined-method` from
+    // it — and ONLY that rule, same envelope as the class-narrowing map.
+    let coll_snaps = typer.collection_shape_snapshots(ast, interner);
     let mut out = Vec::new();
 
     // Visit nodes in id order, which is source-discovery order, so diagnostics
@@ -570,6 +576,12 @@ pub fn analyze_with_source_and_folder(
                 check_narrowed_call(
                     call_id, ast, recv, &method, message_span, safe_nav, env, &typer, interner,
                     index, &class_snaps,
+                )
+            })
+            .or_else(|| {
+                check_collection_call(
+                    call_id, ast, recv, &method, message_span, safe_nav, env, &typer, interner,
+                    index, &coll_snaps,
                 )
             })
             .or_else(|| {
@@ -1431,6 +1443,78 @@ fn check_narrowed_call(
     }
     // Render the narrowed receiver as the reference does: the plain class name
     // of `Nominal[C]` ("undefined method `deep_transform_keys!' for Hash").
+    let class = index.class_id(class_name)?;
+    let recv_ty = interner.intern(Type::Nominal { class, args: vec![] });
+    let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
+    let message = format!("undefined method `{method}' for {receiver_render}");
+    let severity = catalog(CALL_UNDEFINED_METHOD)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
+    Some(Diagnostic {
+        rule_id: CALL_UNDEFINED_METHOD,
+        start_offset: message_span.0,
+        end_offset: message_span.1,
+        message,
+        severity,
+        source_family: "builtin",
+        receiver_type: Some(receiver_render),
+        method_name: Some(method.to_string()),
+    })
+}
+
+/// Apply `call.undefined-method` to a call whose bare-local receiver carries a
+/// COLLECTION shape the flow pass threaded — the mutation/local-binding
+/// counterpart of [`check_call`], firing from the precomputed
+/// [`rigor_infer::Typer::collection_shape_snapshots`] map (spec
+/// docs/notes/20260807-collection-shape-slice-spec.md, stage 1).
+///
+/// All the FP-delicate flow reasoning (which seeds mint a carrier, which
+/// mutators keep the nominal, how branch joins and block bodies decline) lives in
+/// the snapshot pass. Here we apply the residual gates, each `None` FP-safe, in
+/// exact parallel with [`check_narrowed_call`]:
+/// 1. NOT a safe-nav call (belt-and-braces — the pass also skips them).
+/// 2. The call node is in the snapshot map with a class name `C` ("Array"/"Hash").
+/// 3. The receiver still types `Dynamic`/`Top` at the use site. This is what
+///    keeps the rule to its intended job: at TOP level [`ScopedEnv`] already
+///    binds the local, so [`check_call`] owns the site and has already decided
+///    it; only a use inside a `def` body (empty scoped env ⇒ Dynamic) reaches
+///    here, which is exactly the coverage gap the slice closes.
+/// 4. The witnessing tail mirrors [`check_call`]'s core path over `Nominal[C]`.
+#[allow(clippy::too_many_arguments)]
+fn check_collection_call(
+    call_id: rigor_parse::NodeId,
+    ast: &LoweredAst,
+    receiver: rigor_parse::NodeId,
+    method: &str,
+    message_span: (usize, usize),
+    safe_nav: bool,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+    snapshots: &std::collections::HashMap<rigor_parse::NodeId, &'static str>,
+) -> Option<Diagnostic> {
+    // (1) Safe-nav dispatch is out of the envelope.
+    if safe_nav {
+        return None;
+    }
+    // (2) The flow pass must have typed this exact call's receiver.
+    let class_name = *snapshots.get(&call_id)?;
+    // (3) Dynamic/Top-only: any concrete carrier at the use site declines.
+    let rty = typer.type_of(ast, receiver, env, interner);
+    if !matches!(interner.get(rty), Type::Dynamic(_) | Type::Top) {
+        return None;
+    }
+    // (4) Witness absence over the core surface, exactly as `check_call`'s tail.
+    if !index.knows_toplevel_class(class_name) {
+        return None;
+    }
+    if index.class_has_method(class_name, method) {
+        return None;
+    }
+    if typer.source().project_declares_method(class_name, method) {
+        return None;
+    }
     let class = index.class_id(class_name)?;
     let recv_ty = interner.intern(Type::Nominal { class, args: vec![] });
     let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
