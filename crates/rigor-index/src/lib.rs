@@ -351,6 +351,33 @@ impl CoreIndex {
         self.data.method_return_with_block(class, method)
     }
 
+    /// The RETURN class of a core method **called WITHOUT a block**, resolved
+    /// from the BLOCK-FREE overloads alone — the answer the flat
+    /// [`Self::method_return`] loses when a block overload's return diverges
+    /// (`String#split: (…) -> Array[String] | (…) { … } -> self`). `None`
+    /// everywhere else, so callers use it strictly as an `or_else` fallback.
+    /// See [`rbs::CoreData::method_return_block_free`].
+    pub fn method_return_block_free(&self, class: &str, method: &str) -> Option<&'static str> {
+        self.data.method_return_block_free(class, method)
+    }
+
+    /// The singleton twin of [`Self::method_return_block_free`] — `Dir.glob`,
+    /// whose block overload returns `nil`.
+    pub fn singleton_method_return_block_free(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<&'static str> {
+        self.data.singleton_method_return_block_free(class, method)
+    }
+
+    /// The class an RBS TOP-LEVEL object constant is declared to hold
+    /// (`"ENV"` ⇒ `"ENVClass"`, the leaf short key). See
+    /// [`rbs::CoreData::object_constant_class`].
+    pub fn object_constant_class(&self, name: &str) -> Option<&'static str> {
+        self.data.object_constant_class(name)
+    }
+
     /// The RETURN class of a core method together with whether the RBS return is
     /// nilable (`Optional`, `String?`) — `(class, nilable)`, or `None` when the
     /// return is not a resolvable concrete class. Used ONLY by

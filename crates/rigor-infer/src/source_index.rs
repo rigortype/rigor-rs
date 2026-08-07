@@ -231,6 +231,30 @@ pub struct SourceIndex {
     /// `class Key` where it is not lexically visible (the reference resolves it
     /// lexically too, so folding it there manufactures an `Integer#days` FP).
     literal_constants: HashMap<String, Vec<(Vec<String>, ConstLit)>>,
+    /// Collection-shape stage 2e: the SAME harvested values as
+    /// `literal_constants`, keyed instead by the constant's FULLY-QUALIFIED name
+    /// (`"Gitlab::Ci::Reports::CodequalityReports::SEVERITY_PRIORITIES"`).
+    /// Entries pass exactly the same gates (single project-wide assignment,
+    /// fully-literal RHS, no class/module name collision), so the two maps
+    /// always carry the same constants — this one just answers a
+    /// `::A::B::C::CONST` path read, which arrives as one `ConstantRead` whose
+    /// `name` is the whole path and therefore misses the bare-name map.
+    /// Backs [`Self::qualified_literal_constant`].
+    qualified_literal_constants: HashMap<String, (Vec<String>, ConstLit)>,
+    /// Collection-shape stage 2b: the BARE name of every `CONST = …` write the
+    /// project makes in a class/module/program body — INCLUDING the ones C5
+    /// declines to harvest (non-literal RHS, multiply assigned). The C1 shadow
+    /// tables are built from class/module DEFINITIONS only, so they do not see a
+    /// plain constant assignment; the RBS-object-constant arm needs to, because
+    /// `ENV = Object.new` in the project makes the core `ENV: ENVClass`
+    /// declaration the wrong surface entirely (probed: the reference resolves
+    /// the project value and reports a different diagnostic; typing it as
+    /// `ENVClass` produced an oracle FP).
+    ///
+    /// Scope-INDEPENDENT on purpose: the RBS object constants are 18 well-known
+    /// globals, and a project that names one anywhere is reason enough to
+    /// decline. Backs [`Self::project_writes_constant`].
+    project_constant_write_names: HashSet<String>,
     /// C1 (constant-shadow gate): for a constant the project defines NESTED, the
     /// containing-namespace segment vectors keyed by the constant's last segment
     /// (`module Gitlab; module Database; module Partitioning; module Time` keys
@@ -502,6 +526,13 @@ impl SourceIndex {
         for ast in asts {
             collect_literal_constants(ast, ast.root(), &[], &mut lit_first, &mut lit_multi);
         }
+        // Stage 2b: every constant the project ASSIGNS, by bare name — recorded
+        // before the C5 gates below drop the non-literal / multiply-assigned
+        // ones, because the RBS-object-constant arm must decline on those too.
+        for qualified in lit_first.keys() {
+            let bare = qualified.rsplit("::").next().unwrap_or(qualified).to_string();
+            idx.project_constant_write_names.insert(bare);
+        }
         for (qualified, (namespace, lit)) in lit_first {
             if lit_multi.contains(&qualified) {
                 continue;
@@ -514,6 +545,10 @@ impl SourceIndex {
                 continue;
             }
             if let Some(l) = lit {
+                // Stage 2e: the qualified twin, keyed by the full path so a
+                // `::A::B::C::CONST` read resolves. Same entry set, same gates.
+                idx.qualified_literal_constants
+                    .insert(qualified, (namespace.clone(), l.clone()));
                 idx.literal_constants.entry(bare).or_default().push((namespace, l));
             }
         }
@@ -659,6 +694,65 @@ impl SourceIndex {
             .filter(|(ns, _)| ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
             .max_by_key(|(ns, _)| ns.len())
             .map(|(_, lit)| lit)
+    }
+
+    /// Collection-shape stage 2b: whether the project ASSIGNS a constant with
+    /// this bare name anywhere (see [`Self::project_constant_write_names`]).
+    pub fn project_writes_constant(&self, name: &str) -> bool {
+        self.project_constant_write_names.contains(name)
+    }
+
+    /// Collection-shape stage 2e: the harvested value of a constant named by a
+    /// QUALIFIED path (`::A::B::C::CONST` / `A::B::C::CONST` — both lower to one
+    /// `ConstantRead` whose `name` is `"A::B::C::CONST"`, the leading `::` is not
+    /// preserved). `None` for a bare name (the C5 map owns those).
+    ///
+    /// Resolution mirrors PR #64's precedent for qualified REFERENCES: the path
+    /// is taken AS WRITTEN and tried against the use site's lexical contexts —
+    /// every initial segment run of `use_prefix` (innermost first) plus the
+    /// top-level reading. **Ambiguity DECLINES**: if two distinct candidate keys
+    /// both name a harvested constant, we return `None` rather than guess which
+    /// one Ruby's lookup would reach (a strict under-emit; the reference resolves
+    /// it precisely, so this can only lose recall, never fire wrongly).
+    ///
+    /// A resolved key must then pass the SAME lexical-visibility filter
+    /// [`Self::literal_constant`] applies to the bare spelling: the constant's
+    /// DEFINING namespace has to be an initial segment run of `use_prefix`. This
+    /// makes stage 2e a pure SPELLING extension of the already-shipped C5 gate
+    /// rather than a wider resolution reach — load-bearing, and measured: without
+    /// it, a cross-namespace path (gitlab
+    /// `Gitlab::GitalyClient::DiffBlob::ATTRS` read from
+    /// `…::DiffBlobsStitcher`) folded here while the reference stayed silent, an
+    /// oracle FP on the sweep.
+    pub fn qualified_literal_constant(
+        &self,
+        name: &str,
+        use_prefix: &[String],
+    ) -> Option<&ConstLit> {
+        if !name.contains("::") {
+            return None;
+        }
+        let mut hit: Option<(&String, &(Vec<String>, ConstLit))> = None;
+        // Candidate keys: `<prefix[..i]>::<name>` for every i (the lexical
+        // nesting runs), plus `name` itself (i == 0 yields exactly that).
+        for i in 0..=use_prefix.len() {
+            let key = if i == 0 {
+                name.to_string()
+            } else {
+                format!("{}::{}", use_prefix[..i].join("::"), name)
+            };
+            if let Some((k, v)) = self.qualified_literal_constants.get_key_value(&key) {
+                match hit {
+                    // The same constant reached by two spellings is not an
+                    // ambiguity; two DIFFERENT keys are.
+                    Some((prev, _)) if prev != k => return None,
+                    Some(_) => {}
+                    None => hit = Some((k, v)),
+                }
+            }
+        }
+        let (_, (ns, lit)) = hit?;
+        (ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]).then_some(lit)
     }
 
     /// C1 (constant-shadow gate): whether a BARE read of constant `name` at a use

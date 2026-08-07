@@ -419,6 +419,14 @@ impl<'i> Typer<'i> {
                 if let Some(lit) = self.source.literal_constant(name, prefix) {
                     return self.intern_const_lit(lit, interner);
                 }
+                // Collection-shape stage 2e: the same C5 value reached by a
+                // FULLY-QUALIFIED path (`::A::B::C::CONST`), which arrives as one
+                // `ConstantRead` whose `name` is the whole path and so misses the
+                // bare-name map above. Ambiguity declines (see
+                // `SourceIndex::qualified_literal_constant`).
+                if let Some(lit) = self.source.qualified_literal_constant(name, prefix) {
+                    return self.intern_const_lit(lit, interner);
+                }
                 // C1: replace the pre-C1 bare-name project-wide suppression
                 // (`!source.knows_class(name)`) with a LEXICALLY PRECISE
                 // shadow gate: a nested project `module Time` suppresses the
@@ -1559,7 +1567,19 @@ impl<'i> Typer<'i> {
                 if let Some(shapes) = self.index.singleton_method_tuple_return(class_name, method) {
                     return self.intern_rbs_tuple(shapes, interner);
                 }
-                if let Some(ret) = self.index.singleton_method_return(class_name, method) {
+                // Collection-shape stage 2a: `Dir.glob(…)` / `Dir[…]` declare a
+                // BLOCK overload returning `nil`, which breaks the flat slot's
+                // all-overloads-agree collapse even though THIS call site — the
+                // block-free path (a block routes to `type_block_call`) —
+                // unambiguously yields `Array[String]`. The block-free slot is
+                // populated only for methods with BOTH overload kinds and only
+                // when every block-free overload agrees on one concrete class,
+                // so it can only ever REPLACE a `Dynamic[top]` result.
+                if let Some(ret) = self
+                    .index
+                    .singleton_method_return(class_name, method)
+                    .or_else(|| self.index.singleton_method_return_block_free(class_name, method))
+                {
                     // Mint the return instance with the type_dot_new id
                     // resolution: a core (CORE_CLASSES) nominal id when
                     // available, else the source-registry id in the high range
@@ -1570,6 +1590,52 @@ impl<'i> Typer<'i> {
                     }
                     if let Some(class_id) = self.source.class_id(ret) {
                         return interner.intern(Type::Nominal { class: class_id, args: vec![] });
+                    }
+                }
+            }
+        }
+
+        // Collection-shape stage 2b: an RBS TOP-LEVEL **object constant**
+        // receiver — `ENV`, declared `ENV: RBS::Unnamed::ENVClass` in core RBS.
+        // The reference resolves the constant's declared type and types
+        // `ENV.keys` as `Array[String]`; rigor-rs left `ENV` `Dynamic[top]`, so
+        // the whole `(ENV.keys.select { … } - base).present?` chain went
+        // unwitnessed.
+        //
+        // Only the CALL's RETURN is typed here — the constant itself is never
+        // minted as a `Nominal`, so no new undefined-method witnessing surface
+        // appears for `ENV.<anything>` itself (a strict under-emit vs the
+        // reference). Gated on the SAME lexical shadow predicate the
+        // `ConstantRead` arm's C1 gate uses: a project `ENV` constant/class, or
+        // a C5-harvested literal constant of that name, declines.
+        if let Node::ConstantRead { name, span, .. } = ast.get(receiver) {
+            if let Some(decl_class) = self.index.object_constant_class(name) {
+                let prefix = self.enclosing_prefix(*span);
+                if !self.source.constant_shadowed(name, prefix)
+                    && !self.source.project_writes_constant(name)
+                    && self.source.literal_constant(name, prefix).is_none()
+                {
+                    // NILABLE RETURNS DECLINE. `ENVClass#[]` is `(String) ->
+                    // String?`; the reference carries the `String | nil` union
+                    // and dispatch on it declines, so typing the chain as a bare
+                    // `String` fired `ENV['X'].present?` where the oracle is
+                    // silent (measured: 13 of the sweep's 15 FPs on the first
+                    // cut of this arm). The flat `method_return` slot drops the
+                    // nil bit, so this arm reads `method_return_nilable`
+                    // instead. The block-free slot records only bare concrete
+                    // returns, so it is non-nilable by construction.
+                    if let Some(ret) = self
+                        .index
+                        .method_return_nilable(decl_class, method)
+                        .and_then(|(c, nilable)| (!nilable).then_some(c))
+                        .or_else(|| self.index.method_return_block_free(decl_class, method))
+                    {
+                        if let Some(class_id) =
+                            self.index.class_id(ret).or_else(|| self.source.class_id(ret))
+                        {
+                            return interner
+                                .intern(Type::Nominal { class: class_id, args: vec![] });
+                        }
                     }
                 }
             }
@@ -1631,7 +1697,18 @@ impl<'i> Typer<'i> {
             if let Some(shapes) = self.index.method_tuple_return(class_name, method) {
                 return self.intern_rbs_tuple(shapes, interner);
             }
-            if let Some(ret_class) = self.index.method_return(class_name, method) {
+            // Collection-shape stage 2c: the instance twin of the singleton
+            // block-free arm above. `String#split: (…) -> Array[String] | (…)
+            // { … } -> self` loses its return to the flat slot's
+            // all-overloads-agree collapse; a BLOCK-FREE `x.split(':', 2)` (the
+            // only kind that reaches `type_call`) is unambiguously an `Array`,
+            // which is what the reference's `block_required: false` overload
+            // selection resolves too.
+            if let Some(ret_class) = self
+                .index
+                .method_return(class_name, method)
+                .or_else(|| self.index.method_return_block_free(class_name, method))
+            {
                 if let Some(class_id) = self.index.class_id(ret_class) {
                     return interner.intern(Type::Nominal {
                         class: class_id,
@@ -7824,5 +7901,162 @@ mod collection_shape_tests {
             snap(b"output = []\ndef f\n  output.frobnicate_zzz\nend\n", "frobnicate_zzz"),
             None,
         );
+    }
+}
+
+/// Collection-shape **stage 2** — the chain ROOTS. Each micro-slice gets a
+/// fire + decline pair, mirroring the oracle probes recorded in
+/// `docs/notes/20260807-collection-shape-slice-spec.md` §1.
+#[cfg(test)]
+mod collection_shape_stage2_tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    /// The type of the LAST receiver-bearing call in `src`, rendered. Wired like
+    /// the analyze pass (source index + lexical scopes) so the shadow/lexical
+    /// gates the stage-2 arms consult are live.
+    fn ty_of_last_recv_call(src: &[u8]) -> String {
+        let ast = lower(&parse(src));
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let scopes = lexical_scopes(&ast);
+        let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let env = TypeEnv::new();
+        let call_id = ast
+            .iter()
+            .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+            .last()
+            .unwrap();
+        let ty = typer.type_of(&ast, call_id, &env, &mut i);
+        let name = index.class_name_of(&i, ty).map(str::to_string);
+        name.unwrap_or_else(|| rigor_types::describe(&i, ty))
+    }
+
+    // --- 2a: `Dir.glob` / `Dir.[]` -----------------------------------------
+
+    /// FIRE (oracle c02): `Dir.glob(...)` types `Array` on the BLOCK-FREE call
+    /// path even though its block overload returns `nil`. `Dir[...]` (single
+    /// overload, oracle c01) is the untouched control that already worked.
+    #[test]
+    fn s2a_dir_glob_block_free_types_array() {
+        assert_eq!(ty_of_last_recv_call(b"x = Dir.glob('*.rb')\n"), "Array");
+        assert_eq!(ty_of_last_recv_call(b"x = Dir['*.rb']\n"), "Array");
+    }
+
+    /// DECLINE: a singleton whose overloads diverge for a reason OTHER than a
+    /// block (`Regexp.last_match`: `MatchData?` vs `String?`) is unchanged — the
+    /// block-free slot is empty for it, so the arm cannot invent a return.
+    /// A BLOCK-bearing `Dir.glob { }` also stays Dynamic (it routes to
+    /// `type_block_call`, which reads `block_returns`, not this slot).
+    #[test]
+    fn s2a_divergent_overloads_and_block_form_decline() {
+        assert_eq!(ty_of_last_recv_call(b"m = Regexp.last_match(2)\n"), "Dynamic[top]");
+        assert_eq!(
+            ty_of_last_recv_call(b"x = Dir.glob('*.rb') { |f| f }\n"),
+            "Dynamic[top]"
+        );
+    }
+
+    // --- 2b: `ENV` ----------------------------------------------------------
+
+    /// FIRE (oracle c03): `ENV` is declared `ENV: RBS::Unnamed::ENVClass` in
+    /// core RBS, so `ENV.keys` types `Array`.
+    #[test]
+    fn s2b_env_object_constant_types_its_declared_return() {
+        assert_eq!(ty_of_last_recv_call(b"def f\n  x = ENV.keys\nend\n"), "Array");
+        assert_eq!(ty_of_last_recv_call(b"def f\n  x = ENV.to_hash\nend\n"), "Hash");
+    }
+
+    /// DECLINE: a PROJECT `ENV` constant makes the core declaration the wrong
+    /// surface. Probed at the pin: with `ENV = Object.new` the reference reports
+    /// `undefined method 'keys' for Object` — a different diagnostic — so typing
+    /// the chain as `Array` here was an oracle FP. A project `module ENV`
+    /// declines through the same lexical shadow gate, and a method the declared
+    /// class does not define declines for lack of a return.
+    #[test]
+    fn s2b_project_env_shadow_declines() {
+        assert_eq!(
+            ty_of_last_recv_call(b"ENV = Object.new\ndef f\n  x = ENV.keys\nend\n"),
+            "Dynamic[top]"
+        );
+        assert_eq!(
+            ty_of_last_recv_call(b"module ENV\nend\ndef f\n  x = ENV.keys\nend\n"),
+            "Dynamic[top]"
+        );
+        assert_eq!(
+            ty_of_last_recv_call(b"def f\n  x = ENV.frobnicate_zzz\nend\n"),
+            "Dynamic[top]"
+        );
+    }
+
+    // --- 2c: block-free INSTANCE returns (`String#split`) -------------------
+
+    /// FIRE (oracle c08b): `String#split` declares `(…) { … } -> self` beside
+    /// `(…) -> Array[String]`; the block-free call site types `Array`.
+    #[test]
+    fn s2c_string_split_block_free_types_array() {
+        assert_eq!(ty_of_last_recv_call(b"x = 'a:b'.split(':', 2)\n"), "Array");
+    }
+
+    /// DECLINE: the BLOCK form of the same method does not read the block-free
+    /// slot (`'a'.split(':') { }` types through `block_returns`, which records
+    /// the `self` return ⇒ String), and a method with no block overload is
+    /// unchanged.
+    #[test]
+    fn s2c_block_form_and_plain_methods_unchanged() {
+        assert_eq!(ty_of_last_recv_call(b"x = 'a:b'.split(':') { |p| p }\n"), "String");
+        assert_eq!(ty_of_last_recv_call(b"x = 'a'.upcase\n"), "String");
+        assert_eq!(ty_of_last_recv_call(b"x = 'a'.frobnicate_zzz\n"), "Dynamic[top]");
+    }
+
+    // --- 2e: `::`-qualified constant paths ----------------------------------
+
+    /// FIRE (oracle u1): the SAME C5 literal constant reached by a fully
+    /// qualified path types identically to the lexical read — the reference
+    /// resolves all three spellings to `[:high, :low]`.
+    const U1: &[u8] = b"module A\n  module B\n    class C\n      PR = { high: 1, low: 2 }.freeze\n\n      def lexical\n        x = PR.keys\n      end\n\n      def qualified\n        x = ::A::B::C::PR.keys\n      end\n    end\n  end\nend\n";
+
+    #[test]
+    fn s2e_qualified_constant_path_resolves() {
+        // The last receiver-bearing call is the qualified spelling's `.keys`.
+        assert_eq!(ty_of_last_recv_call(U1), "Array");
+    }
+
+    /// DECLINE: an AMBIGUOUS path — two DIFFERENT qualified constants that the
+    /// use site's lexical candidates both reach — resolves to nothing rather
+    /// than guessing which one Ruby would pick.
+    #[test]
+    fn s2e_ambiguous_qualified_path_declines() {
+        // `B::C::PR` at a use site inside `module A` matches BOTH the top-level
+        // `B::C::PR` and `A::B::C::PR`.
+        let src = b"module B\n  module C\n    PR = { top: 1 }.freeze\n  end\nend\n\nmodule A\n  module B\n    module C\n      PR = { nested: 1 }.freeze\n    end\n  end\n\n  class Use\n    def f\n      x = B::C::PR.keys\n    end\n  end\nend\n";
+        assert_eq!(ty_of_last_recv_call(src), "Dynamic[top]");
+        // An unknown path declines too.
+        assert_eq!(
+            ty_of_last_recv_call(b"def f\n  x = ::No::Such::CONST_ZZZ.keys\nend\n"),
+            "Dynamic[top]"
+        );
+    }
+
+    /// DECLINE (measured on the sweep): a resolved path whose constant is NOT
+    /// lexically visible from the use site stays untyped, exactly like the bare
+    /// spelling. Gitlab's `Gitlab::GitalyClient::DiffBlob::ATTRS` read from a
+    /// SIBLING class `…::DiffBlobsStitcher` is the shape; the reference is
+    /// silent there, and folding it was an oracle FP on the first cut.
+    #[test]
+    fn s2e_cross_namespace_path_declines() {
+        let src = b"module G\n  module Client\n    class Blob\n      ATTRS = { a: 1 }.freeze\n    end\n\n    class Stitcher\n      def f\n        x = G::Client::Blob::ATTRS.keys\n      end\n    end\n  end\nend\n";
+        assert_eq!(ty_of_last_recv_call(src), "Dynamic[top]");
+    }
+
+    /// DECLINE (measured on the sweep): a NILABLE declared return on the object
+    /// constant's class. `ENVClass#[]` is `(String) -> String?`; the reference
+    /// carries `String | nil` and declines dispatch, so the chain must stay
+    /// untyped rather than become a bare `String`. `ENV.keys` (non-nilable) is
+    /// the positive control in `s2b_env_object_constant_types_its_declared_return`.
+    #[test]
+    fn s2b_nilable_object_constant_return_declines() {
+        assert_eq!(ty_of_last_recv_call(b"def f\n  x = ENV['HOME']\nend\n"), "Dynamic[top]");
     }
 }

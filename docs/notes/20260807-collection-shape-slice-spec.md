@@ -388,6 +388,152 @@ narrowing branch) — 9 oracle diagnostics, rigor-rs matches 7 on
 (rule, line, column) with the op-write and ivar rows as documented gaps, 0
 extras.
 
+## 7c. Stage 2 — BUILT (2026-08-08)
+
+Three of the five micro-slices shipped, one shipped with a zero-row yield, one
+dropped. Verdicts, then the evidence.
+
+| slice | verdict | census rows closed |
+|---|---|---|
+| 2a `Dir.glob`/`Dir.[]` | **built** | 1 (`authz/permission_groups/resource.rb:56`) |
+| 2b `ENV` | **built** | 2 (`backup/targets/database.rb:235,:246`) |
+| 2c `Base64.decode64` chain | **built** (the root was NOT Base64 — see below) | 1 (`api/helpers/packages_manager_clients_helpers.rb:33`) |
+| 2d const-hash `merge` chain | **dropped**, evidence below | 0 |
+| 2e `::`-qualified constant paths | **built**, oracle-verified, **0 rows** | 0 |
+
+Oracle re-verification at the pin (fresh temp cwd, `--no-cache`, plugin path
+pinned) reproduced §1 exactly: c01 `blank?` `for Array[String]` @3:9, c02
+`to_sentence` `for Array[Dynamic[top]]` @2:70, c03 `present?` `for Array[String]`
+@3:60, c08b `second` `for Array[String]` @4:42, u1 firing on all THREE spellings
+(lexical, `::A::B::C::PR`, `A::B::C::PR`). rigor-rs now matches c01/c02/c03/c08b
+and u1's first two spellings on `(rule, line, column)`; the receiver RENDERING
+stays the bare `Array` (the pre-existing element-erasure gap, not this slice).
+
+### 2a + 2c are ONE mechanism, and 2c's root was mis-attributed
+
+§5 filed `Dir.glob` (singleton) and `Base64.decode64` (module function) as
+separate diagnoses. Measured, they are neither. `Base64.decode64` **already
+typed `String`** in rigor-rs (`annotate` confirms) — the `self?.` ingestion
+family closed by the BigMath / nokogiri notes was never the blocker. c08b's
+actual root is `String#split`:
+
+```
+def split: (?Regexp | string | nil pattern, ?int limit) -> Array[String]
+         | (?Regexp | string | nil pattern, ?int limit) { (String substring) -> void } -> self
+```
+
+— the same shape as `Dir.glob`'s `… -> Array[String] | … { … } -> nil`. In both,
+`method_signature`'s all-overloads-agree collapse drops the return because a
+BLOCK overload disagrees, even though a block-free call site can never select
+it. Shipped as one slot pair, `ClassEntry::block_free_returns` /
+`singleton_block_free_returns`, populated by `block_free_overload_return` ONLY
+when the method declares BOTH overload kinds and EVERY block-free overload
+agrees on one bare concrete `ClassInstanceType`; read by
+`CoreData::method_return_block_free` / `singleton_method_return_block_free`
+(strict first-definer-wins) from the two BLOCK-FREE arms of `Typer::type_call`
+as an `.or_else` fallback. A block call still reads `block_returns`
+(`type_block_call` is a different path entirely), and `Dir.[]` — single
+overload — keeps an EMPTY block-free slot, so the arm provably cannot change any
+result the flat slot already carried.
+
+### 2b: the nil bit is load-bearing
+
+`ENV` is an RBS **object constant** (`ENV: RBS::Unnamed::ENVClass`), a
+declaration kind the index did not ingest at all. Top-level constant
+declarations whose type is a bare `ClassInstanceType` are now recorded
+(`CoreData::object_constants`, 18 declarations in the vendored set, of which
+`CROSS_COMPILING: true?` is the one skipped). The typer types only the CALL's
+return, never `ENV` itself — so no new witnessing surface appears for
+`ENV.<anything>`; a strict under-emit vs the reference.
+
+Two gates were added AFTER measurement, both from real sweep FPs on the first cut:
+
+1. **NILABLE returns decline.** `ENVClass#[] : (String) -> String?`. The flat
+   `method_return` slot drops the nil bit, so `ENV['X'].present?` typed `String`
+   and fired where the reference (carrying `String | nil`, on which dispatch
+   declines) is silent — **13 of 15 FPs**. The arm now reads
+   `method_return_nilable` and refuses a nilable return.
+2. **A project `ENV` write declines.** The C1 shadow tables are built from
+   class/module DEFINITIONS only and never saw a plain `ENV = …` assignment.
+   Probed: with `ENV = Object.new` the reference reports `undefined method
+   'keys' for Object`. `SourceIndex::project_writes_constant` (bare name of
+   every project constant WRITE, including the ones C5 declines to harvest) now
+   gates the arm, scope-independently.
+
+### 2d — DROPPED, with the evidence
+
+The specced question ("does `HashShape.merge(non-literal)` type `Nominal[Hash]`
+in the block-free path?") answers **yes** — probed:
+`H.merge(other).transform_values { … }.compact_blank` already FIRES in rigor-rs
+today, for both a literal and a C5-harvested constant receiver. 2d as written is
+a no-op.
+
+The remaining row's blocker is elsewhere:
+`lib/authn/token_field/generator/routable_token.rb:15` is
+`DEFAULT_ROUTING_PAYLOAD_HASH = { c: ->(_) { Gitlab.config.cell.id } }.freeze` —
+a hash literal with a **LAMBDA value**, so C5's fully-literal `const_lit_of`
+declines the whole constant and the read is `Dynamic`. Closing it needs
+partially-dynamic constant-value harvesting (a `Hash`/`Array` nominal minted
+from a literal whose ELEMENTS are not literal), which is a new mechanism with a
+project-wide FP surface, not the merge fold. Out of scope; not forced.
+
+### 2e — built, oracle-correct, and it closes nothing
+
+`::A::B::C::CONST` lowers to ONE `ConstantRead` whose `name` is the whole path
+(the leading `::` is not preserved), so the bare-name C5 map missed it while the
+lexical spelling of the same constant folded. Fixed with a qualified twin map
+plus `SourceIndex::qualified_literal_constant`: candidate keys are the path AS
+WRITTEN against every initial segment run of the use site's lexical prefix
+(ADR-0042 / PR #64 precedent), **ambiguity declines**, and a resolved key must
+then pass the SAME lexical-visibility filter the bare path applies.
+
+That last filter was also measured, not theorised: without it, gitlab's
+`Gitlab::GitalyClient::DiffBlob::ATTRS` read from a SIBLING class
+`…::DiffBlobsStitcher` folded here while the reference stayed silent — 2 of the
+15 FPs. The reference's own behaviour is finer than either gate: it resolves an
+in-FILE sibling path (fixture 88 case 10 fires there) but not the cross-FILE
+one. rigor-rs's constant harvest is project-wide and cannot tell them apart, so
+it declines both; losing the in-file case is the price of not shipping the
+cross-file FP.
+
+**And the target row does not close.** §3 filed
+`lib/gitlab/ci/reports/codequality_reports.rb:50` as a 2e row, but its constant
+is `SEVERITY_PRIORITIES = %w[…].map.with_index.to_h.freeze` — a CHAIN, not a
+literal, so C5 never harvests it under EITHER spelling. The row is blocked by
+exactly the mechanism 2d was dropped for. 2e ships anyway (0 FP over 9204 files,
+oracle-verified fire + four declines, and a pure spelling extension of an
+already-shipped gate). It is self-contained if a reviewer prefers zero-yield
+code not to land: `SourceIndex::{qualified_literal_constants,
+qualified_literal_constant}`, its one population line, the second arm of the
+typer's `ConstantRead` case, the two `s2e_*` unit tests, and fixture 88 cases 5
+(qualified half) / 10 / 11.
+
+### Verification
+
+- **Unit tests**: 4 in `crates/rigor-index` (block-free slot answers where the
+  flat slot collapses; absent without a block overload; a synthetic
+  divergent-vs-agreeing block-free overload pair on both instance and singleton
+  sides declines/answers; RBS object constants ingested) + 10 in
+  `crates/rigor-infer` (fire + decline per micro-slice, including the
+  project-`ENV`-shadow, the nilable-return, the divergent-overload, the block-form,
+  the ambiguous-path and the cross-namespace-path declines).
+- **Fixture** `harness/corpus/88_collection_shape_stage2.rb` (87 reserved for
+  the in-flight narrowing branch): 9 oracle diagnostics, every line
+  oracle-verified before registering; rigor-rs matches 7 on (rule, line, column)
+  with 2 documented coverage gaps (the `Dir.glob { }` block form, which the
+  reference fires `for nil`; and case 10's in-file sibling path). 0 extras.
+- **Gates** (all green): `cargo build --offline && cargo test --offline` (0
+  failures); `ruby harness/run.rb` 87 fixtures, 299/319 matched, **0
+  unregistered extras**; `ruby harness/run_snapshot.rb` identical;
+  `python3 harness/fp_audit.py --gaps --sweep` **TOTAL FP candidates: 0** over 8
+  corpora / 9204 files; `python3 harness/docs_check.py` PASS; clippy
+  `-D warnings --all-targets` clean in a fresh `CARGO_TARGET_DIR`.
+- **Gap-set diff** (`gap_census.py --sweep --dump`, pre- and post-change release
+  binaries, keyed on `(path, line, rule, method)`): 1096 → 1092, **4 closed, 0
+  opened**. The four are exactly the 2a/2b/2c rows named above. No bonus
+  closures; the shortfall vs the "up to 6" prediction is the two rows 2d and 2e
+  were filed for, both blocked on non-literal constant-value harvesting.
+
 ## 8. Upstream-feedback candidates (bucket E, all runtime-wrong at the pin)
 
 1. **Bare AR-DSL `select('…')` dispatches to `Kernel#select`** — RBS 4.1
