@@ -92,3 +92,30 @@ new FP rows.
   `python3 harness/fp_audit.py --gaps --sweep` (**0 FP / 9204 files**),
   `python3 harness/docs_check.py`, fresh-target clippy
   (`CARGO_TARGET_DIR=<fresh> cargo clippy --workspace -- -D warnings`).
+
+## Outcome (2026-08-07, PR #64)
+
+Built in one commit; **14 gap closures** (census 1193 → 1179, exactly the
+predicted gitlab `Digest::SHA256.hexdigest(...).first/.last` family), sweep
+**0 FP / 9204 files**, all gates green. Fixture 82 (with a project-sig
+ambiguous-leaf shape) reviewer-verified live against the oracle: every
+rigor-rs diagnostic matched, the ambiguity negative control silent on BOTH
+engines.
+
+One spec deviation, ACCEPTED on review: requirement 1 presumed leaf-only
+superclass storage, under which both digest links are ambiguous and the slice
+would close ZERO gaps. The implementation instead retains each reference AS
+WRITTEN (path + absolute bit + lexical context — `superclass_written` /
+`includes_written` / `member_ctxs`) and resolves by RBS's own deterministic
+rule (verified against rbs-4.1.0 `environment.rb:600/608`: super clause in
+OUTER context, members in INNER). The DECLINE survives exactly where fidelity
+is genuinely lost: flat member-level return leaves resolve only on an
+exactly-one-candidate, all-contexts-unanimous walk, and chain walks stop at
+the first unresolvable link (prefix hits are true first definers).
+
+Known boundary, recorded as fixture 82's deliberate gap: the index resolves
+instance returns on namespaced receivers, but infer's Tier 3
+(`crates/rigor-infer/src/lib.rs:1559`) does not consult the RBS return family
+for a source-registry nominal receiver — `Digest::SHA256.new.hexdigest` stays
+Dynamic end-to-end. A follow-up slice could extend Tier 3. NOTE: fixture 82
+moves the harness gap count 3 → 4 (this deliberate row).
