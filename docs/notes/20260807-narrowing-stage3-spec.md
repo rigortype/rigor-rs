@@ -192,6 +192,113 @@ carrier in expression position, d25/g6: descend via `class_flow_stmt`),
 arm STOPS clearing facts up front (f1–f4: ref records uses in every position;
 minting stays position-gated per 3a-2).
 
+#### BUILT (PR — `crates/rigor-infer/src/lib.rs`, fixture
+`harness/corpus/83_narrowing_unmodeled_statements.rb`)
+
+Shipped as specced except for **d4-d7, which moved into the decline set** (see
+"FP found mid-slice" below). Three build-measured corrections:
+
+1. **The no-op arm is an INERT-LEAF arm, not a `LocalVariableRead` arm.** The
+   flat `BeginRescue.body` interleaves the protected statements with each
+   clause's lowered exception `ConstantRead`s (`ast.rs:1516`), so f7 dies on a
+   constant read and d19's `nil` protected body dies on a `NilLit` unless the
+   whole leaf family is inert. The arm covers `LocalVariableRead`,
+   `ConstantRead`, `VariableRead`, `SelfExpr` and the six literal variants —
+   each provably no-op on BOTH halves of the decline it replaces (a leaf binds
+   nothing and, being a leaf, can contain no write to widen). `Range` and
+   `Lambda` are deliberately NOT in the set.
+2. **`RescueClause.bound_name` must be killed** — newly measured, not in the
+   spec's decline set. `rescue StandardError => v` rebinds the narrowed local
+   with no `LocalVariableWrite` node, so `collect_flow_writes` cannot see it;
+   the reference narrows the bound name to the EXCEPTION class and says
+   `for StandardError`. Keeping the `String` fact would have been a live FP.
+   Fixture control (11).
+3. **The `for` decline is narrower than the spec read it.** f10 is ref=0 only
+   when the index REBINDS the narrowed local (`for v in list`); with a distinct
+   index (`for i in list`) the reference FIRES. The decline still stands —
+   `Node::Loop` cannot tell the two apart — but it costs the whole loop-body
+   bucket, not just `for`. Conversely the loop PREDICATE is safe in every case,
+   including `for v in v.use`: the collection is evaluated before the rebind and
+   the reference fires (probes g1b/g1c/g1d).
+
+#### FP found mid-slice: d4-d7 declined, and a PRE-EXISTING carrier gap
+
+The first full sweep of the slice reported **2 FP candidates**, both on the
+ivar/gvar/cvar/constant-write VALUE descent (spec item 2):
+
+- gitlab-foss `lib/ci/inputs/base_input.rb:30` — `spec_hash = spec || {}` then
+  `@spec = spec_hash.is_a?(Hash) ? spec_hash.with_indifferent_access : …`;
+- gitlab-foss `lib/gitlab/encrypted_configuration.rb:70` — `contents =
+  deserialize(read)` (whose body ends `… .presence || {}`) then
+  `raise … unless contents.is_a?(Hash)` / `@config =
+  contents.deep_symbolize_keys`.
+
+Reduced, both are ONE root cause and it is **not in this slice**:
+`narrow_class_other` narrows `Dynamic`/`Top` carriers only, and rigor-rs types
+`Node::Logical` as `Dynamic[top]` (`ast.rs:642`) where the reference's
+`analyse_or` produces a UNION. So for any local bound from `a || b`, from
+`x ||= b`, or from a project method whose inferred return ends in one, the
+reference's gate DECLINES and rigor-rs's passes. Deleting the `|| {}` from the
+`deserialize` body makes the reference fire (probe `enc_v1`), which pins the
+mechanism exactly.
+
+**Master (`a61992f`) emits the same three FPs** on the reduced repro
+(`c = x || {}` / `c ||= {}` / a project method returning `unknown || {}`,
+each with a bare-statement use) — the standing sweep simply contained no
+instance until 3b-1's descent reached two of them at ivar-write RHSs. Per the
+spec's own rule ("any FP found mid-slice moves the offending shape into the
+decline set rather than patching around it") the VALUE descent was dropped; the
+half that ships is fact SURVIVAL past these writes (e1/e6/e7/e8), with a
+`kill_cenv_writes` over the statement span so a write nested in the value still
+invalidates. Unit rows `fp1`/`fp2` pin the decline so re-enabling d4-d7 without
+closing the carrier gap fails loudly.
+
+**Standing finding for the orchestrator**: the carrier-fidelity gap is a live
+hazard for every later narrowing slice (3a-1's `&&`/`||` predicates walk the
+same ground). Closing it means either typing `Node::Logical` as a union or
+excluding `Logical`-derived carriers from the narrowing gate — a stage-1/2
+change, not a 3b change. d4-d7 is worth ~1 census row today.
+
+Other declines carried, each measured ref=1 (coverage gaps, never FPs): survival
+past a `begin`/`rescue` and past a loop (post1/post2); a BLOCK inside a literal
+container or a loop predicate (blk4/blk6 — container elements and a loop
+predicate carry EXPRESSION position); a bare literal container in STATEMENT
+position (the container arms live in `class_flow_expr` only); a use preceding a
+`rescue => e` clause whose bound name shadows the local (bound names are killed
+before the descent, not at the clause).
+
+**Gates** (all green): `cargo test --offline` (the new
+`class_narrowing_stage3b1_statement_form_matrix` carries 59 rows — every 3b
+decision-table row, the e-family survival rows, the nine rows the spec
+corrected to ALREADY-CLOSED, and the declines
+d4-d7/fp1/fp2/f10a/f10b/d21/g3/post1/post2/rescuebind/c5/c2a/c2c/blk4/blk6 plus
+four invalidation rows); `ruby harness/run.rb` 83 fixtures / 0 unregistered
+extras; `run_snapshot.rb`; fresh-target clippy; `docs_check.py`; the full
+`fp_audit.py --gaps --sweep` **TOTAL FP candidates: 0**, 8 corpora / 9204 files.
+
+**Gap diff** (`gap_census.py --sweep`, 1167 → 1161): **6 rows closed, 0
+opened**.
+
+| corpus | row | closed by |
+|---|---|---|
+| app | mastodon `app/lib/activitypub/case_transform.rb:18` `String#underscore` | inert-leaf arm (NAMED archetype) |
+| app | mastodon `app/lib/seo/case_transform.rb:28` `String#underscore` | inert-leaf arm (NAMED archetype) |
+| lib | gitlab-foss `lib/gitlab/auth/o_auth/auth_hash.rb:44` `Hash#locality` | `ArrayLit` descent |
+| lib | gitlab-foss `lib/gitlab/auth/o_auth/auth_hash.rb:44` `Hash#country` | `ArrayLit` descent |
+| lib | gitlab-foss `lib/gitlab/patch/database_config.rb:65` `Hash[…]#deep_stringify_keys` | `BeginRescue` descent |
+| lib | gitlab-foss `lib/gitlab/redis/config_generator.rb:79` `Hash[…]#deep_symbolize_keys` | `BeginRescue` descent |
+
+Both spec-named closures landed. A seventh —
+`lib/gitlab/sidekiq_middleware/concurrency_limit/middleware.rb:14`
+`String#safe_constantize` — closed on the d4-d7 build and reopened with the
+decline; it is the measured price of the carrier gap.
+
+The shortfall against the ≤27 bound is a FINDING, not a failure: 27 was an upper
+bound over OVERLAPPING census tags, and the residue sits in buckets 3b-1 does
+not touch — loop BODIES (3b-2, now known to include `while` as well as `for`),
+`Logical` MINTING (3a-2), and rows whose fact is never minted at all without the
+3a-1 guard shapes.
+
 ### 3a-1 — compound predicate analysis (`&&`/`||`/`!`)
 
 Replace `class_check_predicate`'s single-shape return with a recursive
@@ -292,7 +399,15 @@ descend `while`/`until` bodies only. Worth doing only if the gap diff after
 ## Decline set (enumerated, each load-bearing)
 
 - Argument/receiver/return-operand `Logical` minting (c2c, f5 — ref silent).
-- `for` bodies (f10 — ref silent; arena-invisible rebind).
+- **ADDED BY THE 3b-1 BUILD** — the ivar/gvar/cvar/constant-write VALUE descent
+  (d4–d7): the one arm measured to surface the pre-existing `Dynamic`-carrier
+  fidelity gap (2 live sweep FPs). Fact SURVIVAL past those writes still ships.
+- **ADDED BY THE 3b-1 BUILD** — a `rescue => e` clause's `bound_name` must be
+  killed before the `begin` body is descended (the reference narrows the bound
+  name to the exception class; carrying the old fact in is a live FP).
+- `for` bodies — and, as collateral, `while`/`until` bodies: f10 is ref=0 only
+  when the `for` index rebinds the narrowed local, and `Node::Loop` cannot tell
+  a `for` from a `while` (arena-invisible rebind).
 - `while` predicate minting (c5, evidence note — ref silent).
 - Mixed `when` conditions (g7 — ref fires narrowed-to-subset; declined as
   out of the all-static envelope).

@@ -2440,7 +2440,10 @@ impl<'i> Typer<'i> {
     ///   `kind_of?`/`instance_of?`) — bare `LocalVariableRead` receiver, no
     ///   safe-nav, no block, exactly one `ConstantRead` argument. `&&`/`||`,
     ///   negation, chains, ivars ⇒ no narrowing (ADR-0038 "unmodeled ⇒
-    ///   decline"); a `Logical` in expression context clears ALL facts.
+    ///   decline"). A `Logical` MINTS nothing in any position (stage 3a-2);
+    ///   since stage 3b-1 it no longer clears facts either — its operands are
+    ///   descended so an OUTER fact's uses are recorded, and only a rebind in
+    ///   its span kills.
     /// - **Lexical constant resolution**: `C` resolves at the predicate's
     ///   lexical prefix; a project declaration shadowing `C`
     ///   ([`SourceIndex::constant_shadowed`]) declines entirely — we never
@@ -2463,6 +2466,15 @@ impl<'i> Typer<'i> {
     ///   or a mutated-argument position (the [`collect_flow_writes`]/
     ///   [`indexed_flow_writes`] span machinery) kills the fact; any unmodeled
     ///   statement clears ALL facts (decline backstop).
+    /// - **Unmodeled statement forms** (stage 3b-1,
+    ///   docs/notes/20260807-narrowing-stage3-spec.md): the arms enumerated in
+    ///   [`Typer::class_flow_stmt`] DESCEND instead of declining — inert leaf
+    ///   statements, ivar/gvar/cvar/constant writes, `begin`/`rescue` bodies, a
+    ///   loop PREDICATE and statement-position `&&`/`||` — and the literal
+    ///   containers in [`Typer::class_flow_expr`] likewise. Every one of them
+    ///   records uses under facts that already exist and MINTS NOTHING. A
+    ///   `while`/`until`/`for` BODY and survival past a `begin`/loop/`case`
+    ///   stay declined.
     /// - **Block bodies**: facts do NOT enter a `block_body` (fresh fact env,
     ///   ADR-0038 §3) — the archetype's `value.deep_transform_keys! { … }`
     ///   receiver sits OUTSIDE the block and is recorded before descent; after
@@ -2596,9 +2608,132 @@ impl<'i> Typer<'i> {
                 let mut c: HashMap<String, String> = HashMap::new();
                 self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out, true);
             }
-            // Any other statement (`while`/`case`/`begin`/logical/ivar-write/…)
-            // is UNMODELED: widen `tenv` for the locals it writes and CLEAR ALL
-            // facts (decline backstop). No descent.
+            // ---- stage 3b-1 (docs/notes/20260807-narrowing-stage3-spec.md) ----
+            // Every arm below either DESCENDS to record uses under facts the
+            // stage-1/2 machinery already established, or is a provable no-op.
+            // NONE of them mints a fact.
+            //
+            // An INERT LEAF statement — a bare read or a literal. It binds
+            // nothing, calls nothing, and (being a leaf) can contain no write,
+            // so both halves of the `other` arm's decline are no-ops on it.
+            // Routing it to `other` is what killed the whole recovered-carrier
+            // op-assign family: `cache[v] ||= v.use` has no owned variant and
+            // lowers through `collect_recoverable_children` into a `Statements`
+            // carrier whose children are the bare reads `cache`, `v` and only
+            // THEN the call, so the facts died before the call was reached
+            // (probes d1/d2/d10a/d10b/d11/e3/e9). The literal/`ConstantRead`
+            // members are load-bearing for `BeginRescue`, whose flat `body`
+            // interleaves the protected statements with each clause's lowered
+            // exception `ConstantRead`s (probe f7).
+            Node::LocalVariableRead { .. }
+            | Node::ConstantRead { .. }
+            | Node::VariableRead { .. }
+            | Node::SelfExpr { .. }
+            | Node::StringLit { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::NilLit { .. }
+            | Node::TrueLit { .. }
+            | Node::FalseLit { .. } => {}
+            // `@x = E` / `$gx = E` / `@@cx = E` / `X = E`. None of these can
+            // rebind a LOCAL, so every fact SURVIVES the statement (probes
+            // e1/e6/e7/e8) — the half of the old `other` treatment that was
+            // pure loss. A write nested in `E` still kills by span, exactly as
+            // `other`'s `widen_flow_writes` + a `kill_cenv_writes` do.
+            //
+            // DESCENDING `E` to record the use (spec rows d4-d7) is DECLINED.
+            // The spec's build measured it as the one arm that surfaces a
+            // PRE-EXISTING carrier-fidelity gap: `narrow_class_other` narrows
+            // Dynamic/Top carriers only, and rigor-rs types a `Node::Logical`
+            // (and any project-method return that ends in one) as
+            // `Dynamic[top]` where the reference produces a UNION — so the
+            // reference's gate declines and ours does not. Two live FPs over
+            // the standing sweep sat on this arm (gitlab-foss
+            // `lib/ci/inputs/base_input.rb:30` via `spec_hash = spec || {}`,
+            // `lib/gitlab/encrypted_configuration.rb:70` via a `deserialize`
+            // whose body ends in `… || {}`); master emits the same FPs for a
+            // bare-statement use, so the gap is orthogonal to this slice and
+            // must be closed on the carrier side before d4-d7 can ship.
+            Node::InstanceVariableWrite { span, .. }
+            | Node::VariableWrite { span, .. }
+            | Node::ConstantWrite { span, .. } => {
+                let span = *span;
+                widen_flow_writes(writes, span, tenv, interner);
+                kill_cenv_writes(writes, span, cenv);
+            }
+            // `begin`/`rescue`/`else`/`ensure`. The flat `body` holds the
+            // protected statements, each clause's exception constants and
+            // clause body, the `else` body and the `ensure` body in source
+            // order (`ast.rs:1516`), so ONE descent covers d19/f7/f8.
+            //
+            // A `rescue => e` capture REBINDS `e` with no `LocalVariableWrite`
+            // node, so it is invisible to `collect_flow_writes`: kill the bound
+            // names explicitly BEFORE descending (probe `rescuebind` — the
+            // reference narrows the bound name to the exception class and says
+            // `for StandardError`; keeping the stale fact would emit
+            // `for String`, a live FP). Killing before the protected body costs
+            // the coverage of a use that precedes the clause — a subset.
+            //
+            // Recording under exception paths is safe: facts are only KILLED
+            // inside, never minted, and a runtime path that skips a rebind only
+            // makes a recorded fact more true. Survival PAST the `begin` is
+            // declined (widen + clear, exactly as `other` did) even though the
+            // reference does keep it (probe post1) — unprobed at spec time and
+            // a strict subset.
+            Node::BeginRescue { body, clauses, span, .. } => {
+                let (body, span) = (body.clone(), *span);
+                let bound: Vec<String> =
+                    clauses.iter().filter_map(|c| c.bound_name.clone()).collect();
+                for name in &bound {
+                    cenv.remove(name);
+                }
+                self.class_flow_scope(ast, &body, tenv, cenv, writes, interner, out, stmt_position);
+                widen_flow_writes(writes, span, tenv, interner);
+                cenv.clear();
+            }
+            // `while`/`until`/`for`. The predicate (for `for`, the COLLECTION)
+            // is evaluated ONCE before the body, in the enclosing scope — the
+            // same EXPRESSION position an `if` predicate gets. The reference
+            // fires on a narrowed use in a `while`/`until` predicate and in a
+            // `for` collection, even when the `for` index rebinds that very
+            // local (probes g1/g1b/g1c/g1d — the collection is evaluated before
+            // the rebind).
+            //
+            // The BODY is DECLINED. `Node::Loop` cannot distinguish `for`,
+            // whose index rebind is INVISIBLE in the arena (`ast.rs:1501` drops
+            // the index target) and where the reference is measured SILENT
+            // (probe f10a: `for v in list` then `v.use`), from `while`/`until`,
+            // where it fires (f10b/d21). Descending would be a live FP. Stage
+            // 3b-2 lands an arena discriminator first.
+            Node::Loop { predicate, span, .. } => {
+                let (predicate, span) = (*predicate, *span);
+                if let Some(p) = predicate {
+                    self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out, false);
+                }
+                widen_flow_writes(writes, span, tenv, interner);
+                cenv.clear();
+            }
+            // A statement-position `&&`/`||`. Descend both operands to record
+            // uses of an OUTER fact — valid on both edges, and the reference
+            // records them (probes f1/f2). Establishing a fact FROM the
+            // operands is stage 3a-2 and is NOT done here. The operands are
+            // EXPRESSION position. Afterwards: `widen_flow_writes` keeps the
+            // `tenv` effect byte-identical to the `other` arm this replaces,
+            // and `kill_cenv_writes` drops the fact of any local the
+            // conditionally-executed right operand may rebind (a fact with no
+            // write in the span survives — probe f4b, where the reference also
+            // keeps it).
+            Node::Logical { left, right, span, .. } => {
+                let (left, right, span) = (*left, *right, *span);
+                self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out, false);
+                self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out, false);
+                widen_flow_writes(writes, span, tenv, interner);
+                kill_cenv_writes(writes, span, cenv);
+            }
+            // Any other statement (`case`/`in`/lambda/range/…) is UNMODELED:
+            // widen `tenv` for the locals it writes and CLEAR ALL facts
+            // (decline backstop). No descent.
             other => {
                 let span = other.span();
                 widen_flow_writes(writes, span, tenv, interner);
@@ -2694,13 +2829,19 @@ impl<'i> Typer<'i> {
                 // argument (`f(value = x)`).
                 kill_cenv_writes(writes, call_span, cenv);
             }
-            Node::Logical { left, right, .. } => {
-                // `&&`/`||` — unmodeled narrowing. Clear all facts (decline),
-                // then recurse for block/call reachability.
-                let (left, right) = (*left, *right);
-                cenv.clear();
+            Node::Logical { left, right, span, .. } => {
+                // `&&`/`||`. Stage 3b-1: the up-front `cenv.clear()` is GONE.
+                // Recording a use is POSITION-INDEPENDENT — the reference fires
+                // on a use of an outer fact inside a logical operand in
+                // statement, argument and assignment-RHS position alike (probes
+                // f1-f4). Establishing a fact from the operands stays out of
+                // slice (3a-2), so nothing new is minted here; a
+                // conditionally-executed rebind inside the operands is killed
+                // by span, exactly as the `Call` arm does.
+                let (left, right, span) = (*left, *right, *span);
                 self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out, false);
                 self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out, false);
+                kill_cenv_writes(writes, span, cenv);
             }
             // A write in EXPRESSION position (`f(value = x, value.frobnicate)`)
             // must thread its rebind IMMEDIATELY: Ruby evaluates arguments
@@ -2749,6 +2890,37 @@ impl<'i> Typer<'i> {
             // position (p4, p8) and so is left alone.
             Node::Case { .. } => {
                 self.class_flow_case(ast, id, tenv, cenv, writes, interner, out, stmt_position);
+            }
+            // ---- stage 3b-1: pure-descent expression containers ------------
+            // Recording a narrowed use is position-INDEPENDENT (probe f3), so
+            // descending a literal container closes d14-d17 wherever it sits.
+            // The elements are EXPRESSION position: a container is not a
+            // statement list, so a BLOCK inside one is not descended (probe
+            // blk4 — `x = [[1].map { … }]` — is a recorded coverage gap, not an
+            // FP). Nothing is minted and nothing is cleared: an element cannot
+            // rebind a local except through the expression-position write arms
+            // above, which thread it immediately.
+            Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+                let elements = elements.clone();
+                for e in elements {
+                    self.class_flow_expr(ast, e, tenv, cenv, writes, interner, out, false);
+                }
+            }
+            Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+                let parts = parts.clone();
+                for p in parts {
+                    self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out, false);
+                }
+            }
+            // A `Statements` carrier (the `collect_recoverable_children`
+            // recovery for `x = *use`, `x = (use rescue nil)`, …) or a
+            // `begin`/`rescue` in expression position (`x = begin USE rescue
+            // end`) is a STATEMENT LIST: hand it to the statement walker, which
+            // carries the same position the assignment RHS has (probes
+            // d25/g6/d20). The `BeginRescue` arm's bound-name kill and its
+            // post-clear apply here too.
+            Node::Statements { .. } | Node::BeginRescue { .. } => {
+                self.class_flow_stmt(ast, id, tenv, cenv, writes, interner, out, stmt_position);
             }
             _ => {}
         }
@@ -5233,6 +5405,203 @@ mod class_narrowing_tests {
             let (ast, snaps) = class_snaps(src);
             let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
             assert_eq!(got, *expected, "position matrix row {row}");
+        }
+    }
+
+    /// STAGE 3b-1 (docs/notes/20260807-narrowing-stage3-spec.md § "3b-1"): the
+    /// unmodeled-statement-form decision table. Every row was measured against
+    /// the pinned reference from a fresh cwd with `--no-cache` — `Some(c)` means
+    /// the reference FIRES and rigor-rs must record `c`, `None` means rigor-rs
+    /// must record NOTHING (either the reference is silent, or the row is a
+    /// deliberate coverage decline).
+    ///
+    /// The guard is always `return unless v.is_a?(String)` and the witnessed
+    /// call is always `v.frobnicate_zzz`, so a row's whole point is the
+    /// STATEMENT FORM the use sits in. 3b-1 mints no facts: every `Some` row is
+    /// a use recorded under a fact stage 1-2 already established.
+    #[test]
+    fn class_narrowing_stage3b1_statement_form_matrix() {
+        const G: &str = "  return unless v.is_a?(String)\n";
+        let guarded = |body: &str| format!("def f(v, cache, obj, cond, list)\n{G}{body}end\n");
+        // (row, source, expected narrowed class of the `frobnicate_zzz` call)
+        let mut rows: Vec<(&str, String, Option<&str>)> = vec![
+            // --- d4-d7: ivar / gvar / cvar / constant write VALUES -----------
+            // DECLINED (see the arm's comment): the reference FIRES on all
+            // four, but descending this one arm surfaced a pre-existing
+            // carrier-fidelity FP over the standing sweep. The e-family rows
+            // below pin the half that DID ship — facts survive these writes.
+            ("d4", guarded("  @x = v.frobnicate_zzz\n"), None),
+            ("d5", guarded("  $gx = v.frobnicate_zzz\n"), None),
+            ("d6", guarded("  @@cx = v.frobnicate_zzz\n"), None),
+            (
+                "d7",
+                // A constant write is only legal at top level / in a class body.
+                "v = $stdin\nif v.is_a?(String)\n  XCONST_ZZZ = v.frobnicate_zzz\nend\n".to_string(),
+                None,
+            ),
+            // The two SWEEP FPs the d4-d7 decline retires, reduced. Both are
+            // `narrow_class_other` carrier gaps: rigor-rs types a `Logical`
+            // (fp1) and a project-method return ending in one (fp2) as
+            // `Dynamic[top]` where the reference produces a union, so the
+            // reference's Dynamic-only gate declines and ours would not.
+            // MASTER emits both for a bare-statement use — the gap is
+            // orthogonal to this slice, and these rows fail loudly if d4-d7 is
+            // ever re-enabled without closing it first.
+            (
+                "fp1",
+                "def f(spec)\n  h = spec || {}\n  @spec = h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"
+                    .to_string(),
+                None,
+            ),
+            (
+                "fp2",
+                "class C\n  def config\n    c = mk\n    raise ArgumentError unless c.is_a?(Hash)\n\n    @config = c.frobnicate_zzz\n  end\n\n  def mk\n    unknown_zzz || {}\n  end\nend\n"
+                    .to_string(),
+                None,
+            ),
+            // --- d1/d10/d11: recovered op-assign carriers (bare local reads) --
+            ("d1", guarded("  cache[v] ||= v.frobnicate_zzz\n"), Some("String")),
+            ("d10a", guarded("  cache[v] += v.frobnicate_zzz\n"), Some("String")),
+            ("d10b", guarded("  cache[v] &&= v.frobnicate_zzz\n"), Some("String")),
+            ("d11", guarded("  obj.attr ||= v.frobnicate_zzz\n"), Some("String")),
+            // d2 — the mastodon archetype: an op-assign whose RHS is a nested
+            // conditional. The recovered carrier flattens the `if`, but the use
+            // still records under the OUTER fact.
+            (
+                "d2",
+                guarded("  cache[v] ||= if cond\n    v\n  else\n    v.frobnicate_zzz\n  end\n"),
+                Some("String"),
+            ),
+            // --- d25/g6: a recovered carrier / `rescue` modifier as an RHS ----
+            ("d25", guarded("  x = *v.frobnicate_zzz\n  x\n"), Some("String")),
+            ("g6", guarded("  x = (v.frobnicate_zzz rescue nil)\n  x\n"), Some("String")),
+            // --- d14-d17: literal containers ---------------------------------
+            ("d14", guarded("  a, b = v.frobnicate_zzz, 1\n  [a, b]\n"), Some("String")),
+            ("d15", guarded("  x = [v.frobnicate_zzz]\n  x\n"), Some("String")),
+            ("d16", guarded("  x = { k: v.frobnicate_zzz }\n  x\n"), Some("String")),
+            ("d17", guarded("  x = \"#{v.frobnicate_zzz}\"\n  x\n"), Some("String")),
+            ("d17b", guarded("  x = :\"#{v.frobnicate_zzz}\"\n  x\n"), Some("String")),
+            // --- d19/d20/f7/f8: begin/rescue/else/ensure ---------------------
+            (
+                "d19",
+                guarded("  begin\n    v.frobnicate_zzz\n  rescue StandardError\n    nil\n  end\n"),
+                Some("String"),
+            ),
+            (
+                "d20",
+                guarded(
+                    "  x = begin\n    v.frobnicate_zzz\n  rescue StandardError\n    nil\n  end\n  x\n",
+                ),
+                Some("String"),
+            ),
+            (
+                "f7",
+                guarded("  begin\n    nil\n  rescue StandardError\n    v.frobnicate_zzz\n  end\n"),
+                Some("String"),
+            ),
+            ("f8", guarded("  begin\n    nil\n  ensure\n    v.frobnicate_zzz\n  end\n"), Some("String")),
+            // --- g1: loop PREDICATE (`while`/`until`/`for` collection) -------
+            ("g1", guarded("  while v.frobnicate_zzz\n    break\n  end\n"), Some("String")),
+            ("g1d", guarded("  until v.frobnicate_zzz\n    break\n  end\n"), Some("String")),
+            // g1b/g1c: the `for` COLLECTION is evaluated ONCE, before the index
+            // rebind — the reference fires even when the index is the narrowed
+            // local itself.
+            ("g1b", guarded("  for i in v.frobnicate_zzz\n    nil\n  end\n"), Some("String")),
+            ("g1c", guarded("  for v in v.frobnicate_zzz\n    nil\n  end\n"), Some("String")),
+            // --- f1-f4b: `&&`/`||` no longer clear ---------------------------
+            ("f1", guarded("  cond && v.frobnicate_zzz\n"), Some("String")),
+            ("f2", guarded("  cond || v.frobnicate_zzz\n"), Some("String")),
+            ("f3", guarded("  g(cond && v.frobnicate_zzz)\n"), Some("String")),
+            ("f4", guarded("  x = cond && v.frobnicate_zzz\n  x\n"), Some("String")),
+            ("f4b", guarded("  cond && 1\n  v.frobnicate_zzz\n"), Some("String")),
+            // --- e-family: fact SURVIVAL past the new statement arms ---------
+            ("e1", guarded("  @x = 1\n  v.frobnicate_zzz\n"), Some("String")),
+            ("e6", guarded("  $gx = 1\n  v.frobnicate_zzz\n"), Some("String")),
+            ("e7", guarded("  @@cx = 1\n  v.frobnicate_zzz\n"), Some("String")),
+            ("e3", guarded("  cache[:k] ||= 1\n  v.frobnicate_zzz\n"), Some("String")),
+            ("e9", guarded("  cache\n  v.frobnicate_zzz\n"), Some("String")),
+            // --- ALREADY CLOSED ON MASTER: assert they STAY closed -----------
+            // A regression in any of these is otherwise silent (the spec's
+            // "Where the evidence note's reading was wrong" correction).
+            ("d8", guarded("  cache[v] = v.frobnicate_zzz\n"), Some("String")),
+            ("d9", guarded("  obj.attr = v.frobnicate_zzz\n"), Some("String")),
+            ("d12a", guarded("  @x ||= v.frobnicate_zzz\n"), Some("String")),
+            ("d12b", guarded("  @x += v.frobnicate_zzz\n"), Some("String")),
+            ("d13", guarded("  $gx ||= v.frobnicate_zzz\n"), Some("String")),
+            ("d23", guarded("  yield v.frobnicate_zzz\n"), Some("String")),
+            ("d24", guarded("  defined?(v.frobnicate_zzz)\n"), Some("String")),
+            ("g2", guarded("  super(v.frobnicate_zzz)\n"), Some("String")),
+            ("g5", guarded("  v.frobnicate_zzz rescue nil\n"), Some("String")),
+            // --- DECLINES (each load-bearing) --------------------------------
+            // f10a: the `for` index rebind is INVISIBLE in the arena and the
+            // reference is SILENT here. This row is why `Loop` bodies are not
+            // descended at all — `Node::Loop` cannot tell `for` from `while`.
+            ("f10a", guarded("  for v in list\n    v.frobnicate_zzz\n  end\n"), None),
+            // f10b/d21/g3: `for` with a distinct index, a `while` body and a
+            // `break` operand — the reference FIRES on all three; declined as
+            // collateral of the f10a decline. Stage 3b-2.
+            ("f10b", guarded("  for i in list\n    v.frobnicate_zzz\n  end\n"), None),
+            ("d21", guarded("  while cond\n    v.frobnicate_zzz\n  end\n"), None),
+            ("g3", guarded("  while cond\n    break v.frobnicate_zzz\n  end\n"), None),
+            // post1/post2: the reference KEEPS the fact past a `begin`/loop;
+            // we clear (unprobed at spec time ⇒ decline, a strict subset).
+            (
+                "post1",
+                guarded("  begin\n    nil\n  rescue StandardError\n    nil\n  end\n  v.frobnicate_zzz\n"),
+                None,
+            ),
+            ("post2", guarded("  while cond\n    nil\n  end\n  v.frobnicate_zzz\n"), None),
+            // rescuebind: `rescue => v` REBINDS the narrowed local with no
+            // `LocalVariableWrite` node. The reference narrows it to the
+            // EXCEPTION class (`for StandardError`), so keeping the `String`
+            // fact would be a live FP.
+            (
+                "rescuebind",
+                guarded("  begin\n    nil\n  rescue StandardError => v\n    v.frobnicate_zzz\n  end\n"),
+                None,
+            ),
+            // c5: a `while` PREDICATE mints nothing for the body (reference
+            // silent — evidence note).
+            ("c5", "def f(v)\n  while v.is_a?(String)\n    v.frobnicate_zzz\n  end\nend\n".to_string(), None),
+            // c2a/c2c: `Logical` MINTING stays out of slice (stage 3a-2) in
+            // statement AND argument position.
+            ("c2a", "def f(v)\n  v.is_a?(String) && v.frobnicate_zzz\nend\n".to_string(), None),
+            ("c2c", "def f(v)\n  g(v.is_a?(String) && v.frobnicate_zzz)\nend\n".to_string(), None),
+            // blk4/blk6: a BLOCK inside a literal container or a loop predicate
+            // is not descended (container elements and a loop predicate are
+            // EXPRESSION position). The reference does narrow there — recorded
+            // coverage gaps, not FPs.
+            (
+                "blk4",
+                "def f(v)\n  x = [[1].map { v.is_a?(String) ? v.frobnicate_zzz : v }]\n  x\nend\n"
+                    .to_string(),
+                None,
+            ),
+            (
+                "blk6",
+                "def f(v)\n  while [1].map { v.is_a?(String) ? v.frobnicate_zzz : v }\n    break\n  end\nend\n"
+                    .to_string(),
+                None,
+            ),
+            // --- INVALIDATION through the new arms ---------------------------
+            // A rebind nested in an ivar-write value threads IMMEDIATELY.
+            ("inv1", guarded("  @x = (v = cond)\n  v.frobnicate_zzz\n"), None),
+            // A conditionally-executed rebind in a statement `&&` kills by span.
+            ("inv2", guarded("  cond && (v = cache)\n  v.frobnicate_zzz\n"), None),
+            // A rebind in an earlier array element kills the later sibling.
+            ("inv3", guarded("  x = [v = cache, v.frobnicate_zzz]\n  x\n"), None),
+            // A mutator inside a `begin` body kills the following use.
+            (
+                "inv4",
+                guarded("  begin\n    v.merge!(a: 1)\n    v.frobnicate_zzz\n  rescue StandardError\n    nil\n  end\n"),
+                None,
+            ),
+        ];
+        rows.sort_by_key(|(row, _, _)| *row);
+        for (row, src, expected) in &rows {
+            let (ast, snaps) = class_snaps(src.as_bytes());
+            let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
+            assert_eq!(got, *expected, "stage 3b-1 matrix row {row}\n--- source ---\n{src}");
         }
     }
 
