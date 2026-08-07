@@ -103,6 +103,63 @@ one-line warning naming the class and the two colliding files would do — the
 information is in the exception) instead of failing soft; optionally prefer one
 source when the duplicate is byte-identical modulo location.
 
+## 4. A project-wide toplevel `def` captures same-named DSL methods in every other file
+
+From the [141-row adjudication](20260807-gap-adjudication-141.md), cluster B's
+largest family (16 live diagnostics). 2-file repro:
+
+```ruby
+# helper.rb — an executable script, never loaded by the specs
+require "json"
+def output(obj)
+  print JSON.dump(obj)
+end
+# a_spec.rb
+RSpec.describe "x" do
+  it "prints" do
+    expect { puts "ok" }.to output(/ok/).to_stdout_from_any_process
+  end
+end
+```
+
+Reference: `a_spec.rb:3: error: undefined method 'to_stdout_from_any_process'
+for nil`. The toplevel `def output` (returning `nil` via `print`) is bound in
+an unrelated file where Ruby resolves RSpec's `output` matcher — an included
+module beats `Object`'s private toplevel def in the MRO. Live instances: 16
+diagnostics across dependabot-core's updater specs, all from
+`bundler/helpers/v2/run.rb:31`. rigor-rs is silent.
+
+## 5. `Array.new(n) { block }` element type ignores the block fill
+
+```ruby
+xs = Array.new(2) { "s" }
+xs[0].upcase
+```
+
+Reference: `error: undefined method 'upcase' for nil` — elements are typed by
+the no-block nil-fill despite the block being present. Live instances:
+concurrent-ruby's `AtomicFixnum` counter examples and
+`spec/concurrent/cancellation_spec.rb`. rigor-rs is silent.
+
+## 6. The `defined?` operand is analyzed as evaluated code
+
+```ruby
+class C
+  def setup
+    reset if defined? @subject && !@subject.options.empty?
+  end
+  def reset
+    @subject = nil
+  end
+end
+```
+
+Reference: `error: undefined method 'options' for nil`. Ruby parses the whole
+`&&` expression as the `defined?` operand and never evaluates it — `defined?`
+is a non-evaluating operator, so no call there can raise. Live instance:
+net-ssh `test/authentication/methods/test_keyboard_interactive.rb:14`.
+rigor-rs is silent.
+
 ## Already fixed upstream — no action, listed to close the loop
 
 - **#237** — a `sig/` referencing an undeclared interface/alias made the whole
