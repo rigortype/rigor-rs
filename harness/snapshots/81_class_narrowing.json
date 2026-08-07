@@ -3,49 +3,56 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 15,
+      "line": 22,
       "column": 11,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Hash"
     },
     {
       "rule": "call.undefined-method",
-      "line": 21,
+      "line": 28,
       "column": 27,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Hash"
     },
     {
       "rule": "call.undefined-method",
-      "line": 29,
+      "line": 36,
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Hash"
     },
     {
       "rule": "call.undefined-method",
-      "line": 37,
+      "line": 44,
       "column": 11,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Hash"
     },
     {
       "rule": "call.undefined-method",
-      "line": 39,
+      "line": 46,
       "column": 11,
       "severity": "error",
       "message": "undefined method `frobnicate_yyy' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 69,
+      "line": 56,
+      "column": 49,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 83,
       "column": 27,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Hash"
     },
     {
       "rule": "call.undefined-method",
-      "line": 78,
+      "line": 92,
       "column": 11,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Hash | String"

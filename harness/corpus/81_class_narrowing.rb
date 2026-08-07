@@ -3,9 +3,16 @@
 # to `Nominal[C]` on the truthy edge of a class guard witnesses
 # `call.undefined-method` against C. The NEGATIVE CONTROLS pin the FP-safety
 # declines: a rebind invalidates, the falsey edge / post-`if` code is never
-# narrowed without a terminating opposite branch, facts do not enter block
+# narrowed without a terminating opposite branch, outer facts do not enter block
 # bodies, and a multi-condition `when` declines (union narrowing is a
 # follow-up).
+#
+# The POSITION rule (docs/notes/20260807-block-narrowing-position-rule.md): a
+# block body and a `case`/`when` clause establish a narrowing only in STATEMENT
+# position or on an assignment RHS. Once the value is consumed as a call
+# receiver, as an argument or as a `return` operand the reference is silent, so
+# rigor-rs must be too. Safe-nav is NOT the axis — `h&.m { … }` in statement
+# position fires on both engines (case 9 below).
 
 # --- positives ---------------------------------------------------------------
 
@@ -40,6 +47,13 @@ def narrow_case(value)
   else
     value
   end
+end
+
+# (9) SAFE-NAV block in STATEMENT position: a guard INSIDE the block narrows —
+# FIRES `for String` on both engines. Pins that safe-nav is not what decides a
+# block descent (the shape PR #63 wrongly declined).
+def safe_nav_block_narrows(h)
+  h&.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }
 end
 
 # --- negative controls -------------------------------------------------------
@@ -79,4 +93,25 @@ def multi_condition_when(value)
   else
     value
   end
+end
+
+# (10) block-bearing call consumed as a RECEIVER: the reference establishes no
+# narrowing inside the block once the call is chained — SILENT on both engines.
+# Firing here was a live FP on master (probe s7).
+def chained_block_receiver_declines(h)
+  h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }.compact
+end
+
+# (11) `case` consumed as an ARGUMENT: same positional rule — SILENT on both
+# engines (probe p2). `identity_zzz` keeps the argument position honest without
+# pulling in an unrelated core method.
+def identity_zzz(y)
+  y
+end
+
+def case_as_argument_declines(value)
+  identity_zzz(case value
+               when Hash
+                 value.frobnicate_zzz
+               end)
 end
