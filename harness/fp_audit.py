@@ -167,11 +167,20 @@ def run_rs(files):
     # inflated coverage gaps as the only symptom — and gaps are expected noise
     # by design (ADR-0002), so nobody reads them as failure.
     #
-    # `rigor check` exit codes: 0 = no diagnostics, 1 = diagnostics emitted.
-    # Anything else (64 usage, 101 panic, 127 not-found …) is a failure, and so
-    # is stdout that is not a JSON array, or an exit code that contradicts the
-    # array's emptiness (that last one is what catches a binary which exits 1
-    # while printing nothing at all).
+    # `rigor check` exit codes: 1 iff at least one ERROR-severity diagnostic was
+    # emitted, else 0 — a warning-only batch exits 0 WITH diagnostics on stdout.
+    # So the signal is the allowlist {0, 1}; anything else (64 usage, 101 panic,
+    # 127 not-found …) is a failure, as is stdout that is not a JSON array.
+    #
+    # Deliberately NOT checked: whether the exit code agrees with the diagnostic
+    # list being empty. Warnings are in PARITY, so that rule marks any
+    # warning-only corpus INVALID — a healthy run reported as a failed one, the
+    # mirror image of the defect this file is fixing. Keying it on
+    # ERROR-severity presence instead would be arithmetically right today but
+    # assumes no severity remapping (`.rigor.yml`, `--bleeding-edge`) ever
+    # demotes an error, which is unverified. It also earns nothing: an empty
+    # stdout fails the JSON parse below regardless of exit code, which is what
+    # actually catches a binary that exits 1 while printing nothing.
     global LAST_RS_FAILURE
     rs = resolve_rs()
     r = subprocess.run([rs, "check", "--format", "json"] + files,
@@ -188,10 +197,6 @@ def run_rs(files):
         return None
     if not isinstance(out, list):
         LAST_RS_FAILURE = f"stdout parsed to {type(out).__name__}, expected a JSON array"
-        return None
-    if (r.returncode == 0) != (not out):
-        LAST_RS_FAILURE = (f"exit {r.returncode} contradicts {len(out)} "
-                           f"diagnostics on stdout")
         return None
     LAST_RS_FAILURE = None
     return out

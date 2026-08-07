@@ -81,11 +81,14 @@ Both defects are closed in `harness/fp_audit.py`, `harness/gap_census.py` and
 [harness/CORPUS.md](../../harness/CORPUS.md).
 
 **1 — a failed run is INVALID, never 0.** `run_rs` now returns `None` on
-anything that is not a trustworthy answer, exactly as `run_ref` already did:
-an exit code outside `{0, 1}` (`rigor check` exits 0 with no diagnostics, 1
-with diagnostics), stdout that is not a JSON array, or an exit code that
-contradicts the array's emptiness — that last one is what catches a binary
-which exits 1 while printing nothing, i.e. the `/usr/bin/false` probe. `audit()`
+anything that is not a trustworthy answer, exactly as `run_ref` already did: an
+exit code outside `{0, 1}`, or stdout that is not a JSON array (that second one
+is what catches a binary which exits 1 while printing nothing, i.e. the
+`/usr/bin/false` probe). Note what is NOT checked, after a false-fire in review:
+`rigor check` exits 1 iff at least one **error**-severity diagnostic was
+emitted, so a warning-only batch exits 0 *with* diagnostics — comparing the exit
+code against the list's emptiness marks healthy warning-only corpora INVALID,
+which is the mirror image of the defect being fixed here. `audit()`
 prints `INVALID: rigor-rs failed on this batch [reason] — comparison invalid,
 not FP-free` and returns `None`, the total line is marked `INCOMPLETE (n of m
 corpora compared)`, and the run exits 1. A reference-side failure now counts the

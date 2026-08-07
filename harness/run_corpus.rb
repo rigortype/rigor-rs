@@ -228,8 +228,12 @@ def run_rigorrs_batch(file_map)
   # positives are rs-minus-ref, so an empty rs map makes the FP count 0 by
   # construction and the run prints "STRONG RESULT". Same defect the Python
   # audit carried (docs/notes/20260807-fp-audit-port-side-blind-spots.md).
-  # `rigor check` exits 0 with no diagnostics, 1 with diagnostics; anything else
-  # (64 usage, 101 panic, 127 not-found) is a crash.
+  # `rigor check` exits 1 iff an ERROR-severity diagnostic was emitted, else 0 —
+  # a warning-only batch exits 0 WITH diagnostics — so the allowlist {0, 1} is
+  # the whole signal; anything else (64 usage, 101 panic, 127 not-found) is a
+  # crash. Exit code vs. emptiness is deliberately NOT compared: warnings are a
+  # parity severity, so that rule fails healthy warning-only corpora. See
+  # fp_audit.py's run_rs for the full reasoning.
   unless [0, 1].include?(status.exitstatus)
     abort("ERROR: rigor-rs failed (exit #{status.exitstatus}) — comparison " \
           "invalid, NOT false-positive-free.\n  #{(stderr.empty? ? stdout : stderr).strip[0, 300]}")
@@ -248,11 +252,6 @@ def run_rigorrs_batch(file_map)
   rescue JSON::ParserError => e
     abort("ERROR: rigor-rs JSON parse error (#{e.message}) — comparison " \
           "invalid, NOT false-positive-free.")
-  end
-
-  if status.exitstatus.zero? != Array(parsed).empty?
-    abort("ERROR: rigor-rs exit #{status.exitstatus} contradicts " \
-          "#{Array(parsed).size} diagnostics on stdout — comparison invalid.")
   end
 
   result = Hash.new { |h, k| h[k] = [] }

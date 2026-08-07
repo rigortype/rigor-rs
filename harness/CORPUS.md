@@ -68,10 +68,16 @@ False positives are `rigor-rs − reference`, so an empty *port* result makes th
 FP count 0 by construction; an empty *reference* result turns all of rigor-rs's
 output into phantom FPs. Both sides therefore report a batch failure as
 **INVALID** — never as 0 — and any invalid comparison makes the whole run exit
-non-zero, with `TOTAL FP candidates` marked `INCOMPLETE`. `rigor check` exits 0
-with no diagnostics and 1 with diagnostics; any other exit code, stdout that is
-not a JSON array, or an exit code that contradicts the array's emptiness is a
-failure.
+non-zero, with `TOTAL FP candidates` marked `INCOMPLETE`.
+
+What counts as a port-side failure: `rigor check` exits **1 iff at least one
+ERROR-severity diagnostic was emitted**, else 0 — so a warning-only batch exits
+0 *with* diagnostics on stdout. The failure signals are therefore an exit code
+outside `{0, 1}` (64 usage, 101 panic, 127 not-found …) and stdout that is not a
+JSON array. Exit code versus diagnostic-list emptiness is deliberately **not**
+compared: warnings are a parity severity, so such a rule marks healthy
+warning-only corpora INVALID, and it earns nothing — empty stdout already fails
+the JSON parse.
 
 ## Corpora
 
