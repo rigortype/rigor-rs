@@ -25,7 +25,7 @@ pub mod source_index;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use rigor_index::CoreIndex;
+use rigor_index::{ClassOrdering, CoreIndex};
 use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
@@ -123,6 +123,37 @@ const ARRAY_NEW_TUPLE_LIMIT: i64 = 16;
 /// [`type_of`] / [`build_toplevel_env`] signatures stay source-compatible: they
 /// are thin wrappers over a [`Typer`] built with an empty index. Callers that
 /// want chained-call result typing construct a [`Typer`] with the real index.
+/// One local's class fact inside the narrowing flow pass
+/// ([`Typer::class_narrowing_pass`]). The two variants are the two DIRECTIONS
+/// the two engines' carriers can disagree in, and they never coexist for one
+/// local: `Narrowed` requires a `Dynamic`/`Top` carrier, `Bot` a precise one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ClassFact {
+    /// The local was narrowed FROM `Dynamic`/`Top` TO `Nominal[C]` — the
+    /// reference's `narrow_class_other` (`narrowing.rb:2425`). A call on the
+    /// local witnesses `call.undefined-method` against `C`.
+    Narrowed(String),
+    /// The guard class is DISJOINT from (or, under `instance_of?`, unequal to)
+    /// the local's carrier class, so the reference's narrowing yields `Bot`
+    /// (`narrow_nominal_to_class` / `narrow_shape_to_class` /
+    /// `narrow_constant_to_class`). Dispatch through `Bot` witnesses nothing:
+    /// every call on the local is SUPPRESSED, for every rule.
+    Bot,
+}
+
+/// The output of [`Typer::class_narrowing_pass`] — the two per-call-node
+/// snapshot sets the rules layer consumes.
+#[derive(Default, Debug)]
+pub struct ClassNarrowing {
+    /// `call node id -> narrowed class name C` for a bare-local receiver the
+    /// pass narrowed from `Dynamic`/`Top`. Read by `check_narrowed_call`.
+    pub calls: HashMap<NodeId, String>,
+    /// Call node ids whose bare-local receiver is `Bot` under a disjoint guard.
+    /// The rules layer emits NOTHING at these sites — the reference cannot,
+    /// because `Bot` has no dispatch surface.
+    pub dead: HashSet<NodeId>,
+}
+
 pub struct Typer<'i> {
     index: &'i CoreIndex,
     /// The per-run in-source class index (ADR-0023 tier-4). Empty for a
@@ -2419,7 +2450,8 @@ impl<'i> Typer<'i> {
 
     // -----------------------------------------------------------------------
     // `is_a?` / `case-when` class narrowing (census mechanism 1, spec
-    // docs/notes/20260807-class-narrowing-slice-spec.md)
+    // docs/notes/20260807-class-narrowing-slice-spec.md) + the disjoint-guard
+    // suppression (docs/notes/20260808-disjoint-guard-suppression.md)
     // -----------------------------------------------------------------------
 
     /// Compute the per-call-node class-narrowing snapshot map: `call node id ->
@@ -2488,12 +2520,54 @@ impl<'i> Typer<'i> {
     ///   no scope. `if`/ternary is the documented exception: its branches
     ///   narrow in every position, and only the early-return propagation PAST
     ///   it is statement-only (review R2, above).
-    pub fn class_narrowing_snapshots(
+    ///
+    /// ## The DISJOINT-guard suppression ([`ClassNarrowing::dead`])
+    ///
+    /// The same walk carries a SECOND, opposite-direction fact
+    /// (docs/notes/20260808-disjoint-guard-suppression.md). Where the narrowing
+    /// map covers "our carrier is COARSER than the reference's", this covers
+    /// "our carrier is PRECISE and the reference's is `Bot`": the reference's
+    /// `narrow_nominal_to_class` / `narrow_shape_to_class` /
+    /// `narrow_constant_to_class` (`narrowing.rb:2381,2404,2364`) collapse a
+    /// guarded local to `Bot` when the guard class is DISJOINT from the
+    /// carrier's class — dispatch through `Bot` then witnesses nothing, so the
+    /// reference is silent on every call whose receiver is that local, for
+    /// EVERY rule (measured: `undefined-method`, `wrong-arity`,
+    /// `argument-type-mismatch`). rigor-rs never narrowed a precise carrier, so
+    /// `check_call` kept firing on the pre-guard type — a live FP.
+    ///
+    /// The suppression is bounded to what our side can PROVE, because here
+    /// silence is the fix and an over-broad rule loses real diagnostics:
+    /// - the carrier must map to a class name through
+    ///   [`CoreIndex::class_name_of`] — the SAME function the undefined-method
+    ///   rule dispatches on, so the class we suppress against is exactly the
+    ///   class we would have witnessed against;
+    /// - `is_a?`/`kind_of?`/`===` suppress only on
+    ///   [`ClassOrdering::Disjoint`], i.e. both names resolve in the core index
+    ///   AND both ancestor chains are complete. `Unknown` (an unresolvable or
+    ///   project class, a truncated chain) does NOT suppress, even though the
+    ///   reference's SHAPE carriers collapse to `Bot` there too — proving that
+    ///   arm needs a claim about which carriers the reference holds as a
+    ///   `Tuple`/`HashShape` rather than a `Nominal`, and the probe corpus
+    ///   refutes every cheap proxy for it (`h = *spec` and `h = []; h << 1`
+    ///   witness on the reference under an unknown guard class; `h = [1, 2]`
+    ///   and `h = [1, 2].compact` do not). Declining costs coverage only.
+    /// - `instance_of?` suppresses on any NAME MISMATCH — the reference's
+    ///   `exact:` path returns `Bot` unconditionally once the names differ
+    ///   (`narrowing.rb:2384`, `subclass_of?:2440`), so no hierarchy fact is
+    ///   needed;
+    /// - a `case`/`when` clause suppresses only when EVERY condition is a
+    ///   static constant that collapses (the reference unions the per-condition
+    ///   narrowings, so `when Hash, Array` on an Array keeps the carrier);
+    /// - once `Bot`, the local stays `Bot` on BOTH edges of any further guard
+    ///   and past a nested conditional's join, and is killed only by a rebind
+    ///   — the same invalidation the narrowing fact gets.
+    pub fn class_narrowing_pass(
         &self,
         ast: &LoweredAst,
         interner: &mut Interner,
-    ) -> HashMap<NodeId, String> {
-        let mut out = HashMap::new();
+    ) -> ClassNarrowing {
+        let mut out = ClassNarrowing::default();
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
@@ -2501,12 +2575,22 @@ impl<'i> Typer<'i> {
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
         let mut tenv = TypeEnv::new();
-        let mut cenv: HashMap<String, String> = HashMap::new();
+        let mut cenv: HashMap<String, ClassFact> = HashMap::new();
         let coarse = coarse_locals(ast, &body);
         self.class_flow_scope(
             ast, &body, &mut tenv, &mut cenv, &coarse, &writes, interner, &mut out, true,
         );
         out
+    }
+
+    /// The narrowed-call half of [`Typer::class_narrowing_pass`], for callers
+    /// that only need `call node id -> narrowed class`.
+    pub fn class_narrowing_snapshots(
+        &self,
+        ast: &LoweredAst,
+        interner: &mut Interner,
+    ) -> HashMap<NodeId, String> {
+        self.class_narrowing_pass(ast, interner).calls
     }
 
     /// Thread `(tenv, cenv)` through a scope's statements in source order.
@@ -2520,11 +2604,11 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         stmts: &[NodeId],
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, String>,
+        cenv: &mut HashMap<String, ClassFact>,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, String>,
+        out: &mut ClassNarrowing,
         stmt_position: bool,
     ) {
         for &s in stmts {
@@ -2539,11 +2623,11 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, String>,
+        cenv: &mut HashMap<String, ClassFact>,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, String>,
+        out: &mut ClassNarrowing,
         stmt_position: bool,
     ) {
         match ast.get(id) {
@@ -2612,7 +2696,7 @@ impl<'i> Typer<'i> {
                 // boundary), no effect on the enclosing one.
                 let body = body.clone();
                 let mut t = TypeEnv::new();
-                let mut c: HashMap<String, String> = HashMap::new();
+                let mut c: HashMap<String, ClassFact> = HashMap::new();
                 let inner = coarse_locals(ast, &body);
                 self.class_flow_scope(
                     ast, &body, &mut t, &mut c, &inner, writes, interner, out, true,
@@ -2700,7 +2784,10 @@ impl<'i> Typer<'i> {
                 }
                 self.class_flow_scope(ast, &body, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 widen_flow_writes(writes, span, tenv, interner);
-                cenv.clear();
+                // The body was DESCENDED into `cenv` itself, so a rebind inside
+                // already removed the fact: no edge evidence is needed and no
+                // span kill either (probes `bot_in_begin`, `bot_after_begin`).
+                join_cenv(cenv, &[]);
             }
             // `while`/`until`/`for`. The predicate (for `for`, the COLLECTION)
             // is evaluated ONCE before the body, in the enclosing scope — the
@@ -2722,7 +2809,11 @@ impl<'i> Typer<'i> {
                     self.class_flow_expr(ast, p, tenv, cenv, coarse, writes, interner, out, false);
                 }
                 widen_flow_writes(writes, span, tenv, interner);
-                cenv.clear();
+                // The BODY is not descended, so a rebind inside it is invisible
+                // to the edge evidence: keep the entry `Bot` but kill by span
+                // (probe `bot_after_while`).
+                join_cenv(cenv, &[]);
+                kill_cenv_writes(writes, span, cenv);
             }
             // A statement-position `&&`/`||`. Descend both operands to record
             // uses of an OUTER fact — valid on both edges, and the reference
@@ -2739,7 +2830,7 @@ impl<'i> Typer<'i> {
                 self.class_flow_expr(ast, left, tenv, cenv, coarse, writes, interner, out, false);
                 self.class_flow_expr(ast, right, tenv, cenv, coarse, writes, interner, out, false);
                 widen_flow_writes(writes, span, tenv, interner);
-                kill_cenv_writes(writes, span, cenv);
+                kill_cenv_narrowed(writes, span, cenv);
             }
             // Any other statement (`case`/`in`/lambda/range/…) is UNMODELED:
             // widen `tenv` for the locals it writes and CLEAR ALL facts
@@ -2747,7 +2838,10 @@ impl<'i> Typer<'i> {
             other => {
                 let span = other.span();
                 widen_flow_writes(writes, span, tenv, interner);
-                cenv.clear();
+                // No descent, so no edge evidence: the entry `Bot` rides through
+                // (nothing inside can widen it) and a rebind in the span kills.
+                join_cenv(cenv, &[]);
+                kill_cenv_writes(writes, span, cenv);
             }
         }
     }
@@ -2769,11 +2863,11 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, String>,
+        cenv: &mut HashMap<String, ClassFact>,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, String>,
+        out: &mut ClassNarrowing,
         stmt_position: bool,
     ) {
         match ast.get(id) {
@@ -2792,12 +2886,22 @@ impl<'i> Typer<'i> {
                 // currently narrowed to `C`. Recorded BEFORE any invalidation
                 // below — the receiver read happens before the call's effects
                 // (`value.deep_transform_keys! { … }` must witness).
+                //
+                // The `Bot` fact is recorded on the SAME node key but under
+                // safe-nav too: `narrow_*_to_class` collapsed the receiver, and
+                // a safe-nav dispatch through `Bot` witnesses just as little as
+                // a plain one (the safe-nav decline on `Narrowed` is about
+                // which SHAPES the reference narrows, not about dispatch).
                 if let Some(r) = receiver {
-                    if !safe_nav {
-                        if let Node::LocalVariableRead { name, .. } = ast.get(r) {
-                            if let Some(c) = cenv.get(name) {
-                                out.insert(id, c.clone());
+                    if let Node::LocalVariableRead { name, .. } = ast.get(r) {
+                        match cenv.get(name) {
+                            Some(ClassFact::Bot) => {
+                                out.dead.insert(id);
                             }
+                            Some(ClassFact::Narrowed(c)) if !safe_nav => {
+                                out.calls.insert(id, c.clone());
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2823,22 +2927,48 @@ impl<'i> Typer<'i> {
                     // recording inside the block — a strict subset of the
                     // reference, never an FP; the conservative clear/widen
                     // effects below still apply either way.
+                    //
+                    // The `Bot` facts DO cross into the block: they are not a
+                    // narrowing claim about a Dynamic carrier but the statement
+                    // that the reference's guarded scope bound the local to
+                    // `Bot`, and that scope is exactly what the block body runs
+                    // under (probes `bot_into_block`, `bot_into_block_doend`).
+                    // A rebind inside the block drops it from `bcenv`, so the
+                    // join below drops it from the outer env too
+                    // (`bot_block_rebind`, where the reference fires).
+                    let mut block_edge: Option<HashMap<String, ClassFact>> = None;
                     if stmt_position {
                         let mut btenv = tenv.clone();
-                        let mut bcenv: HashMap<String, String> = HashMap::new();
+                        let mut bcenv: HashMap<String, ClassFact> = cenv
+                            .iter()
+                            .filter(|(_, f)| **f == ClassFact::Bot)
+                            .map(|(k, f)| (k.clone(), f.clone()))
+                            .collect();
                         self.class_flow_scope(
                             ast, &block_body, &mut btenv, &mut bcenv, coarse, writes, interner, out, true,
                         );
+                        block_edge = Some(bcenv);
                     }
-                    cenv.clear();
+                    match block_edge {
+                        Some(edge) => join_cenv(cenv, std::slice::from_ref(&edge)),
+                        // Not descended (expression position): no edge evidence,
+                        // so keep the entry `Bot` and kill by span instead.
+                        None => {
+                            join_cenv(cenv, &[]);
+                            kill_cenv_writes(writes, call_span, cenv);
+                        }
+                    }
                     widen_flow_writes(writes, call_span, tenv, interner);
                 }
                 // Invalidation: kill the fact of every local with a recorded
                 // write/mutation span INSIDE this call — covers a
                 // `MUTATOR_METHODS` receiver (`value.merge!(…)`), a mutated
                 // positional argument (`fill(value)`), and a write nested in an
-                // argument (`f(value = x)`).
-                kill_cenv_writes(writes, call_span, cenv);
+                // argument (`f(value = x)`). A REBIND in the arguments was
+                // already threaded by the expression-position write arms, so
+                // what is left here is MUTATION, which cannot revive a `Bot`
+                // (probe `bot_mutator_use`).
+                kill_cenv_narrowed(writes, call_span, cenv);
             }
             Node::Logical { left, right, span, .. } => {
                 // `&&`/`||`. Stage 3b-1: the up-front `cenv.clear()` is GONE.
@@ -2852,7 +2982,7 @@ impl<'i> Typer<'i> {
                 let (left, right, span) = (*left, *right, *span);
                 self.class_flow_expr(ast, left, tenv, cenv, coarse, writes, interner, out, false);
                 self.class_flow_expr(ast, right, tenv, cenv, coarse, writes, interner, out, false);
-                kill_cenv_writes(writes, span, cenv);
+                kill_cenv_narrowed(writes, span, cenv);
             }
             // A write in EXPRESSION position (`f(value = x, value.frobnicate)`)
             // must thread its rebind IMMEDIATELY: Ruby evaluates arguments
@@ -2952,11 +3082,11 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, String>,
+        cenv: &mut HashMap<String, ClassFact>,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, String>,
+        out: &mut ClassNarrowing,
         stmt_position: bool,
     ) {
         let Node::If { predicate, then_body, else_body, is_unless, span } = ast.get(id) else {
@@ -2987,20 +3117,30 @@ impl<'i> Typer<'i> {
         // fact is dropped and the new one never inserted. A SAME-class re-guard
         // keeps the fact (a no-op re-narrowing).
         let conflict = narrow.as_ref().is_some_and(|(local, class)| {
-            cenv.get(local).is_some_and(|existing| existing != class)
+            cenv.get(local).is_some_and(|existing| existing != &ClassFact::Narrowed(class.clone()))
         });
+        // The OPPOSITE-direction fact: a guard whose class is disjoint from the
+        // local's PRECISE carrier collapses it to `Bot` on the truthy edge
+        // (`narrow_nominal_to_class` / `narrow_shape_to_class`). Mutually
+        // exclusive with `narrow`, which requires a Dynamic/Top carrier.
+        let bot_local = self
+            .bot_guard_local(ast, predicate, tenv, cenv, interner)
+            .filter(|_| narrow.is_none());
         // Truthy edge: then-branch for `if`/ternary, else-branch for `unless`.
         let (truthy, falsey) =
             if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
-        {
+        let truthy_edge = {
             let mut t = tenv.clone();
             let mut c = cenv.clone();
             if let Some((local, class)) = &narrow {
                 if conflict {
                     c.remove(local);
                 } else {
-                    c.insert(local.clone(), class.clone());
+                    c.insert(local.clone(), ClassFact::Narrowed(class.clone()));
                 }
+            }
+            if let Some(local) = &bot_local {
+                c.insert(local.clone(), ClassFact::Bot);
             }
             // The branch bodies INHERIT the conditional's own position: a block
             // inside an expression-position ternary branch narrows nothing
@@ -3008,33 +3148,142 @@ impl<'i> Typer<'i> {
             // position (probe x5). The branch-internal narrowing itself is
             // never position-gated (p4, p8).
             self.class_flow_scope(ast, truthy, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
-        }
-        {
+            c
+        };
+        let falsey_edge = {
             // The falsey edge is NEVER narrowed (`narrow_class_other`: unchanged).
             let mut t = tenv.clone();
             let mut c = cenv.clone();
             self.class_flow_scope(ast, falsey, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
-        }
+            c
+        };
         // Conservative join: widen every local written inside the conditional
-        // and clear ALL facts (a fact never survives a branch merge in this
-        // slice) …
+        // and clear the branch-established facts (a `Narrowed` fact never
+        // survives a branch merge in this slice; an entry `Bot` does, unless an
+        // edge rebound the local) …
         widen_flow_writes(writes, if_span, tenv, interner);
-        cenv.clear();
+        join_cenv(cenv, &[truthy_edge, falsey_edge]);
         // … EXCEPT the early-return propagation (`eval_if:481-493`, probe a5):
         // when the branch bound to the OPPOSITE (falsey) edge terminates, the
         // truthy fact applies to the statements after the conditional — only in
         // STATEMENT position (R2), never on a conflicted guard (R3), and not
         // when any write to the local landed inside the conditional's span.
+        let opposite_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
+        let rewritten = |local: &str| {
+            writes.iter().any(|(ws, n)| n == local && if_span.0 <= ws.0 && ws.1 <= if_span.1)
+        };
         if let Some((local, class)) = narrow {
-            let opposite_terminates =
-                !falsey.is_empty() && branch_terminates(ast, falsey);
-            let rewritten = writes
-                .iter()
-                .any(|(ws, n)| n == &local && if_span.0 <= ws.0 && ws.1 <= if_span.1);
-            if stmt_position && !conflict && opposite_terminates && !rewritten {
-                cenv.insert(local, class);
+            if stmt_position && !conflict && opposite_terminates && !rewritten(&local) {
+                cenv.insert(local, ClassFact::Narrowed(class));
             }
         }
+        // The same propagation for the `Bot` fact — the `return 0 unless
+        // h.is_a?(Hash)` / `raise unless …` shape, where the reference carries
+        // `Bot` past the guard and is silent on every later use.
+        if let Some(local) = bot_local {
+            if stmt_position && opposite_terminates && !rewritten(&local) {
+                cenv.insert(local, ClassFact::Bot);
+            }
+        }
+    }
+
+    /// The local a predicate collapses to `Bot`, or `None`.
+    ///
+    /// Recognises the same predicate shapes [`Typer::class_check_predicate`]
+    /// does PLUS the case-equality form `C === local` (the reference routes it
+    /// through the very same `class_predicate_scopes`,
+    /// `analyse_case_equality_receiver`, `narrowing.rb:1953`), then applies
+    /// [`Typer::guard_collapses`].
+    ///
+    /// `===` is accepted here but NOT in `class_check_predicate`: minting a
+    /// `Narrowed` fact from it would be a new, unprobed COVERAGE claim, while
+    /// collapsing to `Bot` only ever removes output.
+    fn bot_guard_local(
+        &self,
+        ast: &LoweredAst,
+        pred: NodeId,
+        tenv: &TypeEnv,
+        cenv: &HashMap<String, ClassFact>,
+        interner: &Interner,
+    ) -> Option<String> {
+        let Node::Call { receiver: Some(r), method, args, block_body, safe_nav, span, .. } =
+            ast.get(pred)
+        else {
+            return None;
+        };
+        if *safe_nav || !block_body.is_empty() || args.len() != 1 {
+            return None;
+        }
+        let (local, cname, exact) = match method.as_str() {
+            "is_a?" | "kind_of?" | "instance_of?" => {
+                let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
+                let cname = self.resolved_static_constant(ast, args[0], *span)?;
+                (name.clone(), cname, method == "instance_of?")
+            }
+            // `C === local`: the receiver is the CONSTANT and the local is the
+            // sole argument. A non-constant receiver (`(1..10) === x`, `/re/ ===
+            // x`) narrows to Numeric/String in the reference and never to `Bot`.
+            "===" => {
+                let Node::LocalVariableRead { name, .. } = ast.get(args[0]) else { return None };
+                let cname = self.resolved_static_constant(ast, *r, *span)?;
+                (name.clone(), cname, false)
+            }
+            _ => return None,
+        };
+        self.guard_collapses(&local, &cname, exact, tenv, cenv, interner).then_some(local)
+    }
+
+    /// Whether guarding `local` with `class_name` yields `Bot` in the reference.
+    ///
+    /// Three ways, and no fourth (see [`Typer::class_narrowing_pass`] for why
+    /// the `ClassOrdering::Unknown` arm is declined):
+    /// 1. the local is ALREADY `Bot` — `narrow_class_other` / `narrow_other_class`
+    ///    return `Bot` unchanged on both polarities, so a further guard cannot
+    ///    revive it (probes `bot_then_match`, `bot_then_neg`);
+    /// 2. `instance_of?` (`exact:`) with a name the carrier's class does not
+    ///    equal — `narrow_nominal_to_class` returns `Bot` before consulting the
+    ///    hierarchy at all, and `subclass_of?` degenerates to name equality for
+    ///    the shape/constant carriers (`narrowing.rb:2384,2440`);
+    /// 3. a PROVEN-disjoint pair. [`CoreIndex::class_ordering`] answers
+    ///    `Disjoint` only when both names resolve AND both ancestor chains are
+    ///    complete, so an unresolvable/project class or a truncated chain
+    ///    answers `Unknown` and declines.
+    ///
+    /// The carrier's class comes from [`CoreIndex::class_name_of`] — the same
+    /// mapping `check_call` dispatches on, so the suppression is exactly
+    /// co-extensive with the witness it removes. A carrier that mapping
+    /// declines (`Dynamic`, `Top`, a union, a `Singleton`) suppresses nothing.
+    fn guard_collapses(
+        &self,
+        local: &str,
+        class_name: &str,
+        exact: bool,
+        tenv: &TypeEnv,
+        cenv: &HashMap<String, ClassFact>,
+        interner: &Interner,
+    ) -> bool {
+        if cenv.get(local) == Some(&ClassFact::Bot) {
+            return true;
+        }
+        let Some(&ty) = tenv.get(local) else { return false };
+        // The carrier must be one the reference's `narrow_class_dispatch`
+        // (`narrowing.rb:2311`) routes to a COLLAPSING helper. Its table is
+        // Constant / Nominal / Union / Tuple / HashShape / Singleton, and
+        // everything else — an `IntegerRange` included — falls through to
+        // `narrow_other_class`, which returns the type UNCHANGED for anything
+        // that is not Dynamic/Top. `Union` (per-member) and `Singleton` (via
+        // `subclass_of?("Class", …)`) are declined here as unprobed.
+        if !matches!(
+            interner.get(ty),
+            Type::Constant(_) | Type::Nominal { .. } | Type::Tuple(_) | Type::HashShape(_)
+        ) {
+            return false;
+        }
+        let Some(carrier) = self.index.class_name_of(interner, ty) else { return false };
+        if exact {
+            return carrier != class_name;
+        }
+        self.index.class_ordering(carrier, class_name) == ClassOrdering::Disjoint
     }
 
     /// Recognise the accepted guard shape: the WHOLE predicate is
@@ -3119,11 +3368,11 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, String>,
+        cenv: &mut HashMap<String, ClassFact>,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, String>,
+        out: &mut ClassNarrowing,
         stmt_position: bool,
     ) {
         let Node::Case { predicate, branches, else_body, span } = ast.get(id) else {
@@ -3149,6 +3398,16 @@ impl<'i> Typer<'i> {
                 None => true, // unbound ⇒ untyped (Dynamic[top])
                 Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
             });
+        // The `Bot` subject: the same bare local under the same position gate
+        // (probe `case_as_recv` — a `case` consumed as a call receiver narrows
+        // NOTHING and the reference still fires there), but with the PRECISE
+        // carrier the narrowing subject excludes. The per-clause collapse test
+        // is applied below, per condition.
+        let bot_subject = predicate.filter(|_| stmt_position).and_then(|p| match ast.get(p) {
+            Node::LocalVariableRead { name, .. } => Some(name.clone()),
+            _ => None,
+        });
+        let mut edges: Vec<HashMap<String, ClassFact>> = Vec::new();
         for br in branches {
             let Node::When { conditions, body, .. } = ast.get(br) else {
                 // A `case`/`in` pattern carrier — unmodeled, no descent
@@ -3171,16 +3430,36 @@ impl<'i> Typer<'i> {
                     // DIFFERENT-class fact for the subject drops the stale fact
                     // and never inserts (the reference's carrier is a Nominal
                     // there, out of the Dynamic-only envelope). Same class keeps.
-                    if c.get(local).is_some_and(|existing| existing != &class) {
+                    let fact = ClassFact::Narrowed(class);
+                    if c.get(local).is_some_and(|existing| existing != &fact) {
                         c.remove(local);
                     } else {
-                        c.insert(local.clone(), class);
+                        c.insert(local.clone(), fact);
                     }
+                }
+            } else if let Some(local) = &bot_subject {
+                // `case x when C1, C2` runs `C1 === x || C2 === x` and the
+                // reference UNIONS the per-condition narrowings
+                // (`accumulate_case_when_scopes`), so the clause body is `Bot`
+                // only when EVERY condition collapses — `when Hash, Array` on an
+                // Array keeps the carrier and still witnesses (probes
+                // `case_multi_disj` vs `case_multi_mixed`). An empty clause
+                // cannot occur; `all` over one condition is the single-constant
+                // case, which lands here whenever `subject` declined it.
+                let all_collapse = !conditions.is_empty()
+                    && conditions.iter().all(|&cond| {
+                        self.resolved_static_constant(ast, cond, case_span).is_some_and(|class| {
+                            self.guard_collapses(local, &class, false, tenv, &c, interner)
+                        })
+                    });
+                if all_collapse {
+                    c.insert(local.clone(), ClassFact::Bot);
                 }
             }
             // Clause bodies INHERIT the `case`'s position: a block inside an
             // expression-position clause narrows nothing (probe x1).
             self.class_flow_scope(ast, &body, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
+            edges.push(c);
         }
         {
             // The `else` body is a NEGATIVE edge — never narrowed.
@@ -3189,9 +3468,13 @@ impl<'i> Typer<'i> {
             self.class_flow_scope(
                 ast, &else_body, &mut t, &mut c, coarse, writes, interner, out, stmt_position,
             );
+            edges.push(c);
         }
         widen_flow_writes(writes, case_span, tenv, interner);
-        cenv.clear();
+        // A `case`/`in` clause is not descended, so its rebinds are invisible to
+        // the edge evidence — kill by span as well as by edge.
+        join_cenv(cenv, &edges);
+        kill_cenv_writes(writes, case_span, cenv);
     }
 
     // -----------------------------------------------------------------------
@@ -3923,16 +4206,62 @@ fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
     coarse
 }
 
+/// The conservative branch join for a conditional / `case` / block call.
+///
+/// A [`ClassFact::Narrowed`] fact never survives a merge in this slice (the
+/// reference's union of `Nominal[C]` with itself would, but the decline predates
+/// this note and stays). A [`ClassFact::Bot`] fact present on ENTRY does
+/// survive, because the reference's join is `Bot | Bot = Bot` (probes
+/// `bot_after_inner`, `bot_after_begin`, `bot_after_block_call`) — but only
+/// while EVERY edge still carries it. `edges` are the per-edge fact maps the
+/// branches were walked with; an edge that REBOUND the local dropped the fact
+/// from its own clone, and the reference's union of `Bot` with the new binding
+/// is that binding, so the merged fact goes too (probes `bot_rebind_use`,
+/// `bot_block_rebind`). An empty `edges` means the construct was not descended,
+/// so there is no edge evidence and every entry `Bot` rides through — the
+/// caller pairs that with a span-based [`kill_cenv_writes`].
+///
+/// Facts the EDGES established are not in `cenv` at all (edges walk clones), so
+/// nothing minted inside a branch can leak out through here.
+fn join_cenv(cenv: &mut HashMap<String, ClassFact>, edges: &[HashMap<String, ClassFact>]) {
+    cenv.retain(|name, fact| {
+        *fact == ClassFact::Bot
+            && edges.iter().all(|edge| edge.get(name) == Some(&ClassFact::Bot))
+    });
+}
+
 /// Kill the class-narrowing fact of every local whose recorded write/mutation
 /// span is contained in `span` — the `cenv` counterpart of
 /// [`widen_flow_writes`].
 fn kill_cenv_writes(
     writes: &[(rigor_parse::Span, String)],
     span: rigor_parse::Span,
-    cenv: &mut HashMap<String, String>,
+    cenv: &mut HashMap<String, ClassFact>,
 ) {
     for (wspan, name) in writes {
         if span.0 <= wspan.0 && wspan.1 <= span.1 {
+            cenv.remove(name);
+        }
+    }
+}
+
+/// [`kill_cenv_writes`] restricted to [`ClassFact::Narrowed`], for the sites
+/// whose contents were DESCENDED (so a real rebind already removed the fact
+/// through a write arm) and where the recorded span therefore stands for a
+/// MUTATION — a `MUTATOR_METHODS` receiver, a mutated argument position.
+/// A mutation widens a CARRIER, and `Bot` has no carrier to widen: the
+/// reference keeps `Bot` across `h.push(3)` and stays silent afterwards (probe
+/// `bot_mutator_use`), while the narrowing fact must still die there.
+fn kill_cenv_narrowed(
+    writes: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+    cenv: &mut HashMap<String, ClassFact>,
+) {
+    for (wspan, name) in writes {
+        if span.0 <= wspan.0
+            && wspan.1 <= span.1
+            && cenv.get(name).is_some_and(|f| *f != ClassFact::Bot)
+        {
             cenv.remove(name);
         }
     }

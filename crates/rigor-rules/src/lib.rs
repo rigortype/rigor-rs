@@ -524,7 +524,15 @@ pub fn analyze_with_source_and_folder(
     // `Dynamic`/`Top` only). `check_narrowed_call` fires `call.undefined-method`
     // from it — and ONLY that rule (spec pitfall 7: a narrowed receiver must not
     // become witnessable by wrong-arity/ATM in this slice).
-    let class_snaps = typer.class_narrowing_snapshots(ast, interner);
+    // …and, from the SAME pass, the disjoint-guard suppression set: call node
+    // ids whose bare-local receiver the reference collapsed to `Bot`
+    // (docs/notes/20260808-disjoint-guard-suppression.md). `Bot` has no dispatch
+    // surface, so the reference emits NOTHING at those sites — measured across
+    // `undefined-method`, `wrong-arity` and `argument-type-mismatch` — and the
+    // whole call site is skipped rather than one rule.
+    let narrowing = typer.class_narrowing_pass(ast, interner);
+    let class_snaps = narrowing.calls;
+    let dead_calls = narrowing.dead;
     // Collection-shape snapshot map (collection-shape slice, stage 1): call node
     // id -> "Array"/"Hash", the class a bare-local receiver's collection carrier
     // (literal seed, mutator-widened kept nominal, or tier-folded chain result)
@@ -562,6 +570,19 @@ pub fn analyze_with_source_and_folder(
         .collect();
 
     for (call_id, recv, method, args, has_block, message_span, safe_nav, args_all_plain) in calls {
+        // DEAD RECEIVER (disjoint-guard suppression): the reference's guarded
+        // scope binds this receiver to `Bot`, which responds to no method and
+        // carries no signature, so no receiver-driven rule of the reference can
+        // fire here — `undefined-method`, `wrong-arity` and
+        // `argument-type-mismatch` are each measured silent inside the branch
+        // while an unguarded control fires. Skipping the whole site (including
+        // the independent argument-type axis below) is what the oracle shows;
+        // calls whose receiver is a DIFFERENT local, and a call nested in this
+        // one's ARGUMENTS, keep their own node ids and are untouched (probes
+        // `scope_other_local`, `nest_arg_other`).
+        if dead_calls.contains(&call_id) {
+            continue;
+        }
         // Rule precedence at one call site (avoid double-emit):
         //   1. undefined-method  (method absent on the receiver class, incl. nil)
         //   2. wrong-arity       (method present but arg count out of envelope)
@@ -4106,6 +4127,176 @@ mod tests {
             assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
             assert_eq!(diags[0].message, "undefined method `frobnicate_zzz' for Hash");
         }
+    }
+
+    // --- disjoint-guard suppression -----------------------------------------
+    // docs/notes/20260808-disjoint-guard-suppression.md. Every row below was
+    // measured against the pinned reference (`--no-cache`, fresh cwd); the
+    // probe name in each comment is the row in that note's tables.
+
+    /// SILENCED: a call whose bare-local receiver a disjoint guard collapsed to
+    /// `Bot` in the reference. Guard predicates, statement forms, carriers and
+    /// the fact's lifetime — the whole measured family.
+    #[test]
+    fn disjoint_guard_suppresses_the_guarded_local() {
+        for src in [
+            // the reported archetype, in each statement form (probes
+            // base_disj_undefmethod, s_if, s_if_modifier, toplevel, ternary_rhs,
+            // ternary_arg, s_early_return, elsif_disj)
+            &b"def f\n  h = [1, 2]\n  h.is_a?(Hash) ? h.frobnicate_zzz : h\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            &b"h = [1, 2]\nh.frobnicate_zzz if h.is_a?(Hash)\n"[..],
+            &b"def f\n  h = [1, 2]\n  y = h.is_a?(Hash) ? h.frobnicate_zzz : 0\n  y\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  puts(h.is_a?(Hash) ? h.frobnicate_zzz : 0)\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  return 0 unless h.is_a?(Hash)\n  h.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  raise \"x\" unless h.is_a?(Hash)\n  h.frobnicate_zzz\nend\n"[..],
+            &b"def f(c)\n  h = [1, 2]\n  if c\n    0\n  elsif h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            // guard predicates: kind_of?, instance_of? (any name mismatch,
+            // including a SUPERCLASS — the reference's `exact:` path), `===`
+            // (probes g_kind_of, g_instance_of_disjoint, g_instance_of_super,
+            // iof_nominal_super, iof_nominal_unknown, g_triple_eq, tripleeq_if)
+            &b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.kind_of?(Hash)\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Hash)\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Enumerable)\nend\n"[..],
+            &b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.instance_of?(Enumerable)\nend\n"[..],
+            &b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.instance_of?(UnknownZzz)\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if Hash === h\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            // `case`/`when`, single and multi-condition (probes s_case_when,
+            // case_multi_disj)
+            &b"def f\n  h = [1, 2]\n  case h\n  when Hash then h.frobnicate_zzz\n  else 0\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  case h\n  when Hash, Integer then h.frobnicate_zzz\n  else 0\n  end\nend\n"[..],
+            // carriers: array/hash literal (empty and not), %w, splat, a
+            // mutator-widened nominal, `Array.new`, a shape-preserving chain
+            // (probes x_*_disj)
+            &b"def f\n  h = []\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            &b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..],
+            &b"def f\n  h = {}\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..],
+            &b"def f\n  h = %w[a b]\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            &b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            &b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            &b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            &b"def f\n  h = Hash.new\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..],
+            &b"def f\n  h = [1, 2].compact\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            &b"def f\n  h = [1, 2].freeze\n  h.frobnicate_zzz if h.is_a?(Hash)\nend\n"[..],
+            // the fact's REACH inside the branch: a nested conditional, a nested
+            // block body, a second guard on the same local, a chain hop, a
+            // mutator call in between (probes nest_deep, nest_block_recv,
+            // bot_into_block, bot_into_block_doend, double_guard, bot_then_match,
+            // bot_after_inner, bot_after_block_call, bot_after_while,
+            // bot_after_begin, bot_mutator_use)
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    if true\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each { h.frobnicate_zzz }\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each do |x|\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Enumerable)\n    if h.is_a?(Hash)\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    if h.is_a?(Array)\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    if true\n      0\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each { |x| x }\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    while false\n      0\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    begin\n      0\n    rescue\n      0\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h.push(3)\n    h.frobnicate_zzz\n  end\nend\n"[..],
+        ] {
+            let diags = run(src);
+            assert!(
+                diags.is_empty(),
+                "expected silence for {:?}, got {diags:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    /// ANTI-OVER-SUPPRESSION. Silence is the fix here, so a rule that silenced
+    /// too much would sail through the FP gate while destroying coverage. Every
+    /// row is measured FIRING on the reference and must keep firing here: a
+    /// NON-disjoint guard, the unguarded and pre-guard uses, the falsey edge, a
+    /// DIFFERENT local inside the branch, a call nested in the suppressed call's
+    /// arguments, a rebind, and a guard class our hierarchy cannot decide.
+    #[test]
+    fn disjoint_guard_suppression_does_not_over_reach() {
+        for (src, expect) in [
+            // NON-disjoint guards: a superclass/module the carrier includes, the
+            // same class, Object (probes n_super_enumerable, n_same_class,
+            // n_object, x_*_ok, tripleeq_nondisj, elsif_nondisj)
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Object)\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.kind_of?(Enumerable)\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Hash"),
+            // a guard class the core hierarchy cannot RESOLVE — the declined
+            // `ClassOrdering::Unknown` arm. The reference collapses a SHAPE
+            // carrier here and we do not, so this is a documented residual FP
+            // for a Tuple; on a NOMINAL carrier the reference fires too, and
+            // that is the row this control pins (probes isa_nominal_unknown,
+            // x_arr_new_unk, x_arr_push_unk, x_splat_unk).
+            (&b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            (&b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            // the FALSEY edge of a disjoint guard is NOT narrowed
+            // (`narrow_nominal_not_class` preserves it) — probes s_unless_body,
+            // s_negated_if, s_case_when_else_branch
+            (&b"def f\n  h = [1, 2]\n  unless h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  if !h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  case h\n  when Hash then 0\n  else h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
+            // a `when` clause whose conditions do NOT all collapse — the
+            // reference unions them (probe case_multi_mixed)
+            (&b"def f\n  h = [1, 2]\n  case h\n  when Hash, Array then h.frobnicate_zzz\n  else 0\n  end\nend\n"[..], "Array"),
+            // a use BEFORE the guard, and AFTER the conditional (probes
+            // before_guard_fires, after_branch)
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz\n  0 if h.is_a?(Hash)\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    0\n  end\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // a REBIND kills the fact — in the branch and inside a block
+            // (probes bot_rebind_use, rebind_in_branch, bot_block_rebind)
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h = [3, 4]\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each do\n      h = [3, 4]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "Array"),
+            // a non-disjoint guard's early-return propagation still witnesses
+            (&b"def f\n  h = [1, 2]\n  return 0 unless h.is_a?(Enumerable)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // a nested `def` is an independent scope (probe bot_nested_def)
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    def g\n      h = [5, 6]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "Array"),
+        ] {
+            let diags = run(src);
+            assert_eq!(
+                diags.len(),
+                1,
+                "expected one undefined-method for {:?}, got {diags:?}",
+                String::from_utf8_lossy(src)
+            );
+            assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+            assert_eq!(
+                diags[0].message,
+                format!("undefined method `frobnicate_zzz' for {expect}")
+            );
+        }
+    }
+
+    /// The suppression is per-CALL-NODE, keyed on the guarded local being the
+    /// receiver — not a span blanket over the branch. A call on a DIFFERENT
+    /// local, and a call nested in the suppressed call's own arguments, both
+    /// keep firing (the reference does exactly this: only the local's own
+    /// carrier is `Bot`, the branch is NOT dead).
+    #[test]
+    fn disjoint_guard_suppression_is_per_call_not_per_branch() {
+        // The message-span offset of the method token in `<recv>.frobnicate_zzz`.
+        fn at(src: &[u8], recv_call: &[u8]) -> usize {
+            src.windows(recv_call.len()).position(|w| w == recv_call).unwrap() + 2
+        }
+        // probe scope_if_two_stmts — only the `g` statement survives
+        let src = &b"def f\n  h = [1, 2]\n  g = [3, 4]\n  if h.is_a?(Hash)\n    h.frobnicate_zzz\n    g.frobnicate_zzz\n  end\nend\n"[..];
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(diags[0].start_offset, at(src, b"g.frobnicate_zzz"));
+        // probe nest_arg_other — the ARGUMENT's own call fires, the receiver's
+        // does not
+        let src = &b"def f\n  h = [1, 2]\n  g = [3, 4]\n  h.frobnicate_zzz(g.frobnicate_zzz) if h.is_a?(Hash)\nend\n"[..];
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(diags[0].start_offset, at(src, b"g.frobnicate_zzz"));
+        // probe nest_h_as_arg — the guarded local in ARGUMENT position does not
+        // suppress the enclosing call
+        let src = &b"def f\n  h = [1, 2]\n  g = [3, 4]\n  g.frobnicate_zzz(h) if h.is_a?(Hash)\nend\n"[..];
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(diags[0].start_offset, at(src, b"g.frobnicate_zzz"));
     }
 
     /// The narrowed witness stays SILENT when the method exists on the

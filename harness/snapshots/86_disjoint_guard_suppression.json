@@ -1,0 +1,82 @@
+{
+  "fixture": "harness/corpus/86_disjoint_guard_suppression.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 115,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_mmm' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 121,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_nnn' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 126,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ooo' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 134,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ppp' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 142,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_qqq' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 151,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `frobnicate_rrr' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 159,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_sss' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 168,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ttt' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 176,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_uuu' for [3, 4]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 188,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_www' for [3, 4]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 195,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_yyy' for [3, 4]"
+    }
+  ]
+}
