@@ -776,3 +776,181 @@ built release binary — **TOTAL FP candidates: 0**, 8 corpora / 9204 files.
 
 Fixture 89 carries 7 firing rows (each oracle-verified per line) and 5 measured
 declines; its controls emit nothing on either engine.
+
+## 3a-3 — single-hop chain guards, local roots — BUILT 2026-08-08 (PR — `crates/rigor-infer/src/lib.rs`, fixture `harness/corpus/90_narrowing_3a3_chain_guards.rb`)
+
+Shipped **as specced**, with no design revision: the `chain_env` family, its
+mint/record/invalidate/propagate/consume rules and its whole decline set are
+what the spec above describes. The build's headline finding is not about the
+mechanism, which works, but about the CONSUMPTION side downstream of it.
+
+### The verdict up front: the mechanism ships, the gap diff is ZERO, and the blocker is orthogonal
+
+`gap_census.py --sweep --dump`, release binary both sides: **1136 → 1136 — 0
+rows closed, 0 rows opened.**
+
+All **7** target rows from the
+[3a-2/3a-3 window remeasure](20260808-narrowing-3a23-window-remeasure.md) name
+a **NAMESPACED** guard class (`Bundler::Source::Git` ×4,
+`Bundler::Source::Rubygems` ×2, plus the `file_parser.rb` duplicate), and
+`check_narrowed_call`'s witness gate is `CoreIndex::knows_toplevel_class`, which
+by construction answers `false` for any qualified name (`rbs.rs:891` —
+`toplevel_classes` holds only names with an EMPTY namespace; the ADR-0042
+defect-2 rule). Three independent measurements pin it:
+
+| probe | evidence |
+|---|---|
+| `loc3.rb` | the row's shape with a **bare local** and no chain at all — `return unless s.is_a?(Bundler::Source::Git); s.frobnicate_zzz` — reference fires `for Bundler::Source::Git`, rigor-rs is SILENT on **master**. The blocker predates 3a-3 and is not chain-specific. |
+| index probe | `knows_class("Bundler::Source::Git")=false`, `knows_qualified_class=false`, `class_id=None`. The class IS loaded (`knows_class("Git")=true`) but registered by its LEAF key only, and `knows_toplevel_class("Git")=false` deliberately — so neither the qualified nor the short path can witness it. |
+| `w1`-`w4` | the three verified corpus shapes, reduced, with the guard class swapped for a TOP-LEVEL one (`String`): **all four fire on rigor-rs after this build** (ref=1/rs=1) and all four were rs=0 before it. The 3a-3 mechanism closes the shape; only the class NAME blocks the corpus rows. |
+
+So the honest read: **this slice is correct and pays nothing today.** Closing
+the 7 rows needs qualified-name registration in the index + a
+`check_narrowed_call` witness path over it — an ADR-0042 follow-up, strictly
+larger than 3a-3 and orthogonal to narrowing. The remeasure note's "7 verified
+rows" established that the REFERENCE narrows the chain; it did not check that
+rigor-rs's consumption gate could witness the class, and that is the gap
+between its prediction and this measurement. Recorded as the arc's standing
+lesson repeating itself one layer further down: probe the WHOLE path, not the
+half the slice owns.
+
+**Zero rows opened** is the load-bearing half: the slice mints a new fact family
+and regressed no matched diagnostic anywhere in the sweep.
+
+### The mandated composition probes a-e
+
+Pin `v0.3.1`, fresh temp cwd per invocation, `--no-cache`, plugin path pinned;
+`rs` is AFTER the build. Full matrices live in the unit test
+`class_narrowing_stage3a3_chain_guard_matrix` (78 rows).
+
+| # | probe | shape | ref | rs | outcome |
+|---|---|---|:--:|:--:|---|
+| **e** | `c7a` | `h.last.use if h.last.is_a?(String)` | 1 | 1 | harness reproduces the spec matrix |
+| **e** | `c7d` | `h.pop` between guard and use | 0 | 0 | reproduced — root-receiver call invalidates |
+| **a** | `a_conj_right_then` | `if cond && chain.is_a?(C)` | 1 | 1 | the unrecognised conjunct falls back to the chain's truthy scope, exactly as for locals |
+| **a** | `a_conj_left_then` / `a_conj_mid` | chain guard left / middle | 1 | 1 | `&&` truthy CONCATENATION is target-agnostic |
+| **a** | `a_conj_elsif` | the row-#28 `elsif` shape | 1 | 1 | the corpus shape |
+| **a** | `a_conj_else_ctl` | **else edge** of the same `&&` | **0** | **0** | an atomic chain guard has an EMPTY falsey map; narrowing there would be an FP |
+| **a** | `a_or_disjunct_ctl` | `chain.is_a?(C) \|\| cond` | 0 | 0 | the `\|\|` truthy JOIN drops on an unrecognised disjunct |
+| **a** | `a_conj_localguard_mix` | `v.is_a?(Integer) && h.last.is_a?(String)` | 1 | 1 | a local target and a chain target in one map are independent |
+| **b** | `b_bang_else` | `if !chain.is_a?(C) … else USE` | 1 | 1 | the `!` swap reaches a chain fact |
+| **b** | `b_bang_then_ctl` | truthy edge of the same | 0 | 0 | control |
+| **b** | `b_return_if_bang` / `b_raise_unless` / `b_unless_stmt` | falsey-edge termination | 1 | 1 | the 3a-1 both-direction propagation composes |
+| **b** | `b_return_unless_compound` | `return unless cond && chain.is_a?(C)` | 1 | 1 | compound + termination |
+| **b** | `b_next_unless` | the jump inside a block (PR #76) | 1 | 1 | `next`/`break` termination composes |
+| **c** | `c_bot_precise_root` | `h = [1, 2]; h.last.is_a?(String)` | **0** | **0** | the reference COLLAPSES a precise chain carrier; our Dynamic/Top gate — read off the chain CALL — declines the mint and reaches the same silence without needing a chain `Bot` |
+| **c** | `c_must_still_fire` | the Dynamic twin | 1 | 1 | **the must-still-fire control** |
+| **c** | `c_chain_and_local_bot` | `v = [1,2]; if v.is_a?(String) && h.last.is_a?(C)` | 1 | 1 | a LOCAL collapsed to `Bot` beside a chain guard does NOT suppress the chain witness (`out.dead` keys on that local's own calls) |
+| **d** | `d_seq_two_returns_disjoint` | `return unless h.last.is_a?(String)` then `…is_a?(Hash)` | **0** | **0** | **the sequential-disjoint hazard, closed for chains** — see below |
+| **d** | `d_seq_and_disjoint` / `d_nested_reguard` | the same in one `&&` / nested `if` | 0 | 0 | R3 sequencing handles both |
+| **d** | `d_seq_same_class` | same class twice | 1 | 1 | a no-op re-narrowing keeps the fact |
+| **d** | `d_seq_subclass` | `Numeric` then `Integer` | 1 | **0** | DECLINE — the reference narrows to the more specific class; R3 drops. Coverage only, and the LOCAL analogue is declined identically |
+
+#### The one correction the build forced: a pre-join re-seed
+
+`class_flow_if` runs `join_cenv` — which wipes every chain fact — BEFORE the
+early-return propagation, so `apply_guards` would have seen an EMPTY chain env
+and MINTED `Hash` in `d_seq_two_returns_disjoint`, where the reference has
+already collapsed to `Bot`. That is the exact shape of the LOCAL-side defect
+recorded in the `next`/`break` section above (`s1_two_returns_sequential`, a
+pre-existing FP on master). The fix here is narrow and does not touch that
+ordering: the propagation re-seeds the PRE-join fact for **only the addresses
+the carried map mentions**, so R3 has an incoming fact to conflict with, while
+an untouched chain fact still dies at the join (`n_escape_after_if`, ref=0).
+The chain family therefore ships WITHOUT the local family's known defect.
+
+### Carrier hazards — the allow-list does NOT apply to a chain address
+
+The PR #72 `coarse` ALLOW-LIST exists because the reference's carrier for a
+`||`-bound LOCAL is a UNION its `narrow_class_other` declines. A chain
+address's carrier is the DISPATCH RESULT off that union, which the reference
+narrows normally: `h = a || b; h.last.is_a?(String)` **fires on the reference**
+(`k_root_or_union`), as do `h = *spec` (`k_root_splat`), `h = x.fetch(:a)`
+(`k_root_from_call`) and a kwarg root. Applying the allow-list would have been
+pure coverage loss with no FP to pay for it, so it is deliberately not applied
+— and the Dynamic/Top gate on the chain call is what keeps the precise-carrier
+rows silent instead (`k_root_hash_lit`, `k_root_str_lit`, `k_root_int_lit`, all
+reference-silent, all declined).
+
+One divergence worth naming: `h = ["a", "b"]; h.last.is_a?(String)` is ref=1
+but its message is `for "b"` — the reference keeps the more specific Constant
+carrier. Our gate declines it (the address types `String`, not Dynamic), so we
+neither fire nor mis-render. Coverage only.
+
+### Declines added to the set (each measured ref=1, all coverage-only)
+
+- **Any mention of the root** kills every chain rooted at it — the reference
+  keeps the fact through `g(h)`, `other.push(h)` and `other.fill(h)` (`c7c`,
+  `f23`, `n_root_as_arg_to_mutator`). Carried from the spec's decline set; the
+  invalidation is a strict superset of `invalidate_chain_after_call`, so it can
+  never be an FP source.
+- **Block boundaries, both directions**: a chain fact does not enter a block
+  and does not survive one (`n_into_block`, `n_after_block`, both ref=1).
+- **Safe-nav**, on the hop (`m_safe_nav_hop`) or on the use
+  (`m_safe_nav_use`) — the reference fires on both.
+- **`===`** never produces a chain target (`m_case_eq`), mirroring 3a-1's
+  non-mintable treatment of it for locals.
+- **A shadowed guard class** (`m_shadowed_const`) — shared with stages 1-2.
+- **An IVAR root** (`c7b`) — the arena's `VariableRead` is nameless; needs a
+  lowering change first. Unchanged from the spec.
+- **Survival past a `begin`/`rescue` or a `case`** (`x_chain_after_begin`,
+  `x_chain_after_case`) — carried from 3b-1's decline, now measured for chains.
+- **`guard or raise` on a chain** (`x_chain_or_raise`) — 3a-2 (`Logical`
+  statement minting) is DEFERRED, so nothing mints there.
+- **An `||` of DIFFERENT classes on one address** (`x_chain_reguard_or`) — a
+  real union, stage 3a-4.
+
+Rows measured SILENT on both engines and pinned as controls: `c7e` (args on the
+hop), `m_block_on_hop`, `m_two_hop`, `m_different_method`, `m_different_root`,
+`m_dynamic_const`, `n_root_mutator`, `n_root_opwrite`, `n_escape_after_if`,
+`n_use_before_guard`, `x_root_rebind_in_span`, `x_root_rebind_then_return`,
+`x_chain_multiwrite_root`, `x_chain_nested_def`, and the load-bearing `c7g`
+rebind row (the reference fires there, but a DIFFERENT diagnostic — `for nil`,
+off the folded rebound `[].last` — so the write-kill must keep us silent).
+
+Positive rows pinned so a future over-broad invalidation cannot delete them:
+`n_call_on_address` and `n_address_receiver_call` (a call whose receiver is the
+ADDRESS, not the root, invalidates on NEITHER engine), `m_use_with_args` /
+`m_use_with_block` (the OUTER call's args and block are irrelevant — the
+reference narrows the receiver EXPRESSION), `x_two_addresses_one_root`,
+`x_same_addr_two_roots`, `x_chain_in_begin`, `x_chain_in_loop_pred`,
+`x_chain_in_case_clause`, `x_chain_in_array_lit`, `x_chain_ternary`,
+`x_chain_use_as_arg`, `x_chain_use_as_return`, `x_chain_guard_root_also_local`,
+`x_chain_bang_or`, `n_root_write_after`, `n_in_nested_if`.
+
+### The diff
+
+`Facts` replaces the bare `cenv: HashMap<String, ClassFact>` — the per-local
+map plus a `chains: HashMap<(String, String), String>` — so every existing rule
+reads `cenv.locals` and the two invalidation helpers (`Facts::kill_local`,
+`Facts::kill_chains_rooted_at`) put the root-kill in one place. `GuardMap`'s key
+becomes a `GuardTarget` enum (`Local` / `Chain`), which is what lets
+`join_guards`, the R3 collision tracker and the `rewritten` filter stay
+target-agnostic; `GuardFact` gains `chain_call: Option<NodeId>` for the carrier
+gate. `check_narrowed_call` and the rules layer are **untouched** — a chain use
+lands in the same `out.calls` snapshot map, and its Dynamic/Top gate (3) already
+reads the chain call node.
+
+### Gates
+
+`cargo build --offline && cargo test --offline` (all 14 suites green, 1057
+pre-existing tests unchanged; the new `class_narrowing_stage3a3_chain_guard_matrix`
+carries 78 rows plus the split-out `f11` re-read test); `ruby harness/run.rb`
+**90 fixtures, 0 unregistered extras** (339/368 matched, 28 gaps, 1 registered);
+`ruby harness/snapshot.rb` + `ruby harness/run_snapshot.rb`;
+`python3 harness/docs_check.py`; clippy `-D warnings` in a fresh
+`CARGO_TARGET_DIR`; `python3 harness/fp_audit.py --gaps --sweep` on a freshly
+built release binary — **TOTAL FP candidates: 0**, 8 corpora / 9204 files.
+
+Fixture 90 carries 12 firing rows — each oracle-verified per line, and every one
+matching the reference's line, column, rule AND message — and 9 silent controls;
+its single coverage gap is the documented `c7g` `for nil` row.
+
+### Recommended next step
+
+Do NOT build 3a-4 (unions, ≤1 row) or 3b-2 next. The measured blocker in front
+of the narrowing arc is now **qualified-name witnessing**: 7 census rows sit
+behind it, they are the largest single mechanism left in the
+`call.undefined-method` gap set that a narrowing change can reach, and the fix
+is in the index/rules layer, not in the flow pass. That work also unblocks the
+LOCAL narrowing path for the same classes (`loc3.rb`), so it pays twice.

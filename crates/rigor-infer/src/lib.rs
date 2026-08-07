@@ -160,12 +160,87 @@ struct GuardFact {
     exact: bool,
     /// May this fact mint a [`ClassFact::Narrowed`]? `false` for `===`.
     mintable: bool,
+    /// Stage 3a-3: for a [`GuardTarget::Chain`] fact, the arena id of the CHAIN
+    /// CALL the predicate guarded (`h.last` in `h.last.is_a?(String)`). The
+    /// `narrow_class_other` Dynamic/Top carrier gate is evaluated against THAT
+    /// node's type, not against any local's — `h = [1, 2]; h.last.is_a?(String)`
+    /// types the address `Integer`, which the reference collapses to `Bot`
+    /// (probe `k_root_array_lit`, reference-silent). `None` for a
+    /// [`GuardTarget::Local`] fact.
+    chain_call: Option<NodeId>,
+}
+
+/// What a [`GuardFact`] asserts a class of: a bare local (stages 1-3a-1) or a
+/// stable single-hop chain address (stage 3a-3).
+///
+/// `Chain(root, m)` is the port of the reference's `stable_chain_address`
+/// (`narrowing.rb:1826`) restricted to LOCAL roots — an ivar root is declined
+/// because the arena's `VariableRead` carries no name (spec row c7b, a recorded
+/// coverage gap).
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum GuardTarget {
+    Local(String),
+    Chain(String, String),
+}
+
+impl GuardTarget {
+    /// The LOCAL whose rebind invalidates this target — the name itself for a
+    /// local, the ROOT for a chain address.
+    fn root(&self) -> &str {
+        match self {
+            GuardTarget::Local(n) | GuardTarget::Chain(n, _) => n,
+        }
+    }
 }
 
 /// One edge's guard facts in SOURCE ORDER. A `Vec` rather than a map because
-/// [`Typer::apply_guards`] must apply a same-local collision sequentially to
+/// [`Typer::apply_guards`] must apply a same-target collision sequentially to
 /// reproduce the reference's nested scopes (see its doc comment).
-type GuardMap = Vec<(String, GuardFact)>;
+type GuardMap = Vec<(GuardTarget, GuardFact)>;
+
+/// A stable single-hop chain address — `(root local name, method name)`, the
+/// key of the stage-3a-3 `chain_env`.
+type ChainAddr = (String, String);
+
+/// The class-narrowing fact environment threaded through the flow pass: the
+/// per-LOCAL facts stages 1-3a-1 established, plus the stage-3a-3 per-CHAIN
+/// facts keyed by [`ChainAddr`].
+///
+/// The two families are deliberately separate maps rather than one keyed union:
+/// a chain fact is only ever `Narrowed` (there is no chain `Bot` — the
+/// reference's collapse of a precise chain carrier is reproduced by DECLINING
+/// the mint, since our carrier gate reads the same node's type), and the
+/// invalidation rules differ (any mention of the ROOT kills every chain rooted
+/// at it, while a local fact dies only on a write/mutation of that local).
+#[derive(Clone, Default, Debug)]
+struct Facts {
+    /// Per-local facts. Was the bare `cenv: HashMap<String, ClassFact>` before
+    /// stage 3a-3; every existing rule reads and writes exactly this field.
+    locals: HashMap<String, ClassFact>,
+    /// Stage 3a-3: `(root, method) -> narrowed class name`.
+    chains: HashMap<ChainAddr, String>,
+}
+
+impl Facts {
+    /// Invalidate everything a REBIND of `name` invalidates: the local's own
+    /// fact and EVERY chain address rooted at it (the reference drops a chain
+    /// narrowing inside `Scope#with_local`, `narrowing.rb:1800` — probe `c7g`,
+    /// where the reference fires a DIFFERENT diagnostic off the rebound value
+    /// and we must stay silent).
+    fn kill_local(&mut self, name: &str) {
+        self.locals.remove(name);
+        self.chains.retain(|(root, _), _| root != name);
+    }
+
+    /// Invalidate every chain address rooted at `name`, leaving the local fact
+    /// alone — the port of `invalidate_chain_after_call`
+    /// (`indexed_narrowing.rb:151`), widened to any MENTION of the root (spec
+    /// rows c7c/f23: the reference keeps the fact through an argument-position
+    /// mention and we decline, a pure coverage loss).
+    fn kill_chains_rooted_at(&mut self, name: &str) {
+        self.chains.retain(|(root, _), _| root != name);
+    }
+}
 
 /// The output of [`Typer::class_narrowing_pass`] — the two per-call-node
 /// snapshot sets the rules layer consumes.
@@ -2685,7 +2760,7 @@ impl<'i> Typer<'i> {
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
         let mut tenv = TypeEnv::new();
-        let mut cenv: HashMap<String, ClassFact> = HashMap::new();
+        let mut cenv = Facts::default();
         let coarse = coarse_locals(ast, &body);
         self.class_flow_scope(
             ast, &body, &mut tenv, &mut cenv, &coarse, &writes, interner, &mut out, true,
@@ -2714,7 +2789,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         stmts: &[NodeId],
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, ClassFact>,
+        cenv: &mut Facts,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
@@ -2733,7 +2808,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, ClassFact>,
+        cenv: &mut Facts,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
@@ -2756,21 +2831,21 @@ impl<'i> Typer<'i> {
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
                 // Rebinding invalidates the narrowing (probe a4; `scope.rb:194`).
-                cenv.remove(&name);
+                cenv.kill_local(&name);
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
-                    cenv.remove(&name);
+                    cenv.kill_local(&name);
                     tenv.insert(name, ty);
                 }
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
-                cenv.remove(&name);
+                cenv.kill_local(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
@@ -2806,7 +2881,7 @@ impl<'i> Typer<'i> {
                 // boundary), no effect on the enclosing one.
                 let body = body.clone();
                 let mut t = TypeEnv::new();
-                let mut c: HashMap<String, ClassFact> = HashMap::new();
+                let mut c = Facts::default();
                 let inner = coarse_locals(ast, &body);
                 self.class_flow_scope(
                     ast, &body, &mut t, &mut c, &inner, writes, interner, out, true,
@@ -2829,8 +2904,17 @@ impl<'i> Typer<'i> {
             // members are load-bearing for `BeginRescue`, whose flat `body`
             // interleaves the protected statements with each clause's lowered
             // exception `ConstantRead`s (probe f7).
-            Node::LocalVariableRead { .. }
-            | Node::ConstantRead { .. }
+            //
+            // Stage 3a-3 splits the bare LOCAL read out: it is still inert for
+            // the per-local facts, but it MENTIONS a name that may be a chain
+            // root, and this slice's invalidation kills a chain on any mention
+            // (see the `class_flow_expr` arm for why that is a strict superset
+            // of the reference's rule).
+            Node::LocalVariableRead { name, .. } => {
+                let name = name.clone();
+                cenv.kill_chains_rooted_at(&name);
+            }
+            Node::ConstantRead { .. }
             | Node::VariableRead { .. }
             | Node::SelfExpr { .. }
             | Node::StringLit { .. }
@@ -2890,7 +2974,7 @@ impl<'i> Typer<'i> {
                 let bound: Vec<String> =
                     clauses.iter().filter_map(|c| c.bound_name.clone()).collect();
                 for name in &bound {
-                    cenv.remove(name);
+                    cenv.kill_local(name);
                 }
                 self.class_flow_scope(ast, &body, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 widen_flow_writes(writes, span, tenv, interner);
@@ -2973,7 +3057,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, ClassFact>,
+        cenv: &mut Facts,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
@@ -2987,10 +3071,67 @@ impl<'i> Typer<'i> {
                 let block_body = block_body.clone();
                 let safe_nav = *safe_nav;
                 let call_span = *span;
+                // ---- stage 3a-3: chain-address bookkeeping ------------------
+                // Is THIS call the pure address read of a LIVE chain fact
+                // (`h.last` while `(h, "last")` is narrowed)? Two things hang
+                // off the answer, and both are load-bearing:
+                //
+                //  * the read must NOT invalidate its own fact. The reference
+                //    agrees — `invalidate_chain_after_call` runs at the
+                //    STATEMENT `eval_call` and `h.last.frobnicate_zzz`'s outer
+                //    receiver is a `CallNode`, not a stable root, so nothing is
+                //    dropped and a second read narrows too (probe `f11`, the
+                //    reference fires twice);
+                //  * the root read beneath it must not trip the
+                //    root-MENTION kill below.
+                let live_address = stable_chain_address(ast, id)
+                    .filter(|addr| cenv.chains.contains_key(addr));
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
                 // A receiver is EXPRESSION position (probes s5-s7, s11, p3).
+                // Skipped for a live address read: its receiver is the bare root
+                // local, whose descent would kill the very fact being read.
                 if let Some(r) = receiver {
-                    self.class_flow_expr(ast, r, tenv, cenv, coarse, writes, interner, out, false);
+                    if live_address.is_none() {
+                        self.class_flow_expr(
+                            ast, r, tenv, cenv, coarse, writes, interner, out, false,
+                        );
+                    }
+                }
+                // INVALIDATION, the strict superset of
+                // `invalidate_chain_after_call` this slice specced: a call whose
+                // receiver READS the root, other than the pure address read
+                // above, drops every chain rooted there (probe `c7d`, `h.pop`,
+                // reference-silent). The reference's own rule is narrower — it
+                // fires only for a statement-position call — so ours declines
+                // some rows it keeps; killing is always a subset.
+                //
+                // A call whose receiver is the ADDRESS (`h.last.strip`,
+                // `h.last << y`) is NOT a root-receiver call and does not
+                // invalidate, on either engine (probes `n_call_on_address`,
+                // `n_address_receiver_call`, both reference=1).
+                if live_address.is_none() {
+                    if let Some(r) = receiver {
+                        if let Node::LocalVariableRead { name, .. } = ast.get(r) {
+                            cenv.kill_chains_rooted_at(name);
+                        }
+                    }
+                }
+                // Record the CHAIN use: `<addr>.<m>(…)` where `<addr>` carries a
+                // live fact. The outer call's own arguments and block are
+                // irrelevant — the reference narrows the RECEIVER expression
+                // (`method_chain_narrowing_for` gates the node it types, which
+                // is the address, not its caller), so `h.last.zzz(1)` and
+                // `h.last.zzz { }` both fire (probes `m_use_with_args`,
+                // `m_use_with_block`). Safe-nav on the outer call declines, as
+                // everywhere in this slice.
+                if !safe_nav {
+                    if let Some(r) = receiver {
+                        if let Some(addr) = stable_chain_address(ast, r) {
+                            if let Some(c) = cenv.chains.get(&addr) {
+                                out.calls.insert(id, c.clone());
+                            }
+                        }
+                    }
                 }
                 // Record the use: a plain (not safe-nav) call on a bare local
                 // currently narrowed to `C`. Recorded BEFORE any invalidation
@@ -3004,7 +3145,7 @@ impl<'i> Typer<'i> {
                 // which SHAPES the reference narrows, not about dispatch).
                 if let Some(r) = receiver {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
-                        match cenv.get(name) {
+                        match cenv.locals.get(name) {
                             Some(ClassFact::Bot) => {
                                 out.dead.insert(id);
                             }
@@ -3046,18 +3187,29 @@ impl<'i> Typer<'i> {
                     // A rebind inside the block drops it from `bcenv`, so the
                     // join below drops it from the outer env too
                     // (`bot_block_rebind`, where the reference fires).
+                    //
+                    // Stage 3a-3: CHAIN facts do NOT cross into a block. The
+                    // reference does carry them (probe `n_into_block` fires),
+                    // but a chain address is invalidated by a call on its root
+                    // and a block body can invisibly reach the root through a
+                    // capture — the same reason `Narrowed` locals stay out.
+                    // A recorded coverage gap, never an FP.
                     let mut block_edge: Option<HashMap<String, ClassFact>> = None;
                     if stmt_position {
                         let mut btenv = tenv.clone();
-                        let mut bcenv: HashMap<String, ClassFact> = cenv
-                            .iter()
-                            .filter(|(_, f)| **f == ClassFact::Bot)
-                            .map(|(k, f)| (k.clone(), f.clone()))
-                            .collect();
+                        let mut bcenv = Facts {
+                            locals: cenv
+                                .locals
+                                .iter()
+                                .filter(|(_, f)| **f == ClassFact::Bot)
+                                .map(|(k, f)| (k.clone(), f.clone()))
+                                .collect(),
+                            chains: HashMap::new(),
+                        };
                         self.class_flow_scope(
                             ast, &block_body, &mut btenv, &mut bcenv, coarse, writes, interner, out, true,
                         );
-                        block_edge = Some(bcenv);
+                        block_edge = Some(bcenv.locals);
                     }
                     match block_edge {
                         Some(edge) => join_cenv(cenv, std::slice::from_ref(&edge)),
@@ -3106,21 +3258,21 @@ impl<'i> Typer<'i> {
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
-                cenv.remove(&name);
+                cenv.kill_local(&name);
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
-                    cenv.remove(&name);
+                    cenv.kill_local(&name);
                     tenv.insert(name, ty);
                 }
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
-                cenv.remove(&name);
+                cenv.kill_local(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
@@ -3173,6 +3325,19 @@ impl<'i> Typer<'i> {
             Node::Statements { .. } | Node::BeginRescue { .. } => {
                 self.class_flow_stmt(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
+            // Stage 3a-3: a bare read of a chain ROOT anywhere OTHER than
+            // beneath a live address read invalidates every chain rooted at it.
+            // The reference does NOT — `invalidate_chain_after_call` only
+            // matches a call whose RECEIVER is the root, so it keeps the fact
+            // through `g(h)` and `other.push(h)` (probes `c7c_arg_mention`,
+            // `f23_push`, `n_root_as_arg_to_mutator`, all reference=1). The
+            // spec's decline set names this: we kill on ANY root mention,
+            // paying coverage for an invalidation rule that is a strict
+            // superset of the reference's and therefore cannot be an FP source.
+            Node::LocalVariableRead { name, .. } => {
+                let name = name.clone();
+                cenv.kill_chains_rooted_at(&name);
+            }
             _ => {}
         }
     }
@@ -3192,7 +3357,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, ClassFact>,
+        cenv: &mut Facts,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
@@ -3218,7 +3383,7 @@ impl<'i> Typer<'i> {
         let truthy_edge = {
             let mut t = tenv.clone();
             let mut c = cenv.clone();
-            self.apply_guards(&truthy_g, tenv, &mut c, coarse, interner);
+            self.apply_guards(&truthy_g, ast, tenv, &mut c, coarse, interner);
             // The branch bodies INHERIT the conditional's own position: a block
             // inside an expression-position ternary branch narrows nothing
             // (probe x2), while a statement `if`'s branches stay statement
@@ -3236,7 +3401,7 @@ impl<'i> Typer<'i> {
             // `local.is_a?(C)` still contributes NOTHING here (`c1g`).
             let mut t = tenv.clone();
             let mut c = cenv.clone();
-            self.apply_guards(&falsey_g, tenv, &mut c, coarse, interner);
+            self.apply_guards(&falsey_g, ast, tenv, &mut c, coarse, interner);
             self.class_flow_scope(ast, falsey, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
             c
         };
@@ -3245,7 +3410,10 @@ impl<'i> Typer<'i> {
         // survives a branch merge in this slice; an entry `Bot` does, unless an
         // edge rebound the local) …
         widen_flow_writes(writes, if_span, tenv, interner);
-        join_cenv(cenv, &[truthy_edge, falsey_edge]);
+        // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
+        // the propagation's R3 conflict check below (see there for why).
+        let pre_join_chains = cenv.chains.clone();
+        join_cenv(cenv, &[truthy_edge.locals, falsey_edge.locals]);
         // … EXCEPT the early-return propagation (`eval_if:486`/`:495`), which
         // 3a-1 runs in BOTH directions: a terminating FALSEY branch propagates
         // the truthy map (the `return unless guard` idiom a5/c1d), a
@@ -3262,9 +3430,34 @@ impl<'i> Typer<'i> {
         };
         if stmt_position && truthy_terminates != falsey_terminates {
             let carried = if falsey_terminates { &truthy_g } else { &falsey_g };
+            // A CHAIN target is filtered on its ROOT: a rebind of the root
+            // inside the conditional's span invalidates the address just as a
+            // rebind of the local invalidates a local fact (probe `c7g`, where
+            // the reference fires a DIFFERENT diagnostic off the rebound value
+            // and we must stay silent).
             let carried: GuardMap =
-                carried.iter().filter(|(l, _)| !rewritten(l)).cloned().collect();
-            self.apply_guards(&carried, tenv, cenv, coarse, interner);
+                carried.iter().filter(|(t, _)| !rewritten(t.root())).cloned().collect();
+            // Re-seed the PRE-JOIN chain facts for exactly the addresses this
+            // map touches. Without it a sequential disjoint re-guard of one
+            // address (`return unless h.last.is_a?(String)` then `return unless
+            // h.last.is_a?(Hash)`) would mint `Hash` against an EMPTY env and
+            // witness where the reference has already collapsed to `Bot` —
+            // probe `d_seq_two_returns_disjoint`, reference-silent. This is the
+            // chain analogue of the LOCAL-side defect recorded in the
+            // `next`/`break` build note (`s1_two_returns_sequential`), which
+            // sits on the same `join_cenv`-before-propagation ordering; the
+            // narrow re-seed fixes it for chains without touching that ordering.
+            // Only the touched addresses are restored, so an untouched chain
+            // fact still dies at the join (probe `n_escape_after_if`).
+            for (t, _) in &carried {
+                if let GuardTarget::Chain(root, m) = t {
+                    let addr: ChainAddr = (root.clone(), m.clone());
+                    if let Some(class) = pre_join_chains.get(&addr) {
+                        cenv.chains.insert(addr, class.clone());
+                    }
+                }
+            }
+            self.apply_guards(&carried, ast, tenv, cenv, coarse, interner);
         }
     }
 
@@ -3292,49 +3485,113 @@ impl<'i> Typer<'i> {
     /// 3. **Review R3**: a mintable guard conflicting with an existing
     ///    DIFFERENT fact drops the stale fact and inserts nothing. A SAME-class
     ///    re-guard is a no-op re-narrowing and keeps it.
+    ///
+    /// ## Stage 3a-3 — [`GuardTarget::Chain`] entries
+    ///
+    /// A chain target follows the SAME three steps with two differences, each
+    /// measured:
+    /// - there is no `Bot` step. The reference does collapse a precise chain
+    ///   carrier (`h = [1, 2]; h.last.is_a?(String)` is reference-silent, probe
+    ///   `k_root_array_lit`), but we reproduce that by DECLINING the mint — the
+    ///   carrier gate below reads the chain call's own type, which is precise in
+    ///   exactly that case. Silence either way, and no chain `Bot` fact has to
+    ///   exist;
+    /// - the carrier gate reads `type_of(chain_call)` instead of the local's
+    ///   `tenv` entry, and the PR #72 `coarse` ALLOW-list does NOT apply. The
+    ///   allow-list exists because the reference's carrier for a `||`-bound
+    ///   LOCAL is a union its `narrow_class_other` declines; the carrier here is
+    ///   the DISPATCH RESULT off that union, which the reference narrows
+    ///   normally — `h = a || b; h.last.is_a?(String)` fires on the reference
+    ///   (probe `k_root_or_union`), so applying the allow-list would be pure
+    ///   coverage loss with no FP to pay for it.
+    ///
+    /// R3 is load-bearing for chains in a way it is not for locals: a sequential
+    /// disjoint re-guard of the SAME address (`return unless h.last.is_a?(String)`
+    /// then `return unless h.last.is_a?(Hash)`) is reference-SILENT — its scope
+    /// carries `String` into the second guard and collapses — and without R3
+    /// seeing the incoming fact we would witness `for Hash` (probe
+    /// `d_seq_two_returns_disjoint`; the LOCAL spelling of this shape is a known
+    /// pre-existing FP, recorded in the `next`/`break` build note, which this
+    /// slice deliberately does not reproduce for chains).
+    #[allow(clippy::too_many_arguments)]
     fn apply_guards(
         &self,
         guards: &GuardMap,
+        ast: &LoweredAst,
         tenv: &TypeEnv,
-        c: &mut HashMap<String, ClassFact>,
+        c: &mut Facts,
         coarse: &HashSet<String>,
-        interner: &Interner,
+        interner: &mut Interner,
     ) {
-        // The classes each local was already asserted to EARLIER IN THIS MAP.
+        // The classes each TARGET was already asserted to EARLIER IN THIS MAP.
         // Needed because a NON-mintable assertion (`===`, `nil?`) writes nothing
         // to `c`, yet the reference's carrier at the next conjunct is that class
         // — `String === v && v.is_a?(Hash)` and `v.nil? && v.is_a?(String)` are
         // both measured reference-silent and would otherwise witness.
-        let mut asserted: HashMap<&str, &[String]> = HashMap::new();
-        for (local, g) in guards {
-            let collapses = !g.classes.is_empty()
-                && g.classes.iter().all(|class| {
-                    self.guard_collapses(local, class, g.exact, tenv, c, interner)
-                });
-            let prior = asserted.insert(local.as_str(), &g.classes);
-            if collapses {
-                c.insert(local.clone(), ClassFact::Bot);
-                continue;
-            }
-            if prior.is_some_and(|p| p != g.classes.as_slice()) {
-                c.remove(local);
-                continue;
-            }
-            let mintable = g.mintable
-                && g.classes.len() == 1
-                && !coarse.contains(local)
-                && match tenv.get(local) {
-                    None => true, // unbound ⇒ untyped (Dynamic[top])
-                    Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
-                };
-            if !mintable {
-                continue;
-            }
-            let fact = ClassFact::Narrowed(g.classes[0].clone());
-            if c.get(local).is_some_and(|existing| *existing != fact) {
-                c.remove(local);
-            } else {
-                c.insert(local.clone(), fact);
+        let mut asserted: Vec<(&GuardTarget, &[String])> = Vec::new();
+        for (target, g) in guards {
+            let prior = asserted
+                .iter()
+                .rev()
+                .find(|(t, _)| *t == target)
+                .map(|(_, cl)| *cl);
+            asserted.push((target, &g.classes));
+            let conflicts = prior.is_some_and(|p| p != g.classes.as_slice());
+            match target {
+                GuardTarget::Local(local) => {
+                    let collapses = !g.classes.is_empty()
+                        && g.classes.iter().all(|class| {
+                            self.guard_collapses(local, class, g.exact, tenv, c, interner)
+                        });
+                    if collapses {
+                        c.locals.insert(local.clone(), ClassFact::Bot);
+                        continue;
+                    }
+                    if conflicts {
+                        c.locals.remove(local);
+                        continue;
+                    }
+                    let mintable = g.mintable
+                        && g.classes.len() == 1
+                        && !coarse.contains(local)
+                        && match tenv.get(local) {
+                            None => true, // unbound ⇒ untyped (Dynamic[top])
+                            Some(&ty) => {
+                                matches!(interner.get(ty), Type::Dynamic(_) | Type::Top)
+                            }
+                        };
+                    if !mintable {
+                        continue;
+                    }
+                    let fact = ClassFact::Narrowed(g.classes[0].clone());
+                    if c.locals.get(local).is_some_and(|existing| *existing != fact) {
+                        c.locals.remove(local);
+                    } else {
+                        c.locals.insert(local.clone(), fact);
+                    }
+                }
+                GuardTarget::Chain(root, method) => {
+                    let addr: ChainAddr = (root.clone(), method.clone());
+                    if conflicts {
+                        c.chains.remove(&addr);
+                        continue;
+                    }
+                    // `narrow_class_other`'s envelope, read off the CHAIN CALL.
+                    let carrier_ok = g.chain_call.is_some_and(|n| {
+                        let ty = self.type_of(ast, n, tenv, interner);
+                        matches!(interner.get(ty), Type::Dynamic(_) | Type::Top)
+                    });
+                    let mintable = g.mintable && g.classes.len() == 1 && carrier_ok;
+                    if !mintable {
+                        continue;
+                    }
+                    let class = g.classes[0].clone();
+                    if c.chains.get(&addr).is_some_and(|existing| *existing != class) {
+                        c.chains.remove(&addr);
+                    } else {
+                        c.chains.insert(addr, class);
+                    }
+                }
             }
         }
     }
@@ -3449,27 +3706,52 @@ impl<'i> Typer<'i> {
             return None;
         }
         let nil_fact = |name: &str| {
-            (name.to_string(), GuardFact {
+            (GuardTarget::Local(name.to_string()), GuardFact {
                 classes: vec!["NilClass".to_string()],
                 exact: false,
                 mintable: false,
+                chain_call: None,
             })
         };
         match (method.as_str(), args.len()) {
             ("is_a?" | "kind_of?" | "instance_of?", 1) => {
-                let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
                 let class = self.resolved_static_constant(ast, args[0], *span)?;
                 let exact = method == "instance_of?";
-                let g = (name.clone(), GuardFact { classes: vec![class], exact, mintable: true });
+                // Stage 3a-3: the operand is EITHER a bare local (stages 1-2)
+                // OR a stable single-hop chain address off a local root
+                // (`analyse_class_predicate_on_chain`, `narrowing.rb:1805`).
+                // Anything else — an ivar read, a two-hop chain, a hop with
+                // arguments or a block, a safe-nav hop — declines, exactly as
+                // `stable_chain_address` returns nil for it (probes `c7b_ivar`,
+                // `m_two_hop`, `c7e_args_on_hop`, `m_block_on_hop`,
+                // `m_safe_nav_hop`; the last three are reference-silent too,
+                // the first two are recorded coverage gaps).
+                let (target, chain_call) = match ast.get(*r) {
+                    Node::LocalVariableRead { name, .. } => {
+                        (GuardTarget::Local(name.clone()), None)
+                    }
+                    _ => {
+                        let (root, m) = stable_chain_address(ast, *r)?;
+                        (GuardTarget::Chain(root, m), Some(*r))
+                    }
+                };
+                let g = (target, GuardFact {
+                    classes: vec![class],
+                    exact,
+                    mintable: true,
+                    chain_call,
+                });
                 Some((vec![g], Vec::new()))
             }
             ("===", 1) => {
                 let Node::LocalVariableRead { name, .. } = ast.get(args[0]) else { return None };
                 let class = self.resolved_static_constant(ast, *r, *span)?;
-                let g = (
-                    name.clone(),
-                    GuardFact { classes: vec![class], exact: false, mintable: false },
-                );
+                let g = (GuardTarget::Local(name.clone()), GuardFact {
+                    classes: vec![class],
+                    exact: false,
+                    mintable: false,
+                    chain_call: None,
+                });
                 Some((vec![g], Vec::new()))
             }
             ("nil?", 0) => {
@@ -3519,10 +3801,10 @@ impl<'i> Typer<'i> {
         class_name: &str,
         exact: bool,
         tenv: &TypeEnv,
-        cenv: &HashMap<String, ClassFact>,
+        cenv: &Facts,
         interner: &Interner,
     ) -> bool {
-        if cenv.get(local) == Some(&ClassFact::Bot) {
+        if cenv.locals.get(local) == Some(&ClassFact::Bot) {
             return true;
         }
         let Some(&ty) = tenv.get(local) else { return false };
@@ -3595,7 +3877,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         tenv: &mut TypeEnv,
-        cenv: &mut HashMap<String, ClassFact>,
+        cenv: &mut Facts,
         coarse: &HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
@@ -3658,10 +3940,10 @@ impl<'i> Typer<'i> {
                     // and never inserts (the reference's carrier is a Nominal
                     // there, out of the Dynamic-only envelope). Same class keeps.
                     let fact = ClassFact::Narrowed(class);
-                    if c.get(local).is_some_and(|existing| existing != &fact) {
-                        c.remove(local);
+                    if c.locals.get(local).is_some_and(|existing| existing != &fact) {
+                        c.locals.remove(local);
                     } else {
-                        c.insert(local.clone(), fact);
+                        c.locals.insert(local.clone(), fact);
                     }
                 }
             } else if let Some(local) = &bot_subject {
@@ -3680,13 +3962,13 @@ impl<'i> Typer<'i> {
                         })
                     });
                 if all_collapse {
-                    c.insert(local.clone(), ClassFact::Bot);
+                    c.locals.insert(local.clone(), ClassFact::Bot);
                 }
             }
             // Clause bodies INHERIT the `case`'s position: a block inside an
             // expression-position clause narrows nothing (probe x1).
             self.class_flow_scope(ast, &body, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
-            edges.push(c);
+            edges.push(c.locals);
         }
         {
             // The `else` body is a NEGATIVE edge — never narrowed.
@@ -3695,7 +3977,7 @@ impl<'i> Typer<'i> {
             self.class_flow_scope(
                 ast, &else_body, &mut t, &mut c, coarse, writes, interner, out, stmt_position,
             );
-            edges.push(c);
+            edges.push(c.locals);
         }
         widen_flow_writes(writes, case_span, tenv, interner);
         // A `case`/`in` clause is not descended, so its rebinds are invisible to
@@ -4465,11 +4747,46 @@ fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
 ///
 /// Facts the EDGES established are not in `cenv` at all (edges walk clones), so
 /// nothing minted inside a branch can leak out through here.
-fn join_cenv(cenv: &mut HashMap<String, ClassFact>, edges: &[HashMap<String, ClassFact>]) {
-    cenv.retain(|name, fact| {
+///
+/// Stage 3a-3: EVERY chain fact dies at a join, unconditionally. There is no
+/// chain `Bot` to survive, and the reference agrees that a chain narrowing
+/// established inside a branch does not escape it (probe `n_escape_after_if`,
+/// reference-silent). The one place a chain fact must outlive the join is the
+/// early-return propagation, which [`Typer::class_flow_if`] re-seeds explicitly
+/// from a PRE-join snapshot — see its comment on the sequential-disjoint
+/// hazard.
+fn join_cenv(cenv: &mut Facts, edges: &[HashMap<String, ClassFact>]) {
+    cenv.locals.retain(|name, fact| {
         *fact == ClassFact::Bot
             && edges.iter().all(|edge| edge.get(name) == Some(&ClassFact::Bot))
     });
+    cenv.chains.clear();
+}
+
+/// The stable single-hop chain address of `id`, if it has one — the port of the
+/// reference's `stable_chain_address` (`narrowing.rb:1826`) restricted to LOCAL
+/// roots.
+///
+/// `Some((root, method))` iff `id` is a `Call` whose receiver is a bare
+/// `LocalVariableRead`, with NO arguments, NO block and NO safe-nav. The
+/// reference's ivar arm is DECLINED: the arena's `VariableRead` carries no name
+/// (spec row `c7b`, a recorded coverage gap that needs a lowering change first).
+///
+/// Every other decline is measured reference-silent as well: arguments on the
+/// hop (`c7e`), a block on the hop (`m_block_on_hop`), a two-hop chain
+/// (`m_two_hop`). A safe-nav hop is the one exception — the reference fires
+/// (`m_safe_nav_hop`) and we decline, matching `stable_chain_address`'s own
+/// shape gate as ported plus the slice-wide safe-nav decline.
+fn stable_chain_address(ast: &LoweredAst, id: NodeId) -> Option<ChainAddr> {
+    let Node::Call { receiver: Some(r), method, args, block_body, safe_nav, .. } = ast.get(id)
+    else {
+        return None;
+    };
+    if *safe_nav || !args.is_empty() || !block_body.is_empty() {
+        return None;
+    }
+    let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
+    Some((name.clone(), method.clone()))
 }
 
 /// Does this predicate operand's subtree contain a `=~` whose RECEIVER is not a
@@ -4529,8 +4846,8 @@ fn regex_binding_match(ast: &LoweredAst, id: NodeId, depth: u32) -> bool {
 /// the join never suppresses more than either side alone).
 fn join_guards(a: &GuardMap, b: &GuardMap) -> GuardMap {
     let mut out: GuardMap = Vec::new();
-    for (local, ga) in a {
-        let Some((_, gb)) = b.iter().find(|(n, _)| n == local) else { continue };
+    for (target, ga) in a {
+        let Some((_, gb)) = b.iter().find(|(n, _)| n == target) else { continue };
         let mut classes = ga.classes.clone();
         for class in &gb.classes {
             if !classes.contains(class) {
@@ -4538,11 +4855,15 @@ fn join_guards(a: &GuardMap, b: &GuardMap) -> GuardMap {
             }
         }
         out.push((
-            local.clone(),
+            target.clone(),
             GuardFact {
                 classes,
                 exact: ga.exact && gb.exact,
                 mintable: ga.mintable && gb.mintable,
+                // Both sides address the SAME node when the target is a chain
+                // (the join keys on the address), so either id is the carrier
+                // gate's subject; `a`'s is taken for determinism.
+                chain_call: ga.chain_call,
             },
         ));
     }
@@ -4555,11 +4876,11 @@ fn join_guards(a: &GuardMap, b: &GuardMap) -> GuardMap {
 fn kill_cenv_writes(
     writes: &[(rigor_parse::Span, String)],
     span: rigor_parse::Span,
-    cenv: &mut HashMap<String, ClassFact>,
+    cenv: &mut Facts,
 ) {
     for (wspan, name) in writes {
         if span.0 <= wspan.0 && wspan.1 <= span.1 {
-            cenv.remove(name);
+            cenv.kill_local(name);
         }
     }
 }
@@ -4571,17 +4892,22 @@ fn kill_cenv_writes(
 /// A mutation widens a CARRIER, and `Bot` has no carrier to widen: the
 /// reference keeps `Bot` across `h.push(3)` and stays silent afterwards (probe
 /// `bot_mutator_use`), while the narrowing fact must still die there.
+///
+/// Stage 3a-3: a CHAIN fact rooted at the named local dies here unconditionally
+/// — `Bot` has no chain analogue, and a mutation of the root is exactly the
+/// "intervening call against the same root receiver" the reference drops on
+/// (`invalidate_chain_after_call`; probe `n_root_mutator`, reference-silent).
 fn kill_cenv_narrowed(
     writes: &[(rigor_parse::Span, String)],
     span: rigor_parse::Span,
-    cenv: &mut HashMap<String, ClassFact>,
+    cenv: &mut Facts,
 ) {
     for (wspan, name) in writes {
-        if span.0 <= wspan.0
-            && wspan.1 <= span.1
-            && cenv.get(name).is_some_and(|f| *f != ClassFact::Bot)
-        {
-            cenv.remove(name);
+        if span.0 <= wspan.0 && wspan.1 <= span.1 {
+            cenv.kill_chains_rooted_at(name);
+            if cenv.locals.get(name).is_some_and(|f| *f != ClassFact::Bot) {
+                cenv.locals.remove(name);
+            }
         }
     }
 }
@@ -7715,6 +8041,281 @@ mod class_narrowing_tests {
             b"def f(value)\n  case value\n  when Hash\n    [1].each { |_i| value.frobnicate_zzz }\n  end\nend\n",
         );
         assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+
+    /// STAGE 3a-3 — single-hop chain guards, LOCAL roots
+    /// (docs/notes/20260807-narrowing-stage3-spec.md, "3a-3 BUILT").
+    ///
+    /// Same convention as the 3a-1 and `next`/`break` matrices: `Some(c)` — the
+    /// reference FIRES and rigor-rs must record `c`; `None` — rigor-rs records
+    /// nothing, either because the reference is SILENT (recording would be a
+    /// live false positive) or because a decline costs coverage the reference
+    /// has (a strict subset, never an FP). Every row is oracle-measured against
+    /// the pinned reference `v0.3.1` from a FRESH temp cwd with `--no-cache`
+    /// and the checkout plugin path pinned; the row name is the probe name in
+    /// the note's tables.
+    ///
+    /// The expectation is on the FIRST `frobnicate_zzz` call unless the row
+    /// name says otherwise (`f11` asserts both).
+    #[test]
+    fn class_narrowing_stage3a3_chain_guard_matrix() {
+        const USE: &str = "h.last.frobnicate_zzz";
+        const G: &str = "h.last.is_a?(String)";
+        let f = |body: &str| format!("def f(h, g, xs, cond)\n{body}\nend\n");
+        let rows: Vec<(&str, String, Option<&str>)> = vec![
+            // ---- e: the spec's own c7 matrix, reproduced --------------------
+            ("c7a", f(&format!("  {USE} if {G}")), Some("String")),
+            // c7b: an IVAR root. The arena's `VariableRead` is NAMELESS, so
+            // `stable_chain_address` cannot key it — a recorded coverage gap
+            // (the reference fires `for String`).
+            (
+                "c7b_ivar",
+                "class K\n  def f\n    @h.last.frobnicate_zzz if @h.last.is_a?(String)\n  end\nend\n"
+                    .to_string(),
+                None,
+            ),
+            // c7c/f23: the reference KEEPS the fact through an argument-position
+            // mention of the root; we kill on ANY mention. Coverage only.
+            ("c7c_arg_mention", f(&format!("  if {G}\n    g(h)\n    {USE}\n  end")), None),
+            ("f23_push", f(&format!("  if {G}\n    xs.push(h)\n    {USE}\n  end")), None),
+            // c7d: a call whose RECEIVER is the root invalidates — reference
+            // silent, so keeping the fact would be a live FP.
+            ("c7d_pop", f(&format!("  if {G}\n    h.pop\n    {USE}\n  end")), None),
+            // c7e: arguments on the hop ⇒ no stable address, on both engines.
+            (
+                "c7e_args_on_hop",
+                f("  h.fetch(0).frobnicate_zzz if h.fetch(0).is_a?(String)"),
+                None,
+            ),
+            // c7g: the REBIND control. The reference fires here, but with a
+            // DIFFERENT diagnostic (`for nil`, folding the rebound `[].last`),
+            // so the write-kill must make us silent.
+            ("c7g_rebind", f(&format!("  if {G}\n    h = []\n    {USE}\n  end")), None),
+            ("c7h_inert", f(&format!("  if {G}\n    x = 1\n    {USE}\n  end")), Some("String")),
+            ("h1_return_unless", f(&format!("  return unless {G}\n  {USE}")), Some("String")),
+            // ---- a: the chain guard as a CONJUNCT ---------------------------
+            ("a_conj_right_then", f(&format!("  if cond && {G}\n    {USE}\n  end")), Some("String")),
+            ("a_conj_left_then", f(&format!("  if {G} && cond\n    {USE}\n  end")), Some("String")),
+            (
+                "a_conj_elsif",
+                f(&format!("  if g\n    1\n  elsif cond && {G}\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            // The `&&` FALSEY edge of an atomic chain guard is empty — the
+            // reference is silent in the `else`, so narrowing there would be an FP.
+            ("a_conj_else_ctl", f(&format!("  if cond && {G}\n    1\n  else\n    {USE}\n  end")), None),
+            ("a_conj_mid", f(&format!("  if g && {G} && cond\n    {USE}\n  end")), Some("String")),
+            // An `||` with an unrecognised disjunct joins in the un-narrowed
+            // scope ⇒ nothing, on both engines.
+            ("a_or_disjunct_ctl", f(&format!("  if {G} || cond\n    {USE}\n  end")), None),
+            // A LOCAL guard and a CHAIN guard in one predicate are independent
+            // targets — both apply.
+            (
+                "a_conj_localguard_mix",
+                "def f(h, v)\n  if v.is_a?(Integer) && h.last.is_a?(String)\n    h.last.frobnicate_zzz\n  end\nend\n"
+                    .to_string(),
+                Some("String"),
+            ),
+            // ---- b: the `!` swap and falsey-edge termination ----------------
+            ("b_bang_else", f(&format!("  if !{G}\n    1\n  else\n    {USE}\n  end")), Some("String")),
+            ("b_bang_then_ctl", f(&format!("  if !{G}\n    {USE}\n  end")), None),
+            ("b_return_if_bang", f(&format!("  return if !{G}\n  {USE}")), Some("String")),
+            (
+                "b_unless_stmt",
+                f(&format!("  unless {G}\n    1\n  else\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            (
+                "b_return_unless_compound",
+                f(&format!("  return unless cond && {G}\n  {USE}")),
+                Some("String"),
+            ),
+            ("b_raise_unless", f(&format!("  raise 'x' unless {G}\n  {USE}")), Some("String")),
+            // The `next`/`break` termination slice composes with chain facts.
+            (
+                "b_next_unless",
+                f(&format!("  xs.each do |_x|\n    next unless {G}\n    {USE}\n  end")),
+                Some("String"),
+            ),
+            // ---- c: disjoint / `Bot` interaction ----------------------------
+            // A PRECISE chain carrier: the reference collapses `h.last`
+            // (`Integer`) to `Bot` under a `String` guard and is SILENT. Our
+            // carrier gate reads the SAME node's type and declines the mint —
+            // the same silence by a different route, and no chain `Bot` fact.
+            ("c_bot_precise_root", f("  h = [1, 2]\n  h.last.frobnicate_zzz if h.last.is_a?(String)"), None),
+            // The must-still-fire twin of the row above.
+            ("c_must_still_fire", f(&format!("  {USE} if {G}")), Some("String")),
+            // A LOCAL collapsed to `Bot` beside a chain guard does NOT suppress
+            // the chain witness — the reference fires (`out.dead` keys on the
+            // local's own calls, and the chain call's receiver is not that local).
+            (
+                "c_chain_and_local_bot",
+                "def f(h)\n  v = [1, 2]\n  if v.is_a?(String) && h.last.is_a?(String)\n    h.last.frobnicate_zzz\n  end\nend\n"
+                    .to_string(),
+                Some("String"),
+            ),
+            // ---- d: the same address re-guarded in sequence -----------------
+            // The sequential-disjoint hazard. The reference carries `String`
+            // into the second guard and collapses to `Bot`; without the
+            // pre-join re-seed in `class_flow_if` we would witness `for Hash`.
+            (
+                "d_seq_two_returns_disjoint",
+                f(&format!("  return unless {G}\n  return unless h.last.is_a?(Hash)\n  {USE}")),
+                None,
+            ),
+            (
+                "d_seq_and_disjoint",
+                f(&format!("  if {G} && h.last.is_a?(Hash)\n    {USE}\n  end")),
+                None,
+            ),
+            // DECLINE: the reference narrows a SUBCLASS re-guard to the more
+            // specific class; R3 drops it. Coverage only.
+            (
+                "d_seq_subclass",
+                f("  return unless h.last.is_a?(Numeric)\n  return unless h.last.is_a?(Integer)\n  h.last.frobnicate_zzz"),
+                None,
+            ),
+            (
+                "d_seq_same_class",
+                f(&format!("  return unless {G}\n  return unless {G}\n  {USE}")),
+                Some("String"),
+            ),
+            ("d_nested_reguard", f(&format!("  if {G}\n    if h.last.is_a?(Hash)\n      {USE}\n    end\n  end")), None),
+            // ---- carrier hazards on the ADDRESS -----------------------------
+            // A `||`-bound ROOT still narrows: the PR #72 carrier ALLOW-LIST is
+            // a per-LOCAL rule and must NOT be applied to a chain address (the
+            // reference fires — applying it would be pure coverage loss).
+            ("k_root_or_union", "def f(a, b)\n  h = a || b\n  h.last.frobnicate_zzz if h.last.is_a?(String)\nend\n".to_string(), Some("String")),
+            ("k_root_splat", "def f(spec)\n  h = *spec\n  h.last.frobnicate_zzz if h.last.is_a?(String)\nend\n".to_string(), Some("String")),
+            ("k_root_from_call", "def f(x)\n  h = x.fetch(:a)\n  h.last.frobnicate_zzz if h.last.is_a?(String)\nend\n".to_string(), Some("String")),
+            ("k_root_kwarg", "def f(h: nil)\n  h.last.frobnicate_zzz if h.last.is_a?(String)\nend\n".to_string(), Some("String")),
+            // Precise carriers the reference collapses — all reference-SILENT,
+            // all declined by the Dynamic/Top carrier gate.
+            ("k_root_hash_lit", "def f\n  h = { a: 1 }\n  h.size.frobnicate_zzz if h.size.is_a?(String)\nend\n".to_string(), None),
+            ("k_root_str_lit", "def f\n  h = 'abc'\n  h.upcase.frobnicate_zzz if h.upcase.is_a?(Hash)\nend\n".to_string(), None),
+            ("k_root_int_lit", "def f\n  h = 3\n  h.succ.frobnicate_zzz if h.succ.is_a?(String)\nend\n".to_string(), None),
+            // ---- guard family / shape variants ------------------------------
+            ("m_kind_of", f("  h.last.frobnicate_zzz if h.last.kind_of?(String)"), Some("String")),
+            ("m_instance_of", f("  h.last.frobnicate_zzz if h.last.instance_of?(String)"), Some("String")),
+            // DECLINE: `===` is non-mintable (3a-1's own finding) and never
+            // produces a chain target. The reference narrows through it.
+            ("m_case_eq", f("  h.last.frobnicate_zzz if String === h.last"), None),
+            // DECLINE: safe-nav, on the hop or on the use. Reference fires.
+            ("m_safe_nav_hop", f("  h&.last.frobnicate_zzz if h&.last.is_a?(String)"), None),
+            ("m_safe_nav_use", f(&format!("  h.last&.frobnicate_zzz if {G}")), None),
+            // A block on the hop: no stable address, reference silent too.
+            ("m_block_on_hop", f("  h.map { |x| x }.frobnicate_zzz if h.map { |x| x }.is_a?(String)"), None),
+            // The OUTER call's own arguments and block are irrelevant — the
+            // reference narrows the RECEIVER expression, so both fire.
+            ("m_use_with_args", f(&format!("  h.last.frobnicate_zzz(1) if {G}")), Some("String")),
+            ("m_use_with_block", f(&format!("  h.last.frobnicate_zzz {{ |x| x }} if {G}")), Some("String")),
+            // Single-hop only; a different method or root is a different address.
+            ("m_two_hop", f("  h.first.last.frobnicate_zzz if h.first.last.is_a?(String)"), None),
+            ("m_different_method", f(&format!("  h.first.frobnicate_zzz if {G}")), None),
+            ("m_different_root", f(&format!("  g.last.frobnicate_zzz if {G}")), None),
+            // DECLINE: a project declaration shadowing the guard class declines
+            // the whole guard (shared with stages 1-2). Reference fires.
+            (
+                "m_shadowed_const",
+                "class String\nend\ndef f(h)\n  h.last.frobnicate_zzz if h.last.is_a?(String)\nend\n".to_string(),
+                None,
+            ),
+            ("m_dynamic_const", "def f(h, c)\n  h.last.frobnicate_zzz if h.last.is_a?(c)\nend\n".to_string(), None),
+            // ---- invalidation -----------------------------------------------
+            ("n_root_mutator", f(&format!("  if {G}\n    h << 1\n    {USE}\n  end")), None),
+            // A call whose receiver is the ADDRESS (not the root) does NOT
+            // invalidate, on either engine.
+            ("n_call_on_address", f(&format!("  if {G}\n    h.last.strip\n    {USE}\n  end")), Some("String")),
+            ("n_address_receiver_call", f(&format!("  if {G}\n    h.last << g\n    {USE}\n  end")), Some("String")),
+            ("n_root_write_after", f(&format!("  if {G}\n    {USE}\n    h = xs\n  end")), Some("String")),
+            ("n_root_opwrite", f(&format!("  if {G}\n    h += xs\n    {USE}\n  end")), None),
+            // DECLINE: chain facts do not cross a block boundary, in or out.
+            ("n_into_block", f(&format!("  if {G}\n    xs.each {{ |_x| {USE} }}\n  end")), None),
+            ("n_after_block", f(&format!("  if {G}\n    xs.each {{ |_x| 1 }}\n    {USE}\n  end")), None),
+            // A fact minted in a branch does NOT escape it — reference-silent.
+            ("n_escape_after_if", f(&format!("  if {G}\n    1\n  end\n  {USE}")), None),
+            ("n_in_nested_if", f(&format!("  if {G}\n    if cond\n      {USE}\n    end\n  end")), Some("String")),
+            ("n_root_as_arg_to_mutator", f(&format!("  if {G}\n    xs.fill(h)\n    {USE}\n  end")), None),
+            ("n_use_before_guard", f(&format!("  {USE}\n  return unless {G}")), None),
+            // ---- the three verified corpus shapes, reduced ------------------
+            // (over a TOP-LEVEL guard class: the corpus rows themselves name
+            // `Bundler::Source::Git`, and `check_narrowed_call`'s
+            // `knows_toplevel_class` gate cannot witness a NAMESPACED class —
+            // a pre-existing consumption limit this slice does not change, and
+            // the reason the gap diff is 0. See the note's "BUILT" section.)
+            (
+                "w1_elsif_conj",
+                "def f(dep, defn_dep, cond)\n  if dep.nil?\n    1\n  elsif cond && defn_dep.source.is_a?(String)\n    defn_dep.source.frobnicate_zzz\n  end\nend\n".to_string(),
+                Some("String"),
+            ),
+            (
+                "w2_index_write_if_mod",
+                "def f(dep)\n  details = {}\n  details[:commit_sha] = dep.source.frobnicate_zzz if dep.source.instance_of?(String)\n  details\nend\n".to_string(),
+                Some("String"),
+            ),
+            (
+                "w3_return_unless",
+                "def f(dep)\n  return unless dep.source.is_a?(String)\n\n  dep.source.frobnicate_zzz\nend\n".to_string(),
+                Some("String"),
+            ),
+            (
+                "w4_return_if_mod",
+                "def f(spec)\n  return spec.source.frobnicate_zzz if spec.source.instance_of?(String)\n\n  nil\nend\n".to_string(),
+                Some("String"),
+            ),
+            // ---- residual composition --------------------------------------
+            ("x_two_addresses_one_root", f("  if h.first.is_a?(String) && h.last.is_a?(Hash)\n    h.first.frobnicate_zzz\n  end"), Some("String")),
+            ("x_same_addr_two_roots", f(&format!("  if {G} && g.last.is_a?(Hash)\n    {USE}\n  end")), Some("String")),
+            ("x_chain_in_begin", f(&format!("  return unless {G}\n\n  begin\n    {USE}\n  rescue StandardError\n    nil\n  end")), Some("String")),
+            // DECLINE (carried from 3b-1): survival PAST a `begin` / `case`.
+            ("x_chain_after_begin", f(&format!("  return unless {G}\n\n  begin\n    1\n  rescue StandardError\n    nil\n  end\n  {USE}")), None),
+            ("x_chain_after_case", f(&format!("  return unless {G}\n\n  case cond\n  when 1 then 2\n  end\n  {USE}")), None),
+            ("x_chain_in_loop_pred", f(&format!("  return unless {G}\n\n  while {USE}\n    break\n  end")), Some("String")),
+            ("x_chain_in_case_clause", f(&format!("  return unless {G}\n\n  case cond\n  when 1 then {USE}\n  end")), Some("String")),
+            ("x_chain_in_array_lit", f(&format!("  return unless {G}\n\n  x = [{USE}]\n  x")), Some("String")),
+            ("x_chain_ternary", f(&format!("  return unless {G}\n\n  cond ? {USE} : 1")), Some("String")),
+            // DECLINE: 3a-2 (`Logical` statement minting) is DEFERRED, so
+            // `guard or raise` mints nothing. The reference fires.
+            ("x_chain_or_raise", f(&format!("  {G} or raise 'no'\n  {USE}")), None),
+            ("x_chain_guard_root_also_local", f(&format!("  if h.is_a?(Array) && {G}\n    {USE}\n  end")), Some("String")),
+            // A rebind of the root inside the conditional's span declines the
+            // propagation; a rebind before the use kills the fact.
+            ("x_root_rebind_in_span", f(&format!("  if {G}\n    h = xs\n  end\n  {USE}")), None),
+            ("x_root_rebind_then_return", f(&format!("  return unless {G}\n\n  h = xs\n  {USE}")), None),
+            ("x_chain_multiwrite_root", f(&format!("  if {G}\n    h, _y = xs, 1\n    {USE}\n  end")), None),
+            // DECLINE: an `||` of DIFFERENT classes is a real union (3a-4).
+            ("x_chain_reguard_or", f(&format!("  if {G} || h.last.is_a?(Hash)\n    {USE}\n  end")), None),
+            ("x_chain_bang_or", f(&format!("  return if !{G} || h.last.nil?\n\n  {USE}")), Some("String")),
+            // A nested `def` is an independent scope — no fact crosses in.
+            ("x_chain_nested_def", f(&format!("  return unless {G}\n\n  def q(h)\n    {USE}\n  end")), None),
+            ("x_chain_use_as_arg", f(&format!("  return unless {G}\n\n  g({USE})")), Some("String")),
+            ("x_chain_use_as_return", f(&format!("  return unless {G}\n\n  return {USE}")), Some("String")),
+        ];
+        for (row, src, expected) in &rows {
+            let (ast, snaps) = class_snaps(src.as_bytes());
+            let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
+            assert_eq!(got, *expected, "stage 3a-3 matrix row {row}\n--- source ---\n{src}");
+        }
+    }
+
+    /// f11 — the fact SURVIVES its own re-read: BOTH chain uses in one branch
+    /// are recorded (the reference fires twice). Split out of the matrix
+    /// because `call_named` only reaches the first call of a name.
+    #[test]
+    fn class_narrowing_stage3a3_chain_fact_survives_its_own_reread() {
+        let src = b"def f(h)\n  if h.last.is_a?(String)\n    h.last.frobnicate_zzz\n    h.last.frobnicate_zzz\n  end\nend\n";
+        let (ast, snaps) = class_snaps(src);
+        let uses: Vec<_> = ast
+            .iter()
+            .filter_map(|(id, n)| match n {
+                Node::Call { method, .. } if method == "frobnicate_zzz" => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses.len(), 2, "two chain uses");
+        for id in uses {
+            assert_eq!(snaps.get(&id).map(String::as_str), Some("String"), "f11: both uses record");
+        }
     }
 }
 
