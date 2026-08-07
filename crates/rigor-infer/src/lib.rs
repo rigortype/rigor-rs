@@ -3413,6 +3413,8 @@ impl<'i> Typer<'i> {
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
         // the propagation's R3 conflict check below (see there for why).
         let pre_join_chains = cenv.chains.clone();
+        // S2: the LOCAL twin of the same snapshot. See the re-seed below.
+        let pre_join_locals = cenv.locals.clone();
         join_cenv(cenv, &[truthy_edge.locals, falsey_edge.locals]);
         // … EXCEPT the early-return propagation (`eval_if:486`/`:495`), which
         // 3a-1 runs in BOTH directions: a terminating FALSEY branch propagates
@@ -3449,11 +3451,31 @@ impl<'i> Typer<'i> {
             // narrow re-seed fixes it for chains without touching that ordering.
             // Only the touched addresses are restored, so an untouched chain
             // fact still dies at the join (probe `n_escape_after_if`).
+            //
+            // S2 (2026-08-08) closes the LOCAL side of exactly that defect, on
+            // the same narrow re-seed. `return unless v.is_a?(File::Stat)` then
+            // `return unless v.is_a?(URI::HTTP)` is reference-SILENT (its scope
+            // carries `File::Stat` into the second guard, which collapses it to
+            // `Bot`), while rigor-rs minted `URI::HTTP` against the wiped env and
+            // witnessed — probe r7. The same shape on two CORE names
+            // (`Hash` then `String`) was already firing before this slice: the
+            // pre-existing FP the `next`/`break` build note recorded as
+            // `s1_two_returns_sequential`. Re-seeding lets R3 see the prior fact,
+            // conflict, and drop it — silence on both spellings. Only the locals
+            // this map touches are restored, so an untouched fact still dies at
+            // the join.
             for (t, _) in &carried {
-                if let GuardTarget::Chain(root, m) = t {
-                    let addr: ChainAddr = (root.clone(), m.clone());
-                    if let Some(class) = pre_join_chains.get(&addr) {
-                        cenv.chains.insert(addr, class.clone());
+                match t {
+                    GuardTarget::Chain(root, m) => {
+                        let addr: ChainAddr = (root.clone(), m.clone());
+                        if let Some(class) = pre_join_chains.get(&addr) {
+                            cenv.chains.insert(addr, class.clone());
+                        }
+                    }
+                    GuardTarget::Local(name) => {
+                        if let Some(fact) = pre_join_locals.get(name) {
+                            cenv.locals.insert(name.clone(), fact.clone());
+                        }
                     }
                 }
             }
@@ -3833,6 +3855,14 @@ impl<'i> Typer<'i> {
     /// or `None` when the node is not a static constant OR a project
     /// declaration shadows the name ([`SourceIndex::constant_shadowed`] —
     /// decline entirely; this slice never narrows to a project nominal).
+    ///
+    /// S2 (2026-08-08): the name is additionally resolved to a QUALIFIED KEY
+    /// here, at MINT time, because this is where the use site's lexical
+    /// `enclosing_prefix` is available — the class-narrowing fact then carries
+    /// a resolved key rather than the verbatim source spelling. Three spellings
+    /// of the same class must reach the same key (probes p3a–p3d): a relative
+    /// `HTTP` inside `module URI`, a qualified `URI::HTTP`, and an absolute
+    /// `::URI::HTTP` all render `for URI::HTTP` on the reference.
     fn resolved_static_constant(
         &self,
         ast: &LoweredAst,
@@ -3849,7 +3879,44 @@ impl<'i> Typer<'i> {
         if self.source.constant_shadowed(name, prefix) {
             return None;
         }
-        Some(name.clone())
+        Some(self.resolve_constant_as_written(name, prefix))
+    }
+
+    /// Resolve a guard constant's SOURCE SPELLING to the qualified key it names,
+    /// by Ruby's (and RBS's) own rule: an ABSOLUTE reference (`::File::Stat`)
+    /// drops its root marker and is looked up as written; a relative one is
+    /// tried against each enclosing lexical scope innermost-outward, then at the
+    /// root. The first scope that KNOWS the name wins — deterministic, so there
+    /// is no residual ambiguity to decline on (the reference resolves the same
+    /// way, probes q9/q9b).
+    ///
+    /// A name nothing knows is returned as written (minus the root marker): the
+    /// witness gate declines it anyway (probes p2/p2b are reference-silent), and
+    /// leaving it verbatim keeps `guard_collapses` seeing exactly what it saw
+    /// before this slice.
+    fn resolve_constant_as_written(&self, name: &str, prefix: &[String]) -> String {
+        let (bare, absolute) = match name.strip_prefix("::") {
+            Some(rest) => (rest, true),
+            None => (name, false),
+        };
+        if !absolute {
+            for depth in (1..=prefix.len()).rev() {
+                let cand = format!("{}::{bare}", prefix[..depth].join("::"));
+                if self.constant_names_a_known_class(&cand) {
+                    return cand;
+                }
+            }
+        }
+        bare.to_string()
+    }
+
+    /// Whether `qname` names a class/module some AUTHORITATIVE surface knows —
+    /// the bundled RBS qualified registry or the project's own `sig/`. In-source
+    /// declarations are deliberately NOT consulted: the reference is silent on
+    /// them for the ADR-0033 provenance reason (probes p4a/p4b/p5), so resolving
+    /// to one could only ever change which name a declined witness carries.
+    fn constant_names_a_known_class(&self, qname: &str) -> bool {
+        self.index.knows_qualified_class(qname) || self.index.is_qualified_project_sig_class(qname)
     }
 
     /// Narrow through one `case`/`when` node (statement or expression

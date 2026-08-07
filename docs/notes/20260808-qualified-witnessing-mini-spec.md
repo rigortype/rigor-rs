@@ -256,3 +256,63 @@ on an unrelated rule. It is therefore NOT part of this slice. The Nominal path
 with a qualified guard, the only place the ordering would matter, cannot produce
 a narrowing FP anyway: `check_narrowed_call` gate (3) declines any use site whose
 receiver is already a concrete carrier.
+
+### S2 — routing the narrowing witness through qualified resolution (PR B, commit 2)
+
+Two independent blockers removed at once, as the probes note's §2b required:
+`knows_toplevel_class` (refuses every namespaced name — the defect-2 rule, left
+in force for every OTHER consumer) and `CoreIndex::class_id` (interns over the
+nine-element `CORE_CLASSES` array, which is why `Time`/`Range`/`Struct`/
+`Pathname` guards were silent despite passing the first gate). Both are replaced
+by one resolution path over three accepted surfaces — the existing top-level one,
+project `sig/` (nested included), and the bundled qualified registry — plus the
+ISOLATED `qualified_class_has_method` and the unchanged `project_declares_method`
+silencer. No `ClassId` is needed: the render is the resolved path itself, which
+for a core name is the same string `render_receiver` produced.
+
+Resolution happens at MINT time (`Typer::resolve_constant_as_written`, called
+from `resolved_static_constant`), where the use site's `enclosing_prefix` is
+available: strip a leading `::`, then try the name against each enclosing lexical
+scope innermost-outward, then the root. First hit wins — deterministic, the
+reference's own rule, so there is no residual ambiguity to decline on. Verified
+live: all four spellings render `for URI::HTTP`.
+
+**One thing the spec did not predict: an r7 regression, fixed at the root.** With
+qualified names witnessable, the sequential DISJOINT re-guard `return unless
+v.is_a?(File::Stat)` / `return unless v.is_a?(URI::HTTP)` started firing
+``for URI::HTTP`` where the reference is silent. Probing it showed the SAME shape
+on two CORE names (`Hash` then `String`) was ALREADY firing before this slice —
+the pre-existing local-side FP the next/break build note recorded as
+`s1_two_returns_sequential`, and the exact defect the PR #73 chain re-seed
+documents as "the LOCAL-side defect … on the same `join_cenv`-before-propagation
+ordering". Fixed by the LOCAL twin of that chain re-seed: the early-return
+propagation now restores the PRE-JOIN fact for the locals its carried map
+touches, so R3 sees the prior fact, conflicts, and drops it. Both spellings are
+silent now.
+
+The one thing that costs: r3, a SUBCLASS re-guard (`Digest::Base` then
+`Digest::SHA256`), where the reference narrows DOWN and fires. rigor-rs's R3 is
+coarser — any class change drops the fact — so r3 is a DECLINE. It was silent on
+master too (qualified names were not witnessable at all), so this is a
+never-had-it coverage gap, not a regression, and it is in the FP-safe direction.
+Recovering it needs a qualified-aware `class_ordering`; see the S3 section.
+
+| gate | result |
+|---|---|
+| `cargo test --offline` | 1068 pass / 0 fail (3 new rules-layer test groups, ~40 rows) |
+| `ruby harness/run.rb` | PASS — 0 unregistered extras |
+| `ruby harness/run_snapshot.rb` | PASS |
+| `fp_audit.py --gaps --sweep` | **0 FP**; `call.undefined-method` gaps 389 → 380 |
+| `docs_check.py` (bare) | PASS, exit 0 |
+| clippy `-D warnings`, fresh target dir | clean |
+| gap census | 1136 → **1127**; **9 closed, 0 new** |
+
+The 9 closures, each oracle-spot-checked:
+
+| corpus | row | note |
+|---|---|---|
+| dependabot-core ×7 | `unlock!`/`revision` for `Bundler::Source::Git`, `fetchers` for `Bundler::Source::Rubygems` | THE 7 blocked rows the arc set out to close (v2/v4 helper copies + `file_parser.rb`) — depth-3 classes, so S0 + S2 together |
+| gitlab-foss | `to_fs` for `Time` | bonus: top-level, outside `CORE_CLASSES` (the u-family blocker) |
+| concurrent-ruby | `nan?` for `Numeric` | bonus, same cause |
+
+Zero new rows.
