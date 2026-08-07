@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/82_qualified_return_lookup.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 14,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `first' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `utcc' for Time"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 41,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `makecc' for Digest::MakerZzz"
+    }
+  ]
+}
