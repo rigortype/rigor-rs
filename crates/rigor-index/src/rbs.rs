@@ -3960,8 +3960,18 @@ fn is_toplevel_name(tn: &ruby_rbs::node::TypeNameNode) -> bool {
 /// SAME string as the existing short key, by design (Slice 2's resolution
 /// seam). Interned so repeated qualifications of the same name are the same
 /// pointer, mirroring `intern`'s use elsewhere.
+///
+/// `enclosing` is a CHAIN OF LEXICAL SCOPES, innermost LAST, and every element
+/// is ALREADY a full path (`["Bundler", "Bundler::Source"]`) — that shape is
+/// what `resolve_written_ref`/`resolve_leaf_unique` need (each scope is used as
+/// `"{scope}::{ref}"`). So the prefix of this decl is the INNERMOST scope
+/// alone, not the join of the whole chain: joining them produced
+/// `Bundler::Bundler::Source::Git` for every decl at lexical depth ≥ 3
+/// (2026-08-08 probes note §2d.2; depth ≤ 2 was unaffected because a
+/// one-element chain joins to itself).
 fn qualified_name(enclosing: &[&'static str], tn: &ruby_rbs::node::TypeNameNode) -> &'static str {
-    let mut parts: Vec<String> = enclosing.iter().map(|s| (*s).to_string()).collect();
+    let mut parts: Vec<String> =
+        enclosing.last().map(|s| vec![(*s).to_string()]).unwrap_or_default();
     for seg in tn.namespace().path().iter() {
         if let Node::Symbol(sym) = seg {
             parts.push(sym.as_str().to_string());
@@ -5309,6 +5319,46 @@ mod qualified_registry_tests {
             return;
         }
         assert!(idx.knows_class("Util"));
+    }
+
+    /// S0 (2026-08-08): a decl at lexical depth ≥ 3 registers under its TRUE
+    /// qualified key, not a doubled one. `module Bundler; module Source; class
+    /// Git` (`overlay/vendored_gem_sigs/bundler/bundler.rbs`) used to register
+    /// as `Bundler::Bundler::Source::Git` because `qualified_name` joined the
+    /// whole scope CHAIN instead of taking its innermost element.
+    #[test]
+    fn depth_three_decl_is_not_double_prefixed() {
+        let idx = CoreData::load();
+        if !idx.knows_class("Bundler") {
+            return;
+        }
+        assert!(idx.knows_qualified_class("Bundler::Source"));
+        assert!(idx.knows_qualified_class("Bundler::Source::Git"));
+        assert!(idx.knows_qualified_class("Bundler::Source::Rubygems"));
+        assert!(!idx.knows_qualified_class("Bundler::Bundler::Source::Git"));
+        assert!(!idx.knows_qualified_class("Bundler::Bundler::Source::Rubygems"));
+        // The real entry carries the real surface, and witnesses absence.
+        assert!(idx.qualified_declares_instance("Bundler::Source::Git", "initialize"));
+        assert!(!idx.qualified_class_has_method("Bundler::Source::Git", "frobnicate_zzz"));
+    }
+
+    /// S0 controls: depth-2 nesting (`module URI; class HTTP`) and a
+    /// SELF-QUALIFIED file-level decl (`class Nokogiri::CSS::Parser`, whose
+    /// path rides its own `TypeNameNode` namespace) are unchanged — both were
+    /// already correct and must stay so.
+    #[test]
+    fn depth_two_and_self_qualified_decls_unchanged() {
+        let idx = CoreData::load();
+        if !idx.knows_class("URI") {
+            return;
+        }
+        assert!(idx.knows_qualified_class("URI::HTTP"));
+        assert!(idx.knows_qualified_class("URI::Generic"));
+        assert!(!idx.knows_qualified_class("URI::URI::HTTP"));
+        if idx.knows_class("Nokogiri") {
+            assert!(idx.knows_qualified_class("Nokogiri::CSS::Parser"));
+            assert!(!idx.knows_qualified_class("Nokogiri::Nokogiri::CSS::Parser"));
+        }
     }
 }
 

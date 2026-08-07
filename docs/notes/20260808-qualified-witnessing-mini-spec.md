@@ -129,3 +129,40 @@ fires even for UNRESOLVABLE guards (r1d/r1e) and in-source project classes
   `::Class` methods).
 - No widening of `constant_shadowed` to reopens.
 - 3a-2 stays DEFERRED; 3a-4/3b-2 stay parked (remeasure note).
+
+## Build log (2026-08-08)
+
+Baseline for every census diff below: **1136** rows
+(`gap_census.py --sweep --dump`, re-measured on master `7d7ac1b`, matching the
+figure the spec cites).
+
+### S0 — depth-≥3 double-prefix (PR A, `claude/qualified-registry-depth-fix`)
+
+The fix landed one level DEEPER than the spec located it. `child_enclosing =
+enclosing ++ [qual]` is CORRECT: `enclosing` is a chain of lexical scopes,
+innermost last, each element already a full path, and that is exactly the shape
+`resolve_written_ref` / `resolve_leaf_unique` walk (`"{scope}::{ref}"`,
+innermost-outward). The defect was in `qualified_name`, which JOINED the whole
+chain instead of taking its innermost element. Taking `enclosing.last()` fixes
+depth ≥ 3 and is a no-op at depth ≤ 2 (a one-element chain joins to itself) —
+so the spec's "replace, not extend" is implemented on the qualification side,
+leaving the resolver's scope chain intact. Appending only the LEAF, the spec's
+other suggestion, would have produced the right key but broken the resolver
+(scope `"Source"` instead of `"Bundler::Source"`).
+
+Gates, all green:
+
+| gate | result |
+|---|---|
+| `cargo test --offline` | 1061 pass / 0 fail (incl. 2 new registry tests) |
+| `ruby harness/run.rb` | PASS — 0 unregistered extras (90 fixtures, 28 gaps, 1 registered extra) |
+| `ruby harness/run_snapshot.rb` | PASS |
+| `fp_audit.py --gaps --sweep` | **0 FP** |
+| `docs_check.py` (bare) | PASS, exit 0 |
+| clippy `-D warnings`, fresh `CARGO_TARGET_DIR` | clean |
+| gap census (solo diff) | 1136 → **1136**; 0 closed, 0 new |
+
+The solo census diff is EMPTY in both directions — the stop-the-line risk the
+spec flagged (PR #64's return routing starting to resolve depth-≥3 receivers)
+did not materialise on the sweep corpora. S0 pays nothing by itself, exactly as
+predicted; it is the enabler the 7 blocked rows need from S2.
