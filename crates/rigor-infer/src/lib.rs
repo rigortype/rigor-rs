@@ -537,6 +537,17 @@ impl<'i> Typer<'i> {
                     None => interner.intern(Type::Constant(Scalar::Nil)),
                 }
             }
+            // A `when` clause's value: its last body statement — or, when the
+            // body is empty, its last CONDITION (`when X` with no body). This is
+            // byte-identical to the pre-split `BeginRescue` carrier, whose body
+            // held `conditions ++ statements` concatenated.
+            Node::When { conditions, body, .. } => {
+                let tail = body.last().or(conditions.last()).copied();
+                match tail {
+                    Some(tail) => self.stmt_value_type(ast, tail, env, interner),
+                    None => interner.intern(Type::Constant(Scalar::Nil)),
+                }
+            }
             // A multi-write evaluates to its RHS, exactly like the single-target
             // writes: `(a, b = [1, 2])` is `[1, 2]` (reference
             // `expression_typer.rb:119` / `eval_multi_write`).

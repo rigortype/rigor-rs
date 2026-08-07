@@ -3157,6 +3157,13 @@ fn node_children(node: &Node) -> Vec<NodeId> {
             out.extend(branches.iter().copied());
             out.extend(else_body.iter().copied());
         }
+        // A `when` clause's children are its conditions then its body — the
+        // same id set (and order) the pre-split `BeginRescue` carrier held
+        // concatenated in `body`.
+        Node::When { conditions, body, .. } => {
+            out.extend(conditions.iter().copied());
+            out.extend(body.iter().copied());
+        }
         Node::Loop { predicate, body, .. } => {
             if let Some(p) = predicate {
                 out.push(*p);

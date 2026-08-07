@@ -583,6 +583,22 @@ pub enum Node {
         else_body: Vec<NodeId>,
         span: Span,
     },
+    /// One `when` clause of a `case`/`when`: its condition expressions and its
+    /// body statements, held in EXPLICITLY SEPARATE lists. Before this variant
+    /// a `when` lowered to a reused [`Node::BeginRescue`] carrier with the
+    /// conditions PREPENDED to the body — a lossy encoding no consumer could
+    /// split, which the `is_a?`/`case-when` narrowing slice needs (a clause's
+    /// body runs under its conditions' truthy edge). A `case`/`in` pattern
+    /// branch still uses the `BeginRescue` carrier (patterns are not condition
+    /// expressions). As an EXPRESSION the clause's value is its last body
+    /// statement — or, for an empty body, its last condition (`when X` with no
+    /// body: byte-compatible with the pre-split concatenated carrier) — see
+    /// the typer's `stmt_value_type`. Typed `Dynamic[top]` as a bare node.
+    When {
+        conditions: Vec<NodeId>,
+        body: Vec<NodeId>,
+        span: Span,
+    },
     /// `while`/`until`/`for`. The (optional) predicate/collection and the loop
     /// body are lowered. Typed as `Dynamic[top]`.
     Loop {
@@ -742,6 +758,7 @@ impl Node {
             | Node::ModuleDef { span, .. }
             | Node::If { span, .. }
             | Node::Case { span, .. }
+            | Node::When { span, .. }
             | Node::Loop { span, .. }
             | Node::BeginRescue { span, .. }
             | Node::Lambda { span, .. }
@@ -1422,19 +1439,21 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(when_node) = node.as_when_node() {
-            // A `when` branch: lower its condition expressions and body.
-            let mut body: Vec<NodeId> = when_node
+            // A `when` branch: lower its condition expressions and body into the
+            // dedicated `When` variant's SEPARATE lists (pre-split, both were
+            // concatenated into a reused `BeginRescue` carrier's body).
+            let conditions: Vec<NodeId> = when_node
                 .conditions()
                 .iter()
                 .map(|c| self.lower_node(&c))
                 .collect();
-            if let Some(s) = when_node.statements() {
-                body.extend(self.lower_body(&s.body()));
-            }
-            return self.push(Node::BeginRescue {
+            let body = when_node
+                .statements()
+                .map(|s| self.lower_body(&s.body()))
+                .unwrap_or_default();
+            return self.push(Node::When {
+                conditions,
                 body,
-                ensure_body: Vec::new(),
-                clauses: Vec::new(),
                 span: span_of(&when_node.location()),
             });
         }
@@ -2755,6 +2774,48 @@ mod tests {
         assert!(has_call(&ast, "foo"));
         assert!(has_call(&ast, "bar"));
         assert!(has_call(&ast, "baz"));
+    }
+
+    /// A `when` clause lowers to the dedicated `When` variant with its
+    /// conditions and body in SEPARATE lists (multi-condition clauses keep
+    /// every condition), and the `Case`'s branches are those `When` nodes.
+    #[test]
+    fn lowers_when_clause_with_split_conditions_and_body() {
+        let src = b"case v\nwhen 1, 2\n  a.foo\nwhen 3\nelse\n  c.baz\nend\n";
+        let ast = lower(&crate::parse(src));
+        let branches = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::Case { branches, .. } => Some(branches.clone()),
+                _ => None,
+            })
+            .expect("case present");
+        assert_eq!(branches.len(), 2);
+        match ast.get(branches[0]) {
+            Node::When { conditions, body, .. } => {
+                assert_eq!(conditions.len(), 2, "both conditions kept");
+                assert_eq!(body.len(), 1, "body separate from conditions");
+            }
+            other => panic!("first branch must be a When, got {other:?}"),
+        }
+        // An empty-bodied `when` keeps its condition and an empty body.
+        match ast.get(branches[1]) {
+            Node::When { conditions, body, .. } => {
+                assert_eq!(conditions.len(), 1);
+                assert!(body.is_empty());
+            }
+            other => panic!("second branch must be a When, got {other:?}"),
+        }
+        // A `case`/`in` pattern branch still uses the BeginRescue carrier.
+        let pm = lower(&crate::parse(b"case v\nin [x]\n  a.foo\nend\n"));
+        let pm_branches = pm
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::Case { branches, .. } => Some(branches.clone()),
+                _ => None,
+            })
+            .expect("case/in present");
+        assert!(matches!(pm.get(pm_branches[0]), Node::BeginRescue { .. }));
     }
 
     #[test]
