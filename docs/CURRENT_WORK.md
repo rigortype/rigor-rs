@@ -9,7 +9,7 @@ one-line ledger of what landed**. The complete per-subsystem port map is
 ledger line here — verdict + numbers + link — and its detail goes to a dated
 note or ADR *first*. No status essays; this file has a hard byte budget.
 
-Last updated: 2026-08-07.
+Last updated: 2026-08-08.
 
 ## Now / Next
 
