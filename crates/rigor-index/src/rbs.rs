@@ -405,6 +405,11 @@ fn drop_call_site_return(ret: Option<&'static str>) -> Option<&'static str> {
 /// (`String`, `Integer`, …) rejects nil. Consumed by [`CoreData::param_admits_nil`].
 const NIL_COMPATIBLE_CLASS_NAMES: [&str; 4] = ["NilClass", "Object", "BasicObject", "Kernel"];
 
+/// One stored method definition as the per-class tables carry it:
+/// `(return class name if resolvable, arity envelope, nilable)` — see the
+/// `ClassEntry::methods` docs for the slot semantics.
+type StoredMethodDef = (Option<&'static str>, ArityEnvelope, bool);
+
 /// Per-class data extracted from RBS: its instance methods (name -> resolved
 /// return class + arity), its direct superclass, and its included modules.
 #[derive(Default, Clone)]
@@ -507,6 +512,29 @@ struct ClassEntry {
     /// Direct superclass name, if any (`None` ⇒ implicit `Object`, except the
     /// roots which are seeded explicitly).
     superclass: Option<&'static str>,
+    /// ADR-0042 Slice 5: the superclass reference AS WRITTEN — full namespace
+    /// path with a leading `"::"` preserved for an absolute reference
+    /// (`"Digest::Class"`, `"::Class"`) — paired with the OUTER lexical
+    /// context it must be resolved in (the chain of enclosing declarations'
+    /// qualified keys, outermost→innermost; the class itself is NOT in it,
+    /// mirroring the reference's `outer_context` for a super clause,
+    /// `environment.rb:600`). The short `superclass` field above stays
+    /// leaf-only; this is read ONLY by the qualified return-lookup path.
+    superclass_written: Option<(&'static str, Vec<&'static str>)>,
+    /// ADR-0042 Slice 5: `include` references as written (same spelling rules
+    /// as `superclass_written`) paired with their INNER lexical context (which
+    /// DOES contain the declaring class itself — the reference resolves member
+    /// names in `inner_context`, `environment.rb:608`). Read only by the
+    /// qualified return-lookup path; the short `includes` list is unchanged.
+    includes_written: Vec<(&'static str, Vec<&'static str>)>,
+    /// ADR-0042 Slice 5: every INNER lexical context this entry's members were
+    /// ingested under — one per reopen spelling, deduped (`class Digest::Class`
+    /// contributes `["Digest::Class"]`; a `module Digest; class Class` reopen
+    /// would contribute `["Digest", "Digest::Class"]`). Member-level type
+    /// references whose namespace the flat tables discarded (return-class
+    /// leaves, block-return leaves) resolve against ALL of these and must
+    /// agree — any disagreement declines (FP-safe under-emit, never a guess).
+    member_ctxs: Vec<Vec<&'static str>>,
     /// `true` when this name was declared as a `module` (not a `class`) in RBS —
     /// the analogue of the reference's `Environment#rbs_module?`. Read ONLY by
     /// `call.raise-non-exception`'s instance path (a value typed as a module
@@ -1385,6 +1413,13 @@ impl CoreData {
     /// ancestor wins), resolving through `alias` definitions. `None` if the
     /// return is not a known concrete class (or the method is unknown).
     pub fn method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        // ADR-0042 Slice 5: a namespaced receiver (absent from the short map,
+        // present in the qualified registry) routes to qualified resolution; a
+        // top-level name never takes this branch (its qualified key IS its
+        // short key), so short-key behavior is byte-identical.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_method_return_core(class_name, method).map(|(r, _)| r);
+        }
         let (chain, _) = self.ancestors(class_name);
         let ret = self.lookup_on_chain(&chain, method).and_then(|(ret, _, _)| ret);
         self.resolve_call_site_return(ret, class_name)
@@ -1413,6 +1448,10 @@ impl CoreData {
     /// under-emit, never a wrong answer). `None` ⇒ no tuple return ⇒ every
     /// caller behaves exactly as before.
     pub fn method_tuple_return(&self, class_name: &str, method: &str) -> Option<&[RbsReturnShape]> {
+        // ADR-0042 Slice 5: see `method_return` — namespaced receivers only.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_method_tuple_return(class_name, method);
+        }
         let (chain, _) = self.ancestors(class_name);
         for anc in chain {
             if let Some(entry) = self.classes.get(anc) {
@@ -1433,6 +1472,10 @@ impl CoreData {
         class_name: &str,
         method: &str,
     ) -> Option<&[RbsReturnShape]> {
+        // ADR-0042 Slice 5: see `method_return` — namespaced receivers only.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_singleton_tuple_return(class_name, method);
+        }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut cur = Some(class_name);
         while let Some(name) = cur {
@@ -1487,6 +1530,10 @@ impl CoreData {
     /// untyped — `name`/`to_s` are handled by the caller (C3a Part B) and
     /// anything else declines (FP-safe under-emit).
     pub fn singleton_method_return(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        // ADR-0042 Slice 5: see `method_return` — namespaced receivers only.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_singleton_method_return(class_name, method, 0);
+        }
         self.singleton_method_return_inner(class_name, method, 0)
     }
 
@@ -1496,6 +1543,10 @@ impl CoreData {
     /// `method_return` rides — so an override that redeclares a non-void
     /// return correctly reads non-void. Aliases are not chased (under-emit).
     pub fn method_return_is_void(&self, class_name: &str, method: &str) -> bool {
+        // ADR-0042 Slice 5: see `method_return` — namespaced receivers only.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_method_return_is_void(class_name, method);
+        }
         let (chain, _) = self.ancestors(class_name);
         for anc in chain {
             if let Some(entry) = self.classes.get(anc) {
@@ -1511,6 +1562,10 @@ impl CoreData {
     /// (`def self.x: () -> void`), walked over the own superclass chain like
     /// [`Self::singleton_method_return`].
     pub fn singleton_method_is_void(&self, class_name: &str, method: &str) -> bool {
+        // ADR-0042 Slice 5: see `method_return` — namespaced receivers only.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_singleton_is_void(class_name, method);
+        }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut cur = Some(class_name);
         while let Some(name) = cur {
@@ -1575,6 +1630,10 @@ impl CoreData {
         class_name: &str,
         method: &str,
     ) -> Option<(&'static str, bool)> {
+        // ADR-0042 Slice 5: see `method_return` — namespaced receivers only.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_method_return_core(class_name, method);
+        }
         let (chain, _) = self.ancestors(class_name);
         self.lookup_on_chain(&chain, method)
             .and_then(|(ret, _, nilable)| {
@@ -1594,6 +1653,10 @@ impl CoreData {
     /// isn't precisely modeled (no block overload, or a generic/union/void/
     /// unknown return) ⇒ the caller declines to `Dynamic` (zero-FP).
     pub fn method_return_with_block(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        // ADR-0042 Slice 5: see `method_return` — namespaced receivers only.
+        if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
+            return self.qualified_method_return_with_block(class_name, method);
+        }
         let (chain, _) = self.ancestors(class_name);
         let ret = self.lookup_block_return_on_chain(&chain, method, 0)?;
         if ret == SELF_RETURN {
@@ -1637,6 +1700,429 @@ impl CoreData {
             }
         }
         None
+    }
+
+    // -- ADR-0042 Slice 5: qualified-key routing for the return-lookup family --
+    //
+    // The existence gates (`class_has_singleton_method`, `class_has_method`)
+    // were routed through the qualified registry in Slices 2-3; the RETURN
+    // lookups above still opened with the short-key `classes` map, so every
+    // namespaced receiver (`Digest::SHA256`) missed to `None` ⇒ Dynamic and the
+    // chained call went unwitnessed. Each public member of the family
+    // (`method_return`, `method_tuple_return`, `method_return_nilable`,
+    // `method_return_with_block`, `method_return_is_void`,
+    // `singleton_method_return`, `singleton_method_tuple_return`,
+    // `singleton_method_is_void`) now routes a name that is ABSENT from the
+    // short map but PRESENT in the qualified registry to the twins below; a
+    // top-level name never takes the new branch, so short-key behavior is
+    // byte-identical.
+    //
+    // Name resolution is the FP boundary of this slice and is two-tiered:
+    //
+    // * A FULL-FIDELITY reference (`superclass_written` / `includes_written`:
+    //   the written path + absolute bit + its recorded lexical context)
+    //   resolves by RBS's own deterministic rule — innermost context scope
+    //   outward, then root — via [`Self::resolve_written_ref`]. No information
+    //   was lost, so the first hit IS the reference's answer, not a guess.
+    // * A LEAF-ONLY reference (the flat return slots, whose namespace and
+    //   absolute bit `method_signature` discarded) resolves via
+    //   [`Self::resolve_member_type_ref`]: every scope on the walk that holds
+    //   the leaf is a candidate, and anything other than EXACTLY ONE candidate
+    //   (unanimous across all recorded member contexts) DECLINES — the leaf
+    //   `Class` (∈ {`::Class`, `Digest::Class`}) and leaf `Base`
+    //   (∈ {`Random::Base`, `Digest::Base`}) shapes must never resolve by
+    //   guess. Declining loses coverage; guessing manufactures FPs.
+
+    /// Resolve a WRITTEN type reference against the qualified registry with
+    /// RBS's name-resolution rule: an absolute reference (`"::Digest::Instance"`)
+    /// looks up its exact key; a relative one tries each lexical context scope
+    /// innermost-outward (`"{scope}::{written}"`), then the root
+    /// (`"{written}"`). First existing candidate wins — deterministic, because
+    /// the written path is full-fidelity. `None` when nothing matches
+    /// (conservative decline).
+    fn resolve_written_ref(&self, written: &str, ctx: &[&'static str]) -> Option<&'static str> {
+        if let Some(abs) = written.strip_prefix("::") {
+            return self.qualified.get_key_value(abs).map(|(&k, _)| k);
+        }
+        for scope in ctx.iter().rev() {
+            let cand = format!("{scope}::{written}");
+            if let Some((&k, _)) = self.qualified.get_key_value(cand.as_str()) {
+                return Some(k);
+            }
+        }
+        self.qualified.get_key_value(written).map(|(&k, _)| k)
+    }
+
+    /// Resolve a LEAF-ONLY type reference (namespace + absolute bit lost at
+    /// ingestion) in ONE lexical context: every scope on the innermost-outward
+    /// walk (plus the root) that holds the name is a candidate, and the
+    /// resolution succeeds ONLY when exactly one distinct candidate exists.
+    /// Two or more ⇒ the discarded qualifier could have picked either ⇒
+    /// DECLINE (`None`) — never guess.
+    fn resolve_leaf_unique(&self, leaf: &str, ctx: &[&'static str]) -> Option<&'static str> {
+        let mut found: Option<&'static str> = None;
+        for scope in ctx.iter().rev() {
+            let cand = format!("{scope}::{leaf}");
+            if let Some((&k, _)) = self.qualified.get_key_value(cand.as_str()) {
+                match found {
+                    Some(f) if f != k => return None,
+                    _ => found = Some(k),
+                }
+            }
+        }
+        if let Some((&k, _)) = self.qualified.get_key_value(leaf) {
+            match found {
+                Some(f) if f != k => return None,
+                _ => found = Some(k),
+            }
+        }
+        found
+    }
+
+    /// Resolve a member-level type reference (a flat return-class name) of the
+    /// entry `definer`: [`Self::resolve_leaf_unique`] in EVERY member context
+    /// the entry was ingested under, adopting only a unanimous answer. A
+    /// definer with no recorded context (pre-Slice-5 stub data) or any
+    /// disagreement declines.
+    fn resolve_member_type_ref(&self, definer: &str, name: &str) -> Option<&'static str> {
+        let entry = self.qualified.get(definer)?;
+        let mut agreed: Option<&'static str> = None;
+        for ctx in &entry.member_ctxs {
+            let r = self.resolve_leaf_unique(name, ctx)?;
+            match agreed {
+                Some(prev) if prev != r => return None,
+                _ => agreed = Some(r),
+            }
+        }
+        agreed
+    }
+
+    /// Whether every `Class` name inside a tuple-return shape list resolves —
+    /// unambiguously, unanimously — to ITSELF (the stored written name IS the
+    /// qualified key RBS resolution arrives at from `definer`). Only then may
+    /// the qualified path hand the stored shapes onward verbatim: the caller
+    /// interns element nominals by the literal stored name, so a name that
+    /// resolves elsewhere (or not at all) would mint the wrong class ⇒ decline
+    /// the whole tuple. `Unknown` elements are fine (they intern to Dynamic).
+    fn tuple_shapes_self_resolving(&self, definer: &str, shapes: &[RbsReturnShape]) -> bool {
+        shapes.iter().all(|s| match s {
+            RbsReturnShape::Class(name) => {
+                self.resolve_member_type_ref(definer, name) == Some(name)
+            }
+            RbsReturnShape::Tuple(inner) => self.tuple_shapes_self_resolving(definer, inner),
+            RbsReturnShape::Unknown => true,
+        })
+    }
+
+    /// The implicit-`Object` superclass default for a QUALIFIED entry (the
+    /// qualified map is not Object-defaulted in [`Builder::finish`]), mirroring
+    /// [`Self::qualified_class_has_method`]: classes (not modules, not
+    /// `BasicObject`) fall back to `Object`.
+    fn qualified_default_superclass(&self, key: &'static str, entry: &ClassEntry) -> Option<&'static str> {
+        if !entry.is_module && key != "BasicObject" {
+            self.qualified.get_key_value("Object").map(|(&k, _)| k)
+        } else {
+            None
+        }
+    }
+
+    /// The flattened INSTANCE ancestor chain of a qualified entry — the class
+    /// itself, its includes, then its superclass's chain, in the SAME order as
+    /// the short-key [`Self::ancestors`] — with every reference resolved
+    /// through [`Self::resolve_written_ref`]. The walk STOPS at the first
+    /// unresolvable reference or unbuildable entry: everything already pushed
+    /// precedes the break in first-definer-wins order, so a hit on the prefix
+    /// is genuinely the first definer, while a miss on a truncated chain is
+    /// inconclusive (the caller's `None`/`false` fallthrough is the
+    /// conservative answer either way).
+    fn qualified_ancestors_prefix(&self, qname: &str) -> Vec<&'static str> {
+        let mut order: Vec<&'static str> = Vec::new();
+        let Some((&start, _)) = self.qualified.get_key_value(qname) else {
+            return order;
+        };
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        let mut ok = true;
+        self.collect_qualified(start, &mut order, &mut seen, &mut ok);
+        order
+    }
+
+    fn collect_qualified(
+        &self,
+        key: &'static str,
+        order: &mut Vec<&'static str>,
+        seen: &mut HashSet<&'static str>,
+        ok: &mut bool,
+    ) {
+        if !*ok {
+            return;
+        }
+        let Some(entry) = self.qualified.get(key) else {
+            *ok = false;
+            return;
+        };
+        // An unbuildable instance definition has no known surface (its tables
+        // were emptied); walking past it could skip the true first definer.
+        if entry.instance_unbuildable {
+            *ok = false;
+            return;
+        }
+        if !seen.insert(key) {
+            return;
+        }
+        order.push(key);
+        for (w, ctx) in &entry.includes_written {
+            match self.resolve_written_ref(w, ctx) {
+                Some(m) => self.collect_qualified(m, order, seen, ok),
+                None => {
+                    *ok = false;
+                    return;
+                }
+            }
+            if !*ok {
+                return;
+            }
+        }
+        let sup = match &entry.superclass_written {
+            Some((w, ctx)) => match self.resolve_written_ref(w, ctx) {
+                Some(s) => Some(s),
+                None => {
+                    *ok = false;
+                    return;
+                }
+            },
+            None => self.qualified_default_superclass(key, entry),
+        };
+        if let Some(s) = sup {
+            self.collect_qualified(s, order, seen, ok);
+        }
+    }
+
+    /// The singleton (superclass-only) chain of a qualified entry, mirroring
+    /// the walk of [`Self::singleton_method_return_inner`], with the same
+    /// stop-at-first-unresolvable prefix discipline as
+    /// [`Self::qualified_ancestors_prefix`].
+    fn qualified_singleton_chain_prefix(&self, qname: &str) -> Vec<&'static str> {
+        let mut chain: Vec<&'static str> = Vec::new();
+        let Some((&start, _)) = self.qualified.get_key_value(qname) else {
+            return chain;
+        };
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        let mut cur = Some(start);
+        while let Some(key) = cur {
+            let Some(entry) = self.qualified.get(key) else {
+                break;
+            };
+            if entry.singleton_unbuildable || !seen.insert(key) {
+                break;
+            }
+            chain.push(key);
+            cur = match &entry.superclass_written {
+                Some((w, ctx)) => match self.resolve_written_ref(w, ctx) {
+                    Some(s) => Some(s),
+                    None => break,
+                },
+                None => self.qualified_default_superclass(key, entry),
+            };
+        }
+        chain
+    }
+
+    /// First-definer-wins method lookup over a QUALIFIED chain, resolving
+    /// instance `alias`es exactly like [`Self::lookup_on_chain_depth`] but over
+    /// the qualified registry, and additionally reporting WHICH entry defined
+    /// the method (its member contexts resolve the return leaf).
+    fn qualified_lookup_on_chain(
+        &self,
+        chain: &[&'static str],
+        method: &str,
+        depth: usize,
+    ) -> Option<(&'static str, StoredMethodDef)> {
+        for &anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if let Some(&def) = entry.methods.get(method) {
+                    return Some((anc, def));
+                }
+            }
+        }
+        if depth >= 16 {
+            return None;
+        }
+        for &anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if let Some(&old) = entry.aliases.get(method) {
+                    if let Some(found) = self.qualified_lookup_on_chain(chain, old, depth + 1) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The qualified twin of the [`Self::method_return`] /
+    /// [`Self::method_return_nilable`] core: `(resolved return key, nilable)`.
+    /// [`SELF_RETURN`] resolves against the QUALIFIED receiver (`-> self` on
+    /// `Digest::Base#reset` queried as `Digest::SHA256` yields
+    /// `Digest::SHA256`); any other leaf resolves through the DEFINER's member
+    /// contexts.
+    fn qualified_method_return_core(
+        &self,
+        qname: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        let chain = self.qualified_ancestors_prefix(qname);
+        let (definer, (ret, _, nilable)) = self.qualified_lookup_on_chain(&chain, method, 0)?;
+        let ret = ret?;
+        if ret == SELF_RETURN {
+            return self.qualified.get_key_value(qname).map(|(&k, _)| (k, nilable));
+        }
+        self.resolve_member_type_ref(definer, ret).map(|r| (r, nilable))
+    }
+
+    /// The qualified twin of [`Self::method_tuple_return`]: first definer wins
+    /// over the qualified chain; shapes pass through only when every element
+    /// name is self-resolving (see [`Self::tuple_shapes_self_resolving`]).
+    fn qualified_method_tuple_return(
+        &self,
+        qname: &str,
+        method: &str,
+    ) -> Option<&[RbsReturnShape]> {
+        let chain = self.qualified_ancestors_prefix(qname);
+        for anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if entry.methods.contains_key(method) {
+                    let shapes = entry.tuple_returns.get(method).map(|v| v.as_slice())?;
+                    return self.tuple_shapes_self_resolving(anc, shapes).then_some(shapes);
+                }
+            }
+        }
+        None
+    }
+
+    /// The qualified twin of [`Self::method_return_is_void`].
+    fn qualified_method_return_is_void(&self, qname: &str, method: &str) -> bool {
+        let chain = self.qualified_ancestors_prefix(qname);
+        for anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if entry.methods.contains_key(method) {
+                    return entry.void_methods.contains(method);
+                }
+            }
+        }
+        false
+    }
+
+    /// The qualified twin of [`Self::method_return_with_block`], riding
+    /// [`Self::qualified_block_return_on_chain`]; a `self` block return yields
+    /// the QUALIFIED receiver key.
+    fn qualified_method_return_with_block(
+        &self,
+        qname: &str,
+        method: &str,
+    ) -> Option<&'static str> {
+        let chain = self.qualified_ancestors_prefix(qname);
+        let (definer, ret) = self.qualified_block_return_on_chain(&chain, method, 0)?;
+        if ret == SELF_RETURN {
+            self.qualified.get_key_value(qname).map(|(&k, _)| k)
+        } else {
+            self.resolve_member_type_ref(definer, ret)
+        }
+    }
+
+    /// The qualified twin of [`Self::lookup_block_return_on_chain`], reporting
+    /// the defining entry alongside the stored block-return name.
+    fn qualified_block_return_on_chain(
+        &self,
+        chain: &[&'static str],
+        method: &str,
+        depth: usize,
+    ) -> Option<(&'static str, &'static str)> {
+        for &anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if let Some(&ret) = entry.block_returns.get(method) {
+                    return Some((anc, ret));
+                }
+            }
+        }
+        if depth >= 16 {
+            return None;
+        }
+        for &anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if let Some(&old) = entry.aliases.get(method) {
+                    if let Some(found) = self.qualified_block_return_on_chain(chain, old, depth + 1)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The qualified twin of [`Self::singleton_method_return_inner`]: walk the
+    /// qualified singleton chain; the first entry defining the method wins. An
+    /// `-> instance` return late-binds to the QUALIFIED queried class
+    /// (`Digest::Class.file: -> instance` called as `Digest::SHA256.file`
+    /// yields `Digest::SHA256`); a concrete leaf resolves through the
+    /// DEFINER's member contexts; a singleton alias resolves through its
+    /// target on the QUERIED class (instance-binding preserved).
+    fn qualified_singleton_method_return(
+        &self,
+        qname: &str,
+        method: &str,
+        depth: usize,
+    ) -> Option<&'static str> {
+        if depth >= 16 {
+            return None;
+        }
+        let (&self_key, _) = self.qualified.get_key_value(qname)?;
+        let chain = self.qualified_singleton_chain_prefix(qname);
+        for &anc in &chain {
+            let entry = self.qualified.get(anc)?;
+            if let Some(&(ret, _, is_instance)) = entry.singleton_methods.get(method) {
+                return if is_instance {
+                    Some(self_key)
+                } else {
+                    self.resolve_member_type_ref(anc, ret?)
+                };
+            }
+            if let Some(&target) = entry.singleton_aliases.get(method) {
+                return self.qualified_singleton_method_return(qname, target, depth + 1);
+            }
+        }
+        None
+    }
+
+    /// The qualified twin of [`Self::singleton_method_tuple_return`].
+    fn qualified_singleton_tuple_return(
+        &self,
+        qname: &str,
+        method: &str,
+    ) -> Option<&[RbsReturnShape]> {
+        let chain = self.qualified_singleton_chain_prefix(qname);
+        for anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if entry.singleton_methods.contains_key(method) {
+                    let shapes = entry.singleton_tuple_returns.get(method).map(|v| v.as_slice())?;
+                    return self.tuple_shapes_self_resolving(anc, shapes).then_some(shapes);
+                }
+            }
+        }
+        None
+    }
+
+    /// The qualified twin of [`Self::singleton_method_is_void`].
+    fn qualified_singleton_is_void(&self, qname: &str, method: &str) -> bool {
+        let chain = self.qualified_singleton_chain_prefix(qname);
+        for anc in chain {
+            if let Some(entry) = self.qualified.get(anc) {
+                if entry.singleton_methods.contains_key(method) {
+                    return entry.void_singleton_methods.contains(method);
+                }
+            }
+        }
+        false
     }
 
     /// Resolve a method's arity envelope over the ancestor chain (first defining
@@ -2223,6 +2709,12 @@ impl CoreData {
                     overloading_singleton_overloads: Vec::new(),
                     singleton_aliases: HashMap::new(),
                     superclass,
+                    // The stub carries no written references or member contexts
+                    // (the qualified return-lookup path needs the real embedded
+                    // RBS); empty keeps that path inert under the fallback.
+                    superclass_written: None,
+                    includes_written: Vec::new(),
+                    member_ctxs: Vec::new(),
                     // The stub does not distinguish modules from classes; the
                     // raise-non-exception module gate needs the real embedded RBS
                     // (Exception is absent under the stub, so the rule is silent
@@ -2627,8 +3119,17 @@ impl Builder {
         let superclass = c
             .super_class()
             .and_then(|s| type_name_str(&s.name()));
+        // ADR-0042 Slice 5: the superclass reference as WRITTEN, resolved (at
+        // lookup time) in the OUTER lexical context — the enclosing chain
+        // WITHOUT this class (the reference resolves a super clause in
+        // `outer_context`).
+        let superclass_written = c
+            .super_class()
+            .and_then(|s| written_ref(&s.name()))
+            .map(|w| (w, enclosing.to_vec()));
         let mut entry = ClassEntry {
             superclass,
+            superclass_written,
             ..Default::default()
         };
         // ADR-0042 Slice 1: this decl's own qualified key, and the enclosing
@@ -2636,6 +3137,10 @@ impl Builder {
         let qual = qualified_name(enclosing, &tn);
         let child_enclosing: Vec<&'static str> =
             enclosing.iter().copied().chain(std::iter::once(qual)).collect();
+        // ADR-0042 Slice 5: members below are ingested under the INNER lexical
+        // context (this class included) — record it for member-level type-ref
+        // resolution on the qualified path.
+        entry.member_ctxs.push(child_enclosing.clone());
         self.collect_members(c.members().iter(), &mut entry, &child_enclosing, code);
         self.merge_qualified(qual, entry.clone());
         self.short_to_qualified_push(name, qual);
@@ -2658,6 +3163,8 @@ impl Builder {
         let qual = qualified_name(enclosing, &tn);
         let child_enclosing: Vec<&'static str> =
             enclosing.iter().copied().chain(std::iter::once(qual)).collect();
+        // ADR-0042 Slice 5: see `ingest_class` — the inner member context.
+        entry.member_ctxs.push(child_enclosing.clone());
         self.collect_members(m.members().iter(), &mut entry, &child_enclosing, code);
         self.merge_qualified(qual, entry.clone());
         self.short_to_qualified_push(name, qual);
@@ -2794,6 +3301,16 @@ impl Builder {
                     if let Some(modname) = type_name_str(&inc.name()) {
                         if !entry.includes.contains(&modname) {
                             entry.includes.push(modname);
+                        }
+                    }
+                    // ADR-0042 Slice 5: the include reference as WRITTEN plus
+                    // its INNER lexical context (`enclosing` here already
+                    // includes the declaring class — it is the
+                    // `child_enclosing` the ingest passed down).
+                    if let Some(w) = written_ref(&inc.name()) {
+                        let pair = (w, enclosing.to_vec());
+                        if !entry.includes_written.contains(&pair) {
+                            entry.includes_written.push(pair);
                         }
                     }
                 }
@@ -2978,6 +3495,22 @@ impl Builder {
         let slot = self.qualified.entry(qual).or_default();
         if slot.superclass.is_none() {
             slot.superclass = entry.superclass;
+            // ADR-0042 Slice 5: the written reference travels WITH the leaf
+            // slot (both come from the same `< X` clause), so the two stay
+            // first-write-paired.
+            slot.superclass_written = entry.superclass_written;
+        }
+        // ADR-0042 Slice 5: written include refs and member contexts union
+        // across reopens, deduped (a reopen re-ingests the same pair).
+        for pair in entry.includes_written {
+            if !slot.includes_written.contains(&pair) {
+                slot.includes_written.push(pair);
+            }
+        }
+        for ctx in entry.member_ctxs {
+            if !slot.member_ctxs.contains(&ctx) {
+                slot.member_ctxs.push(ctx);
+            }
         }
         slot.is_module |= entry.is_module;
         for (k, v) in entry.methods {
@@ -3457,6 +3990,33 @@ fn written_type_name(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> 
     }
     parts.push(leaf.to_string());
     Some(intern(&parts.join("::")))
+}
+
+/// ADR-0042 Slice 5: the name of a type REFERENCE as written, KEEPING the
+/// leading `"::"` of an absolute reference (`include ::Digest::Instance` ⇒
+/// `"::Digest::Instance"`; `< Digest::Class` ⇒ `"Digest::Class"`; a bare
+/// `< Base` ⇒ `"Base"`). Unlike [`written_type_name`] (which drops the root
+/// marker to match the registry key spelling), the absolute bit is load-bearing
+/// here: the qualified resolver must NOT walk an absolute reference through the
+/// enclosing lexical scopes.
+fn written_ref(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
+    let leaf = type_name_str(tn)?;
+    let ns = tn.namespace();
+    let mut s = String::new();
+    if ns.absolute() {
+        s.push_str("::");
+    }
+    for seg in ns.path().iter() {
+        if let Node::Symbol(sym) = seg {
+            s.push_str(sym.as_str());
+            s.push_str("::");
+        }
+    }
+    if s.is_empty() {
+        return Some(leaf);
+    }
+    s.push_str(leaf);
+    Some(intern(&s))
 }
 
 /// Retain the per-overload positional-parameter shapes of a method definition —
@@ -4543,6 +5103,155 @@ mod qualified_instance_method_tests {
         assert!(idx.qualified_class_has_method("String", "size"));
         // Unknown qualified name ⇒ silent (assume-present).
         assert!(idx.qualified_class_has_method("No::Such", "whatever"));
+    }
+}
+
+#[cfg(test)]
+mod qualified_return_lookup_tests {
+    use super::*;
+
+    /// ADR-0042 Slice 5, the measurement's probe ladder: the return-lookup
+    /// family resolves NAMESPACED receivers through the qualified registry —
+    /// directly on the declaring class, one hop, and multi-hop down the
+    /// namespace-resolved superclass chain (`Digest::SHA256 < Digest::Base <
+    /// Digest::Class`, whose written references resolve exactly).
+    #[test]
+    fn qualified_singleton_return_probe_ladder() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("Digest::Class") {
+            return; // stub fallback (no vendored rbs) — nothing to assert.
+        }
+        // Rung 1: directly on the DECLARING class.
+        assert_eq!(idx.singleton_method_return("Digest::Class", "hexdigest"), Some("String"));
+        // Rung 2: one hop (`Digest::SHA2 < Digest::Class`).
+        assert_eq!(idx.singleton_method_return("Digest::SHA2", "hexdigest"), Some("String"));
+        // Rung 3: multi-hop (`Digest::SHA256 < Digest::Base < Digest::Class`).
+        assert_eq!(idx.singleton_method_return("Digest::SHA256", "hexdigest"), Some("String"));
+        assert_eq!(idx.singleton_method_return("Digest::SHA256", "digest"), Some("String"));
+        // `-> instance` late-binds to the QUALIFIED queried class.
+        assert_eq!(
+            idx.singleton_method_return("Digest::SHA256", "file"),
+            Some("Digest::SHA256")
+        );
+        // A typo stays unresolved.
+        assert_eq!(idx.singleton_method_return("Digest::SHA256", "hexdigset"), None);
+        // An unknown qualified name stays unresolved.
+        assert_eq!(idx.singleton_method_return("No::Such", "hexdigest"), None);
+    }
+
+    /// Rung 4: the INSTANCE side (`Digest::SHA256.new.hexdigest`) resolves
+    /// through the include chain (`Digest::Class include ::Digest::Instance` —
+    /// an ABSOLUTE written reference), and `-> self` resolves to the QUALIFIED
+    /// receiver.
+    #[test]
+    fn qualified_instance_return_through_absolute_include() {
+        let idx = CoreData::load();
+        if !idx.knows_qualified_class("Digest::Class") {
+            return;
+        }
+        assert_eq!(idx.method_return("Digest::SHA256", "hexdigest"), Some("String"));
+        assert_eq!(idx.method_return("Digest::SHA256", "digest_length"), Some("Integer"));
+        // `Digest::Instance#reset: () -> self` ⇒ the qualified receiver.
+        assert_eq!(idx.method_return("Digest::SHA256", "reset"), Some("Digest::SHA256"));
+        // The nil-aware variant rides the same resolution.
+        assert_eq!(
+            idx.method_return_nilable("Digest::SHA256", "hexdigest"),
+            Some(("String", false))
+        );
+        // A typo stays unresolved.
+        assert_eq!(idx.method_return("Digest::SHA256", "hexdigset"), None);
+    }
+
+    /// A namespaced PROJECT-SIG class replica: instance + singleton returns
+    /// resolve through the qualified path (the measured silent rung — the
+    /// method was FOUND, its `-> String` return was LOST).
+    #[test]
+    fn qualified_project_sig_returns() {
+        let dir = std::env::temp_dir().join("rigor_qual_return_projsig_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("f.rbs"),
+            "module Foo\n  class Klass\n    def self.make: () -> String\n    def imake: () -> String\n    def iself: () -> self\n  end\nend\n",
+        )
+        .unwrap();
+        let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+        assert_eq!(idx.method_return("Foo::Klass", "imake"), Some("String"));
+        assert_eq!(idx.singleton_method_return("Foo::Klass", "make"), Some("String"));
+        assert_eq!(idx.method_return("Foo::Klass", "iself"), Some("Foo::Klass"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The slice's entire FP risk: an unqualified superclass leaf that RBS
+    /// resolution CANNOT pin down must DECLINE, never guess. `Base` written
+    /// bare inside `module FooAmb` resolves to neither `Random::Base` nor
+    /// `Digest::Base` (neither is on the lexical walk: `FooAmb::Base`, then
+    /// `::Base` — both absent), so inherited lookups yield None while the
+    /// leaf's OWN definitions (the resolved chain prefix) still answer.
+    #[test]
+    fn ambiguous_superclass_leaf_declines() {
+        let dir = std::env::temp_dir().join("rigor_qual_return_amb_super_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rbs"),
+            "module FooAmb\n  class Sub < Base\n    def own_i: () -> Integer\n    def self.own_s: () -> Integer\n  end\nend\n",
+        )
+        .unwrap();
+        let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+        if !idx.knows_qualified_class("Digest::Base") {
+            return; // stub fallback.
+        }
+        // The vendored set really does hold BOTH same-leaf candidates the
+        // measurement named — the decline below is exercised against them.
+        assert!(idx.knows_qualified_class("Random::Base"));
+        // Inherited singleton/instance lookups DECLINE (the superclass link is
+        // unresolvable — it must NOT resolve to Random::Base or Digest::Base,
+        // whose `hexdigest` would otherwise leak in).
+        assert_eq!(idx.singleton_method_return("FooAmb::Sub", "hexdigest"), None);
+        assert_eq!(idx.method_return("FooAmb::Sub", "hexdigest"), None);
+        // The leaf's own methods precede the break ⇒ still resolve.
+        assert_eq!(idx.method_return("FooAmb::Sub", "own_i"), Some("Integer"));
+        assert_eq!(idx.singleton_method_return("FooAmb::Sub", "own_s"), Some("Integer"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Member-level twin of the ambiguity decline: a flat return LEAF whose
+    /// namespace the tables discarded resolves only when the lexical walk has
+    /// exactly ONE candidate. `-> Class` written inside `module Digest` sees
+    /// BOTH `Digest::Class` and top-level `Class` ⇒ DECLINE; `-> Base` sees
+    /// only `Digest::Base` ⇒ resolves.
+    #[test]
+    fn ambiguous_member_return_leaf_declines() {
+        let dir = std::env::temp_dir().join("rigor_qual_return_amb_member_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("m.rbs"),
+            "module Digest\n  class MakerZzz\n    def makec: () -> Class\n    def makeb: () -> Base\n  end\nend\n",
+        )
+        .unwrap();
+        let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+        if !idx.knows_qualified_class("Digest::Base") {
+            return; // stub fallback.
+        }
+        assert_eq!(idx.method_return("Digest::MakerZzz", "makec"), None);
+        assert_eq!(idx.method_return("Digest::MakerZzz", "makeb"), Some("Digest::Base"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Top-level-name control: the routing branch never fires for a name the
+    /// short map holds, so the existing short-key resolution is untouched.
+    #[test]
+    fn toplevel_return_lookup_control_unchanged() {
+        let idx = CoreData::load();
+        if !idx.knows_class("String") {
+            return;
+        }
+        assert_eq!(idx.method_return("String", "upcase"), Some("String"));
+        assert_eq!(idx.singleton_method_return("Time", "now"), Some("Time"));
+        assert_eq!(idx.method_return_with_block("Array", "map"), Some("Array"));
+        assert!(!idx.method_return_is_void("String", "upcase"));
     }
 }
 

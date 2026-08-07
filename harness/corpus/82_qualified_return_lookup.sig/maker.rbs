@@ -1,0 +1,10 @@
+# ADR-0042 Slice 5 negative control: `makec`'s return is written as the bare
+# leaf `Class` inside a `module Digest` reopen. RBS resolves it lexically to
+# `Digest::Class`; rigor-rs's flat return slot keeps only the leaf, and the
+# lexical walk sees BOTH `Digest::Class` and top-level `Class` — residual
+# ambiguity, so the qualified return path must DECLINE (silent), never guess.
+module Digest
+  class MakerZzz
+    def self.makec: () -> Class
+  end
+end
