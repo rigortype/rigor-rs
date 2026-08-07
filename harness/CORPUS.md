@@ -34,9 +34,50 @@ ruby harness/run_corpus.rb /path/to/dir1 /path/to/dir2
 | `CORPUS_LIMIT`        | `80`                                        | Max .rb files sampled per corpus dir   |
 | `REFERENCE_RIGOR_DIR` | `reference/rigor` (the PINNED submodule)    | The oracle. Pointing this at a working checkout compares against a different version — UPSTREAM.md hazard 3 |
 | `SWEEP_CORPORA`       | `harness/sweep-corpora.yml`                 | The standing sweep set's manifest      |
-| `RIGOR_RS_BIN`        | `target/debug/rigor` (under repo root)      | Path to the rigor-rs binary            |
+| `RIGOR_RS_BIN`        | `target/release/rigor` (under repo root)    | Path to the rigor-rs binary. Same default in `run_corpus.rb`, `fp_audit.py` and `gap_census.py` |
 
-The binary is auto-built if absent (`cargo build --offline -p rigor-cli`).
+### Which binary IS rigor-rs
+
+**`target/release/rigor`, for every corpus-scale tool** — `run_corpus.rb`,
+`fp_audit.py`, `gap_census.py`. Release is what every recorded sweep number was
+measured with, and the sweep runs 9204 files through both implementations, where
+a debug build costs several times more. The fixture harness (`harness/run.rb`,
+`harness/lib.rb` — 76 tiny files in an edit-run loop) deliberately stays on
+`target/debug/rigor`; it is a different loop with different economics.
+
+`run_corpus.rb` used to default to debug while `fp_audit.py` defaulted to
+release, so the two corpus entry points disagreed about which file *is*
+rigor-rs — and nothing rebuilt or dated the release one. A six-day-old release
+binary was measured silently, and two merged slices read as "closed nothing"
+([note](../docs/notes/20260807-fp-audit-port-side-blind-spots.md)). All three
+tools now share one contract:
+
+* the binary is **auto-built when absent** (`cargo build --offline --release -p
+  rigor-cli`) — unless `RIGOR_RS_BIN` was set explicitly, which is then required
+  to exist;
+* its **path and build time are printed in the run header**, so the measured
+  binary is in the transcript rather than reconstructed days later;
+* a binary under `target/` that is **older than the newest file under
+  `crates/`** is REFUSED (exit non-zero, nothing measured). An explicit
+  `RIGOR_RS_BIN` outside the repo is honoured as a deliberate choice; its
+  staleness is not checked, and the header says so.
+
+### A failed run is never a pass
+
+False positives are `rigor-rs − reference`, so an empty *port* result makes the
+FP count 0 by construction; an empty *reference* result turns all of rigor-rs's
+output into phantom FPs. Both sides therefore report a batch failure as
+**INVALID** — never as 0 — and any invalid comparison makes the whole run exit
+non-zero, with `TOTAL FP candidates` marked `INCOMPLETE`.
+
+What counts as a port-side failure: `rigor check` exits **1 iff at least one
+ERROR-severity diagnostic was emitted**, else 0 — so a warning-only batch exits
+0 *with* diagnostics on stdout. The failure signals are therefore an exit code
+outside `{0, 1}` (64 usage, 101 panic, 127 not-found …) and stdout that is not a
+JSON array. Exit code versus diagnostic-list emptiness is deliberately **not**
+compared: warnings are a parity severity, so such a rule marks healthy
+warning-only corpora INVALID, and it earns nothing — empty stdout already fails
+the JSON parse.
 
 ## Corpora
 

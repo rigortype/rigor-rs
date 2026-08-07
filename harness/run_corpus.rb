@@ -18,7 +18,12 @@
 #                         Pointing this at a working checkout compares against a
 #                         DIFFERENT version — see UPSTREAM.md hazard 3.
 #   RIGOR_RS_BIN          path to rigor-rs binary
-#                         (default: target/debug/rigor in repo root)
+#                         (default: target/release/rigor in repo root — the SAME
+#                         binary harness/fp_audit.py measures. This used to say
+#                         debug while fp_audit said release, so the two
+#                         corpus-scale entry points disagreed about which file
+#                         *is* rigor-rs; see
+#                         docs/notes/20260807-fp-audit-port-side-blind-spots.md)
 #
 # Exit codes:
 #   0  — no false positives found
@@ -48,9 +53,10 @@ REFERENCE_LIB = File.join(REFERENCE_RIGOR_DIR, "lib")
 REFERENCE_EXE = File.join(REFERENCE_RIGOR_DIR, "exe", "rigor")
 
 RIGOR_RS_BIN = File.expand_path(
-  ENV.fetch("RIGOR_RS_BIN", "target/debug/rigor"),
+  ENV.fetch("RIGOR_RS_BIN", "target/release/rigor"),
   REPO_ROOT
 )
+CARGO_BUILD = ["cargo", "build", "--offline", "--release", "-p", "rigor-cli"].freeze
 
 # Max .rb files sampled per corpus directory (configurable via env)
 CORPUS_LIMIT = (ENV["CORPUS_LIMIT"] || "80").to_i
@@ -95,17 +101,48 @@ end).freeze
 
 # ─── Build rigor-rs if needed ─────────────────────────────────────────────────
 
-def ensure_binary!
-  return if File.executable?(RIGOR_RS_BIN)
+# Newest file under crates/ — the port's source truth. Everything counts, not
+# just *.rs: the vendored RBS the index loads is an input to the diagnostics
+# exactly as the Rust is.
+def newest_source
+  Dir[File.join(REPO_ROOT, "crates", "**", "*")]
+    .reject { |p| File.directory?(p) }
+    .max_by { |p| File.mtime(p) rescue Time.at(0) }
+end
 
-  warn "rigor-rs binary not found at #{RIGOR_RS_BIN}; building..."
-  Dir.chdir(REPO_ROOT) do
-    system("cargo build --offline -p rigor-cli") or
-      abort("ERROR: cargo build failed")
+def ensure_binary!
+  unless File.executable?(RIGOR_RS_BIN)
+    if ENV.key?("RIGOR_RS_BIN")
+      abort("ERROR: RIGOR_RS_BIN=#{RIGOR_RS_BIN} does not exist. Nothing was measured.")
+    end
+    warn "rigor-rs binary not found at #{RIGOR_RS_BIN}; building..."
+    Dir.chdir(REPO_ROOT) do
+      system(*CARGO_BUILD) or abort("ERROR: #{CARGO_BUILD.join(' ')} failed")
+    end
+    abort("ERROR: binary still missing after build: #{RIGOR_RS_BIN}") unless
+      File.executable?(RIGOR_RS_BIN)
+    warn "Build OK: #{RIGOR_RS_BIN}"
   end
-  abort("ERROR: binary still missing after build: #{RIGOR_RS_BIN}") unless
-    File.executable?(RIGOR_RS_BIN)
-  warn "Build OK: #{RIGOR_RS_BIN}"
+
+  # Same refusal as harness/fp_audit.py: measuring a binary older than the tree
+  # describes a rigor-rs that is not this working tree. A six-day-old release
+  # build once made two merged slices read as "closed nothing".
+  built = File.mtime(RIGOR_RS_BIN)
+  puts "  built:     #{built.strftime('%Y-%m-%d %H:%M:%S')}"
+  return unless RIGOR_RS_BIN.start_with?(File.join(REPO_ROOT, "target") + File::SEPARATOR)
+
+  src = newest_source
+  return if src.nil?
+
+  src_mtime = File.mtime(src)
+  puts "  newest crates/ source: #{src_mtime.strftime('%Y-%m-%d %H:%M:%S')} " \
+       "(#{src.sub("#{REPO_ROOT}/", '')})"
+  return unless src_mtime > built
+
+  $stdout.flush # keep the header above the error when stdout is captured
+  abort("ERROR: STALE BINARY — #{RIGOR_RS_BIN} was built #{built}, but " \
+        "#{src.sub("#{REPO_ROOT}/", '')} changed #{src_mtime}.\n" \
+        "       Rebuild first: #{CARGO_BUILD.join(' ')}")
 end
 
 # ─── File collection ──────────────────────────────────────────────────────────
@@ -185,20 +222,36 @@ def run_rigorrs_batch(file_map)
 
   return {} if temp_files.empty?
 
-  stdout, stderr, _status = Open3.capture3(RIGOR_RS_BIN, "check", *temp_files, "--format", "json")
+  stdout, stderr, status = Open3.capture3(RIGOR_RS_BIN, "check", *temp_files, "--format", "json")
 
-  output = stdout.strip.empty? ? stderr.strip : stdout.strip
-  return {} if output.empty?
+  # A failed port run must NEVER read as "rigor-rs emitted nothing": false
+  # positives are rs-minus-ref, so an empty rs map makes the FP count 0 by
+  # construction and the run prints "STRONG RESULT". Same defect the Python
+  # audit carried (docs/notes/20260807-fp-audit-port-side-blind-spots.md).
+  # `rigor check` exits 1 iff an ERROR-severity diagnostic was emitted, else 0 —
+  # a warning-only batch exits 0 WITH diagnostics — so the allowlist {0, 1} is
+  # the whole signal; anything else (64 usage, 101 panic, 127 not-found) is a
+  # crash. Exit code vs. emptiness is deliberately NOT compared: warnings are a
+  # parity severity, so that rule fails healthy warning-only corpora. See
+  # fp_audit.py's run_rs for the full reasoning.
+  unless [0, 1].include?(status.exitstatus)
+    abort("ERROR: rigor-rs failed (exit #{status.exitstatus}) — comparison " \
+          "invalid, NOT false-positive-free.\n  #{(stderr.empty? ? stdout : stderr).strip[0, 300]}")
+  end
 
-  # Find JSON array or object start
+  output = stdout.strip
   json_start = [output.index("["), output.index("{")].compact.min
-  return {} if json_start.nil?
+  if json_start.nil?
+    abort("ERROR: rigor-rs produced no JSON on stdout (exit " \
+          "#{status.exitstatus}) — comparison invalid, NOT false-positive-free.\n" \
+          "  stderr: #{stderr.strip[0, 300]}")
+  end
 
   begin
     parsed = JSON.parse(output[json_start..])
   rescue JSON::ParserError => e
-    warn "  [rigor-rs] JSON parse error: #{e.message}"
-    return {}
+    abort("ERROR: rigor-rs JSON parse error (#{e.message}) — comparison " \
+          "invalid, NOT false-positive-free.")
   end
 
   result = Hash.new { |h, k| h[k] = [] }
@@ -369,8 +422,6 @@ end
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main
-  ensure_binary!
-
   # Determine corpora: from ARGV or built-in list
   corpora = if ARGV.any?
     ARGV.map.with_index do |dir, i|
@@ -385,6 +436,7 @@ def main
   puts BOLD_SEP
   puts "  Reference: #{REFERENCE_EXE}"
   puts "  rigor-rs:  #{RIGOR_RS_BIN}"
+  ensure_binary!   # builds if absent, refuses if stale, prints its mtime here
   puts "  Corpora:   #{corpora.size}"
   puts "  Limit:     #{CORPUS_LIMIT} files/corpus (overridden per-corpus where noted)"
   # A member of the standing sweep set that is absent on this machine is named,

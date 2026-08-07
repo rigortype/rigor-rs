@@ -75,7 +75,7 @@ sidecar fixtures (`NN_name.rigor.yml`) are handled exactly as `run.rb` does
 | Variable             | Default                              | Description                        |
 |----------------------|--------------------------------------|------------------------------------|
 | `REFERENCE_RIGOR_DIR`| `reference/rigor` (the PINNED submodule) | Reference checkout. Never point this at a working checkout — `UPSTREAM.md` hazard 3 |
-| `RIGOR_RS_BIN`       | `target/debug/rigor`                 | Path to the rigor-rs binary        |
+| `RIGOR_RS_BIN`       | `target/debug/rigor`                 | Path to the rigor-rs binary. Debug is right for this fixture loop; the corpus-scale tools deliberately measure `target/release/rigor` — see [CORPUS.md](CORPUS.md#which-binary-is-rigor-rs) |
 | `CORPUS_DIR`         | `harness/corpus`                     | Directory of fixture `.rb` files   |
 | `DIVERGENCE_REGISTRY`| `harness/divergence-registry.yml`    | Path to the divergence registry    |
 
