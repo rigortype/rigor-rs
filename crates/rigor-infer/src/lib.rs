@@ -2468,6 +2468,14 @@ impl<'i> Typer<'i> {
     ///   receiver sits OUTSIDE the block and is recorded before descent; after
     ///   a block descent all outer facts are cleared (a capture may invisibly
     ///   reassign a local).
+    /// - **Position gate** (docs/notes/20260807-block-narrowing-position-rule
+    ///   .md): a block body and a `case`/`when` clause narrow ONLY from
+    ///   statement position or an assignment RHS. Consumed as a call receiver,
+    ///   as an argument, or as a `return` operand they narrow nothing — the
+    ///   reference types those positions with `ExpressionTyper`, which threads
+    ///   no scope. `if`/ternary is the documented exception: its branches
+    ///   narrow in every position, and only the early-return propagation PAST
+    ///   it is statement-only (review R2, above).
     pub fn class_narrowing_snapshots(
         &self,
         ast: &LoweredAst,
@@ -2482,11 +2490,15 @@ impl<'i> Typer<'i> {
         writes.extend(indexed_flow_writes(ast, self.source));
         let mut tenv = TypeEnv::new();
         let mut cenv: HashMap<String, String> = HashMap::new();
-        self.class_flow_scope(ast, &body, &mut tenv, &mut cenv, &writes, interner, &mut out);
+        self.class_flow_scope(ast, &body, &mut tenv, &mut cenv, &writes, interner, &mut out, true);
         out
     }
 
     /// Thread `(tenv, cenv)` through a scope's statements in source order.
+    /// `stmt_position` is the POSITION the whole statement list sits in (see
+    /// [`Typer::class_flow_expr`]): a method/program body and the branch bodies
+    /// of a statement-position conditional are statement position; the clause
+    /// bodies of an expression-position `case`/ternary inherit `false`.
     #[allow(clippy::too_many_arguments)]
     fn class_flow_scope(
         &self,
@@ -2497,9 +2509,10 @@ impl<'i> Typer<'i> {
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
+        stmt_position: bool,
     ) {
         for &s in stmts {
-            self.class_flow_stmt(ast, s, tenv, cenv, writes, interner, out);
+            self.class_flow_stmt(ast, s, tenv, cenv, writes, interner, out, stmt_position);
         }
     }
 
@@ -2514,17 +2527,21 @@ impl<'i> Typer<'i> {
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
+        stmt_position: bool,
     ) {
         match ast.get(id) {
             Node::Statements { body, .. } => {
                 let body = body.clone();
-                self.class_flow_scope(ast, &body, tenv, cenv, writes, interner, out);
+                self.class_flow_scope(ast, &body, tenv, cenv, writes, interner, out, stmt_position);
             }
+            // An assignment RHS keeps the statement's own position (oracle
+            // probes s8/p1 for `=`, x3 for a multi-write, x4 for an op-write:
+            // the reference narrows a block/`case` on the RHS of all three).
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
                 // Record uses in the RHS BEFORE rebinding — the RHS reads the
                 // pre-write fact (`value = value.frobnicate if value.is_a?(…)`).
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, stmt_position);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
                 // Rebinding invalidates the narrowing (probe a4; `scope.rb:194`).
@@ -2532,7 +2549,7 @@ impl<'i> Typer<'i> {
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     cenv.remove(&name);
@@ -2541,29 +2558,34 @@ impl<'i> Typer<'i> {
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, stmt_position);
                 cenv.remove(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
             Node::Call { .. } => {
-                self.class_flow_expr(ast, id, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, id, tenv, cenv, writes, interner, out, stmt_position);
             }
             // A `return E` evaluates its values in the current facts (`return
             // value.frobnicate if …` must witness). No fact effect: statements
             // after a `return` in the same list are unreachable, and the
             // reference's evaluator threads the same scope past them.
+            //
+            // The operand is EXPRESSION position: the reference is silent on a
+            // `case`/block narrowed under `return` (probes s12, p7), so a
+            // returned value may READ an outer fact but never establishes one
+            // of its own.
             Node::Return { values, .. } => {
                 let values = values.clone();
                 for v in values {
-                    self.class_flow_expr(ast, v, tenv, cenv, writes, interner, out);
+                    self.class_flow_expr(ast, v, tenv, cenv, writes, interner, out, false);
                 }
             }
             Node::If { .. } => {
-                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out, true);
+                self.class_flow_if(ast, id, tenv, cenv, writes, interner, out, stmt_position);
             }
             Node::Case { .. } => {
-                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out);
+                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out, stmt_position);
             }
             Node::Definition { body, .. }
             | Node::ClassDef { body, .. }
@@ -2572,7 +2594,7 @@ impl<'i> Typer<'i> {
                 let body = body.clone();
                 let mut t = TypeEnv::new();
                 let mut c: HashMap<String, String> = HashMap::new();
-                self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out);
+                self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out, true);
             }
             // Any other statement (`while`/`case`/`begin`/logical/ivar-write/…)
             // is UNMODELED: widen `tenv` for the locals it writes and CLEAR ALL
@@ -2588,6 +2610,14 @@ impl<'i> Typer<'i> {
     /// Evaluate an expression for narrowed-local USES: record `call -> C` for a
     /// bare-local receiver in `cenv`, descend a block body with a FRESH fact
     /// env, and kill facts a call's contained writes/mutations invalidate.
+    ///
+    /// `stmt_position` carries the POSITION rule (docs/notes/20260807-block-
+    /// narrowing-position-rule.md): a block body and a `case`/`when` clause
+    /// narrow only when the construct sits in statement position or on an
+    /// assignment RHS. Reaching an expression as a call RECEIVER, as an
+    /// ARGUMENT, or as a `return` OPERAND drops it to `false`, and no
+    /// narrowing is established anywhere beneath — the reference's
+    /// `ExpressionTyper` threads no scope through those positions.
     #[allow(clippy::too_many_arguments)]
     fn class_flow_expr(
         &self,
@@ -2598,6 +2628,7 @@ impl<'i> Typer<'i> {
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
+        stmt_position: bool,
     ) {
         match ast.get(id) {
             Node::Call { receiver, method: _, args, block_body, safe_nav, span, .. } => {
@@ -2607,8 +2638,9 @@ impl<'i> Typer<'i> {
                 let safe_nav = *safe_nav;
                 let call_span = *span;
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
+                // A receiver is EXPRESSION position (probes s5-s7, s11, p3).
                 if let Some(r) = receiver {
-                    self.class_flow_expr(ast, r, tenv, cenv, writes, interner, out);
+                    self.class_flow_expr(ast, r, tenv, cenv, writes, interner, out, false);
                 }
                 // Record the use: a plain (not safe-nav) call on a bare local
                 // currently narrowed to `C`. Recorded BEFORE any invalidation
@@ -2623,8 +2655,9 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
+                // An argument is EXPRESSION position (probes s9, s13, p2).
                 for a in &args {
-                    self.class_flow_expr(ast, *a, tenv, cenv, writes, interner, out);
+                    self.class_flow_expr(ast, *a, tenv, cenv, writes, interner, out, false);
                 }
                 if !block_body.is_empty() {
                     // Block-scope discipline (ADR-0038 §3): descend with a FRESH
@@ -2632,20 +2665,23 @@ impl<'i> Typer<'i> {
                     // outer facts (a capture may invisibly reassign a local) and
                     // widen `tenv` for locals the block visibly writes.
                     //
-                    // SAFE-NAV block calls do NOT descend (oracle-probed
-                    // 2026-08-07, sweep FP gitlab-foss relation_tree_restorer
-                    // .rb:215): the reference stays SILENT on a guard narrowed
-                    // INSIDE a block attached to `x&.m do … end` (`h&.
-                    // transform_values do |v| v.is_a?(String) ? v.presence : v
-                    // end&.compact` — silent), while the identical plain-call
-                    // form fires. Skipping the descent drops every narrowed
-                    // recording inside such a block — pure coverage loss, never
-                    // an FP; the conservative clear/widen effects still apply.
-                    if !safe_nav {
+                    // POSITION GATE (docs/notes/20260807-block-narrowing-
+                    // position-rule.md): descend ONLY from statement position.
+                    // The reference fires on a guard narrowed inside a block
+                    // whose call is a statement or an assignment RHS (probes
+                    // s1-s4, s8, s10, x3-x5 — safe-nav included, which is why
+                    // PR #63's `if !safe_nav` decline was the wrong axis) and
+                    // is SILENT once the call's value is consumed as a receiver
+                    // (s5-s7, s11), as an argument (s9, s13) or as a `return`
+                    // operand (s12). Skipping the descent drops every narrowed
+                    // recording inside the block — a strict subset of the
+                    // reference, never an FP; the conservative clear/widen
+                    // effects below still apply either way.
+                    if stmt_position {
                         let mut btenv = tenv.clone();
                         let mut bcenv: HashMap<String, String> = HashMap::new();
                         self.class_flow_scope(
-                            ast, &block_body, &mut btenv, &mut bcenv, writes, interner, out,
+                            ast, &block_body, &mut btenv, &mut bcenv, writes, interner, out, true,
                         );
                     }
                     cenv.clear();
@@ -2663,8 +2699,8 @@ impl<'i> Typer<'i> {
                 // then recurse for block/call reachability.
                 let (left, right) = (*left, *right);
                 cenv.clear();
-                self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out);
-                self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, left, tenv, cenv, writes, interner, out, false);
+                self.class_flow_expr(ast, right, tenv, cenv, writes, interner, out, false);
             }
             // A write in EXPRESSION position (`f(value = x, value.frobnicate)`)
             // must thread its rebind IMMEDIATELY: Ruby evaluates arguments
@@ -2675,14 +2711,14 @@ impl<'i> Typer<'i> {
             // statement arms.
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, false);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
                 cenv.remove(&name);
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, false);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     cenv.remove(&name);
@@ -2691,7 +2727,7 @@ impl<'i> Typer<'i> {
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
-                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out);
+                self.class_flow_expr(ast, value, tenv, cenv, writes, interner, out, false);
                 cenv.remove(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
@@ -2705,10 +2741,14 @@ impl<'i> Typer<'i> {
             Node::If { .. } => {
                 self.class_flow_if(ast, id, tenv, cenv, writes, interner, out, false);
             }
-            // An expression-position `case` (`x = case value … end`) narrows its
-            // clause bodies the same way a statement `case` does.
+            // A `case` in an ASSIGNMENT RHS narrows its clause bodies like a
+            // statement `case` (probe p1) — hence `stmt_position` rather than a
+            // hard `false`; reached as a receiver/argument/`return` operand the
+            // flag is already `false` and the clauses narrow nothing (p2, p3,
+            // p7). Unlike `if`/ternary, which narrows its branches in EVERY
+            // position (p4, p8) and so is left alone.
             Node::Case { .. } => {
-                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out);
+                self.class_flow_case(ast, id, tenv, cenv, writes, interner, out, stmt_position);
             }
             _ => {}
         }
@@ -2741,8 +2781,8 @@ impl<'i> Typer<'i> {
         let (predicate, is_unless, if_span) = (*predicate, *is_unless, *span);
         let (then_body, else_body) = (then_body.clone(), else_body.clone());
         // The predicate is evaluated first, in the current facts (its own calls
-        // may read an OUTER narrowing).
-        self.class_flow_expr(ast, predicate, tenv, cenv, writes, interner, out);
+        // may read an OUTER narrowing) — EXPRESSION position.
+        self.class_flow_expr(ast, predicate, tenv, cenv, writes, interner, out, false);
         // Recognise the guard, gated on the local currently being Dynamic/Top
         // (`narrow_class_other`: every other carrier is out of scope).
         let narrow = self.class_check_predicate(ast, predicate).filter(|(local, _)| {
@@ -2773,13 +2813,18 @@ impl<'i> Typer<'i> {
                     c.insert(local.clone(), class.clone());
                 }
             }
-            self.class_flow_scope(ast, truthy, &mut t, &mut c, writes, interner, out);
+            // The branch bodies INHERIT the conditional's own position: a block
+            // inside an expression-position ternary branch narrows nothing
+            // (probe x2), while a statement `if`'s branches stay statement
+            // position (probe x5). The branch-internal narrowing itself is
+            // never position-gated (p4, p8).
+            self.class_flow_scope(ast, truthy, &mut t, &mut c, writes, interner, out, stmt_position);
         }
         {
             // The falsey edge is NEVER narrowed (`narrow_class_other`: unchanged).
             let mut t = tenv.clone();
             let mut c = cenv.clone();
-            self.class_flow_scope(ast, falsey, &mut t, &mut c, writes, interner, out);
+            self.class_flow_scope(ast, falsey, &mut t, &mut c, writes, interner, out, stmt_position);
         }
         // Conservative join: widen every local written inside the conditional
         // and clear ALL facts (a fact never survives a branch merge in this
@@ -2872,7 +2917,13 @@ impl<'i> Typer<'i> {
     /// - a `case`/`in` pattern branch (a `BeginRescue` carrier, not a `When`)
     ///   is unmodeled — no descent, matching the pre-slice behavior;
     /// - after the `case`: widen written locals, clear ALL facts (the same
-    ///   conservative join every conditional gets).
+    ///   conservative join every conditional gets);
+    /// - **position gate** (`stmt_position`): a `case` reached as a call
+    ///   receiver, as an argument, or as a `return` operand narrows NOTHING —
+    ///   the reference is silent there (probes p2, p3, p7) while it fires in
+    ///   statement position (p6) and on an assignment RHS (p1). This is the
+    ///   same rule block bodies follow; `if`/ternary is the exception and
+    ///   narrows in every position (p4, p8).
     #[allow(clippy::too_many_arguments)]
     fn class_flow_case(
         &self,
@@ -2883,18 +2934,22 @@ impl<'i> Typer<'i> {
         writes: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, String>,
+        stmt_position: bool,
     ) {
         let Node::Case { predicate, branches, else_body, span } = ast.get(id) else {
             return;
         };
         let (predicate, case_span) = (*predicate, *span);
         let (branches, else_body) = (branches.clone(), else_body.clone());
-        // The subject evaluates first, in the current facts.
+        // The subject evaluates first, in the current facts — EXPRESSION
+        // position (it is the `case`'s operand, not a statement).
         if let Some(p) = predicate {
-            self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out);
+            self.class_flow_expr(ast, p, tenv, cenv, writes, interner, out, false);
         }
-        // The narrowing subject: a bare local currently Dynamic/Top.
+        // The narrowing subject: a bare local currently Dynamic/Top — and only
+        // in statement position / on an assignment RHS (p2, p3, p7 decline).
         let subject = predicate
+            .filter(|_| stmt_position)
             .and_then(|p| match ast.get(p) {
                 Node::LocalVariableRead { name, .. } => Some(name.clone()),
                 _ => None,
@@ -2917,7 +2972,7 @@ impl<'i> Typer<'i> {
             // Conditions evaluate under the un-narrowed facts (they decide the
             // edge; a call condition still records its own uses).
             for &cond in &conditions {
-                self.class_flow_expr(ast, cond, &mut t, &mut c, writes, interner, out);
+                self.class_flow_expr(ast, cond, &mut t, &mut c, writes, interner, out, false);
             }
             if let (Some(local), [only]) = (&subject, conditions.as_slice()) {
                 if let Some(class) = self.resolved_static_constant(ast, *only, case_span) {
@@ -2932,13 +2987,17 @@ impl<'i> Typer<'i> {
                     }
                 }
             }
-            self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out);
+            // Clause bodies INHERIT the `case`'s position: a block inside an
+            // expression-position clause narrows nothing (probe x1).
+            self.class_flow_scope(ast, &body, &mut t, &mut c, writes, interner, out, stmt_position);
         }
         {
             // The `else` body is a NEGATIVE edge — never narrowed.
             let mut t = tenv.clone();
             let mut c = cenv.clone();
-            self.class_flow_scope(ast, &else_body, &mut t, &mut c, writes, interner, out);
+            self.class_flow_scope(
+                ast, &else_body, &mut t, &mut c, writes, interner, out, stmt_position,
+            );
         }
         widen_flow_writes(writes, case_span, tenv, interner);
         cenv.clear();
@@ -5123,25 +5182,58 @@ mod class_narrowing_tests {
         );
     }
 
-    /// Decline: a block attached to a SAFE-NAV call is never descended — the
-    /// reference stays silent on a guard narrowed inside `x&.m do … end`
-    /// (oracle-probed; the sweep FP at gitlab-foss relation_tree_restorer
-    /// .rb:215), while the identical plain-call block DOES narrow.
+    /// The POSITION matrix (docs/notes/20260807-block-narrowing-position-rule
+    /// .md): a block body and a `case`/`when` clause narrow ONLY from statement
+    /// position or an assignment RHS; a receiver, an argument or a `return`
+    /// operand narrows nothing. `if`/ternary is the exception (p4, p8 narrow in
+    /// every position). Every row was measured against the pinned reference —
+    /// `Some(c)` means the reference FIRES and rigor-rs must record `c`, `None`
+    /// means the reference is SILENT and rigor-rs must record nothing.
+    ///
+    /// Safe-nav is NOT the axis: s3/s4 (`h&.transform_values { … }` in
+    /// statement position) fire on both engines, which is why PR #63's
+    /// `if !safe_nav` block decline was wrong.
     #[test]
-    fn class_narrowing_safe_nav_block_body_declines() {
-        let (ast, snaps) = class_snaps(
-            b"def f(h)\n  h&.transform_values do |value|\n    value.is_a?(String) ? value.frobnicate_zzz : value\n  end&.compact\nend\n",
-        );
-        assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
-        // Plain-call control: the same guard inside a non-safe-nav block
-        // narrows (the reference fires here — probe f5).
-        let (ast, snaps) = class_snaps(
-            b"def f(h)\n  h.transform_values do |value|\n    value.is_a?(String) ? value.frobnicate_zzz : value\n  end\nend\n",
-        );
-        assert_eq!(
-            snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str),
-            Some("String")
-        );
+    fn class_narrowing_position_matrix() {
+        // (row, source, expected narrowed class of the `frobnicate_zzz` call)
+        let rows: &[(&str, &[u8], Option<&str>)] = &[
+            // --- block bodies: statement position / assignment RHS -> narrows
+            ("s1", b"def f(h)\n  h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\nend\n", Some("String")),
+            ("s2", b"def f(h)\n  h.transform_values do |v|\n    v.is_a?(String) ? v.frobnicate_zzz : v\n  end\nend\n", Some("String")),
+            ("s3", b"def f(h)\n  h&.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\nend\n", Some("String")),
+            ("s4", b"def f(h)\n  h&.transform_values do |v|\n    v.is_a?(String) ? v.frobnicate_zzz : v\n  end\nend\n", Some("String")),
+            ("s8", b"def f(h)\n  x = h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\n  x\nend\n", Some("String")),
+            ("s10", b"def f(h)\n  h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\n  nil\nend\n", Some("String")),
+            // --- block bodies: receiver / argument / `return` -> declines
+            ("s5", b"def f(h)\n  h&.transform_values do |v|\n    v.is_a?(String) ? v.frobnicate_zzz : v\n  end&.compact\nend\n", None),
+            ("s6", b"def f(h)\n  h&.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }&.compact\nend\n", None),
+            ("s7", b"def f(h)\n  h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }.compact\nend\n", None),
+            ("s9", b"def g(y)\n  y\nend\n\ndef f(h)\n  g(h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v })\nend\n", None),
+            ("s11", b"def f(h)\n  h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }.compact.to_a\nend\n", None),
+            ("s12", b"def f(h)\n  return h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\nend\n", None),
+            ("s13", b"def g(y)\n  y\nend\n\ndef f(h)\n  x = g(h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v })\n  x\nend\n", None),
+            // --- `case`/`when`: the same positional rule
+            ("p6", b"def f(v)\n  case v\n  when Hash\n    v.frobnicate_zzz\n  end\nend\n", Some("Hash")),
+            ("p1", b"def f(v)\n  x = case v\n      when Hash\n        v.frobnicate_zzz\n      end\n  x\nend\n", Some("Hash")),
+            ("p2", b"def g(y)\n  y\nend\n\ndef f(v)\n  g(case v\n    when Hash\n      v.frobnicate_zzz\n    end)\nend\n", None),
+            ("p3", b"def f(v)\n  (case v\n   when Hash\n     v.frobnicate_zzz\n   end).to_s\nend\n", None),
+            ("p7", b"def f(v)\n  return case v\n         when Hash\n           v.frobnicate_zzz\n         end\nend\n", None),
+            // --- `if`/ternary: the EXCEPTION — narrows in every position
+            ("p4", b"def g(y)\n  y\nend\n\ndef f(v)\n  g(v.is_a?(Hash) ? v.frobnicate_zzz : v)\nend\n", Some("Hash")),
+            ("p8", b"def f(v)\n  (v.is_a?(Hash) ? v.frobnicate_zzz : v).to_s\nend\n", Some("Hash")),
+            // --- nesting / carrier corners (all oracle-measured)
+            ("p5", b"def f(h)\n  h.each do |a|\n    a.each do |v|\n      v.is_a?(String) ? v.frobnicate_zzz : v\n    end\n  end\nend\n", Some("String")),
+            ("x1", b"def g(y)\n  y\nend\n\ndef f(h, k)\n  g(case k\n    when Integer\n      h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\n    end)\nend\n", None),
+            ("x2", b"def g(y)\n  y\nend\n\ndef f(h, k)\n  g(k ? h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v } : nil)\nend\n", None),
+            ("x3", b"def f(h)\n  a, b = h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\n  [a, b]\nend\n", Some("String")),
+            ("x4", b"def f(h, x)\n  x ||= h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\n  x\nend\n", Some("String")),
+            ("x5", b"def f(h, k)\n  if k\n    h.transform_values { |v| v.is_a?(String) ? v.frobnicate_zzz : v }\n  end\nend\n", Some("String")),
+        ];
+        for (row, src, expected) in rows {
+            let (ast, snaps) = class_snaps(src);
+            let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
+            assert_eq!(got, *expected, "position matrix row {row}");
+        }
     }
 
     /// Decline: safe-nav dispatch on the narrowed local never records.

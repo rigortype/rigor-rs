@@ -48,6 +48,23 @@ exception that proves it:
 | p8 | `(v.is_a?(Hash) ? v.zzz : v).to_s` | ternary as receiver | 1 | 1 | agree — `if` narrows here |
 | p5 | guard in a block nested in a block | statement | 1 | 1 | agree |
 
+Five further rows measured while building the fix (the `x` block pins the
+carriers neither matrix above covers; all against the same pinned reference):
+
+| # | shape | position | ref | rigor-rs | verdict |
+|---|---|---|:--:|:--:|---|
+| x1 | `g(case k when Integer then h.transform_values { … } end)` | block in an expr-position `case` clause | 0 | **1** | **FALSE POSITIVE** |
+| x2 | `g(k ? h.transform_values { … } : nil)` | block in an expr-position ternary branch | 0 | **1** | **FALSE POSITIVE** |
+| x3 | `a, b = h.transform_values { … }` | multi-write RHS | 1 | 1 | agree |
+| x4 | `x \|\|= h.transform_values { … }` | op-write RHS | 1 | 1 | agree |
+| x5 | `if k then h.transform_values { … } end` | statement inside a statement `if` | 1 | 1 | agree |
+
+x1/x2 make **ten** FP shapes, not eight, and they are the rows that decide the
+SHAPE of the fix: expression position must propagate *through* the branch and
+clause bodies of a conditional, not merely gate the narrowing at the
+construct's own node. x3/x4 show "assignment RHS" covers **every** local
+write carrier (`=`, `a, b =`, `||=`), not just `LocalVariableWrite`.
+
 Probes live in the session scratchpad (`snprobe/`); they are trivial to
 recreate from the tables.
 
@@ -67,8 +84,9 @@ treatment, which `case` and block bodies never got. Only the *early-return
 propagation past* an `if` is statement-only, which the PR #63 review already
 closed as finding R2.
 
-Eight false-positive shapes in total: five for blocks (s7, s9, s11, s12, s13)
-and three for `case` (p2, p3, p7).
+Ten false-positive shapes in total: five for blocks (s7, s9, s11, s12, s13),
+three for `case` (p2, p3, p7), and two where an expression-position conditional
+carries a block in one of its bodies (x1, x2).
 
 That is the same statement-vs-expression asymmetry this project already found
 in the reference's `if` handling: `StatementEvaluator#eval_if` threads narrowed
@@ -82,28 +100,44 @@ a guard narrows should not depend on whether the enclosing expression is later
 chained — but it is a COVERAGE inconsistency, not an unsoundness, so it costs
 us nothing to mirror. Worth carrying into the next upstream feedback batch.
 
-## Fix (see PR)
+## Fix (as built — PR "fix(infer): position rule for block/`case` narrowing")
 
-1. **Delete the safe-nav-based decline** (`class_flow_expr`'s `if !safe_nav`
-   guard around block descent, `crates/rigor-infer/src/lib.rs`). It is the
-   wrong axis: it suppresses s3/s4, which the reference fires on, and it does
-   not suppress s7/s11.
-2. **Descend into a block body only from statement position** — a statement in
-   a scope's statement list, or a local-variable-write RHS — mirroring the
-   `stmt_position` flag review finding R2 already introduced for
-   `class_flow_if`. A block-bearing call reached as a receiver, as an
-   argument, or as a `return` operand records nothing inside its block.
-3. **Apply the same positional gate to `class_flow_case`.** A `case` reached
-   as a receiver, an argument or a `return` operand must not narrow its
-   clauses. Note `class_flow_stmt`'s `Node::Return` arm currently evaluates
-   the returned values with the CURRENT facts — correct for reading an outer
-   narrowing, but it must pass expression (non-statement) position downward,
-   or s12/p7 stay broken.
-4. **Leave `if`/ternary alone**: it narrows in every position (p4, p8), and
-   its statement-only early-return propagation is already gated.
+`stmt_position` is threaded through the WHOLE class-narrowing pass rather than
+gated at individual nodes, because x1/x2 show the position has to survive a
+descent through a conditional's bodies. `class_flow_scope`, `class_flow_stmt`,
+`class_flow_expr` and `class_flow_case` each take the flag (`class_flow_if`
+already had it, for review finding R2); `crates/rigor-infer/src/lib.rs`.
 
-Declining by position is a strict subset of the reference in every row of both
-matrices, which is the FP-safety argument.
+1. **The safe-nav decline is deleted.** `class_flow_expr`'s block descent is
+   now gated on `stmt_position` instead of `!safe_nav` — the wrong axis: it
+   suppressed s3/s4, which the reference fires on, and suppressed neither
+   s7 nor s11. The separate safe-nav decline on *recording a use*
+   (`value&.frobnicate` never narrows) is untouched.
+2. **Statement position is established** at a method/program body and
+   **propagated** through: statement lists, the branch bodies of an `if`, the
+   clause and `else` bodies of a `case`, and the RHS of `LocalVariableWrite` /
+   `MultiWrite` / `LocalVariableOpWrite` (x3, x4). It is **dropped to `false`**
+   at a call receiver, a call argument, a `return` operand, an `if` predicate,
+   a `case` subject and `when` conditions, and both sides of a `Logical`.
+3. **`class_flow_case` takes the same gate**: `subject` is `.filter(|_| stmt_
+   position)`, so an expression-position `case` narrows no clause (p2, p3, p7),
+   and its clause bodies inherit the flag so a block nested inside one narrows
+   nothing either (x1).
+4. **`if`/ternary is left alone**: `class_flow_if` still narrows its branches
+   unconditionally (p4, p8 fire), and only the early-return propagation past it
+   stays statement-only (R2). Its branch bodies do inherit the flag, which is
+   what closes x2.
+
+Everything else is unchanged: the R1 arg-position write threading, the R3
+conflicting-guard removal, mutation/write invalidation, the Dynamic/Top gate,
+and the lexical shadow gate.
+
+Declining by position is a strict subset of the reference in every row of all
+three matrices, which is the FP-safety argument. All 26 rows are pinned as a
+table-driven unit test (`class_narrowing_position_matrix`), and the corpus
+fixture `harness/corpus/81_class_narrowing.rb` carries a safe-nav positive
+(case 9, s3) plus chained-receiver and `case`-as-argument negative controls
+(cases 10 and 11, s7/p2).
 
 ## Why the sweep did not catch it
 
