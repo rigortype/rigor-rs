@@ -13,16 +13,13 @@ Last updated: 2026-08-08.
 
 ## Now / Next
 
-▶ **NEXT (measured, 2026-08-08):** **qualified-name WITNESSING** (mini-spec
-first): 3a-3's 7 target rows AND the bare-local analogue are all blocked by
-`knows_toplevel_class` declining namespaced classes (deliberate ADR-0042
-defect-2 gate — do not just invert it; route via the qualified registry, PR
-#64 precedent). The narrowing arc is otherwise at a STOP: 3a-2 DEFERRED (0
-verified rows), 3a-4/3b-2 windows ≤1 ([remeasure](notes/20260808-narrowing-3a23-window-remeasure.md)).
-The 2d/2e rows sit behind partially-dynamic constant-value harvesting
-(mini-spec first — project-wide FP surface).
-Adjudicate the `Object` bucket (26) before acting on it; no global typing for
-the OpenStruct rows
+▶ **NEXT (measured, 2026-08-08):** partially-dynamic constant-value
+harvesting (mini-spec first — project-wide FP surface; blocks the 2d/2e rows
++ bucket-D synergy). Adjudicate the `Object` bucket (26) before acting on it.
+The narrowing arc AND qualified witnessing are DONE — 3a-2 DEFERRED (0
+verified rows), 3a-4/3b-2 windows ≤1
+([remeasure](notes/20260808-narrowing-3a23-window-remeasure.md)).
+No global typing for the OpenStruct rows
 ([why](notes/20260808-bare-class-bucket-characterisation.md)). Off the gap
 track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 
@@ -41,9 +38,9 @@ track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-08-08, post PRs #74-#79): harness **90 fixtures / 0
-unregistered extras / 28 gaps / 1 registered divergence**, coverage 339/368;
-standing sweep **0 FP / 9204 files / 1136 gaps**, 8 corpora, baselines in
+State (verified 2026-08-08, post PRs #74-#82): harness **91 fixtures / 0
+unregistered extras / 28 gaps / 1 registered divergence**, coverage 350/379;
+standing sweep **0 FP / 9204 files / 1127 gaps**, 8 corpora, baselines in
 `harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. EVERY
 tool that grades the port now prints its binary's path + build time and
 REFUSES one older than `crates/` — corpus tools on release, the fixture
@@ -102,6 +99,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-08-08 qualified-name WITNESSING** (PRs #80 probes / #81 S0 / #82 S1-S3) — the class-narrowing witness now fires for namespaced AND non-`CORE_CLASSES` top-level guard classes (resolution at MINT time via the PR #64 machinery; full-path rendering; modules witnessable). Unblocked by TWO fixes the probes forced: the ADR-0042 registry DOUBLE-PREFIXED depth-≥3 decls (`Bundler::Bundler::Source::Git` — S0, solo census diff EMPTY), and `qualified_class_has_method`'s ancestor walk under-reported inherited methods (real causes: attr members never ingested, modules denied `Object`'s surface). **1136→1127: 9 closed (7 dependabot + `Time#to_fs` + `Numeric#nan?`), 0 opened, 0 FP / 9204 at every slice.** Also fixed at root: the shaped-carrier collapse FP family (reference collapses on `ordering != subclass/equal`, resolution NOT required — probed, not guessed) and the sequential-disjoint LOCAL re-guard FP. [mini-spec+log](notes/20260808-qualified-witnessing-mini-spec.md) / [probes](notes/20260808-qualified-witnessing-probes.md).
 - **2026-08-08 collection-shape stage 2: chain ROOTS** (PR #75) — `Dir.glob`/`String#split` are ONE mechanism (a BLOCK overload breaks all-overloads-agree; block-free return slot), `ENV` object-constant ingestion (nilable returns REFUSED — 13/15 first-cut FPs), `::`-qualified C5 paths (0 yield). 2d DROPPED: blocked on partially-dynamic constant harvesting. **1141→1137: 4 closed, 0 opened, 0 FP / 9204.** [spec §7c](notes/20260807-collection-shape-slice-spec.md).
 - **2026-08-08 collection-shape receiver survival, stage 1** (PR #70) — a literal-seeded local keeps its collection NOMINAL through `<<`/`push`/`[]=`/block mutation instead of widening to Dynamic, so the chained call is witnessed. **1167→1145: 22 rows closed (9 predicted + 13 same-mechanism), 0 opened, 0 FP / 9204 files.** The FP boundary is the join: a branch-contained mutation on an UNWIDENED seed must stay silent (the reference's `Scope#join` leaves a union its dispatcher declines) — reviewer-probed both ways. Deviation found mid-build and oracle-re-probed: `widen_after_block` is a SYNTACTIC walk, not a scope join. [spec+outcome](notes/20260807-collection-shape-slice-spec.md).
 - **2026-08-07/08 the class-narrowing ARC, CLOSED at a measured stop** (PRs #63, #68, #71-#74, #76, #77, #79) — ported `narrow_class_other` end-to-end: snapshot pass + `Node::When` split, 3b-1 statement-form descent, 3a-1 compound predicates (`&&`/`||`/`!`, falsey edge, both-direction termination, `Logical.is_and`), `next`/`break` termination, 3a-3 chain guards (`chain_env`, ships without the local path's sequential-disjoint defect). **19 gap closures + eleven master FP shapes closed** (Bot collapse reached through `!`/`&&`/`||`/`nil?`/`===`). Lessons, each probe-forced: the FP-safety argument was WRONG THREE TIMES (position AXIS, 10 FP shapes; carrier ALLOW-list, 19 FP carriers; disjoint→`Bot`); census windows measure PROXIMITY not mechanism (3a-1 bound 22 → 1 row; the remeasure hand-read all 37 candidates → 3a-2 DEFERRED at 0); and **verify the CONSUMPTION gate can witness the class before crediting rows** — 3a-3's 7 verified rows all name namespaced classes `knows_toplevel_class` declines (gap diff 0/0, mechanism proven by top-level controls). 0 FP / 9204 at every step. [position](notes/20260807-block-narrowing-position-rule.md) / [carriers](notes/20260808-narrowing-carrier-fidelity-fp.md) / [stage3](notes/20260807-narrowing-stage3-spec.md) / [remeasure](notes/20260808-narrowing-3a23-window-remeasure.md) / [spec](notes/20260807-class-narrowing-slice-spec.md).
@@ -120,7 +118,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-08-07 upstream survey `v0.3.1`→`80aaf9bc` (150 commits + rbs 4.1.1) — pin HOLDS** — 2×2 self-diff (checkout × rbs) over the sweep set: upstream logic moves **2 diagnostics on 9204 files** — a drop (#239 rdoc) and an ADD bisected to `c7f28da1` (#271), which is a NEW UPSTREAM FP (a nested `Struct.new` pins an empty member, `.first` folds nil on correct code); **rigor-rs silent at both**. rbs 4.1.0→4.1.1 is **0/0 and structurally so** — the two gems' `core/`+`stdlib/` are BYTE-IDENTICAL. E2E: rigor-rs is **0 FP vs BOTH** oracles, corpus for corpus. GEM_HOME rbs selection is RETIRED (it silently dropped 1650 files); use `ruby -I <rbs>/lib -I <ext>`. [note](notes/20260807-upstream-survey-v031-to-master.md).
 - **2026-07-31 upstream pin `v0.3.0 → v0.3.1` + vendored rbs `4.0.3 → 4.1.0`** — **0 FP / 9153 files, gaps net −2**. 4.1.0's rewritten signatures broke two things, both FIXED rather than accepted: bounded method type params now resolve to their bound, and `-> instance` on an INSTANCE method resolves via the `SELF_RETURN` call-site sentinel. New `harness/vendor_rbs.py` makes the vendoring recipe executable (proven by reproducing the 4.0.3 tree byte-for-byte first). Upstream logic delta: ZERO. [note](notes/20260731-upstream-pin-v031-rbs41.md) / [survey](notes/20260731-v031-preflight-survey.md).
 - **2026-07-25 MultiWrite substrate, slices 1+2** (PRs #46/#47) — `a, b = rhs` had NO arena lowering, so `collect_flow_writes` never saw the rebind: a MEASURED live `check` FP. Added `Node::MultiWrite` + a rule-for-rule `MultiTargetBinder` port; slice 2 closed the last fixture gap by surviving RBS tuple returns as `RbsReturnShape`. **An FP found and fixed mid-build**: naive witness widening fired where the oracle is silent — gated on `is_declaration_only_class`. 14 corpora / 35,706 files bit-identical. [spec](notes/20260725-multiwrite-substrate-spec.md) / [s1](notes/20260725-multiwrite-substrate-s1.md) / [s2](notes/20260725-multiwrite-substrate-s2.md).
-- **2026-07-25 LSP `exclude:` parity** (PR #45) — an excluded file opened in the editor published markers `check` never produces. Decision rule: a buffer is excluded iff EVERY discovery spelling of it is excluded, expressed as 3 tiers — overlay membership (fast path), all-roots × 3 name forms (decoded/named/canonical, `all` load-bearing), then a confirm pass over the SHARED `discovery_spellings` walk so it cannot drift from `project_files`. Review round 1 found 3 regressions (symlinked `.rb`, symlink whose target is excluded, overlapping roots — the first-match + canonicalize-only gate); matrix widened 24→144 runs (+ symlink and multi-root axes). `check` byte-identical under 3 configs incl. an invalid glob. [note](notes/20260725-lsp-exclude-parity.md).
+- **2026-07-25 LSP `exclude:` parity** (PR #45) — a buffer is excluded iff EVERY discovery spelling of it is excluded: overlay membership, all-roots × 3 name forms, then a confirm pass over the SHARED `discovery_spellings` walk so it cannot drift from `project_files`. Review found 3 symlink/multi-root regressions; matrix 24→144 runs. `check` byte-identical under 3 configs. [note](notes/20260725-lsp-exclude-parity.md).
 
 - **2026-07-25 LSP stage-3 parity tail** (PR #44) — the LSP never applied the ADR-8 SeverityStamp: a rule resolved `off` still published markers `check` DROPS (PRESENCE mismatch), severities were authored not profile-resolved, bleeding-edge unplumbed. The stamp now rides `ProjectContext` beside `disable:` (rebuilt by `invalidate` under the S4 generation guard); composition order verified against `main.rs` statement-by-statement. 4 E2E tests vs real `check` output, each proven non-vacuous by re-breaking. Remaining divergences enumerated in the note. [note](notes/20260725-lsp-stage3-parity.md).
 
