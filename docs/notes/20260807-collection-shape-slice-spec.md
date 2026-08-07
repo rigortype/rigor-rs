@@ -337,6 +337,57 @@ construction.
   `Dynamic`-receiver locals now typed) must each be oracle-spot-checked.
   A shortfall is a finding, not a failure.
 
+## 7b. Stage 1 — BUILT (2026-08-08)
+
+Shipped as specced: `Typer::collection_shape_snapshots` +
+`coll_flow_scope/stmt/expr/if/case` (a parallel walker in
+`crates/rigor-infer/src/lib.rs`, deliberately NOT an extension of
+`class_flow_*`), consumed by `check_collection_call` in
+`crates/rigor-rules/src/lib.rs` for `call.undefined-method` only. Pure
+insertions — `MUTATOR_METHODS` and the narrowing pass are untouched; the
+reference's two tables were added alongside as `ARRAY_MUTATORS`/`HASH_MUTATORS`.
+
+**One spec correction, oracle-verified.** §5.4's join rule is right for the
+METHOD body but does NOT apply inside a block. `widen_after_block`
+(`mutation_widening.rb:144`) is a SYNTACTIC walk (`walk_for_outer_mutations`)
+of the block body against the OUTER scope — it never joins the block's
+evaluated scope, its own doc names `arr.push(x) if cond` as a caught case, and
+it recurses into nested blocks. Probed at the pin: a branch-contained `<<`
+inside an `each` block FIRES (`m02b`), as does the nested-block form; a block
+param SHADOWING the outer local also fires, `for []` (the reference declines to
+widen there, but a `Tuple` dispatches as Array anyway — so the `depth` check we
+cannot mirror is FP-neutral by construction). The first implementation joined
+the block's env instead and left the four each-block survey rows open; mirroring
+the syntactic walk closed them.
+
+**Measured** (sweep binary, 8 corpora / 9204 files): `TOTAL FP candidates: 0`.
+Gap-set diff against the post-PR-#68 baseline (1167 rows → 1145): **22 closed,
+0 opened**. All 9 predicted stage-1 rows closed — 5 before the
+`widen_after_block` correction; the remaining 4 (the three jira-tracker rows and
+the ddl-lock row) only after it, which is how the correction was found.
+
+The 13 bonus closures are the same mechanism reaching further than predicted.
+Nine are literal-seeded locals consumed in a `def` body, which §3 never
+enumerated because the census bucketed them by receiver rendering rather than by
+seed: gitlab `api/namespaces.rb:61`, `gitlab/auth/identity.rb:67`,
+`gitlab/ci/config/extendable/entry.rb:86,:88`, `gitlab/kubernetes.rb:149`,
+`gitlab/legacy_github_import/importer.rb:350`, mastodon
+`app/lib/activitypub/linked_data_signature.rb:43`, net-ssh
+`lib/net/ssh/test/packet.rb:88`. Four more were assigned elsewhere in §3 and
+turn out to need only stage 1's local binding: `gitlab/workhorse.rb:306` and
+psych `ext/psych/extconf.rb:29` (both filed 2d), `prometheus/
+cleanup_multiproc_dir_service.rb:13` (filed 2a), and mastodon
+`app/lib/translation_service/deepl.rb:27` ×2 (filed bucket D). Stage 2's
+remaining scope shrinks accordingly. Nothing outside the census set opened.
+
+Verification: 23 unit tests in `crates/rigor-infer` covering every probed row
+(fires m01, m02, m02b, m03, m06 ×2, m07, m14, m17, m19; silences m04, m05, m08,
+m13, m15, m18, m20 plus op-write/ivar/safe-nav/`while`/def-scope), and fixture
+`harness/corpus/84_collection_shape.rb` (83 left free for the in-flight
+narrowing branch) — 9 oracle diagnostics, rigor-rs matches 7 on
+(rule, line, column) with the op-write and ivar rows as documented gaps, 0
+extras.
+
 ## 8. Upstream-feedback candidates (bucket E, all runtime-wrong at the pin)
 
 1. **Bare AR-DSL `select('…')` dispatches to `Kernel#select`** — RBS 4.1

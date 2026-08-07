@@ -3002,6 +3002,578 @@ impl<'i> Typer<'i> {
         widen_flow_writes(writes, case_span, tenv, interner);
         cenv.clear();
     }
+
+    // -----------------------------------------------------------------------
+    // Collection-shape receiver survival (spec
+    // docs/notes/20260807-collection-shape-slice-spec.md, STAGE 1).
+    //
+    // Self-contained region: a parallel walker (`coll_flow_*`) rather than an
+    // extension of `class_flow_*`, so this slice's env discipline (a threaded
+    // `TypeEnv` joined per branch) stays independent of the narrowing pass's
+    // fact env, and neither can regress the other.
+    // -----------------------------------------------------------------------
+
+    /// Compute the per-call-node collection-shape snapshot map: `call node id ->
+    /// "Array" | "Hash"` for every call whose receiver is a bare local whose
+    /// threaded binding is a collection carrier — a literal `Tuple`/`HashShape`
+    /// seed, a `Nominal[Array|Hash]` minted by an in-place mutator that KEPT the
+    /// nominal (`MutationWidening::widen_tuple`/`widen_hash_shape`,
+    /// `reference/rigor/lib/rigor/inference/mutation_widening.rb:251,265`), or a
+    /// `Nominal[Array|Hash]` an already-FP-gated tier fold produced (`missing =
+    /// KEYS.filter { … }`). The rules layer's `check_collection_call` fires
+    /// `call.undefined-method` from this map — and ONLY that rule (the class
+    /// narrowing slice's pitfall 7: no wrong-arity / ATM wiring).
+    ///
+    /// ## FP-safety envelope (every decline load-bearing; §6 of the spec)
+    ///
+    /// - **Seeds only from literals or existing folds.** A mutator on a Dynamic
+    ///   carrier never MINTS a binding (`widen_for_mutator` returns nil for a
+    ///   non-shape carrier — probes m08/m13), which is also what keeps us out of
+    ///   the reference's runtime-wrong `[]=`-on-a-String rows (bucket E, probe
+    ///   c12).
+    /// - **Per-shape mutator tables**, not their union: a Hash-only mutator on a
+    ///   `Tuple` is a no-op, exactly as the reference's `case type` dispatch
+    ///   (`mutation_widening.rb:209`).
+    /// - **Branch join is identical-`TypeId` only** ([`join_flow_envs`]). This is
+    ///   the load-bearing decline: a branch-contained mutation on a not-yet-
+    ///   widened seed leaves `Tuple[] | Array[…]` after the reference's
+    ///   `Scope#join` (`scope.rb:680`) and `receiver_descriptor` has NO
+    ///   `Type::Union` arm (`rbs_dispatch.rb:200`), so the reference is SILENT
+    ///   (probes m18/m20) — we widen to untyped and never model the union.
+    ///   Straight-line widening BEFORE the construct makes both edges agree and
+    ///   the site fires (m01/m19).
+    /// - **Block bodies** mirror `widen_after_block` (`:144`): the block's
+    ///   binding REPLACES the outer one, but only when it is a kept nominal —
+    ///   any other outcome (a rebind, m15; a block-internal branch join) widens
+    ///   to untyped. Descent only from statement position (the block-narrowing
+    ///   position rule, docs/notes/20260807-block-narrowing-position-rule.md);
+    ///   an expression-position block widens its contained writes instead.
+    /// - **Unmodeled constructs decline**: `while`/`until` (the reference DOES
+    ///   fire, probe m10 — deliberate coverage loss, its `break`/`next` join
+    ///   edges are unprobed), `begin`/`rescue`, op-writes (m16), logicals,
+    ///   safe-nav receivers, and every expression kind without an arm below
+    ///   widen every write their span contains and bind nothing.
+    /// - **Ivar carriers are never typed** (probe m09 fires in the reference —
+    ///   bucket B's own future slice).
+    pub fn collection_shape_snapshots(
+        &self,
+        ast: &LoweredAst,
+        interner: &mut Interner,
+    ) -> HashMap<NodeId, &'static str> {
+        let mut out = HashMap::new();
+        let body = match ast.get(ast.root()) {
+            Node::Program { body, .. } => body.clone(),
+            _ => return out,
+        };
+        let mut writes = collect_flow_writes(ast);
+        writes.extend(indexed_flow_writes(ast, self.source));
+        let rebinds = collect_rebind_writes(ast);
+        let ctx = CollCtx { writes: &writes, rebinds: &rebinds };
+        let mut tenv = TypeEnv::new();
+        self.coll_flow_scope(ast, &body, &mut tenv, &ctx, interner, &mut out, true);
+        out
+    }
+
+    /// Thread `tenv` through a scope's statements in source order.
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_scope(
+        &self,
+        ast: &LoweredAst,
+        stmts: &[NodeId],
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+        stmt_position: bool,
+    ) {
+        for &s in stmts {
+            self.coll_flow_stmt(ast, s, tenv, ctx, interner, out, stmt_position);
+        }
+    }
+
+    /// Apply one statement's effect on `tenv` and record collection-typed uses.
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_stmt(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+        stmt_position: bool,
+    ) {
+        match ast.get(id) {
+            Node::Statements { body, .. } => {
+                let body = body.clone();
+                self.coll_flow_scope(ast, &body, tenv, ctx, interner, out, stmt_position);
+            }
+            Node::LocalVariableWrite { .. }
+            | Node::MultiWrite { .. }
+            | Node::LocalVariableOpWrite { .. }
+            | Node::Call { .. } => {
+                self.coll_flow_expr(ast, id, tenv, ctx, interner, out, stmt_position);
+            }
+            // `return E` evaluates its operands in the current bindings; the
+            // operand is EXPRESSION position (no block/`case` effect leaks out).
+            Node::Return { values, .. } => {
+                let values = values.clone();
+                for v in values {
+                    self.coll_flow_expr(ast, v, tenv, ctx, interner, out, false);
+                }
+            }
+            Node::If { .. } => {
+                self.coll_flow_if(ast, id, tenv, ctx, interner, out, stmt_position);
+            }
+            Node::Case { .. } => {
+                self.coll_flow_case(ast, id, tenv, ctx, interner, out, stmt_position);
+            }
+            Node::Definition { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => {
+                // Independent local scope: fresh env, no effect on the enclosing one.
+                let body = body.clone();
+                let mut t = TypeEnv::new();
+                self.coll_flow_scope(ast, &body, &mut t, ctx, interner, out, true);
+            }
+            // Unmodeled statement (`while`/`until`, `begin`/`rescue`, ivar
+            // writes, …): widen every local it writes and do NOT descend.
+            other => {
+                let span = other.span();
+                widen_flow_writes(ctx.writes, span, tenv, interner);
+            }
+        }
+    }
+
+    /// Evaluate an expression: record collection-typed receiver uses, thread
+    /// rebinds, apply the keep-nominal mutator widening, and widen conservatively
+    /// for everything unmodeled.
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_expr(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+        stmt_position: bool,
+    ) {
+        match ast.get(id) {
+            Node::Call { receiver, method, args, block_body, safe_nav, span, .. } => {
+                let receiver = *receiver;
+                let method = method.clone();
+                let args = args.clone();
+                let block_body = block_body.clone();
+                let safe_nav = *safe_nav;
+                let call_span = *span;
+                // The receiver evaluates first (a nested `a.b` in `a.b.c`) —
+                // EXPRESSION position, so no block/`case` under it establishes
+                // anything.
+                if let Some(r) = receiver {
+                    self.coll_flow_expr(ast, r, tenv, ctx, interner, out, false);
+                }
+                // The bare-local receiver name, if any. Safe-nav dispatch is out
+                // of the envelope on both the recording and the widening side.
+                let local = match (receiver, safe_nav) {
+                    (Some(r), false) => match ast.get(r) {
+                        Node::LocalVariableRead { name, .. } => Some(name.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                // Record the use BEFORE any of the call's own effects — the
+                // receiver read happens first (`output << 'a'` reads the seed).
+                if let Some(name) = &local {
+                    if let Some(cls) = tenv.get(name).and_then(|&ty| self.coll_carrier(interner, ty))
+                    {
+                        out.insert(id, cls);
+                    }
+                }
+                // The mutator's effect is decided by the PRE-call carrier
+                // (`widen_for_mutator`, `mutation_widening.rb:209`).
+                let widened = local.as_ref().and_then(|name| {
+                    let ty = *tenv.get(name)?;
+                    self.coll_widen_for_mutator(interner, ty, &method).map(|c| (name.clone(), c))
+                });
+                // Arguments are EXPRESSION position.
+                for a in &args {
+                    self.coll_flow_expr(ast, *a, tenv, ctx, interner, out, false);
+                }
+                if block_body.is_empty() {
+                    // Widen every write the call span contains (the receiver-side
+                    // mutator entry itself, and argument-position mutations via
+                    // `indexed_flow_writes`); the modeled mutator effect is
+                    // re-applied below.
+                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                } else if stmt_position {
+                    // The block body evaluates in a CHILD env seeded from the
+                    // outer one (uses inside the block are recorded there) …
+                    let pre = tenv.clone();
+                    let mut btenv = tenv.clone();
+                    self.coll_flow_scope(ast, &block_body, &mut btenv, ctx, interner, out, true);
+                    // … then every write the call span contains widens (a block
+                    // REBIND of a captured local is visible outside and kills the
+                    // carrier — probe m15) …
+                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    // … and finally `widen_after_block` (`mutation_widening.rb:144`)
+                    // re-applies the mutations. That routine is a SYNTACTIC walk
+                    // of the block body against the OUTER scope, NOT a join of the
+                    // block's evaluated scope: its own doc names `arr.push(x) if
+                    // cond` as a case it catches, so a branch-contained mutation
+                    // inside a block still widens the outer binding (which is why
+                    // the gitlab jira-tracker / ddl-lock rows fire in the
+                    // reference). We mirror it exactly, off the PRE-call carriers.
+                    for (name, cls) in self.coll_block_mutations(ast, &block_body, &pre, interner) {
+                        if !rebound_within(ctx.rebinds, call_span, &name) {
+                            if let Some(ty) = self.coll_nominal(interner, cls) {
+                                tenv.insert(name, ty);
+                            }
+                        }
+                    }
+                } else {
+                    // Expression-position block: no descent (the position rule),
+                    // and every contained write widens.
+                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                }
+                // Keep-nominal widening — unless something inside the call
+                // REBOUND the same local (`output << (output = x)`).
+                if let Some((name, cls)) = widened {
+                    if !rebound_within(ctx.rebinds, call_span, &name) {
+                        if let Some(ty) = self.coll_nominal(interner, cls) {
+                            tenv.insert(name, ty);
+                        }
+                    }
+                }
+            }
+            // `&&`/`||` — the RHS may not execute, so its effects are unmodeled:
+            // evaluate both sides on a THROWAWAY env (uses are still recorded
+            // against the pre-logical bindings) and widen every contained write.
+            Node::Logical { left, right, span, .. } => {
+                let (left, right, lspan) = (*left, *right, *span);
+                let mut scratch = tenv.clone();
+                self.coll_flow_expr(ast, left, &mut scratch, ctx, interner, out, false);
+                self.coll_flow_expr(ast, right, &mut scratch, ctx, interner, out, false);
+                widen_flow_writes(ctx.writes, lspan, tenv, interner);
+            }
+            Node::LocalVariableWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                // The RHS reads the PRE-write binding; an assignment RHS keeps
+                // the statement's own position (the narrowing pass's probe p1).
+                self.coll_flow_expr(ast, value, tenv, ctx, interner, out, stmt_position);
+                let vty = self.type_of(ast, value, tenv, interner);
+                tenv.insert(name, vty);
+            }
+            Node::MultiWrite { targets, value, .. } => {
+                let (targets, value) = (targets.clone(), *value);
+                self.coll_flow_expr(ast, value, tenv, ctx, interner, out, stmt_position);
+                let rhs = self.type_of(ast, value, tenv, interner);
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    tenv.insert(name, ty);
+                }
+            }
+            // Op-writes (`output += [1]`) are unmodeled — the reference folds
+            // `Tuple + Tuple` and keeps the literal shape (probe m16); mirroring
+            // that fold is coverage, not FP-safety, so the target widens.
+            Node::LocalVariableOpWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                self.coll_flow_expr(ast, value, tenv, ctx, interner, out, false);
+                let u = interner.untyped();
+                tenv.insert(name, u);
+            }
+            Node::If { .. } => {
+                self.coll_flow_if(ast, id, tenv, ctx, interner, out, false);
+            }
+            Node::Case { .. } => {
+                self.coll_flow_case(ast, id, tenv, ctx, interner, out, stmt_position);
+            }
+            // Every other expression kind is unmodeled: bind nothing, and widen
+            // every write its span contains (a mutation buried in an array
+            // literal, an interpolation, a pattern, …).
+            other => {
+                let span = other.span();
+                widen_flow_writes(ctx.writes, span, tenv, interner);
+            }
+        }
+    }
+
+    /// Thread one `if`/`unless`/ternary. The two edges run on clones of the
+    /// pre-conditional env and are joined by IDENTICAL `TypeId` only
+    /// ([`join_flow_envs`]) — the mirror of the reference's `Scope#join` union
+    /// plus `receiver_descriptor`'s missing `Type::Union` arm (probes m18/m20
+    /// silent, m01/m19 fire).
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_if(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+        stmt_position: bool,
+    ) {
+        let Node::If { predicate, then_body, else_body, is_unless, .. } = ast.get(id) else {
+            return;
+        };
+        let (predicate, is_unless) = (*predicate, *is_unless);
+        let (then_body, else_body) = (then_body.clone(), else_body.clone());
+        // The predicate evaluates first, in the pre-conditional bindings.
+        self.coll_flow_expr(ast, predicate, tenv, ctx, interner, out, false);
+        let (truthy, falsey) =
+            if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
+        let mut t = tenv.clone();
+        self.coll_flow_scope(ast, truthy, &mut t, ctx, interner, out, stmt_position);
+        let mut f = tenv.clone();
+        self.coll_flow_scope(ast, falsey, &mut f, ctx, interner, out, stmt_position);
+        *tenv = join_flow_envs(&t, &f, interner);
+    }
+
+    /// Thread one `case`/`when`. Every clause body runs on a clone of the
+    /// pre-`case` env and all of them are joined together WITH the pre-`case` env
+    /// (the implicit no-match path) — so a clause-contained mutation on a
+    /// not-yet-widened seed widens to untyped (m18), while a pre-widened nominal
+    /// survives every arm (m19). A `case`/`in` pattern carrier is unmodeled: the
+    /// whole construct's writes widen and nothing is threaded.
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_case(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+        stmt_position: bool,
+    ) {
+        let Node::Case { predicate, branches, else_body, span } = ast.get(id) else {
+            return;
+        };
+        let (predicate, case_span) = (*predicate, *span);
+        let (branches, else_body) = (branches.clone(), else_body.clone());
+        if let Some(p) = predicate {
+            self.coll_flow_expr(ast, p, tenv, ctx, interner, out, false);
+        }
+        // The no-match path: the pre-`case` bindings, unchanged.
+        let mut acc = tenv.clone();
+        for br in branches {
+            let Node::When { conditions, body, .. } = ast.get(br) else {
+                // `case`/`in` pattern carrier — unmodeled, no descent.
+                widen_flow_writes(ctx.writes, case_span, tenv, interner);
+                return;
+            };
+            let (conditions, body) = (conditions.clone(), body.clone());
+            let mut t = tenv.clone();
+            for &cond in &conditions {
+                self.coll_flow_expr(ast, cond, &mut t, ctx, interner, out, false);
+            }
+            self.coll_flow_scope(ast, &body, &mut t, ctx, interner, out, stmt_position);
+            acc = join_flow_envs(&acc, &t, interner);
+        }
+        let mut e = tenv.clone();
+        self.coll_flow_scope(ast, &else_body, &mut e, ctx, interner, out, stmt_position);
+        *tenv = join_flow_envs(&acc, &e, interner);
+    }
+
+    /// The collection class a receiver carrier projects to, or `None`. Mirrors
+    /// the reference's `receiver_descriptor` (`rbs_dispatch.rb:209-212`): a
+    /// `Tuple` dispatches as `Array` and a `HashShape` as `Hash`, and a kept
+    /// `Nominal[Array|Hash]` (mutator-widened or tier-folded) dispatches as
+    /// itself. Every other carrier — including a `Union` — declines.
+    fn coll_carrier(&self, interner: &Interner, ty: TypeId) -> Option<&'static str> {
+        match interner.get(ty) {
+            Type::Tuple(_) => Some("Array"),
+            Type::HashShape(_) => Some("Hash"),
+            Type::Nominal { .. } => self.coll_nominal_carrier(interner, ty),
+            _ => None,
+        }
+    }
+
+    /// As [`Typer::coll_carrier`], restricted to a genuine `Nominal[Array|Hash]`
+    /// (what a block body may propagate outwards).
+    fn coll_nominal_carrier(&self, interner: &Interner, ty: TypeId) -> Option<&'static str> {
+        let Type::Nominal { class, .. } = interner.get(ty) else {
+            return None;
+        };
+        ["Array", "Hash"].into_iter().find(|name| self.index.class_id(name) == Some(*class))
+    }
+
+    /// The reference's `MutationWidening::widen_for_mutator`
+    /// (`reference/rigor/lib/rigor/inference/mutation_widening.rb:209`) as this
+    /// pass needs it: the collection class the receiver local carries AFTER the
+    /// mutation, or `None` when nothing survives.
+    ///
+    /// - `Tuple` + an ARRAY mutator ⇒ `"Array"` (`widen_tuple:251` — the nominal
+    ///   is KEPT, which is the whole slice); `HashShape` + a HASH mutator ⇒
+    ///   `"Hash"` (`widen_hash_shape:265`).
+    /// - An already-widened `Nominal[Array|Hash]` under a mutator of ITS OWN
+    ///   table has "no precision to lose" — the reference leaves the scope
+    ///   untouched, so we re-assert the same nominal (the caller widens the whole
+    ///   call span first, and this is what survives it: probes m01/m03/m17, where
+    ///   the SECOND and later mutations run on an already-nominal carrier).
+    /// - Everything else declines: the tables are per-shape and NOT their union
+    ///   (a Hash-only mutator on a Tuple is a no-op), and a non-shape carrier
+    ///   never MINTS a binding (probes m08/m13, and the bucket-E `[]=`-on-a-
+    ///   String rows we must not mirror).
+    fn coll_widen_for_mutator(
+        &self,
+        interner: &Interner,
+        ty: TypeId,
+        method: &str,
+    ) -> Option<&'static str> {
+        match interner.get(ty) {
+            Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => Some("Array"),
+            Type::HashShape(_) if HASH_MUTATORS.contains(&method) => Some("Hash"),
+            Type::Nominal { .. } => match self.coll_nominal_carrier(interner, ty)? {
+                "Array" if ARRAY_MUTATORS.contains(&method) => Some("Array"),
+                "Hash" if HASH_MUTATORS.contains(&method) => Some("Hash"),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// The reference's `walk_for_outer_mutations` (`mutation_widening.rb:153`)
+    /// over one block body: every `local.<mutator>(…)` call in the body's SPAN —
+    /// nested blocks included, exactly as the reference recurses — applied in
+    /// source order against the carriers `pre` held at the call. Returns the
+    /// final `local -> "Array"|"Hash"` widenings.
+    ///
+    /// This is a SYNTACTIC walk on purpose. The reference does not join the
+    /// block's evaluated scope here; it rewrites the outer scope directly, so a
+    /// branch-contained mutation inside a block (`arr.push(x) if cond`, named in
+    /// its own doc comment) still widens the outer binding — unlike the
+    /// branch-contained mutation of probes m18/m20, which lives in the METHOD
+    /// body and does go through `Scope#join`.
+    ///
+    /// The one piece we cannot mirror is Prism's `depth` capture check
+    /// (`widen_for_outer_receiver:175`): the lowered AST has no block-parameter
+    /// list, so a block param SHADOWING an outer local (`xs.each { |output| … }`)
+    /// widens the outer binding here where the reference leaves it alone. That is
+    /// FP-neutral by construction — the widening only ever rewrites `Tuple` to
+    /// `Nominal[Array]` (or `HashShape` to `Nominal[Hash]`), and both project to
+    /// the SAME dispatch class (`receiver_descriptor:209`), so no use site can
+    /// change its recorded class because of it.
+    fn coll_block_mutations(
+        &self,
+        ast: &LoweredAst,
+        block_body: &[NodeId],
+        pre: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<(String, &'static str)> {
+        let Some(body_span) = span_hull(ast, block_body) else {
+            return Vec::new();
+        };
+        let mut carriers: HashMap<String, TypeId> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut hits: Vec<(rigor_parse::Span, String, String)> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::Call { receiver: Some(r), method, safe_nav: false, span, .. }
+                    if body_span.0 <= span.0 && span.1 <= body_span.1 =>
+                {
+                    match ast.get(*r) {
+                        Node::LocalVariableRead { name, .. } => {
+                            Some((*span, name.clone(), method.clone()))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        hits.sort_by_key(|(s, _, _)| *s);
+        for (_, name, method) in hits {
+            let Some(&cur) = carriers.get(&name).or_else(|| pre.get(&name)) else {
+                continue;
+            };
+            let Some(cls) = self.coll_widen_for_mutator(interner, cur, &method) else {
+                continue;
+            };
+            let Some(ty) = self.coll_nominal(interner, cls) else {
+                continue;
+            };
+            if carriers.insert(name.clone(), ty).is_none() {
+                order.push(name);
+            }
+        }
+        order
+            .into_iter()
+            .filter_map(|name| {
+                let ty = *carriers.get(&name)?;
+                Some((name, self.coll_nominal_carrier(interner, ty)?))
+            })
+            .collect()
+    }
+
+    /// The bare `Nominal[C]` carrier for `"Array"` / `"Hash"`. Elements are NOT
+    /// tracked (`args: vec![]`): undefined-method witnessing is a class-only
+    /// lookup, and the reference's own widening fixes an empty seed's elements
+    /// at `untyped` on the first mutation anyway (`widen_tuple`, `:251`).
+    fn coll_nominal(&self, interner: &mut Interner, class_name: &str) -> Option<TypeId> {
+        let class = self.index.class_id(class_name)?;
+        Some(interner.intern(Type::Nominal { class, args: vec![] }))
+    }
+}
+
+/// The per-program write tables the collection-shape walker threads (bundled to
+/// keep the recursive walkers' signatures under the clippy argument limit).
+struct CollCtx<'a> {
+    /// [`collect_flow_writes`] + [`indexed_flow_writes`] — rebinds AND in-place
+    /// mutations, the conservative widening set.
+    writes: &'a [(rigor_parse::Span, String)],
+    /// REBINDS only (no mutator entries) — used to veto the keep-nominal
+    /// widening when the call that mutates also reassigns the same local.
+    rebinds: &'a [(rigor_parse::Span, String)],
+}
+
+/// Whether `name` is REBOUND (not merely mutated) somewhere inside `span`.
+fn rebound_within(
+    rebinds: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+    name: &str,
+) -> bool {
+    rebinds.iter().any(|(ws, n)| n == name && span.0 <= ws.0 && ws.1 <= span.1)
+}
+
+/// The smallest span covering every node in `ids`, or `None` when empty.
+fn span_hull(ast: &LoweredAst, ids: &[NodeId]) -> Option<rigor_parse::Span> {
+    let mut it = ids.iter().map(|&id| ast.get(id).span());
+    let first = it.next()?;
+    Some(it.fold(first, |acc, s| (acc.0.min(s.0), acc.1.max(s.1))))
+}
+
+/// `reference/rigor/lib/rigor/inference/mutation_widening.rb:70` verbatim.
+const ARRAY_MUTATORS: &[&str] = &[
+    "<<", "push", "append", "prepend", "unshift", "concat", "insert", "pop", "shift", "delete",
+    "delete_at", "delete_if", "reject!", "clear", "compact!", "replace", "fill", "[]=", "map!",
+    "collect!", "select!", "filter!", "keep_if", "uniq!", "flatten!", "sort!", "sort_by!",
+    "reverse!", "rotate!", "shuffle!", "slice!",
+];
+
+/// `reference/rigor/lib/rigor/inference/mutation_widening.rb:82` verbatim.
+const HASH_MUTATORS: &[&str] = &[
+    "[]=", "store", "delete", "delete_if", "reject!", "select!", "filter!", "keep_if", "clear",
+    "compact!", "merge!", "update", "transform_keys!", "transform_values!", "replace",
+];
+
+/// The REBIND half of [`collect_flow_writes`] — local assignments only, with the
+/// in-place-mutation entries left out. The collection-shape pass needs the two
+/// apart: a mutation KEEPS the nominal while a rebind kills it, and the merged
+/// table cannot tell them apart.
+fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    ast.iter()
+        .flat_map(|(_, n)| match n {
+            Node::LocalVariableWrite { name, span, .. }
+            | Node::LocalVariableOpWrite { name, span, .. } => vec![(*span, name.clone())],
+            Node::MultiWrite { targets, span, .. } => targets
+                .bound_names()
+                .into_iter()
+                .map(|(name, _)| (*span, name))
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// Whether a branch body's final statement terminates the enclosing method — a
@@ -5314,5 +5886,351 @@ mod class_narrowing_tests {
             b"def f(value)\n  case value\n  when Hash\n    [1].each { |_i| value.frobnicate_zzz }\n  end\nend\n",
         );
         assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Collection-shape receiver survival (stage 1) — the oracle probe matrix
+// m01-m20 of docs/notes/20260807-collection-shape-slice-spec.md. The SILENT
+// rows are the FP-safety envelope, not coverage bookkeeping: each one is a
+// shape the reference itself declines on (m04/m05/m08/m13/m15/m18/m20) or a
+// deliberate coverage give-up (m16 op-writes, `while`, ivars, safe-nav).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod collection_shape_tests {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    /// The collection-shape snapshot map for `src`, wired exactly as the analyze
+    /// pass wires it (per-file source index + lexical scopes).
+    fn coll_snaps(src: &[u8]) -> (LoweredAst, HashMap<NodeId, &'static str>) {
+        let ast = lower(&parse(src));
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let scopes = lexical_scopes(&ast);
+        let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let snaps = typer.collection_shape_snapshots(&ast, &mut i);
+        (ast, snaps)
+    }
+
+    /// The node id of the first call named `method`, or panic.
+    fn call_named(ast: &LoweredAst, method: &str) -> NodeId {
+        ast.iter()
+            .find_map(|(id, n)| match n {
+                Node::Call { method: m, .. } if m == method => Some(id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("call `{method}` present"))
+    }
+
+    fn snap(src: &[u8], method: &str) -> Option<&'static str> {
+        let (ast, snaps) = coll_snaps(src);
+        snaps.get(&call_named(&ast, method)).copied()
+    }
+
+    // --- FIRES ------------------------------------------------------------
+
+    /// m01: straight-line `<<` widens the seed to `Array`, and the branch-
+    /// contained mutation that follows joins IDENTICALLY (both edges already
+    /// `Nominal[Array]`), so the use after the `if` still dispatches on Array.
+    #[test]
+    fn coll_m01_straight_line_then_branch_mutation_fires() {
+        assert_eq!(
+            snap(
+                b"def f(c)\n  output = []\n  output << 'a'\n  output << 'b' if c\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Array"),
+        );
+    }
+
+    /// m02: a block-contained `<<` on a captured local REPLACES the outer
+    /// binding (`widen_after_block`) — an unmutated seed is enough.
+    #[test]
+    fn coll_m02_each_block_mutation_fires() {
+        assert_eq!(
+            snap(
+                b"def f(xs)\n  output = []\n  xs.each do |x|\n    output << x\n  end\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Array"),
+        );
+    }
+
+    /// m02b: the mutation inside the block is itself BRANCH-contained. The
+    /// reference's `widen_after_block` is a syntactic walk against the outer
+    /// scope (its doc names `arr.push(x) if cond`), so this still fires — unlike
+    /// the same shape in the METHOD body (m20), which goes through `Scope#join`.
+    /// The gitlab jira-tracker / ddl-lock survey rows have exactly this shape.
+    #[test]
+    fn coll_m02b_branch_contained_block_mutation_fires() {
+        assert_eq!(
+            snap(
+                b"def f(xs, c)\n  output = []\n  xs.each do |x|\n    if c\n      output << x\n    end\n  end\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Array"),
+        );
+        // …and the modifier form behind a `next` guard (the ddl-lock row).
+        assert_eq!(
+            snap(
+                b"def f(xs)\n  output = []\n  xs.each do |x|\n    next if x.nil?\n\n    output << x if x\n  end\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Array"),
+        );
+    }
+
+    /// A block-local seed must not leak outwards: only a local ALREADY carrying
+    /// a collection at the call can widen.
+    #[test]
+    fn coll_block_mutation_needs_outer_carrier() {
+        assert_eq!(
+            snap(
+                b"def f(xs)\n  xs.each do |x|\n    inner = []\n    inner << x\n  end\n  inner.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m03: `[]=` on a `{}` seed widens to `Hash` and STAYS Hash across further
+    /// index assignments (the already-nominal carrier re-asserts itself).
+    #[test]
+    fn coll_m03_hash_index_assign_fires() {
+        assert_eq!(
+            snap(
+                b"def f(v)\n  project = {}\n  project[:a] = v\n  project[:b] = v\n  project.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Hash"),
+        );
+    }
+
+    /// m06: no alias tracking — `b = a; b << 1` widens only `b`; `a` keeps its
+    /// `Tuple[]`, which dispatches as Array all the same
+    /// (`receiver_descriptor:209`). BOTH uses fire.
+    #[test]
+    fn coll_m06_alias_both_locals_fire() {
+        let (ast, snaps) =
+            coll_snaps(b"def f\n  a = []\n  b = a\n  b << 1\n  a.first_zzz\n  b.second_zzz\nend\n");
+        assert_eq!(snaps.get(&call_named(&ast, "first_zzz")).copied(), Some("Array"));
+        assert_eq!(snaps.get(&call_named(&ast, "second_zzz")).copied(), Some("Array"));
+    }
+
+    /// m07: an escape into an UNRESOLVED callee does not widen (the reference
+    /// does not model unknown-callee mutation either).
+    #[test]
+    fn coll_m07_unknown_callee_escape_fires() {
+        assert_eq!(
+            snap(
+                b"def f\n  output = []\n  output << 'a'\n  helper_zzz(output)\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Array"),
+        );
+    }
+
+    /// m14: a multi-write seeds each target with its own `Tuple[]`; mutating one
+    /// leaves the other a bare Tuple. Both dispatch as Array.
+    #[test]
+    fn coll_m14_multi_write_seeds_both_fire() {
+        let (ast, snaps) =
+            coll_snaps(b"def f\n  a, b = [], []\n  a << 1\n  a.first_zzz\n  b.second_zzz\nend\n");
+        assert_eq!(snaps.get(&call_named(&ast, "first_zzz")).copied(), Some("Array"));
+        assert_eq!(snaps.get(&call_named(&ast, "second_zzz")).copied(), Some("Array"));
+    }
+
+    /// m17: `push` then `concat` — a chain of mutators all keeps the nominal.
+    #[test]
+    fn coll_m17_push_then_concat_fires() {
+        assert_eq!(
+            snap(
+                b"def f(xs)\n  output = []\n  output.push('a')\n  output.concat(xs)\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Array"),
+        );
+    }
+
+    /// m19: straight-line widening BEFORE a `case` makes every clause's join
+    /// edge agree, so the use after the `case` still dispatches on Array. This
+    /// is the exact contrast with m18 below.
+    #[test]
+    fn coll_m19_prewidened_case_mutation_fires() {
+        assert_eq!(
+            snap(
+                b"def f(x)\n  output = []\n  output << 'a'\n  case x\n  when 1 then output << 'b'\n  when 2 then output << 'c'\n  end\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            Some("Array"),
+        );
+    }
+
+    /// A plain literal seed with NO mutation at all still dispatches as Array /
+    /// Hash inside a `def` body (`Tuple`/`HashShape` project to the collection
+    /// descriptor) — the base case the mutation rows build on.
+    #[test]
+    fn coll_bare_literal_seed_fires() {
+        assert_eq!(
+            snap(b"def f\n  output = [1, 2]\n  output.frobnicate_zzz\nend\n", "frobnicate_zzz"),
+            Some("Array"),
+        );
+        assert_eq!(
+            snap(b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz\nend\n", "frobnicate_zzz"),
+            Some("Hash"),
+        );
+    }
+
+    // --- SILENT (the FP-safety envelope) ----------------------------------
+
+    /// m04: a straight-line rebind kills the carrier.
+    #[test]
+    fn coll_m04_rebind_silent() {
+        assert_eq!(
+            snap(
+                b"def f(x)\n  output = []\n  output << 'a'\n  output = x\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m05: a BRANCH rebind kills it too — the join sees two different carriers.
+    #[test]
+    fn coll_m05_branch_rebind_silent() {
+        assert_eq!(
+            snap(
+                b"def f(x, c)\n  output = []\n  output << 'a'\n  output = x if c\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m08: a Dynamic (parameter) seed is never MINTED into a collection by a
+    /// mutation — the decline that keeps us out of the reference's own
+    /// runtime-wrong `[]=`-on-a-String rows (bucket E, probe c12).
+    #[test]
+    fn coll_m08_param_seed_silent() {
+        assert_eq!(snap(b"def f(a)\n  a << 1\n  a.frobnicate_zzz\nend\n", "frobnicate_zzz"), None);
+    }
+
+    /// m13: same, for a local bound to a Dynamic value.
+    #[test]
+    fn coll_m13_dynamic_carrier_mutation_silent() {
+        assert_eq!(
+            snap(
+                b"def f(x)\n  output = x\n  output << 1\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m15: a REBIND inside a block body kills the outer carrier (only a kept
+    /// nominal ever propagates out of a block).
+    #[test]
+    fn coll_m15_block_rebind_silent() {
+        assert_eq!(
+            snap(
+                b"def f(xs)\n  output = []\n  output << 'a'\n  xs.each { |_x| output = nil }\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m18 — LOAD-BEARING: a `case`-contained mutation on a NOT-yet-widened seed
+    /// leaves `Tuple[] | Array[…]` after the reference's `Scope#join`, and
+    /// `receiver_descriptor` has no `Type::Union` arm, so the reference is
+    /// SILENT. We must never model that union.
+    #[test]
+    fn coll_m18_unwidened_case_mutation_silent() {
+        assert_eq!(
+            snap(
+                b"def f(x)\n  output = []\n  case x\n  when 1 then output << 'a'\n  when 2 then output << 'b'\n  end\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m20 — LOAD-BEARING, the `if` twin of m18.
+    #[test]
+    fn coll_m20_unwidened_if_mutation_silent() {
+        assert_eq!(
+            snap(
+                b"def f(c)\n  output = []\n  output << 'a' if c\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m16: an op-write (`output += [1]`) FIRES in the reference (the `Tuple +
+    /// Tuple` fold keeps the literal shape) — a deliberate coverage give-up
+    /// here, per §5.5 of the spec. Pinned so the give-up stays visible.
+    #[test]
+    fn coll_m16_op_write_silent_coverage_giveup() {
+        assert_eq!(
+            snap(
+                b"def f\n  output = []\n  output += [1]\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// m09 / bucket B: an IVAR carrier is never typed by this slice (the
+    /// reference DOES fire cross-method; that substrate is its own future
+    /// slice).
+    #[test]
+    fn coll_ivar_carrier_silent() {
+        assert_eq!(
+            snap(
+                b"class K\n  def g\n    @h = {}\n    @h[:a] = 1\n    @h.frobnicate_zzz\n  end\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// Safe-nav dispatch is outside the envelope on BOTH sides: a `&.` mutation
+    /// widens nothing and a `&.` use records nothing.
+    #[test]
+    fn coll_safe_nav_silent() {
+        assert_eq!(
+            snap(
+                b"def f\n  output = []\n  output << 'a'\n  output&.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// `while`/`until` bodies are unmodeled (the reference fires — probe m10 —
+    /// but its `break`/`next` join edges are unprobed, so stage 1 declines).
+    #[test]
+    fn coll_while_loop_silent() {
+        assert_eq!(
+            snap(
+                b"def f(c)\n  output = []\n  while c\n    output << 1\n  end\n  output.frobnicate_zzz\nend\n",
+                "frobnicate_zzz",
+            ),
+            None,
+        );
+    }
+
+    /// A `def` body is an INDEPENDENT local scope: a top-level seed never leaks
+    /// into it.
+    #[test]
+    fn coll_def_body_scope_isolation_silent() {
+        assert_eq!(
+            snap(b"output = []\ndef f\n  output.frobnicate_zzz\nend\n", "frobnicate_zzz"),
+            None,
+        );
     }
 }
