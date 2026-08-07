@@ -119,30 +119,36 @@ decline. The row this note predicted would open, gitlab-foss
 (`safe_constantize` is a Rails method) — the prediction was wrong, not the
 accounting.
 
-## Still open: a DIFFERENT FP family the audit turned up
+## The DIFFERENT FP family the audit turned up — now closed
+<!-- follow-up: docs/notes/20260808-disjoint-guard-suppression.md -->
 
-Three probes are still reference-silent / rigor-rs-firing, and they are not
-carrier-fidelity at all — the narrowing map is not involved:
 
-```ruby
-def f
-  h = [1, 2]
-  h.is_a?(Hash) ? h.frobnicate_zzz : h   # rs: "for Array"; reference: silent
-end
-```
+Three probes here were reference-silent / rigor-rs-firing for the opposite
+reason: rigor-rs had the PRECISE carrier and the reference the narrower one
+(`Bot`). Closed in
+[the disjoint-guard suppression slice](20260808-disjoint-guard-suppression.md),
+with 180 oracle rows. Three corrections this note got wrong, worth carrying:
 
-Here rigor-rs has the PRECISE carrier and the reference has the narrower one:
-`narrow_nominal_to_class` on a disjoint class yields `Bot`, so the reference
-silences the whole truthy branch, while rigor-rs never narrows a Nominal and
-the ordinary `check_call` path keeps firing on the pre-guard carrier.
-Reproduced by `disj_arraylit`, `disj_splat` (`h = *spec`) and
-`disj_arraylit_case`. `disj_strlit`/`disj_new` are silent on both only because
-those carriers do not witness anyway.
+- **The mechanism is not (only) `narrow_nominal_to_class`.** The reference
+  types `[1, 2]` as a `Tuple`, so the archetype routes through
+  `narrow_shape_to_class`, whose collapse condition is
+  `!subclass_of?("Array", guard)` — TRUE on an unresolvable guard class as
+  well as a disjoint one. The nominal path collapses only on `:disjoint`. Same
+  visible FP, two different rules, and the difference decides how far a fix can
+  reach.
+- **The branch is not silenced.** Only the guarded local's own calls are: a
+  call on another local in the same branch, and a call nested in the suppressed
+  call's ARGUMENTS, both still fire on the reference.
+- **It is not one rule.** Every receiver-driven rule goes silent through
+  `Bot` — measured for `undefined-method`, `wrong-arity`,
+  `argument-type-mismatch`, `raise-non-exception`, `possible-nil-receiver`.
+  rigor-rs happens to witness only the first through a local carrier today, so
+  the suppression skips the whole call site rather than one rule.
 
-The fix is a SUPPRESSION in the rules layer (a use of a local under an
-`is_a?(C)` guard whose carrier is disjoint from `C` emits nothing), which is
-sound by construction but is a different mechanism, a different consumer and a
-different gate profile from this slice. It wants its own slice.
+`instance_of?` turned out to be the widest arm and was not probed here at all:
+the reference's `exact:` path returns `Bot` on ANY name mismatch, so
+`h = [1, 2]; h.instance_of?(Enumerable)` is silent even though Array IS
+Enumerable.
 
 ## The substrate fix, recommended
 
