@@ -152,3 +152,29 @@ broadly; stage 1 deliberately wires `check_call` only.
   ZERO new FP rows. Report the exact closed-row count vs the 57-row
   candidate list (the window heuristic overcounts; a shortfall is a finding,
   not a failure).
+
+## Outcome (2026-08-07, PR #63)
+
+Built to spec in 5 commits (arena `Node::When` split landed arena-only and
+gate-verified byte-identical before narrowing rode it). **11 gap closures**
+(census 1193 → 1182; 9 gitlab-foss/lib + 2 mastodon `Hash#deep_transform_keys!`
+archetype rows, all inside the 57-candidate list — the 8-line window
+overcounted as predicted; the remaining 46 sit in unmodeled constructs, block
+bodies and op-write RHS). All gates green: harness 246/252 matched / 0
+unregistered extras, sweep **0 FP / 9204 files**, fresh-target clippy clean.
+
+Two findings beyond the spec:
+
+- **Safe-nav block bodies: the reference is internally INCONSISTENT.** It is
+  silent on a guard narrowed inside `h&.transform_values do … end&.compact`
+  (the sweep caught rigor-rs firing there — gitlab
+  `relation_tree_restorer.rb:215`, fixed mid-build by declining all block-body
+  descent under safe-nav) yet fires inside `spec[:rules]&.map { … }`
+  (`base_input.rb:97` — one candidate row deliberately given up). The uniform
+  decline is the FP-safe subset. Follow-up: a safe-nav block probe matrix
+  before anyone chases that row; possibly upstream-feedback material.
+- **Adversarial review round closed 3 UNPROBED edges as declines** (each with
+  a regression test): expression-position writes now thread immediately
+  (`f(v = x, v.zzz)` sibling-arg staleness), early-return propagation is
+  statement-position-only, and a nested CONFLICTING guard (`is_a?(Hash)` then
+  `is_a?(String)`, reference reaches `Bot`) removes the fact entirely.
