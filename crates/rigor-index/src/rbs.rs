@@ -167,6 +167,7 @@ fn mark_unbuildable_definitions(
             entry.method_overloads.clear();
             entry.overloading_method_overloads.clear();
             entry.block_returns.clear();
+            entry.block_free_returns.clear();
             entry.void_methods.clear();
             entry.aliases.clear();
         }
@@ -176,6 +177,7 @@ fn mark_unbuildable_definitions(
             entry.singleton_tuple_returns.clear();
             entry.singleton_method_overloads.clear();
             entry.overloading_singleton_overloads.clear();
+            entry.singleton_block_free_returns.clear();
             entry.void_singleton_methods.clear();
             entry.singleton_aliases.clear();
         }
@@ -489,6 +491,25 @@ struct ClassEntry {
     /// overload, or whose block overload returns a generic/union/void/unknown
     /// shape, are simply absent here (⇒ the block call stays Dynamic / silent).
     block_returns: HashMap<&'static str, &'static str>,
+    /// Collection-shape stage 2a/2c: `method name -> the return class agreed by
+    /// the BLOCK-FREE overloads alone`, populated ONLY for methods that declare
+    /// BOTH a block-bearing and a block-free overload — i.e. exactly the set the
+    /// flat `methods` return slot can lose to the block overload's divergent
+    /// return. `String#split: (…) -> Array[String] | (…) { … } -> self` and
+    /// `Dir.glob: (…) -> Array[String] | (…) { … } -> nil` are the archetypes:
+    /// the flat slot collapses to `None` (⇒ Dynamic) even though a BLOCK-FREE
+    /// call site unambiguously yields `Array`.
+    ///
+    /// Read ONLY from the block-free call path
+    /// ([`CoreData::method_return_block_free`]), mirroring the reference's
+    /// `OverloadSelector` with `block_required: false` — a block call still rides
+    /// `block_returns`. Only a bare concrete `ClassInstanceType` return is
+    /// recorded, and every block-free overload must agree; `self`/`instance`/
+    /// nilable/`void`/union/generic returns and any disagreement are simply
+    /// absent (⇒ the existing Dynamic decline, zero-FP).
+    block_free_returns: HashMap<&'static str, &'static str>,
+    /// The singleton twin of `block_free_returns` (`Dir.glob`, `Dir.[]`).
+    singleton_block_free_returns: HashMap<&'static str, &'static str>,
     /// Singleton (class-level) methods `def self.x` (and the singleton half of
     /// `def self?.x`). Keyed by name -> `(resolved return class, arity envelope)`.
     /// The singleton class inherits down the SUPERCLASS chain, so resolving a
@@ -636,6 +657,22 @@ pub struct CoreData {
     /// ADR-0042 Slice 1: leaf (short) name -> the qualified keys sharing it.
     /// Backs [`Self::resolve_short_unambiguous`].
     short_to_qualified: HashMap<&'static str, Vec<&'static str>>,
+    /// Collection-shape stage 2b: TOP-LEVEL RBS **object constant**
+    /// declarations — `ENV: RBS::Unnamed::ENVClass`, `ARGV: Array[String]`,
+    /// recorded under the declared type's LEAF name (`ENVClass`), the same short
+    /// key the class tables use —
+    /// `STDOUT: IO` — mapped to the declared type's class name. The whole
+    /// vendored set is 18 declarations; only those whose declared type is a bare
+    /// `ClassInstanceType` are recorded (`CROSS_COMPILING: true?` is not one).
+    ///
+    /// Nested constant declarations (`class Float; INFINITY: Float; end`) are
+    /// deliberately NOT recorded: their name is namespace-relative and the flat
+    /// key would be wrong. First write wins.
+    ///
+    /// Read via [`Self::object_constant_class`] from ONE place — the typer's
+    /// constant-receiver arm, which types the CALL's return, never the constant
+    /// itself. So this adds no new witnessing surface for the constant.
+    object_constants: HashMap<&'static str, &'static str>,
 }
 
 impl CoreData {
@@ -748,6 +785,7 @@ impl CoreData {
             interface_method_names,
             mut qualified,
             short_to_qualified,
+            object_constants,
         ) = builder.finish();
         // 4) Neutralise the classes whose definition the REFERENCE cannot build
         //    (see `UNBUILDABLE_DEFINITIONS`). Applied LAST, after project `sig/`
@@ -766,6 +804,7 @@ impl CoreData {
                 interface_method_names,
                 qualified,
                 short_to_qualified,
+                object_constants,
             };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
@@ -1668,6 +1707,110 @@ impl CoreData {
         } else {
             Some(ret)
         }
+    }
+
+    /// Collection-shape stage 2b: the class an RBS TOP-LEVEL object constant is
+    /// declared to hold (`"ENV"` ⇒ `"RBS::Unnamed::ENVClass"`), or `None`.
+    /// See [`Self::object_constants`] for the recording discipline.
+    pub fn object_constant_class(&self, name: &str) -> Option<&'static str> {
+        self.object_constants.get(name).copied()
+    }
+
+    /// The return class of `class_name#method` **when called WITHOUT a block** —
+    /// the block-free-overloads-only companion of [`Self::method_return`],
+    /// answering only where the flat slot LOSES the return to a divergent block
+    /// overload (`String#split: (…) -> Array[String] | (…) { … } -> self`).
+    ///
+    /// FIRST-DEFINER-WINS, strictly: the walk stops at the first ancestor whose
+    /// `methods` table declares `method`, and answers from THAT entry's
+    /// `block_free_returns` alone — an override with no divergent block overload
+    /// therefore declines instead of inheriting a further ancestor's slot.
+    /// Instance `alias`es are resolved on the same chain, exactly like
+    /// [`Self::lookup_on_chain_depth`].
+    ///
+    /// A NAMESPACED receiver absent from the short map declines (`None`): the
+    /// qualified registry has no twin for this slot, which is a pure under-emit
+    /// (the caller stays Dynamic ⇒ silent), never a wrong answer.
+    pub fn method_return_block_free(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<&'static str> {
+        if !self.classes.contains_key(class_name) {
+            return None;
+        }
+        let (chain, _) = self.ancestors(class_name);
+        self.lookup_block_free_return_on_chain(&chain, method, 0)
+    }
+
+    fn lookup_block_free_return_on_chain(
+        &self,
+        chain: &[&'static str],
+        method: &str,
+        depth: usize,
+    ) -> Option<&'static str> {
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if entry.methods.contains_key(method) {
+                    // First definer: its slot is the only admissible answer.
+                    return entry.block_free_returns.get(method).copied();
+                }
+            }
+        }
+        if depth >= 16 {
+            return None;
+        }
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if let Some(&old) = entry.aliases.get(method) {
+                    if let Some(found) =
+                        self.lookup_block_free_return_on_chain(chain, old, depth + 1)
+                    {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The singleton twin of [`Self::method_return_block_free`] (`Dir.glob`,
+    /// `Dir.[]`), walked over the own superclass chain like
+    /// [`Self::singleton_method_return`]. Singleton aliases resolve through
+    /// their target on the QUERIED class. A namespaced receiver declines.
+    pub fn singleton_method_return_block_free(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<&'static str> {
+        self.singleton_block_free_inner(class_name, method, 0)
+    }
+
+    fn singleton_block_free_inner(
+        &self,
+        class_name: &str,
+        method: &str,
+        depth: usize,
+    ) -> Option<&'static str> {
+        if depth >= 16 {
+            return None;
+        }
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let (&key, entry) = self.classes.get_key_value(name)?;
+            if !seen.insert(key) {
+                return None; // superclass cycle guard.
+            }
+            if entry.singleton_methods.contains_key(method) {
+                return entry.singleton_block_free_returns.get(method).copied();
+            }
+            if let Some(&target) = entry.singleton_aliases.get(method) {
+                return self.singleton_block_free_inner(class_name, target, depth + 1);
+            }
+            cur = entry.superclass;
+        }
+        None
     }
 
     /// Walk the chain for `method`'s block-overload return, resolving instance
@@ -2696,6 +2839,11 @@ impl CoreData {
                     // result typing under the fallback); empty keeps it
                     // conservative ⇒ a block-bearing call stays Dynamic/silent.
                     block_returns: HashMap::new(),
+                    // Likewise no divergent block/block-free overload pairs, so
+                    // the block-free return slots stay empty (⇒ the flat return
+                    // is the only answer under the fallback).
+                    block_free_returns: HashMap::new(),
+                    singleton_block_free_returns: HashMap::new(),
                     // The stub lists `size` directly alongside `length`, so it
                     // needs no alias table; real RBS uses `alias size length`.
                     aliases: HashMap::new(),
@@ -2957,6 +3105,8 @@ impl CoreData {
             // falsely `true`), same as the other ATM-substrate maps above.
             qualified: HashMap::new(),
             short_to_qualified: HashMap::new(),
+            // The stub carries no RBS object-constant declarations.
+            object_constants: HashMap::new(),
         }
     }
 
@@ -3002,6 +3152,7 @@ type BuiltData = (
     HashMap<&'static str, Vec<&'static str>>,
     HashMap<&'static str, ClassEntry>,
     HashMap<&'static str, Vec<&'static str>>,
+    HashMap<&'static str, &'static str>,
 );
 
 /// Accumulates parsed RBS declarations into per-class entries before flattening.
@@ -3046,6 +3197,8 @@ struct Builder {
     /// ambiguous one (2+, e.g. `ERB::Util` and `CGI::Util` both share the leaf
     /// `"Util"`).
     short_to_qualified: HashMap<&'static str, Vec<&'static str>>,
+    /// Collection-shape stage 2b: see [`CoreData::object_constants`].
+    object_constants: HashMap<&'static str, &'static str>,
 }
 
 impl Builder {
@@ -3061,11 +3214,43 @@ impl Builder {
             match decl {
                 Node::Class(c) => self.ingest_class(&c, false, &[], code),
                 Node::Module(m) => self.ingest_module(&m, false, &[], code),
+                // Collection-shape stage 2b: a TOP-LEVEL `ENV: …` object
+                // constant. The nested dispatch (`collect_members`) deliberately
+                // does NOT mirror this — see `CoreData::object_constants`.
+                Node::Constant(c) => self.ingest_object_constant(&c),
                 Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code),
                 Node::Interface(i) => self.ingest_interface(&i),
                 _ => {}
             }
         }
+    }
+
+    /// Collection-shape stage 2b: record a TOP-LEVEL RBS object-constant
+    /// declaration (`ENV: RBS::Unnamed::ENVClass`) as `name -> declared class`.
+    ///
+    /// Only a bare `ClassInstanceType` right-hand side is recorded — a generic
+    /// application keeps just its constructor name (`ARGV: Array[String]` ⇒
+    /// `Array`, which is exactly the erasure every other return slot performs).
+    /// A literal / optional / union / interface type (`CROSS_COMPILING: true?`)
+    /// is skipped, so the map only ever carries a name the class tables can
+    /// resolve. First write wins.
+    fn ingest_object_constant(&mut self, c: &ruby_rbs::node::ConstantNode) {
+        let Some(name) = type_name_str(&c.name()) else {
+            return;
+        };
+        // A namespaced declaration name (`Foo::BAR: ...` written at file level)
+        // is not a bare constant read at a use site; skip it rather than key the
+        // map on a name the typer's `ConstantRead` arm cannot produce.
+        if name.contains("::") {
+            return;
+        }
+        let Node::ClassInstanceType(ci) = c.type_() else {
+            return;
+        };
+        let Some(class) = type_name_str(&ci.name()) else {
+            return;
+        };
+        self.object_constants.entry(name).or_insert(class);
     }
 
     /// Fold one `type X = ...` alias into the global map (ATM substrate). First
@@ -3204,6 +3389,11 @@ impl Builder {
                     let (ret, arity, nilable, ret_instance, ret_self, ret_void) =
                         method_signature(&md);
                     let block_ret = block_overload_return(&md);
+                    // Collection-shape stage 2a/2c: the return the BLOCK-FREE
+                    // overloads alone agree on, recorded only when a block
+                    // overload also exists (otherwise it can add nothing the
+                    // flat slot does not already carry).
+                    let block_free_ret = block_free_overload_return(&md);
                     // The structured TUPLE return the flat `ret` slot above
                     // collapses to `None` (Slice 2 of the MultiWrite substrate).
                     let tuple_ret = tuple_return(&md);
@@ -3251,6 +3441,9 @@ impl Builder {
                         if let Some(br) = block_ret {
                             entry.block_returns.entry(mname).or_insert(br);
                         }
+                        if let Some(bfr) = block_free_ret {
+                            entry.block_free_returns.entry(mname).or_insert(bfr);
+                        }
                         // ATM substrate (Slice 1): retain the per-overload,
                         // per-parameter shapes the merged arity path discards.
                         // First write wins on reopen — EXCEPT an OVERLOADING
@@ -3281,6 +3474,9 @@ impl Builder {
                             entry.singleton_tuple_returns.entry(mname).or_insert(shapes);
                         }
                         entry.singleton_methods.entry(mname).or_insert((ret, arity, ret_instance));
+                        if let Some(bfr) = block_free_ret {
+                            entry.singleton_block_free_returns.entry(mname).or_insert(bfr);
+                        }
                         // ATM substrate: retain the class-method per-overload
                         // shapes so `call.argument-type-mismatch` can check a
                         // `CGI.parse(...)` class-method call site. Overloading
@@ -3439,6 +3635,12 @@ impl Builder {
         for (k, v) in entry.block_returns {
             slot.block_returns.entry(k).or_insert(v);
         }
+        for (k, v) in entry.block_free_returns {
+            slot.block_free_returns.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_block_free_returns {
+            slot.singleton_block_free_returns.entry(k).or_insert(v);
+        }
         for (k, v) in entry.singleton_methods {
             let newly = !slot.singleton_methods.contains_key(k);
             slot.singleton_methods.entry(k).or_insert(v);
@@ -3551,6 +3753,12 @@ impl Builder {
         for (k, v) in entry.block_returns {
             slot.block_returns.entry(k).or_insert(v);
         }
+        for (k, v) in entry.block_free_returns {
+            slot.block_free_returns.entry(k).or_insert(v);
+        }
+        for (k, v) in entry.singleton_block_free_returns {
+            slot.singleton_block_free_returns.entry(k).or_insert(v);
+        }
         for (k, v) in entry.singleton_methods {
             let newly = !slot.singleton_methods.contains_key(k);
             slot.singleton_methods.entry(k).or_insert(v);
@@ -3621,6 +3829,7 @@ impl Builder {
             self.interface_method_names,
             self.qualified,
             self.short_to_qualified,
+            self.object_constants,
         )
     }
 }
@@ -4245,6 +4454,68 @@ fn block_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<&'
         }
     }
     found.flatten()
+}
+
+/// The RETURN class agreed by the method's **block-free** overloads — the
+/// overloads the reference's `OverloadSelector` considers at a call site with NO
+/// block (`block_required: false`). The complement of
+/// [`block_overload_return`], and the fix for the collection-shape stage-2
+/// chain roots: `String#split` and `Dir.glob` both declare a block overload
+/// whose return DIVERGES from the block-free one (`self` / `nil` vs
+/// `Array[String]`), so [`method_signature`]'s all-overloads-agree collapse
+/// drops the return to `None` and a block-free `Dir.glob(...).sort` goes
+/// untyped even though the reference types it `Array[String]`.
+///
+/// Returns `Some(class)` ONLY when
+///
+/// - the method declares AT LEAST ONE block-bearing overload (otherwise the
+///   block-free set IS the full set and this slot can add nothing the flat
+///   return already carries — keeping the map empty there makes the delta
+///   provably scoped to the divergent-block-overload methods);
+/// - at least one block-free overload exists; and
+/// - EVERY block-free overload returns the SAME bare concrete
+///   `ClassInstanceType`.
+///
+/// Anything else — a `self`/`instance`/`void`/nilable/union/generic block-free
+/// return, or a disagreement between two block-free overloads — yields `None`,
+/// i.e. the existing Dynamic decline (zero-FP, the same conservative discipline
+/// as [`method_signature`] and [`block_overload_return`]).
+fn block_free_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<&'static str> {
+    let mut has_block_overload = false;
+    let mut agreed: Option<&'static str> = None;
+    let mut seen_block_free = false;
+    for overload in md.overloads().iter() {
+        let Node::MethodDefinitionOverload(ov) = overload else {
+            continue;
+        };
+        let Node::MethodType(mt) = ov.method_type() else {
+            continue;
+        };
+        if mt.block().is_some() {
+            has_block_overload = true;
+            continue;
+        }
+        let Node::FunctionType(ft) = mt.type_() else {
+            // An untyped function type (`(?) -> untyped`) is not a concrete
+            // class: decline the whole method.
+            return None;
+        };
+        let this_ret = match ft.return_type() {
+            Node::ClassInstanceType(ci) => type_name_str(&ci.name()),
+            _ => None,
+        };
+        let this_ret = this_ret?;
+        match agreed {
+            None if !seen_block_free => agreed = Some(this_ret),
+            Some(prev) if prev == this_ret => {}
+            _ => return None,
+        }
+        seen_block_free = true;
+    }
+    if !has_block_overload || !seen_block_free {
+        return None;
+    }
+    agreed
 }
 
 /// Intern a `&str` to a `&'static str` by leaking, deduplicated through a
@@ -5280,5 +5551,126 @@ mod qualified_project_sig_tests {
         assert!(idx.qualified_class_has_method("Outer::Inner", "spin"));
         assert!(!idx.qualified_class_has_method("Outer::Inner", "spni"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod collection_shape_stage2_tests {
+    use super::*;
+
+    /// Stage 2a/2c — the BLOCK-FREE return slot. `String#split` and `Dir.glob`
+    /// each declare a block overload whose return DIVERGES from the block-free
+    /// one (`-> self` / `-> nil` vs `-> Array[String]`), so the flat
+    /// all-overloads-agree slot collapses to `None`; the block-free slot answers
+    /// `Array` for exactly those.
+    #[test]
+    fn block_free_return_answers_where_the_flat_slot_collapses() {
+        let idx = CoreData::load();
+        if !idx.knows_class("String") || !idx.knows_class("Dir") {
+            return;
+        }
+        // Instance side (probe c08b's chain root).
+        assert_eq!(idx.method_return("String", "split"), None);
+        assert_eq!(idx.method_return_block_free("String", "split"), Some("Array"));
+        // Singleton side (probe c02's chain root).
+        assert_eq!(idx.singleton_method_return("Dir", "glob"), None);
+        assert_eq!(idx.singleton_method_return_block_free("Dir", "glob"), Some("Array"));
+    }
+
+    /// The slot is EMPTY for a method with no block overload — the flat return
+    /// is the only answer there, so the new path adds nothing and cannot change
+    /// an existing result. `Dir.[]` (probe c01's root, single overload) and
+    /// `String#upcase` are the controls.
+    #[test]
+    fn block_free_return_is_absent_without_a_block_overload() {
+        let idx = CoreData::load();
+        if !idx.knows_class("String") || !idx.knows_class("Dir") {
+            return;
+        }
+        assert_eq!(idx.singleton_method_return("Dir", "[]"), Some("Array"));
+        assert_eq!(idx.singleton_method_return_block_free("Dir", "[]"), None);
+        assert_eq!(idx.method_return("String", "upcase"), Some("String"));
+        assert_eq!(idx.method_return_block_free("String", "upcase"), None);
+        // An unknown class / method declines on both sides.
+        assert_eq!(idx.method_return_block_free("NoSuchClassZZZ", "split"), None);
+        assert_eq!(idx.method_return_block_free("String", "spilt"), None);
+        assert_eq!(idx.singleton_method_return_block_free("NoSuchClassZZZ", "glob"), None);
+    }
+
+    /// The DECLINE control: block-free overloads that DISAGREE on the return
+    /// leave the slot empty, exactly like the flat slot's all-overloads-agree
+    /// collapse — we never pick one of two divergent block-free returns. The
+    /// agreeing twin on the same class is the positive control.
+    #[test]
+    fn divergent_block_free_overloads_decline() {
+        let dir = std::env::temp_dir().join("rigor_block_free_decline_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("z.rbs"),
+            concat!(
+                "class ZzBlockFree\n",
+                // Two block-free overloads that DISAGREE (String vs Integer) plus
+                // a block overload: must decline.
+                "  def diverge: (String) -> String\n",
+                "             | (Integer) -> Integer\n",
+                "             | (String) { (String) -> void } -> nil\n",
+                // Two block-free overloads that AGREE plus a block overload whose
+                // return diverges: the slot answers, the flat slot does not.
+                "  def agree: (String) -> Array[String]\n",
+                "           | (Integer) -> Array[String]\n",
+                "           | (String) { (String) -> void } -> nil\n",
+                // A non-concrete block-free return declines.
+                "  def void_ret: (String) -> void\n",
+                "              | (String) { (String) -> void } -> nil\n",
+                "  def self.sdiverge: (String) -> String\n",
+                "                   | (Integer) -> Integer\n",
+                "                   | (String) { (String) -> void } -> nil\n",
+                "  def self.sagree: (String) -> Array[String]\n",
+                "                 | (Integer) -> Array[String]\n",
+                "                 | (String) { (String) -> void } -> nil\n",
+                "end\n",
+            ),
+        )
+        .unwrap();
+        let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+        // Flat slot collapses for every one of them (a block overload diverges).
+        assert_eq!(idx.method_return("ZzBlockFree", "diverge"), None);
+        assert_eq!(idx.method_return("ZzBlockFree", "agree"), None);
+        assert_eq!(idx.singleton_method_return("ZzBlockFree", "sdiverge"), None);
+        assert_eq!(idx.singleton_method_return("ZzBlockFree", "sagree"), None);
+        // The block-free slot answers ONLY where the block-free overloads agree.
+        assert_eq!(idx.method_return_block_free("ZzBlockFree", "diverge"), None);
+        assert_eq!(idx.method_return_block_free("ZzBlockFree", "agree"), Some("Array"));
+        assert_eq!(idx.method_return_block_free("ZzBlockFree", "void_ret"), None);
+        assert_eq!(idx.singleton_method_return_block_free("ZzBlockFree", "sdiverge"), None);
+        assert_eq!(
+            idx.singleton_method_return_block_free("ZzBlockFree", "sagree"),
+            Some("Array")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stage 2b — TOP-LEVEL RBS object-constant declarations are ingested, and
+    /// only the ones whose declared type is a bare class instance.
+    #[test]
+    fn rbs_object_constants_are_ingested() {
+        let idx = CoreData::load();
+        if !idx.knows_class("String") {
+            return;
+        }
+        // `type_name_str` yields the LEAF name, the same short key every other
+        // class table uses — `RBS::Unnamed::ENVClass` is registered as
+        // `ENVClass` there, and that is what resolves `keys`.
+        assert_eq!(idx.object_constant_class("ENV"), Some("ENVClass"));
+        // A generic application keeps its constructor name (the same erasure
+        // every other return slot performs).
+        assert_eq!(idx.object_constant_class("ARGV"), Some("Array"));
+        assert_eq!(idx.object_constant_class("STDOUT"), Some("IO"));
+        // `CROSS_COMPILING: true?` is not a bare class instance ⇒ not recorded.
+        assert_eq!(idx.object_constant_class("CROSS_COMPILING"), None);
+        assert_eq!(idx.object_constant_class("NoSuchConstantZZZ"), None);
+        // And the declared class resolves so `ENV.keys` can type (probe c03).
+        assert_eq!(idx.method_return("ENVClass", "keys"), Some("Array"));
     }
 }
