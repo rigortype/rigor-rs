@@ -13,12 +13,14 @@ Last updated: 2026-08-08.
 
 ## Now / Next
 
-▶ **NEXT (measured, 2026-08-08):** the narrowing-limited residue is CLOSE TO
-EXHAUSTED (3a-1's 27-candidate re-scan,
-[spec](notes/20260807-narrowing-stage3-spec.md)) — re-measure 3a-2/3a-3 windows
-against the 1136 census before building (`next`/`break` DONE, PR #76). The
-2d/2e rows sit behind ONE new mechanism: partially-dynamic
-constant-value harvesting (mini-spec first — project-wide FP surface).
+▶ **NEXT (measured, 2026-08-08):** **qualified-name WITNESSING** (mini-spec
+first): 3a-3's 7 target rows AND the bare-local analogue are all blocked by
+`knows_toplevel_class` declining namespaced classes (deliberate ADR-0042
+defect-2 gate — do not just invert it; route via the qualified registry, PR
+#64 precedent). The narrowing arc is otherwise at a STOP: 3a-2 DEFERRED (0
+verified rows), 3a-4/3b-2 windows ≤1 ([remeasure](notes/20260808-narrowing-3a23-window-remeasure.md)).
+The 2d/2e rows sit behind partially-dynamic constant-value harvesting
+(mini-spec first — project-wide FP surface).
 Adjudicate the `Object` bucket (26) before acting on it; no global typing for
 the OpenStruct rows
 ([why](notes/20260808-bare-class-bucket-characterisation.md)). Off the gap
@@ -39,10 +41,9 @@ track: LSP v4+ (`rootUri`, UTF-16 incremental sync), or the next upstream tag.
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-08-08, post PRs #74/#75/#76): harness
-**89 fixtures / 0 unregistered extras / 27 gaps / 1 registered divergence**,
-coverage 326/354; standing sweep **0 FP / 9204 files / 1136 gaps**, 8 corpora,
-baselines in
+State (verified 2026-08-08, post PRs #74-#79): harness **90 fixtures / 0
+unregistered extras / 28 gaps / 1 registered divergence**, coverage 339/368;
+standing sweep **0 FP / 9204 files / 1136 gaps**, 8 corpora, baselines in
 `harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. EVERY
 tool that grades the port now prints its binary's path + build time and
 REFUSES one older than `crates/` — corpus tools on release, the fixture
@@ -101,11 +102,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-08-08 `next`/`break` termination** (PR #76) — probe-first GO (~70 rows): block jumps terminate like `return`; `Node::Other.jump` (argless) + one `stmt_terminates` arm. **1137→1136, 0 opened, 0 FP / 9204.** 2nd row MISATTRIBUTED (possible-nil). Side-find: sequential DISJOINT guards = pre-existing FP (dead-code shape, 0 sweep hits), follow-up filed. [spec](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-08 collection-shape stage 2: chain ROOTS** (PR #75) — `Dir.glob`/`String#split` are ONE mechanism (a BLOCK overload breaks all-overloads-agree; block-free return slot), `ENV` object-constant ingestion (nilable returns REFUSED — 13/15 first-cut FPs), `::`-qualified C5 paths (0 yield). 2d DROPPED: blocked on partially-dynamic constant harvesting. **1141→1137: 4 closed, 0 opened, 0 FP / 9204.** [spec §7c](notes/20260807-collection-shape-slice-spec.md).
-- **2026-08-08 narrowing stage 3a-1: compound predicates** (PR #74) — `&&`/`||`/`!` recursion + falsey edge + both-direction termination; `Logical.is_and` arena split. Gap yield **1 row** (the c1/c4 windows measured proximity, not mechanism); the value is **eleven master FP shapes closed** (PR #73's Bot collapse reached through `!`/`&&`/`||`/`nil?`/`===`). THREE probe-forced spec corrections, incl. "b wins a collision" = live FP and non-guard conjuncts pinning classes via exactly 3 non-mintable-fact mechanisms. [spec BUILT section](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-08 collection-shape receiver survival, stage 1** (PR #70) — a literal-seeded local keeps its collection NOMINAL through `<<`/`push`/`[]=`/block mutation instead of widening to Dynamic, so the chained call is witnessed. **1167→1145: 22 rows closed (9 predicted + 13 same-mechanism), 0 opened, 0 FP / 9204 files.** The FP boundary is the join: a branch-contained mutation on an UNWIDENED seed must stay silent (the reference's `Scope#join` leaves a union its dispatcher declines) — reviewer-probed both ways. Deviation found mid-build and oracle-re-probed: `widen_after_block` is a SYNTACTIC walk, not a scope join. [spec+outcome](notes/20260807-collection-shape-slice-spec.md).
-- **2026-08-07/08 the class-narrowing ARC** (PRs #63, #68, #71, #72, #73) — ported `narrow_class_other` (Dynamic→`Nominal[C]`, truthy edge only) as a per-call snapshot pass + a `Node::When` arena split, then stage 3b-1's descent into unmodeled statement forms: **17 gap closures**, including both census archetypes. Lasting lesson: the FP-safety argument was WRONG THREE TIMES, each caught only by PROBING the reference — the safe-nav decline picked the wrong AXIS (the real rule is positional; **10 live FP shapes**), the Dynamic-only gate the wrong CARRIER (we collapse `a || b` and 18 more to `Dynamic[top]` where the reference keeps more — fixed by an ALLOW-list), and a disjoint guard collapses to `Bot` (reference-silent) where we fired. 0 FP / 9204 at every step; coverage cost 3 rows. **Before accepting "we do strictly less than the reference", check every term means the same thing in both engines.** [position](notes/20260807-block-narrowing-position-rule.md) / [carriers](notes/20260808-narrowing-carrier-fidelity-fp.md) / [stage3](notes/20260807-narrowing-stage3-spec.md) / [spec](notes/20260807-class-narrowing-slice-spec.md).
+- **2026-08-07/08 the class-narrowing ARC, CLOSED at a measured stop** (PRs #63, #68, #71-#74, #76, #77, #79) — ported `narrow_class_other` end-to-end: snapshot pass + `Node::When` split, 3b-1 statement-form descent, 3a-1 compound predicates (`&&`/`||`/`!`, falsey edge, both-direction termination, `Logical.is_and`), `next`/`break` termination, 3a-3 chain guards (`chain_env`, ships without the local path's sequential-disjoint defect). **19 gap closures + eleven master FP shapes closed** (Bot collapse reached through `!`/`&&`/`||`/`nil?`/`===`). Lessons, each probe-forced: the FP-safety argument was WRONG THREE TIMES (position AXIS, 10 FP shapes; carrier ALLOW-list, 19 FP carriers; disjoint→`Bot`); census windows measure PROXIMITY not mechanism (3a-1 bound 22 → 1 row; the remeasure hand-read all 37 candidates → 3a-2 DEFERRED at 0); and **verify the CONSUMPTION gate can witness the class before crediting rows** — 3a-3's 7 verified rows all name namespaced classes `knows_toplevel_class` declines (gap diff 0/0, mechanism proven by top-level controls). 0 FP / 9204 at every step. [position](notes/20260807-block-narrowing-position-rule.md) / [carriers](notes/20260808-narrowing-carrier-fidelity-fp.md) / [stage3](notes/20260807-narrowing-stage3-spec.md) / [remeasure](notes/20260808-narrowing-3a23-window-remeasure.md) / [spec](notes/20260807-class-narrowing-slice-spec.md).
 - **2026-08-08 harness integrity: the 0-FP gate could pass VACUOUSLY** (PR #65) — `fp_audit`/`gap_census` measured `target/release/rigor` while `cargo build` writes debug (a 6-day-old binary made PRs #63/#64 read as "closed nothing"), and `run_rs` swallowed every failure into `[]`, so a panicking port binary scored 0 FP. `run_corpus.rb` carried BOTH defects; the reference side was only half-hardened (a SKIPPED oracle still exited 0). Now: auto-build, STALE-binary refusal vs newest `crates/` file, path+mtime in the header, `None`-not-`[]` on failure, INVALID corpora fail the run. Review killed an exit-code-vs-emptiness check that false-fired on warning-only batches. [note](notes/20260807-fp-audit-port-side-blind-spots.md).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup routing** (PR #64, MERGED) — the 8-member return family routes namespaced receivers via the qualified registry (refs AS WRITTEN + lexical ctx; ambiguity DECLINES); **14 closures (→1179), 0 FP / 9204**; fixture 82 pins the Tier-3 instance boundary (gaps 3→4 on merge). [spec+outcome](notes/20260807-adr0042-s5-return-lookup-spec.md).
 - **2026-08-07 upstream feedback batch 2** — 3 reference-side defects with paste-ready repros: the `c7f28da1` (#271) master FP, the `Dynamic|nil` possible-nil FP class, the fail-soft definition build blinding 12 classes. [note](notes/20260807-upstream-feedback-batch2.md).
