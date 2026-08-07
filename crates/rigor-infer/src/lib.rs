@@ -4277,10 +4277,12 @@ fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
         .collect()
 }
 
-/// Whether a branch body's final statement terminates the enclosing method — a
-/// `return` or a receiverless `raise` (a conservative approximation of the
-/// reference's terminator analysis in `eval_if:481`; missing a termination only
-/// loses narrowing, never adds one). Descends the pure statement carriers
+/// Whether a branch body's final statement EXITS the surrounding control flow
+/// — a `return`, an argument-less `next`/`break`, or a receiverless `raise` (a
+/// conservative approximation of the reference's
+/// `branch_unconditionally_exits?`, `statement_evaluator.rb:2836`; missing a
+/// termination only loses narrowing, never adds one). Descends the pure
+/// statement carriers
 /// (`Statements`, and a `BeginRescue` with no rescue clauses and no ensure —
 /// the lowered `else`-clause / parenthesized-group shape; a real
 /// `begin`/`rescue` declines, its tail `return` may be skipped by a raise
@@ -4295,6 +4297,19 @@ fn branch_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
 fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
     match ast.get(id) {
         Node::Return { .. } => true,
+        // An argument-less `next`/`break` (`Node::Other`'s `jump` tag). The
+        // reference accepts them unconditionally — no in-block gate, no
+        // loop-body special case — and the probe matrix reproduces that:
+        // `next`/`break` in a block (`p1`/`p2`/`p3`), in a `while`/`until` body
+        // (`p5`/`p5b`/`p5c`), in a `lambda`/`define_method`/`loop`/`times`
+        // block (`q15`/`q16`/`r2`/`q18`) all narrow past the guard, and the
+        // loop-carried rebind AFTER the use (`p6`, `r11` — the shape 3b-1
+        // declined loop BODIES over) still fires there. We reach a strict
+        // subset of that: a `while`/`until` BODY is never descended
+        // (`Node::Loop`), a fact never escapes the block (`join_cenv` keeps
+        // only `Bot` — probes `p9`/`p9b`/`p13`/`q10`/`r13`, all
+        // reference-silent), and a rebind BEFORE the use kills it (`q17`).
+        Node::Other { jump: Some(_), .. } => true,
         Node::Call { receiver: None, method, .. } if method == "raise" => true,
         Node::BeginRescue { body, ensure_body, clauses, .. }
             if clauses.is_empty() && ensure_body.is_empty() =>
@@ -7416,6 +7431,151 @@ mod class_narrowing_tests {
             let (ast, snaps) = class_snaps(src.as_bytes());
             let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
             assert_eq!(got, *expected, "stage 3a-1 matrix row {row}\n--- source ---\n{src}");
+        }
+    }
+
+    /// STAGE 3a-1 follow-up — `branch_terminates` recognising `next` / `break`
+    /// (docs/notes/20260807-narrowing-stage3-spec.md, the 2026-08-08 section).
+    ///
+    /// Same convention as the 3a-1 matrix: `Some(c)` — the reference FIRES and
+    /// rigor-rs must record `c`; `None` — rigor-rs must record nothing, either
+    /// because the reference is SILENT (a would-be false positive) or because
+    /// the decline costs coverage the reference has (a strict subset). Every row
+    /// is oracle-measured against the pinned reference `v0.3.1` from a fresh cwd
+    /// with `--no-cache` and the checkout plugin path pinned; the row name is
+    /// the probe name in the note's table.
+    #[test]
+    fn class_narrowing_next_break_termination_matrix() {
+        const USE: &str = "v.frobnicate_zzz";
+        const G: &str = "v.is_a?(String)";
+        // A method wrapper whose body runs INSIDE an `each` block, which is
+        // where `next`/`break` are legal Ruby.
+        let blk = |body: &str| format!("def f(v, w, xs)\n  xs.each do |x|\n{body}\n  end\nend\n");
+        let mut rows: Vec<(&str, String, Option<&str>)> = vec![
+            // ---- the archetype, both jumps, both carriers -------------------
+            ("p1_next_block", blk(&format!("    next unless {G}\n    {USE}")), Some("String")),
+            ("p2_break_block", blk(&format!("    break unless {G}\n    {USE}")), Some("String")),
+            (
+                "p3_next_blockparam",
+                "def f(xs)\n  xs.each do |x|\n    next unless x.is_a?(String)\n    x.frobnicate_zzz\n  end\nend\n".to_string(),
+                Some("String"),
+            ),
+            (
+                "p3b_break_blockparam",
+                "def f(xs)\n  xs.each do |x|\n    break unless x.is_a?(String)\n    x.frobnicate_zzz\n  end\nend\n".to_string(),
+                Some("String"),
+            ),
+            // `!` swap: `next if !guard` carries the falsey map.
+            ("p11_bang_next_if", blk(&format!("    next if !{G}\n    {USE}")), Some("String")),
+            // The compound census shape (`next unless job && x.is_a?(Hash)`).
+            ("p17_next_compound", blk(&format!("    next unless w && {G}\n    {USE}")), Some("String")),
+            ("q13_next_or_guard", blk(&format!("    next if !{G} || v.empty?\n    {USE}")), Some("String")),
+            ("r9_kind_of", blk("    next unless v.kind_of?(String)\n    v.frobnicate_zzz"), Some("String")),
+            ("r10_instance_of", blk("    next unless v.instance_of?(String)\n    v.frobnicate_zzz"), Some("String")),
+            // The jump need only be the branch's LAST statement …
+            (
+                "q6_next_not_last",
+                blk(&format!("    unless {G}\n      w.warn('x')\n      next\n    end\n    {USE}")),
+                Some("String"),
+            ),
+            // … and a jump followed by dead code does NOT terminate the branch
+            // (`.last` is not a `next`) — the reference is silent too.
+            (
+                "q7_next_first_not_last",
+                blk(&format!("    unless {G}\n      next\n      w.warn('x')\n    end\n    {USE}")),
+                None,
+            ),
+            // The block need not be a loop at all — the recognition is syntactic
+            // on the reference and here.
+            (
+                "q16_define_method",
+                "class K\n  define_method(:f) do |v|\n    next unless v.is_a?(String)\n    v.frobnicate_zzz\n  end\nend\n".to_string(),
+                Some("String"),
+            ),
+            (
+                "q15_lambda_rhs",
+                "def f(v)\n  g = lambda do |x|\n    next unless v.is_a?(String)\n    v.frobnicate_zzz\n  end\n  g\nend\n".to_string(),
+                Some("String"),
+            ),
+            // ---- CONTROLS: reference-SILENT, so recording would be an FP ----
+            // The use BEFORE the guard.
+            ("p4_use_before", blk(&format!("    {USE}\n    next unless {G}")), None),
+            // `next if guard` — the truthy edge terminates and the falsey map of
+            // an atomic class guard is EMPTY.
+            ("p10_next_if_positive", blk(&format!("    next if {G}\n    {USE}")), None),
+            // A rebind inside the conditional's span, and one after the guard.
+            ("q3_write_in_span", blk(&format!("    next unless (v = w).is_a?(String)\n    {USE}")), None),
+            ("q17_rebind_then_use", blk(&format!("    next unless {G}\n    v = w\n    {USE}")), None),
+            // A fact minted inside a block NEVER escapes it (`join_cenv` keeps
+            // only `Bot`) — for `next`, for `break`, and out of a NESTED block.
+            (
+                "p9_after_block",
+                format!("def f(v, xs)\n  xs.each do |x|\n    next unless {G}\n  end\n  {USE}\nend\n"),
+                None,
+            ),
+            (
+                "p9b_after_block_break",
+                format!("def f(v, xs)\n  xs.each do |x|\n    break unless {G}\n  end\n  {USE}\nend\n"),
+                None,
+            ),
+            (
+                "p13_nested_block",
+                format!("def f(v, xs, ys)\n  xs.each do |x|\n    ys.each do |y|\n      next unless {G}\n    end\n    {USE}\n  end\nend\n"),
+                None,
+            ),
+            // …nor past an inner `if` inside the block (the join clears it).
+            ("q10_after_nested_if", blk(&format!("    if w\n      next unless {G}\n    end\n    {USE}")), None),
+            // A block in ARGUMENT position is not descended at all.
+            (
+                "r7_block_arg_position",
+                format!("def f(v, xs, sink)\n  sink.push(xs.each do |x|\n    next unless {G}\n    {USE}\n  end)\nend\n"),
+                None,
+            ),
+            // ---- DECLINES: the reference fires, we do not (strict subset) ----
+            // A `while`/`until` BODY is never descended (stage 3b-2).
+            (
+                "p5_next_in_while",
+                format!("def f(v, n)\n  while n > 0\n    next unless {G}\n    {USE}\n  end\nend\n"),
+                None,
+            ),
+            // `next`/`break` WITH a value keeps the recovered-children carrier,
+            // so it is not tagged as a jump.
+            (
+                "p16_next_with_value",
+                format!("def f(v, xs)\n  xs.map do |x|\n    next 0 unless {G}\n    {USE}\n  end\nend\n"),
+                None,
+            ),
+            // `throw` / `exit` / `abort` / `fail` / `redo` all terminate on the
+            // reference; only `raise` is ported (out of this slice).
+            ("p15_throw", blk(&format!("    throw :done unless {G}\n    {USE}")), None),
+            ("p8_redo", blk(&format!("    redo unless {G}\n    {USE}")), None),
+            // BOTH branches jumping: the reference propagates the TRUTHY map
+            // (`eval_if:495` needs only a present then-branch), we decline —
+            // `truthy_terminates != falsey_terminates` is the subset rule.
+            (
+                "q19_break_both_terminate",
+                blk(&format!("    if {G}\n      break\n    else\n      break\n    end\n    {USE}")),
+                None,
+            ),
+            // A `case`/`when` clause ending in `next`: `class_flow_case` has no
+            // termination propagation (stage 3a-4).
+            (
+                "q11_next_case_when",
+                blk(&format!("    case v\n    when Integer then nil\n    else next\n    end\n    {USE}")),
+                None,
+            ),
+            // The carrier ALLOW-list still declines per local (PR #72).
+            (
+                "q4_coarse_carrier",
+                format!("def f(xs, a, b)\n  v = a || b\n  xs.each do |x|\n    next unless {G}\n    {USE}\n  end\nend\n"),
+                None,
+            ),
+        ];
+        rows.sort_by_key(|(row, _, _)| *row);
+        for (row, src, expected) in &rows {
+            let (ast, snaps) = class_snaps(src.as_bytes());
+            let got = snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str);
+            assert_eq!(got, *expected, "next/break termination row {row}\n--- source ---\n{src}");
         }
     }
 
