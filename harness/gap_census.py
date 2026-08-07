@@ -95,14 +95,28 @@ def main():
         print(__doc__)
         return 2
 
+    fp.resolve_rs()  # same contract as fp_audit: the binary is reported, and a
+                     # stale or unbuildable one refuses to run before measuring
     rows = []
+    invalid = []
     for tgt in args:
         files = fp.rb_files(tgt)
         ref = fp.run_ref(files)
         if ref is None:
-            print(f"{tgt}: SKIPPED (unparseable reference output)")
+            print(f"{tgt}: INVALID (unparseable reference output) — no census "
+                  "for this corpus")
+            invalid.append(tgt)
             continue
-        rs_keys = fp.keys(fp.run_rs(files))
+        rs_diags = fp.run_rs(files)
+        if rs_diags is None:
+            # Without a port result every reference diagnostic looks like a gap,
+            # which would read as a census of a catastrophically under-covering
+            # port rather than as a broken run.
+            print(f"{tgt}: INVALID (rigor-rs failed: {fp.LAST_RS_FAILURE}) — no "
+                  "census for this corpus")
+            invalid.append(tgt)
+            continue
+        rs_keys = fp.keys(rs_diags)
         for d in ref:
             if d.get("severity", "error") not in fp.PARITY:
                 continue
@@ -138,6 +152,12 @@ def main():
         with open(dump, "w", encoding="utf-8") as f:
             json.dump(rows, f, indent=1)
         print(f"\nwrote {len(rows)} rows to {dump}")
+    if invalid:
+        print(f"\nINVALID COMPARISONS: {len(invalid)} — the census above covers "
+              "only the corpora that produced a valid comparison:")
+        for t in invalid:
+            print(f"  {t}")
+        return 1
     return 0
 
 

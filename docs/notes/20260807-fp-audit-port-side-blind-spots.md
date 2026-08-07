@@ -74,15 +74,39 @@ the S5 fixture was run against the live oracle by the reviewer, and both
 merged shapes fire in a freshly built binary. What IS void is the post-merge
 census run in this session; it must be redone against a current release build.
 
-## Fix shape (not built here)
+## What was built (2026-08-07)
 
-1. `run_rs` returns `Option`-style `None` on non-zero exit or unparseable
-   output; `audit()` reports `SKIPPED … comparison invalid` and exits
-   non-zero, mirroring `run_ref`'s existing contract.
-2. Make the binary unambiguous: auto-build like `run_corpus.rb`, or resolve
-   debug/release by mtime and REFUSE to run when the chosen binary predates
-   the working tree's last source change. Whichever is chosen, the two
-   harness entry points must agree.
-3. Print the resolved binary path + its mtime in the run header, so a stale
-   measurement is visible in the transcript rather than inferred six days
-   later.
+Both defects are closed in `harness/fp_audit.py`, `harness/gap_census.py` and
+`harness/run_corpus.rb`. The contract is documented in
+[harness/CORPUS.md](../../harness/CORPUS.md).
+
+**1 — a failed run is INVALID, never 0.** `run_rs` now returns `None` on
+anything that is not a trustworthy answer, exactly as `run_ref` already did:
+an exit code outside `{0, 1}` (`rigor check` exits 0 with no diagnostics, 1
+with diagnostics), stdout that is not a JSON array, or an exit code that
+contradicts the array's emptiness — that last one is what catches a binary
+which exits 1 while printing nothing, i.e. the `/usr/bin/false` probe. `audit()`
+prints `INVALID: rigor-rs failed on this batch [reason] — comparison invalid,
+not FP-free` and returns `None`, the total line is marked `INCOMPLETE (n of m
+corpora compared)`, and the run exits 1. A reference-side failure now counts the
+same way (it printed `SKIPPED` but still returned 0, so an all-skipped sweep
+still exited 0). `gap_census.py` inherits all of it and reports the same
+`INVALID` for either side. The same shape existed in `run_corpus.rb`'s
+`run_rigorrs_batch` (`return {}` on every failure → 0 FPs → "STRONG RESULT");
+it now aborts loudly.
+
+**2 — the binary is one binary, and it dates itself.** All three corpus-scale
+tools default to `target/release/rigor` (reasoning: release is what every
+recorded sweep number was measured with, and the sweep is 9204 files through
+both implementations; the fixture harness `run.rb`/`lib.rb` stays on debug,
+which is right for its edit-run loop). The binary is auto-built when absent
+(`cargo build --offline --release -p rigor-cli`), its path and build time are
+printed in the run header, and a binary under `target/` older than the newest
+file under `crates/` is REFUSED with exit 2 — nothing is measured. An explicit
+`RIGOR_RS_BIN` outside the repo is honoured as deliberate but must exist, and
+the header says its staleness was not checked.
+
+Not covered: a binary built from *committed* sources that differ from HEAD in
+some way mtimes cannot see (e.g. a `git checkout` that rewinds source files to
+older mtimes than the binary). The mtime gate catches the observed failure —
+edit, forget to rebuild, measure — not every possible divergence.
