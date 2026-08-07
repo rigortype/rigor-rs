@@ -1,0 +1,68 @@
+{
+  "fixture": "harness/corpus/88_collection_shape_stage2.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 34,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `to_sentence' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `blank?' for Array[String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 68,
+      "severity": "error",
+      "message": "undefined method `present?' for Array[String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 57,
+      "column": 46,
+      "severity": "error",
+      "message": "undefined method `second' for Array[String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 68,
+      "column": 34,
+      "severity": "error",
+      "message": "undefined method `index_with' for [:high, :low]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 72,
+      "column": 67,
+      "severity": "error",
+      "message": "undefined method `index_with' for [:high, :low]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 81,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 92,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 129,
+      "column": 45,
+      "severity": "error",
+      "message": "undefined method `index_with' for [:a]"
+    }
+  ]
+}
