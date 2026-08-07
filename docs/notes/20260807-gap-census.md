@@ -76,6 +76,13 @@ result `String` and witnesses `singularize`; rigor-rs declines because the
 receiver is `Dynamic`. `Object#to_s -> String` holds for every receiver in RBS.
 Cheap, and it feeds mechanism 1's sites too.
 
+> **CORRECTION (2026-08-07, same day): REFUTED by oracle probe — do not
+> build.** The reference is SILENT on `dynamic.to_s.frobnicate_zzz` (its RBS
+> dispatch declines a `Dynamic[Top]` receiver), so there is no universal fold
+> to mirror; an unconditional fold would be FP by construction. The 4 sites
+> reach `String` because the reference types the *block param* cross-file.
+> [spec note](20260807-class-narrowing-slice-spec.md) § "Slice 2 is REFUTED".
+
 ### 3. Inherited singleton returns
 
 ```ruby
@@ -88,6 +95,16 @@ singleton-return lookup not reaching through the ancestor chain for this shape.
 Worth isolating before building — the class is declared in rbs's *openssl* tree,
 which neither engine's `DEFAULT_LIBRARIES` closure carries, so the provenance of
 the reference's answer is itself part of the question.
+
+> **CORRECTION (2026-08-07, same day, measured): both suspicions were wrong.**
+> The declaring file is rbs stdlib `digest` (in BOTH engines'
+> `DEFAULT_LIBRARIES`, byte-identical vendored), and ancestor singleton lookup
+> works for top-level names. The real mechanism: the return-type lookup family
+> (`method_return`, `singleton_method_return` + twins) never received the
+> ADR-0042 qualified-key routing that the existence gates got — ANY method's
+> declared return on a NAMESPACED receiver is lost (instance and singleton,
+> own and inherited alike). ~14 solid gap closures predicted. Buildable as
+> ADR-0042 Slice 5: [spec](20260807-adr0042-s5-return-lookup-spec.md).
 
 ## How to re-run
 
