@@ -343,6 +343,12 @@ impl<'i> Typer<'i> {
             // Range types to `Nominal[Range]` so witnessing resolves against
             // Range's RBS (an `IntegerRange` would erase to `Integer`).
             ConstLit::Range => self.nominal_or_untyped("Range", interner),
+            // Slice B: a partially-literal container. `nominal_or_untyped`
+            // yields `Nominal { args: [] }` — the projection-inert carrier (see
+            // the `ConstLit::BareArray` docs); it degrades to Dynamic when the
+            // class is unregistered, which is silent.
+            ConstLit::BareArray => self.nominal_or_untyped("Array", interner),
+            ConstLit::BareHash => self.nominal_or_untyped("Hash", interner),
         }
     }
 

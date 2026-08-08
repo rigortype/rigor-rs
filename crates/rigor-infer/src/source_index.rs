@@ -63,6 +63,33 @@ pub enum ConstLit {
     /// witnessing resolves against Range's RBS (SOUND — `IntegerRange` would
     /// erase to `Integer` and false-positive on real Range methods).
     Range,
+    /// Slice B: a container LITERAL whose elements are not all literal — a
+    /// lambda value, a `ConstantRead`, a splat, a dynamic key, an interpolated
+    /// string, a call. Types to a BARE `Nominal[Array]` / `Nominal[Hash]` with
+    /// `args: []`, **never with element types**.
+    ///
+    /// Two facts make this the FP-safe carrier, both probed
+    /// (`docs/notes/20260808-partial-constant-harvest-probes.md`):
+    ///
+    /// * The reference never declines such a constant — it types the hole
+    ///   (`->(_){…}` as `Proc`) and keeps a full `HashShape`/`Tuple`. So it
+    ///   dispatches at the direct receiver, and the undefined-method lookup is
+    ///   class-only: `Nominal[Hash]` and `HashShape{c: Proc}` both resolve
+    ///   against `Hash`. Same witnessing set, different rendering.
+    /// * A bare nominal is projection-INERT in rigor-rs:
+    ///   `fold_tuple_projection` / `fold_hash_shape_projection` match
+    ///   `Type::Tuple` / `Type::HashShape` only, and an argument-less generic
+    ///   resolves nothing in the RBS tier. Every `[]`/`fetch`/`keys`/`values`/
+    ///   block-param projection goes silent while the reference fires — the
+    ///   divergence is strictly UNDER-emission.
+    ///
+    /// Element typing is deliberately out of scope: probe z2 shows the
+    /// reference leaves even a harvested-constant element `Dynamic[top]`, so an
+    /// element-typed harvest would out-precise the oracle at exactly the
+    /// projection sites it declines — an FP generator.
+    BareArray,
+    /// The `Hash` twin of [`ConstLit::BareArray`].
+    BareHash,
 }
 
 /// The first [`ClassId`] handed out by the per-run registry. Chosen well above
@@ -1931,19 +1958,35 @@ fn const_lit_of(ast: &LoweredAst, node: NodeId) -> Option<ConstLit> {
         Node::ArrayLit { elements, .. } => {
             let mut elems = Vec::with_capacity(elements.len());
             for &e in elements {
-                elems.push(const_lit_of(ast, e)?);
+                // Slice B: one non-literal element no longer declines the whole
+                // constant — it degrades to the projection-inert bare nominal.
+                // The reference never declines here either (it types the hole
+                // and keeps a Tuple), so this is a spelling of the SAME
+                // constant, one precision tier lower.
+                match const_lit_of(ast, e) {
+                    Some(l) => elems.push(l),
+                    None => return Some(ConstLit::BareArray),
+                }
             }
             Some(ConstLit::Tuple(elems))
         }
         Node::HashLit { elements, all_assoc, .. } => {
             if !*all_assoc {
-                return None; // a `**`splat / non-assoc element ⇒ decline.
+                // A `**` splat / non-assoc element. The reference degrades to a
+                // widened `Hash[K, V]` (probes p3b/p3b2), never declines.
+                return Some(ConstLit::BareHash);
             }
             let mut members: Vec<(ShapeKey, ConstLit)> = Vec::with_capacity(elements.len() / 2);
             let mut i = 0;
             while i + 1 < elements.len() {
-                let key = const_shape_key_of(ast.get(elements[i]))?;
-                let value = const_lit_of(ast, elements[i + 1])?;
+                // A dynamic key (probe p3c) or a non-literal value (p1, the
+                // lambda-hash shape) degrades the container, not the constant.
+                let Some(key) = const_shape_key_of(ast.get(elements[i])) else {
+                    return Some(ConstLit::BareHash);
+                };
+                let Some(value) = const_lit_of(ast, elements[i + 1]) else {
+                    return Some(ConstLit::BareHash);
+                };
                 // Last-wins on a duplicate key (mirrors `hash_shape_or_hash`).
                 if let Some(m) = members.iter_mut().find(|m| m.0 == key) {
                     m.1 = value;
@@ -2897,6 +2940,99 @@ mod tests {
         let core = CoreIndex::new();
         let (_a, idx) = build_one(b"class K\n  R = 1..1024\nend\n", &core);
         assert_eq!(idx.literal_constant("R", &seg(&["K"]), _a.file_id()), Some(&ConstLit::Range));
+    }
+
+    // --- slice B: partially-literal containers ⇒ INERT bare nominals ----------
+
+    #[test]
+    fn partially_literal_containers_harvest_as_bare_nominals() {
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  LAM = { c: ->(_x) { 1 } }.freeze\n  DYN = [1, unknown_zzz, 2].freeze\n  \
+              SPLAT_H = { a: 1, **unknown_zzz }.freeze\n  DYNKEY = { a: 1, unknown_zzz => 2 }.freeze\n  \
+              SPLAT_A = [*unknown_zzz].freeze\n  INTERP = [\"a\", \"b#{1}\"].freeze\n  \
+              CHAIN = [1, \"x\".upcase].freeze\nend\n",
+            &core,
+        );
+        let k = seg(&["K"]);
+        for name in ["LAM", "SPLAT_H", "DYNKEY"] {
+            assert_eq!(
+                idx.literal_constant(name, &k, a.file_id()),
+                Some(&ConstLit::BareHash),
+                "{name} should harvest as a bare Hash nominal"
+            );
+        }
+        for name in ["DYN", "SPLAT_A", "INTERP", "CHAIN"] {
+            assert_eq!(
+                idx.literal_constant(name, &k, a.file_id()),
+                Some(&ConstLit::BareArray),
+                "{name} should harvest as a bare Array nominal"
+            );
+        }
+    }
+
+    #[test]
+    fn fully_literal_harvest_is_unchanged_by_the_widening() {
+        // The value-pinned rendering must not regress: a fully-literal container
+        // still harvests as Tuple/Hash, and the EMPTY literals keep their
+        // zero-size shapes (`[]` / `{}` fold projections off them).
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  T = [1, 2].freeze\n  H = { a: 1 }.freeze\n  E = [].freeze\n  \
+              EH = {}.freeze\n  R = 1..9\nend\n",
+            &core,
+        );
+        let k = seg(&["K"]);
+        assert!(matches!(idx.literal_constant("T", &k, a.file_id()), Some(ConstLit::Tuple(v)) if v.len() == 2));
+        assert!(matches!(idx.literal_constant("H", &k, a.file_id()), Some(ConstLit::Hash(m)) if m.len() == 1));
+        assert_eq!(idx.literal_constant("E", &k, a.file_id()), Some(&ConstLit::Tuple(vec![])));
+        assert_eq!(idx.literal_constant("EH", &k, a.file_id()), Some(&ConstLit::Hash(vec![])));
+        assert_eq!(idx.literal_constant("R", &k, a.file_id()), Some(&ConstLit::Range));
+    }
+
+    #[test]
+    fn a_nested_partial_container_degrades_only_the_inner_level() {
+        // `{ a: [->(){}] }` keeps its OUTER shape (the key is static) and puts a
+        // bare `Array` in the slot — the reference has `{ a: [Proc] }` there, so
+        // `H[:a].zzz` fires in both engines (same class, sharper rendering in
+        // the oracle). Verified against the oracle in fixture 92.
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(b"class K\n  N = { a: [->() { 1 }] }.freeze\nend\n", &core);
+        let Some(ConstLit::Hash(members)) = idx.literal_constant("N", &seg(&["K"]), a.file_id())
+        else {
+            panic!("expected an outer Hash shape");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].1, ConstLit::BareArray);
+    }
+
+    #[test]
+    fn non_container_rhs_still_declines() {
+        // Slice B widens the CONTAINER arms only. A call chain, a bare constant
+        // read, a lambda and a `Class.new` still decline (a chain-valued
+        // constant is slice C's question, assessed separately).
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  CH = %w[a b].map.with_index.to_h.freeze\n  CR = OTHER_ZZZ\n  \
+              L = ->(_x) { 1 }\n  C = Class.new(StandardError)\nend\n",
+            &core,
+        );
+        let k = seg(&["K"]);
+        for name in ["CH", "CR", "L", "C"] {
+            assert_eq!(idx.literal_constant(name, &k, a.file_id()), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn multiple_assignment_still_declines_a_partial_container() {
+        // The reference UNIONS duplicate assignments; C5's single-assignment
+        // gate is a strict under-emit and slice B keeps it unchanged.
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  M = { c: ->(_x) { 1 } }\n  M = [1, 2]\nend\n",
+            &core,
+        );
+        assert_eq!(idx.literal_constant("M", &seg(&["K"]), a.file_id()), None);
     }
 
     // --- slice A: PER-FILE constant-value consumption -------------------------

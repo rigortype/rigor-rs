@@ -2,6 +2,13 @@
   "fixture": "harness/corpus/92_partial_constant_harvest.rb",
   "diagnostics": [
     {
+      "rule": "call.raise-non-exception",
+      "line": 124,
+      "column": 5,
+      "severity": "error",
+      "message": "`raise' operand types as { c: Proc }, which is not an Exception class, an Exception instance, a String, or an object defining `#exception' — this raises TypeError at runtime"
+    },
+    {
       "rule": "call.undefined-method",
       "line": 20,
       "column": 19,
@@ -21,6 +28,181 @@
       "column": 39,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 68,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for { c: Proc }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 69,
+      "column": 26,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for { c: Proc }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 70,
+      "column": 19,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1, Dynamic[top], 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 71,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 72,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 73,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 74,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [\"a\", String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 75,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for { a: [Proc] }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 85,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Proc"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 86,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Proc"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 87,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [:c]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 88,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [Proc]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 89,
+      "column": 34,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Proc"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 90,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [[:c, Proc]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 91,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash[Proc, :c]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 92,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for { c: Proc, a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 93,
+      "column": 44,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for { c: Proc }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 94,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 96,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 97,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 98,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[1 | 2 | Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 99,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [Proc]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 111,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 104,
+      "column": 17,
+      "severity": "error",
+      "message": "wrong number of arguments to `keys' on Hash (given 2, expected 0)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 105,
+      "column": 19,
+      "severity": "error",
+      "message": "wrong number of arguments to `first' on Array (given 2, expected 0..1)"
     }
   ]
 }

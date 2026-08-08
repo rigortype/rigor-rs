@@ -176,6 +176,140 @@ cross-file silences are pinned as Rust unit tests instead
 `qualified_constant_value_is_consumed_only_in_the_assigning_file`,
 `toplevel_constant_value_is_still_per_file`).
 
+## BUILT — slice B (2026-08-08): inert bare nominals for partial containers
+
+`ConstLit` gained `BareArray` / `BareHash`; `const_lit_of`'s two container arms
+now degrade instead of declining (a non-literal element, a `**` splat, a dynamic
+key, a non-literal value). `intern_const_lit` maps them through
+`nominal_or_untyped` → `Nominal { args: [] }`. Everything else is untouched:
+the scalar / fully-literal / `Range` / `.freeze` arms, the single-assignment
+gate, the class-collision gate, the direct-child-of-a-body walk, and the
+non-container catch-all (a chain, a `ConstantRead`, a lambda, `Class.new` all
+still decline — that is slice C's question).
+
+### Message divergence: checked, and NOT registrable
+
+`harness/lib.rb#diag_key` is `(rule, line, column)` and `fp_audit.py` keys on
+`(rule, path, line, column)`. Neither compares the message, so `for Hash` vs the
+reference's `for { c: Proc }` needs no registry entry — verified before adding
+the fixture rows, as the spec required. The fixture header records the
+divergence in prose instead.
+
+### Inertness, re-probed at the CONSTANT carrier (a probe correction)
+
+The 1e series minted its bare nominals from `{a: 1}.merge(x)` / `[1].concat(x)`.
+Off a HARVESTED constant the answer is **not identical**, and in the safe
+direction:
+
+| surface | 1e said (merge-minted) | measured here (harvest-minted) |
+|---|---|---|
+| `H.keys.zzz`, `H.values.zzz` | rigor-rs SILENT (n3) | **both engines fire** — parity-positive |
+| `H.keys(1,2)` / `A.first(1,2)` arity | rigor-rs SILENT (y1) | **both engines fire** — parity-positive |
+| `H.to_a` / `invert` / `merge` / `transform_values` / `compact` / `length` / `size` | not probed | **both engines fire** |
+| `H[:c]`, `H.fetch(:c)`, `A[1]`, `A.first`, `each` block param, `NESTED[:a]`→elements | inert | inert — reference only |
+| `H[:absent].upcase` (possible-nil) | silent | silent (reference fires `for nil`) |
+| always-truthy `if H` / `if A`, ATM `start_with?(H)` | silent both | silent both |
+| `raise H` | fires both | fires both |
+| `def.return-type-mismatch` on an annotated def returning the constant | not probed | reference fires ×2, **rigor-rs silent** |
+
+So "projection-inert" is precise for the VALUE-PINNED folds
+(`fold_tuple_projection` / `fold_hash_shape_projection`) but not for the generic
+RBS tier, which does resolve `Hash#keys -> Array[K]` off an argument-less
+nominal. That is not a hazard: wherever the RBS tier answers, the reference
+answers from a strictly SHARPER carrier of the SAME class, so rigor-rs can only
+match or under-emit. A 40-line nilable-return battery (`min`/`max`/`first`/
+`last`/`detect`/`dig`/`assoc`/`sample`/`pop` on both containers, plus five
+`possible-nil` chains) produced **zero** rigor-rs diagnostics — the one FP shape
+this slice could plausibly have created does not occur.
+
+Across all three probe files every rigor-rs row was oracle-matched on
+`(rule, line, column)`; there was no row to move into a decline set.
+
+### Gates + census
+
+| gate | result |
+|---|---|
+| `cargo build --offline && cargo test --offline` | PASS (5 further unit tests) |
+| `ruby harness/run.rb` | PASS — 374 matched, 33 gaps, 1 registered extra, **0 unregistered** |
+| `ruby harness/run_snapshot.rb` | PASS (identical) |
+| `python3 harness/fp_audit.py --gaps --sweep` | **0 FP / 9204** |
+| `python3 harness/docs_check.py` (bare) | PASS, exit 0 |
+| clippy `-D warnings`, fresh `CARGO_TARGET_DIR` | clean |
+
+Census, and the full diagnostic-set diff (slice-A binary vs slice-B binary over
+the same 9204 files, parity severities):
+
+| | after A | after B |
+|---|---|---|
+| total coverage gaps | 1127 | **1125** |
+| gitlab-foss/lib | 282 | 280 |
+| every other corpus | — | unchanged |
+| rigor-rs rows gained | — | **2** |
+| rigor-rs rows lost | — | **0** |
+| **NEW gap rows (left MATCHED)** | — | **0** |
+
+Both closures oracle-spot-checked in a fresh cwd, `--no-cache`:
+
+1. `lib/authn/token_field/generator/routable_token.rb:61:14` —
+   `compact_blank` off `DEFAULT_ROUTING_PAYLOAD_HASH` (the lambda-hash shape).
+   reference `for Hash[:c | Dynamic[top], Dynamic[top] | String]`, rigor-rs
+   `for Hash`. **This is the row the whole track was opened for.**
+2. `lib/gitlab/github_import/representation/note_text.rb:44:74` — `exclude?`
+   off `MODELS_ALLOWLIST = [::Release, ::Note, ::Issue, ::MergeRequest].freeze`
+   (probe z2's constant-read-element shape). reference
+   `for [Dynamic[top], …]`, rigor-rs `for Array`.
+
+The 292-constant blast radius therefore yielded 2 diagnostics: the newly
+harvested constants are overwhelmingly either never called with an unknown
+method, or read only through the projections rigor-rs stays inert for. Zero new
+rows, so nothing moved into a decline set.
+
+The second census row also confirms the codequality prediction: `:50:89` is
+**still open** after B (probed directly — reference fires `index_with for
+Array[Dynamic[top]]`, rigor-rs silent). It is a chain-valued constant, slice C.
+
+## C — VERDICT: DECLINE (assessed 2026-08-08, not built)
+
+The build condition was "the fold path already produces the nominal AND the
+`keys` projection is a small probed extension". Probing after B:
+
+* **Second condition: PASSES.** `Hash#keys` off an argument-less
+  `Nominal[Hash]` already yields `Array` — measured in fixture 92 (line 87,
+  `LAMBDA_HASH.keys.frobnicate_zzz` fires in both engines) and in the B probe
+  battery. The `keys`/`values`/`to_a`/`invert` group resolves through the
+  generic RBS tier. So the mechanism envelope §2 called a second, missing
+  mechanism is in fact **already present** — a correction to the probes note.
+  Isolated A/B in one file: `SEV_CHAIN = %w[info minor].map.with_index.to_h
+  .freeze` vs `SEV_PARTIAL = { info: 0, minor: unknown_zzz }.freeze`, both then
+  `.keys.index_with(0)`. The reference fires on both; rigor-rs fires **only on
+  the partial one** (`for Array`, oracle-matched at `:9:20`) and is silent on
+  the chain. The delta is entirely "does the constant harvest at all".
+* **First condition: FAILS.** `SEVERITY_PRIORITIES = %w[…].map.with_index
+  .to_h.freeze` is a `Node::Call` RHS that `const_lit_of` hits at its
+  `_ => None` catch-all. There is no "existing typer fold" to reuse from the
+  harvest: `const_lit_of` is a pure syntactic function over the AST inside
+  `SourceIndex`, with no `Typer`, no `Interner`, no env and no `CoreIndex` —
+  the whole `Typer`/RBS return-typing machinery is on the other side of the
+  index build, and `ConstLit` is deliberately a value carrier that never
+  escapes `SourceIndex` except through `intern_const_lit`. Producing a nominal
+  for a chain RHS means running method-return resolution during index
+  construction (or a second typing pass over constant RHSs after it). That is
+  an architectural change, not a small probed extension.
+
+Cost/benefit at the measured numbers: 357 chain-valued constants in the corpora
+bound the blast radius, and the whole 292-constant container widening in B
+bought **2 diagnostics**. A chain harvest would additionally have to reproduce
+the reference's `.freeze`-erases-type-args rule (p2a vs p2c) to avoid minting
+`Hash[Dynamic, Dynamic]` where the oracle carries bare `Hash`. Declining.
+
+If it is ever revisited, the cheap 80% is narrower than the general case: a
+whitelist of chain TAILS whose core-RBS return class is unambiguous and
+argument-independent (`to_h` → Hash, `to_a`/`map`/`sort`/`keys`/`values` →
+Array), applied only when the chain ROOT is itself a literal — no env, no
+interner, a pure syntactic extension of `const_lit_of` in the same style as
+the `.freeze` arm. That is a real slice; it is just not this one, and it wants
+its own census walk and its own commit as the spec requires.
+
 ## Non-goals
 
 - No element typing anywhere in B/C. No shape unions for reassignment.
