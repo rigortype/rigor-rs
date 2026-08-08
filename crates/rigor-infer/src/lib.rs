@@ -491,7 +491,11 @@ impl<'i> Typer<'i> {
                 // visible here lexically, types to that literal value
                 // (Range -> Nominal[Range]) — consulted BEFORE the singleton gate
                 // so `R = 1..1024; R.exclude?` witnesses on the range value.
-                if let Some(lit) = self.source.literal_constant(name, prefix) {
+                // Slice A (2026-08-08): the value only applies at a use site in
+                // the SAME FILE as the assignment — the reference rebuilds its
+                // in-source constant-value table per file, so a cross-file fold
+                // is an emission the oracle never makes.
+                if let Some(lit) = self.source.literal_constant(name, prefix, ast.file_id()) {
                     return self.intern_const_lit(lit, interner);
                 }
                 // Collection-shape stage 2e: the same C5 value reached by a
@@ -499,7 +503,9 @@ impl<'i> Typer<'i> {
                 // `ConstantRead` whose `name` is the whole path and so misses the
                 // bare-name map above. Ambiguity declines (see
                 // `SourceIndex::qualified_literal_constant`).
-                if let Some(lit) = self.source.qualified_literal_constant(name, prefix) {
+                if let Some(lit) =
+                    self.source.qualified_literal_constant(name, prefix, ast.file_id())
+                {
                     return self.intern_const_lit(lit, interner);
                 }
                 // C1: replace the pre-C1 bare-name project-wide suppression
@@ -1688,7 +1694,7 @@ impl<'i> Typer<'i> {
                 let prefix = self.enclosing_prefix(*span);
                 if !self.source.constant_shadowed(name, prefix)
                     && !self.source.project_writes_constant(name)
-                    && self.source.literal_constant(name, prefix).is_none()
+                    && !self.source.literal_constant_visible_any_file(name, prefix)
                 {
                     // NILABLE RETURNS DECLINE. `ENVClass#[]` is `(String) ->
                     // String?`; the reference carries the `String | nil` union

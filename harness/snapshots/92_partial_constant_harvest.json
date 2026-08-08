@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/92_partial_constant_harvest.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 19,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 31,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [\"a\", \"b\"]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 39,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for { a: 1 }"
+    }
+  ]
+}
