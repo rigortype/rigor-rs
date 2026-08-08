@@ -9,7 +9,7 @@ one-line ledger of what landed**. The complete per-subsystem port map is
 ledger line here — verdict + numbers + link — and its detail goes to a dated
 note or ADR *first*. No status essays; this file has a hard byte budget.
 
-Last updated: 2026-08-08.
+Last updated: 2026-08-09.
 
 ## Now / Next
 
@@ -41,8 +41,8 @@ No global typing for the OpenStruct rows
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-08-08, post PRs #74-#84): harness **92 fixtures / 0
-unregistered extras / 1 registered divergence**, coverage 374/408; standing
+State (verified 2026-08-09, post PRs #74-#86): harness **94 fixtures / 0
+unregistered extras / 1 registered divergence**, coverage 386/420; standing
 sweep **0 FP / 9204 files / 1125 gaps**, 8 corpora, baselines in
 `harness/CORPUS.md`. Neither sweep tool sees project-`sig/` behaviour. EVERY
 tool that grades the port now prints its binary's path + build time and
@@ -102,6 +102,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-08-09 chain-guard meet — `Bot` sentinel + refinement** — PR #78 left 3a-3 CHAIN facts on the superseded blind compare, and `chains: …String` could not hold a collapse: a 3rd guard re-minted and a 2-class `||` guard skipped the mint gate outright (2 live FPs). `chains` now carries `ClassFact`; `narrow_nominal_to_class` is EXTRACTED and shared by both arms; a chain `Bot` sticks and records into `dead`. **2 FPs closed, +4 matched, 23/26 probe rows ref-matched** (the 3 declines are `===`/`nil?` RECOGNITION, not the meet); census 1125→1125 (0 closed / 0 opened), 0 FP / 9204. [note](notes/20260809-chain-guard-meet.md).
 - **2026-08-08 sequential-guard meet** — S2's re-seed + R3 drop was the WRONG meet: 5 spellings still witnessed (`===`/`nil?`/union/3rd-guard/wrong-class) and refinement was silenced. Local R3 → the `narrow_nominal_to_class` meet (disjoint→`Bot`, subclass refines, `Unknown` KEEPS — probed: ref ignores project hierarchy). **5 FPs closed, +6 matched, probe set 100% ref-matched; census 1125→1125, 0 FP / 9204.** [note](notes/20260808-sequential-guard-meet.md).
 - **2026-08-08 `Object` bucket ADJUDICATED — 30 rows, all behind decisions, NO slice** (PR #85) — 18 are REFERENCE FPs rigor-rs is correctly silent on (16 `Class.new do…end` block bodies scoped at TOP LEVEL by the reference, 2 `class << Const = Object.new` singleton bodies dropped; both runtime-clean, paste-ready repros recorded); 3 are ADR-0035's deferred leg (whose "plugin never enabled" rationale was STALE — the reference auto-wires rbs-inline at this pin; corrected in the ADR, deferral holds at a measured 4-row cost); 9 closable rows are one file / one corpus (mocha `Object#expects`) — the exact "no generality" profile the characterisation note rejects. [adjudication](notes/20260808-object-bucket-adjudication.md).
 - **2026-08-08 constant-value harvesting: per-file gate + partial containers** (PRs #83 probes / #84) — the reference NEVER declines a partially-literal constant, and its constant-VALUE typing is per-FILE (source-confirmed) — C5's project-wide consumption was a live over-emission class (0 corpus instances). Slice A gates consumption per-file (`LoweredAst.file_id`; binary diff 0 lost / 0 gained); slice B harvests partial containers as INERT bare nominals (elements NEVER typed — element typing would out-precise the oracle). **1127→1125: 2 closed, 0 opened, 0 FP / 9204.** Slice C (chain constants) DECLINED: needs return resolution during index construction. [mini-spec+log](notes/20260808-partial-constant-harvest-mini-spec.md) / [probes](notes/20260808-partial-constant-harvest-probes.md).

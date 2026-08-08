@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/94_chain_guard_meet.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 70,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_fff' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 78,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ggg' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 85,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_hhh' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 94,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_iii' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 103,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_jjj' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 114,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_kkk' for Hash"
+    }
+  ]
+}

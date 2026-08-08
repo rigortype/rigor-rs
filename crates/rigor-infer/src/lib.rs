@@ -207,18 +207,25 @@ type ChainAddr = (String, String);
 /// facts keyed by [`ChainAddr`].
 ///
 /// The two families are deliberately separate maps rather than one keyed union:
-/// a chain fact is only ever `Narrowed` (there is no chain `Bot` — the
-/// reference's collapse of a precise chain carrier is reproduced by DECLINING
-/// the mint, since our carrier gate reads the same node's type), and the
-/// invalidation rules differ (any mention of the ROOT kills every chain rooted
-/// at it, while a local fact dies only on a write/mutation of that local).
+/// the invalidation rules differ (any mention of the ROOT kills every chain
+/// rooted at it, while a local fact dies only on a write/mutation of that
+/// local), and the MINT gate reads a different carrier (the chain call's own
+/// type, not the local's `tenv` entry).
+///
+/// Both families carry the same [`ClassFact`] value. A chain `Bot` was
+/// introduced by the 2026-08-09 chain-guard-meet slice: the reference's
+/// sequential meet collapses a re-guarded chain address exactly as it collapses
+/// a local, and "absent" could not express it — a THIRD guard re-minted against
+/// the empty env and witnessed where the reference stays silent (probe
+/// `chain_third`). `Bot` is a sentinel that survives every later guard and
+/// suppresses the recorded use.
 #[derive(Clone, Default, Debug)]
 struct Facts {
     /// Per-local facts. Was the bare `cenv: HashMap<String, ClassFact>` before
     /// stage 3a-3; every existing rule reads and writes exactly this field.
     locals: HashMap<String, ClassFact>,
-    /// Stage 3a-3: `(root, method) -> narrowed class name`.
-    chains: HashMap<ChainAddr, String>,
+    /// Stage 3a-3: `(root, method) -> class fact`.
+    chains: HashMap<ChainAddr, ClassFact>,
 }
 
 impl Facts {
@@ -3136,12 +3143,24 @@ impl<'i> Typer<'i> {
                 // `h.last.zzz { }` both fire (probes `m_use_with_args`,
                 // `m_use_with_block`). Safe-nav on the outer call declines, as
                 // everywhere in this slice.
-                if !safe_nav {
-                    if let Some(r) = receiver {
-                        if let Some(addr) = stable_chain_address(ast, r) {
-                            if let Some(c) = cenv.chains.get(&addr) {
+                //
+                // A `Bot` chain fact records into `out.dead` instead, exactly
+                // as a `Bot` LOCAL fact does below: the reference's meet
+                // collapsed the address, so it has no dispatch surface and the
+                // rules layer must emit nothing there. Safe-nav does not gate
+                // the `Bot` half (same reasoning as the local twin: the
+                // safe-nav decline is about which SHAPES we narrow, not about
+                // dispatch through `Bot`).
+                if let Some(r) = receiver {
+                    if let Some(addr) = stable_chain_address(ast, r) {
+                        match cenv.chains.get(&addr) {
+                            Some(ClassFact::Bot) => {
+                                out.dead.insert(id);
+                            }
+                            Some(ClassFact::Narrowed(c)) if !safe_nav => {
                                 out.calls.insert(id, c.clone());
                             }
+                            _ => {}
                         }
                     }
                 }
@@ -3482,8 +3501,8 @@ impl<'i> Typer<'i> {
                 match t {
                     GuardTarget::Chain(root, m) => {
                         let addr: ChainAddr = (root.clone(), m.clone());
-                        if let Some(class) = pre_join_chains.get(&addr) {
-                            cenv.chains.insert(addr, class.clone());
+                        if let Some(fact) = pre_join_chains.get(&addr) {
+                            cenv.chains.insert(addr, fact.clone());
                         }
                     }
                     GuardTarget::Local(name) => {
@@ -3529,14 +3548,19 @@ impl<'i> Typer<'i> {
     ///
     /// ## Stage 3a-3 — [`GuardTarget::Chain`] entries
     ///
-    /// A chain target follows the SAME three steps with two differences, each
-    /// measured:
-    /// - there is no `Bot` step. The reference does collapse a precise chain
-    ///   carrier (`h = [1, 2]; h.last.is_a?(String)` is reference-silent, probe
-    ///   `k_root_array_lit`), but we reproduce that by DECLINING the mint — the
-    ///   carrier gate below reads the chain call's own type, which is precise in
-    ///   exactly that case. Silence either way, and no chain `Bot` fact has to
-    ///   exist;
+    /// A chain target follows the SAME steps — Bot short-circuit, R3 conflict,
+    /// sequential MEET, mint — with two differences, each measured:
+    /// - the `Bot` STEP has no `guard_collapses` half. A precise chain carrier
+    ///   IS collapsed by the reference (`h = [1, 2]; h.last.is_a?(String)` is
+    ///   reference-silent, probe `k_root_array_lit`), but we reproduce that by
+    ///   DECLINING the mint — the carrier gate below reads the chain call's own
+    ///   type, which is precise in exactly that case. A chain `Bot` therefore
+    ///   only ever arises from the MEET, and once it does it sticks: it survives
+    ///   every later guard and records the use into `ClassNarrowing::dead`
+    ///   rather than `calls`. Before the 2026-08-09 slice `chains` could not
+    ///   express it at all (the value type was a bare class name), and the
+    ///   "absent" stand-in let a third guard re-mint — probe `chain_third`, a
+    ///   live false positive;
     /// - the carrier gate reads `type_of(chain_call)` instead of the local's
     ///   `tenv` entry, and the PR #72 `coarse` ALLOW-list does NOT apply. The
     ///   allow-list exists because the reference's carrier for a `||`-bound
@@ -3546,15 +3570,25 @@ impl<'i> Typer<'i> {
     ///   (probe `k_root_or_union`), so applying the allow-list would be pure
     ///   coverage loss with no FP to pay for it.
     ///
-    /// R3 is load-bearing for chains in a way it is not for locals: a sequential
-    /// disjoint re-guard of the SAME address (`return unless h.last.is_a?(String)`
-    /// then `return unless h.last.is_a?(Hash)`) is reference-SILENT — its scope
-    /// carries `String` into the second guard and collapses — and without R3
-    /// seeing the incoming fact we would witness `for Hash` (probe
-    /// `d_seq_two_returns_disjoint`; the LOCAL spelling of this shape gets the
-    /// full sequential-guard MEET above — chains keep the plain R3 drop, whose
-    /// disjoint half is the same silence and whose refinement half is an
-    /// unprobed decline).
+    /// A sequential re-guard of the SAME address runs the identical
+    /// `narrow_nominal_to_class` meet the LOCAL arm runs — measured row for row
+    /// against the oracle over the 2026-08-09 `chain_*` matrix, which found the
+    /// chain family to behave EXACTLY like the local one
+    /// (`class_narrowing_chain_guard_meet_matrix`). A disjoint pair reaches
+    /// `Bot` and stays silent (`chain_disjoint`, and the `||` union
+    /// `chain_or_disjoint`, which the pre-slice `classes.len() == 1` mint gate
+    /// skipped outright — a live FP); a subclass guard REFINES
+    /// (`chain_subclass` fires `for Integer`, where the old blind
+    /// keep-if-equal-else-remove dropped it); a superclass guard is a no-op
+    /// (`chain_superclass`); the `Unknown` split keeps a project-class carrier
+    /// (`chain_projclass`/`chain_projsub`/`chain_projsub_or`) and drops an
+    /// RBS-space pair (`chain_r7`).
+    ///
+    /// What stays declined is RECOGNITION, not the meet: `guard_predicate`
+    /// requires a bare local operand, so `===` and `nil?` on a chain receiver
+    /// never produce a chain target at all (`chain_caseeq_same`,
+    /// `chain_caseeq_subclass`, `chain_nilq` — the reference fires, we stay
+    /// silent, pure coverage).
     #[allow(clippy::too_many_arguments)]
     fn apply_guards(
         &self,
@@ -3600,109 +3634,12 @@ impl<'i> Typer<'i> {
                     // `Nominal[carrier]` and this guard narrows THAT, not
                     // `Dynamic` — `narrow_nominal_to_class`
                     // (`narrowing.rb:2381`), probed over the seq_* matrix in
-                    // the 2026-08-08 sequential-guards note. Same class keeps
-                    // the fact (`seq_same`, and `===` too — `seq_caseeq_same`
-                    // fires `for String`); `instance_of?` collapses on a bare
-                    // name mismatch BEFORE the hierarchy (`seq_exact_subclass`
-                    // is reference-silent); a proven-disjoint pair reaches
-                    // `Bot` — surviving the join to suppress, where the S2
-                    // drop merely went silent; a SUBCLASS guard refines to the
-                    // more specific class, mintable or not
-                    // (`seq_subclass`/`seq_caseeq_subclass` fire `for
-                    // Integer`); a SUPERCLASS guard is a no-op
-                    // (`seq_superclass` fires `for Integer`, the carrier);
-                    // `Unknown` splits on WHY (see the arm); a multi-class
-                    // fact (an `||` union) meets per member — see below.
+                    // the 2026-08-08 sequential-guards note. The rule table
+                    // lives on the helper, which the CHAIN arm shares
+                    // unchanged. `Bot` here survives the join to SUPPRESS,
+                    // where the S2 drop merely went silent.
                     if let Some(ClassFact::Narrowed(carrier)) = c.locals.get(local).cloned() {
-                        let met = match g.classes.as_slice() {
-                            [class] if *class == carrier => Some(ClassFact::Narrowed(carrier)),
-                            [_] if g.exact => Some(ClassFact::Bot),
-                            [class] => match self.index.class_ordering(&carrier, class) {
-                                ClassOrdering::Equal | ClassOrdering::Subclass => {
-                                    Some(ClassFact::Narrowed(carrier))
-                                }
-                                ClassOrdering::Superclass => {
-                                    Some(ClassFact::Narrowed(class.clone()))
-                                }
-                                ClassOrdering::Disjoint => Some(ClassFact::Bot),
-                                // `Unknown` splits on WHY the ordering failed.
-                                // A PROJECT-declared class is unknown to the
-                                // reference's RBS env too — `:unknown stays
-                                // conservative` (`narrowing.rb:2388`) KEEPS the
-                                // carrier there, even when the project
-                                // hierarchy would prove disjointness (probe
-                                // `projsub`: `ProjKlass < Hash` after a String
-                                // guard still fires `for String`). But an
-                                // ordering that fails on two RBS-SPACE names is
-                                // OUR resolver being weaker: the reference
-                                // proves `File::Stat` vs `URI::HTTP` disjoint
-                                // and is silent (S2 probe r7), so keeping would
-                                // be a live FP — drop.
-                                ClassOrdering::Unknown => {
-                                    if self.source.knows_class(class)
-                                        || self.source.knows_class(&carrier)
-                                    {
-                                        Some(ClassFact::Narrowed(carrier))
-                                    } else {
-                                        None
-                                    }
-                                }
-                            },
-                            classes => {
-                                // An `||` union meets PER MEMBER and unions the
-                                // results (`accumulate` over `analyse_or`): a
-                                // disjoint member contributes `Bot` (nothing), a
-                                // superclass member the carrier, a subclass
-                                // member itself. Representable when one class
-                                // survives: `{Hash, String}` over a String
-                                // carrier is `Bot ∪ String` and the reference
-                                // fires `for String` (probe `seq_or_mixed`);
-                                // all-disjoint is `Bot` (`seq_or_disjoint`). Two
-                                // surviving classes are a real union — drop.
-                                let mut survivors: Vec<&str> = Vec::new();
-                                let mut unresolvable = false;
-                                for class in classes {
-                                    let met: Option<&str> = if g.exact {
-                                        (*class == carrier).then_some(carrier.as_str())
-                                    } else {
-                                        match self.index.class_ordering(&carrier, class) {
-                                            ClassOrdering::Disjoint => None,
-                                            ClassOrdering::Superclass => Some(class.as_str()),
-                                            ClassOrdering::Equal | ClassOrdering::Subclass => {
-                                                Some(carrier.as_str())
-                                            }
-                                            // Same `Unknown` split as the
-                                            // single-class arm: a project-class
-                                            // member keeps the carrier
-                                            // (`projsub_or`); an RBS-space
-                                            // member our resolver cannot order
-                                            // poisons the whole union — drop.
-                                            ClassOrdering::Unknown => {
-                                                if self.source.knows_class(class)
-                                                    || self.source.knows_class(&carrier)
-                                                {
-                                                    Some(carrier.as_str())
-                                                } else {
-                                                    unresolvable = true;
-                                                    None
-                                                }
-                                            }
-                                        }
-                                    };
-                                    if let Some(m) = met {
-                                        if !survivors.contains(&m) {
-                                            survivors.push(m);
-                                        }
-                                    }
-                                }
-                                match (unresolvable, survivors.as_slice()) {
-                                    (true, _) => None,
-                                    (false, []) => Some(ClassFact::Bot),
-                                    (false, [one]) => Some(ClassFact::Narrowed((*one).to_string())),
-                                    (false, _) => None,
-                                }
-                            }
-                        };
+                        let met = self.narrow_nominal_to_class(&carrier, g);
                         match met {
                             Some(f) => {
                                 c.locals.insert(local.clone(), f);
@@ -3731,11 +3668,53 @@ impl<'i> Typer<'i> {
                 }
                 GuardTarget::Chain(root, method) => {
                     let addr: ChainAddr = (root.clone(), method.clone());
+                    // A collapsed address stays collapsed: the reference's
+                    // scope carries `Bot` into every later guard and
+                    // `narrow_nominal_to_class` cannot revive it (probe
+                    // `chain_third`, String→Hash→String, reference-SILENT —
+                    // a live FP on master, where "absent" let the third guard
+                    // re-mint). The LOCAL twin of this short-circuit lives in
+                    // `guard_collapses`, which returns `true` on an incoming
+                    // `Bot` fact.
+                    if c.chains.get(&addr) == Some(&ClassFact::Bot) {
+                        continue;
+                    }
                     if conflicts {
                         c.chains.remove(&addr);
                         continue;
                     }
-                    // `narrow_class_other`'s envelope, read off the CHAIN CALL.
+                    // Sequential-guard meet, the chain twin of the LOCAL arm
+                    // above and the same `narrow_nominal_to_class`
+                    // (`narrowing.rb:2381`): an existing fact means the
+                    // reference's carrier here is `Nominal[carrier]`, not
+                    // `Dynamic`. Oracle-probed over the 2026-08-09 chain_*
+                    // matrix — a subclass guard REFINES (`chain_subclass` fires
+                    // `for Integer`), a superclass guard is a no-op
+                    // (`chain_superclass` fires `for Integer`), a disjoint pair
+                    // or an all-disjoint `||` union reaches `Bot`
+                    // (`chain_disjoint`, `chain_or_disjoint` — the latter a
+                    // live FP on master, where the `classes.len() == 1` mint
+                    // gate skipped the union guard entirely and the stale
+                    // `String` fact survived to witness), and the `Unknown`
+                    // split keeps a project-class carrier
+                    // (`chain_projclass`/`chain_projsub`/`chain_projsub_or` all
+                    // fire `for String`) while dropping an RBS-space pair our
+                    // resolver cannot order (`chain_r7`).
+                    if let Some(ClassFact::Narrowed(carrier)) = c.chains.get(&addr).cloned() {
+                        match self.narrow_nominal_to_class(&carrier, g) {
+                            Some(f) => {
+                                c.chains.insert(addr, f);
+                            }
+                            None => {
+                                c.chains.remove(&addr);
+                            }
+                        }
+                        continue;
+                    }
+                    // No existing fact by here: `Bot` was consumed by the
+                    // short-circuit, `Narrowed` by the meet. The MINT path is
+                    // unchanged — `narrow_class_other`'s envelope, read off the
+                    // CHAIN CALL.
                     let carrier_ok = g.chain_call.is_some_and(|n| {
                         let ty = self.type_of(ast, n, tenv, interner);
                         matches!(interner.get(ty), Type::Dynamic(_) | Type::Top)
@@ -3744,12 +3723,107 @@ impl<'i> Typer<'i> {
                     if !mintable {
                         continue;
                     }
-                    let class = g.classes[0].clone();
-                    if c.chains.get(&addr).is_some_and(|existing| *existing != class) {
-                        c.chains.remove(&addr);
+                    c.chains.insert(addr, ClassFact::Narrowed(g.classes[0].clone()));
+                }
+            }
+        }
+    }
+
+    /// The MEET of an already-`Nominal[carrier]` fact against one guard — the
+    /// port of the reference's `narrow_nominal_to_class` (`narrowing.rb:2381`),
+    /// shared by the LOCAL and CHAIN arms of [`Typer::apply_guards`].
+    ///
+    /// `Some(fact)` is the met fact, `None` a DROP (the caller removes the
+    /// entry — neither witnessed nor collapsed). Same class keeps the fact
+    /// (`seq_same`/`chain_same`, and `===` too — `seq_caseeq_same` fires
+    /// `for String`); `instance_of?` collapses on a bare name mismatch BEFORE
+    /// the hierarchy (`seq_exact_subclass`/`chain_exact_subclass` are
+    /// reference-silent); a proven-disjoint pair reaches `Bot`; a SUBCLASS
+    /// guard refines to the more specific class, mintable or not
+    /// (`seq_subclass`/`chain_subclass` fire `for Integer`); a SUPERCLASS guard
+    /// is a no-op (`seq_superclass`/`chain_superclass` fire `for Integer`, the
+    /// carrier); `Unknown` splits on WHY (see the arm); a multi-class fact (an
+    /// `||` union) meets per member.
+    ///
+    /// Extracted verbatim from the LOCAL arm by the 2026-08-09 chain-guard-meet
+    /// slice — the chain family measures IDENTICALLY on the oracle across all
+    /// 26 `chain_*` rows, so one implementation is the honest encoding.
+    fn narrow_nominal_to_class(&self, carrier: &str, g: &GuardFact) -> Option<ClassFact> {
+        match g.classes.as_slice() {
+            [class] if class.as_str() == carrier => Some(ClassFact::Narrowed(carrier.to_string())),
+            [_] if g.exact => Some(ClassFact::Bot),
+            [class] => match self.index.class_ordering(carrier, class) {
+                ClassOrdering::Equal | ClassOrdering::Subclass => {
+                    Some(ClassFact::Narrowed(carrier.to_string()))
+                }
+                ClassOrdering::Superclass => Some(ClassFact::Narrowed(class.clone())),
+                ClassOrdering::Disjoint => Some(ClassFact::Bot),
+                // `Unknown` splits on WHY the ordering failed. A
+                // PROJECT-declared class is unknown to the reference's RBS env
+                // too — `:unknown stays conservative` (`narrowing.rb:2388`)
+                // KEEPS the carrier there, even when the project hierarchy
+                // would prove disjointness (probes `projsub`/`chain_projsub`:
+                // `ProjKlass < Hash` after a String guard still fires
+                // `for String`). But an ordering that fails on two RBS-SPACE
+                // names is OUR resolver being weaker: the reference proves
+                // `File::Stat` vs `URI::HTTP` disjoint and is silent (probes
+                // r7/`chain_r7`), so keeping would be a live FP — drop.
+                ClassOrdering::Unknown => {
+                    if self.source.knows_class(class) || self.source.knows_class(carrier) {
+                        Some(ClassFact::Narrowed(carrier.to_string()))
                     } else {
-                        c.chains.insert(addr, class);
+                        None
                     }
+                }
+            },
+            classes => {
+                // An `||` union meets PER MEMBER and unions the results
+                // (`accumulate` over `analyse_or`): a disjoint member
+                // contributes `Bot` (nothing), a superclass member the
+                // carrier, a subclass member itself. Representable when one
+                // class survives: `{Hash, String}` over a String carrier is
+                // `Bot ∪ String` and the reference fires `for String` (probes
+                // `seq_or_mixed`/`chain_or_mixed`); all-disjoint is `Bot`
+                // (`seq_or_disjoint`/`chain_or_disjoint`). Two surviving
+                // classes are a real union — drop.
+                let mut survivors: Vec<&str> = Vec::new();
+                let mut unresolvable = false;
+                for class in classes {
+                    let met: Option<&str> = if g.exact {
+                        (class.as_str() == carrier).then_some(carrier)
+                    } else {
+                        match self.index.class_ordering(carrier, class) {
+                            ClassOrdering::Disjoint => None,
+                            ClassOrdering::Superclass => Some(class.as_str()),
+                            ClassOrdering::Equal | ClassOrdering::Subclass => Some(carrier),
+                            // Same `Unknown` split as the single-class arm: a
+                            // project-class member keeps the carrier
+                            // (`projsub_or`/`chain_projsub_or`); an RBS-space
+                            // member our resolver cannot order poisons the
+                            // whole union — drop.
+                            ClassOrdering::Unknown => {
+                                if self.source.knows_class(class)
+                                    || self.source.knows_class(carrier)
+                                {
+                                    Some(carrier)
+                                } else {
+                                    unresolvable = true;
+                                    None
+                                }
+                            }
+                        }
+                    };
+                    if let Some(m) = met {
+                        if !survivors.contains(&m) {
+                            survivors.push(m);
+                        }
+                    }
+                }
+                match (unresolvable, survivors.as_slice()) {
+                    (true, _) => None,
+                    (false, []) => Some(ClassFact::Bot),
+                    (false, [one]) => Some(ClassFact::Narrowed((*one).to_string())),
+                    (false, _) => None,
                 }
             }
         }
@@ -5012,10 +5086,12 @@ fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
 /// Facts the EDGES established are not in `cenv` at all (edges walk clones), so
 /// nothing minted inside a branch can leak out through here.
 ///
-/// Stage 3a-3: EVERY chain fact dies at a join, unconditionally. There is no
-/// chain `Bot` to survive, and the reference agrees that a chain narrowing
-/// established inside a branch does not escape it (probe `n_escape_after_if`,
-/// reference-silent). The one place a chain fact must outlive the join is the
+/// Stage 3a-3: EVERY chain fact dies at a join, unconditionally — a chain `Bot`
+/// included, unlike the LOCAL `Bot` the retain below preserves. The reference
+/// agrees that a chain narrowing established inside a branch does not escape it
+/// (probe `n_escape_after_if`, reference-silent), and a `Bot` that escaped a
+/// branch would SUPPRESS rather than merely go silent, so the blanket wipe is
+/// the conservative side. The one place a chain fact must outlive the join is the
 /// early-return propagation, which [`Typer::class_flow_if`] re-seeds explicitly
 /// from a PRE-join snapshot — see its comment on the sequential-disjoint
 /// hazard.
@@ -5158,7 +5234,8 @@ fn kill_cenv_writes(
 /// `bot_mutator_use`), while the narrowing fact must still die there.
 ///
 /// Stage 3a-3: a CHAIN fact rooted at the named local dies here unconditionally
-/// — `Bot` has no chain analogue, and a mutation of the root is exactly the
+/// — a chain `Bot` included (a mutated root invalidates the ADDRESS, so the
+/// collapse no longer describes anything), and a mutation of the root is exactly the
 /// "intervening call against the same root receiver" the reference drops on
 /// (`invalidate_chain_after_call`; probe `n_root_mutator`, reference-silent).
 fn kill_cenv_narrowed(
@@ -8327,6 +8404,105 @@ mod class_narrowing_tests {
         }
     }
 
+    /// SEQUENTIAL guards on a stage-3a-3 CHAIN address — the chain twin of
+    /// [`class_narrowing_sequential_guard_meet_matrix`]. Every row was measured
+    /// against the pinned oracle (`v0.3.1`, 2026-08-09 `chain_*` probe matrix,
+    /// one FRESH cwd per scenario, `--no-cache`): `Some(class)` — the reference
+    /// fires `for <class>` and the snapshot must carry it; `(None, true)` — the
+    /// meet reached `Bot` and the call site must be DEAD; `(None, false)` — a
+    /// recorded DECLINE (the reference may fire; we drop the fact — coverage,
+    /// never an FP).
+    ///
+    /// `chain_or_disjoint` and `chain_third` were LIVE false positives on
+    /// master: the union guard skipped the `classes.len() == 1` mint gate and
+    /// the disjoint re-guard could only REMOVE (never collapse), so a stale or
+    /// re-minted fact witnessed `for String` where the reference is silent.
+    #[test]
+    fn class_narrowing_chain_guard_meet_matrix() {
+        let rows: &[(&str, &str, Option<&str>, bool)] = &[
+            // ---- the FP family: disjoint sequential pairs reach Bot ---------
+            ("chain_disjoint", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            // A THIRD guard cannot revive the collapsed address (live FP).
+            ("chain_third", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash)\n  return unless h.last.is_a?(String)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            ("chain_bang", "def f(h)\n  return unless h.last.is_a?(String)\n  return if !h.last.is_a?(Hash)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            // An `||` union whose EVERY member is disjoint (live FP: the mint
+            // gate skipped the 2-class guard and the stale fact survived).
+            ("chain_or_disjoint", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash) || h.last.is_a?(Array)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            // `instance_of?` collapses on a bare name mismatch BEFORE the
+            // hierarchy — a SUBCLASS name included.
+            ("chain_exact_disjoint", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.instance_of?(Hash)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            ("chain_exact_subclass", "def f(h)\n  return unless h.last.is_a?(Numeric)\n  return unless h.last.instance_of?(Integer)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            // A NON-terminating second conditional: the branch-edge meet.
+            ("chain_br_disjoint", "def f(h)\n  return unless h.last.is_a?(String)\n  if h.last.is_a?(Hash)\n    h.last.frobnicate_zzz\n  end\nend\n", None, true),
+            // A use between the guards fires; the use after the collapse is dead.
+            ("chain_ctrl_use_between", "def f(h)\n  return unless h.last.is_a?(String)\n  h.last.frobnicate_yyy\n  return unless h.last.is_a?(Hash)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            // ---- refinement / no-op: the reference FIRES and so must we -----
+            ("chain_subclass", "def f(h)\n  return unless h.last.is_a?(Numeric)\n  return unless h.last.is_a?(Integer)\n  h.last.frobnicate_zzz\nend\n", Some("Integer"), false),
+            ("chain_superclass", "def f(h)\n  return unless h.last.is_a?(Integer)\n  return unless h.last.is_a?(Numeric)\n  h.last.frobnicate_zzz\nend\n", Some("Integer"), false),
+            ("chain_same", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(String)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            ("chain_br_subclass", "def f(h)\n  return unless h.last.is_a?(Numeric)\n  if h.last.is_a?(Integer)\n    h.last.frobnicate_zzz\n  end\nend\n", Some("Integer"), false),
+            ("chain_br_superclass", "def f(h)\n  return unless h.last.is_a?(Integer)\n  if h.last.is_a?(Numeric)\n    h.last.frobnicate_zzz\n  end\nend\n", Some("Integer"), false),
+            // The ELSE edge of a disjoint branch keeps the incoming fact.
+            ("chain_br_else_keeps", "def f(h)\n  return unless h.last.is_a?(String)\n  if h.last.is_a?(Hash)\n    1\n  else\n    h.last.frobnicate_zzz\n  end\nend\n", Some("String"), false),
+            // ---- the keep family: `:unknown stays conservative` + unions ----
+            // `Bot ∪ String` is the carrier.
+            ("chain_or_mixed", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash) || h.last.is_a?(String)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            // A PROJECT class: `:unknown stays conservative` keeps the carrier
+            // even when the project hierarchy would prove disjointness. These
+            // rows passed before this slice only because a project-class guard
+            // is non-mintable and skipped; the explicit `Unknown` split in
+            // `narrow_nominal_to_class` is what keeps them passing now.
+            ("chain_projclass", "class ProjKlass; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            ("chain_projsub", "class ProjKlass < Hash; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            ("chain_projsub_or", "class ProjKlass < Hash; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash) || h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            // ---- must-still-fire controls -----------------------------------
+            ("chain_ctrl_single", "def f(h)\n  return unless h.last.is_a?(String)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            // A rebind of the ROOT resets the address: the second guard mints.
+            ("chain_ctrl_rebind", "def f(h, w)\n  return unless h.last.is_a?(String)\n  h = w\n  return unless h.last.is_a?(Hash)\n  h.last.frobnicate_zzz\nend\n", Some("Hash"), false),
+            // A call ON the root invalidates the address (the existing
+            // `invalidate_chain_after_call` port), so the second guard mints.
+            ("chain_ctrl_pop_between", "def f(h)\n  return unless h.last.is_a?(String)\n  h.pop\n  return unless h.last.is_a?(Hash)\n  h.last.frobnicate_zzz\nend\n", Some("Hash"), false),
+            // ---- declines that STAY -----------------------------------------
+            // Two RBS-space names our resolver cannot order: the reference
+            // proves them disjoint and is silent, so the fact DROPS.
+            ("chain_r7", "def f(h)\n  return unless h.last.is_a?(File::Stat)\n  return unless h.last.is_a?(URI::HTTP)\n  h.last.frobnicate_zzz\nend\n", None, false),
+            // RECOGNITION gap (not this slice): `guard_predicate` requires a
+            // bare LOCAL operand, so `===` / `nil?` on a chain receiver is
+            // never a chain guard at all and the incoming fact dies at the
+            // join. The reference fires on the first three — pure coverage.
+            ("chain_caseeq_same", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless String === h.last\n  h.last.frobnicate_zzz\nend\n", None, false),
+            ("chain_caseeq_subclass", "def f(h)\n  return unless h.last.is_a?(Numeric)\n  return unless Integer === h.last\n  h.last.frobnicate_zzz\nend\n", None, false),
+            ("chain_nilq", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.nil?\n  h.last.frobnicate_zzz\nend\n", None, false),
+            ("chain_caseeq_disjoint", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless Hash === h.last\n  h.last.frobnicate_zzz\nend\n", None, false),
+        ];
+        assert_eq!(rows.len(), 26, "the chain probe matrix has 26 oracle-measured rows");
+        for (row, src, expected, dead) in rows {
+            let ast = lower_src(src.as_bytes());
+            let index = CoreIndex::new();
+            let source = SourceIndex::build(&ast, &index);
+            let scopes = lexical_scopes(&ast);
+            let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+            let mut i = Interner::new();
+            let pass = typer.class_narrowing_pass(&ast, &mut i);
+            let call = call_named(&ast, "frobnicate_zzz");
+            assert_eq!(
+                pass.calls.get(&call).map(String::as_str),
+                *expected,
+                "chain-guard row {row} snapshot\n--- source ---\n{src}"
+            );
+            assert_eq!(pass.dead.contains(&call), *dead, "chain-guard row {row} dead");
+            if *row == "chain_ctrl_use_between" {
+                let first = call_named(&ast, "frobnicate_yyy");
+                assert_eq!(
+                    pass.calls.get(&first).map(String::as_str),
+                    Some("String"),
+                    "chain-guard row {row}: the use BETWEEN the guards fires"
+                );
+                assert!(!pass.dead.contains(&first), "row {row}: first use stays live");
+            }
+        }
+    }
+
     /// Decline: safe-nav dispatch on the narrowed local never records.
     #[test]
     fn class_narrowing_safe_nav_declines() {
@@ -8532,12 +8708,15 @@ mod class_narrowing_tests {
                 f(&format!("  if {G} && h.last.is_a?(Hash)\n    {USE}\n  end")),
                 None,
             ),
-            // DECLINE: the reference narrows a SUBCLASS re-guard to the more
-            // specific class; R3 drops it. Coverage only.
+            // A SUBCLASS re-guard REFINES to the more specific class. Was a
+            // recorded decline (the blind R3 drop) until the 2026-08-09
+            // chain-guard meet; the reference fires `for Integer` (probe
+            // `chain_subclass`) and now so do we — see
+            // `class_narrowing_chain_guard_meet_matrix`.
             (
                 "d_seq_subclass",
                 f("  return unless h.last.is_a?(Numeric)\n  return unless h.last.is_a?(Integer)\n  h.last.frobnicate_zzz"),
-                None,
+                Some("Integer"),
             ),
             (
                 "d_seq_same_class",
