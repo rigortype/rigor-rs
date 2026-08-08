@@ -3423,7 +3423,7 @@ impl<'i> Typer<'i> {
         // edge rebound the local) …
         widen_flow_writes(writes, if_span, tenv, interner);
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
-        // the propagation's R3 conflict check below (see there for why).
+        // the propagation's re-seed below (see there for why).
         let pre_join_chains = cenv.chains.clone();
         // S2: the LOCAL twin of the same snapshot. See the re-seed below.
         let pre_join_locals = cenv.locals.clone();
@@ -3472,10 +3472,12 @@ impl<'i> Typer<'i> {
             // witnessed — probe r7. The same shape on two CORE names
             // (`Hash` then `String`) was already firing before this slice: the
             // pre-existing FP the `next`/`break` build note recorded as
-            // `s1_two_returns_sequential`. Re-seeding lets R3 see the prior fact,
-            // conflict, and drop it — silence on both spellings. Only the locals
-            // this map touches are restored, so an untouched fact still dies at
-            // the join.
+            // `s1_two_returns_sequential`. Re-seeding lets the sequential-guard
+            // MEET in `apply_guards` see the prior fact: a disjoint re-guard
+            // reaches `Bot` (silence on both spellings), a subclass re-guard
+            // refines instead of dropping (`seq_subclass` fires `for Integer`
+            // on the reference). Only the locals this map touches are restored,
+            // so an untouched fact still dies at the join.
             for (t, _) in &carried {
                 match t {
                     GuardTarget::Chain(root, m) => {
@@ -3516,9 +3518,14 @@ impl<'i> Typer<'i> {
     ///    ALLOW-list (`coarse`, PR #72) and its current type is `Dynamic`/`Top`
     ///    (`narrow_class_other`). Both gates are PER-LOCAL: a compound predicate
     ///    may narrow one local and decline another (probe `a_two_locals_then`).
-    /// 3. **Review R3**: a mintable guard conflicting with an existing
-    ///    DIFFERENT fact drops the stale fact and inserts nothing. A SAME-class
-    ///    re-guard is a no-op re-narrowing and keeps it.
+    /// 3. **Sequential-guard meet** (replacing the old review-R3 blanket drop
+    ///    for LOCALS): a guard over an existing `Narrowed` fact narrows the
+    ///    FACT's carrier the way the reference's `narrow_nominal_to_class`
+    ///    narrows `Nominal[C]` — same class keeps, a subclass guard refines, a
+    ///    superclass guard is a no-op, proven-disjoint reaches `Bot`, `exact`
+    ///    collapses on name mismatch, an unresolvable ordering KEEPS the
+    ///    carrier (`:unknown stays conservative`, `narrowing.rb:2388`), and an
+    ///    `||` union meets per member. See the arm's comment for probe rows.
     ///
     /// ## Stage 3a-3 — [`GuardTarget::Chain`] entries
     ///
@@ -3544,9 +3551,10 @@ impl<'i> Typer<'i> {
     /// then `return unless h.last.is_a?(Hash)`) is reference-SILENT — its scope
     /// carries `String` into the second guard and collapses — and without R3
     /// seeing the incoming fact we would witness `for Hash` (probe
-    /// `d_seq_two_returns_disjoint`; the LOCAL spelling of this shape is a known
-    /// pre-existing FP, recorded in the `next`/`break` build note, which this
-    /// slice deliberately does not reproduce for chains).
+    /// `d_seq_two_returns_disjoint`; the LOCAL spelling of this shape gets the
+    /// full sequential-guard MEET above — chains keep the plain R3 drop, whose
+    /// disjoint half is the same silence and whose refinement half is an
+    /// unprobed decline).
     #[allow(clippy::too_many_arguments)]
     fn apply_guards(
         &self,
@@ -3585,6 +3593,99 @@ impl<'i> Typer<'i> {
                         c.locals.remove(local);
                         continue;
                     }
+                    // Sequential-guard meet: the env already carries a
+                    // `Narrowed` fact for this local (an earlier statement's
+                    // early-return propagation minted it, re-seeded past the
+                    // join by S2), so the reference's carrier here is
+                    // `Nominal[carrier]` and this guard narrows THAT, not
+                    // `Dynamic` — `narrow_nominal_to_class`
+                    // (`narrowing.rb:2381`), probed over the seq_* matrix in
+                    // the 2026-08-08 sequential-guards note. Same class keeps
+                    // the fact (`seq_same`, and `===` too — `seq_caseeq_same`
+                    // fires `for String`); `instance_of?` collapses on a bare
+                    // name mismatch BEFORE the hierarchy (`seq_exact_subclass`
+                    // is reference-silent); a proven-disjoint pair reaches
+                    // `Bot` — surviving the join to suppress, where the S2
+                    // drop merely went silent; a SUBCLASS guard refines to the
+                    // more specific class, mintable or not
+                    // (`seq_subclass`/`seq_caseeq_subclass` fire `for
+                    // Integer`); a SUPERCLASS guard is a no-op
+                    // (`seq_superclass` fires `for Integer`, the carrier);
+                    // `Unknown` KEEPS the carrier — `:unknown stays
+                    // conservative` on the reference too, measured even for an
+                    // in-source subclass whose project hierarchy would prove
+                    // disjointness (`seq_projclass`, `projsub` — both fire
+                    // `for String` there). A multi-class fact (an `||` union)
+                    // meets per member — see the union arm below.
+                    if let Some(ClassFact::Narrowed(carrier)) = c.locals.get(local).cloned() {
+                        let met = match g.classes.as_slice() {
+                            [class] if *class == carrier => Some(ClassFact::Narrowed(carrier)),
+                            [_] if g.exact => Some(ClassFact::Bot),
+                            [class] => match self.index.class_ordering(&carrier, class) {
+                                // `:unknown stays conservative` — the reference
+                                // KEEPS the carrier (`narrowing.rb:2388`), even
+                                // for an in-source class whose project
+                                // hierarchy would prove disjointness (probe
+                                // `projsub`: `ProjKlass < Hash` after a String
+                                // guard still fires `for String` there). Both
+                                // engines resolve the ordering over the SAME
+                                // byte-mirrored RBS, so `Unknown` here is
+                                // `:unknown` there.
+                                ClassOrdering::Equal
+                                | ClassOrdering::Subclass
+                                | ClassOrdering::Unknown => Some(ClassFact::Narrowed(carrier)),
+                                ClassOrdering::Superclass => {
+                                    Some(ClassFact::Narrowed(class.clone()))
+                                }
+                                ClassOrdering::Disjoint => Some(ClassFact::Bot),
+                            },
+                            classes => {
+                                // An `||` union meets PER MEMBER and unions the
+                                // results (`accumulate` over `analyse_or`): a
+                                // disjoint member contributes `Bot` (nothing), a
+                                // superclass member the carrier, a subclass
+                                // member itself. Representable when one class
+                                // survives: `{Hash, String}` over a String
+                                // carrier is `Bot ∪ String` and the reference
+                                // fires `for String` (probe `seq_or_mixed`);
+                                // all-disjoint is `Bot` (`seq_or_disjoint`). Two
+                                // surviving classes are a real union — drop.
+                                let mut survivors: Vec<&str> = Vec::new();
+                                for class in classes {
+                                    let met: Option<&str> = if g.exact {
+                                        (*class == carrier).then_some(carrier.as_str())
+                                    } else {
+                                        match self.index.class_ordering(&carrier, class) {
+                                            ClassOrdering::Disjoint => None,
+                                            ClassOrdering::Superclass => Some(class.as_str()),
+                                            ClassOrdering::Equal
+                                            | ClassOrdering::Subclass
+                                            | ClassOrdering::Unknown => Some(carrier.as_str()),
+                                        }
+                                    };
+                                    if let Some(m) = met {
+                                        if !survivors.contains(&m) {
+                                            survivors.push(m);
+                                        }
+                                    }
+                                }
+                                match survivors.as_slice() {
+                                    [] => Some(ClassFact::Bot),
+                                    [one] => Some(ClassFact::Narrowed((*one).to_string())),
+                                    _ => None,
+                                }
+                            }
+                        };
+                        match met {
+                            Some(f) => {
+                                c.locals.insert(local.clone(), f);
+                            }
+                            None => {
+                                c.locals.remove(local);
+                            }
+                        }
+                        continue;
+                    }
                     let mintable = g.mintable
                         && g.classes.len() == 1
                         && !coarse.contains(local)
@@ -3597,12 +3698,9 @@ impl<'i> Typer<'i> {
                     if !mintable {
                         continue;
                     }
-                    let fact = ClassFact::Narrowed(g.classes[0].clone());
-                    if c.locals.get(local).is_some_and(|existing| *existing != fact) {
-                        c.locals.remove(local);
-                    } else {
-                        c.locals.insert(local.clone(), fact);
-                    }
+                    // No existing fact for the local by here: `Bot` was
+                    // consumed by the collapse test, `Narrowed` by the meet.
+                    c.locals.insert(local.clone(), ClassFact::Narrowed(g.classes[0].clone()));
                 }
                 GuardTarget::Chain(root, method) => {
                     let addr: ChainAddr = (root.clone(), method.clone());
@@ -8099,6 +8197,102 @@ mod class_narrowing_tests {
             let pass = typer.class_narrowing_pass(&ast, &mut i);
             let call = call_named(&ast, "frobnicate_zzz");
             assert_eq!(pass.dead.contains(&call), *dead, "3a-1 Bot row {row}");
+        }
+    }
+
+    /// SEQUENTIAL disjoint/refining guards — the [`Typer::apply_guards`]
+    /// sequential-guard meet plus the pre-join propagation in
+    /// [`Typer::class_flow_if`]. Every row is oracle-measured (pin `v0.3.1`,
+    /// 2026-08-08 `seqprobe` matrix): `Some(class)` — the reference fires
+    /// `for <class>` and the snapshot must carry it; `(None, true)` — the
+    /// reference's meet reached `Bot` and the call site must be DEAD (every
+    /// `dead: true` row except the harness-shape controls was a live FP on
+    /// master); `(None, false)` — a recorded DECLINE: the reference fires but
+    /// we drop the fact (never an FP, only coverage).
+    #[test]
+    fn class_narrowing_sequential_guard_meet_matrix() {
+        let rows: &[(&str, &str, Option<&str>, bool)] = &[
+            // ---- the FP family: disjoint sequential pairs reach Bot ---------
+            ("seq_disjoint", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", None, true),
+            ("seq_raise", "def f(v)\n  raise ArgumentError unless v.is_a?(String)\n  raise ArgumentError unless v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", None, true),
+            ("seq_bang", "def f(v)\n  return unless v.is_a?(String)\n  return if !v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", None, true),
+            // A third guard cannot revive the collapsed local.
+            ("seq_third", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(Hash)\n  return unless v.is_a?(String)\n  v.frobnicate_zzz\nend\n", None, true),
+            // `instance_of?` collapses on a bare name mismatch — even a
+            // SUBCLASS name (the reference tests `context.exact` before the
+            // hierarchy; both probes are reference-silent).
+            ("seq_exact_disjoint", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.instance_of?(Hash)\n  v.frobnicate_zzz\nend\n", None, true),
+            ("seq_exact_subclass", "def f(v)\n  return unless v.is_a?(Numeric)\n  return unless v.instance_of?(Integer)\n  v.frobnicate_zzz\nend\n", None, true),
+            // Non-mintable second guards feed the same meet: `===`, `nil?`.
+            ("seq_caseeq_disjoint", "def f(v)\n  return unless v.is_a?(String)\n  return unless Hash === v\n  v.frobnicate_zzz\nend\n", None, true),
+            ("seq_nilq", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.nil?\n  v.frobnicate_zzz\nend\n", None, true),
+            // An `||` union whose EVERY member is disjoint.
+            ("seq_or_disjoint", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(Hash) || v.is_a?(Array)\n  v.frobnicate_zzz\nend\n", None, true),
+            // The `next` spelling inside a block (the r8 shape).
+            ("blk_next_disjoint", "def f(xs)\n  xs.each do |v|\n    next unless v.is_a?(String)\n    next unless v.is_a?(Hash)\n    v.frobnicate_zzz\n  end\nend\n", None, true),
+            // A NON-terminating second conditional: the branch-edge meet.
+            ("br_disjoint", "def f(v)\n  return unless v.is_a?(String)\n  if v.is_a?(Hash)\n    v.frobnicate_zzz\n  end\nend\n", None, true),
+            ("br_exact_disjoint", "def f(v)\n  return unless v.is_a?(String)\n  if v.instance_of?(Hash)\n    v.frobnicate_zzz\n  end\nend\n", None, true),
+            // A use between the guards fires; the use AFTER the collapse is
+            // dead (the reference reports only the first).
+            ("seq_use_between", "def f(v)\n  return unless v.is_a?(String)\n  v.frobnicate_yyy\n  return unless v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", None, true),
+            // ---- refinement / no-op: the reference FIRES and so must we -----
+            // A subclass guard refines to the MORE SPECIFIC class …
+            ("seq_subclass", "def f(v)\n  return unless v.is_a?(Numeric)\n  return unless v.is_a?(Integer)\n  v.frobnicate_zzz\nend\n", Some("Integer"), false),
+            // … a superclass guard is a no-op (the carrier stays) …
+            ("seq_superclass", "def f(v)\n  return unless v.is_a?(Integer)\n  return unless v.is_a?(Numeric)\n  v.frobnicate_zzz\nend\n", Some("Integer"), false),
+            // … a same-class re-guard keeps, `===` included …
+            ("seq_same", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(String)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+            ("seq_caseeq_same", "def f(v)\n  return unless v.is_a?(String)\n  return unless String === v\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+            // … and `===` refines too (updating an existing fact is not
+            // minting — the reference fires `for Integer`).
+            ("seq_caseeq_subclass", "def f(v)\n  return unless v.is_a?(Numeric)\n  return unless Integer === v\n  v.frobnicate_zzz\nend\n", Some("Integer"), false),
+            ("blk_next_subclass", "def f(xs)\n  xs.each do |v|\n    next unless v.is_a?(Numeric)\n    next unless v.is_a?(Integer)\n    v.frobnicate_zzz\n  end\nend\n", Some("Integer"), false),
+            // Refinement through a branch edge (non-terminating conditional).
+            ("br_subclass", "def f(v)\n  return unless v.is_a?(Numeric)\n  if v.is_a?(Integer)\n    v.frobnicate_zzz\n  end\nend\n", Some("Integer"), false),
+            ("br_superclass", "def f(v)\n  return unless v.is_a?(Integer)\n  if v.is_a?(Numeric)\n    v.frobnicate_zzz\n  end\nend\n", Some("Integer"), false),
+            // The ELSE edge of a disjoint branch keeps the incoming fact.
+            ("br_else_keeps", "def f(v)\n  return unless v.is_a?(String)\n  if v.is_a?(Hash)\n    1\n  else\n    v.frobnicate_zzz\n  end\nend\n", Some("String"), false),
+            // ---- must-still-fire controls -----------------------------------
+            ("ctrl_single", "def f(v)\n  return unless v.is_a?(String)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+            // A rebind between the guards resets the meet: the second guard
+            // mints fresh (the reference fires `for Hash`).
+            ("ctrl_write_between", "def f(v, w)\n  return unless v.is_a?(String)\n  v = w\n  return unless v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", Some("Hash"), false),
+            // ---- the keep family: `:unknown stays conservative` + unions ----
+            // An `||` union with a LIVE member meets per member: `Bot ∪
+            // String` is the carrier and the reference fires `for String`.
+            ("seq_or_mixed", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(Hash) || v.is_a?(String)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+            // An unresolvable ordering (a project class): `:unknown stays
+            // conservative` — the reference keeps the carrier and fires
+            // `for String`, even when the project hierarchy (`< Hash`) would
+            // prove disjointness (probe `projsub`).
+            ("seq_projclass", "class ProjKlass; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+            ("seq_projsub", "class ProjKlass < Hash; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+        ];
+        for (row, src, expected, dead) in rows {
+            let ast = lower_src(src.as_bytes());
+            let index = CoreIndex::new();
+            let source = SourceIndex::build(&ast, &index);
+            let scopes = lexical_scopes(&ast);
+            let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+            let mut i = Interner::new();
+            let pass = typer.class_narrowing_pass(&ast, &mut i);
+            let call = call_named(&ast, "frobnicate_zzz");
+            assert_eq!(
+                pass.calls.get(&call).map(String::as_str),
+                *expected,
+                "sequential-guard row {row} snapshot\n--- source ---\n{src}"
+            );
+            assert_eq!(pass.dead.contains(&call), *dead, "sequential-guard row {row} dead");
+            if *row == "seq_use_between" {
+                let first = call_named(&ast, "frobnicate_yyy");
+                assert_eq!(
+                    pass.calls.get(&first).map(String::as_str),
+                    Some("String"),
+                    "sequential-guard row {row}: the use BETWEEN the guards fires"
+                );
+                assert!(!pass.dead.contains(&first), "row {row}: first use stays live");
+            }
         }
     }
 
