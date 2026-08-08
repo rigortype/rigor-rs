@@ -3,6 +3,27 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
+      "line": 21,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for singleton(BigMath)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 35,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for BigDecimal"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 31,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for singleton(Bundler)"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 37,
       "column": 6,
       "severity": "error",
