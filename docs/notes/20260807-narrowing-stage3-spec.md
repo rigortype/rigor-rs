@@ -760,7 +760,10 @@ review-R3 conflict rule has no incoming fact to conflict with. The obvious fix �
 apply the carried map against the PRE-JOIN snapshot — also newly declines
 `s7_two_returns_subclass` (`Numeric` then `Integer`), which the reference FIRES
 and rigor-rs currently MATCHES, so a correct fix needs the disjoint-vs-refinement
-distinction rather than R3's blanket drop. Out of scope here, and not urgent:
+distinction rather than R3's blanket drop. **FIXED 2026-08-08** — the
+sequential-guard meet ([note](20260808-sequential-guard-meet.md)) ports
+`narrow_nominal_to_class` into `apply_guards` and threads the pre-join facts
+through the propagation. Out of scope here, and not urgent:
 the shape is effectively dead code (the second guard can never pass) and the
 standing sweep is **0 FP over 9204 files** with the `next` spelling live.
 
