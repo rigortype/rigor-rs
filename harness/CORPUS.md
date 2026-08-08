@@ -99,22 +99,30 @@ tools — a partial sweep must never read as a full one.
 
 Custom directories passed as positional arguments replace the whole list.
 
-## Standing sweep-set baseline (2026-07-31)
+## Standing sweep-set baseline (2026-08-09)
 
-`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.1`,
-vendored rbs 4.1.0. **9204 files, 0 FP candidates.** Coverage gaps are the
-sound-subset side of ADR-0002 and are expected:
+`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.2`,
+vendored rbs 4.1.1. **9204 files, 0 FP candidates, 841 coverage gaps.** Coverage
+gaps are the sound-subset side of ADR-0002 and are expected:
 
-| corpus | files | coverage gaps |
-|---|---|---|
-| mastodon/app | 1236 | 48 |
-| gitlab-foss/lib | 4676 | 328 |
-| survey/mail | 874 | 540 |
-| survey/Ruby | 192 | 30 |
-| survey/dependabot-core | 1650 | 81 |
-| survey/concurrent-ruby | 345 | 86 |
-| survey/net-ssh | 180 | 75 |
-| survey/haml/lib | 51 | 5 |
+| corpus | files | coverage gaps | (was, `v0.3.1`) |
+|---|---|---|---|
+| mastodon/app | 1236 | 13 | 48 |
+| gitlab-foss/lib | 4676 | 170 | 328 |
+| survey/mail | 874 | 439 | 540 |
+| survey/Ruby | 192 | 30 | 30 |
+| survey/dependabot-core | 1650 | 81 | 81 |
+| survey/concurrent-ruby | 345 | 80 | 86 |
+| survey/net-ssh | 180 | 26 | 75 |
+| survey/haml/lib | 51 | 2 | 5 |
+
+The `v0.3.1` column is the 2026-07-31 baseline (1193 gaps; 1125 by the time of
+the 08-08 slices). Almost all of the drop is upstream RETRACTING diagnostics, not
+the port gaining coverage: `v0.3.2`'s #297 requires a nameable non-nil arm before
+a possible-nil witness, which is the position
+[Tier B/C](../docs/notes/20260717-tier-bc-track-closed.md) had already argued.
+Read the total as "what the oracle now claims", not as progress.
+[pin note](../docs/notes/20260809-repin-v032.md).
 
 Note what this measurement CANNOT see: both sides run from a clean cwd
 (core+stdlib only), so no project-`sig/` behaviour is exercised. Use a

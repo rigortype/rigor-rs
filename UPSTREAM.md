@@ -15,31 +15,50 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.3.1`** (tag, released 2026-07-29) |
-| Commit | `c39e6675` |
+| **Pinned ref** | **`v0.3.2`** (tag, released 2026-08-08) |
+| Commit | `c6b91b9e` |
 
-> `v0.3.1` follows **rbs 4.1.0**, so the vendored RBS was bumped **in the same
-> commit** (see the independent-pin note below — the two must match). The
-> `v0.3.0 → v0.3.1` bump (41 commits, 2026-07-31) contributed **zero** upstream
-> logic delta on 7131 corpus files; everything measurable came from the rbs
-> version, and it closed 2 more gaps than it opened. Two port-side fixes were
-> needed for 4.1.0's rewritten core signatures: bounded method type parameters
-> (`[I < _ToInt] (I index)`) now resolve to their bound, and `-> instance` on an
-> instance method resolves to the receiver's class.
-> [note](docs/notes/20260731-upstream-pin-v031-rbs41.md).
+> `v0.3.2` follows **rbs 4.1.1**, and the vendored RBS moved with it **in the
+> same commit** (see the independent-pin note below — the two must match) —
+> though only its version string: `vendor_rbs.py --check` against the 4.1.1 gem
+> reports an exact match on all 174 `.rbs`, so `core/` + `stdlib/` are
+> byte-identical to 4.1.0 and no signature resolution shifts. The `v0.3.1 →
+> v0.3.2` bump (2026-08-09) measured **0 FP / 9204 files, gaps 1125 → 841**;
+> the −284 is upstream retracting its own possible-nil FPs (#297), not port
+> work. It also emptied BOTH standing exception tables:
+> `UNBUILDABLE_DEFINITIONS` 12 → 0 (#299/#300/#301 fixed every collision it
+> mirrored) and the divergence registry 1 → 0 (#237's fix is an ancestor).
+> [note](docs/notes/20260809-repin-v032.md).
 
-> **Held at `v0.3.1` as of 2026-08-07**, upstream master `80aaf9bc` (+150,
-> still no tag). Measured: the 150 commits move **2 diagnostics on 9204 files**
-> (a drop, upstream #239; an add bisected to `c7f28da1`/#271 that is a new
-> upstream FP) and rigor-rs is silent at both — 0 FP / 1193 gaps against either
-> oracle. The tip's rbs 4.1.0 → 4.1.1 bump ships **byte-identical** `core/` +
-> `stdlib/`, so step 3's re-vendor would be a no-op and
-> `UNBUILDABLE_DEFINITIONS` does not move. When a tag lands, the bump's only
-> real repo work is deleting fixture 79 + its registry entry (master is past
-> `9515c8f8`) and copying `data/core_overlay/resolv.rbs` into the overlay.
+> **The `data/` overlay is the half that actually moves on a pin bump**, and
+> `vendor_rbs.py` does not touch it. `v0.3.1 → v0.3.2` left the rbs tree
+> identical while rewriting five overlay files and adding two directories, one
+> of them load-bearing (`vendored_gem_sigs/racc/`, without which
+> `Nokogiri::CSS::Parser`'s declared superclass does not resolve). Re-sync it by
+> `diff -r`, not by copying the files a survey happened to name; `PROVENANCE.md`
+> carries the executable recipe. The sharp edge: #300/#301 make the reference's
+> `vendored_gem_sigs/{bundler,rubygems}/` DEPEND on the `rbs` gem's
+> `sig/shims/`, which the reference loads on every run and rigor-rs does not
+> vendor — syncing only `data/` left two live false positives
+> (`Bundler.definition`, `Bundler.default_lockfile`) that the **9204-file sweep
+> does not reach**. `overlay/rbs_shims/` closes them; a green sweep was not
+> evidence there.
+
+> The `v0.3.0 → v0.3.1` bump (41 commits, 2026-07-31) contributed **zero**
+> upstream logic delta on 7131 corpus files; everything measurable came from the
+> rbs version (4.0.3 → 4.1.0), and it closed 2 more gaps than it opened. Two
+> port-side fixes were needed for 4.1.0's rewritten core signatures: bounded
+> method type parameters (`[I < _ToInt] (I index)`) now resolve to their bound,
+> and `-> instance` on an instance method resolves to the receiver's class.
+> [note](docs/notes/20260731-upstream-pin-v031-rbs41.md). The pin then HELD at
+> `v0.3.1` from 2026-08-07 to 2026-08-09 waiting for a tag, over a surveyed +150
+> commits worth **2 diagnostics on 9204 files** — rigor-rs was silent at both,
+> including the `c7f28da1`/#271 add, which was a new upstream FP. **That caveat
+> is now moot: #298 fixed #271 before `v0.3.2`.**
 > [survey](docs/notes/20260807-upstream-survey-v031-to-master.md).
 
-> Previous pin: `v0.3.0` (`5802c990`). Before it, `7a69f142` (the v0.3.0 RC);
+> Previous pin: `v0.3.1` (`c39e6675`). Before it, `v0.3.0` (`5802c990`), and
+> before that `7a69f142` (the v0.3.0 RC);
 > that 42-commit bump was behaviour-neutral in every shipped profile, its only
 > delta being 4 reference-only diagnostics traced by bisect to `861b08b9`
 > (ADR-93 auto-wire of `rigor-rbs-inline` — inline `#:` annotations are now read
@@ -50,11 +69,11 @@ submodule rather than tracked against a drifting local checkout.
 > it (#205) — and `static.value-use.void` is bleeding-edge.
 > [note](docs/notes/20260731-upstream-bump-7a69f142-v030.md).
 
-> **The local Ruby must resolve the rbs the pin bundles** (`rbs 4.1.0` today).
+> **The local Ruby must resolve the rbs the pin bundles** (`rbs 4.1.1` today).
 > The harness invokes the reference with a plain `ruby -I`, so RubyGems serves
 > the highest installed version; running the oracle against a different rbs than
 > upstream ships silently compares against different core signatures. `gem list
-> rbs` should show 4.1.0 as the newest.
+> rbs` should show 4.1.1 as the newest.
 
 The differential harness (`harness/run.rb`, `harness/snapshot.rb`) defaults
 `REFERENCE_RIGOR_DIR` to this submodule (`harness/lib.rb`). The reference-free
@@ -62,20 +81,23 @@ snapshot gate (`harness/run_snapshot.rb`, the CI `parity` job) never touches it 
 it replays the pinned snapshots under `harness/snapshots/`, which were generated
 from this exact reference version.
 
-Note: the vendored RBS (`crates/rigor-index/vendor/rbs`, **rbs-4.1.0**) is a
+Note: the vendored RBS (`crates/rigor-index/vendor/rbs`, **rbs-4.1.1**) is a
 **separate pin** with its own `PROVENANCE.md` — but it is not independent in
 practice: it must carry the same rbs version the reference bundles, or the two
 sides read different core signatures. Upstream bundled rbs-4.0.3 from `v0.2.7`
-through `v0.3.0` and moved to 4.1.0 in `v0.3.1`, so the vendored tree moved with
-it. `harness/vendor_rbs.py --check` verifies the tree still matches its source
-gem exactly.
+through `v0.3.0`, moved to 4.1.0 in `v0.3.1` and to 4.1.1 in `v0.3.2`, so the
+vendored tree moved with it (the 4.1.1 step changed the version string only —
+`core/` + `stdlib/` are byte-identical to 4.1.0).
+`harness/vendor_rbs.py --check` verifies the tree still matches its source gem
+exactly. It does NOT verify `overlay/`, which tracks the reference pin instead —
+see step 3 below.
 
 ## First-time setup
 
 ```sh
 git submodule update --init reference/rigor
 # The reference is plain Ruby run in place — no build step:
-ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.3.1
+ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.3.2
 ```
 
 ## Oracle invocation hazard: stale-gem plugin hijack (issue rigortype/rigor#194)
@@ -142,8 +164,19 @@ chasing a non-bug.)
    python3 harness/vendor_rbs.py "$(gem env gemdir)/gems/rbs-<version>"
    ```
    Also re-sync `vendor/rbs/overlay/` from the reference's own `data/`
-   (`data/core_overlay/`, `data/vendored_gem_sigs/` — see `PROVENANCE.md`; those
-   track the reference pin, not the rbs version).
+   (`data/core_overlay/`, `data/vendored_gem_sigs/` — see `PROVENANCE.md` for the
+   `rsync` recipe; those track the reference PIN, not the rbs version, and
+   `vendor_rbs.py` never touches them). **Drive this off `diff -r`, both
+   directions, not off a list of files a survey named** — the `v0.3.1 → v0.3.2`
+   bump moved five files and added two directories where the survey had named
+   one, and one of the additions (`vendored_gem_sigs/racc/`) was load-bearing.
+   Read every "Only in reference" line as a new file to consider, and re-check
+   whether the reference's `data/` has started DEPENDING on a signature source
+   rigor-rs does not vendor: `v0.3.2` made `bundler`/`rubygems` defer to the
+   `rbs` gem's `sig/shims/`, which cost two false positives until
+   `overlay/rbs_shims/` was added — and the sweep could not see either, because
+   no corpus file called the methods. A hand probe of the moved surface against
+   the oracle is part of this step, not optional.
    Then re-derive the classes whose DEFINITION the reference cannot build —
    `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`
    directories collide, and a collision blinds the oracle on that whole class:
@@ -159,8 +192,10 @@ chasing a non-bug.)
    run in.** Unlike everything else in this ritual, the answer is NOT a pure
    function of the pin: `RBS::EnvironmentLoader` prefers an installed gem's own
    `sig/` over `rbs`'s `stdlib/` copy, so *which* signatures collide depends on
-   the host's gem set. Measured: with the `bigdecimal` gem absent, the same
-   pinned reference builds `BigMath` and the set shrinks from 12 to 11. So **a
+   the host's gem set. Measured on the `v0.3.1` pin: with the `bigdecimal` gem
+   absent, the same pinned reference builds `BigMath` and the set shrinks from 12
+   to 11. (At `v0.3.2` the table is EMPTY — record `gem list bigdecimal` when it
+   next changes, so a future reader can tell a pin fix from a gem removal.) So **a
    diff here can mean a GEM changed rather than upstream changing** — the script
    tags each colliding source `[env]` (host-installed gem) or `[pin]` (the
    reference's own `data/` tree, or the version-locked rbs gem); check those tags
@@ -176,11 +211,21 @@ chasing a non-bug.)
    candidate coverage to port (new rules / behaviours in `vX.Y.Z`); any that
    rigor-rs now emits but the reference dropped is a regression to fix or a
    divergence to register ([ADR-0011](docs/adr/0011-reference-oracle-exceptions.md)).
+   Also walk `harness/divergence-registry.yml`: an entry whose upstream fix is now
+   an ancestor MUST be removed (`git -C reference/rigor merge-base --is-ancestor
+   <fix> HEAD`). Remove the ENTRY, not the fixture — once both sides agree the
+   fixture becomes positive parity coverage, and fixture 79 is one of the few that
+   exercises project-`sig/` behaviour, which neither sweep tool can see.
 6. **Re-measure the ported reference-implementation constants** — they can move
    silently across releases. Currently: the shape-tier thresholds
    ([ADR-0039](docs/adr/0039-shape-typing-tier.md)) — `ARRAY_NEW_TUPLE_LIMIT`
    (grep `method_dispatcher.rb`, empirically probe `Array.new(n)`-slice
    possible-nil around the boundary) and, once ported, the other
    `constant_folding.rb` / `shape_dispatch.rb` limits.
-7. Update the tag/commit in this file (and `PROVENANCE.md` if rbs moved), and
-   note the bump in `docs/CURRENT_WORK.md`.
+7. **Re-run the corpus gates on the RELEASE binary** — `cargo build --offline
+   --release -p rigor-cli`, then `python3 harness/fp_audit.py --gaps --sweep`
+   (must be 0 FP) and `python3 harness/gap_census.py --sweep` for the new gap
+   baseline. Record both in `harness/CORPUS.md`.
+8. Update the tag/commit in this file (and `PROVENANCE.md` if rbs moved), record
+   the numbers in `harness/CORPUS.md`, write a dated note in `docs/notes/`, and
+   fold ONE ledger line into `docs/CURRENT_WORK.md`.
