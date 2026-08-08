@@ -89,3 +89,15 @@ recorded, rationalized deferral (bundler-gem-`sig/`, inline RBS).
 Re-open when a project demand for `rigor-rbs-inline` parity is demonstrated, or
 when a maintained Rust rbs-inline parser becomes available (removing reason 2).
 Start at WD1 + WD2.
+
+## Correction (2026-08-08): reason 1's premise is stale at pin `v0.3.1`
+
+The reference now AUTO-WIRES `rigor-rbs-inline` whenever the gem is resolvable
+(upstream ADR-93 WD2, `configuration.rb:238-252`) — probed: it fires on an
+`#: (Object)` annotation with NO plugin `-I` path and no `plugins:` config. So
+"a default run ingests no inline RBS" is no longer true, and the corpus
+differential DOES exercise the plugin on the reference side. The decision
+still holds on the measured numbers: the deferral's sweep-wide cost is 4 gap
+rows (coverage-only — rigor-rs can never FP on annotations it does not read),
+and reasons 2-3 are untouched. Evidence:
+[object-bucket adjudication](../notes/20260808-object-bucket-adjudication.md).
