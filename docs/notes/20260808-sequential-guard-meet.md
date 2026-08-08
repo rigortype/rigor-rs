@@ -22,15 +22,20 @@ Direct port of `narrow_nominal_to_class`:
 - `class_ordering(C1, C2)`: `Superclass` (C2 refines) → `Narrowed(C2)`,
   mintable or not (the fact exists; updating is not minting — `Integer === v`
   after a Numeric guard fires `for Integer` on the reference);
-  `Subclass`/`Equal` → keep `C1`; `Disjoint` → `Bot`; **`Unknown` → KEEP
-  `C1`** — `:unknown stays conservative` (`narrowing.rb:2388`), measured even
-  for an in-source subclass whose project hierarchy would prove disjointness
-  (probe `projsub`: `ProjKlass < Hash` after a String guard still fires
-  `for String`). Both engines resolve the ordering over the same byte-mirrored
-  RBS, so `Unknown` here is `:unknown` there.
+  `Subclass`/`Equal` → keep `C1`; `Disjoint` → `Bot`; **`Unknown` splits on
+  WHY the ordering failed**: a PROJECT-declared class (`SourceIndex`
+  `knows_class`) is unknown to the reference's RBS env too, and `:unknown
+  stays conservative` (`narrowing.rb:2388`) KEEPS the carrier there — measured
+  even when the project hierarchy would prove disjointness (probe `projsub`:
+  `ProjKlass < Hash` after a String guard still fires `for String`); but an
+  ordering that fails on two RBS-SPACE names is OUR resolver being weaker than
+  the reference's — it proves `File::Stat` vs `URI::HTTP` disjoint and is
+  silent (the S2 probe r7) — so keeping would be a live FP: DROP.
 - An `||` union meets PER MEMBER and unions the results: all-disjoint → `Bot`
   (`seq_or_disjoint`); one survivor → that class (`seq_or_mixed`:
-  `Bot ∪ String` fires `for String`); two survivors → a real union → drop.
+  `Bot ∪ String` fires `for String`; `projsub_or` keeps through a
+  project-class member); two survivors → a real union → drop; an RBS-space
+  `Unknown` member poisons the whole union → drop.
 
 Chains (3a-3) keep the plain R3 drop: the disjoint half is the same silence,
 the refinement half is an unprobed decline.
@@ -52,6 +57,7 @@ Guard pairs are `return unless v.is_a?(…)` unless shown; use is
 | seq_exact_disjoint | String → `instance_of?(Hash)` | 0 | 0 | 0 |
 | seq_exact_subclass | Numeric → `instance_of?(Integer)` | 0 | 0 | 0 |
 | br_disjoint / br_exact_disjoint | non-terminating branch use | 0 | 0 | 0 |
+| r7 (S2) | `File::Stat` → `URI::HTTP` | 0 | 0 | 0 (Unknown-drop) |
 | seq_caseeq_subclass | Numeric → `Integer === v` | 1 `for Integer` | **1 `for Numeric`** (wrong class) | 1 `for Integer` |
 | seq_subclass | Numeric → Integer | 1 `for Integer` | 0 | 1 `for Integer` |
 | seq_superclass | Integer → Numeric | 1 `for Integer` | 0 | 1 `for Integer` |
@@ -74,7 +80,7 @@ closed independently by the qualified-witnessing arc — both engines fire
 
 ## Gates (all green, post-rebase onto `94250f8`)
 
-`cargo test --offline` (new `class_narrowing_sequential_guard_meet_matrix`, 29
+`cargo test --offline` (new `class_narrowing_sequential_guard_meet_matrix`, 30
 rows); `ruby harness/run.rb` — **93 fixtures, 0 unregistered extras** (new
 fixture `93_sequential_guard_meet.rb`); `ruby harness/snapshot.rb` +
 `run_snapshot.rb`; clippy `-D warnings` fresh `CARGO_TARGET_DIR`; `python3

@@ -3611,33 +3611,42 @@ impl<'i> Typer<'i> {
                     // (`seq_subclass`/`seq_caseeq_subclass` fire `for
                     // Integer`); a SUPERCLASS guard is a no-op
                     // (`seq_superclass` fires `for Integer`, the carrier);
-                    // `Unknown` KEEPS the carrier — `:unknown stays
-                    // conservative` on the reference too, measured even for an
-                    // in-source subclass whose project hierarchy would prove
-                    // disjointness (`seq_projclass`, `projsub` — both fire
-                    // `for String` there). A multi-class fact (an `||` union)
-                    // meets per member — see the union arm below.
+                    // `Unknown` splits on WHY (see the arm); a multi-class
+                    // fact (an `||` union) meets per member — see below.
                     if let Some(ClassFact::Narrowed(carrier)) = c.locals.get(local).cloned() {
                         let met = match g.classes.as_slice() {
                             [class] if *class == carrier => Some(ClassFact::Narrowed(carrier)),
                             [_] if g.exact => Some(ClassFact::Bot),
                             [class] => match self.index.class_ordering(&carrier, class) {
-                                // `:unknown stays conservative` — the reference
-                                // KEEPS the carrier (`narrowing.rb:2388`), even
-                                // for an in-source class whose project
-                                // hierarchy would prove disjointness (probe
-                                // `projsub`: `ProjKlass < Hash` after a String
-                                // guard still fires `for String` there). Both
-                                // engines resolve the ordering over the SAME
-                                // byte-mirrored RBS, so `Unknown` here is
-                                // `:unknown` there.
-                                ClassOrdering::Equal
-                                | ClassOrdering::Subclass
-                                | ClassOrdering::Unknown => Some(ClassFact::Narrowed(carrier)),
+                                ClassOrdering::Equal | ClassOrdering::Subclass => {
+                                    Some(ClassFact::Narrowed(carrier))
+                                }
                                 ClassOrdering::Superclass => {
                                     Some(ClassFact::Narrowed(class.clone()))
                                 }
                                 ClassOrdering::Disjoint => Some(ClassFact::Bot),
+                                // `Unknown` splits on WHY the ordering failed.
+                                // A PROJECT-declared class is unknown to the
+                                // reference's RBS env too — `:unknown stays
+                                // conservative` (`narrowing.rb:2388`) KEEPS the
+                                // carrier there, even when the project
+                                // hierarchy would prove disjointness (probe
+                                // `projsub`: `ProjKlass < Hash` after a String
+                                // guard still fires `for String`). But an
+                                // ordering that fails on two RBS-SPACE names is
+                                // OUR resolver being weaker: the reference
+                                // proves `File::Stat` vs `URI::HTTP` disjoint
+                                // and is silent (S2 probe r7), so keeping would
+                                // be a live FP — drop.
+                                ClassOrdering::Unknown => {
+                                    if self.source.knows_class(class)
+                                        || self.source.knows_class(&carrier)
+                                    {
+                                        Some(ClassFact::Narrowed(carrier))
+                                    } else {
+                                        None
+                                    }
+                                }
                             },
                             classes => {
                                 // An `||` union meets PER MEMBER and unions the
@@ -3651,6 +3660,7 @@ impl<'i> Typer<'i> {
                                 // all-disjoint is `Bot` (`seq_or_disjoint`). Two
                                 // surviving classes are a real union — drop.
                                 let mut survivors: Vec<&str> = Vec::new();
+                                let mut unresolvable = false;
                                 for class in classes {
                                     let met: Option<&str> = if g.exact {
                                         (*class == carrier).then_some(carrier.as_str())
@@ -3658,9 +3668,25 @@ impl<'i> Typer<'i> {
                                         match self.index.class_ordering(&carrier, class) {
                                             ClassOrdering::Disjoint => None,
                                             ClassOrdering::Superclass => Some(class.as_str()),
-                                            ClassOrdering::Equal
-                                            | ClassOrdering::Subclass
-                                            | ClassOrdering::Unknown => Some(carrier.as_str()),
+                                            ClassOrdering::Equal | ClassOrdering::Subclass => {
+                                                Some(carrier.as_str())
+                                            }
+                                            // Same `Unknown` split as the
+                                            // single-class arm: a project-class
+                                            // member keeps the carrier
+                                            // (`projsub_or`); an RBS-space
+                                            // member our resolver cannot order
+                                            // poisons the whole union — drop.
+                                            ClassOrdering::Unknown => {
+                                                if self.source.knows_class(class)
+                                                    || self.source.knows_class(&carrier)
+                                                {
+                                                    Some(carrier.as_str())
+                                                } else {
+                                                    unresolvable = true;
+                                                    None
+                                                }
+                                            }
                                         }
                                     };
                                     if let Some(m) = met {
@@ -3669,10 +3695,11 @@ impl<'i> Typer<'i> {
                                         }
                                     }
                                 }
-                                match survivors.as_slice() {
-                                    [] => Some(ClassFact::Bot),
-                                    [one] => Some(ClassFact::Narrowed((*one).to_string())),
-                                    _ => None,
+                                match (unresolvable, survivors.as_slice()) {
+                                    (true, _) => None,
+                                    (false, []) => Some(ClassFact::Bot),
+                                    (false, [one]) => Some(ClassFact::Narrowed((*one).to_string())),
+                                    (false, _) => None,
                                 }
                             }
                         };
@@ -8268,6 +8295,10 @@ mod class_narrowing_tests {
             // prove disjointness (probe `projsub`).
             ("seq_projclass", "class ProjKlass; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
             ("seq_projsub", "class ProjKlass < Hash; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+            // The OTHER `Unknown`: two RBS-space names our resolver cannot
+            // order. The reference proves them disjoint and is silent (the S2
+            // probe r7), so the fact DROPS — neither witnessed nor `Bot`.
+            ("seq_ns_unknown_drop", "def f(v)\n  return unless v.is_a?(File::Stat)\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n", None, false),
         ];
         for (row, src, expected, dead) in rows {
             let ast = lower_src(src.as_bytes());
