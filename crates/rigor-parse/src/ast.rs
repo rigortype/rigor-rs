@@ -811,12 +811,49 @@ impl Node {
     }
 }
 
+/// Monotonic source of [`LoweredAst::file_id`]. One `lower()` call == one file,
+/// so a process-global counter gives every lowered file a distinct identity
+/// without threading a path through the parser (which never sees one).
+static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The owned AST: a flat arena of [`Node`]s plus the [`NodeId`] of the root
 /// `Program`. Free of the Prism parse-buffer lifetime (ADR-0012).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct LoweredAst {
     nodes: Vec<Node>,
     root: NodeId,
+    /// Identity of the FILE this AST was lowered from — distinct for every
+    /// [`lower`] call, stable for the AST's lifetime, and preserved by `Clone`
+    /// (a clone is the same file). Cross-file analysis passes need it because a
+    /// project-wide index is built from many ASTs and some facts are per-FILE:
+    /// the reference's in-source CONSTANT VALUE table is rebuilt per file
+    /// (`ScopeIndexer#build_in_source_constants` walks one file's root), so a
+    /// constant's harvested value must only be consumed at use sites in the
+    /// same file. See `SourceIndex::literal_constant`.
+    file_id: u64,
+}
+
+/// Hand-written so `{:?}` stays a CONTENT rendering: `file_id` is extrinsic
+/// identity (a process-global counter), not content, and two lowerings of the
+/// same bytes must still compare equal by `{:?}`. The LSP's incremental-vs-full
+/// differential tests do exactly that comparison, and including the counter
+/// would make them fail on identical trees.
+impl std::fmt::Debug for LoweredAst {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoweredAst")
+            .field("nodes", &self.nodes)
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
+impl LoweredAst {
+    /// The identity of the file this AST was lowered from — see the `file_id`
+    /// field docs. Two ASTs compare equal here iff they came from the same
+    /// `lower()` call (or a clone of it).
+    pub fn file_id(&self) -> u64 {
+        self.file_id
+    }
 }
 
 impl LoweredAst {
@@ -875,6 +912,7 @@ pub fn lower(result: &ParseResult<'_>) -> LoweredAst {
     LoweredAst {
         nodes: builder.nodes,
         root,
+        file_id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     }
 }
 

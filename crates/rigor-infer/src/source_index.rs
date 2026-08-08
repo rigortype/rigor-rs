@@ -63,6 +63,33 @@ pub enum ConstLit {
     /// witnessing resolves against Range's RBS (SOUND — `IntegerRange` would
     /// erase to `Integer` and false-positive on real Range methods).
     Range,
+    /// Slice B: a container LITERAL whose elements are not all literal — a
+    /// lambda value, a `ConstantRead`, a splat, a dynamic key, an interpolated
+    /// string, a call. Types to a BARE `Nominal[Array]` / `Nominal[Hash]` with
+    /// `args: []`, **never with element types**.
+    ///
+    /// Two facts make this the FP-safe carrier, both probed
+    /// (`docs/notes/20260808-partial-constant-harvest-probes.md`):
+    ///
+    /// * The reference never declines such a constant — it types the hole
+    ///   (`->(_){…}` as `Proc`) and keeps a full `HashShape`/`Tuple`. So it
+    ///   dispatches at the direct receiver, and the undefined-method lookup is
+    ///   class-only: `Nominal[Hash]` and `HashShape{c: Proc}` both resolve
+    ///   against `Hash`. Same witnessing set, different rendering.
+    /// * A bare nominal is projection-INERT in rigor-rs:
+    ///   `fold_tuple_projection` / `fold_hash_shape_projection` match
+    ///   `Type::Tuple` / `Type::HashShape` only, and an argument-less generic
+    ///   resolves nothing in the RBS tier. Every `[]`/`fetch`/`keys`/`values`/
+    ///   block-param projection goes silent while the reference fires — the
+    ///   divergence is strictly UNDER-emission.
+    ///
+    /// Element typing is deliberately out of scope: probe z2 shows the
+    /// reference leaves even a harvested-constant element `Dynamic[top]`, so an
+    /// element-typed harvest would out-precise the oracle at exactly the
+    /// projection sites it declines — an FP generator.
+    BareArray,
+    /// The `Hash` twin of [`ConstLit::BareArray`].
+    BareHash,
 }
 
 /// The first [`ClassId`] handed out by the per-run registry. Chosen well above
@@ -144,6 +171,11 @@ struct OverrideClass {
 }
 
 /// The per-run source-class index + instance-class registry. Built once per file.
+/// One harvested constant value: `(defining namespace segments, the
+/// `LoweredAst::file_id` of the ASSIGNING file, the value)`. The file id is
+/// slice A's per-file consumption gate; see [`SourceIndex::literal_constant`].
+type HarvestedConst = (Vec<String>, u64, ConstLit);
+
 #[derive(Default)]
 pub struct SourceIndex {
     /// `class name -> source structure` (only for in-source class/module defs).
@@ -230,7 +262,17 @@ pub struct SourceIndex {
     /// `DAYS_TO_EXPIRE = 7` in `module Expirable` must NOT fold in an including
     /// `class Key` where it is not lexically visible (the reference resolves it
     /// lexically too, so folding it there manufactures an `Integer#days` FP).
-    literal_constants: HashMap<String, Vec<(Vec<String>, ConstLit)>>,
+    /// PER-FILE consumption (slice A, 2026-08-08): each entry also carries the
+    /// [`rigor_parse::LoweredAst::file_id`] of the file that ASSIGNED the
+    /// constant, and [`Self::literal_constant`] only answers a use site in that
+    /// same file. The reference's in-source constant-VALUE table is rebuilt per
+    /// file (`ScopeIndexer#build_in_source_constants` walks one file's root and
+    /// nothing cross-file feeds it), so a cross-file fold is an emission the
+    /// oracle never makes — probed: a fully-literal `TOPL = [1, 2].freeze` in
+    /// `a.rb` read from `b.rb` is reference-silent even with a
+    /// `require_relative`, while rigor-rs fired. The HARVEST stays project-wide
+    /// (the single-assignment gate must still see every file).
+    literal_constants: HashMap<String, Vec<HarvestedConst>>,
     /// Collection-shape stage 2e: the SAME harvested values as
     /// `literal_constants`, keyed instead by the constant's FULLY-QUALIFIED name
     /// (`"Gitlab::Ci::Reports::CodequalityReports::SEVERITY_PRIORITIES"`).
@@ -240,7 +282,7 @@ pub struct SourceIndex {
     /// `::A::B::C::CONST` path read, which arrives as one `ConstantRead` whose
     /// `name` is the whole path and therefore misses the bare-name map.
     /// Backs [`Self::qualified_literal_constant`].
-    qualified_literal_constants: HashMap<String, (Vec<String>, ConstLit)>,
+    qualified_literal_constants: HashMap<String, HarvestedConst>,
     /// Collection-shape stage 2b: the BARE name of every `CONST = …` write the
     /// project makes in a class/module/program body — INCLUDING the ones C5
     /// declines to harvest (non-literal RHS, multiply assigned). The C1 shadow
@@ -521,10 +563,17 @@ impl SourceIndex {
         // is keyed by BARE name + DEFINING NAMESPACE so the use-site consults it
         // lexically — a constant only visible in its defining namespace never
         // folds at an unrelated use site (the app/models concern-constant FP).
-        let mut lit_first: HashMap<String, (Vec<String>, Option<ConstLit>)> = HashMap::new();
+        let mut lit_first: HashMap<String, (Vec<String>, u64, Option<ConstLit>)> = HashMap::new();
         let mut lit_multi: HashSet<String> = HashSet::new();
         for ast in asts {
-            collect_literal_constants(ast, ast.root(), &[], &mut lit_first, &mut lit_multi);
+            collect_literal_constants(
+                ast,
+                ast.root(),
+                &[],
+                ast.file_id(),
+                &mut lit_first,
+                &mut lit_multi,
+            );
         }
         // Stage 2b: every constant the project ASSIGNS, by bare name — recorded
         // before the C5 gates below drop the non-literal / multiply-assigned
@@ -533,7 +582,7 @@ impl SourceIndex {
             let bare = qualified.rsplit("::").next().unwrap_or(qualified).to_string();
             idx.project_constant_write_names.insert(bare);
         }
-        for (qualified, (namespace, lit)) in lit_first {
+        for (qualified, (namespace, file, lit)) in lit_first {
             if lit_multi.contains(&qualified) {
                 continue;
             }
@@ -548,8 +597,8 @@ impl SourceIndex {
                 // Stage 2e: the qualified twin, keyed by the full path so a
                 // `::A::B::C::CONST` read resolves. Same entry set, same gates.
                 idx.qualified_literal_constants
-                    .insert(qualified, (namespace.clone(), l.clone()));
-                idx.literal_constants.entry(bare).or_default().push((namespace, l));
+                    .insert(qualified, (namespace.clone(), file, l.clone()));
+                idx.literal_constants.entry(bare).or_default().push((namespace, file, l));
             }
         }
 
@@ -687,13 +736,45 @@ impl SourceIndex {
     /// within its namespace); among visible entries the LONGEST-namespace
     /// (innermost) wins. The `ConstantRead` arm consults this BEFORE the
     /// singleton gate and re-interns the value via `Typer::intern_const_lit`.
-    pub fn literal_constant(&self, name: &str, use_prefix: &[String]) -> Option<&ConstLit> {
+    ///
+    /// `use_file` is the [`rigor_parse::LoweredAst::file_id`] of the file the use
+    /// site is in, and an entry only applies when it matches the file that
+    /// ASSIGNED the constant. The reference's constant-value table is per-file
+    /// (see the field docs); before this gate a same-namespace cross-file read
+    /// folded here and was silent in the oracle.
+    pub fn literal_constant(
+        &self,
+        name: &str,
+        use_prefix: &[String],
+        use_file: u64,
+    ) -> Option<&ConstLit> {
         self.literal_constants
             .get(name)?
             .iter()
-            .filter(|(ns, _)| ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
-            .max_by_key(|(ns, _)| ns.len())
-            .map(|(_, lit)| lit)
+            .filter(|(_, file, _)| *file == use_file)
+            .filter(|(ns, _, _)| ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
+            .max_by_key(|(ns, _, _)| ns.len())
+            .map(|(_, _, lit)| lit)
+    }
+
+    /// Collection-shape stage 2b's negative check: whether SOME harvested
+    /// literal constant named `name` is lexically visible at `use_prefix`,
+    /// **ignoring which file assigned it**.
+    ///
+    /// Deliberately file-AGNOSTIC, and deliberately separate from
+    /// [`Self::literal_constant`]. That method types a use site, so slice A's
+    /// per-file gate belongs there; this one is a DECLINE predicate whose job is
+    /// to be maximally conservative, and narrowing it would be the one way slice
+    /// A could make the `ENV` arm fire somewhere it previously stayed silent.
+    /// (In practice `project_writes_constant` already subsumes it — that set is
+    /// built from every constant write before the literal gates — but the
+    /// redundancy is the point.)
+    pub fn literal_constant_visible_any_file(&self, name: &str, use_prefix: &[String]) -> bool {
+        self.literal_constants.get(name).is_some_and(|entries| {
+            entries.iter().any(|(ns, _, _)| {
+                ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]
+            })
+        })
     }
 
     /// Collection-shape stage 2b: whether the project ASSIGNS a constant with
@@ -724,15 +805,20 @@ impl SourceIndex {
     /// `Gitlab::GitalyClient::DiffBlob::ATTRS` read from
     /// `…::DiffBlobsStitcher`) folded here while the reference stayed silent, an
     /// oracle FP on the sweep.
+    ///
+    /// `use_file` applies the SAME per-file consumption gate as
+    /// [`Self::literal_constant`] — a qualified path is only a SPELLING of the
+    /// same harvest, so it inherits the same restriction.
     pub fn qualified_literal_constant(
         &self,
         name: &str,
         use_prefix: &[String],
+        use_file: u64,
     ) -> Option<&ConstLit> {
         if !name.contains("::") {
             return None;
         }
-        let mut hit: Option<(&String, &(Vec<String>, ConstLit))> = None;
+        let mut hit: Option<(&String, &HarvestedConst)> = None;
         // Candidate keys: `<prefix[..i]>::<name>` for every i (the lexical
         // nesting runs), plus `name` itself (i == 0 yields exactly that).
         for i in 0..=use_prefix.len() {
@@ -751,8 +837,11 @@ impl SourceIndex {
                 }
             }
         }
-        let (_, (ns, lit)) = hit?;
-        (ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]).then_some(lit)
+        let (_, (ns, file, lit)) = hit?;
+        (*file == use_file
+            && ns.len() <= use_prefix.len()
+            && use_prefix[..ns.len()] == ns[..])
+            .then_some(lit)
     }
 
     /// C1 (constant-shadow gate): whether a BARE read of constant `name` at a use
@@ -1818,13 +1907,14 @@ fn collect_literal_constants(
     ast: &LoweredAst,
     node: NodeId,
     prefix: &[String],
-    first: &mut HashMap<String, (Vec<String>, Option<ConstLit>)>,
+    file: u64,
+    first: &mut HashMap<String, (Vec<String>, u64, Option<ConstLit>)>,
     multi: &mut HashSet<String>,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                collect_literal_constants(ast, child, prefix, first, multi);
+                collect_literal_constants(ast, child, prefix, file, first, multi);
             }
         }
         Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
@@ -1833,7 +1923,7 @@ fn collect_literal_constants(
             }
             let child_prefix = split_qualified(&qualify(prefix, name));
             for &child in body {
-                collect_literal_constants(ast, child, &child_prefix, first, multi);
+                collect_literal_constants(ast, child, &child_prefix, file, first, multi);
             }
         }
         Node::ConstantWrite { name, value, .. } => {
@@ -1843,7 +1933,7 @@ fn collect_literal_constants(
                     multi.insert(e.key().clone());
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((prefix.to_vec(), const_lit_of(ast, *value)));
+                    e.insert((prefix.to_vec(), file, const_lit_of(ast, *value)));
                 }
             }
         }
@@ -1868,19 +1958,35 @@ fn const_lit_of(ast: &LoweredAst, node: NodeId) -> Option<ConstLit> {
         Node::ArrayLit { elements, .. } => {
             let mut elems = Vec::with_capacity(elements.len());
             for &e in elements {
-                elems.push(const_lit_of(ast, e)?);
+                // Slice B: one non-literal element no longer declines the whole
+                // constant — it degrades to the projection-inert bare nominal.
+                // The reference never declines here either (it types the hole
+                // and keeps a Tuple), so this is a spelling of the SAME
+                // constant, one precision tier lower.
+                match const_lit_of(ast, e) {
+                    Some(l) => elems.push(l),
+                    None => return Some(ConstLit::BareArray),
+                }
             }
             Some(ConstLit::Tuple(elems))
         }
         Node::HashLit { elements, all_assoc, .. } => {
             if !*all_assoc {
-                return None; // a `**`splat / non-assoc element ⇒ decline.
+                // A `**` splat / non-assoc element. The reference degrades to a
+                // widened `Hash[K, V]` (probes p3b/p3b2), never declines.
+                return Some(ConstLit::BareHash);
             }
             let mut members: Vec<(ShapeKey, ConstLit)> = Vec::with_capacity(elements.len() / 2);
             let mut i = 0;
             while i + 1 < elements.len() {
-                let key = const_shape_key_of(ast.get(elements[i]))?;
-                let value = const_lit_of(ast, elements[i + 1])?;
+                // A dynamic key (probe p3c) or a non-literal value (p1, the
+                // lambda-hash shape) degrades the container, not the constant.
+                let Some(key) = const_shape_key_of(ast.get(elements[i])) else {
+                    return Some(ConstLit::BareHash);
+                };
+                let Some(value) = const_lit_of(ast, elements[i + 1]) else {
+                    return Some(ConstLit::BareHash);
+                };
                 // Last-wins on a duplicate key (mirrors `hash_shape_or_hash`).
                 if let Some(m) = members.iter_mut().find(|m| m.0 == key) {
                     m.1 = value;
@@ -2777,17 +2883,17 @@ mod tests {
         );
         // Visible inside `K`.
         assert_eq!(
-            idx.literal_constant("N", &seg(&["K"])),
+            idx.literal_constant("N", &seg(&["K"]), _a.file_id()),
             Some(&ConstLit::Scalar(Scalar::Int(42)))
         );
-        assert!(matches!(idx.literal_constant("A", &seg(&["K"])), Some(ConstLit::Tuple(_))));
+        assert!(matches!(idx.literal_constant("A", &seg(&["K"]), _a.file_id()), Some(ConstLit::Tuple(_))));
         assert_eq!(
-            idx.literal_constant("S", &seg(&["K"])),
+            idx.literal_constant("S", &seg(&["K"]), _a.file_id()),
             Some(&ConstLit::Scalar(Scalar::Str("hi".into())))
         );
         // NOT visible from an unrelated namespace or the toplevel.
-        assert_eq!(idx.literal_constant("N", &[]), None);
-        assert_eq!(idx.literal_constant("N", &seg(&["Other"])), None);
+        assert_eq!(idx.literal_constant("N", &[], _a.file_id()), None);
+        assert_eq!(idx.literal_constant("N", &seg(&["Other"]), _a.file_id()), None);
     }
 
     #[test]
@@ -2801,11 +2907,11 @@ mod tests {
         );
         // Visible only within its own namespace.
         assert_eq!(
-            idx.literal_constant("DAYS", &seg(&["Expirable"])),
+            idx.literal_constant("DAYS", &seg(&["Expirable"]), _a.file_id()),
             Some(&ConstLit::Scalar(Scalar::Int(7)))
         );
-        assert_eq!(idx.literal_constant("DAYS", &seg(&["Consumer"])), None);
-        assert_eq!(idx.literal_constant("DAYS", &[]), None);
+        assert_eq!(idx.literal_constant("DAYS", &seg(&["Consumer"]), _a.file_id()), None);
+        assert_eq!(idx.literal_constant("DAYS", &[], _a.file_id()), None);
     }
 
     #[test]
@@ -2814,7 +2920,7 @@ mod tests {
         let core = CoreIndex::new();
         let (_a, idx) =
             build_one(b"class K\n  M = 1\n  M = 2\nend\n", &core);
-        assert_eq!(idx.literal_constant("M", &seg(&["K"])), None);
+        assert_eq!(idx.literal_constant("M", &seg(&["K"]), _a.file_id()), None);
     }
 
     #[test]
@@ -2826,14 +2932,183 @@ mod tests {
             b"class Widget\nend\nWidget = [1]\n",
             &core,
         );
-        assert_eq!(idx.literal_constant("Widget", &[]), None);
+        assert_eq!(idx.literal_constant("Widget", &[], _a.file_id()), None);
     }
 
     #[test]
     fn range_constant_harvests_as_range() {
         let core = CoreIndex::new();
         let (_a, idx) = build_one(b"class K\n  R = 1..1024\nend\n", &core);
-        assert_eq!(idx.literal_constant("R", &seg(&["K"])), Some(&ConstLit::Range));
+        assert_eq!(idx.literal_constant("R", &seg(&["K"]), _a.file_id()), Some(&ConstLit::Range));
+    }
+
+    // --- slice B: partially-literal containers ⇒ INERT bare nominals ----------
+
+    #[test]
+    fn partially_literal_containers_harvest_as_bare_nominals() {
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  LAM = { c: ->(_x) { 1 } }.freeze\n  DYN = [1, unknown_zzz, 2].freeze\n  \
+              SPLAT_H = { a: 1, **unknown_zzz }.freeze\n  DYNKEY = { a: 1, unknown_zzz => 2 }.freeze\n  \
+              SPLAT_A = [*unknown_zzz].freeze\n  INTERP = [\"a\", \"b#{1}\"].freeze\n  \
+              CHAIN = [1, \"x\".upcase].freeze\nend\n",
+            &core,
+        );
+        let k = seg(&["K"]);
+        for name in ["LAM", "SPLAT_H", "DYNKEY"] {
+            assert_eq!(
+                idx.literal_constant(name, &k, a.file_id()),
+                Some(&ConstLit::BareHash),
+                "{name} should harvest as a bare Hash nominal"
+            );
+        }
+        for name in ["DYN", "SPLAT_A", "INTERP", "CHAIN"] {
+            assert_eq!(
+                idx.literal_constant(name, &k, a.file_id()),
+                Some(&ConstLit::BareArray),
+                "{name} should harvest as a bare Array nominal"
+            );
+        }
+    }
+
+    #[test]
+    fn fully_literal_harvest_is_unchanged_by_the_widening() {
+        // The value-pinned rendering must not regress: a fully-literal container
+        // still harvests as Tuple/Hash, and the EMPTY literals keep their
+        // zero-size shapes (`[]` / `{}` fold projections off them).
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  T = [1, 2].freeze\n  H = { a: 1 }.freeze\n  E = [].freeze\n  \
+              EH = {}.freeze\n  R = 1..9\nend\n",
+            &core,
+        );
+        let k = seg(&["K"]);
+        assert!(matches!(idx.literal_constant("T", &k, a.file_id()), Some(ConstLit::Tuple(v)) if v.len() == 2));
+        assert!(matches!(idx.literal_constant("H", &k, a.file_id()), Some(ConstLit::Hash(m)) if m.len() == 1));
+        assert_eq!(idx.literal_constant("E", &k, a.file_id()), Some(&ConstLit::Tuple(vec![])));
+        assert_eq!(idx.literal_constant("EH", &k, a.file_id()), Some(&ConstLit::Hash(vec![])));
+        assert_eq!(idx.literal_constant("R", &k, a.file_id()), Some(&ConstLit::Range));
+    }
+
+    #[test]
+    fn a_nested_partial_container_degrades_only_the_inner_level() {
+        // `{ a: [->(){}] }` keeps its OUTER shape (the key is static) and puts a
+        // bare `Array` in the slot — the reference has `{ a: [Proc] }` there, so
+        // `H[:a].zzz` fires in both engines (same class, sharper rendering in
+        // the oracle). Verified against the oracle in fixture 92.
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(b"class K\n  N = { a: [->() { 1 }] }.freeze\nend\n", &core);
+        let Some(ConstLit::Hash(members)) = idx.literal_constant("N", &seg(&["K"]), a.file_id())
+        else {
+            panic!("expected an outer Hash shape");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].1, ConstLit::BareArray);
+    }
+
+    #[test]
+    fn non_container_rhs_still_declines() {
+        // Slice B widens the CONTAINER arms only. A call chain, a bare constant
+        // read, a lambda and a `Class.new` still decline (a chain-valued
+        // constant is slice C's question, assessed separately).
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  CH = %w[a b].map.with_index.to_h.freeze\n  CR = OTHER_ZZZ\n  \
+              L = ->(_x) { 1 }\n  C = Class.new(StandardError)\nend\n",
+            &core,
+        );
+        let k = seg(&["K"]);
+        for name in ["CH", "CR", "L", "C"] {
+            assert_eq!(idx.literal_constant(name, &k, a.file_id()), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn multiple_assignment_still_declines_a_partial_container() {
+        // The reference UNIONS duplicate assignments; C5's single-assignment
+        // gate is a strict under-emit and slice B keeps it unchanged.
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"class K\n  M = { c: ->(_x) { 1 } }\n  M = [1, 2]\nend\n",
+            &core,
+        );
+        assert_eq!(idx.literal_constant("M", &seg(&["K"]), a.file_id()), None);
+    }
+
+    // --- slice A: PER-FILE constant-value consumption -------------------------
+
+    #[test]
+    fn constant_value_is_consumed_only_in_the_assigning_file() {
+        // The reference rebuilds its in-source constant-value table per file
+        // (`ScopeIndexer#build_in_source_constants` walks ONE file's root), so a
+        // same-namespace read in another file resolves nothing there. Probed:
+        // `module M; class C; L = [1, 2].freeze` in `a.rb`, `L.frobnicate_zzz`
+        // inside the same `M::C` in `b.rb` — reference silent, rigor-rs fired.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"module M\n  class C\n    L = [1, 2].freeze\n  end\nend\n");
+        let a1 = lower_src(b"module M\n  class C\n    def go; L; end\n  end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        // Same file as the assignment: still folds (the harvest is unchanged).
+        assert!(matches!(
+            idx.literal_constant("L", &seg(&["M", "C"]), a0.file_id()),
+            Some(ConstLit::Tuple(_))
+        ));
+        // The USE file did not assign it ⇒ no value, even though the namespace
+        // matches exactly.
+        assert_eq!(idx.literal_constant("L", &seg(&["M", "C"]), a1.file_id()), None);
+    }
+
+    #[test]
+    fn qualified_constant_value_is_consumed_only_in_the_assigning_file() {
+        // Stage 2e is a pure SPELLING of the same harvest, so it inherits the
+        // per-file gate. `M::C::L` read from inside `M::C` in another file.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"module M\n  class C\n    L = [1, 2].freeze\n  end\nend\n");
+        let a1 = lower_src(b"module M\n  class C\n    def go; M::C::L; end\n  end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert!(matches!(
+            idx.qualified_literal_constant("M::C::L", &seg(&["M", "C"]), a0.file_id()),
+            Some(ConstLit::Tuple(_))
+        ));
+        assert_eq!(
+            idx.qualified_literal_constant("M::C::L", &seg(&["M", "C"]), a1.file_id()),
+            None
+        );
+    }
+
+    #[test]
+    fn toplevel_constant_value_is_still_per_file() {
+        // Probed with a `require_relative` in place: the reference is silent on
+        // BOTH a container and a scalar read cross-file, so the gate is about
+        // the FILE, not about namespace visibility or require reachability.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"TOPL = [1, 2].freeze\nSCAL = 5\n");
+        let a1 = lower_src(b"require_relative \"a\"\nclass K\n  def go; TOPL; SCAL; end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        assert!(idx.literal_constant("TOPL", &seg(&["K"]), a0.file_id()).is_some());
+        assert!(idx.literal_constant("SCAL", &seg(&["K"]), a0.file_id()).is_some());
+        assert_eq!(idx.literal_constant("TOPL", &seg(&["K"]), a1.file_id()), None);
+        assert_eq!(idx.literal_constant("SCAL", &seg(&["K"]), a1.file_id()), None);
+    }
+
+    #[test]
+    fn env_negative_check_stays_file_agnostic() {
+        // Non-goal guard: slice A must not let the stage-2b `ENV` arm start
+        // firing where it used to decline. Its decline predicate is
+        // `literal_constant_visible_any_file`, which ignores the use file — a
+        // project `ENV = { a: 1 }` in ANOTHER file still declines the arm.
+        let core = CoreIndex::new();
+        let a0 = lower_src(b"ENV = { a: 1 }.freeze\n");
+        let a1 = lower_src(b"class K\n  def go; ENV; end\nend\n");
+        let idx = SourceIndex::build_project(&[&a0, &a1], &core);
+        // The per-file TYPING gate declines in the reading file …
+        assert_eq!(idx.literal_constant("ENV", &seg(&["K"]), a1.file_id()), None);
+        // … but the 2b decline predicate still sees it from either file.
+        assert!(idx.literal_constant_visible_any_file("ENV", &seg(&["K"])));
+        assert!(idx.literal_constant_visible_any_file("ENV", &[]));
+        // And the coarser project-write set (the arm's other decline) is
+        // unaffected by slice A.
+        assert!(idx.project_writes_constant("ENV"));
     }
 
     #[test]
