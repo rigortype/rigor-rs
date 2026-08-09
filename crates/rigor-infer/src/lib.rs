@@ -3225,7 +3225,7 @@ impl<'i> Typer<'i> {
                     // and a block body can invisibly reach the root through a
                     // capture — the same reason `Narrowed` locals stay out.
                     // A recorded coverage gap, never an FP.
-                    let mut block_edge: Option<HashMap<String, ClassFact>> = None;
+                    let mut block_edge: Option<Facts> = None;
                     if stmt_position {
                         let mut btenv = tenv.clone();
                         let mut bcenv = Facts {
@@ -3240,7 +3240,7 @@ impl<'i> Typer<'i> {
                         self.class_flow_scope(
                             ast, &block_body, &mut btenv, &mut bcenv, coarse, writes, interner, out, true,
                         );
-                        block_edge = Some(bcenv.locals);
+                        block_edge = Some(bcenv);
                     }
                     match block_edge {
                         Some(edge) => join_cenv(cenv, std::slice::from_ref(&edge)),
@@ -3399,7 +3399,28 @@ impl<'i> Typer<'i> {
             return;
         };
         let (predicate, is_unless, if_span) = (*predicate, *is_unless, *span);
-        let (then_body, else_body) = (then_body.clone(), else_body.clone());
+        let then_body = then_body.clone();
+        // Prism models an `else` clause as its own node, and the arena lowers an
+        // `ElseNode` to a CLAUSE-LESS `BeginRescue` carrier (`ast.rs:1457`), so
+        // `else_body` is the single-element `vec![carrier]`. Walking the carrier
+        // as an ordinary statement would run the `BeginRescue` arm, whose
+        // `join_cenv(cenv, &[])` blanket-wipes the edge's `Narrowed` facts — so
+        // EVERY `if` with an `else` lost the incoming fact on its falsey edge,
+        // whatever the else contained (probes `D_else_nil`/`E_both_nil`, where
+        // the reference fires and master is silent). The carrier is not a real
+        // `begin`: `subsequent` is only ever an `elsif` (an `If`, untouched
+        // here) or an `else`, so unwrapping it is exact.
+        let else_body = match else_body.as_slice() {
+            [only] => match ast.get(*only) {
+                Node::BeginRescue { body, ensure_body, clauses, .. }
+                    if ensure_body.is_empty() && clauses.is_empty() =>
+                {
+                    body.clone()
+                }
+                _ => else_body.clone(),
+            },
+            _ => else_body.clone(),
+        };
         // The predicate is evaluated first, in the current facts (its own calls
         // may read an OUTER narrowing) — EXPRESSION position.
         self.class_flow_expr(ast, predicate, tenv, cenv, coarse, writes, interner, out, false);
@@ -3443,10 +3464,20 @@ impl<'i> Typer<'i> {
         widen_flow_writes(writes, if_span, tenv, interner);
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
         // the propagation's re-seed below (see there for why).
-        let pre_join_chains = cenv.chains.clone();
         // S2: the LOCAL twin of the same snapshot. See the re-seed below.
-        let pre_join_locals = cenv.locals.clone();
-        join_cenv(cenv, &[truthy_edge.locals, falsey_edge.locals]);
+        let pre_join = cenv.clone();
+        let (pre_join_chains, pre_join_locals) = (&pre_join.chains, &pre_join.locals);
+        let edges = [truthy_edge, falsey_edge];
+        join_cenv(cenv, &edges);
+        // Join-retention slice: put back every pre-join fact BOTH edges left
+        // untouched. Runs BEFORE the propagation below, so a restored fact is
+        // what the carried guard map MEETS against (the propagation re-reads the
+        // same snapshot for its own targets — idempotent on top of this). Both
+        // branch bodies are always descended here, so the chain edges carry real
+        // evidence and the chain half is enabled — gated on the predicate's own
+        // local mentions (see `locals_in_span`).
+        let predicate_locals = locals_in_span(ast, ast.get(predicate).span());
+        retain_joined_facts(cenv, &pre_join, &edges, writes, if_span, Some(&predicate_locals));
         // … EXCEPT the early-return propagation (`eval_if:486`/`:495`), which
         // 3a-1 runs in BOTH directions: a terminating FALSEY branch propagates
         // the truthy map (the `return unless guard` idiom a5/c1d), a
@@ -4254,11 +4285,21 @@ impl<'i> Typer<'i> {
             Node::LocalVariableRead { name, .. } => Some(name.clone()),
             _ => None,
         });
-        let mut edges: Vec<HashMap<String, ClassFact>> = Vec::new();
+        // Join-retention slice: the pre-`case` facts, snapshot AFTER the subject
+        // was evaluated (each clause clones `cenv` from exactly here).
+        let pre_join = cenv.clone();
+        // Were ALL branches descended? A `case`/`in` pattern clause is not, so
+        // its effects are invisible to the edge evidence. Rebinds are still
+        // caught by the span kill below, but an `invalidate_chain_after_call`
+        // is not recorded in `writes` at all — so the chain half of the restore
+        // is enabled only when every branch produced a real edge.
+        let mut all_descended = true;
+        let mut edges: Vec<Facts> = Vec::new();
         for br in branches {
             let Node::When { conditions, body, .. } = ast.get(br) else {
                 // A `case`/`in` pattern carrier — unmodeled, no descent
                 // (pre-slice behavior; the trailing clear-all covers effects).
+                all_descended = false;
                 continue;
             };
             let (conditions, body) = (conditions.clone(), body.clone());
@@ -4306,7 +4347,7 @@ impl<'i> Typer<'i> {
             // Clause bodies INHERIT the `case`'s position: a block inside an
             // expression-position clause narrows nothing (probe x1).
             self.class_flow_scope(ast, &body, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
-            edges.push(c.locals);
+            edges.push(c);
         }
         {
             // The `else` body is a NEGATIVE edge — never narrowed.
@@ -4315,12 +4356,37 @@ impl<'i> Typer<'i> {
             self.class_flow_scope(
                 ast, &else_body, &mut t, &mut c, coarse, writes, interner, out, stmt_position,
             );
-            edges.push(c.locals);
+            edges.push(c);
         }
         widen_flow_writes(writes, case_span, tenv, interner);
         // A `case`/`in` clause is not descended, so its rebinds are invisible to
         // the edge evidence — kill by span as well as by edge.
         join_cenv(cenv, &edges);
+        // Join-retention slice: restore the pre-`case` facts the clauses left
+        // untouched (`case_intervening`, reference-firing on master's silence).
+        // The narrowing SUBJECT is excluded: the reference replaces its type per
+        // clause and the post-`case` union is out of the Dynamic-only envelope
+        // this pass models, so keeping our incoming fact there would be an
+        // unprobed guess (probe `case_subject_is_target` — the reference fires,
+        // we decline; coverage, never an FP).
+        let subject_excl: Vec<String> = subject.iter().chain(bot_subject.iter()).cloned().collect();
+        let joined_subject: Vec<(String, Option<ClassFact>)> =
+            subject_excl.iter().map(|n| (n.clone(), cenv.locals.get(n).cloned())).collect();
+        let predicate_locals = predicate.map(|p| locals_in_span(ast, ast.get(p).span()));
+        retain_joined_facts(
+            cenv,
+            &pre_join,
+            &edges,
+            writes,
+            case_span,
+            predicate_locals.as_ref().filter(|_| all_descended),
+        );
+        for (name, fact) in joined_subject {
+            match fact {
+                Some(f) => cenv.locals.insert(name, f),
+                None => cenv.locals.remove(&name),
+            };
+        }
         kill_cenv_writes(writes, case_span, cenv);
     }
 
@@ -5095,12 +5161,114 @@ fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
 /// early-return propagation, which [`Typer::class_flow_if`] re-seeds explicitly
 /// from a PRE-join snapshot — see its comment on the sequential-disjoint
 /// hazard.
-fn join_cenv(cenv: &mut Facts, edges: &[HashMap<String, ClassFact>]) {
+///
+/// Join-retention slice (2026-08-09): the two CONDITIONAL callers
+/// ([`Typer::class_flow_if`], [`Typer::class_flow_case`]) pair this wipe with
+/// [`retain_joined_facts`], which puts back every pre-join fact the edges left
+/// untouched. The wipe itself stays exactly as written, because the other four
+/// callers pass NO edges (a construct that was not descended) and must keep the
+/// blanket-clear + span-kill discipline.
+fn join_cenv(cenv: &mut Facts, edges: &[Facts]) {
     cenv.locals.retain(|name, fact| {
         *fact == ClassFact::Bot
-            && edges.iter().all(|edge| edge.get(name) == Some(&ClassFact::Bot))
+            && edges.iter().all(|edge| edge.locals.get(name) == Some(&ClassFact::Bot))
     });
     cenv.chains.clear();
+}
+
+/// Put back, after [`join_cenv`], every PRE-join fact that survived the
+/// conditional untouched — the reference's `Scope#join` keeps a local's type
+/// whenever both edges agree on it (`scope.rb:680`), and a fact minted BEFORE
+/// the conditional is on both edges by construction. Master wiped them all, so
+/// a fact died at ANY later `if`/`unless`/`case`, terminating or not, related or
+/// not (the 2026-08-09 probe matrix: 10 of 14 rows diverged, every one a
+/// coverage loss, plus one live FP — a disjoint re-guard AFTER an intervening
+/// `if` minted against the wiped env and witnessed where the reference's meet
+/// had already reached `Bot`).
+///
+/// A fact is restored only when EVERY edge still carries it IDENTICALLY. That
+/// single test subsumes the spec's separate criteria:
+///
+/// - a REBIND inside a branch removed the fact from that edge's clone
+///   (`branch_rebind_one_side` / `write_to_a_in_if`, both reference-silent for
+///   us — the reference's real union `1 | String` is the separate widen gap);
+/// - the conditional's OWN guard targets moved on at least one edge whenever the
+///   guard did anything (`if a.is_a?(Hash)` after a `String` guard leaves `Bot`
+///   on the truthy edge and `String` on the falsey edge), so the sequential-meet
+///   and `Bot`-collapse results are never resurrected;
+/// - a call on a chain ROOT inside a branch fired `invalidate_chain_after_call`
+///   on that edge, which is invisible to `writes` (probe
+///   `chain_call_on_root_in_branch`, reference-silent).
+///
+/// `writes` + `span` add the span-containment kill on top, for the rebinds an
+/// edge cannot see — a `case`/`in` clause is not descended, so its rebinds are
+/// invisible to the edge evidence (`case_in_rebinds_target`, reference-silent).
+/// `chains` is the caller's gate for the same reason: only a construct whose
+/// every branch was DESCENDED has trustworthy chain edges.
+///
+/// Facts the edges MINTED are absent from `pre` (edges walk clones of it), so
+/// nothing established inside a branch escapes through here — the block/loop
+/// escape rules (probes `n_escape_after_if`, p9/p13) are untouched.
+fn retain_joined_facts(
+    cenv: &mut Facts,
+    pre: &Facts,
+    edges: &[Facts],
+    writes: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+    chains: Option<&HashSet<String>>,
+) {
+    if edges.is_empty() {
+        return;
+    }
+    let written =
+        |name: &str| writes.iter().any(|(ws, n)| n == name && span.0 <= ws.0 && ws.1 <= span.1);
+    for (name, fact) in &pre.locals {
+        if written(name) {
+            continue;
+        }
+        if edges.iter().all(|edge| edge.locals.get(name) == Some(fact)) {
+            cenv.locals.insert(name.clone(), fact.clone());
+        }
+    }
+    let Some(predicate_locals) = chains else { return };
+    for (addr, fact) in &pre.chains {
+        if written(&addr.0) || predicate_locals.contains(&addr.0) {
+            continue;
+        }
+        if edges.iter().all(|edge| edge.chains.get(addr) == Some(fact)) {
+            cenv.chains.insert(addr.clone(), fact.clone());
+        }
+    }
+}
+
+/// Every local NAME read or written anywhere inside `span` — used as the
+/// chain-restore gate in [`retain_joined_facts`].
+///
+/// A conditional's PREDICATE gets no edge evidence of its own: the edges are
+/// clones taken after it ran, so a predicate that narrowed a chain address in a
+/// way [`Typer::analyse_predicate`] does not RECOGNISE leaves both edges
+/// agreeing on the stale incoming fact. `guard_predicate` requires a bare LOCAL
+/// operand, so `String === h.last` and `h.last.nil?` are not chain guards at
+/// all — and `return unless String === h.last` after a disjoint `is_a?` guard is
+/// reference-SILENT (row `chain_caseeq_disjoint`), so restoring there would be a
+/// live false positive. Any mention of the ROOT in the predicate therefore
+/// declines the restore for every address rooted at it, mirroring the
+/// any-mention widening [`Facts::kill_chains_rooted_at`] already applies to
+/// calls.
+fn locals_in_span(ast: &LoweredAst, span: rigor_parse::Span) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for (_, n) in ast.iter() {
+        let (name, nspan) = match n {
+            Node::LocalVariableRead { name, span } => (name, span),
+            Node::LocalVariableWrite { name, span, .. }
+            | Node::LocalVariableOpWrite { name, span, .. } => (name, span),
+            _ => continue,
+        };
+        if span.0 <= nspan.0 && nspan.1 <= span.1 {
+            out.insert(name.clone());
+        }
+    }
+    out
 }
 
 /// The stable single-hop chain address of `id`, if it has one — the port of the
@@ -8503,6 +8671,136 @@ mod class_narrowing_tests {
         }
     }
 
+    /// JOIN RETENTION — a fact minted BEFORE a conditional survives it
+    /// ([`retain_joined_facts`]). Master blanket-wiped every `Narrowed` local
+    /// and every chain fact at each `if`/`unless`/`case` merge, so a fact died
+    /// at ANY later intervening conditional, terminating or not, related or not.
+    ///
+    /// Every row was measured against the PINNED oracle (`v0.3.2`/`c6b91b9e`,
+    /// 2026-08-09, one fresh temp cwd per case, `--no-cache`, both reference
+    /// libs on `-I`). `Some(class)` — the reference fires `for <class>` and the
+    /// snapshot must carry it; `(None, true)` — the site must be DEAD; `(None,
+    /// false)` — no fact (either the reference is silent too, or a recorded
+    /// DECLINE, marked per row).
+    #[test]
+    fn class_narrowing_join_retention_matrix() {
+        let rows: &[(&str, &str, Option<&str>, bool)] = &[
+            // ---- the retention family: master silent, reference FIRES --------
+            ("baseline_single_guard", "def f(a)\n  return unless a.is_a?(String)\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // A guard on a DIFFERENT local killed the first one's fact.
+            ("double_guard", "def f(a, b)\n  return unless a.is_a?(String)\n  return unless b.is_a?(Hash)\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // A wholly unrelated NON-terminating `if`, with and without `else`.
+            ("unrelated_nonterm_if", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    x = 1\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("unrelated_nonterm_if_else", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    x = 1\n  else\n    x = 2\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("unless_intervening", "def f(a, b)\n  return unless a.is_a?(String)\n  unless b\n    x = 1\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("modifier_if_intervening", "def f(a, b)\n  return unless a.is_a?(String)\n  x = 1 if b\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("nested_intervening_if", "def f(a, b, c)\n  return unless a.is_a?(String)\n  if b\n    if c\n      x = 1\n    end\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("two_intervening_ifs", "def f(a, b, c)\n  return unless a.is_a?(String)\n  if b\n    x = 1\n  end\n  if c\n    y = 1\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // The reference does NOT prune the statements after a conditional
+            // whose branches BOTH terminate — the fact rides through.
+            ("both_branches_terminate", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    return\n  else\n    return\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // …and one that terminates on a single edge whose guard map is empty
+            // (the propagation carries nothing; only the retention fires here).
+            ("single_terminating_unrelated", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    return\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // EXPRESSION position: the reference retains there too, so the
+            // restore is NOT gated on `stmt_position` (unlike the propagation).
+            ("expr_position_ternary", "def f(a, b)\n  return unless a.is_a?(String)\n  x = b ? 1 : 2\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("expr_position_if", "def f(a, b)\n  return unless a.is_a?(String)\n  x = if b\n    1\n  else\n    2\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // `case`: an unrelated subject, a `when` clause and an `in` clause.
+            ("case_intervening", "def f(a, b)\n  return unless a.is_a?(String)\n  case b\n  when Integer\n    x = 1\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("case_in_intervening", "def f(a, b)\n  return unless a.is_a?(String)\n  case b\n  in Integer\n    x = 1\n  else\n    x = 2\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // A guard on a CHAIN of another local (`b.length`), and the chain
+            // twin of the whole family (a chain fact across an intervening if).
+            ("three_guard_chain", "def f(a, b)\n  return unless a.is_a?(String)\n  return unless b.is_a?(String)\n  return unless b.length.is_a?(Integer)\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("chain_intervening_if", "def f(h, b)\n  return unless h.last.is_a?(String)\n  if b\n    x = 1\n  end\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            // The CENSUS row, reduced from gitlab-foss
+            // `lib/bulk_imports/object_counter.rb:52`: a non-narrowing guard on
+            // the SAME local (`empty?` / `key?` are not class guards, so they
+            // contribute no guard map and the fact must simply survive).
+            ("object_counter_reduced", "def f(x)\n  return unless x.is_a?(Hash)\n  return if x.empty?\n  x.frobnicate_zzz\nend\n", Some("Hash"), false),
+            ("object_counter_block_form", "def f(x)\n  return unless x.is_a?(Hash)\n  if x.empty?\n    return\n  end\n  x.frobnicate_zzz\nend\n", Some("Hash"), false),
+            ("nonnarrowing_guard_same_var", "def f(x)\n  return unless x.is_a?(Hash)\n  return if x.key?(:a)\n  x.frobnicate_zzz\nend\n", Some("Hash"), false),
+            // The `if` with an `else` lowers its else clause to a clause-less
+            // `BeginRescue` carrier; unwrapping it is what makes the `_else`
+            // rows above pass (an else body of ANY shape used to wipe the edge).
+            ("else_body_is_a_bare_literal", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    nil\n  else\n    nil\n  end\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            // ---- rows that already matched, and must not regress ------------
+            ("unrelated_if_before_guard", "def f(a, b)\n  if b\n    x = 1\n  end\n  return unless a.is_a?(String)\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("intervening_method_call", "def f(a, b)\n  return unless a.is_a?(String)\n  b.to_s\n  a.frobnicate_zzz\nend\n", Some("String"), false),
+            ("use_inside_nonterm_branch", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    a.frobnicate_zzz\n  end\nend\n", Some("String"), false),
+            // ---- FP HAZARDS: every one measured reference-SILENT -------------
+            // 1. A rebind of the target inside ONE branch. The reference fires a
+            //    real union (`for 1 | String`) — the separate widen gap — so we
+            //    must stay silent rather than witness `for String`.
+            ("write_to_a_in_if", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    a = 1\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            ("branch_rebind_one_side", "def f(a, b, w)\n  return unless a.is_a?(String)\n  if b\n    a = w\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            ("rebind_in_else_only", "def f(a, b, w)\n  return unless a.is_a?(String)\n  if b\n    x = 1\n  else\n    a = w\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            ("ternary_rebinds_target", "def f(a, b, w)\n  return unless a.is_a?(String)\n  x = b ? (a = w) : 2\n  a.frobnicate_zzz\nend\n", None, false),
+            // 4. A `case`/`in` pattern clause is NOT descended, so its rebind is
+            //    invisible to the edge evidence — the span kill is what holds.
+            ("case_in_rebinds_target", "def f(a, b)\n  return unless a.is_a?(String)\n  case b\n  in Integer\n    a = 1\n  else\n    a = 2\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            // A REBIND of a chain ROOT inside a branch kills the address.
+            ("chain_root_rebind_in_if", "def f(h, b, w)\n  return unless h.last.is_a?(String)\n  if b\n    h = w\n  end\n  h.last.frobnicate_zzz\nend\n", None, false),
+            // A plain CALL on the chain root inside a branch invalidates the
+            // address (`invalidate_chain_after_call`) — invisible to `writes`,
+            // caught only by the edge disagreement.
+            ("chain_call_on_root_in_branch", "def f(h, b)\n  return unless h.last.is_a?(String)\n  if b\n    h.size\n  end\n  h.last.frobnicate_zzz\nend\n", None, false),
+            ("chain_mutator_on_root_in_branch", "def f(h, b)\n  return unless h.last.is_a?(String)\n  if b\n    h.pop\n  end\n  h.last.frobnicate_zzz\nend\n", None, false),
+            // 2. The conditional's OWN guard targets: a disjoint re-guard must
+            //    still reach `Bot` and the use must be DEAD, both inside the
+            //    branch and — the row that was a LIVE FP on master — after a
+            //    later guard whose meet now sees the RESTORED incoming fact.
+            ("own_guard_disjoint_after", "def f(a)\n  return unless a.is_a?(String)\n  if a.is_a?(Hash)\n    a.frobnicate_zzz\n  end\nend\n", None, true),
+            ("guard_then_if_then_disjoint_guard", "def f(a, b)\n  return unless a.is_a?(String)\n  if b\n    x = 1\n  end\n  return unless a.is_a?(Hash)\n  a.frobnicate_zzz\nend\n", None, true),
+            // …and the refining twin still fires `for Integer`.
+            ("guard_then_if_then_subclass_guard", "def f(a, b)\n  return unless a.is_a?(Numeric)\n  if b\n    x = 1\n  end\n  return unless a.is_a?(Integer)\n  a.frobnicate_zzz\nend\n", Some("Integer"), false),
+            // 5. The guard's OWN `if` with BOTH branches terminating stays
+            //    silent (reference-measured) — there is no PRE-join fact to put
+            //    back, so the retention cannot resurrect the declined
+            //    propagation. Its positive-guard twin is a DECLINE below.
+            ("t_both_terminate_negated", "def f(a)\n  if !a.is_a?(String)\n    return\n  else\n    return\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            // A `Bot` fact riding through an intervening `if` still suppresses.
+            ("bot_intervening_if", "def f(b)\n  v = [1, 2]\n  return unless v.is_a?(Hash)\n  if b\n    x = 1\n  end\n  v.frobnicate_zzz\nend\n", None, true),
+            // ---- DECLINES: the reference FIRES, we stay silent (coverage) ----
+            // The conditional's own guard target after a NON-terminating merge:
+            // the reference unions the edges back to the incoming class. We
+            // exclude every target the edges disagree on, which is the whole
+            // FP-safety of hazard 2 — this is the price.
+            ("d_own_guard_target_after_join", "def f(a)\n  return unless a.is_a?(String)\n  if a.is_a?(Hash)\n    x = 1\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            // The guard's own `if`, both branches terminating, guard on the
+            // TRUTHY edge: the reference fires `for String`, we have no pre-join
+            // fact and the propagation declines when both branches terminate.
+            ("d_t_both_terminate_positive", "def f(a)\n  if a.is_a?(String)\n    return\n  else\n    return\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            // The `case` SUBJECT is excluded from the restore by construction.
+            ("d_case_subject_is_target", "def f(a)\n  return unless a.is_a?(String)\n  case a\n  when Integer\n    x = 1\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            // A MUTATION of the target inside a branch drops the fact
+            // (`kill_cenv_narrowed`); the reference keeps `Array` and fires.
+            ("d_mutator_in_branch", "def f(a, b)\n  return unless a.is_a?(Array)\n  if b\n    a.push(1)\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+            // A `Narrowed` fact still does not enter a BLOCK body, nor survive a
+            // block CALL — the block-boundary rules (`n_escape_after_if`, the
+            // next/break matrix p9/p13) are deliberately untouched by this slice.
+            ("d_use_in_block_after_if", "def f(a, b, xs)\n  return unless a.is_a?(String)\n  if b\n    x = 1\n  end\n  xs.each do |y|\n    a.frobnicate_zzz\n  end\nend\n", None, false),
+            ("d_join_inside_block_use_outside", "def f(a, b, xs)\n  return unless a.is_a?(String)\n  xs.each do |i|\n    if b\n      x = 1\n    end\n  end\n  a.frobnicate_zzz\nend\n", None, false),
+        ];
+        assert_eq!(rows.len(), 42, "the join-retention matrix has 42 oracle-measured rows");
+        for (row, src, expected, dead) in rows {
+            let ast = lower_src(src.as_bytes());
+            let index = CoreIndex::new();
+            let source = SourceIndex::build(&ast, &index);
+            let scopes = lexical_scopes(&ast);
+            let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+            let mut i = Interner::new();
+            let pass = typer.class_narrowing_pass(&ast, &mut i);
+            let call = call_named(&ast, "frobnicate_zzz");
+            assert_eq!(
+                pass.calls.get(&call).map(String::as_str),
+                *expected,
+                "join-retention row {row} snapshot\n--- source ---\n{src}"
+            );
+            assert_eq!(pass.dead.contains(&call), *dead, "join-retention row {row} dead");
+        }
+    }
+
     /// Decline: safe-nav dispatch on the narrowed local never records.
     #[test]
     fn class_narrowing_safe_nav_declines() {
@@ -8810,9 +9108,16 @@ mod class_narrowing_tests {
             ("x_two_addresses_one_root", f("  if h.first.is_a?(String) && h.last.is_a?(Hash)\n    h.first.frobnicate_zzz\n  end"), Some("String")),
             ("x_same_addr_two_roots", f(&format!("  if {G} && g.last.is_a?(Hash)\n    {USE}\n  end")), Some("String")),
             ("x_chain_in_begin", f(&format!("  return unless {G}\n\n  begin\n    {USE}\n  rescue StandardError\n    nil\n  end")), Some("String")),
-            // DECLINE (carried from 3b-1): survival PAST a `begin` / `case`.
+            // DECLINE (carried from 3b-1): survival PAST a `begin` — a
+            // `begin`/`rescue` is not a conditional join, so the join-retention
+            // slice does not reach it.
             ("x_chain_after_begin", f(&format!("  return unless {G}\n\n  begin\n    1\n  rescue StandardError\n    nil\n  end\n  {USE}")), None),
-            ("x_chain_after_case", f(&format!("  return unless {G}\n\n  case cond\n  when 1 then 2\n  end\n  {USE}")), None),
+            // …but survival past a `case` is CLOSED by the join-retention slice
+            // (2026-08-09): the subject is an unrelated local, every clause was
+            // descended and left the address alone, so the pre-`case` fact comes
+            // back. Re-measured against the v0.3.2 oracle: the reference fires
+            // `for String` here.
+            ("x_chain_after_case", f(&format!("  return unless {G}\n\n  case cond\n  when 1 then 2\n  end\n  {USE}")), Some("String")),
             ("x_chain_in_loop_pred", f(&format!("  return unless {G}\n\n  while {USE}\n    break\n  end")), Some("String")),
             ("x_chain_in_case_clause", f(&format!("  return unless {G}\n\n  case cond\n  when 1 then {USE}\n  end")), Some("String")),
             ("x_chain_in_array_lit", f(&format!("  return unless {G}\n\n  x = [{USE}]\n  x")), Some("String")),
