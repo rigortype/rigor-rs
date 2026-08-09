@@ -13,16 +13,13 @@ Last updated: 2026-08-09.
 
 ## Now / Next
 
-▶ **NEXT (2026-08-09): category-2 ADJUDICATED; join-wipe slice DONE** — 3b-2 and
-3a-4 DEFER at 0 verified rows each; the Logical-union fix is a dedicated arc,
-not a slice (option-b REFUTED)
+▶ **NEXT (2026-08-09): `object_counter` is CLOSED TO CARRIER WORK** — the
+unresolved-const carrier shipped 0 FP / **0 rows**; the row needs the deferred
+interprocedural return-tail arc, not a carrier gate
+([note](notes/20260809-unresolved-const-receiver-carrier.md)). Category-2 stays
+ADJUDICATED, batch 3 FILED
 ([verdicts+batch-3](notes/20260809-deferred-slices-and-upstream-feedback.md)).
-Batch 3 FILED (rigor#316-#323; Object repros = #319/#320). Next lever, MEASURED
-by the join-wipe slice: an unresolved-CONSTANT-receiver binding is not a
-narrowable carrier (blocks the `object_counter` census row and its family). Then
-LSP v4+ (`rootUri`, UTF-16 sync). Prior 08-08 records:
-[remeasure](notes/20260808-narrowing-3a23-window-remeasure.md) /
-[harvest](notes/20260808-partial-constant-harvest-mini-spec.md) /
+Next: LSP v4+ (`rootUri`, UTF-16 sync). Prior 08-08:
 [OpenStruct](notes/20260808-bare-class-bucket-characterisation.md).
 
 - Coverage-tool parity lesson (binding for measurement tools): audit at NODE
@@ -103,7 +100,8 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-08-09 join-wipe retention (`Scope#join` fidelity)** — `join_cenv` wiped EVERY `Narrowed`/chain fact at each conditional merge, so a fact died at any later intervening `if`/`unless`/`case`. `retain_joined_facts` puts back what ALL edges still carry identically (one test subsuming rebind / own-guard / `invalidate_chain_after_call`; chains gated on the predicate's root mentions), plus the `else`-carrier unwrap — an `ElseNode` lowers to a clause-less `BeginRescue` whose own wipe cost EVERY `if`-with-`else` its falsey-edge facts. **1 FP closed, 15 probe shapes ref-matched, 0 FP / 9204, census 841→841 (0/0).** The predicted `object_counter` row is blocked ORTHOGONALLY: a binding from a call on an unresolved CONSTANT receiver is not a narrowable carrier — the next lever. [note](notes/20260809-join-wipe-retention.md).
+- **2026-08-09 unresolved-const-receiver carrier** — a call through a constant path whose ROOT resolves to nothing is narrowable; a RESOLVABLE one still declines. 6 oracle rows + fixture 96, **0 FP / 9204, 841→841 — worth 0 ROWS** (real code namespaces its constants); `object_counter` is closed to carrier work. [note](notes/20260809-unresolved-const-receiver-carrier.md).
+- **2026-08-09 join-wipe retention (`Scope#join` fidelity)** — `join_cenv` wiped EVERY `Narrowed`/chain fact at each conditional merge, so a fact died at any later intervening `if`/`unless`/`case`. `retain_joined_facts` puts back what ALL edges still carry identically (one test subsuming rebind / own-guard / `invalidate_chain_after_call`; chains gated on the predicate's root mentions), plus the `else`-carrier unwrap — an `ElseNode` lowers to a clause-less `BeginRescue` whose own wipe cost EVERY `if`-with-`else` its falsey-edge facts. **1 FP closed, 15 probe shapes ref-matched, 0 FP / 9204, census 841→841 (0/0).** [note](notes/20260809-join-wipe-retention.md).
 - **2026-08-09 upstream re-pin `v0.3.1 → v0.3.2` (+ rbs 4.1.1)** — **0 FP / 9204, gaps 1125→841** (−284 = upstream retracting possible-nil FPs, #297 — NOT coverage); BOTH exception tables emptied (`UNBUILDABLE_DEFINITIONS` 12→0, divergence registry 1→0, fixture 79 KEPT as project-`sig/` coverage). rbs byte-identical; the `data/` OVERLAY is what moves. **Trap: #300/#301 made bundler/rubygems sigs DEPEND on the rbs gem's `sig/shims/` — 2 live FPs the sweep CANNOT SEE**, hand-probed, closed by `overlay/rbs_shims/`. [note](notes/20260809-repin-v032.md).
 - **2026-08-09 chain-guard meet — `Bot` sentinel + refinement** — 3a-3 CHAIN facts were on the superseded blind compare and `chains: …String` could not hold a collapse (3rd guard re-minted; 2-class `||` guard skipped the gate — 2 live FPs). `chains` now carries `ClassFact`; `narrow_nominal_to_class` extracted and SHARED by both arms. **2 FPs closed, +4 matched, 23/26 probe rows ref-matched**; census 1125→1125, 0 FP / 9204. [note](notes/20260809-chain-guard-meet.md).
 - **2026-08-08 sequential-guard meet** (PR #78) — S2's re-seed + R3 drop was the WRONG meet: R3 → `narrow_nominal_to_class` (disjoint→`Bot`, subclass refines, `Unknown` splits project-vs-RBS space); propagation sees PRE-join facts. **5 FPs closed, +6 matched; census flat, 0 FP / 9204.** [note](notes/20260808-sequential-guard-meet.md).

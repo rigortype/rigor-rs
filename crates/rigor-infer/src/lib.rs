@@ -2780,7 +2780,7 @@ impl<'i> Typer<'i> {
         writes.extend(indexed_flow_writes(ast, self.source));
         let mut tenv = TypeEnv::new();
         let mut cenv = Facts::default();
-        let coarse = coarse_locals(ast, &body);
+        let coarse = coarse_locals(ast, &body, &|n| self.unresolved_constant_root(n));
         self.class_flow_scope(
             ast, &body, &mut tenv, &mut cenv, &coarse, &writes, interner, &mut out, true,
         );
@@ -2901,7 +2901,7 @@ impl<'i> Typer<'i> {
                 let body = body.clone();
                 let mut t = TypeEnv::new();
                 let mut c = Facts::default();
-                let inner = coarse_locals(ast, &body);
+                let inner = coarse_locals(ast, &body, &|n| self.unresolved_constant_root(n));
                 self.class_flow_scope(
                     ast, &body, &mut t, &mut c, &inner, writes, interner, out, true,
                 );
@@ -4129,6 +4129,34 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// Whether a `ConstantRead` receiver path (`Gitlab`, `Gitlab::Cache::…`)
+    /// resolves to NOTHING either engine can type — the gate that lets a call
+    /// through it into [`narrowable_binding`]'s allow-list (2026-08-09
+    /// unresolved-constant-receiver slice).
+    ///
+    /// The check is on the ROOT segment, deliberately scope-independent and
+    /// conservative toward DECLINING: any RBS short-key hit
+    /// (`knows_class` — so `Float::INFINITY.abs` declines by its `Float` root,
+    /// keeping the pinned `fp_const_recv` FP closed), any RBS object constant
+    /// (`ENV.fetch` — the reference types it `String`, probe `c4_env`), and any
+    /// project-defined name (`constant_defined_anywhere` — an in-source class
+    /// method with a `Logical` return tail is the `fp2` FP through a constant
+    /// receiver, probe `c8_insource_logical`) all refuse. What remains is a
+    /// constant unknown to the shared RBS surface AND the project, whose call
+    /// result is untyped on BOTH sides — the reference narrows it
+    /// (`narrow_class_other`) and fires; declining it was pure coverage loss
+    /// (the gitlab-foss `object_counter.rb:52` census family). Probes
+    /// `p1`–`p9`/`r5_full` (plain, qualified path, leading `::`, chained,
+    /// block-bearing, safe-nav) all fire on the reference; controls
+    /// `c1`/`c3`–`c7` stay silent on both.
+    fn unresolved_constant_root(&self, name: &str) -> bool {
+        let root = name.trim_start_matches("::").split("::").next().unwrap_or("");
+        !root.is_empty()
+            && !self.index.knows_class(root)
+            && self.index.object_constant_class(root).is_none()
+            && !self.source.constant_defined_anywhere(root)
+    }
+
     /// The statically-known name of a `ConstantRead`/`ConstantPath` node (both
     /// lower to `ConstantRead`), resolved lexically at `use_span`'s prefix —
     /// or `None` when the node is not a static constant OR a project
@@ -5033,13 +5061,24 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
 ///   `index_read`, `safenav`, `block_call_dyn`, `call_chain`, `call_ivar_recv`,
 ///   `call_gvar_recv`, `allow_param_index`). `self` is deliberately NOT a
 ///   narrowable receiver — the reference resolves an in-source method through
-///   it and gets that method's real return (`call_self_recv` is an FP), and
-///   neither is a `ConstantRead` (`recv_const_float`).
+///   it and gets that method's real return (`call_self_recv` is an FP) — and a
+///   `ConstantRead` receiver is one ONLY when its root segment resolves to
+///   nothing ([`Typer::unresolved_constant_root`], the 2026-08-09 slice): a
+///   resolvable constant gets a real return on the reference's side
+///   (`recv_const_float`, probe `c8_insource_logical`), while a fully unknown
+///   one is untyped on both (probes `p1`–`p9`).
 ///
 /// Everything else declines. That costs coverage on carriers the reference does
 /// narrow (`yield`, `super`, an implicit-self call, a `begin`/`ensure` value, a
-/// `case` with no `else`, a constant receiver) — a strict subset, never an FP.
-fn narrowable_binding(ast: &LoweredAst, id: NodeId, coarse: &HashSet<String>, depth: u32) -> bool {
+/// `case` with no `else`, a RESOLVABLE constant receiver) — a strict subset,
+/// never an FP.
+fn narrowable_binding(
+    ast: &LoweredAst,
+    id: NodeId,
+    coarse: &HashSet<String>,
+    unresolved_const: &dyn Fn(&str) -> bool,
+    depth: u32,
+) -> bool {
     if depth == 0 {
         return false;
     }
@@ -5047,7 +5086,10 @@ fn narrowable_binding(ast: &LoweredAst, id: NodeId, coarse: &HashSet<String>, de
         Node::LocalVariableRead { name, .. } => !coarse.contains(name),
         Node::VariableRead { .. } => true,
         Node::Call { receiver: Some(r), .. } => {
-            narrowable_binding(ast, *r, coarse, depth - 1)
+            (match ast.get(*r) {
+                Node::ConstantRead { name, .. } => unresolved_const(name),
+                _ => false,
+            }) || narrowable_binding(ast, *r, coarse, unresolved_const, depth - 1)
         }
         _ => false,
     }
@@ -5072,7 +5114,11 @@ fn narrowable_binding(ast: &LoweredAst, id: NodeId, coarse: &HashSet<String>, de
 /// `MultiWrite` targets are deliberately absent: destructuring loses precision
 /// on both sides, and all three measured shapes (`multiwrite`, `mw_from_call`,
 /// `mw_from_logical`) fire on the reference.
-fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
+fn coarse_locals(
+    ast: &LoweredAst,
+    body: &[NodeId],
+    unresolved_const: &dyn Fn(&str) -> bool,
+) -> HashSet<String> {
     let mut coarse: HashSet<String> = HashSet::new();
     let Some(lo) = body.iter().map(|&s| ast.get(s).span().0).min() else {
         return coarse;
@@ -5121,7 +5167,8 @@ fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
             if coarse.contains(name) {
                 continue;
             }
-            let ok = value.is_some_and(|v| narrowable_binding(ast, v, &coarse, 32));
+            let ok =
+                value.is_some_and(|v| narrowable_binding(ast, v, &coarse, unresolved_const, 32));
             if !ok {
                 coarse.insert(name.clone());
                 changed = true;
@@ -7751,8 +7798,35 @@ mod class_narrowing_tests {
             ("fp_splat", bound("*spec"), None),
             ("fp_return", bound("(return {} if cond)"), None),
             // A receiver the reference types precisely enough to resolve the
-            // method on: `self`, a constant.
+            // method on: `self`, a RESOLVABLE constant. `Float::INFINITY`
+            // declines by its RBS-known ROOT (`Float`), `ENV` by the RBS
+            // object-constant table, and the in-source class by
+            // `constant_defined_anywhere` — its `mk` return tail is a
+            // `Logical`, the `fp2` shape reached through a constant receiver
+            // (probe `c8_insource_logical`, reference-SILENT).
             ("fp_const_recv", bound("Float::INFINITY.abs"), None),
+            ("fp_env_recv", bound("ENV.fetch(\"A\")"), None),
+            (
+                "fp_insource_const_recv",
+                format!(
+                    "class ZedNine\n  def self.mk\n    unknown_zzz || {{}}\n  end\nend\n\ndef f(spec)\n  h = ZedNine.mk\n{G}end\n"
+                ),
+                None,
+            ),
+            // ---- ALLOW: an UNRESOLVED constant receiver (2026-08-09 slice) --
+            // The root resolves to nothing on either side, so the call result
+            // is untyped on both and the reference narrows it — probes
+            // `p1`–`p9`/`r5_full` (gitlab-foss `object_counter.rb:52` family).
+            ("ok_unresolved_const_recv", bound("Gitlab.foo_zzz(spec)"), Some("Hash")),
+            ("ok_unresolved_path_recv", bound("Gitlab::Cache.foo_zzz(spec)"), Some("Hash")),
+            ("ok_unresolved_colon_recv", bound("::Gitlab.foo_zzz(spec)"), Some("Hash")),
+            ("ok_unresolved_chained", bound("Gitlab.foo_zzz(spec).bar_zzz"), Some("Hash")),
+            ("ok_unresolved_safenav", bound("Gitlab&.foo_zzz(spec)"), Some("Hash")),
+            (
+                "ok_unresolved_block",
+                bound("Gitlab.foo_zzz(spec) { |a| a }"),
+                Some("Hash"),
+            ),
             // ---- DECLINES that COST coverage (reference FIRES) --------------
             ("cost_yield", format!("def f\n  h = yield\n{G}end\n"), None),
             ("cost_super", format!("class C\n  def f\n    h = super\n  {G}  end\nend\n"), None),
@@ -7764,6 +7838,18 @@ mod class_narrowing_tests {
             ),
             ("cost_const_read", bound("XCONST_ZZZ"), None),
             ("cost_const_recv", bound("File.foo_zzz"), None),
+            // An in-source class through a constant receiver declines even when
+            // the reference fires (probes `p7`/`p8`) — the SAME resolution that
+            // makes it fire here can hand it a precise return elsewhere
+            // (`fp_insource_const_recv`), and there is no per-method
+            // discriminator worth the risk.
+            (
+                "cost_insource_const_recv",
+                format!(
+                    "class ZedEight\n  def self.mk(k)\n  end\nend\n\ndef f(spec)\n  h = ZedEight.mk(spec)\n{G}end\n"
+                ),
+                None,
+            ),
             ("cost_str_recv", bound("\"s\".foo_zzz"), None),
             ("cost_self_recv", format!("class C\n  def f\n    h = self.unknown_zzz\n  {G}  end\nend\n"), None),
             (
