@@ -38,25 +38,4 @@
 #     behaviour is correct per the spec in docs/manual/04-diagnostics.md.
 #   upstream: https://github.com/rigortype/rigor/issues/NNNN
 
-divergences:
-  - fixture: harness/corpus/79_sig_undeclared_type_ref.rb
-    rule: call.undefined-method
-    line: 34
-    column: 21
-    reason: |
-      A project `sig/` that references a type it never declares — an INTERFACE
-      (`_Writable`) or a type ALIAS (`serialized_node`). Rigor stubs a
-      referenced-but-undeclared type so RBS's all-or-nothing per-class build
-      still succeeds; an interface/alias name cannot be declared as a `class`,
-      so in the pinned reference one such stub makes the whole batch
-      unparseable and the batch is discarded IN SILENCE. The project's own
-      signatures then contribute nothing at all, and every diagnostic they
-      would have produced disappears — on a project whose missing names are
-      all aliases, `sig/` is silently inert.
-
-      rigor-rs declares each stub in the kind its name requires, so the
-      signature survives and the `emit_typo` call is witnessed. Upstream AGREES
-      this was a defect and fixed it the same way after the `v0.3.1` pin
-      (`9515c8f8` "Stub each dangling reference in the kind its name requires"
-      + `5bd0aac2`). REMOVE this entry when the pin passes that fix.
-    upstream: https://github.com/rigortype/rigor/issues/237
+divergences: []

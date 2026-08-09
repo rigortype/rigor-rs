@@ -1,4 +1,12 @@
 {
   "fixture": "harness/corpus/79_sig_undeclared_type_ref.rb",
-  "diagnostics": []
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 34,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `emit_typo' for Report"
+    }
+  ]
 }
