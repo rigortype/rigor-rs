@@ -13,19 +13,17 @@ Last updated: 2026-08-09.
 
 ## Now / Next
 
-▶ **NEXT (2026-08-09): gap track FULLY ADJUDICATED, `v0.3.2` re-pin landed** —
-every census bucket sits behind a decision; re-read the census against the new
-841-gap set before picking from it (#297 retracted a bucket). Next work is off
-the gap track: LSP v4+ (`rootUri`, UTF-16 sync). Ready to send: TWO paste-ready
-upstream repros (`Class.new` block scoped at top level; `class << Const =
-Object.new` body dropped —
-[adjudication](notes/20260808-object-bucket-adjudication.md)). The three 08-08
-arcs are DONE: narrowing (3a-2 DEFERRED at 0 verified rows, 3a-4/3b-2 ≤1,
-[remeasure](notes/20260808-narrowing-3a23-window-remeasure.md)), qualified
-witnessing, constant harvesting (slice C DECLINED — architectural,
-[spec+log](notes/20260808-partial-constant-harvest-mini-spec.md)). No global
-typing for the OpenStruct rows
-([why](notes/20260808-bare-class-bucket-characterisation.md)).
+▶ **NEXT (2026-08-09): category-2 candidates ADJUDICATED; join-wipe slice in
+flight** — 3b-2 and 3a-4 DEFER at 0 verified rows each; the Logical-union fix
+is a dedicated arc, not a slice (option-b REFUTED)
+([verdicts+batch-3](notes/20260809-deferred-slices-and-upstream-feedback.md)).
+Upstream feedback batch 3 FILED (rigor#316-#323; the Object-bucket repros are
+now #319/#320). In flight: the sequential-guard join-wipe fix (`Scope#join`
+fidelity — 1 census row, 10/14 probe shapes). After it: LSP v4+ (`rootUri`,
+UTF-16 sync), or re-read the census against the 841-gap set. Prior 08-08 arc
+records: [remeasure](notes/20260808-narrowing-3a23-window-remeasure.md) /
+[harvest](notes/20260808-partial-constant-harvest-mini-spec.md) /
+[OpenStruct](notes/20260808-bare-class-bucket-characterisation.md).
 
 - Coverage-tool parity lesson (binding for measurement tools): audit at NODE
   granularity — per-file histograms net over-claims out against under-claims.
