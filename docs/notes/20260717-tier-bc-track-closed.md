@@ -43,6 +43,12 @@ firing was "94% of possible-nil errors" on idiomatic Ruby.
 
 ## Slice decomposition (why there is no FP-safe path)
 
+Both branches named below are RETAINED DELIBERATELY on `origin`
+(`tier-bc-nilable-return` = 4fb56c5, `flow-cond-assign-nilability` = 7b7fe3d).
+They are the ONLY branches in the repo carrying patches master does not have —
+a branch cleanup must not delete them. Verified 2026-08-09, when every other
+branch (62 of them) was deleted as fully merged.
+
 | Slice | Content | Reuse | Predicted close |
 |---|---|---|---|
 | S1 | nilable-return inference map + source arm | branch `tier-bc-nilable-return` (4fb56c5) cherry-picks whole | **0** (measured 2026-07-06) |

@@ -2,7 +2,10 @@
 
 > **OUTCOME (2026-07-11): BUILT, CORRECT, FP-SAFE, but closes 0 SURVEY GAPS —
 > NOT merged, preserved on branch `flow-cond-assign-nilability` (commit
-> `7b7fe3d`).** Opus implemented the full ADR-0038 Slice 2 substrate (`Node::If`
+> `7b7fe3d`).** The branch is RETAINED DELIBERATELY on `origin` — it is not
+> stale, and a branch cleanup must not delete it (2026-08-09: it and
+> `tier-bc-nilable-return` were the only two survivors of a 62-branch sweep,
+> because they are the only branches carrying patches master does not have). Opus implemented the full ADR-0038 Slice 2 substrate (`Node::If`
 > descend + `join_nil_envs` + conservative predicate-mention narrowing +
 > constant-fold parity guard). Main-session audit CONFIRMED: the mechanism is
 > byte-identical to the reference on the whole self-probe matrix (`x = "s" if c;
