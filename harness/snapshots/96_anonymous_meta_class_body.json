@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/96_anonymous_meta_class_body.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 70,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `attr_reader`. If a project file defines `attr_reader` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 74,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `attr_reader`. If a project file defines `attr_reader` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 80,
+      "column": 20,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `parent_class_lookup`. If a project file defines `parent_class_lookup` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 85,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `trailing_unresolved_call`. If a project file defines `trailing_unresolved_call` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}
