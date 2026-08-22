@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/97_defined_operand_not_evaluated.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 60,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `frobparened' for \"lit\""
+    },
+    {
+      "rule": "flow.dead-assignment",
+      "line": 65,
+      "column": 3,
+      "severity": "warning",
+      "message": "local `unused' assigned in `genuinely_dead_assignment' but never read"
+    }
+  ]
+}

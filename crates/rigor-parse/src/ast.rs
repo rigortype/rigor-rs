@@ -1932,6 +1932,39 @@ impl<'src> Builder<'src> {
             }
         }
 
+        // `defined?(expr)` — the operand is NEVER EVALUATED (`defined?` inspects
+        // the expression statically), so no CALL under it is reachable code.
+        // Upstream #318 / `9e55deae` (shipped in `v0.3.4`) stopped all three of
+        // its engine tree-walks descending here; before it, both implementations
+        // checked the operand and agreed. Measured at the `v0.3.4` pin, keeping
+        // the old behaviour is 2 false positives on the standing sweep
+        // (dependabot-core's `if defined?(git_dir)` idiom) plus two more shapes on
+        // a hand probe: `defined?(s.frobnicate)` on a typed receiver, and an
+        // implicit-self call as the operand.
+        //
+        // Local READS under it survive — see
+        // [`collect_defined_operand_children`]: the reference's
+        // `DeadAssignmentCollector` does its own recursion and still counts them,
+        // so `y = 1; defined?(y)` is not a dead assignment there.
+        //
+        // Ruby's BARE `defined? a && a.m` binds lower than `&&`, so Prism hands the
+        // whole `a && a.m` back as the operand and all of it goes quiet — which is
+        // the point of the upstream issue. The parenthesised `defined?(a) && a.m`
+        // leaves the second call outside the operand, where it stays live code:
+        // that follows from the parse, not from anything special here.
+        if let Some(defined) = node.as_defined_node() {
+            // The OPERAND is what gets the suppressed recovery, not the
+            // `DefinedNode` itself: the collector records a `DefinedNode` whole
+            // (so a nested one is re-entered here), and handing it its own root
+            // would record it forever.
+            let recovered = collect_defined_operand_children(&defined.value());
+            if recovered.is_empty() {
+                return self.push(Node::Other { span, jump: None });
+            }
+            let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
+            return self.push(Node::Statements { body, span });
+        }
+
         // Anything outside the handled subset: RECOVER any meaningful descendant
         // nodes (local reads / op-writes / calls) so structural walks see them.
         //
@@ -2495,9 +2528,30 @@ fn lower_multi_target<'pr>(
 /// found inside expression wrappers in practice, and recovering one flatly (no
 /// owned `Definition`) would confuse the dead-assignment nested-unit barrier.
 fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+    collect_recoverable(node, false)
+}
+
+/// `collect_recoverable_children` with CALLS suppressed — the recovery a
+/// `defined?` operand gets (upstream #318 / `9e55deae`, pin `v0.3.4`).
+///
+/// `defined?` inspects its argument statically and never runs it, so no call
+/// under it is reachable code and none of the call rules may see one. But the
+/// local READS under it are still reads: the reference's #318 change touched its
+/// three engine tree-walks only, and `DeadAssignmentCollector#gather_read_names`
+/// does its own `rigor_each_child` recursion, which still descends into a
+/// `DefinedNode`. So `y = 1; defined?(y)` is NOT a dead assignment there —
+/// measured at the `v0.3.4` pin, and the reason this is a call-suppressing
+/// recovery rather than the leaf it started as. Calls are recursed THROUGH
+/// rather than recorded, so a read in `defined?(foo(y))` still counts.
+fn collect_defined_operand_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+    collect_recoverable(node, true)
+}
+
+fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<PrismNode<'pr>> {
     use ruby_prism::Visit;
     struct Collector<'a, 'pr> {
         out: &'a mut Vec<PrismNode<'pr>>,
+        suppress_calls: bool,
     }
     // Override each recoverable node type to RECORD it and stop (do not recurse —
     // `lower_node` will recurse into it once, normally). Every OTHER node type
@@ -2537,6 +2591,19 @@ fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr
             self.out.push(node.as_node());
         }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.suppress_calls {
+                // Under a `defined?` operand: not reachable code, so never
+                // recorded — but keep descending, because a local READ inside the
+                // call's receiver/arguments still counts as a read.
+                ruby_prism::visit_call_node(self, node);
+                return;
+            }
+            self.out.push(node.as_node());
+        }
+        // A `defined?` buried under an unhandled wrapper (`super(defined?(x))`)
+        // is recovered WHOLE, so its own lowering applies the call suppression
+        // instead of this walk recovering the operand's calls as live code.
+        fn visit_defined_node(&mut self, node: &ruby_prism::DefinedNode<'pr>) {
             self.out.push(node.as_node());
         }
         // A multi-write buried under an unhandled wrapper is recovered WHOLE
@@ -2548,7 +2615,7 @@ fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr
         }
     }
     let mut out = Vec::new();
-    let mut c = Collector { out: &mut out };
+    let mut c = Collector { out: &mut out, suppress_calls };
     // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
     // the unhandled root. The default `visit` dispatches the root to its own
     // (non-overridden) per-type method, which recurses into children — exactly
@@ -2921,6 +2988,53 @@ mod tests {
         assert!(has_call(&b, "foo"));
         assert!(has_call(&b, "bar"));
         assert!(has_call(&b, "baz"));
+    }
+
+    #[test]
+    fn defined_operand_drops_calls_but_keeps_local_reads() {
+        // Upstream #318 (pin v0.3.4): `defined?`'s operand is never evaluated, so
+        // no call under it is reachable code — but the reference's
+        // `DeadAssignmentCollector` still counts the local reads there, so those
+        // must survive.
+        let ast = lower(&crate::parse(b"defined?(s.frobnicate)\n"));
+        assert!(!has_call(&ast, "frobnicate"), "a call under defined? is not live code");
+
+        let ast = lower(&crate::parse(b"defined?(helper_method)\n"));
+        assert!(
+            !has_call(&ast, "helper_method"),
+            "an implicit-self call under defined? is not live code either"
+        );
+
+        let ast = lower(&crate::parse(b"y = 1\ndefined?(y)\n"));
+        assert!(
+            ast.iter()
+                .any(|(_, n)| matches!(n, Node::LocalVariableRead { name, .. } if name == "y")),
+            "a local read under defined? is still a read"
+        );
+
+        // Through a suppressed call: `defined?(foo(z))` still reads `z`.
+        let ast = lower(&crate::parse(b"z = 1\ndefined?(foo(z))\n"));
+        assert!(!has_call(&ast, "foo"), "the call itself stays out");
+        assert!(
+            ast.iter()
+                .any(|(_, n)| matches!(n, Node::LocalVariableRead { name, .. } if name == "z")),
+            "a read inside a suppressed call is still a read"
+        );
+
+        // The parenthesised guard leaves the second call OUTSIDE the operand.
+        let ast = lower(&crate::parse(b"defined?(x) && \"lit\".frobparened\n"));
+        assert!(
+            has_call(&ast, "frobparened"),
+            "a call outside the operand is live code"
+        );
+
+        // A `defined?` buried in an unhandled wrapper is recovered whole, so the
+        // suppression still applies to its operand.
+        let ast = lower(&crate::parse(b"def m\n  super(defined?(q.frobwrapped))\nend\n"));
+        assert!(
+            !has_call(&ast, "frobwrapped"),
+            "a wrapped defined? operand is suppressed too"
+        );
     }
 
     #[test]
