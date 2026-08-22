@@ -9,20 +9,17 @@ one-line ledger of what landed**. The complete per-subsystem port map is
 ledger line here — verdict + numbers + link — and its detail goes to a dated
 note or ADR *first*. No status essays; this file has a hard byte budget.
 
-Last updated: 2026-08-09.
+Last updated: 2026-08-23.
 
 ## Now / Next
 
-▶ **NEXT (2026-08-09): the narrowing frontier is OUT OF CARRIER LEVERS** —
-category-2 ADJUDICATED (3b-2/3a-4 DEFER at 0; Logical-union = a dedicated arc,
-option-b REFUTED), batch 3 FILED
-([verdicts+batch-3](notes/20260809-deferred-slices-and-upstream-feedback.md));
-and the unresolved-const carrier this file named as "the next lever" was BUILT
-and REJECTED at 0 rows — `object_counter` needs the deferred return-tail arc,
-not a carrier gate
-([note](notes/20260809-unresolved-const-receiver-carrier.md)). Next:
-LSP v4+ (`rootUri`, UTF-16 sync). Prior 08-08:
-[OpenStruct](notes/20260808-bare-class-bucket-characterisation.md).
+▶ **NEXT (2026-08-23): pin is current at `v0.3.4`; next is LSP v4+** (`rootUri`,
+UTF-16 sync). The narrowing frontier stays OUT OF CARRIER LEVERS — category-2
+ADJUDICATED and the unresolved-const carrier BUILT then REJECTED at 0 rows
+([verdicts+batch-3](notes/20260809-deferred-slices-and-upstream-feedback.md),
+[carrier](notes/20260809-unresolved-const-receiver-carrier.md)). **Before the
+next bump, diff our OPEN upstream issues against the release notes** — batch 3
+came due all at once as 50 FPs ([note](notes/20260823-repin-v034.md)).
 
 - Coverage-tool parity lesson (binding for measurement tools): audit at NODE
   granularity — per-file histograms net over-claims out against under-claims.
@@ -33,18 +30,18 @@ LSP v4+ (`rootUri`, UTF-16 sync). Prior 08-08:
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
   inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
   deferred by [scoping call](notes/20260719-coverage-command-scoping.md).
-- **Pin is `v0.3.2`** (+ vendored rbs 4.1.1; re-pinned 2026-08-09). Both standing
-  exception tables are now EMPTY — `UNBUILDABLE_DEFINITIONS` and the divergence
+- **Pin is `v0.3.4`** (+ vendored rbs 4.1.1; re-pinned 2026-08-23). Both standing
+  exception tables are still EMPTY — `UNBUILDABLE_DEFINITIONS` and the divergence
   registry — so a new entry in either is a real finding, not maintenance
   (`UPSTREAM.md`, all THREE hazards + the overlay/`sig/shims` trap).
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-08-09, post the `v0.3.2` re-pin): harness **95 fixtures / 0
-unregistered extras / 0 registered divergences**, coverage 399/434; standing
-sweep **0 FP / 9204 files / 841 gaps**, 8 corpora, baselines in
-`harness/CORPUS.md`. The gap drop is upstream retracting possible-nil claims
-(#297), NOT coverage. Neither sweep tool sees project-`sig/` behaviour. EVERY
+State (verified 2026-08-23, post the `v0.3.4` re-pin): harness **97 fixtures / 0
+unregistered extras / 0 registered divergences**, coverage 405/441; standing
+sweep **0 FP / 9204 files / 820 gaps**, 8 corpora, baselines in
+`harness/CORPUS.md`. Gap totals move mostly with upstream retractions, not
+coverage. Neither sweep tool sees project-`sig/` behaviour. EVERY
 tool that grades the port now prints its binary's path + build time and
 REFUSES one older than `crates/` — corpus tools on release, the fixture
 harness on debug (PR #65 + the 08-08 follow-up; a stale debug binary reported
@@ -102,12 +99,13 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-08-09 unresolved-const-receiver carrier — BUILT, REJECTED at 0 rows** (PR #89, closed) — sound (7 shapes ref-matched) but **841→841 on 9204** and the first allow-list member needing both engines' INDEXES to agree — invisible to a core+stdlib sweep. [note](notes/20260809-unresolved-const-receiver-carrier.md).
-- **2026-08-09 join-wipe retention (`Scope#join` fidelity)** — `join_cenv` wiped EVERY `Narrowed`/chain fact at each conditional merge, so a fact died at any later intervening `if`/`unless`/`case`. `retain_joined_facts` puts back what ALL edges still carry identically (one test subsuming rebind / own-guard / `invalidate_chain_after_call`; chains gated on the predicate's root mentions), plus the `else`-carrier unwrap — an `ElseNode` lowers to a clause-less `BeginRescue` whose own wipe cost EVERY `if`-with-`else` its falsey-edge facts. **1 FP closed, 15 probe shapes ref-matched, 0 FP / 9204, census 841→841 (0/0).** [note](notes/20260809-join-wipe-retention.md).
-- **2026-08-09 upstream re-pin `v0.3.1 → v0.3.2` (+ rbs 4.1.1)** — **0 FP / 9204, gaps 1125→841** (−284 = upstream retracting possible-nil FPs, #297 — NOT coverage); BOTH exception tables emptied (`UNBUILDABLE_DEFINITIONS` 12→0, divergence registry 1→0, fixture 79 KEPT as project-`sig/` coverage). rbs byte-identical; the `data/` OVERLAY is what moves. **Trap: #300/#301 made bundler/rubygems sigs DEPEND on the rbs gem's `sig/shims/` — 2 live FPs the sweep CANNOT SEE**, hand-probed, closed by `overlay/rbs_shims/`. [note](notes/20260809-repin-v032.md).
-- **2026-08-09 chain-guard meet — `Bot` sentinel + refinement** — 3a-3 CHAIN facts were on the superseded blind compare and `chains: …String` could not hold a collapse (3rd guard re-minted; 2-class `||` guard skipped the gate — 2 live FPs). `chains` now carries `ClassFact`; `narrow_nominal_to_class` extracted and SHARED by both arms. **2 FPs closed, +4 matched, 23/26 probe rows ref-matched**; census 1125→1125, 0 FP / 9204. [note](notes/20260809-chain-guard-meet.md).
+- **2026-08-23 upstream re-pin `v0.3.2 → v0.3.4`** (151 commits) — **0 FP / 9204, gaps 841→820**, harness 97 fixtures / 0 extras; rbs AND `data/` overlay both UNCHANGED, both exception tables still empty. The raw bump opened **50 FPs** — all upstream RETRACTIONS (#319, #318) that the snapshot diff cannot show, and all from OUR batch-3 reports, now due. [note](notes/20260823-repin-v034.md).
+- **2026-08-09 unresolved-const-receiver carrier — BUILT, REJECTED at 0 rows** (PR #89, closed) — sound (7 shapes ref-matched) but **841→841 on 9204**, and its first allow-list member needs both engines' INDEXES to agree — invisible to a core+stdlib sweep. [note](notes/20260809-unresolved-const-receiver-carrier.md).
+- **2026-08-09 join-wipe retention (`Scope#join` fidelity)** — `join_cenv` wiped EVERY `Narrowed`/chain fact at each conditional merge, so a fact died at any later intervening `if`/`unless`/`case`. `retain_joined_facts` puts back what ALL edges still carry identically, plus the `else`-carrier unwrap (an `ElseNode` lowers to a clause-less `BeginRescue` whose own wipe cost every `if`-with-`else` its falsey-edge facts). **1 FP closed, 15 probe shapes ref-matched, 0 FP / 9204, census 841→841.** [note](notes/20260809-join-wipe-retention.md).
+- **2026-08-09 upstream re-pin `v0.3.1 → v0.3.2` (+ rbs 4.1.1)** — **0 FP / 9204, gaps 1125→841** (−284 = upstream retracting possible-nil FPs, #297 — NOT coverage); BOTH exception tables emptied. rbs byte-identical; the `data/` OVERLAY is what moved. **Trap: bundler/rubygems sigs now DEPEND on the rbs gem's `sig/shims/` — 2 live FPs the sweep CANNOT SEE**, hand-probed, closed by `overlay/rbs_shims/`. [note](notes/20260809-repin-v032.md).
+- **2026-08-09 chain-guard meet — `Bot` sentinel + refinement** — 3a-3 CHAIN facts were on the superseded blind compare and `chains: …String` could not hold a collapse (2 live FPs). `chains` now carries `ClassFact`; `narrow_nominal_to_class` extracted and SHARED by both arms. **2 FPs closed, +4 matched, 23/26 probe rows ref-matched**; census flat, 0 FP / 9204. [note](notes/20260809-chain-guard-meet.md).
 - **2026-08-08 sequential-guard meet** (PR #78) — S2's re-seed + R3 drop was the WRONG meet: R3 → `narrow_nominal_to_class` (disjoint→`Bot`, subclass refines, `Unknown` splits project-vs-RBS space); propagation sees PRE-join facts. **5 FPs closed, +6 matched; census flat, 0 FP / 9204.** [note](notes/20260808-sequential-guard-meet.md).
-- **2026-08-08 `Object` bucket ADJUDICATED — 30 rows, all behind decisions, NO slice** (PR #85) — 18 REFERENCE FPs (16 `Class.new do…end` toplevel-scoped block bodies, 2 `class << Const = Object.new` dropped bodies), 3 = ADR-0035's deferred leg (deferral holds at 4 rows), 9 = one-file mocha rows. [adjudication](notes/20260808-object-bucket-adjudication.md).
+- **2026-08-08 `Object` bucket ADJUDICATED — 30 rows, all behind decisions, NO slice** (PR #85) — 18 REFERENCE FPs (`Class.new do…end` block bodies, `class << Const`), 3 = ADR-0035's deferred leg, 9 = one-file mocha rows. The 18 are FIXED upstream at `v0.3.4` (#319/#320) and ported. [adjudication](notes/20260808-object-bucket-adjudication.md).
 - **2026-08-08 constant-value harvesting: per-file gate + partial containers** (PRs #83 probes / #84) — the reference never declines a partially-literal constant, and its constant-VALUE typing is per-FILE (source-confirmed): C5's project-wide consumption was a live over-emission class. A gates consumption per-file (`file_id`; binary diff 0/0); B harvests partial containers as INERT bare nominals (typing elements would out-precise the oracle). **1127→1125: 2 closed, 0 opened, 0 FP / 9204.** C (chain constants) DECLINED — needs return resolution at index build. [mini-spec+log](notes/20260808-partial-constant-harvest-mini-spec.md) / [probes](notes/20260808-partial-constant-harvest-probes.md).
 - **2026-08-08 qualified-name WITNESSING** (PRs #80 probes / #81 S0 / #82 S1-S3) — the narrowing witness now fires for namespaced AND non-`CORE_CLASSES` top-level guard classes (resolution at MINT time via PR #64's machinery; full-path rendering; modules witnessable). Unblocked by TWO probe-forced fixes: the ADR-0042 registry DOUBLE-PREFIXED depth-≥3 decls (S0, solo diff EMPTY), and the qualified absence-check under-reported inherited methods (attr members never ingested; modules denied `Object`'s surface). **1136→1127: 9 closed, 0 opened, 0 FP / 9204 per slice.** Also root-fixed: the shaped-carrier collapse FP family (collapse needs NO resolution — probed) and the sequential-disjoint LOCAL re-guard FP. [mini-spec+log](notes/20260808-qualified-witnessing-mini-spec.md) / [probes](notes/20260808-qualified-witnessing-probes.md).
 - **2026-08-08 the collection-shape ARC** (PRs #70 stage 1 / #75 stage 2) — a literal-seeded local keeps its collection NOMINAL through `<<`/`[]=`/block mutation (`widen_after_block` is a SYNTACTIC walk, not a scope join — oracle-re-probed mid-build; branch-contained mutation on an UNWIDENED seed stays silent, the reference's join leaves a union its dispatcher declines); then the chain ROOTS: `Dir.glob`/`String#split` block-overload split, `ENV` object-constant ingestion (nilable returns REFUSED — 13/15 first-cut FPs), qualified C5 paths. **26 rows closed total (1167→1145, 1141→1137), 0 opened, 0 FP / 9204 throughout.** [spec+outcomes](notes/20260807-collection-shape-slice-spec.md).

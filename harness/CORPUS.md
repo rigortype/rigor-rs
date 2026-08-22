@@ -99,27 +99,35 @@ tools — a partial sweep must never read as a full one.
 
 Custom directories passed as positional arguments replace the whole list.
 
-## Standing sweep-set baseline (2026-08-09)
+## Standing sweep-set baseline (2026-08-23)
 
-`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.2`,
-vendored rbs 4.1.1. **9204 files, 0 FP candidates, 841 coverage gaps.** Coverage
+`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.4`,
+vendored rbs 4.1.1. **9204 files, 0 FP candidates, 820 coverage gaps.** Coverage
 gaps are the sound-subset side of ADR-0002 and are expected:
 
-| corpus | files | coverage gaps | (was, `v0.3.1`) |
-|---|---|---|---|
-| mastodon/app | 1236 | 13 | 48 |
-| gitlab-foss/lib | 4676 | 170 | 328 |
-| survey/mail | 874 | 439 | 540 |
-| survey/Ruby | 192 | 30 | 30 |
-| survey/dependabot-core | 1650 | 81 | 81 |
-| survey/concurrent-ruby | 345 | 80 | 86 |
-| survey/net-ssh | 180 | 26 | 75 |
-| survey/haml/lib | 51 | 2 | 5 |
+| corpus | files | coverage gaps | (was, `v0.3.2`) | (was, `v0.3.1`) |
+|---|---|---|---|---|
+| mastodon/app | 1236 | 16 | 13 | 48 |
+| gitlab-foss/lib | 4676 | 172 | 170 | 328 |
+| survey/mail | 874 | 432 | 439 | 540 |
+| survey/Ruby | 192 | 30 | 30 | 30 |
+| survey/dependabot-core | 1650 | 84 | 81 | 81 |
+| survey/concurrent-ruby | 345 | 61 | 80 | 86 |
+| survey/net-ssh | 180 | 25 | 26 | 75 |
+| survey/haml/lib | 51 | 0 | 2 | 5 |
+
+**The 0 FP in this row was not free.** The raw `v0.3.2 → v0.3.4` pin bump
+measured **50 FP candidates** — 48 from upstream #319 (`Class.new do … end` is a
+class body, so `call.unresolved-toplevel` can no longer fire in one) and 2 from
+#318 (`defined?`'s operand is not evaluated). Both are upstream *retractions*:
+rigor-rs's output did not change, the oracle's did. Neither was visible in the
+fixture-harness snapshot diff, which showed exactly ONE new reference
+diagnostic. [pin note](../docs/notes/20260823-repin-v034.md).
 
 The `v0.3.1` column is the 2026-07-31 baseline (1193 gaps; 1125 by the time of
-the 08-08 slices). Almost all of the drop is upstream RETRACTING diagnostics, not
-the port gaining coverage: `v0.3.2`'s #297 requires a nameable non-nil arm before
-a possible-nil witness, which is the position
+the 08-08 slices). Almost all of the drop to `v0.3.2` is upstream RETRACTING
+diagnostics, not the port gaining coverage: `v0.3.2`'s #297 requires a nameable
+non-nil arm before a possible-nil witness, which is the position
 [Tier B/C](../docs/notes/20260717-tier-bc-track-closed.md) had already argued.
 Read the total as "what the oracle now claims", not as progress.
 [pin note](../docs/notes/20260809-repin-v032.md).
