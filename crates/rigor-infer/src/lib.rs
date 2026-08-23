@@ -7938,7 +7938,13 @@ mod class_narrowing_tests {
             ("d12b", guarded("  @x += v.frobnicate_zzz\n"), Some("String")),
             ("d13", guarded("  $gx ||= v.frobnicate_zzz\n"), Some("String")),
             ("d23", guarded("  yield v.frobnicate_zzz\n"), Some("String")),
-            ("d24", guarded("  defined?(v.frobnicate_zzz)\n"), Some("String")),
+            // d24 (`defined?(v.frobnicate_zzz)`) is RETIRED at the `v0.3.4` pin.
+            // Upstream #318 stopped every engine walk descending into a
+            // `defined?` operand — the call is not reachable code on either side
+            // any more, so rigor-rs no longer lowers one and there is no node
+            // left to carry a narrowing fact. The behaviour it used to pin now
+            // lives in `rigor-parse`'s `defined_operand_drops_calls_but_keeps_
+            // local_reads` and harness fixture 97.
             ("g2", guarded("  super(v.frobnicate_zzz)\n"), Some("String")),
             ("g5", guarded("  v.frobnicate_zzz rescue nil\n"), Some("String")),
             // --- DECLINES (each load-bearing) --------------------------------

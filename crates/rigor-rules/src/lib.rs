@@ -834,7 +834,7 @@ fn unresolved_toplevel_diagnostics(
     // fires on an unresolved implicit-self call there) — only a `def` nested in a
     // class/module (a method) is non-toplevel, and its calls fall inside the
     // enclosing class/module span.
-    let scope_spans: Vec<rigor_parse::Span> = ast
+    let mut scope_spans: Vec<rigor_parse::Span> = ast
         .iter()
         .filter_map(|(_, n)| match n {
             // A `class << X` singleton-class body is a CLASS scope too — the
@@ -846,6 +846,7 @@ fn unresolved_toplevel_diagnostics(
             _ => None,
         })
         .collect();
+    scope_spans.extend(meta_new_block_body_spans(ast));
 
     for (_, n) in ast.iter() {
         if let Node::Call { receiver: None, method, message_span, .. } = n {
@@ -893,6 +894,99 @@ fn unresolved_toplevel_diagnostics(
             });
         }
     }
+}
+
+/// The class-creating meta calls whose literal block body is a CLASS BODY at
+/// runtime — the reference's `AnonymousMetaClass::META_NEW_SELECTORS`
+/// (upstream #319 / `189c498b`, pin `v0.3.4`). `Struct.new` / `Data.define` are
+/// here for the same reason `Class.new` / `Module.new` are: the block is
+/// `class_eval`'d on the generated class, so `self` inside it is that class.
+const META_NEW_SELECTORS: &[(&str, &str)] = &[
+    ("Class", "new"),
+    ("Module", "new"),
+    ("Struct", "new"),
+    ("Data", "define"),
+];
+
+/// The block-body regions of every `Class.new do … end` / `Module.new { … }` /
+/// `Struct.new(…) do … end` / `Data.define(…) do … end` in the file — NON-toplevel
+/// scopes for `call.unresolved-toplevel`.
+///
+/// Ruby evaluates such a block with `self` bound to the freshly created class, so
+/// `attr_reader` there is a class-level macro and not an unresolved toplevel call.
+/// The reference learned this away from constant-write position at `v0.3.4`
+/// (upstream #319): the body now enters under `Singleton[<anonymous>]`, and
+/// `Scope#toplevel?` is `self_type.nil?`, so the rule can no longer fire inside
+/// one. Before the fix it did, and rigor-rs matched; at the `v0.3.4` pin the same
+/// output became **48 false positives** across the standing sweep (dependabot-core
+/// `base_spec.rb` ×40, concurrent-ruby `erlang_actor_spec.rb` ×8 — RSpec's
+/// `Class.new(described_class) do … end` / `Module.new do … end` idiom).
+///
+/// Only the BLOCK BODY is a class scope; the receiver and the arguments keep the
+/// enclosing scope, so an implicit-self call in `Class.new(parent_of(x)) { … }`'s
+/// arguments still fires. The returned span covers the body statements — a call
+/// nested anywhere inside one of them is contained in it.
+///
+/// The identity half of the upstream change (a synthetic `#<Class:path:line:col>`
+/// name, under which the body's `def`s / `attr_*` are registered and which
+/// `class_new_lift` returns instead of `Singleton[Object]`) is NOT ported here:
+/// it only ever makes the reference emit MORE, so it is coverage, not FP safety.
+///
+/// **The constant-write rvalue is carved out**, and that is the reference's own
+/// asymmetry, not an approximation: `ScopeIndexer` has always keyed
+/// `A = Class.new do … end`'s body by the constant, and `StatementEvaluator` never
+/// routes a constant-write rvalue through the block-body narrowing that #319 added
+/// — so `self` inside such a body is still `Dynamic[top]`, `Scope#toplevel?` still
+/// holds, and the reference still fires there. Measured at the `v0.3.4` pin:
+/// `A = Class.new { attr_reader :a }` fires, `a = Class.new { attr_reader :a }`
+/// and the bare-expression form do not. Only the plain `A = …` spelling is
+/// carved out; `Outer::F = …` lowers to the recovery carrier (no owned
+/// `ConstantPathWrite` variant), so it stays suppressed — a coverage gap, never
+/// an FP.
+fn meta_new_block_body_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+    let constant_write_values: std::collections::HashSet<rigor_parse::NodeId> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::ConstantWrite { value, .. } => Some(*value),
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (id, n) in ast.iter() {
+        if constant_write_values.contains(&id) {
+            continue;
+        }
+        let Node::Call {
+            receiver: Some(recv),
+            method,
+            block_body,
+            ..
+        } = n
+        else {
+            continue;
+        };
+        if block_body.is_empty() {
+            continue;
+        }
+        // The receiver MUST be the bare constant (`Class`, or its `::`-rooted
+        // spelling, which lowers to the same name) — a call through a variable
+        // has no statically known identity, exactly as the reference requires.
+        let Node::ConstantRead { name, .. } = ast.get(*recv) else {
+            continue;
+        };
+        if !META_NEW_SELECTORS
+            .iter()
+            .any(|(konst, sel)| name == konst && method == sel)
+        {
+            continue;
+        }
+        let start = block_body.iter().map(|id| ast.get(*id).span().0).min();
+        let end = block_body.iter().map(|id| ast.get(*id).span().1).max();
+        if let (Some(start), Some(end)) = (start, end) {
+            out.push((start, end));
+        }
+    }
+    out
 }
 
 /// Whether `span` is contained in ANY of `spans` (non-strict). Used to decide a
@@ -5666,6 +5760,60 @@ mod tests {
         let d = unresolved(src);
         assert_eq!(d.len(), 1, "toplevel def body is toplevel, got {d:?}");
         assert_eq!(line_col(src, d[0].start_offset), (2, 3));
+    }
+
+    #[test]
+    fn unresolved_toplevel_inside_anonymous_meta_class_body_silent() {
+        // Upstream #319 (pin v0.3.4): `Class.new do … end` evaluates its block as
+        // the new class's own body, so `self` there is that class and the rule
+        // cannot fire. Away from constant-write position the reference is silent
+        // on all four meta forms. Oracle (v0.3.4): no diagnostics on any of these.
+        for src in [
+            b"k = Class.new do\n  attr_reader :a\nend\n".as_slice(),
+            b"m = Module.new do\n  some_macro\nend\n".as_slice(),
+            b"s = Struct.new(:a) do\n  some_macro\nend\n".as_slice(),
+            b"d = Data.define(:a) do\n  some_macro\nend\n".as_slice(),
+            b"Class.new do\n  attr_reader :a\nend\n".as_slice(),
+            b"@k = Class.new do\n  attr_reader :a\nend\n".as_slice(),
+            b"k = Class.new(StandardError) do\n  attr_reader :a\nend\n".as_slice(),
+        ] {
+            assert!(
+                unresolved(src).is_empty(),
+                "an anonymous meta-class body is a class body: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unresolved_toplevel_fires_in_constant_assigned_meta_class_body() {
+        // The reference's own asymmetry: `ScopeIndexer` keys a constant-assigned
+        // body by the CONSTANT, and `StatementEvaluator` never routes a
+        // constant-write rvalue through the #319 block-body narrowing — so `self`
+        // there is still `Dynamic[top]` and the rule DOES fire. Oracle (v0.3.4):
+        // 2:3 on each. Losing this would trade 48 false positives for a silent
+        // hole in the commonest spelling of the idiom.
+        for src in [
+            b"A = Class.new do\n  attr_reader :a\nend\n".as_slice(),
+            b"A = Class.new(StandardError) do\n  attr_reader :a\nend\n".as_slice(),
+            b"A = Module.new do\n  attr_reader :a\nend\n".as_slice(),
+            b"A = Struct.new(:a) do\n  attr_reader :b\nend\n".as_slice(),
+        ] {
+            let d = unresolved(src);
+            assert_eq!(d.len(), 1, "constant-assigned body still fires: {src:?} {d:?}");
+            assert_eq!(line_col(src, d[0].start_offset), (2, 3));
+        }
+    }
+
+    #[test]
+    fn unresolved_toplevel_fires_outside_an_anonymous_meta_class_body() {
+        // Only the BLOCK BODY is a class scope. A call in the ARGUMENTS, and a
+        // call after the block, keep the enclosing (toplevel) scope. Oracle
+        // (v0.3.4): 1:15 and 4:1.
+        let src = b"k = Class.new(parent_of_x) do\n  attr_reader :a\nend\nstill_missing\n";
+        let d = unresolved(src);
+        assert_eq!(d.len(), 2, "args and trailing call stay toplevel, got {d:?}");
+        assert_eq!(line_col(src, d[0].start_offset), (1, 15));
+        assert_eq!(line_col(src, d[1].start_offset), (4, 1));
     }
 
     #[test]

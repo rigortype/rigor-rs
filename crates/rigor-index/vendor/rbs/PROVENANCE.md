@@ -143,7 +143,16 @@ after a real bump.
 Because the script does NOT touch `overlay/`, a REFERENCE-pin bump needs that
 half re-synced by hand, and it moves independently of the rbs version — the
 `v0.3.1 → v0.3.2` bump left `core/` + `stdlib/` byte-identical while rewriting
-five overlay files and adding two directories:
+five overlay files and adding two directories.
+
+> The `v0.3.2 → v0.3.4` re-pin (2026-08-23) moved **neither** half: rbs stayed
+> 4.1.1 (`--check` exact on all 174 `.rbs`) and `diff -r` over both `data/`
+> halves came back clean in both directions, the only "Only in reference" lines
+> being the two deliberate omissions (`README.md`, `prism/`). Upstream's `data/`
+> churn that release was all in `builtins/ruby_core/` (the offline purity
+> catalog, which this port has no equivalent of) and the new `effects/` tree.
+> Run the `diff -r` anyway — a clean result is a measurement, and it took one
+> command; [note](../../../../docs/notes/20260823-repin-v034.md).
 
 ```sh
 rsync -a --delete --exclude README.md \

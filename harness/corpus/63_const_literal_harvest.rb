@@ -30,12 +30,19 @@ class K
   end
 end
 
-# --- STAYS SILENT ----------------------------------------------------------
+# --- A COVERAGE GAP as of the `v0.3.4` pin ----------------------------------
 
-# A constant defined in a MODULE is not lexically visible in an unrelated class
-# that merely includes it — the reference resolves lexically, so folding it
-# there would be wrong (and would manufacture an ActiveSupport `Integer#days`
-# style FP). `DAYS` is not in `Consumer`'s lexical nesting ⇒ Dynamic ⇒ silent.
+# A constant defined in a MODULE and reached from a class that `include`s it.
+# Through the `v0.3.2` pin the reference resolved constants LEXICALLY only, so
+# `DAYS` — not in `Consumer`'s lexical nesting — stayed `Dynamic` and both sides
+# were silent; folding it would have manufactured an ActiveSupport
+# `Integer#days` style FP.
+#
+# Upstream `1eda3dcf` / #356 (in `v0.3.4`) added the middle step of Ruby's
+# three-step lookup — each entry of `Module.nesting`, THEN the ancestors of the
+# innermost cresting scope, then the top level — so the reference now folds
+# `DAYS` to `7` and witnesses the typo. rigor-rs still resolves lexically: a
+# COVERAGE GAP, the sound-subset direction, never an FP.
 module Expirable
   DAYS = 7
 end
@@ -44,9 +51,11 @@ class Consumer
   include Expirable
 
   def go
-    DAYS.frobdays # NOT folded (DAYS lives in Expirable, not visible here).
+    DAYS.frobdays # reference folds to 7 via the ancestor chain; rigor-rs declines.
   end
 end
+
+# --- STAYS SILENT ----------------------------------------------------------
 
 # A constant assigned MORE THAN ONCE is ambiguous ⇒ declined ⇒ silent.
 class MultiAssign

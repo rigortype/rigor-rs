@@ -28,6 +28,13 @@
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobint' for 42"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 54,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobdays' for 7"
     }
   ]
 }

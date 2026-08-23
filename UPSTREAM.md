@@ -15,13 +15,30 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.3.2`** (tag, released 2026-08-08) |
-| Commit | `c6b91b9e` |
+| **Pinned ref** | **`v0.3.4`** (tag, released 2026-08-21) |
+| Commit | `b10bd5df` |
 
-> `v0.3.2` follows **rbs 4.1.1**, and the vendored RBS moved with it **in the
-> same commit** (see the independent-pin note below — the two must match) —
-> though only its version string: `vendor_rbs.py --check` against the 4.1.1 gem
-> reports an exact match on all 174 `.rbs`, so `core/` + `stdlib/` are
+> `v0.3.4` **does not move rbs** (still 4.1.1, `vendor_rbs.py --check` exact on
+> all 174 `.rbs`) and **does not move the `data/` overlay** (`diff -r` clean in
+> both directions; the only "Only in reference" lines are the two deliberate
+> omissions, `README.md` and `prism/`). Both standing exception tables stay
+> EMPTY. So for the first time since the ritual was written, steps 3's two
+> re-sync halves are both no-ops — and the bump is still **not** free: the
+> `v0.3.2 → v0.3.4` step (151 commits, two releases) opened **48 false
+> positives**, all one root cause, which the fixture harness could not see and
+> only the sweep caught. See [note](docs/notes/20260823-repin-v034.md).
+>
+> Most of the 151 commits are the two new OPT-IN subsystems — the effect system
+> (`rigor effects`, ADR-103) and `rigor unused` (ADR-102) — which are new
+> commands, not new `check` behaviour, and are out of the port's parity scope
+> ([ADR-0002](docs/adr/0002-diagnostic-set-parity.md) is about `rigor check`'s
+> diagnostic set). The `check`-visible delta is ten engine commits, and their
+> net on the FIXTURE corpus was **one** new reference diagnostic.
+
+> Previous pin `v0.3.2` followed **rbs 4.1.1**, and the vendored RBS moved with
+> it **in the same commit** (see the independent-pin note below — the two must
+> match) — though only its version string: `vendor_rbs.py --check` against the
+> 4.1.1 gem reports an exact match on all 174 `.rbs`, so `core/` + `stdlib/` are
 > byte-identical to 4.1.0 and no signature resolution shifts. The `v0.3.1 →
 > v0.3.2` bump (2026-08-09) measured **0 FP / 9204 files, gaps 1125 → 841**;
 > the −284 is upstream retracting its own possible-nil FPs (#297), not port
@@ -150,6 +167,20 @@ up as a red gate, so no past green result is suspect — but it can send you
 chasing a non-bug.)
 
 ## Bumping the pin (following upstream)
+
+> **Step 0 — read the release's `Fixed` section as an FP LIST, and diff it
+> against our own open upstream issues.** Every "no longer reports X" bullet is
+> a place the port may now be strictly LOUDER than the oracle, with no code
+> change on our side: upstream retracted a diagnostic, we did not. A retraction
+> is invisible to step 5's snapshot diff — rigor-rs never emitted it on a
+> fixture either — so only step 7's sweep can see it, and only if a corpus file
+> happens to exercise the shape. This is not hypothetical: the `v0.3.2 →
+> v0.3.4` bump landed ALL FIVE defect reports of our own feedback batch 3 at
+> once and opened **50 false positives**, three of the five being reference FPs
+> this project had adjudicated and deliberately left matched. **A filed upstream
+> issue is a scheduled port obligation**, and the bump that lands the fix is
+> when it comes due. Expect step 7 to send you back to step 4.
+> [note](docs/notes/20260823-repin-v034.md).
 
 1. Fetch + check out the new tag inside the submodule:
    ```sh
