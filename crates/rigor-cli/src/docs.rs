@@ -31,8 +31,11 @@
 use std::process::ExitCode;
 
 /// Where the full manual prose lives (the reference bundles it; the standalone
-/// build does not). Same home the `explain` catalogue's doc URLs anchor under.
-const MANUAL_HOME: &str = "https://github.com/rigortype/rigor/blob/main/docs/manual/";
+/// build does not). Same home the `explain` catalogue's doc URLs anchor under —
+/// the published docs site, which carries no git ref (see
+/// `explain::DOCUMENTATION_BASE`; the old `blob/main` path 404ed on every
+/// emission because the rigor repository has never had a `main` branch).
+const MANUAL_HOME: &str = "https://rigor.typedduck.fail/manual/";
 
 /// `rigor docs [<rule-id>]` — list documented rules, or print one rule's doc.
 /// Exit 0 on success, 64 on an unknown rule or usage error.

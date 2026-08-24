@@ -95,12 +95,12 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
         CALL_UNDEFINED_METHOD => Some(&RuleEntry {
             default_severity: Severity::Error,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-undefined-method",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-call-undefined-method",
         }),
         CALL_WRONG_ARITY => Some(&RuleEntry {
             default_severity: Severity::Error,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-wrong-arity",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-call-wrong-arity",
         }),
         CALL_POSSIBLE_NIL_RECEIVER => Some(&RuleEntry {
             // `error` under the default `balanced` profile (reference
@@ -109,7 +109,7 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // be an ERROR on guarded code — hence the zero-FP decline scan.
             default_severity: Severity::Error,
             evidence_tier: "medium",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-possible-nil-receiver",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-call-possible-nil-receiver",
         }),
         CALL_UNRESOLVED_TOPLEVEL => Some(&RuleEntry {
             // Authored `:warning` (balanced), `:off` in lenient. Evidence tier
@@ -118,26 +118,26 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // routes to the `pre_eval:` review path, not a definite typo.
             default_severity: Severity::Warning,
             evidence_tier: "low",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-unresolved-toplevel",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-call-unresolved-toplevel",
         }),
         FLOW_DEAD_ASSIGNMENT => Some(&RuleEntry {
             default_severity: Severity::Warning,
             evidence_tier: "medium",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-dead-assignment",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-dead-assignment",
         }),
         DEF_OVERRIDE_VISIBILITY_REDUCED => Some(&RuleEntry {
             default_severity: Severity::Warning,
             // The oracle stamps this rule `high` (a purely structural Liskov
             // signature check over the project ancestor chain); mirror exactly.
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-override-visibility-reduced",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-def-override-visibility-reduced",
         }),
         FLOW_UNREACHABLE_BRANCH => Some(&RuleEntry {
             default_severity: Severity::Warning,
             // The oracle stamps this `high` (a purely SYNTACTIC literal-predicate
             // check — no typer, no folding); mirror exactly.
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-unreachable-branch",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-unreachable-branch",
         }),
         FLOW_ALWAYS_RAISES => Some(&RuleEntry {
             // `error` — a provable `ZeroDivisionError` (the oracle stamps it
@@ -145,7 +145,7 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // decline gate in `check_always_raises` is intentionally strict.
             default_severity: Severity::Error,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-raises",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-always-raises",
         }),
         FLOW_ALWAYS_TRUTHY_CONDITION => Some(&RuleEntry {
             // The oracle stamps this `warning` / medium (an inferred-constant
@@ -153,21 +153,21 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // `unreachable-branch`).
             default_severity: Severity::Warning,
             evidence_tier: "medium",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-truthy-condition",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-always-truthy-condition",
         }),
         FLOW_DUPLICATE_HASH_KEY => Some(&RuleEntry {
             // Oracle: warning (balanced) / high — a purely syntactic value-pinned
             // comparison with no metaprogramming escape (Ruby itself warns under `-w`).
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-duplicate-hash-key",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-duplicate-hash-key",
         }),
         FLOW_RETURN_IN_ENSURE => Some(&RuleEntry {
             // Oracle: warning (balanced) / high — a syntactic proof with a
             // frame-aware envelope; Ruby's `ensure` semantics make every firing real.
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-return-in-ensure",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-return-in-ensure",
         }),
         CALL_ARGUMENT_TYPE_MISMATCH => Some(&RuleEntry {
             // Oracle: error across all profiles / high — a positional argument
@@ -178,7 +178,7 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // the single-overload non-nil channel).
             default_severity: Severity::Error,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-argument-type-mismatch",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-call-argument-type-mismatch",
         }),
         CALL_RAISE_NON_EXCEPTION => Some(&RuleEntry {
             // Oracle: error across all profiles / high — the operand's
@@ -187,7 +187,7 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // bail, duck `#exception`, redefinition, unknown-type decline).
             default_severity: Severity::Error,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-raise-non-exception",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-call-raise-non-exception",
         }),
         FLOW_SHADOWED_RESCUE_CLAUSE => Some(&RuleEntry {
             // Oracle: warning (balanced) / high — a purely syntactic + class-
@@ -196,21 +196,21 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // escape. Lenient info / strict error via the profile.
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-shadowed-rescue-clause",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-shadowed-rescue-clause",
         }),
         SUPPRESSION_UNKNOWN_RULE => Some(&RuleEntry {
             // Oracle: warning across ALL profiles / high — pure token-table
             // membership over the same tables the suppression matcher uses.
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-unknown-rule",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-suppression-unknown-rule",
         }),
         SUPPRESSION_EMPTY => Some(&RuleEntry {
             // Oracle: warning across ALL profiles / high — the marker word is
             // present and the token list is provably empty.
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-empty",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-suppression-empty",
         }),
         STATIC_VALUE_USE_VOID => Some(&RuleEntry {
             // Oracle: authored :warning, resolved :off by every shipped profile
@@ -221,7 +221,7 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // direct-dispatch path enters the table.
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-static-value-use-void",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-static-value-use-void",
         }),
         SUPPRESSION_UNKNOWN_MARKER => Some(&RuleEntry {
             // Oracle: warning across ALL profiles / high — the marker word is
@@ -229,7 +229,7 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // escape is excluded before firing.
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-suppression-unknown-marker",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-suppression-unknown-marker",
         }),
         DEF_IVAR_WRITE_MISMATCH => Some(&RuleEntry {
             // Authored `:error`; balanced profile stamps it `:warning` (lenient
@@ -239,7 +239,7 @@ pub fn catalog(rule_id: &str) -> Option<&'static RuleEntry> {
             // each write, no metaprogramming escape).
             default_severity: Severity::Warning,
             evidence_tier: "high",
-            documentation_url: "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-ivar-write-mismatch",
+            documentation_url: "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-def-ivar-write-mismatch",
         }),
         _ => None,
     }
@@ -6179,7 +6179,7 @@ mod tests {
         assert_eq!(e.evidence_tier, "high");
         assert_eq!(
             e.documentation_url,
-            "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-def-override-visibility-reduced"
+            "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-def-override-visibility-reduced"
         );
     }
 
@@ -6302,7 +6302,7 @@ mod tests {
         assert_eq!(e.evidence_tier, "high");
         assert_eq!(
             e.documentation_url,
-            "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-flow-always-raises"
+            "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-flow-always-raises"
         );
     }
 
