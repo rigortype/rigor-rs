@@ -35,6 +35,15 @@ submodule rather than tracked against a drifting local checkout.
 > diagnostic set). The `check`-visible delta is ten engine commits, and their
 > net on the FIXTURE corpus was **one** new reference diagnostic.
 
+> **The pin HOLDS at `v0.3.4`** as of 2026-08-25. Upstream master is 64 commits
+> ahead with no tag past `v0.3.4`, and the surveyed delta is **0 diagnostics
+> added / 0 dropped on 9204 files** — nearly all of it the two opt-in
+> subsystems, which are new commands and not new `check` behaviour. Its rbs bump
+> (4.1.1 → 4.1.3) is a library-code release: `diff -rq` over both gems' entire
+> `core/`, `stdlib/` and `sig/shims/` trees reports zero differing files, and the
+> reference self-diff under both versions is 0/0.
+> [survey](docs/notes/20260825-upstream-survey-v034-master.md).
+
 > Previous pin `v0.3.2` followed **rbs 4.1.1**, and the vendored RBS moved with
 > it **in the same commit** (see the independent-pin note below — the two must
 > match) — though only its version string: `vendor_rbs.py --check` against the
@@ -208,6 +217,19 @@ chasing a non-bug.)
    `overlay/rbs_shims/` was added — and the sweep could not see either, because
    no corpus file called the methods. A hand probe of the moved surface against
    the oracle is part of this step, not optional.
+
+   **Re-sync `crates/rigor-index/vendor/plugins/` too** — it is a third
+   pin-tracking surface, and until 2026-08-25 this ritual did not mention it. The
+   `activesupport-core-ext` copy was taken in 2026-06-26 from a LOCAL rigor
+   checkout (hazard 3, applied to a file instead of an env var) and never moved
+   again; by the `v0.3.4` pin the drift was **10 live false positives**. Copy the
+   PINNED submodule's plugin `sig/` byte-for-byte and `shasum` both sides — see
+   `crates/rigor-index/vendor/plugins/PROVENANCE.md`, which also records why
+   upstream's `data/gem_overlay/` twin is the wrong file to copy. **Neither sweep
+   tool can see this surface**: `fp_audit.py` and `gap_census.py` run both sides
+   from a clean cwd, so no `.rigor.yml` is read and no plugin is ever loaded.
+   Harness fixture 98 is the only gate on it.
+
    Then re-derive the classes whose DEFINITION the reference cannot build —
    `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`
    directories collide, and a collision blinds the oracle on that whole class:
