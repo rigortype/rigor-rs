@@ -1075,6 +1075,11 @@ struct Session {
     /// The S4b overlay scale guard's hysteresis state (review N2). Loop-owned like
     /// everything else here: workers report timings, the loop decides the posture.
     guard: OverlayGuard,
+    /// The per-URI last-good project index the synchronous query handlers answer
+    /// from ([`CrossFileCache`]). Loop-owned: written by [`handle_result`] after
+    /// the liveness gate, read by `hover` / `completion`, cleared on every
+    /// [`swap_project`], evicted on `didClose`.
+    crossfile: CrossFileCache,
 }
 
 // ---------------------------------------------------------------------------
@@ -1248,6 +1253,126 @@ struct Computed {
     /// guard's sample (review N2) — a measurement of the work the dispatch did
     /// anyway, carried back to the loop thread which owns the guard state.
     overlay_build: Option<Duration>,
+    /// The PROJECT `SourceIndex` this dispatch analysed against — the cross-file
+    /// cache's payload — or `None` when the overlay was off (a single-file index
+    /// is what hover/completion already build per request, so caching one buys
+    /// nothing and would only add staleness). Populated in lockstep with
+    /// [`Self::overlay_build`]: `Some` exactly when that is `Some`.
+    ///
+    /// An `Arc` because the index the dispatch built is exactly the index a
+    /// same-URI hover/completion wants, and re-deriving it on the loop thread
+    /// costs the 20-70 ms merge the <100 ms p95 budget cannot spend. Sending it
+    /// over the existing channel adds no concurrency reasoning: `SourceIndex` is
+    /// already `Send + Sync` (it is reachable from the `Arc<ProjectContext>`
+    /// every worker holds).
+    project_index: Option<Arc<SourceIndex>>,
+}
+
+/// The maximum number of per-URI cross-file cache entries kept alive. Hygiene,
+/// NOT a memory control: the probe measured one merged `SourceIndex` at
+/// ~4.1-4.7 KB per project file, so even the largest measured project fits
+/// ~17-90 entries inside ADR-0029's 600 MB budget, an order of magnitude above a
+/// realistic open-tab count. The cap exists only so a pathological session (a
+/// bulk "open every file" action) cannot grow the map without bound.
+const CROSSFILE_CACHE_CAP: usize = 8;
+
+/// One cached last-good project index for one URI.
+struct CachedIndex {
+    /// The `Arc` the dispatch handed back — read, never rebuilt, by a same-URI
+    /// hover / completion.
+    index: Arc<SourceIndex>,
+    /// The project generation the dispatch computed against. A reader re-checks
+    /// it (belt-and-braces: [`swap_project`] already clears the whole cache on
+    /// every generation bump, so an entry can never legally outlive one).
+    generation: u64,
+    /// The LRU clock value of this entry's last store/hit.
+    used: u64,
+}
+
+/// The **per-URI last-good project `SourceIndex`** cache (2026-08-26 cross-file
+/// cache slice). Loop-owned like every other [`Session`] field: only the loop
+/// thread writes it (in [`handle_result`], AFTER the 3-axis liveness gate) and
+/// only the loop thread reads it (the synchronous hover / completion handlers).
+///
+/// **Why per-URI, and why SAME-URI ONLY.** An entry for URI A is the project
+/// index with A's dirty buffer REPLACING A's on-disk file
+/// ([`overlay_source_index`]). Serving it for URI B would answer B's questions
+/// from A's unsaved edits — the double-registration hazard the REPLACE rule
+/// exists to prevent, in the query handlers instead of the diagnostics. So a
+/// reader consults its OWN URI's entry or falls back to today's single-file
+/// [`SourceIndex::build`]; there is no cross-URI borrowing at any staleness.
+///
+/// **Staleness is inherited, not invented.** The write happens at exactly the
+/// point the diagnostics computed alongside it are published, so a cached entry
+/// is never staler than what the editor is currently SHOWING for that file
+/// (probe §4: one debounce + one dispatch, ~230-330 ms worst case) — and hover
+/// agreeing with the visible markers is the UX property, not an accident.
+#[derive(Default)]
+struct CrossFileCache {
+    entries: HashMap<String, CachedIndex>,
+    /// A monotonic counter stamped on every store and every hit — the LRU order.
+    /// A counter, not an `Instant`: the eviction order must be deterministic in
+    /// tests, and "which entry was touched least recently" needs no wall clock.
+    clock: u64,
+}
+
+impl CrossFileCache {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record the project index a LIVE dispatch for `uri` computed under
+    /// `generation`. Called ONLY from [`handle_result`]'s live branch, and only
+    /// when the overlay was on for that dispatch.
+    fn store(&mut self, uri: &Uri, index: Arc<SourceIndex>, generation: u64) {
+        self.clock += 1;
+        let used = self.clock;
+        self.entries.insert(uri_key(uri), CachedIndex { index, generation, used });
+        while self.entries.len() > CROSSFILE_CACHE_CAP {
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| k.clone());
+            let Some(victim) = victim else { break };
+            self.entries.remove(&victim);
+        }
+    }
+
+    /// The cached project index for `uri`, iff it was built under the CURRENT
+    /// `generation`. `None` ⇒ the caller uses today's single-file index.
+    fn get(&mut self, uri: &Uri, generation: u64) -> Option<Arc<SourceIndex>> {
+        self.clock += 1;
+        let now = self.clock;
+        let entry = self.entries.get_mut(&uri_key(uri))?;
+        if entry.generation != generation {
+            return None;
+        }
+        entry.used = now;
+        Some(Arc::clone(&entry.index))
+    }
+
+    /// Drop `uri`'s entry (`didClose` — a closed document can receive no
+    /// hover/completion request, so holding its index is pure retention).
+    fn evict(&mut self, uri: &Uri) {
+        self.entries.remove(&uri_key(uri));
+    }
+
+    /// Drop EVERY entry ([`swap_project`]): a new project generation means every
+    /// cached index was built against a context that no longer exists.
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, uri: &Uri) -> bool {
+        self.entries.contains_key(&uri_key(uri))
+    }
 }
 
 /// The dispatch loop. It is the **sole owner** of the `BufferTable`, the
@@ -1323,6 +1448,7 @@ fn main_loop(
         config_broken,
         results_tx,
         guard,
+        crossfile: CrossFileCache::new(),
     };
 
     // Dynamic registration (S4): the `initialized` notification is CONSUMED by the
@@ -1581,6 +1707,13 @@ fn swap_project(
         exclude: ExcludeMatcher::from_config(&ctx.project_root, &st.cfg),
         overlay,
     });
+    // Every cross-file cache entry was built against the context just superseded
+    // — including the overlay this swap may have just turned OFF (the guard trip)
+    // — so the whole cache dies with it. Clearing HERE, at the single site every
+    // generation bump goes through, is what makes the invalidation total: config
+    // reloads, watched-file re-harvests, empty-project swaps and guard trips are
+    // all covered without any of them having to remember to.
+    st.crossfile.clear();
 }
 
 /// Re-harvest ONLY the changed project `.rb` files' held entries (review N3).
@@ -1850,7 +1983,15 @@ fn handle_message(
                 "textDocument/hover" => {
                     match req.extract::<HoverParams>("textDocument/hover") {
                         Ok((id, params)) => {
-                            let hover = hover(&st.project, &st.buffers, &params);
+                            // SAME-URI only, and only under the CURRENT project
+                            // generation. The `Arc` is cloned out first so the
+                            // `&mut st` borrow the LRU touch needs ends before
+                            // the handler's immutable borrows begin.
+                            let cached = crossfile_for(
+                                st,
+                                &params.text_document_position_params.text_document.uri,
+                            );
+                            let hover = hover(&st.project, &st.buffers, &params, cached.as_deref());
                             let resp = Response::new_ok(id, hover);
                             connection
                                 .sender
@@ -1866,7 +2007,10 @@ fn handle_message(
                 "textDocument/completion" => {
                     match req.extract::<CompletionParams>("textDocument/completion") {
                         Ok((id, params)) => {
-                            let items = completion(&st.project, &st.buffers, &params);
+                            let cached =
+                                crossfile_for(st, &params.text_document_position.text_document.uri);
+                            let items =
+                                completion(&st.project, &st.buffers, &params, cached.as_deref());
                             let resp = Response::new_ok(id, items);
                             connection
                                 .sender
@@ -1955,6 +2099,12 @@ fn handle_message(
                     // `None`) and DROPS its result — no stale publish escapes.
                     bump_epoch(st, &uri);
                     st.debouncer.cancel(&uri);
+                    // A closed document can no longer receive a hover/completion
+                    // request, so its cached project index is pure retention —
+                    // drop it here rather than waiting for the LRU or the next
+                    // generation bump. (A reopen re-populates on its first
+                    // dispatch, which is also the point its diagnostics return.)
+                    st.crossfile.evict(&uri);
                     send_diagnostics(connection, &uri, Vec::new())?;
                 }
             }
@@ -1999,6 +2149,19 @@ fn handle_message(
         Message::Response(_) => {}
     }
     Ok(false)
+}
+
+/// The cross-file cache entry a synchronous query handler for `uri` may answer
+/// from: THAT URI's own last-good project index, and only if it was built under
+/// the CURRENT project generation. `None` ⇒ the handler builds today's
+/// single-file index, exactly as before this slice.
+///
+/// A free function rather than an inline call so the two handlers cannot drift
+/// apart on the same-URI rule, which is the correctness guard of the whole
+/// design (an index cached for A carries A's dirty overlay).
+fn crossfile_for(st: &mut Session, uri: &Uri) -> Option<Arc<SourceIndex>> {
+    let generation = st.project.generation;
+    st.crossfile.get(uri, generation)
 }
 
 /// Send the server→client `client/registerCapability` request registering the
@@ -2119,14 +2282,22 @@ fn spawn_worker(uri: &Uri, text: String, version: i32, ctx: &ServerContext, st: 
         // index `check` would build for the project files PLUS this one); the other
         // two names are what the `exclude:` gate matches patterns against.
         let paths = BufferPaths::for_uri(&uri);
-        let (diags, overlay_build) = panic::catch_unwind(AssertUnwindSafe(|| {
+        let (diags, overlay_build, project_index) = panic::catch_unwind(AssertUnwindSafe(|| {
             gate(version, generation); // test seam: may block (hold mid-flight) or panic.
             compute_diagnostics(&project, &paths, &text)
         }))
         .unwrap_or_default();
         // Always send exactly one result (even empty on a caught panic), so the
         // loop's in-flight tracking for this URI clears. `Err` = loop gone (shutdown).
-        let _ = tx.send(Computed { uri, version, generation, epoch, diags, overlay_build });
+        let _ = tx.send(Computed {
+            uri,
+            version,
+            generation,
+            epoch,
+            diags,
+            overlay_build,
+            project_index,
+        });
     });
 }
 
@@ -2138,14 +2309,19 @@ fn spawn_worker(uri: &Uri, text: String, version: i32, ctx: &ServerContext, st: 
 /// S4 — the close+reopen version-reuse nit). Otherwise: a closed buffer drops
 /// silently; any stale axis DROPS + [`request_dispatch`]es the latest content under
 /// the current context (so the final state is always eventually published).
+///
+/// The live branch is also where the [`CrossFileCache`] entry is written, so the
+/// cache inherits all three staleness axes instead of inventing its own.
 fn handle_result(
     connection: &Connection,
     ctx: &ServerContext,
     st: &mut Session,
-    computed: Computed,
+    mut computed: Computed,
 ) -> Result<(), String> {
     st.in_flight.remove(&uri_key(&computed.uri));
     let sample = computed.overlay_build;
+    // Taken out before the publish moves `diags`; consumed only on the live path.
+    let project_index = computed.project_index.take();
     let outcome = match st.buffers.current_version(&computed.uri) {
         // Buffer closed while the worker ran — drop the result (no stale publish).
         None => Ok(()),
@@ -2154,6 +2330,19 @@ fn handle_result(
                 && computed.generation == st.project.generation
                 && computed.epoch == current_epoch(st, &computed.uri);
             if live {
+                // The cross-file cache write rides the liveness gate rather than
+                // repeating it: a result that is fit to PUBLISH is by definition
+                // the newest content, under the current project context, for a
+                // still-open buffer — precisely the entry a same-URI hover wants,
+                // and precisely the guarantee "hover agrees with the markers on
+                // screen" needs. A superseded result is dropped here exactly as
+                // its diagnostics are, so a stale index can never be cached.
+                //
+                // `project_index` is `Some` iff the overlay was on for this
+                // dispatch, so a guard-off dispatch silently caches nothing.
+                if let Some(index) = project_index {
+                    st.crossfile.store(&computed.uri, index, computed.generation);
+                }
                 // All three axes (version / generation / epoch) current — publish.
                 send_diagnostics(connection, &computed.uri, computed.diags)
             } else {
@@ -2224,13 +2413,21 @@ fn handle_result(
 /// harvest, so a dispatch harvests exactly the one file whose content changed —
 /// the dirty buffer — and calls `merge` directly. Nothing else moves: the same
 /// harvests, over the same files, in the same order, into the same merge.
+///
+/// **The `Arc`** (cross-file cache slice). The merged index used to die on the
+/// worker thread at the end of the dispatch that built it; it is now handed back
+/// so a same-URI hover/completion can READ it instead of paying a rebuild. The
+/// wrap is observationally inert — an `Arc<SourceIndex>` derefs to the same
+/// `&SourceIndex` every analysis call took before — and the fallback branch is
+/// wrapped too, purely so both branches have one type; only the overlay branch's
+/// index is ever cached (see [`compute_diagnostics`]).
 fn overlay_source_index(
     project: &ProjectContext,
     path: Option<&Path>,
     ast: &LoweredAst,
-) -> (SourceIndex, Option<Duration>) {
+) -> (Arc<SourceIndex>, Option<Duration>) {
     let Some(overlay) = &project.overlay else {
-        return (SourceIndex::build(ast, &project.index), None);
+        return (Arc::new(SourceIndex::build(ast, &project.index)), None);
     };
     // The timer starts HERE, before the buffer's harvest: the guard's budget is
     // "what one dispatch costs", and the buffer harvest is part of that.
@@ -2258,7 +2455,10 @@ fn overlay_source_index(
         files.push((&buffer, ast));
     }
     let source = SourceIndex::merge(&files, &project.index);
-    (source, Some(t0.elapsed()))
+    // The timer stops on the MERGE, before the `Arc` wrap: the guard's budget is
+    // the analysis work, and an `Arc::new` is one allocation of a moved value.
+    let elapsed = t0.elapsed();
+    (Arc::new(source), Some(elapsed))
 }
 
 /// The canonical filesystem path a `file:` document URI names, or `None` for a
@@ -2384,20 +2584,26 @@ fn send_diagnostics(
 /// single-file [`SourceIndex::build`]. `buf` carries the buffer's on-disk names —
 /// all `None` for an unsaved/non-`file:` buffer.
 ///
-/// Returns the diagnostics plus the overlay rebuild timing (the scale
-/// guard's sample, `None` when the overlay is off).
+/// Returns the diagnostics, the overlay rebuild timing (the scale guard's
+/// sample, `None` when the overlay is off), and — for the cross-file cache — the
+/// PROJECT index this dispatch analysed against, `Some` on exactly the same
+/// condition as the timing. Handing the index back changes nothing about what is
+/// computed or published: the third slot is dropped by every caller that does
+/// not want it, and every early return (`exclude`d buffer, ERB template, parse
+/// error, caught panic) yields `None` for it exactly as it already does for the
+/// timing.
 fn compute_diagnostics(
     project: &ProjectContext,
     buf: &BufferPaths,
     text: &str,
-) -> (Vec<Diagnostic>, Option<Duration>) {
+) -> (Vec<Diagnostic>, Option<Duration>, Option<Arc<SourceIndex>>) {
     // STAGE-1 PARITY, in `check`'s order (`main.rs`): config `exclude:` FIRST —
     // before the file is even read there, before the buffer is parsed here — then
     // the ERB-template skip. An excluded buffer yields an EMPTY set rather than no
     // publish at all, so the caller's publish CLEARS any markers the editor is
     // already showing for it (the same empty-publish `didClose` uses).
     if project.exclude.excludes(buf, project.overlay.as_ref()) {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     }
     let bytes = text.as_bytes().to_vec();
     // Skip ERB templates (matches `check` + the reference's ErbTemplateDetector):
@@ -2406,7 +2612,7 @@ fn compute_diagnostics(
     // bytes; the LSP runs it on the BUFFER's, which is the same predicate over the
     // content the user is actually editing.
     if rigor_parse::looks_like_erb_template(&bytes) {
-        return (Vec::new(), None);
+        return (Vec::new(), None, None);
     }
     let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
         let result = parse(&bytes);
@@ -2445,12 +2651,18 @@ fn compute_diagnostics(
                 &source,
             ));
         }
-        Some((diags, comments, overlay_build))
+        // The cache's payload rides back beside the guard's sample and on the
+        // SAME condition: a guard-off dispatch built the single-file index
+        // hover/completion already build per request, so caching it would buy
+        // nothing and cost staleness (probe §4 — this is the one gate that keeps
+        // the fallback posture literally unchanged).
+        let project_index = overlay_build.is_some().then(|| Arc::clone(&source));
+        Some((diags, comments, overlay_build, project_index))
     }));
 
-    let (mut diags, comments, overlay_build) = match analysed {
-        Ok(Some(triple)) => triple,
-        Ok(None) | Err(_) => return (Vec::new(), None),
+    let (mut diags, comments, overlay_build, project_index) = match analysed {
+        Ok(Some(quad)) => quad,
+        Ok(None) | Err(_) => return (Vec::new(), None, None),
     };
     // Suppression-marker surveillance, before `filter_suppressed` (self-suppressible).
     diags.extend(rigor_rules::suppression_marker_diagnostics(&comments));
@@ -2476,7 +2688,7 @@ fn compute_diagnostics(
             project.stamp.apply(&mut d).then(|| to_lsp_diagnostic(text, &d))
         })
         .collect();
-    (out, overlay_build)
+    (out, overlay_build, project_index)
 }
 
 /// Map one rigor `Diagnostic` to an LSP `Diagnostic`. `source` = `"rigor"`,
@@ -2507,10 +2719,19 @@ fn to_lsp_diagnostic(text: &str, d: &rigor_rules::Diagnostic) -> Diagnostic {
 /// shows `Name : type`; anything else shows the inferred type + node kind. Reuses
 /// the `type-of` node-locator + type renderer. Returns `None` when the buffer is
 /// unknown, the position is out of range, or no node covers it — a null hover.
+///
+/// **`cached`** is THIS URI's last-good project [`SourceIndex`]
+/// ([`CrossFileCache`]), or `None`. On a hit the hover is answered from the
+/// project index — a call whose class lives in another file finally types — at
+/// the cost of an `Arc` read, never a rebuild. On a miss it is today's
+/// single-file [`SourceIndex::build`], unchanged. The caller resolves the entry
+/// (same-URI, current generation); this function never chooses which index it is
+/// handed.
 fn hover(
     project: &ProjectContext,
     buffers: &BufferTable,
     params: &HoverParams,
+    cached: Option<&SourceIndex>,
 ) -> Option<Hover> {
     let pos = &params.text_document_position_params;
     let text = buffers.text(&pos.text_document.uri)?;
@@ -2519,13 +2740,21 @@ fn hover(
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
         let ast = lower(&parse(text.as_bytes()));
         let node_id = crate::type_of::locate_node(&ast, offset)?;
-        let source = SourceIndex::build(&ast, &project.index);
-        let typer = Typer::with_source(&project.index, &source);
+        // Deferred init, so the single-file index is not even BUILT on a hit.
+        let single_file;
+        let source: &SourceIndex = match cached {
+            Some(project_index) => project_index,
+            None => {
+                single_file = SourceIndex::build(&ast, &project.index);
+                &single_file
+            }
+        };
+        let typer = Typer::with_source(&project.index, source);
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, node_id, &env, &mut interner);
         let (start, end) = ast.get(node_id).span();
-        let type_render = crate::type_of::render_type(&interner, &project.index, &source, ty);
+        let type_render = crate::type_of::render_type(&interner, &project.index, source, ty);
 
         // Extract owned node bits so later `&mut interner` calls don't clash with
         // the `&ast` borrow of `node`.
@@ -2628,10 +2857,18 @@ const COMPLETION_STUB_CONST: &str = "RigorCompletionHole";
 /// sentinel only when the buffer does not parse. Since Ruby's own rule for
 /// "constant or method call after `::`" IS the first character's case, deciding
 /// on the prefix directly is the same decision without the double parse.
+///
+/// **`cached`** is THIS URI's last-good project [`SourceIndex`], exactly as for
+/// [`hover`]: on a hit the receiver is typed against the project index (so a
+/// receiver whose class — or whose class's inferred method return — lives in
+/// another file completes), on a miss against today's single-file index. The
+/// namespace branch uses it too, to UNION the project's own nested constants
+/// into the RBS children.
 fn completion(
     project: &ProjectContext,
     buffers: &BufferTable,
     params: &CompletionParams,
+    cached: Option<&SourceIndex>,
 ) -> Option<CompletionResponse> {
     let tdp = &params.text_document_position;
     let text = buffers.text(&tdp.text_document.uri)?;
@@ -2656,7 +2893,7 @@ fn completion(
     // constant the user is writing; a lowercase-initial one is a class-method
     // call (`Foo::parse`), which stays on the method path.
     if scope_sep && !bytes[ident_start..offset].first().is_some_and(u8::is_ascii_lowercase) {
-        return namespace_completion(project, text, ident_start, offset);
+        return namespace_completion(project, text, ident_start, offset, cached);
     }
     let stub_at = ident_start; // where the stub name begins (right after the sep).
 
@@ -2671,8 +2908,16 @@ fn completion(
             Node::Call { receiver, message_span, .. } if message_span.0 == stub_at => Some(*receiver),
             _ => None,
         })??;
-        let source = SourceIndex::build(&ast, &project.index);
-        let typer = Typer::with_source(&project.index, &source);
+        // Deferred init, so the single-file index is not even BUILT on a hit.
+        let single_file;
+        let source: &SourceIndex = match cached {
+            Some(project_index) => project_index,
+            None => {
+                single_file = SourceIndex::build(&ast, &project.index);
+                &single_file
+            }
+        };
+        let typer = Typer::with_source(&project.index, source);
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
         let ty = typer.type_of(&ast, receiver, &env, &mut interner);
@@ -2703,15 +2948,26 @@ fn completion(
 /// expression-shaped left side (`foo()::Bar`, `[1, 2]::Bar`) resolves to no
 /// constant path and correctly yields nothing.
 ///
-/// Like the reference's `enumerate_constant_children`, this sees only the RBS
-/// surface (core / stdlib / plugins / project `sig/`) — a class defined in the
-/// edited buffer is NOT offered. That is the S4b "hover / completion keep the
-/// single-file index" carve-out and the reference's own scope, not an oversight.
+/// The enumeration surface is the RBS one (core / stdlib / plugins / project
+/// `sig/`) UNIONED, on a cross-file cache hit, with the classes and modules the
+/// PROJECT'S OWN SOURCE declares under the same namespace
+/// ([`SourceIndex::namespace_children`]) — the LSP-v4 note's withheld
+/// "buffer-local constants after `::`" item, closed now that a project index is
+/// available without a per-request rebuild. With no cache entry (no dispatch
+/// yet, a stale generation, the overlay off) the answer is RBS-only, exactly as
+/// before.
+///
+/// **The RBS entry wins a kind conflict.** The two surfaces can disagree about
+/// whether a name is a class or a module — a project that reopens `Process` and
+/// writes `module Status` inside it says MODULE where core RBS says CLASS. RBS
+/// is the declaration of record for a name it knows, so it is inserted LAST and
+/// overwrites; the union still offers the name exactly once.
 fn namespace_completion(
     project: &ProjectContext,
     text: &str,
     ident_start: usize,
     offset: usize,
+    cached: Option<&SourceIndex>,
 ) -> Option<CompletionResponse> {
     let synth = format!("{}{}{}", &text[..ident_start], COMPLETION_STUB_CONST, &text[offset..]);
     let suffix = format!("::{COMPLETION_STUB_CONST}");
@@ -2731,7 +2987,19 @@ fn namespace_completion(
     }))
     .ok()??;
 
-    let children = project.index.namespace_children(&parent);
+    // Name-keyed so the union is deduplicated and stays in the SAME name-sorted
+    // order the RBS-only path already produced (both accessors are `BTreeMap`
+    // collects, so an RBS-only namespace yields a byte-identical list).
+    let mut children: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
+    if let Some(source) = cached {
+        for (name, is_module) in source.namespace_children(&parent) {
+            children.insert(name, is_module);
+        }
+    }
+    // LAST, so an RBS declaration overrides the project's kind on a conflict.
+    for (name, is_module) in project.index.namespace_children(&parent) {
+        children.insert(name, is_module);
+    }
     if children.is_empty() {
         return None;
     }
@@ -2985,7 +3253,7 @@ mod tests {
     #[test]
     fn diagnostics_flag_a_typo() {
         // `"hi".lenght` — undefined method, one diagnostic.
-        let (diags, _) = compute_diagnostics(&project(), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
+        let (diags, _, _) = compute_diagnostics(&project(), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert_eq!(diags.len(), 1, "one undefined-method diagnostic");
         let d = &diags[0];
         assert_eq!(d.source.as_deref(), Some("rigor"));
@@ -3006,7 +3274,7 @@ mod tests {
 
     #[test]
     fn diagnostics_clean_source_is_empty() {
-        let (diags, _) = compute_diagnostics(&project(), &BufferPaths::default(), "x = \"hi\"\nx.upcase\n");
+        let (diags, _, _) = compute_diagnostics(&project(), &BufferPaths::default(), "x = \"hi\"\nx.upcase\n");
         assert!(diags.is_empty());
     }
 
@@ -3025,7 +3293,7 @@ mod tests {
             "severity_overrides:\n  call.undefined-method: off\n",
             "test",
         );
-        let (diags, _) =
+        let (diags, _, _) =
             compute_diagnostics(&project_with_config(&cfg), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert!(diags.is_empty(), "an `off` resolution is DROPPED, not merely downgraded");
     }
@@ -3038,7 +3306,7 @@ mod tests {
             "severity_overrides:\n  call.undefined-method: info\n",
             "test",
         );
-        let (diags, _) =
+        let (diags, _, _) =
             compute_diagnostics(&project_with_config(&cfg), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert_eq!(diags.len(), 1);
         assert_eq!(
@@ -3053,7 +3321,7 @@ mod tests {
     #[test]
     fn stage3_stamp_honours_a_family_override() {
         let cfg = Config::parse_or_warn("severity_overrides:\n  call: off\n", "test");
-        let (diags, _) =
+        let (diags, _, _) =
             compute_diagnostics(&project_with_config(&cfg), &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
         assert!(diags.is_empty(), "the `call` family override covers call.undefined-method");
     }
@@ -3124,7 +3392,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        let h = hover(&project(), &buffers, &params).expect("a hover");
+        let h = hover(&project(), &buffers, &params, None).expect("a hover");
         match h.contents {
             HoverContents::Markup(m) => assert!(m.value.contains("42"), "{}", m.value),
             _ => panic!("expected markup hover"),
@@ -3146,7 +3414,7 @@ mod tests {
             partial_result_params: Default::default(),
             context: None,
         };
-        match completion(&project(), &buffers, &params) {
+        match completion(&project(), &buffers, &params, None) {
             Some(CompletionResponse::Array(items)) => items.into_iter().map(|i| i.label).collect(),
             _ => Vec::new(),
         }
@@ -3326,7 +3594,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        let h = hover(&project(), &buffers, &params).expect("a hover");
+        let h = hover(&project(), &buffers, &params, None).expect("a hover");
         let HoverContents::Markup(m) = h.contents else { panic!("markup") };
         assert!(m.value.contains("String#upcase"), "signature: {}", m.value);
         assert!(m.value.contains("arity"), "arity shown: {}", m.value);
@@ -3345,7 +3613,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        match hover(&project(), &buffers, &params) {
+        match hover(&project(), &buffers, &params, None) {
             Some(Hover { contents: HoverContents::Markup(m), .. }) => m.value,
             _ => String::new(),
         }
@@ -3377,7 +3645,7 @@ mod tests {
             },
             work_done_progress_params: Default::default(),
         };
-        assert!(hover(&project(), &BufferTable::new(), &params).is_none());
+        assert!(hover(&project(), &BufferTable::new(), &params, None).is_none());
     }
 
     #[test]
@@ -4611,7 +4879,7 @@ mod tests {
 
         // (c) …and today's single-file index MISSES it — so this test would fail
         // without the overlay. (Directly: the pre-S4b `compute_diagnostics` path.)
-        let (single_file, _) = compute_diagnostics(&project(), &BufferPaths::default(), SUB_RB);
+        let (single_file, _, _) = compute_diagnostics(&project(), &BufferPaths::default(), SUB_RB);
         assert!(
             single_file.is_empty(),
             "a single-file index cannot see `Base`, so it finds nothing: {single_file:?}"
@@ -5317,6 +5585,7 @@ mod tests {
             config_broken: false,
             results_tx,
             guard: OverlayGuard::new(),
+            crossfile: CrossFileCache::new(),
         };
         (ctx, st)
     }
@@ -6348,6 +6617,7 @@ mod tests {
                     epoch: 0,
                     diags: Vec::new(),
                     overlay_build: Some(Duration::from_millis(ms)),
+                    project_index: None,
                 },
             )
             .unwrap();
@@ -6397,6 +6667,7 @@ mod tests {
                     epoch: 0,
                     diags: Vec::new(),
                     overlay_build: Some(Duration::from_millis(1)),
+                    project_index: None,
                 },
             )
             .unwrap();
@@ -6526,6 +6797,621 @@ mod tests {
             !watched_event_is_ignorable(&ctx, &cfg, canonical.as_deref(), &uri),
             "PROBE F FAILED: under the production root shape a deleted-directory \
              event spelled through the workspace symlink is IGNORED"
+        );
+    }
+
+    // =======================================================================
+    // Cross-file cache — the per-URI last-good project index the SYNCHRONOUS
+    // handlers answer from (mini-spec 20260826-lsp-crossfile-cache-mini-spec.md).
+    // =======================================================================
+
+    /// `Beta#label` returns a `String` — a tier-4b method return, so a caller in
+    /// ANOTHER file types only with project-wide context. Defined in `beta.rb`.
+    const XF_BETA_RB: &str = "class Beta\n  def label\n    \"x\"\n  end\nend\n";
+
+    /// The buffer under test, in a DIFFERENT file from `Beta`. Deliberately
+    /// PARSEABLE: the cache is written by the diagnostics dispatch, and a
+    /// dispatch over a buffer Prism cannot parse produces no index at all (it
+    /// returns early, exactly as it already did for its diagnostics).
+    ///
+    /// * `w = Beta.new.label` — hover on `label` (line 0, char 16) is
+    ///   `Beta#label → String` only cross-file.
+    /// * `w.upcase` — completion right after the dot (line 1, char 2) needs `w`
+    ///   to be a `String`, which needs `Beta#label`'s return, which needs
+    ///   `beta.rb`.
+    const XF_ALPHA_RB: &str = "w = Beta.new.label\nw.upcase\n";
+
+    /// A project namespace whose children live in a project `.rb`, not in RBS.
+    const XF_WRAPPER_RB: &str =
+        "module Wrapper\n  class Inner\n  end\n  module Mixin\n  end\nend\n";
+
+    /// The kind-conflict fixture: the project reopens core `Process` and declares
+    /// `Status` as a MODULE, where core RBS declares it a CLASS.
+    const XF_PROCESS_RB: &str = "module Process\n  module Status\n  end\nend\n";
+
+    /// Round-trip a hover request and return its markdown body (empty on a null
+    /// hover). Unlike [`hover_sync`] this reads the CONTENT, which is what the
+    /// cross-file property is stated in.
+    fn xf_hover_request(h: &Harness, id: i32, uri: &str, line: u32, character: u32) -> String {
+        h.request(
+            id,
+            "textDocument/hover",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        );
+        match h.recv() {
+            Message::Response(r) => {
+                assert_eq!(r.id, RequestId::from(id));
+                r.result
+                    .and_then(|v| serde_json::from_value::<Hover>(v).ok())
+                    .map(|hv| match hv.contents {
+                        HoverContents::Markup(m) => m.value,
+                        other => panic!("expected markup hover, got {other:?}"),
+                    })
+                    .unwrap_or_default()
+            }
+            other => panic!("expected a hover response, got {other:?}"),
+        }
+    }
+
+    /// Round-trip a completion request and return `(label, kind)` per item.
+    fn xf_completion_request(
+        h: &Harness,
+        id: i32,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Vec<(String, Option<CompletionItemKind>)> {
+        h.request(
+            id,
+            "textDocument/completion",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character }
+            }),
+        );
+        match h.recv() {
+            Message::Response(r) => {
+                assert_eq!(r.id, RequestId::from(id));
+                match r.result.and_then(|v| {
+                    serde_json::from_value::<Option<CompletionResponse>>(v).ok().flatten()
+                }) {
+                    Some(CompletionResponse::Array(items)) => {
+                        items.into_iter().map(|i| (i.label, i.kind)).collect()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            other => panic!("expected a completion response, got {other:?}"),
+        }
+    }
+
+    /// Just the labels, for the set assertions.
+    fn xf_labels(items: &[(String, Option<CompletionItemKind>)]) -> Vec<String> {
+        items.iter().map(|(l, _)| l.clone()).collect()
+    }
+
+    // --- family 1: cross-file hover ---------------------------------------
+
+    #[test]
+    fn crossfile_hover_answers_from_the_cached_project_index() {
+        // THE KEYSTONE for hover. A class defined in file B, hovered in open file
+        // A: single-file BEFORE A's first dispatch has published, cross-file
+        // after. Holding the v1 worker mid-flight is what makes "before any
+        // dispatch" a real, deterministic state rather than a race.
+        let p = TempProject::new("xf_hover");
+        p.write("beta.rb", XF_BETA_RB);
+        p.write("alpha.rb", XF_ALPHA_RB);
+        let g = gate_holding(&[1], &[]);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            g.gate.clone(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("alpha.rb"), XF_ALPHA_RB, 1));
+
+        // MISS — the only dispatch is still blocked in the gate, so no entry
+        // exists and the hover is today's single-file answer.
+        let before = xf_hover_request(&h, 10, &p.uri("alpha.rb"), 0, 16);
+        assert!(
+            before.contains("Dynamic[top]#label"),
+            "before any dispatch the hover must fall back to the single-file index: {before}"
+        );
+
+        // Let the dispatch finish: publishing is also where the cache is written.
+        g.release(1);
+        assert!(h.recv_diags().diagnostics.is_empty(), "the fixture is clean");
+
+        // HIT — `Beta` lives in the OTHER file and now types.
+        let after = xf_hover_request(&h, 11, &p.uri("alpha.rb"), 0, 16);
+        assert!(
+            after.contains("Beta#label → String"),
+            "after the dispatch the hover must see `Beta` from beta.rb: {after}"
+        );
+        assert_ne!(before, after, "the two postures must actually differ");
+        h.shutdown();
+    }
+
+    // --- family 2: cross-file method completion ----------------------------
+
+    #[test]
+    fn crossfile_completion_answers_from_the_cached_project_index() {
+        // Same shape for method completion: `w = Beta.new.label` makes `w` a
+        // String ONLY if `Beta#label`'s return is known, which needs beta.rb.
+        let p = TempProject::new("xf_completion");
+        p.write("beta.rb", XF_BETA_RB);
+        p.write("alpha.rb", XF_ALPHA_RB);
+        let g = gate_holding(&[1], &[]);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            g.gate.clone(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("alpha.rb"), XF_ALPHA_RB, 1));
+
+        // MISS — a receiver whose class lives in another file is unresolved, so
+        // the list is null/empty (never a guess).
+        let before = xf_completion_request(&h, 20, &p.uri("alpha.rb"), 1, 2);
+        assert!(
+            before.is_empty(),
+            "before any dispatch the receiver is unresolved: {before:?}"
+        );
+
+        g.release(1);
+        assert!(h.recv_diags().diagnostics.is_empty());
+
+        // HIT — `w` types as String, so the String instance surface is offered.
+        let after = xf_labels(&xf_completion_request(&h, 21, &p.uri("alpha.rb"), 1, 2));
+        assert!(after.contains(&"upcase".to_string()), "String#upcase offered: {after:?}");
+        assert!(after.contains(&"length".to_string()), "String#length offered");
+        assert!(
+            !after.contains(&"respond_to_missing?".to_string()),
+            "and the LSP-v4 private filter still applies on a cache hit"
+        );
+        h.shutdown();
+    }
+
+    // --- family 3: `Foo::` namespace completion ----------------------------
+
+    #[test]
+    fn crossfile_namespace_completion_offers_project_source_children() {
+        // The LSP-v4 note's withheld item: a nested constant declared in a
+        // project `.rb` (never in RBS) is offered after `Foo::`. `Wrapper::Inner`
+        // is spelled as an uppercase PARTIAL so the buffer parses — the cache is
+        // written by a diagnostics dispatch, which needs a parseable buffer.
+        let p = TempProject::new("xf_namespace");
+        p.write("wrapper.rb", XF_WRAPPER_RB);
+        let use_rb = "Wrapper::Inner\n";
+        p.write("use.rb", use_rb);
+        let g = gate_holding(&[1], &[]);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            g.gate.clone(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("use.rb"), use_rb, 1));
+
+        // MISS — RBS knows no `Wrapper`, so the answer is the null completion the
+        // RBS-only path has always returned.
+        let before = xf_completion_request(&h, 30, &p.uri("use.rb"), 0, 14);
+        assert!(before.is_empty(), "RBS-only ⇒ no children for a project namespace: {before:?}");
+
+        g.release(1);
+        let _ = h.recv_diags();
+
+        // HIT — both children, each with its DECLARED kind.
+        let after = xf_completion_request(&h, 31, &p.uri("use.rb"), 0, 14);
+        assert_eq!(
+            after,
+            vec![
+                ("Inner".to_string(), Some(CompletionItemKind::CLASS)),
+                ("Mixin".to_string(), Some(CompletionItemKind::MODULE)),
+            ],
+            "immediate children only, name-sorted, class-vs-module rendered"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn crossfile_namespace_completion_keeps_rbs_results_and_rbs_wins_a_kind_conflict() {
+        // Two properties in one fixture, because they are the same risk: the
+        // union must not disturb the RBS answer.
+        //
+        // (a) RBS RESULTS UNCHANGED — `Process::`'s children are byte-identical
+        //     with and without a cache entry.
+        // (b) KIND CONFLICT — the project declares `module Process::Status`
+        //     where core RBS declares a CLASS. The name appears ONCE, as a CLASS.
+        let p = TempProject::new("xf_kind");
+        p.write("proc.rb", XF_PROCESS_RB);
+        let use_rb = "Process::Status\n";
+        p.write("use.rb", use_rb);
+        let (_ctx, st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
+
+        // The exact index a dispatch for `use.rb` would hand back.
+        let ast = lower(&parse(use_rb.as_bytes()));
+        let canonical = std::fs::canonicalize(p.root.join("lib").join("use.rb")).unwrap();
+        let (cached, sample) = overlay_source_index(&st.project, Some(&canonical), &ast);
+        assert!(sample.is_some(), "precondition: the overlay is live");
+        assert_eq!(
+            cached.namespace_children("Process"),
+            vec![("Status", true)],
+            "precondition: the project's own view says Status is a MODULE"
+        );
+
+        let mut buffers = BufferTable::new();
+        let uri: Uri = p.uri("use.rb").parse().unwrap();
+        buffers.open(&uri, use_rb.to_string(), 1);
+        let params = CompletionParams {
+            text_document_position: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: Position { line: 0, character: 15 },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        };
+        let items = |cached: Option<&SourceIndex>| match completion(
+            &st.project,
+            &buffers,
+            &params,
+            cached,
+        ) {
+            Some(CompletionResponse::Array(v)) => {
+                v.into_iter().map(|i| (i.label, i.kind, i.detail)).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
+        let rbs_only = items(None);
+        let unioned = items(Some(&cached));
+        assert!(!rbs_only.is_empty(), "precondition: core RBS knows Process's children");
+        assert_eq!(
+            unioned, rbs_only,
+            "(a) a namespace whose only project child collides with an RBS one must \
+             be byte-identical to the RBS-only answer"
+        );
+        let statuses: Vec<_> = unioned.iter().filter(|(l, ..)| l == "Status").collect();
+        assert_eq!(statuses.len(), 1, "(b) deduplicated: Status appears once");
+        assert_eq!(
+            statuses[0].1,
+            Some(CompletionItemKind::CLASS),
+            "(b) RBS is the declaration of record ⇒ its CLASS kind wins over the \
+             project's `module Status`"
+        );
+    }
+
+    // --- family 4: the same-URI guard --------------------------------------
+
+    #[test]
+    fn crossfile_cache_is_never_read_across_uris() {
+        // THE CORRECTNESS GUARD. An index cached for A carries A's dirty buffer
+        // REPLACING A's on-disk file, so answering B from it would serve A's
+        // unsaved edits for B — the double-registration hazard the REPLACE rule
+        // exists to prevent, moved into the query handlers. With A dispatched and
+        // B's worker held mid-flight, B must still get the single-file answer.
+        let p = TempProject::new("xf_same_uri");
+        p.write("beta.rb", XF_BETA_RB);
+        p.write("alpha.rb", XF_ALPHA_RB);
+        p.write("other.rb", XF_ALPHA_RB);
+        // B opens at version 7 so the gate can hold ONLY B's worker.
+        let g = gate_holding(&[7], &[]);
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            g.gate.clone(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        // A dispatches to completion, so A's entry exists.
+        h.notify("textDocument/didOpen", open_params(&p.uri("alpha.rb"), XF_ALPHA_RB, 1));
+        assert!(h.recv_diags().diagnostics.is_empty());
+        // B opens; its worker blocks, so B has NO entry of its own.
+        h.notify("textDocument/didOpen", open_params(&p.uri("other.rb"), XF_ALPHA_RB, 7));
+
+        let in_b = xf_hover_request(&h, 40, &p.uri("other.rb"), 0, 16);
+        assert!(
+            in_b.contains("Dynamic[top]#label"),
+            "B must NOT be answered from A's cached index: {in_b}"
+        );
+        assert!(
+            !in_b.contains("Beta#label"),
+            "an index cached for one URI carries THAT URI's overlay: {in_b}"
+        );
+        // The control: the very same question in A, whose entry does exist,
+        // resolves — so the assertion above is a same-URI guard, not a broken
+        // fixture.
+        let in_a = xf_hover_request(&h, 41, &p.uri("alpha.rb"), 0, 16);
+        assert!(in_a.contains("Beta#label → String"), "control: A still resolves: {in_a}");
+
+        g.release(7);
+        let _ = h.recv_diags();
+        h.shutdown();
+    }
+
+    // --- family 5: eviction / population gate / invalidation ---------------
+
+    /// Feed `handle_result` a LIVE result for `uri` carrying `index` — the exact
+    /// shape a worker sends after an overlay-on dispatch.
+    fn xf_feed_live(
+        connection: &Connection,
+        ctx: &ServerContext,
+        st: &mut Session,
+        uri: &Uri,
+        index: Option<Arc<SourceIndex>>,
+        sample: Option<Duration>,
+    ) {
+        let generation = st.project.generation;
+        let epoch = current_epoch(st, uri);
+        let version = st.buffers.current_version(uri).expect("an open buffer");
+        handle_result(
+            connection,
+            ctx,
+            st,
+            Computed {
+                uri: uri.clone(),
+                version,
+                generation,
+                epoch,
+                diags: Vec::new(),
+                overlay_build: sample,
+                project_index: index,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn crossfile_cache_didclose_evicts_the_uris_entry() {
+        // `didClose` drops the entry outright: a closed document can receive no
+        // hover/completion request, so holding its index is pure retention.
+        let p = TempProject::new("xf_close");
+        p.write("beta.rb", XF_BETA_RB);
+        p.write("alpha.rb", XF_ALPHA_RB);
+        let (ctx, mut st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
+        let (server_conn, _client) = Connection::memory();
+        let uri: Uri = p.uri("alpha.rb").parse().unwrap();
+        st.buffers.open(&uri, XF_ALPHA_RB.to_string(), 1);
+
+        let ast = lower(&parse(XF_ALPHA_RB.as_bytes()));
+        let canonical = std::fs::canonicalize(p.root.join("lib").join("alpha.rb")).unwrap();
+        let (index, sample) = overlay_source_index(&st.project, Some(&canonical), &ast);
+        xf_feed_live(&server_conn, &ctx, &mut st, &uri, Some(index), sample);
+        assert!(st.crossfile.contains(&uri), "a live overlay dispatch populates");
+
+        handle_message(
+            &server_conn,
+            &ctx,
+            &mut st,
+            Message::Notification(Notification::new(
+                "textDocument/didClose".to_string(),
+                serde_json::json!({ "textDocument": { "uri": p.uri("alpha.rb") } }),
+            )),
+        )
+        .unwrap();
+        assert!(!st.crossfile.contains(&uri), "didClose evicts the URI's entry");
+        assert_eq!(st.crossfile.len(), 0);
+    }
+
+    #[test]
+    fn crossfile_cache_is_never_populated_by_a_guard_off_dispatch() {
+        // The population gate, at its source: with the overlay OFF a dispatch
+        // builds the SAME single-file index hover/completion already build per
+        // request, so caching it would buy nothing and cost staleness. The index
+        // slot and the guard sample are `Some` on exactly the same condition.
+        let p = TempProject::new("xf_guard_off");
+        p.write("beta.rb", XF_BETA_RB);
+        p.write("alpha.rb", XF_ALPHA_RB);
+        let (ctx, mut st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
+        let (server_conn, _client) = Connection::memory();
+        let uri: Uri = p.uri("alpha.rb").parse().unwrap();
+        st.buffers.open(&uri, XF_ALPHA_RB.to_string(), 1);
+        let buf = BufferPaths::for_uri(&uri);
+
+        // Overlay ON: both slots filled.
+        let (_d, sample_on, index_on) = compute_diagnostics(&st.project, &buf, XF_ALPHA_RB);
+        assert!(sample_on.is_some() && index_on.is_some(), "overlay on ⇒ an index to cache");
+
+        // Overlay OFF (the guard-tripped / empty-project posture): both empty.
+        let index = Arc::clone(&st.project.index);
+        swap_project(&ctx, &mut st, index, None);
+        let (_d, sample_off, index_off) = compute_diagnostics(&st.project, &buf, XF_ALPHA_RB);
+        assert!(sample_off.is_none(), "precondition: no overlay ⇒ no guard sample");
+        assert!(index_off.is_none(), "and no cache payload — the two move together");
+
+        // …and a result carrying no index caches nothing, even on the live path.
+        xf_feed_live(&server_conn, &ctx, &mut st, &uri, None, None);
+        assert_eq!(st.crossfile.len(), 0, "a guard-off dispatch populates nothing");
+    }
+
+    #[test]
+    fn crossfile_cache_is_cleared_by_the_generation_bump_a_guard_trip_makes() {
+        // Invalidation, driven by the S4b forced-low-threshold pattern: with the
+        // budget forced to ZERO every sample is over it, so the SECOND sample
+        // trips the guard, which calls `swap_project` — a generation bump — and
+        // the whole cache dies with the context it was built against.
+        let p = TempProject::new("xf_generation");
+        p.write("beta.rb", XF_BETA_RB);
+        p.write("alpha.rb", XF_ALPHA_RB);
+        let (ctx, mut st) = session_for(&p.root, Config::default(), Duration::ZERO);
+        let (server_conn, _client) = Connection::memory();
+        let uri: Uri = p.uri("alpha.rb").parse().unwrap();
+        st.buffers.open(&uri, XF_ALPHA_RB.to_string(), 1);
+
+        let ast = lower(&parse(XF_ALPHA_RB.as_bytes()));
+        let canonical = std::fs::canonicalize(p.root.join("lib").join("alpha.rb")).unwrap();
+        let feed = |st: &mut Session| {
+            let (index, sample) = overlay_source_index(&st.project, Some(&canonical), &ast);
+            xf_feed_live(&server_conn, &ctx, st, &uri, Some(index), sample);
+        };
+
+        // Sample #1: over budget, but hysteresis means no trip — the entry is
+        // written and readable.
+        feed(&mut st);
+        let generation = st.project.generation;
+        assert_eq!(st.crossfile.len(), 1, "the first live dispatch populates");
+        assert!(st.crossfile.get(&uri, generation).is_some(), "and it reads back");
+
+        // Sample #2: the guard trips → `swap_project` → generation bump.
+        feed(&mut st);
+        assert!(!st.guard.enabled, "precondition: two over-budget samples disable the overlay");
+        assert!(st.project.generation > generation, "precondition: the guard trip bumped it");
+        assert_eq!(
+            st.crossfile.len(),
+            0,
+            "every entry was built against the superseded context — the cache is cleared"
+        );
+    }
+
+    #[test]
+    fn crossfile_cache_reader_rejects_a_stale_generation_and_caps_at_eight() {
+        // Two belt-and-braces properties of the container itself, stated where
+        // they can be seen: `swap_project` already clears the map, so a reader
+        // can only ever meet a matching generation — the check is what makes that
+        // an assertion rather than an assumption. And the LRU cap bounds a
+        // pathological session (a bulk "open every file") without touching the
+        // arithmetic for a realistic one.
+        let mut cache = CrossFileCache::new();
+        let core = Arc::new(CoreIndex::new());
+        let index = || Arc::new(SourceIndex::build(&lower(&parse(b"class Z\nend\n")), &core));
+        let uri: Uri = "file:///gen.rb".parse().unwrap();
+
+        cache.store(&uri, index(), 3);
+        assert!(cache.get(&uri, 4).is_none(), "a bumped generation is not served");
+        assert!(cache.get(&uri, 3).is_some(), "the generation it was built under is");
+
+        // Fill past the cap; the least-recently-used entries go, the touched one
+        // stays.
+        let uris: Vec<Uri> = (0..CROSSFILE_CACHE_CAP + 4)
+            .map(|i| format!("file:///lru{i}.rb").parse().unwrap())
+            .collect();
+        for u in &uris {
+            cache.store(u, index(), 3);
+            // Keep the FIRST one hot, so it survives on recency, not insertion order.
+            let _ = cache.get(&uris[0], 3);
+        }
+        assert_eq!(cache.len(), CROSSFILE_CACHE_CAP, "the cap holds");
+        assert!(cache.contains(&uris[0]), "the repeatedly-touched entry survives");
+        assert!(!cache.contains(&uris[1]), "the least-recently-used one was evicted");
+
+        cache.clear();
+        assert_eq!(cache.len(), 0, "clear drops everything");
+    }
+
+    // --- family 6: the diagnostics path is byte-inert -----------------------
+
+    #[test]
+    fn crossfile_cache_leaves_the_published_diagnostics_byte_identical() {
+        // The Arc hand-back must be OBSERVATIONALLY INERT on the diagnostics
+        // path. Pinned three ways over a fixture whose answer is genuinely
+        // cross-file (`Sub#helper` reducing `Base#helper`'s visibility):
+        //
+        //   (a) the published payload equals `check`'s project-wide answer for
+        //       the file (the S4b acceptance bar, restated against the new
+        //       return shape);
+        //   (b) the published payload is byte-equal to an explicit golden JSON —
+        //       so a change to the SERIALIZED notification, not just the rule
+        //       set, fails here;
+        //   (c) interleaving the new cache READERS (a hover and a completion)
+        //       between two dispatches does not move the second payload.
+        let p = TempProject::new("xf_inert");
+        p.write("base.rb", BASE_RB);
+        p.write("sub.rb", SUB_RB);
+        let mut h = Harness::start_project(
+            Duration::from_millis(10),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("sub.rb"), SUB_RB, 1));
+        let first = h.recv_diags();
+
+        // (a) parity with `check`'s project-wide answer.
+        assert_eq!(
+            diag_keys(&first),
+            check_project_diagnostics(&p.root, "sub.rb"),
+            "the published set must still equal `check`'s project-wide answer"
+        );
+
+        // (b) the exact serialized payload.
+        let payload = |d: &PublishDiagnosticsParams| {
+            serde_json::to_string(&d.diagnostics).unwrap()
+        };
+        assert_eq!(
+            payload(&first),
+            format!(
+                "[{{\"range\":{{\"start\":{{\"line\":3,\"character\":6}},\
+                 \"end\":{{\"line\":3,\"character\":12}}}},\"severity\":2,\
+                 \"code\":\"def.override-visibility-reduced\",\"source\":\"rigor\",\
+                 \"message\":{}}}]",
+                serde_json::to_string(&first.diagnostics[0].message).unwrap()
+            ),
+            "the published diagnostic's BYTES are unchanged by the Arc hand-back"
+        );
+
+        // (c) the readers are inert: hover + completion between dispatches.
+        let hovered = xf_hover_request(&h, 60, &p.uri("sub.rb"), 3, 6);
+        assert!(!hovered.is_empty(), "precondition: the hover actually answered");
+        let _ = xf_completion_request(&h, 61, &p.uri("sub.rb"), 3, 6);
+        h.notify("textDocument/didChange", change_params(&p.uri("sub.rb"), SUB_RB, 2));
+        let second = h.recv_diags();
+        assert_eq!(
+            payload(&second),
+            payload(&first),
+            "a dispatch that follows a cache READ publishes the same bytes"
+        );
+        h.shutdown();
+    }
+
+    #[test]
+    fn crossfile_cache_hit_declines_the_same_file_literal_constant_fold() {
+        // A MEASURED COST of answering from the cached index, pinned so it is a
+        // known behaviour rather than a surprise (see the impl note).
+        //
+        // `SourceIndex::literal_constant` is gated on the ASSIGNING file's
+        // `LoweredAst::file_id` — a process-global counter stamped at `lower()`.
+        // The cached index was merged against the WORKER's lowering; a hover
+        // lowers the buffer AFRESH, so the ids differ and the same-file gate
+        // declines. The fold is a precision gain, never a soundness one, so the
+        // hit degrades to `Dynamic` where the miss folded — coverage, not a
+        // wrong answer, and the direction this project always trades toward.
+        let p = TempProject::new("xf_const");
+        let consts = "FOO = 5\nFOO\n";
+        p.write("consts.rb", consts);
+        p.write("other.rb", "class Other\nend\n");
+        let (_ctx, st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
+        let ast = lower(&parse(consts.as_bytes()));
+        let canonical = std::fs::canonicalize(p.root.join("lib").join("consts.rb")).unwrap();
+        let (cached, _) = overlay_source_index(&st.project, Some(&canonical), &ast);
+
+        let mut buffers = BufferTable::new();
+        let uri: Uri = p.uri("consts.rb").parse().unwrap();
+        buffers.open(&uri, consts.to_string(), 1);
+        let params = HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: Position { line: 1, character: 0 },
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let body = |cached: Option<&SourceIndex>| {
+            match hover(&st.project, &buffers, &params, cached) {
+                Some(Hover { contents: HoverContents::Markup(m), .. }) => m.value,
+                _ => String::new(),
+            }
+        };
+        assert!(body(None).contains("FOO : 5"), "the miss still folds: {}", body(None));
+        assert!(
+            body(Some(&cached)).contains("FOO : Dynamic[top]"),
+            "the hit declines the per-file fold: {}",
+            body(Some(&cached))
         );
     }
 }
