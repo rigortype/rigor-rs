@@ -174,6 +174,12 @@ struct OverrideClass {
     /// Instance-method names defined directly (any visibility) — the existence
     /// set the walk stops on. Mirrors `SourceClass::methods` but lexically keyed.
     methods: HashSet<String>,
+    /// Whether the FIRST declaration of this qualified name was a `module`.
+    /// First-write-wins like `superclass` (Ruby raises on a class/module
+    /// mismatch, so a reopen can never legally disagree). Read ONLY by
+    /// [`SourceIndex::namespace_children`] — the completion-side kind icon —
+    /// never by a rule, a predicate, or the typer.
+    is_module: bool,
 }
 
 /// The per-run source-class index + instance-class registry. Built once per file.
@@ -228,6 +234,13 @@ struct HarvestedOverrideClass {
     methods: Vec<String>,
     method_visibilities: Vec<(String, Visibility)>,
     includes: Vec<String>,
+    /// Whether the declaration was a `module` (vs a `class`). Recorded ONLY so
+    /// [`SourceIndex::namespace_children`] can render the same class-vs-module
+    /// kind [`CoreIndex::namespace_children`] does for the RBS surface; no rule
+    /// and no typing path reads it, so it cannot move a diagnostic.
+    ///
+    /// [`CoreIndex::namespace_children`]: rigor_index::CoreIndex::namespace_children
+    is_module: bool,
 }
 
 /// One QUALIFIED constant name written by a single file, in walk order, with the
@@ -808,6 +821,7 @@ impl SourceIndex {
                     &oc.methods,
                     &oc.method_visibilities,
                     &oc.includes,
+                    oc.is_module,
                 );
             }
         }
@@ -1212,6 +1226,43 @@ impl SourceIndex {
         self.name_to_id.contains_key(name)
     }
 
+    /// The IMMEDIATE class/module children the analysed SOURCE declares under
+    /// the namespace `parent_fqn`, as `(leaf name, is_module)` — the project-side
+    /// twin of [`CoreIndex::namespace_children`], which answers the same question
+    /// over the RBS qualified registry.
+    ///
+    /// Contract, mirrored on that method deliberately so the LSP's `Foo::`
+    /// completion can union the two without reconciling two shapes:
+    ///
+    /// * **Immediate children only** — a grandchild (`Foo::Bar::Baz` under
+    ///   `Foo`) is skipped, exactly as the RBS side skips it and as the
+    ///   reference's `enumerate_constant_children` does.
+    /// * **`is_module` is the DECLARED kind** (`module Foo` ⇒ `true`), taken
+    ///   first-write-wins from the first declaration the merge replayed.
+    /// * **Deterministic, name-sorted order** — a `BTreeMap` collect, the same
+    ///   ordering the RBS path already produces.
+    ///
+    /// Read-only and read by NOBODY else: it enumerates the ADR-35 lexically
+    /// qualified override registry, which is the only project-wide table keyed
+    /// by FULLY-QUALIFIED name (the collapsed `classes` map cannot answer a
+    /// namespace question — `Foo::Bar` and `Baz::Bar` share the key `Bar`).
+    ///
+    /// [`CoreIndex::namespace_children`]: rigor_index::CoreIndex::namespace_children
+    pub fn namespace_children(&self, parent_fqn: &str) -> Vec<(&str, bool)> {
+        let prefix = format!("{parent_fqn}::");
+        let mut set: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
+        for (qual, entry) in &self.override_classes {
+            let Some(leaf) = qual.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            if leaf.is_empty() || leaf.contains("::") {
+                continue;
+            }
+            set.insert(leaf, entry.is_module);
+        }
+        set.into_iter().collect()
+    }
+
     /// MultiWrite substrate Slice 2: whether `name` got its registry id ONLY
     /// from the RBS tuple-element sweep (Pass 2b) — the analyzed source neither
     /// declares the class nor names the constant anywhere, so a value of this
@@ -1470,8 +1521,14 @@ impl SourceIndex {
         methods: &[String],
         method_visibilities: &[(String, Visibility)],
         includes: &[String],
+        is_module: bool,
     ) {
-        let entry = self.override_classes.entry(qualified.to_string()).or_default();
+        // `or_insert_with` (not `or_default`) so `is_module` is FIRST-WRITE-WINS
+        // like `superclass`: a reopen never re-decides the kind.
+        let entry = self
+            .override_classes
+            .entry(qualified.to_string())
+            .or_insert_with(|| OverrideClass { is_module, ..OverrideClass::default() });
         if entry.superclass.is_none() {
             entry.superclass = superclass;
         }
@@ -2184,6 +2241,7 @@ fn collect_override_classes(
                 methods: methods.to_vec(),
                 method_visibilities: method_visibilities.to_vec(),
                 includes: includes.to_vec(),
+                is_module: false,
             });
             let child_prefix = split_qualified(&qualified);
             for &child in body {
@@ -2201,6 +2259,7 @@ fn collect_override_classes(
                 methods: methods.to_vec(),
                 method_visibilities: method_visibilities.to_vec(),
                 includes: includes.to_vec(),
+                is_module: true,
             });
             let child_prefix = split_qualified(&qualified);
             for &child in body {
@@ -2891,6 +2950,7 @@ mod tests {
                 includes: Vec::new(),
                 method_visibilities: HashMap::new(),
                 methods: ["foo".to_string()].into_iter().collect(),
+                is_module: false,
             },
         );
         assert_eq!(
@@ -4310,6 +4370,7 @@ mod probes_s92 {
                     methods,
                     method_visibilities,
                     includes,
+                    false,
                 );
                 let child_prefix = split_qualified(&qualified);
                 for &child in body {
@@ -4321,7 +4382,14 @@ mod probes_s92 {
                     return;
                 }
                 let qualified = qualify(prefix, name);
-                idx.ingest_override_class(&qualified, None, methods, method_visibilities, includes);
+                idx.ingest_override_class(
+                    &qualified,
+                    None,
+                    methods,
+                    method_visibilities,
+                    includes,
+                    true,
+                );
                 let child_prefix = split_qualified(&qualified);
                 for &child in body {
                     legacy_collect_override_classes(idx, ast, child, &child_prefix);
