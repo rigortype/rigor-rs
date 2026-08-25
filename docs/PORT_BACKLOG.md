@@ -581,10 +581,14 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   present — witnessing its absence would be an FP), so the sweep is byte-unchanged. Union
   receivers complete the per-arm INTERSECTION, unresolvable arms skipped (reference `filter_map`).
   [note](notes/20260731-lsp-v4-const-completion-visibility.md).
-- ⬜ **Deferred:** **S4b cross-file project context for open buffers** (the last tier-1 item — a
-  dirty-buffer overlay over the file's indexed contribution; needs a mini-spec). Plus LSP v4+:
-  `rootUri`; temp-file `BufferBinding`; incremental UTF-16 `didChange` sync; `--log` wiring;
-  TCP/socket transport. (`Type::Intersection` completion has no carrier in this type model.)
+- ✅ **S4b cross-file diagnostics overlay landed (2026-07-19, PRs #42/#43 + `16bfb9e`)** —
+  swap-and-rebuild per dispatch + the 100ms OverlayGuard; hover/completion stay single-file
+  pending the harvest/merge keystone
+  ([mini-spec](notes/20260719-lsp-s4b-overlay-mini-spec.md), now issue #92 —
+  [recon](notes/20260825-rust-glancer-frozen-index-recon.md)).
+- ⬜ **Deferred:** LSP v4+: `rootUri`; temp-file `BufferBinding`; incremental UTF-16 `didChange`
+  sync; `--log` wiring; TCP/socket transport. (`Type::Intersection` completion has no carrier in
+  this type model.)
 - ✅ **MCP server landed (2026-07-01) — `rigor mcp`.** A read-only Model Context Protocol server
   over stdio so an AI agent can analyse Ruby with rigor as a tool. **Transport hand-rolled on
   `serde_json`** (MCP stdio = newline-delimited JSON-RPC 2.0, one message per line — simpler than
