@@ -3,8 +3,9 @@
 This tree holds the **exact** RBS signature bundles shipped by Rigor's
 config-gated plugins, vendored into the repo so the analyzer is standalone (no
 runtime dependency on a local plugin gem checkout). Each plugin's RBS is
-embedded at build time by `crates/rigor-index/build.rs` (the `EMBEDDED_PLUGIN_RBS`
-table) and ingested by `CoreData::load_with_plugins()` (`src/rbs.rs`) ONLY when
+embedded by direct `include_str!` in `src/plugins.rs` (no `build.rs` table —
+this file once claimed an `EMBEDDED_PLUGIN_RBS` table that never existed)
+and ingested by `CoreData::load_with_plugins()` (`src/rbs.rs`) ONLY when
 the plugin id is named in `.rigor.yml`'s `plugins:` list (ADR-25). The default
 (no-config) load path never touches these bytes, so default behaviour is
 byte-unchanged.
