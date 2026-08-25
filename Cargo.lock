@@ -346,6 +346,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rigor-effects"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
 name = "rigor-index"
 version = "0.0.1"
 dependencies = [
