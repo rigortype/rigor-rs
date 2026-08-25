@@ -336,3 +336,17 @@ of this session shows exactly one new file (this note). No corpus checkout
 was left with a stray `.rigor.yml` — every temporary config written during
 §3/§4 was removed in a `finally` block and its absence was a precondition
 checked before every write; verified clean after the run.
+
+## Audit (orchestrator, same day)
+
+Spot-checked before folding: §1's skippable-share arithmetic re-derived for
+all four rows (exact); corpus roots verified free of `.rigor.yml` residue;
+the worktree binary re-invoked on mastodon/app (files=1236 matches; timings
+~1.9× the note's medians — but the audit re-run was contaminated by a
+SIBLING agent compiling in parallel, which was ALSO live during part of this
+note's measurement window and is a plausible unnamed contributor to the
++25–55% drift vs the S4b baselines reported in Method). The drift caveat
+does not move any conclusion: the GO/NO-GO calls rest on ratios, growth
+shape, and the guard-cliff location, all load-robust; but treat the ABSOLUTE
+milliseconds here as an upper-bound-ish snapshot, and re-measure on a quiet
+machine before quoting them as the before/after anchor for #92.
