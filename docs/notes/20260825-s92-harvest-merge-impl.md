@@ -44,7 +44,11 @@ Supporting moves:
   `RIGOR_TIMING` labels became `stage1(parse+lower+harvest)` / `stage2(merge)`.
 * Fixed the false doc claim at `infer_method_returns` ("a method never appears
   in BOTH maps"): true per def site, false per `(class, method)` key across a
-  reopen. Pinned by `method_can_appear_in_both_return_maps`.
+  reopen. Pinned by `method_can_appear_in_both_return_maps`. `param_bound_return`
+  asserted the same exclusivity in passing and now states the real contract
+  (the call site consults `method_return` FIRST); `lexical_scopes`' link to
+  `SourceIndex::collect_override_classes` was repointed at the free walker.
+  `cargo doc --no-deps -p rigor-infer` has no unresolved intra-doc links.
 
 ## The equivalence instrument
 
