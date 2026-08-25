@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/98_plugin_sig_parity.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 46,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for \"abc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frobsquish_zzz' for String"
+    }
+  ]
+}

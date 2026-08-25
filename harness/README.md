@@ -162,5 +162,29 @@ reported as `SKIPPED` by both tools — a partial sweep must never read as a ful
 one.
 
 Both run each side from a clean cwd (core+stdlib only), so **no project-`sig/`
-behaviour is measured by either**. That surface needs a hand-built project; see
-[note](../docs/notes/20260731-head-survey-and-set-op-folds.md).
+behaviour is measured by either** — and no plugin, and no `.rigor.yml` at all.
+That blind spot has now cost two separate live-FP findings: the `sig/shims`
+dependency at the `v0.3.2` re-pin, and a stale vendored plugin RBS worth 10 false
+positives at `v0.3.4` ([note](../docs/notes/20260825-upstream-survey-v034-master.md)).
+Config-gated surfaces need a hand-built project, a sidecar-config fixture
+(fixtures 17 and 98), or `effects_diff.py` below.
+
+## Effect-summary differential (project-level)
+
+```sh
+python3 harness/effects_diff.py               # the fixture projects
+python3 harness/effects_diff.py --self-test   # grade the oracle against itself
+python3 harness/effects_diff.py <project-dir>  # any project with a .rigor.yml
+```
+
+Grades `rigor effects --full --format=json` per method, for the effect-system
+port ([ADR-0043](../docs/adr/0043-effect-system-port-parity-model.md)). An effect
+summary is not a diagnostic set — it is keyed by a method, not a location, and it
+carries a proven lane, a declared lane and an exhaustiveness bit — so the verdict
+is four-way rather than two: `MATCH`, `UNDER` (the port claims less: expected,
+the arc's odometer), `OVER` (the port claims more: **the gate**, because the
+proven lane is the only lane a verdict may read), and `DECLARED-MISMATCH`.
+
+It is the first instrument here whose unit is a **project directory** and which
+runs each arm *in* it, so it is also the first one that sees `.rigor.yml`,
+project `sig/` and plugins. Fixture projects live in `effects-corpus/`.

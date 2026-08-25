@@ -58,8 +58,17 @@ impl Entry {
 
 /// Stable documentation home for a built-in rule (mirrors the reference's
 /// `RuleCatalog::DOCUMENTATION_BASE`).
-const DOCUMENTATION_BASE: &str =
-    "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md";
+///
+/// The canonical docs HOST, deliberately not a `github.com/…/blob/<ref>/…` path
+/// (reference ADR-65 amendment, upstream #438): a git ref inside a frozen public
+/// contract is a mutable component, and the one baked in here — `main`, a branch
+/// the rigor repository has never had — made every URL this project ever emitted
+/// 404, on every `--format json` diagnostic and every `rigor explain`. A branch
+/// name rots on a rename; a tag resolves only once pushed, so every build between
+/// a version bump and its tag would 404 again. The published site carries no ref
+/// at all and renders `docs/manual/04-diagnostics.md` verbatim, `<a id="rule-…">`
+/// anchors included, so the fragment half of the contract is unchanged.
+const DOCUMENTATION_BASE: &str = "https://rigor.typedduck.fail/manual/04-diagnostics/";
 
 /// Family wildcard tokens — a bare `<family>` resolves to every rule under
 /// `<family>.` (reference `RULE_FAMILIES`).
@@ -1011,7 +1020,7 @@ mod tests {
         let e = resolve("call.undefined-method");
         assert_eq!(
             e[0].documentation_url(),
-            "https://github.com/rigortype/rigor/blob/main/docs/manual/04-diagnostics.md#rule-call-undefined-method"
+            "https://rigor.typedduck.fail/manual/04-diagnostics/#rule-call-undefined-method"
         );
     }
 

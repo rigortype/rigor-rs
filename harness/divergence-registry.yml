@@ -38,4 +38,44 @@
 #     behaviour is correct per the spec in docs/manual/04-diagnostics.md.
 #   upstream: https://github.com/rigortype/rigor/issues/NNNN
 
-divergences: []
+divergences:
+  # Upstream #437, fixed on master by `44bd23bf` — NOT in the `v0.3.4` pin.
+  #
+  # The `rigor-activesupport-core-ext` plugin's RBS declares `Date#to_time` in
+  # full, and rbs's own `stdlib/date` already ships that row. Two loaded
+  # signature sources declaring one method makes `RBS::DefinitionBuilder` raise;
+  # the reference fails soft, and `Date` AND `DateTime` both degrade to
+  # `Dynamic[top]` — so for every project that activates the plugin (which is
+  # every Rails adopter following the plugin chapter) real methods and typos
+  # alike stop being witnessed on both classes.
+  #
+  # rigor-rs's own ingestion does not share that raise-on-duplicate: it keeps
+  # both definitions, so the two typos below are witnessed. Upstream agrees this
+  # is the defect — `44bd23bf` turns the row into an overload continuation
+  # (`| ...`) rather than dropping it, because dropping would lose ActiveSupport's
+  # widened `to_time(form = :local)` arity and draw a false positive on correct
+  # Rails code. Measured on a master worktree at the same pin: the reference then
+  # fires on both lines exactly as rigor-rs does.
+  #
+  # Retire BOTH entries at the pin bump that makes `44bd23bf` an ancestor
+  # (`git -C reference/rigor merge-base --is-ancestor 44bd23bf HEAD`), keeping
+  # the fixture — it becomes positive parity coverage for a surface neither
+  # sweep tool can reach.
+  - fixture: harness/corpus/98_plugin_sig_parity.rb
+    rule: call.undefined-method
+    line: 67
+    column: 12
+    reason: |
+      The reference cannot build `Date`'s definition at this pin: the plugin's
+      `Date#to_time` collides with rbs's `stdlib/date` row, so the class
+      degrades to `Dynamic[top]` and the typo goes unwitnessed. rigor-rs keeps
+      both declarations and witnesses it.
+    upstream: https://github.com/rigortype/rigor/issues/437
+  - fixture: harness/corpus/98_plugin_sig_parity.rb
+    rule: call.undefined-method
+    line: 68
+    column: 14
+    reason: |
+      `DateTime` is the second casualty of the same `Date#to_time` collision —
+      the builder raises once and both classes go `Dynamic[top]`.
+    upstream: https://github.com/rigortype/rigor/issues/437

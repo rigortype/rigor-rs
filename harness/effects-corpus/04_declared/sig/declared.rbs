@@ -1,0 +1,41 @@
+# The DECLARED lane, in a project `sig/` — the one lane graded as an EXACT
+# match, because it is copied from the author's annotation rather than inferred
+# (ADR-0043 § 2; upstream ADR-103 WD17 rules the declared lane is never judged).
+#
+# This fixture is also the only project-`sig/` coverage a standing gate has:
+# every other corpus tool in this repo runs both sides from a clean cwd with no
+# config, so no `sig/` is ever loaded.
+#
+# OPEN QUESTION, measured 2026-08-25 at the `v0.3.4` pin and NOT yet explained —
+# resolve it before building the port's declared lane (slice 6). Of the three
+# annotated methods below the oracle surfaces `declared:` for exactly ONE,
+# `load_and_log`; `formats` (`%a{pure}`) and `load_row` (the same
+# `%a{rigor:v1:effect io.db}` spelling, same comment shape) both report
+# `declared: []`. `%a{pure}` reading as the EMPTY envelope explains `formats`
+# and nothing else. Four hypotheses were probed against a scratch project and
+# all four are REFUTED: it is not "only when the envelope is exceeded", not
+# "only when the proven lane is non-empty", not "only when the method has a
+# project-method edge", and not a stale effects cache (reproduced with `.rigor`
+# removed). Whatever the rule is, the port must reproduce it or the differential
+# will read a DECLARED-MISMATCH on correct code.
+
+class Declared
+  # `%a{pure}` is the ecosystem's existing purity annotation, read as the EMPTY
+  # envelope (WD5 surface 3).
+  %a{pure}
+  def formats: (Integer) -> String
+
+  # The v1 spelling of a bounded envelope: this method may touch the database
+  # and nothing else.
+  %a{rigor:v1:effect io.db}
+  def load_row: (Integer) -> String
+
+  # An envelope whose body EXCEEDS it — the shape `effect.envelope-exceeded`
+  # fires on once the diagnostic half lands (port slice 6). Until then this is
+  # here so the declared lane has a case where the two lanes disagree.
+  %a{rigor:v1:effect io.db}
+  def load_and_log: (Integer) -> String
+
+  # No annotation at all: the declared lane must be empty on both sides.
+  def unannotated: () -> void
+end
