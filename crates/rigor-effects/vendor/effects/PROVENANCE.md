@@ -1,0 +1,131 @@
+# Vendored effect catalogue — provenance
+
+This tree holds the **exact** two data files that make up Rigor's effect
+catalogue, vendored into the repo so the analyzer is standalone
+([ADR-0043](../../../../docs/adr/0043-effect-system-port-parity-model.md) slice
+1). They are embedded byte-for-byte with `include_str!` from
+`crates/rigor-effects/src/lib.rs` (`REGISTRY_YML` / `CORE_YML`) — no `build.rs`,
+no codegen — and parsed lazily on first use.
+
+The files here are **verbatim** copies — never hand-edit them. A hand-edit fails
+`cargo test -p rigor-effects` on the digest assertion below, and a drift against
+the pin fails `python3 harness/vendor_effects.py --check`.
+
+## Contents
+
+### `registry.yml` — the label vocabulary
+
+- **Source path:** `reference/rigor/data/effects/registry.yml` — **the PINNED
+  submodule**, not a local checkout.
+- **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`).
+- **`sha256`** `bb0eb3f08568bc52c47ce3caa75d22d359b0455b3182825906884797289d7104`
+  (67 lines, 2,217 bytes).
+- **What it is:** `vocabulary: 1`, **36 declared labels** in four commented
+  groups (Steins v1 verbatim 25, Ruby's `mutate` leaves 3, proposed shared
+  `io.db` leaves 3, application-meaning roots 5), and an EMPTY `retired:` table
+  — the rename/removal compatibility mechanism, present and unused at
+  vocabulary 1. Loaded upstream by `Rigor::Effects::Registry.load_file`
+  (`lib/rigor/effects/registry.rb:71`).
+
+  **The load-bearing subtlety:** `Registry#known?` is the declared rows ∪ every
+  ANCESTOR of a declared row (`registry.rb:161`). Four of the ten roots —
+  `global`, `email`, `job`, `cache` — exist ONLY as implied ancestors; no row
+  spells them. `core.yml`'s `global` posture emits the bare `global`, so a
+  reader that validates the catalogue against the 36 declared rows alone
+  **rejects the shipped catalogue.**
+
+### `core.yml` — the per-method catalogue
+
+- **Source path:** `reference/rigor/data/effects/core.yml` — the PINNED
+  submodule.
+- **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`).
+- **`sha256`** `85778dd3433fcb5561a933c9b2b22fb07048af980e35f93091f545655bda9c31`
+  (843 lines, 52,785 bytes).
+- **Upstream's own identity anchor:** `1:85778dd3433fcb5561a933c9b2b22fb07048af980e35f93091f545655bda9c31`.
+  Upstream's effects cache keys on `Catalog#identity` = `schema:sha256(core.yml)`
+  (`lib/rigor/effects/catalog.rb:158`) — i.e. **upstream already treats this
+  file's digest as the catalogue's identity**, so the provenance anchor and
+  upstream's invalidation key are one number. `Catalog::identity()` reproduces
+  it, and a test asserts the string.
+- **What it is:** `schema: 1`, `vocabulary: 1`, **14 `defaults:` postures**, a
+  **34-name `universal:` list**, and **80 classes / 420 rows** (216 instance,
+  204 singleton). Loaded upstream by `Rigor::Effects::Catalog.load_file`
+  (`catalog.rb:122`).
+
+  Two spellings a reader must not normalise away: an explicit `effects: []` (77
+  rows) is NOT the same as having no row, and the `<<` selector is spelt
+  `!!str "<<"` because a bare — even quoted — `<<` key is YAML's MERGE key,
+  which a resolving loader would splice into the enclosing `methods:` map. Four
+  rows depend on it (`IO`, `File`, `SizedQueue`, `Logger`).
+
+## The three carve-outs — this copy is COMPLETE, not truncated
+
+The data file deliberately does not re-spell three things, and a reader who sees
+`mutators: array` with no selector list will otherwise assume the copy was cut
+short. All three are **code, not data**; the first two are ADR-0043 slice 2, the
+third is out of the ADR's scope entirely.
+
+1. **The mutator sets, by reference.** `mutators: array | hash | string`
+   resolves upstream through `Catalog::MUTATOR_SETS` (`catalog.rb:43`) to
+   `Inference::MutationWidening::ARRAY_MUTATORS` (**31** selectors),
+   `HASH_MUTATORS` (**15**) and `Effects::MutationClassifier::STRING_MUTATORS`
+   (**26**). Upstream's internal spec makes the omission normative — "The data
+   file MUST NOT re-spell a selector list"
+   (`docs/internal-spec/effect-summaries.md:169`). Slice 1 carries the set NAME
+   only (`ClassEntry::mutator_set`).
+2. **The narrowing handler BODIES.** A row's `narrow:` names one of the **7**
+   handlers in `Effects::Narrowing::HANDLERS`
+   (`lib/rigor/effects/narrowing.rb:55`) — `kernel_open file_open
+   pathname_open time_new random_new uri_open sql_verb`. `core.yml` uses **6**
+   of them across **7** rows; `sql_verb` has no `core.yml` row at all and serves
+   PLUGIN rows. Slice 1 carries the handler NAMES (validated against that list at
+   load, as upstream does) and none of the bodies, so a narrowed row answers its
+   **unnarrowed** `effects:` — which is exactly upstream's own answer when it is
+   handed no call node, and the sound upper bound the handler degrades to.
+3. **The plugin effect layer.** `plugins/*/lib/rigor/plugin/*/effects.rb` (1,107
+   lines across 9 Rails plugins) contributes its own rows, attributions, edges,
+   entry-point presets and an `effect_labels:` root extension. It is the sole
+   consumer of the 7th narrowing handler and of the `io.db.*` / `job.enqueue` /
+   `email.send` / `cache.*` labels. ADR-0043 names it in no slice.
+
+## Regenerate
+
+**Re-sync at every pin bump** — `UPSTREAM.md` step 3, where this is the THIRD
+pin-tracking surface alongside `crates/rigor-index/vendor/rbs/overlay/` and
+`crates/rigor-index/vendor/plugins/`. The recorded cost of not doing so is not
+hypothetical: the `activesupport-core-ext` copy sat unmoved for two months and
+the drift was **10 live false positives** that neither sweep tool could see.
+
+```sh
+python3 harness/vendor_effects.py --check   # drift gate: exit 1 on ANY byte difference
+python3 harness/vendor_effects.py           # re-vendor from the PINNED submodule
+```
+
+Then read the diff as a **semantic** change, not a copy. `retired:` gaining an
+entry and `vocabulary:` bumping are the two that can invalidate a committed
+`.rigor-effects.yml`; a `schema:` bump changes the row grammar; and a re-audit
+that moves `IO#write` from `io` to `io.fs.write` changes every summary with no
+source change on either side.
+
+Never source this from a local rigor checkout — that is `UPSTREAM.md` hazard 3,
+and the vendored plugin RBS is the recorded case of that hazard applied to a
+file.
+
+## What grades this tree
+
+Three layers, and only the middle one is coverage-independent:
+
+1. **The ported upstream data specs** — `crates/rigor-effects/tests/upstream_data_specs.rs`,
+   a case-for-case port of upstream's `spec/rigor/effects/registry_data_spec.rb`
+   and `catalog_data_spec.rb` over these bytes. The wholesale assertion is that
+   every label all 420 rows and every posture can emit is in the grammar AND
+   `Registry::known`.
+2. **`harness/vendor_effects.py --check`** — byte-for-byte against the pinned
+   submodule. Independent of what any corpus exercises, and the one that fails
+   the instant the pin moves under an unchanged copy.
+3. **The embedded-bytes digest assertion** — `src/lib.rs`'s
+   `the_embedded_bytes_match_the_provenance_digests`, which catches a hand-edit
+   under plain `cargo test`, in a checkout whose `reference/rigor` is empty.
+
+`harness/effects_diff.py` is the *behavioural* gate and grades **6 of the 420
+rows (1.4 %)** today. It cannot be the drift gate, which is why layer 2 exists.

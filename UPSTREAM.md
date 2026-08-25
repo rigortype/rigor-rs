@@ -230,6 +230,27 @@ chasing a non-bug.)
    from a clean cwd, so no `.rigor.yml` is read and no plugin is ever loaded.
    Harness fixture 98 is the only gate on it.
 
+   **Re-sync `crates/rigor-effects/vendor/effects/` too** — the THIRD
+   pin-tracking tree this step re-syncs (after `vendor/rbs/overlay/` and
+   `vendor/plugins/`), added 2026-08-26 with the effect catalogue
+   ([ADR-0043](docs/adr/0043-effect-system-port-parity-model.md) slice 1):
+   ```sh
+   python3 harness/vendor_effects.py --check   # exit 1 on ANY byte difference
+   python3 harness/vendor_effects.py           # re-vendor from the pinned submodule
+   ```
+   On a mismatch, re-vendor and **read the diff as a semantic change, not a
+   copy** — step 3's standing advice applies verbatim here, because a catalogue
+   re-audit that moves `IO#write` from `io` to `io.fs.write` changes every
+   summary with no source change on either side. `retired:` gaining an entry and
+   a `vocabulary:` bump are the two that can invalidate a committed
+   `.rigor-effects.yml`; a `schema:` bump changes the row grammar. **The
+   behavioural instrument cannot cover this**: `harness/effects_diff.py` grades
+   **6 of the catalogue's 420 rows (1.4 %)**, so a drift in the other 414 is
+   invisible to it — exactly the shape that made harness fixture 98 insufficient
+   for the plugin RBS. `crates/rigor-effects/tests/upstream_data_specs.rs` (the
+   ported upstream data specs) and the embedded-bytes digest assertion are the
+   other two layers; see that tree's `PROVENANCE.md`.
+
    Then re-derive the classes whose DEFINITION the reference cannot build —
    `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`
    directories collide, and a collision blinds the oracle on that whole class:

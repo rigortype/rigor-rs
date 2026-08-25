@@ -101,11 +101,41 @@ end).freeze
 
 # ─── Build rigor-rs if needed ─────────────────────────────────────────────────
 
-# Newest file under crates/ — the port's source truth. Everything counts, not
-# just *.rs: the vendored RBS the index loads is an input to the diagnostics
+# The crate directories the measured binary is actually BUILT FROM: the
+# `rigor-cli` path-dependency closure, read out of the manifests. Not every
+# `crates/*` entry — that is a workspace GLOB, and a member nothing links
+# (ADR-0043's `rigor-effects`, which exists precisely to have no consumer) would
+# make the binary read as permanently stale, since cargo never rebuilds `rigor`
+# for it. Derived, never an exclusion list: adding the dependency edge puts the
+# crate back in the scan on its own. Twin of `harness/lib.rb`'s.
+def crate_source_dirs(root = File.join(REPO_ROOT, "crates"))
+  seen = {}
+  queue = ["rigor-cli"]
+  until queue.empty?
+    name = queue.shift
+    next if seen.key?(name)
+
+    dir = File.join(root, name)
+    next unless File.directory?(dir)
+
+    seen[name] = dir
+    manifest = File.join(dir, "Cargo.toml")
+    next unless File.file?(manifest)
+
+    # Explicit encoding: the manifests carry UTF-8 prose, and a US-ASCII
+    # default external encoding makes `scan` raise on it.
+    source = File.read(manifest, encoding: "UTF-8")
+    source.scan(%r{path\s*=\s*"\.\./([\w.-]+)"}).each { |m| queue << m[0] }
+  end
+  seen.values.sort
+end
+
+# Newest file under a LINKED crate — the port's source truth. Everything counts,
+# not just *.rs: the vendored RBS the index loads is an input to the diagnostics
 # exactly as the Rust is.
 def newest_source
-  Dir[File.join(REPO_ROOT, "crates", "**", "*")]
+  crate_source_dirs
+    .flat_map { |dir| Dir[File.join(dir, "**", "*")] }
     .reject { |p| File.directory?(p) }
     .max_by { |p| File.mtime(p) rescue Time.at(0) }
 end

@@ -153,6 +153,40 @@ module RigorHarness
   # Build rigor-rs if binary is absent
   # -------------------------------------------------------------------------
 
+  # The crate directories the measured binary is actually BUILT FROM: the
+  # `rigor-cli` path-dependency closure, read out of the manifests.
+  #
+  # Not every `crates/*` entry, because `crates/*` is a workspace GLOB and a
+  # member nothing links is not an input to the binary. `rigor-effects`
+  # (ADR-0043 slice 1) is deliberately such a member — its whole point is that
+  # no dependency edge exists — so scanning it would make the binary read as
+  # PERMANENTLY stale: cargo never rebuilds `rigor` for it, so the binary's
+  # mtime can never catch up and every gate aborts.
+  #
+  # Derived, never an exclusion list: the day a slice adds the dependency edge,
+  # the crate re-enters the scan on its own.
+  def crate_source_dirs(root = File.join(REPO_ROOT, "crates"))
+    seen = {}
+    queue = ["rigor-cli"]
+    until queue.empty?
+      name = queue.shift
+      next if seen.key?(name)
+
+      dir = File.join(root, name)
+      next unless File.directory?(dir)
+
+      seen[name] = dir
+      manifest = File.join(dir, "Cargo.toml")
+      next unless File.file?(manifest)
+
+      # Explicit encoding: the manifests carry UTF-8 prose, and a US-ASCII
+      # default external encoding makes `scan` raise on it.
+      source = File.read(manifest, encoding: "UTF-8")
+      source.scan(%r{path\s*=\s*"\.\./([\w.-]+)"}).each { |m| queue << m[0] }
+    end
+    seen.values.sort
+  end
+
   # Resolve, REPORT and validate the binary — the fixture-harness twin of
   # `fp_audit.py`'s `resolve_rs`. A stale binary does not fail loudly on its
   # own: it reports diagnostics from code that is not this working tree, which
@@ -177,18 +211,22 @@ module RigorHarness
     puts "rigor-rs binary: #{RIGOR_RS_BIN}"
     puts "  built: #{built.strftime('%Y-%m-%d %H:%M:%S')}"
 
-    # Everything under crates/ counts, not just *.rs: the vendored RBS the
-    # index loads is an input to the diagnostics exactly as the Rust is.
+    # Everything under a LINKED crate counts, not just *.rs: the vendored RBS
+    # the index loads is an input to the diagnostics exactly as the Rust is.
+    # See `crate_source_dirs` for why the scan is the dependency closure and
+    # not the whole `crates/` glob.
     newest_path = nil
     newest_time = Time.at(0)
-    Dir.glob(File.join(REPO_ROOT, "crates", "**", "*"), File::FNM_DOTMATCH).each do |p|
-      next unless File.file?(p)
+    crate_source_dirs.each do |dir|
+      Dir.glob(File.join(dir, "**", "*"), File::FNM_DOTMATCH).each do |p|
+        next unless File.file?(p)
 
-      m = File.mtime(p)
-      next unless m > newest_time
+        m = File.mtime(p)
+        next unless m > newest_time
 
-      newest_time = m
-      newest_path = p
+        newest_time = m
+        newest_path = p
+      end
     end
     return if newest_path.nil? || newest_time <= built
 

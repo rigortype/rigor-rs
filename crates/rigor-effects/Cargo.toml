@@ -1,0 +1,19 @@
+[package]
+name = "rigor-effects"
+version.workspace = true
+edition.workspace = true
+
+# The vendored effect catalogue (ADR-0043 slice 1). Deliberately a SEPARATE
+# crate that nothing depends on: ADR-0043 § 1 forbids the effects work from
+# changing `rigor-infer`'s answers, and a dependency edge that does not exist
+# cannot be violated by review error. When a later slice genuinely needs the
+# typer, that edge becomes a visible, arguable manifest change.
+#
+# serde + serde_yaml ONLY — both already in `Cargo.lock` via `rigor-cli`'s
+# `.rigor.yml` loader, so this crate adds zero new dependencies and stays
+# `cargo build --offline`-safe. No `build.rs`: the payload is two known files
+# embedded with `include_str!`, which is the `vendor/plugins/` precedent, not
+# the `vendor/rbs/` one.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"

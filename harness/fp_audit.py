@@ -33,6 +33,7 @@ Exit:   0 only when every requested corpus produced a VALID comparison with zero
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -76,23 +77,55 @@ def _stamp(mtime):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime))
 
 
-def newest_source():
-    """(mtime, path) of the newest file under crates/ — the port's source truth.
+def crate_source_dirs():
+    """The crate directories the measured binary is actually BUILT FROM.
 
-    Everything under crates/ counts, not just *.rs: the vendored RBS the index
-    loads is an input to the diagnostics exactly as the Rust is.
+    The `rigor-cli` path-dependency closure, read out of the manifests — NOT
+    every `crates/*` entry. `crates/*` is a workspace GLOB, and a member nothing
+    links is not an input to the binary: `rigor-effects` (ADR-0043 slice 1) is
+    deliberately such a member, so scanning it would make the binary read as
+    PERMANENTLY stale — cargo never rebuilds `rigor` for it, so the mtime can
+    never catch up and every gate aborts.
+
+    Derived, never an exclusion list: adding the dependency edge puts the crate
+    back in the scan on its own.
+    """
+    root = os.path.join(REPO, "crates")
+    seen, queue = {}, ["rigor-cli"]
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        seen[name] = path
+        manifest = os.path.join(path, "Cargo.toml")
+        if not os.path.isfile(manifest):
+            continue
+        with open(manifest, encoding="utf-8") as handle:
+            queue.extend(re.findall(r'path\s*=\s*"\.\./([\w.-]+)"', handle.read()))
+    return sorted(seen.values())
+
+
+def newest_source():
+    """(mtime, path) of the newest file under a LINKED crate — the port's source truth.
+
+    Everything under such a crate counts, not just *.rs: the vendored RBS the
+    index loads is an input to the diagnostics exactly as the Rust is.
     """
     newest = (0.0, None)
-    for root, dirs, names in os.walk(os.path.join(REPO, "crates")):
-        dirs[:] = [d for d in dirs if d not in ("target", ".git")]
-        for n in names:
-            p = os.path.join(root, n)
-            try:
-                m = os.path.getmtime(p)
-            except OSError:
-                continue
-            if m > newest[0]:
-                newest = (m, p)
+    for crate in crate_source_dirs():
+        for root, dirs, names in os.walk(crate):
+            dirs[:] = [d for d in dirs if d not in ("target", ".git")]
+            for n in names:
+                p = os.path.join(root, n)
+                try:
+                    m = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if m > newest[0]:
+                    newest = (m, p)
     return newest
 
 

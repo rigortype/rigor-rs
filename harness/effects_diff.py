@@ -44,6 +44,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -71,18 +72,47 @@ LAST_RS_FAILURE = None
 # made two merged slices read as "closed nothing"
 # (docs/notes/20260807-fp-audit-port-side-blind-spots.md).
 # --------------------------------------------------------------------------
+def crate_source_dirs():
+    """The crate directories the measured binary is actually BUILT FROM.
+
+    The `rigor-cli` path-dependency closure, read out of the manifests — NOT
+    every `crates/*` entry. `crates/*` is a workspace GLOB, and a member nothing
+    links is not an input to the binary: `rigor-effects` (ADR-0043 slice 1) is
+    deliberately such a member, so scanning it would make the binary read as
+    PERMANENTLY stale — cargo never rebuilds `rigor` for it. Derived, never an
+    exclusion list; twin of `harness/fp_audit.py`'s.
+    """
+    root = os.path.join(REPO, "crates")
+    seen, queue = {}, ["rigor-cli"]
+    while queue:
+        name = queue.pop(0)
+        if name in seen:
+            continue
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        seen[name] = path
+        manifest = os.path.join(path, "Cargo.toml")
+        if not os.path.isfile(manifest):
+            continue
+        with open(manifest, encoding="utf-8") as handle:
+            queue.extend(re.findall(r'path\s*=\s*"\.\./([\w.-]+)"', handle.read()))
+    return sorted(seen.values())
+
+
 def newest_crates_mtime():
     newest, newest_path = 0.0, None
-    for root, dirs, names in os.walk(os.path.join(REPO, "crates")):
-        dirs[:] = [d for d in dirs if d != "target"]
-        for n in names:
-            p = os.path.join(root, n)
-            try:
-                m = os.path.getmtime(p)
-            except OSError:
-                continue
-            if m > newest:
-                newest, newest_path = m, p
+    for crate in crate_source_dirs():
+        for root, dirs, names in os.walk(crate):
+            dirs[:] = [d for d in dirs if d != "target"]
+            for n in names:
+                p = os.path.join(root, n)
+                try:
+                    m = os.path.getmtime(p)
+                except OSError:
+                    continue
+                if m > newest:
+                    newest, newest_path = m, p
     return newest, newest_path
 
 
