@@ -6172,6 +6172,52 @@ mod tests {
         );
     }
 
+    /// Issue #92 invariant 1, example 1 — FILE ORDER IS NORMATIVE. The project
+    /// index records `method_visibilities` first-write-wins, so which file
+    /// declares `Base#m` FIRST decides whether the override fires. `a,b` sees
+    /// `m` public on Base ⇒ `Sub#m` private reduces it ⇒ warns; `b,a` sees it
+    /// already private ⇒ silent.
+    ///
+    /// This is a property of the pre-existing accumulator, not of any refactor —
+    /// which is exactly why it is pinned here: `SourceIndex::merge` replays the
+    /// per-file harvests in the caller's file order and must never sort them.
+    #[test]
+    fn override_vis_project_order_is_normative() {
+        let a = b"class Base\n  def m\n    1\n  end\nend\n" as &[u8];
+        let b = b"class Base\n  private\n  def m\n    2\n  end\nend\n\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\n" as &[u8];
+        let forward = override_vis_project(&[a, b], 1);
+        assert_eq!(forward.len(), 1, "a,b must fire, got {forward:?}");
+        assert_eq!(
+            forward[0].message,
+            "visibility of `m' reduced from public to private (overrides Base#m); breaks substitutability"
+        );
+        let reversed = override_vis_project(&[b, a], 0);
+        assert!(reversed.is_empty(), "b,a must stay silent, got {reversed:?}");
+    }
+
+    /// Issue #92 invariant 1, example 2 — the same for `include` ACCUMULATION
+    /// order, on a fully idiomatic shape (one class reopened in two files, each
+    /// adding an include). `override_ancestor_names` walks includes in
+    /// accumulated order, so the MRO's nearest defining ancestor flips with the
+    /// file order: M1 first ⇒ a public definer ⇒ fires; M2 first ⇒ a private
+    /// definer ⇒ silent.
+    #[test]
+    fn override_vis_project_include_order_is_normative() {
+        let mods =
+            b"module M1\n  def m; 1; end\nend\nmodule M2\n  private\n  def m; 2; end\nend\n"
+                as &[u8];
+        let a = b"class Foo\n  include M1\nend\n" as &[u8];
+        let b = b"class Foo\n  include M2\n  private\n  def m; 3; end\nend\n" as &[u8];
+        let forward = override_vis_project(&[mods, a, b], 2);
+        assert_eq!(forward.len(), 1, "mods,a,b must fire, got {forward:?}");
+        assert_eq!(
+            forward[0].message,
+            "visibility of `m' reduced from public to private (overrides M1#m); breaks substitutability"
+        );
+        let reversed = override_vis_project(&[mods, b, a], 1);
+        assert!(reversed.is_empty(), "mods,b,a must stay silent, got {reversed:?}");
+    }
+
     #[test]
     fn override_vis_catalog_entry_matches_oracle() {
         let e = catalog(DEF_OVERRIDE_VISIBILITY_REDUCED).expect("catalog entry must exist");

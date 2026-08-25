@@ -127,6 +127,11 @@ pub enum DefKind {
 /// and whether the body contains any explicit `return` (a decline gate — we read
 /// only the tail). Collected per `(qualified owner, method, kind)` so reopens are
 /// joined (all sites must agree on the folded literal, else decline).
+///
+/// `ast_idx` is a POSITION IN THE MERGED SLICE, not a file identity: it is only
+/// meaningful for the exact `&[(Harvest, &LoweredAst)]` the merge was handed.
+/// That is why [`Harvest`] stores [`HarvestedFoldDef`] instead — file-relative,
+/// with the slice position stamped on at merge time (issue #92 §5).
 #[derive(Clone, Copy)]
 struct FoldSite {
     ast_idx: usize,
@@ -174,7 +179,131 @@ struct OverrideClass {
 /// One harvested constant value: `(defining namespace segments, the
 /// `LoweredAst::file_id` of the ASSIGNING file, the value)`. The file id is
 /// slice A's per-file consumption gate; see [`SourceIndex::literal_constant`].
+///
+/// **Persistence hazard (issue #92 §5).** The middle field is a
+/// [`rigor_parse::LoweredAst::file_id`] — an in-memory PROCESS-GLOBAL counter,
+/// not a content or path key. It is stamped at MERGE time from the paired
+/// `&LoweredAst` (never carried inside a [`Harvest`]) precisely because a
+/// harvest that outlived its process — a blake3-keyed on-disk cache, an LSP
+/// harvest held across a rebuild — would otherwise replay a stale id and make
+/// [`SourceIndex::literal_constant`]'s same-file gate answer at the wrong file.
+/// Any future persisted harvest MUST re-stamp this field, or the field must
+/// become a path/content key first.
 type HarvestedConst = (Vec<String>, u64, ConstLit);
+
+/// One source class/module (re)definition, harvested from a single file's AST in
+/// `ast.iter()` order. Replayed through [`SourceIndex::add_source`] at merge, so
+/// the slice order IS the first-`Some`-wins superclass order and the registration
+/// (⇒ [`ClassId`]) order.
+struct HarvestedClass {
+    name: String,
+    superclass: Option<String>,
+    methods: Vec<String>,
+}
+
+/// One lexically-qualified override-class (re)definition, harvested from a single
+/// file's AST in `collect_override_classes` walk order. Replayed through
+/// [`SourceIndex::ingest_override_class`] at merge: the slice order IS the
+/// first-write-wins visibility order and the `includes` append order, and BOTH
+/// reach diagnostics (issue #92 §3.2) — the merge must never sort it.
+struct HarvestedOverrideClass {
+    qualified: String,
+    superclass: Option<String>,
+    methods: Vec<String>,
+    method_visibilities: Vec<(String, Visibility)>,
+    includes: Vec<String>,
+}
+
+/// One QUALIFIED constant name written by a single file, in walk order, with the
+/// value of that file's FIRST write and how many times THAT FILE writes the name.
+///
+/// The count (not a bool) is what makes the per-file harvest reproduce C5's
+/// project-wide single-assignment gate exactly: today's `lit_multi` is tripped by
+/// a second write anywhere — including a second write inside the SAME file — so
+/// the merge declines iff Σ counts ≥ 2.
+struct HarvestedConstWrite {
+    qualified: String,
+    namespace: Vec<String>,
+    /// The harvested value of this file's FIRST write (`None` ⇒ not fully
+    /// literal). A repeat write never re-harvests, exactly as before.
+    lit: Option<ConstLit>,
+    writes: usize,
+}
+
+/// One project `def` site whose interprocedural literal-tail return may fold,
+/// harvested from a single file in walk order. Deliberately FILE-RELATIVE: the
+/// `tail` [`NodeId`] indexes THIS file's AST, and the merge stamps the slice
+/// position on to build a [`FoldSite`]. See [`FoldSite`] for why.
+struct HarvestedFoldDef {
+    owner: String,
+    method: String,
+    kind: DefKind,
+    tail: NodeId,
+    has_explicit_return: bool,
+}
+
+/// **Issue #92** — ONE FILE's contribution to a project [`SourceIndex`], computed
+/// from that file's AST and the FROZEN [`CoreIndex`] alone. A harvest never reads
+/// another file's state, so [`SourceIndex::harvest`] is embarrassingly parallel
+/// (the CLI runs it inside stage 1's rayon closure, beside parse+lower); the
+/// cross-file joins all live in the serial, deterministic
+/// [`SourceIndex::merge`].
+///
+/// ```text
+/// build_project(asts, core) ≡ merge(asts.map(|a| (harvest(a, core), a)), core)
+/// ```
+///
+/// bit-identical, which the `probes_s92` equivalence tests pin field by field.
+///
+/// The fields split by MERGE DISCIPLINE, and the split is load-bearing:
+///
+/// * **Pure unions** (`toplevel_defs`, `discovered_methods`, `mutated_params`,
+///   `constant_write_bare_names`) — commutative + idempotent, mergeable in any
+///   order.
+/// * **Ordered replay** (`source_classes`, `override_classes`,
+///   `rbs_constant_names`, `constant_writes`, `fold_defs`) — first-write-wins /
+///   append semantics that REACH DIAGNOSTICS. The merge replays them in the
+///   caller's file order (`expand_check_paths`: each argument's recursive
+///   expansion sorted, arguments concatenated in argument order) and **must
+///   never sort**: `rigor check a.rb b.rb` and `rigor check b.rb a.rb` are
+///   legitimately different runs today (issue #92 §3.2/§3.5).
+///
+/// Nothing derived from OTHER files is in here — the literal-constant gates, the
+/// declaration-only set, the tier-4b returns, the definers inversion and the
+/// interprocedural fold are all computed by the merge.
+#[derive(Default)]
+pub struct Harvest {
+    // --- pure unions (order-free) ------------------------------------------
+    /// Pass 1c: this file's toplevel `def` names ⇒ `toplevel_defs`.
+    toplevel_defs: HashSet<String>,
+    /// Pass 1d: qualified owner -> this file's own `def` names ⇒ per-key union.
+    discovered_methods: HashMap<String, HashSet<String>>,
+    /// Pass 1e: method name -> mutated positional param indices ⇒ per-key union.
+    mutated_params: HashMap<String, HashSet<usize>>,
+    /// Stage 2b: the BARE name of every constant this file writes ⇒
+    /// `project_constant_write_names` (today's set is the bare names of every
+    /// qualified write key, i.e. exactly this union).
+    constant_write_bare_names: HashSet<String>,
+
+    // --- ordered replay ----------------------------------------------------
+    /// Pass 1, in `ast.iter()` order.
+    source_classes: Vec<HarvestedClass>,
+    /// Pass 1b, in lexical walk order.
+    override_classes: Vec<HarvestedOverrideClass>,
+    /// Pass 2: every `ConstantRead` name the FROZEN core knows, in first-
+    /// occurrence order, deduplicated (`register` is idempotent — see
+    /// [`SourceIndex::register`] — so dropping repeats cannot move an id).
+    ///
+    /// Pre-filtering against `core` here is legal because the `CoreIndex` is
+    /// frozen before any harvest runs (ADR-0028), and today's extra
+    /// `!classes.contains_key(name)` term is a no-op: Pass 1 has already
+    /// registered every source class by the time Pass 2 runs (issue #92 §2.1).
+    rbs_constant_names: Vec<String>,
+    /// C5a, in walk order — one entry per distinct qualified name.
+    constant_writes: Vec<HarvestedConstWrite>,
+    /// Pass 4a, in walk order.
+    fold_defs: Vec<HarvestedFoldDef>,
+}
 
 #[derive(Default)]
 pub struct SourceIndex {
@@ -389,38 +518,300 @@ impl SourceIndex {
     /// [`class_id`]: SourceIndex::class_id
     /// [`class_name_for_id`]: SourceIndex::class_name_for_id
     pub fn build_project(asts: &[&LoweredAst], core: &CoreIndex) -> Self {
-        let mut idx = SourceIndex::default();
+        let files: Vec<(Harvest, &LoweredAst)> =
+            asts.iter().map(|ast| (Self::harvest(ast, core), *ast)).collect();
+        Self::merge(&files, core)
+    }
 
-        // Pass 1: source class/module structure, harvested across ALL files.
-        for ast in asts {
-            for (_, node) in ast.iter() {
-                match node {
-                    Node::ClassDef { name, superclass, methods, .. } => {
-                        if name.is_empty() {
-                            continue; // un-namable (dynamic constant) ⇒ skip.
-                        }
-                        idx.add_source(name, superclass.clone(), methods);
+    /// **Issue #92 — the PARALLEL half.** Everything one file contributes to a
+    /// project index that is derivable from `(that file's AST, the FROZEN
+    /// [`CoreIndex`])` alone: passes 1, 1b, 1c, 1d, 1e, C5a, 2 and the 4a walk.
+    ///
+    /// Reads no other file's state and no accumulated [`SourceIndex`] state, so
+    /// it is safe to run inside the CLI's stage-1 rayon closure beside
+    /// parse+lower. Nothing here decides anything: the ordered fields are
+    /// REPLAYED by [`Self::merge`] in the caller's file order, and every
+    /// cross-file gate (the constant single-assignment gate, the declaration-only
+    /// set, tier-4b returns, the definers inversion, the interprocedural fold)
+    /// runs there.
+    pub fn harvest(ast: &LoweredAst, core: &CoreIndex) -> Harvest {
+        let mut h = Harvest::default();
+
+        // Pass 1: source class/module structure, in `ast.iter()` order (which IS
+        // the registration ⇒ ClassId order once the merge replays it).
+        for (_, node) in ast.iter() {
+            match node {
+                Node::ClassDef { name, superclass, methods, .. } => {
+                    if name.is_empty() {
+                        continue; // un-namable (dynamic constant) ⇒ skip.
                     }
-                    Node::ModuleDef { name, methods, .. } => {
-                        if name.is_empty() {
-                            continue;
-                        }
-                        idx.add_source(name, None, methods); // a module has no super.
+                    h.source_classes.push(HarvestedClass {
+                        name: name.clone(),
+                        superclass: superclass.clone(),
+                        methods: methods.to_vec(),
+                    });
+                }
+                Node::ModuleDef { name, methods, .. } => {
+                    if name.is_empty() {
+                        continue;
                     }
-                    _ => {}
+                    // A module has no super.
+                    h.source_classes.push(HarvestedClass {
+                        name: name.clone(),
+                        superclass: None,
+                        methods: methods.to_vec(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // Pass 1b (ADR-35 slice 1): the LEXICALLY-QUALIFIED override index, by a
+        // recursive walk with a nesting stack, so a nested `module Params` is
+        // keyed `Outer::Params` (not the collapsed `Params`). This is what keeps
+        // the override-visibility rule free of the name-collision false
+        // positives. Kept entirely separate from the collapsed `classes` map —
+        // no other rule is affected.
+        collect_override_classes(ast, ast.root(), &[], &mut h.override_classes);
+
+        // Pass 1c (ADR-34): PROJECT-WIDE toplevel method names for
+        // `call.unresolved-toplevel`. A `def` OUTSIDE any class/module body is a
+        // toplevel def (an Object private method); an in-source reopen of
+        // Object/Kernel/BasicObject injects toplevel-callable methods too. Toplevel
+        // detection is span-containment against the file's class/module spans
+        // (orphan-proof) — a WITHIN-file comparison, which is why the pass is
+        // per-file. The merge unions across files so a `def` in one file resolves
+        // a call in another (the reference's project-mode resolution).
+        let scope_spans: Vec<rigor_parse::Span> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        for (_, node) in ast.iter() {
+            match node {
+                Node::Definition { name: Some(nm), span, .. }
+                    if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
+                {
+                    h.toplevel_defs.insert(nm.clone());
+                }
+                // A TOPLEVEL receiver-bearing `def Foo.bar` registers `bar`
+                // as a toplevel name too. That is not Ruby's runtime
+                // semantics — `bar` is on `Foo`'s singleton — but it is the
+                // reference's: `ScopeIndexer#record_def_node` keys a def
+                // under `<toplevel>` whenever its lexical prefix is empty,
+                // and `def_singleton?` excludes only a `self` receiver and a
+                // receiver naming the lexically enclosing class (impossible
+                // with an empty prefix). Parity is the contract, so rigor-rs
+                // matches it: rigor-survey `io-console-0.8.2`'s `size.rb`
+                // calls `default_console_size` from inside `def
+                // IO.console_size`, where the reference is silent.
+                // `def self.x` at toplevel is NOT registered (the reference
+                // excludes it, and so does this arm — a self receiver leaves
+                // `receiver_def_name` `None`, see the lowering).
+                Node::Definition { receiver_def_name: Some(nm), span, .. }
+                    if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
+                {
+                    h.toplevel_defs.insert(nm.clone());
+                }
+                Node::ClassDef { name, methods, .. } | Node::ModuleDef { name, methods, .. }
+                    if matches!(name.as_str(), "Object" | "Kernel" | "BasicObject") =>
+                {
+                    h.toplevel_defs.extend(methods.iter().cloned());
+                }
+                _ => {}
+            }
+        }
+
+        // Pass 1d: the project's own instance-method declarations per QUALIFIED
+        // class/module (`discovered_methods`), the port of the reference's
+        // `Scope#discovered_method?` suppression gate. A def counts for the
+        // INNERMOST lexical class/module whose span contains it, so a def in a
+        // block or a conditional inside the body still lands on the right class
+        // and a def in a nested class does not leak to the outer one.
+        let scopes = lexical_scopes(ast);
+        for (_, node) in ast.iter() {
+            let Node::Definition { name: Some(nm), span, .. } = node else {
+                continue;
+            };
+            let innermost = scopes
+                .iter()
+                .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
+                .min_by_key(|(s, _)| s.1 - s.0);
+            if let Some((_, segs)) = innermost {
+                h.discovered_methods.entry(segs.join("::")).or_default().insert(nm.clone());
+            }
+        }
+
+        // Pass 1e: the caller-side half of `MutationWidening` — which positional
+        // parameter of each project method the method mutates in place. See
+        // `mutated_params`.
+        for (_, node) in ast.iter() {
+            let Node::Definition { params: Some(names), span, .. } = node else {
+                continue;
+            };
+            if names.is_empty() {
+                continue;
+            }
+            for (_, inner) in ast.iter() {
+                let Node::Call { receiver: Some(r), method, span: cspan, .. } = inner else {
+                    continue;
+                };
+                if !(span.0 <= cspan.0 && cspan.1 <= span.1) {
+                    continue; // not inside this def.
+                }
+                if !crate::MUTATOR_METHODS.contains(&method.as_str()) {
+                    continue;
+                }
+                let Node::LocalVariableRead { name: recv_name, .. } = ast.get(*r) else {
+                    continue;
+                };
+                if let Some(i) = names.iter().position(|p| p == recv_name) {
+                    // The def's NAME: a receiver-bearing def carries it in
+                    // `receiver_def_name` / `singleton_name` instead.
+                    for key in def_names(node) {
+                        h.mutated_params.entry(key).or_default().insert(i);
+                    }
                 }
             }
         }
 
-        // Pass 1b (ADR-35 slice 1): build the LEXICALLY-QUALIFIED override index
-        // by a recursive walk of each file's AST with a nesting stack, so a
-        // nested `module Params` is keyed `Outer::Params` (not the collapsed
-        // `Params`). This is what keeps the override-visibility rule free of the
-        // name-collision false positives. Kept entirely separate from the
-        // collapsed `classes` map above — no other rule is affected.
-        for ast in asts {
-            idx.collect_override_classes(ast, ast.root(), &[]);
+        // C5a: this file's lexically-qualified `CONST = <literal>` writes, in walk
+        // order, with a per-file write COUNT per qualified name. The project-wide
+        // single-assignment gate is the merge's job (see [`Self::merge`]); the
+        // count is what lets it see an INTRA-file duplicate too.
+        let mut seen_writes: HashMap<String, usize> = HashMap::new();
+        collect_literal_constants(ast, ast.root(), &[], &mut h.constant_writes, &mut seen_writes);
+        // Stage 2b: every constant this file ASSIGNS, by bare name — recorded
+        // BEFORE the merge's C5 gates drop the non-literal / multiply-assigned
+        // ones, because the RBS-object-constant arm must decline on those too.
+        for w in &h.constant_writes {
+            let bare = w.qualified.rsplit("::").next().unwrap_or(&w.qualified).to_string();
+            h.constant_write_bare_names.insert(bare);
         }
+
+        // Pass 2: every `ConstantRead` whose `name` the FROZEN core knows, so the
+        // merge can register an instance-class id for it. This lets both
+        // `Pathname.new(...)` instances AND bare singleton constants (`Time`,
+        // `Array`, ...) carry a registry identity that round-trips for rendering.
+        //
+        // ADR-0042 Slice 2: a QUALIFIED RBS-known constant read (`ERB::Util`)
+        // counts too, so it carries a registry id that round-trips for
+        // `Singleton` rendering. `knows_class` (short key) covers top-level and
+        // the merged composite; the added `knows_qualified_class` covers a
+        // namespaced name the short map lacks.
+        //
+        // Today's third term — `!idx.classes.contains_key(name)` — is NOT
+        // reproduced, and cannot change the result: a source class was already
+        // registered by Pass 1, and `register` is idempotent, so the skipped call
+        // was a no-op (issue #92 §2.1, pinned by `register_is_idempotent`).
+        let mut seen_names: HashSet<&str> = HashSet::new();
+        for (_, node) in ast.iter() {
+            if let Node::ConstantRead { name, .. } = node {
+                if !name.is_empty()
+                    && (core.knows_class(name) || core.knows_qualified_class(name))
+                    && seen_names.insert(name.as_str())
+                {
+                    h.rbs_constant_names.push(name.clone());
+                }
+            }
+        }
+
+        // Pass 4a (ADR-0038): every project instance + singleton `def` body by
+        // QUALIFIED owner name (the same lexical walk, so `module Gitlab; module
+        // Database` keys `Gitlab::Database` — matching a
+        // `Gitlab::Database.read_only?` receiver). FILE-RELATIVE: the merge
+        // stamps the slice position on to build each `FoldSite`.
+        walk_fold_defs(ast, ast.root(), &[], &mut h.fold_defs);
+
+        h
+    }
+
+    /// **Issue #92 — the SERIAL half.** Fold per-file [`Harvest`]es into one
+    /// project index, then run every genuinely cross-file pass over the complete
+    /// state. `files` pairs each harvest with ITS OWN AST, in the caller's file
+    /// order.
+    ///
+    /// ## The order is normative — never sort `files`
+    ///
+    /// Today's order is `expand_check_paths`' (each directory argument expands to
+    /// its recursive `**/*.rb` SORTED, arguments concatenated in ARGUMENT order),
+    /// and it reaches diagnostics twice: `method_visibilities` is first-write-wins
+    /// and `includes` is an ordered append, so `rigor check a.rb b.rb` and
+    /// `rigor check b.rb a.rb` legitimately differ (issue #92 §3.2/§3.5).
+    /// Normalising the order here would be a behaviour change, not a cleanup.
+    ///
+    /// ## Three phases, in this order
+    ///
+    /// * **M1 — ordered replay.** Each ordered harvest field, replayed pass by
+    ///   pass across all files (pass by pass, NOT file by file: `names` is
+    ///   appended by Pass 1 and Pass 2 both, so the ClassId order is the pass
+    ///   order interleaved with the file order).
+    /// * **M2 — barrier aggregates.** Cheap, need the complete replayed state:
+    ///   the C1 constant-shadow tables, the C5b literal-constant gates, the Pass
+    ///   2b tuple-element registry + declaration-only set.
+    /// * **M3 — AST-consuming passes.** Pass 3 (tier-4b returns, typed against
+    ///   the complete index) and Pass 4 (the definers inversion + the
+    ///   interprocedural literal-tail fold, which resolves calls into OTHER
+    ///   files' bodies). These are why the merge still takes the ASTs — issue #92
+    ///   §5: harvest-then-evict is NOT unblocked by this decomposition.
+    pub fn merge(files: &[(Harvest, &LoweredAst)], core: &CoreIndex) -> Self {
+        let mut idx = SourceIndex::default();
+
+        // === M1: ordered replay ============================================
+
+        // Pass 1: source class/module structure, across ALL files in order.
+        for (h, _) in files {
+            for c in &h.source_classes {
+                idx.add_source(&c.name, c.superclass.clone(), &c.methods);
+            }
+        }
+
+        // Pass 1b: the lexically-qualified override index. First-write-wins on
+        // superclass + visibility, ordered append-with-dedup on includes — so
+        // this replay is exactly today's call sequence.
+        for (h, _) in files {
+            for oc in &h.override_classes {
+                idx.ingest_override_class(
+                    &oc.qualified,
+                    oc.superclass.clone(),
+                    &oc.methods,
+                    &oc.method_visibilities,
+                    &oc.includes,
+                );
+            }
+        }
+
+        // Passes 1c / 1d / 1e + stage 2b's bare-name set: pure unions. Order-free
+        // (commutative + idempotent), merged in file order anyway.
+        for (h, _) in files {
+            idx.toplevel_defs.extend(h.toplevel_defs.iter().cloned());
+            for (owner, methods) in &h.discovered_methods {
+                idx.discovered_methods
+                    .entry(owner.clone())
+                    .or_default()
+                    .extend(methods.iter().cloned());
+            }
+            for (method, indices) in &h.mutated_params {
+                idx.mutated_params
+                    .entry(method.clone())
+                    .or_default()
+                    .extend(indices.iter().copied());
+            }
+            idx.project_constant_write_names.extend(h.constant_write_bare_names.iter().cloned());
+        }
+
+        // Pass 2: register the RBS-known constant reads. Runs AFTER Pass 1's
+        // registrations, exactly as before — the two share the `names` vector, so
+        // this is the ClassId order.
+        for (h, _) in files {
+            for name in &h.rbs_constant_names {
+                idx.register(name);
+            }
+        }
+
+        // === M2: barrier aggregates ========================================
 
         // C1: derive the constant-shadow tables from the lexically-qualified
         // override index built above (the same class/module set Ruby's lexical
@@ -443,147 +834,34 @@ impl SourceIndex {
             }
         }
 
-        // Pass 1c (ADR-34): PROJECT-WIDE toplevel method names for
-        // `call.unresolved-toplevel`. A `def` OUTSIDE any class/module body is a
-        // toplevel def (an Object private method); an in-source reopen of
-        // Object/Kernel/BasicObject injects toplevel-callable methods too. Toplevel
-        // detection is span-containment against the file's class/module spans
-        // (orphan-proof). Harvested across ALL files so a `def` in one file
-        // resolves a call in another (the reference's project-mode resolution).
-        for ast in asts {
-            let scope_spans: Vec<rigor_parse::Span> = ast
-                .iter()
-                .filter_map(|(_, n)| match n {
-                    Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => Some(*span),
-                    _ => None,
-                })
-                .collect();
-            for (_, node) in ast.iter() {
-                match node {
-                    Node::Definition { name: Some(nm), span, .. }
-                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
-                    {
-                        idx.toplevel_defs.insert(nm.clone());
-                    }
-                    // A TOPLEVEL receiver-bearing `def Foo.bar` registers `bar`
-                    // as a toplevel name too. That is not Ruby's runtime
-                    // semantics — `bar` is on `Foo`'s singleton — but it is the
-                    // reference's: `ScopeIndexer#record_def_node` keys a def
-                    // under `<toplevel>` whenever its lexical prefix is empty,
-                    // and `def_singleton?` excludes only a `self` receiver and a
-                    // receiver naming the lexically enclosing class (impossible
-                    // with an empty prefix). Parity is the contract, so rigor-rs
-                    // matches it: rigor-survey `io-console-0.8.2`'s `size.rb`
-                    // calls `default_console_size` from inside `def
-                    // IO.console_size`, where the reference is silent.
-                    // `def self.x` at toplevel is NOT registered (the reference
-                    // excludes it, and so does this arm — a self receiver leaves
-                    // `receiver_def_name` `None`, see the lowering).
-                    Node::Definition { receiver_def_name: Some(nm), span, .. }
-                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
-                    {
-                        idx.toplevel_defs.insert(nm.clone());
-                    }
-                    Node::ClassDef { name, methods, .. } | Node::ModuleDef { name, methods, .. }
-                        if matches!(name.as_str(), "Object" | "Kernel" | "BasicObject") =>
-                    {
-                        idx.toplevel_defs.extend(methods.iter().cloned());
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Pass 1d: the project's own instance-method declarations per QUALIFIED
-        // class/module (`discovered_methods`), the port of the reference's
-        // `Scope#discovered_method?` suppression gate. A def counts for the
-        // INNERMOST lexical class/module whose span contains it, so a def in a
-        // block or a conditional inside the body still lands on the right class
-        // and a def in a nested class does not leak to the outer one.
-        for ast in asts {
-            let scopes = lexical_scopes(ast);
-            for (_, node) in ast.iter() {
-                let Node::Definition { name: Some(nm), span, .. } = node else {
-                    continue;
-                };
-                let innermost = scopes
-                    .iter()
-                    .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
-                    .min_by_key(|(s, _)| s.1 - s.0);
-                if let Some((_, segs)) = innermost {
-                    idx.discovered_methods
-                        .entry(segs.join("::"))
-                        .or_default()
-                        .insert(nm.clone());
-                }
-            }
-        }
-
-        // Pass 1e: the caller-side half of `MutationWidening` — which positional
-        // parameter of each project method the method mutates in place. See
-        // `mutated_params`.
-        for ast in asts {
-            for (_, node) in ast.iter() {
-                let Node::Definition { params: Some(names), span, .. } = node else {
-                    continue;
-                };
-                if names.is_empty() {
-                    continue;
-                }
-                for (_, inner) in ast.iter() {
-                    let Node::Call { receiver: Some(r), method, span: cspan, .. } = inner else {
-                        continue;
-                    };
-                    if !(span.0 <= cspan.0 && cspan.1 <= span.1) {
-                        continue; // not inside this def.
-                    }
-                    if !crate::MUTATOR_METHODS.contains(&method.as_str()) {
-                        continue;
-                    }
-                    let Node::LocalVariableRead { name: recv_name, .. } = ast.get(*r) else {
-                        continue;
-                    };
-                    if let Some(i) = names.iter().position(|p| p == recv_name) {
-                        // The def's NAME: a receiver-bearing def carries it in
-                        // `receiver_def_name` / `singleton_name` instead.
-                        for key in def_names(node) {
-                            idx.mutated_params.entry(key).or_default().insert(i);
-                        }
-                    }
-                }
-            }
-        }
-
-        // C5: harvest single-assignment fully-literal `CONST = <literal>` values,
-        // LEXICALLY qualified (like the C1 override walk). A QUALIFIED name
-        // qualifies iff it is assigned EXACTLY ONCE project-wide, its RHS harvests
-        // to a `ConstLit` (fully literal), and its bare name does NOT also name a
+        // C5b: the project-wide constant gates. A QUALIFIED name qualifies iff it
+        // is assigned EXACTLY ONCE project-wide, its RHS harvested to a
+        // `ConstLit` (fully literal), and its bare name does NOT also name a
         // class/module. Ambiguity (multiple writes to the same qualified name, a
         // non-literal RHS, a class-name collision) declines. The recorded value
         // is keyed by BARE name + DEFINING NAMESPACE so the use-site consults it
         // lexically — a constant only visible in its defining namespace never
         // folds at an unrelated use site (the app/models concern-constant FP).
+        //
+        // `lit_first` keeps the FIRST write in file-then-walk order and
+        // `lit_writes` sums the per-file counts, so a duplicate ACROSS files and
+        // a duplicate WITHIN one file decline identically — which is what today's
+        // single shared `lit_first`/`lit_multi` pair does.
+        //
+        // The `file` stamp comes from the paired AST, never from the harvest —
+        // see the persistence hazard on `HarvestedConst`.
         let mut lit_first: HashMap<String, (Vec<String>, u64, Option<ConstLit>)> = HashMap::new();
-        let mut lit_multi: HashSet<String> = HashSet::new();
-        for ast in asts {
-            collect_literal_constants(
-                ast,
-                ast.root(),
-                &[],
-                ast.file_id(),
-                &mut lit_first,
-                &mut lit_multi,
-            );
-        }
-        // Stage 2b: every constant the project ASSIGNS, by bare name — recorded
-        // before the C5 gates below drop the non-literal / multiply-assigned
-        // ones, because the RBS-object-constant arm must decline on those too.
-        for qualified in lit_first.keys() {
-            let bare = qualified.rsplit("::").next().unwrap_or(qualified).to_string();
-            idx.project_constant_write_names.insert(bare);
+        let mut lit_writes: HashMap<String, usize> = HashMap::new();
+        for (h, ast) in files {
+            for w in &h.constant_writes {
+                *lit_writes.entry(w.qualified.clone()).or_insert(0) += w.writes;
+                lit_first
+                    .entry(w.qualified.clone())
+                    .or_insert_with(|| (w.namespace.clone(), ast.file_id(), w.lit.clone()));
+            }
         }
         for (qualified, (namespace, file, lit)) in lit_first {
-            if lit_multi.contains(&qualified) {
+            if lit_writes.get(&qualified).is_some_and(|n| *n >= 2) {
                 continue;
             }
             let bare = qualified.rsplit("::").next().unwrap_or(&qualified).to_string();
@@ -602,30 +880,6 @@ impl SourceIndex {
             }
         }
 
-        // Pass 2: register an instance-class id for every `ConstantRead` whose
-        // `name` is RBS-known but not a source class (source classes are already
-        // registered). This lets both `Pathname.new(...)` instances AND bare
-        // singleton constants (`Time`, `Array`, ...) carry a registry identity
-        // that round-trips for rendering. Harvested across ALL files.
-        for ast in asts {
-            for (_, node) in ast.iter() {
-                if let Node::ConstantRead { name, .. } = node {
-                    // ADR-0042 Slice 2: register a QUALIFIED RBS-known constant
-                    // read (`ERB::Util`) too, so it carries a registry id that
-                    // round-trips for `Singleton` rendering. `knows_class` (short
-                    // key) covers top-level and the merged composite; the added
-                    // `knows_qualified_class` covers a namespaced name the short
-                    // map lacks.
-                    if !name.is_empty()
-                        && !idx.classes.contains_key(name)
-                        && (core.knows_class(name) || core.knows_qualified_class(name))
-                    {
-                        idx.register(name);
-                    }
-                }
-            }
-        }
-
         // Pass 2b (MultiWrite substrate Slice 2): register an id for every class
         // an RBS TUPLE return names as an element. Pass 2 above can only see
         // classes the SOURCE mentions, but a tuple element is reached THROUGH a
@@ -640,6 +894,9 @@ impl SourceIndex {
         // source registration (the project's own class wins, as everywhere else),
         // and an element the loaded RBS does not model is skipped — an
         // unregistered name simply leaves that slot `Dynamic[top]` (silent).
+        //
+        // CROSS-FILE by construction: `!name_to_id.contains_key` asks "did NO
+        // analyzed file name this class?", which no per-file harvest can answer.
         for name in core.tuple_return_class_names() {
             if !idx.classes.contains_key(name)
                 && (core.knows_class(name) || core.knows_qualified_class(name))
@@ -654,26 +911,40 @@ impl SourceIndex {
             }
         }
 
+        // === M3: AST-consuming passes ======================================
+
+        let asts: Vec<&LoweredAst> = files.iter().map(|(_, ast)| *ast).collect();
+
         // Pass 3 (ADR-0023 tier-4b): infer per-method RETURN types. Runs AFTER the
         // source/registry maps are complete (so a Typer over `&idx` sees every
         // project class), and produces a fresh map that is then assigned — we must
         // NOT mutate `idx.method_returns` while `&idx` is immutably borrowed for
         // typing, so the inference returns a value.
-        let (returns, param_bound) = infer_method_returns(&idx, core, asts);
+        let (returns, param_bound) = infer_method_returns(&idx, core, &asts);
         idx.method_returns = returns;
         idx.param_bound_returns = param_bound;
 
         // Pass 4 (ADR-0038): interprocedural literal-tail return folding. Runs
         // AFTER Pass 1b (`override_classes`, the ancestry the degrade + implicit-
-        // self resolution walk) and needs no `core`/typing state. Harvests every
-        // project instance + singleton `def` body by QUALIFIED owner name (the
-        // lexical walk, so `module Gitlab; module Database` keys `Gitlab::
-        // Database` — matching a `Gitlab::Database.read_only?` receiver), inverts
-        // to a definers index, then folds each method's tail to a scalar literal
-        // (resolving nested project calls, applying the overridable degrade).
-        let (defs, definers) = collect_fold_defs(asts);
-        idx.definers = definers;
-        idx.literal_returns = idx.compute_literal_returns(asts, &defs);
+        // self resolution walk) and needs no `core`/typing state. Stamps each
+        // harvested def site with its file's SLICE POSITION, inverts to a definers
+        // index, then folds each method's tail to a scalar literal (resolving
+        // nested project calls — into other files' ASTs — and applying the
+        // overridable degrade).
+        let mut defs: HashMap<(String, String, DefKind), Vec<FoldSite>> = HashMap::new();
+        for (ast_idx, (h, _)) in files.iter().enumerate() {
+            for d in &h.fold_defs {
+                defs.entry((d.owner.clone(), d.method.clone(), d.kind)).or_default().push(
+                    FoldSite {
+                        ast_idx,
+                        tail: d.tail,
+                        has_explicit_return: d.has_explicit_return,
+                    },
+                );
+            }
+        }
+        idx.definers = invert_definers(&defs);
+        idx.literal_returns = idx.compute_literal_returns(&asts, &defs);
 
         idx
     }
@@ -1155,75 +1426,6 @@ impl SourceIndex {
         None
     }
 
-    /// ADR-35 slice 1: recursively collect the LEXICALLY-QUALIFIED override
-    /// classes from `ast`, starting at `node` under the lexical `prefix` (the
-    /// enclosing class/module name segments). A `ClassDef`/`ModuleDef` contributes
-    /// an [`OverrideClass`] keyed by `prefix + name`, then recurses into its body
-    /// with the extended prefix so a nested class/module is fully qualified. Other
-    /// nodes recurse over their direct children only enough to reach nested
-    /// class/module bodies (handled via the explicit body lists below).
-    ///
-    /// First-write-wins on reopen / cross-file for visibilities + superclass
-    /// (mirrors the reference's stable accumulator); methods + includes accumulate.
-    fn collect_override_classes(&mut self, ast: &LoweredAst, node: NodeId, prefix: &[String]) {
-        match ast.get(node) {
-            Node::Program { body, .. } | Node::Statements { body, .. } => {
-                for &child in body {
-                    self.collect_override_classes(ast, child, prefix);
-                }
-            }
-            Node::ClassDef {
-                name,
-                superclass_path,
-                methods,
-                method_visibilities,
-                includes,
-                body,
-                ..
-            } => {
-                if name.is_empty() {
-                    return;
-                }
-                let qualified = qualify(prefix, name);
-                self.ingest_override_class(
-                    &qualified,
-                    superclass_path.clone(),
-                    methods,
-                    method_visibilities,
-                    includes,
-                );
-                let child_prefix = split_qualified(&qualified);
-                for &child in body {
-                    self.collect_override_classes(ast, child, &child_prefix);
-                }
-            }
-            Node::ModuleDef {
-                name,
-                methods,
-                method_visibilities,
-                includes,
-                body,
-                ..
-            } => {
-                if name.is_empty() {
-                    return;
-                }
-                let qualified = qualify(prefix, name);
-                self.ingest_override_class(&qualified, None, methods, method_visibilities, includes);
-                let child_prefix = split_qualified(&qualified);
-                for &child in body {
-                    self.collect_override_classes(ast, child, &child_prefix);
-                }
-            }
-            // Any other node: a nested class/module only appears as a DIRECT body
-            // statement of a class/module/program (mirroring the reference's
-            // `record_def_visibility`/qualification, which only qualifies through
-            // class/module bodies). We deliberately do NOT descend into method
-            // bodies / control flow — a def-nested class is out of slice-1 scope.
-            _ => {}
-        }
-    }
-
     /// Fold one (re)definition of a QUALIFIED override class into the index.
     fn ingest_override_class(
         &mut self,
@@ -1611,8 +1813,20 @@ impl SourceIndex {
 ///
 /// The same gates 2/3/4 (empty body / explicit return / branch tail) and the
 /// reopen-disagreement rule apply, tracked independently from the param-
-/// independent map. A method never appears in BOTH maps (its tail is either a
-/// concrete core class under the empty env, or param-rooted — never both).
+/// independent map.
+///
+/// ## Which map wins (the two are NOT mutually exclusive)
+///
+/// Per DEF SITE they are: one tail is either a concrete core class under the
+/// empty env or param-rooted, never both, because [`infer_one_param_bound`] is
+/// only consulted in the `else` arm below. Per `(class, method)` KEY they are
+/// NOT — a method REOPENED across files has two independent sites, each
+/// dispatched on its own, so `A#m` can land in both maps at once (issue #92 §8
+/// probed exactly that: `def m; "s"; end` in one file, `def m(x); x; end` in
+/// another). This is harmless because the call site consults `method_return`
+/// FIRST and `param_bound_return` only on a miss (documented at
+/// [`SourceIndex::param_bound_returns`]) — but do not lean on an exclusivity
+/// that does not hold. The doc claim here used to assert it did.
 // type_complexity: the two-map return shape is the real, documented output of this
 // pass (param-independent vs param-bound returns); a type alias would only hide it.
 #[allow(clippy::type_complexity)]
@@ -1785,6 +1999,81 @@ fn infer_one_param_bound(ast: &LoweredAst, mb: &MethodBody) -> Option<ParamBound
     }
 }
 
+/// ADR-35 slice 1: recursively collect the LEXICALLY-QUALIFIED override classes
+/// from `ast`, starting at `node` under the lexical `prefix` (the enclosing
+/// class/module name segments). A `ClassDef`/`ModuleDef` appends a
+/// [`HarvestedOverrideClass`] keyed by `prefix + name`, then recurses into its
+/// body with the extended prefix so a nested class/module is fully qualified.
+/// Other nodes recurse over their direct children only enough to reach nested
+/// class/module bodies (handled via the explicit body lists below).
+///
+/// Reads ONE file and accumulates nothing: the first-write-wins semantics for
+/// visibilities + superclass and the ordered append-with-dedup for includes are
+/// the MERGE's ([`SourceIndex::ingest_override_class`]), replaying `out` in file
+/// order. That is why `out` must stay in walk order.
+fn collect_override_classes(
+    ast: &LoweredAst,
+    node: NodeId,
+    prefix: &[String],
+    out: &mut Vec<HarvestedOverrideClass>,
+) {
+    match ast.get(node) {
+        Node::Program { body, .. } | Node::Statements { body, .. } => {
+            for &child in body {
+                collect_override_classes(ast, child, prefix, out);
+            }
+        }
+        Node::ClassDef {
+            name,
+            superclass_path,
+            methods,
+            method_visibilities,
+            includes,
+            body,
+            ..
+        } => {
+            if name.is_empty() {
+                return;
+            }
+            let qualified = qualify(prefix, name);
+            out.push(HarvestedOverrideClass {
+                qualified: qualified.clone(),
+                superclass: superclass_path.clone(),
+                methods: methods.to_vec(),
+                method_visibilities: method_visibilities.to_vec(),
+                includes: includes.to_vec(),
+            });
+            let child_prefix = split_qualified(&qualified);
+            for &child in body {
+                collect_override_classes(ast, child, &child_prefix, out);
+            }
+        }
+        Node::ModuleDef { name, methods, method_visibilities, includes, body, .. } => {
+            if name.is_empty() {
+                return;
+            }
+            let qualified = qualify(prefix, name);
+            out.push(HarvestedOverrideClass {
+                qualified: qualified.clone(),
+                superclass: None,
+                methods: methods.to_vec(),
+                method_visibilities: method_visibilities.to_vec(),
+                includes: includes.to_vec(),
+            });
+            let child_prefix = split_qualified(&qualified);
+            for &child in body {
+                collect_override_classes(ast, child, &child_prefix, out);
+            }
+        }
+        // Any other node: a nested class/module only appears as a DIRECT body
+        // statement of a class/module/program (mirroring the reference's
+        // `record_def_visibility`/qualification, which only qualifies through
+        // class/module bodies). We deliberately do NOT descend into method
+        // bodies / control flow — a def-nested class is out of slice-1 scope.
+        _ => {}
+    }
+}
+
 /// ADR-35 slice 1: join a lexical `prefix` and a (possibly already-namespaced)
 /// declaration `name` into a fully-qualified name. A `name` that is itself a
 /// path (`Foo::Bar` declared inside `Outer`) qualifies to `Outer::Foo::Bar`,
@@ -1897,24 +2186,31 @@ fn const_shape_key_of(node: &Node) -> Option<ShapeKey> {
     }
 }
 
-/// C5: recursively collect lexically-qualified `CONST = <literal>` writes from
-/// `ast` under lexical `prefix`. Each `ConstantWrite` records its QUALIFIED name
-/// (for the single-assignment gate) → `(defining namespace, harvested value)`;
-/// a second write to the same qualified name marks it multi (declined). Only
+/// C5a: recursively collect ONE FILE's lexically-qualified `CONST = <literal>`
+/// writes from `ast` under lexical `prefix`, in walk order. The first write of a
+/// qualified name appends `(qualified, defining namespace, harvested value,
+/// writes: 1)` to `out`; every repeat bumps that entry's `writes` (and never
+/// re-harvests the value — the FIRST write wins, as before). Only
 /// class/module/program BODIES are walked (a def-nested constant is out of
 /// scope), mirroring the C1 override / fold discovery inclusion rule.
+///
+/// `seen` maps a qualified name to its position in `out` — a per-file scratch
+/// map the caller owns so the recursion stays cheap.
+///
+/// The project-wide single-assignment gate is NOT here: [`SourceIndex::merge`]
+/// sums the counts across files (Σ ≥ 2 ⇒ declined) and takes the first file's
+/// value, which is exactly what one shared `first`/`multi` pair used to do.
 fn collect_literal_constants(
     ast: &LoweredAst,
     node: NodeId,
     prefix: &[String],
-    file: u64,
-    first: &mut HashMap<String, (Vec<String>, u64, Option<ConstLit>)>,
-    multi: &mut HashSet<String>,
+    out: &mut Vec<HarvestedConstWrite>,
+    seen: &mut HashMap<String, usize>,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                collect_literal_constants(ast, child, prefix, file, first, multi);
+                collect_literal_constants(ast, child, prefix, out, seen);
             }
         }
         Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
@@ -1923,17 +2219,21 @@ fn collect_literal_constants(
             }
             let child_prefix = split_qualified(&qualify(prefix, name));
             for &child in body {
-                collect_literal_constants(ast, child, &child_prefix, file, first, multi);
+                collect_literal_constants(ast, child, &child_prefix, out, seen);
             }
         }
         Node::ConstantWrite { name, value, .. } => {
             let qualified = qualify(prefix, name);
-            match first.entry(qualified) {
-                std::collections::hash_map::Entry::Occupied(e) => {
-                    multi.insert(e.key().clone());
-                }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert((prefix.to_vec(), file, const_lit_of(ast, *value)));
+            match seen.get(&qualified) {
+                Some(&at) => out[at].writes += 1,
+                None => {
+                    seen.insert(qualified.clone(), out.len());
+                    out.push(HarvestedConstWrite {
+                        qualified,
+                        namespace: prefix.to_vec(),
+                        lit: const_lit_of(ast, *value),
+                        writes: 1,
+                    });
                 }
             }
         }
@@ -2018,50 +2318,26 @@ fn scalar_truthy(s: &Scalar) -> bool {
     !matches!(s, Scalar::Nil | Scalar::Bool(false))
 }
 
-/// ADR-0038 — harvest every project instance + singleton `def` body by QUALIFIED
-/// owner name (the same lexical walk `collect_override_classes` uses, so
-/// `module Gitlab; module Database` keys `Gitlab::Database`), returning the
-/// per-`(owner, method, kind)` def sites (tail node + explicit-return flag,
-/// reopens accumulated) and the inverted `(method, kind) -> [owners]` definers
-/// index. Only DIRECT `def` children of a class/module body are harvested — a
-/// def nested in a conditional / inner method is out of scope, matching the
-/// tier-4b / override discovery inclusion rule.
-#[allow(clippy::type_complexity)]
-fn collect_fold_defs(
-    asts: &[&LoweredAst],
-) -> (
-    HashMap<(String, String, DefKind), Vec<FoldSite>>,
-    HashMap<(String, DefKind), Vec<String>>,
-) {
-    let mut defs: HashMap<(String, String, DefKind), Vec<FoldSite>> = HashMap::new();
-    for (ai, ast) in asts.iter().enumerate() {
-        walk_fold_defs(ai, ast, ast.root(), &[], &mut defs);
-    }
-    let mut definers: HashMap<(String, DefKind), Vec<String>> = HashMap::new();
-    for (owner, method, kind) in defs.keys() {
-        let owners = definers.entry((method.clone(), *kind)).or_default();
-        if !owners.contains(owner) {
-            owners.push(owner.clone());
-        }
-    }
-    (defs, definers)
-}
-
-/// Recursive helper for [`collect_fold_defs`]: at each `ClassDef`/`ModuleDef`,
-/// harvest its direct `def` children (instance via `name`, singleton via
-/// `singleton_name`) keyed by the qualified owner, then recurse into the body for
-/// nested classes/modules with the extended lexical prefix.
+/// ADR-0038 — harvest ONE FILE's project instance + singleton `def` bodies by
+/// QUALIFIED owner name (the same lexical walk `collect_override_classes` uses,
+/// so `module Gitlab; module Database` keys `Gitlab::Database`), appending each
+/// site (tail node + explicit-return flag) to `out` in walk order. Only DIRECT
+/// `def` children of a class/module body are harvested — a def nested in a
+/// conditional / inner method is out of scope, matching the tier-4b / override
+/// discovery inclusion rule.
+///
+/// `tail` is a [`NodeId`] in THIS file's AST; the merge pairs it with the file's
+/// slice position to form a [`FoldSite`].
 fn walk_fold_defs(
-    ast_idx: usize,
     ast: &LoweredAst,
     node: NodeId,
     prefix: &[String],
-    defs: &mut HashMap<(String, String, DefKind), Vec<FoldSite>>,
+    out: &mut Vec<HarvestedFoldDef>,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                walk_fold_defs(ast_idx, ast, child, prefix, defs);
+                walk_fold_defs(ast, child, prefix, out);
             }
         }
         Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
@@ -2085,24 +2361,43 @@ fn walk_fold_defs(
                     };
                     if let Some((method, kind)) = entry {
                         if let Some(&tail) = def_body.last() {
-                            defs.entry((qualified.clone(), method, kind)).or_default().push(
-                                FoldSite {
-                                    ast_idx,
-                                    tail,
-                                    has_explicit_return: *has_explicit_return,
-                                },
-                            );
+                            out.push(HarvestedFoldDef {
+                                owner: qualified.clone(),
+                                method,
+                                kind,
+                                tail,
+                                has_explicit_return: *has_explicit_return,
+                            });
                         }
                     }
                 }
             }
             let child_prefix = split_qualified(&qualified);
             for &child in body {
-                walk_fold_defs(ast_idx, ast, child, &child_prefix, defs);
+                walk_fold_defs(ast, child, &child_prefix, out);
             }
         }
         _ => {}
     }
+}
+
+/// ADR-0038 — invert the merged def sites into the `(method, kind) -> [qualified
+/// owners]` definers index that drives the overridable degrade and implicit-self
+/// resolution. Every read of the owner `Vec` is an `.any(…)` (`owner_defines`,
+/// `overridden_in_project`), so its order is not semantic — which is just as
+/// well: it comes from `HashMap` key iteration and is already unstable between
+/// processes on the same input (issue #92 §3.4).
+fn invert_definers(
+    defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
+) -> HashMap<(String, DefKind), Vec<String>> {
+    let mut definers: HashMap<(String, DefKind), Vec<String>> = HashMap::new();
+    for (owner, method, kind) in defs.keys() {
+        let owners = definers.entry((method.clone(), *kind)).or_default();
+        if !owners.contains(owner) {
+            owners.push(owner.clone());
+        }
+    }
+    definers
 }
 
 /// Whether a tail node is a branch/loop carrier whose type is not a single
@@ -3203,15 +3498,24 @@ mod tests {
 }
 
 // ===========================================================================
-// THROWAWAY PROBES — issue #92 (SourceIndex harvest/merge decomposition).
+// EQUIVALENCE HARNESS — issue #92 (SourceIndex harvest/merge decomposition).
 //
-// These are INVESTIGATION instruments, not a permanent test surface: they dump
-// a per-field fingerprint of a built `SourceIndex` so a permutation of the
-// `asts` slice, or the removal of one file, can be compared FIELD BY FIELD.
-// The findings are written up in
-// `docs/notes/20260825-s92-buildproject-pass-inventory.md`. Delete this module
-// when the harvest/merge slice lands (or promote the fingerprint into the
-// parity harness if it earns its keep there).
+// Promoted from the throwaway probe module the pass inventory
+// (`docs/notes/20260825-s92-buildproject-pass-inventory.md`) was written from.
+// It renders a per-FIELD fingerprint of a built `SourceIndex` — all 17 fields —
+// so two build paths, or two file orders, can be compared field by field.
+//
+// It carries three things now:
+//
+//   * `build_project_legacy` — the PRE-#92 body, verbatim, with its own copies
+//     of the three walkers. It is the oracle: `merge(harvests)` must fingerprint
+//     identically to it on every corpus below. Nothing but the tests calls it.
+//   * the five MINIMAL coupling/order examples from the probe, pinned as
+//     assertions (they are the cases a wrong merge order or a missing barrier
+//     would break, and the real-corpus sweep cannot contain them).
+//   * the original probes, kept because each one documents a live channel.
+//
+// `docs/notes/20260825-s92-harvest-merge-impl.md` is the impl write-up.
 // ===========================================================================
 #[cfg(test)]
 mod probes_s92 {
@@ -3246,6 +3550,13 @@ mod probes_s92 {
         out.push((
             "names",
             if sorted { sort_join(idx.names.clone()) } else { idx.names.join(" | ") },
+        ));
+        // `name_to_id` is the reverse half of the registry bijection. Rendered
+        // name-sorted with the ID INCLUDED, so it pins the id assignment itself
+        // in both modes (the 17th field; the probe module shipped 16).
+        out.push((
+            "name_to_id",
+            sort_join(idx.name_to_id.iter().map(|(n, i)| format!("{n}={i}")).collect()),
         ));
         out.push((
             "declaration_only_classes",
@@ -3406,8 +3717,11 @@ mod probes_s92 {
         perm: &[usize],
         core: &CoreIndex,
     ) -> Vec<(&'static str, String)> {
-        let refs: Vec<&LoweredAst> = perm.iter().map(|&i| &asts[i]).collect();
-        fingerprint(&SourceIndex::build_project(&refs, core), false)
+        fingerprint(&SourceIndex::build_project(&perm_refs(asts, perm), core), false)
+    }
+
+    fn perm_refs<'a>(asts: &'a [LoweredAst], perm: &[usize]) -> Vec<&'a LoweredAst> {
+        perm.iter().map(|&i| &asts[i]).collect()
     }
 
     fn diff(
@@ -3422,41 +3736,43 @@ mod probes_s92 {
     }
 
     /// PROBE 1 — permutation sensitivity, field by field. Prints every field
-    /// whose built value depends on the ORDER of the `asts` slice.
+    /// whose built value depends on the ORDER of the `asts` slice, and PINS the
+    /// finding: file order may move only the registry ids and the override
+    /// index. Anything else moving means the merge acquired an order dependence
+    /// the passes never had.
     #[test]
     fn probe_permutation_field_diff() {
         let core = CoreIndex::new();
-        let srcs: Vec<&[u8]> = vec![
-            // f0: Base#m public + a toplevel def + constants (one nested, so
-            // the bare name `K` gets a MULTI-entry `literal_constants` vector).
-            b"class Base\n  def m\n    1\n  end\nend\nmodule M1\n  def shared\n    1\n  end\nend\nTOPC = 1\ndef tl_a; 1; end\nmodule N1\n  K = 1\n  class Time\n  end\nend\n",
-            // f1: Base#m private (visibility CONFLICT with f0) + include M1.
-            b"class Base\n  include M1\n  private\n  def m\n    2\n  end\nend\n",
-            // f2: Base includes M2 (include ORDER conflict with f1) + Sub.
-            b"module M2\n  private\n  def shared\n    2\n  end\nend\nclass Base\n  include M2\nend\nclass Sub < Base\n  private\n  def shared\n    3\n  end\nend\n",
-            // f3: unrelated content that still registers names + constants,
-            // plus the NESTED shapes that populate the Vec-valued maps.
-            b"class Other\n  def name\n    \"x\"\n  end\nend\nOTHERC = [1, 2].freeze\nPathname.new(\"/\")\nmodule N2\n  K = 2\n  class Time\n  end\nend\n",
-        ];
+        let srcs = probe1_sources();
         let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
         let base = build_perm(&asts, &[0, 1, 2, 3], &core);
         let perms: [[usize; 4]; 5] =
             [[1, 0, 2, 3], [3, 2, 1, 0], [2, 3, 0, 1], [0, 2, 1, 3], [3, 0, 1, 2]];
-        let mut any = false;
         for p in perms {
             let other = build_perm(&asts, &p, &core);
             let d = diff(&base, &other);
             if !d.is_empty() {
-                any = true;
                 println!("--- permutation {p:?}: {} field(s) differ", d.len());
-                for (field, x, y) in d {
+                for (field, x, y) in &d {
                     println!("  [{field}]\n    base : {x}\n    perm : {y}");
                 }
             } else {
                 println!("--- permutation {p:?}: identical");
             }
+            // The CANONICAL content: only the two order-bearing fields may move.
+            // (`names` sorted is the same SET; it is `name_to_id` that carries
+            // the assignment.)
+            let canonical = diff(
+                &fingerprint(&SourceIndex::build_project(&perm_refs(&asts, &[0, 1, 2, 3]), &core), true),
+                &fingerprint(&SourceIndex::build_project(&perm_refs(&asts, &p), &core), true),
+            );
+            for (field, _, _) in canonical {
+                assert!(
+                    matches!(field, "name_to_id" | "override_classes"),
+                    "permutation {p:?} moved `{field}`, which is not order-bearing"
+                );
+            }
         }
-        println!("PROBE 1 order-sensitive fields observed: {any}");
     }
 
     /// PROBE 2 — incremental equality: build over ALL files vs ALL-BUT-ONE, and
@@ -3513,46 +3829,12 @@ mod probes_s92 {
         }
     }
 
-    /// PROBE 4 — the MINIMAL 2-file demonstration that Pass 3 (`method_returns`)
-    /// reads state produced by an EARLIER pass over ALL files. File `a` alone
-    /// records `A#m -> Integer` because C5 harvested `MAX = 5`; adding a second
-    /// file that ALSO assigns `MAX` trips the single-assignment gate, the
-    /// harvest is dropped, the tail types Dynamic, and `A#m` disappears — with
-    /// file `a` byte-identical in both builds.
-    #[test]
-    fn probe_pass3_depends_on_pass_c5_over_all_files() {
-        let core = CoreIndex::new();
-        // The constant must be TOPLEVEL: Pass 3 types the tail with a
-        // `Typer::with_source` that has NO lexical scopes attached, so the use
-        // site's prefix is empty and only a `ns == []` harvest is visible.
-        let a = lower(&parse(b"MAX = 5\nclass A\n  def m\n    MAX\n  end\nend\n"));
-        let b = lower(&parse(b"MAX = 6\n"));
-        let alone = SourceIndex::build_project(&[&a], &core);
-        let both = SourceIndex::build_project(&[&a, &b], &core);
-        println!("a alone : A#m -> {:?}", alone.method_return("A", "m"));
-        println!("a + b   : A#m -> {:?}", both.method_return("A", "m"));
-        println!("a alone : literal_constants[MAX] = {:?}", alone.literal_constants.get("MAX"));
-        println!("a + b   : literal_constants[MAX] = {:?}", both.literal_constants.get("MAX"));
-    }
-
-    /// PROBE 5 — the MINIMAL 2-file demonstration of the Pass-4 overridable
-    /// degrade: `Base.m`'s folded literal exists alone and VANISHES once a
-    /// second file declares a subclass that redefines `m`.
-    #[test]
-    fn probe_pass4_degrade_is_cross_file() {
-        let core = CoreIndex::new();
-        let a = lower(&parse(b"class Base\n  def m\n    1\n  end\nend\n"));
-        let b = lower(&parse(b"class Sub < Base\n  def m\n    2\n  end\nend\n"));
-        let key = ("Base".to_string(), "m".to_string(), DefKind::Instance);
-        println!(
-            "a alone : literal_returns[Base.m] = {:?}",
-            SourceIndex::build_project(&[&a], &core).literal_returns.get(&key)
-        );
-        println!(
-            "a + b   : literal_returns[Base.m] = {:?}",
-            SourceIndex::build_project(&[&a, &b], &core).literal_returns.get(&key)
-        );
-    }
+    // PROBES 4, 5 and 8 were PRINTING probes of the Pass-3 / Pass-4b / both-maps
+    // couplings. They are promoted, above, into the asserting tests
+    // `coupling_pass3_reads_the_merged_constant_table`,
+    // `coupling_pass4b_degrade_is_cross_file` and
+    // `method_can_appear_in_both_return_maps` — same inputs, same finding, now a
+    // gate instead of a printout.
 
     /// PROBE 6 — cross-PROCESS instability of the Vec-valued maps. Prints the
     /// built order of `definers` / `literal_constants` /
@@ -3614,22 +3896,769 @@ mod probes_s92 {
 
         let (ida, idb, sab) = render(&SourceIndex::build_project(&[&a, &b], &core));
         println!("order [a,b]: Alpha={ida} Beta={idb} union renders as {sab:?}");
+        assert!(ida < idb, "ids are handed out in file order");
+        assert_eq!(sab, "Alpha | Beta");
         let (ida, idb, sba) = render(&SourceIndex::build_project(&[&b, &a], &core));
         println!("order [b,a]: Alpha={ida} Beta={idb} union renders as {sba:?}");
-        println!("same rendering: {}", sab == sba);
+        assert!(ida > idb);
+        assert_eq!(
+            sba, "Beta | Alpha",
+            "the ClassId channel is LIVE: the merge closes it by assigning ids in \
+             file order, not by the rendering being order-free"
+        );
     }
 
-    /// PROBE 8 — checks `infer_method_returns`'s doc claim that "a method never
-    /// appears in BOTH maps" (`source_index.rs:1613-1615`). The claim holds for
-    /// ONE def site (a tail is either concrete-core or param-rooted), but a
-    /// CROSS-FILE reopen has two independent sites.
+    /// PROBE 8 — `infer_method_returns`'s old doc claim that "a method never
+    /// appears in BOTH maps" is FALSE per `(class, method)` KEY: a CROSS-FILE
+    /// reopen has two independent def sites, each dispatched on its own. Pinned
+    /// as an assertion because the corrected doc now states the truth, and the
+    /// merge must not re-acquire the old assumption.
     #[test]
-    fn probe_method_can_appear_in_both_return_maps() {
+    fn method_can_appear_in_both_return_maps() {
         let core = CoreIndex::new();
         let a = lower(&parse(b"class A\n  def m\n    \"s\"\n  end\nend\n"));
         let b = lower(&parse(b"class A\n  def m(x)\n    x\n  end\nend\n"));
         let idx = SourceIndex::build_project(&[&a, &b], &core);
-        println!("method_returns[A#m]      = {:?}", idx.method_return("A", "m"));
-        println!("param_bound_returns[A#m] = {:?}", idx.param_bound_return("A", "m"));
+        assert_eq!(idx.method_return("A", "m"), Some("String"));
+        assert_eq!(
+            idx.param_bound_return("A", "m"),
+            Some(&ParamBoundReturn { param_index: 0, chain: Vec::new() }),
+            "a cross-file reopen lands in BOTH maps — the call site's \
+             method_return-first precedence is what makes that harmless"
+        );
+    }
+
+    // =======================================================================
+    // The PRE-#92 build path, kept alive as the equivalence oracle.
+    // =======================================================================
+
+    /// `build_project` exactly as it stood before the harvest/merge split, with
+    /// its own copies of the three per-file walkers so the comparison is against
+    /// independent code and not a rename. The shared fold primitives
+    /// (`add_source`, `ingest_override_class`, `infer_method_returns`,
+    /// `compute_literal_returns`) are deliberately the production ones — this
+    /// oracle exists to pin the ORCHESTRATION (pass order, barrier placement,
+    /// replay order), which is what the decomposition actually moved.
+    fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
+        let mut idx = SourceIndex::default();
+
+        // Pass 1.
+        for ast in asts {
+            for (_, node) in ast.iter() {
+                match node {
+                    Node::ClassDef { name, superclass, methods, .. } => {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        idx.add_source(name, superclass.clone(), methods);
+                    }
+                    Node::ModuleDef { name, methods, .. } => {
+                        if name.is_empty() {
+                            continue;
+                        }
+                        idx.add_source(name, None, methods);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Pass 1b.
+        for ast in asts {
+            legacy_collect_override_classes(&mut idx, ast, ast.root(), &[]);
+        }
+
+        // C1.
+        let qualified_defs: Vec<String> = idx.override_classes.keys().cloned().collect();
+        for qualified in &qualified_defs {
+            let segs: Vec<&str> = qualified.split("::").collect();
+            let Some((name, ns)) = segs.split_last() else { continue };
+            if ns.is_empty() {
+                idx.toplevel_constants.insert((*name).to_string());
+            } else {
+                let ns_vec: Vec<String> = ns.iter().map(|s| (*s).to_string()).collect();
+                let entry = idx.nested_constant_namespaces.entry((*name).to_string()).or_default();
+                if !entry.contains(&ns_vec) {
+                    entry.push(ns_vec);
+                }
+            }
+        }
+
+        // Pass 1c.
+        for ast in asts {
+            let scope_spans: Vec<rigor_parse::Span> = ast
+                .iter()
+                .filter_map(|(_, n)| match n {
+                    Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => Some(*span),
+                    _ => None,
+                })
+                .collect();
+            for (_, node) in ast.iter() {
+                match node {
+                    Node::Definition { name: Some(nm), span, .. }
+                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
+                    {
+                        idx.toplevel_defs.insert(nm.clone());
+                    }
+                    Node::Definition { receiver_def_name: Some(nm), span, .. }
+                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
+                    {
+                        idx.toplevel_defs.insert(nm.clone());
+                    }
+                    Node::ClassDef { name, methods, .. } | Node::ModuleDef { name, methods, .. }
+                        if matches!(name.as_str(), "Object" | "Kernel" | "BasicObject") =>
+                    {
+                        idx.toplevel_defs.extend(methods.iter().cloned());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Pass 1d.
+        for ast in asts {
+            let scopes = lexical_scopes(ast);
+            for (_, node) in ast.iter() {
+                let Node::Definition { name: Some(nm), span, .. } = node else {
+                    continue;
+                };
+                let innermost = scopes
+                    .iter()
+                    .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
+                    .min_by_key(|(s, _)| s.1 - s.0);
+                if let Some((_, segs)) = innermost {
+                    idx.discovered_methods
+                        .entry(segs.join("::"))
+                        .or_default()
+                        .insert(nm.clone());
+                }
+            }
+        }
+
+        // Pass 1e.
+        for ast in asts {
+            for (_, node) in ast.iter() {
+                let Node::Definition { params: Some(names), span, .. } = node else {
+                    continue;
+                };
+                if names.is_empty() {
+                    continue;
+                }
+                for (_, inner) in ast.iter() {
+                    let Node::Call { receiver: Some(r), method, span: cspan, .. } = inner else {
+                        continue;
+                    };
+                    if !(span.0 <= cspan.0 && cspan.1 <= span.1) {
+                        continue;
+                    }
+                    if !crate::MUTATOR_METHODS.contains(&method.as_str()) {
+                        continue;
+                    }
+                    let Node::LocalVariableRead { name: recv_name, .. } = ast.get(*r) else {
+                        continue;
+                    };
+                    if let Some(i) = names.iter().position(|p| p == recv_name) {
+                        for key in def_names(node) {
+                            idx.mutated_params.entry(key).or_default().insert(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        // C5.
+        let mut lit_first: HashMap<String, (Vec<String>, u64, Option<ConstLit>)> = HashMap::new();
+        let mut lit_multi: HashSet<String> = HashSet::new();
+        for ast in asts {
+            legacy_collect_literal_constants(
+                ast,
+                ast.root(),
+                &[],
+                ast.file_id(),
+                &mut lit_first,
+                &mut lit_multi,
+            );
+        }
+        for qualified in lit_first.keys() {
+            let bare = qualified.rsplit("::").next().unwrap_or(qualified).to_string();
+            idx.project_constant_write_names.insert(bare);
+        }
+        for (qualified, (namespace, file, lit)) in lit_first {
+            if lit_multi.contains(&qualified) {
+                continue;
+            }
+            let bare = qualified.rsplit("::").next().unwrap_or(&qualified).to_string();
+            if idx.override_classes.contains_key(&qualified) || idx.classes.contains_key(&bare) {
+                continue;
+            }
+            if let Some(l) = lit {
+                idx.qualified_literal_constants
+                    .insert(qualified, (namespace.clone(), file, l.clone()));
+                idx.literal_constants.entry(bare).or_default().push((namespace, file, l));
+            }
+        }
+
+        // Pass 2.
+        for ast in asts {
+            for (_, node) in ast.iter() {
+                if let Node::ConstantRead { name, .. } = node {
+                    if !name.is_empty()
+                        && !idx.classes.contains_key(name)
+                        && (core.knows_class(name) || core.knows_qualified_class(name))
+                    {
+                        idx.register(name);
+                    }
+                }
+            }
+        }
+
+        // Pass 2b.
+        for name in core.tuple_return_class_names() {
+            if !idx.classes.contains_key(name)
+                && (core.knows_class(name) || core.knows_qualified_class(name))
+            {
+                if !idx.name_to_id.contains_key(name) {
+                    idx.declaration_only_classes.insert(name.to_string());
+                }
+                idx.register(name);
+            }
+        }
+
+        // Pass 3.
+        let (returns, param_bound) = infer_method_returns(&idx, core, asts);
+        idx.method_returns = returns;
+        idx.param_bound_returns = param_bound;
+
+        // Pass 4.
+        let (defs, definers) = legacy_collect_fold_defs(asts);
+        idx.definers = definers;
+        idx.literal_returns = idx.compute_literal_returns(asts, &defs);
+
+        idx
+    }
+
+    fn legacy_collect_override_classes(
+        idx: &mut SourceIndex,
+        ast: &LoweredAst,
+        node: NodeId,
+        prefix: &[String],
+    ) {
+        match ast.get(node) {
+            Node::Program { body, .. } | Node::Statements { body, .. } => {
+                for &child in body {
+                    legacy_collect_override_classes(idx, ast, child, prefix);
+                }
+            }
+            Node::ClassDef {
+                name,
+                superclass_path,
+                methods,
+                method_visibilities,
+                includes,
+                body,
+                ..
+            } => {
+                if name.is_empty() {
+                    return;
+                }
+                let qualified = qualify(prefix, name);
+                idx.ingest_override_class(
+                    &qualified,
+                    superclass_path.clone(),
+                    methods,
+                    method_visibilities,
+                    includes,
+                );
+                let child_prefix = split_qualified(&qualified);
+                for &child in body {
+                    legacy_collect_override_classes(idx, ast, child, &child_prefix);
+                }
+            }
+            Node::ModuleDef { name, methods, method_visibilities, includes, body, .. } => {
+                if name.is_empty() {
+                    return;
+                }
+                let qualified = qualify(prefix, name);
+                idx.ingest_override_class(&qualified, None, methods, method_visibilities, includes);
+                let child_prefix = split_qualified(&qualified);
+                for &child in body {
+                    legacy_collect_override_classes(idx, ast, child, &child_prefix);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn legacy_collect_literal_constants(
+        ast: &LoweredAst,
+        node: NodeId,
+        prefix: &[String],
+        file: u64,
+        first: &mut HashMap<String, (Vec<String>, u64, Option<ConstLit>)>,
+        multi: &mut HashSet<String>,
+    ) {
+        match ast.get(node) {
+            Node::Program { body, .. } | Node::Statements { body, .. } => {
+                for &child in body {
+                    legacy_collect_literal_constants(ast, child, prefix, file, first, multi);
+                }
+            }
+            Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+                if name.is_empty() {
+                    return;
+                }
+                let child_prefix = split_qualified(&qualify(prefix, name));
+                for &child in body {
+                    legacy_collect_literal_constants(ast, child, &child_prefix, file, first, multi);
+                }
+            }
+            Node::ConstantWrite { name, value, .. } => {
+                let qualified = qualify(prefix, name);
+                match first.entry(qualified) {
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        multi.insert(e.key().clone());
+                    }
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert((prefix.to_vec(), file, const_lit_of(ast, *value)));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn legacy_collect_fold_defs(
+        asts: &[&LoweredAst],
+    ) -> (
+        HashMap<(String, String, DefKind), Vec<FoldSite>>,
+        HashMap<(String, DefKind), Vec<String>>,
+    ) {
+        let mut defs: HashMap<(String, String, DefKind), Vec<FoldSite>> = HashMap::new();
+        for (ai, ast) in asts.iter().enumerate() {
+            legacy_walk_fold_defs(ai, ast, ast.root(), &[], &mut defs);
+        }
+        let mut definers: HashMap<(String, DefKind), Vec<String>> = HashMap::new();
+        for (owner, method, kind) in defs.keys() {
+            let owners = definers.entry((method.clone(), *kind)).or_default();
+            if !owners.contains(owner) {
+                owners.push(owner.clone());
+            }
+        }
+        (defs, definers)
+    }
+
+    fn legacy_walk_fold_defs(
+        ast_idx: usize,
+        ast: &LoweredAst,
+        node: NodeId,
+        prefix: &[String],
+        defs: &mut HashMap<(String, String, DefKind), Vec<FoldSite>>,
+    ) {
+        match ast.get(node) {
+            Node::Program { body, .. } | Node::Statements { body, .. } => {
+                for &child in body {
+                    legacy_walk_fold_defs(ast_idx, ast, child, prefix, defs);
+                }
+            }
+            Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+                if name.is_empty() {
+                    return;
+                }
+                let qualified = qualify(prefix, name);
+                for &child in body {
+                    if let Node::Definition {
+                        name,
+                        singleton_name,
+                        body: def_body,
+                        has_explicit_return,
+                        ..
+                    } = ast.get(child)
+                    {
+                        let entry = match (name, singleton_name) {
+                            (Some(m), _) => Some((m.clone(), DefKind::Instance)),
+                            (None, Some(m)) => Some((m.clone(), DefKind::Singleton)),
+                            _ => None,
+                        };
+                        if let Some((method, kind)) = entry {
+                            if let Some(&tail) = def_body.last() {
+                                defs.entry((qualified.clone(), method, kind)).or_default().push(
+                                    FoldSite {
+                                        ast_idx,
+                                        tail,
+                                        has_explicit_return: *has_explicit_return,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                let child_prefix = split_qualified(&qualified);
+                for &child in body {
+                    legacy_walk_fold_defs(ast_idx, ast, child, &child_prefix, defs);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // =======================================================================
+    // INVARIANT 7 — merge(harvests) ≡ the legacy inline path, field by field.
+    // =======================================================================
+
+    /// The fields whose ORDER is a function of the input (and therefore MUST
+    /// match exactly): the registry bijection and the override index. The
+    /// remaining `Vec`-valued fields (`definers`, `literal_constants`,
+    /// `nested_constant_namespaces`) come out of `HashMap` iteration and are
+    /// already unstable between processes on identical input (§3.4) — comparing
+    /// them ordered would pin noise, so they are compared CANONICALISED, which
+    /// is the whole content either way.
+    const ORDER_BEARING: [&str; 3] = ["names", "name_to_id", "override_classes"];
+
+    /// Assert `SourceIndex::build_project` (harvest + merge) and the pre-#92
+    /// inline path agree on every field: canonicalised for content, and
+    /// order-exact for the order-bearing fields.
+    fn assert_paths_agree(asts: &[&LoweredAst], core: &CoreIndex, label: &str) {
+        let new_idx = SourceIndex::build_project(asts, core);
+        let old_idx = build_project_legacy(asts, core);
+
+        let (fresh, legacy) = (fingerprint(&new_idx, true), fingerprint(&old_idx, true));
+        assert_eq!(fresh.len(), 17, "the fingerprint must cover every field");
+        if let Some((field, x, y)) = diff(&fresh, &legacy).into_iter().next() {
+            panic!("[{label}] canonical field `{field}` diverged\n  merge  : {x}\n  legacy : {y}");
+        }
+        let (fresh, legacy) = (fingerprint(&new_idx, false), fingerprint(&old_idx, false));
+        let ordered =
+            diff(&fresh, &legacy).into_iter().find(|(field, _, _)| ORDER_BEARING.contains(field));
+        if let Some((field, x, y)) = ordered {
+            panic!("[{label}] ORDER of `{field}` diverged\n  merge  : {x}\n  legacy : {y}");
+        }
+    }
+
+    /// Every corpus this module builds, under every permutation the probes use:
+    /// the merge must reproduce the legacy path bit for bit.
+    #[test]
+    fn merge_equals_legacy_build_project() {
+        let core = CoreIndex::new();
+        let corpora: Vec<(&str, Vec<&[u8]>)> = vec![
+            ("order-conflicts", probe1_sources()),
+            (
+                "drop-one",
+                vec![
+                    b"class Base\n  def m\n    1\n  end\nend\nSHARED = 1\nmodule Wrap\n  DUP = 1\nend\n",
+                    b"class Base\n  private\n  def m\n    2\n  end\nend\nmodule Wrap\n  DUP = 2\nend\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\nSOLO = 7\n",
+                    b"class Solo\n  def q\n    1\n  end\nend\n",
+                ],
+            ),
+            (
+                "singleton-union",
+                vec![
+                    b"class A\n  def x\n    \"s\"\n  end\nend\nC1 = 1\n",
+                    b"class B < A\n  def y\n    A.new\n  end\nend\nC1 = 2\nC2 = 3\n",
+                    b"class C\n  def z\n    C2\n  end\nend\n",
+                ],
+            ),
+            (
+                "cross-file-couplings",
+                vec![
+                    b"MAX = 5\nclass A\n  def m\n    MAX\n  end\nend\n",
+                    b"MAX = 6\n",
+                    b"class Base\n  def m\n    1\n  end\nend\n",
+                    b"class Sub < Base\n  def m\n    2\n  end\nend\n",
+                    b"pid, status = Process.wait2\nputs pid\nstatus.nosuchthing\n",
+                ],
+            ),
+            (
+                "intra-file-duplicate-writes",
+                vec![
+                    b"DUP = 1\nDUP = 2\nSOLO = 3\nmodule N\n  INNER = 4\nend\n",
+                    b"OTHER = [1, 2].freeze\nPathname.new(\"/\")\n",
+                ],
+            ),
+            (
+                "toplevel-and-mutation",
+                vec![
+                    b"def tl_a; 1; end\nclass Object\n  def injected; 2; end\nend\ndef fill(a)\n  a << 1\nend\n",
+                    b"def IO.console_size; 1; end\nmodule Kernel\n  def kern; 3; end\nend\n",
+                ],
+            ),
+        ];
+        for (label, srcs) in corpora {
+            let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+            let refs: Vec<&LoweredAst> = asts.iter().collect();
+            assert_paths_agree(&refs, &core, label);
+            // Reverse order too: the ordered replay must track the caller's
+            // order in BOTH directions, not just the one that happens to be
+            // insertion-order-friendly.
+            let rev: Vec<&LoweredAst> = asts.iter().rev().collect();
+            assert_paths_agree(&rev, &core, &format!("{label} (reversed)"));
+        }
+    }
+
+    /// The same equivalence under the probe's five permutations of the
+    /// order-conflicting corpus — the shape where file order actually moves a
+    /// diagnostic, so the shape a mis-ordered merge would break first.
+    #[test]
+    fn merge_equals_legacy_under_every_permutation() {
+        let core = CoreIndex::new();
+        let srcs = probe1_sources();
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        for p in [[0, 1, 2, 3], [1, 0, 2, 3], [3, 2, 1, 0], [2, 3, 0, 1], [0, 2, 1, 3], [3, 0, 1, 2]]
+        {
+            let refs: Vec<&LoweredAst> = p.iter().map(|&i| &asts[i]).collect();
+            assert_paths_agree(&refs, &core, &format!("perm {p:?}"));
+        }
+    }
+
+    /// The single-file entry point (`SourceIndex::build`) goes through the same
+    /// wrapper — every single-file tool (`sig-gen`, `annotate`, `type_of`)
+    /// depends on it.
+    #[test]
+    fn merge_equals_legacy_for_a_single_file() {
+        let core = CoreIndex::new();
+        let ast = lower(&parse(
+            b"module N\n  K = 1\n  class Time\n  end\n  class Foo < Bar\n    include M1\n    private\n    def m; 2; end\n  end\nend\ndef tl; 1; end\n",
+        ));
+        assert_paths_agree(&[&ast], &core, "single file");
+        let built = SourceIndex::build(&ast, &core);
+        let wrapped = SourceIndex::build_project(&[&ast], &core);
+        assert_eq!(fingerprint(&built, true), fingerprint(&wrapped, true));
+    }
+
+    /// `merge` over an EMPTY file list must still produce the Pass-2b registry
+    /// (the declaration-only classes are core-driven, not source-driven).
+    #[test]
+    fn merge_of_no_files_still_runs_the_barrier_passes() {
+        let core = CoreIndex::new();
+        assert_paths_agree(&[], &core, "empty");
+        let idx = SourceIndex::merge(&[], &core);
+        assert!(idx.is_declaration_only_class("Process::Status"));
+    }
+
+    // =======================================================================
+    // INVARIANTS 1-6 — the five minimal coupling examples, plus the three
+    // semantics the merge is built on top of.
+    // =======================================================================
+
+    /// INVARIANT 1, example 1 (probe §3.2 i) — `method_visibilities` is
+    /// FIRST-WRITE-WINS, so file order decides whether
+    /// `def.override-visibility-reduced` fires. `a,b` records `m` public on
+    /// `Base` (⇒ `Sub#m` private reduces it ⇒ fires); `b,a` records it private
+    /// (⇒ silent). The diagnostic-level twin lives in rigor-rules
+    /// (`override_vis_project_order_is_normative`).
+    #[test]
+    fn order_leak_visibility_first_write_wins() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"class Base\n  def m\n    1\n  end\nend\n"));
+        let b = lower(&parse(
+            b"class Base\n  private\n  def m\n    2\n  end\nend\n\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\n",
+        ));
+        let vis = |idx: &SourceIndex| {
+            idx.override_classes.get("Base").and_then(|c| c.method_visibilities.get("m")).copied()
+        };
+        assert_eq!(vis(&SourceIndex::build_project(&[&a, &b], &core)), Some(Visibility::Public));
+        assert_eq!(vis(&SourceIndex::build_project(&[&b, &a], &core)), Some(Visibility::Private));
+        // …and the walk that reads it flips with them.
+        let ab = SourceIndex::build_project(&[&a, &b], &core);
+        let ba = SourceIndex::build_project(&[&b, &a], &core);
+        assert_eq!(
+            ab.nearest_ancestor_defining("Sub", "m"),
+            Some(("Base".to_string(), Some(Visibility::Public)))
+        );
+        assert_eq!(
+            ba.nearest_ancestor_defining("Sub", "m"),
+            Some(("Base".to_string(), Some(Visibility::Private)))
+        );
+    }
+
+    /// INVARIANT 1, example 2 (probe §3.2 ii) — `includes` accumulate in FILE
+    /// order and `override_ancestor_names` walks them in that order, so the
+    /// MRO's nearest defining ancestor flips with the file order. Idiomatic
+    /// Ruby: one class reopened in two files, each adding an `include`.
+    #[test]
+    fn order_leak_includes_accumulation_order() {
+        let core = CoreIndex::new();
+        let mods = lower(&parse(
+            b"module M1\n  def m; 1; end\nend\nmodule M2\n  private\n  def m; 2; end\nend\n",
+        ));
+        let a = lower(&parse(b"class Foo\n  include M1\nend\n"));
+        let b = lower(&parse(b"class Foo\n  include M2\n  private\n  def m; 3; end\nend\n"));
+        let incs = |idx: &SourceIndex| {
+            idx.override_classes.get("Foo").map(|c| c.includes.clone()).unwrap_or_default()
+        };
+        let ab = SourceIndex::build_project(&[&mods, &a, &b], &core);
+        let ba = SourceIndex::build_project(&[&mods, &b, &a], &core);
+        assert_eq!(incs(&ab), vec!["M1".to_string(), "M2".to_string()]);
+        assert_eq!(incs(&ba), vec!["M2".to_string(), "M1".to_string()]);
+        // `Foo` defines `m` itself, so the ancestor walk starts at the includes:
+        // M1 first ⇒ the public definer is found ⇒ the rule fires; M2 first ⇒ a
+        // private definer ⇒ silent.
+        assert_eq!(
+            ab.nearest_ancestor_defining("Foo", "m"),
+            Some(("M1".to_string(), Some(Visibility::Public)))
+        );
+        assert_eq!(
+            ba.nearest_ancestor_defining("Foo", "m"),
+            Some(("M2".to_string(), Some(Visibility::Private)))
+        );
+    }
+
+    /// INVARIANT 2, example 3 (probe §2.2) — Pass 3 is typed against the
+    /// COMPLETE index, so a second file's constant write can delete a tier-4b
+    /// return for a byte-identical first file. The merge must keep Pass 3 after
+    /// the C5 barrier or this silently re-appears as an over-emission.
+    #[test]
+    fn coupling_pass3_reads_the_merged_constant_table() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"MAX = 5\nclass A\n  def m\n    MAX\n  end\nend\n"));
+        let b = lower(&parse(b"MAX = 6\n"));
+        assert_eq!(SourceIndex::build_project(&[&a], &core).method_return("A", "m"), Some("Integer"));
+        assert_eq!(SourceIndex::build_project(&[&a, &b], &core).method_return("A", "m"), None);
+    }
+
+    /// INVARIANT 2, example 4 (probe §2.2) — the Pass-4b overridable degrade is
+    /// cross-file: `Base.m`'s folded literal exists alone and VANISHES once a
+    /// second file declares a related subclass that redefines `m`.
+    #[test]
+    fn coupling_pass4b_degrade_is_cross_file() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"class Base\n  def m\n    1\n  end\nend\n"));
+        let b = lower(&parse(b"class Sub < Base\n  def m\n    2\n  end\nend\n"));
+        let key = ("Base".to_string(), "m".to_string(), DefKind::Instance);
+        assert_eq!(
+            SourceIndex::build_project(&[&a], &core).literal_returns.get(&key),
+            Some(&Scalar::Int(1))
+        );
+        assert_eq!(SourceIndex::build_project(&[&a, &b], &core).literal_returns.get(&key), None);
+    }
+
+    /// INVARIANT 2, example 5 (probe §2.2) — Pass 2b's declaration-only set asks
+    /// "did NO analyzed file name this class?", which is unanswerable per file.
+    /// `Process::Status` is declaration-only until some file names it.
+    #[test]
+    fn coupling_pass2b_declaration_only_is_cross_file() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"pid, status = Process.wait2\nputs pid\nstatus.nosuchthing\n"));
+        let b = lower(&parse(b"KLASS = Process::Status\nputs KLASS\n"));
+        assert!(SourceIndex::build_project(&[&a], &core)
+            .is_declaration_only_class("Process::Status"));
+        assert!(!SourceIndex::build_project(&[&a, &b], &core)
+            .is_declaration_only_class("Process::Status"));
+    }
+
+    /// INVARIANT 3 — the constant single-assignment gate counts INTRA-file
+    /// duplicates too, which is why `Harvest` carries a per-file write COUNT and
+    /// not a "was written" bool. All three shapes must decline identically:
+    /// twice in one file, once each in two files, twice in one of two files.
+    #[test]
+    fn constant_single_assignment_counts_intra_file_duplicates() {
+        let core = CoreIndex::new();
+        let twice_here = lower(&parse(b"DUP = 1\nDUP = 2\nSOLO = 9\n"));
+        let once_here = lower(&parse(b"DUP = 1\nSOLO = 9\n"));
+        let once_there = lower(&parse(b"DUP = 2\n"));
+        let solo = lower(&parse(b"UNRELATED = 3\n"));
+
+        let harvested = |idx: &SourceIndex, name: &str| idx.literal_constants.contains_key(name);
+        // Twice in ONE file ⇒ declined; the single write beside it survives.
+        let one = SourceIndex::build_project(&[&twice_here], &core);
+        assert!(!harvested(&one, "DUP"));
+        assert!(harvested(&one, "SOLO"));
+        // Once in each of two files ⇒ declined.
+        let split = SourceIndex::build_project(&[&once_here, &once_there], &core);
+        assert!(!harvested(&split, "DUP"));
+        // Twice in one of two files ⇒ still declined.
+        let mixed = SourceIndex::build_project(&[&twice_here, &solo], &core);
+        assert!(!harvested(&mixed, "DUP"));
+        // …and a lone write in a two-file project still harvests.
+        assert!(harvested(&SourceIndex::build_project(&[&once_here, &solo], &core), "DUP"));
+    }
+
+    /// INVARIANT 4 — `register` is idempotent. The Pass-2 pre-filter drops
+    /// today's `!classes.contains_key(name)` term and the harvest deduplicates
+    /// repeated reads; both are no-ops ONLY because a repeat `register` neither
+    /// appends a name nor moves an id.
+    #[test]
+    fn register_is_idempotent() {
+        let mut idx = SourceIndex::default();
+        idx.register("Alpha");
+        idx.register("Beta");
+        let (names, ids) = (idx.names.clone(), idx.name_to_id.clone());
+        for _ in 0..3 {
+            idx.register("Alpha");
+            idx.register("Beta");
+        }
+        assert_eq!(idx.names, names);
+        assert_eq!(idx.name_to_id, ids);
+        // The same fact end to end: a file that reads `Time` fifty times
+        // registers it exactly once, at the same id as reading it once.
+        let core = CoreIndex::new();
+        let once = lower(&parse(b"Time\n"));
+        let many = lower(&parse(b"Time\nTime\nTime\nTime\n"));
+        assert_eq!(
+            SourceIndex::build_project(&[&once], &core).names,
+            SourceIndex::build_project(&[&many], &core).names
+        );
+    }
+
+    /// INVARIANT 5 — `HarvestedConst`'s file id keeps its PER-FILE consumption
+    /// semantics: the stamp is the ASSIGNING file's `LoweredAst::file_id`, and a
+    /// use site in another file never folds. The merge stamps it from the paired
+    /// AST (never from the harvest), which is the discipline a persisted harvest
+    /// would have to keep — see the type's persistence-hazard doc.
+    #[test]
+    fn harvested_const_file_id_is_the_assigning_file() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"TOPL = 7\n"));
+        let b = lower(&parse(b"puts TOPL\n"));
+        let idx = SourceIndex::build_project(&[&a, &b], &core);
+        let entries = idx.literal_constants.get("TOPL").expect("harvested");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1, a.file_id(), "the ASSIGNING file's id, not the reader's");
+        assert!(idx.literal_constant("TOPL", &[], a.file_id()).is_some());
+        assert!(
+            idx.literal_constant("TOPL", &[], b.file_id()).is_none(),
+            "a cross-file read must not fold (the oracle is silent there)"
+        );
+    }
+
+    /// The `Harvest` contract itself: it is a function of ONE file and the
+    /// frozen core, so harvesting a file alone or beside others is the same
+    /// object — this is what makes the CLI's stage-1 hoist legal.
+    #[test]
+    fn harvest_is_file_local() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"MAX = 5\nclass A\n  def m\n    MAX\n  end\nend\n"));
+        let b = lower(&parse(b"MAX = 6\nclass A\n  include M\nend\n"));
+        let solo = SourceIndex::harvest(&a, &core);
+        let beside = SourceIndex::harvest(&a, &core);
+        let render = |h: &Harvest| {
+            (
+                h.source_classes.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                h.override_classes.iter().map(|c| c.qualified.clone()).collect::<Vec<_>>(),
+                h.constant_writes.iter().map(|w| (w.qualified.clone(), w.writes)).collect::<Vec<_>>(),
+                h.rbs_constant_names.clone(),
+                h.fold_defs.iter().map(|d| (d.owner.clone(), d.method.clone())).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(render(&solo), render(&beside));
+        // And merging that harvest with the second file's reproduces the
+        // all-at-once build exactly.
+        let pairs = vec![(SourceIndex::harvest(&a, &core), &a), (SourceIndex::harvest(&b, &core), &b)];
+        assert_eq!(
+            fingerprint(&SourceIndex::merge(&pairs, &core), false),
+            fingerprint(&SourceIndex::build_project(&[&a, &b], &core), false)
+        );
+    }
+
+    /// The four files probe 1 permutes: two visibility conflicts, an include
+    /// order conflict, constants (toplevel + nested, single + multiply
+    /// assigned), a toplevel def and an RBS-known constant read.
+    fn probe1_sources() -> Vec<&'static [u8]> {
+        vec![
+            b"class Base\n  def m\n    1\n  end\nend\nmodule M1\n  def shared\n    1\n  end\nend\nTOPC = 1\ndef tl_a; 1; end\nmodule N1\n  K = 1\n  class Time\n  end\nend\n",
+            b"class Base\n  include M1\n  private\n  def m\n    2\n  end\nend\n",
+            b"module M2\n  private\n  def shared\n    2\n  end\nend\nclass Base\n  include M2\nend\nclass Sub < Base\n  private\n  def shared\n    3\n  end\nend\n",
+            b"class Other\n  def name\n    \"x\"\n  end\nend\nOTHERC = [1, 2].freeze\nPathname.new(\"/\")\nmodule N2\n  K = 2\n  class Time\n  end\nend\n",
+        ]
     }
 }
