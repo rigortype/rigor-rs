@@ -3201,3 +3201,435 @@ mod tests {
         assert!(!idx2.is_toplevel_def("klass_singleton"));
     }
 }
+
+// ===========================================================================
+// THROWAWAY PROBES — issue #92 (SourceIndex harvest/merge decomposition).
+//
+// These are INVESTIGATION instruments, not a permanent test surface: they dump
+// a per-field fingerprint of a built `SourceIndex` so a permutation of the
+// `asts` slice, or the removal of one file, can be compared FIELD BY FIELD.
+// The findings are written up in
+// `docs/notes/20260825-s92-buildproject-pass-inventory.md`. Delete this module
+// when the harvest/merge slice lands (or promote the fingerprint into the
+// parity harness if it earns its keep there).
+// ===========================================================================
+#[cfg(test)]
+mod probes_s92 {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    /// A per-FIELD rendering of the whole index. `sorted = true` canonicalises
+    /// every collection (the SEMANTIC content); `sorted = false` renders the
+    /// `Vec` fields in their built order (exposing ORDER leakage).
+    fn fingerprint(idx: &SourceIndex, sorted: bool) -> Vec<(&'static str, String)> {
+        fn sort_join(mut v: Vec<String>) -> String {
+            v.sort();
+            v.join(" | ")
+        }
+        let mut out: Vec<(&'static str, String)> = Vec::new();
+
+        out.push((
+            "classes",
+            sort_join(
+                idx.classes
+                    .iter()
+                    .map(|(k, c)| {
+                        let mut ms: Vec<&str> = c.methods.iter().map(|s| s.as_str()).collect();
+                        ms.sort();
+                        format!("{k}<{:?}>{{{}}}", c.superclass, ms.join(","))
+                    })
+                    .collect(),
+            ),
+        ));
+        // `names` IS the ClassId assignment order — never sorted for the
+        // ordered fingerprint.
+        out.push((
+            "names",
+            if sorted { sort_join(idx.names.clone()) } else { idx.names.join(" | ") },
+        ));
+        out.push((
+            "declaration_only_classes",
+            sort_join(idx.declaration_only_classes.iter().cloned().collect()),
+        ));
+        out.push((
+            "method_returns",
+            sort_join(
+                idx.method_returns.iter().map(|((c, m), r)| format!("{c}#{m}->{r}")).collect(),
+            ),
+        ));
+        out.push((
+            "param_bound_returns",
+            sort_join(
+                idx.param_bound_returns
+                    .iter()
+                    .map(|((c, m), p)| format!("{c}#{m}->{p:?}"))
+                    .collect(),
+            ),
+        ));
+        out.push((
+            "override_classes",
+            sort_join(
+                idx.override_classes
+                    .iter()
+                    .map(|(k, c)| {
+                        let mut ms: Vec<&str> = c.methods.iter().map(|s| s.as_str()).collect();
+                        ms.sort();
+                        let mut vis: Vec<String> = c
+                            .method_visibilities
+                            .iter()
+                            .map(|(m, v)| format!("{m}={v:?}"))
+                            .collect();
+                        vis.sort();
+                        // `includes` is ORDER-BEARING (MRO): keep source order
+                        // in the ordered fingerprint.
+                        let inc = if sorted {
+                            sort_join(c.includes.clone())
+                        } else {
+                            c.includes.join(",")
+                        };
+                        format!(
+                            "{k}<{:?}>inc[{inc}]m{{{}}}vis{{{}}}",
+                            c.superclass,
+                            ms.join(","),
+                            vis.join(",")
+                        )
+                    })
+                    .collect(),
+            ),
+        ));
+        out.push(("toplevel_defs", sort_join(idx.toplevel_defs.iter().cloned().collect())));
+        out.push((
+            "literal_returns",
+            sort_join(
+                idx.literal_returns
+                    .iter()
+                    .map(|((o, m, k), s)| format!("{o}.{m}/{k:?}->{s:?}"))
+                    .collect(),
+            ),
+        ));
+        out.push((
+            "definers",
+            sort_join(
+                idx.definers
+                    .iter()
+                    .map(|((m, k), owners)| {
+                        let o = if sorted { sort_join(owners.clone()) } else { owners.join(",") };
+                        format!("{m}/{k:?}->[{o}]")
+                    })
+                    .collect(),
+            ),
+        ));
+        out.push((
+            "toplevel_constants",
+            sort_join(idx.toplevel_constants.iter().cloned().collect()),
+        ));
+        out.push((
+            "literal_constants",
+            sort_join(
+                idx.literal_constants
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut es: Vec<String> = v
+                            .iter()
+                            .map(|(ns, f, l)| format!("{}#{f}={l:?}", ns.join("::")))
+                            .collect();
+                        if sorted {
+                            es.sort();
+                        }
+                        format!("{k}->[{}]", es.join(","))
+                    })
+                    .collect(),
+            ),
+        ));
+        out.push((
+            "qualified_literal_constants",
+            sort_join(
+                idx.qualified_literal_constants
+                    .iter()
+                    .map(|(k, (ns, f, l))| format!("{k}->{}#{f}={l:?}", ns.join("::")))
+                    .collect(),
+            ),
+        ));
+        out.push((
+            "project_constant_write_names",
+            sort_join(idx.project_constant_write_names.iter().cloned().collect()),
+        ));
+        out.push((
+            "nested_constant_namespaces",
+            sort_join(
+                idx.nested_constant_namespaces
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut nss: Vec<String> = v.iter().map(|ns| ns.join("::")).collect();
+                        if sorted {
+                            nss.sort();
+                        }
+                        format!("{k}->[{}]", nss.join(","))
+                    })
+                    .collect(),
+            ),
+        ));
+        out.push((
+            "discovered_methods",
+            sort_join(
+                idx.discovered_methods
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut ms: Vec<&str> = v.iter().map(|s| s.as_str()).collect();
+                        ms.sort();
+                        format!("{k}->{{{}}}", ms.join(","))
+                    })
+                    .collect(),
+            ),
+        ));
+        out.push((
+            "mutated_params",
+            sort_join(
+                idx.mutated_params
+                    .iter()
+                    .map(|(k, v)| {
+                        let mut ix: Vec<usize> = v.iter().copied().collect();
+                        ix.sort_unstable();
+                        format!("{k}->{ix:?}")
+                    })
+                    .collect(),
+            ),
+        ));
+        out
+    }
+
+    /// Permute the AST REFERENCES, never re-`lower()`: `file_id` comes from a
+    /// process-global counter, so re-lowering would inject a spurious diff into
+    /// the `literal_constants` / `qualified_literal_constants` fingerprints.
+    fn build_perm(
+        asts: &[LoweredAst],
+        perm: &[usize],
+        core: &CoreIndex,
+    ) -> Vec<(&'static str, String)> {
+        let refs: Vec<&LoweredAst> = perm.iter().map(|&i| &asts[i]).collect();
+        fingerprint(&SourceIndex::build_project(&refs, core), false)
+    }
+
+    fn diff(
+        a: &[(&'static str, String)],
+        b: &[(&'static str, String)],
+    ) -> Vec<(&'static str, String, String)> {
+        a.iter()
+            .zip(b.iter())
+            .filter(|((_, x), (_, y))| x != y)
+            .map(|((k, x), (_, y))| (*k, x.clone(), y.clone()))
+            .collect()
+    }
+
+    /// PROBE 1 — permutation sensitivity, field by field. Prints every field
+    /// whose built value depends on the ORDER of the `asts` slice.
+    #[test]
+    fn probe_permutation_field_diff() {
+        let core = CoreIndex::new();
+        let srcs: Vec<&[u8]> = vec![
+            // f0: Base#m public + a toplevel def + constants (one nested, so
+            // the bare name `K` gets a MULTI-entry `literal_constants` vector).
+            b"class Base\n  def m\n    1\n  end\nend\nmodule M1\n  def shared\n    1\n  end\nend\nTOPC = 1\ndef tl_a; 1; end\nmodule N1\n  K = 1\n  class Time\n  end\nend\n",
+            // f1: Base#m private (visibility CONFLICT with f0) + include M1.
+            b"class Base\n  include M1\n  private\n  def m\n    2\n  end\nend\n",
+            // f2: Base includes M2 (include ORDER conflict with f1) + Sub.
+            b"module M2\n  private\n  def shared\n    2\n  end\nend\nclass Base\n  include M2\nend\nclass Sub < Base\n  private\n  def shared\n    3\n  end\nend\n",
+            // f3: unrelated content that still registers names + constants,
+            // plus the NESTED shapes that populate the Vec-valued maps.
+            b"class Other\n  def name\n    \"x\"\n  end\nend\nOTHERC = [1, 2].freeze\nPathname.new(\"/\")\nmodule N2\n  K = 2\n  class Time\n  end\nend\n",
+        ];
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        let base = build_perm(&asts, &[0, 1, 2, 3], &core);
+        let perms: [[usize; 4]; 5] =
+            [[1, 0, 2, 3], [3, 2, 1, 0], [2, 3, 0, 1], [0, 2, 1, 3], [3, 0, 1, 2]];
+        let mut any = false;
+        for p in perms {
+            let other = build_perm(&asts, &p, &core);
+            let d = diff(&base, &other);
+            if !d.is_empty() {
+                any = true;
+                println!("--- permutation {p:?}: {} field(s) differ", d.len());
+                for (field, x, y) in d {
+                    println!("  [{field}]\n    base : {x}\n    perm : {y}");
+                }
+            } else {
+                println!("--- permutation {p:?}: identical");
+            }
+        }
+        println!("PROBE 1 order-sensitive fields observed: {any}");
+    }
+
+    /// PROBE 2 — incremental equality: build over ALL files vs ALL-BUT-ONE, and
+    /// report which fields change in a way a per-file harvest of the dropped
+    /// file could NOT have reconstructed on its own (i.e. file X's recorded
+    /// contribution depends on file Y's content).
+    #[test]
+    fn probe_drop_one_field_diff() {
+        let core = CoreIndex::new();
+        let srcs: Vec<&[u8]> = vec![
+            // f0: the "other" file — reopens, conflicting constant.
+            b"class Base\n  def m\n    1\n  end\nend\nSHARED = 1\nmodule Wrap\n  DUP = 1\nend\n",
+            // f1: the file under test — its OWN contribution depends on f0.
+            b"class Base\n  private\n  def m\n    2\n  end\nend\nmodule Wrap\n  DUP = 2\nend\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\nSOLO = 7\n",
+            // f2: an unrelated third file.
+            b"class Solo\n  def q\n    1\n  end\nend\n",
+        ];
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        for drop in 0..asts.len() {
+            let all: Vec<&LoweredAst> = asts.iter().collect();
+            let kept: Vec<&LoweredAst> =
+                asts.iter().enumerate().filter(|(i, _)| *i != drop).map(|(_, a)| a).collect();
+            let fa = fingerprint(&SourceIndex::build_project(&all, &core), false);
+            let fk = fingerprint(&SourceIndex::build_project(&kept, &core), false);
+            println!("--- dropping f{drop}");
+            for (field, x, y) in diff(&fa, &fk) {
+                println!("  [{field}]\n    all  : {x}\n    kept : {y}");
+            }
+        }
+    }
+
+    /// PROBE 3 — is `build_project` over N files equal to the UNION of N
+    /// single-file `build_project`s for the "obviously additive" fields? Any
+    /// field where it is NOT is a cross-file computation.
+    #[test]
+    fn probe_union_of_singletons_vs_project() {
+        let core = CoreIndex::new();
+        let srcs: Vec<&[u8]> = vec![
+            b"class A\n  def x\n    \"s\"\n  end\nend\nC1 = 1\n",
+            b"class B < A\n  def y\n    A.new\n  end\nend\nC1 = 2\nC2 = 3\n",
+            b"class C\n  def z\n    C2\n  end\nend\n",
+        ];
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        let all: Vec<&LoweredAst> = asts.iter().collect();
+        let project = fingerprint(&SourceIndex::build_project(&all, &core), true);
+        let singles: Vec<Vec<(&'static str, String)>> = asts
+            .iter()
+            .map(|a| fingerprint(&SourceIndex::build_project(&[a], &core), true))
+            .collect();
+        for (i, (field, joined)) in project.iter().enumerate() {
+            let parts: Vec<String> =
+                singles.iter().map(|s| s[i].1.clone()).filter(|s| !s.is_empty()).collect();
+            println!("[{field}]\n  project : {joined}\n  singles : {}", parts.join("  ||  "));
+        }
+    }
+
+    /// PROBE 4 — the MINIMAL 2-file demonstration that Pass 3 (`method_returns`)
+    /// reads state produced by an EARLIER pass over ALL files. File `a` alone
+    /// records `A#m -> Integer` because C5 harvested `MAX = 5`; adding a second
+    /// file that ALSO assigns `MAX` trips the single-assignment gate, the
+    /// harvest is dropped, the tail types Dynamic, and `A#m` disappears — with
+    /// file `a` byte-identical in both builds.
+    #[test]
+    fn probe_pass3_depends_on_pass_c5_over_all_files() {
+        let core = CoreIndex::new();
+        // The constant must be TOPLEVEL: Pass 3 types the tail with a
+        // `Typer::with_source` that has NO lexical scopes attached, so the use
+        // site's prefix is empty and only a `ns == []` harvest is visible.
+        let a = lower(&parse(b"MAX = 5\nclass A\n  def m\n    MAX\n  end\nend\n"));
+        let b = lower(&parse(b"MAX = 6\n"));
+        let alone = SourceIndex::build_project(&[&a], &core);
+        let both = SourceIndex::build_project(&[&a, &b], &core);
+        println!("a alone : A#m -> {:?}", alone.method_return("A", "m"));
+        println!("a + b   : A#m -> {:?}", both.method_return("A", "m"));
+        println!("a alone : literal_constants[MAX] = {:?}", alone.literal_constants.get("MAX"));
+        println!("a + b   : literal_constants[MAX] = {:?}", both.literal_constants.get("MAX"));
+    }
+
+    /// PROBE 5 — the MINIMAL 2-file demonstration of the Pass-4 overridable
+    /// degrade: `Base.m`'s folded literal exists alone and VANISHES once a
+    /// second file declares a subclass that redefines `m`.
+    #[test]
+    fn probe_pass4_degrade_is_cross_file() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"class Base\n  def m\n    1\n  end\nend\n"));
+        let b = lower(&parse(b"class Sub < Base\n  def m\n    2\n  end\nend\n"));
+        let key = ("Base".to_string(), "m".to_string(), DefKind::Instance);
+        println!(
+            "a alone : literal_returns[Base.m] = {:?}",
+            SourceIndex::build_project(&[&a], &core).literal_returns.get(&key)
+        );
+        println!(
+            "a + b   : literal_returns[Base.m] = {:?}",
+            SourceIndex::build_project(&[&a, &b], &core).literal_returns.get(&key)
+        );
+    }
+
+    /// PROBE 6 — cross-PROCESS instability of the Vec-valued maps. Prints the
+    /// built order of `definers` / `literal_constants` /
+    /// `nested_constant_namespaces` for a FIXED file order; running the test
+    /// twice and diffing the output shows whether the order is a function of
+    /// the input at all.
+    #[test]
+    fn probe_vec_order_stability_across_processes() {
+        let core = CoreIndex::new();
+        let srcs: Vec<&[u8]> = vec![
+            b"module Alpha\n  KEY = 1\n  class Time\n  end\n  def shared; 1; end\nend\n",
+            b"module Beta\n  KEY = 2\n  class Time\n  end\n  def shared; 2; end\nend\n",
+            b"module Gamma\n  KEY = 3\n  class Time\n  end\n  def shared; 3; end\nend\n",
+            b"module Delta\n  KEY = 4\n  class Time\n  end\n  def shared; 4; end\nend\n",
+        ];
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        let idx = SourceIndex::build_project(&refs, &core);
+        println!(
+            "definers[shared/Instance] = {:?}",
+            idx.definers.get(&("shared".to_string(), DefKind::Instance))
+        );
+        println!(
+            "literal_constants[KEY] namespaces = {:?}",
+            idx.literal_constants
+                .get("KEY")
+                .map(|v| v.iter().map(|(ns, _, _)| ns.join("::")).collect::<Vec<_>>())
+        );
+        println!(
+            "nested_constant_namespaces[Time] = {:?}",
+            idx.nested_constant_namespaces.get("Time")
+        );
+        println!("names = {:?}", idx.names);
+    }
+
+    /// PROBE 7 — the `names` (ClassId) ORDER LEAK CHANNEL. `Interner::cmp`
+    /// canonicalises union members by `ClassId` for `Nominal`/`Singleton`
+    /// (`crates/rigor-types/src/interner.rs:135,137`) and `named_union` renders
+    /// members in that canonical order (`crates/rigor-types/src/display.rs:446`
+    /// — only `nil` floats to the end). So file order → registration order →
+    /// ClassId order → rendered union order.
+    #[test]
+    fn probe_classid_order_reaches_union_rendering() {
+        use rigor_types::{Algebra, Type};
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"class Alpha\nend\n"));
+        let b = lower(&parse(b"class Beta\nend\n"));
+
+        let render = |idx: &SourceIndex| {
+            let mut i = Interner::new();
+            let ca = idx.class_id("Alpha").unwrap();
+            let cb = idx.class_id("Beta").unwrap();
+            let na = i.intern(Type::Nominal { class: ca, args: Vec::new() });
+            let nb = i.intern(Type::Nominal { class: cb, args: Vec::new() });
+            let u = Algebra::join(&mut i, na, nb);
+            let resolve = |c: rigor_types::ClassId| idx.class_name_for_id(c).map(str::to_string);
+            (ca.0, cb.0, rigor_types::describe_named(&i, u, &resolve))
+        };
+
+        let (ida, idb, sab) = render(&SourceIndex::build_project(&[&a, &b], &core));
+        println!("order [a,b]: Alpha={ida} Beta={idb} union renders as {sab:?}");
+        let (ida, idb, sba) = render(&SourceIndex::build_project(&[&b, &a], &core));
+        println!("order [b,a]: Alpha={ida} Beta={idb} union renders as {sba:?}");
+        println!("same rendering: {}", sab == sba);
+    }
+
+    /// PROBE 8 — checks `infer_method_returns`'s doc claim that "a method never
+    /// appears in BOTH maps" (`source_index.rs:1613-1615`). The claim holds for
+    /// ONE def site (a tail is either concrete-core or param-rooted), but a
+    /// CROSS-FILE reopen has two independent sites.
+    #[test]
+    fn probe_method_can_appear_in_both_return_maps() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"class A\n  def m\n    \"s\"\n  end\nend\n"));
+        let b = lower(&parse(b"class A\n  def m(x)\n    x\n  end\nend\n"));
+        let idx = SourceIndex::build_project(&[&a, &b], &core);
+        println!("method_returns[A#m]      = {:?}", idx.method_return("A", "m"));
+        println!("param_bound_returns[A#m] = {:?}", idx.param_bound_return("A", "m"));
+    }
+}
