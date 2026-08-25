@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use rayon::prelude::*;
 use rigor_index::CoreIndex;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower_with_key, parse, FileKey};
 use rigor_rules::{analyze_with_source_and_folder, catalog, Diagnostic, Severity};
 use rigor_types::Interner;
 
@@ -745,7 +745,13 @@ fn analyze_files(
                     return None;
                 }
                 let comments = rigor_parse::comment_lines(&result, &source_bytes);
-                Some((lower(&result), comments))
+                // Issue #102: the AST carries the file's CANONICAL-path identity,
+                // which is what the per-file constant gate compares. `check`
+                // lowers each discovered path exactly once, so this is the same
+                // partition the old per-`lower()` counter drew — but it is now a
+                // property of the FILE, so a re-lowering (the LSP) and a
+                // persisted harvest agree with it too.
+                Some((lower_with_key(&result, FileKey::for_path(Path::new(path))), comments))
             }));
             match lowered {
                 Ok(None) => Stage1::Excluded,

@@ -48,7 +48,7 @@ use lsp_types::{
 
 use rigor_index::CoreIndex;
 use rigor_infer::{Harvest, SourceIndex, Typer};
-use rigor_parse::{comment_lines, lower, parse, LoweredAst, Node};
+use rigor_parse::{comment_lines, lower, lower_with_key, parse, FileKey, LoweredAst, Node};
 use rigor_rules::{analyze_with_source_and_folder, filter_suppressed, Severity, SuppressSet};
 use rigor_types::{Interner, Type, TypeId};
 
@@ -854,6 +854,26 @@ fn held_pair(path: &str, core: &CoreIndex) -> Option<(Arc<LoweredAst>, Arc<Harve
     Some((ast, harvest))
 }
 
+/// The [`FileKey`] a document's lowering must carry (issue #102): the file's
+/// canonical path, which is the identity the per-file constant gate compares.
+///
+/// It is derived from the SAME path the overlay's REPLACE lookup compares
+/// ([`uri_to_canonical_path`] for a buffer, tier 1's `canonicalize` for a held
+/// file), and [`FileKey::for_path`] is idempotent on an already-canonical path
+/// (and falls back verbatim for a path that no longer resolves, which is exactly
+/// the parent-resolved spelling [`uri_to_canonical_path`] hands back for a
+/// deleted file). So key equality tracks REPLACE equality exactly: the buffer's
+/// lowering, the worker's lowering of the same buffer and the held on-disk
+/// lowering of the same file all agree, which is what makes a cache-hit hover
+/// fold a same-file literal constant instead of declining it.
+///
+/// `None` — a non-`file:` URI, an untitled buffer — yields a pathless
+/// [`FileKey::anonymous`], distinct from every other lowering, so nothing folds
+/// across two identity-less buffers.
+fn document_file_key(canonical: Option<&Path>) -> FileKey {
+    canonical.map_or_else(FileKey::anonymous, FileKey::for_path)
+}
+
 /// Read + lower ONE project file the way [`build_overlay`] does: ERB templates are
 /// skipped (Prism's recovery over `<%= … %>` yields a garbage AST — matching
 /// `check`), and a read error or a parser panic yields `None` rather than a crash
@@ -864,13 +884,17 @@ fn lower_one(path: &str) -> Option<LoweredAst> {
     if rigor_parse::looks_like_erb_template(&source) {
         return None;
     }
+    // Issue #102: the held AST carries the file's canonical-path identity, the
+    // same one a buffer's lowering of that file gets — so the REPLACE swap in
+    // `overlay_source_index` preserves the per-file constant gate's answer.
+    let key = document_file_key(Some(Path::new(path)));
     panic::catch_unwind(AssertUnwindSafe(|| {
         let result = parse(&source);
         // A file with parse errors contributes nothing to the index, the same
         // answer `check` gives it (`main.rs` stage 1) and the reference's
         // dependency walker gives it: Prism's recovery invents bindings, so
         // indexing the wreckage is worse than not indexing the file.
-        (result.errors().next().is_none()).then(|| lower(&result))
+        (result.errors().next().is_none()).then(|| lower_with_key(&result, key))
     }))
     .ok()
     .flatten()
@@ -2627,7 +2651,11 @@ fn compute_diagnostics(
             return None;
         }
         let comments = comment_lines(&result, &bytes);
-        let ast = lower(&result);
+        // Issue #102: the buffer is the content of a file at a known path, so its
+        // lowering takes that path's key — the same key tier 1 gave the on-disk
+        // lowering this one REPLACES, and the same key `hover`/`completion` give
+        // their own re-lowering of the buffer.
+        let ast = lower_with_key(&result, document_file_key(buf.canonical.as_deref()));
         let (source, overlay_build) =
             overlay_source_index(project, buf.canonical.as_deref(), &ast);
         let mut interner = Interner::new();
@@ -2736,9 +2764,15 @@ fn hover(
     let pos = &params.text_document_position_params;
     let text = buffers.text(&pos.text_document.uri)?;
     let offset = position_to_offset(text, pos.position)?;
+    // Issue #102: the same file key the dispatch's lowering carried, so a
+    // constant this file assigns still folds when the answer comes from the
+    // CACHED project index (which was merged against the worker's lowering of
+    // this same buffer). With the old per-`lower()` counter the two disagreed
+    // and `FOO : 5` degraded to `FOO : Dynamic[top]` on every cache hit.
+    let key = document_file_key(uri_to_canonical_path(&pos.text_document.uri).as_deref());
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let ast = lower(&parse(text.as_bytes()));
+        let ast = lower_with_key(&parse(text.as_bytes()), key);
         let node_id = crate::type_of::locate_node(&ast, offset)?;
         // Deferred init, so the single-file index is not even BUILT on a hit.
         let single_file;
@@ -2899,9 +2933,14 @@ fn completion(
 
     // Splice the stub in after the separator, dropping any half-typed name.
     let synth = format!("{}{}{}", &text[..ident_start], COMPLETION_STUB, &text[offset..]);
+    // Issue #102, exactly as in `hover`: the synthesized text is still THIS
+    // file's content (one stub name spliced in), so its lowering takes this
+    // file's key and a receiver that is a same-file literal constant completes
+    // on a cache hit instead of degrading to `Dynamic`.
+    let key = document_file_key(uri_to_canonical_path(&tdp.text_document.uri).as_deref());
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let ast = lower(&parse(synth.as_bytes()));
+        let ast = lower_with_key(&parse(synth.as_bytes()), key);
         // Our injected call is the unique `Call` whose method-name token starts
         // exactly at `stub_at`.
         let receiver = ast.iter().find_map(|(_, n)| match n {
@@ -7372,27 +7411,34 @@ mod tests {
 
     #[test]
     fn crossfile_cache_hit_declines_the_same_file_literal_constant_fold() {
-        // A MEASURED COST of answering from the cached index, pinned so it is a
-        // known behaviour rather than a surprise (see the impl note).
+        // ISSUE #102 — FLIPPED. This test used to pin a real regression: the
+        // per-file constant gate compared `LoweredAst::file_id`, a process-global
+        // counter stamped at `lower()`, so "the same file" meant "the same
+        // `lower()` call". The cached index was merged against the DISPATCH
+        // WORKER's lowering; `hover` lowers the buffer AFRESH; the ids differed
+        // and the gate declined, degrading `FOO : 5` to `FOO : Dynamic[top]` on
+        // every cache hit.
         //
-        // `SourceIndex::literal_constant` is gated on the ASSIGNING file's
-        // `LoweredAst::file_id` — a process-global counter stamped at `lower()`.
-        // The cached index was merged against the WORKER's lowering; a hover
-        // lowers the buffer AFRESH, so the ids differ and the same-file gate
-        // declines. The fold is a precision gain, never a soundness one, so the
-        // hit degrades to `Dynamic` where the miss folded — coverage, not a
-        // wrong answer, and the direction this project always trades toward.
+        // The identity is now the file's CANONICAL PATH, which both lowerings
+        // carry, so the hit and the miss agree. The name is kept so the history
+        // is traceable from the issue and the impl notes.
+        //
+        // BOTH indices come from production code — the cached one from a real
+        // `compute_diagnostics` dispatch (the worker's own lowering), the miss
+        // from `hover`'s single-file fallback — so nothing here fakes the
+        // identity the assertion is about.
         let p = TempProject::new("xf_const");
         let consts = "FOO = 5\nFOO\n";
         p.write("consts.rb", consts);
         p.write("other.rb", "class Other\nend\n");
         let (_ctx, st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
-        let ast = lower(&parse(consts.as_bytes()));
-        let canonical = std::fs::canonicalize(p.root.join("lib").join("consts.rb")).unwrap();
-        let (cached, _) = overlay_source_index(&st.project, Some(&canonical), &ast);
+        let uri: Uri = p.uri("consts.rb").parse().unwrap();
+        let buf = BufferPaths::for_uri(&uri);
+        let (_diags, sample, cached) = compute_diagnostics(&st.project, &buf, consts);
+        assert!(sample.is_some(), "precondition: the overlay is on for this project");
+        let cached = cached.expect("a live overlay dispatch hands its project index back");
 
         let mut buffers = BufferTable::new();
-        let uri: Uri = p.uri("consts.rb").parse().unwrap();
         buffers.open(&uri, consts.to_string(), 1);
         let params = HoverParams {
             text_document_position_params: lsp_types::TextDocumentPositionParams {
@@ -7409,9 +7455,47 @@ mod tests {
         };
         assert!(body(None).contains("FOO : 5"), "the miss still folds: {}", body(None));
         assert!(
-            body(Some(&cached)).contains("FOO : Dynamic[top]"),
-            "the hit declines the per-file fold: {}",
+            body(Some(&cached)).contains("FOO : 5"),
+            "and so does the HIT — the gate is keyed on the file, not the lowering: {}",
             body(Some(&cached))
+        );
+    }
+
+    #[test]
+    fn crossfile_cache_hit_still_gates_a_cross_file_constant_per_file() {
+        // The other half of #102: closing the SAME-file fold must not open a
+        // CROSS-file one. The reference rebuilds its in-source constant-value
+        // table per file, so a constant assigned in `consts.rb` and read in
+        // `reader.rb` is silent there — and stays silent here, on a cache hit,
+        // where the whole project's harvest is in the index the hover reads.
+        let p = TempProject::new("xf_const_xfile");
+        let consts = "BAR = 5\n";
+        let reader = "BAR\n";
+        p.write("consts.rb", consts);
+        p.write("reader.rb", reader);
+        let (_ctx, st) = session_for(&p.root, Config::default(), OVERLAY_BUILD_BUDGET_DEFAULT);
+        let uri: Uri = p.uri("reader.rb").parse().unwrap();
+        let buf = BufferPaths::for_uri(&uri);
+        let (_diags, sample, cached) = compute_diagnostics(&st.project, &buf, reader);
+        assert!(sample.is_some(), "precondition: the overlay is on for this project");
+        let cached = cached.expect("a live overlay dispatch hands its project index back");
+
+        let mut buffers = BufferTable::new();
+        buffers.open(&uri, reader.to_string(), 1);
+        let params = HoverParams {
+            text_document_position_params: lsp_types::TextDocumentPositionParams {
+                text_document: lsp_types::TextDocumentIdentifier { uri },
+                position: Position { line: 0, character: 0 },
+            },
+            work_done_progress_params: Default::default(),
+        };
+        let body = match hover(&st.project, &buffers, &params, Some(&cached)) {
+            Some(Hover { contents: HoverContents::Markup(m), .. }) => m.value,
+            _ => String::new(),
+        };
+        assert!(
+            body.contains("BAR : Dynamic[top]"),
+            "a constant assigned in ANOTHER file must not fold (the oracle is silent): {body}"
         );
     }
 }

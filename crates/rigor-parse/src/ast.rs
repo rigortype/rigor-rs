@@ -811,10 +811,62 @@ impl Node {
     }
 }
 
-/// Monotonic source of [`LoweredAst::file_id`]. One `lower()` call == one file,
-/// so a process-global counter gives every lowered file a distinct identity
-/// without threading a path through the parser (which never sees one).
-static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Monotonic source of [`FileKey::Anonymous`]. One `lower()` call == one
+/// pathless input, so a process-global counter gives every such lowering a
+/// distinct identity — which is all a pathless caller (a test, a synthesized
+/// buffer, stdin) can be given, and enough for two DIFFERENT pathless inputs
+/// never to compare equal.
+static NEXT_ANONYMOUS_FILE_KEY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Stable identity of the FILE an AST was lowered from (issue #102).
+///
+/// Some analysis facts are per-FILE — the reference's in-source CONSTANT VALUE
+/// table is rebuilt per file (`ScopeIndexer#build_in_source_constants` walks one
+/// file's root), so a constant's harvested value may only be consumed at use
+/// sites in the same file (`SourceIndex::literal_constant`, the C5 gate). That
+/// gate needs an identity for "the same file", and the identity has to survive a
+/// RE-LOWERING of the same bytes: the LSP lowers a buffer once on the diagnostics
+/// worker and again on the hover path, and a per-`lower()`-call counter made
+/// those two disagree (`FOO : 5` degraded to `FOO : Dynamic[top]` on a cache
+/// hit). A persisted harvest would have the same problem across processes.
+///
+/// So the identity is the file's CANONICAL PATH wherever the caller has one, and
+/// a fresh counter value only where it genuinely has none.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum FileKey {
+    /// A file with a filesystem identity, keyed by its canonical path — equal
+    /// across lowerings, across threads, and (once harvests are persisted)
+    /// across processes. `Arc` so the key is cheap to clone into every harvested
+    /// constant.
+    Path(std::sync::Arc<std::path::Path>),
+    /// A lowering with no filesystem identity at all. Distinct for every such
+    /// lowering, so two different pathless inputs never share a key.
+    Anonymous(u64),
+}
+
+impl FileKey {
+    /// The key for a file on disk: its canonical path, so `./a.rb`, `a.rb` and a
+    /// symlink to it are ONE file. A path that cannot be canonicalized (the file
+    /// was deleted between discovery and lowering, or the caller already resolved
+    /// it against a parent that no longer holds the name) is kept VERBATIM rather
+    /// than degraded to an anonymous key: a verbatim path still compares equal to
+    /// itself across lowerings, which is the property the gate needs, and callers
+    /// that pre-canonicalize (the LSP's held table, which resolves a deleted
+    /// buffer's path via its parent) get exactly the spelling they computed.
+    pub fn for_path(path: &std::path::Path) -> Self {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        FileKey::Path(std::sync::Arc::from(resolved.as_path()))
+    }
+
+    /// A fresh pathless key. Never equal to any other key, including another
+    /// `anonymous()`.
+    pub fn anonymous() -> Self {
+        FileKey::Anonymous(
+            NEXT_ANONYMOUS_FILE_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+}
 
 /// The owned AST: a flat arena of [`Node`]s plus the [`NodeId`] of the root
 /// `Program`. Free of the Prism parse-buffer lifetime (ADR-0012).
@@ -822,22 +874,17 @@ static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 pub struct LoweredAst {
     nodes: Vec<Node>,
     root: NodeId,
-    /// Identity of the FILE this AST was lowered from — distinct for every
-    /// [`lower`] call, stable for the AST's lifetime, and preserved by `Clone`
-    /// (a clone is the same file). Cross-file analysis passes need it because a
-    /// project-wide index is built from many ASTs and some facts are per-FILE:
-    /// the reference's in-source CONSTANT VALUE table is rebuilt per file
-    /// (`ScopeIndexer#build_in_source_constants` walks one file's root), so a
-    /// constant's harvested value must only be consumed at use sites in the
-    /// same file. See `SourceIndex::literal_constant`.
-    file_id: u64,
+    /// Identity of the FILE this AST was lowered from — see [`FileKey`]. Stable
+    /// for the AST's lifetime and preserved by `Clone` (a clone is the same
+    /// file).
+    file_key: FileKey,
 }
 
-/// Hand-written so `{:?}` stays a CONTENT rendering: `file_id` is extrinsic
-/// identity (a process-global counter), not content, and two lowerings of the
-/// same bytes must still compare equal by `{:?}`. The LSP's incremental-vs-full
-/// differential tests do exactly that comparison, and including the counter
-/// would make them fail on identical trees.
+/// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
+/// identity (a path, or a process-global counter), not content, and two
+/// lowerings of the same bytes must still compare equal by `{:?}`. The LSP's
+/// incremental-vs-full differential tests do exactly that comparison, and
+/// including the key would make them fail on identical trees.
 impl std::fmt::Debug for LoweredAst {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoweredAst")
@@ -848,11 +895,11 @@ impl std::fmt::Debug for LoweredAst {
 }
 
 impl LoweredAst {
-    /// The identity of the file this AST was lowered from — see the `file_id`
-    /// field docs. Two ASTs compare equal here iff they came from the same
-    /// `lower()` call (or a clone of it).
-    pub fn file_id(&self) -> u64 {
-        self.file_id
+    /// The identity of the file this AST was lowered from — see [`FileKey`]. Two
+    /// ASTs compare equal here iff they name the same canonical path, or came
+    /// from the same pathless `lower()` call (or a clone of it).
+    pub fn file_key(&self) -> &FileKey {
+        &self.file_key
     }
 }
 
@@ -888,10 +935,18 @@ impl LoweredAst {
 }
 
 /// Lower a borrowed Prism [`ParseResult`] into the owned, `NodeId`-indexed AST
-/// (ADR-0012). Walks the tree once; unhandled Prism nodes become
-/// [`Node::Other`] so the walk is total and never panics on a novel construct
-/// (ADR-0016 never-crash posture).
+/// (ADR-0012), with NO filesystem identity — the AST gets a fresh
+/// [`FileKey::anonymous`]. Use [`lower_with_key`] whenever the caller knows which
+/// file the bytes came from; a pathless key cannot match a re-lowering of the
+/// same file, which is what the per-file constant gate compares.
 pub fn lower(result: &ParseResult<'_>) -> LoweredAst {
+    lower_with_key(result, FileKey::anonymous())
+}
+
+/// Lower a borrowed Prism [`ParseResult`] under an explicit [`FileKey`]. Walks
+/// the tree once; unhandled Prism nodes become [`Node::Other`] so the walk is
+/// total and never panics on a novel construct (ADR-0016 never-crash posture).
+pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst {
     let source = result.source();
     // Byte offset of every line start, so a node's 1-based line is a binary
     // search (used to precompute Hash-key lines for `flow.duplicate-hash-key`,
@@ -909,11 +964,7 @@ pub fn lower(result: &ParseResult<'_>) -> LoweredAst {
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
-    LoweredAst {
-        nodes: builder.nodes,
-        root,
-        file_id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    }
+    LoweredAst { nodes: builder.nodes, root, file_key }
 }
 
 /// Mutable accumulator for the owned arena during the lowering walk.
