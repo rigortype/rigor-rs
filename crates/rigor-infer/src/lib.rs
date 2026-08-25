@@ -508,7 +508,7 @@ impl<'i> Typer<'i> {
                 // the SAME FILE as the assignment — the reference rebuilds its
                 // in-source constant-value table per file, so a cross-file fold
                 // is an emission the oracle never makes.
-                if let Some(lit) = self.source.literal_constant(name, prefix, ast.file_id()) {
+                if let Some(lit) = self.source.literal_constant(name, prefix, ast.file_key()) {
                     return self.intern_const_lit(lit, interner);
                 }
                 // Collection-shape stage 2e: the same C5 value reached by a
@@ -517,7 +517,7 @@ impl<'i> Typer<'i> {
                 // bare-name map above. Ambiguity declines (see
                 // `SourceIndex::qualified_literal_constant`).
                 if let Some(lit) =
-                    self.source.qualified_literal_constant(name, prefix, ast.file_id())
+                    self.source.qualified_literal_constant(name, prefix, ast.file_key())
                 {
                     return self.intern_const_lit(lit, interner);
                 }

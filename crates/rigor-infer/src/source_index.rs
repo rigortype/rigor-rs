@@ -41,7 +41,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rigor_index::CoreIndex;
-use rigor_parse::{LoweredAst, MethodBody, Node, NodeId, Visibility};
+use rigor_parse::{FileKey, LoweredAst, MethodBody, Node, NodeId, Visibility};
 use rigor_types::{ClassId, Interner, Scalar, ShapeKey};
 
 /// C5 (const-literal harvest): an owned, interner-INDEPENDENT representation of a
@@ -184,19 +184,22 @@ struct OverrideClass {
 
 /// The per-run source-class index + instance-class registry. Built once per file.
 /// One harvested constant value: `(defining namespace segments, the
-/// `LoweredAst::file_id` of the ASSIGNING file, the value)`. The file id is
-/// slice A's per-file consumption gate; see [`SourceIndex::literal_constant`].
+/// [`FileKey`] of the ASSIGNING file, the value)`. The file key is slice A's
+/// per-file consumption gate; see [`SourceIndex::literal_constant`].
 ///
-/// **Persistence hazard (issue #92 §5).** The middle field is a
-/// [`rigor_parse::LoweredAst::file_id`] — an in-memory PROCESS-GLOBAL counter,
-/// not a content or path key. It is stamped at MERGE time from the paired
-/// `&LoweredAst` (never carried inside a [`Harvest`]) precisely because a
-/// harvest that outlived its process — a blake3-keyed on-disk cache, an LSP
-/// harvest held across a rebuild — would otherwise replay a stale id and make
-/// [`SourceIndex::literal_constant`]'s same-file gate answer at the wrong file.
-/// Any future persisted harvest MUST re-stamp this field, or the field must
-/// become a path/content key first.
-type HarvestedConst = (Vec<String>, u64, ConstLit);
+/// **The middle field is a PATH-derived key (issue #102), not a counter.** It
+/// used to be `LoweredAst::file_id`, an in-memory process-global counter — which
+/// made "the same file" mean "the same `lower()` call", so a RE-lowering of the
+/// same bytes mis-gated: the LSP's hover lowered the buffer afresh against a
+/// cached index built from the worker's lowering and the fold declined
+/// (`FOO : 5` → `FOO : Dynamic[top]`), and a persisted harvest would have had to
+/// re-stamp the field or silently answer at the wrong file (#92 §5). A
+/// [`FileKey::Path`] is stable across lowerings, threads and processes, so
+/// neither hazard survives. It is still stamped at MERGE time from the paired
+/// `&LoweredAst` rather than carried inside a [`Harvest`] — the harvest stays a
+/// pure function of `(AST, CoreIndex)` — but a future persisted harvest may now
+/// carry the key verbatim.
+type HarvestedConst = (Vec<String>, FileKey, ConstLit);
 
 /// Issue #94: the per-MERGE memo of transitive project-ancestor closures, keyed
 /// by definer-candidate name. One entry answers every later
@@ -421,9 +424,9 @@ pub struct SourceIndex {
     /// `class Key` where it is not lexically visible (the reference resolves it
     /// lexically too, so folding it there manufactures an `Integer#days` FP).
     /// PER-FILE consumption (slice A, 2026-08-08): each entry also carries the
-    /// [`rigor_parse::LoweredAst::file_id`] of the file that ASSIGNED the
-    /// constant, and [`Self::literal_constant`] only answers a use site in that
-    /// same file. The reference's in-source constant-VALUE table is rebuilt per
+    /// [`rigor_parse::FileKey`] of the file that ASSIGNED the constant, and
+    /// [`Self::literal_constant`] only answers a use site in that same file.
+    /// The reference's in-source constant-VALUE table is rebuilt per
     /// file (`ScopeIndexer#build_in_source_constants` walks one file's root and
     /// nothing cross-file feeds it), so a cross-file fold is an emission the
     /// oracle never makes — probed: a fully-literal `TOPL = [1, 2].freeze` in
@@ -894,8 +897,9 @@ impl SourceIndex {
         // single shared `lit_first`/`lit_multi` pair does.
         //
         // The `file` stamp comes from the paired AST, never from the harvest —
-        // see the persistence hazard on `HarvestedConst`.
-        let mut lit_first: HashMap<String, (Vec<String>, u64, Option<ConstLit>)> = HashMap::new();
+        // see the note on `HarvestedConst`.
+        let mut lit_first: HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)> =
+            HashMap::new();
         let mut lit_writes: HashMap<String, usize> = HashMap::new();
         for (h, ast) in files {
             let h = h.borrow();
@@ -903,7 +907,7 @@ impl SourceIndex {
                 *lit_writes.entry(w.qualified.clone()).or_insert(0) += w.writes;
                 lit_first
                     .entry(w.qualified.clone())
-                    .or_insert_with(|| (w.namespace.clone(), ast.file_id(), w.lit.clone()));
+                    .or_insert_with(|| (w.namespace.clone(), ast.file_key().clone(), w.lit.clone()));
             }
         }
         for (qualified, (namespace, file, lit)) in lit_first {
@@ -921,7 +925,7 @@ impl SourceIndex {
                 // Stage 2e: the qualified twin, keyed by the full path so a
                 // `::A::B::C::CONST` read resolves. Same entry set, same gates.
                 idx.qualified_literal_constants
-                    .insert(qualified, (namespace.clone(), file, l.clone()));
+                    .insert(qualified, (namespace.clone(), file.clone(), l.clone()));
                 idx.literal_constants.entry(bare).or_default().push((namespace, file, l));
             }
         }
@@ -1054,21 +1058,21 @@ impl SourceIndex {
     /// (innermost) wins. The `ConstantRead` arm consults this BEFORE the
     /// singleton gate and re-interns the value via `Typer::intern_const_lit`.
     ///
-    /// `use_file` is the [`rigor_parse::LoweredAst::file_id`] of the file the use
-    /// site is in, and an entry only applies when it matches the file that
-    /// ASSIGNED the constant. The reference's constant-value table is per-file
-    /// (see the field docs); before this gate a same-namespace cross-file read
-    /// folded here and was silent in the oracle.
+    /// `use_file` is the [`rigor_parse::FileKey`] of the file the use site is in,
+    /// and an entry only applies when it matches the file that ASSIGNED the
+    /// constant. The reference's constant-value table is per-file (see the field
+    /// docs); before this gate a same-namespace cross-file read folded here and
+    /// was silent in the oracle.
     pub fn literal_constant(
         &self,
         name: &str,
         use_prefix: &[String],
-        use_file: u64,
+        use_file: &FileKey,
     ) -> Option<&ConstLit> {
         self.literal_constants
             .get(name)?
             .iter()
-            .filter(|(_, file, _)| *file == use_file)
+            .filter(|(_, file, _)| file == use_file)
             .filter(|(ns, _, _)| ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
             .max_by_key(|(ns, _, _)| ns.len())
             .map(|(_, _, lit)| lit)
@@ -1130,7 +1134,7 @@ impl SourceIndex {
         &self,
         name: &str,
         use_prefix: &[String],
-        use_file: u64,
+        use_file: &FileKey,
     ) -> Option<&ConstLit> {
         if !name.contains("::") {
             return None;
@@ -1155,9 +1159,7 @@ impl SourceIndex {
             }
         }
         let (_, (ns, file, lit)) = hit?;
-        (*file == use_file
-            && ns.len() <= use_prefix.len()
-            && use_prefix[..ns.len()] == ns[..])
+        (file == use_file && ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
             .then_some(lit)
     }
 
@@ -3380,17 +3382,17 @@ mod tests {
         );
         // Visible inside `K`.
         assert_eq!(
-            idx.literal_constant("N", &seg(&["K"]), _a.file_id()),
+            idx.literal_constant("N", &seg(&["K"]), _a.file_key()),
             Some(&ConstLit::Scalar(Scalar::Int(42)))
         );
-        assert!(matches!(idx.literal_constant("A", &seg(&["K"]), _a.file_id()), Some(ConstLit::Tuple(_))));
+        assert!(matches!(idx.literal_constant("A", &seg(&["K"]), _a.file_key()), Some(ConstLit::Tuple(_))));
         assert_eq!(
-            idx.literal_constant("S", &seg(&["K"]), _a.file_id()),
+            idx.literal_constant("S", &seg(&["K"]), _a.file_key()),
             Some(&ConstLit::Scalar(Scalar::Str("hi".into())))
         );
         // NOT visible from an unrelated namespace or the toplevel.
-        assert_eq!(idx.literal_constant("N", &[], _a.file_id()), None);
-        assert_eq!(idx.literal_constant("N", &seg(&["Other"]), _a.file_id()), None);
+        assert_eq!(idx.literal_constant("N", &[], _a.file_key()), None);
+        assert_eq!(idx.literal_constant("N", &seg(&["Other"]), _a.file_key()), None);
     }
 
     #[test]
@@ -3404,11 +3406,11 @@ mod tests {
         );
         // Visible only within its own namespace.
         assert_eq!(
-            idx.literal_constant("DAYS", &seg(&["Expirable"]), _a.file_id()),
+            idx.literal_constant("DAYS", &seg(&["Expirable"]), _a.file_key()),
             Some(&ConstLit::Scalar(Scalar::Int(7)))
         );
-        assert_eq!(idx.literal_constant("DAYS", &seg(&["Consumer"]), _a.file_id()), None);
-        assert_eq!(idx.literal_constant("DAYS", &[], _a.file_id()), None);
+        assert_eq!(idx.literal_constant("DAYS", &seg(&["Consumer"]), _a.file_key()), None);
+        assert_eq!(idx.literal_constant("DAYS", &[], _a.file_key()), None);
     }
 
     #[test]
@@ -3417,7 +3419,7 @@ mod tests {
         let core = CoreIndex::new();
         let (_a, idx) =
             build_one(b"class K\n  M = 1\n  M = 2\nend\n", &core);
-        assert_eq!(idx.literal_constant("M", &seg(&["K"]), _a.file_id()), None);
+        assert_eq!(idx.literal_constant("M", &seg(&["K"]), _a.file_key()), None);
     }
 
     #[test]
@@ -3429,14 +3431,14 @@ mod tests {
             b"class Widget\nend\nWidget = [1]\n",
             &core,
         );
-        assert_eq!(idx.literal_constant("Widget", &[], _a.file_id()), None);
+        assert_eq!(idx.literal_constant("Widget", &[], _a.file_key()), None);
     }
 
     #[test]
     fn range_constant_harvests_as_range() {
         let core = CoreIndex::new();
         let (_a, idx) = build_one(b"class K\n  R = 1..1024\nend\n", &core);
-        assert_eq!(idx.literal_constant("R", &seg(&["K"]), _a.file_id()), Some(&ConstLit::Range));
+        assert_eq!(idx.literal_constant("R", &seg(&["K"]), _a.file_key()), Some(&ConstLit::Range));
     }
 
     // --- slice B: partially-literal containers ⇒ INERT bare nominals ----------
@@ -3454,14 +3456,14 @@ mod tests {
         let k = seg(&["K"]);
         for name in ["LAM", "SPLAT_H", "DYNKEY"] {
             assert_eq!(
-                idx.literal_constant(name, &k, a.file_id()),
+                idx.literal_constant(name, &k, a.file_key()),
                 Some(&ConstLit::BareHash),
                 "{name} should harvest as a bare Hash nominal"
             );
         }
         for name in ["DYN", "SPLAT_A", "INTERP", "CHAIN"] {
             assert_eq!(
-                idx.literal_constant(name, &k, a.file_id()),
+                idx.literal_constant(name, &k, a.file_key()),
                 Some(&ConstLit::BareArray),
                 "{name} should harvest as a bare Array nominal"
             );
@@ -3480,11 +3482,11 @@ mod tests {
             &core,
         );
         let k = seg(&["K"]);
-        assert!(matches!(idx.literal_constant("T", &k, a.file_id()), Some(ConstLit::Tuple(v)) if v.len() == 2));
-        assert!(matches!(idx.literal_constant("H", &k, a.file_id()), Some(ConstLit::Hash(m)) if m.len() == 1));
-        assert_eq!(idx.literal_constant("E", &k, a.file_id()), Some(&ConstLit::Tuple(vec![])));
-        assert_eq!(idx.literal_constant("EH", &k, a.file_id()), Some(&ConstLit::Hash(vec![])));
-        assert_eq!(idx.literal_constant("R", &k, a.file_id()), Some(&ConstLit::Range));
+        assert!(matches!(idx.literal_constant("T", &k, a.file_key()), Some(ConstLit::Tuple(v)) if v.len() == 2));
+        assert!(matches!(idx.literal_constant("H", &k, a.file_key()), Some(ConstLit::Hash(m)) if m.len() == 1));
+        assert_eq!(idx.literal_constant("E", &k, a.file_key()), Some(&ConstLit::Tuple(vec![])));
+        assert_eq!(idx.literal_constant("EH", &k, a.file_key()), Some(&ConstLit::Hash(vec![])));
+        assert_eq!(idx.literal_constant("R", &k, a.file_key()), Some(&ConstLit::Range));
     }
 
     #[test]
@@ -3495,7 +3497,7 @@ mod tests {
         // the oracle). Verified against the oracle in fixture 92.
         let core = CoreIndex::new();
         let (a, idx) = build_one(b"class K\n  N = { a: [->() { 1 }] }.freeze\nend\n", &core);
-        let Some(ConstLit::Hash(members)) = idx.literal_constant("N", &seg(&["K"]), a.file_id())
+        let Some(ConstLit::Hash(members)) = idx.literal_constant("N", &seg(&["K"]), a.file_key())
         else {
             panic!("expected an outer Hash shape");
         };
@@ -3516,7 +3518,7 @@ mod tests {
         );
         let k = seg(&["K"]);
         for name in ["CH", "CR", "L", "C"] {
-            assert_eq!(idx.literal_constant(name, &k, a.file_id()), None, "{name}");
+            assert_eq!(idx.literal_constant(name, &k, a.file_key()), None, "{name}");
         }
     }
 
@@ -3529,7 +3531,7 @@ mod tests {
             b"class K\n  M = { c: ->(_x) { 1 } }\n  M = [1, 2]\nend\n",
             &core,
         );
-        assert_eq!(idx.literal_constant("M", &seg(&["K"]), a.file_id()), None);
+        assert_eq!(idx.literal_constant("M", &seg(&["K"]), a.file_key()), None);
     }
 
     // --- slice A: PER-FILE constant-value consumption -------------------------
@@ -3547,12 +3549,12 @@ mod tests {
         let idx = SourceIndex::build_project(&[&a0, &a1], &core);
         // Same file as the assignment: still folds (the harvest is unchanged).
         assert!(matches!(
-            idx.literal_constant("L", &seg(&["M", "C"]), a0.file_id()),
+            idx.literal_constant("L", &seg(&["M", "C"]), a0.file_key()),
             Some(ConstLit::Tuple(_))
         ));
         // The USE file did not assign it ⇒ no value, even though the namespace
         // matches exactly.
-        assert_eq!(idx.literal_constant("L", &seg(&["M", "C"]), a1.file_id()), None);
+        assert_eq!(idx.literal_constant("L", &seg(&["M", "C"]), a1.file_key()), None);
     }
 
     #[test]
@@ -3564,11 +3566,11 @@ mod tests {
         let a1 = lower_src(b"module M\n  class C\n    def go; M::C::L; end\n  end\nend\n");
         let idx = SourceIndex::build_project(&[&a0, &a1], &core);
         assert!(matches!(
-            idx.qualified_literal_constant("M::C::L", &seg(&["M", "C"]), a0.file_id()),
+            idx.qualified_literal_constant("M::C::L", &seg(&["M", "C"]), a0.file_key()),
             Some(ConstLit::Tuple(_))
         ));
         assert_eq!(
-            idx.qualified_literal_constant("M::C::L", &seg(&["M", "C"]), a1.file_id()),
+            idx.qualified_literal_constant("M::C::L", &seg(&["M", "C"]), a1.file_key()),
             None
         );
     }
@@ -3582,10 +3584,10 @@ mod tests {
         let a0 = lower_src(b"TOPL = [1, 2].freeze\nSCAL = 5\n");
         let a1 = lower_src(b"require_relative \"a\"\nclass K\n  def go; TOPL; SCAL; end\nend\n");
         let idx = SourceIndex::build_project(&[&a0, &a1], &core);
-        assert!(idx.literal_constant("TOPL", &seg(&["K"]), a0.file_id()).is_some());
-        assert!(idx.literal_constant("SCAL", &seg(&["K"]), a0.file_id()).is_some());
-        assert_eq!(idx.literal_constant("TOPL", &seg(&["K"]), a1.file_id()), None);
-        assert_eq!(idx.literal_constant("SCAL", &seg(&["K"]), a1.file_id()), None);
+        assert!(idx.literal_constant("TOPL", &seg(&["K"]), a0.file_key()).is_some());
+        assert!(idx.literal_constant("SCAL", &seg(&["K"]), a0.file_key()).is_some());
+        assert_eq!(idx.literal_constant("TOPL", &seg(&["K"]), a1.file_key()), None);
+        assert_eq!(idx.literal_constant("SCAL", &seg(&["K"]), a1.file_key()), None);
     }
 
     #[test]
@@ -3599,7 +3601,7 @@ mod tests {
         let a1 = lower_src(b"class K\n  def go; ENV; end\nend\n");
         let idx = SourceIndex::build_project(&[&a0, &a1], &core);
         // The per-file TYPING gate declines in the reading file …
-        assert_eq!(idx.literal_constant("ENV", &seg(&["K"]), a1.file_id()), None);
+        assert_eq!(idx.literal_constant("ENV", &seg(&["K"]), a1.file_key()), None);
         // … but the 2b decline predicate still sees it from either file.
         assert!(idx.literal_constant_visible_any_file("ENV", &seg(&["K"])));
         assert!(idx.literal_constant_visible_any_file("ENV", &[]));
@@ -3844,7 +3846,7 @@ mod probes_s92 {
                     .map(|(k, v)| {
                         let mut es: Vec<String> = v
                             .iter()
-                            .map(|(ns, f, l)| format!("{}#{f}={l:?}", ns.join("::")))
+                            .map(|(ns, f, l)| format!("{}#{f:?}={l:?}", ns.join("::")))
                             .collect();
                         if sorted {
                             es.sort();
@@ -3859,7 +3861,7 @@ mod probes_s92 {
             sort_join(
                 idx.qualified_literal_constants
                     .iter()
-                    .map(|(k, (ns, f, l))| format!("{k}->{}#{f}={l:?}", ns.join("::")))
+                    .map(|(k, (ns, f, l))| format!("{k}->{}#{f:?}={l:?}", ns.join("::")))
                     .collect(),
             ),
         ));
@@ -4269,14 +4271,15 @@ mod probes_s92 {
         }
 
         // C5.
-        let mut lit_first: HashMap<String, (Vec<String>, u64, Option<ConstLit>)> = HashMap::new();
+        let mut lit_first: HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)> =
+            HashMap::new();
         let mut lit_multi: HashSet<String> = HashSet::new();
         for ast in asts {
             legacy_collect_literal_constants(
                 ast,
                 ast.root(),
                 &[],
-                ast.file_id(),
+                ast.file_key(),
                 &mut lit_first,
                 &mut lit_multi,
             );
@@ -4295,7 +4298,7 @@ mod probes_s92 {
             }
             if let Some(l) = lit {
                 idx.qualified_literal_constants
-                    .insert(qualified, (namespace.clone(), file, l.clone()));
+                    .insert(qualified, (namespace.clone(), file.clone(), l.clone()));
                 idx.literal_constants.entry(bare).or_default().push((namespace, file, l));
             }
         }
@@ -4403,8 +4406,8 @@ mod probes_s92 {
         ast: &LoweredAst,
         node: NodeId,
         prefix: &[String],
-        file: u64,
-        first: &mut HashMap<String, (Vec<String>, u64, Option<ConstLit>)>,
+        file: &FileKey,
+        first: &mut HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)>,
         multi: &mut HashSet<String>,
     ) {
         match ast.get(node) {
@@ -4429,7 +4432,7 @@ mod probes_s92 {
                         multi.insert(e.key().clone());
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert((prefix.to_vec(), file, const_lit_of(ast, *value)));
+                        e.insert((prefix.to_vec(), file.clone(), const_lit_of(ast, *value)));
                     }
                 }
             }
@@ -4813,11 +4816,11 @@ mod probes_s92 {
         );
     }
 
-    /// INVARIANT 5 — `HarvestedConst`'s file id keeps its PER-FILE consumption
-    /// semantics: the stamp is the ASSIGNING file's `LoweredAst::file_id`, and a
+    /// INVARIANT 5 — `HarvestedConst`'s file key keeps its PER-FILE consumption
+    /// semantics: the stamp is the ASSIGNING file's `LoweredAst::file_key`, and a
     /// use site in another file never folds. The merge stamps it from the paired
     /// AST (never from the harvest), which is the discipline a persisted harvest
-    /// would have to keep — see the type's persistence-hazard doc.
+    /// would have to keep — see the type's doc.
     #[test]
     fn harvested_const_file_id_is_the_assigning_file() {
         let core = CoreIndex::new();
@@ -4826,12 +4829,98 @@ mod probes_s92 {
         let idx = SourceIndex::build_project(&[&a, &b], &core);
         let entries = idx.literal_constants.get("TOPL").expect("harvested");
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].1, a.file_id(), "the ASSIGNING file's id, not the reader's");
-        assert!(idx.literal_constant("TOPL", &[], a.file_id()).is_some());
+        assert_eq!(&entries[0].1, a.file_key(), "the ASSIGNING file's key, not the reader's");
+        assert!(idx.literal_constant("TOPL", &[], a.file_key()).is_some());
         assert!(
-            idx.literal_constant("TOPL", &[], b.file_id()).is_none(),
+            idx.literal_constant("TOPL", &[], b.file_key()).is_none(),
             "a cross-file read must not fold (the oracle is silent there)"
         );
+    }
+
+    /// Issue #102 — the same INVARIANT 5 gate, now stated over PATH-derived keys:
+    /// two distinct FILES that assign the SAME bare constant name each fold only
+    /// at their own use sites. This is the C5 per-file rule itself, and the one
+    /// thing the identity swap must not widen — the gate was never "same
+    /// `lower()` call", it was always "same file"; the counter was the accident.
+    #[test]
+    fn path_keyed_gate_still_folds_per_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "rigor_s102_perfile_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, src: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, src).unwrap();
+            p
+        };
+        // Same bare name `LIMIT`, different NAMESPACES (so the project-wide
+        // single-assignment gate does not decline both), each read in its own
+        // file.
+        let pa = write("a.rb", "module A\n  LIMIT = 5\n  LIMIT\nend\n");
+        let pb = write("b.rb", "module B\n  LIMIT = 9\n  LIMIT\nend\n");
+        let key = |p: &std::path::Path| FileKey::for_path(p);
+        let a = rigor_parse::lower_with_key(&parse(b"module A\n  LIMIT = 5\n  LIMIT\nend\n"), key(&pa));
+        let b = rigor_parse::lower_with_key(&parse(b"module B\n  LIMIT = 9\n  LIMIT\nend\n"), key(&pb));
+
+        let core = CoreIndex::new();
+        let idx = SourceIndex::build_project(&[&a, &b], &core);
+        let seg = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+        let a_ns = seg(&["A"]);
+        let b_ns = seg(&["B"]);
+        // Each file folds its OWN constant …
+        assert_eq!(
+            idx.literal_constant("LIMIT", &a_ns, a.file_key()),
+            Some(&ConstLit::Scalar(Scalar::Int(5)))
+        );
+        assert_eq!(
+            idx.literal_constant("LIMIT", &b_ns, b.file_key()),
+            Some(&ConstLit::Scalar(Scalar::Int(9)))
+        );
+        // … and NEITHER folds the other's, even though the bare name matches and
+        // the entry is present in the project-wide map.
+        assert_eq!(idx.literal_constant("LIMIT", &b_ns, a.file_key()), None);
+        assert_eq!(idx.literal_constant("LIMIT", &a_ns, b.file_key()), None);
+
+        // A RE-lowering of the same file is the SAME file — this is the whole
+        // point of #102, and the property the old counter did not have.
+        let a_again =
+            rigor_parse::lower_with_key(&parse(b"module A\n  LIMIT = 5\n  LIMIT\nend\n"), key(&pa));
+        assert_eq!(a_again.file_key(), a.file_key(), "a re-lowering keeps the file's identity");
+        assert_eq!(
+            idx.literal_constant("LIMIT", &a_ns, a_again.file_key()),
+            Some(&ConstLit::Scalar(Scalar::Int(5))),
+            "the fold survives a re-lowering of the assigning file"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #102 — PATHLESS inputs must not collide. `lower()` (a test, stdin, a
+    /// synthesized buffer) has no filesystem identity to key on, so it gets a
+    /// fresh anonymous key: two different pathless lowerings are two different
+    /// files, and neither folds the other's constants. Without this the retired
+    /// counter's one real job would have been lost.
+    #[test]
+    fn pathless_lowerings_never_collide() {
+        let core = CoreIndex::new();
+        let a = lower(&parse(b"module A\n  LIMIT = 5\n  LIMIT\nend\n"));
+        let b = lower(&parse(b"module B\n  LIMIT = 9\n  LIMIT\nend\n"));
+        assert_ne!(a.file_key(), b.file_key(), "two pathless lowerings are two files");
+        // Even BYTE-IDENTICAL pathless lowerings are distinct files.
+        let c = lower(&parse(b"module A\n  LIMIT = 5\n  LIMIT\nend\n"));
+        assert_ne!(a.file_key(), c.file_key(), "identical bytes, still two files");
+
+        let idx = SourceIndex::build_project(&[&a, &b], &core);
+        let seg = |parts: &[&str]| parts.iter().map(|s| (*s).to_string()).collect::<Vec<String>>();
+        let (a_ns, b_ns) = (seg(&["A"]), seg(&["B"]));
+        assert!(idx.literal_constant("LIMIT", &a_ns, a.file_key()).is_some());
+        assert!(idx.literal_constant("LIMIT", &b_ns, b.file_key()).is_some());
+        assert_eq!(idx.literal_constant("LIMIT", &a_ns, b.file_key()), None);
+        assert_eq!(idx.literal_constant("LIMIT", &b_ns, a.file_key()), None);
+        // …and a THIRD pathless lowering of `a`'s bytes folds nothing, because it
+        // is not the file the index was built from.
+        assert_eq!(idx.literal_constant("LIMIT", &a_ns, c.file_key()), None);
     }
 
     /// The `Harvest` contract itself: it is a function of ONE file and the
