@@ -1281,8 +1281,12 @@ impl SourceIndex {
     /// The ADR-0023 tier-4b call-site PARAMETER-BINDING descriptor for a project
     /// method `(class, method)`, if its tail roots on a positional param. `None`
     /// ⇒ no param-bound entry ⇒ the call site falls through (Dynamic, silent).
-    /// The param-INDEPENDENT [`method_return`] takes precedence at the call site
-    /// (a method has at most one of the two). See [`ParamBoundReturn`].
+    /// The param-INDEPENDENT [`Self::method_return`] takes precedence at the
+    /// call site: it is consulted FIRST and this map only on a miss. That
+    /// precedence — not exclusivity — is the contract. A method reopened across
+    /// files CAN have an entry in both maps (each def site is dispatched on its
+    /// own; issue #92 §8), which is exactly why the order matters.
+    /// See [`ParamBoundReturn`].
     pub fn param_bound_return(&self, class: &str, method: &str) -> Option<&ParamBoundReturn> {
         self.param_bound_returns
             .get(&(class.to_string(), method.to_string()))
@@ -2107,7 +2111,7 @@ fn split_qualified(qualified: &str) -> Vec<String> {
 /// C1: the per-file lexical class/module SCOPES — each `(span, qualified segment
 /// vector)` — so a `ConstantRead`'s use-site lexical prefix can be recovered by
 /// span containment (the innermost enclosing scope). Mirrors the qualification
-/// walk of [`SourceIndex::collect_override_classes`]; computed once per analyzed
+/// walk of [`collect_override_classes`]; computed once per analyzed
 /// file and threaded into the [`Typer`] so its `ConstantRead` arm can consult
 /// [`SourceIndex::constant_shadowed`] with the correct lexical prefix.
 ///
