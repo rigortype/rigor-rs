@@ -44,6 +44,7 @@ Usage:
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -112,11 +113,14 @@ def resolve_rs_binary():
 
 
 # --------------------------------------------------------------------------
-# The two arms. Both run IN the project directory (ADR-0043 § 4) and both
-# disable the result cache where the CLI accepts the flag: the reference's
-# persistent cache is keyed by cwd and NOT scoped to the reference version
-# (UPSTREAM.md hazard 2), and here the cwd is the project rather than a fresh
-# temp dir, so it would persist across runs by construction.
+# The two arms. Both run IN the project directory (ADR-0043 § 4). `rigor
+# effects` accepts NO --no-cache flag (probed 2026-08-26: `invalid option`,
+# exit 64), so the reference arm CLEARS the project's `.rigor/cache` before
+# and after each run instead: the persistent cache is keyed by cwd and here
+# the cwd is the project rather than a fresh temp dir (UPSTREAM.md hazard 2),
+# and a committed or cross-host cache entry would otherwise be read silently.
+# The after-clear also keeps corpus checkouts residue-free (a self-test run
+# used to leave 28 untracked cache directories behind).
 #
 # Both return None (NOT {}) when the arm produced nothing parseable. An empty
 # PORT result makes the OVER count 0 by construction — the exact shape that let
@@ -135,15 +139,25 @@ def _parse_methods(stdout):
     return methods if isinstance(methods, dict) else None
 
 
+def _clear_ref_cache(project):
+    # `.rigor/cache` only — `.rigor/` itself is left alone in case a corpus
+    # project ever carries non-cache state there.
+    shutil.rmtree(os.path.join(project, ".rigor", "cache"), ignore_errors=True)
+
+
 def run_ref(project):
     # The bundled rigor-rbs-inline lib is pinned onto the load path (UPSTREAM.md
     # hazard 1 / upstream #194): the ADR-93 auto-wire otherwise resolves a stale
     # INSTALLED rigortype gem's pre-gate plugin copy and poisons the comparison.
     ref_plugin = os.path.join(REF_DIR, "plugins", "rigor-rbs-inline", "lib")
-    r = subprocess.run(["ruby", "-I", REF_LIB, "-I", ref_plugin,
-                        REF_EXE, "effects", "--full", "--format=json"],
-                       capture_output=True, text=True, cwd=project,
-                       stdin=subprocess.DEVNULL)
+    _clear_ref_cache(project)
+    try:
+        r = subprocess.run(["ruby", "-I", REF_LIB, "-I", ref_plugin,
+                            REF_EXE, "effects", "--full", "--format=json"],
+                           capture_output=True, text=True, cwd=project,
+                           stdin=subprocess.DEVNULL)
+    finally:
+        _clear_ref_cache(project)
     return _parse_methods(r.stdout)
 
 

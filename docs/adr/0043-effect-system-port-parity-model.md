@@ -126,8 +126,13 @@ adding what this surface needs:
   that let a crashing binary pass the central gate once already.
 - **New, and forced by the surface**: the unit of measurement is a **project
   directory**, not a file list, and each arm runs **in that directory** rather
-  than in a fresh temp cwd — the config is the point. The result cache is
-  disabled per UPSTREAM.md hazard 2. Because it runs in-project, this is the
+  than in a fresh temp cwd — the config is the point. *(Amended 2026-08-26:
+  the original text claimed the result cache "is disabled" — `rigor effects`
+  accepts no `--no-cache`; instead the instrument clears the project's
+  `.rigor/cache` around each reference run, and upstream's effects cache key
+  composes the engine digests so a pin bump invalidates on its own — see the
+  [slice-1 probe](../notes/20260826-effects-s1-catalogue-probe.md).)*
+  Because it runs in-project, this is the
   first instrument in the repo that sees project `sig/`, `.rigor.yml` and
   plugins; the standing sweep's blind spots do not apply to it, and it should be
   pointed at project-shaped corpora deliberately.
