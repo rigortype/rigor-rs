@@ -374,7 +374,7 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
 - ✅ **`RIGOR_TIMING` stage-breakdown observability (2026-07-01).** `analyze_files` emits a
   one-line per-stage breakdown to stderr under the `RIGOR_TIMING` env gate (invisible by default —
   the harness never sets it, so byte-exact output + 0-FP are unaffected): `index-load` /
-  `stage1(parse+lower)` / `stage2(build_project)` / `stage3(analyze)` / `sort` / `total` / file +
+  `stage1(parse+lower+harvest)` / `stage2(merge)` / `stage3(analyze)` / `sort` / `total` / file +
   thread count. Fits the "performance prototype" positioning (benchmarkable). **Profiling finding
   (7749 mastodon+gitlab `.rb`, 12 cores, warm, ~296ms total):** stage1 ~152ms/51% (parallel, 3.3×
   — I/O + libprism-FFI bound, the scaling ceiling), **stage2 ~77ms/26% (SERIAL — the next

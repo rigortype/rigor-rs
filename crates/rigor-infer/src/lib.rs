@@ -31,7 +31,7 @@ use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
 pub use source_index::{
-    lexical_scopes, method_body_spans, ConstLit, DefKind, ParamBoundReturn, SourceIndex,
+    lexical_scopes, method_body_spans, ConstLit, DefKind, Harvest, ParamBoundReturn, SourceIndex,
     SOURCE_CLASS_BASE,
 };
 

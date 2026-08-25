@@ -668,12 +668,13 @@ fn analyze_files(
     let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();
     let mut had_io_error = false;
 
-    // PROJECT PASS (ADR-0023 cross-file): parse+lower EVERY file first, build
-    // ONE project-wide SourceIndex, then analyze each file against it. Stages 1
-    // (parse+lower) and 3 (analyze) are file-INDEPENDENT and run on a rayon pool
-    // (§9, ADR-0006/0028); stage 2 (the project-index build) is the serial
-    // barrier between them. Per-file panic isolation (ADR-0016) is preserved at
-    // both parallel stages — each closure `catch_unwind`s its own file.
+    // PROJECT PASS (ADR-0023 cross-file): parse+lower+HARVEST every file first,
+    // MERGE the harvests into ONE project-wide SourceIndex, then analyze each
+    // file against it. Stages 1 (parse+lower+harvest) and 3 (analyze) are
+    // file-INDEPENDENT and run on a rayon pool (§9, ADR-0006/0028); stage 2 (the
+    // merge) is the serial barrier between them. Per-file panic isolation
+    // (ADR-0016) is preserved at both parallel stages — each closure
+    // `catch_unwind`s its own file.
     //
     // Determinism (the parity keystone): each parallel stage collects its
     // outcomes IN INPUT ORDER (`par_iter().map().collect()` preserves the source
@@ -681,6 +682,9 @@ fn analyze_files(
     // findings pushes — are replayed by a SEQUENTIAL drain of that ordered Vec.
     // So the stderr stream, the findings order, and the final `sort_by_key` are
     // all byte-identical to the old serial loop; the pool is invisible in output.
+    // The harvests inherit that contract: they are frozen before the merge
+    // starts and merged in the SAME input order, which is normative (issue #92
+    // — `SourceIndex::merge` must never sort).
     struct Prepared {
         order: usize,
         path: String,
@@ -689,12 +693,16 @@ fn analyze_files(
         comments: Vec<(usize, usize, String)>,
     }
 
-    // STAGE 1 (file-parallel): read + parse + lower. A closure never mutates
-    // shared state — it returns a self-contained outcome that the serial drain
-    // below turns into the same eprintln / push the serial loop did.
+    // STAGE 1 (file-parallel): read + parse + lower + harvest. A closure never
+    // mutates shared state — it returns a self-contained outcome that the serial
+    // drain below turns into the same eprintln / push the serial loop did.
     enum Stage1 {
         Excluded,
-        Prepared(Prepared),
+        /// The lowered file plus its per-file [`rigor_infer::Harvest`], kept
+        /// side by side so the serial drain can fill the two index-aligned Vecs.
+        /// The harvest is BOXED to keep this variant close to the others in size
+        /// (`clippy::large_enum_variant`); one allocation per file, in parallel.
+        Prepared(Prepared, Box<rigor_infer::Harvest>),
         IoError { path: String, msg: String },
         Panic { order: usize, path: String, msg: String },
     }
@@ -741,13 +749,25 @@ fn analyze_files(
             }));
             match lowered {
                 Ok(None) => Stage1::Excluded,
-                Ok(Some((ast, comments))) => Stage1::Prepared(Prepared {
-                    order,
-                    path: path.to_string(),
-                    source,
-                    ast,
-                    comments,
-                }),
+                Ok(Some((ast, comments))) => {
+                    // Issue #92: the per-file HARVEST — everything the project
+                    // index derives from this file's AST + the already-frozen
+                    // `CoreIndex` (ADR-0028 freezes it before any worker starts).
+                    // It reads no other file and no accumulated index state, so
+                    // it belongs here, in the parallel stage, and leaves stage 2
+                    // with only the genuinely cross-file joins.
+                    //
+                    // Deliberately OUTSIDE the `catch_unwind` above: a harvest
+                    // panic propagates out of the pool exactly as a
+                    // `build_project` panic used to propagate out of stage 2,
+                    // rather than silently degrading the file to an
+                    // internal-error diagnostic and dropping it from the index.
+                    let harvest = Box::new(rigor_infer::SourceIndex::harvest(&ast, &index));
+                    Stage1::Prepared(
+                        Prepared { order, path: path.to_string(), source, ast, comments },
+                        harvest,
+                    )
+                }
                 Err(panic_val) => Stage1::Panic {
                     order,
                     path: path.to_string(),
@@ -758,11 +778,17 @@ fn analyze_files(
         .collect();
 
     // Drain stage-1 outcomes in input order: deterministic stderr + findings.
+    // `prepared` and `harvests` stay INDEX-ALIGNED — both are pushed here, in
+    // input order, and nothing reorders either afterwards.
     let mut prepared: Vec<Prepared> = Vec::new();
+    let mut harvests: Vec<rigor_infer::Harvest> = Vec::new();
     for outcome in stage1 {
         match outcome {
             Stage1::Excluded => {}
-            Stage1::Prepared(p) => prepared.push(p),
+            Stage1::Prepared(p, h) => {
+                prepared.push(p);
+                harvests.push(*h);
+            }
             Stage1::IoError { path, msg } => {
                 eprintln!("rigor {verb}: cannot read {path}: {msg}");
                 had_io_error = true;
@@ -776,10 +802,15 @@ fn analyze_files(
 
     let t_stage1 = std::time::Instant::now();
 
-    // STAGE 2 (serial barrier): build ONE project-wide source index from all
-    // cleanly-lowered ASTs. This is the cross-file join — it must see every AST.
-    let asts: Vec<&rigor_parse::LoweredAst> = prepared.iter().map(|p| &p.ast).collect();
-    let project_source = rigor_infer::SourceIndex::build_project(&asts, &index);
+    // STAGE 2 (serial barrier): MERGE the per-file harvests into ONE
+    // project-wide source index. This is the cross-file join — it must see every
+    // file's harvest, and it still takes the ASTs because two merge-resident
+    // passes walk them (tier-4b return typing and the interprocedural literal
+    // fold; issue #92 §5). The pairing is positional: `harvests[i]` was harvested
+    // from `prepared[i].ast`.
+    let files: Vec<(rigor_infer::Harvest, &rigor_parse::LoweredAst)> =
+        harvests.into_iter().zip(prepared.iter().map(|p| &p.ast)).collect();
+    let project_source = rigor_infer::SourceIndex::merge(&files, &index);
     let t_stage2 = std::time::Instant::now();
 
     // STAGE 3 (file-parallel): analyze each file against the shared, now-frozen
@@ -905,8 +936,8 @@ fn analyze_files(
     if timing {
         let t_end = std::time::Instant::now();
         eprintln!(
-            "rigor timing: index-load={:.3?} stage1(parse+lower)={:.3?} \
-             stage2(build_project)={:.3?} stage3(analyze)={:.3?} sort={:.3?} \
+            "rigor timing: index-load={:.3?} stage1(parse+lower+harvest)={:.3?} \
+             stage2(merge)={:.3?} stage3(analyze)={:.3?} sort={:.3?} \
              total={:.3?} files={} threads={}",
             t_index - t_start,
             t_stage1 - t_index,
