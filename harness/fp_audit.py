@@ -240,6 +240,20 @@ def keys(diags):
     }
 
 
+def _by_count(counter):
+    """A Counter's items, ordered for deterministic rendering.
+
+    Highest count first; ties broken by key. `Counter.most_common()` ties
+    break by first-insertion order instead, which here means the iteration
+    order of the `fp`/`gap` SETS that feed the counter — and set iteration
+    order for string-keyed tuples varies with PYTHONHASHSEED (issue #96: two
+    runs of the same binary on the same corpus produced textually different
+    reports). Sorting explicitly at render time removes the dependency
+    regardless of how the counter was populated.
+    """
+    return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+
+
 def audit(tgt, show=12, show_gaps=False, gap_rules=None):
     """FP-candidate count for one corpus, or None when the comparison is INVALID.
 
@@ -271,14 +285,14 @@ def audit(tgt, show=12, show_gaps=False, gap_rules=None):
     print(f"  FP candidates (rigor-rs only): {len(fp)}")
     print(f"  coverage gaps (reference only): {len(gap)}")
     if fp:
-        print("  FP by rule:", dict(Counter(k[3] for k in fp).most_common()))
+        print("  FP by rule:", dict(_by_count(Counter(k[3] for k in fp))))
         for k in sorted(fp)[:show]:
             print(f"    FP: {k[3]} @ {os.path.basename(k[0])}:{k[1]}:{k[2]}")
     if gap_rules is not None:
         for k in gap:
             gap_rules[k[3]] += 1
     if show_gaps and gap:
-        print("  gaps by rule:", dict(Counter(k[3] for k in gap).most_common()))
+        print("  gaps by rule:", dict(_by_count(Counter(k[3] for k in gap))))
     return len(fp)
 
 
@@ -335,7 +349,7 @@ if __name__ == "__main__":
     print(f"\nTOTAL FP candidates: {total}{suffix}")
     if show_gaps:
         print("TOTAL coverage gaps by rule (where to spend coverage effort):")
-        for rule, n in gap_rules.most_common():
+        for rule, n in _by_count(gap_rules):
             print(f"  {n:6}  {rule}")
     if invalid:
         # The FP total above is not a result: it was measured over a subset. A
