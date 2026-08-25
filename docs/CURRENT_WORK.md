@@ -19,9 +19,8 @@ vendored, PR #100)** — slice 2 is DIRECT summaries against the catalogue
 its first job closes the pinned posture-path `mutates_receiver` under-claim
 (the mutator sets).
 Pin HOLDS at `v0.3.4` (master surveyed: 0 diagnostics on 9204). Also open:
-frozen-index follow-ups — cross-file hover/completion (cached last-good
-index, needs a spec) + the harvest-cache re-measure; LSP v4+ (`rootUri`,
-UTF-16 sync). The narrowing frontier stays OUT OF CARRIER
+the harvest-cache re-measure (now ALSO gated on #102); LSP v4+
+(`rootUri`, UTF-16 sync). The narrowing frontier stays OUT OF CARRIER
 LEVERS ([verdicts](notes/20260809-deferred-slices-and-upstream-feedback.md),
 [carrier](notes/20260809-unresolved-const-receiver-carrier.md)). **Before the
 next bump, diff our OPEN upstream issues against the release notes** — batch 3
@@ -47,12 +46,11 @@ State (verified 2026-08-23, post the `v0.3.4` re-pin): harness **97 fixtures / 0
 unregistered extras / 0 registered divergences**, coverage 405/441; standing
 sweep **0 FP / 9204 files / 820 gaps**, 8 corpora, baselines in
 `harness/CORPUS.md`. Gap totals move mostly with upstream retractions, not
-coverage. Neither sweep tool sees project-`sig/` behaviour. EVERY
-tool that grades the port now prints its binary's path + build time and
-REFUSES one older than `crates/` — corpus tools on release, the fixture
-harness on debug (PR #65 + the 08-08 follow-up; a stale debug binary reported
-18 phantom FPs before the guard). Clippy: workspace `-D warnings`, verify in a
-FRESH `CARGO_TARGET_DIR`.
+coverage. Neither sweep tool sees project-`sig/` behaviour. EVERY grading
+tool prints its binary's path + build time and REFUSES one older than the
+rigor-cli path-dep CLOSURE (PR #65; closure-scoped by PR #100) — corpus
+tools on release, the fixture harness on debug. Clippy: workspace
+`-D warnings`, verify in a FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
@@ -107,7 +105,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 - **2026-08-26 effects slice 1 — the vendored catalogue crate (PR #100)** — `crates/rigor-effects` (no consumer yet): registry with implied-ancestor `known?` (the 4 phantom roots pass) + the 420-row catalogue with row→universal→posture `lookup` precedence, at the pin digests; THREE drift layers (ported upstream data specs / `vendor_effects.py --check` / embedded-digest test) + the UPSTREAM.md re-sync bullet. Side effect, audited: all four stale-binary guards now scan the rigor-cli path-dep CLOSURE (an unlinked member made them permanently stale). Debt: posture-path `mutates_receiver` under-claims until the mutator sets port. [spec](notes/20260826-effects-s1-mini-spec.md) / [impl](notes/20260826-effects-s1-impl.md).
 
-- **2026-08-25 the frozen-index ARC (Rust Glancer recon → 4 slices, COMPLETE)** — Glancer validates our standing choices (no Salsa, flat arenas, save-driven invalidation); everything portable converged on the per-file harvest/merge decomposition of `SourceIndex`. Landed: **#92** keystone (PR #95: stage 2 −29%, bit-identical, pre-#92 path kept as the `cfg(test)` equivalence oracle); **#94** per-candidate ancestor closure (PR #98: stage 2 @ 4,675 164.9→82.5ms); **LSP held-harvest** (PR #99: dispatch 112.8→69.8ms @ 4,675 — **the OverlayGuard stays ON; cross-file diagnostics live at gitlab scale**); #96 fp_audit determinism (PR #97 + the null-rule root-fix `31ac9ce`). Probe corrections stand: file order is NORMATIVE (merge never sorts), AST eviction stays blocked (M3 consumes ASTs). #93 baselines: harvest cache = re-measure post-arc, diag cache NO-GO. OPEN: cross-file hover/completion (cached last-good index, own spec). [recon](notes/20260825-rust-glancer-frozen-index-recon.md) / [baselines](notes/20260825-frozen-index-baseline-measurements.md) / [inventory](notes/20260825-s92-buildproject-pass-inventory.md) / [s92](notes/20260825-s92-harvest-merge-impl.md) / [s94](notes/20260825-s94-ancestor-closure-impl.md) / [lsp](notes/20260825-lsp-held-harvest-impl.md).
+- **2026-08-25 the frozen-index ARC (Rust Glancer recon → 4 slices, COMPLETE)** — Glancer validates our standing choices (no Salsa, flat arenas, save-driven invalidation); everything portable converged on the per-file harvest/merge decomposition of `SourceIndex`. Landed: **#92** keystone (PR #95: stage 2 −29%, bit-identical, pre-#92 path kept as the `cfg(test)` equivalence oracle); **#94** per-candidate ancestor closure (PR #98: stage 2 @ 4,675 164.9→82.5ms); **LSP held-harvest** (PR #99: dispatch 112.8→69.8ms @ 4,675 — **the OverlayGuard stays ON; cross-file diagnostics live at gitlab scale**); #96 fp_audit determinism (PR #97 + the null-rule root-fix `31ac9ce`). Probe corrections stand: file order is NORMATIVE (merge never sorts), AST eviction stays blocked (M3 consumes ASTs). #93 baselines: harvest cache = re-measure post-arc, diag cache NO-GO. Cross-file hover/completion LANDED (PR #101: per-URI last-good cache — [impl](notes/20260826-lsp-crossfile-cache-impl.md)); residual: same-file const-hover precision = #102 (file_id root fix). [recon](notes/20260825-rust-glancer-frozen-index-recon.md) / [baselines](notes/20260825-frozen-index-baseline-measurements.md) / [inventory](notes/20260825-s92-buildproject-pass-inventory.md) / [s92](notes/20260825-s92-harvest-merge-impl.md) / [s94](notes/20260825-s94-ancestor-closure-impl.md) / [lsp](notes/20260825-lsp-held-harvest-impl.md).
 - **2026-08-25 effect-system port OPENED — ADR + differential, slice 0** ([ADR-0043](adr/0043-effect-system-port-parity-model.md)) — a summary is not a diagnostic set: graded per METHOD as a **sound subset** (proven ⊆ oracle, taint ≥ oracle, declared exact) by `harness/effects_diff.py`, the first PROJECT-level instrument here — it runs IN the project, so it sees `.rigor.yml` / `sig/` / plugins. Self-test all-MATCH; baseline debt **46 methods / 28 labels**, 0 OVER. Slice order follows upstream's (snapshot first). The `declared:` OPEN is **SOLVED** (s1 probe, 5/5 predictions): it is the CALLER's lane — `import_envelope` joins the callee's envelope at the call site, and rendering drops what the proven lane subsumes; slice 6 needs BOTH rules ([probe](notes/20260826-effects-s1-catalogue-probe.md) §7).
 - **2026-08-25 upstream survey `v0.3.4` → master — HOLD the pin** — 64 commits + rbs 4.1.1→4.1.3 move **0 diagnostics on 9204 files** (both axes; the rbs trees are byte-identical). But the survey found two live rigor-rs defects in surfaces no standing gate reaches: the **vendored plugin RBS had drifted since 2026-06-26 = 10 FPs** (a THIRD pin-tracking surface, sourced from a local checkout — hazard 3 applied to a file; fixture 98 + ritual step 3 now cover it), and every `documentation_url` we emit **404s** (`blob/main`; upstream #438). [survey](notes/20260825-upstream-survey-v034-master.md).
 - **2026-08-23 upstream re-pin `v0.3.2 → v0.3.4`** (151 commits) — **0 FP / 9204, gaps 841→820**, harness 97 fixtures / 0 extras; rbs AND `data/` overlay both UNCHANGED, both exception tables still empty. The raw bump opened **50 FPs** — all upstream RETRACTIONS (#319, #318) that the snapshot diff cannot show, and all from OUR batch-3 reports, now due. [note](notes/20260823-repin-v034.md).
