@@ -37,7 +37,7 @@
 //! Rails models false-positive-free. For an RBS-only instance class (e.g.
 //! `Pathname`) existence defers entirely to RBS's own conservative gate.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, MethodBody, Node, NodeId, Visibility};
@@ -190,6 +190,21 @@ struct OverrideClass {
 /// Any future persisted harvest MUST re-stamp this field, or the field must
 /// become a path/content key first.
 type HarvestedConst = (Vec<String>, u64, ConstLit);
+
+/// Issue #94: the per-MERGE memo of transitive project-ancestor closures, keyed
+/// by definer-candidate name. One entry answers every later
+/// `(candidate, *owner*)` relatedness query of that merge as a set membership
+/// test, replacing one BFS per PAIR with one BFS per CANDIDATE (measured reuse:
+/// 12.5× at gitlab-foss/lib, 21.5× at mastodon/app —
+/// `docs/notes/20260825-s94-pass4b-cost-probe.md` §2).
+///
+/// It is deliberately a plain local threaded by `&mut` through the Pass-4b call
+/// chain, NOT a [`SourceIndex`] field and NOT interior mutability: its soundness
+/// rests on `override_classes` being frozen for the whole of
+/// [`SourceIndex::compute_literal_returns`], and on nothing outliving that call
+/// (the LSP rebuilds the index per dispatch, so a longer-lived cache keyed by
+/// class name alone would serve stale answers across keystrokes).
+type AncestorClosures = HashMap<String, HashSet<String>>;
 
 /// One source class/module (re)definition, harvested from a single file's AST in
 /// `ast.iter()` order. Replayed through [`SourceIndex::add_source`] at merge, so
@@ -1466,15 +1481,22 @@ impl SourceIndex {
     /// overridable-method degrade. A per-key memo makes the recursive body-to-body
     /// fold (`read_write? = !read_only?`) linear; a per-resolution `visiting` set
     /// makes a recursive method (`def loopy; loopy; end`) decline rather than spin.
+    /// A per-candidate [`AncestorClosures`] memo (#94) makes the degrade gate's
+    /// ancestor walk run once per definer-candidate instead of once per
+    /// `(candidate, owner)` pair.
     fn compute_literal_returns(
         &self,
         asts: &[&LoweredAst],
         defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
     ) -> HashMap<(String, String, DefKind), Scalar> {
         let mut memo: HashMap<(String, String, DefKind), Option<Scalar>> = HashMap::new();
+        // Born here, dies here: the closure memo is valid exactly as long as
+        // `override_classes` is frozen, which is exactly this call (every reader
+        // below takes `&self`, and M1's replay finished before M3 started).
+        let mut closures: AncestorClosures = AncestorClosures::new();
         for key in defs.keys() {
             let mut visiting: HashSet<(String, String, DefKind)> = HashSet::new();
-            self.resolve_fold_key(key, defs, asts, &mut memo, &mut visiting);
+            self.resolve_fold_key(key, defs, asts, &mut memo, &mut visiting, &mut closures);
         }
         memo.into_iter().filter_map(|(k, v)| v.map(|s| (k, s))).collect()
     }
@@ -1490,6 +1512,7 @@ impl SourceIndex {
         asts: &[&LoweredAst],
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
         visiting: &mut HashSet<(String, String, DefKind)>,
+        closures: &mut AncestorClosures,
     ) -> Option<Scalar> {
         if let Some(v) = memo.get(key) {
             return v.clone();
@@ -1498,9 +1521,9 @@ impl SourceIndex {
             return None; // cycle (recursive method) ⇒ decline, don't memoize.
         }
         visiting.insert(key.clone());
-        let raw = self.fold_key_sites(key, defs, asts, memo, visiting);
+        let raw = self.fold_key_sites(key, defs, asts, memo, visiting, closures);
         let result = match raw {
-            Some(_) if self.overridden_in_project(&key.0, &key.1, key.2) => None,
+            Some(_) if self.overridden_in_project(&key.0, &key.1, key.2, closures) => None,
             other => other,
         };
         visiting.remove(key);
@@ -1518,6 +1541,7 @@ impl SourceIndex {
         asts: &[&LoweredAst],
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
         visiting: &mut HashSet<(String, String, DefKind)>,
+        closures: &mut AncestorClosures,
     ) -> Option<Scalar> {
         let sites = defs.get(key)?;
         let mut acc: Option<Scalar> = None;
@@ -1526,7 +1550,8 @@ impl SourceIndex {
                 return None;
             }
             let ast = asts[site.ast_idx];
-            let s = self.fold_expr(ast, site.tail, &key.0, key.2, defs, asts, memo, visiting, 0)?;
+            let s = self
+                .fold_expr(ast, site.tail, &key.0, key.2, defs, asts, memo, visiting, closures, 0)?;
             match &acc {
                 None => acc = Some(s),
                 Some(prev) if *prev != s => return None, // disagreeing reopen.
@@ -1553,6 +1578,7 @@ impl SourceIndex {
         asts: &[&LoweredAst],
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
         visiting: &mut HashSet<(String, String, DefKind)>,
+        closures: &mut AncestorClosures,
         depth: usize,
     ) -> Option<Scalar> {
         if depth > FOLD_DEPTH_CAP {
@@ -1577,7 +1603,7 @@ impl SourceIndex {
                         (self.resolve_instance_owner(self_qual, &method)?, DefKind::Instance)
                     }
                 };
-                self.resolve_fold_key(&(owner, method, kind), defs, asts, memo, visiting)
+                self.resolve_fold_key(&(owner, method, kind), defs, asts, memo, visiting, closures)
             }
             Node::Call { receiver: Some(r), method, args, block_body, .. }
                 if block_body.is_empty() =>
@@ -1588,7 +1614,8 @@ impl SourceIndex {
                 // what turns `read_write? = !read_only?` into `true`).
                 if method == "!" && args.is_empty() {
                     let s = self.fold_expr(
-                        ast, r, self_qual, self_kind, defs, asts, memo, visiting, depth + 1,
+                        ast, r, self_qual, self_kind, defs, asts, memo, visiting, closures,
+                        depth + 1,
                     )?;
                     return Some(Scalar::Bool(!scalar_truthy(&s)));
                 }
@@ -1603,6 +1630,7 @@ impl SourceIndex {
                                 asts,
                                 memo,
                                 visiting,
+                                closures,
                             );
                         }
                     }
@@ -1610,12 +1638,13 @@ impl SourceIndex {
                 // A core fold on a value-pinned receiver + args (`1 + 1`, `"x" ==
                 // "y"`). Declines unless every part folds.
                 let recv = self.fold_expr(
-                    ast, r, self_qual, self_kind, defs, asts, memo, visiting, depth + 1,
+                    ast, r, self_qual, self_kind, defs, asts, memo, visiting, closures, depth + 1,
                 )?;
                 let mut arg_scalars = Vec::with_capacity(args.len());
                 for a in args {
                     arg_scalars.push(self.fold_expr(
-                        ast, a, self_qual, self_kind, defs, asts, memo, visiting, depth + 1,
+                        ast, a, self_qual, self_kind, defs, asts, memo, visiting, closures,
+                        depth + 1,
                     )?);
                 }
                 crate::folding::fold(&recv, &method, &arg_scalars)
@@ -1669,18 +1698,110 @@ impl SourceIndex {
     /// owner class, or an includer/prepender of an owner module). A same-name
     /// method in an UNRELATED class is not an override — so the two unrelated
     /// `force_pipeline_creation_to_continue?` definers each still fold.
-    fn overridden_in_project(&self, owner: &str, method: &str, kind: DefKind) -> bool {
+    fn overridden_in_project(
+        &self,
+        owner: &str,
+        method: &str,
+        kind: DefKind,
+        closures: &mut AncestorClosures,
+    ) -> bool {
         let Some(candidates) = self.definers.get(&(method.to_string(), kind)) else {
             return false;
         };
         candidates
             .iter()
-            .any(|c| c != owner && self.related_to_owner(c, owner))
+            .any(|c| c != owner && self.ancestor_closure(c, closures).contains(owner))
     }
 
-    /// Whether `candidate`'s transitive project ancestry reaches `owner` — i.e.
-    /// `candidate` is a subclass of an owner class or an includer of an owner
-    /// module. Reuses the same ancestor walk as method resolution.
+    /// `candidate`'s transitive project-ancestor closure, from the per-merge
+    /// [`AncestorClosures`] memo — built on first use, then reused by every later
+    /// `(candidate, *)` query. `closure(candidate).contains(owner)` IS the old
+    /// per-pair `related_to_owner(candidate, owner)` (#94); the `#[cfg(test)]`
+    /// copy of that walk below is the equivalence oracle that pins it.
+    fn ancestor_closure<'a>(
+        &self,
+        candidate: &str,
+        closures: &'a mut AncestorClosures,
+    ) -> &'a HashSet<String> {
+        // `contains_key` + `insert` rather than the `entry` API on purpose: a HIT
+        // (12–22× more frequent than a miss) must not pay for a key allocation,
+        // and `entry` would force `candidate.to_string()` on every query.
+        if !closures.contains_key(candidate) {
+            let closure = self.build_ancestor_closure(candidate);
+            closures.insert(candidate.to_string(), closure);
+        }
+        &closures[candidate]
+    }
+
+    /// Build `candidate`'s transitive project-ancestor closure: every class name
+    /// the pre-#94 per-pair walk could ever have popped off its queue — same MRO
+    /// BFS order, same cycle guard, same visited cap — collected instead of
+    /// stopping at the first match. So `closure.contains(owner)` answers exactly
+    /// what `related_to_owner(candidate, owner)` answered: `candidate` is a
+    /// transitive subclass of an owner class, or an includer/prepender of an
+    /// owner module.
+    ///
+    /// ## Cap-boundary fidelity (the one subtle equivalence)
+    ///
+    /// In the old loop the `current == owner` test ran on POP — BEFORE the
+    /// seen-skip AND BEFORE the `visited > OVERRIDE_ANCESTOR_WALK_LIMIT` return.
+    /// So the node that OVERFLOWS the cap is still owner-checkable (it can still
+    /// answer `true`), while the nodes left behind in the queue never are. This
+    /// builder reproduces that boundary exactly: it RECORDS each node at its
+    /// first pop, and when the recorded count passes the cap it records the
+    /// overflowing node but does NOT expand it and stops — leaving the rest of
+    /// the queue out of the closure, exactly as the old walk left them
+    /// unreachable. That is also why BFS ORDER is load-bearing here and must stay
+    /// byte-identical to the old walk: under the cap, WHICH nodes make it into
+    /// the closure depends on the order they were popped in.
+    ///
+    /// A DUPLICATE pop needs no recording — its first pop already put it in the
+    /// set — with ONE exception: `candidate` itself is pre-seeded into `seen`
+    /// (the old walk's cycle guard) and so is never recorded by a first pop, yet
+    /// a cycle that walks back to it DID make it owner-checkable in the old loop.
+    /// That case is recorded explicitly.
+    fn build_ancestor_closure(&self, candidate: &str) -> HashSet<String> {
+        // `seen` doubles as the closure being built: a node is inserted exactly
+        // when the old walk would have owner-checked it for the first time.
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(candidate.to_string());
+        let mut candidate_popped = false;
+        let mut queue: VecDeque<String> = self.override_ancestor_names(candidate).into();
+        let mut visited = 0usize;
+        while let Some(current) = queue.pop_front() {
+            if seen.contains(&current) {
+                if current == candidate {
+                    candidate_popped = true;
+                }
+                continue;
+            }
+            visited += 1;
+            if visited > OVERRIDE_ANCESTOR_WALK_LIMIT {
+                // Cap exceeded: this node was popped, so it stays owner-checkable;
+                // it is NOT expanded and the queue behind it is abandoned.
+                seen.insert(current);
+                break;
+            }
+            // The expansion is moved into the queue and `current` is moved into
+            // `seen` — no per-pop `String` re-allocation (the old walk cloned
+            // `current` on every pop).
+            queue.extend(self.override_ancestor_names(&current));
+            seen.insert(current);
+        }
+        if !candidate_popped {
+            // Pre-seeded as the cycle guard, never actually reached ⇒ not part of
+            // its own closure.
+            seen.remove(candidate);
+        }
+        seen
+    }
+
+    /// The PRE-#94 per-pair walk, verbatim, kept as the equivalence oracle for
+    /// [`SourceIndex::build_ancestor_closure`] (the #92 `build_project_legacy`
+    /// pattern). Whether `candidate`'s transitive project ancestry reaches
+    /// `owner` — i.e. `candidate` is a subclass of an owner class or an includer
+    /// of an owner module. Nothing but `probes_s94` calls it.
+    #[cfg(test)]
     fn related_to_owner(&self, candidate: &str, owner: &str) -> bool {
         let mut queue: Vec<String> = self.override_ancestor_names(candidate);
         let mut seen: HashSet<String> = HashSet::new();
@@ -4657,12 +4778,312 @@ mod probes_s92 {
     /// The four files probe 1 permutes: two visibility conflicts, an include
     /// order conflict, constants (toplevel + nested, single + multiply
     /// assigned), a toplevel def and an RBS-known constant read.
-    fn probe1_sources() -> Vec<&'static [u8]> {
+    ///
+    /// `pub(super)` so the #94 equivalence harness (`probes_s94`) can grade the
+    /// ancestor closure on the same override-graph shapes.
+    pub(super) fn probe1_sources() -> Vec<&'static [u8]> {
         vec![
             b"class Base\n  def m\n    1\n  end\nend\nmodule M1\n  def shared\n    1\n  end\nend\nTOPC = 1\ndef tl_a; 1; end\nmodule N1\n  K = 1\n  class Time\n  end\nend\n",
             b"class Base\n  include M1\n  private\n  def m\n    2\n  end\nend\n",
             b"module M2\n  private\n  def shared\n    2\n  end\nend\nclass Base\n  include M2\nend\nclass Sub < Base\n  private\n  def shared\n    3\n  end\nend\n",
             b"class Other\n  def name\n    \"x\"\n  end\nend\nOTHERC = [1, 2].freeze\nPathname.new(\"/\")\nmodule N2\n  K = 2\n  class Time\n  end\nend\n",
         ]
+    }
+}
+
+// ===========================================================================
+// EQUIVALENCE HARNESS — issue #94 (per-candidate ancestor closure).
+//
+// Pass 4b's overridable degrade gate used to run one ancestor BFS per
+// `(candidate, owner)` PAIR (`related_to_owner`); it now runs one per CANDIDATE
+// and answers each pair from the resulting closure. That is a pure performance
+// change, so the whole of its correctness is one claim:
+//
+//     related_to_owner(c, o)  ==  ancestor_closure(c).contains(o)      ∀ c, o
+//
+// The pre-#94 walk is kept verbatim under `#[cfg(test)]` (the #92
+// `build_project_legacy` pattern) and IS the oracle here. The four tests grade
+// the claim on (1) the probe corpora's override-graph shapes, (2) randomized
+// synthetic hierarchies (reopens, includes, cycles, lexical nesting), and
+// (3, 4) both halves of the `OVERRIDE_ANCESTOR_WALK_LIMIT` boundary — the node
+// that overflows the cap, and the queue abandoned behind it. No real corpus
+// reaches the cap at all (0 hits in 12 runs,
+// `docs/notes/20260825-s94-pass4b-cost-probe.md` §2), so those two synthetic
+// tests are its ONLY coverage — and the fan-out one is what catches a change in
+// BFS order, which below the cap is invisible.
+//
+// `docs/notes/20260825-s94-ancestor-closure-impl.md` is the impl write-up.
+// ===========================================================================
+#[cfg(test)]
+mod probes_s94 {
+    use super::*;
+    use rigor_parse::{lower, parse};
+
+    /// The `CoreIndex` is passed in, never built per project: it is the most
+    /// expensive thing in this module by an order of magnitude (RBS load), and
+    /// the graded property does not depend on it.
+    fn build(srcs: &[Vec<u8>], core: &CoreIndex) -> SourceIndex {
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        SourceIndex::build_project(&refs, core)
+    }
+
+    fn owned(srcs: Vec<&[u8]>) -> Vec<Vec<u8>> {
+        srcs.into_iter().map(|s| s.to_vec()).collect()
+    }
+
+    /// Every name the graded pairs are drawn from: every class the override
+    /// index knows, plus names it does NOT know (an unrelated owner must stay
+    /// `false` through both paths).
+    fn universe(idx: &SourceIndex) -> Vec<String> {
+        let mut names: Vec<String> = idx.override_classes.keys().cloned().collect();
+        names.sort();
+        names.push("NoSuchClass".to_string());
+        names.push("".to_string());
+        names
+    }
+
+    /// Grade `closure.contains(owner)` against the pre-#94 walk for EVERY
+    /// ordered pair over the universe, through both the memoized entry point
+    /// (one shared [`AncestorClosures`] map, so cache hits are exercised) and a
+    /// freshly built closure (so a cache hit can never be what makes it agree).
+    /// Returns `(pairs graded, pairs that were related)`.
+    fn grade(idx: &SourceIndex, label: &str) -> (usize, usize) {
+        let names = universe(idx);
+        let mut closures = AncestorClosures::new();
+        let (mut graded, mut related) = (0usize, 0usize);
+        for c in &names {
+            let fresh = idx.build_ancestor_closure(c);
+            for o in &names {
+                let legacy = idx.related_to_owner(c, o);
+                let cached = idx.ancestor_closure(c, &mut closures).contains(o);
+                assert_eq!(legacy, cached, "{label}: cached closure disagrees at ({c:?}, {o:?})");
+                let f = fresh.contains(o);
+                assert_eq!(legacy, f, "{label}: fresh closure disagrees at ({c:?}, {o:?})");
+                graded += 1;
+                if legacy {
+                    related += 1;
+                }
+            }
+        }
+        (graded, related)
+    }
+
+    /// The override-graph shapes the probe corpora actually contain — the four
+    /// permuted probe-1 files, the probe-2 reopen trio, and the awkward shapes a
+    /// real corpus does contain but those two do not: cycles, a self-referential
+    /// class/module, a diamond, and lexical nesting where the SAME short name
+    /// resolves to a nested class in one scope and a toplevel one in another.
+    #[test]
+    fn closure_matches_legacy_on_probe_corpora() {
+        let corpora: Vec<(&str, Vec<Vec<u8>>)> = vec![
+            ("probe1", owned(super::probes_s92::probe1_sources())),
+            (
+                "probe2",
+                owned(vec![
+                    b"class Base\n  def m\n    1\n  end\nend\nSHARED = 1\nmodule Wrap\n  DUP = 1\nend\n",
+                    b"class Base\n  private\n  def m\n    2\n  end\nend\nmodule Wrap\n  DUP = 2\nend\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\nSOLO = 7\n",
+                    b"class Solo\n  def q\n    1\n  end\nend\n",
+                ]),
+            ),
+            (
+                // A superclass cycle, a self-superclass, and a self-include:
+                // the shapes the walk's `seen` guard exists for.
+                "cycles",
+                owned(vec![
+                    b"class A < B\nend\nclass B < A\nend\nclass S < S\nend\n",
+                    b"module Loop\n  include Loop\nend\nclass UsesLoop\n  include Loop\nend\n",
+                    b"class A\n  include Loop\nend\n",
+                ]),
+            ),
+            (
+                // A diamond plus a deep-ish chain, reopened across files so the
+                // includes accumulate in source order (MRO-bearing).
+                "diamond",
+                owned(vec![
+                    b"module Top\nend\nmodule Left\n  include Top\nend\nmodule Right\n  include Top\nend\n",
+                    b"class Mid\n  include Left\nend\nclass Mid\n  include Right\nend\nclass Leaf < Mid\nend\nclass Leafer < Leaf\n  include Left\nend\n",
+                ]),
+            ),
+            (
+                // Lexical nesting: `include Shared` inside `Outer` resolves to
+                // `Outer::Shared`, the same text at toplevel resolves to
+                // `Shared` — the qualification keystone the walk must preserve.
+                "nesting",
+                owned(vec![
+                    b"module Shared\nend\nmodule Outer\n  module Shared\n  end\n  class Inner\n    include Shared\n  end\n  class Deep < Inner\n  end\nend\nclass Flat\n  include Shared\nend\n",
+                    b"module Outer\n  class Inner\n    include Outer::Shared\n  end\nend\nclass Other < Outer::Deep\nend\n",
+                ]),
+            ),
+        ];
+        let core = CoreIndex::new();
+        let mut total_related = 0usize;
+        for (label, srcs) in &corpora {
+            let idx = build(srcs, &core);
+            let (graded, related) = grade(&idx, label);
+            println!("--- {label}: {graded} pairs graded, {related} related");
+            total_related += related;
+        }
+        assert!(
+            total_related >= 20,
+            "the corpora must EXERCISE relatedness, not agree vacuously ({total_related})"
+        );
+    }
+
+    /// A deterministic xorshift64 — the randomized hierarchies are reproducible
+    /// from the fixed seed, so a failure is replayable.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// A random project: `n` classes and modules spread over 3 files, with
+    /// reopens, random `include`s, random superclasses, lexically nested
+    /// namespaces, references to names that resolve nowhere, and no acyclicity
+    /// guarantee whatsoever (cycles are the point).
+    fn random_hierarchy(rng: &mut Rng, n: usize) -> Vec<Vec<u8>> {
+        let pool: Vec<String> = (0..n)
+            .map(|i| match i % 4 {
+                0 => format!("C{i}"),
+                1 => format!("M{i}"),
+                2 => format!("Ns::C{i}"),
+                _ => format!("M{i}"),
+            })
+            .collect();
+        // As-written ancestor names: bare short names (so lexical resolution
+        // does the work), fully qualified names, and a name that exists nowhere.
+        let refname = |rng: &mut Rng| -> String {
+            match rng.below(8) {
+                0 => "Absent".to_string(),
+                1..=2 => {
+                    let p = &pool[rng.below(pool.len())];
+                    p.rsplit("::").next().unwrap().to_string()
+                }
+                _ => pool[rng.below(pool.len())].clone(),
+            }
+        };
+        let mut files: Vec<String> = vec![String::new(), String::new(), String::new()];
+        for _ in 0..(n * 2) {
+            let target = pool[rng.below(pool.len())].clone();
+            let file = rng.below(files.len());
+            let (nested, short) = match target.split_once("::") {
+                Some((_, s)) => (true, s.to_string()),
+                None => (false, target.clone()),
+            };
+            let is_module = short.starts_with('M');
+            let mut body = String::new();
+            for _ in 0..rng.below(3) {
+                body.push_str(&format!("  include {}\n", refname(rng)));
+            }
+            let head = if is_module {
+                format!("module {short}\n")
+            } else if rng.below(3) == 0 {
+                format!("class {short}\n")
+            } else {
+                format!("class {short} < {}\n", refname(rng))
+            };
+            let decl = format!("{head}{body}end\n");
+            if nested {
+                files[file].push_str(&format!("module Ns\n{decl}end\n"));
+            } else {
+                files[file].push_str(&decl);
+            }
+        }
+        files.into_iter().map(|f| f.into_bytes()).collect()
+    }
+
+    /// Old-vs-new over randomized hierarchies. Every pair of every generated
+    /// project is graded against the pre-#94 walk.
+    #[test]
+    fn closure_matches_legacy_on_random_hierarchies() {
+        let core = CoreIndex::new();
+        let mut rng = Rng(0x0094_A9CE_5709_5EED);
+        let (mut graded, mut related) = (0usize, 0usize);
+        for round in 0..120 {
+            let n = 4 + rng.below(14);
+            let srcs = random_hierarchy(&mut rng, n);
+            let idx = build(&srcs, &core);
+            let (g, r) = grade(&idx, &format!("random#{round}"));
+            graded += g;
+            related += r;
+        }
+        println!("--- random: {graded} pairs graded, {related} related");
+        assert!(
+            related >= 200,
+            "the generator must produce genuinely related pairs (got {related} of {graded})"
+        );
+    }
+
+    /// THE CAP TEST — the boundary no corpus reaches. In the pre-#94 walk the
+    /// owner check ran on POP, before the `visited > OVERRIDE_ANCESTOR_WALK_LIMIT`
+    /// return, so the node that OVERFLOWS the cap still answers `true` while
+    /// everything past it answers `false`. Owner placed just inside the cap, AT
+    /// the overflow, and one step past it — old and new must agree at all three.
+    #[test]
+    fn closure_matches_legacy_at_the_walk_cap() {
+        // C0 <- C1 <- ... <- C109; the walk starts at C109's ancestors, so C108
+        // is visit 1 and C{109-i} is visit i.
+        let mut src = String::from("class C0\nend\n");
+        for i in 1..110 {
+            src.push_str(&format!("class C{i} < C{}\nend\n", i - 1));
+        }
+        let idx = build(&[src.into_bytes()], &CoreIndex::new());
+        let candidate = "C109";
+        let limit = OVERRIDE_ANCESTOR_WALK_LIMIT; // 100
+        let just_inside = format!("C{}", 109 - limit); // C9  — visit 100
+        let at_boundary = format!("C{}", 108 - limit); // C8  — visit 101, overflows
+        let just_past = format!("C{}", 107 - limit); // C7  — never popped
+
+        let closure = idx.build_ancestor_closure(candidate);
+        assert!(idx.related_to_owner(candidate, &just_inside), "legacy: inside the cap");
+        assert!(idx.related_to_owner(candidate, &at_boundary), "legacy: the overflowing node");
+        assert!(!idx.related_to_owner(candidate, &just_past), "legacy: past the cap");
+        assert!(closure.contains(&just_inside), "closure: inside the cap");
+        assert!(closure.contains(&at_boundary), "closure: the overflowing node");
+        assert!(!closure.contains(&just_past), "closure: past the cap");
+        // The cap really did fire: 100 visited nodes plus the overflowing one.
+        assert_eq!(closure.len(), limit + 1);
+        grade(&idx, "cap-chain");
+    }
+
+    /// The other half of the cap boundary: nodes still QUEUED when the cap fires
+    /// were never popped, so they were never owner-checkable. A 200-wide fan-out
+    /// leaves 99 modules in the queue behind the overflowing one.
+    #[test]
+    fn closure_matches_legacy_when_the_cap_abandons_a_queue() {
+        let mut src = String::new();
+        for i in 0..200 {
+            src.push_str(&format!("module M{i}\nend\n"));
+        }
+        src.push_str("class R\n");
+        for i in 0..200 {
+            src.push_str(&format!("  include M{i}\n"));
+        }
+        src.push_str("end\n");
+        let idx = build(&[src.into_bytes()], &CoreIndex::new());
+        let limit = OVERRIDE_ANCESTOR_WALK_LIMIT; // 100
+        let closure = idx.build_ancestor_closure("R");
+        // M0..M99 are visits 1..100; M100 overflows the cap but is still popped
+        // (⇒ owner-checkable); M101.. never leave the queue.
+        assert!(idx.related_to_owner("R", &format!("M{}", limit - 1)));
+        assert!(idx.related_to_owner("R", &format!("M{limit}")), "the overflowing node");
+        assert!(!idx.related_to_owner("R", &format!("M{}", limit + 1)), "abandoned in the queue");
+        assert!(closure.contains(&format!("M{}", limit - 1)));
+        assert!(closure.contains(&format!("M{limit}")));
+        assert!(!closure.contains(&format!("M{}", limit + 1)));
+        assert_eq!(closure.len(), limit + 1);
+        grade(&idx, "cap-fanout");
     }
 }
