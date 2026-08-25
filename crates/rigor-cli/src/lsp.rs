@@ -47,7 +47,7 @@ use lsp_types::{
 };
 
 use rigor_index::CoreIndex;
-use rigor_infer::{SourceIndex, Typer};
+use rigor_infer::{Harvest, SourceIndex, Typer};
 use rigor_parse::{comment_lines, lower, parse, LoweredAst, Node};
 use rigor_rules::{analyze_with_source_and_folder, filter_suppressed, Severity, SuppressSet};
 use rigor_types::{Interner, Type, TypeId};
@@ -214,7 +214,7 @@ fn run_stdio() -> Result<(), String> {
     // only steps down if the cost is confirmed by the next real dispatch.
     let mut guard = OverlayGuard::new();
     if build.file_count > 0 {
-        guard.record(build.build_project, OVERLAY_BUILD_BUDGET_DEFAULT);
+        guard.record(build.merge, OVERLAY_BUILD_BUDGET_DEFAULT);
     }
     report_overlay_timing(&build, guard.enabled);
     let overlay = (guard.enabled && build.file_count > 0).then_some(build.files);
@@ -319,14 +319,14 @@ struct ProjectContext {
     /// sits beside them and rides the same `invalidate` / `swap_project` rebuild
     /// and the same S4 generation guard.
     exclude: ExcludeMatcher,
-    /// The **cross-file overlay substrate** (S4b): every project `.rb` file's
-    /// canonical path + its held `LoweredAst`, harvested at build time. A
-    /// diagnostics dispatch rebuilds the project `SourceIndex` from these ASTs
-    /// with the dirty buffer's file's AST REPLACED by the buffer's freshly-lowered
-    /// one ([`overlay_source_index`]), so LSP diagnostics see the same cross-file
-    /// context `check` does. `None` ⇒ the overlay is OFF (the scale guard tripped,
-    /// or no project files were found) and diagnostics fall back to today's
-    /// single-file [`SourceIndex::build`].
+    /// The **cross-file overlay substrate** (S4b): every project `.rb` file as a
+    /// [`HeldFile`] — canonical path, `LoweredAst`, and `Harvest`, all produced at
+    /// build time. A diagnostics dispatch merges these into the project
+    /// `SourceIndex` with the dirty buffer's file's PAIR replaced by the buffer's
+    /// freshly-lowered-and-harvested one ([`overlay_source_index`]), so LSP
+    /// diagnostics see the same cross-file context `check` does. `None` ⇒ the
+    /// overlay is OFF (the scale guard tripped, or no project files were found)
+    /// and diagnostics fall back to today's single-file [`SourceIndex::build`].
     overlay: Option<ProjectFiles>,
 }
 
@@ -525,7 +525,7 @@ impl ExcludeMatcher {
         }
         // TIER 1 — discovery membership. The overlay IS the post-`exclude:` set.
         if let (Some(canonical), Some(overlay)) = (buf.canonical.as_deref(), overlay) {
-            if overlay.files.iter().any(|(p, _)| p == canonical) {
+            if overlay.files.iter().any(|(p, ..)| p == canonical) {
                 return false;
             }
         }
@@ -632,40 +632,73 @@ impl ExcludeMatcher {
     }
 }
 
-/// The tier-1 held project ASTs backing the S4b cross-file overlay: one entry per
-/// analysable project `.rb` file, `(canonical path, lowered AST)`, in the same
-/// order `check`'s stage 1 produces them.
+/// One held project file: its canonical path, its lowered AST, and its per-file
+/// [`Harvest`] — everything `SourceIndex::merge` needs from that file.
 ///
-/// `Sync` by construction (`LoweredAst` is a plain owned arena), so an `Arc<
-/// ProjectContext>` carrying it is shared across the rayon workers exactly as the
-/// `CoreIndex` already is.
+/// The harvest is HELD rather than recomputed per dispatch (the held-harvest
+/// slice). It is a pure function of `(AST, frozen CoreIndex)`, and the table
+/// already pins both, so holding it cannot serve a fact the recomputation would
+/// not have produced — it only removes the recomputation. Measured cost of NOT
+/// holding it: 42.8 ms of every keystroke's dispatch at 4 675 files, which is
+/// what pushed the dispatch over the [`OVERLAY_BUILD_BUDGET_DEFAULT`] and turned
+/// the overlay OFF at that scale. Measured cost of holding it: ~4 KB/file, ~9 %
+/// of the AST it sits beside.
 ///
-/// Each AST is behind its own `Arc` so the WHOLE table is cheap to clone
-/// (`Vec<(PathBuf, Arc<_>)>` — pointer copies, no AST copies, ~100 µs at 4 675
-/// files vs the ~190 MB a deep clone would move). That is what makes the
-/// single-file re-harvest ([`reharvest_sources`]) affordable: replace one entry's
-/// `Arc` and swap the table in, instead of re-parsing the project.
+/// Both are behind their own `Arc` for the same reason the AST always was: one
+/// entry can be replaced ([`reharvest_sources`]) and the whole table cloned by
+/// pointer copy.
+///
+/// **The `CoreIndex` half of that purity is an invariant, not an assumption.** A
+/// harvest filters constant reads against the core it was built with, so a held
+/// harvest is only valid while the `CoreIndex` it was built against is still the
+/// one the merge uses. Every path that can change the core rebuilds the WHOLE
+/// table against the new one ([`invalidate`] → [`apply_full_overlay_build`] →
+/// [`build_overlay`]); the only path that does NOT rebuild the core is
+/// [`reharvest_sources`], which reuses `st.project.index` verbatim — a project
+/// `.rb` file cannot change the plugin set or the signature dirs, which is the
+/// documented reason it never rebuilds the core. So no reachable state pairs a
+/// harvest with a core it did not see.
+type HeldFile = (PathBuf, Arc<LoweredAst>, Arc<Harvest>);
+
+/// The tier-1 held project files backing the S4b cross-file overlay: one
+/// [`HeldFile`] per analysable project `.rb` file, in the same order `check`'s
+/// stage 1 produces them.
+///
+/// `Sync` by construction (`LoweredAst` is a plain owned arena and `Harvest` is
+/// plain owned collections), so an `Arc<ProjectContext>` carrying it is shared
+/// across the rayon workers exactly as the `CoreIndex` already is.
+///
+/// Each entry's members are behind their own `Arc` so the WHOLE table is cheap to
+/// clone (pointer copies, no AST or harvest copies, ~100 µs at 4 675 files vs the
+/// ~190 MB a deep clone would move). That is what makes the single-file re-harvest
+/// ([`reharvest_sources`]) affordable: replace one entry's pair and swap the table
+/// in, instead of re-parsing the project.
 #[derive(Clone)]
 struct ProjectFiles {
-    files: Vec<(PathBuf, Arc<LoweredAst>)>,
+    files: Vec<HeldFile>,
 }
 
 /// One tier-1 overlay build's outcome + its MEASURED cost (S4b). The build does
 /// NOT itself decide whether the overlay stays on — that is [`OverlayGuard`]'s
-/// job, fed by this `build_project` sample.
+/// job, fed by this `merge` sample.
 struct OverlayBuild {
     files: ProjectFiles,
-    /// How many project files were parsed + lowered (reported even when the guard
-    /// trips, so the disclosure can name the scale).
+    /// How many project files were parsed, lowered and harvested (reported even
+    /// when the guard trips, so the disclosure can name the scale).
     file_count: usize,
-    /// Stage 1 equivalent: read + parse + lower the whole project.
-    parse_lower: Duration,
-    /// Stage 2 equivalent: the `SourceIndex::build_project` call the guard times.
-    build_project: Duration,
+    /// Stage 1 equivalent: read + parse + lower + harvest the whole project.
+    parse_lower_harvest: Duration,
+    /// Stage 2 equivalent: the `SourceIndex::merge` call the guard times. This is
+    /// the SAME quantity a dispatch pays ([`overlay_source_index`]) — which is the
+    /// point of sampling it here: tier 1 and the dispatch must be measuring one
+    /// budget, not two different ones.
+    merge: Duration,
 }
 
-/// The `build_project` budget for the S4b cross-file overlay (mini-spec §"Scale
-/// guard"). A per-dispatch overlay rebuild pays this cost on every debounced
+/// The project-index rebuild budget for the S4b cross-file overlay (mini-spec
+/// §"Scale guard"). The quantity is `SourceIndex::merge` — since the held-harvest
+/// slice that is the whole per-dispatch rebuild (`build_project` before it, which
+/// re-harvested every file first). A per-dispatch overlay rebuild pays this cost on every debounced
 /// publish, so it must leave headroom under ADR-0029's 250 ms p50
 /// `didChange`→publish target. Injectable via [`ServerContext::overlay_budget`] so
 /// the guard test can force a trip.
@@ -673,7 +706,7 @@ const OVERLAY_BUILD_BUDGET_DEFAULT: Duration = Duration::from_millis(100);
 
 /// How many CONSECUTIVE over-budget samples DISABLE the overlay (review N2). One
 /// sample is not a classifier: measured on an idle machine at 3 117 files, six
-/// consecutive `build_project` runs were 93.9 / 93.7 / 90.9 / **106.2** / 94.7 /
+/// consecutive rebuilds (`build_project`, pre-held-harvest) were 93.9 / 93.7 / 90.9 / **106.2** / 94.7 /
 /// 92.9 ms against a 100 ms budget — a 1-in-6 false trip on a single sample, and
 /// the same quantity spans 3.3× across machines (145–485 ms). Requiring two
 /// consecutive samples squares that error probability.
@@ -691,7 +724,7 @@ const OVERLAY_GUARD_STRIKES: u32 = 2;
 /// single-sample sticky trip).
 ///
 /// The guard is fed by builds that happen ANYWAY — the per-dispatch
-/// `build_project` while the overlay is ON (free: the dispatch builds it to
+/// rebuild while the overlay is ON (free: the dispatch builds it to
 /// analyse), and the tier-1 build at a structural [`invalidate`] while it is OFF
 /// (the only work done specifically to sample, and structural invalidations are
 /// rare). It disables only after [`OVERLAY_GUARD_STRIKES`] consecutive
@@ -710,9 +743,9 @@ struct OverlayGuard {
 enum GuardVerdict {
     /// No posture change (the common case).
     Unchanged,
-    /// The overlay just turned OFF: drop the held ASTs and disclose.
+    /// The overlay just turned OFF: drop the held files and disclose.
     Disabled,
-    /// The overlay just turned back ON: keep the freshly-built ASTs and disclose.
+    /// The overlay just turned back ON: keep the freshly-built files and disclose.
     ReEnabled,
 }
 
@@ -721,7 +754,7 @@ impl OverlayGuard {
         Self { enabled: true, over: 0 }
     }
 
-    /// Feed one `build_project` timing to the guard and report any posture flip.
+    /// Feed one rebuild timing to the guard and report any posture flip.
     ///
     /// Callers must only pass samples that describe the CURRENT posture: a worker
     /// result produced before a disable-swap says nothing about the state it lands
@@ -751,49 +784,74 @@ impl OverlayGuard {
 
 /// Build the tier-1 overlay substrate (S4b): discover the project's `.rb` files
 /// (bare-`check` semantics — the config's `paths:` roots expanded recursively,
-/// minus `exclude:` and ERB templates), parse + lower them all, then run the
-/// `SourceIndex::build_project` the scale guard times.
+/// minus `exclude:` and ERB templates), parse + lower + HARVEST them all, then run
+/// the `SourceIndex::merge` the scale guard times.
 ///
 /// The returned index itself is DISCARDED: a dispatch always rebuilds with the
-/// buffer's AST swapped in, so a stored copy would only cost memory. What tier 1
-/// keeps is the ASTs (the rebuild input) and the timing (the guard input).
+/// buffer's file swapped in, so a stored copy would only cost memory. What tier 1
+/// keeps is the per-file `(AST, harvest)` pairs (the rebuild input) and the timing
+/// (the guard input).
+///
+/// **The harvest moved here from the dispatch.** `SourceIndex::build_project` is
+/// `merge(asts.map(harvest))` (issue #92), so the old call harvested every project
+/// file on the spot — and so did every keystroke's dispatch. Harvesting once per
+/// file per BUILD instead is the held-harvest slice: same inputs, same result (a
+/// harvest is a pure function of the AST and the frozen `CoreIndex`), one
+/// occurrence instead of one per keystroke.
 ///
 /// Runs on the loop thread — at startup, and inside the SYNCHRONOUS [`invalidate`]
 /// (S4's decision: STRUCTURAL invalidations are rare, so an inline rebuild is
 /// acceptable; a plain `.rb` save no longer comes here at all — see
-/// [`reharvest_sources`]). Parse+lower is rayon-parallel exactly like `check`'s
-/// stage 1.
+/// [`reharvest_sources`]). Parse+lower+harvest is rayon-parallel exactly like
+/// `check`'s stage 1, which harvests inside the same closure (#92).
 fn build_overlay(root: &Path, cfg: &Config, index: &CoreIndex) -> OverlayBuild {
     let paths = project_files(root, cfg);
     let t0 = Instant::now();
-    // Stage-1 equivalent: read + parse + lower, file-parallel, panic-isolated per
-    // file (ADR-0016) — an unreadable or parser-tripping file is simply omitted
-    // from the project index, never a crash and never a diagnostic here (the LSP
-    // only reports on OPEN buffers).
-    let files: Vec<(PathBuf, Arc<LoweredAst>)> = paths
+    // Stage-1 equivalent: read + parse + lower + harvest, file-parallel, with
+    // parse+lower panic-isolated per file (ADR-0016) — an unreadable or
+    // parser-tripping file is simply omitted from the project index, never a crash
+    // and never a diagnostic here (the LSP only reports on OPEN buffers).
+    let files: Vec<HeldFile> = paths
         .par_iter()
         .filter_map(|path| {
             // Canonicalize so a buffer URI's path (also canonicalized) matches this
             // entry exactly — symlinks and `.`/`..` segments would otherwise defeat
             // the REPLACE lookup and silently double-register the file.
             let canonical = std::fs::canonicalize(path).ok()?;
-            Some((canonical, Arc::new(harvest_one(path)?)))
+            let (ast, harvest) = held_pair(path, index)?;
+            Some((canonical, ast, harvest))
         })
         .collect();
-    let parse_lower = t0.elapsed();
+    let parse_lower_harvest = t0.elapsed();
 
     let t1 = Instant::now();
-    let refs: Vec<&LoweredAst> = files.iter().map(|(_, a)| a.as_ref()).collect();
-    let project_index = SourceIndex::build_project(&refs, index);
-    let build_project = t1.elapsed();
+    let pairs: Vec<(&Harvest, &LoweredAst)> =
+        files.iter().map(|(_, a, h)| (h.as_ref(), a.as_ref())).collect();
+    let project_index = SourceIndex::merge(&pairs, index);
+    let merge = t1.elapsed();
     // Deliberately discarded (AFTER the measurement, so the timing is the BUILD,
-    // not the build + teardown): every dispatch rebuilds with the buffer's AST
+    // not the build + teardown): every dispatch rebuilds with the buffer's file
     // swapped in, so keeping this copy would only cost memory. Its purpose here is
     // to be TIMED — it is the quantity the scale guard is defined on.
     drop(project_index);
 
     let file_count = files.len();
-    OverlayBuild { files: ProjectFiles { files }, file_count, parse_lower, build_project }
+    OverlayBuild { files: ProjectFiles { files }, file_count, parse_lower_harvest, merge }
+}
+
+/// One held file's `(AST, harvest)` pair, or `None` when the file contributes
+/// nothing to the project index — the single place the two are produced together,
+/// so a caller cannot swap one and forget the other (a stale harvest beside a
+/// fresh AST would serve cross-file facts the file no longer states).
+///
+/// The harvest is deliberately OUTSIDE [`lower_one`]'s `catch_unwind`, matching
+/// both `check`'s stage 1 (#92 deviation 3) and today's LSP, where the harvest ran
+/// inside an un-isolated `SourceIndex::build_project`: a harvest panic propagates
+/// exactly as it does now rather than silently dropping the file from the index.
+fn held_pair(path: &str, core: &CoreIndex) -> Option<(Arc<LoweredAst>, Arc<Harvest>)> {
+    let ast = Arc::new(lower_one(path)?);
+    let harvest = Arc::new(SourceIndex::harvest(&ast, core));
+    Some((ast, harvest))
 }
 
 /// Read + lower ONE project file the way [`build_overlay`] does: ERB templates are
@@ -801,7 +859,7 @@ fn build_overlay(root: &Path, cfg: &Config, index: &CoreIndex) -> OverlayBuild {
 /// `check`), and a read error or a parser panic yields `None` rather than a crash
 /// (ADR-0016). `None` therefore means "this file contributes nothing to the
 /// project index", which is also the right answer for a file that was deleted.
-fn harvest_one(path: &str) -> Option<LoweredAst> {
+fn lower_one(path: &str) -> Option<LoweredAst> {
     let source = std::fs::read(path).ok()?;
     if rigor_parse::looks_like_erb_template(&source) {
         return None;
@@ -875,10 +933,10 @@ fn report_overlay_timing(build: &OverlayBuild, enabled: bool) {
     }
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     eprintln!(
-        "rigor lsp timing: overlay files={} parse+lower={:.1}ms build_project={:.1}ms overlay={}",
+        "rigor lsp timing: overlay files={} parse+lower+harvest={:.1}ms merge={:.1}ms overlay={}",
         build.file_count,
-        ms(build.parse_lower),
-        ms(build.build_project),
+        ms(build.parse_lower_harvest),
+        ms(build.merge),
         if enabled { "on" } else { "off" },
     );
 }
@@ -970,7 +1028,7 @@ struct ServerContext {
     /// `check` already use); tests inject a temp dir so a real multi-file project
     /// can be driven without mutating the process-global cwd.
     project_root: PathBuf,
-    /// The tier-1 `build_project` scale-guard budget (S4b). Production is
+    /// The tier-1 rebuild scale-guard budget (S4b). Production is
     /// [`OVERLAY_BUILD_BUDGET_DEFAULT`]; the guard test forces a value low enough
     /// to trip deterministically.
     overlay_budget: Duration,
@@ -1185,7 +1243,7 @@ struct Computed {
     /// close+reopen version-reuse nit) → drop + re-dispatch.
     epoch: u64,
     diags: Vec<Diagnostic>,
-    /// How long this dispatch's cross-file overlay `SourceIndex::build_project`
+    /// How long this dispatch's cross-file overlay `SourceIndex::merge`
     /// took, or `None` when the overlay was off (nothing was built). The scale
     /// guard's sample (review N2) — a measurement of the work the dispatch did
     /// anyway, carried back to the loop thread which owns the guard state.
@@ -1360,7 +1418,7 @@ fn main_loop(
 /// as "restart me". See `docs/notes/20260801-lsp-config-reload.md`.
 ///
 /// **S4b**: the rebuild also re-harvests the cross-file overlay substrate and
-/// re-times its `build_project`, feeding the sample to the hysteresis
+/// re-times its `merge`, feeding the sample to the hysteresis
 /// [`OverlayGuard`]. Returns every `window/showMessage` disclosure the rebuild
 /// owes the user (config reload state, then a guard posture flip) for the caller
 /// to send — a `Vec` because one invalidation can genuinely owe both.
@@ -1470,7 +1528,7 @@ fn config_broken_at_startup_message(reason: &str) -> String {
     )
 }
 
-/// Re-harvest the WHOLE overlay against `index`, feed the `build_project` timing
+/// Re-harvest the WHOLE overlay against `index`, feed the `merge` timing
 /// to the scale guard, and swap the resulting context in. Shared by the structural
 /// [`invalidate`] and by [`reharvest_sources`]'s new-file path.
 fn apply_full_overlay_build(
@@ -1482,8 +1540,8 @@ fn apply_full_overlay_build(
     // An EMPTY project is not an over-budget one: it must neither feed the guard a
     // meaningless ~0 sample (which would count toward re-enabling) nor disclose.
     let message = if build.file_count > 0 {
-        let verdict = st.guard.record(build.build_project, ctx.overlay_budget);
-        overlay_guard_message(&verdict, build.file_count, build.build_project, ctx.overlay_budget)
+        let verdict = st.guard.record(build.merge, ctx.overlay_budget);
+        overlay_guard_message(&verdict, build.file_count, build.merge, ctx.overlay_budget)
     } else {
         None
     };
@@ -1525,15 +1583,15 @@ fn swap_project(
     });
 }
 
-/// Re-harvest ONLY the changed project `.rb` files' AST entries (review N3).
+/// Re-harvest ONLY the changed project `.rb` files' held entries (review N3).
 ///
 /// S4 approved a synchronous `invalidate` when it was a `CoreIndex` rebuild on a
 /// RARE trigger. S4b made that ~20× more expensive (it re-reads, re-parses and
 /// re-lowers the whole project — ~200 ms at 3 117 files) while the trigger became
 /// EVERY source save, on the thread that owes hover/completion a <100 ms p95. The
-/// fix is to touch what actually changed: the held table is
-/// `Vec<(PathBuf, Arc<LoweredAst>)>`, so replacing or removing one entry is a
-/// cheap clone + one file's parse — sub-millisecond regardless of project size.
+/// fix is to touch what actually changed: the held table is a `Vec` of
+/// [`HeldFile`]s, so replacing or removing one entry is a cheap clone + one file's
+/// parse + harvest — sub-millisecond regardless of project size.
 ///
 /// **The invariant** (adversarial review of PR #43): the incremental state must be
 /// byte-identical to what a full rebuild would produce. The first implementation
@@ -1545,7 +1603,7 @@ fn swap_project(
 ///
 /// - **Replace in place ONLY when the changed path resolves to an entry ALREADY
 ///   HELD** (looked up by canonical path, keeping its original position — order
-///   matters to `build_project`'s multi-pass harvest). A held entry whose file is
+///   matters to `merge`'s multi-pass replay). A held entry whose file is
 ///   confirmed gone is removed in place.
 /// - **EVERY other case falls back to [`apply_full_overlay_build`]**: an
 ///   unresolvable path (the deleted-directory case), a path not currently held (it
@@ -1603,7 +1661,7 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
                     .files
                     .iter()
                     .enumerate()
-                    .filter(|(_, (q, _))| q == p)
+                    .filter(|(_, (q, ..))| q == p)
                     .map(|(i, _)| i)
                     .collect()
             })
@@ -1636,10 +1694,13 @@ fn reharvest_sources(ctx: &ServerContext, st: &mut Session, uris: &[String]) -> 
             for i in held.iter().rev() {
                 files.files.remove(*i);
             }
-        } else if let Some(ast) = harvest_one(&path.to_string_lossy()) {
-            let ast = Arc::new(ast);
+        } else if let Some((ast, harvest)) = held_pair(&path.to_string_lossy(), &index) {
+            // BOTH halves, always together ([`held_pair`]): the harvest is what
+            // carries this file's cross-file facts into the merge, so swapping only
+            // the AST would leave every other file seeing the pre-save content.
             for i in &held {
                 files.files[*i].1 = Arc::clone(&ast);
+                files.files[*i].2 = Arc::clone(&harvest);
             }
         } else {
             // Present but unharvestable (read error, now an ERB template, a parser
@@ -1976,7 +2037,7 @@ fn register_watched_files(connection: &Connection) -> Result<(), String> {
 enum WatchedChange {
     /// Nothing on the invalidation surface — no work at all.
     None,
-    /// Project `*.rb` saves: re-harvest exactly these files' AST entries.
+    /// Project `*.rb` saves: re-harvest exactly these files' held entries.
     Sources(Vec<String>),
     /// `.rigor.yml` / `Gemfile.lock` / `sig/**/*.rbs`: the plugin set or the
     /// signature environment may have changed, so the `CoreIndex` AND the whole
@@ -2124,7 +2185,7 @@ fn handle_result(
         let files = st.project.overlay.as_ref().map_or(0, |o| o.files.len());
         if let Some(msg) = overlay_guard_message(&verdict, files, sample, ctx.overlay_budget) {
             if verdict == GuardVerdict::Disabled {
-                // Drop the held ASTs — no overlay, no reason to hold them, so the
+                // Drop the held files — no overlay, no reason to hold them, so the
                 // memory goes back. The generation bump inside `swap_project`
                 // re-dispatches anything in flight under the new posture.
                 let index = Arc::clone(&st.project.index);
@@ -2138,7 +2199,7 @@ fn handle_result(
 
 /// Build the `SourceIndex` one diagnostics dispatch analyses against (S4b).
 ///
-/// With the overlay live: the project index rebuilt from tier 1's held ASTs with
+/// With the overlay live: the project index rebuilt from tier 1's held files with
 /// the buffer's file **REPLACED** by `ast` — the buffer's freshly-lowered content.
 /// **Replacement, not addition, is non-negotiable** (mini-spec §Decision): a
 /// project index carrying BOTH the on-disk and the buffer version of one file
@@ -2151,10 +2212,18 @@ fn handle_result(
 ///
 /// With the overlay off (guard tripped / no project files): today's single-file
 /// [`SourceIndex::build`], unchanged.
-/// Returns the index plus, when the overlay was used, the `build_project` timing —
-/// the scale guard's sample. Measuring here is free: the dispatch builds this
-/// index anyway to analyse the buffer, so the guard observes the very quantity it
-/// is protecting, on every publish, at zero extra cost (review N2).
+/// Returns the index plus, when the overlay was used, the rebuild timing — the
+/// scale guard's sample. Measuring here is free: the dispatch builds this index
+/// anyway to analyse the buffer, so the guard observes the very quantity it is
+/// protecting, on every publish, at zero extra cost (review N2).
+///
+/// **The held-harvest slice.** This used to call `SourceIndex::build_project`,
+/// which is `merge(asts.map(harvest))` — i.e. it re-harvested every project file
+/// on every keystroke (42.8 ms of a 114.5 ms dispatch at 4 675 files, which is
+/// what tripped the scale guard OFF at that scale). Tier 1 now HOLDS each file's
+/// harvest, so a dispatch harvests exactly the one file whose content changed —
+/// the dirty buffer — and calls `merge` directly. Nothing else moves: the same
+/// harvests, over the same files, in the same order, into the same merge.
 fn overlay_source_index(
     project: &ProjectContext,
     path: Option<&Path>,
@@ -2163,21 +2232,32 @@ fn overlay_source_index(
     let Some(overlay) = &project.overlay else {
         return (SourceIndex::build(ast, &project.index), None);
     };
-    let mut refs: Vec<&LoweredAst> = Vec::with_capacity(overlay.files.len() + 1);
+    // The timer starts HERE, before the buffer's harvest: the guard's budget is
+    // "what one dispatch costs", and the buffer harvest is part of that.
+    let t0 = Instant::now();
+    // The one harvest a dispatch still pays. `SourceIndex::harvest` reads only its
+    // AST and the frozen `CoreIndex` (#92), so this is exactly the harvest
+    // `build_project` computed for the buffer's AST before.
+    let buffer = SourceIndex::harvest(ast, &project.index);
+    let mut files: Vec<(&Harvest, &LoweredAst)> = Vec::with_capacity(overlay.files.len() + 1);
     let mut replaced = false;
-    for (p, held) in &overlay.files {
+    for (p, held_ast, held_harvest) in &overlay.files {
         if path == Some(p.as_path()) {
-            refs.push(ast); // REPLACE: the buffer's content supersedes the on-disk file.
+            // REPLACE: the buffer's content supersedes the on-disk file — BOTH
+            // halves of it. Swapping the AST while keeping the held harvest would
+            // serve cross-file facts (classes, methods, constants) the buffer no
+            // longer states, which is the double-registration hazard by another
+            // route: a name the user just renamed away, still resolvable.
+            files.push((&buffer, ast));
             replaced = true;
         } else {
-            refs.push(held);
+            files.push((held_harvest.as_ref(), held_ast.as_ref()));
         }
     }
     if !replaced {
-        refs.push(ast);
+        files.push((&buffer, ast));
     }
-    let t0 = Instant::now();
-    let source = SourceIndex::build_project(&refs, &project.index);
+    let source = SourceIndex::merge(&files, &project.index);
     (source, Some(t0.elapsed()))
 }
 
@@ -2304,7 +2384,7 @@ fn send_diagnostics(
 /// single-file [`SourceIndex::build`]. `buf` carries the buffer's on-disk names —
 /// all `None` for an unsaved/non-`file:` buffer.
 ///
-/// Returns the diagnostics plus the overlay `build_project` timing (the scale
+/// Returns the diagnostics plus the overlay rebuild timing (the scale
 /// guard's sample, `None` when the overlay is off).
 fn compute_diagnostics(
     project: &ProjectContext,
@@ -3497,7 +3577,7 @@ mod tests {
                 // first sample and can never disable on its own (hysteresis).
                 let mut guard = OverlayGuard::new();
                 if build.file_count > 0 {
-                    guard.record(build.build_project, overlay_budget);
+                    guard.record(build.merge, overlay_budget);
                 }
                 let overlay = (guard.enabled && build.file_count > 0).then_some(build.files);
                 let project = Arc::new(ProjectContext {
@@ -4323,7 +4403,7 @@ mod tests {
     #[test]
     fn overlay_guard_needs_consecutive_samples_in_both_directions() {
         // Review N2: one sample is not a classifier. Measured on an idle machine at
-        // 3 117 files, six consecutive `build_project` runs straddled a 100 ms
+        // 3 117 files, six consecutive rebuilds straddled a 100 ms
         // budget (93.9 / 93.7 / 90.9 / 106.2 / 94.7 / 92.9 ms) — a single-sample
         // sticky guard is a per-session coin flip with no recovery. Hysteresis in
         // BOTH directions is what makes the posture track the project.
@@ -4700,7 +4780,7 @@ mod tests {
     #[test]
     fn integration_s4b_scale_guard_falls_back_to_single_file_and_discloses() {
         // ACCEPTANCE 4, updated for the hysteresis guard (review N2): with the
-        // budget forced to zero EVERY `build_project` is over it, so the guard
+        // budget forced to zero EVERY rebuild is over it, so the guard
         // trips on the second consecutive sample — startup is #1, the first
         // dispatch is #2 — then DISCLOSES via `window/showMessage` (the ADR-0036
         // posture-disclosure precedent) and falls back to the single-file index,
@@ -4807,7 +4887,7 @@ mod tests {
     fn integration_s4b_watched_file_save_reharvests_the_project_asts() {
         // ACCEPTANCE 5 (S4 plumbing × S4b substrate): a SAVED edit to a project file
         // that is NOT open changes the open buffer's diagnostics, because
-        // `invalidate` re-harvests the held ASTs. This is the pay-off S4 deferred
+        // `invalidate` re-harvests the held files. This is the pay-off S4 deferred
         // ("the cross-file benefit lands in S4b").
         let p = TempProject::new("watched");
         p.write("base.rb", BASE_RB);
@@ -4903,11 +4983,240 @@ mod tests {
         h.shutdown();
     }
 
+    // =======================================================================
+    // Held harvest — the tier-1 table carries each file's `Harvest` beside its
+    // AST, so a dispatch harvests only the dirty buffer and calls
+    // `SourceIndex::merge` directly instead of `build_project`.
+    // =======================================================================
+
+    /// The PRE-slice [`overlay_source_index`] body, kept VERBATIM as the oracle
+    /// (the `probes_s92` / `probes_s94` pattern): assemble the held ASTs with the
+    /// dirty buffer's file REPLACED, then `SourceIndex::build_project` — which
+    /// re-harvests every file on the spot. The ONLY edit is destructuring the held
+    /// entry's third member away, because the table's arity is what this slice
+    /// changed; the control flow, the order, and the REPLACE/append rule are
+    /// character-for-character today's.
+    fn overlay_source_index_legacy(
+        project: &ProjectContext,
+        path: Option<&Path>,
+        ast: &LoweredAst,
+    ) -> SourceIndex {
+        let Some(overlay) = &project.overlay else {
+            return SourceIndex::build(ast, &project.index);
+        };
+        let mut refs: Vec<&LoweredAst> = Vec::with_capacity(overlay.files.len() + 1);
+        let mut replaced = false;
+        for (p, held, _) in &overlay.files {
+            if path == Some(p.as_path()) {
+                refs.push(ast);
+                replaced = true;
+            } else {
+                refs.push(held);
+            }
+        }
+        if !replaced {
+            refs.push(ast);
+        }
+        SourceIndex::build_project(&refs, &project.index)
+    }
+
+    /// Every diagnostic the analysis pass produces for `ast` against `source`, in
+    /// full (rule, span, message) — the observable the equivalence is defined on.
+    fn diags_against(
+        source: &SourceIndex,
+        index: &CoreIndex,
+        ast: &LoweredAst,
+    ) -> Vec<(String, usize, usize, String)> {
+        let mut interner = Interner::new();
+        analyze_with_source_and_folder(ast, &mut interner, index, source, None)
+            .iter()
+            .map(|d| {
+                (d.rule_id.to_string(), d.start_offset, d.end_offset, d.message.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn held_harvest_dispatch_index_equals_the_pre_slice_rebuild() {
+        // THE EQUIVALENCE. A dispatch's index used to be `build_project` over the
+        // held ASTs with the buffer's REPLACED; it is now `merge` over the held
+        // HARVESTS with the buffer's pair replaced. `build_project` IS
+        // `merge(asts.map(harvest))` (#92) and a harvest is a pure function of
+        // `(AST, frozen CoreIndex)` — both pinned by the held table — so the two
+        // must agree on every buffer, on both branches (REPLACE and append) and in
+        // both postures (overlay on and off).
+        let p = TempProject::new("held_harvest_equiv");
+        p.write("base.rb", BASE_RB);
+        p.write("sub.rb", SUB_RB);
+        p.write("helpers.rb", "def helper_fn\n  1\nend\n");
+        p.write("main.rb", "helper_fn\n");
+        p.write("consts.rb", "module Cfg\n  LIMIT = 5\nend\n");
+        p.write("both.rb", "def both_fn\n  1\nend\nboth_fn\n");
+
+        let cfg = Config::default();
+        let (_ctx, st) = session_for(&p.root, cfg, OVERLAY_BUILD_BUDGET_DEFAULT);
+        let project = &st.project;
+        assert_eq!(
+            project.overlay.as_ref().expect("overlay live").files.len(),
+            6,
+            "precondition: all six project files are held"
+        );
+        let in_project = |name: &str| std::fs::canonicalize(p.root.join("lib").join(name)).unwrap();
+
+        // (path handed to the dispatch, buffer text) — each row is a real editor
+        // state, and together they touch every ordered harvest field the merge
+        // replays: classes, the override index, toplevel defs, constant writes.
+        let cases: Vec<(&str, Option<PathBuf>, &str)> = vec![
+            // A held file, buffer == disk: the no-edit dispatch.
+            ("sub unchanged", Some(in_project("sub.rb")), SUB_RB),
+            // A held file, buffer differs: the override is made public again.
+            (
+                "sub public",
+                Some(in_project("sub.rb")),
+                "class Sub < Base\n  def helper\n  end\nend\n",
+            ),
+            // The buffer REDEFINES the base the other files subclass.
+            ("base emptied", Some(in_project("base.rb")), "class Base\nend\n"),
+            // A toplevel call whose definer lives in ANOTHER file (harvest pass 1c).
+            ("main calls toplevel", Some(in_project("main.rb")), "helper_fn\n"),
+            // …and the definer's own buffer renaming it away.
+            ("helpers renamed", Some(in_project("helpers.rb")), "def other_fn\n  1\nend\n"),
+            // A constant write (harvest C5a) edited in the buffer.
+            ("consts edited", Some(in_project("consts.rb")), "module Cfg\n  LIMIT = 9\nend\n"),
+            // THE REPLACE DISCRIMINATORS — the only cases that can tell a REPLACED
+            // buffer harvest from a KEPT held one, because the buffer's own
+            // diagnostics depend on a fact only the buffer's harvest carries:
+            //   * the buffer ADDS a toplevel `def` the file on disk does not have
+            //     (a held harvest ⇒ the call below is `unresolved-toplevel`), and
+            //   * the buffer REMOVES one the file on disk does have while still
+            //     calling it (a held harvest ⇒ the removed name still resolves,
+            //     which is the "renamed away but still resolvable" false negative
+            //     the REPLACE rule exists to prevent).
+            (
+                "buffer adds a toplevel def",
+                Some(in_project("main.rb")),
+                "def local_fn\n  1\nend\nlocal_fn\n",
+            ),
+            ("buffer removes its own toplevel def", Some(in_project("both.rb")), "both_fn\n"),
+            // NOT a project file ⇒ the APPEND branch (an unsaved/untitled buffer).
+            ("untitled buffer", None, "class Sub < Base\n  private\n\n  def helper\n  end\nend\n"),
+            // A `file:` buffer outside the project ⇒ also the append branch.
+            ("outside project", Some(PathBuf::from("/nowhere/at/all/x.rb")), SUB_RB),
+        ];
+
+        let mut nonempty = 0usize;
+        for (label, path, text) in &cases {
+            let ast = lower(&parse(text.as_bytes()));
+            let legacy = overlay_source_index_legacy(project, path.as_deref(), &ast);
+            let (fresh, sample) = overlay_source_index(project, path.as_deref(), &ast);
+            assert!(sample.is_some(), "[{label}] the overlay was live, so it owes a sample");
+            let want = diags_against(&legacy, &project.index, &ast);
+            let got = diags_against(&fresh, &project.index, &ast);
+            assert_eq!(got, want, "[{label}] the held-harvest index diverged from the rebuild");
+            if !want.is_empty() {
+                nonempty += 1;
+            }
+        }
+        // Non-vacuity: the comparison must not be "two empty lists agree" everywhere,
+        // and the corpus must actually contain a CROSS-FILE finding.
+        assert!(nonempty >= 2, "the case set produced almost no diagnostics: {nonempty}");
+        let unchanged = lower(&parse(SUB_RB.as_bytes()));
+        let (idx, _) = overlay_source_index(project, Some(&in_project("sub.rb")), &unchanged);
+        let cross = diags_against(&idx, &project.index, &unchanged);
+        assert_eq!(
+            cross.len(),
+            1,
+            "precondition: `Sub#helper` reducing `Base#helper`'s visibility is a \
+             CROSS-FILE finding that a single-file index cannot produce: {cross:?}"
+        );
+
+        // …and with the overlay OFF the fallback is still literally the same call.
+        let off = ProjectContext {
+            generation: 0,
+            index: Arc::clone(&project.index),
+            disable: Config::default().disable_matcher(),
+            folder: None,
+            stamp: SeverityStamp::from_config(&Config::default()),
+            exclude: ExcludeMatcher::from_config(&p.root, &Config::default()),
+            overlay: None,
+        };
+        let ast = lower(&parse(SUB_RB.as_bytes()));
+        let (fresh, sample) = overlay_source_index(&off, Some(&in_project("sub.rb")), &ast);
+        assert!(sample.is_none(), "no overlay ⇒ no guard sample");
+        assert_eq!(
+            diags_against(&fresh, &project.index, &ast),
+            diags_against(
+                &overlay_source_index_legacy(&off, Some(&in_project("sub.rb")), &ast),
+                &project.index,
+                &ast,
+            ),
+        );
+    }
+
+    #[test]
+    fn held_harvest_save_makes_the_new_content_visible_cross_file() {
+        // The re-harvest swaps BOTH halves. A save takes the incremental
+        // `reharvest_sources` path, which replaces one entry in place — and the
+        // entry now carries a `Harvest` as well as an AST. The merge reads its
+        // cross-file facts ONLY from harvests, so an implementation that swapped
+        // the AST and kept the stale harvest would keep serving the PRE-SAVE
+        // content to every other file, with a fresh AST sitting beside it as
+        // camouflage.
+        //
+        // Driven through `call.unresolved-toplevel` (harvest pass 1c, a pure union)
+        // rather than the override index the other re-harvest tests use, so the two
+        // cover different harvest fields.
+        let p = TempProject::new("held_harvest_save");
+        p.write("helpers.rb", "def helper_fn\n  1\nend\n");
+        p.write("main.rb", "helper_fn\n");
+        let mut h = Harness::start_project(
+            Duration::from_secs(30),
+            production_gate(),
+            serde_json::json!({}),
+            p.root.clone(),
+            OVERLAY_BUILD_BUDGET_DEFAULT,
+        );
+        h.notify("textDocument/didOpen", open_params(&p.uri("main.rb"), "helper_fn\n", 1));
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "precondition: another file's toplevel `def` resolves the call"
+        );
+
+        // The definer is renamed away ON DISK; `main.rb` (the open buffer) is
+        // untouched, so only the re-harvested facts can change the answer.
+        p.write("helpers.rb", "def other_fn\n  1\nend\n");
+        h.notify(
+            "workspace/didChangeWatchedFiles",
+            serde_json::json!({ "changes": [ { "uri": p.uri("helpers.rb"), "type": 2 } ] }),
+        );
+        let after = h.recv_diags();
+        assert_eq!(
+            after.diagnostics.len(),
+            1,
+            "the saved file no longer defines `helper_fn`, so the toplevel call is \
+             unresolved — a STALE held harvest would still resolve it: {:?}",
+            after.diagnostics
+        );
+
+        // …and back: restoring the definer clears it again (a swap, not a one-way
+        // invalidation).
+        p.write("helpers.rb", "def helper_fn\n  1\nend\n");
+        h.notify(
+            "workspace/didChangeWatchedFiles",
+            serde_json::json!({ "changes": [ { "uri": p.uri("helpers.rb"), "type": 2 } ] }),
+        );
+        assert!(
+            h.recv_diags().diagnostics.is_empty(),
+            "restoring the definer re-resolves the call"
+        );
+        h.shutdown();
+    }
+
     /// A complete structural fingerprint of a held overlay: every entry's path AND
     /// its AST's full `Debug` dump, IN ORDER. Comparing this against a fresh
     /// `build_overlay` is the strong form of N3's invariant — not just "the same
     /// files" but the same ASTs in the same positions, which is what
-    /// `build_project`'s order-sensitive multi-pass harvest actually consumes.
+    /// `merge`'s order-sensitive multi-pass replay actually consumes.
     /// A symlink alias for a project root, removed on drop — the "workspace
     /// reached through a symlink" shape (the normal macOS `/tmp` → `/private/tmp`
     /// case, a symlinked project dir, a symlinked home).
@@ -4963,11 +5272,17 @@ mod tests {
         }
     }
 
+    /// Path + AST per held entry. The HARVEST is deliberately not rendered here
+    /// (it has no `Debug`, by design — it is an internal merge input): it is a pure
+    /// function of `(AST, frozen CoreIndex)` produced at the single site
+    /// [`held_pair`], so an equal AST under an equal core implies an equal harvest.
+    /// What pins the harvest SWAP is behavioural — see
+    /// `held_harvest_save_makes_the_new_content_visible_cross_file`.
     fn overlay_fingerprint(files: &ProjectFiles) -> Vec<(String, String)> {
         files
             .files
             .iter()
-            .map(|(p, a)| (p.to_string_lossy().into_owned(), format!("{a:?}")))
+            .map(|(p, a, _)| (p.to_string_lossy().into_owned(), format!("{a:?}")))
             .collect()
     }
 
@@ -5282,11 +5597,14 @@ mod tests {
         // The tier-1 substrate: the post-`exclude:` discovery set, canonicalized —
         // exactly what `build_overlay` holds. Built from `kept` directly so the test
         // pins the MEMBERSHIP rule rather than re-testing the harvest.
+        let empty_core = CoreIndex::new();
         let held = ProjectFiles {
             files: kept
                 .iter()
                 .filter_map(|f| {
-                    Some((std::fs::canonicalize(f).ok()?, Arc::new(lower(&parse(b"")))))
+                    let ast = Arc::new(lower(&parse(b"")));
+                    let harvest = Arc::new(SourceIndex::harvest(&ast, &empty_core));
+                    Some((std::fs::canonicalize(f).ok()?, ast, harvest))
                 })
                 .collect(),
         };
@@ -6037,7 +6355,7 @@ mod tests {
         feed(&mut st, 150); // over #1
         feed(&mut st, 150); // over #2 -> Disabled, overlay dropped
         assert!(!st.guard.enabled, "two over-budget samples disable");
-        assert!(st.project.overlay.is_none(), "the held ASTs are dropped");
+        assert!(st.project.overlay.is_none(), "the held files are dropped");
 
         // Stragglers must NOT flip the posture from here.
         feed(&mut st, 10);
@@ -6210,5 +6528,4 @@ mod tests {
              event spelled through the workspace symlink is IGNORED"
         );
     }
-
 }

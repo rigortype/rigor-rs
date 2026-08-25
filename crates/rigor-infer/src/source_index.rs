@@ -37,6 +37,7 @@
 //! Rails models false-positive-free. For an RBS-only instance class (e.g.
 //! `Pathname`) existence defers entirely to RBS's own conservative gate.
 
+use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rigor_index::CoreIndex;
@@ -771,13 +772,25 @@ impl SourceIndex {
     ///   interprocedural literal-tail fold, which resolves calls into OTHER
     ///   files' bodies). These are why the merge still takes the ASTs — issue #92
     ///   §5: harvest-then-evict is NOT unblocked by this decomposition.
-    pub fn merge(files: &[(Harvest, &LoweredAst)], core: &CoreIndex) -> Self {
+    ///
+    /// ## Why the harvest is BORROWED (`H: Borrow<Harvest>`)
+    ///
+    /// The merge only ever READS each harvest, so the parameter is generic over
+    /// anything that lends one out: `check` passes the owned `Harvest`es its
+    /// stage-1 rayon closure just produced (`H = Harvest`), while the LSP passes
+    /// `&Harvest` borrowed from the per-file harvests tier 1 HOLDS across
+    /// keystrokes (`Arc<Harvest>`, so a context swap stays a pointer copy). An
+    /// owned-only parameter would force the LSP to re-harvest every project file
+    /// on every dispatch — which is exactly the cost the held table removes. No
+    /// behaviour rides on this: `H` is erased before the first read.
+    pub fn merge<H: Borrow<Harvest>>(files: &[(H, &LoweredAst)], core: &CoreIndex) -> Self {
         let mut idx = SourceIndex::default();
 
         // === M1: ordered replay ============================================
 
         // Pass 1: source class/module structure, across ALL files in order.
         for (h, _) in files {
+            let h = h.borrow();
             for c in &h.source_classes {
                 idx.add_source(&c.name, c.superclass.clone(), &c.methods);
             }
@@ -787,6 +800,7 @@ impl SourceIndex {
         // superclass + visibility, ordered append-with-dedup on includes — so
         // this replay is exactly today's call sequence.
         for (h, _) in files {
+            let h = h.borrow();
             for oc in &h.override_classes {
                 idx.ingest_override_class(
                     &oc.qualified,
@@ -801,6 +815,7 @@ impl SourceIndex {
         // Passes 1c / 1d / 1e + stage 2b's bare-name set: pure unions. Order-free
         // (commutative + idempotent), merged in file order anyway.
         for (h, _) in files {
+            let h = h.borrow();
             idx.toplevel_defs.extend(h.toplevel_defs.iter().cloned());
             for (owner, methods) in &h.discovered_methods {
                 idx.discovered_methods
@@ -821,6 +836,7 @@ impl SourceIndex {
         // registrations, exactly as before — the two share the `names` vector, so
         // this is the ClassId order.
         for (h, _) in files {
+            let h = h.borrow();
             for name in &h.rbs_constant_names {
                 idx.register(name);
             }
@@ -868,6 +884,7 @@ impl SourceIndex {
         let mut lit_first: HashMap<String, (Vec<String>, u64, Option<ConstLit>)> = HashMap::new();
         let mut lit_writes: HashMap<String, usize> = HashMap::new();
         for (h, ast) in files {
+            let h = h.borrow();
             for w in &h.constant_writes {
                 *lit_writes.entry(w.qualified.clone()).or_insert(0) += w.writes;
                 lit_first
@@ -948,7 +965,7 @@ impl SourceIndex {
         // overridable degrade).
         let mut defs: HashMap<(String, String, DefKind), Vec<FoldSite>> = HashMap::new();
         for (ast_idx, (h, _)) in files.iter().enumerate() {
-            for d in &h.fold_defs {
+            for d in &h.borrow().fold_defs {
                 defs.entry((d.owner.clone(), d.method.clone(), d.kind)).or_default().push(
                     FoldSite {
                         ast_idx,
@@ -4556,7 +4573,10 @@ mod probes_s92 {
     fn merge_of_no_files_still_runs_the_barrier_passes() {
         let core = CoreIndex::new();
         assert_paths_agree(&[], &core, "empty");
-        let idx = SourceIndex::merge(&[], &core);
+        // Turbofished because an empty literal fixes no `H` (the parameter is
+        // generic over anything that lends a `Harvest` out); `check`'s own element
+        // type is the owned one, so that is what the empty case must instantiate.
+        let idx = SourceIndex::merge::<Harvest>(&[], &core);
         assert!(idx.is_declaration_only_class("Process::Status"));
     }
 
