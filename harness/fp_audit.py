@@ -250,8 +250,16 @@ def _by_count(counter):
     runs of the same binary on the same corpus produced textually different
     reports). Sorting explicitly at render time removes the dependency
     regardless of how the counter was populated.
+
+    Keys can be None: the reference emits some diagnostics with a null
+    `rule` (9 of them on rigor-survey/Ruby), and PR #97's first cut crashed
+    the sweep there comparing None < str. None orders as "" — the key
+    itself is rendered unchanged.
     """
-    return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    return sorted(
+        counter.items(),
+        key=lambda kv: (-kv[1], "" if kv[0] is None else kv[0]),
+    )
 
 
 def audit(tgt, show=12, show_gaps=False, gap_rules=None):
