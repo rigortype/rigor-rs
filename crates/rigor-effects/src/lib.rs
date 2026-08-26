@@ -6,13 +6,17 @@
 //! [`include_str!`], the `vendor/plugins/` precedent — no `build.rs`, no
 //! codegen step, and the runtime bytes stay byte-comparable to upstream's.
 //!
-//! # This crate has no consumer, on purpose
+//! # This crate depends on nothing of ours, on purpose
 //!
 //! ADR-0043 § 1 binds the effects arc to "the effects work may not change
-//! `crates/rigor-infer`'s answers". Nothing in `rigor-infer` / `rigor-rules` /
-//! `rigor-cli` depends on this crate, so that constraint is a
-//! dependency-graph FACT rather than a review promise. When a later slice
-//! genuinely needs it, that edge becomes a visible, arguable manifest change.
+//! `crates/rigor-infer`'s answers". Slice 2 gave the crate its first consumer —
+//! `rigor-cli`'s `effects` collector, the visible, arguable manifest change the
+//! slice-1 note said that edge would be — and the constraint stays a
+//! dependency-graph FACT for the same reason it always was, from the other
+//! side: this crate depends on no crate of ours, the collector lives OUTSIDE
+//! `rigor-infer` / `rigor-rules`, and nothing on the `rigor check` path can
+//! reach either. "The effects work cannot change what `rigor check` decides"
+//! is still true by construction.
 //!
 //! Both files are parsed LAZILY, on first use ([`registry`] / [`catalog`]),
 //! exactly as upstream memoises `Registry.default` / `Catalog.default`. Nothing
@@ -24,24 +28,29 @@
 //! [`Registry`]'s declared-∪-ancestors `known?`, and [`Catalog`]'s parse plus
 //! the row → universal → posture lookup PRECEDENCE.
 //!
-//! Carved out — these are slice-2 CODE, not data, and the data file
-//! deliberately does not re-spell them (see `vendor/effects/PROVENANCE.md`):
+//! Slice 2 CLOSED the first of slice 1's three carve-outs and left the other
+//! two standing (see `vendor/effects/PROVENANCE.md`):
 //!
-//! 1. **Mutator sets.** A class names `mutators: array | hash | string` and
-//!    upstream resolves the name to `MutationWidening::ARRAY_MUTATORS` (31) /
-//!    `HASH_MUTATORS` (15) / `MutationClassifier::STRING_MUTATORS` (26). The
-//!    name stays OPAQUE here ([`ClassEntry::mutator_set`]), so a posture-path
-//!    answer reports `mutates_receiver == false` where upstream would consult
-//!    the set. That is an UNDER-claim, the safe direction under ADR-0043 § 2,
-//!    and [`catalog::tests::posture_path_does_not_expand_the_mutator_set`]
-//!    pins it so slice 2 has to change it deliberately.
+//! 1. ~~Mutator sets.~~ **Closed.** A class names
+//!    `mutators: array | hash | string` and upstream resolves the name to
+//!    `MutationWidening::ARRAY_MUTATORS` (31) / `HASH_MUTATORS` (15) /
+//!    `MutationClassifier::STRING_MUTATORS` (26). Upstream keeps those as Ruby
+//!    literals and its internal spec forbids `core.yml` re-spelling them, so
+//!    `harness/vendor_effects.py` EXTRACTS them into
+//!    `vendor/effects/mutators.yml` ([`mutators`]) and [`Catalog`] expands the
+//!    name on both paths upstream does: an instance ROW in its class's set, and
+//!    the posture entry for such a selector. The set NAME is still readable
+//!    ([`ClassEntry::mutator_set`]).
 //! 2. **Narrowing handler BODIES.** A row's `narrow:` names one of the seven
 //!    handlers in upstream's `Effects::Narrowing::HANDLERS`; the name is
 //!    validated against [`catalog::NARROWING_HANDLERS`] and otherwise stays
 //!    opaque. [`Catalog::lookup`] therefore answers a narrowed row's
 //!    **unnarrowed** `effects:` — which is exactly upstream's own answer when
 //!    it is handed no call node, and is the sound upper bound the handler
-//!    degrades to.
+//!    degrades to. A consumer that HAS the call node must resolve through
+//!    [`Catalog::resolve`] and apply the handler itself; the handlers live in
+//!    `rigor-cli`'s collector, because they read a Prism node and this crate
+//!    depends on nothing of ours.
 //! 3. **The plugin effect layer**, which ADR-0043 puts out of scope entirely.
 //!
 //! Also deferred: `LabelSet`'s lattice (`TOP`, `join`, `admits?`,
@@ -56,9 +65,11 @@ use std::sync::LazyLock;
 pub mod catalog;
 mod digest;
 pub mod label;
+pub mod mutators;
 pub mod registry;
 
-pub use catalog::{Catalog, ClassEntry, Entry, Row};
+pub use catalog::{Catalog, ClassEntry, Entry, Resolution, Row};
+pub use mutators::Mutators;
 pub use registry::Registry;
 
 // ---------------------------------------------------------------------------
@@ -77,6 +88,12 @@ pub const REGISTRY_YML: &str =
 pub const CORE_YML: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/effects/core.yml"));
 
+/// The three by-reference mutator sets, EXTRACTED from the pinned reference's
+/// Ruby source by `harness/vendor_effects.py` (ADR-0043 slice 2). Upstream has
+/// no data file for these — see [`mutators`].
+pub const MUTATORS_YML: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/vendor/effects/mutators.yml"));
+
 /// `sha256(registry.yml)` at [`PIN`], as recorded in `PROVENANCE.md`.
 pub const REGISTRY_SHA256: &str =
     "bb0eb3f08568bc52c47ce3caa75d22d359b0455b3182825906884797289d7104";
@@ -90,8 +107,19 @@ pub const REGISTRY_SHA256: &str =
 pub const CORE_SHA256: &str =
     "85778dd3433fcb5561a933c9b2b22fb07048af980e35f93091f545655bda9c31";
 
+/// `sha256(mutators.yml)` as `harness/vendor_effects.py` renders it at [`PIN`],
+/// recorded in `PROVENANCE.md`. The file is DERIVED, so this digest pins the
+/// extraction's output rather than an upstream file's bytes — which is exactly
+/// what has to stay stable: a re-pin that moves a `%i[…]` literal moves this.
+pub const MUTATORS_SHA256: &str =
+    "5bd8091db9ce2cf593ffe6409154482a38c452967b5d0ad075403e5525915ed7";
+
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     Registry::from_yaml_str(REGISTRY_YML).expect("vendored registry.yml must parse")
+});
+
+static MUTATORS: LazyLock<Mutators> = LazyLock::new(|| {
+    Mutators::from_yaml_str(MUTATORS_YML).expect("vendored mutators.yml must parse")
 });
 
 static CATALOG: LazyLock<Catalog> = LazyLock::new(|| {
@@ -108,6 +136,13 @@ pub fn registry() -> &'static Registry {
 #[must_use]
 pub fn catalog() -> &'static Catalog {
     &CATALOG
+}
+
+/// The shipped mutator sets. Parsed on first use — and by [`catalog`], which
+/// expands each class's `mutators:` name through it.
+#[must_use]
+pub fn mutators() -> &'static Mutators {
+    &MUTATORS
 }
 
 /// SHA-256 of `data`, lowercase hex — how `PROVENANCE.md`'s anchors and
@@ -220,6 +255,13 @@ mod tests {
             CORE_SHA256,
             "vendor/effects/core.yml has been edited — it is a VERBATIM copy of the \
              pinned reference's data/effects/core.yml; re-run \
+             `python3 harness/vendor_effects.py` instead of hand-editing it"
+        );
+        assert_eq!(
+            sha256_hex(MUTATORS_YML.as_bytes()),
+            MUTATORS_SHA256,
+            "vendor/effects/mutators.yml has been edited — it is GENERATED from the \
+             pinned reference's `%i[…]` literals; re-run \
              `python3 harness/vendor_effects.py` instead of hand-editing it"
         );
     }

@@ -36,6 +36,7 @@ mod baseline;
 use baseline::{Baseline, Bucket, DriftStatus, MatchMode, DEFAULT_BASELINE_PATH};
 mod docs;
 mod doctor;
+mod effects;
 mod explain;
 mod init;
 mod lsp;
@@ -54,6 +55,7 @@ const COMMANDS: &[&str] = &[
     "check", "annotate", "type-of", "trace", "type-scan", "explain", "diff",
     "sig-gen", "baseline", "triage", "coverage", "plugins", "plugin", "lsp",
     "mcp", "skill", "docs", "init", "doctor", "version", "show-bleedingedge",
+    "effects",
 ];
 
 fn main() -> ExitCode {
@@ -85,6 +87,9 @@ fn main() -> ExitCode {
         Some("lsp") => lsp::cmd_lsp(&args[1..]),
         Some("mcp") => mcp::cmd_mcp(&args[1..]),
         Some("coverage") => coverage::cmd_coverage(&args[1..]),
+        // ADR-0043 slice 2 — the effect-summary REPORT. Observational: it
+        // shares no state with `check` and consults no inference.
+        Some("effects") => effects::cmd_effects(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => {
             eprintln!("rigor-rs: `{cmd}` is recognized but not yet implemented in this phase");
             ExitCode::from(2)

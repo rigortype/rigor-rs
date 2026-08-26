@@ -1,0 +1,95 @@
+# GENERATED — do not hand-edit. `python3 harness/vendor_effects.py`
+#
+# The three by-reference mutator sets `core.yml`'s `mutators:` key names,
+# EXTRACTED from the pinned reference's Ruby source (ADR-0043 slice 2).
+# Upstream keeps them as `%i[…]` literals rather than data, because the
+# widening rules and the effect model share one hand-audited list and its
+# internal spec forbids `core.yml` re-spelling a selector list. The port
+# needs the contents: a selector in its class's set is a receiver mutation
+# on the row path AND on the posture path (`catalog.rb:194`, `:253`).
+#
+# Every selector is quoted: `<<`, `[]=`, `!` and the bang family are not
+# plain YAML scalars.
+schema: 1
+sets:
+  array:
+    from: "lib/rigor/inference/mutation_widening.rb: ARRAY_MUTATORS"
+    selectors:
+      - "<<"
+      - "push"
+      - "append"
+      - "prepend"
+      - "unshift"
+      - "concat"
+      - "insert"
+      - "pop"
+      - "shift"
+      - "delete"
+      - "delete_at"
+      - "delete_if"
+      - "reject!"
+      - "clear"
+      - "compact!"
+      - "replace"
+      - "fill"
+      - "[]="
+      - "map!"
+      - "collect!"
+      - "select!"
+      - "filter!"
+      - "keep_if"
+      - "uniq!"
+      - "flatten!"
+      - "sort!"
+      - "sort_by!"
+      - "reverse!"
+      - "rotate!"
+      - "shuffle!"
+      - "slice!"
+  hash:
+    from: "lib/rigor/inference/mutation_widening.rb: HASH_MUTATORS"
+    selectors:
+      - "[]="
+      - "store"
+      - "delete"
+      - "delete_if"
+      - "reject!"
+      - "select!"
+      - "filter!"
+      - "keep_if"
+      - "clear"
+      - "compact!"
+      - "merge!"
+      - "update"
+      - "transform_keys!"
+      - "transform_values!"
+      - "replace"
+  string:
+    from: "lib/rigor/effects/mutation_classifier.rb: STRING_MUTATORS"
+    selectors:
+      - "<<"
+      - "concat"
+      - "replace"
+      - "insert"
+      - "prepend"
+      - "clear"
+      - "upcase!"
+      - "downcase!"
+      - "capitalize!"
+      - "swapcase!"
+      - "reverse!"
+      - "strip!"
+      - "lstrip!"
+      - "rstrip!"
+      - "chomp!"
+      - "chop!"
+      - "squeeze!"
+      - "succ!"
+      - "next!"
+      - "sub!"
+      - "gsub!"
+      - "tr!"
+      - "tr_s!"
+      - "delete!"
+      - "slice!"
+      - "[]="
