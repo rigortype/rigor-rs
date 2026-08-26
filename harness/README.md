@@ -189,17 +189,27 @@ It is the first instrument here whose unit is a **project directory** and which
 runs each arm *in* it, so it is also the first one that sees `.rigor.yml`,
 project `sig/` and plugins. Fixture projects live in `effects-corpus/`.
 
-One of them is **generated**, and re-generating it is a gate of its own:
+Two of them are **generated from the vendored effect data**, and re-generating
+each is a gate of its own:
 
 ```sh
 python3 harness/gen_effects_posture_corpus.py           # rewrite effects-corpus/05_posture
 python3 harness/gen_effects_posture_corpus.py --check    # drift gate: bytes vs the catalogue
+python3 harness/gen_effects_mutator_corpus.py           # rewrite effects-corpus/07_mutators
+python3 harness/gen_effects_mutator_corpus.py --check    # drift gate: bytes vs the mutator sets
 ```
 
 `effects-corpus/05_posture` probes every class of the vendored effect catalogue
 (`crates/rigor-effects/vendor/effects/core.yml`) with a selector only a class
-POSTURE could answer, plus row and universal controls. It is generated because
-the set of classes — and the subset of them whose constants the oracle can
-actually resolve — moves with the pin, and a hand-list would go stale silently:
-the hand-written corpus contained none of the eight classes behind issue #106's
-live over-claim ([note](../docs/notes/20260826-s106-posture-over-fix.md)).
+POSTURE could answer, plus row and universal controls.
+`effects-corpus/07_mutators` probes every selector of the vendored by-reference
+mutator sets (`crates/rigor-effects/vendor/effects/mutators.yml`) on each of the
+four receiver shapes the ownership judgment separates, plus the type-free `[]=`
+/ attribute-writer forms and two catalogue-derived control sections.
+
+Both are generated because a hand-list of a vendored table goes stale silently
+as the table moves with the pin — the hand-written corpus contained none of the
+eight classes behind issue #106's live over-claim
+([note](../docs/notes/20260826-s106-posture-over-fix.md)) and touched two of the
+72 vendored mutator selectors
+([note](../docs/notes/20260826-s110-mutator-corpus.md)).
