@@ -174,25 +174,45 @@ because the snapshot is what makes every later slice measurable:
 - **`effects-on-by-default`.** Upstream previews it as bleeding-edge for v0.4.0;
   the port follows the pin, not the preview.
 
-## Open at accepted
+## Open at accepted — SOLVED 2026-08-26
 
-One, and it is the declared lane's — the lane § 2 grades as an exact match, so
-it has to be settled before slice 6 and it is cheap to get wrong quietly.
+One was open, and it was the declared lane's — the lane § 2 grades as an exact
+match, so it had to be settled before slice 6 and it was cheap to get wrong
+quietly. **When does the oracle populate `declared:`?** Of the three annotated
+methods in `harness/effects-corpus/04_declared` the reference surfaced
+`declared:` for exactly one, and four hypotheses about the annotated method were
+all refuted.
 
-**When does the oracle populate `declared:`?** Measured at the `v0.3.4` pin on
-`harness/effects-corpus/04_declared`: of three annotated methods the reference
-surfaces `declared:` for exactly one. `%a{pure}` reading as the empty envelope
-(WD5) explains one of the two silences and nothing explains the other — the two
-`%a{rigor:v1:effect io.db}` methods have the same annotation spelling and the
-same comment shape, and one reports the bound while the other reports `[]`.
-Four hypotheses were probed against a scratch project and all four are refuted:
-not "only when exceeded", not "only when the proven lane is non-empty", not
-"only when the method has a project-method edge", and not a stale effects cache.
+They were refuted because they shared a false assumption: that the declared lane
+belongs to the annotated method. **It is the CALLER's lane.**
+`UnitScan#import_envelope` (`unit_scan.rb:328-338`) runs while scanning a CALL —
+if the callee's declaration carries an envelope, the bound joins the *caller's*
+`≤` lane under an `envelope:` origin — and the lane then travels call edges like
+the proven lane (`propagator.rb:137`). A second rule stacks on top at render
+time: `Entry#rendered_declared = declared.excluding_subsumed_by(proven)`
+(`effect_table.rb:41-43`), over the TRANSITIVE lanes of both, so a declared
+label the proven lane already admits is dropped from the output.
 
-Until it is explained, an implementer must not infer the rule from the fixture.
-The fixture records the reproducer; `effects_diff.py` already captures the lane,
-so the answer is one measurement away and it is not on this slice's critical
-path.
+That explains the fixture with no residue: `load_and_log` calls `load_row` and
+so carries its `io.db`; `load_row` calls nothing annotated; `formats` is
+`%a{pure}`, the empty bound, and uncalled; `unannotated` has nothing.
+
+Two consequences the slice-6 implementer owes, and § 2's phrasing ("copied from
+the author's annotation") is right about the source and wrong about the
+destination:
+
+1. an envelope on a callee joins the **caller's** declared lane, keyed
+   `envelope:<Owner>#<sel>`, and propagates transitively;
+2. the rendered value subtracts anything the **proven** lane admits — and
+   because the port's proven lane is DIRECT where upstream's is transitive, this
+   subtraction is currently wrong in **both** directions, which is fatal in
+   both.
+
+Measured in the [slice-1 catalogue probe](../notes/20260826-effects-s1-catalogue-probe.md)
+§ 7 (five predictions written before the run, all five confirmed) and extended
+by the [slice-6 probe](../notes/20260826-effects-s6-probe.md), which also
+measures the whole direct half of the lane at **+2 MATCH across 36,167 oracle
+methods** and recommends keeping the port's silence rather than retiring it.
 
 ## Consequences
 

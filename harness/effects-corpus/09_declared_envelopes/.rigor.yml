@@ -1,0 +1,16 @@
+# Producer 1's CONFIG stratum — `effects.envelopes:` (issue #114; the slice-6
+# probe § 6a). `EnvelopeIndex.build` reads this block as the third of the five
+# strata an envelope can be written in (`envelope_index.rb:68`), so a project
+# that writes NO annotation of any kind still gets a declared lane.
+#
+# `namespace:` entries participate and `match:` entries deliberately do not
+# (`envelope_index.rb:111` rejects every entry with a nil `namespace`), so the
+# reproducer is spelled with `namespace:`. `Svc::*` is segment-aware and exactly
+# ONE segment (`config_envelopes.rb:143`): it selects `Svc::Repo` and would not
+# select `Svc::Deeper::Far`.
+paths:
+  - .
+effects:
+  envelopes:
+    - namespace: "Svc::*"
+      effect: [io.db]

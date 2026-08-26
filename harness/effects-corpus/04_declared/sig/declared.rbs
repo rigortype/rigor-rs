@@ -6,18 +6,40 @@
 # every other corpus tool in this repo runs both sides from a clean cwd with no
 # config, so no `sig/` is ever loaded.
 #
-# OPEN QUESTION, measured 2026-08-25 at the `v0.3.4` pin and NOT yet explained —
-# resolve it before building the port's declared lane (slice 6). Of the three
-# annotated methods below the oracle surfaces `declared:` for exactly ONE,
-# `load_and_log`; `formats` (`%a{pure}`) and `load_row` (the same
-# `%a{rigor:v1:effect io.db}` spelling, same comment shape) both report
-# `declared: []`. `%a{pure}` reading as the EMPTY envelope explains `formats`
-# and nothing else. Four hypotheses were probed against a scratch project and
-# all four are REFUTED: it is not "only when the envelope is exceeded", not
-# "only when the proven lane is non-empty", not "only when the method has a
-# project-method edge", and not a stale effects cache (reproduced with `.rigor`
-# removed). Whatever the rule is, the port must reproduce it or the differential
-# will read a DECLARED-MISMATCH on correct code.
+# WHY THE ORACLE SURFACES `declared:` FOR EXACTLY ONE OF THE THREE ANNOTATED
+# METHODS BELOW — solved 2026-08-26, see
+# `docs/notes/20260826-effects-s1-catalogue-probe.md` § 7 (five predictions
+# written before the run, all five confirmed) and
+# `docs/notes/20260826-effects-s6-probe.md` § 1-3, which extends it.
+#
+# **`declared:` is the CALLER's lane.** An envelope on a method never colours
+# that method's own row. `UnitScan#import_envelope` (`unit_scan.rb:328-338`)
+# runs while scanning a CALL: if the callee's declaration carries an envelope,
+# the bound joins the *caller's* `≤` lane under an `envelope:` origin, and it
+# then travels call edges like the proven lane (`propagator.rb:137`).
+#
+# A second rule stacks on top at render time:
+# `Entry#rendered_declared = declared.excluding_subsumed_by(proven)`
+# (`effect_table.rb:41-43` → `label_set.rb:100-107`) — a declared label the
+# proven lane already admits is dropped from the output, over the TRANSITIVE
+# lanes of both, and the relation is asymmetric (a proven ANCESTOR drops a
+# declared descendant; a proven descendant does not drop a declared ancestor).
+#
+# That explains this fixture with no residue: `load_and_log` CALLS `load_row`,
+# so it carries `load_row`'s `io.db`; `load_row` itself calls nothing annotated,
+# so its own lane is empty; `formats` is `%a{pure}` — the EMPTY bound, which
+# `add_declared` early-returns on (`unit_scan.rb:156`) — and is uncalled;
+# `unannotated` has nothing.
+#
+# So the port's slice 6 owes TWO rules, not one: (a) an envelope on a callee
+# joins the CALLER's declared lane, keyed `envelope:<Owner>#<sel>`, and
+# propagates transitively; (b) the rendered value subtracts anything the proven
+# lane admits. Omitting (b) alone is a DECLARED-MISMATCH on correct code — and
+# because the port's proven lane is DIRECT while upstream's is transitive,
+# (b) breaks in BOTH directions today (s6 probe § 3c). Until that is fixed the
+# port reports `methods: {}` for any project that could produce a lane at all
+# (`crates/rigor-cli/src/effects/mod.rs`'s `carries_effect_annotations`), which
+# is why this fixture scores four `absent-method` UNDERs and no mismatch.
 
 class Declared
   # `%a{pure}` is the ecosystem's existing purity annotation, read as the EMPTY
