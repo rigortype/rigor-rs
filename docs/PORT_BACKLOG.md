@@ -375,7 +375,13 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   one-line per-stage breakdown to stderr under the `RIGOR_TIMING` env gate (invisible by default —
   the harness never sets it, so byte-exact output + 0-FP are unaffected): `index-load` /
   `stage1(parse+lower+harvest)` / `stage2(merge)` / `stage3(analyze)` / `sort` / `total` / file +
-  thread count. Fits the "performance prototype" positioning (benchmarkable). **Profiling finding
+  thread count. **Stage-1 component split (2026-08-26, issue #104)** adds five fields between
+  `stage1(...)` and `stage2(...)`: `stage1.parse+lower-cpu` / `stage1.harvest-cpu` (SUMS of
+  per-file worker CPU, not wall — stage 1 is rayon-parallel), `stage1.harvest-cpu-max` (the single
+  worst file — a floor on any wall contribution), `stage1.harvest-wall-amortized`
+  (`harvest-cpu / threads`, a MODEL) and `stage1-ex-harvest` (stage-1 wall minus that model). The
+  per-file clock reads are themselves gated on `RIGOR_TIMING`, so the default path takes none.
+  Fits the "performance prototype" positioning (benchmarkable). **Profiling finding
   (7749 mastodon+gitlab `.rb`, 12 cores, warm, ~296ms total):** stage1 ~152ms/51% (parallel, 3.3×
   — I/O + libprism-FFI bound, the scaling ceiling), **stage2 ~77ms/26% (SERIAL — the next
   bottleneck)**, stage3 ~46ms/16% (parallel, 5.3× — pure-Rust analysis scales best), index ~17ms,
