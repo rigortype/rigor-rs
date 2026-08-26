@@ -172,8 +172,10 @@ Config-gated surfaces need a hand-built project, a sidecar-config fixture
 ## Effect-summary differential (project-level)
 
 ```sh
-python3 harness/effects_diff.py               # the fixture projects
+python3 harness/effects_diff.py               # the standing set: fixtures + mastodon/app
+python3 harness/effects_diff.py --scale       # …and the opt-in large corpora too
 python3 harness/effects_diff.py --self-test   # grade the oracle against itself
+python3 harness/effects_diff.py --list        # what would be measured, and what is absent
 python3 harness/effects_diff.py <project-dir>  # any project with a .rigor.yml
 ```
 
@@ -189,8 +191,38 @@ It is the first instrument here whose unit is a **project directory** and which
 runs each arm *in* it, so it is also the first one that sees `.rigor.yml`,
 project `sig/` and plugins. Fixture projects live in `effects-corpus/`.
 
-Two of them are **generated from the vendored effect data**, and re-generating
-each is a gate of its own:
+### The standing set is fixtures **plus a real project**
+
+A corpus the port's own authors wrote can only contain shapes they thought of,
+and this one was measured to contain none that matter for the taint lane: an arm
+emitting **no `unresolved-self-call` taint whatsoever** scored byte-identically
+to master on all seven fixture projects
+([note](../docs/notes/20260826-s112-effects-instrument.md)). So the default run
+also measures `mastodon/app`, and `--scale` adds `gitlab-foss/lib`.
+
+Their paths come from `sweep-corpora.yml` — the repo's single membership list
+for external checkouts, shared with `run_corpus.rb` and `fp_audit.py` — while
+which of them this instrument uses, and why, lives in `effects_diff.py`'s
+`REAL_PROJECTS`. A label that table names and the manifest does not carry is a
+repo bug and hard-fails; a corpus the manifest carries that is not on this
+machine is **SKIPPED loudly**, and the incompleteness rides on the `RESULT:`
+line so a partial run cannot be quoted as a clean pass.
+
+`rigor effects` needs a project and a sweep corpus is a plain tree, so each real
+corpus is **copied into a temp project** with a synthesised `.rigor.yml` beside
+it, removed afterwards. Copying rather than symlinking costs ~0.6 s and buys two
+things: the checkout is only ever READ, so no run can leave residue in it; and
+the temp project has no ancestor directory, so neither engine can discover a
+config above the project root — `gitlab-foss/lib` really does sit one level under
+a `.rigor.yml` with its own `paths:` and `plugins:`.
+
+`effects-corpus/08_resolved` is the hand-written half of the same fix: the
+`resolved`-bit shapes (parameter shape and arity on the CALLEE) and the
+positions the reference's typer never visits, each method commented with the
+property it discriminates.
+
+Two of the fixture projects are **generated from the vendored effect data**, and
+re-generating each is a gate of its own:
 
 ```sh
 python3 harness/gen_effects_posture_corpus.py           # rewrite effects-corpus/05_posture
