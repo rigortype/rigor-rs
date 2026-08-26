@@ -592,7 +592,15 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   pending the harvest/merge keystone
   ([mini-spec](notes/20260719-lsp-s4b-overlay-mini-spec.md), now issue #92 —
   [recon](notes/20260825-rust-glancer-frozen-index-recon.md)).
-- ⬜ **Deferred:** LSP v4+: `rootUri`; temp-file `BufferBinding`; incremental UTF-16 `didChange`
+- ✅ **LSP `rootUri` landed (2026-08-26).** `initialize`'s `workspaceFolders` → `rootUri` →
+  `rootPath` (protocol modernity order) now decides the project root, adopted as the process cwd
+  so `.rigor.yml`, `paths:`/`exclude:` spellings, `sig/`, `Gemfile.lock` and
+  `rbs_collection.lock.yaml` all move together and LSP-vs-`check` parity holds by construction.
+  Multi-root: first folder wins, disclosed (`window/showMessage`, ADR-0036 posture precedent);
+  no client root ⇒ cwd, as before; an unusable root ⇒ cwd + disclosure.
+  `didChangeWorkspaceFolders` is a documented non-goal (the capability is not advertised).
+  ([note](notes/20260826-s111-lsp-rooturi.md))
+- ⬜ **Deferred:** LSP v4+: temp-file `BufferBinding`; incremental UTF-16 `didChange`
   sync; `--log` wiring; TCP/socket transport. (`Type::Intersection` completion has no carrier in
   this type model.)
 - ✅ **MCP server landed (2026-07-01) — `rigor mcp`.** A read-only Model Context Protocol server
