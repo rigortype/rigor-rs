@@ -353,3 +353,29 @@ shared `master` commit this note's context describes — no uncommitted work
 existed there to lose; a fresh worktree
 (`.claude/worktrees/harvest-cache-remeasure`) was created from `master` to
 continue, and every measurement in this note was taken there.
+
+## CORRECTION (2026-08-26, orchestrator, after the #104 probe)
+
+**Design A's ceiling above is computed on a false premise and is too high.**
+It assumes a warm run skips all of stage 1 (`parse + lower + harvest`,
+93.06ms at 4,675 files). It cannot: the `LoweredAst` is still required by
+merge M3 (`source_index.rs:966/973/997` — `infer_method_returns` and
+`compute_literal_returns`, the #92 §5 constraint) AND by stage 3, which
+walks `p.ast` and `p.source` for every file (`main.rs:843/850/858/873`).
+Both re-verified at this commit. A per-file harvest cache therefore skips
+exactly ONE call — `SourceIndex::harvest(&ast, &index)` (`main.rs:776`).
+
+The real prize is the harvest's own cost, and PR #95's interleaved
+before/after (when harvest MOVED from the serial merge into stage 1's
+rayon closure) already bounds it: at 4,675 files stage 2 fell 56.7ms while
+stage 1 rose 4.7ms. So harvesting the project is ~57ms of CPU but only
+~5ms of WALL time once parallelised — and that 4.7ms sits inside the noise
+of a 76.5ms measurement, so it is a bound, not a number. Against it a
+cache must pay hashing every file plus a read and a decode per hit.
+
+**The GO is therefore SUSPENDED, not withdrawn**: the probe's structural
+findings stand, but the decision now needs the harvest's own measured wall
+cost. Next step (the probe's own first recommendation): split the
+`RIGOR_TIMING` stage-1 label into `parse+lower` / `harvest` and measure on
+a quiet machine. Design B's NO-GO is unaffected — it rested on
+invalidation shape, not on this ceiling.
