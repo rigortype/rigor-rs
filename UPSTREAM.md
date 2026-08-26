@@ -142,8 +142,17 @@ ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
 ```
 
 `harness/lib.rb` and `harness/fp_audit.py` do this unconditionally. Ad-hoc
-probes must too — and since the pin is **post-**auto-wire (`v0.3.0` onward),
-this is now load-bearing rather than defensive.
+probes must too.
+
+**Status at the current pin (`v0.3.4`, re-verified 2026-08-26):** upstream
+fixed the MECHANISM — `Loader.bundled_plugin_path` (ADR-93 WD5, "#194 slice
+2") requires bundled plugins by an engine-anchored absolute path, and that
+was live-verified on a machine carrying a genuinely stale `rigortype 0.2.4`
+gem: `rigor plugins` resolved to the pinned checkout with no defensive
+`-I`. So the flag is now **defence in depth, not load-bearing** — but keep
+passing it: it costs nothing, and it becomes load-bearing again the moment
+anything runs an oracle at a pin older than the fix.
+[batch 3](docs/notes/20260826-upstream-feedback-batch3.md).
 
 ## Oracle invocation hazard 2: cross-checkout result-cache hits
 
