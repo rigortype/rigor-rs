@@ -135,9 +135,22 @@ fn run_stdio() -> Result<(), String> {
         .map_err(|e| format!("initialize handshake failed: {e}"))?;
     let watched_files_dynamic_registration = client_supports_watched_files_registration(&init_params);
 
-    // N4 (deferred, recorded in the S4b note): the root is the server's cwd — the
-    // `initialize` params' `rootUri` / `workspaceFolders` are not consulted yet, so
-    // a server launched from the wrong directory discovers zero project files.
+    // S4b's deferred N4, closed: the client's `workspaceFolders` / `rootUri` /
+    // `rootPath` now decide the project root. An editor that opens folder X but
+    // spawns the server elsewhere used to discover ZERO project files and — since
+    // an empty project deliberately does not trip the scale guard — disclose
+    // nothing at all.
+    //
+    // The root is adopted as the process CWD (see [`enter_project_root`] for why
+    // that, and not a threaded absolute root): rigor's project root IS a cwd in
+    // every consumer below, so this puts the server in exactly the state
+    // `cd <root> && rigor check` runs in and leaves `root` — and therefore the
+    // `exclude:` spellings, the `paths:` walk and the config path — byte-identical
+    // to what they were. This MUST stay above `read_project_config`: everything
+    // from here down reads the filesystem relative to the cwd.
+    for (typ, msg) in enter_project_root(&init_params) {
+        send_show_message(&connection, typ, msg)?;
+    }
     let root = PathBuf::from(".");
 
     // Two-tier essence: the RBS environment is built ONCE and reused for the whole
@@ -267,6 +280,201 @@ fn client_supports_watched_files_registration(init_params: &serde_json::Value) -
         .and_then(|d| d.get("dynamicRegistration"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
+}
+
+/// The workspace root a client named at `initialize`, read from the params.
+///
+/// PURE — no filesystem, no connection — so the precedence rule is unit-testable
+/// on its own. [`enter_project_root`] is the half that touches the world.
+#[derive(Default, PartialEq, Eq, Debug)]
+struct RootRequest {
+    /// The directory to adopt as the project root, or `None` when the client
+    /// named nothing usable (then the server's cwd stands, as it always has).
+    path: Option<PathBuf>,
+    /// The RAW spelling of the highest-priority field that named ANYTHING, used
+    /// only for the disclosure when it could not be turned into a path. `Some`
+    /// with `path: None` is the "the editor opened a workspace rigor cannot
+    /// analyse" case (a `vscode-vfs:` / `untitled:` root); `None` with
+    /// `path: None` is "the client named no root at all", which is silent.
+    named: Option<String>,
+    /// The DISPLAY names of the workspace folders that were NOT chosen. Non-empty
+    /// only in a multi-root workspace, and the sole trigger of the multi-root
+    /// disclosure — rigor's config model is single-root, so the others are simply
+    /// not analysed and the user is told so rather than left to wonder.
+    ignored_folders: Vec<String>,
+}
+
+/// Read `initialize`'s three root fields in the protocol's own modernity order
+/// and return the first that names a local directory.
+///
+/// LSP offers three, of decreasing currency:
+///
+/// | field | status | shape |
+/// | --- | --- | --- |
+/// | `workspaceFolders` | current (3.6+) | `[{uri, name}] \| null` |
+/// | `rootUri` | deprecated in favour of `workspaceFolders` | `DocumentUri \| null` |
+/// | `rootPath` | deprecated in favour of `rootUri` (1.x legacy) | plain path `\| null` |
+///
+/// so the precedence is exactly that order, and the rule is "the first source
+/// that yields a filesystem path wins" — one sentence, rather than a matrix of
+/// per-field validity. A `workspaceFolders` entry with a non-`file:` scheme
+/// therefore falls through to `rootUri` instead of aborting, which costs nothing
+/// and is the forgiving direction.
+///
+/// **Multiple folders: the FIRST wins, and the rest are disclosed.** rigor's
+/// configuration model is single-root — one `.rigor.yml`, one `paths:`, one
+/// `sig/` — so there is no honest way to serve N folders from one session, and
+/// the three candidate answers were: pick one silently, refuse to start, or pick
+/// one and say so. Refusing makes the server useless in a VS Code multi-root
+/// workspace that merely happens to contain a Ruby project; picking silently is
+/// the exact failure this whole slice exists to remove (the user sees diagnostics
+/// that do not match `rigor check` and cannot tell why). Picking the first and
+/// DISCLOSING is the ADR-0036 posture precedent this server already follows for
+/// the sidecar and the overlay scale guard: rigor never silently degrades.
+/// "First" rather than "the one with a `.rigor.yml`" because a content heuristic
+/// would let *adding a config file to another folder* silently move the root.
+fn requested_root(init_params: &serde_json::Value) -> RootRequest {
+    let mut out = RootRequest::default();
+
+    // `workspaceFolders` (current). Absent or `null` ⇒ fall through; `[]` is
+    // treated the same as `null` (VS Code sends `null` for "no folder open", but
+    // an empty array means the same thing and must not be read as a root).
+    let folders: Vec<&serde_json::Value> = init_params
+        .get("workspaceFolders")
+        .and_then(serde_json::Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    if let Some(first) = folders.first() {
+        let uri = first.get("uri").and_then(serde_json::Value::as_str);
+        out.named = uri.map(str::to_string);
+        out.path = uri.and_then(file_uri_to_path);
+        // Recorded whatever the first folder resolved to: a multi-root workspace
+        // is a degradation even when the chosen folder is perfectly usable.
+        out.ignored_folders = folders[1..]
+            .iter()
+            .map(|f| {
+                f.get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| f.get("uri").and_then(serde_json::Value::as_str))
+                    .unwrap_or("<unnamed>")
+                    .to_string()
+            })
+            .collect();
+        if out.path.is_some() {
+            return out;
+        }
+    }
+
+    // `rootUri` (deprecated, still what most clients send).
+    if let Some(uri) = init_params.get("rootUri").and_then(serde_json::Value::as_str) {
+        out.named.get_or_insert_with(|| uri.to_string());
+        out.path = file_uri_to_path(uri);
+        if out.path.is_some() {
+            return out;
+        }
+    }
+
+    // `rootPath` (legacy) — a plain filesystem path, NOT a URI, so it is taken
+    // verbatim. An empty string is not a path.
+    if let Some(p) = init_params
+        .get("rootPath")
+        .and_then(serde_json::Value::as_str)
+        .filter(|p| !p.is_empty())
+    {
+        out.named.get_or_insert_with(|| p.to_string());
+        out.path = Some(PathBuf::from(p));
+    }
+    out
+}
+
+/// Adopt the client's workspace root as the server's CURRENT DIRECTORY, and
+/// return every `window/showMessage` the choice owes the user.
+///
+/// **Why a `chdir` and not a threaded root.** rigor's project root is a process
+/// cwd *everywhere* — `Config::load` discovers `.rigor.yml` there, `paths:` and
+/// `exclude:` are matched against the path strings `check` builds from it,
+/// `signature_paths:` (`sig/`) resolve against it, `Gemfile.lock` and
+/// `rbs_collection.lock.yaml` are looked up under it. The LSP already threads a
+/// `project_root` for its own discovery, but that seam covers only two of those
+/// five: `Config::signature_dirs` is cwd-relative by construction, and — the
+/// decisive one — [`join_root`] deliberately spells discovery paths RELATIVELY
+/// so the `exclude:` globs match the same strings `check` matches. Handing that
+/// seam an absolute root would silently stop every relative `exclude:` pattern
+/// from matching, i.e. re-open the presence divergence
+/// `docs/notes/20260725-lsp-exclude-parity.md` closed (and which took three
+/// review-caught regressions to close correctly).
+///
+/// So the root is moved where the model already says it lives. The server ends up
+/// in exactly the state `cd <root> && rigor check` runs in, which makes the parity
+/// bar hold **by construction** rather than by argument, and `project_root` stays
+/// `.` — every consumer below is byte-identically the code that ran before.
+///
+/// Safe here in a way a `chdir` usually is not: `rigor lsp` is a dedicated
+/// single-session process, this runs ONCE on the main thread immediately after the
+/// handshake, and nothing has touched the filesystem yet (`Connection::stdio`'s IO
+/// threads only own stdin/stdout, `--log` is accepted-but-unwired so no path is
+/// captured, and the sidecar, the `CoreIndex` and the overlay are all built after
+/// this point). Buffer URIs are absolute, so no request path depends on the cwd.
+///
+/// A root that cannot be entered — deleted, a file, unreadable — does NOT abort:
+/// the server keeps its cwd and discloses, because a language server that refuses
+/// to start is strictly worse for the user than one that says what it is analysing.
+fn enter_project_root(init_params: &serde_json::Value) -> Vec<(MessageType, String)> {
+    let req = requested_root(init_params);
+    let mut disclosures = Vec::new();
+    match &req.path {
+        Some(path) => match std::env::set_current_dir(path) {
+            Ok(()) => {
+                if !req.ignored_folders.is_empty() {
+                    disclosures.push((
+                        MessageType::WARNING,
+                        multi_root_message(path, &req.ignored_folders),
+                    ));
+                }
+            }
+            Err(e) => disclosures.push((
+                MessageType::WARNING,
+                unusable_root_message(&path.display().to_string(), &e.to_string()),
+            )),
+        },
+        // Named something that is not a local directory at all (a virtual
+        // workspace). Nothing named ⇒ nothing to say: the cwd root is this
+        // server's documented default, not a degradation.
+        None => {
+            if let Some(named) = &req.named {
+                disclosures.push((
+                    MessageType::WARNING,
+                    unusable_root_message(named, "not a local file: directory"),
+                ));
+            }
+        }
+    }
+    disclosures
+}
+
+/// The multi-root disclosure. Names the folder that WON (so the user can tell at
+/// a glance whether it is the one they care about) and the ones dropped, and
+/// points at the two real remedies rather than just stating the limitation.
+fn multi_root_message(chosen: &Path, ignored: &[String]) -> String {
+    format!(
+        "rigor: this workspace has {} folders but rigor's project model is single-root \
+         (one .rigor.yml, one paths:, one sig/) — analysing {} only, ignoring {}. \
+         Open the folder you want in its own window, or widen paths: in its .rigor.yml.",
+        ignored.len() + 1,
+        chosen.display(),
+        ignored.join(", "),
+    )
+}
+
+/// The unusable-root disclosure: the editor believes it opened a workspace and
+/// rigor is analysing something else, which the user must be told or the
+/// mismatched diagnostics are inexplicable.
+fn unusable_root_message(named: &str, reason: &str) -> String {
+    format!(
+        "rigor: the workspace root {named} could not be used ({reason}) — analysing the \
+         server's working directory instead; diagnostics may not match `rigor check` for \
+         your project."
+    )
 }
 
 /// The default per-URI `didChange` debounce (ADR-0029 §debounce; matches the
@@ -1051,6 +1259,13 @@ struct ServerContext {
     /// `.` (the server's cwd, matching the root `CoreIndex::for_project` and bare
     /// `check` already use); tests inject a temp dir so a real multi-file project
     /// can be driven without mutating the process-global cwd.
+    ///
+    /// It stays `.` even now that `rootUri` is honoured, and deliberately: the
+    /// client's root is adopted by moving the process cwd to it
+    /// ([`enter_project_root`]), so the path STRINGS this seam produces — which
+    /// the `exclude:` globs are matched against — remain the relative ones
+    /// `check` builds. An absolute root here would silently stop every relative
+    /// `exclude:` pattern from matching.
     project_root: PathBuf,
     /// The tier-1 rebuild scale-guard budget (S4b). Production is
     /// [`OVERLAY_BUILD_BUDGET_DEFAULT`]; the guard test forces a value low enough
@@ -2520,7 +2735,20 @@ fn uri_to_canonical_path(uri: &Uri) -> Option<PathBuf> {
 /// resolved — so it survives a path whose directory no longer exists, which
 /// [`uri_to_canonical_path`] cannot.
 fn uri_decoded_path(uri: &Uri) -> Option<PathBuf> {
-    let rest = uri.as_str().strip_prefix("file://")?;
+    file_uri_to_path(uri.as_str())
+}
+
+/// …the same decode, from a RAW URI string. [`requested_root`] reads workspace
+/// URIs straight out of the `initialize` params (`serde_json`, not `lsp_types`),
+/// and a second decoder there would be exactly the drift the `exclude:` parity
+/// slice was written to prevent: the root's decode and the buffer's decode must
+/// agree, or a buffer under the root can be spelled outside it. One rule, two
+/// entry points.
+///
+/// `None` for anything that is not a `file:` URI — a virtual workspace
+/// (`vscode-vfs:`, `untitled:`) has no local directory for rigor to analyse.
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
     // Skip the (empty or `localhost`) authority component: `file:///a/b` → `/a/b`.
     let start = rest.find('/')?;
     Some(PathBuf::from(percent_decode(&rest[start..])))
@@ -6546,6 +6774,82 @@ mod tests {
         h.notify("workspace/didChangeWatchedFiles", watched_change(&p.config_uri()));
         assert!(h.recv_diags().diagnostics.is_empty());
         h.shutdown();
+    }
+
+    /// The `initialize` root precedence, pinned field by field. Pure — no
+    /// filesystem, no cwd — so it can assert the RULE without the `chdir` half.
+    #[test]
+    fn requested_root_follows_the_protocols_modernity_order() {
+        let folders = |uris: &[&str]| {
+            serde_json::Value::Array(
+                uris.iter()
+                    .map(|u| serde_json::json!({ "uri": u, "name": u.rsplit('/').next() }))
+                    .collect(),
+            )
+        };
+
+        // Nothing named ⇒ no root, no disclosure: the cwd default stands.
+        assert_eq!(requested_root(&serde_json::json!({})), RootRequest::default());
+        // `null` and `[]` are both "no folder open" and must NOT be read as roots.
+        assert_eq!(
+            requested_root(&serde_json::json!({ "workspaceFolders": null, "rootUri": null })),
+            RootRequest::default()
+        );
+        assert_eq!(
+            requested_root(&serde_json::json!({ "workspaceFolders": [] })),
+            RootRequest::default()
+        );
+
+        // `workspaceFolders` (current) BEATS `rootUri` (deprecated) beats
+        // `rootPath` (legacy) — all three present, most modern wins.
+        let all = serde_json::json!({
+            "workspaceFolders": folders(&["file:///w/folders"]),
+            "rootUri": "file:///w/uri",
+            "rootPath": "/w/path",
+        });
+        assert_eq!(requested_root(&all).path.as_deref(), Some(Path::new("/w/folders")));
+        // …drop the most modern and the next one takes over, twice.
+        let no_folders = serde_json::json!({ "rootUri": "file:///w/uri", "rootPath": "/w/path" });
+        assert_eq!(requested_root(&no_folders).path.as_deref(), Some(Path::new("/w/uri")));
+        let legacy = serde_json::json!({ "rootPath": "/w/path" });
+        assert_eq!(requested_root(&legacy).path.as_deref(), Some(Path::new("/w/path")));
+        // `rootPath` is a PLAIN PATH, not a URI: it is taken verbatim, and an
+        // empty string is not a path.
+        assert_eq!(requested_root(&serde_json::json!({ "rootPath": "" })), RootRequest::default());
+
+        // Percent-escapes decode through the SAME decoder buffer URIs use.
+        assert_eq!(
+            requested_root(&serde_json::json!({ "rootUri": "file:///w/my%20proj" }))
+                .path
+                .as_deref(),
+            Some(Path::new("/w/my proj"))
+        );
+
+        // A virtual workspace has no local directory: no path, but it IS named,
+        // which is what makes the fallback disclosed rather than silent.
+        let virt = requested_root(&serde_json::json!({ "rootUri": "vscode-vfs://host/repo" }));
+        assert_eq!(virt.path, None);
+        assert_eq!(virt.named.as_deref(), Some("vscode-vfs://host/repo"));
+        // …and a non-`file:` FOLDER falls through to a usable `rootUri` rather
+        // than aborting (the forgiving direction).
+        let mixed = requested_root(&serde_json::json!({
+            "workspaceFolders": folders(&["vscode-vfs://host/repo"]),
+            "rootUri": "file:///w/real",
+        }));
+        assert_eq!(mixed.path.as_deref(), Some(Path::new("/w/real")));
+
+        // MULTI-ROOT: the first folder wins and the rest are recorded for the
+        // disclosure. Order is the client's, and it is what we pin.
+        let multi = requested_root(&serde_json::json!({
+            "workspaceFolders": folders(&["file:///w/a", "file:///w/b", "file:///w/c"]),
+        }));
+        assert_eq!(multi.path.as_deref(), Some(Path::new("/w/a")));
+        assert_eq!(multi.ignored_folders, vec!["b".to_string(), "c".to_string()]);
+        // A SINGLE folder is not a degradation and owes nothing.
+        let single = requested_root(&serde_json::json!({
+            "workspaceFolders": folders(&["file:///w/a"]),
+        }));
+        assert!(single.ignored_folders.is_empty());
     }
 
     #[test]

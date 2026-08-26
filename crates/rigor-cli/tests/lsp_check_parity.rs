@@ -171,19 +171,32 @@ impl LspChild {
         serde_json::from_slice(&buf).expect("parse body")
     }
 
-    /// Read until the `publishDiagnostics` for `uri` arrives, skipping the
-    /// startup posture `window/showMessage` and anything else in between.
-    fn recv_diagnostics(&mut self, uri: &str) -> Vec<serde_json::Value> {
+    /// Read until the `publishDiagnostics` for `uri` arrives, COLLECTING every
+    /// `window/showMessage` text seen on the way — the startup posture line and,
+    /// since the `rootUri` slice, any workspace-root disclosure. The root
+    /// decision's degraded branches are disclosed rather than silent, so those
+    /// texts are part of the contract and the tests assert on them.
+    fn recv_diagnostics_and_messages(
+        &mut self,
+        uri: &str,
+    ) -> (Vec<serde_json::Value>, Vec<String>) {
+        let mut messages = Vec::new();
         for _ in 0..50 {
             let msg = self.recv();
-            if msg.get("method").and_then(|m| m.as_str())
-                == Some("textDocument/publishDiagnostics")
+            let method = msg.get("method").and_then(|m| m.as_str());
+            if method == Some("window/showMessage") {
+                if let Some(text) = msg["params"]["message"].as_str() {
+                    messages.push(text.to_string());
+                }
+                continue;
+            }
+            if method == Some("textDocument/publishDiagnostics")
                 && msg["params"]["uri"].as_str() == Some(uri)
             {
-                return msg["params"]["diagnostics"].as_array().unwrap().clone();
+                return (msg["params"]["diagnostics"].as_array().unwrap().clone(), messages);
             }
         }
-        panic!("no publishDiagnostics for {uri} within 50 messages");
+        panic!("no publishDiagnostics for {uri} within 50 messages (saw {messages:?})");
     }
 
     fn shutdown(mut self) {
@@ -525,12 +538,38 @@ fn lsp_analyses_a_file_kept_by_one_of_two_overlapping_roots() {
 
 /// Boot `rigor lsp` in `root`, `didOpen` `rel` with `text`, and return its
 /// published diagnostics in the same comparable shape [`check_findings`] yields.
+///
+/// The client advertises no capabilities and names NO workspace root, so this is
+/// also the standing regression test for the cwd fallback: every assertion in
+/// this file below goes through it, and they all compare against a `check` run in
+/// the same directory.
 fn lsp_findings(root: &Path, rel: &str, text: &str) -> Vec<Finding> {
-    let uri = format!("file://{}", root.join(rel).display());
-    let mut lsp = LspChild::spawn(root);
+    lsp_session(root, root, serde_json::json!({}), rel, text).0
+}
+
+/// The general form: boot `rigor lsp` with its process cwd at `cwd`, hand it
+/// `extra_init` merged into the `initialize` params (this is where `rootUri` /
+/// `workspaceFolders` / `rootPath` go), open `<doc_root>/<rel>`, and return both
+/// the published diagnostics AND every `window/showMessage` text seen on the way.
+///
+/// The messages are returned because the root decision's degraded branches are
+/// DISCLOSED rather than silent (ADR-0036 posture precedent), so the disclosure
+/// is part of the contract under test, not incidental output.
+fn lsp_session(
+    cwd: &Path,
+    doc_root: &Path,
+    extra_init: serde_json::Value,
+    rel: &str,
+    text: &str,
+) -> (Vec<Finding>, Vec<String>) {
+    let uri = format!("file://{}", doc_root.join(rel).display());
+    let mut params = serde_json::json!({ "capabilities": {} });
+    for (k, v) in extra_init.as_object().cloned().unwrap_or_default() {
+        params[k] = v;
+    }
+    let mut lsp = LspChild::spawn(cwd);
     lsp.send(serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": { "capabilities": {} }
+        "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params
     }));
     lsp.recv(); // initialize response
     lsp.send(serde_json::json!({
@@ -542,7 +581,7 @@ fn lsp_findings(root: &Path, rel: &str, text: &str) -> Vec<Finding> {
             "uri": uri, "languageId": "ruby", "version": 1, "text": text
         }}
     }));
-    let diags = lsp.recv_diagnostics(&uri);
+    let (diags, messages) = lsp.recv_diagnostics_and_messages(&uri);
     let findings = diags
         .iter()
         .map(|d| {
@@ -563,5 +602,290 @@ fn lsp_findings(root: &Path, rel: &str, text: &str) -> Vec<Finding> {
         })
         .collect();
     lsp.shutdown();
-    findings
+    (findings, messages)
+}
+
+// ---------------------------------------------------------------------------
+// `rootUri` / `workspaceFolders` — the project root the CLIENT names, not the
+// directory the server happened to be spawned in (S4b's deferred N4).
+//
+// The bar is the same one the rest of this file enforces: the LSP's diagnostics
+// must equal `rigor check`'s for THAT root. Every test here spawns the server in
+// a directory that is NOT the project, so a regression to the cwd root fails them
+// by producing the single-file (silent) answer instead.
+// ---------------------------------------------------------------------------
+
+/// A directory with no Ruby in it, to spawn the server in.
+fn elsewhere(tag: &str) -> TempDir {
+    TempDir::new(tag)
+}
+
+#[test]
+fn lsp_honours_root_uri_over_the_process_cwd() {
+    let project = TempDir::new("lsp-rooturi-project");
+    fs::write(project.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(project.path().join("lib/sub.rb"), SUB_RB).unwrap();
+    let away = elsewhere("lsp-rooturi-away");
+
+    // The bar: `rigor check` run IN the project root. The fixture's finding is
+    // purely cross-file, so it exists only when project discovery worked.
+    let expected = check_findings(project.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(expected.len(), 1, "project `check` reports the cross-file finding: {expected:?}");
+
+    // NON-VACUITY, in the test itself: the same session WITHOUT a client root
+    // sees an empty project (the cwd has no Ruby) and falls back to the
+    // single-file index, so it reports nothing. Any regression to the cwd root
+    // lands here.
+    let (cwd_root, _) =
+        lsp_session(away.path(), project.path(), serde_json::json!({}), "lib/sub.rb", SUB_RB);
+    assert!(
+        cwd_root.is_empty(),
+        "control: with no client root the server discovers nothing under its cwd: {cwd_root:?}"
+    );
+
+    // …and with `rootUri` naming the project it matches `check` exactly.
+    let (actual, messages) = lsp_session(
+        away.path(),
+        project.path(),
+        serde_json::json!({ "rootUri": format!("file://{}", project.path().display()) }),
+        "lib/sub.rb",
+        SUB_RB,
+    );
+    assert_eq!(
+        actual, expected,
+        "a session rooted by `rootUri` must publish what `rigor check` reports for that root"
+    );
+    assert!(
+        messages.iter().all(|m| !m.contains("workspace root")),
+        "a single usable root is not a degradation and owes no disclosure: {messages:?}"
+    );
+}
+
+#[test]
+fn lsp_honours_workspace_folders_and_the_legacy_root_path() {
+    let project = TempDir::new("lsp-rootforms-project");
+    fs::write(project.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(project.path().join("lib/sub.rb"), SUB_RB).unwrap();
+    let away = elsewhere("lsp-rootforms-away");
+    let expected = check_findings(project.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(expected.len(), 1);
+
+    // `workspaceFolders` — the current field.
+    let folders = serde_json::json!({
+        "workspaceFolders": [
+            { "uri": format!("file://{}", project.path().display()), "name": "project" }
+        ]
+    });
+    assert_eq!(
+        lsp_session(away.path(), project.path(), folders, "lib/sub.rb", SUB_RB).0,
+        expected,
+        "`workspaceFolders` roots the session"
+    );
+
+    // `rootPath` — the 1.x legacy field, a PLAIN PATH rather than a URI. Some old
+    // clients still send only this one.
+    let legacy =
+        serde_json::json!({ "rootPath": project.path().display().to_string() });
+    assert_eq!(
+        lsp_session(away.path(), project.path(), legacy, "lib/sub.rb", SUB_RB).0,
+        expected,
+        "the legacy `rootPath` roots the session too"
+    );
+}
+
+#[test]
+fn lsp_multi_root_takes_the_first_folder_and_discloses() {
+    // rigor's config model is single-root, so a multi-root workspace is served
+    // from ONE folder — the first — and the user is told, rather than left to
+    // wonder why the other folder has no markers (ADR-0036 posture precedent).
+    let first = TempDir::new("lsp-multiroot-first");
+    fs::write(first.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(first.path().join("lib/sub.rb"), SUB_RB).unwrap();
+    let second = TempDir::new("lsp-multiroot-second");
+    fs::write(second.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(second.path().join("lib/sub.rb"), SUB_RB).unwrap();
+    // The second folder's config disables the fixture's rule. It must have NO
+    // effect: rigor's single-root model reads exactly one `.rigor.yml`, the
+    // chosen root's — and this is the leg that proves "first folder wins" rather
+    // than "some folder wins".
+    fs::write(
+        second.path().join(".rigor.yml"),
+        "disable:\n  - def.override-visibility-reduced\n",
+    )
+    .unwrap();
+    let away = elsewhere("lsp-multiroot-away");
+
+    let expected = check_findings(first.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(expected.len(), 1);
+
+    let folders = serde_json::json!({
+        "workspaceFolders": [
+            { "uri": format!("file://{}", first.path().display()), "name": "first" },
+            { "uri": format!("file://{}", second.path().display()), "name": "second" }
+        ]
+    });
+    // The FIRST folder's buffer gets the project answer…
+    let (actual, messages) =
+        lsp_session(away.path(), first.path(), folders.clone(), "lib/sub.rb", SUB_RB);
+    assert_eq!(actual, expected, "the first workspace folder is the one analysed");
+    let disclosure = messages
+        .iter()
+        .find(|m| m.contains("single-root"))
+        .unwrap_or_else(|| panic!("no multi-root disclosure among {messages:?}"));
+    assert!(
+        disclosure.contains("second"),
+        "the disclosure must name the folders that were dropped: {disclosure:?}"
+    );
+    assert!(
+        disclosure.contains(&first.path().display().to_string()),
+        "…and the one that won: {disclosure:?}"
+    );
+
+    // …and the SECOND folder's `.rigor.yml` is not in force. Were the chosen root
+    // the second folder (or were both configs merged), its `disable:` would
+    // silence this and the assertion above would already have failed — so this is
+    // the leg that discriminates "the FIRST folder wins" from "a folder wins".
+    // Proof that the config is otherwise effective: `check` run IN the second
+    // folder is silent for the same fixture.
+    let second_silenced = check_findings(second.path(), &["lib"], "lib/sub.rb");
+    assert!(
+        second_silenced.is_empty(),
+        "the second folder's disable: is real — it silences `check` there: {second_silenced:?}"
+    );
+
+    // A buffer that lives in the NON-chosen folder is outside the chosen root's
+    // `paths:`, which is the pre-existing out-of-`paths:` divergence (the exclude
+    // note's item 6, S4b's N5): it is analysed against the chosen root's project
+    // index. Recorded, not asserted as desirable — it is the degradation the
+    // disclosure exists to explain, and the `rootUri` slice neither creates nor
+    // closes it.
+    let (outside, outside_messages) =
+        lsp_session(away.path(), second.path(), folders, "lib/sub.rb", SUB_RB);
+    assert!(
+        outside_messages.iter().any(|m| m.contains("single-root")),
+        "a buffer in a non-chosen folder still gets the multi-root disclosure: \
+         {outside_messages:?}"
+    );
+    assert_eq!(
+        outside, expected,
+        "out-of-`paths:` buffers are analysed against the CHOSEN root's index \
+         (pre-existing divergence N5), so the second folder's own config never applies"
+    );
+}
+
+#[test]
+fn lsp_reads_the_rigor_yml_under_the_client_root_not_the_cwd() {
+    // The config path is derived from the root, so `rootUri` must move it. Both
+    // legs compare against `rigor check` run in the ROOT — the only run whose
+    // answer the editor is supposed to reproduce.
+    let project = TempDir::new("lsp-rootcfg-project");
+    fs::write(project.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(project.path().join("lib/sub.rb"), SUB_RB).unwrap();
+    let away = TempDir::new("lsp-rootcfg-away");
+    let root_uri = serde_json::json!({
+        "rootUri": format!("file://{}", project.path().display())
+    });
+
+    // CONTROL: no config anywhere ⇒ the rule fires in both tools.
+    let firing = check_findings(project.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(firing.len(), 1, "the control must be non-empty: {firing:?}");
+    assert_eq!(
+        lsp_session(away.path(), project.path(), root_uri.clone(), "lib/sub.rb", SUB_RB).0,
+        firing
+    );
+
+    // LEG 1 — a `.rigor.yml` in the CWD must NOT be read. It disables the rule;
+    // if the server read it, the finding would vanish and this leg would fail.
+    fs::write(
+        away.path().join(".rigor.yml"),
+        "disable:\n  - def.override-visibility-reduced\n",
+    )
+    .unwrap();
+    assert_eq!(
+        lsp_session(away.path(), project.path(), root_uri.clone(), "lib/sub.rb", SUB_RB).0,
+        firing,
+        "the config that governs is the ROOT's, not the directory the server was spawned in"
+    );
+
+    // LEG 2 — the same `.rigor.yml` under the ROOT *is* read, and both tools go
+    // silent together.
+    fs::write(
+        project.path().join(".rigor.yml"),
+        "disable:\n  - def.override-visibility-reduced\n",
+    )
+    .unwrap();
+    let silenced = check_findings(project.path(), &["lib"], "lib/sub.rb");
+    assert!(silenced.is_empty(), "`check` honours the root's disable: {silenced:?}");
+    assert_eq!(
+        lsp_session(away.path(), project.path(), root_uri, "lib/sub.rb", SUB_RB).0,
+        silenced,
+        "the LSP must honour the root's .rigor.yml exactly as `check` does"
+    );
+}
+
+#[test]
+fn lsp_ingests_the_project_sig_dir_under_the_client_root() {
+    // `signature_paths:` (default `["sig"]`) resolves against the process cwd by
+    // construction — `Config::signature_dirs` builds bare `PathBuf::from(entry)`
+    // — so it is the consumer a merely-threaded absolute root would NOT have
+    // moved, and the project's own RBS would have gone unread under a client
+    // root. Pinned end to end because neither harness nor `fp_audit` can see
+    // project-`sig/` behaviour (both run core+stdlib only).
+    let project = TempDir::new("lsp-rootsig-project");
+    fs::create_dir_all(project.path().join("sig")).unwrap();
+    fs::write(project.path().join("sig/widget.rbs"), WIDGET_RBS).unwrap();
+    fs::write(project.path().join("lib/void_use.rb"), VOID_USE_RB).unwrap();
+    fs::write(project.path().join(".rigor.yml"), "bleeding_edge:\n  - use-of-void-value\n")
+        .unwrap();
+    let away = elsewhere("lsp-rootsig-away");
+
+    // The finding exists ONLY if `sig/widget.rbs` was ingested (it is what
+    // declares `Widget#fire: () -> void`) AND the root's `.rigor.yml` adopted the
+    // rule — so this one assertion covers the config path and the signature path
+    // at once, and cannot pass vacuously.
+    let expected = check_findings(project.path(), &["lib"], "lib/void_use.rb");
+    assert_eq!(expected.len(), 1, "the control: the project RBS makes the rule fire: {expected:?}");
+    assert_eq!(expected[0].3, "static.value-use.void");
+
+    let (actual, _) = lsp_session(
+        away.path(),
+        project.path(),
+        serde_json::json!({ "rootUri": format!("file://{}", project.path().display()) }),
+        "lib/void_use.rb",
+        VOID_USE_RB,
+    );
+    assert_eq!(
+        actual, expected,
+        "the client root's `sig/` must be ingested, not the spawn directory's"
+    );
+}
+
+#[test]
+fn lsp_falls_back_to_the_cwd_and_discloses_when_the_named_root_is_unusable() {
+    // A root that is not a local directory — a virtual workspace, or one that has
+    // been deleted — must not stop the server: it keeps its cwd and SAYS so, since
+    // otherwise the editor's markers silently describe a different project.
+    let project = TempDir::new("lsp-badroot-project");
+    fs::write(project.path().join("lib/base.rb"), BASE_RB).unwrap();
+    fs::write(project.path().join("lib/sub.rb"), SUB_RB).unwrap();
+    let expected = check_findings(project.path(), &["lib"], "lib/sub.rb");
+    assert_eq!(expected.len(), 1);
+
+    for (tag, root) in [
+        ("virtual", serde_json::json!({ "rootUri": "vscode-vfs://host/repo" })),
+        (
+            "missing",
+            serde_json::json!({ "rootUri": "file:///no/such/rigor/root/anywhere" }),
+        ),
+    ] {
+        // The server is spawned IN the project, so the cwd fallback is the right
+        // answer and stays comparable to `check`.
+        let (actual, messages) =
+            lsp_session(project.path(), project.path(), root, "lib/sub.rb", SUB_RB);
+        assert_eq!(actual, expected, "[{tag}] the cwd fallback still analyses the project");
+        assert!(
+            messages.iter().any(|m| m.contains("could not be used")),
+            "[{tag}] the fallback must be disclosed, not silent: {messages:?}"
+        );
+    }
 }
