@@ -188,3 +188,18 @@ proven lane is the only lane a verdict may read), and `DECLARED-MISMATCH`.
 It is the first instrument here whose unit is a **project directory** and which
 runs each arm *in* it, so it is also the first one that sees `.rigor.yml`,
 project `sig/` and plugins. Fixture projects live in `effects-corpus/`.
+
+One of them is **generated**, and re-generating it is a gate of its own:
+
+```sh
+python3 harness/gen_effects_posture_corpus.py           # rewrite effects-corpus/05_posture
+python3 harness/gen_effects_posture_corpus.py --check    # drift gate: bytes vs the catalogue
+```
+
+`effects-corpus/05_posture` probes every class of the vendored effect catalogue
+(`crates/rigor-effects/vendor/effects/core.yml`) with a selector only a class
+POSTURE could answer, plus row and universal controls. It is generated because
+the set of classes — and the subset of them whose constants the oracle can
+actually resolve — moves with the pin, and a hand-list would go stale silently:
+the hand-written corpus contained none of the eight classes behind issue #106's
+live over-claim ([note](../docs/notes/20260826-s106-posture-over-fix.md)).

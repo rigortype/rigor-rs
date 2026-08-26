@@ -24,12 +24,36 @@
 //! ADR-0043 § 1 ("collection is observational") a dependency fact here: nothing
 //! below reads inference state, and nothing in `rigor-infer` is asked anything.
 //!
-//! It is also what makes the posture tier safe. `Catalog#lookup`'s third tier
-//! answers the class's POSTURE for a selector it does not row, and upstream
-//! reaches it through `record.receiver_class` too — which converts typing
-//! precision directly into proven labels, and rigor-rs is sometimes MORE precise
-//! than the reference. With the typer arm declined the posture only ever fires
-//! on a constant both engines spell from the same syntax.
+//! # No POSTURE tier either — and the typer-free argument does NOT save it
+//!
+//! `Catalog#lookup`'s third tier answers the class's POSTURE for a selector it
+//! does not row. Slice 2 kept that tier for constant-path receivers on the
+//! argument that the constant is spelled by the same syntax in both engines.
+//! **That argument is false and shipped a live over-claim** (issue #106): the
+//! posture is not gated on how the receiver is SPELLED, it is gated on how the
+//! receiver was TYPED — `posture_allowed?` is `!implicit && !record&.dynamic &&
+//! …` (`unit_scan.rb:429`) — and the reference cannot resolve every constant its
+//! own catalogue names. Eight of the eighty listed classes type as `Dynamic`
+//! there (`Net::HTTP`, `Net::SMTP`, `Net::FTP`, `OpenSSL::SSL::SSLSocket`,
+//! `Fiddle::Handle`, `Fiddle::Function`, `PTY`, `SOCKSSocket` at the pin), so
+//! upstream refuses the posture and proves nothing, while a typer-free port with
+//! the tier on proves the class default — seven measured OVER rows on
+//! `harness/effects-corpus/05_posture`.
+//!
+//! So the tier is OFF for every receiver, which is what upstream itself does
+//! whenever the receiver is `Dynamic`. Two roads were rejected: an allow-list of
+//! the constants the reference resolves (a function of ITS RBS environment,
+//! which moves with the pin and with the machine's installed gems — the
+//! `UNBUILDABLE_DEFINITIONS` hazard), and asking rigor-rs's own typer (the port
+//! is deliberately MORE robust than the reference on shapes it degrades to
+//! `untyped` — `sig_gen.rs:20-23` — and `untyped == Dynamic`, so its answer
+//! moves in exactly the unsafe direction).
+//!
+//! Nothing else is lost: `Catalog#lookup` answers a ROW first and the 34-name
+//! `universal:` list second, both BEFORE it consults `posture:`
+//! (`catalog.rb:186`), so a row stays authoritative even on a class the oracle
+//! cannot resolve. Measured cost: 0 on the graded corpus, 4 methods of 6,948 on
+//! mastodon/app — all UNDER (`docs/notes/20260826-effects-s3-probe.md` § 3c).
 //!
 //! # What slice 2 does NOT collect
 //!
@@ -64,11 +88,6 @@ const DECLARATION_MACROS: &[&str] =
 const FRAME_LOCAL_GLOBALS: &[&str] = &["$~", "$_", "$&", "$`", "$'", "$+", "$!"];
 
 const REFLECTIVE_SEND: &[&str] = &["send", "public_send", "__send__"];
-
-/// Selectors a per-class POSTURE default must never answer for, because a more
-/// specific reading of the same site exists and would be swallowed
-/// (`unit_scan.rb:48`). An explicit ROW still wins.
-const DEFERRED_SELECTORS: &[&str] = &["send", "public_send", "__send__", "call"];
 
 const EVAL_SELECTORS: &[&str] = &["eval", "instance_eval", "class_eval", "module_eval"];
 
@@ -444,40 +463,48 @@ impl<'pr> UnitScan<'pr> {
     /// claim suppresses the uncatalogued reading, which is what an explicit ∅
     /// row is for (`unit_scan.rb:381`).
     fn claimed_by_catalogue(&mut self, node: &CallNode<'pr>) -> bool {
-        let Some((owner, singleton, implicit)) = catalog_target(node) else { return false };
+        let Some((owner, singleton, _implicit)) = catalog_target(node) else { return false };
         let selector = name_of(node.name().as_slice());
-        let posture = !implicit && !DEFERRED_SELECTORS.contains(&selector.as_str());
         let catalog = rigor_effects::catalog();
-        let Some(resolved) = catalog.resolve(&owner, &selector, singleton, posture) else {
+        // `posture: false` — ALWAYS, for every receiver shape. The tier is gated
+        // upstream on the typer's `dynamic` bit, which this collector does not
+        // have and must not guess (module docs, issue #106). It is the answer
+        // upstream itself gives for a `Dynamic` receiver, so what survives is a
+        // strict subset of upstream's rows and universal answers.
+        let Some(resolved) = catalog.resolve(&owner, &selector, singleton, false) else {
             return false;
         };
-        let (labels, mutates, from_posture) = match resolved {
+        let (labels, mutates) = match resolved {
             Resolution::Row(row) => match row.narrow() {
                 // ADR-0043 § 2: the row's own `effects:` is the UNNARROWED
                 // upper bound, and a coarser label than the oracle proves is an
                 // OVER. A handler this port does not implement answers ∅ — never
                 // the parent — and the row still CLAIMS the call.
-                Some(handler) => (
-                    narrowing::apply(handler, node).unwrap_or_default(),
-                    row.mutates_receiver(),
-                    false,
-                ),
-                None => (row.labels().to_vec(), row.mutates_receiver(), false),
+                Some(handler) => {
+                    (narrowing::apply(handler, node).unwrap_or_default(), row.mutates_receiver())
+                }
+                None => (row.labels().to_vec(), row.mutates_receiver()),
             },
+            // The 34-name `universal:` list, which answers ∅ and claims the
+            // call. `Posture` is unreachable with the tier off, and is spelled
+            // here rather than `unreachable!()` because the two entries read
+            // identically — a future tier would be a DECISION, not a panic.
             Resolution::Universal(entry) | Resolution::Posture(entry) => {
-                (entry.labels().to_vec(), entry.mutates_receiver(), entry.posture())
+                (entry.labels().to_vec(), entry.mutates_receiver())
             }
         };
         if !labels.is_empty() {
             let separator = if singleton { "." } else { "#" };
             self.summary.add(&format!("catalogue:{owner}{separator}{selector}"), labels);
         }
-        // `mutating_catalogued?` (`unit_scan.rb:413`). The posture arm passes
-        // the CATALOGUE TARGET as the receiver class, not a typer projection —
-        // which is why it is safe here: `owner` came from the syntax.
-        if mutates
-            || (from_posture && MutationClassifier::mutating(&selector, Some(owner.as_str())))
-        {
+        // `mutating_catalogued?` (`unit_scan.rb:413`) is
+        // `mutates_receiver? || (posture? && mutating?(node, owner))`, and with
+        // the posture tier off the second disjunct is constant-false: no entry
+        // this lookup can return has `posture?` set. It was already inert —
+        // that arm only ever fired on a CONSTANT receiver, which
+        // `MutationClassifier::label_for` never classifies — so dropping it
+        // moves nothing.
+        if mutates {
             self.classify_mutation(node.receiver().as_ref());
         }
         true
@@ -896,9 +923,10 @@ mod tests {
     fn an_implicit_self_call_reads_a_kernel_row_and_never_the_posture() {
         assert_eq!(one(r#"  puts "hello""#), ["io.output.stdout"]);
         assert_eq!(one("  rand(10)"), ["nondet.random"]);
-        // …but a project method of the same shape must stay ∅: the posture is
-        // disallowed for implicit self, or every unqualified call in a project
-        // body would read `io`.
+        // …but a project method of the same shape must stay ∅. Upstream refuses
+        // `Kernel`'s `world` posture for implicit self (else every unqualified
+        // call in a project body would read `io`); this port refuses the tier
+        // outright (issue #106), so the two agree here for two reasons.
         assert!(one("  helper(1)").is_empty());
         assert!(one("  self.helper(1)").is_empty());
     }
@@ -915,12 +943,49 @@ mod tests {
     }
 
     #[test]
-    fn the_posture_answers_for_an_uncatalogued_selector_on_a_listed_class() {
-        assert_eq!(one("  File.some_uncatalogued_thing"), ["io.fs"]);
+    fn the_posture_tier_never_answers_however_the_receiver_is_spelled() {
+        // Issue #106. Upstream gates the class default on the TYPER's `dynamic`
+        // bit, not on the receiver's spelling, and it cannot resolve every
+        // constant its own catalogue names — so this port, which has no such
+        // bit, may not read the tier at all. `File.some_uncatalogued_thing`
+        // proves `io.fs` upstream and ∅ here (a deliberate UNDER); the eight
+        // classes below prove ∅ on BOTH sides, and reading the tier for them is
+        // the over-claim this closes.
+        assert!(one("  File.some_uncatalogued_thing").is_empty());
+        for class in [
+            "Net::HTTP",
+            "Net::SMTP",
+            "Net::FTP",
+            "OpenSSL::SSL::SSLSocket",
+            "Fiddle::Handle",
+            "Fiddle::Function",
+            "PTY",
+            "SOCKSSocket",
+        ] {
+            assert!(one(&format!("  {class}.zz_uncatalogued_zz")).is_empty(), "{class}");
+        }
+        // A `kind: object` constant takes the same answer on the INSTANCE side.
+        assert!(one("  ENV.zz_uncatalogued_zz").is_empty());
         // A class the catalogue does NOT list contributes nothing at all.
         assert!(one("  SomeUndeclaredGem::Client.new.fetch").is_empty());
-        // …and the universal list beats the posture.
+    }
+
+    #[test]
+    fn the_row_and_universal_tiers_still_answer_with_the_posture_off() {
+        // The must-still-fire control for the tier drop above: `Catalog#lookup`
+        // reads a ROW first and the 34-name `universal:` list second, both
+        // BEFORE `posture:` (`catalog.rb:186`), so switching the third tier off
+        // may not cost either. `Net::HTTP.get` is the sharp case — a row on one
+        // of the eight classes the oracle cannot resolve, which the oracle
+        // still proves, so an over-corrected fix reads as a missing label here.
+        assert_eq!(one("  Net::HTTP.get(uri)"), ["io.net.http"]);
+        assert_eq!(one("  Net::HTTP.post_form(uri, data)"), ["io.net.http"]);
+        assert_eq!(one("  File.read(path)"), ["io.fs.read"]);
+        assert_eq!(one(r#"  ENV["HOME"]"#), ["global.read"]);
+        // The universal list answers ∅ — and it is what keeps `File.class` at ∅
+        // rather than `io.fs` for any tier consulted after it.
         assert!(one("  File.class").is_empty());
+        assert!(one("  File.frozen?").is_empty());
     }
 
     // -----------------------------------------------------------------------
