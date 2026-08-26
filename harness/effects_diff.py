@@ -37,17 +37,28 @@ indistinguishable there.
 Exit 0 iff every project compared cleanly (0 OVER, 0 DECLARED-MISMATCH) and no
 comparison was INVALID.
 
+The standing set is the hand-written fixture projects under
+`harness/effects-corpus/` **plus a REAL project** (`REAL_PROJECTS` below). The
+fixtures alone cannot fail a slice: an arm emitting no `unresolved-self-call`
+taint whatsoever scored byte-identically to a tuned one on all seven of them
+(`docs/notes/20260826-effects-s4-probe.md` § 6), which is the fixture-corpus
+blind spot in its purest form. A corpus the port's own authors wrote can only
+contain shapes they thought of.
+
 Usage:
-  effects_diff.py [PROJECT_DIR ...]     # default: harness/effects-corpus/*
+  effects_diff.py [PROJECT_DIR ...]     # default: fixtures + default real set
+  effects_diff.py --scale               # …and the opt-in large corpora too
   effects_diff.py --list                # what would be measured
 """
 import argparse
+import contextlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections import Counter
 
@@ -56,6 +67,41 @@ REF_DIR = os.environ.get("REFERENCE_RIGOR_DIR", os.path.join(REPO, "reference/ri
 REF_LIB = os.path.join(REF_DIR, "lib")
 REF_EXE = os.path.join(REF_DIR, "exe", "rigor")
 DEFAULT_CORPUS = os.path.join(REPO, "harness", "effects-corpus")
+SWEEP_MANIFEST = os.environ.get(
+    "SWEEP_CORPORA", os.path.join(REPO, "harness", "sweep-corpora.yml")
+)
+
+# --------------------------------------------------------------------------
+# The REAL projects in the standing set.
+#
+# Selection and rationale live here; the PATHS do not. Each entry names a label
+# from `harness/sweep-corpora.yml`, which stays the repo's single membership
+# list for "which external checkouts do we measure" — the drift `run_corpus.rb`
+# and `fp_audit.py` already share that file to avoid. A label this table names
+# that the manifest does not carry is a REPO bug and hard-fails; a corpus the
+# manifest carries that is not on this MACHINE is SKIPPED, loudly.
+#
+# `opt_in` keeps the default run at fixture speed plus roughly ten seconds.
+# --------------------------------------------------------------------------
+REAL_PROJECTS = [
+    {
+        "label": "mastodon/app",
+        "opt_in": False,
+        "why": "1,236 files / ~6,948 methods of Rails application code, and the "
+               "cheapest real project in the set (~10 s). Contains the shapes no "
+               "fixture author writes on purpose: `elsif` arms, `return` values, "
+               "kwarg callees, blocks nested in blocks.",
+    },
+    {
+        "label": "gitlab-foss/lib",
+        "opt_in": True,
+        "why": "28,607 methods and ~40 s. Every slice-4 arm that was 0 OVER on "
+               "the fixtures AND on mastodon still leaked here — 111, 29 and 5 "
+               "OVER for three successively stricter rules "
+               "(20260826-effects-s4-probe.md § 5c). Opt-in on run time alone; "
+               "it is the strongest member of the set.",
+    },
+]
 
 # Header keys excluded from any snapshot comparison (ADR-0043 § 3): the version
 # string necessarily differs between the two implementations, and the digest
@@ -286,7 +332,74 @@ def compare(ref, rs):
     return verdicts, findings
 
 
-def self_test(project, show):
+# --------------------------------------------------------------------------
+# The unit of measurement: a PROJECT DIRECTORY.
+#
+# A fixture project already is one. A real corpus is a plain checkout — no
+# `.rigor.yml`, so `rigor effects` has no project to analyse and no closed world
+# to scope. Making one has exactly two honest shapes, and this tool takes the
+# second:
+#
+#   1. synthesise a `.rigor.yml` in a temp cwd beside a SYMLINK to the real tree
+#      — O(1), and measured to give bit-identical results (2026-08-26);
+#   2. COPY the tree into a temp project — ~0.6 s for mastodon/app's 38 MB,
+#      ~1.4 s for gitlab-foss/lib.
+#
+# The copy wins on the constraint that outranks run time: **the user's checkout
+# must not be able to receive residue**, and a copy makes that structural rather
+# than conditional. A symlink leaves a live writable path into the checkout for
+# the duration of the run — today's writes (`.rigor/cache`, `.rigor-effects.yml`)
+# land in the cwd, but nothing about the arrangement PREVENTS a future write
+# beside a source file, and stray `.rigor.yml` files in these very checkouts have
+# had to be cleaned up by hand once already.
+#
+# The copy also closes an ambush the symlink leaves open: config discovery. The
+# temp project has no ancestor directory to walk into, whereas the real
+# `gitlab-foss/lib` sits one level under a REAL `.rigor.yml` with its own
+# `paths:`, `plugins:` and `severity_profile:`. Neither engine walks up into it
+# today — measured equal on both arms — but "measured equal today" is what the
+# pin bumps for a living, and a confound in the instrument is worth more than
+# 0.6 s.
+# --------------------------------------------------------------------------
+SYNTHETIC_CONFIG = """\
+# SYNTHESISED by harness/effects_diff.py — not part of the corpus checkout.
+#
+# `rigor effects` needs a project; a sweep corpus is a plain tree. This config
+# and the copy of that tree beside it are created in a temp directory per run
+# and removed afterwards, so the checkout itself is only ever READ. Deliberately
+# minimal: no `plugins:`, no `severity_profile:`, so the two arms differ in
+# nothing but the engine under test.
+paths:
+  - {name}
+"""
+
+
+@contextlib.contextmanager
+def project_dir(target):
+    """The directory the two arms run in, for one target.
+
+    A fixture yields its own path. A real corpus yields a temp project holding a
+    copy of the tree and a synthesised config, removed on the way out — on the
+    exception path too, which is why this is a context manager and not two calls.
+    """
+    if target["kind"] == "fixture":
+        yield target["path"]
+        return
+    parent = tempfile.mkdtemp(prefix="rigor-effects-")
+    try:
+        name = os.path.basename(target["path"].rstrip(os.sep))
+        # `symlinks=True`: a symlink inside the corpus is copied AS a link rather
+        # than followed, so neither a link cycle nor a link pointing at half the
+        # user's disk can turn the copy into a runaway.
+        shutil.copytree(target["path"], os.path.join(parent, name), symlinks=True)
+        with open(os.path.join(parent, ".rigor.yml"), "w", encoding="utf-8") as handle:
+            handle.write(SYNTHETIC_CONFIG.format(name=name))
+        yield parent
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+def self_test(target, show):
     """Grade the reference against ITSELF: every method must be MATCH.
 
     The comparison's own gate. A `compare()` that returned MATCH unconditionally,
@@ -294,9 +407,14 @@ def self_test(project, show):
     would be invisible while the port reports nothing — the whole first slice
     runs with one arm empty, which is exactly when a broken instrument reads as a
     green one.
+
+    Real projects are included: a self-diff over one also proves the temp-project
+    mechanism produces a project the reference can actually analyse, which an
+    all-fixture self-test cannot.
     """
-    label = os.path.relpath(project, REPO) if project.startswith(REPO) else project
-    ref = run_ref(project)
+    label = target["label"]
+    with project_dir(target) as project:
+        ref = run_ref(project)
     print(f"\n=== SELF-TEST {label} ===")
     if ref is None:
         print("  INVALID: the reference produced no parseable effects JSON.")
@@ -312,11 +430,12 @@ def self_test(project, show):
     return verdicts
 
 
-def measure(rs_bin, project, show):
-    label = os.path.relpath(project, REPO) if project.startswith(REPO) else project
+def measure(rs_bin, target, show):
+    label = target["label"]
     t = time.time()
-    ref = run_ref(project)
-    rs = run_rs(rs_bin, project)
+    with project_dir(target) as project:
+        ref = run_ref(project)
+        rs = run_rs(rs_bin, project)
     print(f"\n=== {label} ({time.time() - t:.1f}s) ===")
     if ref is None:
         print("  INVALID: the reference produced no parseable effects JSON "
@@ -345,14 +464,65 @@ def measure(rs_bin, project, show):
     return verdicts
 
 
-def projects(args):
-    if args:
-        return [os.path.abspath(a) for a in args]
+def _fixture(path):
+    label = os.path.relpath(path, REPO) if path.startswith(REPO) else path
+    return {"kind": "fixture", "label": label, "path": path}
+
+
+def fixture_targets():
     if not os.path.isdir(DEFAULT_CORPUS):
         return []
-    return sorted(os.path.join(DEFAULT_CORPUS, d)
-                  for d in os.listdir(DEFAULT_CORPUS)
-                  if os.path.isdir(os.path.join(DEFAULT_CORPUS, d)))
+    return [_fixture(os.path.join(DEFAULT_CORPUS, d))
+            for d in sorted(os.listdir(DEFAULT_CORPUS))
+            if os.path.isdir(os.path.join(DEFAULT_CORPUS, d))]
+
+
+def real_targets(scale):
+    """The real projects of the standing set, split into present and absent.
+
+    Absent ones are RETURNED, not dropped — the caller reports them, because a
+    run that quietly measured half its set reads as a green gate
+    (`fp_audit.py`'s contract, and the reason `sweep-corpora.yml` says so in its
+    header).
+    """
+    import yaml  # local: a bare fixture run has no dependency on PyYAML
+
+    with open(SWEEP_MANIFEST, encoding="utf-8") as handle:
+        paths = {e["label"]: e["path"] for e in yaml.safe_load(handle).get("corpora", [])}
+    present, absent = [], []
+    for entry in REAL_PROJECTS:
+        if entry["opt_in"] and not scale:
+            continue
+        label = entry["label"]
+        if label not in paths:
+            # Not a machine fact: this table names a corpus the repo's own
+            # membership list no longer carries. Fail rather than skip.
+            sys.exit(f"ERROR: REAL_PROJECTS names `{label}`, which is not in "
+                     f"{SWEEP_MANIFEST}.\n"
+                     "       The manifest is the single membership list; fix one or the other.")
+        target = {"kind": "real", "label": label, "path": paths[label],
+                  "opt_in": entry["opt_in"]}
+        (present if os.path.isdir(paths[label]) else absent).append(target)
+    return present, absent
+
+
+def resolve_targets(args, scale):
+    """Everything to measure, plus the real corpora this machine does not have.
+
+    Positional arguments REPLACE the whole standing set — the same rule
+    `run_corpus.rb` states for its corpus list — so an ad-hoc project run costs
+    nothing and reports no skips.
+    """
+    if args:
+        return [_fixture(os.path.abspath(a)) for a in args], []
+    present, absent = real_targets(scale)
+    return fixture_targets() + present, absent
+
+
+def report_skips(absent):
+    for target in absent:
+        print(f"\n=== {target['label']} — SKIPPED: {target['path']} is not on this "
+              "machine (the standing set is INCOMPLETE for this run) ===")
 
 
 def main():
@@ -362,22 +532,28 @@ def main():
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--self-test", action="store_true",
                     help="grade the reference against itself; every method must MATCH")
+    ap.add_argument("--scale", action="store_true",
+                    help="also measure the opt-in large real corpora (~40 s each)")
     args = ap.parse_args()
 
-    targets = projects(args.projects)
+    targets, absent = resolve_targets(args.projects, args.scale)
     if args.list:
         for t in targets:
-            print(t)
+            print(f"{t['kind']:8} {t['label']:34} {t['path']}")
+        for t in absent:
+            print(f"{'ABSENT':8} {t['label']:34} {t['path']}")
         return 0
     if args.self_test:
         print(f"reference:       {REF_DIR}")
         broken = 0
-        for p in targets:
-            v = self_test(p, args.show)
+        for t in targets:
+            v = self_test(t, args.show)
             if v is None or v["OVER"] or v["UNDER"] or v["DECLARED-MISMATCH"]:
                 broken += 1
+        report_skips(absent)
         print("\nRESULT: " + ("FAIL — the comparison itself is broken."
-                              if broken else "PASS — the comparison is sound on every project."))
+                              if broken else "PASS — the comparison is sound on every project."
+                                             + _incomplete(absent)))
         return 1 if broken else 0
     if not targets:
         sys.exit(f"ERROR: no projects to measure (default corpus {DEFAULT_CORPUS} is absent).\n"
@@ -388,23 +564,39 @@ def main():
 
     totals = Counter()
     invalid = []
-    for p in targets:
-        v = measure(rs_bin, p, args.show)
+    for t in targets:
+        v = measure(rs_bin, t, args.show)
         if v is None:
-            invalid.append(p)
+            invalid.append(t)
             continue
         totals.update(v)
+    report_skips(absent)
 
     print(f"\nTOTAL  MATCH={totals['MATCH']}  UNDER={totals['UNDER']}  "
           f"OVER={totals['OVER']}  DECLARED-MISMATCH={totals['DECLARED-MISMATCH']}")
     if invalid:
-        print(f"INVALID comparisons: {len(invalid)} — {', '.join(os.path.basename(p) for p in invalid)}")
+        print(f"INVALID comparisons: {len(invalid)} — "
+              f"{', '.join(t['label'] for t in invalid)}")
     fatal = totals["OVER"] + totals["DECLARED-MISMATCH"]
     if fatal or invalid:
         print("\nRESULT: FAIL — the port may never claim an effect the oracle does not prove.")
         return 1
-    print("\nRESULT: PASS — no over-claims. (UNDER is the arc's odometer, not a failure.)")
+    # A skipped corpus does not fail the run — the standing set is machine-local
+    # and a member may legitimately be absent — but it may not let the run read
+    # as a clean pass either. `RESULT: PASS` is the line that gets grepped and
+    # quoted into a note, so the incompleteness rides on THAT line and not only
+    # on a SKIPPED banner further up.
+    print("\nRESULT: PASS — no over-claims. (UNDER is the arc's odometer, not a failure.)"
+          + _incomplete(absent))
     return 0
+
+
+def _incomplete(absent):
+    if not absent:
+        return ""
+    noun = "corpus" if len(absent) == 1 else "corpora"
+    return (f"\n        INCOMPLETE — {len(absent)} standing {noun} SKIPPED: "
+            f"{', '.join(t['label'] for t in absent)}")
 
 
 if __name__ == "__main__":

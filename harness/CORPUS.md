@@ -91,6 +91,9 @@ Two sources, one list:
    corpora are measured — the drift that let 24 false positives sit unmeasured
    on corpora nobody had typed into a command line
    ([note](../docs/notes/20260731-survey-fp-triage-24.md)).
+   `harness/effects_diff.py` is a third reader: it resolves the paths of the
+   real projects in its own standing set by LABEL from this manifest, so those
+   paths stay single-sourced too.
 
 Each entry carries a `why:` recording what that corpus caught that no other
 member catches. Add one only with such a reason; do not remove one because it is
