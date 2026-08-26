@@ -55,13 +55,58 @@
 //! cannot resolve. Measured cost: 0 on the graded corpus, 4 methods of 6,948 on
 //! mastodon/app — all UNDER (`docs/notes/20260826-effects-s3-probe.md` § 3c).
 //!
-//! # What slice 2 does NOT collect
+//! # The TAINT bit (slice 3) — exhaustive iff no producer can fire
 //!
-//! Taints and their causes (slice 3), project edges and the transitive lane
-//! (slice 4), the declared lane — attribution table, imported envelopes (slice
-//! 6) — and the plugin stratum (out of ADR-0043 entirely). Where upstream would
-//! record a taint, this collector records NOTHING, which is what makes the
-//! always-`exhaustive: false` report honest.
+//! `exhaustive` in the graded JSON is upstream's **transitive** bit, not the
+//! direct one: `causes.empty?` per unit (`unit_scan.rb:138`), joined across
+//! reopenings (`summary.rb:89`), then ANDed along every resolved project edge to
+//! a fixpoint (`propagator.rb:128`). Emitting the direct bit instead scores 10
+//! OVER on the graded corpus and 986 on mastodon/app
+//! (`docs/notes/20260826-effects-s3-probe.md` § 3a), so this collector computes
+//! the transitive reading under one rule:
+//!
+//! > **A method is exhaustive iff the collector can see that no producer fires,
+//! > counting every undecidable site as firing.**
+//!
+//! Three of upstream's producers are pure syntax and are ported EXACTLY —
+//! `dynamic-send` (a reflective send whose selector is not a literal),
+//! `opaque-callable`'s eval / `binding` / `&expr` arms, and `unknown-ownership`
+//! wherever the ownership judgment is syntax-only. Three are the typer's and
+//! cannot be decided here, so every site that reaches them taints:
+//! `opaque-callable`'s `.call` arm (upstream's `record.nil?` is always true
+//! without a typer), `dynamic-receiver` at every uncatalogued call with an
+//! explicit receiver, and `unresolved-self-call` at every uncatalogued
+//! receiver-less one.
+//!
+//! ## The transitive AND, priced as a selector-set test
+//!
+//! [`UnitScan::push_edge`] is the single funnel every project edge goes through
+//! upstream — the claimed path when `keeps_project_edge?` says so
+//! (`unit_scan.rb:409`), a reflective `send` with a literal selector
+//! (`:476`), and the uncatalogued path (`:514`). A **catalogue-CLAIMED call
+//! still keeps an edge** for implicit self, which is why a body the catalogue
+//! answers completely can still be transitively tainted (`Kernel#format` beside
+//! a project's own `format`; `harness/effects-corpus/06_edge`).
+//!
+//! So the port taints at `push_edge` whenever the selector names ANY unit the
+//! run collected. `Propagator::Index#targets_for` can only resolve to keys the
+//! collection holds (`propagator.rb:195`), so {real targets} ⊆ {units whose
+//! selector matches} and ignoring `kind` and the ancestry scope makes this a
+//! superset — sound, and measured at zero cost on the graded corpus. Slice 4
+//! replaces it with the real closure, and the taint it manufactures goes away.
+//!
+//! The set is only known once every file is scanned, so a unit records its
+//! candidate selectors and [`Summary::exhaustive`] resolves them at report time.
+//!
+//! # What this still does NOT collect
+//!
+//! The transitive LABEL lane and the `resolved` bit (slice 4), the declared lane
+//! — attribution table, imported envelopes (slice 6) — and the plugin stratum
+//! (out of ADR-0043 entirely). Envelopes and plugin rows both make upstream MORE
+//! exhaustive at a site; ignoring them can only taint more, which is the safe
+//! direction. A plugin's own `taint:` moves the other way, and the report
+//! withholds `exhaustive: true` from a plugin-bearing project for that reason
+//! (`mod.rs`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
@@ -105,6 +150,25 @@ const UNDEF: &str = "construct:undef";
 const RECEIVER_MUTATION: &str = "construct:receiver-mutation";
 const ATTR_WRITER: &str = "construct:attr-writer";
 
+// The taint causes this collector can produce — four of upstream's closed
+// ten-member `TaintCause::ALL` enum (`taint_cause.rb:16`). The other six have no
+// producer here: `method-missing` and `budget` have none at the pin at all,
+// `template-not-analysed` and `plugin-attribution` are the plugin stratum's,
+// and `collector-error` is upstream's per-unit rescue where the port is
+// per-FILE fail-soft (it omits the file's units instead, which is an UNDER).
+pub(super) const DYNAMIC_RECEIVER: &str = "dynamic-receiver";
+pub(super) const DYNAMIC_SEND: &str = "dynamic-send";
+pub(super) const UNRESOLVED_SELF_CALL: &str = "unresolved-self-call";
+pub(super) const OPAQUE_CALLABLE: &str = "opaque-callable";
+pub(super) const UNKNOWN_OWNERSHIP: &str = "unknown-ownership";
+
+/// One `[cause, detail]` pair. `detail` is the selector for
+/// `unresolved-self-call` and None everywhere else: upstream's other details are
+/// the `Inference::DynamicOrigin` name (there is no analogue here — `coverage
+/// --protection` is unimplemented) and the plugin row key (out of scope), and
+/// upstream itself emits `null` when it has neither.
+pub(super) type Cause = (String, Option<String>);
+
 /// Selectors that mutate EVERY receiver (`[]=`, an attribute writer) but which
 /// some catalogued ROW answers as a NON-mutation — the one place declining the
 /// typer arm could over-claim rather than under-claim, so it is the one place
@@ -139,10 +203,16 @@ static NON_MUTATING_ROWED_SELECTORS: LazyLock<BTreeSet<String>> = LazyLock::new(
     suppressed
 });
 
-/// One effect unit's DIRECT summary: `{origin => labels}`, and its flat join.
+/// One effect unit's DIRECT summary: `{origin => labels}` and its flat join,
+/// plus the two halves of the taint bit — the causes this unit's own walk
+/// decided, and the selectors its calls could reach a project unit through.
 #[derive(Debug, Default, Clone)]
 pub(super) struct Summary {
     bundles: BTreeMap<String, BTreeSet<String>>,
+    causes: BTreeSet<Cause>,
+    /// Every selector this unit could contribute a project EDGE for. Resolved
+    /// against the run's own unit set at report time — see the module docs.
+    edge_selectors: BTreeSet<String>,
 }
 
 impl Summary {
@@ -158,12 +228,16 @@ impl Summary {
         self.bundles.entry(origin.to_string()).or_default().extend(labels);
     }
 
-    /// Union per origin. Reopenings of one method — in one file and across
-    /// the several files that contribute to it — fold through this.
+    /// Union per origin, and per cause and per pending edge. Reopenings of one
+    /// method — in one file and across the several files that contribute to it —
+    /// fold through this, exactly as upstream's `Summary#join` ANDs the bit and
+    /// unions the causes (`summary.rb:89`).
     pub(super) fn join(&mut self, other: Self) {
         for (origin, labels) in other.bundles {
             self.bundles.entry(origin).or_default().extend(labels);
         }
+        self.causes.extend(other.causes);
+        self.edge_selectors.extend(other.edge_selectors);
     }
 
     /// The flat proven lane — every origin's labels, sorted and de-duplicated.
@@ -176,6 +250,31 @@ impl Summary {
     pub(super) fn bundles(&self) -> &BTreeMap<String, BTreeSet<String>> {
         &self.bundles
     }
+
+    /// The TRANSITIVE bit: no producer fired, and no call could carry taint in
+    /// along a project edge. `selectors` is the run's own unit-selector set.
+    pub(super) fn exhaustive(&self, selectors: &BTreeSet<String>) -> bool {
+        self.causes.is_empty() && self.edge_selectors.is_disjoint(selectors)
+    }
+
+    /// `[[cause, detail], …]` — de-duplicated and sorted by `[cause, detail]`,
+    /// which is `BTreeSet` order with `None` reading as upstream's `nil.to_s`
+    /// (`summary.rb:143`). The invariant `causes.empty? == exhaustive` holds by
+    /// construction: the edge taints are materialised here too.
+    pub(super) fn causes(&self, selectors: &BTreeSet<String>) -> Vec<Cause> {
+        let mut causes = self.causes.clone();
+        for selector in self.edge_selectors.intersection(selectors) {
+            causes.insert((UNRESOLVED_SELF_CALL.to_string(), Some(selector.clone())));
+        }
+        causes.into_iter().collect()
+    }
+}
+
+/// The selector half of a unit key — `C#m` / `C.m` / `Outer::Inner#m` /
+/// `<toplevel>#m` all answer `m`. A class name carries neither `#` nor `.`, and
+/// no method name does either, so the FIRST of the two separates them.
+pub(super) fn selector_of(key: &str) -> &str {
+    key.find(['#', '.']).map_or(key, |at| &key[at + 1..])
 }
 
 /// A synthesised `attr_writer` / `attr_accessor` setter's summary — the same
@@ -284,7 +383,12 @@ impl Scanner {
     ) {
         let key = format!("{class_name}{}{method_name}", if singleton { "." } else { "#" });
         let names = parameter_names(parameters);
-        let mut scan = UnitScan::new(singleton, names.clone(), owned_locals(body, &names));
+        let mut scan = UnitScan::new(
+            singleton,
+            names.clone(),
+            block_parameter_name(parameters),
+            owned_locals(body, &names),
+        );
         if let Some(body) = body {
             scan.visit(body);
         }
@@ -371,19 +475,26 @@ fn define_method_unit<'pr>(node: &CallNode<'pr>) -> Option<NestedUnit<'pr>> {
 /// One method body, scanned into its direct summary.
 struct UnitScan<'pr> {
     singleton: bool,
+    /// The unit's own `&blk` parameter NAME. Read by the two `opaque-callable`
+    /// producers that treat a call on it as FORWARDING rather than as an opaque
+    /// callable (`unit_scan.rb:490`, `:528`); slice 2 dropped it because nothing
+    /// but taints read it.
+    block_parameter: Option<String>,
     mutation: MutationClassifier,
     summary: Summary,
     nested: Vec<NestedUnit<'pr>>,
 }
 
 impl<'pr> UnitScan<'pr> {
-    /// The unit's `&blk` parameter name is deliberately absent: it is read
-    /// only by upstream's `opaque_callable?` and `visit_block_argument`, both
-    /// of which produce TAINTS and nothing else, and slice 2 carries no taints.
-    /// Slice 3 reinstates it.
-    fn new(singleton: bool, parameters: BTreeSet<String>, owned: BTreeSet<String>) -> Self {
+    fn new(
+        singleton: bool,
+        parameters: BTreeSet<String>,
+        block_parameter: Option<String>,
+        owned: BTreeSet<String>,
+    ) -> Self {
         Self {
             singleton,
+            block_parameter,
             mutation: MutationClassifier::new(singleton, parameters, owned),
             summary: Summary::default(),
             nested: Vec::new(),
@@ -392,6 +503,25 @@ impl<'pr> UnitScan<'pr> {
 
     fn finish(self) -> (Summary, Vec<NestedUnit<'pr>>) {
         (self.summary, self.nested)
+    }
+
+    fn taint(&mut self, cause: &str, detail: Option<&str>) {
+        self.summary.causes.insert((cause.to_string(), detail.map(str::to_string)));
+    }
+
+    /// Upstream's `push_edge` (`unit_scan.rb:514`) — the funnel every project
+    /// edge goes through. Upstream records `(receiver class, kind, selector)`
+    /// for the propagator; without a typer there is no receiver class, so the
+    /// port records the SELECTOR and lets the report decide whether it names a
+    /// project unit (module docs).
+    fn push_edge(&mut self, selector: &str) {
+        self.summary.edge_selectors.insert(selector.to_string());
+    }
+
+    /// Whether `node` is a read of this unit's own `&blk` parameter.
+    fn is_block_parameter(&self, node: &Node<'pr>) -> bool {
+        let Some(local) = node.as_local_variable_read_node() else { return false };
+        self.block_parameter.as_deref() == Some(name_of(local.name().as_slice()).as_str())
     }
 
     /// The construct origins (`unit_scan.rb:192-218`), minus the `CallNode` arm,
@@ -463,7 +593,7 @@ impl<'pr> UnitScan<'pr> {
     /// claim suppresses the uncatalogued reading, which is what an explicit ∅
     /// row is for (`unit_scan.rb:381`).
     fn claimed_by_catalogue(&mut self, node: &CallNode<'pr>) -> bool {
-        let Some((owner, singleton, _implicit)) = catalog_target(node) else { return false };
+        let Some((owner, singleton, implicit)) = catalog_target(node) else { return false };
         let selector = name_of(node.name().as_slice());
         let catalog = rigor_effects::catalog();
         // `posture: false` — ALWAYS, for every receiver shape. The tier is gated
@@ -507,38 +637,115 @@ impl<'pr> UnitScan<'pr> {
         if mutates {
             self.classify_mutation(node.receiver().as_ref());
         }
+        // `keeps_project_edge?(entry, implicit)` is `entry.posture? || implicit`
+        // (`unit_scan.rb:409`). With the posture tier off no entry this lookup
+        // can return has `posture?` set, so the surviving disjunct is IMPLICIT
+        // SELF — an unqualified name resolves against self's ancestry first, and
+        // a project method of the same name wins at run time. `Kernel#format`
+        // beside a project's own `format` is the measured case, and it is why a
+        // fully catalogued body can still be transitively tainted.
+        if implicit {
+            self.push_edge(&selector);
+        }
         true
     }
 
-    /// What is left when the catalogue said nothing. Upstream produces taints
-    /// and project edges here; slice 2 produces only the mutation judgment,
-    /// which runs first and independently of the taints
-    /// (`unit_scan.rb:445` — `params[:x] = 1` on an untyped `params` is a
-    /// proven `mutate.instance` *and* a `dynamic-receiver` taint).
+    /// What is left when the catalogue said nothing — `visit_uncatalogued`
+    /// (`unit_scan.rb:433`), arm for arm and in upstream's order. The mutation
+    /// judgment runs first and independently of the taints (`params[:x] = 1` on
+    /// an untyped `params` is a proven `mutate.instance` *and* a
+    /// `dynamic-receiver` taint), and the last two arms are where the port's
+    /// blanket conservatism lives: upstream reads the typer's `dynamic` and
+    /// `resolved` bits, this collector has neither, so every site that reaches
+    /// them taints.
     fn visit_uncatalogued(&mut self, node: &CallNode<'pr>) {
         let selector = name_of(node.name().as_slice());
         // Upstream RETURNS before the mutation judgment for both of these.
-        if REFLECTIVE_SEND.contains(&selector.as_str()) || opaque_eval(node, &selector) {
-            return;
+        if REFLECTIVE_SEND.contains(&selector.as_str()) {
+            return self.visit_reflective_send(node);
         }
-        if NON_MUTATING_ROWED_SELECTORS.contains(&selector) {
-            return;
+        if opaque_eval(node, &selector) {
+            return self.taint(OPAQUE_CALLABLE, None);
         }
         // No typer, so no receiver class: only the universally-mutating
         // selectors survive here, which is upstream's own answer whenever it
-        // has no receiver class either.
-        if MutationClassifier::mutating(&selector, None) {
+        // has no receiver class either. `NON_MUTATING_ROWED_SELECTORS` suppresses
+        // the LABEL only — it is a port-side device against one over-claim, not
+        // an upstream arm, so it may not swallow the taints below.
+        if !NON_MUTATING_ROWED_SELECTORS.contains(&selector)
+            && MutationClassifier::mutating(&selector, None)
+        {
             self.classify_mutation(node.receiver().as_ref());
         }
+        // `opaque-callable` is checked before `dynamic-receiver` because it is
+        // the more specific reading of the same site. Upstream's last condition
+        // is `record.nil? || record.receiver_class.nil? || receiver_class ∈
+        // {Proc, Method}`, and `record.nil?` is always true without a typer — so
+        // this arm is SOUND and over-taints (`.call` on a project object is an
+        // ordinary edge upstream).
+        if self.opaque_callable(node, &selector) {
+            return self.taint(OPAQUE_CALLABLE, None);
+        }
+        // `record_edge` (`:497`). Upstream taints `dynamic-receiver` only when
+        // the typer said `Dynamic`, and `unresolved-self-call` only when the
+        // dispatcher declined; the port can prove NEITHER negative, so it taints
+        // at every such site. Both are strict over-taints — the safe direction
+        // (ADR-0043 § 2) — and they are what the residual UNDER column measures.
+        if node.receiver().is_some() {
+            return self.taint(DYNAMIC_RECEIVER, None);
+        }
+        self.push_edge(&selector);
+        self.taint(UNRESOLVED_SELF_CALL, Some(&selector));
+    }
+
+    /// `send` / `public_send` / `__send__`: a LITERAL selector is an ordinary
+    /// edge and must not taint, a computed one is `dynamic-send`
+    /// (`unit_scan.rb:472`).
+    fn visit_reflective_send(&mut self, node: &CallNode<'pr>) {
+        match node.arguments().and_then(|args| args.arguments().iter().next()).and_then(
+            |first| literal_selector(&first),
+        ) {
+            Some(selector) => self.push_edge(&selector),
+            None => self.taint(DYNAMIC_SEND, None),
+        }
+    }
+
+    /// A `.call` the analyzer cannot follow to a body (`unit_scan.rb:486`). A
+    /// call on a lambda literal is the literal's own body by containment, and a
+    /// call on the unit's `&blk` is forwarding — the block's effects are
+    /// accounted at the caller's literal.
+    fn opaque_callable(&self, node: &CallNode<'pr>, selector: &str) -> bool {
+        if selector != "call" {
+            return false;
+        }
+        let Some(receiver) = node.receiver() else { return false };
+        receiver.as_lambda_node().is_none() && !self.is_block_parameter(&receiver)
+    }
+
+    /// `&expr` where `expr` is neither a symbol nor this unit's own `&blk`
+    /// (`unit_scan.rb:522`) — a callable handed to a callee the analyzer will
+    /// not read. Runs on EVERY call, catalogued or not. An anonymous forward
+    /// (`foo(&)`) has no expression and is silent, exactly as upstream's
+    /// `expression.nil?` guard.
+    fn visit_block_argument(&mut self, node: &CallNode<'pr>) {
+        let Some(block) = node.block() else { return };
+        let Some(argument) = block.as_block_argument_node() else { return };
+        let Some(expression) = argument.expression() else { return };
+        if expression.as_symbol_node().is_some() || self.is_block_parameter(&expression) {
+            return;
+        }
+        self.taint(OPAQUE_CALLABLE, None);
     }
 
     /// A mutation whose ownership is not provable is upstream's
     /// `unknown-ownership` TAINT and never a proven bare `mutate`
-    /// (`unit_scan.rb:533`). Slice 2 does not carry taints, so it records
-    /// nothing — the suppression is the slice-2 half of that rule.
+    /// (`unit_scan.rb:533`). `MutationClassifier::label_for` is pure syntax on
+    /// both sides, so this producer is EXACT wherever the caller is — the six
+    /// compound-write node types, and the claimed `mutates: receiver` path.
     fn classify_mutation(&mut self, receiver: Option<&Node<'pr>>) {
-        if let Some(ownership) = self.mutation.label_for(receiver) {
-            self.summary.add(RECEIVER_MUTATION, [ownership.label()]);
+        match self.mutation.label_for(receiver) {
+            Some(ownership) => self.summary.add(RECEIVER_MUTATION, [ownership.label()]),
+            None => self.taint(UNKNOWN_OWNERSHIP, None),
         }
     }
 }
@@ -576,6 +783,8 @@ impl<'pr> Visit<'pr> for UnitScan<'pr> {
         if !self.claimed_by_catalogue(node) {
             self.visit_uncatalogued(node);
         }
+        // Upstream runs this on every call, claimed or not (`unit_scan.rb:232`).
+        self.visit_block_argument(node);
         // Containment: a block literal's origins always join the enclosing
         // method, so the walk descends into every child including the block.
         ruby_prism::visit_call_node(self, node);
@@ -614,6 +823,16 @@ fn opaque_eval(node: &CallNode<'_>, selector: &str) -> bool {
         return false;
     }
     positional_arity(node) > 0
+}
+
+/// Upstream's `literal_selector` — a `send` argument that settles the callee's
+/// name (`unit_scan.rb:481`). An interpolated string is not a `StringNode` and
+/// so answers None, which is the `dynamic-send` taint.
+fn literal_selector(node: &Node<'_>) -> Option<String> {
+    if let Some(symbol) = node.as_symbol_node() {
+        return Some(name_of(symbol.unescaped()));
+    }
+    node.as_string_node().map(|string| name_of(string.unescaped()))
 }
 
 fn positional_arity(node: &CallNode<'_>) -> usize {
@@ -671,6 +890,15 @@ fn parameter_names(parameters: Option<&ParametersNode<'_>>) -> BTreeSet<String> 
         }
     }
     names
+}
+
+/// The unit's `&blk` parameter name — upstream's `block_parameter_name`
+/// (`scanner.rb:283`), which is `parameters.block&.name&.to_s` and deliberately
+/// NOT part of `parameter_names`: a block parameter is not an ordinary one for
+/// the ownership judgment. An anonymous `&` has no name and answers None.
+fn block_parameter_name(parameters: Option<&ParametersNode<'_>>) -> Option<String> {
+    let block = parameters?.block()?;
+    block.name().map(|name| name_of(name.as_slice()))
 }
 
 /// The name of one parameter node, for every shape that has one. Upstream's
@@ -778,6 +1006,35 @@ mod tests {
 
     fn keys(source: &str) -> Vec<String> {
         summaries(source).into_keys().collect()
+    }
+
+    /// `{key => (exhaustive, causes)}` for one source, resolved against that
+    /// source's OWN unit set — the same two-pass shape `report_rows` runs.
+    fn bits(source: &str) -> BTreeMap<String, (bool, Vec<Cause>)> {
+        let result = rigor_parse::parse(source.as_bytes());
+        assert!(result.errors().next().is_none(), "the fixture must parse");
+        let scanned = scan(&result.node());
+        let selectors: BTreeSet<String> =
+            scanned.keys().map(|key| selector_of(key).to_string()).collect();
+        scanned
+            .into_iter()
+            .map(|(key, summary)| {
+                let bit = summary.exhaustive(&selectors);
+                (key, (bit, summary.causes(&selectors)))
+            })
+            .collect()
+    }
+
+    /// One method body's `(exhaustive, causes)`. The unit carries a `&blk`, so
+    /// the forwarding arms of `opaque-callable` are reachable from here.
+    fn taint(body: &str) -> (bool, Vec<Cause>) {
+        bits(&format!("class C\n def m(list, path, payload, &blk)\n{body}\n end\nend"))
+            .remove("C#m")
+            .expect("the unit must exist")
+    }
+
+    fn cause(cause: &str, detail: Option<&str>) -> Cause {
+        (cause.to_string(), detail.map(str::to_string))
     }
 
     // -----------------------------------------------------------------------
@@ -1066,5 +1323,215 @@ mod tests {
     fn yield_and_block_forwarding_originate_nothing() {
         assert!(one("  yield 1").is_empty());
         assert!(summaries("class C\n def m(&blk)\n  other(&blk)\n end\nend")["C#m"].is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // The taint bit (slice 3). Every negative below needs its positive control:
+    // "no producer fired" is only meaningful beside a body that DOES reach
+    // exhaustiveness, and the whole lane reads 0 OVER when the bit is never
+    // claimed at all — which is precisely what slice 2 shipped.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_body_whose_every_call_the_catalogue_settles_is_exhaustive() {
+        // THE CONTROL for every taint test below.
+        assert_eq!(taint(r#"  puts "hi""#), (true, vec![]));
+        assert_eq!(taint("  File.read(path)"), (true, vec![]));
+        assert_eq!(taint("  @x = 1"), (true, vec![]));
+        assert_eq!(taint("  yield 1"), (true, vec![]), "yield is not a call node");
+        assert_eq!(taint("  list.send(:known)"), (true, vec![]));
+
+        // …and the honest limit of the control: a LITERAL receiver is a shape
+        // both engines type identically and neither calls `Dynamic`, but this
+        // collector reads no types at all, so `1 + 2` taints where upstream does
+        // not. Probe § 6b prices that island; slice 3 does not spend it.
+        assert_eq!(taint("  (1 + 2) * 3"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+    }
+
+    #[test]
+    fn an_uncatalogued_call_taints_by_its_receiver_shape() {
+        // Upstream reads the typer's `dynamic` / `resolved` bits here; the port
+        // can prove neither negative, so both sites taint (module docs).
+        assert_eq!(taint("  list.each_slice(2)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(
+            taint("  helper(1)"),
+            (false, vec![cause(UNRESOLVED_SELF_CALL, Some("helper"))]),
+            "the detail is the selector, character for character with upstream"
+        );
+        // A constant receiver the catalogue does not list is the same shape.
+        assert_eq!(
+            taint("  SomeUndeclaredGem::Client.fetch"),
+            (false, vec![cause(DYNAMIC_RECEIVER, None)])
+        );
+    }
+
+    #[test]
+    fn a_reflective_send_taints_only_on_a_computed_selector() {
+        assert_eq!(taint("  list.send(:known)"), (true, vec![]), "a literal is an ordinary edge");
+        assert_eq!(taint(r#"  list.send("known")"#), (true, vec![]));
+        assert_eq!(taint("  list.send(path)"), (false, vec![cause(DYNAMIC_SEND, None)]));
+        assert_eq!(taint("  public_send(path)"), (false, vec![cause(DYNAMIC_SEND, None)]));
+        assert_eq!(taint(r#"  __send__("a#{path}")"#), (false, vec![cause(DYNAMIC_SEND, None)]));
+    }
+
+    #[test]
+    fn the_three_opaque_callable_arms_fire_and_their_forwarding_shapes_do_not() {
+        // (a) the eval family with a POSITIONAL argument, and a bare `binding`.
+        assert_eq!(taint(r#"  eval("1")"#), (false, vec![cause(OPAQUE_CALLABLE, None)]));
+        assert_eq!(taint(r#"  instance_eval("1")"#), (false, vec![cause(OPAQUE_CALLABLE, None)]));
+        assert_eq!(taint("  binding"), (false, vec![cause(OPAQUE_CALLABLE, None)]));
+        // The BLOCK form is containment and the keyword form is `grep_v`'d, so
+        // neither is OPAQUE — both fall through to the ordinary receiver-less
+        // reading, which is what upstream does with them too.
+        assert_eq!(
+            taint("  instance_eval { @x = 1 }"),
+            (false, vec![cause(UNRESOLVED_SELF_CALL, Some("instance_eval"))])
+        );
+        assert_eq!(
+            taint("  instance_eval(mode: 1)"),
+            (false, vec![cause(UNRESOLVED_SELF_CALL, Some("instance_eval"))])
+        );
+
+        // (b) `&expr` that is neither a symbol nor this unit's own `&blk`.
+        assert_eq!(taint("  list.each(&blk)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(taint("  send(:each, &blk)"), (true, vec![]), "forwarding the unit's own block");
+        assert_eq!(taint("  send(:each, &:to_s)"), (true, vec![]), "a symbol is not opaque");
+        assert_eq!(
+            taint("  send(:each, &payload)"),
+            (false, vec![cause(OPAQUE_CALLABLE, None)]),
+            "any other callable is"
+        );
+
+        // (c) `.call` on a receiver that is neither a lambda literal nor `&blk`.
+        // Upstream's own last condition is `record.nil? || …`, which is always
+        // true without a typer — so this arm is the SOUND, over-tainting one.
+        assert_eq!(taint("  payload.call"), (false, vec![cause(OPAQUE_CALLABLE, None)]));
+        // The two exemptions still fall through to the ordinary explicit-receiver
+        // reading rather than to `opaque-callable`: a lambda literal's body is
+        // already counted by containment, and `&blk` is forwarding. (Upstream
+        // reaches `exhaustive: true` for both because it can see the receiver is
+        // a Proc; the port cannot, so it keeps the weaker `dynamic-receiver` —
+        // an over-taint, the safe direction.)
+        assert_eq!(taint("  blk.call"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(taint("  ->(x) { x }.call(1)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+    }
+
+    #[test]
+    fn an_unprovable_ownership_taints_where_slice_2_was_merely_silent() {
+        // The label half is unchanged (`…suppresses_the_label_rather_than_guessing`);
+        // this is the taint upstream records at the same site. `b = list` is a
+        // non-allocating assignment, so `b` is neither a parameter nor
+        // frame-owned and its ownership is genuinely unprovable.
+        //
+        // At the six COMPOUND-write node types the producer is exact and alone:
+        // they never reach the catalogue and are not `CallNode`s, so the
+        // ownership judgment is the whole reading on both sides.
+        assert_eq!(
+            taint("  b = list\n  b[0] += 1\n  nil"),
+            (false, vec![cause(UNKNOWN_OWNERSHIP, None)])
+        );
+        assert_eq!(
+            taint("  b = list\n  b.count ||= 1\n  nil"),
+            (false, vec![cause(UNKNOWN_OWNERSHIP, None)])
+        );
+        // The CALL form taints twice — upstream classifies the mutation first
+        // and independently, then reads the receiver (`unit_scan.rb:445`).
+        assert_eq!(
+            taint("  b = list\n  b.name = 1\n  nil"),
+            (false, vec![cause(DYNAMIC_RECEIVER, None), cause(UNKNOWN_OWNERSHIP, None)])
+        );
+        // A provable owner produces the label and no ownership taint.
+        assert_eq!(taint("  @x[0] += 1"), (true, vec![]));
+        assert_eq!(taint("  list[0] += 1"), (true, vec![]), "a parameter is mutate.instance");
+        assert_eq!(taint("  b = []\n  b[0] += 1\n  nil"), (true, vec![]), "a frame-owned local");
+    }
+
+    #[test]
+    fn a_catalogue_claimed_implicit_call_still_taints_when_it_shadows_a_project_unit() {
+        // The transitive trap, and the single reason this port's bit is not the
+        // direct one: `Kernel#format` is a real row with `effects: []`, so the
+        // site has no taint of its own — but an unqualified name resolves
+        // against self's ancestry first, and the project's own `format` is not
+        // exhaustive. `harness/effects-corpus/06_edge` is the corpus half.
+        let shadowed = bits(
+            "class C\n def calls\n  format(\"a\")\n end\n def format(s)\n  s.render\n end\nend",
+        );
+        assert!(!shadowed["C#calls"].0);
+        assert_eq!(shadowed["C#calls"].1, vec![cause(UNRESOLVED_SELF_CALL, Some("format"))]);
+
+        // …and the same call in a project that does NOT define `format` stays
+        // exhaustive. Without this control the rule would read as "every
+        // catalogued implicit call taints", which is the useless suppression.
+        let plain = bits("class C\n def calls\n  format(\"a\")\n end\nend");
+        assert_eq!(plain["C#calls"], (true, vec![]));
+
+        // A LITERAL reflective send is the third edge source and reads the same
+        // way (`unit_scan.rb:476`).
+        let reflective =
+            bits("class C\n def calls\n  send(:target)\n end\n def target\n  x.y\n end\nend");
+        assert!(!reflective["C#calls"].0);
+        assert_eq!(reflective["C#calls"].1, vec![cause(UNRESOLVED_SELF_CALL, Some("target"))]);
+
+        // The edge is keyed on the SELECTOR alone, so a singleton unit of the
+        // same name is a target too — deliberately a superset of what the
+        // propagator would resolve, which is the sound direction.
+        let singleton =
+            bits("class C\n def calls\n  format(\"a\")\n end\nend\nclass D\n def self.format(s)\n  s.render\n end\nend");
+        assert!(!singleton["C#calls"].0);
+    }
+
+    #[test]
+    fn causes_are_deduplicated_and_sorted_and_stay_inside_upstreams_enum() {
+        const ALL: &[&str] = &[
+            "dynamic-receiver",
+            "dynamic-send",
+            "method-missing",
+            "unresolved-self-call",
+            "opaque-callable",
+            "unknown-ownership",
+            "plugin-attribution",
+            "template-not-analysed",
+            "collector-error",
+            "budget",
+        ];
+        let (exhaustive, causes) = taint(
+            "  list.one\n  payload.two\n  helper(1)\n  helper(2)\n  other(3)\n  \
+             list.send(path)\n  binding",
+        );
+        assert!(!exhaustive);
+        assert_eq!(
+            causes,
+            vec![
+                cause(DYNAMIC_RECEIVER, None),
+                cause(DYNAMIC_SEND, None),
+                cause(OPAQUE_CALLABLE, None),
+                cause(UNRESOLVED_SELF_CALL, Some("helper")),
+                cause(UNRESOLVED_SELF_CALL, Some("other")),
+            ],
+            "de-duplicated, and sorted by [cause, detail] as `summary.rb:143` sorts"
+        );
+        for (name, _) in &causes {
+            assert!(ALL.contains(&name.as_str()), "{name} is outside TaintCause::ALL");
+        }
+    }
+
+    #[test]
+    fn the_bit_is_joined_across_reopenings() {
+        // Upstream's `Summary#join` ANDs it and unions the causes
+        // (`summary.rb:89`), so one tainted reopening taints the key.
+        let found = bits(
+            "class C\n def m\n  puts 1\n end\nend\nclass C\n def m(thing)\n  thing.other\n end\nend",
+        );
+        assert_eq!(found["C#m"], (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+    }
+
+    #[test]
+    fn a_unit_key_splits_into_its_selector_at_the_first_separator() {
+        assert_eq!(selector_of("C#m"), "m");
+        assert_eq!(selector_of("C.m"), "m");
+        assert_eq!(selector_of("Outer::Inner#deep"), "deep");
+        assert_eq!(selector_of("<toplevel>#m"), "m");
+        assert_eq!(selector_of("C#[]="), "[]=");
+        assert_eq!(selector_of("C#respond_to_missing?"), "respond_to_missing?");
     }
 }
