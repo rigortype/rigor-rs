@@ -68,9 +68,16 @@ upstream's closed 10-member enum, `detail` = the selector for
 | 02_propagation | **10** | 5 | 0 | 0 |
 | 03_taint | **9** | 2 | 0 | 0 |
 | 04_declared | 0 | 4 | 0 | 0 |
-| **TOTAL** | **35** | **11** | **0** | **0** → PASS |
+| **TOTAL (these four)** | **35** | **11** | **0** | **0** → PASS |
 
-A HIGHER MATCH is a stop-and-re-derive event, not a win. The 4 remaining
+**`05_posture` (added after this table by [#106](20260826-s106-posture-over-fix.md), 133 methods) is NOT predicted here.** Its
+slice-3 behaviour was never simulated, so it carries a different bar: **0
+OVER is mandatory**, and its MATCH count is REPORTED, not pinned. Derive a
+prediction for it first if you want one — do not retrofit the table to
+whatever the build produces.
+
+A HIGHER MATCH on the four predicted projects is a stop-and-re-derive
+event, not a win. The 4 remaining
 non-04 UNDERs are known and structural: 2 need receiver typing
 (`Pipeline#transform`, `Taint#through_a_ghost`), 2 need the `resolved` bit
 plus slice 4's real closure (`Recursive#mutual_b`, `Recursive#walk`).
