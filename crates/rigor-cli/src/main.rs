@@ -659,6 +659,10 @@ fn analyze_files(
     // — invisible by default, so the differential harness (which never sets it)
     // and the byte-exact output are unaffected. `Instant::now()` is cheap; the
     // markers are unconditional but only formatted/emitted under the env gate.
+    // The stage-1 line is further split into its `parse+lower` and `harvest`
+    // components (issue #104) — those PER-FILE clock reads happen inside the
+    // rayon closure and are therefore gated on this flag, not unconditional.
+    // See `Stage1Times` for what each reported field means.
     let timing = std::env::var_os("RIGOR_TIMING").is_some();
     let t_start = std::time::Instant::now();
 
@@ -698,6 +702,39 @@ fn analyze_files(
         comments: Vec<(usize, usize, String)>,
     }
 
+    /// Per-file stage-1 component costs, for the `RIGOR_TIMING` split of the
+    /// `stage1(parse+lower+harvest)` label into its two halves (issue #104).
+    ///
+    /// **What is measured, and why it is reported the way it is.** Stage 1 runs
+    /// on rayon, so a per-file duration is CPU time on one worker, NOT wall
+    /// time — summing them across 4 675 files yields a number several times
+    /// larger than the stage's own wall clock, and quoting that sum as "what a
+    /// harvest cache would save" would be wrong by exactly the parallel speedup.
+    /// The line therefore reports three different things and labels them as
+    /// such: the **summed** per-file harvest CPU (`harvest-cpu`), the **single
+    /// worst** file's harvest (`harvest-cpu-max`, a floor on any wall
+    /// contribution — one file's harvest cannot be split across threads), and
+    /// the **amortized wall estimate** `harvest-cpu / threads`
+    /// (`harvest-wall-amortized`), which is a MODEL — it assumes the harvest
+    /// work distributes as evenly over the pool as the rest of stage 1 does.
+    /// `stage1-ex-harvest` is stage 1's measured wall minus that estimate.
+    /// A true marginal wall cost needs an A/B against a build that does the
+    /// harvest a different number of times; the model is the honest in-process
+    /// approximation, not a substitute for it.
+    ///
+    /// Excluded / unreadable / unparseable files produce no `Prepared`, so they
+    /// contribute to neither sum — which is the right domain, since those files
+    /// have no harvest for a cache to serve either.
+    #[derive(Clone, Copy, Default)]
+    struct Stage1Times {
+        /// Read + ERB sniff + parse + lower, i.e. everything a cache hit must
+        /// still pay (the AST is required by merge M3 and by stage 3).
+        parse_lower: std::time::Duration,
+        /// `SourceIndex::harvest` alone — the one call a per-file harvest cache
+        /// could skip.
+        harvest: std::time::Duration,
+    }
+
     // STAGE 1 (file-parallel): read + parse + lower + harvest. A closure never
     // mutates shared state — it returns a self-contained outcome that the serial
     // drain below turns into the same eprintln / push the serial loop did.
@@ -707,7 +744,9 @@ fn analyze_files(
         /// side by side so the serial drain can fill the two index-aligned Vecs.
         /// The harvest is BOXED to keep this variant close to the others in size
         /// (`clippy::large_enum_variant`); one allocation per file, in parallel.
-        Prepared(Prepared, Box<rigor_infer::Harvest>),
+        /// The third field is the `RIGOR_TIMING` component split (all-zero when
+        /// the env gate is unset).
+        Prepared(Prepared, Box<rigor_infer::Harvest>, Stage1Times),
         IoError { path: String, msg: String },
         Panic { order: usize, path: String, msg: String },
     }
@@ -715,6 +754,11 @@ fn analyze_files(
         .par_iter()
         .enumerate()
         .map(|(order, path)| {
+            // `RIGOR_TIMING` component split: the clock is read ONLY under the
+            // env gate, so an unset `RIGOR_TIMING` costs one already-hot
+            // predicted branch per file and zero clock reads — the same
+            // "invisible by default" contract the stage markers have.
+            let t_file = timing.then(std::time::Instant::now);
             // Config `exclude:` — skip the file entirely before reading it.
             if cfg.is_excluded(path) {
                 return Stage1::Excluded;
@@ -773,10 +817,19 @@ fn analyze_files(
                     // `build_project` panic used to propagate out of stage 2,
                     // rather than silently degrading the file to an
                     // internal-error diagnostic and dropping it from the index.
+                    let t_harvest = timing.then(std::time::Instant::now);
                     let harvest = Box::new(rigor_infer::SourceIndex::harvest(&ast, &index));
+                    let times = Stage1Times {
+                        parse_lower: match (t_file, t_harvest) {
+                            (Some(a), Some(b)) => b - a,
+                            _ => std::time::Duration::ZERO,
+                        },
+                        harvest: t_harvest.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
+                    };
                     Stage1::Prepared(
                         Prepared { order, path: path.to_string(), source, ast, comments },
                         harvest,
+                        times,
                     )
                 }
                 Err(panic_val) => Stage1::Panic {
@@ -793,10 +846,18 @@ fn analyze_files(
     // input order, and nothing reorders either afterwards.
     let mut prepared: Vec<Prepared> = Vec::new();
     let mut harvests: Vec<rigor_infer::Harvest> = Vec::new();
+    // `RIGOR_TIMING` accumulators — folded into the drain that already runs, so
+    // the split costs no extra pass and nothing inside the parallel region.
+    let mut pl_cpu = std::time::Duration::ZERO;
+    let mut hv_cpu = std::time::Duration::ZERO;
+    let mut hv_cpu_max = std::time::Duration::ZERO;
     for outcome in stage1 {
         match outcome {
             Stage1::Excluded => {}
-            Stage1::Prepared(p, h) => {
+            Stage1::Prepared(p, h, t) => {
+                pl_cpu += t.parse_lower;
+                hv_cpu += t.harvest;
+                hv_cpu_max = hv_cpu_max.max(t.harvest);
                 prepared.push(p);
                 harvests.push(*h);
             }
@@ -946,18 +1007,31 @@ fn analyze_files(
 
     if timing {
         let t_end = std::time::Instant::now();
+        let threads = rayon::current_num_threads();
+        // See `Stage1Times`: `*-cpu` fields are SUMS of per-file worker time,
+        // `harvest-wall-amortized` is `harvest-cpu / threads` (a model), and
+        // `stage1-ex-harvest` is stage 1's measured wall minus that model.
+        let hv_wall = hv_cpu / u32::try_from(threads.max(1)).unwrap_or(1);
         eprintln!(
             "rigor timing: index-load={:.3?} stage1(parse+lower+harvest)={:.3?} \
+             stage1.parse+lower-cpu={:.3?} stage1.harvest-cpu={:.3?} \
+             stage1.harvest-cpu-max={:.3?} stage1.harvest-wall-amortized={:.3?} \
+             stage1-ex-harvest={:.3?} \
              stage2(merge)={:.3?} stage3(analyze)={:.3?} sort={:.3?} \
              total={:.3?} files={} threads={}",
             t_index - t_start,
             t_stage1 - t_index,
+            pl_cpu,
+            hv_cpu,
+            hv_cpu_max,
+            hv_wall,
+            (t_stage1 - t_index).saturating_sub(hv_wall),
             t_stage2 - t_stage1,
             t_stage3 - t_stage2,
             t_end - t_stage3,
             t_end - t_start,
             prepared.len(),
-            rayon::current_num_threads(),
+            threads,
         );
     }
     (findings, had_io_error)
