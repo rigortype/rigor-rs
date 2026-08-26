@@ -105,11 +105,13 @@ pub const SOURCE_CLASS_BASE: u32 = 1_000_000;
 /// never a false positive) rather than risk a runaway on a pathological graph.
 pub const OVERRIDE_ANCESTOR_WALK_LIMIT: usize = 100;
 
-/// Interprocedural literal-tail fold: the recursion depth cap on
-/// [`SourceIndex::fold_expr`] (bodies calling bodies — `read_write? = !read_only?`).
-/// Past it the fold declines (a missed witness, never a false positive). Bodies
-/// this deep are vanishingly rare; the cap just backstops a pathological chain the
-/// per-key cycle guard would otherwise still terminate but slowly.
+/// Interprocedural literal-tail fold: the syntactic depth cap the tail capture
+/// applies ([`capture_fold_tail`]; bodies calling bodies — `read_write? =
+/// !read_only?`). Past it the fold declines (a missed witness, never a false
+/// positive). Bodies this deep are vanishingly rare; the cap just backstops a
+/// pathological chain the per-key cycle guard would otherwise still terminate but
+/// slowly. **Issue #113 moved the check** from the (retired) `fold_expr` walk to
+/// the capture; it is now applied exactly once, at harvest time.
 const FOLD_DEPTH_CAP: usize = 16;
 
 /// The method KIND an interprocedural literal-tail fold is keyed on: an ordinary
@@ -124,20 +126,70 @@ pub enum DefKind {
 }
 
 /// One (re)definition site of a method whose interprocedural literal-tail return
-/// we may fold: which analyzed AST holds it, the tail (return) expression node,
-/// and whether the body contains any explicit `return` (a decline gate — we read
-/// only the tail). Collected per `(qualified owner, method, kind)` so reopens are
-/// joined (all sites must agree on the folded literal, else decline).
+/// we may fold: the CAPTURED tail expression ([`FoldTail`]) and whether the body
+/// contains any explicit `return` (a decline gate — we read only the tail).
+/// Collected per `(qualified owner, method, kind)` so reopens are joined (all
+/// sites must agree on the folded literal, else decline).
 ///
-/// `ast_idx` is a POSITION IN THE MERGED SLICE, not a file identity: it is only
-/// meaningful for the exact `&[(Harvest, &LoweredAst)]` the merge was handed.
-/// That is why [`Harvest`] stores [`HarvestedFoldDef`] instead — file-relative,
-/// with the slice position stamped on at merge time (issue #92 §5).
+/// **Issue #113 — this used to carry `ast_idx: usize`, a POSITION IN THE MERGED
+/// SLICE.** That made a [`Harvest`] meaningful only for the exact
+/// `&[(Harvest, &LoweredAst)]` the merge was handed — the last member of the
+/// identity-hazard family #102/#103 retired. The site now borrows the mini-tree
+/// the harvest already owns, so the fold needs no `&[&LoweredAst]` at all and a
+/// harvest is self-contained for Pass 4b.
 #[derive(Clone, Copy)]
-struct FoldSite {
-    ast_idx: usize,
-    tail: NodeId,
+struct FoldSite<'a> {
+    tail: &'a FoldTail,
     has_explicit_return: bool,
+}
+
+/// The merged def table Pass 4b folds: `(qualified owner, method, kind) -> every
+/// (re)definition site`, borrowing each site's mini-tree from its [`Harvest`].
+type FoldDefs<'a> = HashMap<(String, String, DefKind), Vec<FoldSite<'a>>>;
+
+/// **Issue #113 — the captured tail of one project `def`.** Either a mini-tree
+/// [`SourceIndex::fold_tail`] can fold, or `Decline`.
+///
+/// `SourceIndex::fold_expr` — the pre-capture fold, now retired and kept only as
+/// the `probes_s92` oracle — inspected exactly 10 of the 37 [`Node`] variants and declined everything else at its `_ => None` arm,
+/// and **every one of those declines is decided by SYNTAX alone**: the shape tag,
+/// `args.is_empty()`, `block_body.is_empty()`, `name.is_empty()`. None of them
+/// consults merged state. So [`capture_fold_tail`] can make the decision at
+/// HARVEST time and the prune is exact by construction — not a subset argument
+/// (`docs/notes/20260826-ast-eviction-probe.md` §1.1).
+///
+/// `Decline` is the overwhelmingly common case (an ivar read, a block-bearing
+/// call, an `if`/`case` carrier, a local read — all `_ => None`), and it costs
+/// exactly the null niche of the `Box`: a declining def carries 8 bytes and no
+/// heap node at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FoldTail {
+    /// `fold_expr`'s `_ => None`, decided by syntax at harvest time — including
+    /// the [`FOLD_DEPTH_CAP`] cut-off (see [`capture_fold_tail`]).
+    Decline,
+    Expr(Box<FoldExpr>),
+}
+
+/// One node of a captured tail — the 10 shapes the pre-capture `fold_expr` read,
+/// with the AST indirection already resolved away.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FoldExpr {
+    /// The seven scalar literal shapes (`StringLit` / `IntegerLit` / `FloatLit` /
+    /// `SymbolLit` / `NilLit` / `TrueLit` / `FalseLit`), already converted.
+    Scalar(Scalar),
+    /// A block-free implicit-self call (`read_only?`). Args are deliberately NOT
+    /// captured: the fold is param-INDEPENDENT and never looked at them.
+    SelfCall { method: String },
+    /// A block-free, arg-free call on a non-empty `ConstantRead` receiver
+    /// (`Gitlab::Database.read_only?`) — an OWN-CLASS singleton project call.
+    /// `owner` already has the `::` prefix stripped, exactly as `fold_expr` did.
+    ConstCall { owner: String, method: String },
+    /// `!expr` — Prism lowers unary not to a receiver-bearing call named `!` with
+    /// no args.
+    Not { operand: FoldTail },
+    /// Any other block-free receiver-bearing call: a core fold on a value-pinned
+    /// receiver + args (`1 + 1`, `"x" == "y"`), applied by [`crate::folding::fold`].
+    CoreCall { recv: FoldTail, method: String, args: Vec<FoldTail> },
 }
 
 /// Per-class structure harvested from source: own instance methods + superclass.
@@ -263,14 +315,17 @@ struct HarvestedConstWrite {
 }
 
 /// One project `def` site whose interprocedural literal-tail return may fold,
-/// harvested from a single file in walk order. Deliberately FILE-RELATIVE: the
-/// `tail` [`NodeId`] indexes THIS file's AST, and the merge stamps the slice
-/// position on to build a [`FoldSite`]. See [`FoldSite`] for why.
+/// harvested from a single file in walk order.
+///
+/// **Issue #113: `tail` is an OWNED mini-tree, not a `NodeId` into this file's
+/// AST.** It carries exactly what the pre-capture `fold_expr` could have reached
+/// from this def's tail and nothing else, so the merge's Pass 4b needs no AST and
+/// no slice position (see [`FoldTail`] and [`FoldSite`]).
 struct HarvestedFoldDef {
     owner: String,
     method: String,
     kind: DefKind,
-    tail: NodeId,
+    tail: FoldTail,
     has_explicit_return: bool,
 }
 
@@ -976,25 +1031,24 @@ impl SourceIndex {
 
         // Pass 4 (ADR-0038): interprocedural literal-tail return folding. Runs
         // AFTER Pass 1b (`override_classes`, the ancestry the degrade + implicit-
-        // self resolution walk) and needs no `core`/typing state. Stamps each
-        // harvested def site with its file's SLICE POSITION, inverts to a definers
-        // index, then folds each method's tail to a scalar literal (resolving
-        // nested project calls — into other files' ASTs — and applying the
-        // overridable degrade).
-        let mut defs: HashMap<(String, String, DefKind), Vec<FoldSite>> = HashMap::new();
-        for (ast_idx, (h, _)) in files.iter().enumerate() {
+        // self resolution walk) and needs no `core`/typing state. Joins the
+        // harvested def sites by key, inverts to a definers index, then folds each
+        // method's CAPTURED tail to a scalar literal (resolving nested project
+        // calls — into other files' harvests — and applying the overridable
+        // degrade).
+        //
+        // Issue #113: the site borrows the mini-tree its harvest owns, so this
+        // pass reads no AST at all. `asts` above is Pass 3's alone.
+        let mut defs: FoldDefs<'_> = FoldDefs::new();
+        for (h, _) in files {
             for d in &h.borrow().fold_defs {
                 defs.entry((d.owner.clone(), d.method.clone(), d.kind)).or_default().push(
-                    FoldSite {
-                        ast_idx,
-                        tail: d.tail,
-                        has_explicit_return: d.has_explicit_return,
-                    },
+                    FoldSite { tail: &d.tail, has_explicit_return: d.has_explicit_return },
                 );
             }
         }
         idx.definers = invert_definers(&defs);
-        idx.literal_returns = idx.compute_literal_returns(&asts, &defs);
+        idx.literal_returns = idx.compute_literal_returns(&defs);
 
         idx
     }
@@ -1553,17 +1607,16 @@ impl SourceIndex {
     // -----------------------------------------------------------------------
 
     /// Compute the `(qualified owner, method, kind) -> folded scalar` table from
-    /// the harvested `defs` (which carry each method's tail node), applying the
-    /// overridable-method degrade. A per-key memo makes the recursive body-to-body
-    /// fold (`read_write? = !read_only?`) linear; a per-resolution `visiting` set
-    /// makes a recursive method (`def loopy; loopy; end`) decline rather than spin.
-    /// A per-candidate [`AncestorClosures`] memo (#94) makes the degrade gate's
-    /// ancestor walk run once per definer-candidate instead of once per
-    /// `(candidate, owner)` pair.
+    /// the harvested `defs` (which carry each method's CAPTURED tail — issue
+    /// #113, no AST), applying the overridable-method degrade. A per-key memo
+    /// makes the recursive body-to-body fold (`read_write? = !read_only?`)
+    /// linear; a per-resolution `visiting` set makes a recursive method
+    /// (`def loopy; loopy; end`) decline rather than spin. A per-candidate
+    /// [`AncestorClosures`] memo (#94) makes the degrade gate's ancestor walk run
+    /// once per definer-candidate instead of once per `(candidate, owner)` pair.
     fn compute_literal_returns(
         &self,
-        asts: &[&LoweredAst],
-        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
+        defs: &FoldDefs<'_>,
     ) -> HashMap<(String, String, DefKind), Scalar> {
         let mut memo: HashMap<(String, String, DefKind), Option<Scalar>> = HashMap::new();
         // Born here, dies here: the closure memo is valid exactly as long as
@@ -1572,7 +1625,7 @@ impl SourceIndex {
         let mut closures: AncestorClosures = AncestorClosures::new();
         for key in defs.keys() {
             let mut visiting: HashSet<(String, String, DefKind)> = HashSet::new();
-            self.resolve_fold_key(key, defs, asts, &mut memo, &mut visiting, &mut closures);
+            self.resolve_fold_key(key, defs, &mut memo, &mut visiting, &mut closures);
         }
         memo.into_iter().filter_map(|(k, v)| v.map(|s| (k, s))).collect()
     }
@@ -1584,8 +1637,7 @@ impl SourceIndex {
     fn resolve_fold_key(
         &self,
         key: &(String, String, DefKind),
-        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
-        asts: &[&LoweredAst],
+        defs: &FoldDefs<'_>,
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
         visiting: &mut HashSet<(String, String, DefKind)>,
         closures: &mut AncestorClosures,
@@ -1597,7 +1649,7 @@ impl SourceIndex {
             return None; // cycle (recursive method) ⇒ decline, don't memoize.
         }
         visiting.insert(key.clone());
-        let raw = self.fold_key_sites(key, defs, asts, memo, visiting, closures);
+        let raw = self.fold_key_sites(key, defs, memo, visiting, closures);
         let result = match raw {
             Some(_) if self.overridden_in_project(&key.0, &key.1, key.2, closures) => None,
             other => other,
@@ -1613,8 +1665,7 @@ impl SourceIndex {
     fn fold_key_sites(
         &self,
         key: &(String, String, DefKind),
-        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
-        asts: &[&LoweredAst],
+        defs: &FoldDefs<'_>,
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
         visiting: &mut HashSet<(String, String, DefKind)>,
         closures: &mut AncestorClosures,
@@ -1625,9 +1676,7 @@ impl SourceIndex {
             if site.has_explicit_return {
                 return None;
             }
-            let ast = asts[site.ast_idx];
-            let s = self
-                .fold_expr(ast, site.tail, &key.0, key.2, defs, asts, memo, visiting, closures, 0)?;
+            let s = self.fold_tail(site.tail, &key.0, key.2, defs, memo, visiting, closures)?;
             match &acc {
                 None => acc = Some(s),
                 Some(prev) if *prev != s => return None, // disagreeing reopen.
@@ -1637,95 +1686,76 @@ impl SourceIndex {
         acc
     }
 
-    /// Fold one expression node to a scalar literal, or `None` to decline. Handles
-    /// literals, `!expr`, an implicit-self project call (resolved against
-    /// `self_qual`/`self_kind`), a `Const.method` singleton call, and a core fold
-    /// on a value-pinned receiver + args. A leaf that is anything else (a param /
-    /// ivar / non-folding call / branch carrier) declines the whole fold — which
-    /// is why an if/case/loop-carrier tail or a param-dependent body never folds.
+    /// Fold one CAPTURED tail ([`FoldTail`]) to a scalar literal, or `None` to
+    /// decline. Handles literals, `!expr`, an implicit-self project call (resolved
+    /// against `self_qual`/`self_kind`), a `Const.method` singleton call, and a
+    /// core fold on a value-pinned receiver + args. A `Decline` — a param / ivar /
+    /// non-folding call / branch carrier / anything past [`FOLD_DEPTH_CAP`] —
+    /// declines the whole fold, which is why an if/case/loop-carrier tail or a
+    /// param-dependent body never folds.
+    ///
+    /// **Issue #113: this is the post-capture half of the old `fold_expr`.** The
+    /// syntactic half moved to [`capture_fold_tail`] at harvest time; what is
+    /// left is exactly the part that needs merged state — `resolve_instance_owner`
+    /// (the override ancestry), `resolve_fold_key` (the cross-file def table) and
+    /// `folding::fold`. Hence no `&LoweredAst`, no `&[&LoweredAst]`, and no
+    /// `depth` (the cap is applied by the capture — see there).
     #[allow(clippy::too_many_arguments)]
-    fn fold_expr(
+    fn fold_tail(
         &self,
-        ast: &LoweredAst,
-        node_id: NodeId,
+        tail: &FoldTail,
         self_qual: &str,
         self_kind: DefKind,
-        defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
-        asts: &[&LoweredAst],
+        defs: &FoldDefs<'_>,
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
         visiting: &mut HashSet<(String, String, DefKind)>,
         closures: &mut AncestorClosures,
-        depth: usize,
     ) -> Option<Scalar> {
-        if depth > FOLD_DEPTH_CAP {
+        let FoldTail::Expr(expr) = tail else {
             return None;
-        }
-        match ast.get(node_id) {
-            Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
-            Node::IntegerLit { value, .. } => Some(Scalar::Int(*value)),
-            Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
-            Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
-            Node::NilLit { .. } => Some(Scalar::Nil),
-            Node::TrueLit { .. } => Some(Scalar::Bool(true)),
-            Node::FalseLit { .. } => Some(Scalar::Bool(false)),
-            // An implicit-self project call (`read_only?`). Args are ignored — the
-            // fold is param-INDEPENDENT; if the body reads a param the recursive
-            // fold declines on that param leaf. A block form is out of scope.
-            Node::Call { receiver: None, method, block_body, .. } if block_body.is_empty() => {
-                let method = method.clone();
+        };
+        match &**expr {
+            FoldExpr::Scalar(s) => Some(s.clone()),
+            // An implicit-self project call (`read_only?`). Args were never read —
+            // the fold is param-INDEPENDENT; if the body reads a param the
+            // recursive fold declines on that param leaf.
+            FoldExpr::SelfCall { method } => {
                 let (owner, kind) = match self_kind {
                     DefKind::Singleton => (self_qual.to_string(), DefKind::Singleton),
                     DefKind::Instance => {
-                        (self.resolve_instance_owner(self_qual, &method)?, DefKind::Instance)
+                        (self.resolve_instance_owner(self_qual, method)?, DefKind::Instance)
                     }
                 };
-                self.resolve_fold_key(&(owner, method, kind), defs, asts, memo, visiting, closures)
+                self.resolve_fold_key(&(owner, method.clone(), kind), defs, memo, visiting, closures)
             }
-            Node::Call { receiver: Some(r), method, args, block_body, .. }
-                if block_body.is_empty() =>
-            {
-                let (r, method, args) = (*r, method.clone(), args.clone());
-                // `!expr` — Prism lowers unary not to a receiver-bearing call named
-                // `!`. Fold the receiver and invert its Ruby truthiness (this is
-                // what turns `read_write? = !read_only?` into `true`).
-                if method == "!" && args.is_empty() {
-                    let s = self.fold_expr(
-                        ast, r, self_qual, self_kind, defs, asts, memo, visiting, closures,
-                        depth + 1,
-                    )?;
-                    return Some(Scalar::Bool(!scalar_truthy(&s)));
-                }
-                // `Const.method` — an OWN-CLASS singleton project call.
-                if args.is_empty() {
-                    if let Node::ConstantRead { name, .. } = ast.get(r) {
-                        if !name.is_empty() {
-                            let owner = name.strip_prefix("::").unwrap_or(name).to_string();
-                            return self.resolve_fold_key(
-                                &(owner, method, DefKind::Singleton),
-                                defs,
-                                asts,
-                                memo,
-                                visiting,
-                                closures,
-                            );
-                        }
-                    }
-                }
-                // A core fold on a value-pinned receiver + args (`1 + 1`, `"x" ==
-                // "y"`). Declines unless every part folds.
-                let recv = self.fold_expr(
-                    ast, r, self_qual, self_kind, defs, asts, memo, visiting, closures, depth + 1,
-                )?;
+            // `Const.method` — an OWN-CLASS singleton project call.
+            FoldExpr::ConstCall { owner, method } => self.resolve_fold_key(
+                &(owner.clone(), method.clone(), DefKind::Singleton),
+                defs,
+                memo,
+                visiting,
+                closures,
+            ),
+            // `!expr`: fold the receiver and invert its Ruby truthiness (this is
+            // what turns `read_write? = !read_only?` into `true`).
+            FoldExpr::Not { operand } => {
+                let s =
+                    self.fold_tail(operand, self_qual, self_kind, defs, memo, visiting, closures)?;
+                Some(Scalar::Bool(!scalar_truthy(&s)))
+            }
+            // A core fold on a value-pinned receiver + args (`1 + 1`, `"x" ==
+            // "y"`). Declines unless every part folds.
+            FoldExpr::CoreCall { recv, method, args } => {
+                let recv =
+                    self.fold_tail(recv, self_qual, self_kind, defs, memo, visiting, closures)?;
                 let mut arg_scalars = Vec::with_capacity(args.len());
                 for a in args {
-                    arg_scalars.push(self.fold_expr(
-                        ast, a, self_qual, self_kind, defs, asts, memo, visiting, closures,
-                        depth + 1,
+                    arg_scalars.push(self.fold_tail(
+                        a, self_qual, self_kind, defs, memo, visiting, closures,
                     )?);
                 }
-                crate::folding::fold(&recv, &method, &arg_scalars)
+                crate::folding::fold(&recv, method, &arg_scalars)
             }
-            _ => None,
         }
     }
 
@@ -2529,8 +2559,8 @@ fn scalar_truthy(s: &Scalar) -> bool {
 /// conditional / inner method is out of scope, matching the tier-4b / override
 /// discovery inclusion rule.
 ///
-/// `tail` is a [`NodeId`] in THIS file's AST; the merge pairs it with the file's
-/// slice position to form a [`FoldSite`].
+/// Issue #113: each site's tail is CAPTURED here into an owned [`FoldTail`], so
+/// nothing downstream needs this file's AST (or its slice position) again.
 fn walk_fold_defs(
     ast: &LoweredAst,
     node: NodeId,
@@ -2568,7 +2598,10 @@ fn walk_fold_defs(
                                 owner: qualified.clone(),
                                 method,
                                 kind,
-                                tail,
+                                // Depth 0: `fold_key_sites` always entered
+                                // `fold_expr` at 0, so the cap resets per SITE
+                                // exactly as it did per key.
+                                tail: capture_fold_tail(ast, tail, 0),
                                 has_explicit_return: *has_explicit_return,
                             });
                         }
@@ -2584,15 +2617,86 @@ fn walk_fold_defs(
     }
 }
 
+/// **Issue #113 — capture one def's tail into an owned [`FoldTail`].**
+///
+/// The exact structural mirror of the pre-capture `fold_expr`: the same match
+/// arms, in the same order, reading the same fields, with the same
+/// `block_body.is_empty()` / `args.is_empty()` / `name.is_empty()` guards. Every
+/// arm `fold_expr` did not have is this function's `_ => Decline`.
+///
+/// **Why this is exact and not a subset argument.** `fold_expr`'s decline is
+/// decided by SYNTAX alone at every arm — the shape tag, `args.is_empty()`,
+/// `block_body.is_empty()`, `name.is_empty()`. Nothing in the declining path
+/// consults merged state, the `CoreIndex`, or another file. So the decision is
+/// already available at harvest time and a `Decline` here is provably the `None`
+/// `fold_expr` would have returned (`docs/notes/20260826-ast-eviction-probe.md`
+/// §1.1). What is NOT decidable here — `resolve_instance_owner`, the definers
+/// index, the overridable degrade, `folding::fold`'s own table — is exactly what
+/// stays behind as an unresolved [`FoldExpr`] node for the merge to apply.
+///
+/// **`depth` is the cap, and it is now the ONLY place it lives.** `fold_expr`
+/// checked `depth > FOLD_DEPTH_CAP` on ENTRY and `fold_key_sites` always entered
+/// at 0, so nodes at depth `0..=16` were evaluated and a node at depth 17
+/// declined without being looked at. The capture cuts at exactly that boundary
+/// and [`SourceIndex::fold_tail`] carries no depth at all — which keeps the two
+/// halves from disagreeing, and makes an off-by-one here observable rather than
+/// masked by a second check downstream. `probes_s92`'s `fold_depth_cap_*` tests
+/// pin the 15/16/17 boundary against the verbatim pre-capture oracle.
+fn capture_fold_tail(ast: &LoweredAst, node_id: NodeId, depth: usize) -> FoldTail {
+    if depth > FOLD_DEPTH_CAP {
+        return FoldTail::Decline;
+    }
+    let expr = match ast.get(node_id) {
+        Node::StringLit { value, .. } => FoldExpr::Scalar(Scalar::Str(value.clone())),
+        Node::IntegerLit { value, .. } => FoldExpr::Scalar(Scalar::Int(*value)),
+        Node::FloatLit { value, .. } => FoldExpr::Scalar(Scalar::Float(*value)),
+        Node::SymbolLit { value, .. } => FoldExpr::Scalar(Scalar::Sym(value.clone())),
+        Node::NilLit { .. } => FoldExpr::Scalar(Scalar::Nil),
+        Node::TrueLit { .. } => FoldExpr::Scalar(Scalar::Bool(true)),
+        Node::FalseLit { .. } => FoldExpr::Scalar(Scalar::Bool(false)),
+        Node::Call { receiver: None, method, block_body, .. } if block_body.is_empty() => {
+            FoldExpr::SelfCall { method: method.clone() }
+        }
+        Node::Call { receiver: Some(r), method, args, block_body, .. }
+            if block_body.is_empty() =>
+        {
+            if method == "!" && args.is_empty() {
+                FoldExpr::Not { operand: capture_fold_tail(ast, *r, depth + 1) }
+            } else {
+                // `Const.method` — an OWN-CLASS singleton project call. Reached
+                // ONLY here: a bare `ConstantRead` anywhere else falls to
+                // `_ => Decline`, exactly as it hit `fold_expr`'s `_ => None`.
+                let const_owner = match (args.is_empty(), ast.get(*r)) {
+                    (true, Node::ConstantRead { name, .. }) if !name.is_empty() => {
+                        Some(name.strip_prefix("::").unwrap_or(name).to_string())
+                    }
+                    _ => None,
+                };
+                match const_owner {
+                    Some(owner) => FoldExpr::ConstCall { owner, method: method.clone() },
+                    None => FoldExpr::CoreCall {
+                        recv: capture_fold_tail(ast, *r, depth + 1),
+                        method: method.clone(),
+                        args: args
+                            .iter()
+                            .map(|&a| capture_fold_tail(ast, a, depth + 1))
+                            .collect(),
+                    },
+                }
+            }
+        }
+        _ => return FoldTail::Decline,
+    };
+    FoldTail::Expr(Box::new(expr))
+}
+
 /// ADR-0038 — invert the merged def sites into the `(method, kind) -> [qualified
 /// owners]` definers index that drives the overridable degrade and implicit-self
 /// resolution. Every read of the owner `Vec` is an `.any(…)` (`owner_defines`,
 /// `overridden_in_project`), so its order is not semantic — which is just as
 /// well: it comes from `HashMap` key iteration and is already unstable between
 /// processes on the same input (issue #92 §3.4).
-fn invert_definers(
-    defs: &HashMap<(String, String, DefKind), Vec<FoldSite>>,
-) -> HashMap<(String, DefKind), Vec<String>> {
+fn invert_definers(defs: &FoldDefs<'_>) -> HashMap<(String, DefKind), Vec<String>> {
     let mut definers: HashMap<(String, DefKind), Vec<String>> = HashMap::new();
     for (owner, method, kind) in defs.keys() {
         let owners = definers.entry((method.clone(), *kind)).or_default();
@@ -4334,10 +4438,10 @@ mod probes_s92 {
         idx.method_returns = returns;
         idx.param_bound_returns = param_bound;
 
-        // Pass 4.
+        // Pass 4 — the PRE-CAPTURE fold, verbatim (issue #113).
         let (defs, definers) = legacy_collect_fold_defs(asts);
         idx.definers = definers;
-        idx.literal_returns = idx.compute_literal_returns(asts, &defs);
+        idx.literal_returns = legacy_compute_literal_returns(&idx, asts, &defs);
 
         idx
     }
@@ -4440,14 +4544,219 @@ mod probes_s92 {
         }
     }
 
+    // =======================================================================
+    // ISSUE #113 — the PRE-CAPTURE Pass-4b fold, kept VERBATIM as the oracle.
+    //
+    // `FoldSite` used to carry `(ast_idx, tail: NodeId)` and `fold_expr` walked
+    // the real arena with a `depth` counter. Everything from here to
+    // `legacy_fold_expr` is that code, unchanged except for being free functions
+    // over `&SourceIndex` (they were `&self` methods) — so the equivalence tests
+    // grade the capture against an INDEPENDENT copy of the AST-walking fold, not
+    // against a rename of itself. The shared primitives it calls
+    // (`resolve_instance_owner`, `overridden_in_project`, `folding::fold`) are
+    // deliberately the production ones: the capture did not touch them, and the
+    // claim under test is that the mini-tree reaches the same calls with the
+    // same arguments.
+    // =======================================================================
+
+    /// The pre-#113 `FoldSite`: a POSITION in the `asts` slice plus a `NodeId`
+    /// into that file's arena.
+    #[derive(Clone, Copy)]
+    struct LegacyFoldSite {
+        ast_idx: usize,
+        tail: NodeId,
+        has_explicit_return: bool,
+    }
+
+    type LegacyFoldDefs = HashMap<(String, String, DefKind), Vec<LegacyFoldSite>>;
+
+    fn legacy_compute_literal_returns(
+        idx: &SourceIndex,
+        asts: &[&LoweredAst],
+        defs: &LegacyFoldDefs,
+    ) -> HashMap<(String, String, DefKind), Scalar> {
+        let mut memo: HashMap<(String, String, DefKind), Option<Scalar>> = HashMap::new();
+        let mut closures: AncestorClosures = AncestorClosures::new();
+        for key in defs.keys() {
+            let mut visiting: HashSet<(String, String, DefKind)> = HashSet::new();
+            legacy_resolve_fold_key(idx, key, defs, asts, &mut memo, &mut visiting, &mut closures);
+        }
+        memo.into_iter().filter_map(|(k, v)| v.map(|s| (k, s))).collect()
+    }
+
+    fn legacy_resolve_fold_key(
+        idx: &SourceIndex,
+        key: &(String, String, DefKind),
+        defs: &LegacyFoldDefs,
+        asts: &[&LoweredAst],
+        memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
+        visiting: &mut HashSet<(String, String, DefKind)>,
+        closures: &mut AncestorClosures,
+    ) -> Option<Scalar> {
+        if let Some(v) = memo.get(key) {
+            return v.clone();
+        }
+        if visiting.contains(key) {
+            return None; // cycle (recursive method) ⇒ decline, don't memoize.
+        }
+        visiting.insert(key.clone());
+        let raw = legacy_fold_key_sites(idx, key, defs, asts, memo, visiting, closures);
+        let result = match raw {
+            Some(_) if idx.overridden_in_project(&key.0, &key.1, key.2, closures) => None,
+            other => other,
+        };
+        visiting.remove(key);
+        memo.insert(key.clone(), result.clone());
+        result
+    }
+
+    fn legacy_fold_key_sites(
+        idx: &SourceIndex,
+        key: &(String, String, DefKind),
+        defs: &LegacyFoldDefs,
+        asts: &[&LoweredAst],
+        memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
+        visiting: &mut HashSet<(String, String, DefKind)>,
+        closures: &mut AncestorClosures,
+    ) -> Option<Scalar> {
+        let sites = defs.get(key)?;
+        let mut acc: Option<Scalar> = None;
+        for site in sites {
+            if site.has_explicit_return {
+                return None;
+            }
+            let ast = asts[site.ast_idx];
+            let s = legacy_fold_expr(
+                idx, ast, site.tail, &key.0, key.2, defs, asts, memo, visiting, closures, 0,
+            )?;
+            match &acc {
+                None => acc = Some(s),
+                Some(prev) if *prev != s => return None, // disagreeing reopen.
+                _ => {}
+            }
+        }
+        acc
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn legacy_fold_expr(
+        idx: &SourceIndex,
+        ast: &LoweredAst,
+        node_id: NodeId,
+        self_qual: &str,
+        self_kind: DefKind,
+        defs: &LegacyFoldDefs,
+        asts: &[&LoweredAst],
+        memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
+        visiting: &mut HashSet<(String, String, DefKind)>,
+        closures: &mut AncestorClosures,
+        depth: usize,
+    ) -> Option<Scalar> {
+        if depth > FOLD_DEPTH_CAP {
+            return None;
+        }
+        match ast.get(node_id) {
+            Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
+            Node::IntegerLit { value, .. } => Some(Scalar::Int(*value)),
+            Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
+            Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+            Node::NilLit { .. } => Some(Scalar::Nil),
+            Node::TrueLit { .. } => Some(Scalar::Bool(true)),
+            Node::FalseLit { .. } => Some(Scalar::Bool(false)),
+            Node::Call { receiver: None, method, block_body, .. } if block_body.is_empty() => {
+                let method = method.clone();
+                let (owner, kind) = match self_kind {
+                    DefKind::Singleton => (self_qual.to_string(), DefKind::Singleton),
+                    DefKind::Instance => {
+                        (idx.resolve_instance_owner(self_qual, &method)?, DefKind::Instance)
+                    }
+                };
+                legacy_resolve_fold_key(
+                    idx,
+                    &(owner, method, kind),
+                    defs,
+                    asts,
+                    memo,
+                    visiting,
+                    closures,
+                )
+            }
+            Node::Call { receiver: Some(r), method, args, block_body, .. }
+                if block_body.is_empty() =>
+            {
+                let (r, method, args) = (*r, method.clone(), args.clone());
+                if method == "!" && args.is_empty() {
+                    let s = legacy_fold_expr(
+                        idx,
+                        ast,
+                        r,
+                        self_qual,
+                        self_kind,
+                        defs,
+                        asts,
+                        memo,
+                        visiting,
+                        closures,
+                        depth + 1,
+                    )?;
+                    return Some(Scalar::Bool(!scalar_truthy(&s)));
+                }
+                if args.is_empty() {
+                    if let Node::ConstantRead { name, .. } = ast.get(r) {
+                        if !name.is_empty() {
+                            let owner = name.strip_prefix("::").unwrap_or(name).to_string();
+                            return legacy_resolve_fold_key(
+                                idx,
+                                &(owner, method, DefKind::Singleton),
+                                defs,
+                                asts,
+                                memo,
+                                visiting,
+                                closures,
+                            );
+                        }
+                    }
+                }
+                let recv = legacy_fold_expr(
+                    idx,
+                    ast,
+                    r,
+                    self_qual,
+                    self_kind,
+                    defs,
+                    asts,
+                    memo,
+                    visiting,
+                    closures,
+                    depth + 1,
+                )?;
+                let mut arg_scalars = Vec::with_capacity(args.len());
+                for a in args {
+                    arg_scalars.push(legacy_fold_expr(
+                        idx,
+                        ast,
+                        a,
+                        self_qual,
+                        self_kind,
+                        defs,
+                        asts,
+                        memo,
+                        visiting,
+                        closures,
+                        depth + 1,
+                    )?);
+                }
+                crate::folding::fold(&recv, &method, &arg_scalars)
+            }
+            _ => None,
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn legacy_collect_fold_defs(
         asts: &[&LoweredAst],
-    ) -> (
-        HashMap<(String, String, DefKind), Vec<FoldSite>>,
-        HashMap<(String, DefKind), Vec<String>>,
-    ) {
-        let mut defs: HashMap<(String, String, DefKind), Vec<FoldSite>> = HashMap::new();
+    ) -> (LegacyFoldDefs, HashMap<(String, DefKind), Vec<String>>) {
+        let mut defs: LegacyFoldDefs = HashMap::new();
         for (ai, ast) in asts.iter().enumerate() {
             legacy_walk_fold_defs(ai, ast, ast.root(), &[], &mut defs);
         }
@@ -4466,7 +4775,7 @@ mod probes_s92 {
         ast: &LoweredAst,
         node: NodeId,
         prefix: &[String],
-        defs: &mut HashMap<(String, String, DefKind), Vec<FoldSite>>,
+        defs: &mut LegacyFoldDefs,
     ) {
         match ast.get(node) {
             Node::Program { body, .. } | Node::Statements { body, .. } => {
@@ -4496,7 +4805,7 @@ mod probes_s92 {
                         if let Some((method, kind)) = entry {
                             if let Some(&tail) = def_body.last() {
                                 defs.entry((qualified.clone(), method, kind)).or_default().push(
-                                    FoldSite {
+                                    LegacyFoldSite {
                                         ast_idx,
                                         tail,
                                         has_explicit_return: *has_explicit_return,
@@ -4649,6 +4958,271 @@ mod probes_s92 {
         // type is the owned one, so that is what the empty case must instantiate.
         let idx = SourceIndex::merge::<Harvest>(&[], &core);
         assert!(idx.is_declaration_only_class("Process::Status"));
+    }
+
+    // =======================================================================
+    // ISSUE #113 — the Pass-4b CAPTURE: equivalence, non-vacuity, and the
+    // FOLD_DEPTH_CAP boundary the corpora never reach.
+    // =======================================================================
+
+    /// A deliberately FOLD-RICH corpus: every shape `capture_fold_tail` keeps
+    /// (all seven scalars, implicit-self instance + singleton, `!`, `Const.method`
+    /// including a `::`-prefixed one, a core fold on a receiver + args) beside a
+    /// representative of every shape it prunes (a block-bearing call, an ivar, a
+    /// bare `ConstantRead`, an arg-bearing const call, an `if` carrier, an
+    /// explicit `return`, a recursive cycle), plus the two cross-file joins the
+    /// fold has — a disagreeing reopen (`Dup#two`) and the overridable degrade
+    /// (`Base#kind` vs `Sub#kind`).
+    ///
+    /// The existing `merge_equals_legacy_*` corpora fold almost nothing, so
+    /// grading the capture on them alone would be near-vacuous —
+    /// `fold_capture_is_non_vacuous` pins that this one is not.
+    fn fold_corpus() -> Vec<&'static [u8]> {
+        vec![
+            // f0 — the ADR-0038 canonical singleton pair + half of the reopen.
+            b"module Gitlab\n  module Database\n    def self.read_only?\n      false\n    end\n\n    def self.read_write?\n      !read_only?\n    end\n  end\nend\n\nclass Dup\n  def two\n    1\n  end\nend\n",
+            // f1 — every scalar shape, a core fold, and a CROSS-FILE Const.method.
+            b"class Flags\n  def self.enabled?\n    Gitlab::Database.read_write?\n  end\n\n  def self.label\n    \"on\"\n  end\n\n  def self.num\n    1 + 2\n  end\n\n  def self.pi\n    3.5\n  end\n\n  def self.tag\n    :sym\n  end\n\n  def self.nothing\n    nil\n  end\n\n  def self.yes\n    true\n  end\n\n  def self.cmp\n    \"a\" == \"b\"\n  end\nend\n",
+            // f2 — instance implicit-self, a `::`-prefixed const call, and one of
+            // every pruned shape. `blocky_self` / `blocky_const` are the
+            // OVER-capture discriminators: both would fold if the capture lost
+            // either `block_body.is_empty()` guard, and both must stay silent.
+            b"class Conf\n  def enabled\n    flag\n  end\n\n  def flag\n    true\n  end\n\n  def deep_const\n    ::Flags.label\n  end\n\n  def loopy\n    loopy\n  end\n\n  def blocky\n    [1].map { |x| x }\n  end\n\n  def blocky_self\n    flag { 1 }\n  end\n\n  def blocky_const\n    Flags.label { 1 }\n  end\n\n  def ivar\n    @x\n  end\n\n  def branchy\n    if flag\n      1\n    else\n      2\n    end\n  end\n\n  def early\n    return 1\n  end\n\n  def bare_const\n    MAX\n  end\n\n  def const_args\n    Gitlab::Database.pick(1)\n  end\nend\n",
+            // f3 — the overridable degrade + the other half of the reopen.
+            b"class Base\n  def kind\n    1\n  end\nend\n\nclass Sub < Base\n  def kind\n    2\n  end\nend\n\nclass Dup\n  def two\n    2\n  end\nend\n",
+        ]
+    }
+
+    fn folded(idx: &SourceIndex, owner: &str, method: &str, kind: DefKind) -> Option<Scalar> {
+        idx.literal_returns.get(&(owner.to_string(), method.to_string(), kind)).cloned()
+    }
+
+    /// The capture graded against the VERBATIM pre-capture fold over the
+    /// fold-rich corpus, forward, reversed, and under **every** one of its 24
+    /// permutations. Permutations are what would catch a capture that leaked file
+    /// order — the mini-tree is built per file and joined per key, so a mistake
+    /// there shows up as a key whose sites arrive in a different order.
+    #[test]
+    fn merge_equals_legacy_over_the_fold_corpus() {
+        let core = CoreIndex::new();
+        let srcs = fold_corpus();
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        assert_paths_agree(&refs, &core, "fold corpus");
+        let rev: Vec<&LoweredAst> = asts.iter().rev().collect();
+        assert_paths_agree(&rev, &core, "fold corpus (reversed)");
+        for p in ALL_PERMUTATIONS_OF_4 {
+            let refs: Vec<&LoweredAst> = p.iter().map(|&i| &asts[i]).collect();
+            assert_paths_agree(&refs, &core, &format!("fold corpus perm {p:?}"));
+        }
+    }
+
+    /// The 24 permutations of a 4-element list, spelled out so the test reads as
+    /// exhaustive rather than as a sample.
+    const ALL_PERMUTATIONS_OF_4: [[usize; 4]; 24] = [
+        [0, 1, 2, 3], [0, 1, 3, 2], [0, 2, 1, 3], [0, 2, 3, 1], [0, 3, 1, 2], [0, 3, 2, 1],
+        [1, 0, 2, 3], [1, 0, 3, 2], [1, 2, 0, 3], [1, 2, 3, 0], [1, 3, 0, 2], [1, 3, 2, 0],
+        [2, 0, 1, 3], [2, 0, 3, 1], [2, 1, 0, 3], [2, 1, 3, 0], [2, 3, 0, 1], [2, 3, 1, 0],
+        [3, 0, 1, 2], [3, 0, 2, 1], [3, 1, 0, 2], [3, 1, 2, 0], [3, 2, 0, 1], [3, 2, 1, 0],
+    ];
+
+    /// **The non-vacuity floor.** A capture that silently declined EVERYTHING
+    /// would be byte-identical to the oracle on a corpus with no folds, so the
+    /// equivalence tests above are only worth what this test pins: each captured
+    /// shape actually produces its folded value, and each pruned shape actually
+    /// produces no entry.
+    #[test]
+    fn fold_capture_is_non_vacuous() {
+        use DefKind::{Instance, Singleton};
+        let core = CoreIndex::new();
+        let srcs = fold_corpus();
+        let asts: Vec<LoweredAst> = srcs.iter().map(|s| lower(&parse(s))).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        let idx = SourceIndex::build_project(&refs, &core);
+
+        // Every KEPT shape folds, and to the same value the oracle folds it to.
+        let kept: [(&str, &str, DefKind, Scalar); 14] = [
+            // the seven scalar shapes
+            ("Gitlab::Database", "read_only?", Singleton, Scalar::Bool(false)),
+            ("Flags", "label", Singleton, Scalar::Str("on".to_string())),
+            ("Flags", "pi", Singleton, Scalar::Float(3.5)),
+            ("Flags", "tag", Singleton, Scalar::Sym("sym".to_string())),
+            ("Flags", "nothing", Singleton, Scalar::Nil),
+            ("Flags", "yes", Singleton, Scalar::Bool(true)),
+            ("Conf", "flag", Instance, Scalar::Bool(true)),
+            // `!expr` over a singleton implicit-self call
+            ("Gitlab::Database", "read_write?", Singleton, Scalar::Bool(true)),
+            // a cross-file `Const.method` singleton call
+            ("Flags", "enabled?", Singleton, Scalar::Bool(true)),
+            // a `::`-prefixed const call from an INSTANCE body
+            ("Conf", "deep_const", Instance, Scalar::Str("on".to_string())),
+            // an instance implicit-self call resolved through the override index
+            ("Conf", "enabled", Instance, Scalar::Bool(true)),
+            // core folds on a value-pinned receiver + args
+            ("Flags", "num", Singleton, Scalar::Int(3)),
+            ("Flags", "cmp", Singleton, Scalar::Bool(false)),
+            // a subclass override is itself foldable
+            ("Sub", "kind", Instance, Scalar::Int(2)),
+        ];
+        for (owner, method, kind, want) in &kept {
+            assert_eq!(
+                folded(&idx, owner, method, *kind).as_ref(),
+                Some(want),
+                "{owner}.{method}/{kind:?} must fold to {want:?} — the capture kept its shape"
+            );
+        }
+
+        // Every PRUNED shape declines. A capture that kept one of these would
+        // start emitting a `Type::Constant` where the pre-capture fold emitted
+        // nothing, which is the FP direction.
+        let pruned: [(&str, &str, DefKind); 11] = [
+            ("Conf", "loopy", Instance),        // recursive cycle
+            ("Conf", "blocky", Instance),       // a receiver-bearing call WITH a block
+            ("Conf", "blocky_self", Instance),  // an implicit-self call WITH a block
+            ("Conf", "blocky_const", Instance), // `Const.method { }` — a block
+            ("Conf", "ivar", Instance),         // an ivar read
+            ("Conf", "branchy", Instance),      // an `if` carrier
+            ("Conf", "early", Instance),        // an explicit `return`
+            ("Conf", "bare_const", Instance),   // a bare `ConstantRead` tail
+            ("Conf", "const_args", Instance),   // `Const.method(1)` — args non-empty
+            ("Base", "kind", Instance),         // the overridable degrade
+            ("Dup", "two", Instance),           // a disagreeing cross-file reopen
+        ];
+        for (owner, method, kind) in pruned {
+            assert_eq!(
+                folded(&idx, owner, method, kind),
+                None,
+                "{owner}.{method}/{kind:?} must decline"
+            );
+        }
+
+        // …and the table is not accidentally the whole table: the corpus folds
+        // exactly the 14 keys above.
+        assert_eq!(idx.literal_returns.len(), kept.len());
+    }
+
+    /// A `!`-chain `n` deep: `def m; !!!…!true; end`. The tail is the OUTERMOST
+    /// `!` at depth 0 and each nested `!` is one deeper, so the `true` leaf sits
+    /// at depth `n` — which is exactly the axis [`FOLD_DEPTH_CAP`] cuts.
+    fn not_chain(n: usize) -> Vec<u8> {
+        let mut s = b"class Deep\n  def m\n    ".to_vec();
+        s.extend(std::iter::repeat_n(b'!', n));
+        s.extend_from_slice(b"true\n  end\nend\n");
+        s
+    }
+
+    /// An argument-nested arithmetic chain `1 + (1 + (1 + … + 1))`, `n` deep. A
+    /// second, structurally different depth axis: the recursion here runs through
+    /// `CoreCall`'s ARGS, not through `Not`'s single operand, and it also fans out
+    /// (a receiver AND an arg at every level).
+    fn add_chain(n: usize) -> Vec<u8> {
+        let mut s = b"class Deep\n  def m\n    ".to_vec();
+        for _ in 0..n {
+            s.extend_from_slice(b"1 + (");
+        }
+        s.extend_from_slice(b"1");
+        s.extend(std::iter::repeat_n(b')', n));
+        s.extend_from_slice(b"\n  end\nend\n");
+        s
+    }
+
+    /// **The `FOLD_DEPTH_CAP` boundary harness (mini-spec evidence item 2).** The
+    /// cap has never been observed to fire on any corpus, so the sweep and the
+    /// fixtures give it ZERO coverage — and the capture makes it load-bearing,
+    /// because it is now the capture that applies it (a mini-tree truncated one
+    /// level too shallow or too deep changes a fold, silently).
+    ///
+    /// Both depth axes, at 15 / 16 / 17, graded against the verbatim pre-capture
+    /// fold. `#94`'s cap-boundary lesson applies verbatim: a cap's only coverage
+    /// is a purpose-built test.
+    #[test]
+    fn fold_depth_cap_boundary_agrees_with_the_oracle() {
+        let core = CoreIndex::new();
+        for n in [0, 1, 14, 15, 16, 17, 18, 20] {
+            for (axis, src) in [("not", not_chain(n)), ("add", add_chain(n))] {
+                let ast = lower(&parse(&src));
+                assert_paths_agree(&[&ast], &core, &format!("{axis} chain depth {n}"));
+            }
+        }
+    }
+
+    /// …and the boundary is where it is claimed to be, not merely agreed upon.
+    /// `assert_paths_agree` alone would pass if BOTH sides declined everything;
+    /// this pins the exact 16-in / 17-out step, in both engines.
+    #[test]
+    fn fold_depth_cap_fires_at_seventeen() {
+        let core = CoreIndex::new();
+        let key = ("Deep".to_string(), "m".to_string(), DefKind::Instance);
+
+        // `!`-chain: `n` bangs put the literal at depth `n`. `fold_expr` declined
+        // on ENTRY at `depth > 16`, so `n = 16` is the last one that folds.
+        for n in [0, 1, 15, 16] {
+            let ast = lower(&parse(&not_chain(n)));
+            let idx = SourceIndex::build_project(&[&ast], &core);
+            assert_eq!(
+                idx.literal_returns.get(&key),
+                Some(&Scalar::Bool(n % 2 == 0)),
+                "a {n}-deep `!` chain is INSIDE the cap and must fold"
+            );
+        }
+        for n in [17, 18, 25] {
+            let ast = lower(&parse(&not_chain(n)));
+            let idx = SourceIndex::build_project(&[&ast], &core);
+            assert_eq!(
+                idx.literal_returns.get(&key),
+                None,
+                "a {n}-deep `!` chain is PAST the cap and must decline"
+            );
+        }
+
+        // …and the same step on the arg-nested axis.
+        for n in [15, 16] {
+            let ast = lower(&parse(&add_chain(n)));
+            let idx = SourceIndex::build_project(&[&ast], &core);
+            assert_eq!(
+                idx.literal_returns.get(&key),
+                Some(&Scalar::Int(n as i64 + 1)),
+                "a {n}-deep `+` chain is INSIDE the cap and must fold"
+            );
+        }
+        for n in [17, 18] {
+            let ast = lower(&parse(&add_chain(n)));
+            let idx = SourceIndex::build_project(&[&ast], &core);
+            assert_eq!(
+                idx.literal_returns.get(&key),
+                None,
+                "a {n}-deep `+` chain is PAST the cap and must decline"
+            );
+        }
+    }
+
+    /// The cap resets per SITE, exactly as `fold_key_sites` reset it per key by
+    /// always entering `fold_expr` at depth 0: a 16-deep tail that calls ANOTHER
+    /// 16-deep method still folds, because the callee's tail is a fresh capture
+    /// rooted at 0. A capture that threaded a running depth across
+    /// `resolve_fold_key` would break this and nothing else would notice.
+    #[test]
+    fn fold_depth_cap_resets_per_site() {
+        let core = CoreIndex::new();
+        let mut src = b"class Deep\n  def outer\n    ".to_vec();
+        src.extend(std::iter::repeat_n(b'!', 16));
+        src.extend_from_slice(b"inner\n  end\n\n  def inner\n    ");
+        src.extend(std::iter::repeat_n(b'!', 16));
+        src.extend_from_slice(b"true\n  end\nend\n");
+        let ast = lower(&parse(&src));
+        assert_paths_agree(&[&ast], &core, "per-site depth reset");
+        let idx = SourceIndex::build_project(&[&ast], &core);
+        // 16 `!` over `inner`: the innermost operand is the SelfCall at depth 16,
+        // which is inside the cap; `inner` then folds from its own depth 0.
+        assert_eq!(
+            idx.literal_returns.get(&("Deep".to_string(), "inner".to_string(), DefKind::Instance)),
+            Some(&Scalar::Bool(true))
+        );
+        assert_eq!(
+            idx.literal_returns.get(&("Deep".to_string(), "outer".to_string(), DefKind::Instance)),
+            Some(&Scalar::Bool(true)),
+            "32 syntactic levels fold because the cap resets at the call boundary"
+        );
     }
 
     // =======================================================================
