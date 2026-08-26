@@ -16,20 +16,32 @@
 //!
 //! The JSON's `effects` key is upstream's TRANSITIVE lane; this slice computes
 //! the DIRECT one and prints it there, which is a subset (transitive is direct
-//! joined with every project method reached) and therefore an UNDER. Two more
-//! deliberate under-claims sit beside it:
+//! joined with every project method reached) and therefore an UNDER.
 //!
-//! - **`"exhaustive": false` on every method.** Slice 2 has no taint model, so
-//!   claiming the bit would be claiming a completeness nothing checked. False
-//!   can never trip the grader's over-claim branch, and it is what the summary
-//!   honestly reads: "these effects, and possibly more". `causes` carries an
-//!   out-of-enum `port-incomplete` marker rather than a fabricated cause.
+//! `exhaustive` and `causes` are slice 3's ([`collect`]): the bit is the
+//! TRANSITIVE reading, tainted by every producer the collector cannot rule out
+//! and by every call that could carry taint in along a project edge. `causes`
+//! is `[[cause, detail], …]` with `cause` drawn from upstream's closed
+//! `TaintCause::ALL` enum — the out-of-enum `port-incomplete` marker slice 2
+//! shipped is RETIRED, because it broke the port's own
+//! `causes.empty? == exhaustive` invariant.
+//!
+//! Two self-defenses sit beside them, both of them under-claims by construction:
+//!
 //! - **`"declared": []` on every method.** The declared lane is copied from the
 //!   author's annotation, and it is the one lane graded as an EXACT match — so
 //!   a port that cannot compute it must not report a method that HAS one. The
 //!   self-defense is lexical and total: a project carrying an effect annotation
 //!   (or an `effects.attribution:` table) reports `methods: {}`, which is
 //!   always an under-claim. [`carries_effect_annotations`].
+//! - **No `"exhaustive": true` from a plugin-bearing project.** A plugin's rows
+//!   move the bit the UNSAFE way: a non-discharging row taints
+//!   (`unit_scan.rb:262`), and plugins additionally synthesise framework units
+//!   (`scanner.rb:163`) that widen the selector set the edge taint reads. The
+//!   port has no plugin effect stratum at all, so a project whose `.rigor.yml`
+//!   configures `plugins:` gets every bit withheld. [`configures_plugins`].
+//!   Deliberately NARROWER than the annotation self-defense — the rows are still
+//!   reported, and only the one lane the plugin could move is withheld.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -151,7 +163,7 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     let rows = if carries_effect_annotations(&cfg, &config_path, &files, &project_root) {
         Vec::new()
     } else {
-        report_rows(&files, full)
+        report_rows(&files, full, configures_plugins(&cfg))
     };
 
     if format == "json" {
@@ -266,41 +278,75 @@ fn collect_rbs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Whether the project's config activates any plugin — the trigger for the
+/// exhaustiveness self-defense above.
+///
+/// Keyed on the `plugins:` list ALONE, and deliberately not on
+/// [`crate::Config::effective_plugins`]: the reference discovers effect-bearing
+/// plugins only from that list. Its one auto-wire (ADR-93,
+/// `configuration.rb:308`) is `rigor-rbs-inline`, which ships no
+/// `effect_attributions:` and so contributes neither a row nor a framework unit
+/// — verified against the pinned checkout. A bundler-detected RBS overlay is the
+/// same shape. Were either to grow an effects stratum this predicate would have
+/// to widen with it.
+fn configures_plugins(cfg: &crate::Config) -> bool {
+    !cfg.plugins.is_empty()
+}
+
 /// One method's row of the report.
 struct Row {
     key: String,
     effects: Vec<String>,
+    exhaustive: bool,
+    causes: Vec<collect::Cause>,
     direct: std::collections::BTreeMap<String, BTreeSet<String>>,
 }
 
 impl Row {
     /// Upstream's `trivial?` — exhaustive, proving nothing beyond frame-local
     /// mutation, and claiming nothing the proven lane does not already admit
-    /// (`effect_table.rb:50`). Ported faithfully and, with `exhaustive` always
-    /// false, never true: this port's default report lists exactly what
-    /// `--full` does, which the probe measured as graded-identically.
+    /// (`effect_table.rb:50`). The declared half is vacuous while the port's
+    /// declared lane is always ∅. Reachable from slice 3 on, so the DEFAULT
+    /// report now omits rows; the differential always passes `--full`.
     fn trivial(&self) -> bool {
-        self.exhaustive() && self.effects.iter().all(|label| label == "mutate.local")
-    }
-
-    fn exhaustive(&self) -> bool {
-        false
+        self.exhaustive && self.effects.iter().all(|label| label == "mutate.local")
     }
 }
 
-fn report_rows(files: &[String], full: bool) -> Vec<Row> {
+fn report_rows(files: &[String], full: bool, plugins: bool) -> Vec<Row> {
     let mut merged: std::collections::BTreeMap<String, Summary> = std::collections::BTreeMap::new();
     for path in files {
         for (key, summary) in scan_file(path) {
             merged.entry(key).or_default().join(summary);
         }
     }
+    // The run's own selector set, which the collector's edge taints resolve
+    // against — the port's stand-in for the propagator's edge resolution. It is
+    // knowable only once every file has been scanned, which is why the collector
+    // records candidate selectors rather than deciding.
+    let selectors: BTreeSet<String> =
+        merged.keys().map(|key| collect::selector_of(key).to_string()).collect();
     merged
         .into_iter()
-        .map(|(key, summary)| Row {
-            key,
-            effects: summary.proven(),
-            direct: summary.bundles().clone(),
+        .map(|(key, summary)| {
+            let exhaustive = !plugins && summary.exhaustive(&selectors);
+            let mut causes = summary.causes(&selectors);
+            // The plugin self-defense keeps `causes.empty? == exhaustive` true
+            // by naming its own reason, rather than emitting a bare `false` with
+            // nothing behind it. `plugin-attribution` is upstream's spelling for
+            // "a stratum claimed this and the analyzer did not read the body"
+            // (`unit_scan.rb:262`), which is exactly what is being withheld; the
+            // detail is the plugin row key upstream and unknown here.
+            if plugins && causes.is_empty() {
+                causes.push(("plugin-attribution".to_string(), None));
+            }
+            Row {
+                key,
+                effects: summary.proven(),
+                exhaustive,
+                causes,
+                direct: summary.bundles().clone(),
+            }
         })
         .filter(|row| full || !row.trivial())
         .collect()
@@ -332,16 +378,23 @@ fn render_json(rows: &[Row]) -> String {
                 (origin.clone(), serde_json::Value::from(labels.iter().cloned().collect::<Vec<_>>()))
             })
             .collect();
+        // `[[cause, detail], …]` — upstream's spelling exactly: a JSON array of
+        // two-element arrays, `detail` a string or `null`, the pairs
+        // de-duplicated and sorted by `[cause, detail]` (`summary.rb:143`).
+        let causes: Vec<serde_json::Value> = row
+            .causes
+            .iter()
+            .map(|(cause, detail)| {
+                serde_json::json!([cause, detail.as_ref().map(String::as_str)])
+            })
+            .collect();
         methods.insert(
             row.key.clone(),
             serde_json::json!({
                 "effects": row.effects,
                 "declared": Vec::<String>::new(),
-                "exhaustive": row.exhaustive(),
-                // Ungraded, and deliberately OUT of upstream's closed
-                // `TaintCause::ALL` enum: slice 2 has no taint model, so it
-                // says so rather than borrowing a cause it did not compute.
-                "causes": [["port-incomplete", "taint is ADR-0043 slice 3"]],
+                "exhaustive": row.exhaustive,
+                "causes": causes,
                 "direct": direct,
             }),
         );
@@ -352,7 +405,7 @@ fn render_json(rows: &[Row]) -> String {
 
 fn render_text(rows: &[Row]) {
     for row in rows {
-        let suffix = if row.exhaustive() { "" } else { " …?" };
+        let suffix = if row.exhaustive { "" } else { " …?" };
         println!("{}: [{}]{suffix}", row.key, row.effects.join(", "));
     }
 }
@@ -397,15 +450,24 @@ mod tests {
         assert!(!annotation_hint("# talks about %a{ and effects"));
     }
 
-    #[test]
-    fn a_row_is_never_trivial_while_the_port_declines_the_taint_bit() {
-        let row = Row {
-            key: "C#m".to_string(),
-            effects: vec!["mutate.local".to_string()],
+    fn row(key: &str, effects: &[&str], exhaustive: bool, causes: &[(&str, Option<&str>)]) -> Row {
+        Row {
+            key: key.to_string(),
+            effects: effects.iter().map(|l| (*l).to_string()).collect(),
+            exhaustive,
+            causes: causes
+                .iter()
+                .map(|(cause, detail)| ((*cause).to_string(), detail.map(str::to_string)))
+                .collect(),
             direct: std::collections::BTreeMap::new(),
-        };
-        assert!(!row.exhaustive());
-        assert!(!row.trivial(), "`--full` and the default must list the same rows");
+        }
+    }
+
+    #[test]
+    fn trivial_reads_the_taint_bit_and_is_reachable_from_slice_3() {
+        assert!(!row("C#m", &["mutate.local"], false, &[("dynamic-receiver", None)]).trivial());
+        assert!(row("C#m", &["mutate.local"], true, &[]).trivial());
+        assert!(!row("C#m", &["io.fs.read"], true, &[]).trivial(), "a real label is never trivial");
     }
 
     #[test]
@@ -413,6 +475,8 @@ mod tests {
         let rows = vec![Row {
             key: "C#m".to_string(),
             effects: vec!["io.fs.read".to_string()],
+            exhaustive: false,
+            causes: vec![("unresolved-self-call".to_string(), Some("helper".to_string()))],
             direct: [("catalogue:File.read".to_string(), ["io.fs.read".to_string()].into())]
                 .into_iter()
                 .collect(),
@@ -423,7 +487,25 @@ mod tests {
         assert_eq!(entry["effects"], serde_json::json!(["io.fs.read"]));
         assert_eq!(entry["declared"], serde_json::json!([]));
         assert_eq!(entry["exhaustive"], serde_json::json!(false));
+        // Upstream's `causes` spelling exactly, `port-incomplete` retired.
+        assert_eq!(entry["causes"], serde_json::json!([["unresolved-self-call", "helper"]]));
         assert_eq!(entry["direct"]["catalogue:File.read"], serde_json::json!(["io.fs.read"]));
+
+        // A cause with no detail renders `null`, not the string "null".
+        let bare = vec![row("C#n", &[], false, &[("dynamic-send", None)])];
+        let payload: serde_json::Value =
+            serde_json::from_str(&render_json(&bare)).expect("valid JSON");
+        assert_eq!(payload["methods"]["C#n"]["causes"], serde_json::json!([["dynamic-send", null]]));
+
+        // An exhaustive row carries NO causes — the port's own
+        // `causes.empty? == exhaustive` invariant, which slice 2's out-of-enum
+        // marker broke.
+        let clean = vec![row("C#o", &[], true, &[])];
+        let payload: serde_json::Value =
+            serde_json::from_str(&render_json(&clean)).expect("valid JSON");
+        assert_eq!(payload["methods"]["C#o"]["exhaustive"], serde_json::json!(true));
+        assert_eq!(payload["methods"]["C#o"]["causes"], serde_json::json!([]));
+
         // An empty report is still a parseable object — the grader reads
         // `None` as INVALID, not as "0 methods".
         let empty: serde_json::Value =
@@ -474,10 +556,62 @@ mod tests {
         );
         // THE CONTROL: the same file set, through the same report path, must
         // produce a method. Without this the negative case above proves nothing.
-        let rows = report_rows(&files, true);
+        let rows = report_rows(&files, true, false);
         assert_eq!(rows.len(), 1, "the control project must report its method");
         assert_eq!(rows[0].key, "X#m");
         assert_eq!(rows[0].effects, ["io.output.stdout"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // The PLUGIN self-defense, both directions.
+    //
+    // Same shape as the annotation one and for the same reason: a predicate
+    // that answered "plugins" for every project would make the exhaustiveness
+    // lane green by construction — 0 OVER with the bit never claimed is exactly
+    // what slice 2 shipped — and would look like a passing slice. So the
+    // negative case is not "the predicate returns false", it is "the predicate
+    // returns false AND that project still REACHES exhaustiveness".
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_plugin_free_project_still_reaches_exhaustiveness() {
+        let root = scratch("plainplugins");
+        let cfg = scratch_config(&root);
+        assert!(!configures_plugins(&cfg), "a config with no `plugins:` must not suppress");
+
+        // THE MUST-STILL-FIRE CONTROL. `puts` is a `Kernel` row and no project
+        // unit is called `puts`, so nothing taints and nothing keeps an edge:
+        // this method MUST come out exhaustive. If it does not, the taint bit is
+        // unreachable and every 0-OVER verdict below is vacuous.
+        let files = vec![root.join("lib/x.rb").to_string_lossy().into_owned()];
+        let rows = report_rows(&files, true, false);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].exhaustive, "a plugin-free project must still reach exhaustiveness");
+        assert!(rows[0].causes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plugin_bearing_project_never_claims_exhaustiveness() {
+        let root = scratch("plugins");
+        let mut cfg = scratch_config(&root);
+        cfg.plugins = vec!["rigor-actionpack".to_string()];
+        assert!(configures_plugins(&cfg));
+
+        // The SAME file that is exhaustive above must now be withheld — and the
+        // rows are still reported, which is what makes this narrower than the
+        // annotation self-defense's `methods: {}`.
+        let files = vec![root.join("lib/x.rb").to_string_lossy().into_owned()];
+        let rows = report_rows(&files, true, true);
+        assert_eq!(rows.len(), 1, "the rows themselves are NOT withheld");
+        assert_eq!(rows[0].effects, ["io.output.stdout"]);
+        assert!(!rows[0].exhaustive);
+        // …and the bit is not bare: the invariant `causes.empty? == exhaustive`
+        // holds on the port side.
+        assert_eq!(rows[0].causes, [("plugin-attribution".to_string(), None)]);
 
         let _ = std::fs::remove_dir_all(&root);
     }
