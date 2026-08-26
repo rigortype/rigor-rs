@@ -3,13 +3,16 @@
 This tree holds the **exact** two data files that make up Rigor's effect
 catalogue, vendored into the repo so the analyzer is standalone
 ([ADR-0043](../../../../docs/adr/0043-effect-system-port-parity-model.md) slice
-1). They are embedded byte-for-byte with `include_str!` from
-`crates/rigor-effects/src/lib.rs` (`REGISTRY_YML` / `CORE_YML`) — no `build.rs`,
-no codegen — and parsed lazily on first use.
+1), plus **one derived file** slice 2 added because upstream keeps its contents
+as code rather than data. All three are embedded byte-for-byte with
+`include_str!` from `crates/rigor-effects/src/lib.rs` (`REGISTRY_YML` /
+`CORE_YML` / `MUTATORS_YML`) — no `build.rs`, no codegen — and parsed lazily on
+first use.
 
-The files here are **verbatim** copies — never hand-edit them. A hand-edit fails
-`cargo test -p rigor-effects` on the digest assertion below, and a drift against
-the pin fails `python3 harness/vendor_effects.py --check`.
+Never hand-edit any of them: the two copies are **verbatim**, the third is
+**generated**. A hand-edit fails `cargo test -p rigor-effects` on the digest
+assertions below, and a drift against the pin fails
+`python3 harness/vendor_effects.py --check`.
 
 ## Contents
 
@@ -58,31 +61,64 @@ the pin fails `python3 harness/vendor_effects.py --check`.
   which a resolving loader would splice into the enclosing `methods:` map. Four
   rows depend on it (`IO`, `File`, `SizedQueue`, `Logger`).
 
-## The three carve-outs — this copy is COMPLETE, not truncated
+### `mutators.yml` — the three by-reference mutator sets (DERIVED)
 
-The data file deliberately does not re-spell three things, and a reader who sees
+- **Source paths:** `reference/rigor/lib/rigor/inference/mutation_widening.rb`
+  (`ARRAY_MUTATORS`, `HASH_MUTATORS`) and
+  `reference/rigor/lib/rigor/effects/mutation_classifier.rb`
+  (`STRING_MUTATORS`) — the PINNED submodule.
+- **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`), ADR-0043 slice 2.
+- **`sha256`** `5bd8091db9ce2cf593ffe6409154482a38c452967b5d0ad075403e5525915ed7`.
+  This digests the GENERATOR'S OUTPUT, not an upstream file: `--check`
+  regenerates the document in memory from the pinned Ruby and compares bytes, so
+  a `%i[…]` literal that moves upstream fails the gate exactly as an edited copy
+  would.
+- **What it is:** `schema: 1` and three sets — **array 31**, **hash 15**,
+  **string 26** selectors, each with the `lib/…: CONSTANT` it was lifted from.
+- **Why it is derived rather than copied:** upstream has no data file for it.
+  `core.yml` names the sets BY REFERENCE (`mutators: array`) and upstream's
+  internal spec makes that normative — "The data file MUST NOT re-spell a
+  selector list" (`docs/internal-spec/effect-summaries.md:169`) — because the
+  widening rules and the effect model share one hand-audited list and must never
+  drift apart. The port needs the contents: a selector in its class's set is a
+  receiver mutation on the ROW path (`catalog.rb:259`'s `in_mutator_set`) AND on
+  the POSTURE path (`catalog.rb:194`).
+- **Extraction hazard, for whoever next reads the generator:** `[]=` is a member
+  of all three sets and spells a balanced `[` `]` INSIDE the Ruby literal, which
+  is how `%i[…]` reads it. The extractor counts bracket DEPTH; a regex stopping
+  at the first `]` truncates `ARRAY_MUTATORS` at `fill` and silently drops 13
+  selectors. The pinned counts are what catch that.
+
+## The carve-outs — this copy is COMPLETE, not truncated
+
+The data file deliberately does not re-spell two things, and a reader who sees
 `mutators: array` with no selector list will otherwise assume the copy was cut
-short. All three are **code, not data**; the first two are ADR-0043 slice 2, the
-third is out of the ADR's scope entirely.
+short. Both are **code, not data**; the second is out of ADR-0043's scope
+entirely.
 
-1. **The mutator sets, by reference.** `mutators: array | hash | string`
-   resolves upstream through `Catalog::MUTATOR_SETS` (`catalog.rb:43`) to
-   `Inference::MutationWidening::ARRAY_MUTATORS` (**31** selectors),
-   `HASH_MUTATORS` (**15**) and `Effects::MutationClassifier::STRING_MUTATORS`
-   (**26**). Upstream's internal spec makes the omission normative — "The data
-   file MUST NOT re-spell a selector list"
-   (`docs/internal-spec/effect-summaries.md:169`). Slice 1 carries the set NAME
-   only (`ClassEntry::mutator_set`).
-2. **The narrowing handler BODIES.** A row's `narrow:` names one of the **7**
+Slice 2 CLOSED the first of the three slice 1 recorded — the mutator sets, now
+`mutators.yml` above. The set NAME is still what `core.yml` carries and what
+`ClassEntry::mutator_set` reports; what changed is that the name is now
+EXPANDED, so `Array#push` answers `mutates_receiver == true` as upstream does.
+
+1. **The narrowing handler BODIES.** A row's `narrow:` names one of the **7**
    handlers in `Effects::Narrowing::HANDLERS`
    (`lib/rigor/effects/narrowing.rb:55`) — `kernel_open file_open
    pathname_open time_new random_new uri_open sql_verb`. `core.yml` uses **6**
    of them across **7** rows; `sql_verb` has no `core.yml` row at all and serves
-   PLUGIN rows. Slice 1 carries the handler NAMES (validated against that list at
-   load, as upstream does) and none of the bodies, so a narrowed row answers its
-   **unnarrowed** `effects:` — which is exactly upstream's own answer when it is
-   handed no call node, and the sound upper bound the handler degrades to.
-3. **The plugin effect layer.** `plugins/*/lib/rigor/plugin/*/effects.rb` (1,107
+   PLUGIN rows. This crate carries the handler NAMES (validated against that list
+   at load, as upstream does) and none of the bodies, so `Catalog::lookup`
+   answers a narrowed row's **unnarrowed** `effects:` — exactly upstream's own
+   answer when it is handed no call node, and the sound upper bound the handler
+   degrades to.
+
+   Slice 2 implements the six bodies in `crates/rigor-cli/src/effects/`, not
+   here, because they read a **Prism call node** and this crate depends on no
+   crate of ours. `Catalog::resolve` is the seam: it hands the `Row` back
+   un-collapsed so the consumer branches on `Row::narrow` itself. A consumer
+   that reads `lookup` instead gets the parent label, which ADR-0043 § 2 grades
+   as an OVER rather than as a coarser truth.
+2. **The plugin effect layer.** `plugins/*/lib/rigor/plugin/*/effects.rb` (1,107
    lines across 9 Rails plugins) contributes its own rows, attributions, edges,
    entry-point presets and an `effect_labels:` root extension. It is the sole
    consumer of the 7th narrowing handler and of the `io.db.*` / `job.enqueue` /
@@ -105,7 +141,10 @@ Then read the diff as a **semantic** change, not a copy. `retired:` gaining an
 entry and `vocabulary:` bumping are the two that can invalidate a committed
 `.rigor-effects.yml`; a `schema:` bump changes the row grammar; and a re-audit
 that moves `IO#write` from `io` to `io.fs.write` changes every summary with no
-source change on either side.
+source change on either side. A `mutators.yml` diff is the same kind of event
+one layer down: a selector entering `ARRAY_MUTATORS` makes that call a proven
+`mutate.*` in every project that makes it, so the generator REFUSES to write a
+set whose size moved and the crate pins 31 / 15 / 26 in a test.
 
 Never source this from a local rigor checkout — that is `UPSTREAM.md` hazard 3,
 and the vendored plugin RBS is the recorded case of that hazard applied to a
@@ -125,7 +164,11 @@ Three layers, and only the middle one is coverage-independent:
    the instant the pin moves under an unchanged copy.
 3. **The embedded-bytes digest assertion** — `src/lib.rs`'s
    `the_embedded_bytes_match_the_provenance_digests`, which catches a hand-edit
-   under plain `cargo test`, in a checkout whose `reference/rigor` is empty.
+   of any of the three files under plain `cargo test`, in a checkout whose
+   `reference/rigor` is empty. `mutators.rs`'s count test (31 / 15 / 26) sits
+   beside it and is what a truncated extraction fails.
 
 `harness/effects_diff.py` is the *behavioural* gate and grades **6 of the 420
-rows (1.4 %)** today. It cannot be the drift gate, which is why layer 2 exists.
+rows (1.4 %)** today. It cannot be the drift gate, which is why layer 2 exists —
+and slice 2's own composition probes (a scratch project measured against the
+oracle, `docs/notes/20260826-effects-s2-impl.md`) exist for the same reason.

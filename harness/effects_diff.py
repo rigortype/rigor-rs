@@ -77,10 +77,16 @@ def crate_source_dirs():
 
     The `rigor-cli` path-dependency closure, read out of the manifests — NOT
     every `crates/*` entry. `crates/*` is a workspace GLOB, and a member nothing
-    links is not an input to the binary: `rigor-effects` (ADR-0043 slice 1) is
-    deliberately such a member, so scanning it would make the binary read as
-    PERMANENTLY stale — cargo never rebuilds `rigor` for it. Derived, never an
-    exclusion list; twin of `harness/fp_audit.py`'s.
+    links is not an input to the binary, so scanning one would make the binary
+    read as PERMANENTLY stale: cargo never rebuilds `rigor` for it.
+
+    `rigor-effects` was exactly that case through ADR-0043 slice 1, when nothing
+    linked it. Slice 2 gave it a consumer — `rigor-cli`'s `effects` collector —
+    and the crate therefore RE-ENTERED this scan on its own, with no edit here,
+    which is the whole point of deriving the set instead of listing it. Its
+    `vendor/effects/*.yml` are `include_str!`d, so a re-vendored catalogue now
+    correctly reads as a stale binary. Derived, never an exclusion list; twin of
+    `harness/fp_audit.py`'s.
     """
     root = os.path.join(REPO, "crates")
     seen, queue = {}, ["rigor-cli"]

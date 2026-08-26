@@ -73,16 +73,29 @@ class Origins
     (a + b) * 2
   end
 
-  # Mutating an object the frame OWNS (fresh, unescaped) is `mutate.local`,
-  # which every envelope tolerates (WD4). Distinguishing it from `mutate.arg` is
-  # the ownership half of the model.
+  # NOT `mutate.local` — measured, this is `effects: []` + `exhaustive: false`
+  # + `causes: [["unknown-ownership", null]]`, and the fixture is correct as
+  # recorded. The method's TAIL is a bare `buffer` read, and `LocalOwnership`'s
+  # `trailing_reads` counts that as an escape (a body whose value is a local
+  # hands it to the caller), so the frame does not own it after all.
+  #
+  # `mutate.local` IS reachable — `s = +""; s.upcase!; nil` proves it, and a
+  # `; nil` tail is the whole difference — but no method in this corpus produces
+  # one. Growing that coverage is ADR-0043 slice 2's corpus work, not a change
+  # to this method: what it pins is the CONSERVATIVE direction of the ownership
+  # rule, which is worth a fixture of its own.
   def owns_what_it_mutates
     buffer = []
     buffer << 1
     buffer
   end
 
-  # Mutating an ARGUMENT is not the same thing.
+  # NOT `mutate.instance` either, and for a different reason: `list` is an
+  # untyped parameter, so the typer names no receiver class, so `mutating?`
+  # declines `<<` — it is a mutator only on a KNOWN Array / Hash / String,
+  # because `n << 2` is a bit shift and `io << "x"` is output. Measured:
+  # `effects: []` + a `dynamic-receiver` cause. `list[0] = 1` would reach the
+  # `mutate.instance` case, since `[]=` claims a write on every receiver.
   def mutates_its_argument(list)
     list << 1
     list

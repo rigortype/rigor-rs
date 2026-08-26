@@ -54,10 +54,10 @@ pub const NARROWING_HANDLERS: &[&str] = &[
 ];
 
 /// The mutator sets a class may name, by reference (upstream's
-/// `Catalog::MUTATOR_SETS`, `catalog.rb:43`). Names only: the selector lists
-/// live in `MutationWidening` / `MutationClassifier` and are slice-2 code. The
-/// internal spec makes the by-reference rule normative — "The data file MUST
-/// NOT re-spell a selector list".
+/// `Catalog::MUTATOR_SETS`, `catalog.rb:43`). The internal spec makes the
+/// by-reference rule normative — "The data file MUST NOT re-spell a selector
+/// list" — so `core.yml` carries only these names and the selectors arrive
+/// through [`crate::mutators`], extracted from the pinned Ruby.
 pub const MUTATOR_SETS: &[&str] = &["array", "hash", "string"];
 
 // ---------------------------------------------------------------------------
@@ -150,10 +150,9 @@ impl Entry {
         &self.labels
     }
 
-    /// Whether the row declares `mutates: receiver`.
-    ///
-    /// Slice-1 carve-out: on the POSTURE path this is always `false`, because
-    /// deciding it requires expanding a mutator set (crate docs, carve-out 1).
+    /// Whether this call is a receiver mutation on the catalogue's own reading
+    /// — the row's `mutates: receiver`, or (either on a row or on the posture)
+    /// the selector being a member of the class's `mutators:` set.
     #[must_use]
     pub fn mutates_receiver(&self) -> bool {
         self.mutates_receiver
@@ -178,6 +177,11 @@ pub struct Row {
 impl Row {
     /// The row's own labels — for a narrowed row, its **unnarrowed** answer:
     /// the upper bound the handler degrades to.
+    ///
+    /// **A slice-2 consumer holding the call node must branch on
+    /// [`Self::narrow`] before reading this** (ADR-0043 § 2 grades the proven
+    /// lane as a raw STRING-set subset, so `io.fs` where the oracle proves
+    /// `io.fs.read` is an OVER, not a coarser truth).
     #[must_use]
     pub fn labels(&self) -> &[String] {
         self.entry.labels()
@@ -212,7 +216,13 @@ impl Row {
 }
 
 /// One class of the data file, resolved: its two method buckets, its posture's
-/// labels, its mutator-set NAME, and the two memoised posture [`Entry`]s.
+/// labels, its mutator set (name AND expansion), and the three memoised posture
+/// [`Entry`]s.
+///
+/// Three, not two, for the reason upstream's `posture_entry(singleton,
+/// mutating)` memoises three (`catalog.rb:88-97`): only the instance side can be
+/// a receiver mutation, so the singleton side needs one entry and the instance
+/// side needs a mutating and a non-mutating one.
 #[derive(Debug)]
 pub struct ClassEntry {
     instance_methods: BTreeMap<String, Row>,
@@ -221,9 +231,11 @@ pub struct ClassEntry {
     posture_labels: Vec<String>,
     singleton_posture_labels: Vec<String>,
     mutators: Option<String>,
+    mutator_selectors: BTreeSet<String>,
     object: bool,
     why: String,
     posture_entry: Entry,
+    mutating_posture_entry: Entry,
     singleton_posture_entry: Entry,
 }
 
@@ -261,13 +273,17 @@ impl ClassEntry {
     }
 
     /// The `mutators:` set NAME this class references, or `None`.
-    ///
-    /// Slice-1 carve-out: the name is never expanded (crate docs, carve-out 1).
-    /// Slice 2 resolves it to `MutationWidening::ARRAY_MUTATORS` (31 selectors)
-    /// / `HASH_MUTATORS` (15) / `MutationClassifier::STRING_MUTATORS` (26).
     #[must_use]
     pub fn mutator_set(&self) -> Option<&str> {
         self.mutators.as_deref()
+    }
+
+    /// Whether `selector` is in this class's `mutators:` set — upstream's
+    /// `entry.mutators.include?(name)` (`catalog.rb:194`), the second disjunct
+    /// of both mutation questions. Always false for a class with no set.
+    #[must_use]
+    pub fn in_mutator_set(&self, selector: &str) -> bool {
+        self.mutator_selectors.contains(selector)
     }
 
     /// Whether the constant names an OBJECT rather than a class, so a call on
@@ -427,8 +443,9 @@ impl Catalog {
     /// call spells `Kernel#name`, and defaulting every unqualified call in a
     /// project body to `io` would colour the world.
     ///
-    /// Slice-1 carve-out: a narrowed row answers its UNNARROWED entry, which is
-    /// exactly upstream's answer when it is handed no call node.
+    /// Carve-out: a narrowed row answers its UNNARROWED entry, which is exactly
+    /// upstream's answer when it is handed no call node. A caller that HAS the
+    /// call node must go through [`Self::resolve`] instead.
     #[must_use]
     pub fn lookup_with(
         &self,
@@ -437,20 +454,65 @@ impl Catalog {
         singleton: bool,
         posture: bool,
     ) -> Option<&Entry> {
+        Some(match self.resolve(owner, selector, singleton, posture)? {
+            Resolution::Row(row) => &row.entry,
+            Resolution::Universal(entry) | Resolution::Posture(entry) => entry,
+        })
+    }
+
+    /// The same precedence, resolved WITHOUT collapsing a narrowed row to its
+    /// unnarrowed entry — which is the only form a slice-2 consumer may read.
+    ///
+    /// [`Self::lookup_with`] is upstream's `lookup(…, call_node: nil)`: sound,
+    /// and an OVER the moment a caller with the call node in hand uses it,
+    /// because the proven lane is graded as a raw string-set subset
+    /// (ADR-0043 § 2 — `io.fs` where the oracle proved `io.fs.read` is an
+    /// over-claim). `resolve` hands the [`Row`] back so the caller can branch on
+    /// [`Row::narrow`] and run the handler over its own AST; the two ∅-shaped
+    /// arms are returned distinctly for the same reason [`Entry::posture`]
+    /// exists.
+    #[must_use]
+    pub fn resolve(
+        &self,
+        owner: &str,
+        selector: &str,
+        singleton: bool,
+        posture: bool,
+    ) -> Option<Resolution<'_>> {
         let entry = self.classes.get(owner)?;
         let bucket =
             if singleton { &entry.singleton_methods } else { &entry.instance_methods };
         if let Some(row) = bucket.get(selector) {
-            return Some(&row.entry);
+            return Some(Resolution::Row(row));
         }
         if self.universal.contains(selector) {
-            return Some(&UNIVERSAL_ENTRY);
+            return Some(Resolution::Universal(&UNIVERSAL_ENTRY));
         }
         if !posture {
             return None;
         }
-        Some(if singleton { &entry.singleton_posture_entry } else { &entry.posture_entry })
+        Some(Resolution::Posture(if singleton {
+            &entry.singleton_posture_entry
+        } else if entry.in_mutator_set(selector) {
+            &entry.mutating_posture_entry
+        } else {
+            &entry.posture_entry
+        }))
     }
+}
+
+/// Which tier of the precedence answered — the shape [`Catalog::resolve`]
+/// returns, and the reason it exists rather than a bare [`Entry`].
+#[derive(Debug, Clone, Copy)]
+pub enum Resolution<'a> {
+    /// The class's own row. **May carry a `narrow:` handler** the caller has to
+    /// apply; [`Row::labels`] is only the unnarrowed upper bound.
+    Row(&'a Row),
+    /// The 34-name `universal:` list — an `Object`-level selector that exists on
+    /// every receiver and touches nothing.
+    Universal(&'a Entry),
+    /// The class's default posture. Never carries a handler.
+    Posture(&'a Entry),
 }
 
 impl RawClass {
@@ -494,25 +556,37 @@ fn build_class(
             return Err(Error::UnknownMutatorSet { class: name.to_string(), set: set.clone() });
         }
     };
+    // Upstream's `resolve_mutators` (`catalog.rb:238`) — the NAME expanded
+    // through the reference's own three literals. A class with no `mutators:`
+    // key gets the empty set, so `in_mutator_set` is a plain lookup everywhere.
+    let mutator_selectors = crate::mutators().set(mutators.as_deref()).clone();
     let posture_labels = resolve_posture(name, body.posture.as_deref(), postures)?;
     let singleton_posture_labels = resolve_posture(
         name,
         body.singleton_posture.as_deref().or(body.posture.as_deref()),
         postures,
     )?;
-    let instance_methods = build_rows(name, "#", body.methods)?;
-    let singleton_methods = build_rows(name, ".", body.singleton_methods)?;
+    // Only the INSTANCE bucket is handed the mutator set, exactly as upstream
+    // does (`catalog.rb:222-223`): `Array.push` is not a receiver mutation, and
+    // a singleton row that happens to share a mutator's name must not read as
+    // one.
+    let instance_methods = build_rows(name, "#", body.methods, &mutator_selectors)?;
+    let singleton_methods = build_rows(name, ".", body.singleton_methods, &BTreeSet::new())?;
 
     Ok(ClassEntry {
         instance_methods,
         singleton_methods,
         posture: body.posture,
         // Memoised rather than built per call — the lookup sits inside the
-        // effect scan's walk. `mutates_receiver` is false on both: deciding it
-        // needs the mutator set expanded, which is slice-2 code.
+        // effect scan's walk.
         posture_entry: Entry {
             labels: posture_labels.clone(),
             mutates_receiver: false,
+            from_posture: true,
+        },
+        mutating_posture_entry: Entry {
+            labels: posture_labels.clone(),
+            mutates_receiver: true,
             from_posture: true,
         },
         singleton_posture_entry: Entry {
@@ -523,6 +597,7 @@ fn build_class(
         posture_labels,
         singleton_posture_labels,
         mutators,
+        mutator_selectors,
         object: body.kind.as_deref() == Some("object"),
         why: body.why.unwrap_or_default(),
     })
@@ -544,11 +619,13 @@ fn build_rows(
     class_name: &str,
     joiner: &str,
     rows: Option<BTreeMap<String, Option<RawRow>>>,
+    mutators: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, Row>, Error> {
     let mut built = BTreeMap::new();
     for (selector, body) in rows.unwrap_or_default() {
         let key = format!("{class_name}{joiner}{selector}");
-        let row = build_row(&key, body.unwrap_or(RawRow::empty()))?;
+        let in_mutator_set = mutators.contains(&selector);
+        let row = build_row(&key, body.unwrap_or(RawRow::empty()), in_mutator_set)?;
         built.insert(selector, row);
     }
     Ok(built)
@@ -560,7 +637,7 @@ impl RawRow {
     }
 }
 
-fn build_row(key: &str, body: RawRow) -> Result<Row, Error> {
+fn build_row(key: &str, body: RawRow, in_mutator_set: bool) -> Result<Row, Error> {
     if let Some(handler) = &body.narrow {
         if !NARROWING_HANDLERS.contains(&handler.as_str()) {
             return Err(Error::UnknownNarrowingHandler {
@@ -573,10 +650,11 @@ fn build_row(key: &str, body: RawRow) -> Result<Row, Error> {
         return Err(Error::MissingWhy { key: key.to_string() });
     }
     let labels = label_set(key, body.effects)?;
-    // `in_mutator_set` is upstream's second disjunct here; slice 1 cannot
-    // evaluate it (crate docs, carve-out 1), so only the explicit declaration
-    // is read.
-    let mutates_receiver = body.mutates.as_deref() == Some("receiver");
+    // Upstream's `mutates_receiver = body["mutates"] == "receiver" ||
+    // in_mutator_set` (`catalog.rb:259`): an instance row whose selector is in
+    // its class's set is a receiver mutation even though the row never says so
+    // — `Array#push` has an `effects: []` row and mutates.
+    let mutates_receiver = body.mutates.as_deref() == Some("receiver") || in_mutator_set;
     Ok(Row {
         narrow: body.narrow,
         why: body.why.unwrap_or_default(),
@@ -689,7 +767,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The carve-outs, pinned so slice 2 has to change them deliberately.
+    // The carve-outs: one closed by slice 2, one still standing.
     // -----------------------------------------------------------------------
 
     #[test]
@@ -710,18 +788,118 @@ mod tests {
     }
 
     #[test]
-    fn posture_path_does_not_expand_the_mutator_set() {
-        // SLICE-1 CARVE-OUT. Upstream answers `mutates_receiver == true` for
-        // `Array#push` by expanding `MutationWidening::ARRAY_MUTATORS`; slice 1
-        // carries the set NAME only, so the posture path under-claims. That is
-        // the safe direction (ADR-0043 § 2) and nothing consumes it yet.
-        let entry = catalog().lookup("Array", "push").expect("posture");
-        assert!(entry.posture());
-        assert!(!entry.mutates_receiver(), "slice 1 must not expand the mutator set");
+    fn every_narrowed_row_is_reachable_as_a_row_through_resolve() {
+        // The probe's § 7c gate: a slice-2 consumer resolves, sees `Row`, and
+        // branches on `narrow()`. A row that answered through the UNIVERSAL or
+        // POSTURE arm instead would silently hand the consumer the unnarrowed
+        // upper bound and turn `File.open(p, "w")` into an OVER.
+        let narrowed = [
+            ("File", "open", true),
+            ("Kernel", "open", false),
+            ("Pathname", "open", false),
+            ("Time", "new", true),
+            ("Random", "new", true),
+            ("URI", "open", true),
+            ("OpenURI", "open_uri", true),
+        ];
+        for (owner, selector, singleton) in narrowed {
+            let resolved = catalog()
+                .resolve(owner, selector, singleton, true)
+                .unwrap_or_else(|| panic!("{owner}.{selector} answers nothing"));
+            let Resolution::Row(row) = resolved else {
+                panic!("{owner}.{selector} did not answer as a ROW: {resolved:?}");
+            };
+            assert!(row.narrow().is_some(), "{owner}.{selector} lost its narrow: handler");
+        }
+        // …and exactly seven rows in the shipped catalogue carry one, so a
+        // handler upstream ADDS fails here rather than in a corpus nobody runs.
+        let with_handler = catalog()
+            .class_names()
+            .iter()
+            .flat_map(|name| {
+                let entry = catalog().class_entry(name).expect("listed");
+                entry.instance_methods().values().chain(entry.singleton_methods().values())
+            })
+            .filter(|row| row.narrow().is_some())
+            .count();
+        assert_eq!(with_handler, narrowed.len());
+    }
+
+    #[test]
+    fn the_mutator_set_is_expanded_on_the_row_and_the_posture_path() {
+        // SLICE-2: the slice-1 carve-out, closed. Upstream answers
+        // `mutates_receiver == true` for `Array#push` by expanding
+        // `MutationWidening::ARRAY_MUTATORS`; the port now expands the same
+        // three literals, extracted into `vendor/effects/mutators.yml`.
+        //
+        // The three value classes row almost nothing, so on the SHIPPED
+        // catalogue every mutator answers through the POSTURE arm — the one
+        // slice 1's pin named. `Array#push` and `String#squeeze!` both read
+        // `false` before this slice.
+        for (owner, selector) in [("Array", "push"), ("Hash", "store"), ("String", "squeeze!")] {
+            let posture = catalog().lookup(owner, selector).expect("posture");
+            assert!(posture.posture(), "{owner}#{selector} is not the posture arm");
+            assert!(posture.mutates_receiver(), "{owner}#{selector} is in its mutator set");
+            assert!(posture.labels().is_empty(), "…and still a `value` posture");
+        }
+        // …and a non-mutator on the same class stays non-mutating, which is what
+        // makes this an expansion rather than a class-wide flag.
+        let read_only = catalog().lookup("Array", "map").expect("posture");
+        assert!(!read_only.mutates_receiver());
+
         assert_eq!(catalog().class_entry("Array").expect("listed").mutator_set(), Some("array"));
+        assert!(catalog().class_entry("Array").expect("listed").in_mutator_set("push"));
 
         // An EXPLICIT `mutates: receiver` row still reads.
         assert!(catalog().lookup("Array", "shuffle!").expect("rowed").mutates_receiver());
+
+        // Three classes name a set; nothing else expands one.
+        let with_set: Vec<&str> = catalog()
+            .class_names()
+            .into_iter()
+            .filter(|name| catalog().class_entry(name).expect("listed").mutator_set().is_some())
+            .collect();
+        assert_eq!(with_set, ["Array", "Hash", "String"]);
+    }
+
+    #[test]
+    fn an_in_set_row_mutates_even_though_the_row_never_says_so() {
+        // The ROW disjunct of upstream's `mutates_receiver = body["mutates"] ==
+        // "receiver" || in_mutator_set`. It is unreachable on the SHIPPED
+        // catalogue — `Array#shuffle!` is the only rowed selector that is also
+        // in its class's set, and it declares `mutates: receiver` outright — so
+        // it is pinned over synthetic bytes instead of going untested.
+        let source = concat!(
+            "schema: 1\ndefaults:\n  value:\nclasses:\n  Array:\n    posture: value\n",
+            "    mutators: array\n",
+            "    methods:\n      push: { effects: [], why: rowed but silent }\n",
+            "      map: { effects: [], why: rowed and pure }\n"
+        );
+        let catalog = Catalog::from_yaml_str(source).expect("parses");
+        let pushed = catalog.lookup("Array", "push").expect("rowed");
+        assert!(!pushed.posture(), "the row must win over the posture");
+        assert!(pushed.mutates_receiver(), "an in-set ROW is a receiver mutation");
+        assert!(!catalog.lookup("Array", "map").expect("rowed").mutates_receiver());
+    }
+
+    #[test]
+    fn only_the_instance_side_expands_the_mutator_set() {
+        // `Array.new` is a singleton row and `new` is not a mutator anywhere;
+        // the load-bearing half is that the singleton BUCKET is built with no
+        // set at all, so a singleton selector sharing a mutator's name (`Hash`'s
+        // `[]`-family, `String.replace`-shaped) can never read as a receiver
+        // mutation. Upstream passes `nil` there (`catalog.rb:223`).
+        let entry = catalog().class_entry("String").expect("listed");
+        assert!(entry.in_mutator_set("replace"));
+        for row in entry.singleton_methods().values() {
+            assert!(!row.mutates_receiver(), "a singleton row expanded the mutator set");
+        }
+        // The singleton POSTURE entry likewise: `String.some_mutator_named_thing`
+        // is a call on the class object.
+        let singleton_posture =
+            catalog().lookup_with("String", "squeeze!", true, true).expect("posture");
+        assert!(singleton_posture.posture());
+        assert!(!singleton_posture.mutates_receiver());
     }
 
     // -----------------------------------------------------------------------

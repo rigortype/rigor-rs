@@ -334,6 +334,7 @@ dependencies = [
  "lsp-types",
  "rayon",
  "regex",
+ "rigor-effects",
  "rigor-index",
  "rigor-infer",
  "rigor-parse",
