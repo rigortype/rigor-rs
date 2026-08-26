@@ -31,17 +31,50 @@
 //! - **`"declared": []` on every method.** The declared lane is copied from the
 //!   author's annotation, and it is the one lane graded as an EXACT match — so
 //!   a port that cannot compute it must not report a method that HAS one. The
-//!   self-defense is lexical and total: a project carrying an effect annotation
-//!   (or an `effects.attribution:` table) reports `methods: {}`, which is
-//!   always an under-claim. [`carries_effect_annotations`].
+//!   self-defense is total: a project that could produce a declared lane at all
+//!   reports `methods: {}`, which is always an under-claim.
+//!   [`carries_effect_annotations`].
+//!
+//!   Upstream has **four** producers of that lane, and the predicate covers all
+//!   four (issue #114; the slice-6 probe § 6 measured what covering only two
+//!   costs — a project with `effects.envelopes:` scored 1 DECLARED-MISMATCH and
+//!   a `plugins:`-only project scored 3, both FATAL, both on correct code):
+//!
+//!   | producer | reference | this predicate's arm |
+//!   |---|---|---|
+//!   | `import_envelope` — an envelope at a call site | `unit_scan.rb:337` | the `ANNOTATION_HINT` line scan over the project's `sig/` + `.rb` (envelope strata 1–3) **and** `effects.envelopes:` (stratum 4) |
+//!   | `attribute` — the project's `effects.attribution:` table | `unit_scan.rb:370` | `effects.attribution:` |
+//!   | `attribute_plugin` — a loaded plugin's effect rows | `unit_scan.rb:258` | `plugins:` non-empty |
+//!   | `FrameworkUnits` — plugin-synthesised units born with a lane | `framework_units.rb:155` | `plugins:` non-empty |
+//!
+//!   The direction this forces reads backwards at face value — parity with the
+//!   reference here means MORE suppression, not less — and it is only
+//!   reconciled by ADR-0043 § 2's exact-match rule: lane-absent == lane-empty,
+//!   so silence is the sole sound answer for a lane the port cannot compute.
+//!
+//!   One RESIDUAL, stated rather than hidden: envelope stratum 5 — annotated
+//!   members of the BUILT RBS environment (gem-shipped signatures, bundled
+//!   overlays, core RBS) — has no arm of its own. At the pin the only `%a{…}`
+//!   in installed core/stdlib RBS is one `%a{pure}` in `core/regexp.rbs`, an
+//!   EMPTY bound that produces no declared label, and the non-empty ones live
+//!   in plugin RBS, which the `plugins:` arm covers. What is left uncovered is a
+//!   third-party gem shipping an annotated `.rbs` into a project that names no
+//!   plugin. Closing it needs an RBS annotation reader the port does not have
+//!   (`crates/rigor-index/src/rbs.rs` carries no `%a{…}` handling at all).
 //! - **No `"exhaustive": true` from a plugin-bearing project.** A plugin's rows
 //!   move the bit the UNSAFE way: a non-discharging row taints
 //!   (`unit_scan.rb:262`), and plugins additionally synthesise framework units
 //!   (`scanner.rb:163`) that widen the selector set the edge taint reads. The
 //!   port has no plugin effect stratum at all, so a project whose `.rigor.yml`
 //!   configures `plugins:` gets every bit withheld. [`configures_plugins`].
-//!   Deliberately NARROWER than the annotation self-defense — the rows are still
-//!   reported, and only the one lane the plugin could move is withheld.
+//!
+//!   Since #114 this is SUBSUMED at the `cmd_effects` call site — the same
+//!   `plugins:` list now suppresses the whole report, so [`report_rows`] is only
+//!   ever reached with `plugins: false` from there. It is kept rather than
+//!   deleted because it is the narrower and independently correct rule for the
+//!   one lane a plugin moves, it is the arm that survives whenever the declared
+//!   lane does land (ADR-0043 slice 6+), and deleting a working FP-safety
+//!   mechanism to tidy up a subsumption is how this repo has been burned before.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -163,6 +196,11 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     let rows = if carries_effect_annotations(&cfg, &config_path, &files, &project_root) {
         Vec::new()
     } else {
+        // `configures_plugins` is now an arm of the predicate above, so this
+        // argument is false on every path that reaches here. Spelled out rather
+        // than hard-coded: the plugin self-defense is a rule about the
+        // exhaustiveness bit, not about the declared lane, and it is what
+        // remains once the declared lane lands.
         report_rows(&files, full, configures_plugins(&cfg))
     };
 
@@ -212,8 +250,8 @@ fn resolve_paths(raw: &[&str], cfg: &crate::Config) -> Vec<String> {
     out
 }
 
-/// Whether this project carries an effect ANNOTATION or an
-/// `effects.attribution:` table — in which case the report is `methods: {}`.
+/// Whether this project can produce a DECLARED LANE at all — in which case the
+/// report is `methods: {}`.
 ///
 /// The declared lane is graded as an exact match (ADR-0043 § 2), a missing lane
 /// reads as ∅, and slice 2 does not implement the lane at all; so the only safe
@@ -221,16 +259,30 @@ fn resolve_paths(raw: &[&str], cfg: &crate::Config) -> Vec<String> {
 /// always an under-claim, and this makes "do not point the differential at an
 /// annotated project" a property of the binary rather than of the gate command.
 ///
-/// The test is LEXICAL — upstream's own routing regex over the project's `.rbs`
-/// and `.rb` surfaces — and never parses an envelope. Slice 6 replaces it with
-/// the caller-lane join.
+/// The union of upstream's four producers, tabulated in this module's docs. The
+/// ANNOTATION arm is LEXICAL — upstream's own routing regex over the project's
+/// `.rbs` and `.rb` surfaces — and never parses an envelope; the other three
+/// arms are config keys, which is all their producers need.
+///
+/// Widened by issue #114 after the slice-6 probe measured the two-arm version
+/// emitting a FATAL DECLARED-MISMATCH on correct code; the reproducers are
+/// `harness/effects-corpus/09_declared_envelopes` and `10_declared_plugins`.
+/// A later slice may REPLACE the lexical arm with a parsed envelope index
+/// (probe § 4c step 1) — which is a widening in precision, not a narrowing of
+/// the producer set.
 fn carries_effect_annotations(
     cfg: &crate::Config,
     config_path: &Path,
     files: &[String],
     project_root: &Path,
 ) -> bool {
-    if config_declares_attribution(config_path) {
+    if config_declares_effect_lane(config_path) {
+        return true;
+    }
+    // Producers 3 and 4 — a plugin's effect rows and the framework units a
+    // plugin synthesises. Both are keyed on the `plugins:` list alone, for the
+    // reasons [`configures_plugins`] states.
+    if configures_plugins(cfg) {
         return true;
     }
     let mut sources: Vec<PathBuf> = Vec::new();
@@ -248,17 +300,32 @@ fn carries_effect_annotations(
     })
 }
 
-/// Whether the config carries an `effects: { attribution: … }` table — a
-/// declared-lane producer (`unit_scan.rb:360`), and slice 6's. An absent config
-/// declares nothing; a config that does not PARSE refuses to report at all,
-/// because "I could not read it" is not "it has no table".
-fn config_declares_attribution(config_path: &Path) -> bool {
+/// Whether the config carries an `effects:` block that PRODUCES a declared
+/// lane. Two keys do, and no other key under `effects:` does:
+///
+/// - **`attribution:`** — the project's own attribution table, producer 2
+///   (`unit_scan.rb:370`);
+/// - **`envelopes:`** — envelopes by convention, which is producer 1's CONFIG
+///   stratum. `EnvelopeIndex.build` reads it as the third of the five strata an
+///   envelope can be written in (`envelope_index.rb:68`), so a project with no
+///   annotation anywhere still gets a lane. A `namespace:` entry distributes
+///   exactly as a class-level annotation does, i.e. over every method of every
+///   class it selects.
+///
+/// An absent config declares nothing; a config that does not PARSE refuses to
+/// report at all, because "I could not read it" is not "it has no table".
+///
+/// PRESENT-AND-NOT-NULL is the test, so `envelopes: []` suppresses although it
+/// produces nothing — the same reading the `attribution:` arm has always had,
+/// kept uniform deliberately. It is the safe direction (an under-claim), and
+/// making it exact would mean parsing entries the port does not otherwise read.
+fn config_declares_effect_lane(config_path: &Path) -> bool {
     let Ok(text) = std::fs::read_to_string(config_path) else { return false };
     let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else { return true };
-    value
-        .get("effects")
-        .and_then(|effects| effects.get("attribution"))
-        .is_some_and(|table| !table.is_null())
+    let Some(effects) = value.get("effects") else { return false };
+    ["attribution", "envelopes"]
+        .iter()
+        .any(|key| effects.get(key).is_some_and(|table| !table.is_null()))
 }
 
 fn collect_rbs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -279,7 +346,11 @@ fn collect_rbs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Whether the project's config activates any plugin — the trigger for the
-/// exhaustiveness self-defense above.
+/// exhaustiveness self-defense above, and (since #114) for the declared-lane
+/// one as well: a plugin's rows go to the DECLARED lane always
+/// (`unit_scan.rb:255-258`, `add_declared` runs whether or not the row
+/// discharges), and `FrameworkUnits` synthesises whole units born with a lane
+/// (`framework_units.rb:155`).
 ///
 /// Keyed on the `plugins:` list ALONE, and deliberately not on
 /// [`crate::Config::effective_plugins`]: the reference discovers effect-bearing
@@ -677,6 +748,81 @@ mod tests {
         // "I could not read it" is not "it has no table".
         std::fs::write(&config_path, b"paths:\n  - lib\n  bad indent: [\n").unwrap();
         assert!(carries_effect_annotations(&cfg, &config_path, &files, &root));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // The two arms issue #114 added, each with its own must-still-fire control.
+    //
+    // Widening a suppression is the one change that cannot fail its own gate:
+    // every fixture gets quieter, and quieter is the direction the differential
+    // grades as safe. So each arm owes a project that trips NEITHER trigger and
+    // still emits a real method — otherwise "suppress everything" would pass
+    // both of these tests and the whole corpus.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_envelopes_block_in_the_config_suppresses_and_a_config_without_one_still_reports() {
+        let root = scratch("envelopes");
+        let cfg = scratch_config(&root);
+        let files = vec![root.join("lib/x.rb").to_string_lossy().into_owned()];
+        let config_path = root.join(".rigor.yml");
+
+        // Producer 1's CONFIG stratum, the shape
+        // `harness/effects-corpus/09_declared_envelopes` reproduces: no
+        // annotation anywhere, and a declared lane regardless.
+        std::fs::write(
+            &config_path,
+            b"paths:\n  - lib\neffects:\n  envelopes:\n    - namespace: \"Svc::*\"\n      effect: [io.db]\n",
+        )
+        .unwrap();
+        assert!(
+            carries_effect_annotations(&cfg, &config_path, &files, &root),
+            "an `effects.envelopes:` block is a declared-lane producer"
+        );
+
+        // THE MUST-STILL-FIRE CONTROL: an `effects:` block carrying neither
+        // producer key, no `plugins:`, no annotation — this project must still
+        // be reported, and must still produce its method with its real label.
+        std::fs::write(&config_path, b"paths:\n  - lib\neffects:\n  tolerated: [io.fs]\n").unwrap();
+        assert!(!carries_effect_annotations(&cfg, &config_path, &files, &root));
+        let rows = report_rows(&files, true, false);
+        assert_eq!(rows.len(), 1, "the control project must report its method");
+        assert_eq!(rows[0].key, "X#m");
+        assert_eq!(rows[0].effects, ["io.output.stdout"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plugins_list_suppresses_the_whole_report_and_a_plugin_free_project_still_reports() {
+        let root = scratch("declaredplugins");
+        let files = vec![root.join("lib/x.rb").to_string_lossy().into_owned()];
+        let config_path = root.join(".rigor.yml");
+        std::fs::write(&config_path, b"paths:\n  - lib\n").unwrap();
+
+        // Producers 3 and 4, the shape `harness/effects-corpus/10_declared_plugins`
+        // reproduces: a `plugins:` entry and NOTHING else — no `effects:` block,
+        // no `sig/`, no annotation.
+        let mut with_plugins = scratch_config(&root);
+        with_plugins.plugins = vec!["rigor-activesupport-core-ext".to_string()];
+        assert!(
+            carries_effect_annotations(&with_plugins, &config_path, &files, &root),
+            "a configured plugin's effect rows go to the declared lane, always"
+        );
+
+        // THE MUST-STILL-FIRE CONTROL: the SAME project with the `plugins:`
+        // entry removed is reported, and reports its method with its real
+        // label. This is the assertion that fails if the widening ever
+        // degenerates into "suppress every project".
+        let plugin_free = scratch_config(&root);
+        assert!(!carries_effect_annotations(&plugin_free, &config_path, &files, &root));
+        let rows = report_rows(&files, true, configures_plugins(&plugin_free));
+        assert_eq!(rows.len(), 1, "the control project must report its method");
+        assert_eq!(rows[0].key, "X#m");
+        assert_eq!(rows[0].effects, ["io.output.stdout"]);
+        assert!(rows[0].exhaustive, "…and must still reach exhaustiveness");
 
         let _ = std::fs::remove_dir_all(&root);
     }

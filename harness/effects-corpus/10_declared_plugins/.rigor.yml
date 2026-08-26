@@ -1,0 +1,13 @@
+# Producers 3 and 4 — a `plugins:` list and NOTHING else (issue #114; the
+# slice-6 probe § 6b). No `effects:` block, no `sig/`, no annotation: the whole
+# declared lane on this project comes from the plugin's own effect rows.
+#
+# `rigor-activesupport-core-ext` is BUNDLED by the pinned reference
+# (`plugins/rigor-activesupport-core-ext/lib/…`), and `Plugin::Loader`
+# `require`s a bundled plugin by its engine-relative path rather than by gem
+# name (`loader.rb:74`, upstream #194 slice 2), so this entry resolves from the
+# submodule with no extra load path and no installed gem.
+paths:
+  - .
+plugins:
+  - rigor-activesupport-core-ext
