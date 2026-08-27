@@ -90,6 +90,28 @@ Two more rules that follow, and are stated so a slice cannot quietly break them:
   exists on our side of the closed world and not on theirs, so any envelope over
   it is judged against evidence the oracle never had.
 
+**Caveat, added 2026-08-28 (issue #116): the exhaustive row REVERSES on the
+snapshot surface, where it meets the rule above.** The two are consistent for
+the REPORT and contradict each other in `.rigor-effects.yml`, because
+`Snapshot.omit?` (`snapshot.rb:293-300`) reads the taint bit: a row that is
+exhaustive-and-trivial is dropped, so being **more** tainted does not merely
+under-claim — it KEEPS a row the oracle omits, which is "a method rigor-rs
+reports that the reference does not". Measured reproducer:
+`TypeFree#owned_writer` in `harness/effects-corpus/07_mutators`, where both
+engines agree on `effects: ["mutate.local"]` and on the origin bundle
+(`construct:receiver-mutation`) and differ only in the bit — the oracle omits
+the row, the port would write it. Two rows on that fixture today.
+
+So the exhaustive row's "more taint is safe" holds **only where a
+non-exhaustive summary produces no finding**. It does not hold where the bit
+selects what gets WRITTEN. Any port snapshot writer must omit a row whenever
+EITHER reading would omit it — treating `proven ⊆ {mutate.local} ∧ declared ∅`
+as omission regardless of its own bit — which is strictly an under-claim and is
+the only direction that survives both rules. Whether the port does that, or the
+artifact records the divergence instead, is open; the
+[slice-5 probe](../notes/20260826-effects-s5-probe.md) § 5a states the case and
+[the snapshot gate note](../notes/20260826-s116-snapshot-gate.md) measures it.
+
 ### 3. `.rigor-effects.yml` is the parity artifact; the JSON report is the detail
 
 Two surfaces, both already diffable, and the port owes both:
@@ -106,10 +128,15 @@ Two surfaces, both already diffable, and the port owes both:
   exposes the taint bit and the origin attribution — a summary that is right for
   the wrong reason is a slice away from being wrong.
 
-The snapshot header (`rigor:` version, `vocabulary:`, `config_digest:`) is
-**excluded** from the comparison: the version string necessarily differs
-(`0.3.4` vs `0.0.1`), and the digest covers config both sides read identically.
-Excluding it is a normalisation, and the harness states it rather than hiding it.
+Of the snapshot header's four fields, only **`rigor:` is excluded** from the
+comparison: the version string necessarily differs (`0.3.4` vs `0.0.1`).
+`schema:`, `vocabulary:` and `config_digest:` are all reproducible — a
+constant, the vendored registry's version, and a pure function of the parsed
+`effects:` block — and each is a pin-tracking fact worth failing on, so all
+three are compared. *(Narrowed 2026-08-28, issue #116; it excluded all four
+until then, which hid `schema:`, the one field whose whole job is to say "an
+older reader would misread this file".)* Excluding `rigor:` is a normalisation,
+and the harness states it rather than hiding it.
 
 ### 4. `harness/effects_diff.py` is the instrument
 
@@ -158,8 +185,32 @@ because the snapshot is what makes every later slice measurable:
 | 2 | **direct** summaries: catalogue rows + the construct origins (backticks, `$gvar`, `@@cvar`, `@ivar` writes, `alias`/`undef`, `define_method`) | 0 OVER on the fixture set |
 | 3 | the taint bit and its causes (unresolved / dynamic receivers) | 0 OVER; taint at least as strict as the oracle's |
 | 4 | transitive propagation over the project call graph, overrides joined | 0 OVER |
-| 5 | `rigor effects` + `--format=json` + `effects update` / `check` / `diff` | snapshot byte-comparable modulo the excluded header |
+| 5 | `rigor effects` + `--format=json` + `effects update` / `check` / `diff` | the snapshot gate below |
 | 6+ | the declared lane, envelopes, and the `effect.*` diagnostics | ADR-0002's existing gate, once the diagnostics exist |
+
+**Row 5's gate, restated 2026-08-28 (issue #116).** It read "snapshot
+byte-comparable modulo the excluded header", and that is **unmeetable as
+written**, not merely far off: `unresolved:` renders the reference's own account
+of why its typer declined, and 4,503 of mastodon's 4,525 parameterised
+`dynamic-receiver(…)` causes carry a typer-internal reason code
+(`unsupported_syntax` ×3,297, `inferred_return_untyped` ×1,206) that a
+typer-free port cannot produce. Byte-parity's structural ceiling measures at
+**19 % on mastodon/app** against 89–100 % on the fixtures — the fixture blind
+spot again, and a fourth vacuous gate if adopted unchanged
+([the slice-5 probe](../notes/20260826-effects-s5-probe.md) § 3). What is
+achievable, and what the snapshot half of `harness/effects_diff.py` measures:
+
+> the port's `methods:` key set is a SUBSET of the oracle's; every shared row's
+> `effects:` and `declared:` are byte-equal; `exhaustive:` may be `false` only
+> where the oracle's is `true`; `unresolved:` is UNGRADED and the port writes
+> its own causes; the header agrees on `schema:`, `vocabulary:` and
+> `config_digest:`, with only `rigor:` excluded.
+
+Measured against that, mastodon's shared rows are 87 % identical today
+(1,130 of 1,301 once `unresolved:` is set aside, against 9.6 % byte-identical
+with it) — honest, attributable debt rather than a number that cannot move. The
+subset clause is the one that fails right now, on `07_mutators`, for the § 2
+reason above ([note](../notes/20260826-s116-snapshot-gate.md)).
 
 ### 6. Explicitly out of scope for the port's v1
 
