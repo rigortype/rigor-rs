@@ -104,11 +104,24 @@ the row, the port would write it. Two rows on that fixture today.
 
 So the exhaustive row's "more taint is safe" holds **only where a
 non-exhaustive summary produces no finding**. It does not hold where the bit
-selects what gets WRITTEN. Any port snapshot writer must omit a row whenever
-EITHER reading would omit it — treating `proven ⊆ {mutate.local} ∧ declared ∅`
-as omission regardless of its own bit — which is strictly an under-claim and is
-the only direction that survives both rules. Whether the port does that, or the
-artifact records the divergence instead, is open; the
+selects what gets WRITTEN. **Resolved 2026-08-28 — the writer rule.** A port snapshot writer evaluates
+`omit?`'s clauses 1, 2, 4 and 5 and **drops clause 3**
+(`return false unless direct.exhaustive?`): the port's own taint bit never
+keeps a row. Sound by cases — where the oracle is exhaustive and we are not
+(this defect), the remaining clauses see the same `effects` and the same
+bundles and reach the same decision, so the row is omitted and the rows MATCH;
+where the oracle is genuinely tainted and keeps a row we omit, that is a
+missing row, i.e. an under-claim; where both are exhaustive the readings are
+identical. So the rule can never manufacture a row and can only drop one,
+which is the only direction that survives both rules above and is consistent
+with parity outranking coverage.
+
+The artifact does NOT record the divergence instead — a committed file that
+users diff is the last place to carry an over-claim. Until a slice ships
+`update`, `harness/effects_diff.py` synthesises what the port would write
+under the naive reading, so the disagreement stays visible and non-gating;
+when the writer lands, the synthesis is replaced by real output and
+`--snapshot-gate` becomes the default. The
 [slice-5 probe](../notes/20260826-effects-s5-probe.md) § 5a states the case and
 [the snapshot gate note](../notes/20260826-s116-snapshot-gate.md) measures it.
 
