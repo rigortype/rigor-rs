@@ -677,15 +677,28 @@ pub enum Node {
     Range { span: Span },
     /// An instance/class/global variable read (`@x`, `@@x`, `$x`). Typed
     /// `Dynamic[top]` — no ivar/cvar/gvar type tracking in this slice.
+    ///
+    /// `name` carries the SIGIL (`"@x"`, `"@@x"`, `"$x"`), which is both the
+    /// spelling the reference's `scope.ivar`/`cvar`/`global` tables key on and
+    /// the discriminator between the three variable kinds. It exists for the
+    /// inference layer's #521 untyped-argument gate
+    /// (`Typer::arg_is_reference_untyped`), which must decide whether the
+    /// reference would type THIS variable `Dynamic[Top]` — a question that needs
+    /// the name to find the variable's writes. Nothing else reads it; the
+    /// variant is still typed `Dynamic[top]`.
     // TODO(spec): ivar typing (ADR-0022).
-    VariableRead { span: Span },
+    VariableRead { name: String, span: Span },
     /// A class/global variable write (`@@x = v`, `$x = v`). The value is lowered
     /// (so a call in the assigned expression is analysed). Not a value itself.
     /// An INSTANCE variable write (`@x = v`) lowers to the dedicated
     /// [`Node::InstanceVariableWrite`] instead (it carries the name the
-    /// `def.ivar-write-mismatch` rule groups on); this nameless variant keeps
-    /// covering the class-var / global-var writes, which no rule inspects by name.
-    VariableWrite { value: NodeId, span: Span },
+    /// `def.ivar-write-mismatch` rule groups on); this variant keeps covering
+    /// the class-var / global-var writes.
+    ///
+    /// `name` carries the SIGIL (`"@@x"`, `"$x"`) — the twin of
+    /// [`Node::VariableRead`]'s, so the #521 gate can pair a cvar/gvar read with
+    /// the writes that bind it. No RULE inspects it.
+    VariableWrite { name: String, value: NodeId, span: Span },
     /// An instance variable write (`@x = v`). Lowered as a dedicated variant
     /// (mirroring [`Node::LocalVariableWrite`]) so the `def.ivar-write-mismatch`
     /// collector can see the target NAME + its value's type — Prism would
@@ -799,7 +812,7 @@ impl Node {
             | Node::ArrayLit { span, .. }
             | Node::HashLit { span, .. }
             | Node::Range { span }
-            | Node::VariableRead { span }
+            | Node::VariableRead { span, .. }
             | Node::VariableWrite { span, .. }
             | Node::InstanceVariableWrite { span, .. }
             | Node::ConstantRead { span, .. }
@@ -1871,15 +1884,19 @@ impl<'src> Builder<'src> {
             });
         }
         if let Some(cvw) = node.as_class_variable_write_node() {
+            let name = constant_string(cvw.name().as_slice());
             let value = self.lower_node(&cvw.value());
             return self.push(Node::VariableWrite {
+                name,
                 value,
                 span: span_of(&cvw.location()),
             });
         }
         if let Some(gvw) = node.as_global_variable_write_node() {
+            let name = constant_string(gvw.name().as_slice());
             let value = self.lower_node(&gvw.value());
             return self.push(Node::VariableWrite {
+                name,
                 value,
                 span: span_of(&gvw.location()),
             });
@@ -1887,16 +1904,19 @@ impl<'src> Builder<'src> {
 
         if let Some(ivr) = node.as_instance_variable_read_node() {
             return self.push(Node::VariableRead {
+                name: constant_string(ivr.name().as_slice()),
                 span: span_of(&ivr.location()),
             });
         }
         if let Some(cvr) = node.as_class_variable_read_node() {
             return self.push(Node::VariableRead {
+                name: constant_string(cvr.name().as_slice()),
                 span: span_of(&cvr.location()),
             });
         }
         if let Some(gvr) = node.as_global_variable_read_node() {
             return self.push(Node::VariableRead {
+                name: constant_string(gvr.name().as_slice()),
                 span: span_of(&gvr.location()),
             });
         }
@@ -3390,6 +3410,31 @@ mod tests {
         assert!(ast.iter().any(|(_, n)| matches!(n, Node::Logical { .. })));
         assert!(has_call(&ast, "foo"));
         assert!(has_call(&ast, "bar"));
+    }
+
+    #[test]
+    fn variable_reads_and_writes_carry_their_sigilled_name() {
+        // The #521 untyped-argument gate keys an ivar/cvar/gvar root on this
+        // spelling, and it is the ONLY discriminator between the three kinds
+        // (they share one nameless-until-now node variant). Prism's `name` is
+        // already sigilled (`:@x`, `:@@x`, `:$x`); pin that it stays that way.
+        let ast = lower(&crate::parse(b"@@c = 1\n$g = 2\n@i.foo\n@@c.bar\n$g.baz\n"));
+        let names: Vec<&str> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::VariableRead { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["@i", "@@c", "$g"]);
+        let writes: Vec<&str> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::VariableWrite { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes, vec!["@@c", "$g"]);
     }
 
     #[test]
