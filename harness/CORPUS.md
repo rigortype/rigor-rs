@@ -102,6 +102,42 @@ tools — a partial sweep must never read as a full one.
 
 Custom directories passed as positional arguments replace the whole list.
 
+## Standing sweep-set baseline (2026-09-09)
+
+`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.8`
+(`ffb456b0`), vendored rbs 4.2.0, release binary at the `upstream-pin-v0.3.8`
+merge of all six retraction families. **9204 files, 0 FP candidates, 799
+coverage gaps** (`gap_census.py --sweep` agrees: 799). The raw bump — same
+reference, port unchanged from `v0.3.4` — measured **12 FP candidates**, five of
+them the fixture harness's F-A family and seven in two families only the sweep
+could see (#627 dead version-guard arms ×6, #540 mutated literal constants ×1);
+see [pin note](../docs/notes/20260909-repin-v038.md) § 4.
+
+| corpus | files | coverage gaps | (was, `v0.3.4`) | wall, reference |
+|---|---|---|---|---|
+| mastodon/app | 1236 | 20 | 16 | 18 s |
+| gitlab-foss/lib | 4676 | 163 | 172 | 104 s |
+| survey/mail | 874 | 391 | 432 | **4,737 s** |
+| survey/Ruby | 192 | 31 | 30 | 8 s |
+| survey/dependabot-core | 1650 | 73 | 84 | 40 s |
+| survey/concurrent-ruby | 345 | 96 | 61 | 9 s |
+| survey/net-ssh | 180 | 25 | 25 | 5 s |
+| survey/haml/lib | 51 | 0 | 0 | 2 s |
+
+Gaps moved 820 → 799 with the pin, not with the port: the port's own fixes
+removed exactly the 12 FP rows and no matched row (per-corpus gap counts are
+identical before and after the six fixes). concurrent-ruby's +35 and
+mastodon's +4 are new `v0.3.7` reference diagnostics; mail's −41 and
+dependabot's −11 are retractions the port never emitted.
+
+**The `mail` corpus now costs 70–80 minutes** (130 s at `v0.3.4`): one vendored
+file, `rufo-0.18.2/lib/rufo/formatter.rb`, does not finish in 25 minutes on the
+`v0.3.8` reference alone — an upstream performance regression bisected to
+`acd35612` (PR #547), reported as
+[feedback batch 4](../docs/notes/20260909-upstream-feedback-batch4.md) § 1.
+Until it is fixed upstream, budget ~80 minutes for `--sweep` and run
+`gap_census.py --sweep` in parallel rather than after it.
+
 ## Standing sweep-set baseline (2026-08-23)
 
 `python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.4`,

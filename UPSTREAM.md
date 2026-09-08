@@ -332,7 +332,14 @@ chasing a non-bug.)
 7. **Re-run the corpus gates on the RELEASE binary** — `cargo build --offline
    --release -p rigor-cli`, then `python3 harness/fp_audit.py --gaps --sweep`
    (must be 0 FP) and `python3 harness/gap_census.py --sweep` for the new gap
-   baseline. Record both in `harness/CORPUS.md`.
+   baseline. Record both in `harness/CORPUS.md`. **Budget ~80 minutes and run
+   the two in parallel**: since `v0.3.7` the reference takes over an hour on
+   one vendored file of the `mail` corpus (rufo's `formatter.rb`, upstream
+   #547 — [feedback batch 4](docs/notes/20260909-upstream-feedback-batch4.md)).
+   Expect the sweep to find families the fixture corpus cannot: at `v0.3.8` it
+   found two (#627 version guards, #540 mutated constants) on top of the four
+   the snapshot diff showed. Also `python3 harness/effects_diff.py`: the
+   effects gate has its own retraction class (`v0.3.5` made `super` taint).
 8. Update the tag/commit in this file (and `PROVENANCE.md` if rbs moved), record
    the numbers in `harness/CORPUS.md`, write a dated note in `docs/notes/`, and
    fold ONE ledger line into `docs/CURRENT_WORK.md`.
