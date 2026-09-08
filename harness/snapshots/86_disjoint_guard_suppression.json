@@ -24,13 +24,6 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 134,
-      "column": 5,
-      "severity": "error",
-      "message": "undefined method `frobnicate_ppp' for Array"
-    },
-    {
-      "rule": "call.undefined-method",
       "line": 142,
       "column": 7,
       "severity": "error",

@@ -6,7 +6,7 @@
       "line": 27,
       "column": 10,
       "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top] | String]"
     },
     {
       "rule": "call.undefined-method",
@@ -27,21 +27,21 @@
       "line": 61,
       "column": 11,
       "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Hash[Dynamic[top], Dynamic[top]]"
+      "message": "undefined method `frobnicate_zzz' for Hash[Dynamic[top] | Symbol, Dynamic[top]]"
     },
     {
       "rule": "call.undefined-method",
       "line": 73,
       "column": 10,
       "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top] | String]"
     },
     {
       "rule": "call.undefined-method",
       "line": 81,
       "column": 5,
       "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top]]"
+      "message": "undefined method `frobnicate_zzz' for Array[Dynamic[top] | Integer]"
     },
     {
       "rule": "call.undefined-method",

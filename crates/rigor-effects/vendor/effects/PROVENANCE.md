@@ -20,12 +20,17 @@ assertions below, and a drift against the pin fails
 
 - **Source path:** `reference/rigor/data/effects/registry.yml` — **the PINNED
   submodule**, not a local checkout.
-- **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`).
-- **`sha256`** `bb0eb3f08568bc52c47ce3caa75d22d359b0455b3182825906884797289d7104`
-  (67 lines, 2,217 bytes).
-- **What it is:** `vocabulary: 1`, **36 declared labels** in four commented
+- **Vendored:** 2026-09-09 at the `v0.3.8` pin (`ffb456b0`); was 2026-08-26 at
+  `v0.3.4` (`b10bd5df`, sha256 `bb0eb3f0…`, 67 lines, 36 labels).
+- **`sha256`** `4eefb74c3bbd9969ac5d600d83af050a3dde24aa4c781a1c997c7f8379d5af75`
+  (95 lines, 4,115 bytes).
+- **What it is:** `vocabulary: 1`, **40 declared labels** in five commented
   groups (Steins v1 verbatim 25, Ruby's `mutate` leaves 3, proposed shared
-  `io.db` leaves 3, application-meaning roots 5), and an EMPTY `retired:` table
+  `io.db` leaves 3, Steins' `failure` / `failure.{environment,input,resource}` 4
+  — registered at `v0.3.5` so a Steins policy parses, never produced, ADR-103
+  WD16 — and application-meaning roots 5), an 11-root `descriptions:` block
+  (new at `v0.3.5`, read only by `rigor effects --list-labels`), and an EMPTY
+  `retired:` table
   — the rename/removal compatibility mechanism, present and unused at
   vocabulary 1. Loaded upstream by `Rigor::Effects::Registry.load_file`
   (`lib/rigor/effects/registry.rb:71`).
@@ -34,25 +39,31 @@ assertions below, and a drift against the pin fails
   ANCESTOR of a declared row (`registry.rb:161`). Four of the ten roots —
   `global`, `email`, `job`, `cache` — exist ONLY as implied ancestors; no row
   spells them. `core.yml`'s `global` posture emits the bare `global`, so a
-  reader that validates the catalogue against the 36 declared rows alone
+  reader that validates the catalogue against the 40 declared rows alone
   **rejects the shipped catalogue.**
 
 ### `core.yml` — the per-method catalogue
 
 - **Source path:** `reference/rigor/data/effects/core.yml` — the PINNED
   submodule.
-- **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`).
-- **`sha256`** `85778dd3433fcb5561a933c9b2b22fb07048af980e35f93091f545655bda9c31`
-  (843 lines, 52,785 bytes).
-- **Upstream's own identity anchor:** `1:85778dd3433fcb5561a933c9b2b22fb07048af980e35f93091f545655bda9c31`.
+- **Vendored:** 2026-09-09 at the `v0.3.8` pin (`ffb456b0`); was 2026-08-26 at
+  `v0.3.4` (`b10bd5df`, sha256 `85778dd3…`, 843 lines, 80 classes / 420 rows).
+  The `v0.3.4 → v0.3.8` delta is semantic, not cosmetic: `Socket` gains four
+  singleton rows that DEMOTE `gethostname` / `getifaddrs` / `ip_address_list`
+  from the `net` posture's `io.net` to plain `io` (#458 — a hostname lookup is
+  not network traffic), and `Net::IMAP` / `Net::POP3` are new `net`-posture
+  classes (#463).
+- **`sha256`** `651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2`
+  (860 lines, 54,214 bytes).
+- **Upstream's own identity anchor:** `1:651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2`.
   Upstream's effects cache keys on `Catalog#identity` = `schema:sha256(core.yml)`
   (`lib/rigor/effects/catalog.rb:158`) — i.e. **upstream already treats this
   file's digest as the catalogue's identity**, so the provenance anchor and
   upstream's invalidation key are one number. `Catalog::identity()` reproduces
   it, and a test asserts the string.
 - **What it is:** `schema: 1`, `vocabulary: 1`, **14 `defaults:` postures**, a
-  **34-name `universal:` list**, and **80 classes / 420 rows** (216 instance,
-  204 singleton). Loaded upstream by `Rigor::Effects::Catalog.load_file`
+  **34-name `universal:` list**, and **82 classes / 424 rows** (216 instance,
+  208 singleton). Loaded upstream by `Rigor::Effects::Catalog.load_file`
   (`catalog.rb:122`).
 
   Two spellings a reader must not normalise away: an explicit `effects: []` (77
@@ -67,7 +78,10 @@ assertions below, and a drift against the pin fails
   (`ARRAY_MUTATORS`, `HASH_MUTATORS`) and
   `reference/rigor/lib/rigor/effects/mutation_classifier.rb`
   (`STRING_MUTATORS`) — the PINNED submodule.
-- **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`), ADR-0043 slice 2.
+- **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`), ADR-0043 slice 2;
+  re-derived 2026-09-09 at `v0.3.8` (`ffb456b0`) — **byte-identical**, all three
+  `%i[…]` literals unmoved (the `v0.3.7` mutation-widening rewrite added
+  `SHAPE_MUTATORS` / `VALUE_REWRITING_MUTATORS` beside them, not inside them).
 - **`sha256`** `5bd8091db9ce2cf593ffe6409154482a38c452967b5d0ad075403e5525915ed7`.
   This digests the GENERATOR'S OUTPUT, not an upstream file: `--check`
   regenerates the document in memory from the pinned Ruby and compares bytes, so
@@ -157,7 +171,7 @@ Three layers, and only the middle one is coverage-independent:
 1. **The ported upstream data specs** — `crates/rigor-effects/tests/upstream_data_specs.rs`,
    a case-for-case port of upstream's `spec/rigor/effects/registry_data_spec.rb`
    and `catalog_data_spec.rb` over these bytes. The wholesale assertion is that
-   every label all 420 rows and every posture can emit is in the grammar AND
+   every label all 424 rows and every posture can emit is in the grammar AND
    `Registry::known`.
 2. **`harness/vendor_effects.py --check`** — byte-for-byte against the pinned
    submodule. Independent of what any corpus exercises, and the one that fails

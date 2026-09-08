@@ -24,13 +24,6 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 42,
-      "column": 5,
-      "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Digest::Instance"
-    },
-    {
-      "rule": "call.undefined-method",
       "line": 48,
       "column": 5,
       "severity": "error",

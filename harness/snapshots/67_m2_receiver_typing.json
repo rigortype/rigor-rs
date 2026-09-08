@@ -24,13 +24,6 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 36,
-      "column": 17,
-      "severity": "error",
-      "message": "undefined method `presence' for Array[Dynamic[top]]"
-    },
-    {
-      "rule": "call.undefined-method",
       "line": 41,
       "column": 3,
       "severity": "error",
@@ -56,13 +49,6 @@
       "column": 8,
       "severity": "error",
       "message": "undefined method `frobnicate' for Float"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 59,
-      "column": 11,
-      "severity": "error",
-      "message": "undefined method `frobnicate' for Integer"
     },
     {
       "rule": "call.undefined-method",

@@ -3,20 +3,6 @@
   "diagnostics": [
     {
       "rule": "call.unresolved-toplevel",
-      "line": 70,
-      "column": 3,
-      "severity": "warning",
-      "message": "unresolved toplevel call to `attr_reader`. If a project file defines `attr_reader` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
-    },
-    {
-      "rule": "call.unresolved-toplevel",
-      "line": 74,
-      "column": 3,
-      "severity": "warning",
-      "message": "unresolved toplevel call to `attr_reader`. If a project file defines `attr_reader` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
-    },
-    {
-      "rule": "call.unresolved-toplevel",
       "line": 80,
       "column": 20,
       "severity": "warning",

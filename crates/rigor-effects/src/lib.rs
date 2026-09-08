@@ -78,7 +78,7 @@ pub use registry::Registry;
 
 /// The reference pin these bytes were taken at. Moves only with
 /// `UPSTREAM.md`'s pin, via `harness/vendor_effects.py`.
-pub const PIN: &str = "v0.3.4 (b10bd5df)";
+pub const PIN: &str = "v0.3.8 (ffb456b0)";
 
 /// `data/effects/registry.yml`, verbatim.
 pub const REGISTRY_YML: &str =
@@ -96,7 +96,7 @@ pub const MUTATORS_YML: &str =
 
 /// `sha256(registry.yml)` at [`PIN`], as recorded in `PROVENANCE.md`.
 pub const REGISTRY_SHA256: &str =
-    "bb0eb3f08568bc52c47ce3caa75d22d359b0455b3182825906884797289d7104";
+    "4eefb74c3bbd9969ac5d600d83af050a3dde24aa4c781a1c997c7f8379d5af75";
 
 /// `sha256(core.yml)` at [`PIN`], as recorded in `PROVENANCE.md`.
 ///
@@ -105,7 +105,7 @@ pub const REGISTRY_SHA256: &str =
 /// provenance anchor and upstream's invalidation key are one value — see
 /// [`Catalog::identity`].
 pub const CORE_SHA256: &str =
-    "85778dd3433fcb5561a933c9b2b22fb07048af980e35f93091f545655bda9c31";
+    "651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2";
 
 /// `sha256(mutators.yml)` as `harness/vendor_effects.py` renders it at [`PIN`],
 /// recorded in `PROVENANCE.md`. The file is DERIVED, so this digest pins the
@@ -272,7 +272,7 @@ mod tests {
         // Ruby loader in the slice-1 probe § 1c.
         assert_eq!(
             catalog().identity(),
-            "1:85778dd3433fcb5561a933c9b2b22fb07048af980e35f93091f545655bda9c31"
+            "1:651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2"
         );
     }
 }

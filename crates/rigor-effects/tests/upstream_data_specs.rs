@@ -5,15 +5,16 @@
 //! submodule, and the embedded-bytes sha256 assertion in `src/lib.rs`, which
 //! does not).
 //!
-//! Sources, ported case for case at the `v0.3.4` pin (`b10bd5df`):
+//! Sources, ported case for case at the `v0.3.8` pin (`ffb456b0`) — first
+//! ported at `v0.3.4` (`b10bd5df`), re-walked at the 2026-09-09 re-pin:
 //!
 //! - `spec/rigor/effects/registry_data_spec.rb`
 //! - `spec/rigor/effects/catalog_data_spec.rb`
 //!
 //! These files are hand-written, not generated, and every row is a vocabulary
 //! or audit decision — so a change to them must be a deliberate edit here too.
-//! Six of the catalogue's 420 rows (1.4%) are exercised by
-//! `harness/effects_diff.py`; these assertions are what covers the other 414.
+//! Six of the catalogue's 424 rows (1.4%) are exercised by
+//! `harness/effects_diff.py`; these assertions are what covers the other 418.
 //!
 //! Two upstream cases are NOT ported, both for stated slice-1 carve-outs; each
 //! is replaced by the strongest assertion the vendored data alone supports and
@@ -64,7 +65,15 @@ const RUBY_LEAVES: &[&str] = &["mutate.self", "mutate.instance", "mutate.static"
 /// Proposed shared core leaves, to raise with Steins.
 const PROPOSED_SHARED: &[&str] = &["io.db.read", "io.db.write", "io.db.transaction"];
 
-/// The small shared set of application-meaning roots a policy actually names.
+/// Steins' own family (its ADR-0042), registered at `v0.3.5` and never
+/// produced: it names why a failure arm exists rather than what a method does,
+/// and exists so a Steins-authored policy parses here (ADR-103 WD16).
+const STEINS_SIDE_UNPRODUCED: &[&str] =
+    &["failure", "failure.environment", "failure.input", "failure.resource"];
+
+/// The small set of application-meaning roots a policy actually names.
+/// Rigor-owned and proposed to Steins, which holds ecosystem labels outside
+/// its builtin set (ADR-103 WD16).
 const APPLICATION_MEANING: &[&str] =
     &["telemetry", "email.send", "job.enqueue", "cache.read", "cache.write"];
 
@@ -74,18 +83,19 @@ fn registry_carries_vocabulary_version_one() {
 }
 
 #[test]
-fn registry_declares_exactly_the_four_groups_and_nothing_else() {
+fn registry_declares_exactly_the_five_groups_and_nothing_else() {
     let expected: BTreeSet<&str> = STEINS_V1
         .iter()
         .chain(RUBY_LEAVES)
         .chain(PROPOSED_SHARED)
+        .chain(STEINS_SIDE_UNPRODUCED)
         .chain(APPLICATION_MEANING)
         .copied()
         .collect();
     let declared: BTreeSet<&str> = registry().labels().iter().map(String::as_str).collect();
 
     assert_eq!(declared, expected);
-    assert_eq!(declared.len(), 36);
+    assert_eq!(declared.len(), 40);
 }
 
 #[test]
@@ -121,9 +131,9 @@ fn registry_ships_an_empty_retired_table_at_vocabulary_one() {
 }
 
 #[test]
-fn registry_opens_only_the_roots_the_three_layers_name() {
+fn registry_opens_only_the_roots_the_layers_name() {
     assert_eq!(registry().roots(), [
-        "cache", "email", "exit", "ffi", "global", "io", "job", "mutate", "nondet", "telemetry"
+        "cache", "email", "exit", "failure", "ffi", "global", "io", "job", "mutate", "nondet", "telemetry"
     ]);
 }
 
@@ -156,7 +166,7 @@ fn registry_is_embedded_in_the_binary() {
     // is that the bytes are `include_str!`d — there is no packaging step that
     // can drop them — and that they are non-empty at the pin.
     assert!(REGISTRY_YML.contains("vocabulary: 1"));
-    assert_eq!(REGISTRY_YML.lines().count(), 67);
+    assert_eq!(REGISTRY_YML.lines().count(), 95);
     assert!(!registry().labels().is_empty());
 }
 
@@ -207,7 +217,7 @@ fn the_two_vendored_files_agree_on_the_vocabulary() {
 ///
 /// This is what catches a bad vendor or a bad ancestor rule in one assertion,
 /// and it is the assertion the `known?`-with-ancestors trap breaks: `core.yml`'s
-/// `global` posture emits the bare `global`, which is NOT one of the 36 declared
+/// `global` posture emits the bare `global`, which is NOT one of the 40 declared
 /// rows. See [`catalog_emits_exactly_one_label_no_row_declares`].
 #[test]
 fn catalog_spells_every_label_in_the_grammar_and_in_the_shared_vocabulary() {
@@ -220,7 +230,7 @@ fn catalog_spells_every_label_in_the_grammar_and_in_the_shared_vocabulary() {
     assert_eq!(seen, 22, "the distinct-label count the slice-1 probe measured");
 
     // …and the sweep really did walk all 420 rows.
-    assert_eq!(rows().len(), 420);
+    assert_eq!(rows().len(), 424);
 }
 
 /// Every distinct label the catalogue can put on a summary.
@@ -385,6 +395,33 @@ fn catalog_never_mentions_the_fold_safety_facet_in_the_data() {
     }
 }
 
+/// Measured on Redmine (#458): `Socket.gethostname` read as `io.net` under the
+/// class's `net` posture, and Redmine builds its Message-IDs from it — so 219 of
+/// 4,234 rows, every model `save` and every `Mailer#*` among them, claimed
+/// network traffic on the strength of a hostname lookup. `io` is the honest
+/// bound for a call that leaves the process and sends nothing.
+#[test]
+fn catalog_reads_the_machines_own_identity_as_io_rather_than_io_net() {
+    for selector in ["gethostname", "ip_address_list", "getifaddrs"] {
+        let entry = catalog().lookup_with("Socket", selector, true, true).expect("rowed");
+        assert_eq!(entry.labels(), ["io"], "Socket.{selector}");
+    }
+}
+
+/// The other half of the same decision: resolution really does reach the
+/// network, and the class's posture still answers for every socket call the
+/// rows do not name.
+#[test]
+fn catalog_keeps_io_net_for_resolution_and_for_the_rest_of_the_socket_surface() {
+    let labels = |owner: &str, selector: &str, singleton: bool| {
+        catalog().lookup_with(owner, selector, singleton, true).expect("posture").labels().to_vec()
+    };
+    assert_eq!(labels("Socket", "gethostbyname", true), ["io.net"]);
+    assert_eq!(labels("Socket", "getaddrinfo", true), ["io.net"]);
+    assert_eq!(labels("Socket", "connect", false), ["io.net"]);
+    assert_eq!(labels("Addrinfo", "foreach", true), ["io.net"]);
+}
+
 #[test]
 fn catalog_gives_random_rand_a_nondet_random_label() {
     // Even though the fold catalogue calls it `leaf`.
@@ -396,6 +433,6 @@ fn catalog_gives_random_rand_a_nondet_random_label() {
 fn catalog_is_embedded_in_the_binary() {
     // Upstream's gemspec-packaging assertion; see the registry twin.
     assert!(CORE_YML.contains("schema: 1"));
-    assert_eq!(CORE_YML.lines().count(), 843);
+    assert_eq!(CORE_YML.lines().count(), 860);
     assert!(!catalog().class_names().is_empty());
 }

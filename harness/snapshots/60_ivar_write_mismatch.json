@@ -38,13 +38,6 @@
     },
     {
       "rule": "def.ivar-write-mismatch",
-      "line": 59,
-      "column": 5,
-      "severity": "warning",
-      "message": "instance variable `@upload_duration' on KernelFloatConversion was previously assigned Float; this write assigns Integer"
-    },
-    {
-      "rule": "def.ivar-write-mismatch",
       "line": 67,
       "column": 5,
       "severity": "warning",
