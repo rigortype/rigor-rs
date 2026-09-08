@@ -36,7 +36,12 @@ def bundler_git_typo(v)
   v.frobnicate_zzz
 end
 
-# q5 — a qualified MODULE is a witnessable guard target, not only a class.
+# q5 — a qualified MODULE is NOT a witnessable guard target. It was, up to the
+# `v0.3.4` pin; upstream #739 / PR #741 (`3636649f`, shipped in `v0.3.8`)
+# retracted it: a value typed as a mixin module is an instance of whatever class
+# includes the module, and that class contributes an arbitrary surface, so
+# nothing here can prove a method absent. SILENT on both engines at `ffb456b0`.
+# The rest of the family lives in fixture 101.
 def digest_instance_typo(v)
   return unless v.is_a?(Digest::Instance)
   v.frobnicate_zzz
