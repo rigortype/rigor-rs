@@ -24,49 +24,49 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 41,
+      "line": 45,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for Array[1 | 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 43,
+      "line": 47,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for Array[bot]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 49,
+      "line": 53,
       "column": 11,
       "severity": "error",
       "message": "undefined method `hours' for Integer"
     },
     {
       "rule": "call.undefined-method",
-      "line": 53,
+      "line": 57,
       "column": 8,
       "severity": "error",
       "message": "undefined method `frobnicate' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 75,
+      "line": 83,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for Time"
     },
     {
       "rule": "call.undefined-method",
-      "line": 78,
+      "line": 86,
       "column": 3,
       "severity": "error",
       "message": "undefined method `end_of_month' for Date"
     },
     {
       "rule": "call.undefined-method",
-      "line": 81,
+      "line": 89,
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for String"
