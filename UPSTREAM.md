@@ -15,8 +15,28 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.3.4`** (tag, released 2026-08-21) |
-| Commit | `b10bd5df` |
+| **Pinned ref** | **`v0.3.8`** (tag, released 2026-09-08) |
+| Commit | `ffb456b0` |
+
+> **`v0.3.4 → v0.3.8` (2026-09-09): four releases, 924 commits, and every one of
+> the three re-sync halves moved.** rbs 4.1.1 → **4.2.0** (`vendor_rbs.py`
+> rewrote 5 files / 15 lines — `IO#putc` / `StringIO#putc` overloads, concrete
+> `ERB` / `Monitor` returns; `sig/shims/` and the `data/` overlay byte-identical);
+> the vendored **plugin sig doubled** (867 → 1,735 lines, `v0.3.7`'s ActiveSupport
+> `Time` / `Date` / `Duration` surface); the **effects catalogue** grew (registry 36 →
+> 40 labels + a `descriptions:` block the port's reader had to learn; `core.yml`
+> 80/420 → 82/424 with `Socket`'s identity rows demoted `io.net` → `io`); and the
+> reference's `.rigor-effects.yml` moved to **schema 2** (`unresolved:` is a count,
+> an empty `reach:` carries a note), which `harness/effects_diff.py` had to follow
+> before its own self-test could pass. `UNBUILDABLE_DEFINITIONS` stays EMPTY; the
+> divergence registry is EMPTY again (#437's fix `44bd23bf` is an ancestor —
+> fixture 98's two rows now MATCH). The fixture-harness snapshot diff showed 2
+> new reference diagnostics and **7 retractions**, bisected to four upstream
+> commits (#537 untyped-argument overload pinning ×3, #533 unorderable `is_a?`
+> guard, #739 mixin-module receiver, #619 constant-write meta-new body) and
+> ported as four fixes — see the port spec
+> [note](docs/notes/20260909-repin-v038-port-spec.md) and the bump note.
+> Sweep numbers are in `harness/CORPUS.md`.
 
 > `v0.3.4` **does not move rbs** (still 4.1.1, `vendor_rbs.py --check` exact on
 > all 174 `.rbs`) and **does not move the `data/` overlay** (`diff -r` clean in
@@ -35,14 +55,13 @@ submodule rather than tracked against a drifting local checkout.
 > diagnostic set). The `check`-visible delta is ten engine commits, and their
 > net on the FIXTURE corpus was **one** new reference diagnostic.
 
-> **The pin HOLDS at `v0.3.4`** as of 2026-08-25. Upstream master is 64 commits
-> ahead with no tag past `v0.3.4`, and the surveyed delta is **0 diagnostics
-> added / 0 dropped on 9204 files** — nearly all of it the two opt-in
-> subsystems, which are new commands and not new `check` behaviour. Its rbs bump
-> (4.1.1 → 4.1.3) is a library-code release: `diff -rq` over both gems' entire
-> `core/`, `stdlib/` and `sig/shims/` trees reports zero differing files, and the
-> reference self-diff under both versions is 0/0.
-> [survey](docs/notes/20260825-upstream-survey-v034-master.md).
+> Before that the pin HELD at `v0.3.4` from 2026-08-25 (master then 64 commits
+> ahead, surveyed at 0 diagnostics added / 0 dropped on 9204 files; rbs 4.1.1 →
+> 4.1.3 a library-code release with zero differing signature files —
+> [survey](docs/notes/20260825-upstream-survey-v034-master.md)). The two weeks
+> after that survey are where `v0.3.7`'s engine work landed, and the fixture
+> harness alone caught seven retractions from it — the 9204-file sweep is what
+> sizes the rest.
 
 > Previous pin `v0.3.2` followed **rbs 4.1.1**, and the vendored RBS moved with
 > it **in the same commit** (see the independent-pin note below — the two must
@@ -95,11 +114,11 @@ submodule rather than tracked against a drifting local checkout.
 > it (#205) — and `static.value-use.void` is bleeding-edge.
 > [note](docs/notes/20260731-upstream-bump-7a69f142-v030.md).
 
-> **The local Ruby must resolve the rbs the pin bundles** (`rbs 4.1.1` today).
+> **The local Ruby must resolve the rbs the pin bundles** (`rbs 4.2.0` today).
 > The harness invokes the reference with a plain `ruby -I`, so RubyGems serves
 > the highest installed version; running the oracle against a different rbs than
 > upstream ships silently compares against different core signatures. `gem list
-> rbs` should show 4.1.1 as the newest.
+> rbs` should show 4.2.0 as the newest.
 
 The differential harness (`harness/run.rb`, `harness/snapshot.rb`) defaults
 `REFERENCE_RIGOR_DIR` to this submodule (`harness/lib.rb`). The reference-free
@@ -123,7 +142,7 @@ see step 3 below.
 ```sh
 git submodule update --init reference/rigor
 # The reference is plain Ruby run in place — no build step:
-ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.3.2
+ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.3.8
 ```
 
 ## Oracle invocation hazard: stale-gem plugin hijack (issue rigortype/rigor#194)
@@ -266,6 +285,11 @@ chasing a non-bug.)
    ```sh
    ruby harness/unbuildable_classes.rb --check   # else: paste the printed table
    ```
+   And re-run `python3 harness/effects_diff.py --self-test` before anything
+   else on the effects side: the grader mirrors the reference's snapshot
+   serialiser byte for byte (`PORT_SNAPSHOT_SCHEMA`, the empty-`reach:` note),
+   so a serialiser change upstream fails the self-test on EVERY corpus, which is
+   the intended tell — `v0.3.6`'s schema 2 did exactly that at the `v0.3.8` bump.
    A `MISSING` line is a false positive rigor-rs will now emit; a `STALE` line
    means the collision is gone and rigor-rs should resume witnessing. Both need
    the `UNBUILDABLE_DEFINITIONS` table in `crates/rigor-index/src/rbs.rs` updated
