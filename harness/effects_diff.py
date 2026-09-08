@@ -415,6 +415,13 @@ def compare(ref, rs):
 #     a surface that does not exist. Every project in the standing set leaves
 #     the key empty, where the reference itself writes `reach: {}` — so this is
 #     a guard, not a behaviour.
+#  5b. The port's taint bit never KEEPS a row (ADR-0043 § 2's writer rule): it
+#     is dropped from clause 3 AND read as true inside clause 1's `trivial?`.
+#     Measured 2026-09-09: without the clause-1 half, three `mutate.local` rows
+#     the `v0.3.8` oracle omits as trivial were written as SNAPSHOT-OVER because
+#     the port still taints them — an under-claim at the report level turned
+#     into a manufactured row at the artifact level, the exact inversion § 2
+#     rules out.
 #  6. A port JSON row missing `effects` or `exhaustive` is INVALID, not
 #     defaulted. `lanes()`'s weakest-value rule ("a shape this tool does not
 #     understand can only produce UNDER") CANNOT transfer to this surface:
@@ -655,7 +662,15 @@ def synthesise_port_methods(json_methods):
         exhaustive = bool(entry["exhaustive"])
         bundles = entry.get("direct") or {}
         rendered = _excluding_subsumed_by(declared, proven)
-        trivial = exhaustive and _subsumed_by(proven, TRIVIAL_BOUND) and not rendered
+        # ADR-0043 § 2, the writer rule, applied to clause 1 as well as clause 3:
+        # the port's OWN taint bit never keeps a row. `Summary#trivial?` upstream
+        # is `exhaustive? && proven ⊆ TRIVIAL_BOUND && rendered.empty?`; read with
+        # the port's `exhaustive` it kept `TypeFree#owned_writer` (`mutate.local`,
+        # port-tainted, oracle-exhaustive) as a SNAPSHOT-OVER the moment the
+        # `v0.3.8` oracle resolved more than the port does. The port's bit is
+        # therefore read as TRUE here — a row it would keep only by being more
+        # tainted than the oracle is omitted (an under-claim), never written.
+        trivial = _subsumed_by(proven, TRIVIAL_BOUND) and not rendered
         if omit(trivial=trivial, exhaustive=exhaustive, bundles=bundles,
                 proven=proven, declared=declared):
             continue

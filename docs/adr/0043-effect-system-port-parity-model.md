@@ -107,7 +107,13 @@ non-exhaustive summary produces no finding**. It does not hold where the bit
 selects what gets WRITTEN. **Resolved 2026-08-28 — the writer rule.** A port snapshot writer evaluates
 `omit?`'s clauses 1, 2, 4 and 5 and **drops clause 3**
 (`return false unless direct.exhaustive?`): the port's own taint bit never
-keeps a row. Sound by cases — where the oracle is exhaustive and we are not
+keeps a row. **Clause 1 reads the same way** (clarified 2026-09-09 at the
+`v0.3.8` re-pin): `Summary#trivial?` is `exhaustive? && proven ⊆ {mutate.local}
+&& rendered.empty?`, and the port evaluates it with its exhaustive term read as
+true — otherwise a row the port taints and the oracle does not is "not trivial"
+on our side, kept, and written, which is the same inversion by another clause
+(measured: three `mutate.local` rows once the `v0.3.8` oracle resolved more
+than the port does). Sound by cases — where the oracle is exhaustive and we are not
 (this defect), the remaining clauses see the same `effects` and the same
 bundles and reach the same decision, so the row is omitted and the rows MATCH;
 where the oracle is genuinely tainted and keeps a row we omit, that is a
