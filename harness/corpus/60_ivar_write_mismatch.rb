@@ -51,7 +51,12 @@ class RescueBare
   end
 end
 
-# Increment (b): `Float(non_constant)` types Float; the rescue write is Integer.
+# Increment (b), RETRACTED at the `v0.3.4 -> v0.3.8` re-pin: `Float(untyped)` no
+# longer types Float. Upstream #521 / PR #537 (`3d5dddbb`) stops pinning one
+# overload when the argument cannot discriminate between them, so `Float`'s arms
+# join to `Dynamic[union]`, the first ivar write carries no class, and the
+# `rescue`-arm `= 0` is no mismatch. SILENT on both engines now (measured at
+# `ffb456b0`); it was one of the four re-pin false positives.
 class KernelFloatConversion
   def initialize(kwargs)
     @upload_duration = Float(kwargs[:upload_duration])

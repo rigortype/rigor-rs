@@ -38,14 +38,14 @@
     },
     {
       "rule": "def.ivar-write-mismatch",
-      "line": 67,
+      "line": 72,
       "column": 5,
       "severity": "warning",
       "message": "instance variable `@x' on ModuleMismatch was previously assigned String; this write assigns Integer"
     },
     {
       "rule": "def.ivar-write-mismatch",
-      "line": 81,
+      "line": 86,
       "column": 5,
       "severity": "warning",
       "message": "instance variable `@x' on Reopened was previously assigned String; this write assigns Integer"

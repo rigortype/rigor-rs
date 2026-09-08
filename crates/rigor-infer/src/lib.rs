@@ -124,9 +124,8 @@ const ARRAY_NEW_TUPLE_LIMIT: i64 = 16;
 /// are thin wrappers over a [`Typer`] built with an empty index. Callers that
 /// want chained-call result typing construct a [`Typer`] with the real index.
 /// One local's class fact inside the narrowing flow pass
-/// ([`Typer::class_narrowing_pass`]). The two variants are the two DIRECTIONS
-/// the two engines' carriers can disagree in, and they never coexist for one
-/// local: `Narrowed` requires a `Dynamic`/`Top` carrier, `Bot` a precise one.
+/// ([`Typer::class_narrowing_pass`]). `Narrowed` requires a `Dynamic`/`Top`
+/// carrier; `Bot` and `Widened` a precise one.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum ClassFact {
     /// The local was narrowed FROM `Dynamic`/`Top` TO `Nominal[C]` — the
@@ -139,6 +138,38 @@ enum ClassFact {
     /// `narrow_constant_to_class`). Dispatch through `Bot` witnesses nothing:
     /// every call on the local is SUPPRESSED, for every rule.
     Bot,
+    /// The guard proved membership in a class the environment cannot ORDER
+    /// against a NOMINAL carrier, so the reference's `narrow_nominal_to_class`
+    /// answers `untyped` — upstream #533 item 4 (`70ca7e74`), ported at the
+    /// `v0.3.4 → v0.3.8` re-pin. "The guard destroyed the old knowledge": a
+    /// `Concurrent::Maybe` guard on an `Array`-bound local licensed
+    /// `undefined-method` on the branch the guard had just PROVEN.
+    ///
+    /// It is deliberately NOT `Bot`, though both suppress every receiver-typed
+    /// witness on the edge. `Bot` is the JOIN IDENTITY — `Bot ∪ Array` is
+    /// `Array`, so a call AFTER the `if` still fires (measured: row b15b, a
+    /// Tuple carrier, where upstream still answers `Bot` and both engines fire).
+    /// `untyped` ABSORBS — `Dynamic ∪ Array` is `Dynamic`, so the post-guard
+    /// call goes silent too (row b2b). `Bot` also feeds the Bot-on-entry
+    /// reasoning in [`join_cenv`]; `Widened` feeds no `Bot`-derived verdict.
+    ///
+    /// Its rules, each measured against the pin (`ffb456b0`):
+    /// * it SUPPRESSES every rule at a call on the local, like `Bot`
+    ///   (`ClassNarrowing::dead`) — rows b1/b3/b4/b8/b9/b12;
+    /// * it SURVIVES a branch join, and PROPAGATES out of one
+    ///   ([`propagate_widened`]) — rows b2b/b26c/b27b;
+    /// * a REBIND clears it ([`Facts::kill_local`]) — row b16b, where both
+    ///   engines fire again after `h = Array.new`;
+    /// * a MUTATION does not ([`kill_cenv_narrowed`]) — row b32b, where
+    ///   `h.push(1)` between the guard and the use leaves both engines silent;
+    /// * it does NOT escape a BLOCK join — row b17b, where a guard inside
+    ///   `[1].each do … end` leaves the post-block call firing on both engines —
+    ///   though it does cross INTO one (row b28);
+    /// * it STICKS: a later guard on the same local neither re-mints nor
+    ///   collapses (rows b21/b34b). Upstream would re-narrow the widened carrier
+    ///   to the new guard class (row b20a, where it fires `for String` and we
+    ///   stay silent — a recorded coverage gap, never an FP).
+    Widened,
 }
 
 /// One local's class assertion on ONE edge of a predicate, before any gate is
@@ -1377,6 +1408,61 @@ impl<'i> Typer<'i> {
             });
         }
 
+        // #521 (upstream `3d5dddbb`, the `v0.3.4 → v0.3.8` re-pin): an UNTYPED
+        // argument cannot discriminate between a method's overloads, so a
+        // conversion whose overloads DISAGREE on their return must not pin one.
+        // Upstream's strict and alias passes now decline on an untyped argument,
+        // the gradual pass answers EVERY arity-compatible overload, and the
+        // dispatch joins their returns as `Dynamic[union]` — on which no negative
+        // rule fires. Reproduced here as a DECLINE for the four folds whose
+        // Kernel overloads disagree, measured at the pin (`ffb456b0`):
+        // `Float(u)`, `Integer(u)`, `Integer(u, 16)`, `Array(u)` and `rand(u)`
+        // are all reference-SILENT (rows a1/a2/a17/a4/a5), and so is the
+        // `def.ivar-write-mismatch` the pinned `Float` used to license (fixture
+        // 60 row a18).
+        //
+        // `String` and `format`/`sprintf` are NOT on the list and keep their
+        // answers: each has a single matching overload, so upstream's join is
+        // that one return and both engines still fire (rows a3/a9/a32/a33).
+        // `Hash` is not on it either — it already declines for a non-shape
+        // argument, and the reference's `Hash(u)` answer is a recorded coverage
+        // gap (row a26), not an FP.
+        //
+        // WHY THE GATE IS NOT UPSTREAM'S BARE TYPE TEST. Upstream asks
+        // `untyped_arg?(t)` — "is this exactly `Dynamic[Top]`". rigor-rs CANNOT
+        // ask that here: a use site inside a method body reads an EMPTY
+        // `TypeEnv` (rules `ScopedEnv::at` — a def body is an independent local
+        // scope and the flat top-level env types the wrong value there), so
+        // EVERY def-body local read answers `Dynamic[top]` whether or not the
+        // reference knows its type. Measured at the pin: with the bare type test
+        // in place, `s = "x"; Float(s)`, `s = "x" if s.nil?; Array(s)`,
+        // `return unless s.is_a?(String); Integer(s, 16)` and
+        // `return unless s.is_a?(Integer); rand(s)` all went SILENT while the
+        // reference keeps firing (rows q4/a20/a25/a31) — four must-still-fire
+        // controls, silenced by a decline that "does strictly less".
+        //
+        // The ALLOW-LIST instead: decline only for an argument rooted at a local
+        // the enclosing `def` never WRITES and never CLASS-GUARDS. An unwritten,
+        // unguarded local inside a method body is a parameter, which the
+        // reference also carries as `Dynamic[Top]` — and an arbitrary call chain
+        // over an untyped root (`kwargs[:upload_duration]`, fixture 60) is
+        // untyped there too. See [`Typer::arg_is_reference_untyped`].
+        //
+        // The decline ANSWERS `Dynamic[top]` rather than returning `None`,
+        // because the explicit `Kernel.Float(u)` spelling routes here too and a
+        // `None` there falls through to the singleton-RBS tier, which would
+        // re-pin the very return this declines (row a19, reference-silent).
+        if matches!(method, "Float" | "Integer" | "Array" | "rand") {
+            let untyped = interner.untyped();
+            let declines = args.iter().any(|&a| {
+                self.type_of(ast, a, env, interner) == untyped
+                    && self.arg_is_reference_untyped(ast, a)
+            });
+            if declines {
+                return Some(untyped);
+            }
+        }
+
         // `Hash(v)` folds on the argument's TYPE (HashShape identity, or an
         // empty HashShape for `nil` / an empty Tuple), not on scalar values, so
         // it is handled before the value-pinning path below.
@@ -1485,6 +1571,146 @@ impl<'i> Typer<'i> {
             _ => None,
         };
         nominal_class.map(|class| self.nominal_or_untyped(class, interner))
+    }
+
+    /// Would the REFERENCE type this argument expression `Dynamic[Top]` too? —
+    /// the #521 decline's gate (see [`Typer::type_implicit_self_call`]).
+    ///
+    /// rigor-rs cannot answer this from the argument's TYPE the way upstream's
+    /// `untyped_arg?` does. A use site inside a method body reads an EMPTY
+    /// `TypeEnv` (the rules layer's `ScopedEnv::at`: a Ruby method body is an
+    /// independent local scope, and reading the flat top-level env there typed
+    /// the wrong value — two `wrong-arity` and two `undefined-method` false
+    /// positives on rigor-survey), so EVERY def-body local read answers
+    /// `Dynamic[top]` here. `def f(u) = Float(u)` (reference-SILENT at the pin)
+    /// and `s = "x"; Float(s)` (reference-FIRING) are literally the same
+    /// `TypeId` at this call site.
+    ///
+    /// So the gate is an ALLOW-LIST of shapes that are untyped on BOTH engines:
+    /// the expression's ROOT is a bare local read, that root sits inside a
+    /// `def`, and inside that def's span the root is
+    ///
+    /// * never CLASS-GUARDED — no `is_a?` / `kind_of?` / `instance_of?` / `===`
+    ///   with it as receiver or argument, and no `case` on it (rows
+    ///   q6/q8/q9/q10/a25/a31, where the reference narrows the parameter to a
+    ///   Nominal and fires); and
+    /// * either never REBOUND (it is then a parameter, which the reference
+    ///   carries as `Dynamic[Top]`), or rebound only from values that are
+    ///   themselves untyped by this same test — `t = s.to_s` over an untyped `s`
+    ///   leaves `t` untyped and the reference declines `Float(t)` (row q5),
+    ///   while `s = "x" if s.nil?` makes the reference's `s` the UNION
+    ///   `"x" | Dynamic[top]`, which it still discriminates on (rows a7/a20/a25,
+    ///   q2/q3/q4/q7 — all must keep firing). A `MultiWrite` target and a
+    ///   `rescue => name` binding are not modelled and decline the whole test.
+    ///
+    /// An arbitrary call chain over an untyped root is untyped on the reference
+    /// as well, which is what reaches fixture 60's
+    /// `Float(kwargs[:upload_duration])`.
+    ///
+    /// Every decline this predicate withholds is a coverage loss, never a false
+    /// positive: the fold keeps its pinned answer, exactly as before #521. The
+    /// known withholdings, recorded rather than chased: an IVAR argument (the
+    /// arena's `VariableRead` carries no name, so an ivar root cannot be
+    /// matched), a local shadowed by a block parameter of the same name (block
+    /// params are not arena writes, so the outer test answers for the inner
+    /// read), and a top-level (non-`def`) use site, where the env is real and
+    /// the naive type test would be sound but is not needed by any measured row.
+    ///
+    /// COST: two arena scans per untyped-argument conversion fold, so quadratic
+    /// in the number of such folds per file. Measured on a synthetic worst case
+    /// (9000 lines, 4500 `Float`/`Integer`/`Array` calls on bare parameters):
+    /// 1.48s vs 0.89s user for the same file with literal arguments, where the
+    /// `type_of` gate keeps the helper from running at all. Real files carry a
+    /// handful of these, and the whole predicate is skipped unless the argument
+    /// already types `Dynamic[top]`. Revisit if a sweep file regresses.
+    fn arg_is_reference_untyped(&self, ast: &LoweredAst, arg: NodeId) -> bool {
+        self.expr_is_reference_untyped(ast, arg, &mut Vec::new())
+    }
+
+    /// [`Typer::arg_is_reference_untyped`]'s recursion. `seen` carries the local
+    /// names already on the chain, so a self-referential rebind (`t = t.foo`)
+    /// terminates instead of recursing, and bounds the walk's depth.
+    fn expr_is_reference_untyped(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        let Some(root) = untyped_expr_root_local(ast, id, 8) else { return false };
+        if seen.len() >= 4 || seen.contains(&root) {
+            return false;
+        }
+        let use_span = ast.get(id).span();
+        // The INNERMOST enclosing `def` — the scope whose writes and guards
+        // decide whether `root` is still an untyped binding at this point.
+        let mut def_span: Option<rigor_parse::Span> = None;
+        for (_, n) in ast.iter() {
+            let Node::Definition { span, .. } = n else { continue };
+            if span.0 <= use_span.0 && use_span.1 <= span.1 {
+                let narrower = def_span.is_none_or(|d| span.1 - span.0 < d.1 - d.0);
+                if narrower {
+                    def_span = Some(*span);
+                }
+            }
+        }
+        let Some(def_span) = def_span else { return false };
+        let inside = |s: rigor_parse::Span| def_span.0 <= s.0 && s.1 <= def_span.1;
+        let reads_root = |i: NodeId| {
+            matches!(ast.get(i), Node::LocalVariableRead { name, .. } if name == &root)
+        };
+        let mut rebinds: Vec<NodeId> = Vec::new();
+        for (_, n) in ast.iter() {
+            match n {
+                Node::LocalVariableWrite { name, value, span, .. }
+                    if name == &root && inside(*span) =>
+                {
+                    rebinds.push(*value);
+                }
+                // `x ||= v` / `x += v` reads the old binding as well, so the
+                // result is a JOIN the reference can type — decline outright
+                // rather than model it (row q3, which must keep firing).
+                Node::LocalVariableOpWrite { name, span, .. }
+                    if name == &root && inside(*span) =>
+                {
+                    return false;
+                }
+                Node::MultiWrite { targets, span, .. }
+                    if inside(*span)
+                        && targets.bound_names().iter().any(|(n, _)| n == &root) =>
+                {
+                    return false;
+                }
+                Node::BeginRescue { clauses, span, .. }
+                    if inside(*span)
+                        && clauses
+                            .iter()
+                            .any(|c| c.bound_name.as_deref() == Some(root.as_str())) =>
+                {
+                    return false;
+                }
+                Node::Call { receiver, method, args, span, .. }
+                    if inside(*span)
+                        && matches!(
+                            method.as_str(),
+                            "is_a?" | "kind_of?" | "instance_of?" | "==="
+                        )
+                        && (receiver.is_some_and(&reads_root)
+                            || args.iter().copied().any(&reads_root)) =>
+                {
+                    return false;
+                }
+                Node::Case { predicate, span, .. }
+                    if inside(*span) && predicate.is_some_and(&reads_root) =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        seen.push(root);
+        let untyped = rebinds.iter().all(|&v| self.expr_is_reference_untyped(ast, v, seen));
+        seen.pop();
+        untyped
     }
 
     /// `Kernel#Hash(v)` fold (reference `try_hash`): a `HashShape` argument
@@ -2746,16 +2972,19 @@ impl<'i> Typer<'i> {
     ///   [`CoreIndex::class_name_of`] — the SAME function the undefined-method
     ///   rule dispatches on, so the class we suppress against is exactly the
     ///   class we would have witnessed against;
-    /// - `is_a?`/`kind_of?`/`===` suppress only on
+    /// - `is_a?`/`kind_of?`/`===` reach `Bot` only on
     ///   [`ClassOrdering::Disjoint`], i.e. both names resolve in the core index
     ///   AND both ancestor chains are complete. `Unknown` (an unresolvable or
-    ///   project class, a truncated chain) does NOT suppress, even though the
-    ///   reference's SHAPE carriers collapse to `Bot` there too — proving that
-    ///   arm needs a claim about which carriers the reference holds as a
-    ///   `Tuple`/`HashShape` rather than a `Nominal`, and the probe corpus
-    ///   refutes every cheap proxy for it (`h = *spec` and `h = []; h << 1`
-    ///   witness on the reference under an unknown guard class; `h = [1, 2]`
-    ///   and `h = [1, 2].compact` do not). Declining costs coverage only.
+    ///   project class, a truncated chain) reaches [`ClassFact::Widened`]
+    ///   instead — a THIRD fact the `v0.3.4 -> v0.3.8` re-pin introduced
+    ///   (upstream #533 item 4, `70ca7e74`), which suppresses like `Bot` but
+    ///   ABSORBS at a join instead of being its identity. Before the re-pin the
+    ///   `Unknown` arm suppressed NOTHING on a Nominal carrier, and the probe
+    ///   corpus refuted every cheap proxy for the missing hierarchy fact
+    ///   (`h = *spec` and `h = []; h << 1` witnessed on the reference under an
+    ///   unknown guard class while `h = [1, 2]` did not) — upstream answered it
+    ///   by widening ALL of them, and the divergence that survives is only which
+    ///   CARRIER KIND is involved: a shaped carrier still collapses to `Bot`;
     /// - `instance_of?` suppresses on any NAME MISMATCH — the reference's
     ///   `exact:` path returns `Bot` unconditionally once the names differ
     ///   (`narrowing.rb:2384`, `subclass_of?:2440`), so no hierarchy fact is
@@ -2765,7 +2994,9 @@ impl<'i> Typer<'i> {
     ///   narrowings, so `when Hash, Array` on an Array keeps the carrier);
     /// - once `Bot`, the local stays `Bot` on BOTH edges of any further guard
     ///   and past a nested conditional's join, and is killed only by a rebind
-    ///   — the same invalidation the narrowing fact gets.
+    ///   — the same invalidation the narrowing fact gets. `Widened` sticks the
+    ///   same way, but a mutation does not kill it either, and it PROPAGATES out
+    ///   of a branch join ([`propagate_widened`]) where `Bot` only survives one.
     pub fn class_narrowing_pass(
         &self,
         ast: &LoweredAst,
@@ -3154,7 +3385,10 @@ impl<'i> Typer<'i> {
                 if let Some(r) = receiver {
                     if let Some(addr) = stable_chain_address(ast, r) {
                         match cenv.chains.get(&addr) {
-                            Some(ClassFact::Bot) => {
+                            // `Widened` suppresses exactly as `Bot` does — the
+                            // reference's carrier is `untyped`, which has no
+                            // dispatch surface to witness on either.
+                            Some(ClassFact::Bot | ClassFact::Widened) => {
                                 out.dead.insert(id);
                             }
                             Some(ClassFact::Narrowed(c)) if !safe_nav => {
@@ -3177,7 +3411,11 @@ impl<'i> Typer<'i> {
                 if let Some(r) = receiver {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
                         match cenv.locals.get(name) {
-                            Some(ClassFact::Bot) => {
+                            // `Widened` suppresses like `Bot`, safe-nav
+                            // included: the guard erased the carrier, so there
+                            // is nothing to witness against (rows b1/b3/b4/
+                            // b8/b9/b12, all reference-silent).
+                            Some(ClassFact::Bot | ClassFact::Widened) => {
                                 out.dead.insert(id);
                             }
                             Some(ClassFact::Narrowed(c)) if !safe_nav => {
@@ -3219,6 +3457,14 @@ impl<'i> Typer<'i> {
                     // join below drops it from the outer env too
                     // (`bot_block_rebind`, where the reference fires).
                     //
+                    // A `Widened` fact crosses in for the same reason and is
+                    // measured doing so: row b28 (`return unless
+                    // h.is_a?(UnknownZzzClass)` then `[1].each { h.use }`) is
+                    // reference-SILENT. It does NOT come back OUT, though — the
+                    // block-call join below carries no `propagate_widened`, and
+                    // row b17b (a guard INSIDE the block, then a use after it)
+                    // fires on both engines.
+                    //
                     // Stage 3a-3: CHAIN facts do NOT cross into a block. The
                     // reference does carry them (probe `n_into_block` fires),
                     // but a chain address is invalidated by a call on its root
@@ -3232,7 +3478,9 @@ impl<'i> Typer<'i> {
                             locals: cenv
                                 .locals
                                 .iter()
-                                .filter(|(_, f)| **f == ClassFact::Bot)
+                                .filter(|(_, f)| {
+                                    matches!(f, ClassFact::Bot | ClassFact::Widened)
+                                })
                                 .map(|(k, f)| (k.clone(), f.clone()))
                                 .collect(),
                             chains: HashMap::new(),
@@ -3478,6 +3726,23 @@ impl<'i> Typer<'i> {
         // local mentions (see `locals_in_span`).
         let predicate_locals = locals_in_span(ast, ast.get(predicate).span());
         retain_joined_facts(cenv, &pre_join, &edges, writes, if_span, Some(&predicate_locals));
+        let truthy_terminates = !truthy.is_empty() && branch_terminates(ast, truthy);
+        let falsey_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
+        // … PLUS the #533 widening, which is the one fact that flows the other
+        // way through the join: `untyped ∪ anything` is `untyped`, so a branch
+        // that widened a local widens it for everything after the `if` (row
+        // b2b). A TERMINATING edge is excluded — the code after the `if` never
+        // runs on it (rows b24/b29/b33, all firing on both engines).
+        let [truthy_edge, falsey_edge] = &edges;
+        propagate_widened(
+            cenv,
+            &[
+                (truthy_edge.clone(), truthy_terminates),
+                (falsey_edge.clone(), falsey_terminates),
+            ],
+            writes,
+            if_span,
+        );
         // … EXCEPT the early-return propagation (`eval_if:486`/`:495`), which
         // 3a-1 runs in BOTH directions: a terminating FALSEY branch propagates
         // the truthy map (the `return unless guard` idiom a5/c1d), a
@@ -3487,8 +3752,6 @@ impl<'i> Typer<'i> {
         // BOTH branches terminate: the statements after are then unreachable
         // and the reference emits nothing there (probe `t_both_terminate` — a
         // measured would-be FP).
-        let truthy_terminates = !truthy.is_empty() && branch_terminates(ast, truthy);
-        let falsey_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
         let rewritten = |local: &str| {
             writes.iter().any(|(ws, n)| n == local && if_span.0 <= ws.0 && ws.1 <= if_span.1)
         };
@@ -3559,9 +3822,11 @@ impl<'i> Typer<'i> {
     /// a live false positive.
     ///
     /// Per local, in order:
-    /// 1. **`Bot`** (PR #73) when EVERY class in the fact's union collapses the
-    ///    local's precise carrier ([`Typer::guard_collapses`]). Tested first and
-    ///    against `c`, so an earlier conjunct's `Bot` sticks.
+    /// 1. **The precise-carrier meet** ([`Typer::guard_meet_precise`]), tested
+    ///    first and against `c`, so an earlier conjunct's fact sticks. One
+    ///    unorderable member answers `Widened` and widens the whole edge (the
+    ///    `v0.3.8` re-pin, upstream #533 item 4); otherwise `Bot` (PR #73) when
+    ///    EVERY class in the fact's union collapses the local's carrier.
     /// 2. **`Narrowed`** when the fact is mintable (not `===`), carries exactly
     ///    ONE class (an `||` union is stage 3a-4 — the reference narrows to
     ///    `Hash | String` and we decline), the local passes the carrier
@@ -3581,7 +3846,7 @@ impl<'i> Typer<'i> {
     ///
     /// A chain target follows the SAME steps — Bot short-circuit, R3 conflict,
     /// sequential MEET, mint — with two differences, each measured:
-    /// - the `Bot` STEP has no `guard_collapses` half. A precise chain carrier
+    /// - the `Bot` STEP has no `guard_meet_precise` half. A precise chain carrier
     ///   IS collapsed by the reference (`h = [1, 2]; h.last.is_a?(String)` is
     ///   reference-silent, probe `k_root_array_lit`), but we reproduce that by
     ///   DECLINING the mint — the carrier gate below reads the chain call's own
@@ -3646,10 +3911,24 @@ impl<'i> Typer<'i> {
             let conflicts = prior.is_some_and(|p| p != g.classes.as_slice());
             match target {
                 GuardTarget::Local(local) => {
-                    let collapses = !g.classes.is_empty()
-                        && g.classes.iter().all(|class| {
-                            self.guard_collapses(local, class, g.exact, tenv, c, interner)
-                        });
+                    // Step 1, three-valued since the re-pin: the guard's meet
+                    // against a PRECISE carrier. One unorderable member WIDENS
+                    // the whole edge (`untyped | anything = Dynamic`, upstream
+                    // #533 item 4); otherwise the historical rule stands and the
+                    // fact collapses only when EVERY member collapses.
+                    let met: Vec<Option<ClassFact>> = g
+                        .classes
+                        .iter()
+                        .map(|class| {
+                            self.guard_meet_precise(local, class, g.exact, tenv, c, interner)
+                        })
+                        .collect();
+                    if met.iter().any(|m| m.as_ref() == Some(&ClassFact::Widened)) {
+                        c.locals.insert(local.clone(), ClassFact::Widened);
+                        continue;
+                    }
+                    let collapses = !met.is_empty()
+                        && met.iter().all(|m| m.as_ref() == Some(&ClassFact::Bot));
                     if collapses {
                         c.locals.insert(local.clone(), ClassFact::Bot);
                         continue;
@@ -3705,9 +3984,16 @@ impl<'i> Typer<'i> {
                     // `chain_third`, String→Hash→String, reference-SILENT —
                     // a live FP on master, where "absent" let the third guard
                     // re-mint). The LOCAL twin of this short-circuit lives in
-                    // `guard_collapses`, which returns `true` on an incoming
+                    // `guard_meet_precise`, which answers `Bot` on an incoming
                     // `Bot` fact.
-                    if c.chains.get(&addr) == Some(&ClassFact::Bot) {
+                    // A WIDENED address is equally final: the reference's carrier
+                    // there is `untyped`, which no later guard in this slice
+                    // re-narrows (the local twin of the same short-circuit lives
+                    // in `guard_meet_precise`).
+                    if matches!(
+                        c.chains.get(&addr),
+                        Some(ClassFact::Bot) | Some(ClassFact::Widened)
+                    ) {
                         continue;
                     }
                     if conflicts {
@@ -3789,23 +4075,23 @@ impl<'i> Typer<'i> {
                 }
                 ClassOrdering::Superclass => Some(ClassFact::Narrowed(class.clone())),
                 ClassOrdering::Disjoint => Some(ClassFact::Bot),
-                // `Unknown` splits on WHY the ordering failed. A
-                // PROJECT-declared class is unknown to the reference's RBS env
-                // too — `:unknown stays conservative` (`narrowing.rb:2388`)
-                // KEEPS the carrier there, even when the project hierarchy
-                // would prove disjointness (probes `projsub`/`chain_projsub`:
-                // `ProjKlass < Hash` after a String guard still fires
-                // `for String`). But an ordering that fails on two RBS-SPACE
-                // names is OUR resolver being weaker: the reference proves
-                // `File::Stat` vs `URI::HTTP` disjoint and is silent (probes
-                // r7/`chain_r7`), so keeping would be a live FP — drop.
-                ClassOrdering::Unknown => {
-                    if self.source.knows_class(class) || self.source.knows_class(carrier) {
-                        Some(ClassFact::Narrowed(carrier.to_string()))
-                    } else {
-                        None
-                    }
-                }
+                // `Unknown` WIDENS (upstream #533 item 4, `70ca7e74`, ported at
+                // the `v0.3.4 → v0.3.8` re-pin): `narrow_nominal_to_class`'s
+                // `:unknown` arm now answers `untyped` — "the guard proved
+                // membership in a class the environment cannot name, which
+                // destroys the old knowledge".
+                //
+                // This replaces a two-way split the pin RETIRED. Until `v0.3.8`
+                // the reference's `:unknown` KEPT the bound, so a PROJECT-class
+                // guard kept the carrier and only an unorderable RBS-space pair
+                // dropped. Re-measured at `ffb456b0`, all six of those rows are
+                // now reference-SILENT and were live rigor-rs false positives:
+                // `seq_projclass`/`seq_projsub`/`seq_projsub_or` and their
+                // `chain_*` twins, each firing `for String` after a
+                // `ProjKlass`/`ProjBare` re-guard. `seq_ns_unknown_drop` /
+                // `chain_r7` (`File::Stat` then `URI::HTTP`) were already silent
+                // through the DROP and stay silent through the widening.
+                ClassOrdering::Unknown => Some(ClassFact::Widened),
             },
             classes => {
                 // An `||` union meets PER MEMBER and unions the results
@@ -3818,7 +4104,7 @@ impl<'i> Typer<'i> {
                 // (`seq_or_disjoint`/`chain_or_disjoint`). Two surviving
                 // classes are a real union — drop.
                 let mut survivors: Vec<&str> = Vec::new();
-                let mut unresolvable = false;
+                let mut widened = false;
                 for class in classes {
                     let met: Option<&str> = if g.exact {
                         (class.as_str() == carrier).then_some(carrier)
@@ -3827,20 +4113,18 @@ impl<'i> Typer<'i> {
                             ClassOrdering::Disjoint => None,
                             ClassOrdering::Superclass => Some(class.as_str()),
                             ClassOrdering::Equal | ClassOrdering::Subclass => Some(carrier),
-                            // Same `Unknown` split as the single-class arm: a
-                            // project-class member keeps the carrier
-                            // (`projsub_or`/`chain_projsub_or`); an RBS-space
-                            // member our resolver cannot order poisons the
-                            // whole union — drop.
+                            // One unorderable member WIDENS THE WHOLE union: the
+                            // reference unions the per-member narrowings and
+                            // `untyped | anything` is `Dynamic` (the `Dynamic[T]`
+                            // algebra absorbs). Measured: `h.is_a?(UnknownZzz) ||
+                            // h.is_a?(Hash)` on an `Array.new` carrier is
+                            // reference-silent (row b4) even though the `Hash`
+                            // member alone would be `Bot`, and the retired
+                            // keep-the-carrier split fired `for String` on
+                            // `seq_projsub_or`/`chain_projsub_or`.
                             ClassOrdering::Unknown => {
-                                if self.source.knows_class(class)
-                                    || self.source.knows_class(carrier)
-                                {
-                                    Some(carrier)
-                                } else {
-                                    unresolvable = true;
-                                    None
-                                }
+                                widened = true;
+                                None
                             }
                         }
                     };
@@ -3850,8 +4134,8 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
-                match (unresolvable, survivors.as_slice()) {
-                    (true, _) => None,
+                match (widened, survivors.as_slice()) {
+                    (true, _) => Some(ClassFact::Widened),
                     (false, []) => Some(ClassFact::Bot),
                     (false, [one]) => Some(ClassFact::Narrowed((*one).to_string())),
                     (false, _) => None,
@@ -4048,12 +4332,12 @@ impl<'i> Typer<'i> {
         }
     }
 
-    /// Whether guarding `local` with `class_name` yields `Bot` in the reference.
+    /// What guarding `local` with `class_name` does to a PRECISE carrier in the
+    /// reference: `Some(Bot)` collapses it, `Some(Widened)` erases it to
+    /// `untyped`, `None` keeps it (the caller then falls through to the
+    /// sequential meet / mint).
     ///
-    /// Three ways, and no fourth (see [`Typer::class_narrowing_pass`] for why
-    /// the `ClassOrdering::Unknown` arm is declined FOR A NOMINAL CARRIER — S3
-    /// measured that a Constant/Tuple/HashShape carrier collapses on `Unknown`
-    /// too, because its helper asks `subclass_of?` rather than `disjoint?`):
+    /// `Bot`, four ways:
     /// 1. the local is ALREADY `Bot` — `narrow_class_other` / `narrow_other_class`
     ///    return `Bot` unchanged on both polarities, so a further guard cannot
     ///    revive it (probes `bot_then_match`, `bot_then_neg`);
@@ -4064,13 +4348,24 @@ impl<'i> Typer<'i> {
     /// 3. a PROVEN-disjoint pair. [`CoreIndex::class_ordering`] answers
     ///    `Disjoint` only when both names resolve AND both ancestor chains are
     ///    complete, so an unresolvable/project class or a truncated chain
-    ///    answers `Unknown` and declines.
+    ///    answers `Unknown`;
+    /// 4. a SHAPED carrier (`Constant`/`Tuple`/`HashShape`) under any ordering
+    ///    that is not `Subclass`/`Equal` — S3 measured that its helper
+    ///    (`narrow_shape_to_class`, `:2508`) asks `subclass_of?` rather than
+    ///    `disjoint?`, so `Unknown` collapses there. Upstream `70ca7e74` did NOT
+    ///    touch that helper, and the difference is visible: row b15b, where a
+    ///    `[1, 2]` carrier under an `UnknownZzzClass` guard is `Bot` on the
+    ///    truthy edge and BOTH engines still fire on the call after the `if`,
+    ///    because `Bot` is the join identity.
+    ///
+    /// `Widened`, one way: a NOMINAL carrier under an `Unknown` ordering. That
+    /// is the whole of upstream #533 item 4 — see [`ClassFact::Widened`].
     ///
     /// The carrier's class comes from [`CoreIndex::class_name_of`] — the same
     /// mapping `check_call` dispatches on, so the suppression is exactly
     /// co-extensive with the witness it removes. A carrier that mapping
-    /// declines (`Dynamic`, `Top`, a union, a `Singleton`) suppresses nothing.
-    fn guard_collapses(
+    /// declines (`Dynamic`, `Top`, a union, a `Singleton`) meets to `None`.
+    fn guard_meet_precise(
         &self,
         local: &str,
         class_name: &str,
@@ -4078,11 +4373,15 @@ impl<'i> Typer<'i> {
         tenv: &TypeEnv,
         cenv: &Facts,
         interner: &Interner,
-    ) -> bool {
-        if cenv.locals.get(local) == Some(&ClassFact::Bot) {
-            return true;
+    ) -> Option<ClassFact> {
+        match cenv.locals.get(local) {
+            Some(ClassFact::Bot) => return Some(ClassFact::Bot),
+            // A widened local stays widened for the rest of the edge (rows
+            // b21/b34b).
+            Some(ClassFact::Widened) => return Some(ClassFact::Widened),
+            _ => {}
         }
-        let Some(&ty) = tenv.get(local) else { return false };
+        let &ty = tenv.get(local)?;
         // The carrier must be one the reference's `narrow_class_dispatch`
         // (`narrowing.rb:2311`) routes to a COLLAPSING helper. Its table is
         // Constant / Nominal / Union / Tuple / HashShape / Singleton, and
@@ -4094,11 +4393,16 @@ impl<'i> Typer<'i> {
             interner.get(ty),
             Type::Constant(_) | Type::Nominal { .. } | Type::Tuple(_) | Type::HashShape(_)
         ) {
-            return false;
+            return None;
         }
-        let Some(carrier) = self.index.class_name_of(interner, ty) else { return false };
+        let carrier = self.index.class_name_of(interner, ty)?;
         if exact {
-            return carrier != class_name;
+            // `instance_of?` is `Bot`-or-keep on EVERY carrier, widening
+            // included: `narrow_nominal_to_class` returns `Bot` for `exact:`
+            // before it ever consults the ordering (`narrowing.rb:2482`), which
+            // is why row b13 is silent on both engines through `Bot`, not
+            // through the new fact.
+            return (carrier != class_name).then_some(ClassFact::Bot);
         }
         // S3 (2026-08-08): the collapse condition is per-CARRIER-KIND, and it is
         // NOT the same predicate for all of them — reading `narrow_class_dispatch`
@@ -4108,9 +4412,9 @@ impl<'i> Typer<'i> {
         //   (`:2364`) keep the carrier iff `subclass_of?(carrier, class_name)`,
         //   i.e. iff the ordering is `Subclass`/`Equal`. `Unknown` therefore
         //   COLLAPSES: a shaped carrier does not need the guard class to resolve.
-        // * `narrow_nominal_to_class` (`:2381`) is different — it PRESERVES the
-        //   bound on `Subclass` and stays conservative on `Unknown`, collapsing
-        //   only on `Disjoint`.
+        // * `narrow_nominal_to_class` (`:2480`) is different — it PRESERVES the
+        //   bound on `Subclass` and, since `70ca7e74`, WIDENS on `Unknown`,
+        //   collapsing only on `Disjoint`.
         //
         // Treating every carrier as the Nominal case (the pre-S3 code) left a
         // live false positive: `v = [1, 2]; return unless v.is_a?(File::Stat);
@@ -4120,12 +4424,27 @@ impl<'i> Typer<'i> {
         // `Array` guards all FIRE (subclass/equal ⇒ the shape survives) while
         // `File::Stat` and `Foo::Bar::Baz` are SILENT — which pins the condition
         // as `subclass_of?`, not as "any shaped carrier collapses".
+        //
+        // The re-pin does NOT move the shaped arms. `narrow_shape_to_class` is
+        // untouched by `70ca7e74`, and `narrow_constant_to_class`'s own
+        // `:unknown ⇒ untyped` (#657) is unobservable here: rigor-rs is already
+        // silent on both halves of the Constant row (b14a/b14b measure BOTH
+        // engines silent), so answering `Bot` there costs nothing and keeps this
+        // change inside the family it ports. Row b15b is the control that the
+        // Tuple arm must stay `Bot`.
+        let ordering = self.index.class_ordering(carrier, class_name);
         match interner.get(ty) {
-            Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) => !matches!(
-                self.index.class_ordering(carrier, class_name),
-                ClassOrdering::Subclass | ClassOrdering::Equal
-            ),
-            _ => self.index.class_ordering(carrier, class_name) == ClassOrdering::Disjoint,
+            Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) => {
+                match ordering {
+                    ClassOrdering::Subclass | ClassOrdering::Equal => None,
+                    _ => Some(ClassFact::Bot),
+                }
+            }
+            _ => match ordering {
+                ClassOrdering::Disjoint => Some(ClassFact::Bot),
+                ClassOrdering::Unknown => Some(ClassFact::Widened),
+                ClassOrdering::Subclass | ClassOrdering::Equal | ClassOrdering::Superclass => None,
+            },
         }
     }
 
@@ -4194,7 +4513,7 @@ impl<'i> Typer<'i> {
     ///
     /// A name nothing knows is returned as written (minus the root marker): the
     /// witness gate declines it anyway (probes p2/p2b are reference-silent), and
-    /// leaving it verbatim keeps `guard_collapses` seeing exactly what it saw
+    /// leaving it verbatim keeps `guard_meet_precise` seeing exactly what it saw
     /// before this slice.
     fn resolve_constant_as_written(&self, name: &str, prefix: &[String]) -> String {
         let (bare, absolute) = match name.strip_prefix("::") {
@@ -4295,6 +4614,10 @@ impl<'i> Typer<'i> {
         // is enabled only when every branch produced a real edge.
         let mut all_descended = true;
         let mut edges: Vec<Facts> = Vec::new();
+        // Parallel to `edges`: does that clause's body TERMINATE? Only
+        // [`propagate_widened`] reads it — a `when` arm that returns widens
+        // nothing for the code after the `case`.
+        let mut edge_terminates: Vec<bool> = Vec::new();
         for br in branches {
             let Node::When { conditions, body, .. } = ast.get(br) else {
                 // A `case`/`in` pattern carrier — unmodeled, no descent
@@ -4334,13 +4657,27 @@ impl<'i> Typer<'i> {
                 // `case_multi_disj` vs `case_multi_mixed`). An empty clause
                 // cannot occur; `all` over one condition is the single-constant
                 // case, which lands here whenever `subject` declined it.
-                let all_collapse = !conditions.is_empty()
-                    && conditions.iter().all(|&cond| {
-                        self.resolved_static_constant(ast, cond, case_span).is_some_and(|class| {
-                            self.guard_collapses(local, &class, false, tenv, &c, interner)
+                //
+                // Since the re-pin the per-condition meet is three-valued: one
+                // UNORDERABLE condition class widens the whole clause, exactly
+                // as an `||` union member does in `apply_guards` (row b8,
+                // `case h when UnknownZzzClass`, reference-silent where rigor-rs
+                // fired `for Array`). Row b30 is the shaped-carrier control the
+                // widening must not swallow: a `[1, 2]` subject stays `Bot` and
+                // the call after the `case` fires on both engines.
+                let met: Vec<Option<ClassFact>> = conditions
+                    .iter()
+                    .map(|&cond| {
+                        self.resolved_static_constant(ast, cond, case_span).and_then(|class| {
+                            self.guard_meet_precise(local, &class, false, tenv, &c, interner)
                         })
-                    });
-                if all_collapse {
+                    })
+                    .collect();
+                let all_collapse =
+                    !met.is_empty() && met.iter().all(|m| m.as_ref() == Some(&ClassFact::Bot));
+                if met.iter().any(|m| m.as_ref() == Some(&ClassFact::Widened)) {
+                    c.locals.insert(local.clone(), ClassFact::Widened);
+                } else if all_collapse {
                     c.locals.insert(local.clone(), ClassFact::Bot);
                 }
             }
@@ -4348,6 +4685,7 @@ impl<'i> Typer<'i> {
             // expression-position clause narrows nothing (probe x1).
             self.class_flow_scope(ast, &body, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
             edges.push(c);
+            edge_terminates.push(!body.is_empty() && branch_terminates(ast, &body));
         }
         {
             // The `else` body is a NEGATIVE edge — never narrowed.
@@ -4357,6 +4695,7 @@ impl<'i> Typer<'i> {
                 ast, &else_body, &mut t, &mut c, coarse, writes, interner, out, stmt_position,
             );
             edges.push(c);
+            edge_terminates.push(!else_body.is_empty() && branch_terminates(ast, &else_body));
         }
         widen_flow_writes(writes, case_span, tenv, interner);
         // A `case`/`in` clause is not descended, so its rebinds are invisible to
@@ -4387,6 +4726,15 @@ impl<'i> Typer<'i> {
                 None => cenv.locals.remove(&name),
             };
         }
+        // AFTER the subject restore above, which would otherwise overwrite the
+        // widening for the one local that most often carries it: the `case`
+        // subject itself (row b27b — `case h when UnknownZzzClass` then a use
+        // after the `case`, reference-silent). Row b30b is the control: a `[1,
+        // 2]` subject collapses to `Bot`, which does NOT propagate, and both
+        // engines fire after the `case`.
+        let widened_edges: Vec<(Facts, bool)> =
+            edges.iter().cloned().zip(edge_terminates.iter().copied()).collect();
+        propagate_widened(cenv, &widened_edges, writes, case_span);
         kill_cenv_writes(writes, case_span, cenv);
     }
 
@@ -5170,10 +5518,56 @@ fn coarse_locals(ast: &LoweredAst, body: &[NodeId]) -> HashSet<String> {
 /// blanket-clear + span-kill discipline.
 fn join_cenv(cenv: &mut Facts, edges: &[Facts]) {
     cenv.locals.retain(|name, fact| {
-        *fact == ClassFact::Bot
-            && edges.iter().all(|edge| edge.locals.get(name) == Some(&ClassFact::Bot))
+        matches!(fact, ClassFact::Bot | ClassFact::Widened)
+            && edges.iter().all(|edge| edge.locals.get(name) == Some(fact))
     });
     cenv.chains.clear();
+}
+
+/// Carry a [`ClassFact::Widened`] established INSIDE a branch back OUT of the
+/// join — the half [`join_cenv`] structurally cannot do, since its `retain`
+/// only ever keeps facts that were already in `cenv` before the branch.
+///
+/// This is the join rule of upstream #533 item 4 stated positively: `untyped`
+/// ABSORBS at a join (`Dynamic ∪ Array = Dynamic`), so one edge widening a local
+/// widens it for everything after the construct. Row b2b is the measurement —
+/// `h.t1 if h.is_a?(UnknownZzzClass)` then a bare `h.t2`, where the reference is
+/// silent on BOTH calls and rigor-rs fired on both — and rows b26c and b27b
+/// repeat it past an intervening `if` and out of a `case`.
+///
+/// Two filters, each pinned by a must-still-fire row:
+///
+/// * a TERMINATING edge contributes nothing. `return if h.is_a?(UnknownZzzClass)`
+///   widens only the path that returns; the code after the `if` runs on the
+///   FALSEY edge, where the carrier is untouched, and both engines fire there
+///   (rows b24/b29/b33). Leaking the widening out of the terminating edge would
+///   silence all three.
+/// * a local REBOUND anywhere inside the construct's span contributes nothing —
+///   the reference's join is then the new binding, not the widening (row b18,
+///   `if h.is_a?(U); h = Array.new; end`, firing on both engines). This mirrors
+///   [`retain_joined_facts`]'s own `written` filter.
+///
+/// Only [`Typer::class_flow_if`] and [`Typer::class_flow_case`] call it. The
+/// BLOCK join deliberately does not: row b17b measures a widening established
+/// inside a block NOT escaping it.
+fn propagate_widened(
+    cenv: &mut Facts,
+    edges: &[(Facts, bool)],
+    writes: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+) {
+    let written =
+        |name: &str| writes.iter().any(|(ws, n)| n == name && span.0 <= ws.0 && ws.1 <= span.1);
+    for (edge, terminates) in edges {
+        if *terminates {
+            continue;
+        }
+        for (name, fact) in &edge.locals {
+            if *fact == ClassFact::Widened && !written(name) {
+                cenv.locals.insert(name.clone(), ClassFact::Widened);
+            }
+        }
+    }
 }
 
 /// Put back, after [`join_cenv`], every PRE-join fact that survived the
@@ -5269,6 +5663,25 @@ fn locals_in_span(ast: &LoweredAst, span: rigor_parse::Span) -> HashSet<String> 
         }
     }
     out
+}
+
+/// The bare LOCAL a value expression is rooted at, walking down call receivers:
+/// `u` for `u`, for `kwargs[:k]` and for `u.foo.bar`. `None` for any other root
+/// (a literal, an ivar, a constant, an implicit-self call).
+///
+/// Used by [`Typer::arg_is_reference_untyped`]. Walking receivers is sound for
+/// that purpose because a call on an untyped receiver is itself untyped on the
+/// reference — which is exactly fixture 60's `Float(kwargs[:upload_duration])`.
+/// `depth` bounds the walk so a pathological chain cannot recurse away.
+fn untyped_expr_root_local(ast: &LoweredAst, id: NodeId, depth: u32) -> Option<String> {
+    if depth == 0 {
+        return None;
+    }
+    match ast.get(id) {
+        Node::LocalVariableRead { name, .. } => Some(name.clone()),
+        Node::Call { receiver: Some(r), .. } => untyped_expr_root_local(ast, *r, depth - 1),
+        _ => None,
+    }
 }
 
 /// The stable single-hop chain address of `id`, if it has one — the port of the
@@ -5397,9 +5810,11 @@ fn kill_cenv_writes(
 /// whose contents were DESCENDED (so a real rebind already removed the fact
 /// through a write arm) and where the recorded span therefore stands for a
 /// MUTATION — a `MUTATOR_METHODS` receiver, a mutated argument position.
-/// A mutation widens a CARRIER, and `Bot` has no carrier to widen: the
-/// reference keeps `Bot` across `h.push(3)` and stays silent afterwards (probe
-/// `bot_mutator_use`), while the narrowing fact must still die there.
+/// A mutation widens a CARRIER, and neither `Bot` nor `Widened` has a carrier to
+/// widen: the reference keeps `Bot` across `h.push(3)` and stays silent
+/// afterwards (probe `bot_mutator_use`), and it keeps the #533 widening there
+/// too (row b32b — a mutation between the guard and the use leaves both engines
+/// silent). Only the narrowing fact dies here.
 ///
 /// Stage 3a-3: a CHAIN fact rooted at the named local dies here unconditionally
 /// — a chain `Bot` included (a mutated root invalidates the ADDRESS, so the
@@ -5414,7 +5829,7 @@ fn kill_cenv_narrowed(
     for (wspan, name) in writes {
         if span.0 <= wspan.0 && wspan.1 <= span.1 {
             cenv.kill_chains_rooted_at(name);
-            if cenv.locals.get(name).is_some_and(|f| *f != ClassFact::Bot) {
+            if matches!(cenv.locals.get(name), Some(ClassFact::Narrowed(_))) {
                 cenv.locals.remove(name);
             }
         }
@@ -7134,6 +7549,13 @@ mod m2_go_slice_tests {
     }
 
     /// Slice 2/3: Kernel#Array folds by argument type; rand types by arity.
+    ///
+    /// The two UNTYPED-parameter rows moved at the `v0.3.4 → v0.3.8` re-pin:
+    /// upstream #521 (`3d5dddbb`) stops pinning one overload when the argument
+    /// cannot discriminate, so `Array(c)` and `rand(c)` over a bare parameter
+    /// now answer `Dynamic[top]` on both engines (fixture 99 rows a4/a5, and
+    /// fixture 67's own `Array(config).presence` / `rand(n).frobnicate`, which
+    /// were two of the four re-pin false positives).
     #[test]
     fn kernel_array_and_rand_type() {
         let ty = |src: &[u8]| -> String {
@@ -7156,13 +7578,23 @@ mod m2_go_slice_tests {
         assert_eq!(ty(b"Array([1, 2])\n"), "Tuple[Constant[1], Constant[2]]");
         assert_eq!(ty(b"Array(nil)\n"), "Tuple[]");
         assert_eq!(ty(b"Array(5)\n"), "Tuple[Constant[5]]");
-        // Nominal Array renders by core id (Array = Class<4>).
-        assert_eq!(ty(b"def f(c)\n  Array(c)\nend\n"), "Class<4>");
-        // rand: 0-arg Float (Class<2>); ANY non-Range 1-arg Integer (Class<1>,
-        // the reference's measured overload pick); a Range arg declines.
+        // An UNTYPED argument declines since #521 (both `Array` overloads match
+        // and their returns differ) — the nominal `Class<4>` this row asserted
+        // before the re-pin was the retracted pin.
+        assert_eq!(ty(b"def f(c)\n  Array(c)\nend\n"), "Dynamic[top]");
+        // …but a REBOUND local is typed on the REFERENCE, so the decline must
+        // not reach it and the nominal fallback stands. (rigor-rs's own env is
+        // empty inside a method body — see `arg_is_reference_untyped` — so the
+        // answer here is the nominal `Class<4>`, not the Tuple the reference
+        // sees; that gap is older than this slice.)
+        assert_eq!(ty(b"def f(c)\n  c = [1, 2]\n  Array(c)\nend\n"), "Class<4>");
+        // rand: 0-arg Float (Class<2>); a non-Range 1-arg with a TYPED argument
+        // Integer (Class<1>, the reference's measured overload pick); an untyped
+        // argument declines (#521), and a Range arg declines as before.
         assert_eq!(ty(b"rand\n"), "Class<2>");
         assert_eq!(ty(b"rand(5)\n"), "Class<1>");
-        assert_eq!(ty(b"def f(c)\n  rand(c)\nend\n"), "Class<1>");
+        assert_eq!(ty(b"def f(c)\n  rand(c)\nend\n"), "Dynamic[top]");
+        assert_eq!(ty(b"def f(c)\n  c = 5\n  rand(c)\nend\n"), "Class<1>");
         assert_eq!(ty(b"rand(1..5)\n"), "Dynamic[top]");
     }
 }
@@ -8536,20 +8968,33 @@ mod class_narrowing_tests {
             // A rebind between the guards resets the meet: the second guard
             // mints fresh (the reference fires `for Hash`).
             ("ctrl_write_between", "def f(v, w)\n  return unless v.is_a?(String)\n  v = w\n  return unless v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", Some("Hash"), false),
-            // ---- the keep family: `:unknown stays conservative` + unions ----
+            // ---- the union family, and the `Unknown` arm the re-pin moved ---
             // An `||` union with a LIVE member meets per member: `Bot ∪
             // String` is the carrier and the reference fires `for String`.
             ("seq_or_mixed", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(Hash) || v.is_a?(String)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
-            // An unresolvable ordering (a project class): `:unknown stays
-            // conservative` — the reference keeps the carrier and fires
-            // `for String`, even when the project hierarchy (`< Hash`) would
-            // prove disjointness (probe `projsub`).
-            ("seq_projclass", "class ProjKlass; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
-            ("seq_projsub", "class ProjKlass < Hash; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", Some("String"), false),
+            // An unresolvable ordering now WIDENS (upstream #533 item 4,
+            // `70ca7e74`). These five rows asserted `Some("String")` until the
+            // `v0.3.4 → v0.3.8` re-pin, on the retired `:unknown stays
+            // conservative` rule; re-measured against `ffb456b0` (2026-09-09,
+            // fresh cwd, `--no-cache`) all five are reference-SILENT, so each
+            // was a live false positive. They are now `Widened` ⇒ DEAD.
+            ("seq_projclass", "class ProjBare; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjBare)\n  v.frobnicate_zzz\nend\n", None, true),
+            ("seq_projsub", "class ProjKlass < Hash; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", None, true),
+            // One unorderable MEMBER widens the whole `||` union, even though
+            // its `Hash` member alone would be `Bot`.
+            ("seq_projsub_or", "class ProjKlass < Hash; end\n\ndef f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(Hash) || v.is_a?(ProjKlass)\n  v.frobnicate_zzz\nend\n", None, true),
             // The OTHER `Unknown`: two RBS-space names our resolver cannot
             // order. The reference proves them disjoint and is silent (the S2
-            // probe r7), so the fact DROPS — neither witnessed nor `Bot`.
-            ("seq_ns_unknown_drop", "def f(v)\n  return unless v.is_a?(File::Stat)\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n", None, false),
+            // probe r7); before the re-pin the fact DROPPED (silent but live),
+            // now it widens (silent and suppressed) — same observable answer.
+            ("seq_ns_unknown_drop", "def f(v)\n  return unless v.is_a?(File::Stat)\n  return unless v.is_a?(URI::HTTP)\n  v.frobnicate_zzz\nend\n", None, true),
+            // The widening STICKS here: a later orderable guard neither
+            // re-mints nor collapses. A recorded COVERAGE GAP, not parity — the
+            // reference re-narrows its `untyped` carrier through
+            // `narrow_class_other` and fires `for Hash` (measured at the pin;
+            // rows b20a/b34b are the same shape). Suppressing is the FP-safe
+            // side, and re-minting over a widened fact is unprobed guesswork.
+            ("seq_unknown_then_known", "def f(v)\n  return unless v.is_a?(String)\n  return unless v.is_a?(UnknownZzzClass)\n  return unless v.is_a?(Hash)\n  v.frobnicate_zzz\nend\n", None, true),
         ];
         for (row, src, expected, dead) in rows {
             let ast = lower_src(src.as_bytes());
@@ -8618,17 +9063,18 @@ mod class_narrowing_tests {
             ("chain_br_superclass", "def f(h)\n  return unless h.last.is_a?(Integer)\n  if h.last.is_a?(Numeric)\n    h.last.frobnicate_zzz\n  end\nend\n", Some("Integer"), false),
             // The ELSE edge of a disjoint branch keeps the incoming fact.
             ("chain_br_else_keeps", "def f(h)\n  return unless h.last.is_a?(String)\n  if h.last.is_a?(Hash)\n    1\n  else\n    h.last.frobnicate_zzz\n  end\nend\n", Some("String"), false),
-            // ---- the keep family: `:unknown stays conservative` + unions ----
+            // ---- the union family, and the `Unknown` arm the re-pin moved ---
             // `Bot ∪ String` is the carrier.
             ("chain_or_mixed", "def f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash) || h.last.is_a?(String)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
-            // A PROJECT class: `:unknown stays conservative` keeps the carrier
-            // even when the project hierarchy would prove disjointness. These
-            // rows passed before this slice only because a project-class guard
-            // is non-mintable and skipped; the explicit `Unknown` split in
-            // `narrow_nominal_to_class` is what keeps them passing now.
-            ("chain_projclass", "class ProjKlass; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
-            ("chain_projsub", "class ProjKlass < Hash; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
-            ("chain_projsub_or", "class ProjKlass < Hash; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash) || h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
+            // The chain twin of `seq_projclass`/`seq_projsub`/`seq_projsub_or`.
+            // These asserted `Some("String")` on the retired `:unknown stays
+            // conservative` rule; re-measured against `ffb456b0` all three are
+            // reference-SILENT (each a live false positive), and the widening
+            // makes them DEAD. `chain_r7` below is the RBS-space `Unknown`, which
+            // was silent through the DROP and is silent through the widening.
+            ("chain_projclass", "class ProjBare; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(ProjBare)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            ("chain_projsub", "class ProjKlass < Hash; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", None, true),
+            ("chain_projsub_or", "class ProjKlass < Hash; end\n\ndef f(h)\n  return unless h.last.is_a?(String)\n  return unless h.last.is_a?(Hash) || h.last.is_a?(ProjKlass)\n  h.last.frobnicate_zzz\nend\n", None, true),
             // ---- must-still-fire controls -----------------------------------
             ("chain_ctrl_single", "def f(h)\n  return unless h.last.is_a?(String)\n  h.last.frobnicate_zzz\nend\n", Some("String"), false),
             // A rebind of the ROOT resets the address: the second guard mints.
@@ -8638,8 +9084,10 @@ mod class_narrowing_tests {
             ("chain_ctrl_pop_between", "def f(h)\n  return unless h.last.is_a?(String)\n  h.pop\n  return unless h.last.is_a?(Hash)\n  h.last.frobnicate_zzz\nend\n", Some("Hash"), false),
             // ---- declines that STAY -----------------------------------------
             // Two RBS-space names our resolver cannot order: the reference
-            // proves them disjoint and is silent, so the fact DROPS.
-            ("chain_r7", "def f(h)\n  return unless h.last.is_a?(File::Stat)\n  return unless h.last.is_a?(URI::HTTP)\n  h.last.frobnicate_zzz\nend\n", None, false),
+            // proves them disjoint and is silent. Before the `v0.3.8` re-pin the
+            // fact DROPPED here; it now WIDENS, so the site is dead instead of
+            // merely factless — the same observable silence.
+            ("chain_r7", "def f(h)\n  return unless h.last.is_a?(File::Stat)\n  return unless h.last.is_a?(URI::HTTP)\n  h.last.frobnicate_zzz\nend\n", None, true),
             // RECOGNITION gap (not this slice): `guard_predicate` requires a
             // bare LOCAL operand, so `===` / `nil?` on a chain receiver is
             // never a chain guard at all and the incoming fact dies at the

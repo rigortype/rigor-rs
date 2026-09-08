@@ -1,0 +1,124 @@
+{
+  "fixture": "harness/corpus/99_untyped_arg_overloads.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 83,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a3' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 84,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a9' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 85,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a33' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 88,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a6' for 1.5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 89,
+      "column": 18,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a8' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 90,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a21' for Array[1 | 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 91,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a22' for Array[5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 92,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a24' for 31"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 95,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a23' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 102,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a7' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 107,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a20' for [\"x\" | Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 112,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_q3' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 117,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_q4' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 125,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_q6' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 131,
+      "column": 18,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a25' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 137,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a31' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 142,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `frobnicate_a13' for String"
+    }
+  ]
+}

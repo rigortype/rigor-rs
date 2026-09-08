@@ -126,10 +126,15 @@ def instance_of_exact_still_fires
   h.frobnicate_ooo if h.instance_of?(Array)
 end
 
-# (10) a guard class the core hierarchy cannot RESOLVE. `ClassOrdering::Unknown`
-# does not suppress — on a NOMINAL carrier the reference does not collapse
-# either, and this is the row that pins the decline.
-def unknown_guard_class_still_fires
+# (10) a guard class the core hierarchy cannot ORDER. RETRACTED at the
+# `v0.3.4 -> v0.3.8` re-pin: upstream #533 item 4 (`70ca7e74`) makes
+# `narrow_nominal_to_class`'s `:unknown` arm answer `untyped` — "the guard proved
+# membership in a class the environment cannot name, which destroys the old
+# knowledge" — so a NOMINAL carrier no longer keeps its bound here. SILENT on
+# both engines now; this line was the fourth of the four re-pin false positives.
+# The shaped-carrier twin still collapses to `Bot` (see fixture 100 row b15b,
+# where the call AFTER the guard fires because `Bot` is the join identity).
+def unknown_guard_class_widens
   h = Array.new
   h.frobnicate_ppp if h.is_a?(UnknownZzzClass)
 end

@@ -29,10 +29,14 @@ DOUBLE.frobnicate
 DYNAMIC = compute_something.freeze
 DYNAMIC.frobnicate
 
-# --- 2. `Kernel#Array` types by argument (nominal Array when undecidable) ---
+# --- 2. `Kernel#Array` types by argument (UNTYPED argument declines) ---
 
 def coerce(config)
-  # AS `presence` is absent on core Array -> undefined-method on Array.
+  # RETRACTED at the `v0.3.4 -> v0.3.8` re-pin (#521 / `3d5dddbb`): an untyped
+  # argument cannot discriminate between `Array`'s overloads, whose returns
+  # differ, so the dispatch joins to `Dynamic[union]` and nothing is witnessed.
+  # SILENT on both engines; this line was one of the four re-pin false
+  # positives. The typed-argument controls below still fold.
   Array(config).presence
 end
 
@@ -54,8 +58,12 @@ def ratio
 end
 
 def unknown_bound(n)
-  # ANY non-Range 1-arg call resolves the `(int) -> Integer` overload, matching
-  # the reference's measured pick - fires on Integer.
+  # RETRACTED at the `v0.3.4 -> v0.3.8` re-pin (#521 / `3d5dddbb`), the same
+  # root cause as `coerce` above: an UNTYPED bound no longer resolves the
+  # `(int) -> Integer` overload in preference to the others, so the join is
+  # `Dynamic[union]`. SILENT on both engines; the third of the four re-pin false
+  # positives. `rand(5)` in `jitter` above is the typed-argument control and
+  # still fires on Integer.
   rand(n).frobnicate
 end
 

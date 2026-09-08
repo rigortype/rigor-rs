@@ -4624,13 +4624,22 @@ mod tests {
             &b"module Proj\n  class Thing\n  end\nend\ndef f\n  v = [1, 2]\n  return unless v.is_a?(Proj::Thing)\n  v.frobnicate_zzz\nend\n"[..],
             // A DECLINE S3 costs, measured and accepted: `h = []` then
             // `h << 1` under an unresolvable guard. The reference widens that
-            // carrier to a NOMINAL `Array[Dynamic[top]]` and so stays
-            // conservative and FIRES, while rigor-rs keeps the more precise
-            // SHAPE carrier, which now collapses. Silence, not a false
-            // positive — the fixture-85 carrier-fidelity family, out of scope
-            // here. (`Array.new` and `h = *spec` widen to a nominal on BOTH
-            // engines and are pinned as must-fire above.)
+            // carrier to a NOMINAL `Array[Dynamic[top]]`, and since the
+            // `v0.3.8` re-pin that nominal WIDENS under an unorderable guard
+            // rather than staying conservative, so both engines are silent —
+            // this row and the two NOMINAL rows below now agree for the same
+            // reason, where before the re-pin they diverged.
             &b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
+            // A NOMINAL carrier under a guard class the hierarchy cannot ORDER:
+            // upstream #533 item 4 (`70ca7e74`) answers `untyped` there — "the
+            // guard proved membership in a class the engine cannot name, which
+            // destroys the old knowledge". Both rows asserted FIRING `for Array`
+            // in the anti-over-suppression test until the `v0.3.4 → v0.3.8`
+            // re-pin; re-measured at `ffb456b0` both are reference-SILENT, and
+            // the first is fixture 86 row 134, one of the four re-pin false
+            // positives. See `ClassFact::Widened`.
+            &b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
+            &b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
         ] {
             let diags = run(src);
             assert!(
@@ -4660,15 +4669,23 @@ mod tests {
             (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "Array"),
             (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
             (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Hash"),
-            // a guard class the core hierarchy cannot RESOLVE — the
-            // `ClassOrdering::Unknown` arm, which S3 split by carrier kind. On
-            // a NOMINAL carrier the reference stays conservative and FIRES, and
-            // that is what these rows pin (probes isa_nominal_unknown,
-            // x_arr_new_unk, x_arr_push_unk, x_splat_unk). The SHAPE carrier's
-            // twin of this row is the opposite — collapsed — and lives in the
-            // silence test above.
-            (&b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
-            (&b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            // (The two `ClassOrdering::Unknown`-on-a-NOMINAL rows that used to
+            // sit here moved to the silence test at the `v0.3.8` re-pin —
+            // upstream #533 item 4 widens that arm to `untyped`. The rows below
+            // are the controls that the widening must NOT swallow.)
+            //
+            // A SHAPED carrier keeps collapsing to `Bot` on `Unknown`
+            // (`narrow_shape_to_class` is untouched by the re-pin), and `Bot` is
+            // the JOIN IDENTITY — so the call AFTER the conditional still fires
+            // where a widened one would be silent.
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // A TERMINATING truthy edge widens only the path that returns; the
+            // code after runs on the untouched falsey edge.
+            (&b"def f\n  h = Array.new\n  return if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // A REBIND after the widening clears it.
+            (&b"def f\n  h = Array.new\n  h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  h = Array.new\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // A widening established INSIDE a block does not escape it.
+            (&b"def f\n  h = Array.new\n  [1].each do |_i|\n    h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  end\n  h.frobnicate_zzz\nend\n"[..], "Array"),
             // S3 anti-over-suppression: a SHAPED carrier under a guard it IS a
             // subclass of survives and still witnesses. All three measured
             // firing on the reference (`… for [1, 2]` / `… for { a: 1 }`).
@@ -7248,19 +7265,36 @@ mod tests {
         assert!(ivar_diags(src).is_empty());
     }
 
+    /// Increment (b): a Kernel conversion types the first ivar write, so the
+    /// second write's class mismatch is witnessed — but ONLY when the argument
+    /// discriminates. Upstream #521 (`3d5dddbb`, ported at the
+    /// `v0.3.4 → v0.3.8` re-pin) stops pinning one overload for an UNTYPED
+    /// argument, and both engines then answer `Dynamic[union]`, on which no
+    /// negative rule fires. Fixture 60 line 59 (`Float(kwargs[:upload_duration])`
+    /// with the `rescue`-arm `= 0`) was one of the four re-pin false positives.
     #[test]
-    fn ivar_kernel_float_conversion_fires() {
-        // Increment (b): `Float(non_constant)` types Float; then `= 0` is Integer.
-        let src = b"class Foo\n  def m(k)\n    @d = Float(k)\n  rescue ArgumentError, TypeError\n    @d = 0\n  end\nend\n";
-        let d = ivar_diags(src);
-        assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].message, "instance variable `@d' on Foo was previously assigned Float; this write assigns Integer");
+    fn ivar_kernel_conversion_of_untyped_argument_is_silent() {
+        // A bare parameter: reference-SILENT at `ffb456b0` (both rows measured).
+        let float_src = b"class Foo\n  def m(k)\n    @d = Float(k)\n  rescue ArgumentError, TypeError\n    @d = 0\n  end\nend\n";
+        assert!(ivar_diags(float_src).is_empty(), "{:?}", ivar_diags(float_src));
+        let int_src = b"class Foo\n  def m(a)\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
+        assert!(ivar_diags(int_src).is_empty(), "{:?}", ivar_diags(int_src));
     }
 
+    /// …and the must-still-fire half of the same pair: a conversion whose
+    /// argument the reference can discriminate keeps its pinned return, so the
+    /// mismatch still fires. Both rows measured FIRING at `ffb456b0`.
     #[test]
-    fn ivar_kernel_integer_and_string_conversions_fire() {
-        let src = b"class Foo\n  def m(a)\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
-        let d = ivar_diags(src);
+    fn ivar_kernel_conversion_of_typed_argument_still_fires() {
+        // A literal argument …
+        let lit = b"class Foo\n  def m\n    @n = Integer(\"12\")\n    @n = \"x\"\n  end\nend\n";
+        let d = ivar_diags(lit);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@n' on Foo was previously assigned Integer; this write assigns String");
+        // … and a parameter REBOUND to one, which the reference types and this
+        // port's allow-list therefore refuses to declare untyped.
+        let rebound = b"class Foo\n  def m(a)\n    a = \"12\"\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
+        let d = ivar_diags(rebound);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].message, "instance variable `@n' on Foo was previously assigned Integer; this write assigns String");
     }

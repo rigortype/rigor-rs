@@ -1,0 +1,96 @@
+{
+  "fixture": "harness/corpus/100_unorderable_guard_widens.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 124,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b5' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 132,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b11' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 143,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b15b' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 151,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b30b' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 159,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b13b' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 168,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b24' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 176,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b33' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 185,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b18' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 193,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b16b' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 202,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b17b' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 210,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b31a' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 212,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b31b' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 218,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_b26a' for Array"
+    }
+  ]
+}
