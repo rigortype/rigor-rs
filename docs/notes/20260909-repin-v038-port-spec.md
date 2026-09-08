@@ -207,20 +207,140 @@ the meta-new call) — are coverage gaps: record them, do not chase them.
 | d10' | … its body `attr_reader :p` | silent | fires | **RS — close** |
 | d11 | `some_dsl_call do attr_reader :d end` (#316 DSL block) | fires ×2 | fires ×2 | BOTH — control |
 
-## 5. What the sweep may add
+## 5. What the sweep added — measured (12 FP candidates on 9204 files, mail took 4,161 s)
 
-The 9204-file standing sweep (`python3 harness/fp_audit.py --gaps --sweep`, release
-binary) was still running when this spec was written. Its FP list is classified in the
-bump note; rows that fall into families 1–4 are closed by this work, anything else gets
-its own section there. Candidates from the `v0.3.7` `Fixed` list that the fixture corpus
-cannot see: #627 dead version-guard arms (mail's `yaml.rb`), #546 block-taking calls on a
-folded `Set` constant, #545/#507/#504 `||=`-filled collections no longer folding
-`empty?`/`size`, #559 index writes on an unshapeable receiver, #554 `extend` /
-`module_function` surfaces, #652/#685 compact-namespace constant resolution.
+`python3 harness/fp_audit.py --gaps --sweep` on the release binary at `53ea933`:
+**12 FP candidates / 799 coverage gaps** (mastodon 0/20, gitlab-foss/lib 5/163,
+mail 3/391, Ruby 0/31, dependabot-core 0/73, concurrent-ruby 4/96, net-ssh 0/25,
+haml 0/0). Every candidate was bisected or matched to an upstream commit:
+
+| corpus | site | rule | family |
+|---|---|---|---|
+| gitlab-foss | `gitlab/auth/identity.rb:67:35` — `args = Array(job[…]); … args.second` | undefined-method | **F-A** (`3d5dddbb`, `Array(untyped)`) |
+| gitlab-foss | `ci/config/entry/pull_policy.rb:28:28` — `Array(@config).presence` | undefined-method | **F-A** (`3d5dddbb`) |
+| gitlab-foss | `gitlab/filter_evaluator.rb:15:58` — `Array(expected).exclude?` | undefined-method | **F-A** |
+| gitlab-foss | `tasks/gitlab/permissions/routes/docs_task.rb:151:70` — `Array(….dig(…)).pluck` | undefined-method | **F-A** |
+| gitlab-foss | `uploaded_file.rb:42:7` — `@upload_duration = Float(kwargs[…])` / `rescue … = 0` | ivar-write-mismatch | **F-A** (fixture 60's twin) |
+| mail (vendor) | `date-3.5.1/ext/date/extconf.rb:6:1` — `append_cflags(…) if RUBY_VERSION < "2.7."` | unresolved-toplevel | **F-F** (`d20d6f90`) |
+| mail (vendor) | `stringio-3.2.0/ext/stringio/extconf.rb:8:26` — `else` arm of `if RUBY_ENGINE == 'ruby'` | unresolved-toplevel | **F-F** |
+| mail (vendor) | `rake-13.4.2/lib/rake/file_utils.rb:116:8` — `if LN_SUPPORTED[0]` (`LN_SUPPORTED[0] = false` elsewhere in the file) | always-truthy | **F-G** (`fc3b8b42`) |
+| concurrent-ruby | `ext/concurrent-ruby-ext/extconf.rb:5:26` — body of `unless RUBY_ENGINE == "ruby"` | unresolved-toplevel | **F-F** |
+| concurrent-ruby | `spec/concurrent/promises_spec.rb:571:7`, `:583:7`, `:598:7` — `skip … if RUBY_VERSION < '3.4'` | unresolved-toplevel | **F-F** |
+
+So the bump has SIX families: the four above from the fixture corpus, and two more
+only the sweep could see. The `mail` corpus took **4,161 s** (69 min) against 130 s at
+`v0.3.4`: one vendored file, `rufo-0.18.2/lib/rufo/formatter.rb` (4,221 lines), does
+not finish in 25 minutes on `v0.3.8` alone (23 s for the whole gem at `v0.3.4`) —
+bisected to `acd35612` (PR #547, "Bind user-method call args per parameter"). That is
+an upstream performance regression to report, not port work.
+
+## 7. F-F — the dead arm of a decidable Ruby-version guard reports nothing (upstream #627 / `d20d6f90`, ADR-47 WD5)
+
+**Upstream semantics** (`lib/rigor/inference/version_guard.rb`,
+`lib/rigor/analysis/check_rules/dead_version_guard_arms.rb` — read both, they are
+short): `VersionGuard.verdict(predicate)` answers `:truthy` / `:falsey` for an `if` /
+`unless` / ternary / modifier / `elsif` predicate that is ONE comparison call
+(`< <= > >= == !=`, no block, exactly one argument) whose two operands are both
+readable: a String literal, `RUBY_VERSION` (String semantics — LEXICAL, `"4.0.5" <
+"3.4"` is false), `RUBY_ENGINE` (equality only), `Psych::VERSION` (the one curated
+`X::VERSION`), or `Gem::Version.new(<one of those>)` on BOTH sides (version semantics;
+a mixed wrapped/bare pair is never folded). Not folded, both arms stay live:
+`RUBY_PLATFORM`, `<=>`, `!` / `&&` / `||` compositions, `case` subjects, a value
+read through a local, two bare literals, `.to_f` spellings. The values are the
+**analyzer's own** `RUBY_VERSION` / `RUBY_ENGINE` — `target_ruby` is deliberately not
+consulted. Then `DeadVersionGuardArms.filter` DROPS every diagnostic whose location
+falls inside a dead arm (the walk does not descend into a dead arm; nested guards
+inside a live arm are decided on their own), for every rule EXCEPT `suppression.*`.
+The evaluator also elides the dead arm's writes from the post-`if` scope (row f20) —
+that half is typing precision (coverage), not FP safety: do NOT build it.
+
+**The port's reference Ruby.** rigor-rs has no runtime to read `RUBY_VERSION` from.
+Decision: a single `const` pair in one place (`HOST_RUBY_VERSION = "4.0.5"`,
+`HOST_RUBY_ENGINE = "ruby"` — the Ruby the parity oracle runs under on the standing
+harness host, `ruby -e 'p RUBY_VERSION'`), overridable by the environment variables
+`RIGOR_RUBY_VERSION` / `RIGOR_RUBY_ENGINE`, documented where the CLI's other env
+vars are. Decline `Psych::VERSION` entirely (both arms live — a safe under-claim; the
+oracle's value depends on which psych gem the host loads). `Gem::Version` comparison
+needs a RubyGems-compatible segment comparator (numeric vs. alphabetic prerelease
+segments); implement it only if you can pin it with the `Gem::Version` cases below,
+otherwise decline it and record the residue. The fixture header must state the
+assumed host values.
+
+**Port site**: a new module in `crates/rigor-rules` (the verdict is a pure function of
+the lowered AST; check that `rigor-parse`'s lowering keeps `if`/`unless`/ternary/
+modifier/`elsif` distinguishable and their arm spans), applied as a span filter over
+the file's diagnostics at the point where rigor-rules assembles them, before the
+`# rigor:disable` suppression pass and excluding `suppression.*`.
+
+| row | shape (`"abc".typo …`) | oracle (host 4.0.5 / ruby) | port | verdict |
+|---|---|---|---|---|
+| f1 | `… if RUBY_VERSION < "2.7."` | silent | fires | **RS — close** |
+| f2 | `… if RUBY_VERSION >= "3.0"` | fires | fires | BOTH — control (live arm) |
+| f3 | `if RUBY_VERSION < "3.4"; A; else; B; end` | A silent, B fires | A fires, B fires | **close A**, keep B |
+| f4 | `… unless RUBY_ENGINE == "ruby"` | silent | fires | **RS — close** |
+| f5 | `… if RUBY_ENGINE == "jruby"` | silent | fires | **RS — close** |
+| f6 | `… if RUBY_PLATFORM =~ /java/` | fires | fires | BOTH — control |
+| f7 | `… if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.4")` | silent | fires | **RS — close or decline-and-record** |
+| f8 | `… if RUBY_VERSION.to_f < 3.4` | fires | fires | BOTH — control (mixed spelling) |
+| f9 | `… if RUBY_VERSION < "3.4" && ENV["X"]` | fires | fires | BOTH — control (composition) |
+| f10 | `… if RUBY_VERSION < "3.4" \|\| RUBY_ENGINE == "jruby"` | fires | fires | BOTH — control |
+| f11 | `case RUBY_VERSION when "2.7.0" then A else B end` | A fires, B fires | same | BOTH — control |
+| f12 | `RUBY_VERSION < "3.4" ? A : B` | A silent, B fires | A fires | **close A** |
+| f13 | `return … if RUBY_VERSION < "3.4"` | silent | fires | **RS — close** |
+| f14 | `if RUBY_VERSION >= "3.4"; A; elsif RUBY_VERSION >= "3.0"; B; end` | A fires, B silent | both fire | **close B** |
+| f15 | `… if RUBY_VERSION == "4.0.5"` | fires | fires | BOTH — control (true on the host) |
+| f16 | `… if "2.7" > RUBY_VERSION` (literal on the left) | silent | fires | **RS — close** |
+| f17 | `v = RUBY_VERSION; … if v < "3.4"` | fires | fires | BOTH — control (through a local) |
+| f19 | `if RUBY_VERSION < "3.4"; y = 1; end` (`flow.dead-assignment`) | silent | fires | **RS — close** (flow rules are filtered too) |
+| f20 | `x = 1; x = "s" if RUBY_VERSION < "3.4"; x.typo` | fires `for 1` | silent | REF — gap, leave (the elision half) |
+
+Add: a `suppression.unknown-rule` marker INSIDE a dead arm (must still fire on
+both engines — measure it), a dead arm containing a nested live guard, and the
+`RIGOR_RUBY_VERSION` override exercised in a unit test (`"3.3.0"` flips f1's twin).
+
+## 8. F-G — a literal-shape constant the file itself mutates stops folding (upstream #540 / `fc3b8b42`)
+
+**Upstream semantics** (`lib/rigor/inference/scope_indexer.rb`,
+`collect_literal_receiver_mutations` and the two wideners — read the commit): one
+whole-file census, scope-insensitive (blocks and top level included, tracking only the
+lexical class/module prefix), records every MUTATION whose receiver is a
+`ConstantRead` / `ConstantPath` / `ClassVariableRead`: the `Index{Or,And,Operator}Write`
+family (`C[i] ||= v`, `C[i] += v`), an attribute or index writer call (`C.x = v`,
+`C[i] = v`), or a call named in `MutationWidening::ARRAY_MUTATORS ∪ HASH_MUTATORS`
+(the port carries both tables in `crates/rigor-infer/src/lib.rs` ≈ 4934). A bare
+constant contributes every lexical candidate (`A::B::C`, `A::C`, `C`). Every in-source
+constant (and per-class cvar) whose name is in the census has its harvested type
+wrapped in `Dynamic` — so a read no longer folds through the literal shape and no
+negative rule fires on it — while unmutated constants (`VERSION` strings, frozen
+tables) keep their fold. Same-file scope only.
+
+**Port site**: the in-source constant harvest (`crates/rigor-infer/src/source_index.rs`
+`harvest`, ≈ 624, and wherever `ConstantWrite` values are folded — grep
+`build_in_source_constants` in `crates/rigor-infer/src/lib.rs`), plus the cvar index
+if the port has one. The port's Dynamic wrapper is `Type::Dynamic(inner)`.
+
+| row | shape | oracle | port | verdict |
+|---|---|---|---|---|
+| g2 | `LN = [true]`; another method `LN[0] = false`; `if LN[0]` | silent | always-truthy | **RS — close** |
+| g3 | `FROZEN = [true].freeze`; `if FROZEN[0]` | fires | fires | BOTH — control |
+| g5 | `PUSHED = []`; `PUSHED << 1`; `if PUSHED.empty?` | silent | silent | both silent — pin |
+| g7 | `H = {}`; `H[:k] = 1`; `if H.empty?` | silent | silent | both silent — pin |
+| g8 | `UNTOUCHED = [true]`; `if UNTOUCHED[0]` | fires | fires | BOTH — control |
+| g10 | `CLEARED = [1, 2]`; `CLEARED.clear`; `if CLEARED.size == 2` | silent | fires | **RS — close** |
+| g11 | `M = [true]`; top-level `[1].each { M[0] = false }`; `if M[0]` | silent | fires | **RS — close** (block position counts) |
+
+Add and measure: a mutation through a QUALIFIED path (`Outer::T[0] = 1` against a
+bare read inside `module Outer`), a cvar (`@@emails = []` + `@@emails << x` +
+`@@emails.empty?`), an attribute writer (`C.x = 1` on a Struct-valued constant), a
+`||=` index write, and the frozen / untouched controls. Cross-file mutation must NOT
+widen (write the mutation in a second file of a two-file probe and pin that the
+fold survives on both engines).
 
 ## 6. The probe files
 
-`fa_overload.rb`, `fb_guard.rb`, `fc_module.rb`, `fd_constbody.rb` — verbatim, so the
+`fa_overload.rb`, `fb_guard.rb`, `fc_module.rb`, `fd_constbody.rb` (§ 1–4; the § 7 / § 8
+probes `ff_version_guard.rb` / `fg_mutated_const.rb` are spelt out row by row in their
+own tables) — verbatim, so the
 tables above can be regenerated with the side-by-side runner
 (`probe_diff.py <ref-checkout> <rs-bin> <file>…`, which prints `REF`/`RS`/`BOTH` per
 `(rule, line, column)` for parity severities). Row ids in the tables are the `frobnicate_<id>`
