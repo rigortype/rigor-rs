@@ -23,7 +23,7 @@ stop (slices 4/6 CLOSED by measurement; 20 resolvable-`super` rows are slice-4 d
 the narrowing frontier stays OUT OF CARRIER LEVERS.
 
 - Measurement-tool lesson (binding): audit at NODE granularity — per-file
-  histograms net over-claims out against under-claims.
+  histograms net over-claims against under-claims.
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
   (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
   [plan](notes/20260718-compat-next-stage-plan.md)).
@@ -34,13 +34,13 @@ the narrowing frontier stays OUT OF CARRIER LEVERS.
 - **Pin is `v0.3.8`** (`ffb456b0`; + vendored rbs 4.2.0; re-pinned 2026-09-09). Both
   standing exception tables are EMPTY — `UNBUILDABLE_DEFINITIONS` and the divergence
   registry (#437 retired) — so a new entry in either is a real finding, not maintenance
-  (`UPSTREAM.md`, all THREE hazards + the overlay/`sig/shims` trap). The version-guard
+  (`UPSTREAM.md`: three hazards + the overlay/`sig/shims` trap). The version-guard
   port folds against `HOST_RUBY_VERSION` 4.0.5 / `ruby` (`RIGOR_RUBY_VERSION` /
   `RIGOR_RUBY_ENGINE` override) — the oracle's own host dependence, mirrored.
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-09-09, post the `v0.3.8` re-pin): harness **105 fixtures / 0
+State (verified 2026-09-09, post-re-pin): harness **105 fixtures / 0
 unregistered extras / 0 registered divergences**, coverage 487/538; standing
 sweep **0 FP / 9204 files / 799 gaps**, 8 corpora, baselines in
 `harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). Gap totals move mostly with upstream retractions, not
