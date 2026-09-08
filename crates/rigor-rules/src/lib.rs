@@ -12,6 +12,11 @@ use rigor_types::{Interner, Scalar, Type};
 mod shadowed_rescue;
 pub use shadowed_rescue::shadowed_rescue_diagnostics;
 
+pub mod dead_version_guard;
+pub use dead_version_guard::{
+    filter_dead_version_guard_arms, filter_dead_version_guard_arms_with, RubyRuntime,
+};
+
 // ---------------------------------------------------------------------------
 // Severity enum
 // ---------------------------------------------------------------------------

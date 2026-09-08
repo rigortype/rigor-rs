@@ -8,6 +8,21 @@
 //! *silent* subset into a *disclosed* coverage posture and freeze the vocabulary
 //! before any production-ready announcement. The exit-69 hard-error teeth land
 //! with the sidecar (phase b).
+//!
+//! # The CLI's Ruby-related environment variables
+//!
+//! | variable | layer | meaning |
+//! |---|---|---|
+//! | `RIGOR_RUBY` | this module | the coverage POSTURE: `require` / `auto` / `off`, or a path to a ruby |
+//! | `RIGOR_NO_RUBY` | this module | boolean shorthand for `RIGOR_RUBY=off` (setting both is an error) |
+//! | `RIGOR_RUBY_VERSION` | `rigor_rules::dead_version_guard` | the `RUBY_VERSION` a decidable VERSION GUARD folds against (default `HOST_RUBY_VERSION`) |
+//! | `RIGOR_RUBY_ENGINE` | `rigor_rules::dead_version_guard` | the `RUBY_ENGINE` twin (default `HOST_RUBY_ENGINE`) |
+//!
+//! The bottom two are a DIFFERENT axis from the top two and never interact: the
+//! reference decides `if RUBY_VERSION < "2.7."` against the Ruby the ANALYZER
+//! runs under (ADR-47 WD5 / upstream #627), and rigor-rs has no runtime to read
+//! that from, so it bakes the harness host's pair and lets the environment move
+//! it. They are listed here because this is the CLI's Ruby env-var surface.
 
 use std::fmt;
 
