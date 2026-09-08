@@ -356,6 +356,15 @@ impl<'i> Typer<'i> {
             // class is unregistered, which is silent.
             ConstLit::BareArray => self.nominal_or_untyped("Array", interner),
             ConstLit::BareHash => self.nominal_or_untyped("Hash", interner),
+            // Issue #540 (`fc3b8b42`) — a literal shape the file itself mutates.
+            // `Type::Combinator.dynamic(literal)` in the reference: the class
+            // survives for dispatch, the SHAPE stops licensing the negative
+            // rules (a `Dynamic[Tuple]` projects to nothing, so `if LN[0]` no
+            // longer folds to a truthy constant).
+            ConstLit::Widened(inner) => {
+                let t = self.intern_const_lit(inner, interner);
+                interner.intern(Type::Dynamic(t))
+            }
         }
     }
 

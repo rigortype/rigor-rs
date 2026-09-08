@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/104_mutated_literal_constants.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 175,
+      "column": 18,
+      "severity": "error",
+      "message": "undefined method `frobnicate_g22' for \"1.0\""
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 144,
+      "column": 17,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 150,
+      "column": 17,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 157,
+      "column": 17,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 166,
+      "column": 19,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 208,
+      "column": 17,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 216,
+      "column": 17,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

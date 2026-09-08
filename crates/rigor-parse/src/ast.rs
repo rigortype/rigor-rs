@@ -878,6 +878,49 @@ pub struct LoweredAst {
     /// for the AST's lifetime and preserved by `Clone` (a clone is the same
     /// file).
     file_key: FileKey,
+    /// Upstream #540 (`fc3b8b42`) — every site in this file that MUTATES a
+    /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
+    /// table rather than owned nodes.
+    const_mutations: Vec<ConstMutation>,
+}
+
+/// One site where a CONSTANT-shaped receiver is mutated — the raw material of
+/// upstream #540's `collect_literal_receiver_mutations` census
+/// (`lib/rigor/inference/scope_indexer.rb`), which widens a literal-shape
+/// constant the file itself mutates so reads stop folding through a shape the
+/// program has already outgrown.
+///
+/// # Why a side table
+///
+/// Two of the three mutating shapes are invisible in the owned arena. A plain
+/// `C[i] = v` / `C.x = v` is a Prism `CallNode` and lowers to [`Node::Call`], but
+/// the `Index{Or,And,Operator}Write` family (`C[i] ||= v`, `C[i] += v`) has no
+/// owned variant — it falls to the [`Node::Other`] / recovered-children path,
+/// which keeps the subtree reachable but erases which node was the mutated
+/// RECEIVER. Giving those an owned `Call`-shaped variant would put a synthetic
+/// `[]=` dispatch in front of every call rule (a new arity/undefined-method
+/// surface for zero gain), so the census is collected during the lowering walk —
+/// where the Prism tree is still in hand — and consumed by the SourceIndex.
+///
+/// The census is deliberately RAW: it names the receiver and the mutating method
+/// and leaves the `ARRAY_MUTATORS` / `HASH_MUTATORS` membership test to
+/// `rigor-infer`, which owns those tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstMutation {
+    /// The enclosing `class`/`module` header names, outermost first, each the
+    /// RENDERED path of one header (`class A::B` contributes one `"A::B"`
+    /// segment — mirroring the reference's `qualified_prefix + [name]`).
+    pub prefix: Vec<String>,
+    /// The receiver's dotted constant name (`"C"`, `"Outer::T"`).
+    pub receiver: String,
+    /// `true` when the receiver was written as a `A::B` PATH (or `::A`), which
+    /// the reference records as the full name only — a BARE name instead
+    /// contributes every lexical-resolution candidate.
+    pub receiver_is_path: bool,
+    /// The mutating call's method name, or `None` when the site is a mutation
+    /// unconditionally — the `Index{Or,And,Operator}Write` family and a Prism
+    /// `attribute_write?` call (`C.x = v`, `C[i] = v`).
+    pub method: Option<String>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -900,6 +943,12 @@ impl LoweredAst {
     /// from the same pathless `lower()` call (or a clone of it).
     pub fn file_key(&self) -> &FileKey {
         &self.file_key
+    }
+
+    /// Upstream #540's mutation census for this file, in walk order. See
+    /// [`ConstMutation`].
+    pub fn const_mutations(&self) -> &[ConstMutation] {
+        &self.const_mutations
     }
 }
 
@@ -964,7 +1013,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
-    LoweredAst { nodes: builder.nodes, root, file_key }
+    let const_mutations = collect_const_mutations(&root_prism);
+    LoweredAst { nodes: builder.nodes, root, file_key, const_mutations }
 }
 
 /// Mutable accumulator for the owned arena during the lowering walk.
@@ -2193,6 +2243,129 @@ fn constant_path_string(node: &PrismNode<'_>) -> String {
     }
 }
 
+/// The STRICT twin of [`constant_path_string`] — the reference's
+/// `Source::ConstantPath.qualified_name_or_nil`. A dynamic base anywhere in the
+/// chain (`expr::Bar`) yields `None` rather than a best-effort trailing name, so
+/// a caller that statically NAMES constants treats the path as opaque. A leading
+/// `::` renders as the un-rooted name under both policies (`::Foo` => `"Foo"`),
+/// because the discovered-constant tables are keyed by un-rooted names.
+fn strict_constant_path_string(node: &PrismNode<'_>) -> Option<String> {
+    if let Some(cr) = node.as_constant_read_node() {
+        return Some(constant_string(cr.name().as_slice()));
+    }
+    let cp = node.as_constant_path_node()?;
+    let last = constant_string(cp.name()?.as_slice());
+    match cp.parent() {
+        None => Some(last),
+        Some(parent) => Some(format!("{}::{last}", strict_constant_path_string(&parent)?)),
+    }
+}
+
+/// Upstream #540 (`fc3b8b42`) — the whole-file mutation census behind the
+/// SourceIndex's two wideners, a faithful port of `ScopeIndexer`'s
+/// `collect_literal_receiver_mutations` / `walk_literal_receiver_mutations` /
+/// `record_literal_receiver_mutation` / `mutating_receiver_of`.
+///
+/// Scope-INSENSITIVE: blocks, method bodies and the top level all count; the
+/// only thing tracked is the lexical `class`/`module` prefix. A NAMED
+/// class/module is entered through its BODY only (its header path and
+/// superclass expression are not walked) — the reference's `return` after
+/// recursing into `node.body`.
+///
+/// Class-variable receivers (`@@table << x`) are deliberately NOT recorded: the
+/// port's lowering has no cvar index to widen (`@@x` lowers to the nameless
+/// [`Node::VariableRead`], already `Dynamic[top]`), so the reference's cvar half
+/// is a no-op here.
+fn collect_const_mutations(root: &PrismNode<'_>) -> Vec<ConstMutation> {
+    use ruby_prism::Visit;
+
+    struct Census {
+        out: Vec<ConstMutation>,
+        prefix: Vec<String>,
+    }
+
+    impl Census {
+        /// `record_literal_receiver_mutation`: keep the site iff the receiver is
+        /// a constant read or a statically-nameable constant path.
+        fn record<'pr>(&mut self, receiver: Option<PrismNode<'pr>>, method: Option<String>) {
+            let Some(receiver) = receiver else { return };
+            let is_path = receiver.as_constant_path_node().is_some();
+            if !is_path && receiver.as_constant_read_node().is_none() {
+                return;
+            }
+            let Some(name) = strict_constant_path_string(&receiver) else { return };
+            self.out.push(ConstMutation {
+                prefix: self.prefix.clone(),
+                receiver: name,
+                receiver_is_path: is_path,
+                method,
+            });
+        }
+    }
+
+    impl<'pr> Visit<'pr> for Census {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let name = constant_path_string(&node.constant_path());
+            if name.is_empty() {
+                ruby_prism::visit_class_node(self, node);
+                return;
+            }
+            self.prefix.push(name);
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.prefix.pop();
+        }
+
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let name = constant_path_string(&node.constant_path());
+            if name.is_empty() {
+                ruby_prism::visit_module_node(self, node);
+                return;
+            }
+            self.prefix.push(name);
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.prefix.pop();
+        }
+
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.receiver().is_some() {
+                // `attribute_write?` (`C.x = v`, `C[i] = v`) is a mutation
+                // whatever it is called; anything else is one only when the name
+                // is in `rigor-infer`'s mutator tables, which decides later.
+                let method = (!node.is_attribute_write())
+                    .then(|| constant_string(node.name().as_slice()));
+                self.record(node.receiver(), method);
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+
+        fn visit_index_or_write_node(&mut self, node: &ruby_prism::IndexOrWriteNode<'pr>) {
+            self.record(node.receiver(), None);
+            ruby_prism::visit_index_or_write_node(self, node);
+        }
+
+        fn visit_index_and_write_node(&mut self, node: &ruby_prism::IndexAndWriteNode<'pr>) {
+            self.record(node.receiver(), None);
+            ruby_prism::visit_index_and_write_node(self, node);
+        }
+
+        fn visit_index_operator_write_node(
+            &mut self,
+            node: &ruby_prism::IndexOperatorWriteNode<'pr>,
+        ) {
+            self.record(node.receiver(), None);
+            ruby_prism::visit_index_operator_write_node(self, node);
+        }
+    }
+
+    let mut census = Census { out: Vec::new(), prefix: Vec::new() };
+    census.visit(root);
+    census.out
+}
+
 /// The name of a constant *reference* used as a superclass (`< Bar`,
 /// `< Foo::Bar`): the **last** path component, since that is what the
 /// source-superclass chain walk resolves against the SourceIndex / RBS by simple
@@ -2678,6 +2851,68 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream #540's census, rendered as `prefix|receiver|path?|method`.
+    fn census(src: &str) -> Vec<String> {
+        let result = crate::parse(src.as_bytes());
+        lower(&result)
+            .const_mutations()
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}|{}|{}|{}",
+                    m.prefix.join("::"),
+                    m.receiver,
+                    m.receiver_is_path,
+                    m.method.clone().unwrap_or_else(|| "*".into())
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn const_mutation_census_records_the_three_mutating_shapes() {
+        // The `Index{Or,And,Operator}Write` family has no owned arena variant —
+        // it is the whole reason the census lives in the lowering.
+        assert_eq!(census("C[0] ||= 1\n"), ["|C|false|*"]);
+        assert_eq!(census("C[0] &&= 1\n"), ["|C|false|*"]);
+        assert_eq!(census("C[0] += 1\n"), ["|C|false|*"]);
+        // Prism's `attribute_write?` — the method name is irrelevant.
+        assert_eq!(census("C[0] = 1\n"), ["|C|false|*"]);
+        assert_eq!(census("C.x = 1\n"), ["|C|false|*"]);
+        // A plain send carries its NAME; `rigor-infer` applies the mutator tables.
+        assert_eq!(census("C.push(1)\n"), ["|C|false|push"]);
+        assert_eq!(census("C.each { |x| x }\n"), ["|C|false|each"]);
+        // A receiver that is not a constant, or not statically nameable, is out.
+        assert!(census("x[0] = 1\n").is_empty());
+        assert!(census("@x[0] = 1\n").is_empty());
+        assert!(census("expr::Bar[0] = 1\n").is_empty());
+        assert!(census("C\n").is_empty());
+    }
+
+    #[test]
+    fn const_mutation_census_tracks_only_the_lexical_prefix() {
+        // Scope-INSENSITIVE below the class/module level: a method body, a block
+        // and the top level all record the same prefix.
+        assert_eq!(
+            census("module A\n  module B\n    def m\n      [1].each { C[0] = 1 }\n    end\n  end\nend\n"),
+            ["A::B|C|false|*"]
+        );
+        // A `class A::B` header contributes ONE rendered segment.
+        assert_eq!(census("class A::B\n  C[0] = 1\nend\n"), ["A::B|C|false|*"]);
+        // A PATH receiver keeps the name as written and is flagged as a path.
+        assert_eq!(census("Outer::T[0] = 1\n"), ["|Outer::T|true|*"]);
+        assert_eq!(census("::Outer::T[0] = 1\n"), ["|Outer::T|true|*"]);
+        // A named class is entered through its BODY only, so a mutation in the
+        // SUPERCLASS expression is not recorded (the reference `return`s there).
+        assert!(census("class K < D[C.push(1)]\nend\n").is_empty());
+        // A class HEADER is rendered LENIENTLY, exactly as the reference's
+        // `Source::ConstantPath.qualified_name` does: a dynamic base is dropped
+        // and the trailing name still opens a prefix. (Only the mutated
+        // RECEIVER uses the strict `qualified_name_or_nil` policy — see the
+        // `expr::Bar[0] = 1` case above.)
+        assert_eq!(census("class expr::K\n  C[0] = 1\nend\n"), ["K|C|false|*"]);
+    }
 
     #[test]
     fn lowers_assignment_and_call_with_precise_spans() {
