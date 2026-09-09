@@ -8,9 +8,9 @@
 # references an `element` nobody ever bound, which the toplevel-call rule then
 # reported four times (rigor-survey `Ruby/searches/fibonacci_search.rb`).
 #
-# The reference's parse diagnostics (`rule: null`) are a coverage gap here —
-# rigor-rs emits none — which the harness allows. What it must NOT do is emit a
-# rule diagnostic the reference does not.
+# The parse diagnostics themselves (`rule: null`) used to be a coverage gap here;
+# that REPORTING half is now ported (`107_parse_errors.rb`). The SKIP is not: what
+# this fixture pins is that no RULE diagnostic fires on a file Prism cannot read.
 def broken_header int arr, int element
   n = arr.size
 

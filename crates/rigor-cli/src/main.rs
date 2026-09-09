@@ -748,7 +748,21 @@ fn analyze_files(
         /// the env gate is unset).
         Prepared(Prepared, Box<rigor_infer::Harvest>, Stage1Times),
         IoError { path: String, msg: String },
+        /// A file Prism could not parse: NOT analysed (see the guard below),
+        /// but its parse errors are reported, one diagnostic per raw Prism
+        /// error. The source rides along so the serial drain can resolve each
+        /// byte offset to a line/column exactly as every other finding does.
+        ParseErrors { order: usize, path: String, source: String, diags: Vec<Diagnostic> },
         Panic { order: usize, path: String, msg: String },
+    }
+
+    /// The two outcomes of the panic-isolated parse+lower closure: a file that
+    /// parsed (and is lowered), or one that did not (and carries its parse
+    /// errors instead). Replaces the earlier `Option`, whose `None` conflated
+    /// "unparseable" with "nothing to report".
+    enum Lowered {
+        Parsed(rigor_parse::LoweredAst, Vec<(usize, usize, String)>),
+        Unparseable(Vec<Diagnostic>),
     }
     let stage1: Vec<Stage1> = files
         .par_iter()
@@ -790,8 +804,16 @@ fn analyze_files(
                 // parse diagnostics of its own, so the file falls silent: a
                 // coverage gap against the reference's `rule: null` errors, not
                 // a false positive.
+                //
+                // The REPORTING half is separable from that skip, and is
+                // ported: the reference's `analyze_file_body` returns
+                // `parse_diagnostics(path, parse_result)` here — one
+                // `error`-severity, `rule: nil` diagnostic per raw Prism error,
+                // 1:1, no filtering and no dedupe — and rigor-rs now does too.
+                // Without them `rigor check` answered `[]` and exited 0 on a
+                // file it could not read, which a CI gate reads as clean.
                 if result.errors().next().is_some() {
-                    return None;
+                    return Lowered::Unparseable(parse_diagnostics(&result));
                 }
                 let comments = rigor_parse::comment_lines(&result, &source_bytes);
                 // Issue #102: the AST carries the file's CANONICAL-path identity,
@@ -800,11 +822,16 @@ fn analyze_files(
                 // partition the old per-`lower()` counter drew — but it is now a
                 // property of the FILE, so a re-lowering (the LSP) and a
                 // persisted harvest agree with it too.
-                Some((lower_with_key(&result, FileKey::for_path(Path::new(path))), comments))
+                Lowered::Parsed(lower_with_key(&result, FileKey::for_path(Path::new(path))), comments)
             }));
             match lowered {
-                Ok(None) => Stage1::Excluded,
-                Ok(Some((ast, comments))) => {
+                Ok(Lowered::Unparseable(diags)) => Stage1::ParseErrors {
+                    order,
+                    path: path.to_string(),
+                    source,
+                    diags,
+                },
+                Ok(Lowered::Parsed(ast, comments)) => {
                     // Issue #92: the per-file HARVEST — everything the project
                     // index derives from this file's AST + the already-frozen
                     // `CoreIndex` (ADR-0028 freezes it before any worker starts).
@@ -860,6 +887,21 @@ fn analyze_files(
                 hv_cpu_max = hv_cpu_max.max(t.harvest);
                 prepared.push(p);
                 harvests.push(*h);
+            }
+            Stage1::ParseErrors { order, path, source, diags } => {
+                // Pushed straight into `findings`, bypassing stage 3 — which is
+                // exactly what the reference does. Its `analyze_file_body`
+                // RETURNS `parse_diagnostics` before any rule runs, and both
+                // downstream filters short-circuit on a nil rule anyway:
+                // `SeverityStamp.stamp` ("return diagnostic if
+                // diagnostic.rule.nil?") and `filter_suppressed` ("Diagnostics
+                // with `rule == nil` … are NEVER suppressed — they represent
+                // failures the user cannot silence away"). So a parse error is
+                // not re-stamped by `severity_profile:`, not silenced by
+                // `disable:`, and not silenced by a `# rigor:disable` marker.
+                for diag in diags {
+                    findings.push((order, path.clone(), source.clone(), diag));
+                }
             }
             Stage1::IoError { path, msg } => {
                 eprintln!("rigor {verb}: cannot read {path}: {msg}");
@@ -1740,6 +1782,12 @@ fn print_text(findings: &[(usize, String, String, Diagnostic)]) {
 /// `path/line/column/rule` are always present; the harness reads these.
 /// Hand-rolled (no serde dependency) — the field set is small and fixed.
 fn print_json(findings: &[(usize, String, String, Diagnostic)]) {
+    println!("{}", json_document(findings));
+}
+
+/// The `--format json` payload as a string. Split out of [`print_json`] so a
+/// test can assert on the exact bytes rather than re-implementing the writer.
+fn json_document(findings: &[(usize, String, String, Diagnostic)]) -> String {
     let mut buf = String::from("[");
     for (idx, (_order, path, source, diag)) in findings.iter().enumerate() {
         if idx > 0 {
@@ -1753,7 +1801,14 @@ fn print_json(findings: &[(usize, String, String, Diagnostic)]) {
         push_kv_num(&mut buf, "line", line);
         push_kv_num(&mut buf, "column", col);
         push_kv_str(&mut buf, "severity", diag.severity.as_str(), false);
-        push_kv_str(&mut buf, "rule", diag.rule_id, false);
+        // A ruleless diagnostic (a parse error) serialises as JSON `null`, the
+        // reference's `"rule" => rule` with `rule` nil — NOT `""`, which is a
+        // different `(rule, line, column)` key for `harness/lib.rb`'s `DiagKey`
+        // and would score the row as a gap AND an unregistered extra at once.
+        match diag.qualified_rule() {
+            Some(rule) => push_kv_str(&mut buf, "rule", rule, false),
+            None => push_kv_raw(&mut buf, "rule", "null"),
+        }
         push_kv_str(&mut buf, "source_family", diag.source_family, false);
         push_kv_str(&mut buf, "message", &diag.message, false);
 
@@ -1774,7 +1829,7 @@ fn print_json(findings: &[(usize, String, String, Diagnostic)]) {
         buf.push('}');
     }
     buf.push(']');
-    println!("{buf}");
+    buf
 }
 
 /// GitHub Actions workflow-command format: one annotation line per diagnostic,
@@ -1818,6 +1873,13 @@ fn gh_escape_prop(s: &str) -> String {
 /// even with zero results. Built as a `serde_json::Value` and pretty-printed.
 /// ADDITIVE — does not touch text/json.
 fn print_sarif(findings: &[(usize, String, String, Diagnostic)]) {
+    println!("{}", serde_json::to_string_pretty(&sarif_document(findings)).unwrap());
+}
+
+/// The SARIF log as a `serde_json::Value`. Split out of [`print_sarif`] so a
+/// test can assert on the REAL tree instead of re-implementing the builder (a
+/// duplicated test-side builder cannot catch a change here at all).
+fn sarif_document(findings: &[(usize, String, String, Diagnostic)]) -> serde_json::Value {
     use serde_json::{json, Value};
 
     let mut rules: Vec<Value> = Vec::new();
@@ -1825,9 +1887,15 @@ fn print_sarif(findings: &[(usize, String, String, Diagnostic)]) {
     let mut results: Vec<Value> = Vec::new();
 
     for (_order, path, source, diag) in findings {
-        if !seen_rules.contains(&diag.rule_id) {
-            seen_rules.push(diag.rule_id);
-            rules.push(json!({ "id": diag.rule_id }));
+        // A ruleless diagnostic declares no rule and carries no `ruleId` — the
+        // reference's `filter_map(&:qualified_rule)` for the driver's rule list
+        // and `entry["ruleId"] = rule_id if rule_id` for the result.
+        let rule = diag.qualified_rule();
+        if let Some(rule) = rule {
+            if !seen_rules.contains(&rule) {
+                seen_rules.push(rule);
+                rules.push(json!({ "id": rule }));
+            }
         }
 
         let (line, col) = line_col(source, diag.start_offset);
@@ -1837,20 +1905,28 @@ fn print_sarif(findings: &[(usize, String, String, Diagnostic)]) {
             Severity::Info => "note",
         };
 
-        results.push(json!({
-            "ruleId": diag.rule_id,
-            "level": level,
-            "message": { "text": diag.message },
-            "locations": [{
+        // `ruleId` keeps its leading position for rule-carrying rows (the key
+        // order rigor-rs has always emitted) and is absent — not `""` — for a
+        // ruleless one.
+        let mut entry = serde_json::Map::new();
+        if let Some(rule) = rule {
+            entry.insert("ruleId".into(), json!(rule));
+        }
+        entry.insert("level".into(), json!(level));
+        entry.insert("message".into(), json!({ "text": diag.message }));
+        entry.insert(
+            "locations".into(),
+            json!([{
                 "physicalLocation": {
                     "artifactLocation": { "uri": path },
                     "region": { "startLine": line, "startColumn": col }
                 }
-            }]
-        }));
+            }]),
+        );
+        results.push(Value::Object(entry));
     }
 
-    let log = json!({
+    json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
         "runs": [{
@@ -1863,9 +1939,7 @@ fn print_sarif(findings: &[(usize, String, String, Diagnostic)]) {
             },
             "results": results
         }]
-    });
-
-    println!("{}", serde_json::to_string_pretty(&log).unwrap());
+    })
 }
 
 /// Flatten findings into `Rendered` rows (resolve each byte offset to a 1-based
@@ -1897,7 +1971,7 @@ fn to_rendered(findings: &[(usize, String, String, Diagnostic)]) -> Vec<Rendered
                 line,
                 column,
                 severity: diag.severity,
-                rule_id: diag.rule_id,
+                rule_id: diag.qualified_rule(),
                 message: &diag.message,
             }
         })
@@ -1990,6 +2064,15 @@ fn push_kv_str(buf: &mut String, key: &str, value: &str, first: bool) {
     buf.push_str(&json_string(value));
 }
 
+/// Append `,"key":<raw>` with `raw` spliced in as a JSON *literal*, not a
+/// string. Used for the `null` a ruleless diagnostic's `rule` field carries.
+fn push_kv_raw(buf: &mut String, key: &str, raw: &str) {
+    buf.push(',');
+    buf.push_str(&json_string(key));
+    buf.push(':');
+    buf.push_str(raw);
+}
+
 fn push_kv_num(buf: &mut String, key: &str, value: usize) {
     buf.push(',');
     buf.push_str(&json_string(key));
@@ -2027,6 +2110,45 @@ fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     }
     // Column = byte count between the line start and the offset, plus 1.
     (line, clamped - line_start + 1)
+}
+
+/// One diagnostic per raw Prism parse ERROR, in Prism's own order.
+///
+/// Ports the reference's `Runner#parse_diagnostics`:
+///
+/// ```ruby
+/// parse_result.errors.map do |error|
+///   location = error.location
+///   Diagnostic.new(path: path, line: location.start_line,
+///                  column: location.start_column + 1,
+///                  message: error.message, severity: :error)
+/// end
+/// ```
+///
+/// So: **1:1 with `errors`, no filtering and no dedupe** — two errors on one
+/// line stay two rows; `severity: :error`; `rule` defaulted, i.e. `nil`, here
+/// [`rigor_rules::NO_RULE`]; the message verbatim from Prism. `warnings` are
+/// NOT reported (the reference never reads them here — measured, not assumed).
+/// The location travels as the byte offsets it already is: `line_col` resolves
+/// them to Prism's `start_line` / `start_column + 1`, because it counts BYTES
+/// from the line start and adds one, which is exactly Prism's column.
+fn parse_diagnostics(result: &rigor_parse::ruby_prism::ParseResult<'_>) -> Vec<Diagnostic> {
+    result
+        .errors()
+        .map(|error| {
+            let location = error.location();
+            Diagnostic {
+                rule_id: rigor_rules::NO_RULE,
+                start_offset: location.start_offset(),
+                end_offset: location.end_offset(),
+                message: error.message().to_string(),
+                severity: Severity::Error,
+                source_family: "builtin",
+                receiver_type: None,
+                method_name: None,
+            }
+        })
+        .collect()
 }
 
 /// Build the synthetic `internal-error` diagnostic emitted when a file panics
@@ -2225,50 +2347,20 @@ mod tests {
         assert_eq!(github_all(&[]), "");
     }
 
-    /// Build the SARIF value tree the same way `print_sarif` does, so we can
-    /// assert on the parsed structure.
+    /// The REAL SARIF builder. This used to be a test-side re-implementation of
+    /// `print_sarif`, which by construction could not catch a change to the
+    /// emitter it was supposed to pin.
     fn sarif_value(findings: &[(usize, String, String, Diagnostic)]) -> serde_json::Value {
-        use serde_json::{json, Value};
-        let mut rules: Vec<Value> = Vec::new();
-        let mut seen: Vec<&str> = Vec::new();
-        let mut results: Vec<Value> = Vec::new();
-        for (_o, path, source, d) in findings {
-            if !seen.contains(&d.rule_id) {
-                seen.push(d.rule_id);
-                rules.push(json!({ "id": d.rule_id }));
-            }
-            let (line, col) = line_col(source, d.start_offset);
-            let level = match d.severity {
-                Severity::Error => "error",
-                Severity::Warning => "warning",
-                Severity::Info => "note",
-            };
-            results.push(json!({
-                "ruleId": d.rule_id,
-                "level": level,
-                "message": { "text": d.message },
-                "locations": [{ "physicalLocation": {
-                    "artifactLocation": { "uri": path },
-                    "region": { "startLine": line, "startColumn": col }
-                }}]
-            }));
-        }
-        json!({
-            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-            "version": "2.1.0",
-            "runs": [{
-                "tool": { "driver": {
-                    "name": "rigor-rs",
-                    "informationUri": "https://github.com/rigortype/rigor",
-                    "rules": rules
-                }},
-                "results": results
-            }]
-        })
+        sarif_document(findings)
     }
 
     fn finding(rule: &'static str, sev: Severity, msg: &str) -> (usize, String, String, Diagnostic) {
         (0, "f.rb".to_string(), String::new(), diag(rule, sev, msg))
+    }
+
+    /// A finding with NO rule — what `parse_diagnostics` produces.
+    fn finding_ruleless(msg: &str) -> (usize, String, String, Diagnostic) {
+        (0, "f.rb".to_string(), String::new(), diag(rigor_rules::NO_RULE, Severity::Error, msg))
     }
 
     #[test]
@@ -2311,6 +2403,106 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["call.undefined-method", "some.warn", "internal-error"]);
         assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "rigor-rs");
+    }
+
+    /// A parse error carries NO rule. `--format json` must spell that as JSON
+    /// `null`, exactly as the reference's `"rule" => rule` with `rule` nil —
+    /// **not** as `""`.
+    ///
+    /// This is not cosmetic. `harness/lib.rb`'s `DiagKey` is
+    /// `(rule, line, column)`; `""` is a different key from `nil`, so the row
+    /// would score as a coverage gap AND an unregistered extra at once — the
+    /// slice would manufacture a false positive in the gate that grades it.
+    /// `parse_diagnostics` is 1:1 with Prism's `errors` — no dedupe, no
+    /// per-line collapsing — and reads NOTHING from `warnings`. Oracle-measured
+    /// at pin `ffb456b0`: `def sum_of int a, int b` gives the reference three
+    /// rows on one line at columns 15 / 16 / 23, and a file with one Prism
+    /// warning and zero errors gives it none.
+    #[test]
+    fn parse_diagnostics_are_one_per_prism_error_and_ignore_warnings() {
+        let src = b"def sum_of int a, int b\n  a + b\nend\n";
+        let result = parse(src);
+        let diags = parse_diagnostics(&result);
+        assert_eq!(diags.len(), 3, "three errors on one line stay three rows: {diags:?}");
+        let source = std::str::from_utf8(src).unwrap();
+        let positions: Vec<(usize, usize)> =
+            diags.iter().map(|d| line_col(source, d.start_offset)).collect();
+        assert_eq!(positions, vec![(1, 15), (1, 16), (1, 23)]);
+        for d in &diags {
+            assert_eq!(d.severity, Severity::Error);
+            assert_eq!(d.rule_id, rigor_rules::NO_RULE);
+            assert!(d.qualified_rule().is_none());
+            assert_eq!(d.source_family, "builtin");
+        }
+        assert_eq!(diags[0].message, "expected a delimiter to close the parameters");
+
+        // Warnings are not errors: a file Prism warns about but parses cleanly
+        // produces no parse diagnostics.
+        let warned = parse(b"x = 1\nif x = 2\n  puts 'a'\nend\n");
+        assert!(warned.warnings().next().is_some(), "the probe must actually warn");
+        assert!(parse_diagnostics(&warned).is_empty());
+    }
+
+    #[test]
+    fn ruleless_diagnostic_serialises_rule_as_json_null() {
+        let findings = vec![finding_ruleless("unexpected 'else', ignoring it")];
+        let doc = json_document(&findings);
+        assert!(doc.contains(r#""rule":null"#), "rule must be the null literal: {doc}");
+        assert!(!doc.contains(r#""rule":"""#), "an empty-string rule is a DIFFERENT key: {doc}");
+
+        // It re-parses, and `rule` is really null (not the four-character
+        // string "null").
+        let v: serde_json::Value = serde_json::from_str(&doc).unwrap();
+        assert!(v[0]["rule"].is_null());
+        assert_eq!(v[0]["severity"], "error");
+        assert_eq!(v[0]["source_family"], "builtin");
+        // No catalogue enrichment for a rule that does not exist.
+        assert!(v[0].get("evidence_tier").is_none());
+
+        // A rule-carrying row is untouched.
+        let doc = json_document(&[finding("call.undefined-method", Severity::Error, "e1")]);
+        assert!(doc.contains(r#""rule":"call.undefined-method""#), "{doc}");
+    }
+
+    /// SARIF: the reference declares no rule for a ruleless diagnostic
+    /// (`filter_map(&:qualified_rule)`) and omits the result's `ruleId`
+    /// (`entry["ruleId"] = rule_id if rule_id`) — measured against the
+    /// reference at pin `ffb456b0`, which emitted `"rules": []` and results
+    /// with no `ruleId` key.
+    #[test]
+    fn sarif_omits_rule_id_for_a_ruleless_diagnostic() {
+        let findings = vec![
+            finding_ruleless("unexpected 'else', ignoring it"),
+            finding("call.undefined-method", Severity::Error, "e1"),
+        ];
+        let v = sarif_value(&findings);
+        let results = v["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].get("ruleId").is_none(), "no ruleId key at all: {}", results[0]);
+        assert_eq!(results[0]["level"], "error");
+        assert_eq!(results[1]["ruleId"], "call.undefined-method");
+
+        let ids: Vec<&str> = v["runs"][0]["tool"]["driver"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["call.undefined-method"], "the ruleless row declares no rule");
+    }
+
+    /// The text format has no rule slot at all, so a ruleless row is already
+    /// `path:line:col: error: message` — the exact shape the reference prints
+    /// (`Diagnostic#to_s` returns the unsuffixed base when `qualified_rule` is
+    /// nil), measured at pin `ffb456b0`.
+    #[test]
+    fn text_row_for_a_ruleless_diagnostic_matches_the_reference_shape() {
+        let (_o, path, source, d) = finding_ruleless("unexpected 'else', ignoring it");
+        let (line, col) = line_col(&source, d.start_offset);
+        assert_eq!(
+            format!("{path}:{line}:{col}: {}: {}", d.severity.as_str(), d.message),
+            "f.rb:1:1: error: unexpected 'else', ignoring it"
+        );
     }
 
     #[test]
