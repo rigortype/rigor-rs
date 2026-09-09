@@ -312,10 +312,27 @@ ceiling — 43 files, 7 corpora. 71 verified, 9 already-rejected mocha rows, and
 `rigor-survey/Ruby/searches/{binary,linear,ternary}_search.rb` and
 `fibonacci_search.rb` do not parse (`puts if cond` followed by a dangling
 `else`). The reference reports Prism's errors (`unexpected 'else', ignoring it`);
-the port reports nothing. In-situ on `binary_search.rb`: REF 2, RS 0. A
-reporting-surface gap with no standing decision recorded anywhere in
-`AGENTS.md`, `docs/adr/` or `PORT_BACKLOG.md`. 9 rows, 4 files, 1 corpus.
-Cheap, but it is diagnostics about broken files, not inference.
+the port reports nothing. In-situ on `binary_search.rb`: REF 2, RS 0. 9 rows,
+4 files, 1 corpus.
+
+**Correction after this note's first draft** (orchestrator, same day): there IS
+a standing decision, recorded where the search above did not look — a comment in
+`crates/rigor-cli/src/main.rs` at the `result.errors().next().is_some()` guard.
+It skips an unparseable file **index included**, because Prism's error recovery
+invents bindings (`def f int a, int b` recovers as a body referencing a
+never-bound `b`) that the rules then over-fire on, and it names this exact
+consequence: "rigor-rs emits no parse diagnostics of its own, so the file falls
+silent: a coverage gap against the reference's `rule: null` errors, not a false
+positive." ADR-0016 covers the surrounding never-crash posture.
+
+**The decision covers ANALYSING the file, and the reporting half is separable.**
+Measured: on a file whose only defect is a syntax error, the reference answers
+one `error`-severity row with `success: false`, and the port answers `[]` **and
+exits 0** — so a CI gate built on the port reads a file it could not parse as
+clean. Emitting Prism's errors while still skipping the analysis closes these 9
+rows, carries no FP risk (the diagnostics are the reference's own), and removes
+the green-on-unreadable-input behaviour. That is a smaller and safer slice than
+bucket 10, and the ranking below predates the correction.
 
 ## Ranked recommendation
 
