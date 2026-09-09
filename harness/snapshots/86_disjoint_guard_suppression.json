@@ -24,56 +24,49 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 134,
-      "column": 5,
-      "severity": "error",
-      "message": "undefined method `frobnicate_ppp' for Array"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 142,
+      "line": 147,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_qqq' for [1, 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 151,
+      "line": 156,
       "column": 27,
       "severity": "error",
       "message": "undefined method `frobnicate_rrr' for [1, 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 159,
+      "line": 164,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_sss' for [1, 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 168,
+      "line": 173,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_ttt' for [1, 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 176,
+      "line": 181,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_uuu' for [3, 4]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 188,
+      "line": 193,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_www' for [3, 4]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 195,
+      "line": 200,
       "column": 22,
       "severity": "error",
       "message": "undefined method `frobnicate_yyy' for [3, 4]"

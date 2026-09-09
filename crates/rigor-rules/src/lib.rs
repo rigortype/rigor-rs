@@ -12,6 +12,11 @@ use rigor_types::{Interner, Scalar, Type};
 mod shadowed_rescue;
 pub use shadowed_rescue::shadowed_rescue_diagnostics;
 
+pub mod dead_version_guard;
+pub use dead_version_guard::{
+    filter_dead_version_guard_arms, filter_dead_version_guard_arms_with, RubyRuntime,
+};
+
 // ---------------------------------------------------------------------------
 // Severity enum
 // ---------------------------------------------------------------------------
@@ -932,30 +937,28 @@ const META_NEW_SELECTORS: &[(&str, &str)] = &[
 /// `class_new_lift` returns instead of `Singleton[Object]`) is NOT ported here:
 /// it only ever makes the reference emit MORE, so it is coverage, not FP safety.
 ///
-/// **The constant-write rvalue is carved out**, and that is the reference's own
-/// asymmetry, not an approximation: `ScopeIndexer` has always keyed
-/// `A = Class.new do … end`'s body by the constant, and `StatementEvaluator` never
-/// routes a constant-write rvalue through the block-body narrowing that #319 added
-/// — so `self` inside such a body is still `Dynamic[top]`, `Scope#toplevel?` still
-/// holds, and the reference still fires there. Measured at the `v0.3.4` pin:
-/// `A = Class.new { attr_reader :a }` fires, `a = Class.new { attr_reader :a }`
-/// and the bare-expression form do not. Only the plain `A = …` spelling is
-/// carved out; `Outer::F = …` lowers to the recovery carrier (no owned
-/// `ConstantPathWrite` variant), so it stays suppressed — a coverage gap, never
-/// an FP.
+/// **The constant-write rvalue is included**, since upstream #590 / `b3d688f7`
+/// (pin `v0.3.8`). It used to be carved out because the reference's own
+/// `StatementEvaluator` had no `ConstantWriteNode` handler at all: the rvalue fell
+/// to the pure-expression default, its block was never walked, and
+/// `ScopeIndexer.propagate` handed every node inside the ENCLOSING scope — a nil
+/// `self_type` at file top level, which is exactly what `Scope#toplevel?` keys on.
+/// `b3d688f7` added the handler and routes the rvalue block through the same
+/// `enter_meta_class_body` the #319 arm uses, so `Registry = Class.new do
+/// attr_reader :entries end` is now silent on both sides. Measured at the
+/// `v0.3.8` pin (`ffb456b0`): rows d1-d4, d8 and d10' of
+/// `docs/notes/20260909-repin-v038-port-spec.md` are silent on the oracle.
+///
+/// Two spellings where the ORACLE still fires and rigor-rs is silent are coverage
+/// gaps, not FP risk, and are deliberately not chased: `X = Class.new do … end
+/// .freeze` and `X ||= Class.new do … end` — in both the constant's rvalue is not
+/// the meta-new call itself, so upstream's `meta_new_constant_body_context`
+/// declines while rigor-rs's span scan sees the inner `Class.new` block regardless.
+/// `Outer::F = …` lowers to the recovery carrier (no owned `ConstantPathWrite`
+/// variant) and is silent on BOTH sides (row d5).
 fn meta_new_block_body_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
-    let constant_write_values: std::collections::HashSet<rigor_parse::NodeId> = ast
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Node::ConstantWrite { value, .. } => Some(*value),
-            _ => None,
-        })
-        .collect();
     let mut out = Vec::new();
-    for (id, n) in ast.iter() {
-        if constant_write_values.contains(&id) {
-            continue;
-        }
+    for (_, n) in ast.iter() {
         let Node::Call {
             receiver: Some(recv),
             method,
@@ -1279,6 +1282,66 @@ fn check_override_visibility(
 // Rule implementations
 // ---------------------------------------------------------------------------
 
+/// The reference's `METACLASS_ARMS` (`analysis/check_rules.rb`), verbatim: a value
+/// typed `Class` or `Module` is SOME class or module object, and its singleton
+/// methods cannot be read off the metaclass — `def self.included(base)` receives
+/// the includer, so `base.class_attribute :main_menu` is a call on whatever
+/// included the module.
+const METACLASS_ARMS: &[&str] = &["Class", "Module"];
+
+/// Whether `call.undefined-method` must DECLINE on a receiver whose resolved class
+/// is `class_name`, because that class's method surface is not enumerable.
+///
+/// The port of upstream #742 / PR #743 (`23341a87`) — `unenumerable_receiver?`,
+/// which is `METACLASS_ARMS ∪ unbounded_receiver_surface?` and runs on BOTH the
+/// instance and the singleton side. rigor-rs has no `unbounded_receiver_surface?`
+/// analogue at this seam (ADR-26 open classes and synthesized stubs are handled by
+/// the conservative `class_has_method` completeness gate), so only the metaclass
+/// half needs porting. Measured at pin `ffb456b0`: `Class.frobnicate` and
+/// `Module.frobnicate` — SINGLETON reads of the two constants — are silent on the
+/// oracle and were rigor-rs false positives (rows x3/x4 of
+/// `docs/notes/20260909-repin-v038-rules-families.md`).
+fn unenumerable_metaclass_receiver(class_name: &str) -> bool {
+    METACLASS_ARMS.contains(&class_name.strip_prefix("::").unwrap_or(class_name))
+}
+
+/// Whether `call.undefined-method` must DECLINE on an INSTANCE-side receiver whose
+/// resolved class is `class_name`.
+///
+/// The port of upstream #739 / PR #741 (`3636649f`) joined with the metaclass half
+/// above. A value typed as a mixin MODULE is an instance of whatever class includes
+/// the module, and that class contributes an arbitrary surface: in RBS a parameter
+/// typed `Taggable` means "something whose class includes Taggable", not "something
+/// whose methods are Taggable's". Nothing there can prove a method absent, so the
+/// reference stopped retrying the lookup against `Object` and declines outright
+/// (`module_mixin_receiver?` in `last_resort_surface_answers?`).
+///
+/// SCOPE, three ways, each measured rather than argued:
+///
+/// * INSTANCE side only for the module half. The reference's `module_mixin_receiver?`
+///   tests `receiver_type.is_a?(Type::Nominal)`, so a SINGLETON module receiver keeps
+///   firing — `Comparable.typo`, `Digest::Instance.typo` (rows c4/c5) — because a
+///   namespace module's `module_function` / `def self.` surface is real and
+///   enumerable. Declining every `Singleton` receiver would silence those and `String
+///   .typo` (c11); that is the control an over-broad fix fails.
+/// * `call.undefined-method` only. Upstream moved nothing else: `unenumerable_receiver?`
+///   is called from the undefined-method diagnostic alone, and the arity rule reads the
+///   narrower `unbounded_receiver_surface?`. Probed at the pin: `v.hexdigest(1, 2, 3)`
+///   behind a `Digest::Instance` guard still reports `call.wrong-arity` on the oracle
+///   (row x1) — rigor-rs is silent there for an unrelated, pre-existing reason.
+/// * The QUALIFIED name, not the short key. `is_qualified_module` asks the isolated
+///   registry exactly as the reference's `rbs_module?` asks `env.class_decls`; the
+///   short-key map answers `false` for `Digest::Instance` and would leak a nested
+///   module's moduleness onto an unrelated project class of the same leaf name.
+///
+/// The one shape upstream keys on SYNTAX rather than type — `mixin_self_class_receiver?`,
+/// i.e. `v.class.typo` where `v` is mixin-typed — needs no port: rigor-rs is already
+/// silent there on both engines (row c6), because `.class` on a Dynamic receiver
+/// yields no witnessable carrier.
+fn unenumerable_instance_receiver(index: &CoreIndex, class_name: &str) -> bool {
+    unenumerable_metaclass_receiver(class_name) || index.is_qualified_module(class_name)
+}
+
 /// Apply `call.undefined-method` to a single call with a receiver.
 ///
 /// Zero-false-positive gate (ADR-0023): emit *only* when the receiver's concrete
@@ -1326,6 +1389,15 @@ fn check_call(
         let Some(name) = typer.source().class_name_for_id(class) else {
             return None; // not round-trippable ⇒ silent (never guess).
         };
+        // Upstream #742 — `Class.typo` / `Module.typo`. The reference's
+        // `unenumerable_receiver?` runs before the surface lookup on BOTH sides,
+        // so the two generic metaclasses decline here as well. The MODULE half of
+        // the retraction deliberately does NOT reach this branch: a named module's
+        // singleton surface is real and enumerable, and `Comparable.typo` /
+        // `Digest::Instance.typo` keep firing (rows c4/c5).
+        if unenumerable_metaclass_receiver(name) {
+            return None;
+        }
         // `class_has_singleton_method` is conservative: `false` only when the
         // class-method surface is fully known and lacks the method (handles
         // `extend`ed modules; incomplete/unknown ⇒ `true` ⇒ silent).
@@ -1427,6 +1499,15 @@ fn check_call(
             // The shadow test applies ONLY to the bundled-RBS arm. A project
             // SIG class is authoritative for its own name (fixture 70), and the
             // declaration-only arm is already isolated by its qualified key.
+            // Upstream #739/#742 — an INSTANCE receiver whose class is an RBS
+            // module (its includer contributes an arbitrary surface) or the
+            // generic `Class`/`Module`. Placed before the resolution gates for the
+            // same reason the reference puts `unenumerable_receiver?` at the top of
+            // the diagnostic: the question is about the receiver, not about which
+            // surface happens to model it.
+            if unenumerable_instance_receiver(index, name) {
+                return None;
+            }
             let use_prefix = typer.enclosing_prefix(message_span);
             let bundled_toplevel = index.knows_toplevel_class(name)
                 && !typer.source().constant_shadowed(name, use_prefix);
@@ -1460,6 +1541,13 @@ fn check_call(
     // registry surface (a project class, or a non-core `X.new` like Pathname)
     // returns `None` here ⇒ silent (reference leniency, see the rustdoc above).
     let class_name = index.class_name_of(interner, recv_ty)?;
+    // Upstream #739/#742 — the core-id twin of the decline above. `class_name_of`
+    // answers only with a `CORE_CLASSES` name today, none of which is a module or a
+    // metaclass, so this is defence in depth: it keeps the two instance paths
+    // answering the same question the same way should that array ever widen.
+    if unenumerable_instance_receiver(index, class_name) {
+        return None;
+    }
     if !index.knows_class(class_name) {
         return None;
     }
@@ -1564,6 +1652,22 @@ fn check_narrowed_call(
     // lexical prefix is available), so all three spellings of a class — bare,
     // qualified, `::`-absolute — reach the same surface and the same rendering.
     //
+    // Upstream #739/#742 (pin `v0.3.8`) — the guard NAMES the receiver's class,
+    // and when that class is an RBS module or the generic `Class` / `Module` the
+    // surface is not enumerable. This is the path the whole F-C family actually
+    // fires from: `return unless v.is_a?(Digest::Instance)` types `v` through the
+    // narrowing snapshot, not through a carrier `check_call` can see. `class_name`
+    // arrives already resolved to a QUALIFIED key
+    // (`Typer::resolve_constant_as_written`), which is exactly the spelling
+    // `is_qualified_module` wants.
+    //
+    // Note what this does NOT touch: an `Enumerable` guard on a value already
+    // typed `Array` keeps the `Array` bound (subclass ordering), so `class_name`
+    // there is `"Array"` and the witness still fires on both engines — row x11,
+    // the control an "any module in the guard" test would have silenced.
+    if unenumerable_instance_receiver(index, class_name) {
+        return None;
+    }
     // Accepted surfaces: the existing top-level one, the project's own `sig/`
     // (nested included — probes q2/q3/q8), and the bundled qualified registry.
     // Everything else DECLINES, which is free: an unresolvable name (p2/p2b)
@@ -4277,8 +4381,8 @@ mod tests {
             // r8/v4 — a DEPTH-3 decl, the S0 fix's payoff
             (&b"def f(v)\n  return unless v.is_a?(Bundler::Source::Git)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Bundler::Source::Git"),
             (&b"def f(v)\n  return unless v.is_a?(Bundler::Source::Rubygems)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Bundler::Source::Rubygems"),
-            // q5/q4c — a qualified MODULE, and an ambiguous LEAF
-            (&b"def f(v)\n  return unless v.is_a?(Digest::Instance)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Digest::Instance"),
+            // q4c — an ambiguous LEAF. (q5, the qualified MODULE twin, moved to
+            // the declines below: upstream #739 retracted it in `v0.3.8`.)
             (&b"def f(v)\n  return unless v.is_a?(Random::Base)\n  v.frobnicate_zzz\nend\n"[..], "frobnicate_zzz", "Random::Base"),
             // q4 — NO leaf fallback: `superclass` is a `::Class` method, and
             // `Digest::Class` must not inherit it
@@ -4327,6 +4431,24 @@ mod tests {
             // q5b — an Object method on a MODULE target (RBS's implicit
             // `::Object` self-type; S1)
             &b"def f(v)\n  return unless v.is_a?(Digest::Instance)\n  v.frozen?\nend\n"[..],
+            // q5 — upstream #739 / PR #741 (`3636649f`, `v0.3.8`): an
+            // instance-side MODULE receiver declines outright now. The value is
+            // an instance of whatever class includes the module, and that class
+            // contributes an arbitrary surface, so nothing can prove a method
+            // absent. Qualified and top-level spellings, and the `Class`/`Module`
+            // metaclass twins from #742 / PR #743 (`23341a87`). Fixture 101.
+            &b"def f(v)\n  return unless v.is_a?(Digest::Instance)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Comparable)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Kernel)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f(v)\n  case v\n  when Comparable then v.frobnicate_zzz\n  end\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Class)\n  v.frobnicate_zzz\nend\n"[..],
+            &b"def f(v)\n  return unless v.is_a?(Module)\n  v.frobnicate_zzz\nend\n"[..],
+            // …and the SINGLETON reads of the two metaclass constants, which the
+            // reference's `unenumerable_receiver?` declines above the
+            // instance/singleton split.
+            &b"Class.frobnicate_zzz\n"[..],
+            &b"Module.frobnicate_zzz\n"[..],
             // p7b/v2 — inherited over the AS-WRITTEN chain, through two
             // ambiguous leaves (S1)
             &b"def f(v)\n  return unless v.is_a?(Digest::SHA256)\n  v.hexdigest\nend\n"[..],
@@ -4376,6 +4498,37 @@ mod tests {
                 "expected silence for {:?}, got {diags:?}",
                 String::from_utf8_lossy(src)
             );
+        }
+    }
+
+    /// The anti-over-suppression half of upstream #739/#742. Declining every
+    /// `Singleton` receiver, or every receiver whose guard names a module, would
+    /// pass the declines above and silence all four of these — which is why the
+    /// port keys the module half on the INSTANCE side and reads the guard's
+    /// RESOLVED carrier, not the guard's written name. Every row measured firing
+    /// on the oracle at pin `ffb456b0` (rows c4/c5/c11/x11; fixture 101).
+    #[test]
+    fn module_receiver_decline_leaves_the_enumerable_surfaces_alone() {
+        for (src, expect) in [
+            // c4/c5 — a namespace module's OWN singleton surface is real.
+            (&b"require \"digest\"\nDigest::Instance.frobnicate_zzz\n"[..], "singleton(Digest::Instance)"),
+            (&b"Comparable.frobnicate_zzz\n"[..], "singleton(Comparable)"),
+            // c11 — an ordinary class singleton, the row a `Singleton`-wide
+            // decline would take with it.
+            (&b"String.frobnicate_zzz\n"[..], "singleton(String)"),
+            // x11 — a module guard the environment can ORDER against the carrier
+            // keeps the carrier's bound (`Array < Enumerable`), so the receiver
+            // is `Array` and the witness stands.
+            (&b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Array"),
+        ] {
+            let diags = run(src);
+            assert_eq!(
+                diags.len(),
+                1,
+                "expected one undefined-method for {:?}, got {diags:?}",
+                String::from_utf8_lossy(src)
+            );
+            assert_eq!(diags[0].receiver_type.as_deref(), Some(expect));
         }
     }
 
@@ -4476,13 +4629,22 @@ mod tests {
             &b"module Proj\n  class Thing\n  end\nend\ndef f\n  v = [1, 2]\n  return unless v.is_a?(Proj::Thing)\n  v.frobnicate_zzz\nend\n"[..],
             // A DECLINE S3 costs, measured and accepted: `h = []` then
             // `h << 1` under an unresolvable guard. The reference widens that
-            // carrier to a NOMINAL `Array[Dynamic[top]]` and so stays
-            // conservative and FIRES, while rigor-rs keeps the more precise
-            // SHAPE carrier, which now collapses. Silence, not a false
-            // positive — the fixture-85 carrier-fidelity family, out of scope
-            // here. (`Array.new` and `h = *spec` widen to a nominal on BOTH
-            // engines and are pinned as must-fire above.)
+            // carrier to a NOMINAL `Array[Dynamic[top]]`, and since the
+            // `v0.3.8` re-pin that nominal WIDENS under an unorderable guard
+            // rather than staying conservative, so both engines are silent —
+            // this row and the two NOMINAL rows below now agree for the same
+            // reason, where before the re-pin they diverged.
             &b"def f\n  h = []\n  h << 1\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
+            // A NOMINAL carrier under a guard class the hierarchy cannot ORDER:
+            // upstream #533 item 4 (`70ca7e74`) answers `untyped` there — "the
+            // guard proved membership in a class the engine cannot name, which
+            // destroys the old knowledge". Both rows asserted FIRING `for Array`
+            // in the anti-over-suppression test until the `v0.3.4 → v0.3.8`
+            // re-pin; re-measured at `ffb456b0` both are reference-SILENT, and
+            // the first is fixture 86 row 134, one of the four re-pin false
+            // positives. See `ClassFact::Widened`.
+            &b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
+            &b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
         ] {
             let diags = run(src);
             assert!(
@@ -4512,15 +4674,23 @@ mod tests {
             (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "Array"),
             (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
             (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Hash"),
-            // a guard class the core hierarchy cannot RESOLVE — the
-            // `ClassOrdering::Unknown` arm, which S3 split by carrier kind. On
-            // a NOMINAL carrier the reference stays conservative and FIRES, and
-            // that is what these rows pin (probes isa_nominal_unknown,
-            // x_arr_new_unk, x_arr_push_unk, x_splat_unk). The SHAPE carrier's
-            // twin of this row is the opposite — collapsed — and lives in the
-            // silence test above.
-            (&b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
-            (&b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..], "Array"),
+            // (The two `ClassOrdering::Unknown`-on-a-NOMINAL rows that used to
+            // sit here moved to the silence test at the `v0.3.8` re-pin —
+            // upstream #533 item 4 widens that arm to `untyped`. The rows below
+            // are the controls that the widening must NOT swallow.)
+            //
+            // A SHAPED carrier keeps collapsing to `Bot` on `Unknown`
+            // (`narrow_shape_to_class` is untouched by the re-pin), and `Bot` is
+            // the JOIN IDENTITY — so the call AFTER the conditional still fires
+            // where a widened one would be silent.
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // A TERMINATING truthy edge widens only the path that returns; the
+            // code after runs on the untouched falsey edge.
+            (&b"def f\n  h = Array.new\n  return if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // A REBIND after the widening clears it.
+            (&b"def f\n  h = Array.new\n  h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  h = Array.new\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // A widening established INSIDE a block does not escape it.
+            (&b"def f\n  h = Array.new\n  [1].each do |_i|\n    h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  end\n  h.frobnicate_zzz\nend\n"[..], "Array"),
             // S3 anti-over-suppression: a SHAPED carrier under a guard it IS a
             // subclass of survives and still witnesses. All three measured
             // firing on the reference (`… for [1, 2]` / `… for { a: 1 }`).
@@ -5785,23 +5955,43 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_toplevel_fires_in_constant_assigned_meta_class_body() {
-        // The reference's own asymmetry: `ScopeIndexer` keys a constant-assigned
-        // body by the CONSTANT, and `StatementEvaluator` never routes a
-        // constant-write rvalue through the #319 block-body narrowing — so `self`
-        // there is still `Dynamic[top]` and the rule DOES fire. Oracle (v0.3.4):
-        // 2:3 on each. Losing this would trade 48 false positives for a silent
-        // hole in the commonest spelling of the idiom.
+    fn unresolved_toplevel_silent_in_constant_assigned_meta_class_body() {
+        // Upstream #590 / `b3d688f7` (pin `v0.3.8`) closed the reference's own
+        // asymmetry: `StatementEvaluator` gained a `ConstantWriteNode` handler
+        // that enters the rvalue block through the same `enter_meta_class_body`
+        // the #319 arm uses, so `self` there is the created class and
+        // `Scope#toplevel?` no longer holds. Oracle at `ffb456b0`: silent on each.
         for src in [
             b"A = Class.new do\n  attr_reader :a\nend\n".as_slice(),
             b"A = Class.new(StandardError) do\n  attr_reader :a\nend\n".as_slice(),
             b"A = Module.new do\n  attr_reader :a\nend\n".as_slice(),
             b"A = Struct.new(:a) do\n  attr_reader :b\nend\n".as_slice(),
+            b"A = Data.define(:a) do\n  attr_reader :b\nend\n".as_slice(),
         ] {
             let d = unresolved(src);
-            assert_eq!(d.len(), 1, "constant-assigned body still fires: {src:?} {d:?}");
-            assert_eq!(line_col(src, d[0].start_offset), (2, 3));
+            assert!(d.is_empty(), "constant-assigned body is a class body: {src:?} {d:?}");
         }
+    }
+
+    #[test]
+    fn unresolved_toplevel_fires_outside_a_constant_assigned_meta_class_body() {
+        // The control an over-broad #590 port WOULD silence: widening the
+        // suppression from "the block body" to "the whole constant write", or to
+        // "any block body", takes these two with it. Only the BLOCK BODY is a
+        // class scope — the ARGUMENTS keep the enclosing (toplevel) scope, and a
+        // block on a call that is NOT a meta-new selector (#316's DSL block) is
+        // not a class body at all. Oracle at `ffb456b0`: 1:15, and 4:1 + 5:3.
+        let src = b"A = Class.new(parent_of_x) do\n  attr_reader :a\nend\n";
+        let d = unresolved(src);
+        assert_eq!(d.len(), 1, "constant-write args stay toplevel, got {d:?}");
+        assert_eq!(line_col(src, d[0].start_offset), (1, 15));
+
+        let src = b"A = Class.new do\n  attr_reader :a\nend\nsome_dsl_call do\n  attr_reader :d\nend\n";
+        let d = unresolved(src);
+        assert_eq!(d.len(), 2, "#316 DSL block is not a class body, got {d:?}");
+        let mut at: Vec<(usize, usize)> = d.iter().map(|x| line_col(src, x.start_offset)).collect();
+        at.sort_unstable();
+        assert_eq!(at, vec![(4, 1), (5, 3)]);
     }
 
     #[test]
@@ -7080,19 +7270,36 @@ mod tests {
         assert!(ivar_diags(src).is_empty());
     }
 
+    /// Increment (b): a Kernel conversion types the first ivar write, so the
+    /// second write's class mismatch is witnessed — but ONLY when the argument
+    /// discriminates. Upstream #521 (`3d5dddbb`, ported at the
+    /// `v0.3.4 → v0.3.8` re-pin) stops pinning one overload for an UNTYPED
+    /// argument, and both engines then answer `Dynamic[union]`, on which no
+    /// negative rule fires. Fixture 60 line 59 (`Float(kwargs[:upload_duration])`
+    /// with the `rescue`-arm `= 0`) was one of the four re-pin false positives.
     #[test]
-    fn ivar_kernel_float_conversion_fires() {
-        // Increment (b): `Float(non_constant)` types Float; then `= 0` is Integer.
-        let src = b"class Foo\n  def m(k)\n    @d = Float(k)\n  rescue ArgumentError, TypeError\n    @d = 0\n  end\nend\n";
-        let d = ivar_diags(src);
-        assert_eq!(d.len(), 1, "{d:?}");
-        assert_eq!(d[0].message, "instance variable `@d' on Foo was previously assigned Float; this write assigns Integer");
+    fn ivar_kernel_conversion_of_untyped_argument_is_silent() {
+        // A bare parameter: reference-SILENT at `ffb456b0` (both rows measured).
+        let float_src = b"class Foo\n  def m(k)\n    @d = Float(k)\n  rescue ArgumentError, TypeError\n    @d = 0\n  end\nend\n";
+        assert!(ivar_diags(float_src).is_empty(), "{:?}", ivar_diags(float_src));
+        let int_src = b"class Foo\n  def m(a)\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
+        assert!(ivar_diags(int_src).is_empty(), "{:?}", ivar_diags(int_src));
     }
 
+    /// …and the must-still-fire half of the same pair: a conversion whose
+    /// argument the reference can discriminate keeps its pinned return, so the
+    /// mismatch still fires. Both rows measured FIRING at `ffb456b0`.
     #[test]
-    fn ivar_kernel_integer_and_string_conversions_fire() {
-        let src = b"class Foo\n  def m(a)\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
-        let d = ivar_diags(src);
+    fn ivar_kernel_conversion_of_typed_argument_still_fires() {
+        // A literal argument …
+        let lit = b"class Foo\n  def m\n    @n = Integer(\"12\")\n    @n = \"x\"\n  end\nend\n";
+        let d = ivar_diags(lit);
+        assert_eq!(d.len(), 1, "{d:?}");
+        assert_eq!(d[0].message, "instance variable `@n' on Foo was previously assigned Integer; this write assigns String");
+        // … and a parameter REBOUND to one, which the reference types and this
+        // port's allow-list therefore refuses to declare untyped.
+        let rebound = b"class Foo\n  def m(a)\n    a = \"12\"\n    @n = Integer(a)\n    @n = \"x\"\n  end\nend\n";
+        let d = ivar_diags(rebound);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].message, "instance variable `@n' on Foo was previously assigned Integer; this write assigns String");
     }

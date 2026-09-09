@@ -1,0 +1,61 @@
+{
+  "fixture": "harness/corpus/101_module_receiver_not_enumerable.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 179,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c4' for singleton(Digest::Instance)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 184,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c5' for singleton(Comparable)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 189,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c11' for singleton(String)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 198,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c9' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 207,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_x11' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 222,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c12' for String"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 228,
+      "column": 5,
+      "severity": "error",
+      "message": "wrong number of arguments to `hexdigest' on Digest::Instance (given 3, expected 0..1)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 234,
+      "column": 5,
+      "severity": "error",
+      "message": "wrong number of arguments to `upcase' on String (given 3, expected 0..2)"
+    }
+  ]
+}

@@ -14,6 +14,20 @@
       "column": 14,
       "severity": "error",
       "message": "undefined method `frobsquish_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 67,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobdate_zzz' for Date"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 68,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frobdatetime_zzz' for DateTime"
     }
   ]
 }

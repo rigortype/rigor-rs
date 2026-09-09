@@ -1177,8 +1177,28 @@ impl CoreData {
     /// Whether `name` was declared as a `module` in RBS (the analogue of the
     /// reference `Environment#rbs_module?`). `false` for a class or an unknown
     /// name. Read only by `call.raise-non-exception`'s instance path.
+    ///
+    /// SHORT-key map: a nested declaration is filed under its LEAF name, so this
+    /// answers `false` for `"Digest::Instance"` and `true` for the bare
+    /// `"Instance"` (merged, defect-2 style, with every other nested `Instance`).
+    /// Callers holding a qualified name want [`Self::is_qualified_module`].
     pub fn is_module(&self, name: &str) -> bool {
         self.classes.get(name).is_some_and(|e| e.is_module)
+    }
+
+    /// Whether `qname` — a name spelled as the QUALIFIED registry files it
+    /// (`"Digest::Instance"`, `"Enumerable"`) — was declared as an RBS `module`.
+    ///
+    /// This is the faithful shape of the reference's `Environment#rbs_module?`,
+    /// which parses the name and looks `env.class_decls[rbs_name]` up EXACTLY:
+    /// no short-key collapse, so a project `class Instance` cannot make
+    /// `Digest::Instance`'s moduleness leak onto it (or the reverse). A top-level
+    /// module's qualified key IS its bare name, so `Kernel` / `Enumerable` /
+    /// `Comparable` answer `true` here too. `false` for a class and for an
+    /// unknown name (fail-soft, exactly as the reference's `rescue`).
+    pub fn is_qualified_module(&self, qname: &str) -> bool {
+        let qname = qname.strip_prefix("::").unwrap_or(qname);
+        self.qualified.get(qname).is_some_and(|e| e.is_module)
     }
 
     /// The subtyping relation of two RBS-known class names, a faithful port of

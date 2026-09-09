@@ -22,8 +22,12 @@ embedded core RBS, is the zero-false-positive keystone of plugin parity.
   `activesupport-core-ext`).
 - **Source path:** `reference/rigor/plugins/rigor-activesupport-core-ext/sig/active_support/core_ext.rbs`
   — **the PINNED submodule**, not a local checkout.
-- **Vendored:** 2026-08-25 at the `v0.3.4` pin (`b10bd5df`), `shasum`
-  `996ccf62856134ee4fb20efaee32c88a9a3fc143`. Was 2026-06-26, from
+- **Vendored:** 2026-09-09 at the `v0.3.8` pin (`ffb456b0`), `shasum`
+  `802cbe008d224d98f86267354771335a6fd1beb3`, 1,735 lines — `v0.3.7` (#658,
+  #670, #632, #666, #765) roughly doubled the file with the ActiveSupport
+  `Time` / `Date` / `DateTime` calculation surface and the `Duration` readers.
+  Was 2026-08-25 at `v0.3.4` (`b10bd5df`, `996ccf62…`, 867 lines), and before
+  that 2026-06-26, from
   `/Users/megurine/repo/ruby/rigor/plugins/…` — a local WORKING checkout, which
   is the hazard `UPSTREAM.md` records as hazard 3 applied to a different file.
   The copy then sat unmoved for two months while upstream's grew, and the drift

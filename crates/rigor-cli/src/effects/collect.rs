@@ -76,7 +76,44 @@
 //! `opaque-callable`'s `.call` arm (upstream's `record.nil?` is always true
 //! without a typer), `dynamic-receiver` at every uncatalogued call with an
 //! explicit receiver, and `unresolved-self-call` at every uncatalogued
-//! receiver-less one.
+//! receiver-less one. A seventh, `unresolved-super`, is the ANCESTRY's and is
+//! decided the same way — see below.
+//!
+//! ## `super` — a dispatch with no receiver to name (#446, v0.3.5)
+//!
+//! Upstream's `visit_super` (`unit_scan.rb:249`) emits an EDGE carrying the
+//! enclosing unit's own class and selector with `super_call: true`, and
+//! `Propagator::Index#super_targets` resolves it against the merged ancestry
+//! *above* the owner class: the parent's proven labels join the child's, the
+//! parent's taint bit ANDs into the child's, and when nothing answers the
+//! propagator seeds `unresolved-super(<selector>)` (`propagator.rb:71`).
+//!
+//! **This collector taints at EVERY `super`, resolved or not**, and the reason
+//! is measured rather than assumed. The port has no ancestry at all — nothing
+//! records `superclass` or `include`, and `record_declaration` treats both as
+//! no-ops — so `super_targets` has no analogue to call. Both halves of the
+//! upstream answer are therefore unavailable, and the taint is the sound one:
+//! a summary that is more tainted under-claims (ADR-0043 § 2), while claiming
+//! exhaustiveness across an unread parent body is the OVER this ports away.
+//!
+//! Measured on mastodon/app at the v0.3.8 pin (`docs/notes/20260909-repin-v038-effects-super.md`):
+//! 94 units contain a `super`; the oracle calls exactly 4 of them exhaustive.
+//! Of the 15 rows the port was over-claiming, 11 carry the oracle's own
+//! `unresolved-super` — and the OTHER 4 are supers that DO resolve into the
+//! project, onto a parent that is itself tainted. So a rule that taints only
+//! the unresolvable ones would leave those 4 OVER, and resolving the ancestry
+//! without also carrying the parent's bit through a real fixpoint (slice 4's
+//! closure, declined here) cannot fix them either. The whole cost of the
+//! blanket rule is the 2 rows where the oracle resolves a clean project parent
+//! AND the port had nothing else to taint on — `LinkFeed#initialize` and
+//! `TagFeed#initialize`, both now UNDER.
+//!
+//! Every syntactic shape is one node type or the other — `super`, `super()`,
+//! `super(args)`, with or without a block, and each of those inside a block, a
+//! `rescue` or a string interpolation, because the walk descends into all of
+//! them. A `super` inside a NESTED `def` belongs to the nested unit, which
+//! falls out of [`UnitScan::visit_def_node`] recording the def instead of
+//! descending into it.
 //!
 //! ## The transitive AND, priced as a selector-set test
 //!
@@ -150,20 +187,23 @@ const UNDEF: &str = "construct:undef";
 const RECEIVER_MUTATION: &str = "construct:receiver-mutation";
 const ATTR_WRITER: &str = "construct:attr-writer";
 
-// The taint causes this collector can produce — four of upstream's closed
-// ten-member `TaintCause::ALL` enum (`taint_cause.rb:16`). The other six have no
-// producer here: `method-missing` and `budget` have none at the pin at all,
+// The taint causes this collector can produce — six of upstream's closed
+// eleven-member `TaintCause::ALL` enum (`taint_cause.rb:16`; `unresolved-super`
+// joined it in v0.3.5 / #446). The other five have no producer here:
+// `method-missing` and `budget` have none at the pin at all,
 // `template-not-analysed` and `plugin-attribution` are the plugin stratum's,
 // and `collector-error` is upstream's per-unit rescue where the port is
 // per-FILE fail-soft (it omits the file's units instead, which is an UNDER).
 pub(super) const DYNAMIC_RECEIVER: &str = "dynamic-receiver";
 pub(super) const DYNAMIC_SEND: &str = "dynamic-send";
 pub(super) const UNRESOLVED_SELF_CALL: &str = "unresolved-self-call";
+pub(super) const UNRESOLVED_SUPER: &str = "unresolved-super";
 pub(super) const OPAQUE_CALLABLE: &str = "opaque-callable";
 pub(super) const UNKNOWN_OWNERSHIP: &str = "unknown-ownership";
 
 /// One `[cause, detail]` pair. `detail` is the selector for
-/// `unresolved-self-call` and None everywhere else: upstream's other details are
+/// `unresolved-self-call` / `unresolved-super` and None everywhere else:
+/// upstream's other details are
 /// the `Inference::DynamicOrigin` name (there is no analogue here — `coverage
 /// --protection` is unimplemented) and the plugin row key (out of scope), and
 /// upstream itself emits `null` when it has neither.
@@ -385,6 +425,7 @@ impl Scanner {
         let names = parameter_names(parameters);
         let mut scan = UnitScan::new(
             singleton,
+            method_name,
             names.clone(),
             block_parameter_name(parameters),
             owned_locals(body, &names),
@@ -475,6 +516,10 @@ fn define_method_unit<'pr>(node: &CallNode<'pr>) -> Option<NestedUnit<'pr>> {
 /// One method body, scanned into its direct summary.
 struct UnitScan<'pr> {
     singleton: bool,
+    /// The unit's OWN selector, which is the one thing a `super` in its body
+    /// names (`unit_scan.rb:249` reads `@method_name` for exactly this). It is
+    /// the taint detail, and upstream renders it as `unresolved-super(name)`.
+    method_name: String,
     /// The unit's own `&blk` parameter NAME. Read by the two `opaque-callable`
     /// producers that treat a call on it as FORWARDING rather than as an opaque
     /// callable (`unit_scan.rb:490`, `:528`); slice 2 dropped it because nothing
@@ -488,12 +533,14 @@ struct UnitScan<'pr> {
 impl<'pr> UnitScan<'pr> {
     fn new(
         singleton: bool,
+        method_name: &str,
         parameters: BTreeSet<String>,
         block_parameter: Option<String>,
         owned: BTreeSet<String>,
     ) -> Self {
         Self {
             singleton,
+            method_name: method_name.to_string(),
             block_parameter,
             mutation: MutationClassifier::new(singleton, parameters, owned),
             summary: Summary::default(),
@@ -516,6 +563,26 @@ impl<'pr> UnitScan<'pr> {
     /// project unit (module docs).
     fn push_edge(&mut self, selector: &str) {
         self.summary.edge_selectors.insert(selector.to_string());
+    }
+
+    /// `super` in every shape — bare `super`/zsuper, `super()`, `super(args)`,
+    /// each with or without a block, and each of those inside a block, a
+    /// `rescue` or a string interpolation (`unit_scan.rb:249`, #446).
+    ///
+    /// Upstream states the target's IDENTITY here (this unit's class and
+    /// selector) and lets the propagator answer it against the merged ancestry;
+    /// the port has no ancestry to answer it with, so it takes upstream's own
+    /// "cannot say" branch at every site. See the module docs for the
+    /// measurement that says the blanket rule is not merely sound but
+    /// necessary: 4 of the 15 rows it fixes are supers that RESOLVE, onto a
+    /// parent that is itself tainted.
+    ///
+    /// The arguments and the block are NOT swallowed: this runs on the enter
+    /// hook and the walk still descends, so `super(io.read)` keeps `io.read`'s
+    /// own origins exactly as upstream's `walk` does.
+    fn visit_super(&mut self) {
+        let selector = self.method_name.clone();
+        self.taint(UNRESOLVED_SUPER, Some(&selector));
     }
 
     /// Whether `node` is a read of this unit's own `&blk` parameter.
@@ -567,6 +634,9 @@ impl<'pr> UnitScan<'pr> {
         }
         if node.as_undef_node().is_some() {
             return self.summary.add(UNDEF, ["mutate.static"]);
+        }
+        if node.as_super_node().is_some() || node.as_forwarding_super_node().is_some() {
+            return self.visit_super();
         }
         // The compound index / attribute writes. Unlike a plain `[]=` CALL these
         // never reach the catalogue at all, so the ownership judgment is the
@@ -1414,6 +1484,63 @@ mod tests {
         // an over-taint, the safe direction.)
         assert_eq!(taint("  blk.call"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
         assert_eq!(taint("  ->(x) { x }.call(1)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+    }
+
+    #[test]
+    fn every_shape_of_super_taints_with_the_units_own_selector() {
+        // #446 / v0.3.5. Upstream states the target's identity and lets the
+        // propagator answer it against the ancestry; the port has no ancestry,
+        // so it takes upstream's "cannot say" branch everywhere (module docs).
+        // The detail is this unit's OWN selector, which is `taint`'s `m`.
+        let m = cause(UNRESOLVED_SUPER, Some("m"));
+        assert_eq!(taint("  super"), (false, vec![m.clone()]), "bare super (zsuper)");
+        assert_eq!(taint("  super()"), (false, vec![m.clone()]), "an explicit empty list");
+        assert_eq!(taint("  super(path)"), (false, vec![m.clone()]), "with arguments");
+        assert_eq!(taint("  super(key: 1)"), (false, vec![m.clone()]), "with kwargs");
+        assert_eq!(taint("  super { |x| x }"), (false, vec![m.clone()]), "with a block");
+        assert_eq!(taint("  super() { |x| x }"), (false, vec![m.clone()]));
+        // The shapes the WALK has to reach it through. Each of these would read
+        // as a claimed exhaustiveness the oracle does not claim — an OVER.
+        let in_rescue = taint("  File.read(path)\nrescue StandardError\n  super");
+        assert_eq!(in_rescue, (false, vec![m.clone()]));
+        assert_eq!(taint("  :ok\nensure\n  super"), (false, vec![m.clone()]));
+        assert_eq!(taint(r#"  "v3:#{super}""#), (false, vec![m.clone()]));
+        assert_eq!(taint("  File.open(path) { super }"), (false, vec![m.clone()]));
+        assert_eq!(
+            taint("  File.open(path) { Dir.glob(path) { super } }"),
+            (false, vec![m.clone()])
+        );
+        assert_eq!(taint("  if payload\n   super\n  else\n   :no\n  end"), (false, vec![m]));
+        // The CONTROL: the same body without the `super` claims exhaustiveness.
+        assert_eq!(taint("  File.open(path) { :plain }"), (true, vec![]));
+    }
+
+    #[test]
+    fn a_super_belongs_to_the_unit_that_encloses_it_and_no_other() {
+        // A nested `def` is a unit boundary, so its `super` is the NESTED
+        // unit's — `outer` must stay exhaustive. (`harness/effects-corpus/11_super`
+        // pins the oracle's agreement.)
+        let nested = bits("class C\n def outer\n  def inner\n   super\n  end\n end\nend");
+        assert_eq!(nested["C#outer"], (true, vec![]));
+        assert_eq!(nested["C#inner"], (false, vec![cause(UNRESOLVED_SUPER, Some("inner"))]));
+        // The singleton side reads the same, and the detail carries no sigil.
+        let singleton = bits("class C\n def self.s\n  super\n end\nend");
+        assert_eq!(singleton["C.s"], (false, vec![cause(UNRESOLVED_SUPER, Some("s"))]));
+        // A `define_method` block is the DEFINED method's body, so the `super`
+        // lands there rather than on the class body's enclosing unit.
+        let defined = bits("class C\n def m\n  define_method(:d) { super }\n end\nend");
+        assert_eq!(defined["C#d"], (false, vec![cause(UNRESOLVED_SUPER, Some("d"))]));
+        assert_eq!(defined["C#m"], (true, vec![]));
+    }
+
+    #[test]
+    fn a_super_does_not_swallow_its_own_arguments_or_block() {
+        // The taint runs on the ENTER hook and the walk still descends, so the
+        // origins inside `super`'s arguments and block are collected exactly as
+        // upstream's `walk` collects them.
+        assert_eq!(one("  super(File.read(path))"), ["io.fs.read"]);
+        assert_eq!(one(r#"  super { puts "ran" }"#), ["io.output.stdout"]);
+        assert_eq!(one(r#"  "v3:#{super(`id`)}""#), ["io.process"]);
     }
 
     #[test]

@@ -50,6 +50,11 @@ struct RawRegistry {
     labels: Option<Vec<String>>,
     #[serde(default)]
     retired: Option<BTreeMap<String, Replacements>>,
+    /// One line per root, new at `v0.3.5` (#429): what `rigor effects
+    /// --list-labels` prints beside a root. Read, never consulted by the
+    /// collector — but a reader that refuses the key rejects the shipped file.
+    #[serde(default)]
+    descriptions: Option<BTreeMap<String, String>>,
 }
 
 /// The shipped vocabulary, as a frozen value object.
@@ -60,6 +65,7 @@ pub struct Registry {
     known: BTreeSet<String>,
     roots: Vec<String>,
     retired: BTreeMap<String, Vec<String>>,
+    descriptions: BTreeMap<String, String>,
 }
 
 impl Registry {
@@ -80,6 +86,7 @@ impl Registry {
             raw.vocabulary,
             raw.labels.unwrap_or_default(),
             raw.retired.unwrap_or_default(),
+            raw.descriptions.unwrap_or_default(),
         ))
     }
 
@@ -87,6 +94,7 @@ impl Registry {
         vocabulary_version: u32,
         labels: Vec<String>,
         retired: BTreeMap<String, Replacements>,
+        descriptions: BTreeMap<String, String>,
     ) -> Self {
         // `labels.map(&:to_s).uniq.sort` — a BTreeSet gives both at once.
         let labels: Vec<String> = labels.into_iter().collect::<BTreeSet<_>>().into_iter().collect();
@@ -106,7 +114,14 @@ impl Registry {
                 (spelling, replacements)
             })
             .collect();
-        Self { vocabulary_version, labels, known, roots, retired }
+        // `text.to_s.gsub(/\s+/, " ").strip` (`registry.rb:86`) — a folded YAML
+        // scalar arrives with its line breaks already joined, so this only
+        // collapses runs and trims the ends.
+        let descriptions = descriptions
+            .into_iter()
+            .map(|(root, text)| (root, text.split_whitespace().collect::<Vec<_>>().join(" ")))
+            .collect();
+        Self { vocabulary_version, labels, known, roots, retired, descriptions }
     }
 
     /// The vocabulary version. Bumps only on a rename or a removal, never on a
@@ -125,7 +140,8 @@ impl Registry {
     }
 
     /// The roots of the vocabulary — the outermost segments an extension would
-    /// treat as already owned. Ten at vocabulary 1, four of them implied.
+    /// treat as already owned. Eleven at the `v0.3.8` pin (`failure` joined as
+    /// a DECLARED root at `v0.3.5`, ADR-103 WD16), four of them implied.
     #[must_use]
     pub fn roots(&self) -> &[String] {
         &self.roots
@@ -145,6 +161,15 @@ impl Registry {
     #[must_use]
     pub fn retired(&self, label: &str) -> Option<&[String]> {
         self.retired.get(label).map(Vec::as_slice)
+    }
+
+    /// The data file's `descriptions:` — one whitespace-normalised line per
+    /// root (`registry.rb:103`, `attr_reader :descriptions`). A root nothing
+    /// describes (a plugin's, a project's) has no entry; the shipped file
+    /// describes all eleven roots at `v0.3.8`.
+    #[must_use]
+    pub fn descriptions(&self) -> &BTreeMap<String, String> {
+        &self.descriptions
     }
 
     /// The nearest recognised label to a misspelling, within
@@ -256,6 +281,21 @@ mod tests {
         assert_eq!(registry().suggest("io.fs.write"), None);
         assert_eq!(registry().suggest("completely.unrelated.spelling"), None);
         assert_eq!(registry().suggest("NOT A LABEL"), None);
+    }
+
+    #[test]
+    fn descriptions_are_read_and_whitespace_normalised() {
+        let descriptions = registry().descriptions();
+        assert_eq!(descriptions.len(), 11, "one line per root at v0.3.8");
+        for root in registry().roots() {
+            assert!(descriptions.contains_key(root), "{root:?} has no description");
+        }
+        // `failure`'s text is a two-line plain scalar in the data file; the
+        // reference collapses it to single spaces and so does the port.
+        let failure = &descriptions["failure"];
+        assert!(failure.starts_with("registered so a policy written for Steins"), "{failure:?}");
+        assert!(!failure.contains("  ") && !failure.contains('\n'), "{failure:?}");
+        assert_eq!(descriptions["exit"], "can end the process");
     }
 
     #[test]

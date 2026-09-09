@@ -221,6 +221,17 @@ a `.rigor.yml` with its own `paths:` and `plugins:`.
 positions the reference's typer never visits, each method commented with the
 property it discriminates.
 
+`effects-corpus/11_super` pins `super` as a dispatch (upstream #446, reached by
+the v0.3.8 repin). Its `Shapes` class is the part that BITES: every selector
+there is deliberately absent from the parent, so the oracle taints
+`unresolved-super` and an engine whose walk never reached the `super` — through
+a `rescue`, an `ensure`, a string interpolation, a block, a block inside a
+block, a `super`'s own block, kwargs, a conditional arm — claims exhaustiveness
+the oracle does not, which is an OVER. `Resolvable` is the other direction: the
+oracle resolves the parent through a superclass, an `include`d module and the
+singleton chain and CONTRIBUTES its labels, which the port has no ancestry to do
+and so records as UNDER.
+
 Two of the fixture projects are **generated from the vendored effect data**, and
 re-generating each is a gate of its own:
 

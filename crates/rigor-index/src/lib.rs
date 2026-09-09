@@ -236,6 +236,15 @@ impl CoreIndex {
         self.data.is_module(class_name)
     }
 
+    /// Whether `qname` (spelled as the QUALIFIED registry files it) was declared
+    /// as an RBS `module` — the faithful shape of the reference
+    /// `Environment#rbs_module?`, which looks the parsed name up exactly. See
+    /// [`rbs::CoreData::is_qualified_module`]. Read by `call.undefined-method`'s
+    /// unenumerable-receiver decline (upstream #739).
+    pub fn is_qualified_module(&self, qname: &str) -> bool {
+        self.data.is_qualified_module(qname)
+    }
+
     /// **Sig-gen only — NOT a diagnostic predicate.** Whether the flattened
     /// ancestor chain of `class` is fully loaded. See
     /// [`rbs::CoreData::chain_complete`].
@@ -679,6 +688,30 @@ mod tests {
         assert!(!idx.class_has_method("Integer", "upcase"));
         assert!(!idx.class_has_method("NilClass", "upcase"));
         assert!(!idx.class_has_method("String", "lenght"));
+    }
+
+    #[test]
+    fn qualified_module_predicate_answers_for_nested_and_toplevel_names() {
+        // Upstream #739's decline is keyed on "is this receiver's class an RBS
+        // MODULE", asked of a QUALIFIED name. The short-key map cannot answer it:
+        // a nested declaration is filed under its leaf, so `is_module` says
+        // `false` for `Digest::Instance` — the exact hole this predicate closes.
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Comparable") {
+            return; // stub fallback: no RBS tree loaded.
+        }
+        for m in ["Kernel", "Enumerable", "Comparable"] {
+            assert!(idx.is_qualified_module(m), "{m} is an RBS module");
+        }
+        assert!(idx.is_qualified_module("Digest::Instance"));
+        assert!(idx.is_qualified_module("::Comparable"), "a `::`-rooted spelling");
+        assert!(!idx.is_module("Digest::Instance"), "the short map cannot answer");
+        // Classes — including the two generic metaclasses, which is why the rule
+        // needs a separate name test for them.
+        for c in ["String", "Array", "Class", "Module", "Object"] {
+            assert!(!idx.is_qualified_module(c), "{c} is an RBS class");
+        }
+        assert!(!idx.is_qualified_module("NoSuchThingZzz"));
     }
 
     #[test]

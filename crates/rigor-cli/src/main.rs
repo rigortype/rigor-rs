@@ -921,7 +921,12 @@ fn analyze_files(
                         &project_source,
                     ));
                 }
-                diags
+                // ADR-47 WD5 (upstream #627) — the dead arm of a decidable
+                // version guard reports nothing: it cannot run on the Ruby being
+                // checked with, so a diagnostic there is a false positive.
+                // Applied AFTER every type/flow rule and BEFORE `suppression.*`
+                // joins the list (which stays reportable inside a dead arm).
+                rigor_rules::filter_dead_version_guard_arms(diags, &p.ast, &p.source)
             }));
             match result {
                 Ok(mut diags) => {

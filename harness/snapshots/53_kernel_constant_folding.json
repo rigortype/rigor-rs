@@ -105,6 +105,13 @@
       "column": 3,
       "severity": "error",
       "message": "undefined method `frobnicate' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 82,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for \"%d\""
     }
   ]
 }

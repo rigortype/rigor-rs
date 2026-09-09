@@ -1,4 +1,12 @@
 {
   "fixture": "harness/corpus/20_in_source_param_bound_silent.rb",
-  "diagnostics": []
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `lenght' for [\"a\"]"
+    }
+  ]
 }

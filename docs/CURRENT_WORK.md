@@ -12,21 +12,18 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-08-28): the EFFECT-SYSTEM arc is at a clean stop** — slices 0–3 are in,
-slice 4's label lane and slice 6's declared lane are both CLOSED by measurement (see
-Standing conclusions), and slice 5 is scoped to a `methods:`-only subset whose writer
-rule ADR-0043 §2 now fixes. The gate is honest: the snapshot half is measured and
-non-gating until a port `update` exists.
-Last updated: 2026-08-28.
-Pin HOLDS at `v0.3.4` (master surveyed: 0 diagnostics on 9204).
-The narrowing frontier stays OUT OF CARRIER
-LEVERS ([verdicts](notes/20260809-deferred-slices-and-upstream-feedback.md),
-[carrier](notes/20260809-unresolved-const-receiver-carrier.md)). **Before the
-next bump, diff our OPEN upstream issues against the release notes** — batch 3
-came due all at once as 50 FPs ([note](notes/20260823-repin-v034.md)).
+▶ **NEXT (2026-09-09): the `v0.3.8` re-pin is on branch `upstream-pin-v0.3.8`, all
+gates green, PR pending merge.** Six retraction families ported (fixtures 99–105) plus
+the effects `super` taint; the two follow-ups are issue #118 (the pre-existing
+`"abc"[u]` generic-dispatch FP) and upstream #547's rufo performance regression, which
+makes `--sweep` an 80-minute gate until fixed
+([note](notes/20260909-repin-v038.md)). Upstream master is 112 commits past `v0.3.8`;
+survey it before the next tag, bisect-first. The effect-system arc stays at its clean
+stop (slices 4/6 CLOSED by measurement; 20 resolvable-`super` rows are slice-4 debt);
+the narrowing frontier stays OUT OF CARRIER LEVERS.
 
 - Measurement-tool lesson (binding): audit at NODE granularity — per-file
-  histograms net over-claims out against under-claims.
+  histograms net over-claims against under-claims.
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
   (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
   [plan](notes/20260718-compat-next-stage-plan.md)).
@@ -34,17 +31,19 @@ came due all at once as 50 FPs ([note](notes/20260823-repin-v034.md)).
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
   inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
   deferred by [scoping call](notes/20260719-coverage-command-scoping.md).
-- **Pin is `v0.3.4`** (+ vendored rbs 4.1.1; re-pinned 2026-08-23). Both standing
-  exception tables are still EMPTY — `UNBUILDABLE_DEFINITIONS` and the divergence
-  registry — so a new entry in either is a real finding, not maintenance
-  (`UPSTREAM.md`, all THREE hazards + the overlay/`sig/shims` trap).
+- **Pin is `v0.3.8`** (`ffb456b0`; + vendored rbs 4.2.0; re-pinned 2026-09-09). Both
+  standing exception tables are EMPTY — `UNBUILDABLE_DEFINITIONS` and the divergence
+  registry (#437 retired) — so a new entry in either is a real finding, not maintenance
+  (`UPSTREAM.md`: three hazards + the overlay/`sig/shims` trap). The version-guard
+  port folds against `HOST_RUBY_VERSION` 4.0.5 / `ruby` (`RIGOR_RUBY_VERSION` /
+  `RIGOR_RUBY_ENGINE` override) — the oracle's own host dependence, mirrored.
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-08-23, post the `v0.3.4` re-pin): harness **97 fixtures / 0
-unregistered extras / 0 registered divergences**, coverage 405/441; standing
-sweep **0 FP / 9204 files / 820 gaps**, 8 corpora, baselines in
-`harness/CORPUS.md`. Gap totals move mostly with upstream retractions, not
+State (verified 2026-09-09, post-re-pin): harness **105 fixtures / 0
+unregistered extras / 0 registered divergences**, coverage 487/538; standing
+sweep **0 FP / 9204 files / 799 gaps**, 8 corpora, baselines in
+`harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). Gap totals move mostly with upstream retractions, not
 coverage. Neither sweep tool sees project-`sig/` behaviour. EVERY grading
 tool prints its binary's path + build time and REFUSES one older than the
 rigor-cli path-dep CLOSURE (PR #65; closure-scoped by PR #100) — corpus
@@ -103,6 +102,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-09 upstream re-pin `v0.3.4 → v0.3.8`** (924 commits / 4 releases; branch `upstream-pin-v0.3.8`) — **0 FP / 9204, gaps 820→799**, harness 98→**105** fixtures / 0 extras, effects gate 0 OVER. Every re-sync half moved (rbs 4.2.0, plugin sig ×2, effects catalogue + snapshot schema 2). Raw bump = 7 fixture retractions + 12 sweep FPs = **SIX families**, each bisected to its commit (#537 untyped-arg overloads, #533 unorderable guards, #739 module receivers, #619 constant-write meta bodies, #627 dead version-guard arms, #540 mutated constants) and ported by four worktree agents; plus the effects gate's own retraction (#446 `super` taints). **Three spec claims were wrong and the must-fire controls caught them** (the `Dynamic[top]` gate; "decline `Psych::VERSION`" — drop BOTH arms; F-C's site is `check_narrowed_call`). Residues: #118 (`"abc"[u]`, pre-existing FP), 20 resolvable-`super` rows. **Upstream perf regression** (rufo `formatter.rb`, `acd35612`/#547) makes `--sweep` 80 min. [note](notes/20260909-repin-v038.md) / [spec](notes/20260909-repin-v038-port-spec.md) / [feedback 4](notes/20260909-upstream-feedback-batch4.md).
 - **2026-08-26/28 the effects GATE was lying, three times** (PRs #112/#115/#117) — (a) an arm with the `unresolved-self-call` taint DELETED scored byte-identically on the 7-project corpus, so `mastodon/app` (6,948 methods) now runs by DEFAULT and `gitlab-foss/lib` behind `--scale`, each COPIED into a temp project, plus `08_resolved` — the wrong arm now fails by **76 OVER**. (b) slice 2's `methods: {}` guard covered 2 of the **4** declared-lane producers, so `envelopes:` or `plugins:` ALONE drew a FATAL DECLARED-MISMATCH (09/10 ship as the gate) — and (a)'s synthesised config had ERASED the only shape exercising them: **a normalisation that removes a confound can remove coverage**. (c) the s5 probe reversed the snapshot premise — `methods:` is the **DIRECT** lane and `reach:` is opt-in, so the declined transitive lane blocks `reach:` only, and the shipped binary is 5985/963/**0 OVER** on mastodon's snapshot — but `omit?` **inverts ADR-0043 §2** (over-taint KEEPS a row the oracle drops as trivial, which the report gate scores UNDER); `effects_diff` now synthesises the port's snapshot from its own JSON and bites on 2 rows. **Resolved**: the writer drops `omit?`'s clause 3, so its taint bit can only DROP a row, never manufacture one. All three found the same way — by trying to make the gate lie. [s112](notes/20260826-s112-effects-instrument.md) / [s5](notes/20260826-effects-s5-probe.md) / [s116](notes/20260826-s116-snapshot-gate.md).
 
 
@@ -111,13 +111,10 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-08-25/26 the EFFECT-SYSTEM arc, slices 0–3** (PRs #91/#100/#105/#107/#108/#111) — summaries graded per METHOD as a **sound subset**. s1 vendored the 420-row catalogue crate; s2 added a **typer-free** Prism collector + `rigor effects --format=json` (**the subset argument failed a FOURTH time** — a ROW makes upstream NARROWER where the port loses the receiver type); s3 emits upstream's **TRANSITIVE** exhaustive bit (the direct bit is 986 OVER on mastodon). **35 MATCH / 11 UNDER / 0 OVER** on the four pinned projects; mastodon extra-taint 945→242. `05_posture`/`07_mutators` are GENERATED from the vendored tables (#106's lesson, after a live OVER hand fixtures could not see); `06_edge` is mutation-proven to be the only gate against the direct bit. [s3](notes/20260826-effects-s3-impl.md) / [#106](notes/20260826-s106-posture-over-fix.md).
 
 - **2026-08-25/26 frozen-index ARC — COMPLETE** (PRs #95/#97-#99/#101/#103/#109/#113) — the per-file harvest/merge split: #92's keystone (stage 2 −29%, pre-#92 path kept as a `cfg(test)` oracle), #94's ancestor closure (4,675: 164.9→82.5ms), LSP held harvests (112.8→69.8ms — **OverlayGuard stays ON; cross-file diagnostics live at gitlab scale**), the per-URI cross-file cache, #102's `FileKey`, #96's fp_audit determinism, and **#113's Pass-4b fold capture**: an OWNED mini-tree per def ⇒ Pass 4b reads NO AST and `FoldSite::ast_idx` (the last slice-POSITION) is gone — exact by construction, every decline being SYNTACTIC, so **no subset argument**. `FOLD_DEPTH_CAP` finally HAS coverage (8/10 mutations killed); harvest +338 B/f. **Standing**: file order is NORMATIVE in `merge` (never sort — it reaches diagnostics); eviction stays BLOCKED — **Pass 3** + stage 3 need every tree, and 3's sub-arena is DEFERRED behind an ADR-0029 budget trigger; harvest cache **NO-GO** (#104: prize 1.2% of wall, reads 10×). [s92](notes/20260825-s92-harvest-merge-impl.md) / [s94](notes/20260825-s94-ancestor-closure-impl.md) / [lsp](notes/20260826-lsp-crossfile-cache-impl.md) / [spec](notes/20260826-fold-capture-mini-spec.md) / [s113](notes/20260826-s113-fold-capture-impl.md).
-- **2026-08-25 upstream survey `v0.3.4` → master — HOLD the pin** — 64 commits + rbs 4.1.1→4.1.3 move **0 diagnostics on 9204 files** (both axes; the rbs trees are byte-identical). But the survey found two live rigor-rs defects in surfaces no standing gate reaches: the **vendored plugin RBS had drifted since 2026-06-26 = 10 FPs** (a THIRD pin-tracking surface, sourced from a local checkout — hazard 3 applied to a file; fixture 98 + ritual step 3 now cover it), and every `documentation_url` we emit **404s** (`blob/main`; upstream #438). [survey](notes/20260825-upstream-survey-v034-master.md).
-- **2026-08-23 upstream re-pin `v0.3.2 → v0.3.4`** (151 commits) — **0 FP / 9204, gaps 841→820**, harness 97 fixtures / 0 extras; rbs AND `data/` overlay both UNCHANGED, both exception tables still empty. The raw bump opened **50 FPs** — all upstream RETRACTIONS (#319, #318) that the snapshot diff cannot show, and all from OUR batch-3 reports, now due. [note](notes/20260823-repin-v034.md).
+- **2026-08-23/25 re-pin `v0.3.2 → v0.3.4` + master survey (HOLD)** — 151 commits: **0 FP / 9204, gaps 841→820**, harness 97 fixtures; rbs and `data/` unchanged, exception tables empty; the raw bump opened **50 FPs**, all upstream RETRACTIONS (#319, #318) from OUR batch-3 reports, invisible to the snapshot diff ([note](notes/20260823-repin-v034.md)). The 64-commit survey moved 0 diagnostics but found the **vendored plugin RBS had drifted since 2026-06-26 = 10 FPs** (a THIRD pin-tracking surface; fixture 98 + ritual step 3 now cover it) and that every `documentation_url` 404s (upstream #438) ([survey](notes/20260825-upstream-survey-v034-master.md)).
 - **2026-08-09 unresolved-const-receiver carrier — BUILT, REJECTED at 0 rows** (PR #89, closed) — sound but **841→841 on 9204**, and its first allow-list member needs both engines' INDEXES to agree — invisible to a core+stdlib sweep. [note](notes/20260809-unresolved-const-receiver-carrier.md).
 - **2026-08-09 era (3 slices, folded)** — re-pin `v0.3.1 → v0.3.2` (+rbs 4.1.1): 0 FP / 9204, gaps 1125→841 (upstream retracting possible-nil FPs, #297); BOTH exception tables emptied; **trap: bundler/rubygems sigs depend on the rbs gem's `sig/shims/` — 2 FPs the sweep CANNOT SEE**, closed by `overlay/rbs_shims/` ([note](notes/20260809-repin-v032.md)); join-wipe retention (`retain_joined_facts` + the `else`-carrier unwrap; 1 FP closed, 15 probe shapes ref-matched — [note](notes/20260809-join-wipe-retention.md)); chain-guard meet (`chains` carries `ClassFact`, `narrow_nominal_to_class` shared by both arms; 2 FPs closed — [note](notes/20260809-chain-guard-meet.md)).
-- **2026-08-08 the narrowing/shape trio, folded** — sequential-guard meet (PR #78: R3 → `narrow_nominal_to_class`, disjoint→`Bot`; 5 FPs closed — [note](notes/20260808-sequential-guard-meet.md)); qualified-name WITNESSING (PRs #80-#82: the witness fires for namespaced AND non-`CORE_CLASSES` guards, 1136→1127, unblocked by two probe-forced index fixes — [mini-spec](notes/20260808-qualified-witnessing-mini-spec.md) / [probes](notes/20260808-qualified-witnessing-probes.md)); the collection-shape ARC (PRs #70 / #75: literal-seeded locals keep their collection nominal through mutation; chain roots incl. `ENV` ingestion with nilable returns REFUSED; **26 rows closed** — [spec](notes/20260807-collection-shape-slice-spec.md)). 0 FP / 9204 throughout.
-- **2026-08-08 `Object` bucket ADJUDICATED — 30 rows, all behind decisions, NO slice** (PR #85) — 18 REFERENCE FPs (`Class.new do…end` block bodies, `class << Const`), 3 = ADR-0035's deferred leg, 9 = one-file mocha rows. The 18 are FIXED upstream at `v0.3.4` (#319/#320) and ported. [adjudication](notes/20260808-object-bucket-adjudication.md).
-- **2026-08-08 constant-value harvesting: per-file gate + partial containers** (PRs #83 / #84) — the reference never declines a partially-literal constant, and its constant-VALUE typing is per-FILE (source-confirmed): C5's project-wide consumption was a live over-emission class. A gates consumption per-file; B harvests partial containers as INERT bare nominals. **1127→1125, 0 FP / 9204.** C (chain constants) DECLINED — needs return resolution at index build. [mini-spec+log](notes/20260808-partial-constant-harvest-mini-spec.md).
+- **2026-08-08 era, folded (0 FP / 9204 throughout)** — the narrowing/shape trio (PRs #70/#75/#78/#80–#82: sequential-guard meet, qualified-name WITNESSING 1136→1127, the collection-shape ARC — **26 rows closed**; [meet](notes/20260808-sequential-guard-meet.md) / [witnessing](notes/20260808-qualified-witnessing-mini-spec.md) / [shape](notes/20260807-collection-shape-slice-spec.md)); the `Object` bucket ADJUDICATED, 30 rows behind decisions, 18 of them reference FPs fixed upstream at `v0.3.4` (PR #85, [adjudication](notes/20260808-object-bucket-adjudication.md)); constant-value harvesting per-file gate + partial containers (PRs #83/#84: 1127→1125; chain constants DECLINED — [mini-spec](notes/20260808-partial-constant-harvest-mini-spec.md)).
 - **2026-08-07/08 the class-narrowing ARC, CLOSED at a measured stop** (PRs #63, #68, #71-#74, #76, #77, #79) — ported `narrow_class_other` end-to-end (snapshot pass, statement-form descent, compound predicates, `next`/`break`, chain guards): **19 gap closures + eleven master FP shapes**, 0 FP / 9204 at every step. Three probe-forced lessons: the FP-safety argument was WRONG THREE TIMES (position AXIS; carrier ALLOW-list; disjoint→`Bot`); census windows measure PROXIMITY not mechanism; **verify the CONSUMPTION gate can witness the class before crediting rows**. [spec](notes/20260807-class-narrowing-slice-spec.md) / [stage3](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-01/08 instruments + adjudication, folded** — the 0-FP gate could pass VACUOUSLY (PR #65: corpus tools measured `target/release` while `cargo build` writes debug, and `run_rs` swallowed failures into `[]` — [note](notes/20260807-fp-audit-port-side-blind-spots.md)); the coverage-gap CENSUS buckets gaps by MECHANISM, not rule, and half sit behind decisions already made ([note](notes/20260807-gap-census.md)); `arity_eligible?` was never ported = a `call.wrong-arity` FP (fixture 80); LSP config reload keeps LAST GOOD ([lsp](notes/20260801-lsp-config-reload.md)).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup routing** (PR #64, MERGED) — the 8-member return family routes namespaced receivers via the qualified registry (refs AS WRITTEN + lexical ctx; ambiguity DECLINES); **14 closures (→1179), 0 FP / 9204**; fixture 82 pins the Tier-3 instance boundary (gaps 3→4 on merge). [spec+outcome](notes/20260807-adr0042-s5-return-lookup-spec.md).

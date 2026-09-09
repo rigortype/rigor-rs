@@ -11,8 +11,11 @@
 # `erlang_actor_spec.rb` x8 — RSpec's `Class.new(described_class) do ... end` and
 # `Module.new do ... end` idioms).
 #
+# Upstream #590 / PR #619 (`b3d688f7`, shipped in `v0.3.8`) then closed the one
+# position #319 had left out — the constant-write rvalue, section (7) below.
+#
 # Every firing line and every silent control below is oracle-measured at the
-# `v0.3.4` pin (`b10bd5df`), one fresh temp cwd per case, `--no-cache`, both
+# `v0.3.8` pin (`ffb456b0`), one fresh temp cwd per case, `--no-cache`, both
 # reference libs pinned onto `-I` (UPSTREAM.md hazard 1).
 
 # --- STAYS SILENT: the block body is a class body ---------------------------
@@ -60,12 +63,22 @@ end
   attr_reader :cached
 end
 
-# --- FIRES: the reference's own asymmetry ------------------------------------
+# --- STAYS SILENT: the constant-write body too (since v0.3.8) ----------------
 
-# (7) a CONSTANT-assigned body still fires. `ScopeIndexer` keys it by the
-# constant, and `StatementEvaluator` never routes a constant-write rvalue through
-# the block-body narrowing #319 added, so `self` there is still `Dynamic[top]`
-# and `Scope#toplevel?` still holds. Measured firing at the `v0.3.4` pin.
+# (7) a CONSTANT-assigned body was the reference's own asymmetry up to the
+# `v0.3.4` pin: `ScopeIndexer` keyed it by the constant, but `StatementEvaluator`
+# had no `ConstantWriteNode` handler at all, so the rvalue fell to the
+# pure-expression default, its block was never walked, and `propagate` handed
+# every node inside the ENCLOSING scope — a nil `self_type` at file top level,
+# which is exactly what `Scope#toplevel?` keys on.
+#
+# Upstream #590 / PR #619 (`b3d688f7`, shipped in `v0.3.8`) added the handler and
+# routes the rvalue block through the same `enter_meta_class_body` the #319 arm
+# uses, so the body is now the class body it is. SILENT on both engines at
+# `ffb456b0`. Two spellings where the ORACLE still fires and rigor-rs does not —
+# `X = Class.new do … end.freeze` and `X ||= Class.new do … end`, where the
+# constant's rvalue is not the meta-new call — are coverage gaps, pinned in
+# fixture 102.
 Registry = Class.new do
   attr_reader :entries
 end

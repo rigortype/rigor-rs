@@ -91,6 +91,20 @@ pub enum ConstLit {
     BareArray,
     /// The `Hash` twin of [`ConstLit::BareArray`].
     BareHash,
+    /// Upstream #540 (`fc3b8b42`) — a literal shape the FILE ITSELF mutates.
+    ///
+    /// `LN_SUPPORTED = [true]` with a sibling method writing `LN_SUPPORTED[0] =
+    /// false` is only as good as the file's own mutations: reads must not fold
+    /// through a shape the program has already outgrown. The reference wraps
+    /// such an accumulator entry in `Type::Combinator.dynamic(literal)`; the
+    /// port carries the wrapper on the harvested VALUE and
+    /// `Typer::intern_const_lit` turns it into `Type::Dynamic(inner)`, so a read
+    /// stays honest (the class is still there for dispatch) without licensing
+    /// any negative rule.
+    ///
+    /// Same-file scope only, and never nested: an entry is wrapped at most once,
+    /// mirroring the reference's `next if existing.is_a?(Type::Dynamic)`.
+    Widened(Box<ConstLit>),
 }
 
 /// The first [`ClassId`] handed out by the per-run registry. Chosen well above
@@ -769,7 +783,17 @@ impl SourceIndex {
         // single-assignment gate is the merge's job (see [`Self::merge`]); the
         // count is what lets it see an INTRA-file duplicate too.
         let mut seen_writes: HashMap<String, usize> = HashMap::new();
-        collect_literal_constants(ast, ast.root(), &[], &mut h.constant_writes, &mut seen_writes);
+        // Issue #540 — the file's OWN mutation census, consulted as each write is
+        // recorded (see `mutated_constant_names`).
+        let mutated = mutated_constant_names(ast);
+        collect_literal_constants(
+            ast,
+            ast.root(),
+            &[],
+            &mut h.constant_writes,
+            &mut seen_writes,
+            &mutated,
+        );
         // Stage 2b: every constant this file ASSIGNS, by bare name — recorded
         // BEFORE the merge's C5 gates drop the non-literal / multiply-assigned
         // ones, because the RBS-object-constant arm must decline on those too.
@@ -2439,11 +2463,12 @@ fn collect_literal_constants(
     prefix: &[String],
     out: &mut Vec<HarvestedConstWrite>,
     seen: &mut HashMap<String, usize>,
+    mutated: &HashSet<String>,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                collect_literal_constants(ast, child, prefix, out, seen);
+                collect_literal_constants(ast, child, prefix, out, seen, mutated);
             }
         }
         Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
@@ -2452,7 +2477,7 @@ fn collect_literal_constants(
             }
             let child_prefix = split_qualified(&qualify(prefix, name));
             for &child in body {
-                collect_literal_constants(ast, child, &child_prefix, out, seen);
+                collect_literal_constants(ast, child, &child_prefix, out, seen, mutated);
             }
         }
         Node::ConstantWrite { name, value, .. } => {
@@ -2460,11 +2485,19 @@ fn collect_literal_constants(
             match seen.get(&qualified) {
                 Some(&at) => out[at].writes += 1,
                 None => {
+                    // Issue #540: a constant this file MUTATES is harvested
+                    // Dynamic-wrapped, so a read no longer folds through the
+                    // literal shape. Applied at insert time rather than as a
+                    // second pass over the accumulator — the census is a pure
+                    // function of the same file, so the result is identical and
+                    // the merge stays untouched.
+                    let lit = const_lit_of(ast, *value)
+                        .map(|l| widen_if_mutated(&qualified, l, mutated));
                     seen.insert(qualified.clone(), out.len());
                     out.push(HarvestedConstWrite {
                         qualified,
                         namespace: prefix.to_vec(),
-                        lit: const_lit_of(ast, *value),
+                        lit,
                         writes: 1,
                     });
                 }
@@ -2472,6 +2505,59 @@ fn collect_literal_constants(
         }
         _ => {}
     }
+}
+
+/// Wrap a harvested constant value in [`ConstLit::Widened`] when the file's own
+/// mutation census names it (reference `widen_mutated_constants`).
+fn widen_if_mutated(qualified: &str, lit: ConstLit, mutated: &HashSet<String>) -> ConstLit {
+    if mutated.contains(qualified) {
+        ConstLit::Widened(Box::new(lit))
+    } else {
+        lit
+    }
+}
+
+/// Upstream #540 (`fc3b8b42`) — the qualified constant names THIS FILE mutates,
+/// from the lowering's raw census ([`rigor_parse::ConstMutation`]).
+///
+/// A site counts when it is an `Index{Or,And,Operator}Write` / attribute-or-index
+/// writer (`method: None`) or when its method is in `ARRAY_MUTATORS` ∪
+/// `HASH_MUTATORS` — the reference's `mutating_receiver_of`. A BARE receiver
+/// name contributes EVERY lexical-resolution candidate (`A::B` + `C` yields
+/// `A::B::C` and `C`, mirroring how the reads resolve); a `A::B` PATH receiver
+/// contributes only the name as written.
+///
+/// Same-file scope: the census is built per file, so a mutation in ANOTHER file
+/// never widens this file's fold — which is also what the reference's per-file
+/// `in_source_constants` table gives.
+fn mutated_constant_names(ast: &LoweredAst) -> HashSet<String> {
+    let mut out = HashSet::new();
+    for m in ast.const_mutations() {
+        if let Some(method) = &m.method {
+            if !crate::ARRAY_MUTATORS.contains(&method.as_str())
+                && !crate::HASH_MUTATORS.contains(&method.as_str())
+            {
+                continue;
+            }
+        }
+        if m.receiver.is_empty() {
+            continue;
+        }
+        if m.receiver_is_path {
+            out.insert(m.receiver.clone());
+            continue;
+        }
+        // `constant_mutation_candidates`: `[A, B]` + `C` -> `A::B::C`, `A::C`, `C`.
+        for keep in 0..=m.prefix.len() {
+            let prefix = &m.prefix[..m.prefix.len() - keep];
+            out.insert(if prefix.is_empty() {
+                m.receiver.clone()
+            } else {
+                format!("{}::{}", prefix.join("::"), m.receiver)
+            });
+        }
+    }
+    out
 }
 
 /// C5: harvest a `ConstLit` from a constant's RHS `node`, or `None` when the RHS
@@ -3499,6 +3585,59 @@ mod tests {
         assert_eq!(idx.literal_constant("N", &seg(&["Other"]), _a.file_key()), None);
     }
 
+    /// Upstream #540 (`fc3b8b42`) — a literal-shape constant the FILE mutates is
+    /// harvested `Dynamic`-wrapped, so a read stops folding through the shape.
+    #[test]
+    fn mutated_literal_constants_are_widened() {
+        let core = CoreIndex::new();
+        let (a, idx) = build_one(
+            b"LN = [true]\nUNTOUCHED = [true]\nFROZEN = [true].freeze\n\
+              def m\n  LN[0] = false\nend\ndef n\n  UNTOUCHED.each { |x| x }\nend\n",
+            &core,
+        );
+        // The mutated one is wrapped exactly once, around the shape it had.
+        assert_eq!(
+            idx.literal_constant("LN", &[], a.file_key()),
+            Some(&ConstLit::Widened(Box::new(ConstLit::Tuple(vec![ConstLit::Scalar(
+                Scalar::Bool(true)
+            )]))))
+        );
+        // A non-mutating call (`each`) and `.freeze` leave the fold alone.
+        assert!(matches!(
+            idx.literal_constant("UNTOUCHED", &[], a.file_key()),
+            Some(ConstLit::Tuple(_))
+        ));
+        assert!(matches!(
+            idx.literal_constant("FROZEN", &[], a.file_key()),
+            Some(ConstLit::Tuple(_))
+        ));
+    }
+
+    /// The census resolves a BARE receiver through every lexical candidate, and
+    /// a `A::B` PATH receiver through the name as written. Same-file only.
+    #[test]
+    fn mutation_census_candidates_and_file_scope() {
+        let core = CoreIndex::new();
+        // A bare `T[0] = 1` inside `module Outer` widens `Outer::T` AND a
+        // toplevel `T`; the path spelling widens only `Outer::T`.
+        let (a, idx) = build_one(
+            b"module Outer\n  T = [true]\n  def self.m\n    T[0] = false\n  end\nend\nT = [1]\n",
+            &core,
+        );
+        assert!(matches!(
+            idx.literal_constant("T", &seg(&["Outer"]), a.file_key()),
+            Some(ConstLit::Widened(_))
+        ));
+        // A mutation in ANOTHER file must not widen this file's fold.
+        let mutator = lower_src(b"def m\n  XF[0] = false\nend\n");
+        let holder = lower_src(b"XF = [true]\n");
+        let idx = SourceIndex::build_project(&[&holder, &mutator], &core);
+        assert!(matches!(
+            idx.literal_constant("XF", &[], holder.file_key()),
+            Some(ConstLit::Tuple(_))
+        ));
+    }
+
     #[test]
     fn cross_namespace_constant_not_folded() {
         // `module Expirable; DAYS = 7; end` — `DAYS` is NOT visible from an
@@ -4386,6 +4525,7 @@ mod probes_s92 {
                 ast.file_key(),
                 &mut lit_first,
                 &mut lit_multi,
+                &mutated_constant_names(ast),
             );
         }
         for qualified in lit_first.keys() {
@@ -4513,11 +4653,14 @@ mod probes_s92 {
         file: &FileKey,
         first: &mut HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)>,
         multi: &mut HashSet<String>,
+        mutated: &HashSet<String>,
     ) {
         match ast.get(node) {
             Node::Program { body, .. } | Node::Statements { body, .. } => {
                 for &child in body {
-                    legacy_collect_literal_constants(ast, child, prefix, file, first, multi);
+                    legacy_collect_literal_constants(
+                        ast, child, prefix, file, first, multi, mutated,
+                    );
                 }
             }
             Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
@@ -4526,17 +4669,27 @@ mod probes_s92 {
                 }
                 let child_prefix = split_qualified(&qualify(prefix, name));
                 for &child in body {
-                    legacy_collect_literal_constants(ast, child, &child_prefix, file, first, multi);
+                    legacy_collect_literal_constants(
+                        ast,
+                        child,
+                        &child_prefix,
+                        file,
+                        first,
+                        multi,
+                        mutated,
+                    );
                 }
             }
             Node::ConstantWrite { name, value, .. } => {
                 let qualified = qualify(prefix, name);
+                let lit =
+                    const_lit_of(ast, *value).map(|l| widen_if_mutated(&qualified, l, mutated));
                 match first.entry(qualified) {
                     std::collections::hash_map::Entry::Occupied(e) => {
                         multi.insert(e.key().clone());
                     }
                     std::collections::hash_map::Entry::Vacant(e) => {
-                        e.insert((prefix.to_vec(), file.clone(), const_lit_of(ast, *value)));
+                        e.insert((prefix.to_vec(), file.clone(), lit));
                     }
                 }
             }

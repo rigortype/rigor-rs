@@ -24,56 +24,49 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 42,
-      "column": 5,
-      "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Digest::Instance"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 48,
+      "line": 53,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Time"
     },
     {
       "rule": "call.undefined-method",
-      "line": 53,
+      "line": 58,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Range"
     },
     {
       "rule": "call.undefined-method",
-      "line": 59,
+      "line": 64,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for File::Stat"
     },
     {
       "rule": "call.undefined-method",
-      "line": 65,
+      "line": 70,
       "column": 10,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for File::Stat"
     },
     {
       "rule": "call.undefined-method",
-      "line": 71,
+      "line": 76,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for File::Stat"
     },
     {
       "rule": "call.undefined-method",
-      "line": 186,
+      "line": 191,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for [1, 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 192,
+      "line": 197,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for [1, 2]"

@@ -5,14 +5,21 @@ into the repo so the analyzer is standalone (no runtime dependency on a local
 `rbs` gem). It is embedded at build time by `crates/rigor-index/build.rs` and
 ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset.
 
-- **Source gem:** `rbs-4.1.1`
-- **Source path:** `/Users/megurine/.local/share/mise/installs/ruby/4.0.5/lib/ruby/gems/4.0.0/gems/rbs-4.1.1`
-- **Vendored:** 2026-08-09 (was `rbs-4.1.0`, 2026-07-31; before that `rbs-4.0.3`,
-  2026-06-26 — bumped with the reference pin to `v0.3.2`, which follows rbs
-  4.1.1; the two pins must match). **The 4.1.0 → 4.1.1 bump is a no-op for this
-  tree**: `vendor_rbs.py --check` against the 4.1.1 gem reports an exact match on
-  all 174 `.rbs`, so `core/` and `stdlib/` are byte-identical across the two
-  releases and no signature-resolution behaviour moves with the version string.
+- **Source gem:** `rbs-4.2.0`
+- **Source path:** `/Users/megurine/.local/share/mise/installs/ruby/4.0.5/lib/ruby/gems/4.0.0/gems/rbs-4.2.0`
+- **Vendored:** 2026-09-09 (was `rbs-4.1.1`, 2026-08-09; `rbs-4.1.0`, 2026-07-31;
+  `rbs-4.0.3`, 2026-06-26 — bumped with the reference pin to `v0.3.8`, which
+  follows rbs 4.2.0; the two pins must match). **The 4.1.1 → 4.2.0 step moves
+  five files / 15 lines** and is a signature change, not a version-string one:
+  `IO#putc` and `StringIO#putc` become two overloads (`(real) -> real |
+  (String) -> String`), `ERB#initialize` / `#run` / `#def_method` /
+  `.def_erb_method`, `Monitor#wait_for_cond` and
+  `MonitorMixin::ConditionVariable#wait` / `#wait_until` / `#wait_while` get
+  concrete returns where 4.1.1 had `untyped`, and `Singleton` gains an empty
+  `SingletonInstanceMethods` module. `sig/shims/` is byte-identical, and so were
+  4.1.1 → 4.1.3 (`diff -rq` over `core/`, `stdlib/`, `sig/shims/`: nothing).
+  Before that, 4.1.0 → 4.1.1 was a no-op for this tree (`--check` exact on all
+  174 `.rbs`).
 - **What the set is:** the WHOLE `core/` directory ⊕ the `DEFAULT_LIBRARIES`
   stdlib set (`src/rbs.rs`) transitively closed over each lib's
   `manifest.yaml` `dependencies:` — i.e. byte-for-byte the set the old runtime
@@ -39,10 +46,11 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
 
 ## Contents
 
-- `core/` — all 89 `.rbs` from `…/rbs-4.1.1/core` (nested under `io/`,
+- `core/` — all 89 `.rbs` from `…/rbs-4.2.0/core` (nested under `io/`,
   `enumerator/`, `object_space/`, `rbs/`, `rbs/unnamed/`, `rubygems/`). 4.1.0
   added three: `file_constants.rbs` and `file_stat.rbs` (`File` split out) and
-  `rbs/ops.rbs`; 4.1.1 changed nothing here (byte-identical to 4.1.0).
+  `rbs/ops.rbs`; 4.1.1 changed nothing here (byte-identical to 4.1.0); 4.2.0
+  touches `io.rbs` only (`putc`).
 - `stdlib/<lib>/0/…` — 49 libs (the resolved transitive closure), 85 `.rbs`
   total, each with its `manifest.yaml` preserved for auditability:
   `abbrev base64 benchmark bigdecimal bigdecimal-math cgi cgi-escape csv date

@@ -910,7 +910,7 @@ mod tests {
     fn the_shipped_catalogue_has_the_shape_the_probe_measured() {
         let catalog = catalog();
         assert_eq!(catalog.schema(), 1);
-        assert_eq!(catalog.class_names().len(), 80);
+        assert_eq!(catalog.class_names().len(), 82);
         assert_eq!(catalog.universal().len(), 34);
         assert_eq!(
             ["value", "world", "fs", "net", "ipc", "http", "process", "signal", "global",
@@ -925,7 +925,9 @@ mod tests {
             let entry = catalog.class_entry(name).expect("listed");
             (acc.0 + entry.instance_methods().len(), acc.1 + entry.singleton_methods().len())
         });
-        assert_eq!((instance, singleton, instance + singleton), (216, 204, 420));
+        // 420 at `v0.3.4`; `v0.3.8` adds four `Socket` singleton rows (#458)
+        // and two rowless `net`-posture classes, `Net::IMAP` / `Net::POP3` (#463).
+        assert_eq!((instance, singleton, instance + singleton), (216, 208, 424));
     }
 
     #[test]
