@@ -1789,13 +1789,13 @@ impl<'i> Typer<'i> {
                             method.as_str(),
                             "is_a?" | "kind_of?" | "instance_of?" | "==="
                         )
-                        && (receiver.is_some_and(&reads_root)
+                        && (receiver.is_some_and(reads_root)
                             || args.iter().copied().any(&reads_root)) =>
                 {
                     return false;
                 }
                 Node::Case { predicate, span, .. }
-                    if guards_here(*span) && predicate.is_some_and(&reads_root) =>
+                    if guards_here(*span) && predicate.is_some_and(reads_root) =>
                 {
                     return false;
                 }
