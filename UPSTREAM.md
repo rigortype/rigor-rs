@@ -114,7 +114,17 @@ submodule rather than tracked against a drifting local checkout.
 > it (#205) — and `static.value-use.void` is bleeding-edge.
 > [note](docs/notes/20260731-upstream-bump-7a69f142-v030.md).
 
-> **The local Ruby must resolve the rbs the pin bundles** (`rbs 4.2.0` today).
+> **The local Ruby must resolve the rbs the pin bundles** (`rbs 4.2.0` today), and
+> since `v0.3.8` its VERSION is load-bearing too: ADR-47 WD5's version guards fold
+> against the analyzer's OWN runtime (upstream #871), while rigor-rs bakes
+> `HOST_RUBY_VERSION` / `HOST_RUBY_ENGINE`. A host Ruby that moves under the harness
+> therefore flips the oracle's verdict on a guard while the port keeps folding the
+> baked one — measured 2026-09-09 on `RUBY_VERSION == "4.0.5"`: `:truthy` under ruby
+> 4.0.5, `:falsey` under 4.0.6, i.e. an unregistered false positive from a patch bump
+> alone. Fixture 103 is written to be verdict-STABLE across host Rubies (every
+> comparison is against a version far from any Ruby this toolchain runs on, and its
+> one live equality tests `RUBY_ENGINE`); keep any new version-guard row that way, or
+> pin the row with `RIGOR_RUBY_VERSION`.
 > The harness invokes the reference with a plain `ruby -I`, so RubyGems serves
 > the highest installed version; running the oracle against a different rbs than
 > upstream ships silently compares against different core signatures. `gem list
