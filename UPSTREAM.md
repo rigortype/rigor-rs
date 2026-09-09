@@ -126,11 +126,12 @@ snapshot gate (`harness/run_snapshot.rb`, the CI `parity` job) never touches it 
 it replays the pinned snapshots under `harness/snapshots/`, which were generated
 from this exact reference version.
 
-Note: the vendored RBS (`crates/rigor-index/vendor/rbs`, **rbs-4.1.1**) is a
+Note: the vendored RBS (`crates/rigor-index/vendor/rbs`, **rbs-4.2.0**) is a
 **separate pin** with its own `PROVENANCE.md` — but it is not independent in
 practice: it must carry the same rbs version the reference bundles, or the two
 sides read different core signatures. Upstream bundled rbs-4.0.3 from `v0.2.7`
-through `v0.3.0`, moved to 4.1.0 in `v0.3.1` and to 4.1.1 in `v0.3.2`, so the
+through `v0.3.0`, moved to 4.1.0 in `v0.3.1`, to 4.1.1 in `v0.3.2` and to 4.2.0
+in `v0.3.7`, so the
 vendored tree moved with it (the 4.1.1 step changed the version string only —
 `core/` + `stdlib/` are byte-identical to 4.1.0).
 `harness/vendor_rbs.py --check` verifies the tree still matches its source gem
@@ -163,7 +164,8 @@ ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
 `harness/lib.rb` and `harness/fp_audit.py` do this unconditionally. Ad-hoc
 probes must too.
 
-**Status at the current pin (`v0.3.4`, re-verified 2026-08-26):** upstream
+**Status (verified at the `v0.3.4` pin on 2026-08-26; the mechanism is unchanged
+at `v0.3.8`, where the same defensive `-I` is still passed):** upstream
 fixed the MECHANISM — `Loader.bundled_plugin_path` (ADR-93 WD5, "#194 slice
 2") requires bundled plugins by an engine-anchored absolute path, and that
 was live-verified on a machine carrying a genuinely stale `rigortype 0.2.4`
