@@ -14,13 +14,15 @@
 # The evaluator's separate elision of the dead arm's WRITES is typing precision
 # rather than FP safety and is deliberately NOT ported (see the last block).
 #
-# ASSUMED HOST RUBY: `RUBY_VERSION` = "4.0.5", `RUBY_ENGINE` = "ruby"
-# (`ruby -e 'p RUBY_VERSION, RUBY_ENGINE'` on the harness host, 2026-09-09).
-# rigor-rs bakes the same pair as `HOST_RUBY_VERSION` / `HOST_RUBY_ENGINE`,
-# overridable by `RIGOR_RUBY_VERSION` / `RIGOR_RUBY_ENGINE`. EVERY line below —
-# firing and silent alike — was oracle-measured at the `v0.3.8` pin (`ffb456b0`),
-# one fresh temp cwd per case, `--no-cache`, both reference libs pinned onto `-I`
-# (UPSTREAM.md hazard 1). A host on a different Ruby moves the expectations.
+# HOST RUBY: the reference folds these guards against ITS OWN runtime while
+# rigor-rs bakes `HOST_RUBY_VERSION` / `HOST_RUBY_ENGINE` ("4.0.5" / "ruby",
+# overridable by `RIGOR_RUBY_VERSION` / `RIGOR_RUBY_ENGINE`), so the two agree
+# only where the guard's verdict is the same on both. Every row below is
+# therefore chosen to be STABLE across host Ruby versions — the comparisons are
+# against versions far from any Ruby this toolchain runs on, and the one live
+# equality tests the ENGINE (see f15). EVERY line — firing and silent alike —
+# was oracle-measured at the `v0.3.8` pin (`ffb456b0`), one fresh temp cwd per
+# case, `--no-cache`, both reference libs pinned onto `-I` (UPSTREAM.md hazard 1).
 
 # --- STAYS SILENT: the dead arm ---------------------------------------------
 
@@ -130,8 +132,18 @@ when "2.7.0" then "abc".frobnicate_f11a
 else "abc".frobnicate_f11b
 end
 
-# (f15) an equality that is TRUE on this host keeps its body.
-"abc".frobnicate_f15 if RUBY_VERSION == "4.0.5"
+# (f15) an equality that is TRUE on this host keeps its body. Deliberately the
+# ENGINE and not `RUBY_VERSION == "<patch>"`: the reference folds against its own
+# runtime while rigor-rs bakes `HOST_RUBY_VERSION`, so a version-equality row goes
+# red the moment the harness host takes a patch bump (measured: this row was
+# `RUBY_VERSION == "4.0.5"` and a host moving to 4.0.6 turns it into an
+# unregistered false positive — the oracle drops the arm, the port keeps folding
+# it true). The engine is stable across every Ruby this toolchain runs on.
+"abc".frobnicate_f15 if RUBY_ENGINE == "ruby"
+
+# (f15b) the same operator on the dead edge, equally host-stable: no Ruby this
+# analyzer runs on is 1.9.3, so the arm is dropped on both sides.
+"abc".frobnicate_f15b if RUBY_VERSION == "1.9.3"
 
 # (f17) a value read through a LOCAL is not a readable operand.
 def f17_through_a_local

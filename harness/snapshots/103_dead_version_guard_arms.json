@@ -3,154 +3,154 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 34,
+      "line": 36,
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_f3b' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 48,
+      "line": 50,
       "column": 54,
       "severity": "error",
       "message": "undefined method `frobnicate_f12b' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 58,
+      "line": 60,
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_f14a' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 87,
+      "line": 89,
       "column": 11,
       "severity": "error",
       "message": "undefined method `frobnicate_f23b' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 93,
+      "line": 95,
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_f24a' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 112,
+      "line": 114,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f2' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 116,
+      "line": 118,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f6' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 119,
+      "line": 121,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f8' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 122,
+      "line": 124,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f9' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 125,
+      "line": 127,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f10' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 129,
+      "line": 131,
       "column": 25,
       "severity": "error",
       "message": "undefined method `frobnicate_f11a' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 130,
+      "line": 132,
       "column": 12,
       "severity": "error",
       "message": "undefined method `frobnicate_f11b' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 134,
+      "line": 142,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f15' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 139,
+      "line": 151,
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_f17' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 144,
+      "line": 156,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f18' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 149,
+      "line": 161,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f25' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 152,
+      "line": 164,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f27' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 155,
+      "line": 167,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f28' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 181,
+      "line": 193,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_f20' for 1"
     },
     {
       "rule": "call.undefined-method",
-      "line": 188,
+      "line": 200,
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_f29a' for \"abc\""
     },
     {
       "rule": "flow.dead-assignment",
-      "line": 161,
+      "line": 173,
       "column": 5,
       "severity": "warning",
       "message": "local `y_f19c' assigned in `f19_control_undecidable_guard' but never read"
     },
     {
       "rule": "suppression.unknown-rule",
-      "line": 170,
+      "line": 182,
       "column": 24,
       "severity": "warning",
       "message": "unknown rule `not.a.rule` in `# rigor:disable` — the token matches no known rule, alias, or family, so this suppression has no effect. Likely a typo; `rigor explain <rule>` lists the canonical ids."
