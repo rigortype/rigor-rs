@@ -565,6 +565,18 @@ struct ClassEntry {
     /// names in `inner_context`, `environment.rb:608`). Read only by the
     /// qualified return-lookup path; the short `includes` list is unchanged.
     includes_written: Vec<(&'static str, Vec<&'static str>)>,
+    /// The [`Self::prepends`] twin carrying the reference AS WRITTEN plus the
+    /// INNER lexical context, exactly as `includes_written` does.
+    prepends_written: Vec<(&'static str, Vec<&'static str>)>,
+    /// A `module` declaration's SELF-TYPE constraints as WRITTEN
+    /// (`module PPMethods : _PPMethodsRequired`, `module Kernel : BasicObject`),
+    /// paired with the OUTER lexical context — the self-type clause is resolved
+    /// like a `< X` super clause, not like a member. RBS folds these into the
+    /// MODULE'S OWN instance definition (the reference's `PP::PPMethods` has
+    /// exactly its 11 declared methods plus the interface's `text`/`breakable`/
+    /// `group`, and NOT `Object`'s surface), so the lookups consult them for the
+    /// leaf module only and never propagate them to an includer.
+    self_types_written: Vec<(&'static str, Vec<&'static str>)>,
     /// ADR-0042 Slice 5: every INNER lexical context this entry's members were
     /// ingested under — one per reopen spelling, deduped (`class Digest::Class`
     /// contributes `["Digest::Class"]`; a `module Digest; class Class` reopen
@@ -581,6 +593,14 @@ struct ClassEntry {
     is_module: bool,
     /// Included module names (in source order).
     includes: Vec<&'static str>,
+    /// `prepend`ed module names (in source order). A prepended module sits
+    /// BEFORE the prepending class in Ruby's method resolution order (an
+    /// `include` sits after it), so the walks push these ahead of the class
+    /// itself — first-definer-wins then matches RBS's own linearization.
+    /// Without them `class LoadError; prepend DidYouMean::Correctable; end`
+    /// contributed nothing and `LoadError#corrections` read as proven-absent
+    /// (a false positive) while the reference resolves it.
+    prepends: Vec<&'static str>,
     /// `extend`ed module names (in source order). An `extend M` directive folds
     /// `M`'s INSTANCE methods into THIS class/module's SINGLETON surface (the
     /// class object gains them as class methods — e.g. `SecureRandom` does
@@ -1120,6 +1140,9 @@ impl CoreData {
         let mut order: Vec<&'static str> = Vec::new();
         let mut seen: HashSet<&'static str> = HashSet::new();
         let mut complete = true;
+        for pre in &entry.prepends {
+            self.collect(pre, &mut order, &mut seen, &mut complete);
+        }
         for inc in &entry.includes {
             self.collect(inc, &mut order, &mut seen, &mut complete);
         }
@@ -1167,9 +1190,65 @@ impl CoreData {
         {
             return true;
         }
+        // A module's SELF-TYPE constraint is part of ITS OWN instance surface in
+        // RBS: `module PPMethods : _PPMethodsRequired` resolves `#text` /
+        // `#breakable` / `#group` from the interface, and the reference's
+        // definition for `PP::PPMethods` carries exactly those 3 alongside its
+        // own 11. Consulted here as an additional PRESENT source only — never a
+        // new absence witness, and never propagated to an includer (the
+        // reference does not give a class that `include`s a self-typed module
+        // the self type's methods).
+        if self.qualified_self_type_provides(qname, method) {
+            return true;
+        }
         // Absent across the leaf + its resolvable ancestry: witness only when
         // the chain is fully loaded.
         !complete
+    }
+
+    /// Whether `qname`'s own SELF-TYPE constraints supply `method`. An
+    /// INTERFACE self type (`: _PPMethodsRequired`) contributes the interface's
+    /// declared method names; a CLASS/MODULE self type (`: BasicObject`)
+    /// contributes that entry's flattened qualified surface. A self type that
+    /// resolves to nothing answers `true` — the surface is then not fully
+    /// known, and an absence witness on it would be a false positive.
+    ///
+    /// Deliberately NON-recursive (a self type's own self type is not
+    /// consulted): the walk cannot cycle, and the 2026-09-09 1202-class diff is
+    /// the check that nothing is left uncovered.
+    fn qualified_self_type_provides(&self, qname: &str, method: &str) -> bool {
+        let Some(entry) = self.qualified.get(qname) else {
+            return false;
+        };
+        for (w, ctx) in &entry.self_types_written {
+            let leaf = w.rsplit("::").next().unwrap_or(w);
+            if leaf.starts_with('_') {
+                // The interface table is keyed by the LEAF name (see
+                // `Builder::ingest_interface`).
+                match self.interface_method_names.get(leaf) {
+                    Some(names) => {
+                        if names.contains(&method) {
+                            return true;
+                        }
+                    }
+                    None => return true,
+                }
+                continue;
+            }
+            match self.resolve_written_ref(w, ctx) {
+                Some(k) => {
+                    let (chain, complete) = self.qualified_ancestors(k);
+                    if !complete
+                        || self.qualified_lookup_on_chain(&chain, method, 0).is_some()
+                        || self.qualified_attr_on_chain(&chain, method)
+                    {
+                        return true;
+                    }
+                }
+                None => return true,
+            }
+        }
+        false
     }
 
     /// Whether an INSTANCE `alias` on `entry` resolves `method` to a real
@@ -2120,6 +2199,19 @@ impl CoreData {
         if !seen.insert(key) {
             return;
         }
+        // See `collect`: a PREPENDED module precedes the prepending class.
+        for (w, ctx) in &entry.prepends_written {
+            match self.resolve_written_ref(w, ctx) {
+                Some(m) => self.collect_qualified(m, order, seen, ok),
+                None => {
+                    *ok = false;
+                    return;
+                }
+            }
+            if !*ok {
+                return;
+            }
+        }
         order.push(key);
         for (w, ctx) in &entry.includes_written {
             match self.resolve_written_ref(w, ctx) {
@@ -2895,6 +2987,13 @@ impl CoreData {
         if entry.instance_unbuildable {
             *complete = false;
         }
+        // PREPENDED modules sit AHEAD of the class in Ruby's MRO, so they are
+        // pushed before it — a `prepend`ed definition wins first-definer-wins
+        // over the class's own. (`seen` already holds `key`, so a module that
+        // prepends its own prepender terminates.)
+        for pre in &entry.prepends {
+            self.collect(pre, order, seen, complete);
+        }
         order.push(key);
         // Included modules sit between the class and its superclass in Ruby's
         // method resolution order; for *existence* the order doesn't matter.
@@ -2973,6 +3072,11 @@ impl CoreData {
                     // RBS); empty keeps that path inert under the fallback.
                     superclass_written: None,
                     includes_written: Vec::new(),
+                    // The stub models no `prepend` directives.
+                    prepends: Vec::new(),
+                    prepends_written: Vec::new(),
+                    // The stub declares no module self types.
+                    self_types_written: Vec::new(),
                     member_ctxs: Vec::new(),
                     // The stub does not distinguish modules from classes; the
                     // raise-non-exception module gate needs the real embedded RBS
@@ -3456,6 +3560,19 @@ impl Builder {
             is_module: true,
             ..Default::default()
         };
+        // ADR-0042: a module's self-type clause (`module PPMethods :
+        // _PPMethodsRequired`) resolves in the OUTER lexical context, exactly
+        // like a class's `< X` super clause.
+        for st in m.self_types().iter() {
+            if let Node::ModuleSelf(ms) = st {
+                if let Some(w) = written_ref(&ms.name()) {
+                    let pair = (w, enclosing.to_vec());
+                    if !entry.self_types_written.contains(&pair) {
+                        entry.self_types_written.push(pair);
+                    }
+                }
+            }
+        }
         let qual = qualified_name(enclosing, &tn);
         let child_enclosing: Vec<&'static str> =
             enclosing.iter().copied().chain(std::iter::once(qual)).collect();
@@ -3660,6 +3777,23 @@ impl Builder {
                         }
                     }
                 }
+                Node::Prepend(pre) => {
+                    // `prepend M` inserts M AHEAD of this class in the MRO. For
+                    // method EXISTENCE that is the same contribution as an
+                    // `include`; the walks keep the ordering distinction so a
+                    // first-definer-wins return lookup stays faithful.
+                    if let Some(modname) = type_name_str(&pre.name()) {
+                        if !entry.prepends.contains(&modname) {
+                            entry.prepends.push(modname);
+                        }
+                    }
+                    if let Some(w) = written_ref(&pre.name()) {
+                        let pair = (w, enclosing.to_vec());
+                        if !entry.prepends_written.contains(&pair) {
+                            entry.prepends_written.push(pair);
+                        }
+                    }
+                }
                 Node::Extend(ext) => {
                     // `extend M` folds M's INSTANCE methods into this class
                     // object's SINGLETON surface (e.g. `SecureRandom extend
@@ -3823,6 +3957,11 @@ impl Builder {
         // Attribute members are pure existence, so a reopen simply unions them.
         slot.attr_methods.extend(entry.attr_methods);
         slot.singleton_attr_methods.extend(entry.singleton_attr_methods);
+        for pre in entry.prepends {
+            if !slot.prepends.contains(&pre) {
+                slot.prepends.push(pre);
+            }
+        }
         for inc in entry.includes {
             if !slot.includes.contains(&inc) {
                 slot.includes.push(inc);
@@ -3860,6 +3999,16 @@ impl Builder {
         for pair in entry.includes_written {
             if !slot.includes_written.contains(&pair) {
                 slot.includes_written.push(pair);
+            }
+        }
+        for pair in entry.prepends_written {
+            if !slot.prepends_written.contains(&pair) {
+                slot.prepends_written.push(pair);
+            }
+        }
+        for pair in entry.self_types_written {
+            if !slot.self_types_written.contains(&pair) {
+                slot.self_types_written.push(pair);
             }
         }
         for ctx in entry.member_ctxs {
@@ -3944,6 +4093,11 @@ impl Builder {
         // Attribute members are pure existence, so a reopen simply unions them.
         slot.attr_methods.extend(entry.attr_methods);
         slot.singleton_attr_methods.extend(entry.singleton_attr_methods);
+        for pre in entry.prepends {
+            if !slot.prepends.contains(&pre) {
+                slot.prepends.push(pre);
+            }
+        }
         for inc in entry.includes {
             if !slot.includes.contains(&inc) {
                 slot.includes.push(inc);
@@ -4126,9 +4280,22 @@ fn is_toplevel_name(tn: &ruby_rbs::node::TypeNameNode) -> bool {
 /// (2026-08-08 probes note §2d.2; depth ≤ 2 was unaffected because a
 /// one-element chain joins to itself).
 fn qualified_name(enclosing: &[&'static str], tn: &ruby_rbs::node::TypeNameNode) -> &'static str {
-    let mut parts: Vec<String> =
-        enclosing.last().map(|s| vec![(*s).to_string()]).unwrap_or_default();
-    for seg in tn.namespace().path().iter() {
+    let ns = tn.namespace();
+    // An ABSOLUTE declaration name is ROOTED, not nested: `module ::Kernel`
+    // written inside `module Gem` reopens the top-level `Kernel`, not a
+    // `Gem::Kernel`. Prefixing it with the lexical scope minted a phantom
+    // qualified entry that (a) hid the overlay's `def self?.gem` from every
+    // qualified ancestor walk that passes through the real `Kernel` — the 22
+    // `gem` holes of the 2026-09-09 diff — and (b) made the short leaf
+    // `"Kernel"` ambiguous in `short_to_qualified` (two qualified keys), so
+    // `resolve_short_unambiguous("Kernel")` declined. Dropping the prefix on
+    // `absolute()` is the whole fix; a relative name is unaffected.
+    let mut parts: Vec<String> = if ns.absolute() {
+        Vec::new()
+    } else {
+        enclosing.last().map(|s| vec![(*s).to_string()]).unwrap_or_default()
+    };
+    for seg in ns.path().iter() {
         if let Node::Symbol(sym) = seg {
             parts.push(sym.as_str().to_string());
         }
