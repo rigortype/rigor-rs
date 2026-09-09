@@ -1352,12 +1352,37 @@ impl SourceIndex {
     /// ## Why the rules need this (an FP measured, not theorised)
     ///
     /// The rules' qualified-witness arm reports a method as undefined over the
-    /// ADR-0042 qualified surface. For a NAMESPACED *gem* class that surface is
-    /// knowingly WEAKER than the oracle's: the reference supplements the rbs gem
-    /// with `data/vendored_gem_sigs/` (rubygems / cgi / nokogiri / prism / …),
-    /// which rigor-rs does not vendor. Probed: `Gem::Version.new("1.0").segments`
+    /// ADR-0042 qualified surface. When this landed (`2fe6493`, 2026-07-25) that
+    /// surface was knowingly WEAKER than the oracle's for a NAMESPACED *gem*
+    /// class: the reference supplements the rbs gem with
+    /// `data/vendored_gem_sigs/` (rubygems / cgi / nokogiri / prism / …), which
+    /// rigor-rs did not vendor. Probed then: `Gem::Version.new("1.0").segments`
     /// — `segments` is declared ONLY in the reference's `rubygems_extras.rbs`, so
-    /// the ORACLE IS SILENT and an unrestricted arm fired ⇒ a false positive.
+    /// the ORACLE WAS SILENT and an unrestricted arm fired ⇒ a false positive.
+    ///
+    /// ## That premise EXPIRED on 2026-07-31 — read before removing this
+    ///
+    /// `800b3a1` vendored `data/vendored_gem_sigs/` under
+    /// `crates/rigor-index/vendor/rbs/overlay/` (every gem named above except
+    /// `prism`, excluded deliberately — see that tree's `PROVENANCE.md`), so the
+    /// sentence above stopped being true six days after it was written. Measured
+    /// 2026-09-09 over a 651-name vocabulary per class, with a non-vacuous
+    /// control: the port's surface for `Bundler`, `Bundler::Definition`,
+    /// `Gem::Specification`, `Gem::Version`, `Psych::DisallowedClass` and
+    /// `ENV` is COMPLETE — zero methods witnessed that the reference has — and
+    /// `Gem::Version#segments` resolves here and is silent on both engines. It
+    /// cannot re-open.
+    ///
+    /// What still holds the restriction up is a DIFFERENT and smaller fact: 26
+    /// `(class, method)` holes where a late overlay reopen (`module Kernel` in
+    /// `overlay/rbs_shims/rubygems.rbs`, merged last so upstream wins) is not
+    /// carried to a subclass by the qualified ancestor flattening — e.g.
+    /// `("Gem::Dependency", "gem")` answers true and `("Bundler::Dependency",
+    /// "gem")` false. Removing this restriction before those are fixed fires on
+    /// `Bundler::Dependency.new("a","b").gem("x")`, which the oracle is silent
+    /// on. Tracked as rigor-rs#123; the 7 gap rows this would then close, their
+    /// must-still-fire controls and the counted prize are in
+    /// `docs/notes/20260909-declared-unwitnessed-gem-classes.md`.
     ///
     /// Restricting the arm to declaration-only classes closes that door
     /// structurally rather than by name: a project that writes `Gem::Version`
@@ -1370,8 +1395,9 @@ impl SourceIndex {
     /// the only tuple-element class reachable from a TOP-LEVEL receiver — the
     /// only receivers whose tuple return resolves, since the lookup rides the
     /// SHORT-key map, which holds no qualified keys — is `Process::Status`.
-    /// Remove this restriction when rigor-rs vendors the reference's gem-sig
-    /// extras.
+    /// Remove this restriction once rigor-rs#123's ancestor-closure holes are
+    /// closed — NOT merely "when rigor-rs vendors the gem-sig extras", which it
+    /// has done since 2026-07-31.
     pub fn is_declaration_only_class(&self, name: &str) -> bool {
         self.declaration_only_classes.contains(name)
     }
