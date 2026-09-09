@@ -243,7 +243,12 @@ impl Baseline {
         let mut counts: BTreeMap<(String, String, Option<String>), usize> = BTreeMap::new();
 
         for (rel, diag) in entries {
-            let rule = diag.rule_id.to_string();
+            // `next if diag.qualified_rule.nil?` — a RULELESS diagnostic (a
+            // parse error) is not baselinable: there is no rule to key a bucket
+            // on, and an empty `rule:` row would silence every future parse
+            // error in the file.
+            let Some(rule) = diag.qualified_rule() else { continue };
+            let rule = rule.to_string();
             let msg = match mode {
                 MatchMode::Rule => None,
                 MatchMode::Message => Some(regexp_escape(&diag.message)),
@@ -311,15 +316,23 @@ impl Baseline {
         // a synthetic "no-bucket" bin keyed by (file, rule) so it surfaces.
         let mut bins: BTreeMap<BinKeyOrd, Vec<usize>> = BTreeMap::new();
 
+        let mut surfaced = Vec::new();
+
         for (i, (rel, diag)) in entries.iter().enumerate() {
+            // "Diagnostics that lacked a rule or a path bypass the baseline
+            // entirely (the baseline can't address them)" — they are never
+            // binned and therefore never silenced.
+            let Some(rule) = diag.qualified_rule() else {
+                surfaced.push(i);
+                continue;
+            };
             let key = match self.claim_bucket(rel, diag) {
                 Some(bi) => BinKeyOrd::Bucket(bi),
-                None => BinKeyOrd::NoBucket(rel.clone(), diag.rule_id.to_string()),
+                None => BinKeyOrd::NoBucket(rel.clone(), rule.to_string()),
             };
             bins.entry(key).or_default().push(i);
         }
 
-        let mut surfaced = Vec::new();
         let mut silenced = 0usize;
         for (key, idxs) in bins {
             match key {
@@ -335,12 +348,16 @@ impl Baseline {
 
     /// The bucket that claims `diag`: a message-pattern bucket whose regex
     /// matches the message wins; else the rule-ID bucket for `(file, rule)`.
-    /// Returns the bucket's index in `self.buckets`, or `None`.
+    /// Returns the bucket's index in `self.buckets`, or `None` — including for
+    /// a RULELESS diagnostic (a parse error), which no bucket can key on
+    /// (reference: `next if diag.qualified_rule.nil?` in `audit` and
+    /// `group_diagnostics_for_filtering`).
     fn claim_bucket(&self, rel: &str, diag: &Diagnostic) -> Option<usize> {
+        let rule = diag.qualified_rule()?;
         let mut rule_fallback: Option<usize> = None;
         // Message-pattern buckets take precedence over the rule-ID bucket.
         for (i, b) in self.buckets.iter().enumerate() {
-            if b.file != rel || b.rule != diag.rule_id {
+            if b.file != rel || b.rule != rule {
                 continue;
             }
             match &b.message_regex {

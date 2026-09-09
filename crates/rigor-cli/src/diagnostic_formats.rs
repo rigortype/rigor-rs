@@ -29,13 +29,15 @@ use serde::Serialize;
 /// One diagnostic flattened for the CI formatters: the resolved location plus
 /// the fields a format renders. `rule_id` is the qualified rule (rigor-rs keeps
 /// the `builtin` family bare in `rule_id`, so it already equals the reference's
-/// `qualified_rule` for built-in rules).
+/// `qualified_rule` for built-in rules) — and `None` for the RULELESS producers
+/// (parse errors), which each format below degrades gracefully, exactly as the
+/// reference's `nil`-returning `qualified_rule` makes it.
 pub struct Rendered<'a> {
     pub path: &'a str,
     pub line: usize,
     pub column: usize,
     pub severity: Severity,
-    pub rule_id: &'a str,
+    pub rule_id: Option<&'a str>,
     pub message: &'a str,
 }
 
@@ -72,7 +74,9 @@ pub fn render_gitlab(rows: &[Rendered]) -> String {
         .iter()
         .map(|r| Entry {
             description: gitlab_description(r),
-            check_name: r.rule_id,
+            // `diagnostic.qualified_rule || "rigor"` — Code Quality requires a
+            // check name, so a ruleless row is attributed to the tool.
+            check_name: r.rule_id.unwrap_or("rigor"),
             fingerprint: gitlab_fingerprint(r),
             severity: gitlab_severity(r.severity),
             location: Location {
@@ -93,9 +97,13 @@ fn gitlab_severity(severity: Severity) -> &'static str {
 }
 
 /// `"<message> [<rule>]"` — the rule rides in the description because Code
-/// Quality has no dedicated rule field (matches the reference).
+/// Quality has no dedicated rule field (matches the reference). A ruleless
+/// diagnostic gets the bare message, with no empty bracket.
 fn gitlab_description(r: &Rendered) -> String {
-    format!("{} [{}]", r.message, r.rule_id)
+    match r.rule_id {
+        Some(rule) => format!("{} [{}]", r.message, rule),
+        None => r.message.to_string(),
+    }
 }
 
 /// SHA-256 over the locating tuple (path, rule, line, column, message) joined by
@@ -105,7 +113,13 @@ fn gitlab_description(r: &Rendered) -> String {
 fn gitlab_fingerprint(r: &Rendered) -> String {
     let payload = format!(
         "{}\0{}\0{}\0{}\0{}",
-        r.path, r.rule_id, r.line, r.column, r.message
+        r.path,
+        // A ruleless row hashes with an empty slot — the reference joins
+        // `diagnostic.qualified_rule`, and `nil.to_s` is `""`.
+        r.rule_id.unwrap_or(""),
+        r.line,
+        r.column,
+        r.message
     );
     sha256_hex(payload.as_bytes())
 }
@@ -123,13 +137,19 @@ pub fn render_checkstyle(rows: &[Rendered]) -> String {
     for (path, group) in group_by_path(rows) {
         lines.push(format!("  <file name=\"{}\">", xml_escape(path)));
         for r in group {
+            // `attrs += %( source="…") if rule_id` — a ruleless diagnostic
+            // carries NO `source` attribute at all, rather than an empty one.
+            let source = match r.rule_id {
+                Some(rule) => format!(" source=\"{}\"", xml_escape(rule)),
+                None => String::new(),
+            };
             lines.push(format!(
-                "    <error line=\"{}\" column=\"{}\" severity=\"{}\" message=\"{}\" source=\"{}\" />",
+                "    <error line=\"{}\" column=\"{}\" severity=\"{}\" message=\"{}\"{} />",
                 r.line,
                 r.column,
                 checkstyle_severity(r.severity),
                 xml_escape(r.message),
-                xml_escape(r.rule_id),
+                source,
             ));
         }
         lines.push("  </file>".to_string());
@@ -169,7 +189,8 @@ pub fn render_junit(rows: &[Rendered]) -> String {
             lines.push(format!(
                 "  <testcase name=\"{}\" classname=\"{}\">",
                 xml_escape(&name),
-                xml_escape(r.rule_id),
+                // `diagnostic.qualified_rule || "rigor"`.
+                xml_escape(r.rule_id.unwrap_or("rigor")),
             ));
             lines.push(format!(
                 "    <failure type=\"{}\" message=\"{}\" />",
@@ -210,7 +231,11 @@ pub fn render_teamcity(rows: &[Rendered]) -> String {
         ],
     )];
     for r in rows {
-        let text = format!("{} [{}]", r.message, r.rule_id);
+        // `rule_id ? "#{message} [#{rule_id}]" : message` — no empty bracket.
+        let text = match r.rule_id {
+            Some(rule) => format!("{} [{}]", r.message, rule),
+            None => r.message.to_string(),
+        };
         let line = r.line.to_string();
         lines.push(teamcity_message(
             "inspection",
@@ -400,7 +425,56 @@ mod tests {
         rule_id: &'a str,
         message: &'a str,
     ) -> Rendered<'a> {
-        Rendered { path, line, column, severity, rule_id, message }
+        Rendered { path, line, column, severity, rule_id: Some(rule_id), message }
+    }
+
+    /// A RULELESS row — what a parse error flattens to.
+    fn ruleless_row<'a>(
+        path: &'a str,
+        line: usize,
+        column: usize,
+        message: &'a str,
+    ) -> Rendered<'a> {
+        Rendered { path, line, column, severity: Severity::Error, rule_id: None, message }
+    }
+
+    /// Each CI format degrades a ruleless diagnostic the way the reference's
+    /// `nil`-returning `qualified_rule` makes it degrade — measured against the
+    /// reference at pin `ffb456b0` on
+    /// `rigor-survey/Ruby/searches/binary_search.rb`:
+    ///
+    /// - gitlab: `check_name` falls back to `"rigor"`, description has NO
+    ///   `[rule]` bracket;
+    /// - checkstyle: the `source=` attribute is ABSENT, not empty;
+    /// - junit: `classname` falls back to `"rigor"`;
+    /// - teamcity: the message has NO `[rule]` bracket.
+    ///
+    /// The failure this guards is an empty rule rendering as `""` / `[]`, which
+    /// is the same class of bug as a JSON `"rule": ""` where the reference
+    /// gives `null`.
+    #[test]
+    fn ruleless_rows_degrade_as_the_reference_does() {
+        let rows = vec![ruleless_row("a.rb", 28, 1, "unexpected 'else', ignoring it")];
+
+        let gitlab = render_gitlab(&rows);
+        assert!(gitlab.contains(r#""check_name": "rigor""#), "{gitlab}");
+        assert!(
+            gitlab.contains(r#""description": "unexpected 'else', ignoring it""#),
+            "no empty bracket in the description: {gitlab}"
+        );
+
+        let checkstyle = render_checkstyle(&rows);
+        assert!(!checkstyle.contains("source="), "no source attribute: {checkstyle}");
+        assert!(checkstyle.contains(r#"severity="error""#), "{checkstyle}");
+
+        let junit = render_junit(&rows);
+        assert!(junit.contains(r#"classname="rigor""#), "{junit}");
+
+        let teamcity = render_teamcity(&rows);
+        assert!(
+            teamcity.contains("message='unexpected |'else|', ignoring it'"),
+            "no empty bracket in the message: {teamcity}"
+        );
     }
 
     #[test]

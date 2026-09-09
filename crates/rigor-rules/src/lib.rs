@@ -45,6 +45,26 @@ impl Severity {
 // Diagnostic struct
 // ---------------------------------------------------------------------------
 
+/// The `rule_id` of a **ruleless** diagnostic — one no rule produced.
+///
+/// The reference models this as `rule: nil` on its `Diagnostic` and reads it
+/// back through `Diagnostic#qualified_rule`, which returns `nil`; the producers
+/// it names are "parse errors, path errors, internal analyzer errors"
+/// (`lib/rigor/analysis/diagnostic.rb`). rigor-rs keeps `rule_id: &'static str`
+/// — over fifty call sites read it as a plain string (the `disable:` matcher,
+/// the severity stamp, the baseline binner, the LSP `code`) and an `Option`
+/// there would be a mechanical rewrite of all of them for one producer — and
+/// spells the absent rule as this empty-string sentinel instead.
+///
+/// **Never format `rule_id` directly.** Go through
+/// [`Diagnostic::qualified_rule`], which maps the sentinel back to `None`, so
+/// that the decision "what does a ruleless diagnostic look like here" is taken
+/// once per emitter and cannot silently render as `""`. A `""` in the JSON
+/// `rule` field is a DIFFERENT `(rule, line, column)` key from the reference's
+/// `nil` for `harness/lib.rb`'s `DiagKey`, so the row would count as both a
+/// coverage gap and an unregistered extra.
+pub const NO_RULE: &str = "";
+
 /// A diagnostic finding, identified by `rule_id` + location (ADR-0002 parity
 /// is defined over this pair).
 ///
@@ -75,6 +95,19 @@ pub struct Diagnostic {
     pub receiver_type: Option<String>,
     /// Called / defined method name for call/def rules; `None` otherwise.
     pub method_name: Option<String>,
+}
+
+impl Diagnostic {
+    /// The qualified rule identifier, or `None` for a ruleless diagnostic
+    /// (see [`NO_RULE`]).
+    ///
+    /// Mirrors the reference's `Diagnostic#qualified_rule`. rigor-rs keeps the
+    /// `builtin` family bare in `rule_id`, so for every rule-produced
+    /// diagnostic this is `rule_id` unchanged; the whole job of the accessor is
+    /// to give every emitter ONE place to decide what "no rule" renders as.
+    pub fn qualified_rule(&self) -> Option<&'static str> {
+        (self.rule_id != NO_RULE).then_some(self.rule_id)
+    }
 }
 
 // ---------------------------------------------------------------------------
