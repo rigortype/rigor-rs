@@ -355,6 +355,24 @@ pub struct OverloadSignature {
     /// `true` iff the overload declares any trailing positional (a positional
     /// after a rest, e.g. `(*T, U)`).
     pub has_trailing_positionals: bool,
+    /// `true` iff the overload declares a block the caller MUST supply
+    /// (`{ … }`, not `?{ … }`) — the reference's
+    /// `OverloadSelector.overload_requires_block?`. A block-less call site never
+    /// engages such an overload.
+    pub block_required: bool,
+    /// The overload's RETURN type in its VERBATIM written form, whitespace-
+    /// normalised (`Array[[ E, X ]]` ⇒ `"Array[[ E, X ]]"`). Two overloads
+    /// answer the *same* return iff these strings are equal.
+    ///
+    /// The flat [`CoreData::method_return`] slot compares only the ERASED head
+    /// class, so `Array[[E, X]]` and `Array[Array[E | U]]` "agree" there while
+    /// the reference translates them to two distinct types and joins them into
+    /// `Dynamic[union]` (upstream #521). This field is what lets a consumer see
+    /// that difference. When the source slice is unavailable the builder stores
+    /// a per-overload sentinel (`"\0unresolved<i>"`) rather than an empty
+    /// string, so an unreadable return never *agrees* with anything — the
+    /// conservative direction.
+    pub return_form: String,
 }
 
 /// Sentinel for a return type that is only knowable at the CALL SITE: a block
@@ -4439,9 +4457,27 @@ fn method_overloads(
             has_optional_keywords: ft.optional_keywords().iter().next().is_some(),
             has_rest_keywords: ft.rest_keywords().is_some(),
             has_trailing_positionals: ft.trailing_positionals().iter().next().is_some(),
+            block_required: mt.block().is_some_and(|b| b.required()),
+            return_form: normalized_written_form(&ft.return_type(), code, out.len()),
         });
     }
     out
+}
+
+/// [`node_written_form`] normalised for EQUALITY comparison: whitespace runs
+/// collapse to one space and the ends are trimmed, so a return type wrapped
+/// across lines in the RBS source compares equal to the same type written on
+/// one line. An unavailable slice becomes a per-overload sentinel so it never
+/// compares equal to another overload's return (the conservative direction:
+/// "these overloads disagree" only ever makes a consumer answer LESS).
+fn normalized_written_form(node: &Node, code: &str, ordinal: usize) -> String {
+    let raw = node_written_form(node, code);
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        format!("\0unresolved{ordinal}")
+    } else {
+        normalized
+    }
 }
 
 /// The upper bounds a method type declares for its own type parameters, as

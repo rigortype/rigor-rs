@@ -2322,6 +2322,19 @@ impl<'i> Typer<'i> {
                 .method_return(class_name, method)
                 .or_else(|| self.index.method_return_block_free(class_name, method))
             {
+                // #521 in the GENERIC dispatch (issue #118). The flat return
+                // slot answers a BARE `Nominal[C]`; the reference answers what
+                // the surviving overloads actually join to. When those differ —
+                // a nilable `C?`, or two candidates the erased head hid — a
+                // REFERENCE-UNTYPED argument means the reference cannot fold the
+                // call to a value either, so its carrier is the union and no
+                // negative rule fires on it. Decline to `Dynamic[top]` there.
+                let untyped_arg = self.rbs_dispatch_declines_on_untyped_arg(
+                    class_name, method, ast, args, env, interner,
+                );
+                if untyped_arg {
+                    return interner.untyped();
+                }
                 if let Some(class_id) = self.index.class_id(ret_class) {
                     return interner.intern(Type::Nominal {
                         class: class_id,
@@ -2374,6 +2387,129 @@ impl<'i> Typer<'i> {
 
         // Tier 5: unknown -> Dynamic[top].
         interner.untyped()
+    }
+
+    /// Whether the tier-3 flat-slot answer for `class_name#method` must be
+    /// WITHHELD at this call site — the generic-dispatch half of upstream #521
+    /// (`3d5dddbb`, PR #537), issue #118.
+    ///
+    /// ## What the reference does, and where the flat slot diverges
+    ///
+    /// The reference selects the overloads that match the call's arity and block
+    /// shape and joins their translated returns (`join_candidate_returns`): one
+    /// candidate answers its own return, several with the SAME return answer it,
+    /// several with distinct returns answer `Dynamic[union]` — a carrier no
+    /// negative rule fires on. rigor-rs has no RBS type translator, so tier 3
+    /// reads a per-method flat slot instead, which is right only when the
+    /// reference's join is a single BARE nominal. Two measured ways it is not
+    /// (both oracle-measured at pin `ffb456b0`):
+    ///
+    /// 1. **A nilable return.** `String#[]`'s four overloads all return
+    ///    `String?`; the reference answers `String | nil` and stays silent,
+    ///    while `method_return` drops the nil bit and hands tier 3 a bare
+    ///    `String` that `call.undefined-method` witnesses on — issue #118's
+    ///    `"abc"[u].frobnicate` (rows a15, and the `slice` / `byteslice` /
+    ///    `index` / `rindex` / `getbyte` / `byteindex` / `assoc` / `rassoc` /
+    ///    `Float#<=>` twins).
+    /// 2. **Returns that agree only after ERASURE.** `method_signature` compares
+    ///    the head class NAME, so `Array[[E, X]]` and `Array[Array[E | U]]`
+    ///    "agree" on `Array`; the reference joins them to `Dynamic[union]` and
+    ///    stays silent. This is #521's own `[true] * n` class of defect — here
+    ///    `Array#product`, `Array#zip` and `String#scan`, whose candidate sets
+    ///    this predicate reproduces exactly.
+    ///
+    /// ## The gate
+    ///
+    /// Withhold only when an argument is REFERENCE-UNTYPED
+    /// ([`Typer::arg_is_reference_untyped`], the same allow-list the Kernel
+    /// folds use). An untyped argument is what makes the reference unable to
+    /// value-fold the call, which is what leaves the union standing: with a
+    /// LITERAL argument the reference folds `"abc"[0]` to `"a"` and fires, and
+    /// rigor-rs's bare `String` matches that row — so gating on untypedness
+    /// keeps every such row (`"abc"[0]`, `"abc"[1..]`, `"abc".byteslice(1)`,
+    /// `"abc".index("b")`, `"abc".slice(1)`, all measured BOTH before and after).
+    ///
+    /// The index test runs FIRST and the arena walk only if it says the answer
+    /// is at risk: `arg_is_reference_untyped` is two arena scans per argument
+    /// (see its own COST note), and tier 3 is the hot dispatch path.
+    ///
+    /// Known withholdings, recorded not chased: an argument the reference types
+    /// but rigor-rs cannot see as such stays firing (a class-GUARDED parameter —
+    /// `return unless u.is_a?(Integer); "abc"[u].typo` is reference-silent and
+    /// still fires here), because the allow-list is deliberately syntactic; and
+    /// an overload written as an untyped function (`(?) -> untyped`) is not
+    /// retained in `method_overloads` at all, so it cannot contribute a
+    /// disagreement (18 occurrences in the vendored RBS, none of them a
+    /// multi-overload method whose flat slot answers).
+    fn rbs_dispatch_declines_on_untyped_arg(
+        &self,
+        class_name: &str,
+        method: &str,
+        ast: &LoweredAst,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        if args.is_empty() || self.rbs_join_is_one_bare_nominal(class_name, method, args.len()) {
+            return false;
+        }
+        let untyped = interner.untyped();
+        args.iter().any(|&a| {
+            self.type_of(ast, a, env, interner) == untyped
+                && self.arg_is_reference_untyped(ast, a)
+        })
+    }
+
+    /// The index half of [`Typer::rbs_dispatch_declines_on_untyped_arg`]:
+    /// whether the reference's join over the overloads that match `argc` and a
+    /// BLOCK-FREE call site is a single bare nominal — the only shape tier 3's
+    /// flat slot can spell faithfully.
+    ///
+    /// `true` (keep the flat answer) when the return is non-nilable AND every
+    /// candidate declares the same verbatim return. `true` also when the method
+    /// retains no overload shapes (nothing to contradict the slot) or when no
+    /// candidate matches the arity — the reference then falls back to a SINGLE
+    /// overload (`overloads.find { !requires_block } || overloads.first`) and
+    /// pins it, exactly as the flat slot does.
+    ///
+    /// Candidate selection is deliberately PERMISSIVE where the retained shapes
+    /// are coarse (a trailing positional does not raise the minimum arity, and
+    /// no per-argument type filtering is applied): admitting an extra candidate
+    /// can only turn agreement into disagreement, i.e. make the port answer
+    /// LESS, which is FP-safe.
+    fn rbs_join_is_one_bare_nominal(&self, class_name: &str, method: &str, argc: usize) -> bool {
+        // (1) A nilable return — the reference's carrier is `C | nil`.
+        if matches!(self.index.method_return_nilable(class_name, method), Some((_, true))) {
+            return false;
+        }
+        // (2) The candidates the reference would join.
+        let Some(overloads) = self.index.method_overloads(class_name, method) else {
+            return true;
+        };
+        let mut agreed: Option<&str> = None;
+        for ov in overloads {
+            // A block-less call site never engages a block-REQUIRING overload,
+            // and the reference skips an overload with a required keyword
+            // (`rejects_keyword_required?`) because no keyword is passed here.
+            if ov.block_required || ov.has_required_keywords {
+                continue;
+            }
+            if argc < ov.required_positionals.len() {
+                continue;
+            }
+            if !ov.has_rest_positionals
+                && !ov.has_trailing_positionals
+                && argc > ov.required_positionals.len() + ov.optional_positionals.len()
+            {
+                continue;
+            }
+            match agreed {
+                None => agreed = Some(ov.return_form.as_str()),
+                Some(prev) if prev == ov.return_form => {}
+                Some(_) => return false,
+            }
+        }
+        true
     }
 
     /// Resolve a tier-4b call-site PARAMETER-BINDING descriptor against the
@@ -7954,6 +8090,41 @@ mod m2_go_slice_tests {
         assert_eq!(ty_of_last_recv_call(b"s = Integer.sqrt(4)\n"), "Class<1>");
         // Divergent overloads (Regexp.last_match) stay Dynamic on THIS path.
         assert_eq!(ty_of_last_recv_call(b"m = Regexp.last_match(2)\n"), "Dynamic[top]");
+    }
+
+    /// Issue #118 — upstream #521 (`3d5dddbb`) in the GENERIC receiver
+    /// dispatch. Tier 3's flat slot may answer a bare `Nominal[C]` only when the
+    /// reference's join over the surviving overloads IS one. With a
+    /// reference-untyped argument two shapes decline: a NILABLE return
+    /// (`String#[] -> String?`, whose four overloads agree, so the slot's
+    /// all-agree collapse cannot see the nil bit) and an ERASURE-only agreement
+    /// (`Array#product`'s `Array[[E, X]]` vs `Array[Array[E | U]]`, which the
+    /// flat slot reads as "both Array"). The controls keep their answers: an
+    /// overload set that genuinely agrees on a bare class, and any call whose
+    /// argument the reference can value-fold.
+    #[test]
+    fn generic_dispatch_declines_under_an_untyped_argument() {
+        // (1) nilable join — issue #118's own row.
+        assert_eq!(ty_of_last_recv_call(b"def f(u)\n  \"abc\"[u]\nend\n"), "Dynamic[top]");
+        assert_eq!(
+            ty_of_last_recv_call(b"def f(u)\n  \"abc\".byteslice(u)\nend\n"),
+            "Dynamic[top]"
+        );
+        // (2) the candidates agree only after erasure.
+        assert_eq!(
+            ty_of_last_recv_call(b"def f(u)\n  [1, 2].product(u)\nend\n"),
+            "Dynamic[top]"
+        );
+        // (3) CONTROL — one matching overload returning a bare `String`: both
+        // engines keep witnessing on it.
+        assert_eq!(
+            ty_of_last_recv_call(b"def f(u)\n  \"abc\".center(u)\nend\n"),
+            "Class<0>"
+        );
+        // (4) CONTROL — a LITERAL argument is not reference-untyped, and the
+        // reference constant-folds the call to a `String` value, so withholding
+        // here would LOSE a matched row.
+        assert_eq!(ty_of_last_recv_call(b"def f\n  \"abc\"[0]\nend\n"), "Class<0>");
     }
 
     /// Slice 2/3: Kernel#Array folds by argument type; rand types by arity.
