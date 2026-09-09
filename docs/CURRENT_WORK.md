@@ -57,27 +57,29 @@ tools on release, the fixture harness on debug. Clippy: workspace
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
-- **Possible-nil / Tier B/C is CLOSED, not deferred** — 16/16 sampled coverage
-  gaps are REFERENCE FPs; the only closing slice deletes rigor-rs's
-  nameable-concrete-arm FP-safety mechanism, and `fp_audit` (which measures
-  against the reference) would score that deletion 0 FP: the parity gate points
-  the wrong way there. [tier-bc-track-closed](notes/20260717-tier-bc-track-closed.md).
-- **141 more undefined-method gaps are REFERENCE FPs, adjudicated and CLOSED** —
-  `pre_eval:` cross-file monkey-patch (49; the reference fires *having located*
-  the project's definition, and closing would require INVERTING the ADR-0033
-  provenance gate), receiver-typed-`nil` (63; 63/63 runtime-correct, the
-  exactly-nil corner of Tier B/C), rdoc generated-parser `Hash` receivers (29;
-  a wrong flow-insensitive ivar-arm collapse). 717 of 1168 gaps now sit behind
-  decisions. [note](notes/20260807-gap-adjudication-141.md).
+- **Possible-nil / Tier B/C is CLOSED, not deferred** — the closing slice deletes
+  rigor-rs's nameable-concrete-arm FP-safety mechanism and `fp_audit` would score it
+  0 FP: the parity gate points the wrong way
+  ([tier-bc](notes/20260717-tier-bc-track-closed.md)). **Its SCOPE, measured per row
+  at `v0.3.8` with the oracle's `type-of`: the 85 `Dynamic`-arm rows, NOT the 93
+  concrete-arm ones** (gated on nested-scope typing, then a 36-source tail).
+- **Reference-FP undefined-method clusters, CLOSED** — `pre_eval:` cross-file
+  monkey-patch (closing INVERTS the ADR-0033 provenance gate), receiver-typed-`nil`,
+  rdoc generated-parser `Hash` ([141](notes/20260807-gap-adjudication-141.md)).
+  Re-adjudicated whole at `v0.3.8` ([799](notes/20260909-gap-adjudication-799.md)):
+  rdoc is **93 rows**, all naming a class the port's RBS does not declare (vendoring
+  it is anti-parity); plus `Class.new(X) do…end` bodies read at TOP-LEVEL scope,
+  nested `def` never indexed, gvar/OpenStruct. **395 of 799 sit behind decisions;
+  the only mechanism above 13 rows is nested-scope receiver typing, 71 rows sized
+  with no build by LIFTING the block body to top level.**
 - **Five consecutive FP-safe flow slices closed 0 survey gaps** — never build a
   coverage slice without a valid-mode `fp_audit --gaps` prediction (AGENTS.md;
   [flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
-- **The receiver-typing lever is NOT exhausted — that 2026-07 conclusion is
-  RETIRED.** The 2026-08-07 census re-opened it by asking which MECHANISM each
-  gap is (not which rule), and the four slices that followed closed **47 rows**
-  on shapes the port already had signatures for. Pick slices from the census's
-  mechanism buckets, and re-run `gap_census.py --sweep` after each — the gap
-  set's SHAPE moves even when its total barely does.
+- **The receiver-typing lever is NOT exhausted** (the 2026-07 conclusion is RETIRED):
+  the 2026-08-07 census re-opened it by asking which MECHANISM each gap is, not which
+  rule, and four slices closed **47 rows** on shapes the port already had signatures
+  for. Pick from mechanism buckets; re-run `gap_census.py --sweep` after each — the
+  gap set's SHAPE moves even when its total barely does.
 - **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (2026-08-26 slice-4 probe). Four progressively stricter typer-free rules were MEASURED; the best is still 5 OVER on gitlab-foss/lib. Upstream's edge set IS the set of call nodes its typer visited, and that set is not characterisable — the blind positions depend on the condition FOLDING, sometimes THROUGH A CALL. The inversion that settles it: more edges ⇒ more TAINT (sound) but more edges ⇒ more LABELS (unsound), and `absorb` moves both in ONE pass. The ~2,000-method prize would need a registered-divergence device weakening the OVER gate — **REJECTED 2026-08-26: matching the reference outranks coverage**. Labels stay UNDER permanently; any future proposal must show it MATCHES the oracle, not merely scores better. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen arc is closed** — byte-mismatch surface 0, `--write` sound;
   remaining items are thin coverage-only. Parity model: sound-superset
