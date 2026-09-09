@@ -201,7 +201,10 @@ fn diagnostic_value(path: &str, source: &str, diag: &Diagnostic) -> Value {
     map.insert("line".into(), json!(line));
     map.insert("column".into(), json!(col));
     map.insert("severity".into(), json!(diag.severity.as_str()));
-    map.insert("rule".into(), json!(diag.rule_id));
+    // `json!(None::<&str>)` is `null` — the same shape `check --format json`
+    // gives a ruleless diagnostic, so a `rigor diff` against a reference
+    // `--format json` baseline compares like against like.
+    map.insert("rule".into(), json!(diag.qualified_rule()));
     map.insert("source_family".into(), json!(diag.source_family));
     map.insert("message".into(), json!(diag.message));
     if let Some(rt) = &diag.receiver_type {

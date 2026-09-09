@@ -379,15 +379,22 @@ fn build_summary(diags: &[DiagRef]) -> Summary {
     Summary { total: diags.len(), error, warning, info }
 }
 
+/// Reference `Triage::UNCATEGORISED` — the bucket a RULELESS diagnostic (a
+/// parse error) falls into, "rather than vanishing".
+const UNCATEGORISED: &str = "(uncategorised)";
+
 /// The qualified rule id (reference `rule_key`/`Diagnostic#qualified_rule`): a
 /// `builtin` / empty family renders the bare (already-canonical) rule, else
-/// `family.rule`.
+/// `family.rule`; a ruleless diagnostic buckets under [`UNCATEGORISED`].
 fn qualified_rule(d: &Diagnostic) -> String {
+    let Some(rule) = d.qualified_rule() else {
+        return UNCATEGORISED.to_string();
+    };
     let family = d.source_family;
     if family.is_empty() || family == "builtin" {
-        d.rule_id.to_string()
+        rule.to_string()
     } else {
-        format!("{family}.{}", d.rule_id)
+        format!("{family}.{rule}")
     }
 }
 
