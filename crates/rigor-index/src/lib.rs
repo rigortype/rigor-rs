@@ -1152,6 +1152,83 @@ mod tests {
         assert!(idx.qualified_class_has_method("Nokogiri::CSS::Parser", "do_parse"));
     }
 
+    /// The qualified ancestor closure must reach members an ABSOLUTE nested
+    /// declaration contributes. `overlay/rbs_shims/rubygems.rbs` writes
+    /// `module ::Kernel; def self?.gem; end` INSIDE `module Gem`; qualifying
+    /// that as `Gem::Kernel` hid `gem` from every qualified chain passing
+    /// through the real `Kernel` — 22 of the 26 holes in the 2026-09-09
+    /// 1202-class / 185 625-probe diff against the reference.
+    ///
+    /// `Gem::Dependency` answered `true` only by accident (its SHORT-key walk
+    /// reaches `Object → Kernel`, where the leaf-keyed reopen did land), while
+    /// `Bundler::Dependency` — whose short superclass `Dependency` is a merged
+    /// composite that never reaches `Object` — fell through to the qualified
+    /// walk and witnessed false absence.
+    #[test]
+    fn absolute_nested_reopen_lands_on_the_toplevel_qualified_key() {
+        let idx = CoreIndex::new();
+        if !idx.knows_class("Bundler") {
+            return; // stub fallback — no stdlib in the index.
+        }
+        // The phantom key is gone; the real one carries the member.
+        assert!(!idx.knows_qualified_class("Gem::Kernel"));
+        assert!(idx.qualified_class_has_method("Kernel", "gem"));
+        // Both `Dependency` classes now agree, and so do the other families the
+        // diff flagged (Nokogiri's HTML tree, Resolv's nested resources).
+        assert!(idx.qualified_class_has_method("Gem::Dependency", "gem"));
+        assert!(idx.qualified_class_has_method("Bundler::Dependency", "gem"));
+        assert!(idx.qualified_class_has_method("Nokogiri::HTML::Document", "gem"));
+        assert!(idx.qualified_class_has_method("Resolv::DNS::Resource::IN::MX", "gem"));
+        // The controls: these classes still WITNESS absence, so the assertions
+        // above are not vacuously true against a silenced surface.
+        assert!(!idx.qualified_class_has_method("Bundler::Dependency", "frobnicate_zzz"));
+        assert!(!idx.qualified_class_has_method("Nokogiri::HTML::Document", "frobnicate_zzz"));
+        assert!(!idx.qualified_class_has_method("Resolv::DNS::Resource::IN::MX", "frobnicate_zzz"));
+    }
+
+    /// A `prepend`ed module contributes to the instance surface. `class
+    /// LoadError; prepend DidYouMean::Correctable; end` was ingested as
+    /// nothing, so `#corrections` read as proven-absent on `LoadError`,
+    /// `Gem::LoadError`, `NameError`, `NoMethodError` and `KeyError` while the
+    /// reference resolves it.
+    #[test]
+    fn prepended_modules_are_on_the_instance_surface() {
+        let idx = CoreIndex::new();
+        if !idx.knows_class("LoadError") {
+            return; // stub fallback.
+        }
+        assert!(idx.qualified_class_has_method("LoadError", "corrections"));
+        assert!(idx.qualified_class_has_method("Gem::LoadError", "corrections"));
+        assert!(idx.qualified_class_has_method("NameError", "corrections"));
+        assert!(idx.class_has_method("LoadError", "corrections"));
+        // Controls: absence is still witnessable on the same classes.
+        assert!(!idx.qualified_class_has_method("LoadError", "frobnicate_zzz"));
+        assert!(!idx.qualified_class_has_method("Gem::LoadError", "frobnicate_zzz"));
+        assert!(!idx.class_has_method("LoadError", "frobnicate_zzz"));
+    }
+
+    /// A module's SELF-TYPE constraint is part of its own instance definition.
+    /// `module PPMethods : _PPMethodsRequired` gets `#text` / `#breakable` /
+    /// `#group` from the interface — the reference's `PP::PPMethods` definition
+    /// has exactly its own 11 methods plus those 3.
+    #[test]
+    fn module_self_type_contributes_to_the_module_surface() {
+        let idx = CoreIndex::new();
+        if !idx.knows_qualified_class("PP::PPMethods") {
+            return; // stub fallback.
+        }
+        assert!(idx.qualified_class_has_method("PP::PPMethods", "text"));
+        assert!(idx.qualified_class_has_method("PP::PPMethods", "breakable"));
+        assert!(idx.qualified_class_has_method("PP::PPMethods", "group"));
+        // Its own declared member still resolves, and absence is witnessable.
+        assert!(idx.qualified_class_has_method("PP::PPMethods", "guard_inspect_key"));
+        assert!(!idx.qualified_class_has_method("PP::PPMethods", "frobnicate_zzz"));
+        // The self type does NOT leak to an includer: RBS folds it into the
+        // MODULE's definition only. `Comparable : _WithSpaceshipOperator` gives
+        // `Comparable` its `<=>`, but a class that includes it gains nothing.
+        assert!(idx.qualified_class_has_method("Comparable", "<=>"));
+    }
+
     /// The `Object#`-level conversion-function surface. The reference loads
     /// `data/vendored_gem_sigs/` unconditionally, so a `class Object` reopen in
     /// that tree (`def Nokogiri:`) is on the ORACLE's surface; rigor-rs carries
