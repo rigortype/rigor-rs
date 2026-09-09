@@ -130,13 +130,16 @@ identical before and after the six fixes). concurrent-ruby's +35 and
 mastodon's +4 are new `v0.3.7` reference diagnostics; mail's −41 and
 dependabot's −11 are retractions the port never emitted.
 
-**The `mail` corpus now costs 70–80 minutes** (130 s at `v0.3.4`): one vendored
-file, `rufo-0.18.2/lib/rufo/formatter.rb`, does not finish in 25 minutes on the
-`v0.3.8` reference alone — an upstream performance regression bisected to
+**The `mail` corpus costs 70–80 minutes at THIS pin** (130 s at `v0.3.4`): one
+vendored file, `rufo-0.18.2/lib/rufo/formatter.rb`, does not finish in 25 minutes on
+the `v0.3.8` reference alone — an upstream performance regression bisected to
 `acd35612` (PR #547), reported as
-[feedback batch 4](../docs/notes/20260909-upstream-feedback-batch4.md) § 1.
-Until it is fixed upstream, budget ~80 minutes for `--sweep` and run
-`gap_census.py --sweep` in parallel rather than after it.
+[feedback batch 4](../docs/notes/20260909-upstream-feedback-batch4.md) § 1. Budget
+~80 minutes for `--sweep` and run `gap_census.py --sweep` in parallel rather than
+after it. **It is already fixed upstream** (#872 / PR #874, the mutual-recursion
+memo): measured 2026-09-09 on master `80b086a5`, that file checks in **3 s** and this
+corpus's reference arm in **39 s against 2,162 s at the pin** — so the budget lapses
+at the next bump ([survey](../docs/notes/20260909-survey-v038-master.md)).
 
 ## Standing sweep-set baseline (2026-08-23)
 

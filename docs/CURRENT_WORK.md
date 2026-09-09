@@ -15,10 +15,14 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 ▶ **NEXT (2026-09-09): the `v0.3.8` re-pin is MERGED** (PR #119, `0cd4749`). **#118 is CLOSED** (PR #120: tier 3's flat slot drops the nil bit and measures
 agreement after ERASURE — 13 FPs closed, no matched row lost, 9204 corpus files
 byte-identical); its residue is **#121** (a class-guarded argument, which needs the
-port's folder to learn `String#[]` first). Upstream took all five reports:
-#870/#872 (the rufo perf regression — `--sweep` is an 80-minute gate until it
-lands), #871, #877, #878, #879
-([batch 4](notes/20260909-upstream-feedback-batch4.md)). Upstream master is 112 commits past `v0.3.8`;
+port's folder to learn `String#[]` first). Upstream took all five reports and
+fixed them the same day (#870/#872, #871, #877, #878, #879). **Master surveyed at
+`80b086a5`, 219 commits: HOLD the pin** — 10 diagnostics on 9204 files, port silent on
+all ten, rbs / `data/` / plugin sig all unchanged. One obligation comes due at the
+bump: **#122** (#877's rooted version guard — the port would be louder than the new
+oracle, and no corpus file exercises it). The rufo perf regression is fixed upstream,
+so `--sweep`'s 80-minute budget lapses then
+([survey](notes/20260909-survey-v038-master.md)). Upstream master is 112 commits past `v0.3.8`;
 survey it before the next tag, bisect-first. The effect-system arc stays at its clean
 stop (slices 4/6 CLOSED by measurement; 20 resolvable-`super` rows are slice-4 debt);
 the narrowing frontier stays OUT OF CARRIER LEVERS.
