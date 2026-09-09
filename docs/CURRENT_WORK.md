@@ -12,12 +12,11 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-09): the `v0.3.8` re-pin is on branch `upstream-pin-v0.3.8`, all
-gates green, PR pending merge.** Six retraction families ported (fixtures 99–105) plus
-the effects `super` taint; the two follow-ups are issue #118 (the pre-existing
-`"abc"[u]` generic-dispatch FP) and upstream #547's rufo performance regression, which
-makes `--sweep` an 80-minute gate until fixed
-([note](notes/20260909-repin-v038.md)). Upstream master is 112 commits past `v0.3.8`;
+▶ **NEXT (2026-09-09): the `v0.3.8` re-pin is MERGED** (PR #119, `0cd4749`). Follow-ups:
+**#118** (the pre-existing `"abc"[u]` FP — `join_candidate_returns` in the GENERIC
+dispatch, not just the Kernel folds) and **upstream #547's rufo perf regression**,
+which makes `--sweep` an 80-minute gate — repro written up, NOT yet filed upstream
+([batch 4](notes/20260909-upstream-feedback-batch4.md)). Upstream master is 112 commits past `v0.3.8`;
 survey it before the next tag, bisect-first. The effect-system arc stays at its clean
 stop (slices 4/6 CLOSED by measurement; 20 resolvable-`super` rows are slice-4 debt);
 the narrowing frontier stays OUT OF CARRIER LEVERS.
