@@ -190,13 +190,20 @@ before and after.
   could now go through `NO_RULE` — but `internal-error` is load-bearing in
   `finding_fails_run` and in the severity-stamp bypass, so that is its own
   slice with its own oracle probes, not a rider on this one.
-- **The gitlab fingerprint joins on `\0`; at v0.3.8 the reference joins on a
-  space** (`[...].join(" ")`), while the port's comment claims the reference
-  uses `\0`. Pre-existing and unrelated to rulelessness — it makes EVERY row's
-  fingerprint differ, not just a ruleless one. Not touched here; worth a
-  separate look, since a `--format gitlab` consumer dedups on it.
-- **SARIF key order** for rule-carrying rows was preserved as rigor-rs has
-  always emitted it (`ruleId` first); the reference appends `ruleId` last. Also
-  pre-existing, also untouched.
+- ~~**The gitlab fingerprint joins on `\0`** where the reference joins on a
+  space, so every row's fingerprint differs.~~ **RETRACTED by the orchestrator's
+  audit — this does not reproduce.** Measured with a freshly built release
+  binary, port and reference agree byte for byte on both a rule-bearing row
+  (`60fc7b81…`) and a ruleless one (`29b0ec09…`), and
+  `diagnostic_formats.rs`'s comment says the space is load-bearing, which is
+  what the code does. The claim came from a stale `target/release/rigor`, which
+  predates this slice and emits nothing at all for an unparseable file — the
+  hazard `sweep-measures-release-binary` records. Nothing to fix.
+- **SARIF key order** differs, but not as first written: both engines put
+  `ruleId` LAST. The real difference is the two keys before it — the reference
+  emits `level, message, locations, ruleId`, the port `level, locations,
+  message, ruleId`. Pre-existing, untouched, and invisible to any SARIF consumer
+  (JSON objects are unordered); recorded only so the next reader does not
+  re-derive it.
 - The full `fp_audit.py --gaps --sweep` was NOT run (~80 min at this pin); the
   four-corpus before/after diff above stands in for it.
