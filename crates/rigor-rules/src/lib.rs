@@ -1511,12 +1511,16 @@ fn check_call(
             // in `knows_toplevel_class`, and a nested-only class's SHORT key has
             // no qualified entry.
             //
-            // The DECLARATION-ONLY restriction is load-bearing and was measured,
-            // not theorised: for a namespaced GEM class rigor-rs's surface is
-            // knowingly weaker than the oracle's (the reference's
-            // `data/vendored_gem_sigs/`, which rigor-rs does not vendor), and
+            // The DECLARATION-ONLY restriction was measured, not theorised —
+            // but on a premise that has since EXPIRED. In 2026-07 rigor-rs's
+            // surface for a namespaced GEM class was weaker than the oracle's
+            // (the reference's `data/vendored_gem_sigs/`, then unvendored) and
             // `Gem::Version.new("1.0").segments` fired here while the oracle
-            // stayed silent. See `SourceIndex::is_declaration_only_class` for
+            // stayed silent. `800b3a1` vendored those sigs on 2026-07-31; the
+            // port's surface for those classes is now COMPLETE and that FP
+            // cannot re-open (measured 2026-09-09, 651 names per class). What
+            // holds the restriction up today is rigor-rs#123's 26 ancestor-
+            // closure holes. See `SourceIndex::is_declaration_only_class` for
             // the full argument and the audit of what remains reachable.
             // A project class carries only its SHORT key here, so a bundled RBS
             // class of the same bare name is a DIFFERENT class and its method
