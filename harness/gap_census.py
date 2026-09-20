@@ -117,6 +117,13 @@ def main():
             invalid.append(tgt)
             continue
         rs_keys = fp.keys(rs_diags)
+        # Count THIS corpus's rows by where they were appended, not by matching
+        # `corpus` afterwards: that label is the target's BASENAME, and two
+        # members of the standing set end in `lib` (`gitlab-foss/lib` and
+        # `rigor-survey/haml/lib`), so the filter counted the first one's rows
+        # again under the second's name — haml read as 164 gaps where it has 2,
+        # while the total below stayed right.
+        before = len(rows)
         for d in ref:
             if d.get("severity", "error") not in fp.PARITY:
                 continue
@@ -131,7 +138,7 @@ def main():
                 "kind": receiver_kind(recv), "path": key[0], "line": key[1],
                 "message": (d.get("message") or "").strip(),
             })
-        print(f"{tgt}: {len([r for r in rows if r['corpus'] == os.path.basename(tgt.rstrip('/'))])} gaps")
+        print(f"{tgt}: {len(rows) - before} gaps")
 
     print(f"\n=== {len(rows)} coverage gaps ===")
     for rule, n in Counter(r["rule"] for r in rows).most_common():

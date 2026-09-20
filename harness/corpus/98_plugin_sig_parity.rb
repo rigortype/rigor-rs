@@ -32,6 +32,20 @@ Date.today.all_day
 "abc".underscore
 3.minutes
 
+# The `v0.3.9` re-sync's own surface (#916): `ActiveSupport::TimeWithZone` is
+# modelled as a subclass of `Time`, so the readers only a zone-aware time has
+# resolve on `Time.current`; `to_param` / `to_query` / `duplicable?` are declared
+# on `Object` where ActiveSupport defines them. The file grew 1,735 -> 1,840
+# lines, and without a row here that growth is invisible to every gate this
+# project owns.
+Time.current.time_zone
+Time.current.period
+Time.current.comparable_time
+1.hour.ago.time_zone
+"abc".to_param
+"abc".to_query("k")
+"abc".duplicable?
+
 # ActiveSupport WIDENS the arity of `Date#to_time` to `to_time(form = :local)`.
 # The reference carries the row as a full redeclaration at this pin, which is
 # the defect below; upstream's fix (master `44bd23bf`, #437) turns it into an

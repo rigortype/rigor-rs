@@ -52,6 +52,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 72,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frobnicate' for Integer[1..5]"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 83,
       "column": 3,
       "severity": "error",

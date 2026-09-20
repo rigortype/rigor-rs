@@ -59,14 +59,13 @@
 //!
 //! Not folded, both arms stay live: `RUBY_PLATFORM`, `<=>`, `!` / `&&` / `||`
 //! compositions, `case` subjects, a value read through a local, two bare String
-//! literals, and `.to_f` spellings. A `::RUBY_VERSION` (leading-`::`) spelling is
-//! declined too: the reference accepts `RUBY_VERSION` only as a
-//! `Prism::ConstantReadNode`, and the port's lowering collapses `::RUBY_VERSION`
-//! into the same `ConstantRead` — so the bare-name arm re-checks the SOURCE
-//! SPELLING (measured: the oracle fires on `… if ::RUBY_VERSION < "3.4"`).
-//! `::Gem::Version.new(…)` on the other hand IS accepted, because the reference
-//! reads that receiver through `qualified_name_or_nil`, which renders
-//! `::Gem::Version` as `"Gem::Version"`.
+//! literals, and `.to_f` spellings. The ROOTED spelling `::RUBY_VERSION` IS
+//! folded, and so is `Gem::Version.new(::RUBY_VERSION)`: since upstream
+//! `152f7c9f` (#883, `v0.3.9`) the reference dispatches on the resolved name
+//! rather than on the Prism node class, and `::` only makes the top-level
+//! lookup explicit. What stays declined is a DYNAMIC base (`k::RUBY_VERSION`),
+//! where `qualified_name_or_nil` answers nil. `::Gem::Version.new(…)` was
+//! always accepted, for the same resolved-name reason.
 //!
 //! # `Psych::VERSION`: unreadable, so BOTH arms are dead
 //!
@@ -174,16 +173,14 @@ pub enum Verdict {
 pub fn filter_dead_version_guard_arms(
     diagnostics: Vec<Diagnostic>,
     ast: &LoweredAst,
-    source: &str,
 ) -> Vec<Diagnostic> {
-    filter_dead_version_guard_arms_with(diagnostics, ast, source, &RubyRuntime::from_env())
+    filter_dead_version_guard_arms_with(diagnostics, ast, &RubyRuntime::from_env())
 }
 
 /// [`filter_dead_version_guard_arms`] against an explicit reference Ruby.
 pub fn filter_dead_version_guard_arms_with(
     diagnostics: Vec<Diagnostic>,
     ast: &LoweredAst,
-    source: &str,
     runtime: &RubyRuntime,
 ) -> Vec<Diagnostic> {
     // The scan is a whole-file walk, so it is paid only when there is something
@@ -191,7 +188,7 @@ pub fn filter_dead_version_guard_arms_with(
     if diagnostics.is_empty() {
         return diagnostics;
     }
-    let arms = dead_arm_spans(ast, source, runtime);
+    let arms = dead_arm_spans(ast, runtime);
     if arms.is_empty() {
         return diagnostics;
     }
@@ -210,13 +207,13 @@ pub fn filter_dead_version_guard_arms_with(
 /// The reference's walk does not DESCEND into a dead arm; this one visits every
 /// node, which is equivalent for the filter — a guard nested inside a dead arm
 /// can only contribute ranges the dead arm already covers.
-pub fn dead_arm_spans(ast: &LoweredAst, source: &str, runtime: &RubyRuntime) -> Vec<Span> {
+pub fn dead_arm_spans(ast: &LoweredAst, runtime: &RubyRuntime) -> Vec<Span> {
     let mut arms = Vec::new();
     for (_, node) in ast.iter() {
         let Node::If { predicate, then_body, else_body, is_unless, .. } = node else {
             continue;
         };
-        let Some(verdict) = verdict(ast, *predicate, source, runtime) else {
+        let Some(verdict) = verdict(ast, *predicate, runtime) else {
             continue;
         };
         // `unless` runs its body on the FALSEY edge, so the arms are swapped.
@@ -310,12 +307,7 @@ const VERSION_CONSTANTS: &[&str] = &["Psych::VERSION"];
 
 /// `:truthy` / `:falsey` for a decidable version-guard predicate, `None` when the
 /// guard is undecidable (both arms stay live — the pre-existing behaviour).
-pub fn verdict(
-    ast: &LoweredAst,
-    predicate: NodeId,
-    source: &str,
-    runtime: &RubyRuntime,
-) -> Option<Verdict> {
+pub fn verdict(ast: &LoweredAst, predicate: NodeId, runtime: &RubyRuntime) -> Option<Verdict> {
     let Node::Call { receiver, method, args, block_body, args_all_plain, .. } = ast.get(predicate)
     else {
         return None;
@@ -331,8 +323,8 @@ pub fn verdict(
         return None;
     }
     let receiver = (*receiver)?;
-    let left = read_operand(ast, receiver, source, runtime)?;
-    let right = read_operand(ast, args[0], source, runtime)?;
+    let left = read_operand(ast, receiver, runtime)?;
+    let right = read_operand(ast, args[0], runtime)?;
     decide(&left, &right, method)
 }
 
@@ -347,24 +339,26 @@ fn is_equality(method: &str) -> bool {
 }
 
 /// Reads one side of the comparison, or `None` when it is not readable.
-fn read_operand(
-    ast: &LoweredAst,
-    node: NodeId,
-    source: &str,
-    runtime: &RubyRuntime,
-) -> Option<Operand> {
+fn read_operand(ast: &LoweredAst, node: NodeId, runtime: &RubyRuntime) -> Option<Operand> {
     match ast.get(node) {
         Node::StringLit { value, .. } => Some(Operand::LiteralString(value.clone())),
-        Node::ConstantRead { name, span } => {
-            // The reference reads `RUBY_VERSION` / `RUBY_ENGINE` only from a
-            // `Prism::ConstantReadNode` — a BARE name — and a curated
-            // `X::VERSION` only from a `Prism::ConstantPathNode`. The port's
-            // lowering collapses both into this one variant, so re-derive "bare"
-            // from the rendered name plus the source spelling: a `ConstantPathNode`
-            // either renders a `::` separator (`Psych::VERSION`) or is spelt with a
-            // leading `::` (`::RUBY_VERSION` renders as bare `"RUBY_VERSION"`, and
-            // only the source slice tells the two apart).
-            let bare = !name.contains("::") && source.get(span.0..span.1) == Some(name.as_str());
+        Node::ConstantRead { name, dynamic_base, .. } => {
+            // Upstream `152f7c9f` (#883, `v0.3.9`) stopped dispatching on the
+            // Prism node CLASS and dispatches on the RESOLVED name instead:
+            // `::RUBY_VERSION` is a `ConstantPathNode` with a nil parent, so the
+            // old node-class dispatch sent the rooted spelling down the curated
+            // `X::VERSION` route and declined it — one program, two spellings of
+            // one constant, two diagnostic sets (#877).
+            //
+            // The port's lowering already collapses both spellings into this one
+            // variant under the same rendering the reference's
+            // `qualified_name_or_nil` gives (`::Foo` => `"Foo"`), so the resolved
+            // name IS `name` — with one exception the lenient rendering cannot
+            // express: a DYNAMIC base (`k::RUBY_VERSION`) drops its base and
+            // renders bare too, where `qualified_name_or_nil` answers nil.
+            // `dynamic_base` is that answer, and it is what the source-spelling
+            // re-check this arm used to carry was really testing.
+            let bare = !name.contains("::") && !*dynamic_base;
             if bare {
                 match name.as_str() {
                     "RUBY_VERSION" => Some(Operand::VersionString(runtime.version.clone())),
@@ -393,7 +387,7 @@ fn read_operand(
                 Node::ConstantRead { name, .. } if name == "Gem::Version" => {}
                 _ => return None,
             }
-            let inner = read_operand(ast, args[0], source, runtime)?;
+            let inner = read_operand(ast, args[0], runtime)?;
             let text = match &inner {
                 Operand::LiteralString(s) | Operand::VersionString(s) | Operand::Engine(s) => s,
                 // The reference cannot check `Gem::Version.correct?` on a value
@@ -612,9 +606,9 @@ mod tests {
 
     /// The verdict of the FIRST `if`/`unless`/ternary in `src`.
     fn first_verdict(src: &str, rt: &RubyRuntime) -> Option<Verdict> {
-        let (ast, source) = ast_of(src);
+        let (ast, _source) = ast_of(src);
         ast.iter().find_map(|(_, n)| match n {
-            Node::If { predicate, .. } => Some(verdict(&ast, *predicate, &source, rt)),
+            Node::If { predicate, .. } => Some(verdict(&ast, *predicate, rt)),
             _ => None,
         })?
     }
@@ -659,13 +653,38 @@ mod tests {
             "v = RUBY_VERSION\na if v < \"3.4\"",
             "a if (RUBY_VERSION <=> \"3.4\") < 0",
             "a if \"a\" < \"b\"",
-            "a if ::RUBY_VERSION < \"3.4\"",
+            // A DYNAMIC base is not a rooted spelling: the reference's
+            // `qualified_name_or_nil` answers nil, and so does the lowering's
+            // `dynamic_base` bit. `::RUBY_VERSION` itself moved OUT of this list
+            // at `v0.3.9` (#883) — see `a_rooted_predefined_constant_folds`.
+            "k = Object\na if k::RUBY_VERSION < \"3.4\"",
+            "a if Object::RUBY_VERSION < \"3.4\"",
             "a if Foo::VERSION < \"5.0\"",
             "a if defined?(Ractor)",
             "a if !(RUBY_VERSION < \"3.4\")",
         ] {
             assert_eq!(first_verdict(src, &host()), None, "{src}");
         }
+    }
+
+    /// Upstream `152f7c9f` (#883, `v0.3.9`) dispatches the operand reader on the
+    /// RESOLVED name instead of the Prism node class, so the rooted spelling of a
+    /// predefined constant folds exactly as its bare twin does. Before the bump
+    /// every row here answered `None` and the dead arm kept reporting.
+    #[test]
+    fn a_rooted_predefined_constant_folds() {
+        assert_eq!(
+            first_verdict("a if ::RUBY_VERSION < \"3.4\"", &host()),
+            first_verdict("a if RUBY_VERSION < \"3.4\"", &host()),
+        );
+        assert_eq!(
+            first_verdict("a if ::RUBY_ENGINE == \"jruby\"", &host()),
+            first_verdict("a if RUBY_ENGINE == \"jruby\"", &host()),
+        );
+        assert_eq!(
+            first_verdict("a if Gem::Version.new(::RUBY_VERSION) < Gem::Version.new(\"2.7.0\")", &host()),
+            first_verdict("a if Gem::Version.new(RUBY_VERSION) < Gem::Version.new(\"2.7.0\")", &host()),
+        );
     }
 
     /// The reference READS `Psych::VERSION` out of its own runtime, so declining
@@ -696,8 +715,8 @@ mod tests {
         assert_eq!(first_verdict("a if Psych::VERSION < RUBY_ENGINE", &host()), None);
         // …and BOTH arms of such a guard are dropped.
         let src = "if Psych::VERSION >= \"3.1.0\"\n  a\nelse\n  b\nend\n";
-        let (ast, source) = ast_of(src);
-        assert_eq!(dead_arm_spans(&ast, &source, &host()).len(), 2);
+        let (ast, _source) = ast_of(src);
+        assert_eq!(dead_arm_spans(&ast, &host()).len(), 2);
     }
 
     #[test]
@@ -807,8 +826,8 @@ mod tests {
     #[test]
     fn a_ternary_drops_only_the_dead_half() {
         let src = "RUBY_VERSION < \"3.4\" ? a : b\n";
-        let (ast, source) = ast_of(src);
-        let arms = dead_arm_spans(&ast, &source, &host());
+        let (ast, _source) = ast_of(src);
+        let arms = dead_arm_spans(&ast, &host());
         assert_eq!(arms.len(), 1);
         let (start, end) = arms[0];
         assert_eq!(&src[start..end], "a");
@@ -818,8 +837,8 @@ mod tests {
     fn an_elsif_chain_decides_each_link_on_its_own() {
         // f14: `>= "3.4"` is TRUE on the host, so the whole `elsif` chain is dead.
         let src = "if RUBY_VERSION >= \"3.4\"\n  a\nelsif RUBY_VERSION >= \"3.0\"\n  b\nend\n";
-        let (ast, source) = ast_of(src);
-        let arms = dead_arm_spans(&ast, &source, &host());
+        let (ast, _source) = ast_of(src);
+        let arms = dead_arm_spans(&ast, &host());
         assert_eq!(arms.len(), 1);
         let (start, end) = arms[0];
         assert!(src[start..end].starts_with("elsif"), "{:?}", &src[start..end]);
@@ -829,7 +848,7 @@ mod tests {
     #[test]
     fn suppression_diagnostics_survive_a_dead_arm() {
         let src = "if RUBY_VERSION < \"3.4\"\n  a.b\nend\n";
-        let (ast, source) = ast_of(src);
+        let (ast, _source) = ast_of(src);
         let inside = src.find("a.b").expect("offset");
         let diag = |rule: &'static str| Diagnostic {
             rule_id: rule,
@@ -844,7 +863,6 @@ mod tests {
         let kept = filter_dead_version_guard_arms_with(
             vec![diag("call.undefined-method"), diag("suppression.unknown-rule")],
             &ast,
-            &source,
             &host(),
         );
         assert_eq!(kept.len(), 1);

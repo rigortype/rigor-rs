@@ -21,7 +21,7 @@
 # therefore chosen to be STABLE across host Ruby versions — the comparisons are
 # against versions far from any Ruby this toolchain runs on, and the one live
 # equality tests the ENGINE (see f15). EVERY line — firing and silent alike —
-# was oracle-measured at the `v0.3.8` pin (`ffb456b0`), one fresh temp cwd per
+# was oracle-measured at the `v0.3.9` pin (`d0c370f7`), one fresh temp cwd per
 # case, `--no-cache`, both reference libs pinned onto `-I` (UPSTREAM.md hazard 1).
 
 # --- STAYS SILENT: the dead arm ---------------------------------------------
@@ -155,10 +155,18 @@ end
 # no arm to pick.
 "abc".frobnicate_f18 if Gem::Version.new(RUBY_VERSION) < "3.4"
 
-# (f25) `::RUBY_VERSION` is a `ConstantPathNode` upstream, and the predefined
-# read admits `ConstantReadNode` only. rigor-rs lowers both to one
-# `ConstantRead`, so the port re-checks the SOURCE SPELLING.
+# (f25) the ROOTED spelling folds since upstream `152f7c9f` (#883, `v0.3.9`):
+# the reader dispatches on the RESOLVED name, and `::` only makes the top-level
+# lookup explicit. At `v0.3.8` this row FIRED on both engines, which is why it
+# retracted at the bump.
 "abc".frobnicate_f25 if ::RUBY_VERSION < "3.4"
+
+# (f30) the rooted ENGINE read folds the same way (equality only).
+"abc".frobnicate_f30 if ::RUBY_ENGINE == "nonexistent_engine_zz"
+
+# (f31) and the rooted operand reaches the `Gem::Version` wrapper through the
+# recursion that reader already had.
+"abc".frobnicate_f31 if Gem::Version.new(::RUBY_VERSION) < Gem::Version.new("2.7.0")
 
 # (f27) a `defined?` capability probe is not a comparison.
 "abc".frobnicate_f27 if defined?(Ractor)
@@ -201,3 +209,15 @@ if Psych::VERSION >= "3.1.0"
 else
   "abc".frobnicate_f29b
 end
+
+# (f32) the row that keeps the rooted fold from becoming a blanket one: a
+# DYNAMIC base is not a rooted spelling. The port's lenient constant rendering
+# drops the base and would render this bare `"RUBY_VERSION"` — the lowering's
+# `dynamic_base` bit is what stands in for `qualified_name_or_nil` answering
+# nil, and both engines still report here.
+kzz32 = Object
+"abc".frobnicate_f32 if kzz32::RUBY_VERSION < "3.4"
+
+# (f33) a QUALIFIED name that merely ends in a predefined one is not predefined
+# either — it renders with a `::` and misses the curated set, so both arms live.
+"abc".frobnicate_f33 if Object::RUBY_VERSION < "3.4"

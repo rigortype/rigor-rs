@@ -158,7 +158,7 @@ fn resolve_constant(
     source_index: &SourceIndex,
     source: &str,
 ) -> Option<String> {
-    let Node::ConstantRead { name, span } = ast.get(exc) else {
+    let Node::ConstantRead { name, span, .. } = ast.get(exc) else {
         return None; // splat / local / call / dynamic ⇒ opaque.
     };
     if name.is_empty() {

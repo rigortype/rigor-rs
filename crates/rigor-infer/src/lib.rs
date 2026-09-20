@@ -4778,17 +4778,15 @@ impl<'i> Typer<'i> {
     ///    `Disjoint` only when both names resolve AND both ancestor chains are
     ///    complete, so an unresolvable/project class or a truncated chain
     ///    answers `Unknown`;
-    /// 4. a SHAPED carrier (`Constant`/`Tuple`/`HashShape`) under any ordering
-    ///    that is not `Subclass`/`Equal` — S3 measured that its helper
+    /// 4. a SHAPED carrier (`Constant`/`Tuple`/`HashShape`) under a
+    ///    `Disjoint` or `Superclass` ordering — its helper
     ///    (`narrow_shape_to_class`, `:2508`) asks `subclass_of?` rather than
-    ///    `disjoint?`, so `Unknown` collapses there. Upstream `70ca7e74` did NOT
-    ///    touch that helper, and the difference is visible: row b15b, where a
-    ///    `[1, 2]` carrier under an `UnknownZzzClass` guard is `Bot` on the
-    ///    truthy edge and BOTH engines still fire on the call after the `if`,
-    ///    because `Bot` is the join identity.
+    ///    `disjoint?`, so anything that is not `Subclass`/`Equal` collapses
+    ///    EXCEPT the `Unknown` that `declines_bot?` now intercepts.
     ///
-    /// `Widened`, one way: a NOMINAL carrier under an `Unknown` ordering. That
-    /// is the whole of upstream #533 item 4 — see [`ClassFact::Widened`].
+    /// `Widened`, two ways: a NOMINAL carrier under an `Unknown` ordering
+    /// (upstream #533 item 4) and — since `v0.3.9`'s `6cde8381` — a SHAPED one
+    /// under the same ordering (#657 item 2). See [`ClassFact::Widened`].
     ///
     /// The carrier's class comes from [`CoreIndex::class_name_of`] — the same
     /// mapping `check_call` dispatches on, so the suppression is exactly
@@ -4854,19 +4852,32 @@ impl<'i> Typer<'i> {
         // `File::Stat` and `Foo::Bar::Baz` are SILENT — which pins the condition
         // as `subclass_of?`, not as "any shaped carrier collapses".
         //
-        // The re-pin does NOT move the shaped arms. `narrow_shape_to_class` is
-        // untouched by `70ca7e74`, and `narrow_constant_to_class`'s own
-        // `:unknown ⇒ untyped` (#657) is unobservable here: rigor-rs is already
-        // silent on both halves of the Constant row (b14a/b14b measure BOTH
-        // engines silent), so answering `Bot` there costs nothing and keeps this
-        // change inside the family it ports. Row b15b is the control that the
-        // Tuple arm must stay `Bot`.
+        // `v0.3.9` DOES move the shaped arms. `6cde8381` lifted
+        // `narrow_constant_to_class`'s `:unknown ⇒ untyped` (#657) into a shared
+        // `declines_bot?` and gave it to `narrow_shape_to_class` and
+        // `narrow_singleton_to_class` too, so the `Unknown` ordering now widens
+        // on every positive-edge carrier rather than collapsing. Rows b15b/b30b
+        // measured the OLD behaviour (both engines firing on the call after the
+        // `if`, through `Bot`'s join identity) and are the rows that retracted.
+        // The SINGLETON half is not ported here: `guard_meet_precise` declines a
+        // `Singleton` carrier outright, and probe t3 measures BOTH engines
+        // silent on `case Widget when Meta` with `extend Meta` — there is no
+        // witness to remove.
         let ordering = self.index.class_ordering(carrier, class_name);
         match interner.get(ty) {
             Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) => {
                 match ordering {
                     ClassOrdering::Subclass | ClassOrdering::Equal => None,
-                    _ => Some(ClassFact::Bot),
+                    // Upstream `6cde8381` (#657 item 2, `v0.3.9`) lifted the
+                    // `Unknown` decline out of `narrow_constant_to_class` into
+                    // the shared `declines_bot?` and gave it to EVERY
+                    // positive-edge carrier: a `Tuple` / `HashShape` projects
+                    // through `Array` / `Hash`, and a project module included
+                    // into either leaves the ordering `Unknown` for exactly
+                    // #657's reason. `Bot` asserts "this can never match", and
+                    // only `Disjoint` is evidence for that.
+                    ClassOrdering::Unknown => Some(ClassFact::Widened),
+                    ClassOrdering::Disjoint | ClassOrdering::Superclass => Some(ClassFact::Bot),
                 }
             }
             _ => match ordering {
@@ -5356,10 +5367,32 @@ impl<'i> Typer<'i> {
                 }
                 // The mutator's effect is decided by the PRE-call carrier
                 // (`widen_for_mutator`, `mutation_widening.rb:209`).
-                let widened = local.as_ref().and_then(|name| {
+                let widened = match local.as_ref().and_then(|name| {
                     let ty = *tenv.get(name)?;
-                    self.coll_widen_for_mutator(interner, ty, &method).map(|c| (name.clone(), c))
-                });
+                    self.coll_widen_for_mutator(interner, ty, &method)
+                        .map(|c| (name.clone(), c, ty))
+                }) {
+                    None => None,
+                    // `Inference::MutationRejoin` (`1ad7351e`, #580, `v0.3.9`):
+                    // the later store grows the carrier's value side instead of
+                    // being swallowed by the already-widened nominal. Read off
+                    // the PRE-call carrier, like the widening itself.
+                    Some((name, cls, pre_ty)) => {
+                        let mut members = self.coll_value_members(interner, pre_ty);
+                        for &a in Typer::coll_store_value_args(&method, &args) {
+                            for m in self.coll_store_value_classes(ast, a, tenv, interner) {
+                                if !members.contains(&m) {
+                                    members.push(m);
+                                }
+                            }
+                        }
+                        // Canonical order: the member set is compared only by the
+                        // interned `TypeId` two branch edges end up with, so the
+                        // order stores happened in must not separate them.
+                        members.sort_unstable();
+                        Some((name, cls, members))
+                    }
+                };
                 // Arguments are EXPRESSION position.
                 for a in &args {
                     self.coll_flow_expr(ast, *a, tenv, ctx, interner, out, false);
@@ -5402,9 +5435,9 @@ impl<'i> Typer<'i> {
                 }
                 // Keep-nominal widening — unless something inside the call
                 // REBOUND the same local (`output << (output = x)`).
-                if let Some((name, cls)) = widened {
+                if let Some((name, cls, members)) = widened {
                     if !rebound_within(ctx.rebinds, call_span, &name) {
-                        if let Some(ty) = self.coll_nominal(interner, cls) {
+                        if let Some(ty) = self.coll_nominal_with(interner, cls, &members) {
                             tenv.insert(name, ty);
                         }
                     }
@@ -5490,7 +5523,7 @@ impl<'i> Typer<'i> {
         self.coll_flow_scope(ast, truthy, &mut t, ctx, interner, out, stmt_position);
         let mut f = tenv.clone();
         self.coll_flow_scope(ast, falsey, &mut f, ctx, interner, out, stmt_position);
-        *tenv = join_flow_envs(&t, &f, interner);
+        *tenv = self.coll_join_envs(&t, &f, interner);
     }
 
     /// Thread one `case`/`when`. Every clause body runs on a clone of the
@@ -5532,11 +5565,11 @@ impl<'i> Typer<'i> {
                 self.coll_flow_expr(ast, cond, &mut t, ctx, interner, out, false);
             }
             self.coll_flow_scope(ast, &body, &mut t, ctx, interner, out, stmt_position);
-            acc = join_flow_envs(&acc, &t, interner);
+            acc = self.coll_join_envs(&acc, &t, interner);
         }
         let mut e = tenv.clone();
         self.coll_flow_scope(ast, &else_body, &mut e, ctx, interner, out, stmt_position);
-        *tenv = join_flow_envs(&acc, &e, interner);
+        *tenv = self.coll_join_envs(&acc, &e, interner);
     }
 
     /// The collection class a receiver carrier projects to, or `None`. Mirrors
@@ -5593,6 +5626,31 @@ impl<'i> Typer<'i> {
                 "Hash" if HASH_MUTATORS.contains(&method) => Some("Hash"),
                 _ => None,
             },
+            // A union [`Typer::coll_join_envs`] minted — every member a carrier
+            // of the SAME collection class. A store RE-JOINS it into one carrier
+            // (`MutationRejoin` grows an already-widened carrier; upstream's
+            // `joinable_receiver?` had to stop skipping an already-nominal
+            // receiver for exactly this reason). The union is not a Dynamic
+            // carrier, so minting here does not breach this pass's "never mint
+            // from Dynamic" envelope: every member was minted from a literal
+            // seed already.
+            Type::Union(members) => {
+                let members = members.clone();
+                let mut carrier: Option<&'static str> = None;
+                for m in members {
+                    let c = self.coll_nominal_carrier(interner, m)?;
+                    match carrier {
+                        None => carrier = Some(c),
+                        Some(prev) if prev == c => {}
+                        Some(_) => return None,
+                    }
+                }
+                match carrier? {
+                    "Array" if ARRAY_MUTATORS.contains(&method) => Some("Array"),
+                    "Hash" if HASH_MUTATORS.contains(&method) => Some("Hash"),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -5677,6 +5735,259 @@ impl<'i> Typer<'i> {
     fn coll_nominal(&self, interner: &mut Interner, class_name: &str) -> Option<TypeId> {
         let class = self.index.class_id(class_name)?;
         Some(interner.intern(Type::Nominal { class, args: vec![] }))
+    }
+
+    /// The same carrier, tagged with the accumulated set of erased STORE VALUE
+    /// classes — upstream's `Inference::MutationRejoin` (`1ad7351e`, #580,
+    /// `v0.3.9`) as this pass needs it.
+    ///
+    /// Before `v0.3.9` mutation widening was a one-way door: the first content
+    /// mutation replaced the literal shape with a bare nominal and every later
+    /// store was invisible, so both edges of a branch carried the SAME
+    /// `Nominal[Hash]` and the join kept it. The re-join grows the carrier's
+    /// value side with each later store, so two edges that stored DIFFERENT
+    /// value classes no longer carry the same instantiation — the reference
+    /// joins them into a `Type::Union`, and `receiver_descriptor` has no union
+    /// arm, so the receiver stops witnessing entirely.
+    ///
+    /// This pass models exactly that difference and nothing else: the member set
+    /// rides in the nominal's `args`, so [`join_flow_envs`]'s identical-`TypeId`
+    /// test — this slice's standing decline — does the union for us. The members
+    /// themselves are never read; only their EQUALITY is. A store whose value
+    /// class this pass cannot name contributes nothing, which is the same thing
+    /// the reference's own `Dynamic[top]` seed does (it is in every instantiation
+    /// and so never separates two of them).
+    fn coll_nominal_with(
+        &self,
+        interner: &mut Interner,
+        class_name: &str,
+        members: &[TypeId],
+    ) -> Option<TypeId> {
+        let class = self.index.class_id(class_name)?;
+        let args = match members.len() {
+            0 => vec![],
+            1 => vec![members[0]],
+            _ => vec![interner.intern(Type::Union(members.to_vec()))],
+        };
+        Some(interner.intern(Type::Nominal { class, args }))
+    }
+
+    /// The store-value classes a carrier has accumulated so far, in canonical
+    /// order (the `args` of [`Typer::coll_nominal_with`], unwrapped).
+    fn coll_value_members(&self, interner: &Interner, ty: TypeId) -> Vec<TypeId> {
+        let args = match interner.get(ty) {
+            Type::Nominal { args, .. } => args,
+            // A carrier the join left as `Nominal[C] | Nominal[C]` re-joins into
+            // ONE carrier on the next store (`MutationRejoin`'s whole point), and
+            // what it carries is every member either edge had.
+            Type::Union(members) => {
+                let mut out: Vec<TypeId> = Vec::new();
+                for &m in members {
+                    for v in self.coll_value_members(interner, m) {
+                        if !out.contains(&v) {
+                            out.push(v);
+                        }
+                    }
+                }
+                out.sort_unstable();
+                return out;
+            }
+            _ => return Vec::new(),
+        };
+        match args.first() {
+            None => Vec::new(),
+            Some(&a) => match interner.get(a) {
+                Type::Union(ms) => ms.clone(),
+                _ => vec![a],
+            },
+        }
+    }
+
+    /// The erased classes one stored value contributes to the carrier's value
+    /// side, or an EMPTY set when this pass cannot name them. Empty is the
+    /// conservative answer in the DIRECTION THAT KEEPS TODAY'S BEHAVIOUR: an
+    /// unnamed store leaves the member set untouched, so both edges of a branch
+    /// keep agreeing and the receiver keeps witnessing. Naming more kinds can
+    /// therefore only ever remove witnesses, never add one — but it can also
+    /// RECOVER them, because an edge that names what the other edge already had
+    /// agrees with it (rows r14/r15).
+    ///
+    /// A local is read through the pass's own `tenv`, which is how the gitlab
+    /// `normalized_cache['key'] = key_config` store — the one the `v0.3.9` sweep
+    /// caught — is separated from the `Array(...)` store beside it.
+    ///
+    /// It is a SET rather than one class because a conditional value contributes
+    /// every arm the reference's typer joins: `out << (flag ? 'a' : 1)` puts both
+    /// `String` and `Integer` in the union, and a later `String` store then adds
+    /// nothing (row r15).
+    fn coll_store_value_classes(
+        &self,
+        ast: &LoweredAst,
+        node: NodeId,
+        tenv: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<TypeId> {
+        let name = match ast.get(node) {
+            Node::IntegerLit { .. } => "Integer",
+            Node::FloatLit { .. } => "Float",
+            Node::StringLit { .. } | Node::InterpolatedString { .. } => "String",
+            Node::SymbolLit { .. } | Node::InterpolatedSymbol { .. } => "Symbol",
+            Node::ArrayLit { .. } => "Array",
+            Node::HashLit { .. } => "Hash",
+            Node::NilLit { .. } => "NilClass",
+            Node::LocalVariableRead { name, .. } => {
+                let Some(&ty) = tenv.get(name) else { return Vec::new() };
+                let Some(cls) = self.coll_carrier(interner, ty) else { return Vec::new() };
+                cls
+            }
+            // A ternary (or an `if` used as a value): the reference's typer joins
+            // the arms before the store. Naming it is load-bearing — mastodon's
+            // `application_helper.rb:180` is a ternary push followed by a branch
+            // push of the SAME class, and leaving the ternary unnamed made the
+            // two edges disagree and cost the row.
+            Node::If { then_body, else_body, .. } => {
+                let then_body = then_body.clone();
+                let else_body = else_body.clone();
+                let mut out = Vec::new();
+                for arm in [then_body.last().copied(), else_body.last().copied()] {
+                    let Some(arm) = arm else { continue };
+                    for m in self.coll_store_value_classes(ast, arm, tenv, interner) {
+                        if !out.contains(&m) {
+                            out.push(m);
+                        }
+                    }
+                }
+                return out;
+            }
+            // The ternary's `else` arm lowers through the `ElseNode` path, i.e.
+            // as a body-only `BeginRescue`; `Statements` wraps a multi-statement
+            // clause. Both reduce to "the value this clause evaluates to".
+            Node::BeginRescue { body, clauses, ensure_body, .. } if clauses.is_empty() => {
+                let body = body.clone();
+                let ensure_body = ensure_body.clone();
+                let Some(tail) = ensure_body.last().or_else(|| body.last()).copied() else {
+                    return Vec::new();
+                };
+                return self.coll_store_value_classes(ast, tail, tenv, interner);
+            }
+            Node::Statements { body, .. } => {
+                let body = body.clone();
+                let Some(tail) = body.last().copied() else { return Vec::new() };
+                return self.coll_store_value_classes(ast, tail, tenv, interner);
+            }
+            // `true` / `false` are deliberately unnamed: the reference joins them
+            // through `bool`, and this pass has no probe for that shape.
+            _ => return Vec::new(),
+        };
+        self.coll_nominal(interner, name).into_iter().collect()
+    }
+
+    /// [`join_flow_envs`] for this pass: two carriers of the SAME collection
+    /// class that differ only in the store-value members they accumulated join
+    /// to a `Type::Union` of the two, which is what the reference's `Scope#join`
+    /// leaves behind once `MutationRejoin` lets the edges diverge.
+    ///
+    /// Keeping the union rather than collapsing to untyped matters in BOTH
+    /// directions. A use site sees no witness either way ([`Typer::coll_carrier`]
+    /// has no union arm, exactly as `receiver_descriptor` has none). But a later
+    /// STORE re-joins the union into one carrier, and mastodon's
+    /// `application_helper.rb:180` needs that: a branch push makes the edges
+    /// diverge, the unconditional push after it re-joins them, and the reference
+    /// fires on the `compact_blank` that follows. Collapsing to untyped loses
+    /// that row, because a mutator on a Dynamic carrier never mints.
+    ///
+    /// Every other disagreement — a shape against a nominal, two different
+    /// collection classes, a non-carrier — still widens to untyped, which is this
+    /// pass's standing decline (probes m18/m20).
+    fn coll_join_envs(&self, a: &TypeEnv, b: &TypeEnv, interner: &mut Interner) -> TypeEnv {
+        let u = interner.untyped();
+        let mut out = TypeEnv::with_capacity(a.len());
+        for (k, av) in a {
+            let v = match b.get(k) {
+                Some(bv) if bv == av => *av,
+                Some(bv) => self.coll_union_carrier(interner, *av, *bv).unwrap_or(u),
+                None => u,
+            };
+            out.insert(k.clone(), v);
+        }
+        for k in b.keys() {
+            if !a.contains_key(k) {
+                out.insert(k.clone(), u);
+            }
+        }
+        out
+    }
+
+    /// The union of two collection carriers of the same class, or `None` when
+    /// they are not both that. Members are flattened and sorted so the result is
+    /// a function of the SET — two edges that reach the same set must intern to
+    /// the same `TypeId` or the next join separates them for no reason.
+    fn coll_union_carrier(
+        &self,
+        interner: &mut Interner,
+        a: TypeId,
+        b: TypeId,
+    ) -> Option<TypeId> {
+        let ca = self.coll_union_class(interner, a)?;
+        let cb = self.coll_union_class(interner, b)?;
+        if ca != cb {
+            return None;
+        }
+        let mut members: Vec<TypeId> = Vec::new();
+        for side in [a, b] {
+            match interner.get(side) {
+                Type::Union(ms) => {
+                    for &m in ms {
+                        if !members.contains(&m) {
+                            members.push(m);
+                        }
+                    }
+                }
+                _ => {
+                    if !members.contains(&side) {
+                        members.push(side);
+                    }
+                }
+            }
+        }
+        members.sort_unstable();
+        match members.len() {
+            0 => None,
+            1 => Some(members[0]),
+            _ => Some(interner.intern(Type::Union(members))),
+        }
+    }
+
+    /// The single collection class a carrier — or a union of carriers — stands
+    /// for, or `None` when it is neither.
+    fn coll_union_class(&self, interner: &Interner, ty: TypeId) -> Option<&'static str> {
+        match interner.get(ty) {
+            Type::Nominal { .. } => self.coll_nominal_carrier(interner, ty),
+            Type::Union(members) => {
+                let mut cls: Option<&'static str> = None;
+                for &m in members {
+                    let c = self.coll_nominal_carrier(interner, m)?;
+                    match cls {
+                        None => cls = Some(c),
+                        Some(prev) if prev == c => {}
+                        Some(_) => return None,
+                    }
+                }
+                cls
+            }
+            _ => None,
+        }
+    }
+
+    /// The argument positions of `method` that STORE a value into the receiver —
+    /// the only ones `MutationRejoin` grows the value side from. Every other
+    /// mutator (`delete`, `clear`, `sort!`, …) leaves the member set alone.
+    fn coll_store_value_args<'a>(method: &str, args: &'a [NodeId]) -> &'a [NodeId] {
+        match method {
+            "[]=" | "store" => args.last().map(std::slice::from_ref).unwrap_or(&[]),
+            "<<" | "push" | "append" | "unshift" | "prepend" => args,
+            _ => &[],
+        }
     }
 }
 

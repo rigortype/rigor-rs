@@ -108,49 +108,56 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 161,
-      "column": 7,
-      "severity": "error",
-      "message": "undefined method `frobnicate_f25' for \"abc\""
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 164,
+      "line": 172,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f27' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 167,
+      "line": 175,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_f28' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 193,
+      "line": 201,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_f20' for 1"
     },
     {
       "rule": "call.undefined-method",
-      "line": 200,
+      "line": 208,
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_f29a' for \"abc\""
     },
     {
+      "rule": "call.undefined-method",
+      "line": 219,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_f32' for \"abc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 223,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_f33' for \"abc\""
+    },
+    {
       "rule": "flow.dead-assignment",
-      "line": 173,
+      "line": 181,
       "column": 5,
       "severity": "warning",
       "message": "local `y_f19c' assigned in `f19_control_undecidable_guard' but never read"
     },
     {
       "rule": "suppression.unknown-rule",
-      "line": 182,
+      "line": 190,
       "column": 24,
       "severity": "warning",
       "message": "unknown rule `not.a.rule` in `# rigor:disable` — the token matches no known rule, alias, or family, so this suppression has no effect. Likely a typo; `rigor explain <rule>` lists the canonical ids."

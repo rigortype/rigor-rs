@@ -22,8 +22,13 @@ embedded core RBS, is the zero-false-positive keystone of plugin parity.
   `activesupport-core-ext`).
 - **Source path:** `reference/rigor/plugins/rigor-activesupport-core-ext/sig/active_support/core_ext.rbs`
   — **the PINNED submodule**, not a local checkout.
-- **Vendored:** 2026-09-09 at the `v0.3.8` pin (`ffb456b0`), `shasum`
-  `802cbe008d224d98f86267354771335a6fd1beb3`, 1,735 lines — `v0.3.7` (#658,
+- **Vendored:** 2026-09-21 at the `v0.3.9` pin (`d0c370f7`), `shasum`
+  `80698597a93eb934ffc5ab688838cc76bb3d2ad1`, 1,840 lines — `v0.3.9` (#916)
+  models `ActiveSupport::TimeWithZone` as a subclass of `Time` (so `time_zone`,
+  `period` and `comparable_time` resolve on `Time.current` and the `1.hour.ago`
+  family) and declares `to_param`, `to_query`, `duplicable?`, `instance_values`
+  and `instance_variable_names` on `Object`. Was 2026-09-09 at `v0.3.8`
+  (`ffb456b0`, `802cbe00…`, 1,735 lines) — `v0.3.7` (#658,
   #670, #632, #666, #765) roughly doubled the file with the ActiveSupport
   `Time` / `Date` / `DateTime` calculation surface and the `Duration` readers.
   Was 2026-08-25 at `v0.3.4` (`b10bd5df`, `996ccf62…`, 867 lines), and before
