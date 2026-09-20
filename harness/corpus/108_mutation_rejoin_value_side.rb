@@ -182,3 +182,37 @@ def r15(flag)
   out << 'c' if flag
   out.frobnicate_r15
 end
+
+# --- `true` / `false` / `nil` are SEPARATE members --------------------------
+
+# (r16) two stores of `true` agree — the reference's own union carries
+# `… | TrueClass`, not a joined `bool`, so this row fires.
+def r16(flag)
+  h = {}
+  h['a'] = true
+  if flag
+    h['b'] = true
+  end
+  h.frobnicate_r16
+end
+
+# (r17) a `true` / `false` pair does NOT agree. Name both through one `bool`
+# member and this row fires where the reference is silent.
+def r17(flag)
+  h = {}
+  h['a'] = true
+  if flag
+    h['b'] = false
+  end
+  h.frobnicate_r17
+end
+
+# (r18) `nil` is a member like any other.
+def r18(flag)
+  h = {}
+  h['a'] = nil
+  if flag
+    h['b'] = nil
+  end
+  h.frobnicate_r18
+end

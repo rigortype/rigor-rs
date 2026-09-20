@@ -42,7 +42,7 @@ argument, needing the port's folder to learn `String#[]`) is still open.
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
 State (verified 2026-09-21, at the `v0.3.9` pin): harness **108 fixtures / 0
-unregistered extras / 0 registered divergences**, coverage 527/576; standing
+unregistered extras / 0 registered divergences**, coverage 529/578; standing
 sweep **0 FP / 9,337 files / 892 gaps**, 8 corpora, baselines in
 `harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). `--sweep` is a
 3-MINUTE gate again (upstream #874); read per-corpus MATCHED counts, not only FPs. Gap totals move mostly with upstream retractions, not

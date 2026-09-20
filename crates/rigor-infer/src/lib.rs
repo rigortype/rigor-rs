@@ -5839,6 +5839,11 @@ impl<'i> Typer<'i> {
             Node::ArrayLit { .. } => "Array",
             Node::HashLit { .. } => "Hash",
             Node::NilLit { .. } => "NilClass",
+            // `true` and `false` are SEPARATE members, which is what the
+            // reference's own union carries (`… | TrueClass`): two stores of
+            // `true` agree and a `true` / `false` pair does not. Probes e1/e2.
+            Node::TrueLit { .. } => "TrueClass",
+            Node::FalseLit { .. } => "FalseClass",
             Node::LocalVariableRead { name, .. } => {
                 let Some(&ty) = tenv.get(name) else { return Vec::new() };
                 let Some(cls) = self.coll_carrier(interner, ty) else { return Vec::new() };
@@ -5879,8 +5884,6 @@ impl<'i> Typer<'i> {
                 let Some(tail) = body.last().copied() else { return Vec::new() };
                 return self.coll_store_value_classes(ast, tail, tenv, interner);
             }
-            // `true` / `false` are deliberately unnamed: the reference joins them
-            // through `bool`, and this pass has no probe for that shape.
             _ => return Vec::new(),
         };
         self.coll_nominal(interner, name).into_iter().collect()

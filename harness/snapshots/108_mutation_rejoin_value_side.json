@@ -70,6 +70,20 @@
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_r15' for Array[Dynamic[top] | Integer | String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 196,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r16' for Hash[Dynamic[top] | String, Dynamic[top] | TrueClass]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 217,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r18' for Hash[Dynamic[top] | String, Dynamic[top]?]"
     }
   ]
 }
