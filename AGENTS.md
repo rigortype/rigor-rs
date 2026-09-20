@@ -113,6 +113,11 @@ When splitting work to subagents:
 - **Implement with Opus** on a NEW branch from a spec that names the
   誤実装しやすい pitfalls explicitly. Require gates in the prompt: full tests +
   clippy + both harnesses + **fresh-dir E2E parity probes** vs the reference.
+  **Run clippy as `cargo +1.88.0 clippy --workspace --locked -- -D warnings`** —
+  CI pins that toolchain (`dtolnay/rust-toolchain@1.88`) and a newer local
+  clippy is not a substitute: 1.88 flags `only_used_in_recursion` on a `self`
+  that only the recursive call uses, 1.95 does not, and the difference took a
+  green local run to a red CI one.
 - **Open PRs as DRAFT** (`gh pr create --draft`); `gh pr ready` only once the
   audit below passes. A non-draft PR means "reviewed, mergeable" — nothing else.
   Push with an explicit refspec (`git push origin HEAD:refs/heads/<branch>`):

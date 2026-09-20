@@ -5378,7 +5378,7 @@ impl<'i> Typer<'i> {
                     // being swallowed by the already-widened nominal. Read off
                     // the PRE-call carrier, like the widening itself.
                     Some((name, cls, pre_ty)) => {
-                        let mut members = self.coll_value_members(interner, pre_ty);
+                        let mut members = Typer::coll_value_members(interner, pre_ty);
                         for &a in Typer::coll_store_value_args(&method, &args) {
                             for m in self.coll_store_value_classes(ast, a, tenv, interner) {
                                 if !members.contains(&m) {
@@ -5774,7 +5774,11 @@ impl<'i> Typer<'i> {
 
     /// The store-value classes a carrier has accumulated so far, in canonical
     /// order (the `args` of [`Typer::coll_nominal_with`], unwrapped).
-    fn coll_value_members(&self, interner: &Interner, ty: TypeId) -> Vec<TypeId> {
+    ///
+    /// A free function rather than a method: it reads nothing but the interner,
+    /// and clippy 1.88 — the version CI pins — flags a `self` that only the
+    /// recursive call uses (`only_used_in_recursion`).
+    fn coll_value_members(interner: &Interner, ty: TypeId) -> Vec<TypeId> {
         let args = match interner.get(ty) {
             Type::Nominal { args, .. } => args,
             // A carrier the join left as `Nominal[C] | Nominal[C]` re-joins into
@@ -5783,7 +5787,7 @@ impl<'i> Typer<'i> {
             Type::Union(members) => {
                 let mut out: Vec<TypeId> = Vec::new();
                 for &m in members {
-                    for v in self.coll_value_members(interner, m) {
+                    for v in Typer::coll_value_members(interner, m) {
                         if !out.contains(&v) {
                             out.push(v);
                         }
