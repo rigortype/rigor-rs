@@ -15,8 +15,30 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.3.8`** (tag, released 2026-09-08) |
-| Commit | `ffb456b0` |
+| **Pinned ref** | **`v0.3.9`** (tag, released 2026-09-12) |
+| Commit | `d0c370f7` |
+
+> **`v0.3.8 → v0.3.9` (2026-09-21): 447 commits, the largest `Fixed` list
+> upstream has shipped — and the gentlest bump since `v0.3.1`.** rbs does NOT
+> move (still 4.2.0, `vendor_rbs.py --check` exact on all 174 `.rbs`), the
+> `data/` overlay does not move (`diff -r` clean both ways), and the effects
+> catalogue is byte-identical on all three files. The ONE re-sync half that
+> moved is the vendored plugin sig (1,735 → **1,840** lines, #916's
+> `ActiveSupport::TimeWithZone < Time`), and fixture 98 gained rows for that
+> surface because nothing else in this project can see it. Both standing
+> exception tables stay EMPTY and the divergence registry stays empty. The raw
+> bump measured **3 fixture FPs + 1 sweep FP**, three families: `6cde8381`
+> (#657, `declines_bot?` reaches the shaped carriers), `152f7c9f` (#883, a
+> rooted `::RUBY_VERSION` folds like its bare twin), and `1ad7351e` (#580,
+> `MutationRejoin` grows an already-widened collection's value side — the
+> sweep-only one). **The `v0.3.8` sweep budget is GONE**: #874 fixed the
+> mutual-recursion re-walk, so `--sweep` runs end to end in under three minutes
+> (the `mail` corpus 2,162 s → 37 s) and the "budget ~80 minutes" advice in step
+> 7 no longer applies. New surface to keep an eye on:
+> `data/capability_roles/capability_roles.rbs` (#976) is loaded into every
+> default run and is deliberately NOT vendored — rigor-rs has no `conforms-to`
+> support, so nothing there can reach a diagnostic. See the
+> [note](docs/notes/20260921-repin-v039.md).
 
 > **`v0.3.4 → v0.3.8` (2026-09-09): four releases, 924 commits, and every one of
 > the three re-sync halves moved.** rbs 4.1.1 → **4.2.0** (`vendor_rbs.py`
@@ -153,7 +175,7 @@ see step 3 below.
 ```sh
 git submodule update --init reference/rigor
 # The reference is plain Ruby run in place — no build step:
-ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.3.8
+ruby -I reference/rigor/lib reference/rigor/exe/rigor --version   # -> rigor 0.3.9
 ```
 
 ## Oracle invocation hazard: stale-gem plugin hijack (issue rigortype/rigor#194)
@@ -175,7 +197,7 @@ ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
 probes must too.
 
 **Status (verified at the `v0.3.4` pin on 2026-08-26; the mechanism is unchanged
-at `v0.3.8`, where the same defensive `-I` is still passed):** upstream
+at `v0.3.9`, where the same defensive `-I` is still passed):** upstream
 fixed the MECHANISM — `Loader.bundled_plugin_path` (ADR-93 WD5, "#194 slice
 2") requires bundled plugins by an engine-anchored absolute path, and that
 was live-verified on a machine carrying a genuinely stale `rigortype 0.2.4`
@@ -291,6 +313,16 @@ chasing a non-bug.)
    ported upstream data specs) and the embedded-bytes digest assertion are the
    other two layers; see that tree's `PROVENANCE.md`.
 
+   **`data/capability_roles/` is a fourth `data/` directory and is deliberately
+   NOT vendored.** `v0.3.9`'s #976 ships five capability-role interfaces
+   (`_Closable`, `_RewindableStream`, `_ClosableStream`, `_FileDescriptorBacked`,
+   `_Callable`) into EVERY default run, so a `%a{rigor:v1:conforms-to …}` written
+   by following the specification resolves with no configuration. rigor-rs has no
+   `conforms-to` support at all, so an interface there is unreachable and cannot
+   produce a false positive — but that premise is the reason, so re-check it at
+   the bump that gives the port `conforms-to`, and re-check the directory itself
+   the way `diff -r` checks the other two.
+
    Then re-derive the classes whose DEFINITION the reference cannot build —
    `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`
    directories collide, and a collision blinds the oracle on that whole class:
@@ -344,13 +376,19 @@ chasing a non-bug.)
 7. **Re-run the corpus gates on the RELEASE binary** — `cargo build --offline
    --release -p rigor-cli`, then `python3 harness/fp_audit.py --gaps --sweep`
    (must be 0 FP) and `python3 harness/gap_census.py --sweep` for the new gap
-   baseline. Record both in `harness/CORPUS.md`. **Budget ~80 minutes and run
-   the two in parallel**: since `v0.3.7` the reference takes over an hour on
-   one vendored file of the `mail` corpus (rufo's `formatter.rb`, upstream
-   #547 — [feedback batch 4](docs/notes/20260909-upstream-feedback-batch4.md)).
-   Expect the sweep to find families the fixture corpus cannot: at `v0.3.8` it
-   found two (#627 version guards, #540 mutated constants) on top of the four
-   the snapshot diff showed. Also `python3 harness/effects_diff.py`: the
+   baseline. Record both in `harness/CORPUS.md`. **Each takes about three
+   minutes at `v0.3.9`** — the `v0.3.7` performance regression that made this
+   an 80-minute gate (rufo's `formatter.rb`, upstream #547) was fixed by #874,
+   and that corpus's reference arm went 2,162 s → 37 s. Expect the sweep to
+   find families the fixture corpus cannot: at `v0.3.8` it found two (#627
+   version guards, #540 mutated constants) on top of the four the snapshot diff
+   showed, and at `v0.3.9` it found the bump's third and largest family (#580
+   `MutationRejoin`) where the fixtures found two.
+   **Compare the per-corpus MATCHED counts, not just the FP count**: a fix that
+   over-declines passes the 0-FP gate while silently costing matched rows, and
+   at `v0.3.9` the first cut of the #580 port did exactly that (mastodon 420 →
+   419, recovered by modelling the union re-join rather than collapsing to
+   untyped). Also `python3 harness/effects_diff.py`: the
    effects gate has its own retraction class (`v0.3.5` made `super` taint).
 8. Update the tag/commit in this file (and `PROVENANCE.md` if rbs moved), record
    the numbers in `harness/CORPUS.md`, write a dated note in `docs/notes/`, and

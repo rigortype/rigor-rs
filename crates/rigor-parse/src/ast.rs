@@ -722,7 +722,14 @@ pub enum Node {
     /// constant read itself (which stays `Dynamic[top]` — no class-object typing,
     /// the zero-FP-safe choice). Empty for an un-namable dynamic constant.
     // TODO(spec): constant resolution (ADR-0019).
-    ConstantRead { name: String, span: Span },
+    /// A constant reference. `name` is the LENIENT rendering
+    /// ([`constant_path_string`]): `::Foo` renders bare as `"Foo"`, and a
+    /// dynamic base (`expr::Bar`) contributes nothing, so `k::LIMIT` also
+    /// renders as `"LIMIT"`. `dynamic_base` is what separates those two — it
+    /// is the reference's `Source::ConstantPath.qualified_name_or_nil`
+    /// answering nil, which a consumer that must not read through a runtime
+    /// receiver (the version-guard operand reader) tests.
+    ConstantRead { name: String, span: Span, dynamic_base: bool },
     /// A constant write (`FOO = v`). The value is lowered. Not a value itself.
     /// `name` is the WRITTEN constant name (`"FOO"`; the last component for a
     /// `Foo::Bar = v` path-write, else empty for an un-namable dynamic form) —
@@ -1934,6 +1941,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::ConstantRead {
                 name: constant_string(cr.name().as_slice()),
                 span: span_of(&cr.location()),
+                dynamic_base: false,
             });
         }
         if let Some(cp) = node.as_constant_path_node() {
@@ -1944,6 +1952,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::ConstantRead {
                 name: constant_path_string(node),
                 span: span_of(&cp.location()),
+                dynamic_base: strict_constant_path_string(node).is_none(),
             });
         }
 

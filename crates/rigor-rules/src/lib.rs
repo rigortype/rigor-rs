@@ -4682,6 +4682,15 @@ mod tests {
             // positives. See `ClassFact::Widened`.
             &b"def f\n  h = Array.new\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
             &b"def f(spec)\n  h = *spec\n  h.frobnicate_zzz if h.is_a?(UnknownZzz)\nend\n"[..],
+            // `v0.3.9`'s `6cde8381` (#657 item 2) gave the same `declines_bot?`
+            // to the SHAPED carriers: a `Tuple` projects through `Array` and a
+            // `HashShape` through `Hash`, so an unorderable guard class leaves
+            // the ordering `Unknown` there too. Both rows fired `for Array` /
+            // `for Hash` on the call AFTER the `if` until the re-pin — `Bot` is
+            // the join identity and `Widened` absorbs — and both are the fixture
+            // 100 rows b15b/b30b that retracted.
+            &b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..],
+            &b"def f\n  h = { a: 1 }\n  h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..],
         ] {
             let diags = run(src);
             assert!(
@@ -4716,11 +4725,13 @@ mod tests {
             // upstream #533 item 4 widens that arm to `untyped`. The rows below
             // are the controls that the widening must NOT swallow.)
             //
-            // A SHAPED carrier keeps collapsing to `Bot` on `Unknown`
-            // (`narrow_shape_to_class` is untouched by the re-pin), and `Bot` is
-            // the JOIN IDENTITY — so the call AFTER the conditional still fires
-            // where a widened one would be silent.
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            // A SHAPED carrier collapses to `Bot` on a PROVEN-DISJOINT guard,
+            // and `Bot` is the JOIN IDENTITY — so the call AFTER the conditional
+            // still fires where a widened one would be silent. (The `Unknown`
+            // twin of this row moved to the silence test at the `v0.3.9` re-pin:
+            // `6cde8381` gave `narrow_shape_to_class` the same `declines_bot?`
+            // the nominal arm had.)
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(Comparable)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
             // A TERMINATING truthy edge widens only the path that returns; the
             // code after runs on the untouched falsey edge.
             (&b"def f\n  h = Array.new\n  return if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),

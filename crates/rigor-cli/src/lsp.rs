@@ -2910,7 +2910,7 @@ fn compute_diagnostics(
         // ADR-47 WD5 (upstream #627) — the dead arm of a decidable version guard
         // reports nothing. Same position as `check`'s stage 3: after every
         // type/flow rule, before `suppression.*` joins the list.
-        let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast, text);
+        let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast);
         // The cache's payload rides back beside the guard's sample and on the
         // SAME condition: a guard-off dispatch built the single-file index
         // hover/completion already build per request, so caching it would buy

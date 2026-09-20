@@ -45,13 +45,6 @@
     },
     {
       "rule": "call.wrong-arity",
-      "line": 228,
-      "column": 5,
-      "severity": "error",
-      "message": "wrong number of arguments to `hexdigest' on Digest::Instance (given 3, expected 0..1)"
-    },
-    {
-      "rule": "call.wrong-arity",
       "line": 234,
       "column": 5,
       "severity": "error",

@@ -115,6 +115,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 415,
+      "column": 39,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r11' for 1.0"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 429,
       "column": 36,
       "severity": "error",

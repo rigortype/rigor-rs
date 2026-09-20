@@ -102,6 +102,46 @@ tools — a partial sweep must never read as a full one.
 
 Custom directories passed as positional arguments replace the whole list.
 
+## Standing sweep-set baseline (2026-09-21)
+
+`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.9`
+(`d0c370f7`), vendored rbs 4.2.0, release binary at the `upstream-pin-v0.3.9`
+merge of all three retraction families. **9,337 files, 0 FP candidates, 892
+coverage gaps** (`gap_census.py --sweep` agrees: 892). The raw bump — same
+reference, port unchanged from `v0.3.8` — measured **4 FP candidates**: three the
+fixture harness saw (`6cde8381` #657 ×2, `152f7c9f` #883 ×1) and one only the
+sweep could (`1ad7351e` #580, gitlab-foss
+`lib/gitlab/duo_agent_platform/config.rb:98`).
+
+| corpus | files | coverage gaps | (was, `v0.3.8`) | wall, reference |
+|---|---|---|---|---|
+| mastodon/app | 1236 | 18 | 20 | 11 s |
+| gitlab-foss/lib | 4676 | 162 | 163 | 44 s |
+| survey/mail | 874 | 379 | 391 | **37 s** (was 4,737 s) |
+| survey/Ruby | 192 | 22 | 31 | 8 s |
+| survey/dependabot-core | 1781 | 187 | 73 | 47 s |
+| survey/concurrent-ruby | 345 | 97 | 96 | 9 s |
+| survey/net-ssh | 181 | 25 | 25 | 5 s |
+| survey/haml/lib | 52 | 2 | 0 | 2 s |
+
+**The two columns are not comparable corpus-for-corpus**: the survey checkouts
+themselves grew since 2026-09-09 (dependabot-core 1,650 → 1,781 files, net-ssh
+180 → 181, haml 51 → 52), which is most of dependabot's +114. The FP column is
+what the gate reads, and it is 0 at both pins.
+
+**The 80-minute sweep budget is GONE.** Upstream #874 (the mutual-recursion memo)
+fixed the `v0.3.7` regression that made rufo's `formatter.rb` take over an hour:
+the `mail` corpus's reference arm went **2,162 s → 37 s**, and the whole sweep
+now runs in under three minutes. Run `fp_audit.py` and `gap_census.py`
+back-to-back; there is no longer a reason to parallelise them.
+
+**Read the per-corpus MATCHED counts, not only the FP count.** A port fix that
+over-declines passes the 0-FP gate while costing coverage, and the first cut of
+the #580 port did exactly that — mastodon 420 → 419 matched, one row
+(`application_helper.rb:180`) lost to a join that collapsed to untyped where the
+reference re-joins. After the fix every corpus's matched count is unchanged
+except gitlab-foss, which loses precisely the one FP row (1,088 → 1,087).
+
 ## Standing sweep-set baseline (2026-09-09)
 
 `python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.8`

@@ -306,7 +306,7 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
         diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
         // ADR-47 WD5 — dead version-guard arms, before `suppression.*` joins.
-        let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast, source);
+        let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast);
         (diags, comments)
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())?;
@@ -358,7 +358,7 @@ fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
         diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
         // ADR-47 WD5 — dead version-guard arms, before `suppression.*` joins.
-        let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast, source);
+        let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast);
         (diags, comments)
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())?;

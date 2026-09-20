@@ -15,10 +15,18 @@
 # rigor-rs carries a SEPARATE `ClassFact::Widened` rather than reusing `Bot` — is
 # the JOIN. `Bot` is the join identity (`Bot ∪ Array = Array`), so a call after
 # the `if` still fires; `untyped` ABSORBS (`Dynamic ∪ Array = Dynamic`), so it
-# goes silent. Rows b2b and b15b are that pair, measured on both engines.
+# goes silent. Row b2b is that pair's firing half, and rows b41/b42 below keep a
+# `Disjoint` ordering on the collapsing side of it.
 #
-# Every firing line and every silent control is oracle-measured at the `v0.3.8`
-# pin (`ffb456b0`), one fresh temp cwd per case, `--no-cache`, both reference
+# `v0.3.9`'s `6cde8381` (#657 item 2) then gave the SAME decline to the other
+# positive-edge carriers: `Tuple` and `HashShape` project through `Array` /
+# `Hash`, `Singleton` through `Class`, and a project module mixed into any of
+# those leaves the ordering `:unknown` exactly as #657's `Integer` did. So rows
+# b15b/b30b — which fired on BOTH engines at `v0.3.8` through `Bot`'s join
+# identity — retracted at the bump, and a shaped carrier now widens too.
+#
+# Every firing line and every silent control is oracle-measured at the `v0.3.9`
+# pin (`d0c370f7`), one fresh temp cwd per case, `--no-cache`, both reference
 # libs pinned onto `-I` (UPSTREAM.md hazard 1).
 
 class ProjKlass100 < Hash; end
@@ -132,11 +140,10 @@ def b11
   h.frobnicate_b11 if h.is_a?(Enumerable)
 end
 
-# (13) a SHAPED carrier still collapses to `Bot` (`narrow_shape_to_class` is
-# untouched by the re-pin), and `Bot` is the JOIN IDENTITY — so the guarded call
-# is silent while the call AFTER the `if` fires. This is the row that separates
-# the two facts; reusing `Bot` for the widening, or widening for the shape,
-# breaks one half of it.
+# (13) a SHAPED carrier widens like a nominal one since `6cde8381`, so BOTH the
+# guarded call and the call after the `if` are silent. These two rows fired at
+# the `v0.3.8` pin and are the fixture half of that bump's retraction; rows
+# b41/b42 keep the widening from swallowing the `Disjoint` collapse.
 def b15
   h = [1, 2]
   h.frobnicate_b15a if h.is_a?(UnknownZzzClass)
@@ -234,4 +241,39 @@ end
 def b6
   s = String.new
   s.frobnicate_b6 if s.is_a?(ProjKlass100)
+end
+
+# (40) the HASHSHAPE carrier takes the same route — `{ a: 1 }` projects through
+# `Hash`, so the `:unknown` ordering widens and both halves go silent.
+def b40
+  h = { a: 1 }
+  h.frobnicate_b40a if h.is_a?(UnknownZzzClass)
+  h.frobnicate_b40b
+end
+
+# --- STILL FIRES AFTER THE GUARD: `Disjoint` is NOT `Unknown` ----------------
+
+# (41) a shaped carrier under a PROVEN-disjoint guard still collapses to `Bot`,
+# and `Bot` is still the join identity — so the call after the `if` fires. This
+# is the control that `6cde8381` widened only the `:unknown` verdict: answer
+# `Widened` here and this row goes silent on rigor-rs alone.
+def b41
+  h = [1, 2]
+  h.frobnicate_b41a if h.is_a?(Comparable)
+  h.frobnicate_b41b
+end
+
+# (42) the HashShape twin of b41.
+def b42
+  h = { a: 1 }
+  h.frobnicate_b42a if h.is_a?(Comparable)
+  h.frobnicate_b42b
+end
+
+# (43) `instance_of?` on a shaped carrier is `Bot` before the ordering is ever
+# consulted, so the widening must not reach it either.
+def b43
+  h = [1, 2]
+  h.frobnicate_b43a if h.instance_of?(UnknownZzzClass)
+  h.frobnicate_b43b
 end

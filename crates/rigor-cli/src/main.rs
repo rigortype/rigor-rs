@@ -968,7 +968,7 @@ fn analyze_files(
                 // checked with, so a diagnostic there is a false positive.
                 // Applied AFTER every type/flow rule and BEFORE `suppression.*`
                 // joins the list (which stays reportable inside a dead arm).
-                rigor_rules::filter_dead_version_guard_arms(diags, &p.ast, &p.source)
+                rigor_rules::filter_dead_version_guard_arms(diags, &p.ast)
             }));
             match result {
                 Ok(mut diags) => {

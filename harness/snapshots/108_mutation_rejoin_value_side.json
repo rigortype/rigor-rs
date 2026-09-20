@@ -1,0 +1,89 @@
+{
+  "fixture": "harness/corpus/108_mutation_rejoin_value_side.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 82,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r5' for Hash[Dynamic[top] | String, Array[Integer] | Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 94,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r6' for Hash[Dynamic[top] | String, Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 104,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r7' for Array[Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 111,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r8' for Hash[Dynamic[top] | String, Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 123,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r9' for Hash[Dynamic[top] | String, Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 133,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r10' for Array[Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 139,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r11' for {}"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 154,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r12' for Array[Dynamic[top] | String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 174,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r14' for Array[Dynamic[top] | String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 183,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r15' for Array[Dynamic[top] | Integer | String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 196,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r16' for Hash[Dynamic[top] | String, Dynamic[top] | TrueClass]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 217,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r18' for Hash[Dynamic[top] | String, Dynamic[top]?]"
+    }
+  ]
+}
