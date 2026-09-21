@@ -5378,19 +5378,62 @@ impl<'i> Typer<'i> {
                     // being swallowed by the already-widened nominal. Read off
                     // the PRE-call carrier, like the widening itself.
                     Some((name, cls, pre_ty)) => {
-                        let mut members = Typer::coll_value_members(interner, pre_ty);
+                        let mut added: Vec<TypeId> = Vec::new();
                         for &a in Typer::coll_store_value_args(&method, &args) {
                             for m in self.coll_store_value_classes(ast, a, tenv, interner) {
-                                if !members.contains(&m) {
-                                    members.push(m);
+                                if !added.contains(&m) {
+                                    added.push(m);
                                 }
                             }
                         }
                         // Canonical order: the member set is compared only by the
                         // interned `TypeId` two branch edges end up with, so the
                         // order stores happened in must not separate them.
-                        members.sort_unstable();
-                        Some((name, cls, members))
+                        let grown = |base: &[TypeId]| {
+                            let mut members = base.to_vec();
+                            for &m in &added {
+                                if !members.contains(&m) {
+                                    members.push(m);
+                                }
+                            }
+                            members.sort_unstable();
+                            members
+                        };
+                        match interner.get(pre_ty) {
+                            // `widen_union` (mutation_widening.rb:316) widens
+                            // EACH arm and `Combinator.union` re-joins, deduping
+                            // only structurally identical arms — the edges
+                            // converge iff every arm grows to the same set.
+                            // Collapsing to one merged carrier fired where the
+                            // oracle kept the union (probe r2).
+                            Type::Union(arms) => {
+                                let arms = arms.clone();
+                                let mut minted = Vec::with_capacity(arms.len());
+                                for arm in arms {
+                                    let members =
+                                        grown(&Typer::coll_value_members(interner, arm));
+                                    if let Some(t) =
+                                        self.coll_nominal_with(interner, cls, &members)
+                                    {
+                                        minted.push(t);
+                                    }
+                                }
+                                minted.sort_unstable();
+                                minted.dedup();
+                                match minted.as_slice() {
+                                    [] => None,
+                                    [only] => Some((name, *only)),
+                                    _ => Some((name, interner.intern(Type::Union(minted)))),
+                                }
+                            }
+                            _ => self
+                                .coll_nominal_with(
+                                    interner,
+                                    cls,
+                                    &grown(&Typer::coll_value_members(interner, pre_ty)),
+                                )
+                                .map(|ty| (name, ty)),
+                        }
                     }
                 };
                 // Arguments are EXPRESSION position.
@@ -5435,11 +5478,9 @@ impl<'i> Typer<'i> {
                 }
                 // Keep-nominal widening — unless something inside the call
                 // REBOUND the same local (`output << (output = x)`).
-                if let Some((name, cls, members)) = widened {
+                if let Some((name, ty)) = widened {
                     if !rebound_within(ctx.rebinds, call_span, &name) {
-                        if let Some(ty) = self.coll_nominal_with(interner, cls, &members) {
-                            tenv.insert(name, ty);
-                        }
+                        tenv.insert(name, ty);
                     }
                 }
             }
@@ -5627,13 +5668,14 @@ impl<'i> Typer<'i> {
                 _ => None,
             },
             // A union [`Typer::coll_join_envs`] minted — every member a carrier
-            // of the SAME collection class. A store RE-JOINS it into one carrier
-            // (`MutationRejoin` grows an already-widened carrier; upstream's
-            // `joinable_receiver?` had to stop skipping an already-nominal
-            // receiver for exactly this reason). The union is not a Dynamic
-            // carrier, so minting here does not breach this pass's "never mint
-            // from Dynamic" envelope: every member was minted from a literal
-            // seed already.
+            // of the SAME collection class. A store widens EACH arm and the
+            // union re-joins only where the arms converge (`widen_union`,
+            // mutation_widening.rb:316; `MutationRejoin` grows an
+            // already-widened carrier — upstream's `joinable_receiver?` had to
+            // stop skipping an already-nominal receiver for exactly this
+            // reason). The union is not a Dynamic carrier, so minting here does
+            // not breach this pass's "never mint from Dynamic" envelope: every
+            // member was minted from a literal seed already.
             Type::Union(members) => {
                 let members = members.clone();
                 let mut carrier: Option<&'static str> = None;
@@ -5789,9 +5831,9 @@ impl<'i> Typer<'i> {
     fn coll_value_members(interner: &Interner, ty: TypeId) -> Vec<TypeId> {
         let args = match interner.get(ty) {
             Type::Nominal { args, .. } => args,
-            // A carrier the join left as `Nominal[C] | Nominal[C]` re-joins into
-            // ONE carrier on the next store (`MutationRejoin`'s whole point), and
-            // what it carries is every member either edge had.
+            // Defensive: the store path handles a `Nominal[C] | Nominal[C]`
+            // union arm-by-arm before reaching here (`widen_union`), so this
+            // arm only merges member sets if a union arrives some other way.
             Type::Union(members) => {
                 let mut out: Vec<TypeId> = Vec::new();
                 for &m in members {
@@ -5865,8 +5907,11 @@ impl<'i> Typer<'i> {
                     self.coll_erased_store_member(interner, m, out);
                 }
             }
-            // `erase_to_rbs_named`'s own rule: a refinement or a difference
-            // erases through its base, an intersection through its first member.
+            // Erasing through the base (or an intersection's first member)
+            // matches `erase_to_rbs_named`; the store path's own normalizer
+            // (`widen_value_pinned`) would keep these wrappers whole, so this
+            // is the merge-direction residual — unreachable via `type_of`
+            // today since no expression types to them here.
             Type::Refined { base, .. } | Type::Difference { base, .. } => {
                 let base = *base;
                 self.coll_erased_store_member(interner, base, out);
@@ -6016,7 +6061,11 @@ impl<'i> Typer<'i> {
 
     /// The argument positions of `method` that STORE a value into the receiver —
     /// the only ones `MutationRejoin` grows the value side from. Every other
-    /// mutator (`delete`, `clear`, `sort!`, …) leaves the member set alone.
+    /// mutator (`delete`, `clear`, `sort!`, …) leaves the member set alone, and
+    /// the reference's remaining content adders (`concat`/`insert`/`fill`/
+    /// `replace`) stay out of scope for this pass. A Hash `[]=`/`store` also
+    /// joins the KEY's type into the reference's K side (`join_added_pairs`) —
+    /// this pass's flat member set is value-side only, a documented residual.
     fn coll_store_value_args<'a>(method: &str, args: &'a [NodeId]) -> &'a [NodeId] {
         match method {
             "[]=" | "store" => args.last().map(std::slice::from_ref).unwrap_or(&[]),

@@ -81,7 +81,52 @@ types and joins them (`Tuple[1]` vs `Tuple[2]` differ; `String` vs
 `Dynamic[String]` differ), this pass compares erased class sets. Two
 consequences, both FP-direction but pre-existing and unreachable by today's
 sweep: two same-class-but-different-type stores agree here where the oracle
-separates; and a `Dynamic`-with-facet store contributes nothing where the
-oracle adds the facet's member. Unbound locals still type `Dynamic[top]` —
+separates (measured: `h['a'] = [1, 'x']` + `h['b'] = [2] if flag` — both
+erase to `Array`, port fires, oracle silent; identical under the old
+classifier); and a store whose value types `Dynamic` contributes nothing
+where the oracle adds a member (`h['b'] = 1..3 if flag` — `Range` is not a
+registered core class so `nominal_or_untyped` degrades to `untyped`; again
+identical under the old classifier — both are latent pre-existing FPs, not
+regressions). Unbound locals still type `Dynamic[top]` —
 the residue the issue itself leaves by design, and the measurement that
 decides whether the faithful content-join port is worth its own arc.
+
+## Review round (adversarial subagent; every claim oracle-probed)
+
+A read-only adversarial review traced the diff against `mutation_widening.rb`,
+`mutation_rejoin.rb`, `content_join.rb`, and `combinator.rb` and reported five
+candidate FP seams plus four lost-row/latent ones. Probing each against the
+v0.3.9 oracle in fresh dirs:
+
+- **FIXED — store on a union-of-carriers collapsed the union** (pre-existing):
+  `h['a']=1; h['b']='x' if flag; h['c']=1.5` — the port merged every arm's
+  members into one carrier and fired; the reference's `widen_union` widens
+  each arm and re-unions, keeping `Hash[…,I|S|F] | Hash[…,I|F]`, so it is
+  silent. The store path now grows each union arm separately and re-interns
+  the union, deduping only structurally identical arms (fixture r23; the
+  converging r12/`h[:c]='y'` shape still re-joins and fires).
+- **DEFERRED — Hash store KEYS are not members** (pre-existing):
+  `h['a']=1; h[:b]=1 if flag` — the reference joins the key into `Hash[K,V]`'s
+  K side and separates; the flat member set is value-side only and fires. A
+  flat key∪value mix was tried and REVERTED: it hides a value-side class
+  behind an identical key-side class, turning `h['a']=1; h['b']='x' if flag`
+  (today correctly silent) into an FP. The faithful fix is a two-sided member
+  encoding — a carrier-model change filed as a follow-up.
+- **NOT REPRODUCED — seed literal elements**: `a=[1]…` vs `a=['s']…` is silent
+  in BOTH engines; the claimed FP does not exist on this shape.
+- **OUT OF SCOPE per the issue brief** — block-body store args
+  (`coll_block_mutations`) and the `concat`/`insert`/`fill`/`replace`
+  content-adders. Probes confirm the port fires where the reference is
+  silent on `insert` (pre-existing); the issue explicitly excludes both.
+- **Lost rows confirmed, deferred** (coverage gaps, not FPs): the
+  `pinned_evidence` admissibility floor (`a=[1]` then `a<<'x'` vs `a<<1.5` —
+  the reference floors both to `Array[1|u]` and fires; the port separates)
+  and the `regrowable_carrier?`/`keep_precise_parameters` gate
+  (`Hash.new(0)` keeps a proven `Integer` value side — the reference fires;
+  the port separates).
+- Stale comments corrected: the r15 fixture note (union arms now contribute
+  both classes), `coll_widen_for_mutator`'s "re-joins into one carrier",
+  `coll_store_value_args`'s doc (key side + remaining adders noted), and the
+  `coll_erased_store_member` wrapper-erasure citation (the store path's
+  normalizer is `widen_value_pinned`, which keeps the wrappers whole — a
+  merge-direction residual, unreachable via `type_of` today).

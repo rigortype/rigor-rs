@@ -174,8 +174,8 @@ def r14(flag, other)
   out.frobnicate_r14
 end
 
-# (r15) arms of DIFFERENT classes name nothing, so the store contributes nothing
-# — the conservative direction, which keeps today's answer.
+# (r15) the union-typed store contributes BOTH arm classes — `String | Integer`
+# — so the conditional `String` store adds nothing new and the edges agree.
 def r15(flag)
   out = []
   out << (flag ? 'a' : 1)
@@ -269,4 +269,21 @@ def r22(flag)
     h['b'] = s
   end
   h.frobnicate_r22
+end
+
+# --- a store on a union-of-carriers re-joins only on convergence ----------
+
+# (r23) the conditional store diverged the carrier, and the later `Float`
+# store does NOT close the gap — the union survives, so both engines stay
+# silent (`widen_union` widens each arm; the union collapses only when the
+# arms converge, which the `String` store in r12 does and `Float` here does
+# not).
+def r23(flag)
+  h = {}
+  h['a'] = 1
+  if flag
+    h['b'] = 'x'
+  end
+  h['c'] = 1.5
+  h.frobnicate_r23
 end
