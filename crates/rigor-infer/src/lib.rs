@@ -5378,19 +5378,62 @@ impl<'i> Typer<'i> {
                     // being swallowed by the already-widened nominal. Read off
                     // the PRE-call carrier, like the widening itself.
                     Some((name, cls, pre_ty)) => {
-                        let mut members = Typer::coll_value_members(interner, pre_ty);
+                        let mut added: Vec<TypeId> = Vec::new();
                         for &a in Typer::coll_store_value_args(&method, &args) {
                             for m in self.coll_store_value_classes(ast, a, tenv, interner) {
-                                if !members.contains(&m) {
-                                    members.push(m);
+                                if !added.contains(&m) {
+                                    added.push(m);
                                 }
                             }
                         }
                         // Canonical order: the member set is compared only by the
                         // interned `TypeId` two branch edges end up with, so the
                         // order stores happened in must not separate them.
-                        members.sort_unstable();
-                        Some((name, cls, members))
+                        let grown = |base: &[TypeId]| {
+                            let mut members = base.to_vec();
+                            for &m in &added {
+                                if !members.contains(&m) {
+                                    members.push(m);
+                                }
+                            }
+                            members.sort_unstable();
+                            members
+                        };
+                        match interner.get(pre_ty) {
+                            // `widen_union` (mutation_widening.rb:316) widens
+                            // EACH arm and `Combinator.union` re-joins, deduping
+                            // only structurally identical arms — the edges
+                            // converge iff every arm grows to the same set.
+                            // Collapsing to one merged carrier fired where the
+                            // oracle kept the union (probe r2).
+                            Type::Union(arms) => {
+                                let arms = arms.clone();
+                                let mut minted = Vec::with_capacity(arms.len());
+                                for arm in arms {
+                                    let members =
+                                        grown(&Typer::coll_value_members(interner, arm));
+                                    if let Some(t) =
+                                        self.coll_nominal_with(interner, cls, &members)
+                                    {
+                                        minted.push(t);
+                                    }
+                                }
+                                minted.sort_unstable();
+                                minted.dedup();
+                                match minted.as_slice() {
+                                    [] => None,
+                                    [only] => Some((name, *only)),
+                                    _ => Some((name, interner.intern(Type::Union(minted)))),
+                                }
+                            }
+                            _ => self
+                                .coll_nominal_with(
+                                    interner,
+                                    cls,
+                                    &grown(&Typer::coll_value_members(interner, pre_ty)),
+                                )
+                                .map(|ty| (name, ty)),
+                        }
                     }
                 };
                 // Arguments are EXPRESSION position.
@@ -5435,11 +5478,9 @@ impl<'i> Typer<'i> {
                 }
                 // Keep-nominal widening — unless something inside the call
                 // REBOUND the same local (`output << (output = x)`).
-                if let Some((name, cls, members)) = widened {
+                if let Some((name, ty)) = widened {
                     if !rebound_within(ctx.rebinds, call_span, &name) {
-                        if let Some(ty) = self.coll_nominal_with(interner, cls, &members) {
-                            tenv.insert(name, ty);
-                        }
+                        tenv.insert(name, ty);
                     }
                 }
             }
@@ -5627,13 +5668,14 @@ impl<'i> Typer<'i> {
                 _ => None,
             },
             // A union [`Typer::coll_join_envs`] minted — every member a carrier
-            // of the SAME collection class. A store RE-JOINS it into one carrier
-            // (`MutationRejoin` grows an already-widened carrier; upstream's
-            // `joinable_receiver?` had to stop skipping an already-nominal
-            // receiver for exactly this reason). The union is not a Dynamic
-            // carrier, so minting here does not breach this pass's "never mint
-            // from Dynamic" envelope: every member was minted from a literal
-            // seed already.
+            // of the SAME collection class. A store widens EACH arm and the
+            // union re-joins only where the arms converge (`widen_union`,
+            // mutation_widening.rb:316; `MutationRejoin` grows an
+            // already-widened carrier — upstream's `joinable_receiver?` had to
+            // stop skipping an already-nominal receiver for exactly this
+            // reason). The union is not a Dynamic carrier, so minting here does
+            // not breach this pass's "never mint from Dynamic" envelope: every
+            // member was minted from a literal seed already.
             Type::Union(members) => {
                 let members = members.clone();
                 let mut carrier: Option<&'static str> = None;
@@ -5757,6 +5799,14 @@ impl<'i> Typer<'i> {
     /// class this pass cannot name contributes nothing, which is the same thing
     /// the reference's own `Dynamic[top]` seed does (it is in every instantiation
     /// and so never separates two of them).
+    ///
+    /// The member set is an APPROXIMATION of the reference's model: the
+    /// reference carries REAL element types and joins them (`Tuple[1]` and
+    /// `Tuple[2]` are different members; `String` and `Dynamic[String]` are too),
+    /// while this pass compares ERASED class sets for equality. Two values of
+    /// the same erased class therefore agree here where the reference may still
+    /// separate them — a residual that can witness where the oracle is silent,
+    /// and the reason a faithful port of the content-join model is its own arc.
     fn coll_nominal_with(
         &self,
         interner: &mut Interner,
@@ -5781,9 +5831,9 @@ impl<'i> Typer<'i> {
     fn coll_value_members(interner: &Interner, ty: TypeId) -> Vec<TypeId> {
         let args = match interner.get(ty) {
             Type::Nominal { args, .. } => args,
-            // A carrier the join left as `Nominal[C] | Nominal[C]` re-joins into
-            // ONE carrier on the next store (`MutationRejoin`'s whole point), and
-            // what it carries is every member either edge had.
+            // Defensive: the store path handles a `Nominal[C] | Nominal[C]`
+            // union arm-by-arm before reaching here (`widen_union`), so this
+            // arm only merges member sets if a union arrives some other way.
             Type::Union(members) => {
                 let mut out: Vec<TypeId> = Vec::new();
                 for &m in members {
@@ -5808,22 +5858,21 @@ impl<'i> Typer<'i> {
     }
 
     /// The erased classes one stored value contributes to the carrier's value
-    /// side, or an EMPTY set when this pass cannot name them. Empty is the
-    /// conservative answer in the DIRECTION THAT KEEPS TODAY'S BEHAVIOUR: an
-    /// unnamed store leaves the member set untouched, so both edges of a branch
-    /// keep agreeing and the receiver keeps witnessing. Naming more kinds can
-    /// therefore only ever remove witnesses, never add one — but it can also
-    /// RECOVER them, because an edge that names what the other edge already had
-    /// agrees with it (rows r14/r15).
+    /// side — the erased class of the value expression's TYPED answer, not a
+    /// syntactic read of its shape (issue #128). The reference names the store
+    /// by typing the argument; the syntactic classifier this replaced named
+    /// strictly less, and the gap was symmetric: `h['a'] = 1.to_s` lost a row
+    /// (the reference's two edges agreed where ours could not) and
+    /// `h['b'] = 'y'.to_i` false-positived (our two edges agreed where the
+    /// reference's did not).
     ///
-    /// A local is read through the pass's own `tenv`, which is how the gitlab
-    /// `normalized_cache['key'] = key_config` store — the one the `v0.3.9` sweep
-    /// caught — is separated from the `Array(...)` store beside it.
-    ///
-    /// It is a SET rather than one class because a conditional value contributes
-    /// every arm the reference's typer joins: `out << (flag ? 'a' : 1)` puts both
-    /// `String` and `Integer` in the union, and a later `String` store then adds
-    /// nothing (row r15).
+    /// The env the value is typed against is the pass's OWN threaded `tenv` —
+    /// the same sparse env the local-assignment arm already calls `type_of`
+    /// with — never the rules layer's `ScopedEnv` (top-level only, and empty
+    /// inside a `def` body, which is where mutation code lives). A sparse env
+    /// is safe: an unbound local types `Dynamic[top]`, which contributes
+    /// nothing — the same thing the reference's own `Dynamic[top]` seed does
+    /// (it is in every instantiation and so never separates two of them).
     fn coll_store_value_classes(
         &self,
         ast: &LoweredAst,
@@ -5831,62 +5880,86 @@ impl<'i> Typer<'i> {
         tenv: &TypeEnv,
         interner: &mut Interner,
     ) -> Vec<TypeId> {
-        let name = match ast.get(node) {
-            Node::IntegerLit { .. } => "Integer",
-            Node::FloatLit { .. } => "Float",
-            Node::StringLit { .. } | Node::InterpolatedString { .. } => "String",
-            Node::SymbolLit { .. } | Node::InterpolatedSymbol { .. } => "Symbol",
-            Node::ArrayLit { .. } => "Array",
-            Node::HashLit { .. } => "Hash",
-            Node::NilLit { .. } => "NilClass",
-            // `true` and `false` are SEPARATE members, which is what the
-            // reference's own union carries (`… | TrueClass`): two stores of
-            // `true` agree and a `true` / `false` pair does not. Probes e1/e2.
-            Node::TrueLit { .. } => "TrueClass",
-            Node::FalseLit { .. } => "FalseClass",
-            Node::LocalVariableRead { name, .. } => {
-                let Some(&ty) = tenv.get(name) else { return Vec::new() };
-                let Some(cls) = self.coll_carrier(interner, ty) else { return Vec::new() };
-                cls
+        let ty = self.stmt_value_type(ast, node, tenv, interner);
+        let mut out = Vec::new();
+        self.coll_erased_store_member(interner, ty, &mut out);
+        out
+    }
+
+    /// Pushes the erased member classes of one typed store value onto `out`.
+    ///
+    /// The answer is ERASED before it becomes a member: the member set is
+    /// compared by interned `TypeId` equality and never read, so a precise type
+    /// (`Constant["a"]` for `'a'`) would separate two edges the reference joins.
+    /// Members stay bare class nominals with no args.
+    ///
+    /// It is a SET rather than one class because a union value contributes every
+    /// member the reference's join puts in the element set: `out << (flag ? 'a'
+    /// : 1)` types `String | Integer`, both go in, and a later `String` store
+    /// then adds nothing (row r15). A `Dynamic` member — `Dynamic[top]` or any
+    /// faceted dynamic — names nothing: the erased class of a dynamic is
+    /// `untyped`, not a class.
+    fn coll_erased_store_member(&self, interner: &mut Interner, ty: TypeId, out: &mut Vec<TypeId>) {
+        match interner.get(ty) {
+            Type::Union(members) => {
+                let members = members.clone();
+                for m in members {
+                    self.coll_erased_store_member(interner, m, out);
+                }
             }
-            // A ternary (or an `if` used as a value): the reference's typer joins
-            // the arms before the store. Naming it is load-bearing — mastodon's
-            // `application_helper.rb:180` is a ternary push followed by a branch
-            // push of the SAME class, and leaving the ternary unnamed made the
-            // two edges disagree and cost the row.
-            Node::If { then_body, else_body, .. } => {
-                let then_body = then_body.clone();
-                let else_body = else_body.clone();
-                let mut out = Vec::new();
-                for arm in [then_body.last().copied(), else_body.last().copied()] {
-                    let Some(arm) = arm else { continue };
-                    for m in self.coll_store_value_classes(ast, arm, tenv, interner) {
-                        if !out.contains(&m) {
-                            out.push(m);
-                        }
+            // Erasing through the base (or an intersection's first member)
+            // matches `erase_to_rbs_named`; the store path's own normalizer
+            // (`widen_value_pinned`) would keep these wrappers whole, so this
+            // is the merge-direction residual — unreachable via `type_of`
+            // today since no expression types to them here.
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                let base = *base;
+                self.coll_erased_store_member(interner, base, out);
+            }
+            Type::Intersection(members) => {
+                if let Some(&m) = members.first() {
+                    self.coll_erased_store_member(interner, m, out);
+                }
+            }
+            // The erased class of a nominal is itself minus the args — interned
+            // straight off the `ClassId`, so a PROJECT-class nominal names too
+            // (`CoreIndex::class_name_of` can only spell the nine CORE_CLASSES).
+            Type::Nominal { class, .. } | Type::DataInstance { class, .. } => {
+                let class = *class;
+                Self::push_store_member(interner, out, Type::Nominal { class, args: vec![] });
+            }
+            // A class object (`Time`, `Array`) contributes its singleton
+            // carrier — already erased-level, and injective, so it separates
+            // exactly the edges the reference's `singleton(C)` member does.
+            Type::Singleton(class) => {
+                let class = *class;
+                Self::push_store_member(interner, out, Type::Singleton(class));
+            }
+            // `Constants`, `Tuple`, `HashShape`, `IntegerRange`: the index's
+            // type→class-name erasure (`"a"` -> `String`, `[1]` -> `Array`,
+            // `1..3` -> `Integer`). `Dynamic`/`Top`/anything else names
+            // nothing.
+            _ => {
+                if let Some(name) = self.index.class_name_of(interner, ty) {
+                    if let Some(class) = self.index.class_id(name) {
+                        Self::push_store_member(
+                            interner,
+                            out,
+                            Type::Nominal { class, args: vec![] },
+                        );
                     }
                 }
-                return out;
             }
-            // The ternary's `else` arm lowers through the `ElseNode` path, i.e.
-            // as a body-only `BeginRescue`; `Statements` wraps a multi-statement
-            // clause. Both reduce to "the value this clause evaluates to".
-            Node::BeginRescue { body, clauses, ensure_body, .. } if clauses.is_empty() => {
-                let body = body.clone();
-                let ensure_body = ensure_body.clone();
-                let Some(tail) = ensure_body.last().or_else(|| body.last()).copied() else {
-                    return Vec::new();
-                };
-                return self.coll_store_value_classes(ast, tail, tenv, interner);
-            }
-            Node::Statements { body, .. } => {
-                let body = body.clone();
-                let Some(tail) = body.last().copied() else { return Vec::new() };
-                return self.coll_store_value_classes(ast, tail, tenv, interner);
-            }
-            _ => return Vec::new(),
-        };
-        self.coll_nominal(interner, name).into_iter().collect()
+        }
+    }
+
+    /// Interns `member` and pushes it unless already present — member sets are
+    /// sets, so two arms of a union erasing to the same class contribute once.
+    fn push_store_member(interner: &mut Interner, out: &mut Vec<TypeId>, member: Type) {
+        let m = interner.intern(member);
+        if !out.contains(&m) {
+            out.push(m);
+        }
     }
 
     /// [`join_flow_envs`] for this pass: two carriers of the SAME collection
@@ -5988,7 +6061,11 @@ impl<'i> Typer<'i> {
 
     /// The argument positions of `method` that STORE a value into the receiver —
     /// the only ones `MutationRejoin` grows the value side from. Every other
-    /// mutator (`delete`, `clear`, `sort!`, …) leaves the member set alone.
+    /// mutator (`delete`, `clear`, `sort!`, …) leaves the member set alone, and
+    /// the reference's remaining content adders (`concat`/`insert`/`fill`/
+    /// `replace`) stay out of scope for this pass. A Hash `[]=`/`store` also
+    /// joins the KEY's type into the reference's K side (`join_added_pairs`) —
+    /// this pass's flat member set is value-side only, a documented residual.
     fn coll_store_value_args<'a>(method: &str, args: &'a [NodeId]) -> &'a [NodeId] {
         match method {
             "[]=" | "store" => args.last().map(std::slice::from_ref).unwrap_or(&[]),
