@@ -216,3 +216,57 @@ def r18(flag)
   end
   h.frobnicate_r18
 end
+
+# --- STORE VALUES TYPED THROUGH CALLS AND LOCALS (issue #128) ---------------
+#
+# The member a store contributes is the erased class of the value expression's
+# TYPED answer — the reference names `1.to_s` as `String` — not a syntactic
+# read of its shape. The classifier before #128 named literals and carrier
+# locals only, and the gap ran in BOTH directions: r19 is the row it lost,
+# r20/r22 the false positives it left.
+
+# (r19) the `a1` shape from #128: `1.to_s` types to `String`, so both edges
+# carry `String` and the call fires.
+def r19(flag)
+  h = {}
+  h['a'] = 1.to_s
+  if flag
+    h['b'] = 'x'
+  end
+  h.frobnicate_r19
+end
+
+# (r20) the `b1` mirror: `'y'.to_i` types to `Integer`, the conditional store
+# separates the edges, and both engines stay silent.
+def r20(flag)
+  h = {}
+  h['a'] = 'x'
+  if flag
+    h['b'] = 'y'.to_i
+  end
+  h.frobnicate_r20
+end
+
+# (r21) a String-typed LOCAL names `String` — not only collection carriers.
+# Same class as the unconditional store, so the edges agree and this fires.
+def r21(flag)
+  s = 'x'
+  h = {}
+  h['a'] = 'y'
+  if flag
+    h['b'] = s
+  end
+  h.frobnicate_r21
+end
+
+# (r22) the r21 mirror: a String local stored under a branch disagrees with
+# the `Integer` already carried, so both engines stay silent.
+def r22(flag)
+  s = 'x'
+  h = {}
+  h['a'] = 1
+  if flag
+    h['b'] = s
+  end
+  h.frobnicate_r22
+end

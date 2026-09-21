@@ -84,6 +84,20 @@
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_r18' for Hash[Dynamic[top] | String, Dynamic[top]?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 236,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r19' for Hash[Dynamic[top] | String, Dynamic[top] | String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 259,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r21' for Hash[Dynamic[top] | String, Dynamic[top] | String]"
     }
   ]
 }
