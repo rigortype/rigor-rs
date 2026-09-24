@@ -933,7 +933,7 @@ pub struct LoweredAst {
 /// where the Prism tree is still in hand — and consumed by the SourceIndex.
 ///
 /// The census is deliberately RAW: it names the receiver and the mutating method
-/// and leaves the `ARRAY_MUTATORS` / `HASH_MUTATORS` membership test to
+/// and leaves the `SHAPE_MUTATORS` membership test (`is_shape_mutator`) to
 /// `rigor-infer`, which owns those tables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstMutation {

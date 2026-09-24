@@ -6102,7 +6102,7 @@ fn span_hull(ast: &LoweredAst, ids: &[NodeId]) -> Option<rigor_parse::Span> {
     Some(it.fold(first, |acc, s| (acc.0.min(s.0), acc.1.max(s.1))))
 }
 
-/// `reference/rigor/lib/rigor/inference/mutation_widening.rb:70` verbatim.
+/// `reference/rigor/lib/rigor/inference/mutation_widening.rb:85` verbatim.
 const ARRAY_MUTATORS: &[&str] = &[
     "<<", "push", "append", "prepend", "unshift", "concat", "insert", "pop", "shift", "delete",
     "delete_at", "delete_if", "reject!", "clear", "compact!", "replace", "fill", "[]=", "map!",
@@ -6110,11 +6110,52 @@ const ARRAY_MUTATORS: &[&str] = &[
     "reverse!", "rotate!", "shuffle!", "slice!",
 ];
 
-/// `reference/rigor/lib/rigor/inference/mutation_widening.rb:82` verbatim.
+/// `reference/rigor/lib/rigor/inference/mutation_widening.rb:99` verbatim.
+///
+/// `shift` since upstream `495a7458` (pin `e59b7b89`): a name both classes
+/// define is listed in both tables, and its absence here let `k = { a: 1 };
+/// k.shift` keep the literal shape of a hash that is empty at runtime.
 const HASH_MUTATORS: &[&str] = &[
-    "[]=", "store", "delete", "delete_if", "reject!", "select!", "filter!", "keep_if", "clear",
-    "compact!", "merge!", "update", "transform_keys!", "transform_values!", "replace",
+    "[]=", "store", "shift", "delete", "delete_if", "reject!", "select!", "filter!", "keep_if",
+    "clear", "compact!", "merge!", "update", "transform_keys!", "transform_values!", "replace",
 ];
+
+/// `reference/rigor/lib/rigor/inference/hash_lookup_mutation.rb:22` verbatim —
+/// the Hash methods that change what a READ of the pairs answers without
+/// changing the pair set. Upstream keeps them off [`HASH_MUTATORS`] on purpose
+/// (`HashLookupMutation.widen_shape` opens a shape instead of widening it to a
+/// nominal — issue #1280, not ported: a local's shape is left as-is here). Read
+/// only through [`is_shape_mutator`], the constant-mutation census.
+const HASH_LOOKUP_MUTATORS: &[&str] = &["default=", "default_proc=", "compare_by_identity"];
+
+/// `reference/rigor/lib/rigor/inference/string_mutation.rb:25` verbatim — the
+/// one String table (upstream `4a6b43f6`, pin `e59b7b89`, which grew it to 35
+/// and retired the effect classifier's drifted copy). Upstream's
+/// `StringMutation.widen_constant` widens a `Constant["ab"]` local to the bare
+/// `String` nominal under any of these; the port widens the binding to
+/// `Dynamic` instead, through [`MUTATOR_METHODS`] — strictly fewer
+/// diagnostics, never more.
+const STRING_MUTATORS: &[&str] = &[
+    "<<", "concat", "insert", "prepend", "replace", "clear", "[]=", "slice!", "setbyte",
+    "bytesplice", "append_as_bytes", "force_encoding", "sub!", "gsub!", "tr!", "tr_s!",
+    "delete!", "squeeze!", "succ!", "next!", "upcase!", "downcase!", "capitalize!", "swapcase!",
+    "reverse!", "strip!", "lstrip!", "rstrip!", "chomp!", "chop!", "delete_prefix!",
+    "delete_suffix!", "encode!", "scrub!", "unicode_normalize!",
+];
+
+/// Upstream's `MutationWidening::SHAPE_MUTATORS` (`mutation_widening.rb:110`):
+/// `ARRAY_MUTATORS | HASH_MUTATORS | HashLookupMutation::MUTATORS |
+/// StringMutation::MUTATORS` — "could an in-place call on this name change its
+/// binding?". The constant-mutation census (`scope_indexer.rb`
+/// `mutating_receiver_of`) reads it since pin `e59b7b89`; before that it read
+/// the Array and Hash tables alone, so `FOO = "ab"; FOO.upcase!` kept folding
+/// `FOO == "ab"` on both sides.
+pub(crate) fn is_shape_mutator(method: &str) -> bool {
+    ARRAY_MUTATORS.contains(&method)
+        || HASH_MUTATORS.contains(&method)
+        || HASH_LOOKUP_MUTATORS.contains(&method)
+        || STRING_MUTATORS.contains(&method)
+}
 
 /// The REBIND half of [`collect_flow_writes`] — local assignments only, with the
 /// in-place-mutation entries left out. The collection-shape pass needs the two
@@ -6775,14 +6816,27 @@ fn kill_cenv_narrowed(
     }
 }
 
-/// In-place mutator methods that invalidate a value-pinned literal-shape carrier
-/// (`Tuple` / `HashShape`) bound to a local — the union of the reference's
-/// `MutationWidening::ARRAY_MUTATORS` and `HASH_MUTATORS`
-/// (`reference/rigor/lib/rigor/inference/mutation_widening.rb:70-87`), minus the
+/// In-place mutator methods that invalidate a value-pinned literal carrier
+/// (`Tuple` / `HashShape` / a `Constant` String) bound to a local — the union of
+/// the reference's `MutationWidening::ARRAY_MUTATORS`, `HASH_MUTATORS` and
+/// `StringMutation::MUTATORS` (`reference/rigor/lib/rigor/inference/
+/// mutation_widening.rb:85-104`, `string_mutation.rb:25`), minus the
 /// `PURE_SELF_RETURNERS` (`freeze`/`dup`/`clone`/`itself`), which never appear
 /// here. A call `local.<m>(…)` for `m` in this set mutates `local`'s content, so
-/// the literal arity/pair-set the shape carrier tracked is no longer justified —
+/// the literal arity/pair-set/value the carrier tracked is no longer justified —
 /// the binding must widen (see [`collect_flow_writes`]).
+///
+/// The String half is upstream's `StringMutation.widen_constant`, which the port
+/// had never carried: `s = "ab"; s.upcase!; if s == "ab"` folded here and fired
+/// `flow.always-truthy-condition` where the oracle widens `s` to `String`. Pin
+/// `e59b7b89` grew the String table 26 -> 35 (`delete_prefix!`, `encode!`,
+/// `scrub!`, …), which turned more of the same shape into oracle silence.
+///
+/// `HashLookupMutation::MUTATORS` (`default=` / `default_proc=` /
+/// `compare_by_identity`) is deliberately NOT here: upstream keeps a local's
+/// present keys readable through them (`h = { a: 1 }; h.compare_by_identity;
+/// if h[:a]` still fires on the oracle), so widening would be a coverage loss;
+/// their shape-opening half is issue #1280.
 const MUTATOR_METHODS: &[&str] = &[
     // ARRAY mutators
     "<<", "push", "append", "prepend", "unshift", "concat", "insert", "pop", "shift", "delete",
@@ -6791,6 +6845,11 @@ const MUTATOR_METHODS: &[&str] = &[
     "reverse!", "rotate!", "shuffle!", "slice!",
     // HASH mutators not already listed above
     "store", "merge!", "update", "transform_keys!", "transform_values!",
+    // STRING mutators not already listed above
+    "setbyte", "bytesplice", "append_as_bytes", "force_encoding", "sub!", "gsub!", "tr!",
+    "tr_s!", "delete!", "squeeze!", "succ!", "next!", "upcase!", "downcase!", "capitalize!",
+    "swapcase!", "strip!", "lstrip!", "rstrip!", "chomp!", "chop!", "delete_prefix!",
+    "delete_suffix!", "encode!", "scrub!", "unicode_normalize!",
 ];
 
 /// Collect every flow-write `(span, name)` in the arena, once, for
@@ -7050,6 +7109,37 @@ mod tests {
 
     fn lower_src(src: &[u8]) -> LoweredAst {
         lower(&parse(src))
+    }
+
+    #[test]
+    fn mutator_tables_match_the_pinned_reference() {
+        // Sizes at pin `e59b7b89` (`mutation_widening.rb`, `string_mutation.rb`,
+        // `hash_lookup_mutation.rb`) — the same sets the effect catalogue's
+        // `mutators.yml` is extracted from, so a drift here and a
+        // `vendor_effects.py --check` failure arrive together.
+        assert_eq!(ARRAY_MUTATORS.len(), 31);
+        assert_eq!(HASH_MUTATORS.len(), 16);
+        assert!(HASH_MUTATORS.contains(&"shift"));
+        assert_eq!(STRING_MUTATORS.len(), 35);
+        assert_eq!(HASH_LOOKUP_MUTATORS.len(), 3);
+        // The local-widening set is exactly Array ∪ Hash ∪ String — the
+        // `HashLookupMutation` names stay out (see `MUTATOR_METHODS`).
+        let union: std::collections::BTreeSet<&str> = ARRAY_MUTATORS
+            .iter()
+            .chain(HASH_MUTATORS)
+            .chain(STRING_MUTATORS)
+            .copied()
+            .collect();
+        let widening: std::collections::BTreeSet<&str> =
+            MUTATOR_METHODS.iter().copied().collect();
+        assert_eq!(widening.len(), MUTATOR_METHODS.len(), "MUTATOR_METHODS repeats a name");
+        assert_eq!(widening, union);
+        for m in HASH_LOOKUP_MUTATORS {
+            assert!(!MUTATOR_METHODS.contains(m));
+            assert!(is_shape_mutator(m), "{m} is a SHAPE_MUTATORS member");
+        }
+        assert!(union.iter().all(|m| is_shape_mutator(m)));
+        assert!(!is_shape_mutator("upcase"));
     }
 
     #[test]

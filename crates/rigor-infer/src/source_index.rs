@@ -2547,8 +2547,10 @@ fn widen_if_mutated(qualified: &str, lit: ConstLit, mutated: &HashSet<String>) -
 /// from the lowering's raw census ([`rigor_parse::ConstMutation`]).
 ///
 /// A site counts when it is an `Index{Or,And,Operator}Write` / attribute-or-index
-/// writer (`method: None`) or when its method is in `ARRAY_MUTATORS` ∪
-/// `HASH_MUTATORS` — the reference's `mutating_receiver_of`. A BARE receiver
+/// writer (`method: None`) or when its method is in upstream's `SHAPE_MUTATORS`
+/// ([`crate::is_shape_mutator`]) — the reference's `mutating_receiver_of`,
+/// which read `ARRAY_MUTATORS` ∪ `HASH_MUTATORS` alone until pin `e59b7b89`
+/// added the String and `HashLookupMutation` tables. A BARE receiver
 /// name contributes EVERY lexical-resolution candidate (`A::B` + `C` yields
 /// `A::B::C` and `C`, mirroring how the reads resolve); a `A::B` PATH receiver
 /// contributes only the name as written.
@@ -2560,9 +2562,7 @@ fn mutated_constant_names(ast: &LoweredAst) -> HashSet<String> {
     let mut out = HashSet::new();
     for m in ast.const_mutations() {
         if let Some(method) = &m.method {
-            if !crate::ARRAY_MUTATORS.contains(&method.as_str())
-                && !crate::HASH_MUTATORS.contains(&method.as_str())
-            {
+            if !crate::is_shape_mutator(method) {
                 continue;
             }
         }

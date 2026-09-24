@@ -2,7 +2,7 @@
 """Generate `harness/effects-corpus/07_mutators` from the VENDORED mutator sets.
 
 The blind spot this project closes (issue #110, the shape of #106): the port
-vendors **72 selectors** in three by-reference sets
+vendors **86 selectors** (31 / 20 / 35 at the `e59b7b89` pin; 72 before it) in three by-reference sets
 (`crates/rigor-effects/vendor/effects/mutators.yml`), the collector's mutation
 judgment is the only consumer of them, and the whole rest of
 `harness/effects-corpus/` touches **two** — `clear` and `upcase!`. A vendored
@@ -13,7 +13,7 @@ see it.
 **Generated, not hand-written**, for the reason
 `harness/gen_effects_posture_corpus.py` is: the sets move with the pin (they are
 extracted from upstream's `%i[…]` literals by `harness/vendor_effects.py`), and a
-hand-list would freeze today's 72 and go quietly stale. Nothing here encodes what
+hand-list would freeze today's set and go quietly stale. Nothing here encodes what
 either engine ANSWERS — every selector in the vendored file gets the same five
 probes and the differential reports the verdict.
 
@@ -25,7 +25,7 @@ Four receiver shapes per (set, selector), because the slice-2 / slice-3 rules
   `Unowned#*`   the same seed with a trailing bare read, so the type is known and
                 the ownership is not: upstream answers ∅ + `unknown-ownership`,
                 never a bare `mutate`. A port that ever guessed an owner here
-                turns all 72 into OVER rows.
+                turns every one into an OVER row.
   `Ivar#*`      an `@ivar` receiver — `mutate.self`, and `mutate.static` in a
                 singleton unit. The proven label must be the SELF one, so a
                 mis-owned mutation shows up as an OVER rather than as silence.
@@ -208,7 +208,8 @@ def assert_total(mutators):
         sys.exit(f"gen_effects_mutator_corpus: no seed literal for set(s) {unknown} — "
                  "add one to SEEDS and re-read the differential")
     unspellable = sorted({s for _, s, _ in pairs(mutators)
-                          if not IDENTIFIER.match(s) and s not in SPELLINGS})
+                          if not IDENTIFIER.match(s) and not ATTRIBUTE_WRITER.match(s)
+                          and s not in SPELLINGS})
     if unspellable:
         sys.exit(f"gen_effects_mutator_corpus: no call spelling for {unspellable} — "
                  "add one to SPELLINGS")
