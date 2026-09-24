@@ -66,27 +66,6 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 102,
-      "column": 12,
-      "severity": "error",
-      "message": "undefined method `frobnicate_a7' for Float"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 107,
-      "column": 12,
-      "severity": "error",
-      "message": "undefined method `frobnicate_a20' for [\"x\" | Dynamic[top]]"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 112,
-      "column": 12,
-      "severity": "error",
-      "message": "undefined method `frobnicate_q3' for Float"
-    },
-    {
-      "rule": "call.undefined-method",
       "line": 117,
       "column": 12,
       "severity": "error",

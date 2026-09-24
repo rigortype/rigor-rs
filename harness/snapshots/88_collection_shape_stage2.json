@@ -6,7 +6,7 @@
       "line": 34,
       "column": 6,
       "severity": "error",
-      "message": "undefined method `to_sentence' for Array[Dynamic[top]]"
+      "message": "undefined method `to_sentence' for Array[String]"
     },
     {
       "rule": "call.undefined-method",
