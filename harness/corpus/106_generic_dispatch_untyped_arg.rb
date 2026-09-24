@@ -104,3 +104,46 @@ def g33(u) = 1.gcd(u).frobnicate_g33
 # on it, and it stays a pre-existing false positive this slice does not close —
 # see `docs/notes/20260909-generic-dispatch-untyped-arg.md` residue 1. It is out
 # of the corpus because a fixture may not carry an unregistered extra.
+
+# --- #1021: a UNION with an untyped member is imprecise too -----------------
+
+# (6) Upstream `5496acd6` (the `e59b7b89` re-pin) makes every overload pass
+# decline on `Dynamic[top] | X`, not just the bare carrier, so a parameter the
+# body rebinds only CONDITIONALLY reaches the call as that union and the same
+# nilable joins stand: reference-silent, and fired here before the port (rows
+# r01/r11, and the ivar twin v07 whose class writes it both untyped and typed).
+def r01(s)
+  s = 1 if s.nil?
+  "abc"[s].frobnicate_r01
+end
+
+def r11(s)
+  s = "b" if s.nil?
+  "abc".index(s).frobnicate_r11
+end
+
+class V07GenericMixed
+  def initialize(c)
+    @v07 = c
+  end
+
+  def reset
+    @v07 = 1
+  end
+
+  def v
+    "abc"[@v07].frobnicate_v07
+  end
+end
+
+# (7) …while a single-return method still fires through the union, and an
+# UNCONDITIONAL rebind is precise and keeps the literal fold (row r25).
+def r04(s)
+  s = 4 if s.nil?
+  "x".center(s).frobnicate_r04
+end
+
+def r25(s)
+  s = 1
+  "abc"[s].frobnicate_r25
+end

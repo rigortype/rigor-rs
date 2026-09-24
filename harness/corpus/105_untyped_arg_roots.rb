@@ -2,8 +2,9 @@
 #
 # Fixture 99 pins the first half of upstream #521 / PR #537 (`3d5dddbb`, the
 # `v0.3.4 -> v0.3.8` re-pin): `Float`/`Integer`/`Array`/`rand` must not pin one
-# overload when the argument is the literal untyped carrier. Its allow-list
-# (`Typer::arg_is_reference_untyped`) only admitted a root that is a LOCAL of the
+# overload when the argument is the literal untyped carrier — and, since #1021
+# (`5496acd6`, the `e59b7b89` re-pin), a union with an untyped member. Its
+# analysis (`Typer::arg_reach`) first only admitted a root that is a LOCAL of the
 # enclosing `def`, which left two false positives standing on the standing
 # sweep — gitlab-foss `lib/gitlab/ci/config/entry/pull_policy.rb:28`
 # (`Array(@config).presence`, an ivar with no write in the file) and
@@ -15,14 +16,16 @@
 #
 #   ivar   `scope.ivar` reads the per-class table `build_class_ivar_index`
 #          builds from `@x = …` writes in the class's `def` bodies. No entry ->
-#          `Dynamic[Top]`; an entry whose every write is itself reference-untyped
-#          stays untyped; but `contribute_read_before_write_nil!` folds
-#          `Constant[nil]` into an entry the class reads before writing unless
-#          `initialize` (or the class body) writes it — so an untyped write in a
-#          non-ctor method still fires.
+#          `Dynamic[Top]`; otherwise the union of the writes (plus a nil from
+#          `contribute_read_before_write_nil!` unless `initialize` writes it).
+#          Since #1021 ONE untyped write makes that union imprecise, so it
+#          declines; only all-precise writes fire. Inside the reading `def` a
+#          definite `@x = …` before the read replaces the entry (flow).
 #   cvar   `build_class_cvar_index` collects `def`-body writes ONLY; a class-body
-#          `@@n = nil` is walked past and never recorded.
-#   gvar   `build_program_global_index` is program-wide: every `$x = …` counts.
+#          `@@n = nil` is walked past and never recorded. One untyped write
+#          declines.
+#   gvar   `build_program_global_index` is program-wide: every `$x = …` counts,
+#          and one untyped write declines.
 #   proc   a `->` / `lambda {}` / `proc {}` / `Proc.new {}` parameter is untyped
 #          like a method's. An ORDINARY block's parameter is NOT (the RBS yield
 #          types it), and a `->` body's local writes never bind at all, while the
@@ -31,8 +34,9 @@
 #          qualified path and anything the project writes all keep firing.
 #
 # Every firing line and every silent row below is oracle-measured at the `v0.3.8`
-# pin (`ffb456b0`), one fresh temp cwd per case, `--no-cache`, both reference
-# libs pinned onto `-I` (UPSTREAM.md hazard 1). Local names are unique per row on
+# pin (`ffb456b0`) and re-measured at `e59b7b89`, one fresh temp cwd per case,
+# `--no-cache`, both reference libs pinned onto `-I` (UPSTREAM.md hazard 1).
+# Local names are unique per row on
 # purpose: the write/guard scans are region-wide, not flow-ordered, so a reused
 # name in a sibling row would refuse the test for a reason the row is not about.
 
@@ -176,21 +180,12 @@ class N1TwoUntypedWrites
   end
 end
 
-# --- KEEPS FIRING ------------------------------------------------------------
-
-# (8) ONE typed write makes the union discriminable again: a ctor literal
-# (row r3), a typed sibling write beside an untyped ctor one (rows r5/z6), a
-# defaulting write in the reader itself (row z10), and a ctor `nil` (row n2).
-class R3IvarLiteral
-  def initialize
-    @lit = "x"
-  end
-
-  def v
-    Array(@lit).frobnicate_r3
-  end
-end
-
+# (7b) #1021: ONE untyped write makes the entry a union with an untyped member,
+# which is imprecise and declines — beside a typed sibling write (rows r5/z6/v3),
+# a defaulting write in the reader itself (row z10), a `nil` reset (row v1), and
+# an untyped write in a NON-ctor method, whose read-before-write nil only adds a
+# precise member (rows z7/i12/v9). All five of r5/z6/z10/z7/i12 fired before the
+# re-pin.
 class R5MixedWrites
   def initialize(c)
     @c5 = c
@@ -230,20 +225,34 @@ class Z10DefaultedInReader
   end
 end
 
-class N2CtorNil
-  def initialize
-    @n2 = nil
+class V1ResetNil
+  def initialize(c)
+    @v1 = c
+  end
+
+  def reset
+    @v1 = nil
   end
 
   def v
-    Array(@n2).frobnicate_n2
+    Float(@v1).frobnicate_v1
   end
 end
 
-# (9) an untyped write in a NON-ctor method is not exempt from the
-# read-before-write nil contribution, so the entry is nil-bearing and the
-# reference still fires — rows z7 and i12 (`@c12 = @d12` over an ivar nothing
-# writes). These two are why the ctor write is a REQUIREMENT, not a bonus.
+class V3CtorTypedSiblingUntyped
+  def initialize
+    @v3 = "x"
+  end
+
+  def s(c)
+    @v3 = c
+  end
+
+  def v
+    Float(@v3).frobnicate_v3
+  end
+end
+
 class Z7NonCtorWrite
   def s(c)
     @s7 = c
@@ -261,6 +270,82 @@ class I12IvarFromIvar
 
   def v
     Array(@c12).frobnicate_i12
+  end
+end
+
+class V9NonCtorMixed
+  def s(c)
+    @v9 = c
+  end
+
+  def t
+    @v9 = "x"
+  end
+
+  def v
+    Float(@v9).frobnicate_v9
+  end
+end
+
+# --- KEEPS FIRING ------------------------------------------------------------
+
+# (8) an entry whose every write is PRECISE discriminates: a ctor literal
+# (row r3), a ctor `nil` (row n2), a typed write in a non-ctor method (row v2),
+# and — whatever the class writes elsewhere — a definite write in the reading
+# `def` itself before the read (row v8). `rand` also still pins through a
+# `Dynamic[top] | 1` entry (row v6, see fixture 99 section (13)).
+class R3IvarLiteral
+  def initialize
+    @lit = "x"
+  end
+
+  def v
+    Array(@lit).frobnicate_r3
+  end
+end
+
+class N2CtorNil
+  def initialize
+    @n2 = nil
+  end
+
+  def v
+    Array(@n2).frobnicate_n2
+  end
+end
+
+class V2NonCtorTypedOnly
+  def s
+    @v2 = "x"
+  end
+
+  def v
+    Float(@v2).frobnicate_v2
+  end
+end
+
+class V8SameDefOverwrite
+  def initialize(c)
+    @v8 = c
+  end
+
+  def v
+    @v8 = "x"
+    Float(@v8).frobnicate_v8
+  end
+end
+
+class V6RandMixed
+  def initialize(c)
+    @v6 = c
+  end
+
+  def reset
+    @v6 = 1
+  end
+
+  def v
+    rand(@v6).frobnicate_v6
   end
 end
 
@@ -370,10 +455,48 @@ def n4_reader
   Float($gv4).frobnicate_n4
 end
 
+# (14b) #1021: an untyped write beside a typed one — a cvar (row c01), a gvar
+# over a top-level `nil` (row g01) or a typed `def` write (row g02).
+class C01CvarMixed
+  def s(c)
+    @@c01 = c
+  end
+
+  def t
+    @@c01 = "x"
+  end
+
+  def v
+    Float(@@c01).frobnicate_c01
+  end
+end
+
+$g01 = nil
+def g01_writer(c)
+  $g01 = c
+end
+
+def g01_reader
+  Float($g01).frobnicate_g01
+end
+
+def g02_writer(c)
+  $g02 = c
+end
+
+def g02_typed
+  $g02 = "x"
+end
+
+def g02_reader
+  Float($g02).frobnicate_g02
+end
+
 # --- KEEPS FIRING ------------------------------------------------------------
 
-# (15) a `def`-body cvar write IS recorded (row c1); a gvar write anywhere in the
-# program counts, at top level (row r15) or inside a `def` (row g3).
+# (15) a `def`-body cvar write IS recorded (row c1) — beside a class-body `nil`
+# the class table never sees (row c02); a gvar write anywhere in the program
+# counts, at top level (row r15) or inside a `def` (row g3).
 class C1CvarDefWrite
   def s
     @@k1 = "s"
@@ -381,6 +504,18 @@ class C1CvarDefWrite
 
   def v
     Float(@@k1).frobnicate_c1
+  end
+end
+
+class C02CvarClassBodyNilDefTyped
+  @@c02 = nil
+
+  def t
+    @@c02 = "x"
+  end
+
+  def v
+    Float(@@c02).frobnicate_c02
   end
 end
 

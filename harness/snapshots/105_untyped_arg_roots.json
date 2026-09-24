@@ -3,161 +3,189 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 91,
+      "line": 95,
       "column": 16,
       "severity": "error",
       "message": "undefined method `frobnicate_i2' for Array[\"s\"]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 190,
+      "line": 303,
       "column": 17,
       "severity": "error",
       "message": "undefined method `frobnicate_r3' for Array[\"x\"]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 239,
+      "line": 313,
       "column": 16,
       "severity": "error",
       "message": "undefined method `frobnicate_n2' for Array[bot]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 276,
+      "line": 323,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v2' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 334,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v8' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 348,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v6' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 361,
       "column": 17,
       "severity": "error",
       "message": "undefined method `frobnicate_i11' for Array[\"s\"]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 286,
+      "line": 371,
       "column": 16,
       "severity": "error",
       "message": "undefined method `frobnicate_i8' for Array[\"s\"]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 292,
+      "line": 377,
       "column": 14,
       "severity": "error",
       "message": "undefined method `frobnicate_i6' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 296,
+      "line": 381,
       "column": 12,
       "severity": "error",
       "message": "undefined method `frobnicate_t1' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 308,
+      "line": 393,
       "column": 16,
       "severity": "error",
       "message": "undefined method `frobnicate_i5' for Array[\"s\"]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 322,
+      "line": 407,
       "column": 16,
       "severity": "error",
       "message": "undefined method `frobnicate_i3' for Array[\"s\"]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 383,
+      "line": 506,
       "column": 17,
       "severity": "error",
       "message": "undefined method `frobnicate_c1' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 389,
+      "line": 518,
+      "column": 18,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c02' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 524,
       "column": 15,
       "severity": "error",
       "message": "undefined method `frobnicate_r15' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 394,
+      "line": 529,
       "column": 18,
       "severity": "error",
       "message": "undefined method `frobnicate_g3' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 415,
+      "line": 550,
       "column": 39,
       "severity": "error",
       "message": "undefined method `frobnicate_r11' for 1.0"
     },
     {
       "rule": "call.undefined-method",
-      "line": 429,
+      "line": 564,
       "column": 36,
       "severity": "error",
       "message": "undefined method `frobnicate_r9' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 430,
+      "line": 565,
       "column": 37,
       "severity": "error",
       "message": "undefined method `frobnicate_r10' for Array[1 | 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 435,
+      "line": 570,
       "column": 44,
       "severity": "error",
       "message": "undefined method `frobnicate_m13' for 1.0"
     },
     {
       "rule": "call.undefined-method",
-      "line": 441,
+      "line": 576,
       "column": 31,
       "severity": "error",
       "message": "undefined method `frobnicate_l5' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 463,
+      "line": 598,
       "column": 17,
       "severity": "error",
       "message": "undefined method `frobnicate_k1' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 467,
+      "line": 602,
       "column": 17,
       "severity": "error",
       "message": "undefined method `frobnicate_k5' for Array[1 | 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 474,
+      "line": 609,
       "column": 19,
       "severity": "error",
       "message": "undefined method `frobnicate_k8' for 5.0"
     },
     {
       "rule": "call.undefined-method",
-      "line": 479,
+      "line": 614,
       "column": 17,
       "severity": "error",
       "message": "undefined method `frobnicate_k3' for [singleton(String)]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 483,
+      "line": 618,
       "column": 26,
       "severity": "error",
       "message": "undefined method `frobnicate_k4' for Infinity"
     },
     {
       "rule": "call.undefined-method",
-      "line": 487,
+      "line": 622,
       "column": 24,
       "severity": "error",
       "message": "undefined method `frobnicate_k6' for Float"
