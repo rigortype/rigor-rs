@@ -22,7 +22,17 @@ embedded core RBS, is the zero-false-positive keystone of plugin parity.
   `activesupport-core-ext`).
 - **Source path:** `reference/rigor/plugins/rigor-activesupport-core-ext/sig/active_support/core_ext.rbs`
   — **the PINNED submodule**, not a local checkout.
-- **Vendored:** 2026-09-21 at the `v0.3.9` pin (`d0c370f7`), `shasum`
+- **Vendored:** 2026-09-25 at the upstream-master pin (`e59b7b89`), `shasum`
+  `66865f00802ddcd8316f3cca4658dec7842910d7`, 2,006 lines — the copy had 23
+  selectors firing on rigor-rs and silent on the oracle (`presence_in`, `with`,
+  `with_options`, `Object#class_eval`, `downcase_first`, `acts_like_string?`,
+  `is_utf8?`, `Symbol#starts_with?` / `#ends_with?`, `second_to_last`,
+  `third_to_last`, `extract_options!`, `many?`, `in_order_of`, `to_options(!)`,
+  `deep_merge?`, `nested_under_indifferent_access`, `extractable_options?`,
+  `with_defaults(!)`, `reverse_update`, `extract!`, `Range#overlaps?`); all
+  silent after the copy, the typo control still fires, and fixture 98 carries a
+  sample. The reader accepted the new file unchanged. Was 2026-09-21 at the
+  `v0.3.9` pin (`d0c370f7`), `shasum`
   `80698597a93eb934ffc5ab688838cc76bb3d2ad1`, 1,840 lines — `v0.3.9` (#916)
   models `ActiveSupport::TimeWithZone` as a subclass of `Time` (so `time_zone`,
   `period` and `comparable_time` resolve on `Time.current` and the `1.hour.ago`
