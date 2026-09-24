@@ -140,6 +140,20 @@
       "column": 23,
       "severity": "error",
       "message": "undefined method `frobnicate_g33' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 143,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r04' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 148,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r25' for \"b\""
     }
   ]
 }

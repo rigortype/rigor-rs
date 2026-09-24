@@ -1450,12 +1450,20 @@ impl<'i> Typer<'i> {
         // reference keeps firing (rows q4/a20/a25/a31) — four must-still-fire
         // controls, silenced by a decline that "does strictly less".
         //
-        // The ALLOW-LIST instead: decline only for an argument rooted at a local
-        // the enclosing `def` never WRITES and never CLASS-GUARDS. An unwritten,
-        // unguarded local inside a method body is a parameter, which the
-        // reference also carries as `Dynamic[Top]` — and an arbitrary call chain
-        // over an untyped root (`kwargs[:upload_duration]`, fixture 60) is
-        // untyped there too. See [`Typer::arg_is_reference_untyped`].
+        // A syntactic REACH analysis instead ([`Typer::arg_reach`]): which values
+        // can reach the argument's root on the reference, and is one of them the
+        // untyped carrier? An unwritten, unguarded parameter is; an arbitrary
+        // call chain over an untyped root (`kwargs[:upload_duration]`, fixture
+        // 60) is too.
+        //
+        // #1021 (upstream `5496acd6`, the `v0.3.8 -> e59b7b89` re-pin) widened
+        // upstream's test from `untyped_arg?` to `imprecise_arg?` — the bare
+        // carrier OR a union with an untyped member — so a CONDITIONAL rebind
+        // that leaves the parameter reachable (`s = "x" if s.nil?`, the
+        // reference's `Dynamic[top] | "x"`) now declines too (rows a7/a20/q3),
+        // while an unconditional one (`s = "x"`, row q4) still fires. `rand` is
+        // the one conversion whose join a union's precise members can still pin
+        // (see [`Reach`]), so it asks [`Reach::declines_rand`] instead.
         //
         // The decline ANSWERS `Dynamic[top]` rather than returning `None`,
         // because the explicit `Kernel.Float(u)` spelling routes here too and a
@@ -1464,8 +1472,14 @@ impl<'i> Typer<'i> {
         if matches!(method, "Float" | "Integer" | "Array" | "rand") {
             let untyped = interner.untyped();
             let declines = args.iter().any(|&a| {
-                self.type_of(ast, a, env, interner) == untyped
-                    && self.arg_is_reference_untyped(ast, a)
+                self.type_of(ast, a, env, interner) == untyped && {
+                    let reach = self.arg_reach(ast, a);
+                    if method == "rand" {
+                        reach.declines_rand()
+                    } else {
+                        reach.untyped
+                    }
+                }
             });
             if declines {
                 return Some(untyped);
@@ -1582,125 +1596,238 @@ impl<'i> Typer<'i> {
         nominal_class.map(|class| self.nominal_or_untyped(class, interner))
     }
 
-    /// Would the REFERENCE type this argument expression `Dynamic[Top]` too? —
-    /// the #521 decline's gate (see [`Typer::type_implicit_self_call`]).
+    /// What can the REFERENCE's type for this argument expression hold? — the
+    /// gate of the #521 / #1021 declines (see [`Typer::type_implicit_self_call`]
+    /// and [`Typer::rbs_dispatch_declines_on_untyped_arg`]).
     ///
-    /// rigor-rs cannot answer this from the argument's TYPE the way upstream's
-    /// `untyped_arg?` does. A use site inside a method body reads an EMPTY
-    /// `TypeEnv` (the rules layer's `ScopedEnv::at`: a Ruby method body is an
-    /// independent local scope, and reading the flat top-level env there typed
-    /// the wrong value — two `wrong-arity` and two `undefined-method` false
-    /// positives on rigor-survey), so EVERY def-body local read answers
-    /// `Dynamic[top]` here. `def f(u) = Float(u)` (reference-SILENT at the pin)
-    /// and `s = "x"; Float(s)` (reference-FIRING) are literally the same
-    /// `TypeId` at this call site.
+    /// Upstream asks `imprecise_arg?(t)` (#1021, `5496acd6`): is the argument the
+    /// bare untyped carrier `Dynamic[Top]`, OR a UNION with such a member
+    /// (`Dynamic[top] | "x"`)? Either one skips the strict and alias overload
+    /// passes, so the gradual pass answers every overload that accepts ALL of
+    /// the union's members and the dispatch joins their returns.
+    /// [`Reach::untyped`] is that question; the other two flags describe the
+    /// union's precise members, which only `rand` needs (see [`Reach`]).
     ///
-    /// So the gate is an ALLOW-LIST of shapes that are untyped on BOTH engines:
-    /// the expression's ROOT is a bare local read, that root sits inside a
-    /// `def`, and inside that def's span the root is
+    /// rigor-rs cannot answer this from the argument's TYPE. A use site inside a
+    /// method body reads an EMPTY `TypeEnv` (the rules layer's `ScopedEnv::at`:
+    /// a Ruby method body is an independent local scope, and reading the flat
+    /// top-level env there typed the wrong value — two `wrong-arity` and two
+    /// `undefined-method` false positives on rigor-survey), so EVERY def-body
+    /// local read answers `Dynamic[top]` here. `def f(u) = Float(u)`
+    /// (reference-SILENT) and `s = "x"; Float(s)` (reference-FIRING) are
+    /// literally the same `TypeId` at this call site.
     ///
-    /// * never CLASS-GUARDED — no `is_a?` / `kind_of?` / `instance_of?` / `===`
-    ///   with it as receiver or argument, and no `case` on it (rows
-    ///   q6/q8/q9/q10/a25/a31, where the reference narrows the parameter to a
-    ///   Nominal and fires); and
-    /// * either never REBOUND (it is then a parameter, which the reference
-    ///   carries as `Dynamic[Top]`), or rebound only from values that are
-    ///   themselves untyped by this same test — `t = s.to_s` over an untyped `s`
-    ///   leaves `t` untyped and the reference declines `Float(t)` (row q5),
-    ///   while `s = "x" if s.nil?` makes the reference's `s` the UNION
-    ///   `"x" | Dynamic[top]`, which it still discriminates on (rows a7/a20/a25,
-    ///   q2/q3/q4/q7 — all must keep firing). A `MultiWrite` target and a
-    ///   `rescue => name` binding are not modelled and decline the whole test.
+    /// So the answer is a SYNTACTIC reach analysis over the argument's ROOT (a
+    /// local, ivar, cvar, gvar or constant — [`untyped_expr_root`]): which
+    /// VALUES can reach this read, and is any of them untyped on the reference?
+    /// Each root kind has its own arm, a port of how the reference seeds that
+    /// kind of variable; the value side is [`Typer::expr_reach`]. A class-GUARD
+    /// on a local (`is_a?` & co., `case`) still refuses outright — the
+    /// reference narrows the parameter to a Nominal and fires (rows
+    /// q6/q8/q9/q10/a25/a31, and l29 where the guard follows a `Dynamic | "x"`
+    /// rebind).
     ///
-    /// An arbitrary call chain over an untyped root is untyped on the reference
-    /// as well, which is what reaches fixture 60's
-    /// `Float(kwargs[:upload_duration])`.
+    /// Every error in this analysis must fall on the DECLINE side: a value the
+    /// port cannot place is untyped ([`Reach::UNKNOWN`]), because a decline
+    /// withholds a diagnostic (a coverage loss) while a wrong precise answer
+    /// mints one the reference does not emit.
     ///
-    /// Every decline this predicate withholds is a coverage loss, never a false
-    /// positive: the fold keeps its pinned answer, exactly as before #521. The
-    /// known withholdings, recorded rather than chased: an IVAR argument (the
-    /// arena's `VariableRead` carries no name, so an ivar root cannot be
-    /// matched), a local shadowed by a block parameter of the same name (block
-    /// params are not arena writes, so the outer test answers for the inner
-    /// read), and a top-level (non-`def`) use site, where the env is real and
-    /// the naive type test would be sound but is not needed by any measured row.
-    ///
-    /// COST: two arena scans per untyped-argument conversion fold, so quadratic
-    /// in the number of such folds per file. Measured on a synthetic worst case
-    /// (9000 lines, 4500 `Float`/`Integer`/`Array` calls on bare parameters):
-    /// 1.48s vs 0.89s user for the same file with literal arguments, where the
-    /// `type_of` gate keeps the helper from running at all. Real files carry a
-    /// handful of these, and the whole predicate is skipped unless the argument
-    /// already types `Dynamic[top]`. Revisit if a sweep file regresses.
-    fn arg_is_reference_untyped(&self, ast: &LoweredAst, arg: NodeId) -> bool {
-        self.expr_is_reference_untyped(ast, arg, &mut Vec::new())
+    /// COST: two arena scans per root visited, so quadratic in the number of
+    /// such folds per file. Measured on a synthetic worst case (9000 lines, 4500
+    /// `Float`/`Integer`/`Array` calls on bare parameters): 1.48s vs 0.89s user
+    /// for the same file with literal arguments, where the `type_of` gate keeps
+    /// the helper from running at all. Real files carry a handful of these, and
+    /// the whole analysis is skipped unless the argument already types
+    /// `Dynamic[top]`. Revisit if a sweep file regresses.
+    fn arg_reach(&self, ast: &LoweredAst, arg: NodeId) -> Reach {
+        self.expr_reach(ast, arg, &mut Vec::new())
     }
 
-    /// [`Typer::arg_is_reference_untyped`]'s recursion. `seen` carries the root
-    /// spellings already on the chain, so a self-referential rebind (`t = t.foo`,
-    /// `@x = @x.foo`) terminates instead of recursing, and bounds the walk's
-    /// depth. The five root kinds are disjoint by spelling (a local can begin
-    /// with neither a sigil nor a capital), so one flat `seen` covers them all.
-    fn expr_is_reference_untyped(
+    /// The VALUE side of [`Typer::arg_reach`]: what the reference's type for
+    /// the value of expression `id` can hold. A branching value (`c ? "x" : s`,
+    /// `s || "x"`, an `if`/`case` used as a value) is the join of its arms — the
+    /// reference unions them, so one untyped arm makes the whole value
+    /// imprecise (row l31). A literal is precise; anything else goes through its
+    /// root ([`Typer::chain_reach`]).
+    fn expr_reach(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Reach {
+        match ast.get(id) {
+            Node::If { then_body, else_body, .. } => self
+                .body_value_reach(ast, then_body, seen)
+                .join(self.body_value_reach(ast, else_body, seen)),
+            Node::Logical { left, right, .. } => {
+                self.expr_reach(ast, *left, seen).join(self.expr_reach(ast, *right, seen))
+            }
+            Node::Statements { body, .. } => self.body_value_reach(ast, body, seen),
+            // Also the carrier an `if`'s `else` clause lowers to (no clauses).
+            Node::BeginRescue { body, clauses, .. } => {
+                let mut reach = self.body_value_reach(ast, body, seen);
+                for c in clauses {
+                    reach = reach.join(self.body_value_reach(ast, &c.body, seen));
+                }
+                reach
+            }
+            Node::Case { branches, else_body, .. } => {
+                let mut reach = self.body_value_reach(ast, else_body, seen);
+                for &b in branches {
+                    reach = reach.join(match ast.get(b) {
+                        Node::When { body, .. } => self.body_value_reach(ast, body, seen),
+                        _ => Reach::UNKNOWN,
+                    });
+                }
+                reach
+            }
+            Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::FloatLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::NilLit { .. }
+            | Node::TrueLit { .. }
+            | Node::FalseLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::HashLit { .. } => Reach::LITERAL,
+            // `rand`'s `(?0) -> Float` overload accepts the literal `0`, and a
+            // Range is what its two Range overloads take: either member keeps a
+            // second overload in `rand`'s join (see [`Reach`]).
+            Node::IntegerLit { value, .. } => {
+                if *value == 0 {
+                    Reach::OPAQUE
+                } else {
+                    Reach::LITERAL
+                }
+            }
+            Node::Range { .. } => Reach::OPAQUE,
+            _ => self.chain_reach(ast, id, seen),
+        }
+    }
+
+    /// The value of a statement list — its last statement, or `nil` when empty
+    /// (an `if` with no `else`).
+    fn body_value_reach(&self, ast: &LoweredAst, body: &[NodeId], seen: &mut Vec<String>) -> Reach {
+        match body.last() {
+            Some(&last) => self.expr_reach(ast, last, seen),
+            None => Reach::LITERAL,
+        }
+    }
+
+    /// A root read, or a call CHAIN over one. An arbitrary chain over an untyped
+    /// root is untyped on the reference as well (a method on `Dynamic[Top]`
+    /// answers `Dynamic[Top]`) — which is what reaches fixture 60's
+    /// `Float(kwargs[:upload_duration])` — and a chain over a union keeps that
+    /// untyped member beside whatever the precise members answer. A chain over
+    /// a precise root is precise, but never a `rand`-safe literal. An
+    /// expression with no root (an implicit-self call, `self`) is precise.
+    fn chain_reach(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Reach {
+        let Some(root) = untyped_expr_root(ast, id, 8) else { return Reach::OPAQUE };
+        let reach = self.root_reach(ast, &root, ast.get(id).span(), seen);
+        if matches!(ast.get(id), Node::Call { .. }) {
+            Reach { untyped: reach.untyped, precise: reach.precise, opaque: reach.precise }
+        } else {
+            reach
+        }
+    }
+
+    /// Dispatch a root to its arm. `seen` carries the `(root, position)` pairs
+    /// already on the recursion, so a self-referential value (`s = s.to_s`,
+    /// `@x = @x.foo`) terminates. A revisited pair contributes NOTHING — the
+    /// least fixpoint, which is exact here: an untyped value can only originate
+    /// from a non-cyclic source (a parameter, an unwritten variable, an
+    /// untyped write), and every such source is joined in by the outer visit.
+    /// Running out of depth instead answers [`Reach::UNKNOWN`] — the decline
+    /// side.
+    fn root_reach(
         &self,
         ast: &LoweredAst,
-        id: NodeId,
+        root: &UntypedRoot,
+        use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
-    ) -> bool {
-        let Some(root) = untyped_expr_root(ast, id, 8) else { return false };
-        let key = root.spelling().to_string();
-        if seen.len() >= 4 || seen.contains(&key) {
-            return false;
+    ) -> Reach {
+        let key = format!("{}@{}", root.spelling(), use_span.0);
+        if seen.contains(&key) {
+            return Reach::NONE;
         }
-        let use_span = ast.get(id).span();
+        if seen.len() >= 4 {
+            return Reach::UNKNOWN;
+        }
         seen.push(key);
-        let untyped = match &root {
-            UntypedRoot::Local(name) => self.local_is_reference_untyped(ast, name, use_span, seen),
-            UntypedRoot::Ivar(name) => self.ivar_is_reference_untyped(ast, name, use_span, seen),
-            UntypedRoot::Cvar(name) => self.cvar_is_reference_untyped(ast, name, use_span, seen),
-            UntypedRoot::Gvar(name) => self.gvar_is_reference_untyped(ast, name, seen),
-            UntypedRoot::Const(name) => self.const_is_reference_untyped(name, use_span),
+        let reach = match root {
+            UntypedRoot::Local(name) => self.local_reach(ast, name, use_span, seen),
+            UntypedRoot::Ivar(name) => self.ivar_reach(ast, name, use_span, seen),
+            UntypedRoot::Cvar(name) => self.cvar_reach(ast, name, use_span, seen),
+            UntypedRoot::Gvar(name) => self.gvar_reach(ast, name, seen),
+            UntypedRoot::Const(name) => {
+                if self.const_is_reference_untyped(name, use_span) {
+                    Reach::UNTYPED
+                } else {
+                    Reach::OPAQUE
+                }
+            }
         };
         seen.pop();
-        untyped
+        reach
     }
 
-    /// The LOCAL arm of [`Typer::expr_is_reference_untyped`] — the original
-    /// allow-list, plus the two facts the `->` lambda measurements added.
+    /// The LOCAL arm of [`Typer::root_reach`].
     ///
-    /// The region whose writes and guards decide the answer is the innermost
+    /// The REGION whose writes and guards decide the answer is the innermost
     /// enclosing `def`. With NO enclosing `def` the use site must sit directly
     /// in a PROC-LIKE binder body (`->`, `lambda {}`, `proc {}`, `Proc.new {}`),
     /// whose parameters the reference carries as `Dynamic[Top]` exactly like a
     /// method's (rows r6/r7/r8, and the gitlab-foss `filter_evaluator.rb:15`
-    /// site this closes); the region is then the whole file, so a CAPTURED outer
-    /// local that the reference DOES type still refuses (row l5, which must keep
-    /// firing), and writes inside an unrelated `def` are excluded as a different
-    /// scope. An ORDINARY block's parameter is deliberately NOT admitted — the
-    /// reference types it from the RBS yield (`[1, 2].each { |x| Float(x) }`
-    /// fires `for 1.0`, row m11) — so the innermost binder must be proc-like.
+    /// site); the region is then the whole file, and writes inside an unrelated
+    /// `def` are excluded as a different scope. An ORDINARY block's parameter
+    /// is deliberately NOT admitted there — the reference types it from the RBS
+    /// yield (`[1, 2].each { |x| Float(x) }` fires `for 1.0`, row m11) — so the
+    /// innermost binder must be proc-like. A write INSIDE a `->` body never
+    /// binds on the reference (rows r11/p13), while the `lambda {}` / `proc {}`
+    /// / ordinary-block spellings DO (rows m1/m2/m6/m13), so a
+    /// `Node::Lambda`-interior write is skipped and every other write counts.
     ///
-    /// A write INSIDE a `->` body never binds on the reference: neither a
-    /// parameter rebind (`->(y) { y = 1; Float(y) }`, row r11) nor a fresh
-    /// lambda-local (`->(y) { z = 1; z.typo }`, row p13) is observable there,
-    /// while the `lambda {}` / `proc {}` / ordinary-block spellings DO bind
-    /// (rows m1/m2/m6/m13 all fire). So a `Node::Lambda`-interior write is
-    /// skipped and every other write counts.
-    fn local_is_reference_untyped(
+    /// Inside the region the reaching values are, flow-approximately:
+    ///
+    /// * the local's INITIAL value — untyped for a parameter (the reference
+    ///   carries every parameter kind, defaults and keywords included, as
+    ///   `Dynamic[Top]`: rows l14-l17), and `nil` for a plain local. A name the
+    ///   `def` does not list as a parameter can still be a BLOCK parameter
+    ///   (which the arena does not record) when the read sits inside a block;
+    ///   it is then taken as untyped unless the region writes it OUTSIDE every
+    ///   block around the read (a captured outer local, row l5). A local with
+    ///   no write at all is untyped for the same reason (a pattern or `for`
+    ///   binding is not an arena write either).
+    /// * every write of the name — EXCEPT that a DEFINITE assignment on the
+    ///   read's statement path ([`latest_definite_assignment`]) cuts off the
+    ///   initial value and every earlier write: `s = "x"; Float(s)` fires (rows
+    ///   q4/l04), and so does an `if`/`else` that rebinds on BOTH arms (row l05),
+    ///   while a conditional rebind leaves the parameter reachable — the
+    ///   reference's `Dynamic[top] | "x"`, which #1021 declines on (rows a7/a20,
+    ///   l01/l09/l11/l19/l23/l24). A write lexically AFTER the read only counts
+    ///   when a loop or block can carry it back round (row l27 — the
+    ///   parameter itself reaches the read there).
+    /// * `x ||= v` / `x += v` / `x &&= v` never cut anything off (each may keep
+    ///   the old value) and add `v`'s reach — so `s ||= "x"` over a parameter
+    ///   declines (row q3, retracted upstream by #1021) while `t = nil; t ||=
+    ///   "x"` still fires (row l06).
+    ///
+    /// A `rescue => name` binding and a class guard refuse the whole test (the
+    /// reference types both precisely).
+    fn local_reach(
         &self,
         ast: &LoweredAst,
         root: &str,
         use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
-    ) -> bool {
+    ) -> Reach {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-        // One pass for the scope shapes: every `def` span, every `->` span, and
-        // the narrowest binder (a `def`, a `->`, or any block-bearing call)
-        // around the use site.
+        // One pass for the scope shapes: every `def` span, every `->` span, the
+        // innermost `def` around the use site, the narrowest binder (a `def`, a
+        // `->`, or any block-bearing call) around it, and every block extent
+        // around it.
         let mut def_spans: Vec<rigor_parse::Span> = Vec::new();
         let mut lambda_spans: Vec<rigor_parse::Span> = Vec::new();
-        let mut def_span: Option<rigor_parse::Span> = None;
+        let mut def: Option<(rigor_parse::Span, NodeId)> = None;
         let mut binder: Option<(rigor_parse::Span, bool)> = None;
+        let mut blocks_around: Vec<rigor_parse::Span> = Vec::new();
+        let mut loop_spans: Vec<rigor_parse::Span> = Vec::new();
         let mut note_binder = |span: rigor_parse::Span, proc_like: bool| {
             if contains(span, use_span) {
                 let narrower = binder.is_none_or(|(b, _)| span.1 - span.0 < b.1 - b.0);
@@ -1709,39 +1836,52 @@ impl<'i> Typer<'i> {
                 }
             }
         };
-        for (_, n) in ast.iter() {
+        for (id, n) in ast.iter() {
             match n {
                 Node::Definition { span, .. } => {
                     def_spans.push(*span);
                     if contains(*span, use_span) {
-                        let narrower = def_span.is_none_or(|d| span.1 - span.0 < d.1 - d.0);
+                        let narrower = def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0);
                         if narrower {
-                            def_span = Some(*span);
+                            def = Some((*span, id));
                         }
                     }
                     note_binder(*span, false);
                 }
                 Node::Lambda { span, .. } => {
                     lambda_spans.push(*span);
+                    if contains(*span, use_span) {
+                        blocks_around.push(*span);
+                    }
                     note_binder(*span, true);
                 }
+                Node::Loop { span, .. } if contains(*span, use_span) => loop_spans.push(*span),
                 Node::Call { receiver, method, block_body, .. } if !block_body.is_empty() => {
                     // A call's own span covers its receiver and arguments too, so
                     // the binder region is the BLOCK BODY's extent.
                     let lo = block_body.iter().map(|&b| ast.get(b).span().0).min();
                     let hi = block_body.iter().map(|&b| ast.get(b).span().1).max();
                     if let (Some(lo), Some(hi)) = (lo, hi) {
+                        if contains((lo, hi), use_span) {
+                            blocks_around.push((lo, hi));
+                        }
                         note_binder((lo, hi), proc_like_block(ast, *receiver, method));
                     }
                 }
                 _ => {}
             }
         }
-        let (region, skip_defs) = match def_span {
-            Some(d) => (d, false),
+        let (region, skip_defs, flow_body, params): (_, _, &[NodeId], &[String]) = match def {
+            Some((d, id)) => match ast.get(id) {
+                Node::Definition { body, param_names, .. } => (d, false, body, param_names),
+                _ => return Reach::UNKNOWN,
+            },
             None => match binder {
-                Some((_, true)) => (ast.get(ast.root()).span(), true),
-                _ => return false,
+                Some((_, true)) => match ast.get(ast.root()) {
+                    Node::Program { body, span } => (*span, true, body, &[]),
+                    _ => return Reach::UNKNOWN,
+                },
+                _ => return Reach::OPAQUE,
             },
         };
         let in_region = |s: rigor_parse::Span| {
@@ -1749,39 +1889,41 @@ impl<'i> Typer<'i> {
                 && !lambda_spans.iter().any(|&l| contains(l, s))
                 && !(skip_defs && def_spans.iter().any(|&d| contains(d, s)))
         };
+        // Only the blocks INSIDE the region can hold a block parameter, and only
+        // they (or a loop) can carry a later write back round to the read.
+        blocks_around.retain(|&b| contains(region, b));
+        loop_spans.retain(|&l| contains(region, l));
+        let loopy = !blocks_around.is_empty() || !loop_spans.is_empty();
         // A guard is a narrowing, not a binding, so the `->` skip does not apply
         // to it — only the region does.
         let guards_here = |s: rigor_parse::Span| contains(region, s);
         let reads_root = |i: NodeId| {
             matches!(ast.get(i), Node::LocalVariableRead { name, .. } if name == root)
         };
-        let mut rebinds: Vec<NodeId> = Vec::new();
+        let mut writes: Vec<(rigor_parse::Span, LocalWrite)> = Vec::new();
         for (_, n) in ast.iter() {
             match n {
                 Node::LocalVariableWrite { name, value, span, .. }
                     if name == root && in_region(*span) =>
                 {
-                    rebinds.push(*value);
+                    writes.push((*span, LocalWrite::Plain(*value)));
                 }
-                // `x ||= v` / `x += v` reads the old binding as well, so the
-                // result is a JOIN the reference can type — decline outright
-                // rather than model it (row q3, which must keep firing).
-                Node::LocalVariableOpWrite { name, span, .. }
+                Node::LocalVariableOpWrite { name, value, span }
                     if name == root && in_region(*span) =>
                 {
-                    return false;
+                    writes.push((*span, LocalWrite::Op(*value)));
                 }
-                Node::MultiWrite { targets, span, .. }
+                Node::MultiWrite { targets, value, span, .. }
                     if in_region(*span)
                         && targets.bound_names().iter().any(|(n, _)| n == root) =>
                 {
-                    return false;
+                    writes.push((*span, LocalWrite::Multi(*value)));
                 }
                 Node::BeginRescue { clauses, span, .. }
                     if in_region(*span)
                         && clauses.iter().any(|c| c.bound_name.as_deref() == Some(root)) =>
                 {
-                    return false;
+                    return Reach::OPAQUE;
                 }
                 Node::Call { receiver, method, args, span, .. }
                     if guards_here(*span)
@@ -1792,44 +1934,94 @@ impl<'i> Typer<'i> {
                         && (receiver.is_some_and(reads_root)
                             || args.iter().copied().any(&reads_root)) =>
                 {
-                    return false;
+                    return Reach::OPAQUE;
                 }
                 Node::Case { predicate, span, .. }
                     if guards_here(*span) && predicate.is_some_and(reads_root) =>
                 {
-                    return false;
+                    return Reach::OPAQUE;
                 }
                 _ => {}
             }
         }
-        rebinds.iter().all(|&v| self.expr_is_reference_untyped(ast, v, seen))
+        let is_target = |n: &Node| match n {
+            Node::LocalVariableWrite { name, .. } => name == root,
+            Node::MultiWrite { targets, .. } => {
+                targets.bound_names().iter().any(|(n, _)| n == root)
+            }
+            _ => false,
+        };
+        let kill = latest_definite_assignment(ast, flow_body, use_span, &is_target);
+        let mut reach = match kill {
+            Some(_) => Reach::NONE,
+            None => {
+                let outer_write = writes
+                    .iter()
+                    .any(|(w, _)| !blocks_around.iter().any(|&b| contains(b, *w)));
+                if params.iter().any(|p| p == root) || !outer_write {
+                    Reach::UNTYPED
+                } else {
+                    Reach::LITERAL // an unassigned local reads `nil`
+                }
+            }
+        };
+        for (span, write) in &writes {
+            if kill.is_some_and(|k| span.0 < k.0) {
+                continue;
+            }
+            if !loopy && (span.1 > use_span.0) {
+                continue; // at or after the read, and nothing loops back
+            }
+            reach = reach.join(match *write {
+                LocalWrite::Plain(v) => self.expr_reach(ast, v, seen),
+                LocalWrite::Op(v) => {
+                    let r = self.expr_reach(ast, v, seen);
+                    Reach { untyped: r.untyped, precise: true, opaque: true }
+                }
+                LocalWrite::Multi(v) => match ast.get(v) {
+                    Node::ArrayLit { elements, .. } => {
+                        let mut r = Reach::LITERAL;
+                        for &e in elements {
+                            r = r.join(self.expr_reach(ast, e, seen));
+                        }
+                        r
+                    }
+                    _ => Reach::UNKNOWN,
+                },
+            });
+        }
+        reach
     }
 
     /// The INSTANCE-VARIABLE arm — the port of the reference's class-ivar
-    /// pre-pass (`scope_indexer.rb`'s `build_class_ivar_index`), restricted to
-    /// what makes an entry the literal untyped carrier.
+    /// pre-pass (`scope_indexer.rb`'s `build_class_ivar_index`).
     ///
     /// The reference seeds a method body's ivars from a per-CLASS table built
     /// from `@x = …` writes inside the class's `def` bodies, unioned
-    /// flow-insensitively. Three properties of that table are the whole rule,
-    /// each measured at the pin:
+    /// flow-insensitively. Measured at the pins:
     ///
     /// * a class with NO write for the name has no entry at all, so the read is
     ///   `Dynamic[Top]` — rows r2/r4/i7, and the gitlab-foss
-    ///   `pull_policy.rb:28` (`Array(@config).presence`) site this closes. A
-    ///   CLASS-BODY `@x = "s"` is not an instance-ivar write and contributes
-    ///   nothing (row i1); neither does a write in a NESTED class (row i9), an
-    ///   `@x ||= …` (row i2 — the collector only recognises a plain
+    ///   `pull_policy.rb:28` (`Array(@config).presence`) site. A CLASS-BODY
+    ///   `@x = "s"` is not an instance-ivar write and contributes nothing (row
+    ///   i1); neither does a write in a NESTED class (row i9), an `@x ||= …`
+    ///   (row i2 — the collector only recognises a plain
     ///   `InstanceVariableWriteNode`, exactly as this arena does), nor a write
     ///   in a `def` when the read is in another class entirely.
-    /// * an entry whose every write is itself reference-untyped stays untyped
-    ///   (row r1: `@config = config` in `initialize`), while ONE typed write
-    ///   makes the union discriminable again (rows r3/r5/z6/z10/n2).
-    /// * `contribute_read_before_write_nil!` folds `Constant[nil]` into an entry
-    ///   the class reads before writing UNLESS `initialize` (or the class body)
-    ///   writes it — so an untyped write in a NON-ctor method still answers a
-    ///   nil-bearing union and the reference fires (rows z7/i12). The
-    ///   `initialize` write is therefore a REQUIREMENT once any write exists.
+    /// * otherwise the entry is the UNION of the writes, and since #1021 one
+    ///   untyped write is enough to make it imprecise: an untyped ctor write
+    ///   beside a typed one (rows r5/z6/z10), and an untyped write in a non-ctor
+    ///   method — whose `contribute_read_before_write_nil!` nil only adds a
+    ///   precise member (rows z7/i12) — all decline now. Only an entry whose
+    ///   every write is precise keeps firing (rows r3/n2).
+    /// * inside the reading `def` itself the reference is flow-sensitive: a
+    ///   DEFINITE `@x = …` on the read's statement path replaces the seeded
+    ///   entry (`@x = "s"; Float(@x)` fires however the class writes it
+    ///   elsewhere, rows i6/v08).
+    ///
+    /// The read-before-write nil is deliberately NOT added as a precise member:
+    /// it only matters to `rand`'s join, where a member the reference does not
+    /// actually contribute would turn a decline into a false positive.
     ///
     /// No guard scan: the reference does not class-narrow an ivar at all here —
     /// `return unless @x.is_a?(String)` then `@x.typo` is silent on BOTH the
@@ -1840,53 +2032,83 @@ impl<'i> Typer<'i> {
     /// whole test: `@a, @b = "s", 1` IS collected by the reference
     /// (`record_multi_write_ivars`, row i5 fires) and the arena's
     /// `MultiTarget::Ignored` carries no name to match.
-    fn ivar_is_reference_untyped(
+    fn ivar_reach(
         &self,
         ast: &LoweredAst,
         root: &str,
         use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
-    ) -> bool {
+    ) -> Reach {
+        let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
         let scope = self.class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
-        let mut writes: Vec<NodeId> = Vec::new();
-        let mut ctor_write = false;
-        for (_, n) in ast.iter() {
+        let mut writes: Vec<(rigor_parse::Span, NodeId)> = Vec::new();
+        let mut def: Option<(rigor_parse::Span, NodeId)> = None;
+        let mut loopy = false;
+        for (id, n) in ast.iter() {
             match n {
                 Node::MultiWrite { targets, span, .. }
                     if scope.contains(*span) && has_non_local_target(targets) =>
                 {
-                    return false;
+                    return Reach::OPAQUE;
                 }
                 Node::InstanceVariableWrite { name, value, span, .. }
                     if name == root && scope.contains(*span) =>
                 {
-                    match scope.def_of(*span) {
-                        // A `def`-body write is what the class-ivar table
-                        // collects; `initialize` additionally exempts the name
-                        // from the read-before-write nil contribution.
-                        Some(def_name) => {
-                            writes.push(*value);
-                            ctor_write |= def_name.as_deref() == Some("initialize");
-                        }
-                        // A class-body (or top-level) write binds only inside
-                        // that same body — and is the OTHER half of the
-                        // reference's nil-contribution exemption.
-                        None => {
-                            ctor_write = true;
-                            if !use_in_def {
-                                writes.push(*value);
-                            }
-                        }
+                    // A `def`-body write is what the class-ivar table collects;
+                    // a class-body (or top-level) write binds only inside that
+                    // same body.
+                    if scope.def_of(*span).is_some() || !use_in_def {
+                        writes.push((*span, *value));
+                    }
+                }
+                Node::Definition { span, is_singleton_class: false, .. }
+                    if contains(*span, use_span) && scope.contains(*span) =>
+                {
+                    if def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0) {
+                        def = Some((*span, id));
+                    }
+                }
+                Node::Loop { span, .. } if contains(*span, use_span) => loopy = true,
+                Node::Lambda { span, .. } if contains(*span, use_span) => loopy = true,
+                Node::Call { block_body, .. } if !block_body.is_empty() => {
+                    let lo = block_body.iter().map(|&b| ast.get(b).span().0).min();
+                    let hi = block_body.iter().map(|&b| ast.get(b).span().1).max();
+                    if let (Some(lo), Some(hi)) = (lo, hi) {
+                        loopy |= contains((lo, hi), use_span);
                     }
                 }
                 _ => {}
             }
         }
-        if writes.is_empty() {
-            return true;
+        // The reading def's own flow: a definite write on the read's path
+        // replaces the seeded entry.
+        if let Some((d, id)) = def {
+            if let Node::Definition { body, .. } = ast.get(id) {
+                let is_target =
+                    |n: &Node| matches!(n, Node::InstanceVariableWrite { name, .. } if name == root);
+                if let Some(kill) = latest_definite_assignment(ast, body, use_span, &is_target) {
+                    let mut reach = Reach::NONE;
+                    for &(span, value) in &writes {
+                        if contains(d, span)
+                            && span.0 >= kill.0
+                            && (loopy || span.1 <= use_span.0)
+                        {
+                            reach = reach.join(self.expr_reach(ast, value, seen));
+                        }
+                    }
+                    return reach;
+                }
+            }
         }
-        ctor_write && writes.iter().all(|&v| self.expr_is_reference_untyped(ast, v, seen))
+        if writes.is_empty() {
+            return Reach::UNTYPED;
+        }
+        let mut reach = Reach::NONE;
+        for &(_, value) in &writes {
+            reach = reach.join(self.expr_reach(ast, value, seen));
+        }
+        reach
     }
 
     /// The CLASS-VARIABLE arm. `build_class_cvar_index` collects
@@ -1894,15 +2116,16 @@ impl<'i> Typer<'i> {
     /// class-body `@@n = nil` is walked past and never recorded, so it leaves
     /// the read `Dynamic[Top]` (row r14, and row n7 where a class-body write
     /// sits beside an untyped `def` one). There is no read-before-write nil
-    /// contribution for cvars, so an entry whose writes are all reference-
-    /// untyped simply stays untyped (row n3); one typed write refuses (row c1).
-    fn cvar_is_reference_untyped(
+    /// contribution for cvars; an entry is the union of its writes, so one
+    /// untyped write makes it imprecise (rows n3, c01) and only all-precise
+    /// writes keep firing (rows c1, c02).
+    fn cvar_reach(
         &self,
         ast: &LoweredAst,
         root: &str,
         use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
-    ) -> bool {
+    ) -> Reach {
         let scope = self.class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
         let mut writes: Vec<NodeId> = Vec::new();
@@ -1916,21 +2139,16 @@ impl<'i> Typer<'i> {
                 }
             }
         }
-        writes.iter().all(|&v| self.expr_is_reference_untyped(ast, v, seen))
+        self.writes_reach(ast, &writes, seen)
     }
 
     /// The GLOBAL-VARIABLE arm. `build_program_global_index` is program-wide —
     /// every `$x = …` in the file counts, at top level and inside any `def`
     /// alike — so the region is the whole file and there is no scope gate. A
     /// gvar nothing writes is `Dynamic[Top]` (row g2); `$g = nil` at top level
-    /// or `$g = "s"` in a def keeps firing (rows r15/g3), and a gvar written
-    /// only from an untyped parameter is untyped (row n4).
-    fn gvar_is_reference_untyped(
-        &self,
-        ast: &LoweredAst,
-        root: &str,
-        seen: &mut Vec<String>,
-    ) -> bool {
+    /// or `$g = "s"` in a def keeps firing (rows r15/g3), and a gvar with any
+    /// untyped write is imprecise (rows n4, g01/g02).
+    fn gvar_reach(&self, ast: &LoweredAst, root: &str, seen: &mut Vec<String>) -> Reach {
         let writes: Vec<NodeId> = ast
             .iter()
             .filter_map(|(_, n)| match n {
@@ -1938,7 +2156,20 @@ impl<'i> Typer<'i> {
                 _ => None,
             })
             .collect();
-        writes.iter().all(|&v| self.expr_is_reference_untyped(ast, v, seen))
+        self.writes_reach(ast, &writes, seen)
+    }
+
+    /// A flow-insensitive table entry: untyped when nothing writes it, else
+    /// the join of its writes.
+    fn writes_reach(&self, ast: &LoweredAst, writes: &[NodeId], seen: &mut Vec<String>) -> Reach {
+        if writes.is_empty() {
+            return Reach::UNTYPED;
+        }
+        let mut reach = Reach::NONE;
+        for &v in writes {
+            reach = reach.join(self.expr_reach(ast, v, seen));
+        }
+        reach
     }
 
     /// The CONSTANT arm: a name NOTHING can resolve reads `Dynamic[Top]` on the
@@ -2420,18 +2651,23 @@ impl<'i> Typer<'i> {
     ///
     /// ## The gate
     ///
-    /// Withhold only when an argument is REFERENCE-UNTYPED
-    /// ([`Typer::arg_is_reference_untyped`], the same allow-list the Kernel
-    /// folds use). An untyped argument is what makes the reference unable to
-    /// value-fold the call, which is what leaves the union standing: with a
-    /// LITERAL argument the reference folds `"abc"[0]` to `"a"` and fires, and
-    /// rigor-rs's bare `String` matches that row — so gating on untypedness
-    /// keeps every such row (`"abc"[0]`, `"abc"[1..]`, `"abc".byteslice(1)`,
-    /// `"abc".index("b")`, `"abc".slice(1)`, all measured BOTH before and after).
+    /// Withhold only when an argument is REFERENCE-IMPRECISE — untyped, or
+    /// since #1021 (`5496acd6`) a union with an untyped member
+    /// ([`Typer::arg_reach`], the same analysis the Kernel folds use:
+    /// `s = 1 if s.nil?; "abc"[s]` and `"abc".index(s)` are reference-silent
+    /// now, rows r01/r11). An imprecise argument is what makes the reference
+    /// unable to value-fold the call, which is what leaves the union standing:
+    /// with a LITERAL argument the reference folds `"abc"[0]` to `"a"` and
+    /// fires, and rigor-rs's bare `String` matches that row — so gating on
+    /// imprecision keeps every such row (`"abc"[0]`, `"abc"[1..]`,
+    /// `"abc".byteslice(1)`, `"abc".index("b")`, `"abc".slice(1)`, all measured
+    /// BOTH before and after). A union's precise members can narrow the
+    /// reference's candidate set back to one agreeing return, which this
+    /// declines on anyway — a coverage loss, never a false positive.
     ///
     /// The index test runs FIRST and the arena walk only if it says the answer
-    /// is at risk: `arg_is_reference_untyped` is two arena scans per argument
-    /// (see its own COST note), and tier 3 is the hot dispatch path.
+    /// is at risk: `arg_reach` is two arena scans per root visited (see its own
+    /// COST note), and tier 3 is the hot dispatch path.
     ///
     /// Known withholdings, recorded not chased: an argument the reference types
     /// but rigor-rs cannot see as such stays firing (a class-GUARDED parameter —
@@ -2455,8 +2691,7 @@ impl<'i> Typer<'i> {
         }
         let untyped = interner.untyped();
         args.iter().any(|&a| {
-            self.type_of(ast, a, env, interner) == untyped
-                && self.arg_is_reference_untyped(ast, a)
+            self.type_of(ast, a, env, interner) == untyped && self.arg_reach(ast, a).untyped
         })
     }
 
@@ -6489,8 +6724,221 @@ fn locals_in_span(ast: &LoweredAst, span: rigor_parse::Span) -> HashSet<String> 
     out
 }
 
+/// What the REFERENCE's type for a value can hold, as far as the overload
+/// selector's `imprecise_arg?` (#1021, `5496acd6`) and the joins behind it
+/// care. Computed by [`Typer::arg_reach`]; the flags join by OR.
+///
+/// `untyped` is the question every #521/#1021 gate asks: is the bare
+/// `Dynamic[Top]` carrier the whole type or a member of its union. For
+/// `Float`, `Integer` (both arities) and `Array` that alone decides — each has
+/// an overload that takes anything (`(untyped, ?exception: bool) -> Float?`,
+/// `(untyped, ?untyped, ?exception: bool) -> Integer?`, `[T] (T) -> [T]`) plus
+/// an interface overload whose gradual acceptance is lenient, so whatever the
+/// union's precise members are, two overloads with different returns survive
+/// and the join is `Dynamic[union]` (grid G1, eleven member kinds, all silent).
+///
+/// `rand` is the exception, and what `precise` / `opaque` are for. Its
+/// overloads are `(?0) -> Float`, `(int) -> Integer` and two Range ones, and a
+/// union argument must be accepted member-wise: a string, `nil`, a non-zero
+/// Integer, a Float, a Symbol, an Array or Hash literal, `true` rules out
+/// every overload but `(int)` (whose `_ToInt` arm accepts leniently), so the
+/// join is `Integer` and the reference FIRES (grid G1 row R); only a Range or
+/// the literal `0` member keeps a second overload alive. So `rand` declines
+/// only when the argument is BARE untyped (`!precise`) or a member might be
+/// one of those (`opaque` — also any precise value this analysis cannot see
+/// into, the conservative side).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reach {
+    /// A `Dynamic[Top]` value may reach.
+    untyped: bool,
+    /// A precisely-typed value may reach.
+    precise: bool,
+    /// A precise value that is not known to be a `rand`-pinning literal may
+    /// reach (a Range, the literal `0`, or anything not a literal).
+    opaque: bool,
+}
+
+impl Reach {
+    /// Nothing reaches (a join's identity, and a revisited recursion node).
+    const NONE: Reach = Reach { untyped: false, precise: false, opaque: false };
+    /// Only the untyped carrier reaches.
+    const UNTYPED: Reach = Reach { untyped: true, precise: false, opaque: false };
+    /// A precise literal `rand` would pin on.
+    const LITERAL: Reach = Reach { untyped: false, precise: true, opaque: false };
+    /// A precise value of unknown shape.
+    const OPAQUE: Reach = Reach { untyped: false, precise: true, opaque: true };
+    /// Anything at all — the decline side of every gate.
+    const UNKNOWN: Reach = Reach { untyped: true, precise: true, opaque: true };
+
+    fn join(self, other: Reach) -> Reach {
+        Reach {
+            untyped: self.untyped || other.untyped,
+            precise: self.precise || other.precise,
+            opaque: self.opaque || other.opaque,
+        }
+    }
+
+    /// Whether `rand(arg)` declines: see the type's doc.
+    fn declines_rand(self) -> bool {
+        self.untyped && (!self.precise || self.opaque)
+    }
+}
+
+/// One write of a local, as [`Typer::local_reach`] collects them.
+#[derive(Debug, Clone, Copy)]
+enum LocalWrite {
+    /// `x = v`.
+    Plain(NodeId),
+    /// `x op= v` — keeps the old value on some path, so it never cuts one off.
+    Op(NodeId),
+    /// `a, x = v` — the right-hand side.
+    Multi(NodeId),
+}
+
+/// The span of the LAST statement on `use_span`'s statement path that
+/// DEFINITELY assigns the variable `is_target` recognises — the flow cut of
+/// [`Typer::local_reach`] and [`Typer::ivar_reach`].
+///
+/// Starting from `body` (a `def` body, or the file), the walk takes the
+/// statement containing the read, checks every statement BEFORE it, and
+/// descends into the branch, loop body, `begin`/`rescue`/`ensure` section or
+/// block body that holds the read, repeating there. A `->` body is not
+/// entered (its writes never bind on the reference, rows r11/p13), nor is any
+/// other expression shape. A statement definitely assigns when it is the
+/// write, or an `if`/`else` or an `else`-bearing `case` every arm of which
+/// definitely assigns or ends in `return` (row l05), or a sequence containing
+/// such a statement. A `begin` body with a `rescue` does not count — the
+/// `rescue` path may skip the write (row l24, reference-silent).
+fn latest_definite_assignment(
+    ast: &LoweredAst,
+    body: &[NodeId],
+    use_span: rigor_parse::Span,
+    is_target: &dyn Fn(&Node) -> bool,
+) -> Option<rigor_parse::Span> {
+    let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
+    let holds = |b: &[NodeId]| b.iter().any(|&s| contains(ast.get(s).span(), use_span));
+    let mut kill = None;
+    let mut body: &[NodeId] = body;
+    for _ in 0..64 {
+        let Some(pos) = body.iter().position(|&s| contains(ast.get(s).span(), use_span)) else {
+            break;
+        };
+        for &s in &body[..pos] {
+            if definitely_assigns(ast, s, is_target) {
+                kill = Some(ast.get(s).span());
+            }
+        }
+        // The statement's own sections first; failing that (the read sits in
+        // an expression — `x = items.map { |v| t = 1; Float(t) }`, a hash of
+        // `lambda {}`s, an `if` predicate's block), the OUTERMOST section of a
+        // node nested in it. Skipping the expression layers in between is
+        // sound: an expression orders no statements, so only a section can
+        // hold a cut. A `->` between the statement and the read stops the
+        // walk — its writes never bind (rows r11/p13).
+        let stmt = body[pos];
+        let next: Option<&[NodeId]> =
+            statement_sections(ast, stmt).into_iter().find(|b| holds(b)).or_else(|| {
+                let outer = ast.get(stmt).span();
+                let mut best: Option<(rigor_parse::Span, &[NodeId])> = None;
+                for (id, n) in ast.iter() {
+                    let sp = n.span();
+                    if id == stmt || !contains(outer, sp) || !contains(sp, use_span) {
+                        continue;
+                    }
+                    if matches!(n, Node::Lambda { .. }) {
+                        return None;
+                    }
+                    if best.is_some_and(|(b, _)| sp.1 - sp.0 <= b.1 - b.0) {
+                        continue;
+                    }
+                    if let Some(section) = statement_sections(ast, id).into_iter().find(|b| holds(b)) {
+                        best = Some((sp, section));
+                    }
+                }
+                best.map(|(_, section)| section)
+            });
+        match next {
+            Some(b) => body = b,
+            None => break,
+        }
+    }
+    kill
+}
+
+/// The statement lists a node sequences — an `if`'s arms, a `case`'s `when`
+/// bodies and `else`, a loop body, a `begin`'s body / `ensure` / `rescue`
+/// clauses, a block body, a parenthesised sequence. A `->` body is not one
+/// (see [`latest_definite_assignment`]), nor is a nested `def`'s.
+fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
+    match ast.get(id) {
+        Node::If { then_body, else_body, .. } => vec![then_body, else_body],
+        Node::Case { branches, else_body, .. } => branches
+            .iter()
+            .filter_map(|&w| match ast.get(w) {
+                Node::When { body, .. } => Some(body.as_slice()),
+                _ => None,
+            })
+            .chain(std::iter::once(else_body.as_slice()))
+            .collect(),
+        Node::Loop { body, .. } | Node::Statements { body, .. } => vec![body],
+        Node::BeginRescue { body, ensure_body, clauses, .. } => [body.as_slice(), ensure_body]
+            .into_iter()
+            .chain(clauses.iter().map(|c| c.body.as_slice()))
+            .collect(),
+        Node::Call { block_body, .. } => vec![block_body],
+        _ => Vec::new(),
+    }
+}
+
+/// Whether statement `id` is a `return`, possibly wrapped in the clause-less
+/// carrier an `else` clause lowers to — an `if` arm that never falls through.
+fn ends_in_return(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::Return { .. } => true,
+        Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
+            body.last().is_some_and(|&l| ends_in_return(ast, l))
+        }
+        Node::Statements { body, .. } => body.last().is_some_and(|&l| ends_in_return(ast, l)),
+        _ => false,
+    }
+}
+
+/// Whether statement `id` assigns on every path that falls through it — see
+/// [`latest_definite_assignment`].
+fn definitely_assigns(ast: &LoweredAst, id: NodeId, is_target: &dyn Fn(&Node) -> bool) -> bool {
+    let node = ast.get(id);
+    if is_target(node) {
+        return true;
+    }
+    let arm = |b: &[NodeId]| {
+        b.iter().any(|&s| definitely_assigns(ast, s, is_target))
+            || b.last().is_some_and(|&l| ends_in_return(ast, l))
+    };
+    match node {
+        Node::If { predicate, then_body, else_body, .. } => {
+            definitely_assigns(ast, *predicate, is_target) || (arm(then_body) && arm(else_body))
+        }
+        Node::Case { predicate, branches, else_body, .. } => {
+            predicate.is_some_and(|p| definitely_assigns(ast, p, is_target))
+                || (!else_body.is_empty()
+                    && arm(else_body)
+                    && branches.iter().all(|&w| match ast.get(w) {
+                        Node::When { body, .. } => arm(body),
+                        _ => false,
+                    }))
+        }
+        Node::Statements { body, .. } => body.iter().any(|&s| definitely_assigns(ast, s, is_target)),
+        // A clause-less `begin` — which is also the carrier an `if`'s `else`
+        // clause lowers to — runs its body to the end.
+        Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
+            body.iter().any(|&s| definitely_assigns(ast, s, is_target))
+        }
+        _ => false,
+    }
+}
+
 /// The BINDING a value expression is rooted at, for
-/// [`Typer::arg_is_reference_untyped`]. The five kinds each have their own
+/// [`Typer::arg_reach`]. The five kinds each have their own
 /// "would the reference type this `Dynamic[Top]`" rule; nothing else can be
 /// answered (a literal, an implicit-self call, `self`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6527,7 +6975,7 @@ impl UntypedRoot {
 /// `@config.presence`. `None` for any other root (a literal, an implicit-self
 /// call, `self`).
 ///
-/// Used by [`Typer::arg_is_reference_untyped`]. Walking receivers is sound for
+/// Used by [`Typer::arg_reach`]. Walking receivers is sound for
 /// that purpose because a call on an untyped receiver is itself untyped on the
 /// reference — which is exactly fixture 60's `Float(kwargs[:upload_duration])`
 /// and row z8's `Array(@s8.to_s)`. `depth` bounds the walk so a pathological
@@ -8558,10 +9006,14 @@ mod m2_go_slice_tests {
         assert_eq!(ty(b"def f(c)\n  Array(c)\nend\n"), "Dynamic[top]");
         // …but a REBOUND local is typed on the REFERENCE, so the decline must
         // not reach it and the nominal fallback stands. (rigor-rs's own env is
-        // empty inside a method body — see `arg_is_reference_untyped` — so the
+        // empty inside a method body — see `arg_reach` — so the
         // answer here is the nominal `Class<4>`, not the Tuple the reference
         // sees; that gap is older than this slice.)
         assert_eq!(ty(b"def f(c)\n  c = [1, 2]\n  Array(c)\nend\n"), "Class<4>");
+        // #1021: a CONDITIONAL rebind leaves the parameter reachable — the
+        // reference's `Dynamic[top] | [1, 2]` is imprecise and declines too.
+        assert_eq!(ty(b"def f(c)\n  c = [1, 2] if c.nil?\n  Array(c)\nend\n"), "Dynamic[top]");
+        assert_eq!(ty(b"def f(c)\n  c ||= [1, 2]\n  Array(c)\nend\n"), "Dynamic[top]");
         // rand: 0-arg Float (Class<2>); a non-Range 1-arg with a TYPED argument
         // Integer (Class<1>, the reference's measured overload pick); an untyped
         // argument declines (#521), and a Range arg declines as before.
@@ -8570,6 +9022,10 @@ mod m2_go_slice_tests {
         assert_eq!(ty(b"def f(c)\n  rand(c)\nend\n"), "Dynamic[top]");
         assert_eq!(ty(b"def f(c)\n  c = 5\n  rand(c)\nend\n"), "Class<1>");
         assert_eq!(ty(b"rand(1..5)\n"), "Dynamic[top]");
+        // A union's precise members still pin `rand` (only `(int)` accepts a
+        // String member, grid G1), unless one is a Range (or `0`).
+        assert_eq!(ty(b"def f(c)\n  c = 'x' if c.nil?\n  rand(c)\nend\n"), "Class<1>");
+        assert_eq!(ty(b"def f(c)\n  c = (1..2) if c.nil?\n  rand(c)\nend\n"), "Dynamic[top]");
     }
 
     /// The #521 decline over roots that are NOT a `def` local — ivar, cvar,
@@ -8600,9 +9056,10 @@ mod m2_go_slice_tests {
             rigor_types::describe(&i, t)
         };
         // IVAR: no write in the class at all, and a write from an untyped ctor
-        // parameter, are both the carrier; a ctor literal and a non-ctor untyped
-        // write (which the reference's read-before-write pass makes nil-bearing)
-        // are not.
+        // parameter, are both the carrier; a ctor literal is not. A non-ctor
+        // untyped write is `Dynamic[top] | nil` on the reference (its
+        // read-before-write pass adds the nil) — imprecise since #1021, so it
+        // declines too, as does an untyped write beside a typed one.
         assert_eq!(ty(b"class C\n  def v\n    Array(@x)\n  end\nend\n"), "Dynamic[top]");
         assert_eq!(
             ty(b"class C\n  def initialize(c)\n    @x = c\n  end\n  def v\n    Array(@x)\n  end\nend\n"),
@@ -8614,6 +9071,15 @@ mod m2_go_slice_tests {
         );
         assert_eq!(
             ty(b"class C\n  def s(c)\n    @x = c\n  end\n  def v\n    Array(@x)\n  end\nend\n"),
+            "Dynamic[top]"
+        );
+        assert_eq!(
+            ty(b"class C\n  def initialize(c)\n    @x = c\n  end\n  def r\n    @x = 1\n  end\n  def v\n    Array(@x)\n  end\nend\n"),
+            "Dynamic[top]"
+        );
+        // …unless the reading def itself definitely rebinds it first.
+        assert_eq!(
+            ty(b"class C\n  def initialize(c)\n    @x = c\n  end\n  def v\n    @x = 1\n    Array(@x)\n  end\nend\n"),
             "Class<4>"
         );
         // CVAR: a class-body write is never recorded; a `def`-body one is.
@@ -8628,6 +9094,10 @@ mod m2_go_slice_tests {
         // GVAR: program-wide, so a top-level write counts.
         assert_eq!(ty(b"def f\n  Array($g)\nend\n"), "Dynamic[top]");
         assert_eq!(ty(b"$g = nil\ndef f\n  Array($g)\nend\n"), "Class<4>");
+        assert_eq!(
+            ty(b"$g = nil\ndef w(c)\n  $g = c\nend\ndef f\n  Array($g)\nend\n"),
+            "Dynamic[top]"
+        );
         // PROC-LIKE parameters are untyped; an ORDINARY block's parameter is
         // typed from the RBS yield and must keep its pin.
         assert_eq!(ty(b"F = ->(a) { Array(a) }\n"), "Dynamic[top]");
