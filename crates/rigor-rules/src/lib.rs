@@ -885,6 +885,7 @@ fn unresolved_toplevel_diagnostics(
         })
         .collect();
     scope_spans.extend(meta_new_block_body_spans(ast));
+    scope_spans.extend(receiver_eval_block_spans(ast));
 
     for (_, n) in ast.iter() {
         if let Node::Call { receiver: None, method, message_span, .. } = n {
@@ -1023,6 +1024,57 @@ fn meta_new_block_body_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
         }
     }
     out
+}
+
+/// The reference's `RECEIVER_EVAL_CALL_NAMES` (`check_rules.rb`, upstream #1135
+/// / `ee33407e`): the calls whose literal block Ruby evaluates with `self`
+/// rebound to the receiver.
+const RECEIVER_EVAL_CALL_NAMES: &[&str] = &[
+    "class_eval",
+    "module_eval",
+    "class_exec",
+    "module_exec",
+    "instance_eval",
+    "instance_exec",
+];
+
+/// The literal-block regions of every `class_eval` / `module_eval` /
+/// `class_exec` / `module_exec` / `instance_eval` / `instance_exec` call in the
+/// file — `call.unresolved-toplevel` declines any receiverless call inside one.
+///
+/// A faithful port of the reference's `receiver_eval_block_ranges` +
+/// `call_inside_receiver_eval_ranges?` (upstream #1135, `ee33407e` / `f918c6f0`,
+/// pin `e59b7b89`): an eval body is morally a class body, so ADR-34 stays silent
+/// there — on a genuinely undefined name too. The reference keys on the call's
+/// NAME alone and on offsets alone, so, unlike [`meta_new_block_body_spans`]:
+///
+/// * the receiver shape is irrelevant — a constant, a local, `self`, another
+///   call, or NO receiver at all (a bare `class_eval do … end`) all qualify;
+/// * the range is the whole `BlockNode` (`{ … }` and `do … end` alike,
+///   parameters and delimiters included), so a call inside a `def` or a nested
+///   block within the eval block is covered, and so is a heredoc body that sits
+///   textually inside it;
+/// * only a LITERAL block counts: the string form `class_eval("…")` and the
+///   block-pass `class_eval(&blk)` carry no `BlockNode`, and the arguments keep
+///   the enclosing scope — `Foo.class_eval(helper) do … end` still fires on
+///   `helper`.
+///
+/// The measured motive: 9 standing-sweep false positives in rspec's
+/// `minitest_integration.rb` (`Minitest::Test.class_eval do include
+/// ::RSpec::Matchers … end`). Upstream's companion `fb781023` (moving eval-block
+/// `def`s off the toplevel-def table) is deliberately NOT ported with it: alone
+/// it only removes resolutions, i.e. would create firings.
+fn receiver_eval_block_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+    ast.iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call { method, block_span: Some(block), .. }
+                if RECEIVER_EVAL_CALL_NAMES.contains(&method.as_str()) =>
+            {
+                Some(*block)
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Whether `span` is contained in ANY of `spans` (non-strict). Used to decide a
@@ -6052,6 +6104,48 @@ mod tests {
         assert_eq!(d.len(), 2, "args and trailing call stay toplevel, got {d:?}");
         assert_eq!(line_col(src, d[0].start_offset), (1, 15));
         assert_eq!(line_col(src, d[1].start_offset), (4, 1));
+    }
+
+    #[test]
+    fn unresolved_toplevel_silent_inside_receiver_eval_blocks() {
+        // Upstream #1135 (`ee33407e`, pin `e59b7b89`): the reference declines any
+        // receiverless call inside the literal block of a call NAMED
+        // `class_eval` / `module_eval` / `class_exec` / `module_exec` /
+        // `instance_eval` / `instance_exec`, whatever the receiver — constant,
+        // local, or none. Oracle at `e59b7b89`: silent on each.
+        for sel in [
+            "class_eval",
+            "module_eval",
+            "class_exec",
+            "module_exec",
+            "instance_eval",
+            "instance_exec",
+        ] {
+            for src in [
+                format!("class Foo; end\nFoo.{sel} do\n  zzz_missing\nend\n"),
+                format!("class Foo; end\nx = Foo\nx.{sel} do\n  zzz_missing\nend\n"),
+                format!("class Foo; end\nFoo.{sel} {{ zzz_missing }}\n"),
+                format!(
+                    "Minitest::Test.{sel} do\n  include ::RSpec::Matchers\n  def m\n    zzz_nested\n  end\nend\n"
+                ),
+            ] {
+                let d = unresolved(src.as_bytes());
+                assert!(d.is_empty(), "eval block body is a class body: {src:?} {d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_toplevel_fires_around_receiver_eval_blocks() {
+        // The must-still-fire controls: only the LITERAL block counts. The eval
+        // call's arguments, a block-pass operand, a receiverless `class_eval`
+        // itself, and a call after the block keep the toplevel scope. Oracle at
+        // `e59b7b89`: 2:16, 4:17, 5:1, 8:1.
+        let src = b"class Foo; end\nFoo.class_eval(zzz_arg) do\nend\nFoo.class_eval(&zzz_pass)\nclass_eval do\n  zzz_body\nend\nzzz_after\n";
+        let d = unresolved(src);
+        let mut at: Vec<(usize, usize)> = d.iter().map(|x| line_col(src, x.start_offset)).collect();
+        at.sort_unstable();
+        assert_eq!(at, vec![(2, 16), (4, 17), (5, 1), (8, 1)], "got {d:?}");
     }
 
     #[test]
