@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/110_core_overlay_stringio_lazy.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 35,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `nonexistent_zzz' for StringIO"
+    }
+  ]
+}
