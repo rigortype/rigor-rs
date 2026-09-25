@@ -12,12 +12,11 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-25): pin is upstream MASTER `e59b7b89`**, 0 FP / 9,337 files.
-Retractions no gate sees, **#134–#138**, are the next port work (each its own inference
-mechanism). Pre-existing FPs: #139, #140, #146, #164, #165. Coverage: #141 (`fb781023`,
-3,002 of the 3,829 gaps), #166 and #167 (#148/#154 regressions); #142–#145 and #152 closed at
-0 rows (`.out-of-scope/`). CLI/config parity (#129 follow-ups): #155–#159, #162, #163
-ready-for-agent, #168–#171; #160 blocked upstream. Also #130, #132. `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
+▶ **NEXT (2026-09-26): pin `e59b7b89`, 0 FP / 9,337.** Retractions no gate sees:
+**#134–#138** (a mechanism each). FPs: #139, #140, #146, #164. Coverage: #141 (`fb781023`,
+3,002 of 3,829 gaps), #166/#167 regressions; #142–#145/#152 closed at 0 rows.
+CLI/config parity (#129): #155–#159, #162–#163, #168–#171; #160 blocked upstream. Also
+#130 (waits for `0.4.0` tag; ADR-109 drops `int<min,max>`), #132.
 
 - Measurement-tool lesson (binding): audit at NODE granularity — per-file
   histograms net over-claims against under-claims.
@@ -102,6 +101,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-26 #165 CLOSED** (PR #175): `wrong-arity` declines on splat/kwarg/`...`; `&b`→#176. 0 FP; fx 116. [note](notes/20260926-issue-165-splat-arity.md).
 - **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 4 review rounds found 39 FP families no gate saw; **0 FP / 9,337, = master**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
 - **2026-09-25 #151 CLOSED + #153 rows 1–3** (PR #154): `Statements` carriers gain a kind (`Inert` = `defined?`/`END`/`BEGIN`/`super`/`yield`, writes dropped; `Recovered` widens); `for` index is a rebind. **0 FP / 9,337, = master**; fixture 114 exact. Review: 0 new keys. [note](notes/20260925-issues-151-153-binder-writes.md).
 - **2026-09-25 #121 CLOSED** (PR #149): String `[]`/`slice`/`byteslice`/`index` fold on literals; a class-guarded param drops the nilable slot (10 FPs). Review BLOCKed a stale-top-local nil fold (now declines) and found `i32`→`0` literal lowering and `nil&.m`, both fixed. **0 FP / 9,337, gaps = master**; fixture 113. [note](notes/20260925-string-lookup-fold-guarded-arg.md).
