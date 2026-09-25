@@ -262,6 +262,8 @@ gem is indistinguishable from a real behaviour change in the diff alone.
    port's constant folder learns `String#[]` / `#slice` / `#byteslice` / `#index`
    first. Deliberately out of scope here; it is a PRE-EXISTING false positive,
    not one this change introduces, and it is named in fixture 106's trailer.
+   **Closed for nilable returns by issue #121** — see
+   [`20260925-string-lookup-fold-guarded-arg.md`](20260925-string-lookup-fold-guarded-arg.md).
 2. **The carrier is `Dynamic[top]`, not the reference's union.** `annotate` shows
    `Dynamic[top]` where the reference shows `String?` or `Dynamic[Array[…] |
    Array[…]]`, and `coverage` counts it imprecise. No diagnostic depends on it.

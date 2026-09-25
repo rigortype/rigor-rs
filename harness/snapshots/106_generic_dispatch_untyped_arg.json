@@ -143,14 +143,14 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 143,
+      "line": 147,
       "column": 17,
       "severity": "error",
       "message": "undefined method `frobnicate_r04' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 148,
+      "line": 152,
       "column": 12,
       "severity": "error",
       "message": "undefined method `frobnicate_r25' for \"b\""

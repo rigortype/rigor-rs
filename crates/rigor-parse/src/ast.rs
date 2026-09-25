@@ -296,8 +296,10 @@ impl MultiTargets {
 pub enum Node {
     /// The compilation unit: an ordered list of top-level statements.
     Program { body: Vec<NodeId>, span: Span },
-    /// A sequence of statements (a `begin`/method/program body in Prism).
-    Statements { body: Vec<NodeId>, span: Span },
+    /// A sequence of statements (a `begin`/method/program body in Prism), or a
+    /// recovery carrier that links the recovered children of a Prism node with
+    /// no owned variant. `kind` tells the two apart; see [`StatementsKind`].
+    Statements { body: Vec<NodeId>, span: Span, kind: StatementsKind },
     /// `name = <value>`. The written local feeds the inference environment as
     /// statements are walked in order (ADR-0023 tier-0 literal typing).
     ///
@@ -367,8 +369,9 @@ pub enum Node {
     /// carries the lowered interpolation segments so calls inside `#{ … }`
     /// stay reachable for the walk, exactly like `InterpolatedString`.
     InterpolatedSymbol { parts: Vec<NodeId>, span: Span },
-    /// An integer literal (`42`).
-    IntegerLit { value: i64, span: Span },
+    /// An integer literal (`42`). `value` is `None` for a literal outside
+    /// `i64` (a Bignum): no consumer may pin it, since every scalar is `i64`.
+    IntegerLit { value: Option<i64>, span: Span },
     /// A float literal (`3.14`); `value` is the parsed `f64`.
     FloatLit { value: f64, span: Span },
     /// A symbol literal (`:foo`); `value` is the symbol name (no leading colon).
@@ -620,9 +623,18 @@ pub enum Node {
     },
     /// `while`/`until`/`for`. The (optional) predicate/collection and the loop
     /// body are lowered. Typed as `Dynamic[top]`.
+    ///
+    /// `index` is the LOCAL names a `for` index target binds (`for w in xs`,
+    /// `for a, (b, *c) in xs`), each with its target span, which sits inside the
+    /// loop's span. It is empty for `while`/`until`, and for a `for` whose index
+    /// binds no local (`for @a in xs`, `for A in xs`, `for h[:k] in xs`). The
+    /// reference binds the index to the element type on every iteration
+    /// (`statement_evaluator.rb` `bind_for_index`), so the flow write collectors
+    /// treat each name as a rebind (rigor-rs#151).
     Loop {
         predicate: Option<NodeId>,
         body: Vec<NodeId>,
+        index: Vec<(String, Span)>,
         span: Span,
     },
     /// `begin`/`rescue`/`else`/`ensure`. The protected body, each rescue body,
@@ -796,6 +808,40 @@ pub enum Node {
     Other { span: Span, jump: Option<JumpKind> },
 }
 
+/// What a [`Node::Statements`] carrier is, for the passes that thread a local
+/// environment through it (rigor-rs#151 / #153).
+///
+/// The lowering links recovered children under a `Statements` carrier so the
+/// structural walks (the call rules, `flow.dead-assignment`'s read gather) keep
+/// seeing them. That carrier used to look exactly like a real statement
+/// sequence, so the env binders descended it as straight-line code and bound a
+/// write that runs conditionally, later, or never. Every structural walk ignores
+/// `kind`; only a pass that BINDS or WIDENS locals reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StatementsKind {
+    /// A real statement sequence: a Prism `StatementsNode`, or the `#{ … }` of
+    /// an interpolation. Its children run in order, so a write in it binds.
+    Sequence,
+    /// The generic recovery carrier of a Prism node with no owned variant: a
+    /// `rescue` modifier, `super(…)`, `yield`, a splat, … Its children are
+    /// flattened out of arbitrary expression structure, so their order and
+    /// whether they run at all are unknown (`(w = 1) rescue nil` may raise
+    /// before the write; a conditional under `super(…)` is flattened away).
+    /// A write in it must not bind; the binders widen it instead.
+    Recovered,
+    /// Code whose writes never reach the local scope, as far as flow is
+    /// concerned: a `defined?` operand (never evaluated), an `END { }` body
+    /// (deferred to exit), a `BEGIN { }` body, and the arguments and block of
+    /// `super(…)` / `super` / `yield(…)`. The reference's statement evaluator
+    /// has no handler for `DefinedNode`, `PostExecutionNode`,
+    /// `PreExecutionNode`, `SuperNode`, `ForwardingSuperNode` or `YieldNode`, so
+    /// it types them as pure expressions and leaves the scope unchanged: a write
+    /// inside neither binds nor widens (probes r2/c2, r1/c1, b1/b2, g1/g2,
+    /// s1-s5, m1/m3/m4/m5). The write collectors drop every write inside one;
+    /// see [`LoweredAst::in_inert_carrier`].
+    Inert,
+}
+
 /// Which control-flow jump an argument-less [`Node::Other`] is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JumpKind {
@@ -921,6 +967,12 @@ pub struct LoweredAst {
     /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
     /// table rather than owned nodes.
     const_mutations: Vec<ConstMutation>,
+    /// Sorted start offsets of every `LocalVariableRead`, so
+    /// [`LoweredAst::reads_local_within`] is a binary search, not an arena scan.
+    local_read_starts: Vec<usize>,
+    /// The spans of every [`StatementsKind::Inert`] carrier, for
+    /// [`LoweredAst::in_inert_carrier`].
+    inert_spans: Vec<Span>,
 }
 
 /// One site where a CONSTANT-shaped receiver is mutated — the raw material of
@@ -992,6 +1044,20 @@ impl LoweredAst {
 }
 
 impl LoweredAst {
+    /// Whether some `LocalVariableRead` starts inside `span`. A read is a leaf,
+    /// so starting inside a node's span means lying inside its subtree.
+    pub fn reads_local_within(&self, (lo, hi): Span) -> bool {
+        let i = self.local_read_starts.partition_point(|&s| s < lo);
+        self.local_read_starts.get(i).is_some_and(|&s| s < hi)
+    }
+
+    /// Whether `span` lies inside a [`StatementsKind::Inert`] carrier (a
+    /// `defined?` operand, an `END { }` / `BEGIN { }` body). A local write there
+    /// does not exist for flow: the reference never evaluates it in sequence.
+    pub fn in_inert_carrier(&self, span: Span) -> bool {
+        self.inert_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
     /// Resolve a handle to its owned node.
     pub fn get(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
@@ -1053,7 +1119,28 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
     let const_mutations = collect_const_mutations(&root_prism);
-    LoweredAst { nodes: builder.nodes, root, file_key, const_mutations }
+    let mut local_read_starts: Vec<usize> = builder
+        .nodes
+        .iter()
+        .filter_map(|n| matches!(n, Node::LocalVariableRead { .. }).then(|| n.span().0))
+        .collect();
+    local_read_starts.sort_unstable();
+    let inert_spans: Vec<Span> = builder
+        .nodes
+        .iter()
+        .filter_map(|n| match n {
+            Node::Statements { kind: StatementsKind::Inert, span, .. } => Some(*span),
+            _ => None,
+        })
+        .collect();
+    LoweredAst {
+        nodes: builder.nodes,
+        root,
+        file_key,
+        const_mutations,
+        local_read_starts,
+        inert_spans,
+    }
 }
 
 /// Mutable accumulator for the owned arena during the lowering walk.
@@ -1142,6 +1229,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::Statements {
                 body,
                 span: span_of(&stmts.location()),
+                kind: StatementsKind::Sequence,
             });
         }
 
@@ -1235,13 +1323,10 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(int) = node.as_integer_node() {
-            // Prism's `Integer` exposes only `TryInto<i32>` in this binding;
-            // for the tracer-bullet literal subset that range suffices.
-            // TODO(spec): widen to full bignum / i64 once a wider accessor is
-            // available (or via to_u32_digits) — value-lattice Constant[Int].
-            let value: i64 = TryInto::<i32>::try_into(int.value())
-                .map(i64::from)
-                .unwrap_or(0);
+            // Prism's `TryInto<i32>` covers only `i32`; the digit view widens
+            // that to all of `i64`. A Bignum lowers to `None` — never to a
+            // wrong value (`3_000_000_000` once lowered to `0` and folded).
+            let value = integer_value(&int.value());
             return self.push(Node::IntegerLit {
                 value,
                 span: span_of(&int.location()),
@@ -1698,6 +1783,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::Loop {
                 predicate,
                 body,
+                index: Vec::new(),
                 span: span_of(&while_node.location()),
             });
         }
@@ -1711,21 +1797,26 @@ impl<'src> Builder<'src> {
             return self.push(Node::Loop {
                 predicate,
                 body,
+                index: Vec::new(),
                 span: span_of(&until_node.location()),
             });
         }
 
         if let Some(for_node) = node.as_for_node() {
             // `for x in coll; …; end`. Lower the collection (a call can live
-            // there) and the body. The index target is a write target, no call.
+            // there) and the body. The index target is a write target, not an
+            // arena node: only the LOCAL names it binds are recorded, so the flow
+            // write collectors see the rebind (rigor-rs#151).
             let predicate = Some(self.lower_node(&for_node.collection()));
             let body = for_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            let index = for_index_names(&for_node.index());
             return self.push(Node::Loop {
                 predicate,
                 body,
+                index,
                 span: span_of(&for_node.location()),
             });
         }
@@ -2037,6 +2128,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::Statements {
                 body,
                 span: span_of(&embedded.location()),
+                kind: StatementsKind::Sequence,
             });
         }
 
@@ -2117,7 +2209,37 @@ impl<'src> Builder<'src> {
                 return self.push(Node::Other { span, jump: None });
             }
             let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
-            return self.push(Node::Statements { body, span });
+            return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
+        }
+
+        // `BEGIN { … }` / `END { … }`. The reference's statement evaluator has no
+        // handler for `PreExecutionNode` / `PostExecutionNode`: it types them as
+        // pure expressions (`END` as `nil`, `expression_typer.rb:174`) and leaves
+        // the scope unchanged, and an `END` body is deferred to exit
+        // (`scope_indexer.rb` `DEFERRED_RANGE_NODES`). So a write in either body
+        // never binds or widens the local it names (probes r1/c1/f7/b1/b2,
+        // rigor-rs#153). The body is still recovered, exactly as the generic
+        // carrier below recovered it, so the structural walks see the same
+        // children; only the carrier's kind differs.
+        //
+        // `super(…)`, a bare `super`, and `yield(…)` are the same case: the
+        // statement evaluator has no handler for `SuperNode`,
+        // `ForwardingSuperNode` or `YieldNode` and does not thread their
+        // arguments or block, so a write inside one never binds, at the top
+        // level, inside a `def`, or as an assignment's value (probes g1/g2,
+        // s1/s2/s3/s5, m1/m3/m4/m5).
+        if node.as_pre_execution_node().is_some()
+            || node.as_post_execution_node().is_some()
+            || node.as_super_node().is_some()
+            || node.as_forwarding_super_node().is_some()
+            || node.as_yield_node().is_some()
+        {
+            let recovered = collect_recoverable_children(node);
+            if recovered.is_empty() {
+                return self.push(Node::Other { span, jump: None });
+            }
+            let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
+            return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
         }
 
         // Anything outside the handled subset: RECOVER any meaningful descendant
@@ -2138,7 +2260,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::Other { span, jump: None });
         }
         let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
-        self.push(Node::Statements { body, span })
+        self.push(Node::Statements { body, span, kind: StatementsKind::Recovered })
     }
 
     /// Lower a Prism `NodeList` body (statement sequence) into owned ids in
@@ -2198,6 +2320,17 @@ impl<'src> Builder<'src> {
 /// total on exotic encodings.
 fn constant_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// A prism integer's value when it fits `i64`, from its little-endian `u32`
+/// digits; `None` for a Bignum.
+fn integer_value(int: &ruby_prism::Integer<'_>) -> Option<i64> {
+    let (negative, digits) = int.to_u32_digits();
+    let mut mag: i128 = 0;
+    for &d in digits.iter().rev() {
+        mag = mag.checked_mul(1 << 32)?.checked_add(i128::from(d))?;
+    }
+    i64::try_from(if negative { -mag } else { mag }).ok()
 }
 
 /// Parse a Ruby integer literal's source slice to its `i128` value for
@@ -2851,6 +2984,30 @@ fn lower_multi_target<'pr>(
     MultiTarget::Ignored { span: span_of(&node.location()) }
 }
 
+/// The local names a `for` index target binds, each with its target span — the
+/// reference's `bind_for_index` set (`statement_evaluator.rb`): a
+/// `LocalVariableTargetNode`, or the local slots of a `MultiTargetNode` (as the
+/// multi-assign binder reads them, a `*rest` slot included). A non-local index
+/// (`@a`, `A`, `h[:k]`, `a.b`) binds no local and yields nothing, and so does a
+/// bare `for *w in xs`, which the reference leaves unbound.
+fn for_index_names(index: &PrismNode<'_>) -> Vec<(String, Span)> {
+    if let Some(t) = index.as_local_variable_target_node() {
+        return vec![(constant_string(t.name().as_slice()), span_of(&t.location()))];
+    }
+    if let Some(t) = index.as_multi_target_node() {
+        let mut ignored = Vec::new();
+        return lower_multi_targets(
+            &t.lefts(),
+            t.rest().as_ref(),
+            &t.rights(),
+            span_of(&t.location()),
+            &mut ignored,
+        )
+        .bound_names();
+    }
+    Vec::new()
+}
+
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
 /// node — a local read / write / operator-write / call — WITHOUT descending past
 /// one (so [`Builder::lower_node`] recurses into it once, normally). Used by the
@@ -3157,6 +3314,98 @@ mod tests {
             });
             assert!(found, "expected LocalVariableOpWrite for `{name}` in {src:?}");
         }
+    }
+
+    #[test]
+    fn reads_local_within_finds_reads_inside_a_span_only() {
+        let src = b"s = 1\n\"abc\"[s]\n\"abc\"[0]\n";
+        let ast = lower(&crate::parse(src));
+        let span_of = |needle: &[u8]| {
+            let lo = src.windows(needle.len()).position(|w| w == needle).unwrap();
+            (lo, lo + needle.len())
+        };
+        assert!(ast.reads_local_within(span_of(b"\"abc\"[s]")));
+        assert!(!ast.reads_local_within(span_of(b"\"abc\"[0]")));
+        assert!(!ast.reads_local_within(span_of(b"s = 1")));
+    }
+
+    /// rigor-rs#151: a `for` index carries the local names it binds, each
+    /// keyed inside the loop's span; a non-local index binds nothing.
+    #[test]
+    fn for_index_names_are_carried_on_the_loop() {
+        let src = b"for w in xs; end\nfor a, (b, *c) in xs; end\nfor @i in xs; end\nfor A in xs; end\nwhile x; end\n";
+        let ast = lower(&crate::parse(src));
+        let loops: Vec<Vec<String>> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::Loop { index, span, .. } => {
+                    assert!(index.iter().all(|(_, s)| span.0 <= s.0 && s.1 <= span.1));
+                    Some(index.iter().map(|(n, _)| n.clone()).collect())
+                }
+                _ => None,
+            })
+            .collect();
+        let expect: Vec<Vec<String>> = vec![
+            vec!["w".into()],
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![],
+            vec![],
+            vec![],
+        ];
+        assert_eq!(loops, expect);
+    }
+
+    /// rigor-rs#153: the carrier kinds. A real statement list is a sequence;
+    /// `defined?`, `END`, `BEGIN`, `super` and `yield` are inert; any other
+    /// recovery (a `rescue` modifier) is `Recovered`. Every write stays in the
+    /// arena for the structural walks.
+    #[test]
+    fn statements_carriers_record_their_kind() {
+        let kinds = |src: &[u8]| -> Vec<StatementsKind> {
+            let ast = lower(&crate::parse(src));
+            ast.iter()
+                .filter_map(|(_, n)| match n {
+                    Node::Statements { kind, .. } => Some(*kind),
+                    _ => None,
+                })
+                .collect()
+        };
+        use StatementsKind::*;
+        assert_eq!(kinds(b"defined?(w = 1)\n"), [Inert]);
+        assert_eq!(kinds(b"END { w = 1 }\n"), [Inert]);
+        assert_eq!(kinds(b"BEGIN { w = 1 }\n"), [Inert]);
+        assert_eq!(kinds(b"super(w = 1)\n"), [Inert]);
+        assert_eq!(kinds(b"def m\n  yield(w = 1)\nend\n"), [Inert]);
+        assert_eq!(kinds(b"(w = 1) rescue nil\n"), [Recovered]);
+        assert_eq!(kinds(b"\"#{w = 1}\"\n"), [Sequence]);
+        let ast = lower(&crate::parse(b"x = 1\ndefined?(w = 1)\n"));
+        let writes: Vec<(Span, bool)> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::LocalVariableWrite { span, .. } => Some((*span, ast.in_inert_carrier(*span))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(writes.iter().map(|w| w.1).collect::<Vec<_>>(), [false, true]);
+    }
+
+    #[test]
+    fn integer_literals_lower_across_i64_and_decline_bignums() {
+        // Beyond `i32` used to lower to `0`; beyond `i64` must not pin at all.
+        let src = b"[1, -2, 3_000_000_000, 0x7fff_ffff_ffff_ffff, \
+                    -9223372036854775808, 9223372036854775808, 100000000000000000000]\n";
+        let ast = lower(&crate::parse(src));
+        let values: Vec<Option<i64>> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::IntegerLit { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [Some(1), Some(-2), Some(3_000_000_000), Some(i64::MAX), Some(i64::MIN), None, None]
+        );
     }
 
     #[test]

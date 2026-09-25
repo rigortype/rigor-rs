@@ -629,18 +629,28 @@ pub fn analyze_with_source_and_folder(
         // returning the first that fires.
         // Ruby method bodies are independent local scopes, so a use site inside a
         // `def` never reads the file's top-level locals (`ScopedEnv::at`).
+        let gate_env = env.gate_at(message_span);
         let env = env.at(message_span);
-        let diag = check_call(ast, recv, &method, message_span, env, &typer, interner, index)
+        // `nil&.m` never dispatches: the reference's `safe_navigation_receiver`
+        // turns a receiver that is exactly nil into `bot` for undefined-method.
+        // A `T | nil` union still flows through unchanged, as it does there.
+        let nil_skip = safe_nav && {
+            let recv_ty = typer.type_of(ast, recv, env, interner);
+            arg_is_pure_nil(interner, index, typer.source(), recv_ty)
+        };
+        let diag = (!nil_skip)
+            .then(|| check_call(ast, recv, &method, message_span, env, &typer, interner, index))
+            .flatten()
             .or_else(|| {
                 check_narrowed_call(
-                    call_id, ast, recv, &method, message_span, safe_nav, env, &typer, interner,
-                    index, &class_snaps,
+                    call_id, ast, recv, &method, message_span, safe_nav, gate_env, &typer,
+                    interner, index, &class_snaps,
                 )
             })
             .or_else(|| {
                 check_collection_call(
-                    call_id, ast, recv, &method, message_span, safe_nav, env, &typer, interner,
-                    index, &coll_snaps,
+                    call_id, ast, recv, &method, message_span, safe_nav, gate_env, &typer,
+                    interner, index, &coll_snaps,
                 )
             })
             .or_else(|| {
@@ -3046,8 +3056,18 @@ fn span_within(inner: rigor_parse::Span, outer: rigor_parse::Span) -> bool {
 /// bindings it withholds were all wrong. Method-body locals are not typed by
 /// this walk at all today (they are absent from the flat env), so nothing that
 /// used to fire correctly stops firing.
+///
+/// The top-level env widens every local a nested construct rebinds
+/// (`Typer::build_toplevel_check_env`, rigor-rs#133): the flat binder cannot see
+/// a rebind inside an `if`, a loop or a block, nor one on a `next` / `break`
+/// path. Widening only ever declines a rule that needs a concrete receiver — but
+/// the class-narrowing and collection-shape rules fire ONLY on a `Dynamic`
+/// carrier, so for them a widened local would OPEN the gate the stale concrete
+/// type closed. They read the unwidened env through [`Self::gate_at`], exactly
+/// as before.
 struct ScopedEnv {
     top: rigor_infer::TypeEnv,
+    gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
     method_bodies: Vec<rigor_parse::Span>,
 }
@@ -3055,7 +3075,8 @@ struct ScopedEnv {
 impl ScopedEnv {
     fn build(typer: &Typer, ast: &LoweredAst, interner: &mut Interner) -> Self {
         ScopedEnv {
-            top: typer.build_toplevel_env(ast, interner),
+            top: typer.build_toplevel_check_env(ast, interner),
+            gate_top: typer.build_toplevel_env(ast, interner),
             empty: rigor_infer::TypeEnv::new(),
             method_bodies: rigor_infer::method_body_spans(ast),
         }
@@ -3065,11 +3086,25 @@ impl ScopedEnv {
     /// inside a block, which DOES capture the enclosing locals), an empty env
     /// inside any method body.
     fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
-        if self.method_bodies.iter().any(|d| span_within(span, *d)) {
+        if self.in_method_body(span) {
             &self.empty
         } else {
             &self.top
         }
+    }
+
+    /// [`Self::at`] for the `Dynamic`-only gates of the class-narrowing and
+    /// collection-shape rules: the unwidened top-level env.
+    fn gate_at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
+        if self.in_method_body(span) {
+            &self.empty
+        } else {
+            &self.gate_top
+        }
+    }
+
+    fn in_method_body(&self, span: rigor_parse::Span) -> bool {
+        self.method_bodies.iter().any(|d| span_within(span, *d))
     }
 }
 

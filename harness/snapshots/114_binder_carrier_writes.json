@@ -1,0 +1,75 @@
+{
+  "fixture": "harness/corpus/114_binder_carrier_writes.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 56,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 106,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 134,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 195,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frob' for Float"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 84,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 91,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 98,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 166,
+      "column": 8,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 175,
+      "column": 8,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}
