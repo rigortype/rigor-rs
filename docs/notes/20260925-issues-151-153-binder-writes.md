@@ -140,7 +140,8 @@ An Opus reviewer ran about 190 three-way probes. They covered:
 - `type-of`, hover and `sig-gen`
 - dead-assignment
 
-**No branch-only key, no message regression at a key where master matched the reference.** The
+**No branch-only key.** The claim of no message regression was wrong: the review gate's Opus
+pass found five more at keys where master matched the reference (see Residuals, #152). The
 branch reaches some new key-matched sites where it carries master's existing wording gap, for
 example `for Integer` where the reference says `for 12`. It also removes more master FPs than
 this note lists: the `defined?(foo(v = nil))` shape, `is_a?` guards after `BEGIN`/`END`, and the
@@ -153,10 +154,23 @@ product of the widening.
 
 ## Residuals (all pre-existing or FP-safe; none adds a key)
 
-- **One message drift at a matched key, from the widening floor.** e11:
-  `w = 5; for w in [5]; end; "abc".center(w).lenght`. The reference and master both give
-  `for " abc "`. The branch gives `for String`, because the widened argument no longer
-  folds. This is the #148 trade (#152). Binding the element type would fix it.
+- **Six message drifts at matched keys, from widening (#152).** The reference and pre-branch
+  master agree on each; the branch widens `w` so the message no longer carries the value.
+  Found after merge by the review gate's Opus 5.5 pass (only e11 was known at merge).
+
+  | # | probe | reference | branch |
+  |---|---|---|---|
+  | e11 | `w = 5; for w in [5]; end; "abc".center(w).lenght` | `for " abc "` | `for String` |
+  | d3 | `w = 5; for w in [5]; end; [w].frob` | `for [5]` | `for [Dynamic[top]]` |
+  | d1 | `w = 5; (w = 5) rescue nil; "abc".center(w).lenght` | `for " abc "` | `for String` |
+  | d2 | `w = 5; (w = 5) rescue nil; [w].frob` | `for [5]` | `for [Dynamic[top]]` |
+  | d4 | `w = 5; (w = 5) rescue nil; { a: w }.frob` | `for { a: 5 }` | `for { a: Dynamic[top] }` |
+  | d6 | `w = 5; h = {}; h[w = 5] ||= 1; [w].frob` | `for [5]` | `for [Dynamic[top]]` |
+
+  e11 and d3 come from the `for`-index floor; binding the element type would fix them. d1,
+  d2, d4 and d6 come from the `Recovered` widening in `bind_check_statement`. For a rescue
+  modifier, joining the pre- and post-bind envs as the reference's `eval_rescue_modifier`
+  does would fix the same-value rows.
 - **Pre-existing FPs the floor does not cure (the key is the same on master):**
   - e7/e9/x1/x2/x5/x6: a widened or `for`-rebound argument to a folding method. The
     reference unions the argument's members and goes silent. The port says `for String` /
