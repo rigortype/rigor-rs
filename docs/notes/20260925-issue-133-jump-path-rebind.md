@@ -89,6 +89,20 @@ the fixture does not name:
 - `w = [1]; [1].each { w = nil }; w.first(1, 2, 3)`: master fires wrong-arity where the
   reference says possible-nil.
 
+## Adversarial review (before merge)
+
+An Opus reviewer probed about 80 shapes: span edge cases, recovery carriers, folds through a
+widened argument, rule precedence, and performance. It found **no branch-only FP on (rule,
+line, col)**. It did find one claim above that is too strong. Widening cannot ADD a site, but it
+can CHANGE the message at a site that all three engines flag. Take
+`w = 5; if $c; w = 5; end; "abc".center(w).lenght`: the reference and master say
+`for " abc "`, while the branch says `for String`. The widened argument no longer folds, so the
+message falls back to the RBS return. The gates key on (rule, line, col) and cannot see this.
+Accepted for this slice, and recorded with the additional coverage losses on rigor-rs#152. The
+cheapest of those is a block-param shadow (`{ |w| w = 2 }`) being counted as a rebind. The
+review also surfaced pre-existing FPs that master shares, filed as rigor-rs#153: `END { w = 1 }`,
+`defined?(w = 1)` and `(w = 1) rescue nil` are bound as straight-line writes.
+
 ## Coverage traded (FP-safe losses, all at top level)
 
 These rows used to match on `(rule, line, column)`, often with the wrong message. They are
