@@ -7644,47 +7644,175 @@ fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
             _ => None,
         })
         .collect();
-    // `(scope span, names the scope binds)` for every literal block / lambda.
-    // A block's span is its `BlockNode` span (parameters included); a lambda's
-    // is the whole `LambdaNode`. Only scopes that bind at least one name can
-    // shadow a write, so empty `locals` lists are skipped.
-    let shadow_scopes: Vec<(rigor_parse::Span, &[String])> = ast
+    // `(body descendant ids, names the scope binds)` for every literal block /
+    // lambda. The membership test must be STRUCTURAL, never span-based: a
+    // heredoc's body lines follow its opener, so a `#{w = 2}` inside a heredoc
+    // that sits in the call's arguments (or a sibling statement) lies inside
+    // the block's SPAN while evaluating in the outer scope — and the same
+    // escaping `#{…}` span makes a genuinely block-scoped interpolation write
+    // reachable only through the arg's child links, not through any body
+    // root's span (rigor-rs#166 review). Only scopes that bind at least one
+    // name can shadow a write, so empty `locals` lists are skipped.
+    let shadow_scopes: Vec<(HashSet<NodeId>, &[String])> = ast
         .iter()
         .filter_map(|(_, n)| match n {
             Node::Call {
-                block_span: Some(span),
+                block_body,
                 block_locals,
                 ..
-            } if !block_locals.is_empty() => Some((*span, block_locals.as_slice())),
-            Node::Lambda { span, locals, .. } if !locals.is_empty() => {
-                Some((*span, locals.as_slice()))
+            } if !block_locals.is_empty() => Some((
+                descendants_of(ast, block_body),
+                block_locals.as_slice(),
+            )),
+            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
+                Some((descendants_of(ast, body), locals.as_slice()))
             }
             _ => None,
         })
         .collect();
-    let mut out: Vec<(rigor_parse::Span, String)> = Vec::new();
-    for (_, n) in ast.iter() {
+    let mut out: Vec<(NodeId, rigor_parse::Span, String)> = Vec::new();
+    for (id, n) in ast.iter() {
         match n {
             Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. } => out.push((*span, name.clone())),
+            | Node::LocalVariableOpWrite { name, span, .. } => {
+                out.push((id, *span, name.clone()));
+            }
             Node::MultiWrite { targets, span, .. } => {
-                out.extend(targets.bound_names().into_iter().map(|(name, _)| (*span, name)));
+                out.extend(
+                    targets
+                        .bound_names()
+                        .into_iter()
+                        .map(|(name, _)| (id, *span, name)),
+                );
             }
             Node::BeginRescue { clauses, .. } => out.extend(
-                clauses.iter().filter_map(|c| c.bound_name.clone().map(|name| (c.span, name))),
+                clauses
+                    .iter()
+                    .filter_map(|c| c.bound_name.clone().map(|name| (id, c.span, name))),
             ),
-            Node::Loop { index, .. } => out.extend(for_index_rebinds(index)),
+            Node::Loop { index, .. } => {
+                out.extend(for_index_rebinds(index).into_iter().map(|(s, n)| (id, s, n)));
+            }
             _ => {}
         }
     }
-    out.retain(|(w, name)| {
+    out.retain(|(id, w, name)| {
         !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
-            && !shadow_scopes.iter().any(|(s, bound)| {
-                s.0 <= w.0 && w.1 <= s.1 && bound.iter().any(|b| b == name)
+            && !shadow_scopes.iter().any(|(descendants, bound)| {
+                descendants.contains(id) && bound.iter().any(|b| b == name)
             })
     });
+    let mut out: Vec<(rigor_parse::Span, String)> =
+        out.into_iter().map(|(_, s, n)| (s, n)).collect();
     drop_inert_writes(ast, &mut out);
     out
+}
+
+/// Every node reachable from `roots` through child links, roots included —
+/// the structural "inside a block body" test for [`toplevel_rebinds`]. Orphan
+/// arena nodes (a `def` parameter default, a `Range` bound — lowered for
+/// reachability but never linked under their node) are not reached; a write
+/// in one stays a rebind, which declines rather than risks a false positive.
+fn descendants_of(ast: &LoweredAst, roots: &[NodeId]) -> HashSet<NodeId> {
+    let mut seen = HashSet::new();
+    let mut stack: Vec<NodeId> = roots.to_vec();
+    while let Some(id) = stack.pop() {
+        if seen.insert(id) {
+            node_child_ids(ast.get(id), &mut stack);
+        }
+    }
+    seen
+}
+
+/// Push `n`'s child node ids — every variant field that links lowered children
+/// into the arena. Used only by [`descendants_of`]; missing a variant can only
+/// under-mark a body descendant, which keeps the write a rebind and declines
+/// (the zero-FP-safe direction).
+fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
+    match n {
+        Node::Program { body, .. }
+        | Node::Statements { body, .. }
+        | Node::Definition { body, .. }
+        | Node::ClassDef { body, .. }
+        | Node::ModuleDef { body, .. }
+        | Node::Lambda { body, .. } => out.extend_from_slice(body),
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => out.push(*value),
+        Node::MultiWrite { value, target_exprs, .. } => {
+            out.push(*value);
+            out.extend_from_slice(target_exprs);
+        }
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            out.extend_from_slice(parts);
+        }
+        Node::Call {
+            receiver,
+            args,
+            block_body,
+            ..
+        } => {
+            out.extend(receiver.iter().copied());
+            out.extend_from_slice(args);
+            out.extend_from_slice(block_body);
+        }
+        Node::If {
+            predicate,
+            then_body,
+            else_body,
+            ..
+        } => {
+            out.push(*predicate);
+            out.extend_from_slice(then_body);
+            out.extend_from_slice(else_body);
+        }
+        Node::Case {
+            predicate,
+            branches,
+            else_body,
+            ..
+        } => {
+            out.extend(predicate.iter().copied());
+            out.extend_from_slice(branches);
+            out.extend_from_slice(else_body);
+        }
+        Node::When {
+            conditions, body, ..
+        } => {
+            out.extend_from_slice(conditions);
+            out.extend_from_slice(body);
+        }
+        Node::Loop {
+            predicate, body, ..
+        } => {
+            out.extend(predicate.iter().copied());
+            out.extend_from_slice(body);
+        }
+        Node::BeginRescue {
+            body,
+            ensure_body,
+            clauses,
+            ..
+        } => {
+            out.extend_from_slice(body);
+            out.extend_from_slice(ensure_body);
+            for clause in clauses {
+                out.extend_from_slice(&clause.exceptions);
+                out.extend_from_slice(&clause.body);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            out.push(*left);
+            out.push(*right);
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            out.extend_from_slice(elements);
+        }
+        Node::Return { values, .. } => out.extend_from_slice(values),
+        _ => {}
+    }
 }
 
 /// The flow writes that need the project index or a cross-node lookup, appended

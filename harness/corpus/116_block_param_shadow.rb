@@ -155,3 +155,53 @@ w24.lenght
 w25 = "s"
 [1].each { |x25| -> { w25 = 2 } }
 w25.lenght
+
+# --- heredoc bodies run in their opener's scope, not the block's span -------
+# A `#{…}` interpolation write evaluates where the heredoc OPENER sits, but
+# its body lines follow after — so it can lie inside an enclosing block's
+# SPAN while belonging to the outer scope. Shadowing must therefore be
+# decided by structure (reachability from the block's own body), not by span
+# containment (the #166 review's h1–h9 false positives). The reference joins
+# these writes (`for 2`); the port widens instead — declined, like the other
+# captured-rebind rows.
+
+# (26) the heredoc opener is an ARGUMENT of the block's own call.
+w26 = "s"
+[1].each_slice(<<~H26.size) do |w26|
+#{w26 = 2}
+H26
+end
+w26.lenght
+
+# (27) the opener is a sibling statement; the lambda's braces wrap the body.
+w27 = "s"
+puts(<<~H27); ->(w27) {
+#{w27 = 2}
+H27
+}
+w27.lenght
+
+# (28) an xstring heredoc the same way.
+w28 = "s"
+puts(<<~`H28`); [1].each { |w28|
+#{w28 = 2}
+H28
+}
+w28.lenght
+
+# (29) FIRE control: the opener IS inside the block body, so `#{w29 = 2}`
+# evaluates inside the block — a block-scoped write, not a rebind. Both
+# engines fire `for "s"`.
+w29 = "s"
+[1].each { |w29| puts <<~H29
+#{w29 = 2}
+H29
+}
+w29.lenght
+
+# (30) twin FIRE control through an ordinary interpolated string inside the
+# body: `#{w30 = 2}` is evaluated in the block's scope, so the write is
+# block-local and both engines fire `for "s"`.
+w30 = "s"
+[1].each { |w30| puts "#{w30 = 2}" }
+w30.lenght

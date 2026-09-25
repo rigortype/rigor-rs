@@ -168,6 +168,41 @@
       "column": 5,
       "severity": "error",
       "message": "undefined method `lenght' for \"s\" | 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 174,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lenght' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 182,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lenght' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 190,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lenght' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 200,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 207,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"s\""
     }
   ]
 }
