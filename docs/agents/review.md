@@ -7,39 +7,17 @@ merges.
 
 ## Who reviews
 
-| Harness | Model | Thinking | Role |
-| --- | --- | --- | --- |
-| Claude Code subagent | Opus 5.5 (inherit the session model) | session default | the review pass when the orchestrator is a Claude session |
-| `pi` | `xai/grok-4.6` | `high` | external pass A |
-| `pi` | `claude-bridge/claude-opus-5-5` | `high` | external pass B |
+- **Claude Code subagents**: Opus 5.5, inheriting the session model.
+- **Reviewers from other agents**: Grok 4.6 and Opus 5.5, both at `high`
+  thinking, run as two independent reviews. Neither sees the other's output,
+  and **both must return `Approved`**. They catch different things: on
+  PR #154, Grok approved while Opus found six message regressions the PR text
+  denied.
 
-The two external passes run as independent reviews of every PR that changes
-`crates/`. Neither sees the other's output, and **both must return
-`Approved`**. A PR that changes only `harness/`, `docs/` or CI gets the Opus
-pass alone (`harness/review.sh N --full` forces both). The gate runs once per
-PR, on the final head after CI is green, not on every push. A `Needs fix` from
-either sends the PR back to the implementer, and both passes run again on the
-new head. The two catch different things: on PR #154, Grok approved while Opus
-found six message regressions the PR text denied.
-
-```bash
-harness/review.sh <PR number>
-```
-
-It builds the PR head and its merge base once, each in its own worktree,
-starts the passes at once
-(`pi -p` without its edit and write tools, with this file as of the PR's base
-commit as the appended prompt), and prints each verdict. `bash` stays available,
-so the prompt is what confines a pass's writes to its probe directory. A pass takes about 15 minutes. Both ids are
-subscription-backed. If either stops resolving (`pi --list-models grok-4.6`),
-report `Blocked — need human`. Neither a pay-per-use provider route nor a
-cheaper model stands in for it.
-
-`claude-bridge` runs the
-Claude Code bundled in its own `@anthropic-ai/claude-agent-sdk`, not the one on
-`PATH`. A `400 … does not support this model` means that bundle is too old.
-`pi update --extensions` leaves it pinned, so update it directly with
-`npm --prefix ~/.pi/agent/npm update @anthropic-ai/claude-agent-sdk`.
+Review once per PR, on the final head after CI is green, not on every push. A
+`Needs fix` sends the PR back to the implementer, and the review runs again on
+the new head. Read CI (`gh pr checks`) rather than re-running its gates; spend
+the time on probes and counterexamples.
 
 ## Input
 
@@ -71,8 +49,7 @@ Claude Code bundled in its own `@anthropic-ai/claude-agent-sdk`, not the one on
 ## Output
 
 Report the verdict, and make the report's **last line** exactly one of
-`Verdict: Approved`, `Verdict: Needs fix` or `Verdict: Blocked — need human`
-(`harness/review.sh` reads that line and nothing else).
+`Verdict: Approved`, `Verdict: Needs fix` or `Verdict: Blocked — need human`.
 
 - `Approved` comes with:
   1. **a PR body revision draft**: title, summary, probe tables and gate

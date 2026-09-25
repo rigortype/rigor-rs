@@ -275,7 +275,3 @@ It exits 1 on any difference.
 `gate.sh` is the quick gate before each push: `docs_check.py`, `cargo test -p`
 for the crates the branch changed, and `run_snapshot.rb`. It prints one line per
 step and the tail of the first failure. The rest runs in CI on the draft PR.
-
-`review.sh <PR>` runs the review gate (`docs/agents/review.md`) once per PR:
-it builds the PR head and its merge base, each in its own worktree, and runs
-the `pi` reviewer passes there in parallel.

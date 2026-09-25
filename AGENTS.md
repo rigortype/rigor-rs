@@ -44,10 +44,9 @@ thing that stops two agents taking the same issue.
    Record the measured outcome in the PR body: the probe tables and the gate
    numbers.
 7. **Review, then ready.** Once CI is green on the final head, run the
-   pre-ready gates, then `harness/review.sh N` once (contract in
-   `docs/agents/review.md`); its passes re-probe the parity claims
-   themselves. Only on `Approved` run `gh pr ready`. A non-draft PR means
-   "reviewed, mergeable".
+   pre-ready gates, then get the review (`docs/agents/review.md`), whose
+   reviewers re-probe the parity claims themselves. Only on `Approved` run
+   `gh pr ready`. A non-draft PR means "reviewed, mergeable".
 8. **Fold after merge.** Write the detail into a dated `docs/notes/` file or
    an ADR, then add one ledger line to `docs/CURRENT_WORK.md`.
 
@@ -81,8 +80,7 @@ budget. CI is the authority for clippy: a newer local clippy disagrees with
   The corpora are local checkouts, so this cannot run in CI. It measures
   `target/release`, not the debug build `gate.sh` makes, and refuses a release
   binary older than the crate sources.
-- The review gate, `harness/review.sh N`, about 20 minutes. Both passes for
-  a `crates/` change, the Opus pass alone otherwise.
+- The review (`docs/agents/review.md`).
 
 What the gates cannot see, so probe it by hand:
 
@@ -145,7 +143,7 @@ What the gates cannot see, so probe it by hand:
 - An implementer works in an isolated worktree, from a spec that names the
   likely mis-implementations and requires the full *Gates* list. It may
   resolve a spec-vs-oracle conflict toward the oracle; the review confirms it.
-- Reviewers from other harnesses are Grok 4.6 and Opus 5.5, both at `high`,
+- Reviewers from other agents are Grok 4.6 and Opus 5.5, both at `high`,
   run together (`docs/agents/review.md`).
 - A new worktree starts with an empty `reference/rigor`. Populate it with
   `git submodule update --init reference/rigor`, which reads the main
