@@ -508,6 +508,20 @@ pub fn scalar_has_replacement_char(s: &Scalar) -> bool {
     matches!(s, Scalar::Str(t) | Scalar::Sym(t) if t.contains('\u{FFFD}'))
 }
 
+/// Whether `s` is a `Str`/`Sym` carrying a non-ASCII char — the second mark a
+/// position- or content-sensitive fold cannot trust, this one on the FILE's
+/// script encoding rather than the literal's bytes: when the magic encoding
+/// comment names anything other than UTF-8, Ruby reads the literal's bytes
+/// under that encoding's character width, so the UTF-8 text the scalar
+/// carries does not share Ruby's char positions or slice contents (under
+/// `# encoding: binary`, `"é"[1]` is `"\xA9"` where the UTF-8 read answers
+/// `"a"` — issue #164 fix round). The caller declines such scalars exactly
+/// like [`scalar_has_replacement_char`] ones; ASCII literals are unaffected
+/// either way (byte = char for all of them).
+pub fn scalar_is_non_ascii(s: &Scalar) -> bool {
+    matches!(s, Scalar::Str(t) | Scalar::Sym(t) if !t.is_ascii())
+}
+
 /// `NUM2LONG` on a scalar argument: an Integer is itself; a Float truncates
 /// toward zero (`"abc".getbyte(1.5)` is `getbyte(1)`, probed); everything else
 /// — plus a non-finite or out-of-`long`-range Float — raises in Ruby, so the
