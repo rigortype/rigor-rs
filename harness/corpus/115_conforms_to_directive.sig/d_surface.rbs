@@ -1,0 +1,23 @@
+# ROW: a module's surface is its self types' OWN definitions (default `Object`,
+# which brings `Kernel` but not `BasicObject`), so `#==` and `#!` are missing.
+interface _Eq
+  def ==: (untyped) -> bool
+  def !: () -> bool
+  def inspect: () -> String
+end
+%a{rigor:v1:conforms-to _Eq}
+module ModEq
+end
+
+# SILENT: a class inherits `BasicObject` through its superclass chain.
+%a{rigor:v1:conforms-to _Eq}
+class ClsEq
+end
+
+# SILENT: reopening a generic class without its type parameters fails the build
+# (`GenericParameterMismatchError`), for `Set` and every class below it.
+class Set
+end
+%a{rigor:v1:conforms-to _Closable}
+class SetSub < Set[Integer]
+end

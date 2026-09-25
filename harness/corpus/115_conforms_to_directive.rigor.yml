@@ -1,0 +1,5 @@
+# Issue #129: CONFIGURES `signature_paths:` (the reference runs the
+# `conforms-to` scan only when this key is set). Staged as the project's own
+# `.rigor.yml`, so `sig` resolves to the staged `sig/` for both tools.
+signature_paths:
+  - sig

@@ -32,6 +32,10 @@ pub mod plugins;
 mod rbs;
 
 pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
+pub use rbs::{
+    parse_conforms_to, ConformanceFinding, ConformanceKind, RBS_EXTENDED_UNRESOLVED,
+    UNSATISFIED_CONFORMANCE,
+};
 
 /// The core classes this index registers, in a fixed order. The slice index of
 /// a name in this array IS its [`ClassId`] (see [`CoreIndex::class_id`]), so the
@@ -108,13 +112,34 @@ impl CoreIndex {
     /// [`Self::with_plugins`], and with no `sig/` on disk the ingestion is inert,
     /// so the default no-config path stays unchanged.
     pub fn for_project(enabled: &[String], sig_dirs: &[std::path::PathBuf]) -> Self {
+        Self::for_project_parts(enabled, sig_dirs, &[])
+    }
+
+    /// [`Self::for_project`] with the rbs-collection gem dirs passed apart
+    /// from the `signature_paths:` dirs. Every rule sees both alike; the
+    /// `conforms-to` scan (issue #129) stays silent on classes a collection
+    /// gem declares first.
+    pub fn for_project_parts(
+        enabled: &[String],
+        sig_dirs: &[std::path::PathBuf],
+        collection_dirs: &[std::path::PathBuf],
+    ) -> Self {
         let resolved: Vec<&'static plugins::BundledPlugin> = enabled
             .iter()
             .filter_map(|id| plugins::bundled_plugin(id))
             .collect();
         Self {
-            data: rbs::CoreData::load_for_project(&resolved, sig_dirs),
+            data: rbs::CoreData::load_for_project_parts(&resolved, sig_dirs, collection_dirs),
         }
+    }
+
+    /// The port's recorded RBS model as `harness/conformance_load_set.rb`
+    /// compares it with the reference's default environment (issue #129).
+    /// A harness seam, not an API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn conformance_surface_dump(&self) -> String {
+        self.data.conformance_surface_dump()
     }
 
     /// Which RBS signature source backs this index (embedded vendored set, the
@@ -123,6 +148,21 @@ impl CoreIndex {
     /// (audit-R1 / ADR-0007).
     pub fn rbs_source(&self) -> &rbs::RbsSource {
         self.data.source()
+    }
+
+    /// Issue #129: the `rigor:v1:conforms-to` rows the reference emits for the
+    /// project's signature files (`rbs_extended.unsatisfied-conformance` /
+    /// `dynamic.rbs-extended.unresolved`), in its order. Empty unless a
+    /// project `sig/` carries the directive. The CLI owns the run-level gate
+    /// (the reference scans only when `signature_paths:` is configured).
+    pub fn conformance_findings(&self) -> Vec<ConformanceFinding> {
+        self.data.conformance_findings()
+    }
+
+    /// The text of a project signature file exactly as the index parsed it
+    /// (issue #129: conformance rows are positioned against these bytes).
+    pub fn conformance_source(&self, file: &str) -> Option<&str> {
+        self.data.conformance_source(file)
     }
 
     /// How many distinct classes the loaded RBS surface registered — a coarse

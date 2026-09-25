@@ -30,6 +30,13 @@ use ruby_rbs::node::{
 // index; sorted is chosen for reproducibility.
 include!(concat!(env!("OUT_DIR"), "/embedded_rbs.rs"));
 
+// `%a{rigor:v1:conforms-to _Interface}` (issue #129, ADR-0044).
+mod conformance;
+pub use conformance::{
+    parse_conforms_to, ConformanceFinding, ConformanceKind, RBS_EXTENDED_UNRESOLVED,
+    UNSATISFIED_CONFORMANCE,
+};
+
 /// The stdlib libraries loaded on top of `core/` — the reference's
 /// `DEFAULT_LIBRARIES` (`Rigor::Environment::DEFAULT_LIBRARIES`). Each name maps
 /// to `<RBS_ROOT>/stdlib/<lib>/0/*.rbs`. A lib whose dir is absent is skipped
@@ -710,6 +717,9 @@ pub struct CoreData {
     /// constant-receiver arm, which types the CALL's return, never the constant
     /// itself. So this adds no new witnessing surface for the constant.
     object_constants: HashMap<&'static str, &'static str>,
+    /// Issue #129: the `rigor:v1:conforms-to` scan tables (see
+    /// [`conformance`]). Read only by [`Self::conformance_findings`].
+    conformance: conformance::ConformanceData,
 }
 
 impl CoreData {
@@ -767,6 +777,19 @@ impl CoreData {
         plugins: &[&crate::plugins::BundledPlugin],
         sig_dirs: &[PathBuf],
     ) -> Self {
+        Self::load_for_project_parts(plugins, sig_dirs, &[])
+    }
+
+    /// [`Self::load_for_project`] with the rbs-collection gem dirs apart from
+    /// the `signature_paths:` ones. Both are project signature files to every
+    /// rule; only the `conforms-to` scan tells them apart (issue #129: a class
+    /// first declared by a collection gem sits where the port cannot place it
+    /// in the reference's declaration order, so its directives stay silent).
+    pub fn load_for_project_parts(
+        plugins: &[&crate::plugins::BundledPlugin],
+        sig_dirs: &[PathBuf],
+        collection_dirs: &[PathBuf],
+    ) -> Self {
         // 1) Resolve the core source (override dir, else embedded), folding into a
         //    fresh builder — the SAME logic [`Self::load`] previously inlined.
         let mut builder = Builder::default();
@@ -787,7 +810,10 @@ impl CoreData {
         //    used. The reopen-union merge handles classes already present.
         for plugin in plugins {
             for (name, contents) in plugin.rbs {
+                let key = intern(&format!("plugin:{}:{name}", plugin.id));
+                builder.conformance.set_origin(Some(conformance::Origin::Plugin(key)));
                 ingest_rbs_source(&mut builder, name, contents);
+                builder.conformance.set_origin(None);
             }
         }
 
@@ -799,9 +825,11 @@ impl CoreData {
         let pre_sig: HashSet<&'static str> = builder.classes.keys().copied().collect();
         let pre_sig_qualified: HashSet<&'static str> =
             builder.qualified.keys().copied().collect();
-        for dir in sig_dirs {
-            ingest_rbs_dir(&mut builder, dir);
-        }
+        ingest_project_dirs(&mut builder, sig_dirs, collection_dirs);
+        // Issue #129: the capability-role catalogue goes in AFTER the project's
+        // own signatures, per declaration (conformance table only).
+        builder.conformance.ingest_capability_roles();
+        let conformance = std::mem::take(&mut builder.conformance).finish();
         let project_sig_classes: HashSet<&'static str> = builder
             .classes
             .keys()
@@ -842,6 +870,7 @@ impl CoreData {
                 qualified,
                 short_to_qualified,
                 object_constants,
+                conformance,
             };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
@@ -3322,6 +3351,7 @@ impl CoreData {
             short_to_qualified: HashMap::new(),
             // The stub carries no RBS object-constant declarations.
             object_constants: HashMap::new(),
+            conformance: conformance::ConformanceData::default(),
         }
     }
 
@@ -3373,6 +3403,8 @@ type BuiltData = (
 /// Accumulates parsed RBS declarations into per-class entries before flattening.
 #[derive(Default)]
 struct Builder {
+    /// Issue #129: the `conforms-to` side walk (see [`conformance`]).
+    conformance: conformance::ConformanceBuilder,
     classes: HashMap<&'static str, ClassEntry>,
     /// Short names declared at GENUINE top level (empty namespace) in at least
     /// one declaration. Threaded out via [`Self::finish`] into
@@ -3422,6 +3454,7 @@ impl Builder {
         let Ok(sig) = parse(code) else {
             return;
         };
+        self.conformance.walk(code, sig.directives(), sig.declarations());
         for decl in sig.declarations().iter() {
             // `false` = top-level (file-level) declaration: only these may enter
             // the `toplevel_classes` set. `code` is threaded so the ATM substrate
@@ -4163,6 +4196,153 @@ fn ingest_rbs_dir(builder: &mut Builder, dir: &std::path::Path) {
             }
         }
     }
+}
+
+/// Ingest the project's own signature files: every `signature_paths:` dir and
+/// every rbs-collection gem dir, exactly as the reference's
+/// `RbsLoader.project_sig_files` + `add_project_signatures` collect them —
+/// `Dir.glob(dir/**/*.rbs)` per existing directory, `File.expand_path`'d into
+/// a SET (a file reached twice loads once), added in SORTED order.
+fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_dirs: &[PathBuf]) {
+    let mut files: std::collections::BTreeMap<String, conformance::Phase> =
+        std::collections::BTreeMap::new();
+    for (dirs, phase) in [
+        (collection_dirs, conformance::Phase::Collection),
+        (sig_dirs, conformance::Phase::Project),
+    ] {
+        for dir in dirs {
+            if !dir.is_dir() {
+                continue;
+            }
+            let mut found = Vec::new();
+            if !glob_rbs(dir, &mut found) {
+                // A name the port cannot read as UTF-8: Ruby's glob sees it.
+                builder.conformance.block();
+            }
+            for f in found {
+                // A file both a `signature_paths:` dir and a collection reach
+                // counts as the project's. A path that is not UTF-8 (a
+                // component ABOVE the sig dir, on Linux) would be keyed and
+                // re-read lossily here: stand the scan down instead.
+                let abs = expand_path(&f);
+                let Some(abs) = abs.to_str() else {
+                    builder.conformance.block();
+                    continue;
+                };
+                files.insert(abs.to_string(), phase);
+            }
+        }
+    }
+    for (abs, phase) in files {
+        let Ok(code) = std::fs::read_to_string(&abs) else {
+            // A directory named `*.rbs` or a dangling link is skipped upstream
+            // too; a real file the port cannot read (not UTF-8) is one it
+            // cannot prove it reads as the reference does.
+            if std::fs::metadata(&abs).is_ok_and(|m| m.is_file()) {
+                builder.conformance.block();
+            }
+            continue;
+        };
+        // A NUL byte crashes the reference's run; `resolve-type-names` is a
+        // magic comment rbs reads Ruby-side (the port's parser never sees it).
+        if code.contains('\0') || code.contains("resolve-type-names") {
+            builder.conformance.block();
+        }
+        let key = intern(&abs);
+        let origin = match phase {
+            conformance::Phase::Collection => conformance::Origin::Collection(key),
+            conformance::Phase::Project => conformance::Origin::Project(key),
+        };
+        builder.conformance.set_origin(Some(origin));
+        let walked = builder.conformance.walks();
+        ingest_rbs_source(builder, &abs, &code);
+        // Not walked = the port's parser rejected it: never drop it silently.
+        if builder.conformance.walks() == walked {
+            builder.conformance.block();
+        }
+        builder.conformance.set_origin(None);
+    }
+}
+
+/// Ruby's `Dir.glob("<dir>/**/*.rbs")` (no `FNM_DOTMATCH`): a name starting
+/// with `.` never matches and a dot-directory is never entered; `**` does not
+/// descend into a symlinked directory; `*.rbs` matches any entry by NAME (a
+/// symlink, a dangling link, even a directory — the caller's read skips the
+/// unreadable ones). On a case-insensitive volume Ruby folds case, so
+/// `b.RBS` matches there and only there.
+///
+/// Returns `false` when an entry's name is not UTF-8 (skipped here, seen by
+/// Ruby), so the caller can stand the `conforms-to` scan down.
+fn glob_rbs(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return true;
+    };
+    let mut clean = true;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            clean = false;
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if rbs_name_matches(dir, name) {
+            out.push(path.clone());
+        }
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            clean &= glob_rbs(&path, out);
+        }
+    }
+    clean
+}
+
+/// Whether `*.rbs` matches the entry `name` in `dir` (see [`glob_rbs`]).
+fn rbs_name_matches(dir: &std::path::Path, name: &str) -> bool {
+    let n = name.len();
+    if n <= 4 || !name.is_char_boundary(n - 4) {
+        return false;
+    }
+    let (stem, ext) = name.split_at(n - 4);
+    if ext == ".rbs" {
+        return true;
+    }
+    if !ext.eq_ignore_ascii_case(".rbs") {
+        return false;
+    }
+    // Case-folded only on a case-insensitive volume: the lower-cased spelling
+    // then names the very same directory entry.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = std::fs::symlink_metadata(dir.join(name));
+        let b = std::fs::symlink_metadata(dir.join(format!("{stem}.rbs")));
+        matches!((a, b), (Ok(a), Ok(b)) if a.dev() == b.dev() && a.ino() == b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, stem);
+        cfg!(windows)
+    }
+}
+
+/// Ruby's `File.expand_path`: absolute, with `.` and `..` folded lexically
+/// (symlinks are NOT resolved, as there).
+fn expand_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = std::path::PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Fold one RBS source's declarations into `builder`. The single per-file ingest
