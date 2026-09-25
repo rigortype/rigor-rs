@@ -19,17 +19,24 @@ either sends the PR back to the implementer, and both passes run again on the
 new head.
 
 ```bash
-pi -p --model xai/grok-4.6:high --append-system-prompt docs/agents/review.md "Review PR #N at head <sha>."
+pi -p --model xai/grok-4.6:high --exclude-tools edit,write --append-system-prompt docs/agents/review.md "Review PR #N at head <sha>."
 ```
 
 ```bash
-pi -p --model claude-bridge/claude-opus-5-5:high --append-system-prompt docs/agents/review.md "Review PR #N at head <sha>."
+pi -p --model claude-bridge/claude-opus-5-5:high --exclude-tools edit,write --append-system-prompt docs/agents/review.md "Review PR #N at head <sha>."
 ```
 
-`pi` loads `AGENTS.md` itself. If a model id stops resolving
-(`pi --list-models grok-4.6`), use the same model through another provider
-(`opencode/claude-opus-5-5`, `opencode/grok-4.6`). If no provider serves it,
-report `Blocked — need human`. A cheaper model does not stand in for it.
+`pi` loads `AGENTS.md` itself; `--exclude-tools edit,write` keeps the pass
+read-only. Both ids are subscription-backed. If
+either stops resolving (`pi --list-models grok-4.6`), report
+`Blocked — need human`. Neither a pay-per-use provider route nor a cheaper
+model stands in for it.
+
+A pass takes about 15 minutes, so start both at once. `claude-bridge` runs the
+Claude Code bundled in its own `@anthropic-ai/claude-agent-sdk`, not the one on
+`PATH`. A `400 … does not support this model` means that bundle is too old.
+`pi update --extensions` leaves it pinned, so update it directly with
+`npm --prefix ~/.pi/agent/npm update @anthropic-ai/claude-agent-sdk`.
 
 ## Input
 
