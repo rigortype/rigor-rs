@@ -32,8 +32,8 @@
 //! 2. **Definition build failure.** `ConformanceChecker` skips a class whose
 //!    instance definition cannot be built: a method (def / attr / alias name)
 //!    declared twice across the class's declarations — core reopens included —
-//!    an alias to nothing, a superclass mismatch, or ANY such failure on an
-//!    ancestor. An interface whose definition cannot be built (a member
+//!    an alias to nothing, a superclass mismatch, a reopen with different type
+//!    parameters, or ANY such failure on an ancestor. An interface whose definition cannot be built (a member
 //!    redefined through an include, an unresolvable include) makes the
 //!    reference report "not loaded"; the port stays silent there instead.
 
@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 
 use ruby_rbs::node::{
     parse, AliasKind, AttributeKind, ClassNode, InterfaceNode, MethodDefinitionKind, ModuleNode,
-    Node, NodeList, TypeNameNode,
+    Node, NodeList, TypeNameNode, TypeParamVariance,
 };
 
 use super::{intern, qualified_name, type_name_str, CoreData};
@@ -223,6 +223,9 @@ pub(super) struct ConformanceBuilder {
     instance_members: HashMap<&'static str, HashSet<&'static str>>,
     def_conflicts: HashSet<&'static str>,
     explicit_super: HashMap<&'static str, String>,
+    /// The first declaration's type-parameter shape per class/module, across
+    /// ALL sources (see [`param_shape`]).
+    type_params: HashMap<&'static str, ParamShape>,
     first_seen: HashMap<&'static str, Seen>,
     annotations: Vec<AnnotationRecord>,
 }
@@ -236,6 +239,32 @@ pub(super) struct ConformanceData {
     /// Annotations in the reference's `env.class_decls` order, with those in a
     /// possibly-quarantined file already dropped.
     annotations: Vec<AnnotationRecord>,
+}
+
+/// The type-parameter shape of one class/module declaration, as
+/// `RBS::Environment::{Class,Module}Entry#validate_type_params` compares it
+/// after renaming: `(variance, unchecked)` per parameter. `None` when a
+/// parameter carries a bound or a default, whose equality the port does not
+/// model: any second declaration then counts as a mismatch (silent).
+type ParamShape = Option<Vec<(u8, bool)>>;
+
+fn param_shape(params: NodeList<'_>) -> ParamShape {
+    let mut out = Vec::new();
+    for p in params.iter() {
+        let Node::TypeParam(tp) = p else {
+            return None;
+        };
+        if tp.upper_bound().is_some() || tp.lower_bound().is_some() || tp.default_type().is_some() {
+            return None;
+        }
+        let variance = match tp.variance() {
+            TypeParamVariance::Invariant => 0,
+            TypeParamVariance::Covariant => 1,
+            TypeParamVariance::Contravariant => 2,
+        };
+        out.push((variance, tp.unchecked()));
+    }
+    Some(out)
 }
 
 /// Written `TypeNameNode` → (`A::B::_C` without leading `::`, absolute?).
@@ -345,6 +374,26 @@ impl ConformanceBuilder {
         }
     }
 
+    /// `GenericParameterMismatchError`: every declaration of a class/module
+    /// must repeat the first one's type parameters (up to renaming), so a
+    /// project `class Set` reopening core's `class Set[unchecked out A]` makes
+    /// `Set` unbuildable, and with it every class that has it as an ancestor
+    /// (oracle-measured: `Enumerable`, and through it `Hash` / `Struct`
+    /// subclasses, `File`, `StringIO`).
+    fn see_type_params(&mut self, q: &'static str, params: NodeList<'_>) {
+        let shape = param_shape(params);
+        match self.type_params.get(q) {
+            None => {
+                self.type_params.insert(q, shape);
+            }
+            Some(first) => {
+                if first.is_none() || shape.is_none() || *first != shape {
+                    self.def_conflicts.insert(q);
+                }
+            }
+        }
+    }
+
     fn record_annotations(&mut self, q: &'static str, annotations: NodeList<'_>) {
         let Some(file) = self.current_file else {
             return;
@@ -367,6 +416,7 @@ impl ConformanceBuilder {
         let q = qualified_name(enclosing, &c.name());
         self.declare_const(q, ConstKind::Class);
         self.see_class(q, usize::try_from(c.location().start()).unwrap_or(0));
+        self.see_type_params(q, c.type_params());
         if let Some(sup) = c.super_class().and_then(|s| written_name(&s.name())) {
             let text = format!("{}{}", if sup.1 { "::" } else { "" }, sup.0);
             match self.explicit_super.get(q) {
@@ -388,6 +438,7 @@ impl ConformanceBuilder {
         let q = qualified_name(enclosing, &m.name());
         self.declare_const(q, ConstKind::Module);
         self.see_class(q, usize::try_from(m.location().start()).unwrap_or(0));
+        self.see_type_params(q, m.type_params());
         self.record_annotations(q, m.annotations());
         let child: Vec<&'static str> = enclosing.iter().copied().chain([q]).collect();
         self.members(q, m.members(), &child);
@@ -556,6 +607,24 @@ impl ConformanceBuilder {
     }
 }
 
+/// Union of presence answers: present if any part has it, absent only when
+/// every part is decided.
+fn any_present(parts: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    let mut unknown = false;
+    for p in parts {
+        match p {
+            Some(true) => return Some(true),
+            Some(false) => {}
+            None => unknown = true,
+        }
+    }
+    if unknown {
+        None
+    } else {
+        Some(false)
+    }
+}
+
 /// Resolve a written reference `name` against lexical scopes `ctx` (innermost
 /// last), longest prefix first, then top level.
 fn resolve_in_ctx(
@@ -685,11 +754,22 @@ impl CoreData {
             if !self.conformance_class_buildable(ann.class) {
                 continue;
             }
-            let missing: Vec<&'static str> = required
-                .into_iter()
-                .filter(|m| !self.qualified_class_has_method(ann.class, m))
-                .collect();
-            if !missing.is_empty() {
+            // Every member must be DECIDED: one the port cannot place on the
+            // reference's surface either way silences the whole row, because a
+            // row with a shorter or longer list is as wrong as a spurious one.
+            let mut missing: Vec<&'static str> = Vec::new();
+            let mut decided = true;
+            for m in required {
+                match self.rbs_instance_has(ann.class, m, 0) {
+                    Some(true) => {}
+                    Some(false) => missing.push(m),
+                    None => {
+                        decided = false;
+                        break;
+                    }
+                }
+            }
+            if decided && !missing.is_empty() {
                 out.push(finding(ConformanceKind::Unsatisfied { missing }));
             }
         }
@@ -716,13 +796,107 @@ impl CoreData {
         for anc in &chain {
             if let Some(entry) = self.qualified.get(anc) {
                 for old in entry.aliases.values() {
-                    if !self.qualified_class_has_method(anc, old) {
+                    if self.rbs_instance_has(anc, old, 0) != Some(true) {
                         return false;
                     }
                 }
             }
         }
         true
+    }
+
+    /// Whether `class`'s RBS instance definition — what
+    /// `RBS::DefinitionBuilder#build_instance` returns and the reference's
+    /// `ConformanceChecker` reads as `provided` — has `method`. `None` when
+    /// the port cannot tell (an unresolvable reference, an unbuildable or
+    /// unknown entry): the caller then stays silent.
+    ///
+    /// Deliberately NOT [`Self::qualified_class_has_method`]: that helper
+    /// answers "present" whenever unsure, which is the safe side for an
+    /// undefined-method witness but not here, where a member wrongly counted
+    /// present shortens the reported list. It also gives a module `Object`'s
+    /// whole chain, while RBS gives a module only its self types' OWN
+    /// surfaces (default `Object`: `Object` plus `Kernel`, not `BasicObject`,
+    /// oracle-measured: `#==` and `#!` are reported missing on a module).
+    fn rbs_instance_has(&self, class: &str, method: &str, depth: usize) -> Option<bool> {
+        if depth > 32 {
+            return None;
+        }
+        let (&key, entry) = self.qualified.get_key_value(class)?;
+        if entry.instance_unbuildable {
+            return None;
+        }
+        let mut parts: Vec<Option<bool>> = Vec::new();
+        if entry.is_module {
+            // `build_instance`: each self type's `define_instance` (an
+            // interface self type contributes its members), default `Object`.
+            if entry.self_types_written.is_empty() {
+                parts.push(self.rbs_define_instance_has("Object", method, depth + 1));
+            }
+            for (w, ctx) in &entry.self_types_written {
+                parts.push(self.rbs_ref_has(w, ctx, method, depth + 1));
+            }
+        } else {
+            // `build_instance`: the superclass's whole definition first.
+            match &entry.superclass_written {
+                Some((w, ctx)) => parts.push(
+                    self.resolve_written_ref(w, ctx)
+                        .and_then(|s| self.rbs_instance_has(s, method, depth + 1)),
+                ),
+                None if key == "BasicObject" => {}
+                None => parts.push(self.rbs_instance_has("Object", method, depth + 1)),
+            }
+        }
+        parts.push(self.rbs_define_instance_has(key, method, depth + 1));
+        any_present(parts)
+    }
+
+    /// `RBS::DefinitionBuilder#define_instance`: the entry's own members, then
+    /// its included and prepended modules' (and interfaces'), recursively.
+    /// No superclass, and no self types (those only resolve aliases there).
+    fn rbs_define_instance_has(&self, class: &str, method: &str, depth: usize) -> Option<bool> {
+        if depth > 32 {
+            return None;
+        }
+        let entry = self.qualified.get(class)?;
+        if entry.instance_unbuildable {
+            return None;
+        }
+        if entry.methods.contains_key(method)
+            || entry.attr_methods.contains(method)
+            || entry.aliases.contains_key(method)
+        {
+            return Some(true);
+        }
+        any_present(
+            entry
+                .includes_written
+                .iter()
+                .chain(&entry.prepends_written)
+                .map(|(w, ctx)| self.rbs_ref_has(w, ctx, method, depth + 1)),
+        )
+    }
+
+    /// A written `include` / `prepend` / self-type reference: an interface
+    /// contributes its (built) members, a module its `define_instance`.
+    fn rbs_ref_has(
+        &self,
+        written: &str,
+        ctx: &[&'static str],
+        method: &str,
+        depth: usize,
+    ) -> Option<bool> {
+        let (name, absolute) = match written.strip_prefix("::") {
+            Some(rest) => (rest, true),
+            None => (written, false),
+        };
+        if name.rsplit("::").next().is_some_and(|leaf| leaf.starts_with('_')) {
+            let data = &self.conformance;
+            let iface = resolve_in_ctx(&data.interfaces, name, absolute, ctx)?;
+            return Some(data.required(iface, 0)?.contains(&method));
+        }
+        let target = self.resolve_written_ref(written, ctx)?;
+        self.rbs_define_instance_has(target, method, depth)
     }
 }
 
@@ -836,6 +1010,53 @@ mod tests {
         ]);
         assert_eq!(got.len(), 1, "{got:?}");
         assert!(got[0].2.starts_with("`Fires` declares"));
+    }
+
+    /// Oracle-measured on Ruby 4.0 at `e59b7b89` (PR #150 audit): a module's
+    /// surface is its self types' OWN (default `Object`, which brings `Kernel`
+    /// but not `BasicObject`), so `#==` / `#!` are missing there; a generic
+    /// class reopened without its parameters fails to build, silencing it and
+    /// every class below it.
+    #[test]
+    fn module_surface_and_generic_mismatch() {
+        let got = rows(&[(
+            "a.rbs",
+            "interface _Eq\n  def ==: (untyped) -> bool\n  def !: () -> bool\n  def inspect: () -> String\nend\n\
+             %a{rigor:v1:conforms-to _Eq}\nmodule ModEq\nend\n\
+             %a{rigor:v1:conforms-to _Eq}\nclass ClsEq\nend\n\
+             class Set\nend\n\
+             %a{rigor:v1:conforms-to _Closable}\nclass SetSub < Set[Integer]\nend\n\
+             %a{rigor:v1:conforms-to _Closable}\nmodule Enumerable\nend\n\
+             %a{rigor:v1:conforms-to _Closable}\nclass HashSub < Hash[Integer, Integer]\nend\n",
+        )]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0].2.starts_with("`ModEq` declares `conforms-to _Eq` but does not provide 2 required methods: `#==`, `#!`."),
+            "{got:?}"
+        );
+        // Renamed parameters are the same parameters: the reopen still builds.
+        let got = rows(&[(
+            "a.rbs",
+            "%a{rigor:v1:conforms-to _Closable}\nclass Array[unchecked out T]\nend\n",
+        )]);
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(got[0].2.starts_with("`Array` declares `conforms-to _Closable`"), "{got:?}");
+    }
+
+    /// The reference collects project signature files into a set of expanded
+    /// paths: a file reached through two `signature_paths:` entries loads once
+    /// (it is neither reported twice nor a duplicate declaration).
+    #[test]
+    fn a_file_reached_twice_loads_once() {
+        let (_, dir) = project(&[(
+            "a.rbs",
+            "%a{rigor:v1:conforms-to _Closable}\nclass Twice\n  def x: () -> void\nend\n",
+        )]);
+        let sig = dir.join("sig");
+        let data = CoreData::load_for_project(&[], &[sig.clone(), dir.join(".").join("sig")]);
+        let got = data.conformance_findings();
+        std::fs::remove_dir_all(dir).ok();
+        assert_eq!(got.len(), 1, "{:?}", got.iter().map(ConformanceFinding::message).collect::<Vec<_>>());
     }
 
     /// `RBS::DefinitionBuilder#build_interface` order: includes first (last

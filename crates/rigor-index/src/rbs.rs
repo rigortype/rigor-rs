@@ -3396,6 +3396,11 @@ struct Builder {
     /// Set while the project `signature_paths:` / rbs-collection dirs are
     /// ingested, so [`ingest_rbs_dir`] tags those files as PROJECT sources.
     conformance_project_phase: bool,
+    /// Project signature files already ingested, by lexically-expanded
+    /// absolute path: the reference collects them into a set
+    /// (`project_sig_files`), so `signature_paths: [sig, ./sig]` or an
+    /// overlapping `[sig, sig/sub]` loads each file once.
+    project_files_seen: HashSet<std::path::PathBuf>,
     classes: HashMap<&'static str, ClassEntry>,
     /// Short names declared at GENUINE top level (empty namespace) in at least
     /// one declaration. Threaded out via [`Self::finish`] into
@@ -4184,7 +4189,10 @@ fn ingest_rbs_dir(builder: &mut Builder, dir: &std::path::Path) {
         } else if path.extension().is_some_and(|e| e == "rbs") {
             if let Ok(code) = std::fs::read_to_string(&path) {
                 if builder.conformance_project_phase {
-                    let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+                    let abs = expand_path(&path);
+                    if !builder.project_files_seen.insert(abs.clone()) {
+                        continue;
+                    }
                     builder.conformance.set_project_file(Some(intern(&abs.to_string_lossy())));
                 }
                 ingest_rbs_source(builder, &path.to_string_lossy(), &code);
@@ -4192,6 +4200,24 @@ fn ingest_rbs_dir(builder: &mut Builder, dir: &std::path::Path) {
             }
         }
     }
+}
+
+/// Ruby's `File.expand_path`: absolute, with `.` and `..` folded lexically
+/// (symlinks are NOT resolved, as there).
+fn expand_path(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let mut out = std::path::PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// Fold one RBS source's declarations into `builder`. The single per-file ingest

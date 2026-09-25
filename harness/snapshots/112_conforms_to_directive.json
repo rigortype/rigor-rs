@@ -1,5 +1,5 @@
 {
-  "fixture": "harness/corpus/129_conforms_to_directive.rb",
+  "fixture": "harness/corpus/112_conforms_to_directive.rb",
   "diagnostics": [
     {
       "rule": "dynamic.rbs-extended.unresolved",
@@ -56,6 +56,14 @@
       "severity": "warning",
       "message": "`ProjClosable` declares `conforms-to _Closable` but does not provide required method: `#shut_hard`. Implement the missing method(s) or remove the directive.",
       "file": "sig/b_shadow.rbs"
+    },
+    {
+      "rule": "rbs_extended.unsatisfied-conformance",
+      "line": 8,
+      "column": 1,
+      "severity": "warning",
+      "message": "`ModEq` declares `conforms-to _Eq` but does not provide 2 required methods: `#==`, `#!`. Implement the missing method(s) or remove the directive.",
+      "file": "sig/d_surface.rbs"
     }
   ]
 }
