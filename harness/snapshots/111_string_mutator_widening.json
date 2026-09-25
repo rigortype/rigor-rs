@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/111_string_mutator_widening.rb",
+  "diagnostics": [
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 64,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 71,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 80,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

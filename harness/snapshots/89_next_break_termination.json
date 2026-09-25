@@ -52,6 +52,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 114,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `span_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 165,
       "column": 11,
       "severity": "error",

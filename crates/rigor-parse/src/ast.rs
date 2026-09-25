@@ -394,6 +394,16 @@ pub enum Node {
         /// so calls inside the block reach the rule walk. Empty for a call with
         /// no block. Not a *value* of the call — purely a reachability handle.
         block_body: Vec<NodeId>,
+        /// Span of the attached LITERAL block (`{ … }` / `do … end`) — Prism's
+        /// `BlockNode` location, parameters and delimiters included. `None` for
+        /// a call with no block AND for a `&expr` block-pass (a
+        /// `BlockArgumentNode`), whose expression still rides `block_body`.
+        /// Read by `call.unresolved-toplevel`'s receiver-eval carve-out, which
+        /// mirrors the reference's `receiver_eval_block_ranges` offset test —
+        /// the whole block node, not just its body statements (a heredoc body or
+        /// a block-parameter default sits inside the node but outside every
+        /// body statement's span).
+        block_span: Option<Span>,
         /// Span of the method-name token (`lenght`), the diagnostic anchor.
         message_span: Span,
         /// `true` for a safe-navigation call (`x&.foo`), `false` for a plain
@@ -488,6 +498,15 @@ pub enum Node {
         /// The full RBS-relevant parameter STRUCTURE (counts + flags), for
         /// `sig-gen`'s `initialize` stub. See [`ParamShape`].
         param_shape: ParamShape,
+        /// EVERY name the parameter list binds — required, optional, rest,
+        /// post, keyword, keyword-rest and block parameters, destructured
+        /// (`def f((a, b))`) names included — in no particular order. Empty for a
+        /// parameterless def and for a `class << X` body. Read by the #1021
+        /// reach analysis (`rigor-infer`), which must know whether a def-body
+        /// local STARTS as an untyped parameter or as an unassigned (`nil`)
+        /// local. Over-collection is safe there (a name wrongly counted as a
+        /// parameter only declines more); a missed name is not.
+        param_names: Vec<String>,
         /// Precise span of the method-NAME token (Prism `name_loc`), or `None`
         /// for a name-less `class << self` body. The
         /// `def.override-visibility-reduced` rule anchors its diagnostic here
@@ -682,7 +701,7 @@ pub enum Node {
     /// spelling the reference's `scope.ivar`/`cvar`/`global` tables key on and
     /// the discriminator between the three variable kinds. It exists for the
     /// inference layer's #521 untyped-argument gate
-    /// (`Typer::arg_is_reference_untyped`), which must decide whether the
+    /// (`Typer::arg_reach`), which must decide whether the
     /// reference would type THIS variable `Dynamic[Top]` — a question that needs
     /// the name to find the variable's writes. Nothing else reads it; the
     /// variant is still typed `Dynamic[top]`.
@@ -923,7 +942,7 @@ pub struct LoweredAst {
 /// where the Prism tree is still in hand — and consumed by the SourceIndex.
 ///
 /// The census is deliberately RAW: it names the receiver and the mutating method
-/// and leaves the `ARRAY_MUTATORS` / `HASH_MUTATORS` membership test to
+/// and leaves the `SHAPE_MUTATORS` membership test (`is_shape_mutator`) to
 /// `rigor-infer`, which owns those tables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstMutation {
@@ -1335,6 +1354,9 @@ impl<'src> Builder<'src> {
                     }
                 }
             };
+            let block_span = call
+                .block()
+                .and_then(|b| b.as_block_node().map(|bn| span_of(&bn.location())));
             // The message_loc is the method-name token; fall back to the whole
             // call span if Prism elides it (e.g. operator-ish forms).
             let message_span = call
@@ -1346,6 +1368,7 @@ impl<'src> Builder<'src> {
                 method,
                 args,
                 block_body,
+                block_span,
                 message_span,
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
@@ -1439,6 +1462,7 @@ impl<'src> Builder<'src> {
                 has_explicit_return,
                 params,
                 param_shape,
+                param_names: all_param_names(def.parameters().as_ref()),
                 name_span,
                 body,
                 span: span_of(&def.location()),
@@ -1529,6 +1553,7 @@ impl<'src> Builder<'src> {
                 has_explicit_return: false,
                 params: None,    // no single method ⇒ no param binding.
                 param_shape: ParamShape::default(),
+                param_names: Vec::new(),
                 name_span: None, // no single name ⇒ no name span.
                 body,
                 span: span_of(&sclass.location()),
@@ -2666,6 +2691,62 @@ fn param_shape_of(params: Option<&ruby_prism::ParametersNode<'_>>) -> ParamShape
         has_kwrest: p.keyword_rest().is_some(),
         has_block: p.block().is_some(),
     }
+}
+
+/// Every name a `def`'s parameter list binds, for [`Node::Definition`]'s
+/// `param_names`. A full subtree walk rather than a per-slot read, so a
+/// destructured positional (`def f((a, *b))`) and every parameter kind are
+/// covered without enumerating them twice; a default-value expression's own
+/// nested parameters (a `->(x) {}` default) are collected too, which only
+/// over-counts — the safe direction for the consumer.
+fn all_param_names(params: Option<&ruby_prism::ParametersNode<'_>>) -> Vec<String> {
+    use ruby_prism::Visit;
+    struct Names(Vec<String>);
+    impl Names {
+        fn add(&mut self, name: Option<ruby_prism::ConstantId<'_>>) {
+            if let Some(n) = name {
+                self.0.push(constant_string(n.as_slice()));
+            }
+        }
+    }
+    impl<'pr> Visit<'pr> for Names {
+        fn visit_required_parameter_node(&mut self, n: &ruby_prism::RequiredParameterNode<'pr>) {
+            self.add(Some(n.name()));
+        }
+        fn visit_optional_parameter_node(&mut self, n: &ruby_prism::OptionalParameterNode<'pr>) {
+            self.add(Some(n.name()));
+            ruby_prism::visit_optional_parameter_node(self, n);
+        }
+        fn visit_rest_parameter_node(&mut self, n: &ruby_prism::RestParameterNode<'pr>) {
+            self.add(n.name());
+        }
+        fn visit_required_keyword_parameter_node(
+            &mut self,
+            n: &ruby_prism::RequiredKeywordParameterNode<'pr>,
+        ) {
+            self.add(Some(n.name()));
+        }
+        fn visit_optional_keyword_parameter_node(
+            &mut self,
+            n: &ruby_prism::OptionalKeywordParameterNode<'pr>,
+        ) {
+            self.add(Some(n.name()));
+            ruby_prism::visit_optional_keyword_parameter_node(self, n);
+        }
+        fn visit_keyword_rest_parameter_node(
+            &mut self,
+            n: &ruby_prism::KeywordRestParameterNode<'pr>,
+        ) {
+            self.add(n.name());
+        }
+        fn visit_block_parameter_node(&mut self, n: &ruby_prism::BlockParameterNode<'pr>) {
+            self.add(n.name());
+        }
+    }
+    let Some(p) = params else { return Vec::new() };
+    let mut names = Names(Vec::new());
+    names.visit_parameters_node(p);
+    names.0
 }
 
 /// Whether a Prism `def` body contains an explicit `return` statement ANYWHERE

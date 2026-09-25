@@ -35,20 +35,6 @@
       "column": 19,
       "severity": "warning",
       "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
-    },
-    {
-      "rule": "flow.always-truthy-condition",
-      "line": 208,
-      "column": 17,
-      "severity": "warning",
-      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
-    },
-    {
-      "rule": "flow.always-truthy-condition",
-      "line": 216,
-      "column": 17,
-      "severity": "warning",
-      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
     }
   ]
 }

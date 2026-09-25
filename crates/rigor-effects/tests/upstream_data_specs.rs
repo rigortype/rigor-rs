@@ -344,8 +344,8 @@ fn catalog_gives_every_narrowed_row_a_non_empty_unnarrowed_fallback() {
 }
 
 /// **SLICE-1 DEVIATION.** Upstream asserts that every selector of
-/// `MutationWidening::ARRAY_MUTATORS` (31) / `HASH_MUTATORS` (15) /
-/// `MutationClassifier::STRING_MUTATORS` (26) answers
+/// `MutationWidening::ARRAY_MUTATORS` (31) / `MutationClassifier::HASH_MUTATORS`
+/// (20) / `StringMutation::MUTATORS` (35) — the `e59b7b89` pin's sets — answers
 /// `mutates_receiver? == true`, which is what proves the YAML and the analyser's
 /// own sets cannot drift. Those sets are Ruby CODE, not data — the internal spec
 /// makes "the data file MUST NOT re-spell a selector list" normative — so the

@@ -102,6 +102,33 @@ tools — a partial sweep must never read as a full one.
 
 Custom directories passed as positional arguments replace the whole list.
 
+## Standing sweep-set baseline (2026-09-25)
+
+`python3 harness/fp_audit.py --gaps --sweep`, reference pinned at upstream master
+`e59b7b89`, vendored rbs 4.2.0, release binary at the `upstream-pin-master-e59b7b89`
+merge of both families. **9,337 files, 0 FP candidates, 3,829 coverage gaps**
+(`gap_census.py --sweep` agrees). The raw bump measured **9 FP candidates**, all
+`call.unresolved-toplevel` inside rspec's `class_eval` blocks in mail's
+`vendor/bundle` (`ee33407e`, #1135). MATCHED counts are unchanged from the raw bump
+on every corpus.
+
+| corpus | files | matched | coverage gaps | (was, `v0.3.9`) |
+|---|---|---|---|---|
+| mastodon/app | 1236 | 420 | 18 | 18 |
+| gitlab-foss/lib | 4676 | 1087 | 156 | 162 |
+| survey/mail | 874 | 6647 | **3344** | 379 |
+| survey/Ruby | 192 | 14 | 20 | 22 |
+| survey/dependabot-core | 1781 | 156703 | 170 | 187 |
+| survey/concurrent-ruby | 345 | 5715 | 97 | 97 |
+| survey/net-ssh | 181 | 125 | 20 | 25 |
+| survey/haml/lib | 52 | 5 | 4 | 2 |
+
+**mail's +2,965 is one family, not a regression.** Upstream `fb781023` moved
+`def`s written inside `X.class_eval do … end` off the toplevel def table, so the
+reference now fires `expect` ×2,915 and `to` ×87. The port keeps the old phantom
+entries and stays silent (#141). Excluding that family, the total is 827 against
+892.
+
 ## Standing sweep-set baseline (2026-09-21)
 
 `python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.3.9`

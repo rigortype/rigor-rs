@@ -2,10 +2,10 @@
 #
 # Source: crates/rigor-effects/vendor/effects/mutators.yml — the VENDORED
 # by-reference mutator sets, i.e. the bytes the measured binary compiles in
-# (array 31, hash 15, string 26), plus crates/rigor-effects/vendor/effects/core.yml
+# (array 31, hash 20, string 35), plus crates/rigor-effects/vendor/effects/core.yml
 # for the two catalogue-row control sections.
 #
-# The MUTATOR-SET coverage gate (issue #110). `mutators.yml` carries 72
+# The MUTATOR-SET coverage gate (issue #110). `mutators.yml` carries 86
 # (set, selector) pairs and the collector's mutation judgment is their only
 # consumer, yet the rest of harness/effects-corpus touches two of them. That is
 # the shape that shipped the posture over-claim (#106): a vendored data table
@@ -61,6 +61,7 @@ K_A_SHUFFLE_BANG = []
 K_A_SLICE_BANG = []
 K_H_INDEX_SET = {}
 K_H_STORE = {}
+K_H_SHIFT = {}
 K_H_DELETE = {}
 K_H_DELETE_IF = {}
 K_H_REJECT_BANG = {}
@@ -74,12 +75,30 @@ K_H_UPDATE = {}
 K_H_TRANSFORM_KEYS_BANG = {}
 K_H_TRANSFORM_VALUES_BANG = {}
 K_H_REPLACE = {}
+K_H_DEFAULT_SET = {}
+K_H_DEFAULT_PROC_SET = {}
+K_H_COMPARE_BY_IDENTITY = {}
+K_H_REHASH = {}
 K_S_SHOVEL = +""
 K_S_CONCAT = +""
-K_S_REPLACE = +""
 K_S_INSERT = +""
 K_S_PREPEND = +""
+K_S_REPLACE = +""
 K_S_CLEAR = +""
+K_S_INDEX_SET = +""
+K_S_SLICE_BANG = +""
+K_S_SETBYTE = +""
+K_S_BYTESPLICE = +""
+K_S_APPEND_AS_BYTES = +""
+K_S_FORCE_ENCODING = +""
+K_S_SUB_BANG = +""
+K_S_GSUB_BANG = +""
+K_S_TR_BANG = +""
+K_S_TR_S_BANG = +""
+K_S_DELETE_BANG = +""
+K_S_SQUEEZE_BANG = +""
+K_S_SUCC_BANG = +""
+K_S_NEXT_BANG = +""
 K_S_UPCASE_BANG = +""
 K_S_DOWNCASE_BANG = +""
 K_S_CAPITALIZE_BANG = +""
@@ -90,16 +109,11 @@ K_S_LSTRIP_BANG = +""
 K_S_RSTRIP_BANG = +""
 K_S_CHOMP_BANG = +""
 K_S_CHOP_BANG = +""
-K_S_SQUEEZE_BANG = +""
-K_S_SUCC_BANG = +""
-K_S_NEXT_BANG = +""
-K_S_SUB_BANG = +""
-K_S_GSUB_BANG = +""
-K_S_TR_BANG = +""
-K_S_TR_S_BANG = +""
-K_S_DELETE_BANG = +""
-K_S_SLICE_BANG = +""
-K_S_INDEX_SET = +""
+K_S_DELETE_PREFIX_BANG = +""
+K_S_DELETE_SUFFIX_BANG = +""
+K_S_ENCODE_BANG = +""
+K_S_SCRUB_BANG = +""
+K_S_UNICODE_NORMALIZE_BANG = +""
 
 # The `TypeFree` constant receiver — one shared read; a constant carries no
 # per-site state.
@@ -107,7 +121,7 @@ K_TYPE_FREE = []
 
 # --- the PROVABLY-OWNED receiver ---------------------------------------------
 #
-# One method per vendored (set, selector) pair (72). The local is seeded by
+# One method per vendored (set, selector) pair (86). The local is seeded by
 # the set's own literal, so the reference's typer names the class the set
 # belongs to, and it never escapes, so `LocalOwnership#owned` proves it —
 # the one shape in which upstream proves `mutate.local` for a set member.
@@ -346,6 +360,13 @@ class Owned
     nil
   end
 
+  # hash: shift
+  def h_shift
+    recv = {}
+    recv.shift
+    nil
+  end
+
   # hash: delete
   def h_delete
     recv = {}
@@ -437,6 +458,34 @@ class Owned
     nil
   end
 
+  # hash: default=
+  def h_default_set
+    recv = {}
+    recv.default = 1
+    nil
+  end
+
+  # hash: default_proc=
+  def h_default_proc_set
+    recv = {}
+    recv.default_proc = 1
+    nil
+  end
+
+  # hash: compare_by_identity
+  def h_compare_by_identity
+    recv = {}
+    recv.compare_by_identity
+    nil
+  end
+
+  # hash: rehash
+  def h_rehash
+    recv = {}
+    recv.rehash
+    nil
+  end
+
   # string: <<
   def s_shovel
     recv = +""
@@ -448,13 +497,6 @@ class Owned
   def s_concat
     recv = +""
     recv.concat
-    nil
-  end
-
-  # string: replace
-  def s_replace
-    recv = +""
-    recv.replace
     nil
   end
 
@@ -472,10 +514,115 @@ class Owned
     nil
   end
 
+  # string: replace
+  def s_replace
+    recv = +""
+    recv.replace
+    nil
+  end
+
   # string: clear
   def s_clear
     recv = +""
     recv.clear
+    nil
+  end
+
+  # string: []=
+  def s_index_set
+    recv = +""
+    recv[0] = 1
+    nil
+  end
+
+  # string: slice!
+  def s_slice_bang
+    recv = +""
+    recv.slice!
+    nil
+  end
+
+  # string: setbyte
+  def s_setbyte
+    recv = +""
+    recv.setbyte
+    nil
+  end
+
+  # string: bytesplice
+  def s_bytesplice
+    recv = +""
+    recv.bytesplice
+    nil
+  end
+
+  # string: append_as_bytes
+  def s_append_as_bytes
+    recv = +""
+    recv.append_as_bytes
+    nil
+  end
+
+  # string: force_encoding
+  def s_force_encoding
+    recv = +""
+    recv.force_encoding
+    nil
+  end
+
+  # string: sub!
+  def s_sub_bang
+    recv = +""
+    recv.sub!
+    nil
+  end
+
+  # string: gsub!
+  def s_gsub_bang
+    recv = +""
+    recv.gsub!
+    nil
+  end
+
+  # string: tr!
+  def s_tr_bang
+    recv = +""
+    recv.tr!
+    nil
+  end
+
+  # string: tr_s!
+  def s_tr_s_bang
+    recv = +""
+    recv.tr_s!
+    nil
+  end
+
+  # string: delete!
+  def s_delete_bang
+    recv = +""
+    recv.delete!
+    nil
+  end
+
+  # string: squeeze!
+  def s_squeeze_bang
+    recv = +""
+    recv.squeeze!
+    nil
+  end
+
+  # string: succ!
+  def s_succ_bang
+    recv = +""
+    recv.succ!
+    nil
+  end
+
+  # string: next!
+  def s_next_bang
+    recv = +""
+    recv.next!
     nil
   end
 
@@ -549,73 +696,38 @@ class Owned
     nil
   end
 
-  # string: squeeze!
-  def s_squeeze_bang
+  # string: delete_prefix!
+  def s_delete_prefix_bang
     recv = +""
-    recv.squeeze!
+    recv.delete_prefix!
     nil
   end
 
-  # string: succ!
-  def s_succ_bang
+  # string: delete_suffix!
+  def s_delete_suffix_bang
     recv = +""
-    recv.succ!
+    recv.delete_suffix!
     nil
   end
 
-  # string: next!
-  def s_next_bang
+  # string: encode!
+  def s_encode_bang
     recv = +""
-    recv.next!
+    recv.encode!
     nil
   end
 
-  # string: sub!
-  def s_sub_bang
+  # string: scrub!
+  def s_scrub_bang
     recv = +""
-    recv.sub!
+    recv.scrub!
     nil
   end
 
-  # string: gsub!
-  def s_gsub_bang
+  # string: unicode_normalize!
+  def s_unicode_normalize_bang
     recv = +""
-    recv.gsub!
-    nil
-  end
-
-  # string: tr!
-  def s_tr_bang
-    recv = +""
-    recv.tr!
-    nil
-  end
-
-  # string: tr_s!
-  def s_tr_s_bang
-    recv = +""
-    recv.tr_s!
-    nil
-  end
-
-  # string: delete!
-  def s_delete_bang
-    recv = +""
-    recv.delete!
-    nil
-  end
-
-  # string: slice!
-  def s_slice_bang
-    recv = +""
-    recv.slice!
-    nil
-  end
-
-  # string: []=
-  def s_index_set
-    recv = +""
-    recv[0] = 1
+    recv.unicode_normalize!
     nil
   end
 end
@@ -860,6 +972,13 @@ class Unowned
     recv
   end
 
+  # hash: shift
+  def h_shift
+    recv = {}
+    recv.shift
+    recv
+  end
+
   # hash: delete
   def h_delete
     recv = {}
@@ -951,6 +1070,34 @@ class Unowned
     recv
   end
 
+  # hash: default=
+  def h_default_set
+    recv = {}
+    recv.default = 1
+    recv
+  end
+
+  # hash: default_proc=
+  def h_default_proc_set
+    recv = {}
+    recv.default_proc = 1
+    recv
+  end
+
+  # hash: compare_by_identity
+  def h_compare_by_identity
+    recv = {}
+    recv.compare_by_identity
+    recv
+  end
+
+  # hash: rehash
+  def h_rehash
+    recv = {}
+    recv.rehash
+    recv
+  end
+
   # string: <<
   def s_shovel
     recv = +""
@@ -962,13 +1109,6 @@ class Unowned
   def s_concat
     recv = +""
     recv.concat
-    recv
-  end
-
-  # string: replace
-  def s_replace
-    recv = +""
-    recv.replace
     recv
   end
 
@@ -986,10 +1126,115 @@ class Unowned
     recv
   end
 
+  # string: replace
+  def s_replace
+    recv = +""
+    recv.replace
+    recv
+  end
+
   # string: clear
   def s_clear
     recv = +""
     recv.clear
+    recv
+  end
+
+  # string: []=
+  def s_index_set
+    recv = +""
+    recv[0] = 1
+    recv
+  end
+
+  # string: slice!
+  def s_slice_bang
+    recv = +""
+    recv.slice!
+    recv
+  end
+
+  # string: setbyte
+  def s_setbyte
+    recv = +""
+    recv.setbyte
+    recv
+  end
+
+  # string: bytesplice
+  def s_bytesplice
+    recv = +""
+    recv.bytesplice
+    recv
+  end
+
+  # string: append_as_bytes
+  def s_append_as_bytes
+    recv = +""
+    recv.append_as_bytes
+    recv
+  end
+
+  # string: force_encoding
+  def s_force_encoding
+    recv = +""
+    recv.force_encoding
+    recv
+  end
+
+  # string: sub!
+  def s_sub_bang
+    recv = +""
+    recv.sub!
+    recv
+  end
+
+  # string: gsub!
+  def s_gsub_bang
+    recv = +""
+    recv.gsub!
+    recv
+  end
+
+  # string: tr!
+  def s_tr_bang
+    recv = +""
+    recv.tr!
+    recv
+  end
+
+  # string: tr_s!
+  def s_tr_s_bang
+    recv = +""
+    recv.tr_s!
+    recv
+  end
+
+  # string: delete!
+  def s_delete_bang
+    recv = +""
+    recv.delete!
+    recv
+  end
+
+  # string: squeeze!
+  def s_squeeze_bang
+    recv = +""
+    recv.squeeze!
+    recv
+  end
+
+  # string: succ!
+  def s_succ_bang
+    recv = +""
+    recv.succ!
+    recv
+  end
+
+  # string: next!
+  def s_next_bang
+    recv = +""
+    recv.next!
     recv
   end
 
@@ -1063,73 +1308,38 @@ class Unowned
     recv
   end
 
-  # string: squeeze!
-  def s_squeeze_bang
+  # string: delete_prefix!
+  def s_delete_prefix_bang
     recv = +""
-    recv.squeeze!
+    recv.delete_prefix!
     recv
   end
 
-  # string: succ!
-  def s_succ_bang
+  # string: delete_suffix!
+  def s_delete_suffix_bang
     recv = +""
-    recv.succ!
+    recv.delete_suffix!
     recv
   end
 
-  # string: next!
-  def s_next_bang
+  # string: encode!
+  def s_encode_bang
     recv = +""
-    recv.next!
+    recv.encode!
     recv
   end
 
-  # string: sub!
-  def s_sub_bang
+  # string: scrub!
+  def s_scrub_bang
     recv = +""
-    recv.sub!
+    recv.scrub!
     recv
   end
 
-  # string: gsub!
-  def s_gsub_bang
+  # string: unicode_normalize!
+  def s_unicode_normalize_bang
     recv = +""
-    recv.gsub!
-    recv
-  end
-
-  # string: tr!
-  def s_tr_bang
-    recv = +""
-    recv.tr!
-    recv
-  end
-
-  # string: tr_s!
-  def s_tr_s_bang
-    recv = +""
-    recv.tr_s!
-    recv
-  end
-
-  # string: delete!
-  def s_delete_bang
-    recv = +""
-    recv.delete!
-    recv
-  end
-
-  # string: slice!
-  def s_slice_bang
-    recv = +""
-    recv.slice!
-    recv
-  end
-
-  # string: []=
-  def s_index_set
-    recv = +""
-    recv[0] = 1
+    recv.unicode_normalize!
     recv
   end
 end
@@ -1373,6 +1583,13 @@ class Ivar
     nil
   end
 
+  # hash: shift
+  def h_shift
+    @recv = {}
+    @recv.shift
+    nil
+  end
+
   # hash: delete
   def h_delete
     @recv = {}
@@ -1464,6 +1681,34 @@ class Ivar
     nil
   end
 
+  # hash: default=
+  def h_default_set
+    @recv = {}
+    @recv.default = 1
+    nil
+  end
+
+  # hash: default_proc=
+  def h_default_proc_set
+    @recv = {}
+    @recv.default_proc = 1
+    nil
+  end
+
+  # hash: compare_by_identity
+  def h_compare_by_identity
+    @recv = {}
+    @recv.compare_by_identity
+    nil
+  end
+
+  # hash: rehash
+  def h_rehash
+    @recv = {}
+    @recv.rehash
+    nil
+  end
+
   # string: <<
   def s_shovel
     @recv = +""
@@ -1475,13 +1720,6 @@ class Ivar
   def s_concat
     @recv = +""
     @recv.concat
-    nil
-  end
-
-  # string: replace
-  def s_replace
-    @recv = +""
-    @recv.replace
     nil
   end
 
@@ -1499,10 +1737,115 @@ class Ivar
     nil
   end
 
+  # string: replace
+  def s_replace
+    @recv = +""
+    @recv.replace
+    nil
+  end
+
   # string: clear
   def s_clear
     @recv = +""
     @recv.clear
+    nil
+  end
+
+  # string: []=
+  def s_index_set
+    @recv = +""
+    @recv[0] = 1
+    nil
+  end
+
+  # string: slice!
+  def s_slice_bang
+    @recv = +""
+    @recv.slice!
+    nil
+  end
+
+  # string: setbyte
+  def s_setbyte
+    @recv = +""
+    @recv.setbyte
+    nil
+  end
+
+  # string: bytesplice
+  def s_bytesplice
+    @recv = +""
+    @recv.bytesplice
+    nil
+  end
+
+  # string: append_as_bytes
+  def s_append_as_bytes
+    @recv = +""
+    @recv.append_as_bytes
+    nil
+  end
+
+  # string: force_encoding
+  def s_force_encoding
+    @recv = +""
+    @recv.force_encoding
+    nil
+  end
+
+  # string: sub!
+  def s_sub_bang
+    @recv = +""
+    @recv.sub!
+    nil
+  end
+
+  # string: gsub!
+  def s_gsub_bang
+    @recv = +""
+    @recv.gsub!
+    nil
+  end
+
+  # string: tr!
+  def s_tr_bang
+    @recv = +""
+    @recv.tr!
+    nil
+  end
+
+  # string: tr_s!
+  def s_tr_s_bang
+    @recv = +""
+    @recv.tr_s!
+    nil
+  end
+
+  # string: delete!
+  def s_delete_bang
+    @recv = +""
+    @recv.delete!
+    nil
+  end
+
+  # string: squeeze!
+  def s_squeeze_bang
+    @recv = +""
+    @recv.squeeze!
+    nil
+  end
+
+  # string: succ!
+  def s_succ_bang
+    @recv = +""
+    @recv.succ!
+    nil
+  end
+
+  # string: next!
+  def s_next_bang
+    @recv = +""
+    @recv.next!
     nil
   end
 
@@ -1576,73 +1919,38 @@ class Ivar
     nil
   end
 
-  # string: squeeze!
-  def s_squeeze_bang
+  # string: delete_prefix!
+  def s_delete_prefix_bang
     @recv = +""
-    @recv.squeeze!
+    @recv.delete_prefix!
     nil
   end
 
-  # string: succ!
-  def s_succ_bang
+  # string: delete_suffix!
+  def s_delete_suffix_bang
     @recv = +""
-    @recv.succ!
+    @recv.delete_suffix!
     nil
   end
 
-  # string: next!
-  def s_next_bang
+  # string: encode!
+  def s_encode_bang
     @recv = +""
-    @recv.next!
+    @recv.encode!
     nil
   end
 
-  # string: sub!
-  def s_sub_bang
+  # string: scrub!
+  def s_scrub_bang
     @recv = +""
-    @recv.sub!
+    @recv.scrub!
     nil
   end
 
-  # string: gsub!
-  def s_gsub_bang
+  # string: unicode_normalize!
+  def s_unicode_normalize_bang
     @recv = +""
-    @recv.gsub!
-    nil
-  end
-
-  # string: tr!
-  def s_tr_bang
-    @recv = +""
-    @recv.tr!
-    nil
-  end
-
-  # string: tr_s!
-  def s_tr_s_bang
-    @recv = +""
-    @recv.tr_s!
-    nil
-  end
-
-  # string: delete!
-  def s_delete_bang
-    @recv = +""
-    @recv.delete!
-    nil
-  end
-
-  # string: slice!
-  def s_slice_bang
-    @recv = +""
-    @recv.slice!
-    nil
-  end
-
-  # string: []=
-  def s_index_set
-    @recv = +""
-    @recv[0] = 1
+    @recv.unicode_normalize!
     nil
   end
 end
@@ -1853,6 +2161,12 @@ class Konstant
     nil
   end
 
+  # hash: shift
+  def h_shift
+    K_H_SHIFT.shift
+    nil
+  end
+
   # hash: delete
   def h_delete
     K_H_DELETE.delete
@@ -1931,6 +2245,30 @@ class Konstant
     nil
   end
 
+  # hash: default=
+  def h_default_set
+    K_H_DEFAULT_SET.default = 1
+    nil
+  end
+
+  # hash: default_proc=
+  def h_default_proc_set
+    K_H_DEFAULT_PROC_SET.default_proc = 1
+    nil
+  end
+
+  # hash: compare_by_identity
+  def h_compare_by_identity
+    K_H_COMPARE_BY_IDENTITY.compare_by_identity
+    nil
+  end
+
+  # hash: rehash
+  def h_rehash
+    K_H_REHASH.rehash
+    nil
+  end
+
   # string: <<
   def s_shovel
     K_S_SHOVEL << 1
@@ -1940,12 +2278,6 @@ class Konstant
   # string: concat
   def s_concat
     K_S_CONCAT.concat
-    nil
-  end
-
-  # string: replace
-  def s_replace
-    K_S_REPLACE.replace
     nil
   end
 
@@ -1961,9 +2293,99 @@ class Konstant
     nil
   end
 
+  # string: replace
+  def s_replace
+    K_S_REPLACE.replace
+    nil
+  end
+
   # string: clear
   def s_clear
     K_S_CLEAR.clear
+    nil
+  end
+
+  # string: []=
+  def s_index_set
+    K_S_INDEX_SET[0] = 1
+    nil
+  end
+
+  # string: slice!
+  def s_slice_bang
+    K_S_SLICE_BANG.slice!
+    nil
+  end
+
+  # string: setbyte
+  def s_setbyte
+    K_S_SETBYTE.setbyte
+    nil
+  end
+
+  # string: bytesplice
+  def s_bytesplice
+    K_S_BYTESPLICE.bytesplice
+    nil
+  end
+
+  # string: append_as_bytes
+  def s_append_as_bytes
+    K_S_APPEND_AS_BYTES.append_as_bytes
+    nil
+  end
+
+  # string: force_encoding
+  def s_force_encoding
+    K_S_FORCE_ENCODING.force_encoding
+    nil
+  end
+
+  # string: sub!
+  def s_sub_bang
+    K_S_SUB_BANG.sub!
+    nil
+  end
+
+  # string: gsub!
+  def s_gsub_bang
+    K_S_GSUB_BANG.gsub!
+    nil
+  end
+
+  # string: tr!
+  def s_tr_bang
+    K_S_TR_BANG.tr!
+    nil
+  end
+
+  # string: tr_s!
+  def s_tr_s_bang
+    K_S_TR_S_BANG.tr_s!
+    nil
+  end
+
+  # string: delete!
+  def s_delete_bang
+    K_S_DELETE_BANG.delete!
+    nil
+  end
+
+  # string: squeeze!
+  def s_squeeze_bang
+    K_S_SQUEEZE_BANG.squeeze!
+    nil
+  end
+
+  # string: succ!
+  def s_succ_bang
+    K_S_SUCC_BANG.succ!
+    nil
+  end
+
+  # string: next!
+  def s_next_bang
+    K_S_NEXT_BANG.next!
     nil
   end
 
@@ -2027,63 +2449,33 @@ class Konstant
     nil
   end
 
-  # string: squeeze!
-  def s_squeeze_bang
-    K_S_SQUEEZE_BANG.squeeze!
+  # string: delete_prefix!
+  def s_delete_prefix_bang
+    K_S_DELETE_PREFIX_BANG.delete_prefix!
     nil
   end
 
-  # string: succ!
-  def s_succ_bang
-    K_S_SUCC_BANG.succ!
+  # string: delete_suffix!
+  def s_delete_suffix_bang
+    K_S_DELETE_SUFFIX_BANG.delete_suffix!
     nil
   end
 
-  # string: next!
-  def s_next_bang
-    K_S_NEXT_BANG.next!
+  # string: encode!
+  def s_encode_bang
+    K_S_ENCODE_BANG.encode!
     nil
   end
 
-  # string: sub!
-  def s_sub_bang
-    K_S_SUB_BANG.sub!
+  # string: scrub!
+  def s_scrub_bang
+    K_S_SCRUB_BANG.scrub!
     nil
   end
 
-  # string: gsub!
-  def s_gsub_bang
-    K_S_GSUB_BANG.gsub!
-    nil
-  end
-
-  # string: tr!
-  def s_tr_bang
-    K_S_TR_BANG.tr!
-    nil
-  end
-
-  # string: tr_s!
-  def s_tr_s_bang
-    K_S_TR_S_BANG.tr_s!
-    nil
-  end
-
-  # string: delete!
-  def s_delete_bang
-    K_S_DELETE_BANG.delete!
-    nil
-  end
-
-  # string: slice!
-  def s_slice_bang
-    K_S_SLICE_BANG.slice!
-    nil
-  end
-
-  # string: []=
-  def s_index_set
-    K_S_INDEX_SET[0] = 1
+  # string: unicode_normalize!
+  def s_unicode_normalize_bang
+    K_S_UNICODE_NORMALIZE_BANG.unicode_normalize!
     nil
   end
 end

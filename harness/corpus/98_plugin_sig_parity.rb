@@ -46,6 +46,23 @@ Time.current.comparable_time
 "abc".to_query("k")
 "abc".duplicable?
 
+# The `e59b7b89` re-sync (1,840 -> 2,006 lines): 23 selectors fired on rigor-rs
+# and were silent on the oracle until the copy moved. A sample across the
+# receivers the growth touched — Object, String, Symbol, Array, Hash, Range.
+"a".presence_in(["a"])
+Object.new.with_options(a: 1) { |o| o }
+Object.new.class_eval { 1 }
+"Abc".downcase_first
+"a".is_utf8?
+:abc.starts_with?("a")
+[1, 2, 3].second_to_last
+[1, { a: 1 }].extract_options!
+[1, 2].many?
+{ a: 1 }.to_options
+{ a: 1 }.with_defaults(b: 2)
+{ a: 1 }.extract!(:a)
+Range.new(1, 3).overlaps?(2..4)
+
 # ActiveSupport WIDENS the arity of `Date#to_time` to `to_time(form = :local)`.
 # The reference carries the row as a full redeclaration at this pin, which is
 # the defect below; upstream's fix (master `44bd23bf`, #437) turns it into an
@@ -63,9 +80,10 @@ Date.today.to_time(:utc)
 # kept here so the two fixtures fail independently).
 "abc".squish.frobsquish_zzz
 
-# --- REGISTERED DIVERGENCE (upstream #437) -----------------------------------
+# --- FIRES on both sides since `v0.3.8` (upstream #437, registry entry retired)
 
-# rigor-rs FIRES on both; the reference at this pin is SILENT on both.
+# History: at the `v0.3.4` pin rigor-rs FIRED on both and the reference was
+# SILENT on both, as a registered divergence.
 #
 # The plugin's own full `Date#to_time` declaration redeclares the row rbs's
 # `stdlib/date` already ships, `RBS::DefinitionBuilder` raises on the duplicate,
@@ -76,7 +94,7 @@ Date.today.to_time(:utc)
 #
 # This is the FIXED-UPSTREAM direction: master `44bd23bf` makes the row an
 # overload continuation and the reference then fires on both lines exactly as
-# rigor-rs does (measured on a master worktree). The registry entry retires
-# itself at the pin bump that lands it.
+# rigor-rs does. `44bd23bf` is an ancestor of the `v0.3.8` pin, so the entry
+# retired at that re-pin; re-measured firing on both sides at `e59b7b89`.
 Date.today.frobdate_zzz
 DateTime.now.frobdatetime_zzz

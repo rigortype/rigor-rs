@@ -3,122 +3,227 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 83,
+      "line": 223,
       "column": 23,
       "severity": "error",
       "message": "undefined method `frobnicate_a3' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 84,
+      "line": 224,
       "column": 29,
       "severity": "error",
       "message": "undefined method `frobnicate_a9' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 85,
+      "line": 225,
       "column": 31,
       "severity": "error",
       "message": "undefined method `frobnicate_a33' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 88,
+      "line": 228,
       "column": 23,
       "severity": "error",
       "message": "undefined method `frobnicate_a6' for 1.5"
     },
     {
       "rule": "call.undefined-method",
-      "line": 89,
+      "line": 229,
       "column": 18,
       "severity": "error",
       "message": "undefined method `frobnicate_a8' for Integer"
     },
     {
       "rule": "call.undefined-method",
-      "line": 90,
+      "line": 230,
       "column": 25,
       "severity": "error",
       "message": "undefined method `frobnicate_a21' for Array[1 | 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 91,
+      "line": 231,
       "column": 20,
       "severity": "error",
       "message": "undefined method `frobnicate_a22' for Array[5]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 92,
+      "line": 232,
       "column": 29,
       "severity": "error",
       "message": "undefined method `frobnicate_a24' for 31"
     },
     {
       "rule": "call.undefined-method",
-      "line": 95,
+      "line": 235,
       "column": 16,
       "severity": "error",
       "message": "undefined method `frobnicate_a23' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 102,
-      "column": 12,
-      "severity": "error",
-      "message": "undefined method `frobnicate_a7' for Float"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 107,
-      "column": 12,
-      "severity": "error",
-      "message": "undefined method `frobnicate_a20' for [\"x\" | Dynamic[top]]"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 112,
-      "column": 12,
-      "severity": "error",
-      "message": "undefined method `frobnicate_q3' for Float"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 117,
+      "line": 247,
       "column": 12,
       "severity": "error",
       "message": "undefined method `frobnicate_q4' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 125,
+      "line": 252,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v1' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 261,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v2' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 270,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v3' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 279,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v4' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 285,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v5' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 292,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v6' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 299,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v7' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 305,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v8' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 311,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v9' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 316,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v10' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 322,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v11' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 328,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v12' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 335,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_v13' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 343,
       "column": 12,
       "severity": "error",
       "message": "undefined method `frobnicate_q6' for Float"
     },
     {
       "rule": "call.undefined-method",
-      "line": 131,
+      "line": 349,
       "column": 18,
       "severity": "error",
       "message": "undefined method `frobnicate_a25' for Integer"
     },
     {
       "rule": "call.undefined-method",
-      "line": 137,
+      "line": 355,
       "column": 11,
       "severity": "error",
       "message": "undefined method `frobnicate_a31' for Integer"
     },
     {
       "rule": "call.undefined-method",
-      "line": 142,
+      "line": 360,
       "column": 30,
       "severity": "error",
       "message": "undefined method `frobnicate_a13' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 368,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_w1' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 373,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `frobnicate_w2' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 382,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_w3' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 387,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_w4' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 392,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_w5' for Integer"
     }
   ]
 }

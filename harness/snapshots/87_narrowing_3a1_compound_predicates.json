@@ -161,6 +161,13 @@
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_ttt' for String"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 254,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
     }
   ]
 }

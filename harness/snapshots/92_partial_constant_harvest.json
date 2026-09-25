@@ -55,14 +55,14 @@
       "line": 71,
       "column": 16,
       "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Hash"
+      "message": "undefined method `frobnicate_zzz' for Hash[Dynamic[top] | Symbol, Dynamic[top] | Integer]"
     },
     {
       "rule": "call.undefined-method",
       "line": 72,
       "column": 22,
       "severity": "error",
-      "message": "undefined method `frobnicate_zzz' for Hash"
+      "message": "undefined method `frobnicate_zzz' for Hash[Dynamic[top] | Symbol, Integer]"
     },
     {
       "rule": "call.undefined-method",

@@ -67,9 +67,19 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
 
 - `overlay/` — **not from the rbs gem**. The reference's own supplementary
   signatures, copied from `reference/rigor/data/`:
-  - `overlay/core_overlay/` ⇐ `data/core_overlay/` (6 files) — reopens core
+  - `overlay/core_overlay/` ⇐ `data/core_overlay/` (9 files) — reopens core
     classes to add methods upstream RBS omits but every concrete value answers
-    (`Numeric#to_f`, `Pathname`, `CSV`, `Psych`, `StringScanner`, `Resolv`).
+    (`Numeric#to_f`, `Pathname`, `CSV`, `Psych`, `StringScanner`, `Resolv`;
+    since the `e59b7b89` pin also `StringIO` including `Enumerable[String]`,
+    `Enumerable#detect(ifnone)`'s fallback overloads, and the
+    `Enumerator::Lazy` methods CRuby redefines to chain lazily).
+    **`hash_rbs3.rbs` is deliberately EXCLUDED**: the reference gates it to
+    the rbs `< 4.0` line (`RbsLoader::RBS_LINE_CORE_OVERLAYS`, checked against
+    the running `RBS::VERSION`), and this tree emulates rbs 4.2, which declares
+    those `Hash#transform_keys` overloads upstream — the file's `| ...`
+    continuation would load a second copy of them. rigor-rs loads every
+    embedded overlay file unconditionally, so the gate is applied at copy time.
+    Revisit only if the vendored rbs ever drops below 4.0.
   - `overlay/vendored_gem_sigs/<gem>/` ⇐ `data/vendored_gem_sigs/<gem>/`
     (12 gems) — signatures for gems whose own RBS is missing or incomplete
     (`ast bcrypt bundler cgi did_you_mean idn-ruby mysql2 nokogiri pg racc redis
@@ -163,7 +173,7 @@ five overlay files and adding two directories.
 > command; [note](../../../../docs/notes/20260823-repin-v034.md).
 
 ```sh
-rsync -a --delete --exclude README.md \
+rsync -a --delete --exclude README.md --exclude hash_rbs3.rbs \
   reference/rigor/data/core_overlay/ \
   crates/rigor-index/vendor/rbs/overlay/core_overlay/
 rsync -a --delete --exclude README.md --exclude prism/ \
@@ -174,8 +184,17 @@ cp "$(gem env gemdir)"/gems/rbs-<version>/sig/shims/*.rbs \
 ```
 
 Then `diff -r` both `data/` halves against the copies: an "Only in reference"
-line is a new file to consider, and the `prism` exclusion is the one deliberate
-omission.
+line is a new file to consider, and the `prism/` and `hash_rbs3.rbs` exclusions
+are the two deliberate omissions (plus the `README.md`s).
+
+**`rsync -a` preserves the SOURCE mtimes, and `build.rs` only re-embeds on
+`cargo:rerun-if-changed=vendor/rbs`.** A file added with an mtime older than the
+last build (the submodule checkout was earlier that day) does NOT trigger a
+rebuild: the binary keeps the old embedded set and every probe of the new
+surface still shows the pre-sync behaviour. `touch` the copied files (or
+`cargo clean -p rigor-index`) before building — measured at the `e59b7b89`
+re-sync, where the first post-rsync build silently embedded none of the three
+new files.
 
 The closure is computed exactly as `CoreData::load()` does. Note that the
 manifest set is NOT stable across rbs versions (4.1.0 gave `tempfile` its first
