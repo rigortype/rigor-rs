@@ -53,7 +53,7 @@ fn static_shape_key_of_node(node: &Node) -> Option<ShapeKey> {
     match node {
         Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
         Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
-        Node::IntegerLit { value, .. } => Some(ShapeKey::Int(*value)),
+        Node::IntegerLit { value, .. } => value.map(ShapeKey::Int),
         Node::FloatLit { value, .. } => Some(ShapeKey::Float(value.to_bits())),
         Node::TrueLit { .. } => Some(ShapeKey::Bool(true)),
         Node::FalseLit { .. } => Some(ShapeKey::Bool(false)),
@@ -456,9 +456,11 @@ impl<'i> Typer<'i> {
             // twin of `InterpolatedString` above, differing only in the
             // nominal type name, so it never mis-types as a `String`.
             Node::InterpolatedSymbol { .. } => self.nominal_or_untyped("Symbol", interner),
-            Node::IntegerLit { value, .. } => {
+            Node::IntegerLit { value: Some(value), .. } => {
                 interner.intern(Type::Constant(Scalar::Int(*value)))
             }
+            // A Bignum: the reference pins it, but no `i64` scalar can.
+            Node::IntegerLit { value: None, .. } => self.nominal_or_untyped("Integer", interner),
             Node::FloatLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Float(*value)))
             }
@@ -1690,7 +1692,7 @@ impl<'i> Typer<'i> {
             // Range is what its two Range overloads take: either member keeps a
             // second overload in `rand`'s join (see [`Reach`]).
             Node::IntegerLit { value, .. } => {
-                if *value == 0 {
+                if *value == Some(0) {
                     Reach::OPAQUE
                 } else {
                     Reach::LITERAL

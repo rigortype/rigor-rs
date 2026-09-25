@@ -2460,7 +2460,7 @@ fn const_shape_key_of(node: &Node) -> Option<ShapeKey> {
     match node {
         Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
         Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
-        Node::IntegerLit { value, .. } => Some(ShapeKey::Int(*value)),
+        Node::IntegerLit { value, .. } => value.map(ShapeKey::Int),
         Node::FloatLit { value, .. } => Some(ShapeKey::Float(value.to_bits())),
         Node::TrueLit { .. } => Some(ShapeKey::Bool(true)),
         Node::FalseLit { .. } => Some(ShapeKey::Bool(false)),
@@ -2593,7 +2593,7 @@ fn mutated_constant_names(ast: &LoweredAst) -> HashSet<String> {
 /// always exactly the carrier the Typer builds for the same inline literal.
 fn const_lit_of(ast: &LoweredAst, node: NodeId) -> Option<ConstLit> {
     match ast.get(node) {
-        Node::IntegerLit { value, .. } => Some(ConstLit::Scalar(Scalar::Int(*value))),
+        Node::IntegerLit { value, .. } => value.map(|v| ConstLit::Scalar(Scalar::Int(v))),
         Node::FloatLit { value, .. } => Some(ConstLit::Scalar(Scalar::Float(*value))),
         Node::StringLit { value, .. } => Some(ConstLit::Scalar(Scalar::Str(value.clone()))),
         Node::SymbolLit { value, .. } => Some(ConstLit::Scalar(Scalar::Sym(value.clone()))),
@@ -2760,7 +2760,7 @@ fn capture_fold_tail(ast: &LoweredAst, node_id: NodeId, depth: usize) -> FoldTai
     }
     let expr = match ast.get(node_id) {
         Node::StringLit { value, .. } => FoldExpr::Scalar(Scalar::Str(value.clone())),
-        Node::IntegerLit { value, .. } => FoldExpr::Scalar(Scalar::Int(*value)),
+        Node::IntegerLit { value: Some(value), .. } => FoldExpr::Scalar(Scalar::Int(*value)),
         Node::FloatLit { value, .. } => FoldExpr::Scalar(Scalar::Float(*value)),
         Node::SymbolLit { value, .. } => FoldExpr::Scalar(Scalar::Sym(value.clone())),
         Node::NilLit { .. } => FoldExpr::Scalar(Scalar::Nil),
@@ -4836,7 +4836,7 @@ mod probes_s92 {
         }
         match ast.get(node_id) {
             Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
-            Node::IntegerLit { value, .. } => Some(Scalar::Int(*value)),
+            Node::IntegerLit { value, .. } => value.map(Scalar::Int),
             Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
             Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
             Node::NilLit { .. } => Some(Scalar::Nil),

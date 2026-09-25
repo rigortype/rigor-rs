@@ -93,8 +93,9 @@ Why the gate is narrower than "the argument is guarded":
 
 ## Rows
 
-Fixture `harness/corpus/112_string_lookup_fold_guarded_arg.rb` has 40 firing
-rows and 13 silent ones, every one oracle-measured at the pin.
+Fixture `harness/corpus/112_string_lookup_fold_guarded_arg.rb` has 44 firing
+rows and 16 silent ones, every one oracle-measured at the pin. Section 6 was
+added by the local verification pass below.
 
 | section | shape | oracle | master | branch |
 |---|---|---|---|---|
@@ -103,8 +104,11 @@ rows and 13 silent ones, every one oracle-measured at the pin.
 | 2 (n10) | `"abc"[99].upcase` | fires | silent (gap) | fires ✓ new |
 | 3 (t1-t3) | `if "abc"[99]` / `.index("z")` / `"abc"[0]` | always-falsey / truthy | silent (gap) | fires ✓ new |
 | 3b (d1-d5) | Float index, Regexp, Range, multibyte | fires on the folded value | fires | fires (fold declines) ✓ |
-| 4 (g1-g13) | class-guarded parameter, nilable return | **silent** | fires (FP) | silent ✓ |
+| 4 (g1-g13) | class-guarded parameter, nilable return | **silent** | fires (FP) on 10; g6/g8/g12 already silent | silent ✓ |
 | 5 (c1-c8) | precise write, rebind, non-nilable, erasure family, a25/a31 | fires | fires | fires ✓ |
+| 6 (i1-i3) | literal index/offset past `i32` | fires on the real value | fires `for String` | fires, same value ✓ |
+| 6 (f1-f3) | `&.` on a folded nil / on `nil` | silent | fires (FP) | silent ✓ |
+| 6 (f4) | `"abc"[0]&.m` | fires `for "a"` | fires `for String` | fires ✓ |
 
 ## Residues — still port-only false positives, recorded not chased
 
@@ -125,46 +129,66 @@ Measured at the pin: reference-silent, port still fires.
    (`"abc"[nil].zz`, `"abc".byteslice("a").zz`, and `"abc".index(1).zz`, where
    the reference also reports no mismatch). This is a separate pre-existing
    family, not touched here.
+5. **Found by the local pass, all pre-existing and identical on master.** In
+   each case the flat slot answers `String` / `Integer` where the reference
+   cannot fold. The shapes are:
+   * a guarded parameter read through an alias (`v = u; "abc"[v].m`);
+   * a mutated local receiver (`s = +"abc"; s << "d"; s[4].m`);
+   * an interpolated or adjacent-literal receiver (`"a#{1}c"[5].m`,
+     `("ab" "c")[2].m`);
+   * an argument kind with no overload (`"abc"["b", 1].m`, `"abc".index(98).m`);
+   * a Bignum argument (`"abc"[100000000000000000000].m`, which raises in Ruby).
+6. **Message only, pre-existing.** `scalar_inspect` renders a String constant
+   with Rust `Debug`, so control characters spell differently from the
+   reference (`"\u{1b}"` against `"\e"`, and `"\0"` against `"\u0000"`). The
+   fold only makes this reachable through more calls. The gate keys on `(rule,
+   line, column)` and is unaffected.
+
+## Local verification pass (2026-09-25, maintainer machine)
+
+The first cut was written in a container that could not run the standing sweep.
+It was re-verified locally on ruby 4.0.6 and rbs 4.2.0, with the submodule at
+the `e59b7b89` pin. 106 fresh-dir probes against the reference found two defects
+in the fold's inputs, and both are fixed here:
+
+* **Integer literals past `i32` lowered to `0`.** Prism's binding exposes only
+  `TryInto<i32>`, and the lowering used `unwrap_or(0)`. The fold turned that
+  into wrong values: `"abc"[9223372036854775807]` answered `"a"` where Ruby and
+  the reference say `nil`. The same bug was already live on master
+  (`100000000000000000000.m` rendered `for 0`). `IntegerLit.value` is now
+  `Option<i64>` and is read from the digit view. A Bignum is `None`, which types
+  as a nominal `Integer` and never pins a scalar, a shape key or a fold.
+* **`nil&.m` fired `call.undefined-method`.** The reference's
+  `safe_navigation_receiver` turns a receiver that is exactly nil into `bot`, so
+  it stays silent, and a `T | nil` union flows through unchanged. The port had no
+  such arm. On master this was a position FP for `nil&.m` and
+  `"abc"[99]&.m` (`for String`). The fold made the second one read `for nil`.
+  It is now ported for the undefined-method rule only. Arity still fires on
+  `nil&.to_s(1, 2, 3)`, as the reference does.
+
+The probes also found more port-only FPs at the same position on master. They
+are pre-existing, and each is recorded as a residue above.
 
 ## Corpus evidence
 
-The standing sweep set's paths are the maintainer's machine, so `fp_audit.py
---sweep` cannot run in this container. Six of the eight members are on GitHub
-and were shallow-cloned at their current HEADs: `mastodon/app`, `mail`,
-`TheAlgorithms/Ruby`, `concurrent-ruby`, `net-ssh` and `haml/lib`.
-`gitlab-foss` (gitlab.com) and `dependabot-core` were not cloned.
+`python3 harness/fp_audit.py --gaps --sweep` ran over all eight
+`harness/sweep-corpora.yml` members with a freshly built release binary. The
+result was **0 FP candidates, 9,337 files and 3,829 gaps**. That is identical to
+master's baseline (`harness/CORPUS.md`), both on this branch as it arrived and
+after the two fixes above.
 
-* **Port-vs-port diff**, with release binaries of master and of this branch run
-  over the same explicit file lists (2220 files): **0 removed, 0 added,
-  0 message changed** on every corpus. The diff tool is not vacuous. Pointed at
-  fixture 112, it reports exactly the 10 section-4 rows removed and the 4 new
-  rows added.
-* **`fp_audit.py --gaps`** over the same six directories, against the pinned
-  reference, reports **0 FP candidates on every corpus**:
-
-  | corpus | files | reference | rigor-rs | matched | FP |
-  |---|---|---|---|---|---|
-  | TheAlgorithms/Ruby | 192 | 34 | 14 | 14 | 0 |
-  | haml/lib | 52 | 9 | 5 | 5 | 0 |
-  | net-ssh | 181 | 145 | 125 | 125 | 0 |
-  | concurrent-ruby | 345 | 5812 | 5715 | 5715 | 0 |
-  | mastodon/app | 1254 | 452 | 431 | 431 | 0 |
-  | mail | 196 | 8501 | 8488 | 8488 | 0 |
-
-  The port's output on these files is identical to master's (the diff above),
-  so no per-corpus matched count can have gone down. These are shallow clones
-  of today's upstream HEADs, not the maintainer's checkouts, so the counts are
-  not comparable to `harness/CORPUS.md`'s baselines.
+The first cut also ran a port-vs-port diff over shallow clones of six members,
+which reported 0 removed and 0 added. The sweep supersedes it.
 
 ## Gates
 
-* `cargo test --workspace`: PASS (1320 passed).
-* `cargo +1.88.0 clippy --workspace --locked -- -D warnings`: clean, and with
-  `--all-targets` too.
-* `ruby harness/run.rb`: **PASS**, 597 matched, 47 gaps, 0 unregistered. That
-  is 557 + fixture 112's 40 rows, with the gap count unchanged, so no existing
-  row was lost.
-* `ruby harness/run_snapshot.rb`: PASS with the same numbers.
-* `ruby harness/snapshot.rb`: 2 written (112 is new; 106's trailer grew by four
-  lines, a line shift only), 110 unchanged.
+Re-run locally after the fixes:
+
+* `cargo test --workspace`: PASS (1321 passed).
+* `cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings` in a
+  fresh target dir: exit 0.
+* `ruby harness/run.rb` and `ruby harness/run_snapshot.rb`: PASS, 601 matched,
+  0 unregistered, with the gap count unchanged from master.
+* `ruby harness/snapshot.rb` reproduced every committed snapshot on ruby 4.0.6.
+  Only 112 was rewritten, for section 6.
 * `python3 harness/docs_check.py`: PASS.

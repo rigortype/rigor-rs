@@ -261,6 +261,34 @@
       "message": "undefined method `frobnicate_c8' for Integer"
     },
     {
+      "rule": "call.undefined-method",
+      "line": 208,
+      "column": 37,
+      "severity": "error",
+      "message": "undefined method `frobnicate_i1' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 209,
+      "column": 40,
+      "severity": "error",
+      "message": "undefined method `frobnicate_i2' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 210,
+      "column": 49,
+      "severity": "error",
+      "message": "undefined method `frobnicate_i3' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 217,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `frobnicate_f4' for \"a\""
+    },
+    {
       "rule": "flow.always-truthy-condition",
       "line": 63,
       "column": 6,

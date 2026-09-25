@@ -200,3 +200,18 @@ def c8(s)
   return unless s.is_a?(Integer)
   rand(s).frobnicate_c8
 end
+
+# --- (6) Literals past `i32`, and `&.` on a folded nil ------------------------
+
+# An integer literal past `i32` once lowered to `0`, so the fold answered
+# `"abc"[0]`. Every literal in `i64` now pins its own value.
+def i1 = "abc"[9223372036854775807].frobnicate_i1
+def i2 = "abc"[1, 9223372036854775807].frobnicate_i2
+def i3 = "abc".index("a", -9223372036854775808).frobnicate_i3
+
+# `&.` on a receiver that is exactly nil never dispatches (the reference's
+# `safe_navigation_receiver`); a non-nil fold still fires through it.
+def f1 = "abc"[99]&.frobnicate_f1
+def f2 = "abc"[99]&.upcase.frobnicate_f2
+def f3 = nil&.frobnicate_f3
+def f4 = "abc"[0]&.frobnicate_f4
