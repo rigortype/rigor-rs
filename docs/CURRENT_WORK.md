@@ -17,7 +17,7 @@ Retractions no gate sees, **#134–#138**, are the next port work (each its own 
 mechanism). Pre-existing FPs: #139, #140, #146, #164, #165. Coverage: #141 (`fb781023`,
 3,002 of the 3,829 gaps), #166 and #167 (#148/#154 regressions); #142–#145 and #152 closed at
 0 rows (`.out-of-scope/`). CLI/config parity (#129 follow-ups): #155–#159, #162, #163
-ready-for-agent, #160/#161 ready-for-human. Also #130, #132. `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
+ready-for-agent, #168–#171; #160 blocked upstream. Also #130, #132. `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
 
 - Measurement-tool lesson (binding): audit at NODE granularity — per-file
   histograms net over-claims against under-claims.

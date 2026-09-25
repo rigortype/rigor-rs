@@ -255,8 +255,8 @@ fixture 115 (8 rows) are identical. The sweep is configless and unchanged.
 
 ### Accepted divergences (host-dependent, recorded with their reproducers)
 
-Two environment inputs are not gated, because the reference picks them up
-from the host Ruby it runs on, and the gate cannot inspect that Ruby. Both
+Three environment inputs are not gated, because the reference picks them up
+from the host Ruby it runs on, and the gate cannot inspect that Ruby. All
 are the same class as the load-set list and `UNBUILDABLE_DEFINITIONS`:
 properties of the host's installed gems. They are visible here, and the
 rv4 probes reproduce them:
@@ -272,6 +272,12 @@ rv4 probes reproduce them:
   stdlib copy. Its signatures can declare an interface or reopen `Object`,
   which moves both rows. `harness/conformance_load_set.rb --check` catches
   this for the gate host's own gem set, not for another host's.
+- **`prism`, `rbs` and `rdoc` in the reference's default environment**
+  (#161, decided 2026-09-26). The reference loads their signatures as default
+  libraries from whatever versions the host has installed. The port's index
+  does not carry them. This is the same class as the bullet above, so it is
+  accepted rather than vendored. The rest of #161's load-set items depend only
+  on project files and bundler config, so they are ported (#170, #171).
 
 **Environments where the reference cannot start** (rv5 `d5.rb` / `d2.rb`:
 `i_disable_gems` with `RUBYOPT=--disable-gems`, `i_gem_path_empty` with an
