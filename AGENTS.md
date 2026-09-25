@@ -55,8 +55,9 @@ is the durable record; a branch alone is not.
 
 ## Gates
 
-Each must exit 0 and be read by its exit code, never through `grep`.
-Clippy's ANSI-coloured lines defeat a line count.
+Each must exit 0. Run it bare and read its exit code: a pipe (`| tail -1`)
+reports the last command's status, and a `grep` count misses clippy's
+ANSI-coloured lines. Both have let a failing gate through.
 
 - `cargo test --workspace --locked`
 - `cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings`,
@@ -81,6 +82,11 @@ What the gates cannot see, so probe it by hand:
   tuple, message included.
 - **Retractions**: a site the reference stops flagging is invisible to the
   snapshot diff. Only the sweep sees it.
+- **Source the fixtures cannot hold**: the fixtures are small, well-formed,
+  all-ASCII files. They cannot contain a multi-byte character left of a
+  token, a syntax error, or a name that driver code and a later `def` share.
+  After a change to scoping, positions or lowering, also run `fp_audit.py` on
+  the survey corpora (`harness/README.md`).
 
 ## Probing
 
@@ -103,7 +109,10 @@ What the gates cannot see, so probe it by hand:
   harness itself has been wrong.
 - **Measure before you build.** A coverage slice needs a `fp_audit --gaps`
   count predicting that it closes gaps. FP-safe flow slices have repeatedly
-  closed 0 gaps (`docs/notes/20260706-flow-frontier-exhausted.md`).
+  closed 0 gaps (`docs/notes/20260706-flow-frontier-exhausted.md`). Predict by
+  type, not text: a call chain dies at its first unresolved link, so the
+  method named near a gap's column is often not the one to fix. Build the
+  slice on a scratch branch and diff the gap set.
 
 ## Parity bars
 
@@ -128,6 +137,13 @@ What the gates cannot see, so probe it by hand:
   resolve a spec-vs-oracle conflict toward the oracle; the review confirms it.
 - Reviewers from other harnesses are Grok 4.6 and Opus 5.5, both at `high`,
   run together (`docs/agents/review.md`).
+- A new worktree starts with an empty `reference/rigor`. Populate it with
+  `git submodule update --init reference/rigor`, which reads the main
+  checkout's module store at the pin. Never point `REFERENCE_RIGOR_DIR` at
+  another checkout (UPSTREAM.md hazard 3).
+- To wait for a long run, have its command write a marker file and poll that
+  file, or wait on its PID. Two `pgrep -f` waiters match each other's command
+  lines and never exit.
 
 ## Docs hygiene
 

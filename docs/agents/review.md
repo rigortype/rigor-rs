@@ -48,8 +48,15 @@ Claude Code bundled in its own `@anthropic-ai/claude-agent-sdk`, not the one on
 - **Must-still-fire controls.** A suppression needs a nearby row that still
   fires. Add a control the PR is missing.
 - **Counterexamples.** Construct shapes the PR does not test: other receivers,
-  argument shapes, value edges, project `sig/`. A green gate is not evidence
-  for a shape the gate cannot see.
+  argument shapes, project `sig/`, and value edges (literals past `i32` and
+  `i64`, `&.`, control and multi-byte characters, interpolated or mutated
+  receivers). A green gate is not evidence for a shape the gate cannot see.
+- **Subset arguments.** "The port only declines where the reference would",
+  "we handle a subset of its receivers": such arguments quantify over a term
+  (`Dynamic`, "block", "narrower") whose meaning differs between the engines.
+  They have been wrong five times. Probe each term on both engines, in both
+  directions, including where the port is precise and the reference
+  collapses.
 - **Negative claims.** Every "no regression", "identical" or "no new key" in
   the PR body or its note needs a probe that could have falsified it. A
   same-key message change is the usual miss: the (rule, line, col) gates and
