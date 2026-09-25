@@ -465,6 +465,15 @@ pub enum Node {
         /// on the reference and stay silent here. A safe-side coverage gap;
         /// `center("x", &b)` cannot show it (`center("x")` is silent on both).
         args_all_plain: bool,
+        /// `true` iff the call carries a Prism ArgumentsNode — `foo(1)` or
+        /// `foo 1`, but NOT `foo()`: Prism leaves `call.arguments` nil for
+        /// empty parens (verified at the pin; the `opening_loc` is what
+        /// records the `()`). The reference's exactly-once block-timing proof
+        /// (rigor#1105 / rigor-rs#140) gates on that same `node.arguments`
+        /// check, so `x.tap() { break v }` is treated exactly like
+        /// `x.tap { break v }` on both engines, while `x.tap(1) { break v }`
+        /// declines.
+        explicit_arg_list: bool,
         /// Span of the whole call expression.
         span: Span,
     },
@@ -680,6 +689,17 @@ pub enum Node {
     /// slice will need.
     BeginRescue {
         body: Vec<NodeId>,
+        /// Just the `begin` node's OWN statements — the ids that lead `body`
+        /// before the rescue / `else` / `ensure` children are appended.
+        /// `body` deliberately stays flat (every existing consumer is
+        /// byte-for-byte unaffected), but that flatness merges the `else`
+        /// clause's statements into the same list, and an `else` must NOT
+        /// count toward the `never_completes_normally?` walk (rigor-rs#140):
+        /// it only runs when the protected body completes, so `begin; "x";
+        /// else; break "s"; end` still completes normally via `else`. For the
+        /// reused carriers (`else`/`in`/parenthesized groups — no real
+        /// `begin` node) `main_body` equals `body`.
+        main_body: Vec<NodeId>,
         ensure_body: Vec<NodeId>,
         /// The per-clause rescue-chain structure (empty for the reused carriers —
         /// `else`/`when`/`in`/parenthesized groups — and for a `begin` with no
@@ -876,15 +896,30 @@ pub enum StatementsKind {
     /// s1-s5, m1/m3/m4/m5). The write collectors drop every write inside one;
     /// see [`LoweredAst::in_inert_carrier`].
     Inert,
+    /// A jump statement that carries (or could carry) VALUE expressions:
+    /// `break e` / `next e` hold their argument list in `body`, and `redo` /
+    /// `retry` ride the same carrier with an empty `body`. The children are
+    /// real lowered expressions (a read under `break x` stays reachable, just
+    /// as the `Recovered` carrier kept it), but the jump's control-flow kind is
+    /// what the exactly-once block-timing proof (rigor-rs#140, upstream
+    /// rigor#1105) discriminates on. A write in `body` must not bind — it is
+    /// an argument position, not a sequence — so the kind reads like
+    /// `Recovered` to every binder.
+    Jump(JumpKind),
 }
 
-/// Which control-flow jump an argument-less [`Node::Other`] is.
+/// Which control-flow jump an argument-less [`Node::Other`] or a
+/// [`StatementsKind::Jump`] carrier is.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JumpKind {
     /// `next` — skip to the next iteration of the enclosing block / loop.
     Next,
     /// `break` — leave the enclosing block / loop.
     Break,
+    /// `redo` — restart the enclosing block / loop body's current iteration.
+    Redo,
+    /// `retry` — restart the enclosing `begin`/`rescue` from the top.
+    Retry,
 }
 
 impl Node {
@@ -1504,6 +1539,7 @@ impl<'src> Builder<'src> {
                 block_body,
                 block_span,
                 block_locals,
+                explicit_arg_list: call.arguments().is_some(),
                 message_span,
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
@@ -1742,8 +1778,10 @@ impl<'src> Builder<'src> {
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            let main_body = body.clone();
             return self.push(Node::BeginRescue {
                 body,
+                main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
                 span: span_of(&else_node.location()),
@@ -1817,8 +1855,10 @@ impl<'src> Builder<'src> {
             if let Some(s) = in_node.statements() {
                 body.extend(self.lower_body(&s.body()));
             }
+            let main_body = body.clone();
             return self.push(Node::BeginRescue {
                 body,
+                main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
                 span: span_of(&in_node.location()),
@@ -1878,6 +1918,11 @@ impl<'src> Builder<'src> {
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            // Just the protected body's own statements — the ids `body` will
+            // still hold alone once the rescue / else / ensure children are
+            // appended below (the `never_completes_normally?` walk must not
+            // count an `else` clause's statements toward the body's).
+            let main_body = body.clone();
             // Walk the rescue chain (each RescueNode links to the next). Build the
             // per-clause `RescueClause` view ALONGSIDE the flat `body`: every
             // `lower_node`/`lower_body` call happens in the exact same order as
@@ -1926,6 +1971,7 @@ impl<'src> Builder<'src> {
             body.extend(ensure_body.iter().copied());
             return self.push(Node::BeginRescue {
                 body,
+                main_body,
                 ensure_body,
                 clauses,
                 span: span_of(&begin_node.location()),
@@ -2039,8 +2085,10 @@ impl<'src> Builder<'src> {
             if let [only] = body[..] {
                 return only;
             }
+            let main_body = body.clone();
             return self.push(Node::BeginRescue {
                 body,
+                main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
                 span: span_of(&parens.location()),
@@ -2212,23 +2260,56 @@ impl<'src> Builder<'src> {
             return self.push(Node::Return { values, span });
         }
 
-        // An ARGUMENT-LESS `next` / `break`: still an unmodeled leaf (it binds
-        // nothing, reads nothing, and the typer's catch-all types it
-        // `Dynamic[top]` exactly as before), but tagged so the class-narrowing
-        // pass's early-termination propagation can see it — the reference's
-        // `branch_unconditionally_exits?` (statement_evaluator.rb:2836) accepts
-        // `NextNode`/`BreakNode` beside `ReturnNode`. With an argument the node
-        // falls through to the recovery below UNCHANGED, so its value stays
-        // reachable to the rule walk; that shape is a recorded decline.
+        // `next` / `break` / `redo` / `retry`. An ARGUMENT-LESS `next` / `break`
+        // stays the tagged `Node::Other` leaf the class-narrowing pass already
+        // reads (it binds nothing, and the typer's catch-all types it
+        // `Dynamic[top]` exactly as before). A VALUED `next e` / `break e` and
+        // an argument-less `redo` / `retry` lower to the `StatementsKind::Jump`
+        // carrier instead — the reference's `never_completes_normally?`
+        // (block_call_timing.rb) discriminates all four kinds, and the carrier
+        // keeps the value expressions lowered (the `Recovered` fallback would
+        // have kept them reachable anyway; the kind is the added information).
+        // Every binder reads `Jump` exactly like `Recovered` — the value ids
+        // are argument positions, so nothing in them binds.
         if let Some(n) = node.as_next_node() {
-            if n.arguments().is_none() {
-                return self.push(Node::Other { span, jump: Some(JumpKind::Next) });
-            }
+            return match n.arguments() {
+                None => self.push(Node::Other { span, jump: Some(JumpKind::Next) }),
+                Some(args) => {
+                    let body = self.lower_body(&args.arguments());
+                    self.push(Node::Statements {
+                        body,
+                        span,
+                        kind: StatementsKind::Jump(JumpKind::Next),
+                    })
+                }
+            };
         }
         if let Some(n) = node.as_break_node() {
-            if n.arguments().is_none() {
-                return self.push(Node::Other { span, jump: Some(JumpKind::Break) });
-            }
+            return match n.arguments() {
+                None => self.push(Node::Other { span, jump: Some(JumpKind::Break) }),
+                Some(args) => {
+                    let body = self.lower_body(&args.arguments());
+                    self.push(Node::Statements {
+                        body,
+                        span,
+                        kind: StatementsKind::Jump(JumpKind::Break),
+                    })
+                }
+            };
+        }
+        if node.as_redo_node().is_some() {
+            return self.push(Node::Statements {
+                body: Vec::new(),
+                span,
+                kind: StatementsKind::Jump(JumpKind::Redo),
+            });
+        }
+        if node.as_retry_node().is_some() {
+            return self.push(Node::Statements {
+                body: Vec::new(),
+                span,
+                kind: StatementsKind::Jump(JumpKind::Retry),
+            });
         }
 
         // `defined?(expr)` — the operand is NEVER EVALUATED (`defined?` inspects
@@ -3162,6 +3243,26 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
         // `collect_flow_writes`. Without this the wrapper's default recursion
         // would recover only the RHS's reads/calls and drop the LHS names again.
         fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
+            self.out.push(node.as_node());
+        }
+        // A jump buried under an unhandled wrapper (`raise "x" rescue break
+        // "s"` — a RescueModifierNode has no owned variant) is recovered WHOLE
+        // too: its own lowering emits the `Jump`/`Other{jump}` carrier the
+        // exactly-once block-timing proof (rigor-rs#140) scans for, and the
+        // reference's block-level jump scan descends the same wrappers —
+        // `JUMP_BOUNDARY_NODES` prunes only nested blocks/lambdas/defs/loops.
+        // Recovered here only means the node exists in the arena; the
+        // `Recovered` carrier still keeps its order and reachability unknown.
+        fn visit_break_node(&mut self, node: &ruby_prism::BreakNode<'pr>) {
+            self.out.push(node.as_node());
+        }
+        fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
+            self.out.push(node.as_node());
+        }
+        fn visit_redo_node(&mut self, node: &ruby_prism::RedoNode<'pr>) {
+            self.out.push(node.as_node());
+        }
+        fn visit_retry_node(&mut self, node: &ruby_prism::RetryNode<'pr>) {
             self.out.push(node.as_node());
         }
     }
@@ -4133,5 +4234,103 @@ mod tests {
             })
             .expect("expected a named Definition");
         assert_eq!(&src[name_span.0..name_span.1], b"foo");
+    }
+
+    #[test]
+    fn lowers_valued_break_and_next_as_jump_carriers() {
+        // rigor-rs#140: `break e` / `next e` keep their value expressions in a
+        // `StatementsKind::Jump` carrier — the exactly-once block-timing proof
+        // discriminates the kind, and the values stay lowered/reachable.
+        let src = b"[1].each { break \"s\" }
+[1].each { next 1 }
+";
+        let ast = lower(&crate::parse(src));
+
+        let mut kinds = Vec::new();
+        for (_, n) in ast.iter() {
+            if let Node::Statements { body, kind: StatementsKind::Jump(jk), .. } = n {
+                assert_eq!(body.len(), 1, "valued jump carries exactly one arg");
+                kinds.push(*jk);
+            }
+        }
+        assert_eq!(kinds, vec![JumpKind::Break, JumpKind::Next]);
+    }
+
+    #[test]
+    fn lowers_bare_break_and_next_as_tagged_other() {
+        // The argument-less forms stay the tagged `Node::Other` leaf.
+        let src = b"[1].each { break }
+[1].each { next }
+";
+        let ast = lower(&crate::parse(src));
+
+        let mut kinds = Vec::new();
+        for (_, n) in ast.iter() {
+            if let Node::Other { jump: Some(jk), .. } = n {
+                kinds.push(*jk);
+            }
+        }
+        assert_eq!(kinds, vec![JumpKind::Break, JumpKind::Next]);
+    }
+
+    #[test]
+    fn lowers_redo_and_retry_as_jump_carriers() {
+        // `redo` / `retry` take no argument list; they lower to `Jump` carriers
+        // with an empty `body` so `never_completes_normally?` can see them.
+        let src = b"[1].each { redo }\nbegin\nrescue\n  retry\nend\n";
+        let ast = lower(&crate::parse(src));
+
+        let mut kinds = Vec::new();
+        for (_, n) in ast.iter() {
+            if let Node::Statements { body, kind: StatementsKind::Jump(jk), .. } = n {
+                assert!(body.is_empty(), "argument-less jump carries no children");
+                kinds.push(*jk);
+            }
+        }
+        assert_eq!(kinds, vec![JumpKind::Redo, JumpKind::Retry]);
+    }
+
+    #[test]
+    fn call_records_explicit_arg_list_presence() {
+        // `x.tap` and `x.tap()` both lower `args: []` AND both leave
+        // `explicit_arg_list` false — Prism produces no ArgumentsNode for
+        // empty parens, and the reference's `node.arguments` gate (rigor#1105)
+        // sees the same nil. Only a non-empty argument list sets the flag.
+        let src = b"x.tap { }\nx.tap() { }\nx.tap(1) { }\nx.tap\n";
+        let ast = lower(&crate::parse(src));
+
+        let flags: Vec<bool> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::Call { method, explicit_arg_list, .. } if method == "tap" => {
+                    Some(*explicit_arg_list)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn begin_rescue_main_body_excludes_rescue_else_ensure() {
+        // `main_body` is JUST the protected statements — the flat `body` still
+        // appends the rescue / `else` / `ensure` children, but an `else` must
+        // not count toward `never_completes_normally?` (rigor-rs#140).
+        let src = b"begin\n  \"x\"\nrescue\n  \"r\"\nelse\n  \"e\"\nensure\n  \"n\"\nend\n";
+        let ast = lower(&crate::parse(src));
+
+        let (body, main_body, ensure_body) = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::BeginRescue { body, main_body, ensure_body, .. } => {
+                    Some((body.clone(), main_body.clone(), ensure_body.clone()))
+                }
+                _ => None,
+            })
+            .expect("expected a BeginRescue node");
+        assert_eq!(main_body.len(), 1, "main_body holds only the protected stmt");
+        assert_eq!(ensure_body.len(), 1, "ensure_body holds only the ensure stmt");
+        assert_eq!(body.len(), 4, "flat body still appends every clause");
+        assert_eq!(&body[..main_body.len()], &main_body[..]);
     }
 }

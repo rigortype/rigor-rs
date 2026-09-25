@@ -379,6 +379,10 @@ pub struct Harvest {
     toplevel_defs: HashSet<String>,
     /// Pass 1d: qualified owner -> this file's own `def` names ⇒ per-key union.
     discovered_methods: HashMap<String, HashSet<String>>,
+    /// Pass 1d: EVERY method name this file defines in any `def` form —
+    /// instance, `def self.x`, and receiver-bearing `def obj.x` — flattened
+    /// with no owner. ⇒ `defined_method_names`.
+    defined_method_names: HashSet<String>,
     /// Pass 1e: method name -> mutated positional param indices ⇒ per-key union.
     mutated_params: HashMap<String, HashSet<usize>>,
     /// Stage 2b: the BARE name of every constant this file writes ⇒
@@ -576,6 +580,16 @@ pub struct SourceIndex {
     /// (`MethodBody::params`) contribute — a splat/kwarg signature has no stable
     /// index-to-name map, so it records nothing.
     mutated_params: HashMap<String, HashSet<usize>>,
+    /// rigor-rs#140: every method name the project defines ANYWHERE, in any
+    /// `def` form (instance, `def self.x`, `def obj.x`), flattened with no
+    /// owner — the port of the reference's `project_defines_anywhere?`
+    /// (block_call_timing.rb), which reads the union of the discovered-method
+    /// tables on BOTH sides. Deliberately coarse, exactly like the reference:
+    /// a `class C; def self.raise` shadows nothing at the `raise` call site,
+    /// yet still disables the non-returning-call proof — resolving the site's
+    /// `self` ancestry buys nothing for names this rare. Read only to DECLINE
+    /// (keep the pre-proof answer), never to witness.
+    defined_method_names: HashSet<String>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
@@ -731,8 +745,16 @@ impl SourceIndex {
         // INNERMOST lexical class/module whose span contains it, so a def in a
         // block or a conditional inside the body still lands on the right class
         // and a def in a nested class does not leak to the outer one.
+        // `defined_method_names` rides the same loop but records EVERY def name
+        // form (instance, `self.`, receiver-bearing) with no owner — the
+        // reference's `project_defines_anywhere?` union (rigor-rs#140).
         let scopes = lexical_scopes(ast);
         for (_, node) in ast.iter() {
+            if matches!(node, Node::Definition { .. }) {
+                for nm in def_names(node) {
+                    h.defined_method_names.insert(nm);
+                }
+            }
             let Node::Definition { name: Some(nm), span, .. } = node else {
                 continue;
             };
@@ -913,6 +935,7 @@ impl SourceIndex {
         for (h, _) in files {
             let h = h.borrow();
             idx.toplevel_defs.extend(h.toplevel_defs.iter().cloned());
+            idx.defined_method_names.extend(h.defined_method_names.iter().cloned());
             for (owner, methods) in &h.discovered_methods {
                 idx.discovered_methods
                     .entry(owner.clone())
@@ -1099,6 +1122,15 @@ impl SourceIndex {
 
     pub fn is_toplevel_def(&self, name: &str) -> bool {
         self.toplevel_defs.contains(name)
+    }
+
+    /// rigor-rs#140: whether the project defines a method named `method`
+    /// ANYWHERE, in any `def` form — the flattened union of
+    /// [`Self::defined_method_names`]. Deliberately coarse, exactly like the
+    /// reference's `project_defines_anywhere?` (`block_call_timing.rb`); the
+    /// caller ORs it with [`Self::is_toplevel_def`] for the full gate.
+    pub fn project_defines_method_name(&self, method: &str) -> bool {
+        self.defined_method_names.contains(method)
     }
 
     /// Register a name in the id registry (idempotent), returning nothing.

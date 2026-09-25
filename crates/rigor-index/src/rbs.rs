@@ -1917,6 +1917,43 @@ impl CoreData {
         }
     }
 
+    /// rigor-rs#140 (upstream rigor#1105): the flattened ancestor names of
+    /// `class_name` (itself first), or `None` when the class is unknown or the
+    /// chain is INCOMPLETE — an unresolvable ancestor must never read as
+    /// absent (the same conservative gate [`Self::class_has_method`] applies).
+    /// Used by the exactly-once block-timing proof, which asks every ancestor
+    /// whether a project reopening patched the method under it.
+    pub fn ancestor_names(&self, class_name: &str) -> Option<Vec<&'static str>> {
+        if !self.classes.contains_key(class_name) {
+            return None;
+        }
+        let (chain, complete) = self.ancestors(class_name);
+        complete.then_some(chain)
+    }
+
+    /// rigor-rs#140 (upstream rigor#1105): the FIRST ancestor on `class_name`'s
+    /// flattened chain that DIRECTLY declares `method` — its own `methods`
+    /// table or an instance `alias` — or `None` when the class is unknown, the
+    /// chain is incomplete, or no ancestor declares it. This is the resolved
+    /// declaration's OWNER, the fact the reference's `defined_in` check
+    /// (`BlockCallTiming.exactly_once_owner?`) gates on: `Array#tap` resolves
+    /// to `Kernel`, while a class that overrides `tap` itself reports that
+    /// class, never Kernel.
+    pub fn declaring_ancestor(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        if !self.classes.contains_key(class_name) {
+            return None;
+        }
+        let (chain, complete) = self.ancestors(class_name);
+        if !complete {
+            return None;
+        }
+        chain.into_iter().find(|anc| {
+            self.classes.get(anc).is_some_and(|entry| {
+                entry.methods.contains_key(method) || entry.aliases.contains_key(method)
+            })
+        })
+    }
+
     /// Collection-shape stage 2b: the class an RBS TOP-LEVEL object constant is
     /// declared to hold (`"ENV"` ⇒ `"RBS::Unnamed::ENVClass"`), or `None`.
     /// See [`Self::object_constants`] for the recording discipline.
