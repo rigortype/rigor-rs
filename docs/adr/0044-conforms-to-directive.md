@@ -1,6 +1,6 @@
 # Read `%a{rigor:v1:conforms-to _Interface}`: presence tier only, silent wherever the reference may not load, build or resolve
 
-Status: accepted 2026-09-25 (issue [#129](https://github.com/rigortype/rigor-rs/issues/129); pin `e59b7b89`); amended the same day by the second review round (the allow-list)
+Status: accepted 2026-09-25 (issue [#129](https://github.com/rigortype/rigor-rs/issues/129); pin `e59b7b89`); amended the same day by the second review round (the allow-list) and the third (the environment-parity gate)
 
 ## Context
 
@@ -108,7 +108,8 @@ pass:
 An entity declared ONLY by bundled RBS (core / stdlib / overlay / catalogue /
 a bundled plugin) is trusted: the pinned oracle builds every one of them,
 and the load-set list below names each whose surface differs. A project
-file carrying a directive (`use`, `resolve-type-names`) is not modelled. The
+file carrying a directive (`use`, `resolve-type-names`) stands the whole
+scan down (§ "Environment-parity gate"). The
 member sets come from the same walk, so presence is exact wherever the build
 is provable. Earlier silences (duplicate members, file quarantine, generic
 reopens) are now rows of that table.
@@ -139,6 +140,7 @@ Config inputs the port does not mirror still stand the whole scan down:
 `libraries:`, `bundler:`, `includes:`, a `.bundle/config` or
 `vendor/bundle/`, a plugin the port does not bundle, and a `target_ruby:`
 outside `3.3` / `3.4` / `4.0` (with or without a patch level) and `latest`.
+Round 3 generalises these into the environment-parity gate below.
 The reference rejects a malformed `target_ruby` before the run (exit 64) and
 one its Prism cannot parse with a lone `configuration-error` row (exit 1;
 the message embeds Prism's own error text, so the port does not reproduce
@@ -166,6 +168,79 @@ included. A relative `signature_paths:` entry resolves against the directory
 of the config file actually read (`Configuration.resolve_paths_in`), so
 `--config conf/custom.yml` reads `conf/sig`. This moves every rule's
 project-sig loading, as intended.
+
+### Environment-parity gate (PR #150, third review round)
+
+The third review found 58 port-only projects in 14 families, and none came
+from the build model: 440 random multi-file projects and 80 member shapes
+gave gaps only. Every one came from the reference running a different
+ENVIRONMENT or CONFIG than the port assumed. That set is open-ended too, so
+the scan now also requires that the environment be provably the one the
+reference builds. Each clause below is oracle-justified. "Stands down"
+means no conformance row at all for the run.
+
+| clause | why (oracle, `e59b7b89`) |
+|---|---|
+| the reference's run has ≥1 Ruby file: an explicit `*.rb` file argument, or a directory root (no glob metacharacter) with a `**/*.rb` file that `File.fnmatch?` could not exclude (over-approximated; built-in `vendor/bundle`, `.bundle`, `node_modules` excludes included) | with no file the reference builds no environment and emits no row (an empty `lib/`, a missing or `.rbs` argument, an empty `paths:`) |
+| the config text fits a strict YAML subset and every key passes a coercion read in `configuration.rb` (below) | the reference rejects many values the port accepts, exits 64 or 1, and emits no row |
+| every `signature_paths:` entry: no leading `~`, no glob metacharacter (`*?[]{}\`) in the absolute path `Dir.glob` receives, and a `..` only where the lexical fold names the directory the OS reaches | `File.expand_path` expands `~`; `Dir.glob` interprets metacharacters, including in the project root (`proj[x]`); `lnk/../sig` folds lexically upstream |
+| no `rbs_collection.lock.yaml` and no discovered collection dir | the reference skips collection gems named in `DEFAULT_LIBRARIES` or vendored (`json`, `redis`, `prism`, `rbs`, …); the skip list is not modelled |
+| a `Gemfile.lock` has only `GEM` / `PLATFORMS` / `DEPENDENCIES` / `RUBY VERSION` / `BUNDLED WITH` / `CHECKSUMS` sections | Bundler reads a `GIT` / `PATH` gem as locked and loads its overlay; the port reads `GEM` only |
+| every project `.rbs` is readable, parses with the port's parser, and holds no NUL byte, no directive and no `resolve-type-names` comment (index side) | `ruby-rbs` 0.3.0 rejects non-ASCII identifiers rbs 4.2 accepts, and the file used to be dropped silently; a NUL crashes the reference; `use Foo::_Bar as _Baz` stubs `Foo::_Bar` in EVERY file; the magic comment is read Ruby-side only |
+| (kept) `signature_paths:` configured and non-empty, `target_ruby` accepted, no `.bundle/config` or `vendor/bundle/`, only bundled plugins, no `prepend` of an interface | rounds 1 and 2 |
+
+**The config subset.** `conformance_gate.rs` parses the file itself: top-level
+`key: scalar`, `key: []` / `{}`, or ONE level of block sequence or mapping,
+with comments, CRLF and a leading `---`. Anchors, aliases, tags, flow content,
+block scalars, escapes, tabs, nesting and duplicate keys all stand the scan
+down. A plain scalar counts as a string only when Psych (YAML 1.1) and
+`serde_yaml` both read it as its text: it has name and path characters only,
+no leading digit or sign, and is none of `yes/no/true/false/on/off/null`
+(any case), `.inf` or `.nan`. So a bare `off`, `yes` or `1_0` directory is
+refused, and so are a date (`DisallowedClass`) and a `:symbol`. Accepted keys:
+- `signature_paths`, `paths`, `exclude`, `disable`: lists of strings (`exclude`
+  and `disable` may be null);
+- `plugins`: `rigor-<id>` gem names of bundled plugins only. A bare id loads
+  nothing upstream; the port normalises it;
+- `target_ruby`: quoted, or plain `3.3` / `3.4` / `4.0` / `latest` /
+  `x.y.z`. `3.3e0` is a String to Psych and a float to `serde_yaml`;
+- `severity_profile`: `lenient` / `balanced` / `strict`;
+- `severity_overrides`: a mapping whose values are the strings `error`,
+  `warning`, `info` or `off` (so `off` must be quoted);
+- `baseline`: a string or `false`;
+- `bleeding_edge`: `true`, `false` or a list;
+- `rigor_rs`: a mapping of strings;
+- keys the reference does not own: inert there (only warned about), so they
+  are accepted when their values are strings, booleans or plain integers.
+
+Every other key the reference owns stands the scan down: `libraries`,
+`includes`, `bundler`, `rbs_collection`, `cache`, `parallel`,
+`dependencies`, `effects`, `plugins_isolation`, `plugins_io`, `pre_eval`,
+`fold_platform_specific_paths`, `parameter_inference`. Their validation or
+their effect on the environment is not modelled.
+
+**Fixed exactly rather than gated:** (6) a bundled plugin's `sig/` is deferred
+upstream and dropped when a class's arity differs from that class's FIRST
+declaration (bundled, else the first project one); the port compared against
+its own first declaration, the plugin's. (14) the annotation's column is
+counted in characters (Unicode scalar values), as RBS does. The oracle agrees
+with 2-, 3- and 4-byte characters and with a combining mark before the
+annotation.
+
+**Measured cost.** Of rv3's 320 projects, 23 that the reference and the
+port used to agree on became gaps:
+- `resolve-type-names`, `# resolve-type-names: true` included (6);
+- rbs collections, `rbs_collection:` included (3);
+- an unreadable or unparseable project file whose rows came from another
+  file: invalid UTF-8, a BOM, `-> instance` in an interface (4);
+- config values: a null or numeric `signature_paths:` element,
+  `effects:`, `target_ruby: 3.40` or `!!str 3.4`, a plugin listed twice (6);
+- a glob metacharacter in a directory name (2);
+- a `PATH` lockfile (1);
+- the `Gemfile.lock` overlay treated as a deferred plugin (1).
+
+Ordinary projects keep their rows: `probes7.rb`'s `w_realistic` (3 rows) and
+fixture 112 (8 rows) are identical. The sweep is configless and unchanged.
 
 ### Scope boundaries
 
@@ -280,3 +355,23 @@ grows about 2.5 ms (28.5 → 31 ms) for the model. `run.rb` live and
 `run_snapshot.rb`: 0 unregistered; fixture 112 keeps its 8 rows MATCHED and
 byte-identical (`snapshot.rb --check`: up to date). Details:
 [`docs/notes/20260925-conforms-to-audit.md`](../notes/20260925-conforms-to-audit.md).
+
+### Third round: the environment-parity gate (2026-09-25, same pin and host)
+
+The third review's 58 port-only projects (14 families, all environment or
+config) are fixed: 57 now emit no conformance row, and the multibyte-column
+one is identical. Re-run on the release build, in fresh cwds with
+`--no-cache`:
+- rv3 `b1`–`b15` + `fuzz` seed 1: 320 projects;
+- `fuzz` seeds 2–11: 400 more;
+- the earlier sets (first-round `probes1`–`8`, `/tmp/rv150`, `al/q1`–`q7`):
+  239.
+
+Across the 959 there are **0 port-only rows and 0 order differences**. The
+cost is the 23 agreements listed under "Measured cost". Gates:
+`cargo test --workspace` 1,344 passed; clippy 1.88 clean in both modes;
+`snapshot.rb --check` up to date; `run_snapshot.rb` and `run.rb` 0
+unregistered (fixture 112 8/8); `fp_audit.py --gaps --sweep` 0 FP / 9,337
+files / 3,829 gaps; `conformance_load_set.rb --check` OK. The divergences
+these families expose for OTHER rules are listed in the audit note as
+follow-ups.

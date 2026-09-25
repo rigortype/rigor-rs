@@ -341,6 +341,15 @@ pub(super) struct ConformanceBuilder {
     /// A project `prepend` of an interface: the reference's build raises a
     /// non-RBS error there and the whole run dies.
     crash_risk: bool,
+    /// Issue #129 round 3: a project signature file the port cannot prove it
+    /// reads as the reference does (it fails to parse here — the port's
+    /// `ruby-rbs` rejects non-ASCII identifiers rbs 4.2 accepts — or holds a
+    /// NUL byte, a `use` directive or a `resolve-type-names` magic comment).
+    /// The whole scan stands down.
+    blocked: bool,
+    /// Parsed sources walked so far (a project file that did not add one
+    /// failed to parse).
+    walks: usize,
     /// The source text being walked (for header argument spellings).
     code: String,
     first_seen: HashMap<&'static str, (Seen, Origin)>,
@@ -368,6 +377,7 @@ pub(super) struct ConformanceData {
     /// type names (stubs) and undeclared namespace prefixes.
     pub(super) maybe_synthetic: HashSet<&'static str>,
     pub(super) crash_risk: bool,
+    pub(super) blocked: bool,
     /// Annotations in the reference's `env.class_decls` order, restricted to
     /// classes first declared in a (non-quarantined) project file.
     pub(super) annotations: Vec<AnnotationRecord>,
@@ -547,6 +557,16 @@ fn header(name: &TypeNameNode<'_>, args: NodeList<'_>) -> Option<HeaderRef> {
 }
 
 impl ConformanceBuilder {
+    /// Stand the whole scan down (see `blocked`).
+    pub(super) fn block(&mut self) {
+        self.blocked = true;
+    }
+
+    /// Parsed sources walked so far.
+    pub(super) fn walks(&self) -> usize {
+        self.walks
+    }
+
     /// Enter a source of the given origin (`None` = bundled).
     pub(super) fn set_origin(&mut self, origin: Option<Origin>) {
         if let Some(Origin::Collection(f)) = origin {
@@ -563,10 +583,16 @@ impl ConformanceBuilder {
     pub(super) fn walk(&mut self, code: &str, directives: NodeList<'_>, decls: NodeList<'_>) {
         self.code.clear();
         self.code.push_str(code);
+        self.walks += 1;
         let origin = self.origin();
         if let Origin::Project(f) | Origin::Collection(f) = origin {
             if directives.iter().next().is_some() {
+                // A `use` directive binds names the port does not model — and
+                // upstream it also STUBS a missing `use` target, in every
+                // file (oracle: `use Foo::_Bar as _Baz` makes a directive on
+                // `Foo::_Bar` silent). The scan stands down.
                 self.directive_files.insert(f);
+                self.blocked = true;
             }
         }
         self.walk_decls(decls, &[]);
@@ -991,15 +1017,27 @@ impl ConformanceBuilder {
     }
 
     pub(super) fn finish(mut self) -> ConformanceData {
-        // A plugin source whose class clashes in generic ARITY with another
-        // declaration is dropped whole upstream (`add_deferred_signatures`).
+        // A plugin source whose class clashes in generic ARITY with the
+        // class's FIRST declaration is dropped whole upstream
+        // (`add_deferred_signatures`). Plugin `sig/` is deferred AFTER the
+        // bundled and project sources, so that first declaration is the first
+        // bundled one, else the first project one in sorted order — exactly
+        // the first non-plugin declaration here (bundled RBS is ingested
+        // first, project files sorted). Upstream checks only a plugin's
+        // `class` declarations; checking its modules too only adds silence.
+        // A class only plugins declare, in more than one source, is suspect.
         for decls in self.classes.values() {
-            let arity = decls.first().map_or(0, |d| d.params.len());
+            let first = decls.iter().find(|x| !matches!(x.origin, Origin::Plugin(_)));
             for d in decls {
-                if let Origin::Plugin(k) = d.origin {
-                    if d.params.len() != arity {
-                        self.suspect.insert(k);
-                    }
+                let Origin::Plugin(k) = d.origin else {
+                    continue;
+                };
+                let clash = match first {
+                    Some(f) => f.params.len() != d.params.len(),
+                    None => decls.iter().any(|x| x.origin != d.origin),
+                };
+                if clash {
+                    self.suspect.insert(k);
                 }
             }
         }
@@ -1090,6 +1128,7 @@ impl ConformanceBuilder {
             unknown_names,
             maybe_synthetic,
             crash_risk: self.crash_risk,
+            blocked: self.blocked,
             constants,
             globals,
             annotations,

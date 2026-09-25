@@ -1184,7 +1184,7 @@ impl<'a> Checker<'a> {
 pub(super) fn findings(d: &ConformanceData) -> Vec<ConformanceFinding> {
     // A project `prepend _Iface` makes the reference's build raise a non-RBS
     // error: the whole run dies there, with no rows at all.
-    if d.crash_risk {
+    if d.crash_risk || d.blocked {
         return Vec::new();
     }
     let ck = Checker::new(d, false);

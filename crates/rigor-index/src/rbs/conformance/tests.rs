@@ -405,6 +405,54 @@ fn load_set_divergent_names_are_silent() {
     assert!(got.is_empty(), "{got:?}");
 }
 
+/// Round 3 (ADR-0044 § "Environment-parity gate"): a project signature file
+/// the port cannot prove it reads as the reference does stands the WHOLE scan
+/// down — never a silent per-file drop. Each case was a port-only row on the
+/// oracle: the port's parser rejects non-ASCII identifiers rbs 4.2 accepts;
+/// a NUL byte crashes the reference; a `use` directive stubs its target in
+/// every file; `resolve-type-names` is a magic comment the parser never sees.
+#[test]
+fn unprovable_project_files_stand_the_scan_down() {
+    let gate = "interface _Cl\n  def close: () -> void\n  def closed?: () -> bool\nend\n\
+                %a{rigor:v1:conforms-to _Cl}\nclass Gate\n  def close: () -> void\nend\n";
+    // Control: the same project fires.
+    assert_eq!(messages(&[("a.rbs", gate)]).len(), 1);
+    for other in [
+        "class Gate\n  def closed?: () -> bool\n  def été: () -> void\nend\n",
+        "class Other\nend\n\0\n",
+        "use Foo::_Bar as _Baz\nclass User\n  def x: () -> _Baz\nend\n",
+        "# resolve-type-names: false\nclass User\nend\n",
+    ] {
+        let got = messages(&[("a.rbs", gate), ("b.rbs", other)]);
+        assert!(got.is_empty(), "{other:?}: {got:?}");
+    }
+}
+
+/// Round 3, family 6: a bundled plugin's `sig/` is DEFERRED upstream and
+/// dropped whole when one of its classes clashes in arity with that class's
+/// FIRST declaration — bundled, else the first project one. The port used to
+/// compare against its own first declaration (the plugin's), so a project
+/// `Duration[T]` against the plugin's `Duration` went unnoticed.
+#[test]
+fn plugin_arity_standdown_compares_against_the_first_non_plugin_declaration() {
+    let plugin = crate::plugins::bundled_plugin("activesupport-core-ext").unwrap();
+    let pres = "interface _Pres\n  def present?: () -> bool\n  def closed?: () -> bool\nend\n\
+                %a{rigor:v1:conforms-to _Pres}\nclass Gate\nend\n";
+    let run = |other: &str| {
+        let (_, dir) = project(&[("a.rbs", pres), ("b.rbs", other)]);
+        let data = CoreData::load_for_project(&[plugin], &[dir.join("sig")]);
+        let got: Vec<String> = render(&data).into_iter().map(|r| r.2).collect();
+        std::fs::remove_dir_all(dir).ok();
+        got
+    };
+    // Oracle: the plugin stands down, `present?` goes missing too — silent here.
+    assert!(run("module ActiveSupport\n  class Duration[T]\n  end\nend\n").is_empty());
+    // Control (oracle-identical): same arity, the plugin loads, `present?` is provided.
+    let got = run("module ActiveSupport\n  class Duration\n  end\nend\n");
+    assert_eq!(got.len(), 1, "{got:?}");
+    assert!(got[0].contains("required method: `#closed?`"), "{got:?}");
+}
+
 /// The vendored catalogue is byte-identical to the pinned reference's
 /// (skipped when the submodule is not checked out).
 #[test]

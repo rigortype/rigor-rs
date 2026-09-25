@@ -26,6 +26,7 @@ mod coverage;
 mod bundler;
 mod bleeding_edge;
 mod config_audit;
+mod conformance_gate;
 mod diff;
 mod triage;
 mod type_display;
@@ -266,8 +267,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
     // `# rigor:disable` applied). Shared with `baseline generate`.
+    let ref_has_files = reference_has_ruby_files(&cfg, &files);
     let (mut findings, had_io_error) =
-        analyze_files(&expanded, &cfg, "check", folder_ref, &bleeding_edge);
+        analyze_files(&expanded, &cfg, "check", folder_ref, &bleeding_edge, ref_has_files);
 
     // ADR-22 slice 5 — snapshot the RAW (pre-baseline-filter) findings for the
     // `--baseline-strict` audit. The reference audits `raw_result.diagnostics`
@@ -626,6 +628,7 @@ fn analyze_files(
     verb: &str,
     folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
     bleeding_edge: &config::BleedingEdgeSelector,
+    ref_has_files: bool,
 ) -> (Vec<(usize, String, String, Diagnostic)>, bool) {
     let disable_matcher = cfg.disable_matcher();
     // ADR-8 "Severity profile" — the resolution inputs, computed once: the
@@ -1063,7 +1066,7 @@ fn analyze_files(
     // annotation in the project `.rbs`, re-stamped by the severity profile but
     // NOT filtered by `disable:` (its `disable:` filter only sees per-file rows;
     // oracle-measured, `disable: [all]` leaves both rows standing).
-    if conformance_scan_active(cfg, root) {
+    if conformance_scan_active(cfg, root, ref_has_files) {
         findings.extend(conformance_rows(&index, profile, &user_overrides, &bleeding_overrides));
     }
 
@@ -1099,6 +1102,18 @@ fn analyze_files(
     (findings, had_io_error)
 }
 
+/// Issue #129: whether the reference's run over these positional roots (none
+/// = the config's `paths:`, default `lib`) has a Ruby file at all — see
+/// [`conformance_gate::reference_has_ruby_files`].
+pub(crate) fn reference_has_ruby_files(cfg: &Config, positional: &[&str]) -> bool {
+    conformance_gate::reference_has_ruby_files(
+        positional,
+        cfg.paths_explicitly_declared().then_some(cfg.paths.as_slice()),
+        cfg.config_base_dir(),
+        &cfg.exclude,
+    )
+}
+
 /// Issue #129 — whether the `conforms-to` scan runs at all. The reference gates
 /// it on the project CONFIGURING `signature_paths:` (`project_signature_paths?`:
 /// non-nil and non-empty — a defaulted `sig/` is loaded but not scanned), and
@@ -1110,11 +1125,31 @@ fn analyze_files(
 /// `vendor/bundle`), an unbundled plugin, and `includes:` (whose merged keys
 /// rigor-rs does not read). It also stands down on a `target_ruby:` the
 /// reference may reject: that run emits no row but its own error.
-fn conformance_scan_active(cfg: &Config, root: &Path) -> bool {
-    if cfg.explicit_signature_paths().is_none_or(<[String]>::is_empty) {
+///
+/// Round 3 (ADR-0044 § "Environment-parity gate") adds the clauses that prove
+/// the reference runs in the environment the port models: the reference has
+/// at least one Ruby file (else it builds no environment), the config text
+/// is one it provably loads and reads the same way, every signature path is
+/// the directory it reads, no rbs collection (its skip list is not
+/// modelled), and a `Gemfile.lock` the port parses whole. The per-file
+/// clauses (parse, NUL, `use`, `resolve-type-names`) are index-side.
+fn conformance_scan_active(cfg: &Config, root: &Path, ref_has_files: bool) -> bool {
+    let Some(entries) = cfg.explicit_signature_paths().filter(|e| !e.is_empty()) else {
+        return false;
+    };
+    if !ref_has_files || !cfg.parity_text_ok() || !cfg.target_ruby_supported() {
         return false;
     }
-    if !cfg.target_ruby_supported() {
+    if !entries
+        .iter()
+        .all(|e| conformance_gate::signature_entry_ok(e, cfg.config_base_dir()))
+    {
+        return false;
+    }
+    if !conformance_gate::lockfile_ok(root)
+        || root.join("rbs_collection.lock.yaml").exists()
+        || !cfg.collection_signature_dirs(root).is_empty()
+    {
         return false;
     }
     if ["libraries", "bundler", "includes"].iter().any(|k| cfg.declares_key(k)) {
@@ -1158,10 +1193,16 @@ fn conformance_rows(
             .entry(f.file)
             .or_insert_with(|| std::fs::read_to_string(f.file).unwrap_or_default())
             .clone();
+        // RBS reports the annotation's column in CHARACTERS (Unicode scalar
+        // values: oracle-measured with 2-, 3- and 4-byte characters and a
+        // combining mark before it), where `line_col` counts bytes. Shift the
+        // offset back by the difference so the shared renderer prints the
+        // reference's column.
+        let delta = char_column_delta(&source, f.start_offset);
         let diag = Diagnostic {
             rule_id: f.rule_id(),
-            start_offset: f.start_offset,
-            end_offset: f.end_offset,
+            start_offset: f.start_offset - delta,
+            end_offset: f.end_offset.saturating_sub(delta),
             message: f.message(),
             severity,
             source_family: "builtin",
@@ -1171,6 +1212,16 @@ fn conformance_rows(
         rows.push((usize::MAX, f.file.to_string(), source, diag));
     }
     rows
+}
+
+/// Bytes minus characters between the start of `offset`'s line and `offset`
+/// (0 on an ASCII line or an offset off a character boundary).
+fn char_column_delta(source: &str, offset: usize) -> usize {
+    let Some(before) = source.get(..offset) else {
+        return 0;
+    };
+    let line = &before[before.rfind('\n').map_or(0, |i| i + 1)..];
+    line.len() - line.chars().count()
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1392,7 @@ fn baseline_analysis(
     // "No positional roots AND no declared `paths:`" — the reference's default
     // `["lib"]` is a fallback, not a user-declared scope.
     let scope_undeclared = roots.is_empty() && !cfg.paths_explicitly_declared();
+    let roots_given = !roots.is_empty();
 
     let config_paths: Vec<&str>;
     let roots: &[&str] = if roots.is_empty() {
@@ -1349,10 +1401,17 @@ fn baseline_analysis(
     } else {
         roots
     };
+    let ref_has_files = reference_has_ruby_files(&cfg, if roots_given { roots } else { &[] });
     let (expanded_owned, _path_errors) = expand_check_paths(roots);
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
-    let (findings, _had_io_error) =
-        analyze_files(&expanded, &cfg, verb, folder_ref, &cfg.bleeding_edge_selector());
+    let (findings, _had_io_error) = analyze_files(
+        &expanded,
+        &cfg,
+        verb,
+        folder_ref,
+        &cfg.bleeding_edge_selector(),
+        ref_has_files,
+    );
     Ok((cfg, findings, scope_undeclared))
 }
 
@@ -2409,6 +2468,18 @@ mod tests {
         let line_start = src.find('\n').unwrap() + 1;
         assert_eq!(line_col(src, off), (2, off - line_start + 1));
         assert_eq!(line_col(src, off).1, 8);
+    }
+
+    #[test]
+    fn conformance_column_counts_characters() {
+        // Oracle (PR #150 round 3): `type t = "é" %a{…}` puts the annotation
+        // at column 16 upstream; bytes would say 17. One Unicode scalar per
+        // character (here 16 before it), a combining mark counted apart.
+        let src = "iface\ntype t = \"é😀e\u{301}\" %a{x}\n";
+        let off = src.find("%a").unwrap();
+        let fixed = off - char_column_delta(src, off);
+        assert_eq!(line_col(src, fixed), (2, 17));
+        assert_eq!(char_column_delta("abc %a", 4), 0);
     }
 
     #[test]

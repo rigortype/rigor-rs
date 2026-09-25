@@ -161,3 +161,88 @@ No common row changed order.
 | `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered; fixture 112 8/8 MATCHED, byte-identical |
 | `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps, identical to master |
 | `conformance_load_set.rb --check` (+ `--plugin activesupport-core-ext`) | OK, 897 names (plugin adds none) |
+
+## Third round: the environment, not the build
+
+A second independent review (probe sets `rv3/b1`–`b15` plus `fuzz.rb`)
+found 58 port-only projects in 14 families. None came from the build model:
+440 random multi-file projects and 80 member shapes gave gaps only. Each
+came from the reference running a different environment or configuration:
+
+| # | family | reference |
+|---|---|---|
+| 1 | `use` directives | `use Foo::_Bar as _Baz` stubs `Foo::_Bar` (in every file); `use Nope::*` crashes |
+| 2 | `# resolve-type-names: false` | read Ruby-side; the port's parser never sees it |
+| 3 | non-ASCII identifiers | rbs 4.2 parses them; `ruby-rbs` 0.3.0 rejects the file, which the port dropped silently |
+| 4 | a NUL byte in a project `.rbs` | the run crashes |
+| 5 | rbs collections | gems named in `DEFAULT_LIBRARIES` or vendored are skipped |
+| 6 | deferred plugin arity | compared against the class's first bundled/project declaration |
+| 7 | `plugins: [activesupport-core-ext]` | a load error, no plugin |
+| 8 | activesupport locked from `GIT` | the overlay loads (Bundler's parser) |
+| 9 | no Ruby file analysed | no environment, no rows |
+| 10 | glob metacharacters in the signature path (root included) | `Dir.glob` interprets them |
+| 11 | `~` in `signature_paths:` | expanded to `$HOME` |
+| 12 | `lnk/../sig` | folded lexically |
+| 13 | 22 configs | rejected (exit 64 / 1) or read otherwise (YAML 1.1 `off` / `yes` / `1_0`, dates, aliases, symbols, bad profile / override / workers / isolation / cache / dependencies, `3.3e0`) |
+| 14 | a column after multibyte text | counted in characters |
+
+**The fix** (ADR-0044 § "Environment-parity gate") adds a gate. The scan
+stands down unless the environment is provably the reference's:
+- the reference has ≥1 Ruby file;
+- the config fits a strict YAML subset whose every key's coercion was read
+  in `configuration.rb`;
+- signature paths have no `~`, no glob metacharacter, and a `..` only where
+  the lexical fold matches the physical path;
+- no rbs collection;
+- a `Gemfile.lock` with `GEM`-only gem sources;
+- every project `.rbs` is readable and parseable, with no NUL, directive or
+  `resolve-type-names`.
+
+Two families are fixed exactly: the plugin arity comparison (6) and the
+character column (14; oracle: 2-, 3- and 4-byte characters and a combining
+mark all count as one scalar each).
+
+### Tallies (release build, one fresh cwd per project, `--no-cache`)
+
+| probe set | projects | identical | same rows, other diffs | gap-only | exit code only | port-only rows |
+|---|---|---|---|---|---|---|
+| rv3 `b1`–`b15` + `fuzz` (seed 1) | 320 | 180 | 63 | 77 | — | 0 |
+| rv3 `fuzz` seeds 2–11 | 400 | 173 | 159 | 68 | — | 0 |
+| first round `probes1`–`8`, reviewer `/tmp/rv150`, `al/q1`–`q7` | 239 | 129 | — | 104 | 6 | 0 |
+
+- All 58 rv3 port-only projects are fixed: 57 now emit no conformance row,
+  and the multibyte-column one is identical.
+- The rv3 runner counts "same rows, other diffs" separately: rows identical,
+  exit code or other rules different. The first-round runner folds that
+  into "gap-only" and reports exit codes apart. Its six exit-code
+  differences have no port row: the reference's `prepend _Z` crash, three
+  `target_ruby` rejections, a bare-`off` override (exit 64), and the
+  unbundled `rigor-rails` stand-down.
+- No common row changed order.
+- `probes7.rb`'s `w_realistic` (3 rows) and fixture 112 (8 rows) are
+  identical.
+- Measured cost: 23 rv3 projects the two tools used to agree on became gaps
+  (listed in the ADR).
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | 1,344 passed, 0 failed, 1 ignored |
+| clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 112 8/8 MATCHED |
+| `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps |
+| `conformance_load_set.rb --check` | OK, 897 names |
+
+**Divergences for other rules (not fixed here, follow-up candidates):**
+every family above except 9 and 14 also changes what the port's other
+rules see from project RBS or config. That covers `use` /
+`resolve-type-names` unmodelled, non-ASCII files dropped, NUL, the
+collection skip list, deferred plugin arity, bare plugin ids, `GIT` / `PATH`
+lockfile sources, glob / `~` / `..` path resolution, and the 22 rejected
+or differently-read configs. It adds the round-2 items (`paths:`,
+`pre_eval`, `plugins_io.allowed_paths` and `includes` resolved against
+cwd; a scalar `signature_paths: sig`; an unsupported `target_ruby` emitting
+only its error), `.rigor.dist.yml` discovery, and the Gemfile.lock overlay
+loaded as a project signature path upstream but as a plugin here. `exclude:`
+matching also differs: the reference uses `File.fnmatch?` with no flags and
+does not appear to apply `exclude:` to explicit file arguments; the port
+uses `glob::Pattern` on every file. That last point was read, not probed.

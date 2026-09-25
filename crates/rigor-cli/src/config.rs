@@ -127,6 +127,11 @@ pub struct Config {
     /// Set by [`Config::read`]; never (de)serialized.
     #[serde(skip)]
     base_dir: Option<std::path::PathBuf>,
+    /// Issue #129: the file's text is a config the reference provably loads
+    /// and reads as the port does ([`crate::conformance_gate::config_text_ok`]).
+    /// `false` for the default (no file). Never (de)serialized.
+    #[serde(skip)]
+    parity_text_ok: bool,
 }
 
 /// ADR-0036: the `rigor_rs:` namespace for rigor-rs-specific config keys — those
@@ -213,6 +218,7 @@ impl Default for Config {
             present_keys: std::collections::BTreeSet::new(),
             target_ruby: serde_yaml::Value::Null,
             base_dir: None,
+            parity_text_ok: false,
         }
     }
 }
@@ -289,6 +295,7 @@ impl Config {
                 Ok(mut cfg) => {
                     cfg.present_keys = top_level_keys(&text);
                     cfg.base_dir = config_base_dir(path);
+                    cfg.parity_text_ok = crate::conformance_gate::config_text_ok(&text);
                     ConfigRead::Parsed(Box::new(cfg))
                 }
                 Err(e) => ConfigRead::Malformed(e.to_string()),
@@ -613,6 +620,24 @@ impl Config {
     /// stands down otherwise.
     #[must_use]
     pub fn target_ruby_supported(&self) -> bool {
+        self.target_ruby_value_supported()
+    }
+
+    /// Issue #129: whether the config text passed the environment-parity
+    /// subset (see [`crate::conformance_gate::config_text_ok`]).
+    #[must_use]
+    pub fn parity_text_ok(&self) -> bool {
+        self.parity_text_ok
+    }
+
+    /// The directory relative `signature_paths:` / `paths:` resolve against
+    /// in the reference, when it is not the cwd.
+    #[must_use]
+    pub fn config_base_dir(&self) -> Option<&Path> {
+        self.base_dir.as_deref()
+    }
+
+    fn target_ruby_value_supported(&self) -> bool {
         let text = match &self.target_ruby {
             serde_yaml::Value::Null => return !self.present_keys.contains("target_ruby"),
             serde_yaml::Value::String(s) => s.clone(),

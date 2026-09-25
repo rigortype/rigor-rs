@@ -4225,15 +4225,31 @@ fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_d
     }
     for (abs, phase) in files {
         let Ok(code) = std::fs::read_to_string(&abs) else {
-            continue; // a directory named `*.rbs`, a dangling link: skipped upstream too
+            // A directory named `*.rbs` or a dangling link is skipped upstream
+            // too; a real file the port cannot read (not UTF-8) is one it
+            // cannot prove it reads as the reference does.
+            if std::fs::metadata(&abs).is_ok_and(|m| m.is_file()) {
+                builder.conformance.block();
+            }
+            continue;
         };
+        // A NUL byte crashes the reference's run; `resolve-type-names` is a
+        // magic comment rbs reads Ruby-side (the port's parser never sees it).
+        if code.contains('\0') || code.contains("resolve-type-names") {
+            builder.conformance.block();
+        }
         let key = intern(&abs);
         let origin = match phase {
             conformance::Phase::Collection => conformance::Origin::Collection(key),
             conformance::Phase::Project => conformance::Origin::Project(key),
         };
         builder.conformance.set_origin(Some(origin));
+        let walked = builder.conformance.walks();
         ingest_rbs_source(builder, &abs, &code);
+        // Not walked = the port's parser rejected it: never drop it silently.
+        if builder.conformance.walks() == walked {
+            builder.conformance.block();
+        }
         builder.conformance.set_origin(None);
     }
 }
