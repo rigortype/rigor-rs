@@ -2505,7 +2505,18 @@ impl<'i> Typer<'i> {
         // guess). The nullary case (`args` empty) folds the no-arg core.
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
             if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
-                if let Some(folded) = folding::fold(&scalar, method, &arg_scalars) {
+                // A String lookup can answer `nil`, so a stale value flips the
+                // result's CLASS. The top-level flat env keeps a local's first
+                // literal across `<<`, `+=`, branch and block writes, so a lookup
+                // that reads a local declines to the RBS answer (#149 review:
+                // `buf = ""; buf << "x"; buf[0].upcase` fired `for nil`).
+                let stale_risk = folding::is_str_lookup(&scalar, method)
+                    && std::iter::once(receiver)
+                        .chain(args.iter().copied())
+                        .any(|id| reads_local(ast, id));
+                if let Some(folded) =
+                    (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
+                {
                     return interner.intern(Type::Constant(folded));
                 }
                 // ADR-0008 sidecar fallback: the Rust core declined, but if this
@@ -2513,7 +2524,9 @@ impl<'i> Typer<'i> {
                 // wired (full-fidelity mode), execute it there. A declined /
                 // absent folder leaves the value widened (sound subset).
                 if let Some(folder) = self.folder {
-                    if folding::sidecar_foldable(folding::scalar_class(&scalar), method) {
+                    if folding::sidecar_foldable(folding::scalar_class(&scalar), method)
+                        && !folding::sidecar_blows_up(method, &arg_scalars)
+                    {
                         if let Some(folded) = folder.fold(&scalar, method, &arg_scalars) {
                             return interner.intern(Type::Constant(folded));
                         }
@@ -7590,6 +7603,18 @@ fn set_difference(a: &[Scalar], b: &[Scalar]) -> Vec<Scalar> {
 pub fn type_of(ast: &LoweredAst, id: NodeId, env: &TypeEnv, interner: &mut Interner) -> TypeId {
     let empty = CoreIndex::new();
     Typer::new(&empty).type_of(ast, id, env, interner)
+}
+
+/// Whether `id`'s subtree reads a local variable: some `LocalVariableRead`
+/// lies inside its span.
+fn reads_local(ast: &LoweredAst, id: NodeId) -> bool {
+    let (lo, hi) = ast.get(id).span();
+    ast.iter().any(|(_, n)| {
+        matches!(n, Node::LocalVariableRead { .. }) && {
+            let (a, b) = n.span();
+            lo <= a && b <= hi
+        }
+    })
 }
 
 /// Walk the top-level statement sequence binding each local write. Free-function

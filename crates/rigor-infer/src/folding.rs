@@ -115,6 +115,15 @@ pub fn sidecar_foldable(receiver_class: &str, method: &str) -> bool {
     )
 }
 
+/// Reference `string_pad_blow_up?` (`constant_folding.rb`): `center` / `ljust` /
+/// `rjust` with a width past `STRING_FOLD_BYTE_LIMIT` does not fold. The sidecar
+/// would otherwise build the string, and a 3e9 width took 70 s and 10 GB.
+pub fn sidecar_blows_up(method: &str, args: &[Scalar]) -> bool {
+    matches!(method, "center" | "ljust" | "rjust")
+        && matches!(args.first(), Some(Scalar::Int(w))
+            if *w > crate::kernel_fold::STRING_FOLD_BYTE_LIMIT as i64)
+}
+
 /// Executes a purity-gated fold the Rust core declined, by running the real Ruby
 /// method (ADR-0008 — the Ruby sidecar). Injected into the [`crate::Typer`] so
 /// the pure `rigor-infer` crate never itself does IO / spawns a process; the
@@ -333,6 +342,12 @@ fn fold_str(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
     }
 }
 
+/// Whether `method` on `recv` is one of the String lookups, which can fold to
+/// `nil` and so change the receiver's class downstream.
+pub fn is_str_lookup(recv: &Scalar, method: &str) -> bool {
+    matches!(recv, Scalar::Str(_)) && matches!(method, "[]" | "slice" | "byteslice" | "index")
+}
+
 /// `String#[]` / `#slice` / `#byteslice` / `#index` on pinned scalars (issue
 /// #121 step 1). The reference folds all four by running the real method, so a
 /// fold here must be exactly Ruby's answer — including `nil` for an index out of
@@ -536,6 +551,14 @@ mod tests {
         assert!(!sidecar_foldable("Array", "sample"));
         assert!(!sidecar_foldable("Integer", "+")); // Rust core owns it
         assert!(!sidecar_foldable("String", "gsub")); // unverified — not routed
+    }
+
+    #[test]
+    fn sidecar_declines_a_pad_past_the_byte_limit() {
+        assert!(!sidecar_blows_up("center", &[Scalar::Int(4096)]));
+        assert!(sidecar_blows_up("center", &[Scalar::Int(4097)]));
+        assert!(sidecar_blows_up("ljust", &[Scalar::Int(3_000_000_000), Scalar::Str("-".into())]));
+        assert!(!sidecar_blows_up("tr", &[Scalar::Int(9999)]));
     }
 
     #[test]

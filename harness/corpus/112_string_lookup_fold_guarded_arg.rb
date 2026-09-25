@@ -215,3 +215,23 @@ def f1 = "abc"[99]&.frobnicate_f1
 def f2 = "abc"[99]&.upcase.frobnicate_f2
 def f3 = nil&.frobnicate_f3
 def f4 = "abc"[0]&.frobnicate_f4
+
+# --- (7) STAYS SILENT: a lookup that reads a top-level local -----------------
+
+# The top-level env keeps a local's first literal across `<<`, `+=` and branch
+# writes, so folding these would compute nil from a stale value (#149 review).
+buf7 = ""
+buf7 << "hello"
+buf7[0].upcase
+
+str7 = ""
+str7 += "x"
+str7.index("x").succ
+
+idx7 = 99
+idx7 -= 98
+"abc"[idx7].upcase
+
+# A pad past the reference's 4096-byte fold limit stays the nominal answer (and
+# never reaches the sidecar); it fires on the same row.
+def p1 = "abc".center(4097).frobnicate_p1
