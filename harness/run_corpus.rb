@@ -194,7 +194,8 @@ end
 def run_reference_batch(file_map, tmpdir_with_files)
   # cwd is a separate throw-away dir to isolate config discovery; being fresh
   # per invocation it also defuses the reference's cwd-keyed persistent result
-  # cache (UPSTREAM.md hazard 2).
+  # cache (UPSTREAM.md hazard 2), and `--no-cache` keeps it from being written
+  # at all, as in fp_audit.py and probe.py.
   Dir.mktmpdir("rigor-corpus-ref-cwd") do |cwd|
     # Pass the staging directory — reference accepts a directory and analyzes
     # all .rb files recursively.
@@ -202,13 +203,24 @@ def run_reference_batch(file_map, tmpdir_with_files)
       "ruby",
       "-E", "UTF-8", # see harness/lib.rb: messages inspect strings
       "-I", REFERENCE_LIB,
+      # Pin the CHECKOUT's bundled rigor-rbs-inline, as harness/lib.rb does:
+      # the ADR-93 auto-wire's `require "rigor-rbs-inline"` can otherwise
+      # resolve a stale installed rigortype gem's copy and poison every
+      # diagnostic (UPSTREAM.md, upstream issue #194).
+      "-I", File.join(REFERENCE_RIGOR_DIR, "plugins", "rigor-rbs-inline", "lib"),
       REFERENCE_EXE,
       "check",
       tmpdir_with_files,
-      "--format", "json"
+      "--format", "json",
+      "--no-cache"
     ]
 
     stdout, stderr, _status = Open3.capture3(*cmd, chdir: cwd)
+    # Messages can carry non-ASCII (e.g. an em-dash); under a US-ASCII default
+    # external encoding (LANG unset) parsing the untagged bytes raised, the
+    # rescue below returned {}, and every rigor-rs diagnostic read as a false
+    # positive. Tag UTF-8 first, as harness/lib.rb does.
+    stdout = stdout.dup.force_encoding("UTF-8")
 
     # Preamble (if any) goes to stderr; strip anything before first `{` in stdout
     json_start = stdout.index("{")
@@ -270,7 +282,7 @@ def run_rigorrs_batch(file_map)
           "invalid, NOT false-positive-free.\n  #{(stderr.empty? ? stdout : stderr).strip[0, 300]}")
   end
 
-  output = stdout.strip
+  output = stdout.dup.force_encoding("UTF-8").strip # see run_reference_batch
   json_start = [output.index("["), output.index("{")].compact.min
   if json_start.nil?
     abort("ERROR: rigor-rs produced no JSON on stdout (exit " \
