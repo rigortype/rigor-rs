@@ -3016,8 +3016,12 @@ impl<'i> Typer<'i> {
     /// (`"abc"[1..]` folds `"abc"` — and `nil` still fires on
     /// `undefined-method`), and a `Regexp`-shaped `Other` on those three plus
     /// `index` (`"abc".index(/b/)` folds `1`). When such a literal reads a
-    /// local (`x..y`, `/#{x}/`) the fold is imprecise and the reference
-    /// withholds on the union — so those withhold here too.
+    /// local (`x..y`, `/#{x}/`) the port cannot prove the local is stable —
+    /// `a = 1; b = 2; a = 9; "abc"[a..b]` is what the reference withholds on,
+    /// and the port cannot tell it apart from the stable `a = 1; b = 2` case
+    /// the reference DOES fold (`for "bc"`). Declining both loses that one
+    /// set-match; it is the safe side of a distinction the flat env cannot
+    /// make.
     ///
     /// On the remaining nilable lookups — `rindex` / `byteindex` /
     /// `byterindex` / `getbyte` and the scalar `<=>`s — NO literal kind is
