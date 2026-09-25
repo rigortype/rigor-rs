@@ -2523,6 +2523,23 @@ impl<'i> Typer<'i> {
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
             match self.pin_arg_scalars(ast, args, env, interner) {
                 Some(arg_scalars) => {
+                    // A `Str`/`Sym` scalar minted from a literal whose
+                    // unescaped bytes were not valid UTF-8 carries U+FFFD
+                    // where Ruby has the real byte — a position or comparison
+                    // fold on it mints the wrong constant (#164 review:
+                    // `"\xFFabc".getbyte(0)` is `255`, not `0xEF`). The
+                    // nilable lookups and `<=>` decline to `Dynamic` (the
+                    // String lookups also carry the check inside
+                    // `fold_str_lookup` as `Opaque`); other folds keep their
+                    // standing behaviour on the normalized text.
+                    if (folding::is_str_lookup(&scalar, method)
+                        || folding::is_nilable_cmp(&scalar, method))
+                        && std::iter::once(&scalar)
+                            .chain(arg_scalars.iter())
+                            .any(folding::scalar_has_replacement_char)
+                    {
+                        return interner.untyped();
+                    }
                     // A fold that can answer `nil` flips the result's CLASS, so
                     // it must not trust a value read from the flat env: the
                     // top-level env keeps a local's first literal across `<<`,
@@ -2544,7 +2561,8 @@ impl<'i> Typer<'i> {
                         {
                             match folding::fold_str_lookup(text, method, &arg_scalars) {
                                 folding::LookupFold::Value(s) => Some(Ok(s)),
-                                folding::LookupFold::Raises => Some(Err(())),
+                                folding::LookupFold::Raises
+                                | folding::LookupFold::Opaque => Some(Err(())),
                                 folding::LookupFold::Decline => None,
                             }
                         } else {
@@ -3003,9 +3021,11 @@ impl<'i> Typer<'i> {
     ///
     /// On the remaining nilable lookups — `rindex` / `byteindex` /
     /// `byterindex` / `getbyte` and the scalar `<=>`s — NO literal kind is
-    /// fire-capable: before this fold they flowed down the untyped-arg path
-    /// (silent), and every non-pinnable literal is a raise-or-`nil` answer in
+    /// fire-capable: every non-pinnable literal is a raise-or-`nil` answer in
     /// Ruby (`"abc".rindex(/z/)` is `nil`, `"abc".getbyte(1..2)` raises).
+    /// Declining them here trades the old `for Integer` set-match on a hit
+    /// (`rindex(/b/)` did fire before, weaker message) for silence on the
+    /// miss — a small coverage loss taken to kill the miss FP.
     /// Interpolations and containers ride the union on every family — the
     /// reference does not constant-fold an interpolated argument, so
     /// `"abc".index("a#{x}")` withholds too.
@@ -3014,9 +3034,10 @@ impl<'i> Typer<'i> {
             Node::Range { .. } => matches!(method, "[]" | "slice" | "byteslice"),
             // `Other` covers Regexp literals (which fold) alongside `__LINE__`
             // / backticks / lambdas (which ride the union). `index` keeps it
-            // fire-capable — the hit set-match is standing behaviour — while
-            // the newer lookups withhold, matching the silent untyped-arg
-            // path they took before this fold.
+            // fire-capable — the `for Integer` hit set-match is standing
+            // behaviour — while the newer lookups withhold: their `/z/` misses
+            // were flat-`Integer` FPs, and losing the `/b/` set-match is the
+            // trade that kills them.
             Node::Other { .. } => matches!(method, "[]" | "slice" | "byteslice" | "index"),
             // Scalar literals pin and never reach this path; interpolated and
             // container literals ride the union on every family.
