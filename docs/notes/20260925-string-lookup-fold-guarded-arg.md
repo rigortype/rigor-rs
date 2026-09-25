@@ -93,9 +93,9 @@ Why the gate is narrower than "the argument is guarded":
 
 ## Rows
 
-Fixture `harness/corpus/112_string_lookup_fold_guarded_arg.rb` has 44 firing
-rows and 16 silent ones, every one oracle-measured at the pin. Section 6 was
-added by the local verification pass below.
+Fixture `harness/corpus/112_string_lookup_fold_guarded_arg.rb` has 45 firing
+rows and 19 silent ones, every one oracle-measured at the pin. Sections 6 and 7
+were added by the local verification pass and the adversarial review below.
 
 | section | shape | oracle | master | branch |
 |---|---|---|---|---|
@@ -109,6 +109,8 @@ added by the local verification pass below.
 | 6 (i1-i3) | literal index/offset past `i32` | fires on the real value | fires `for String` | fires, same value ✓ |
 | 6 (f1-f3) | `&.` on a folded nil / on `nil` | silent | fires (FP) | silent ✓ |
 | 6 (f4) | `"abc"[0]&.m` | fires `for "a"` | fires `for String` | fires ✓ |
+| 7 (top level) | a lookup reading a mutated / `+=` / `-=` local | silent | silent | silent ✓ (declines) |
+| 7 (p1) | `"abc".center(4097)` | fires `for literal-string` | fires `for String` | fires, same row ✓ |
 
 ## Residues — still port-only false positives, recorded not chased
 
@@ -166,6 +168,34 @@ in the fold's inputs, and both are fixed here:
   It is now ported for the undefined-method rule only. Arity still fires on
   `nil&.to_s(1, 2, 3)`, as the reference does.
 
+An adversarial review of that state (an Opus subagent, about 150 probes)
+returned **BLOCK**, and I reproduced its finding. The top-level flat env
+(`build_toplevel_env`) keeps a local's FIRST literal across `<<`, `+=`, `-=`,
+branch writes and block writes. Before, a lookup on such a local typed as
+`String`, so the stale value never changed the receiver's class. The fold can
+answer `nil`, so the class flipped. For example, `buf = ""; buf << "hello";
+buf[0].upcase` fired `for nil`, and `x = 99; x -= 98; "abc"[x].upcase` fired as
+well. The reference and master are silent on both. Two more fixes follow:
+
+* **A lookup that reads a local declines.** If the receiver or an argument
+  subtree contains a `LocalVariableRead` (`reads_local`), the RBS answer stands.
+  Inside a `def` the env is empty, so nothing is lost there. At top level the
+  cost is `s = "abc"; s[5].m` becoming a gap again, as on master.
+* **`center` / `ljust` / `rjust` wider than 4096 skip the sidecar.** This ports
+  the reference's `string_pad_blow_up?`. The widened integer lowering had
+  brought `"abc".center(3_000_000_000)` into reach, and it took 70 s and 10 GB.
+  The same problem existed on master with a width of 2e9.
+
+The flat env's staleness is older than this PR and reaches other folds too.
+`s = "ab"; s << "c"; [1, 2][s.length].succ` is a port-only FP on master. The
+real fix is flow-sensitive top-level typing (ADR-0022), which is out of scope
+here.
+
+The integer widening also cost four rows that master matched only by accident.
+Master lowered a Bignum to `0`, so a Bignum hash key, `big - big` and `if
+big_local` happened to fold to the reference's answer. They are gaps now, and
+there are no FPs.
+
 The probes also found more port-only FPs at the same position on master. They
 are pre-existing, and each is recorded as a residue above.
 
@@ -174,8 +204,8 @@ are pre-existing, and each is recorded as a residue above.
 `python3 harness/fp_audit.py --gaps --sweep` ran over all eight
 `harness/sweep-corpora.yml` members with a freshly built release binary. The
 result was **0 FP candidates, 9,337 files and 3,829 gaps**. That is identical to
-master's baseline (`harness/CORPUS.md`), both on this branch as it arrived and
-after the two fixes above.
+master's baseline (`harness/CORPUS.md`). It was measured three times: on the
+branch as it arrived, after the first two fixes, and after the review fixes.
 
 The first cut also ran a port-vs-port diff over shallow clones of six members,
 which reported 0 removed and 0 added. The sweep supersedes it.
@@ -184,11 +214,11 @@ which reported 0 removed and 0 added. The sweep supersedes it.
 
 Re-run locally after the fixes:
 
-* `cargo test --workspace`: PASS (1321 passed).
+* `cargo test --workspace`: PASS (1322 passed).
 * `cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings` in a
   fresh target dir: exit 0.
-* `ruby harness/run.rb` and `ruby harness/run_snapshot.rb`: PASS, 601 matched,
+* `ruby harness/run.rb` and `ruby harness/run_snapshot.rb`: PASS, 602 matched,
   0 unregistered, with the gap count unchanged from master.
 * `ruby harness/snapshot.rb` reproduced every committed snapshot on ruby 4.0.6.
-  Only 112 was rewritten, for section 6.
+  Only 112 was rewritten, for sections 6 and 7.
 * `python3 harness/docs_check.py`: PASS.
