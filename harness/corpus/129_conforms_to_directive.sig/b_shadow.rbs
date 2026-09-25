@@ -1,0 +1,18 @@
+# The catalogue loads per DECLARATION, after the project's signatures: this
+# project `_Closable` wins (ROW: its extra member is required) while the shipped
+# `_ClosableStream` still loads (SILENT below).
+interface _Closable
+  def close: () -> void
+  def shut_hard: () -> void
+end
+
+%a{rigor:v1:conforms-to _Closable}
+class ProjClosable
+  def close: () -> void
+end
+
+%a{rigor:v1:conforms-to _ClosableStream}
+class StillShipped
+  def close: () -> void
+  def closed?: () -> bool
+end

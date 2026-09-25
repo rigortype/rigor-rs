@@ -32,6 +32,10 @@ pub mod plugins;
 mod rbs;
 
 pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
+pub use rbs::{
+    parse_conforms_to, ConformanceFinding, ConformanceKind, RBS_EXTENDED_UNRESOLVED,
+    UNSATISFIED_CONFORMANCE,
+};
 
 /// The core classes this index registers, in a fixed order. The slice index of
 /// a name in this array IS its [`ClassId`] (see [`CoreIndex::class_id`]), so the
@@ -123,6 +127,15 @@ impl CoreIndex {
     /// (audit-R1 / ADR-0007).
     pub fn rbs_source(&self) -> &rbs::RbsSource {
         self.data.source()
+    }
+
+    /// Issue #129: the `rigor:v1:conforms-to` rows the reference emits for the
+    /// project's signature files (`rbs_extended.unsatisfied-conformance` /
+    /// `dynamic.rbs-extended.unresolved`), in its order. Empty unless a
+    /// project `sig/` carries the directive. The CLI owns the run-level gate
+    /// (the reference scans only when `signature_paths:` is configured).
+    pub fn conformance_findings(&self) -> Vec<ConformanceFinding> {
+        self.data.conformance_findings()
     }
 
     /// How many distinct classes the loaded RBS surface registered — a coarse

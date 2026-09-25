@@ -52,8 +52,9 @@ submodule rather than tracked against a drifting local checkout.
 > (the `mail` corpus 2,162 s → 37 s) and the "budget ~80 minutes" advice in step
 > 7 no longer applies. New surface to keep an eye on:
 > `data/capability_roles/capability_roles.rbs` (#976) is loaded into every
-> default run and is deliberately NOT vendored — rigor-rs has no `conforms-to`
-> support, so nothing there can reach a diagnostic. See the
+> default run; it was NOT vendored at this pin because rigor-rs then had no
+> `conforms-to` support (superseded by issue #129 / ADR-0044, which vendors it
+> — see step 3). See the
 > [note](docs/notes/20260921-repin-v039.md).
 
 > **`v0.3.4 → v0.3.8` (2026-09-09): four releases, 924 commits, and every one of
@@ -329,15 +330,24 @@ chasing a non-bug.)
    ported upstream data specs) and the embedded-bytes digest assertion are the
    other two layers; see that tree's `PROVENANCE.md`.
 
-   **`data/capability_roles/` is a fourth `data/` directory and is deliberately
-   NOT vendored.** `v0.3.9`'s #976 ships five capability-role interfaces
-   (`_Closable`, `_RewindableStream`, `_ClosableStream`, `_FileDescriptorBacked`,
-   `_Callable`) into EVERY default run, so a `%a{rigor:v1:conforms-to …}` written
-   by following the specification resolves with no configuration. rigor-rs has no
-   `conforms-to` support at all, so an interface there is unreachable and cannot
-   produce a false positive — but that premise is the reason, so re-check it at
-   the bump that gives the port `conforms-to`, and re-check the directory itself
-   the way `diff -r` checks the other two.
+   **Re-sync `crates/rigor-index/vendor/capability_roles/` too** — the reference's
+   `data/capability_roles/` (`v0.3.9`'s #976: `_Closable`, `_RewindableStream`,
+   `_ClosableStream`, `_FileDescriptorBacked`, `_Callable`), vendored since the
+   port reads `%a{rigor:v1:conforms-to …}` (issue #129,
+   [ADR-0044](docs/adr/0044-conforms-to-directive.md)). Until then it was
+   deliberately NOT vendored because the directive was never read; that premise
+   is gone. A role there RESOLVES a directive that would otherwise be an
+   unresolved-interface row, and its members are what the presence check
+   requires, so a drift changes rows with no source change on either side:
+   ```sh
+   diff -r -x PROVENANCE.md reference/rigor/data/capability_roles crates/rigor-index/vendor/capability_roles
+   ```
+   On a difference, copy, `touch crates/rigor-index/src/rbs/conformance.rs` (the
+   file is `include_str!`-embedded) and update the sha256 in that tree's
+   `PROVENANCE.md`; `vendored_catalogue_matches_the_pin` fails until you do. A NEW
+   file there is a new decision, not a copy. **Neither sweep tool can see this
+   surface** (both run configless, and the scan needs a configured
+   `signature_paths:`): harness fixture 129 is the gate.
 
    Then re-derive the classes whose DEFINITION the reference cannot build —
    `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`

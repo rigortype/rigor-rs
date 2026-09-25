@@ -498,6 +498,14 @@ impl Config {
         self.present_keys.contains("paths")
     }
 
+    /// Whether `key` was written at the top level of the loaded config file
+    /// (issue #129: the `conforms-to` scan stands down when the file names a
+    /// load-set input rigor-rs does not mirror, e.g. `libraries:`).
+    #[must_use]
+    pub fn declares_key(&self, key: &str) -> bool {
+        self.present_keys.contains(key)
+    }
+
     /// The `signature_paths:` entries when the key was EXPLICITLY configured, or
     /// `None` when it was left to the `["sig"]` default. The config audit only
     /// warns on explicit paths — an absent (auto-detected) `sig/` is a normal

@@ -1,0 +1,7 @@
+# SILENT: any duplicate declaration (this constant is core's) makes the
+# reference DROP the whole file, annotation included.
+RUBY_VERSION: String
+
+%a{rigor:v1:conforms-to _Closable}
+class InQuarantinedFile
+end

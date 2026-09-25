@@ -112,6 +112,46 @@ module RigorHarness
     File.directory?(dir) ? dir : nil
   end
 
+  # Whether a fixture is a PROJECT fixture (issue #129): it ships BOTH a
+  # sidecar `.rigor.yml` and a `.sig/` dir. Its sidecar is then staged as the
+  # cwd's own `.rigor.yml` (auto-discovered, never `--config`), because the
+  # reference resolves a config file's relative `signature_paths:` against THAT
+  # FILE's directory: a `--config harness/corpus/NN.rigor.yml` naming `sig`
+  # would point it at `harness/corpus/sig`, not the staged copy. Staged in the
+  # project root, `sig` means the staged `sig/` for both tools.
+  #
+  # Such a fixture also compares the rows positioned in the staged `sig/`
+  # (`rigor:v1:conforms-to` reports at the annotation in the `.rbs`), keyed by
+  # their `sig/`-relative `file` — see `run_reference` / `parse_rigor_rs_diags`.
+  def project_config_fixture?(fixture_path)
+    !sidecar_config(fixture_path).nil? && !sig_dir(fixture_path).nil?
+  end
+
+  # The `--config` flags for a fixture: its sidecar, unless it is staged as the
+  # project's own `.rigor.yml` (see `project_config_fixture?`).
+  def config_flags_for(fixture_path)
+    sidecar = sidecar_config(fixture_path)
+    return [] if sidecar.nil? || project_config_fixture?(fixture_path)
+
+    ["--config", File.expand_path(sidecar)]
+  end
+
+  # Normalise a reported diagnostic to the rows the parity gate compares: the
+  # fixture file's own rows, plus — for a project fixture staged in `tmpdir` —
+  # the rows positioned in its staged `sig/`, tagged with a `file` key
+  # (`sig/a.rbs`). Returns nil for any other row.
+  def parity_row(d, abs_fixture, tmpdir)
+    path = File.expand_path(d["path"].to_s)
+    return d if path == abs_fixture
+    return nil if tmpdir.nil?
+
+    sig_root = File.join(File.realpath(tmpdir), "sig") + File::SEPARATOR
+    real = File.exist?(path) ? File.realpath(path) : path
+    return nil unless real.start_with?(sig_root)
+
+    d.merge("file" => "sig/#{real.delete_prefix(sig_root)}")
+  end
+
   # Whether a fixture needs a staged cwd (it ships a project sig/ or an rbs
   # collection). Both tools then run with `chdir: <staged tmpdir>`.
   def staged_fixture?(fixture_path)
@@ -125,6 +165,9 @@ module RigorHarness
   def stage_fixture_env(fixture_path, tmpdir)
     if (sig = sig_dir(fixture_path))
       FileUtils.cp_r(sig, File.join(tmpdir, "sig"))
+    end
+    if project_config_fixture?(fixture_path)
+      FileUtils.cp(sidecar_config(fixture_path), File.join(tmpdir, ".rigor.yml"))
     end
     if (coll = collection_dir(fixture_path))
       Dir.each_child(coll) do |child|
@@ -261,7 +304,7 @@ module RigorHarness
       stage_fixture_env(fixture_path, tmpdir)
 
       sidecar = sidecar_config(fixture_path)
-      config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
+      config_flags = config_flags_for(fixture_path)
 
       cmd = [
         "ruby",
@@ -294,9 +337,10 @@ module RigorHarness
       parsed = JSON.parse(json_str)
       diags = parsed.fetch("diagnostics", [])
 
-      diags.select do |d|
-        PARITY_SEVERITIES.include?(d["severity"]) &&
-          File.expand_path(d["path"].to_s) == abs_fixture
+      diags.filter_map do |d|
+        next unless PARITY_SEVERITIES.include?(d["severity"])
+
+        parity_row(d, abs_fixture, project_config_fixture?(fixture_path) ? tmpdir : nil)
       end
     end
   rescue JSON::ParserError => e
@@ -310,8 +354,7 @@ module RigorHarness
   def run_rigor_rs(fixture_path)
     abs_fixture = File.expand_path(fixture_path)
 
-    sidecar = sidecar_config(fixture_path)
-    config_flags = sidecar ? ["--config", File.expand_path(sidecar)] : []
+    config_flags = config_flags_for(fixture_path)
     cmd = [RIGOR_RS_BIN, "check", abs_fixture, "--format", "json", *config_flags]
 
     # ADR-0033/0034: a fixture shipping a project sig/ or an rbs collection runs
@@ -323,7 +366,8 @@ module RigorHarness
       Dir.mktmpdir("rigor-harness-rs") do |tmpdir|
         stage_fixture_env(fixture_path, tmpdir)
         stdout, stderr, _status = Open3.capture3(*cmd, chdir: tmpdir)
-        parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
+        parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path,
+                             project_config_fixture?(fixture_path) ? tmpdir : nil)
       end
     else
       stdout, stderr, _status = Open3.capture3(*cmd)
@@ -335,7 +379,7 @@ module RigorHarness
   # diagnostic array shared by both run paths. rigor-rs omits `severity`, so it
   # defaults to `"error"`; diagnostics are filtered to parity severities and the
   # fixture file.
-  def parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
+  def parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path, tmpdir = nil)
     # Tag UTF-8 (Open3 returns ASCII-8BIT) so a non-ASCII message byte such as
     # the em-dash in `suppression.unknown-rule` does not break `JSON.parse`.
     stdout = stdout.dup.force_encoding("UTF-8")
@@ -347,9 +391,10 @@ module RigorHarness
     parsed.map do |d|
       d["severity"] ||= "error"
       d
-    end.select do |d|
-      PARITY_SEVERITIES.include?(d["severity"]) &&
-        File.expand_path(d["path"].to_s) == abs_fixture
+    end.filter_map do |d|
+      next unless PARITY_SEVERITIES.include?(d["severity"])
+
+      parity_row(d, abs_fixture, tmpdir)
     end
   rescue JSON::ParserError => e
     warn "  WARNING: rigor-rs produced invalid JSON for #{fixture_path}: #{e.message}"
@@ -360,12 +405,14 @@ module RigorHarness
   # Diagnostic key — parity is defined over (rule, line, column)
   # -------------------------------------------------------------------------
 
-  DiagKey = Struct.new(:rule, :line, :column) do
-    def to_s = "#{rule} @ line #{line}, col #{column}"
+  # `file` is nil for a row in the fixture itself, else the `sig/`-relative
+  # `.rbs` a project fixture's row is positioned in (see `parity_row`).
+  DiagKey = Struct.new(:rule, :line, :column, :file) do
+    def to_s = "#{rule} @ #{file ? "#{file} " : ""}line #{line}, col #{column}"
   end
 
   def diag_key(d)
-    DiagKey.new(d["rule"], d["line"].to_i, d["column"].to_i)
+    DiagKey.new(d["rule"], d["line"].to_i, d["column"].to_i, d["file"])
   end
 
   # -------------------------------------------------------------------------
@@ -390,7 +437,7 @@ module RigorHarness
     registry.each do |entry|
       next unless entry["fixture"] == fixture_rel
 
-      excused << DiagKey.new(entry["rule"], entry["line"].to_i, entry["column"].to_i)
+      excused << DiagKey.new(entry["rule"], entry["line"].to_i, entry["column"].to_i, entry["file"])
     end
 
     excused
@@ -455,19 +502,24 @@ module RigorHarness
   # (message/severity). `path` is deliberately omitted: it is absolute and
   # machine-specific, and `run_reference` already filtered to the fixture.
   def snapshot_diag(d)
-    {
+    row = {
       "rule"     => d["rule"],
       "line"     => d["line"].to_i,
       "column"   => d["column"].to_i,
       "severity" => d["severity"],
       "message"  => d["message"]
     }
+    # A `sig/` row of a project fixture keeps its (relative) file; a fixture
+    # row stays keyless, so every pre-#129 snapshot is byte-identical.
+    row["file"] = d["file"] if d["file"]
+    row
   end
 
-  # Deterministic ordering: (rule, line, column) then message as a tiebreaker.
+  # Deterministic ordering: fixture rows first, then (file, rule, line, column),
+  # message as a tiebreaker.
   def sort_snapshot_diags(diags)
     diags.sort_by do |d|
-      [d["rule"].to_s, d["line"].to_i, d["column"].to_i, d["message"].to_s]
+      [d["file"].to_s, d["rule"].to_s, d["line"].to_i, d["column"].to_i, d["message"].to_s]
     end
   end
 

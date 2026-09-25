@@ -1,0 +1,85 @@
+# ROW: a shipped capability role (`data/capability_roles/`), member missing.
+%a{rigor:v1:conforms-to _ClosableStream}
+class Gate
+  def close: () -> void
+end
+
+# ROW: `dynamic.rbs-extended.unresolved` — the name resolves nowhere.
+%a{rigor:v1:conforms-to _NoSuchRoleZzz}
+class Portal
+  def close: () -> void
+end
+
+# SILENT: conforms (own def + an `attr_reader` inherited through a superclass).
+class StreamBase
+  def close: () -> void
+end
+%a{rigor:v1:conforms-to _ClosableStream}
+class StreamOk < StreamBase
+  attr_reader closed?: bool
+end
+
+# SILENT: `IO` provides every member of both roles.
+%a{rigor:v1:conforms-to _RewindableStream}
+%a{rigor:v1:conforms-to _FileDescriptorBacked}
+class MyIO < IO
+end
+
+# SILENT: no directive at all.
+class NoDirective
+end
+
+# ROW (x2): two directives on one declaration are checked independently.
+%a{rigor:v1:conforms-to _Closable}
+%a{rigor:v1:conforms-to _Callable}
+class Double
+end
+
+# ROW: nested declaration, namespace-relative interface lookup; the annotation
+# position is its own column.
+module Outer
+  interface _Inner
+    def inner_m: () -> void
+  end
+
+  %a{rigor:v1:conforms-to _Inner}
+  class Bar
+  end
+end
+
+# ROW: `RBS::DefinitionBuilder#build_interface` member order — the includes
+# first (LAST include first), then own members, an alias after its target.
+interface _Za
+  def zm: () -> void
+end
+interface _Ab
+  def am: () -> void
+end
+interface _Ordered
+  alias bb aa
+  include _Za
+  include _Ab
+  def aa: () -> void
+  def cc: () -> void
+end
+%a{rigor:v1:conforms-to _Ordered}
+class OrderCls
+end
+
+# SILENT: a class whose definition the reference cannot build (the same method
+# declared twice) is skipped, not reported.
+%a{rigor:v1:conforms-to _Closable}
+class DupDef
+  def x: () -> void
+  def x: () -> void
+end
+
+# SILENT: a module gets `Object`'s surface (`to_s`), and `self?` defs count.
+interface _NeedsToS
+  def to_s: () -> String
+  def frob: () -> void
+end
+%a{rigor:v1:conforms-to _NeedsToS}
+module ModOk
+  def self?.frob: () -> void
+end

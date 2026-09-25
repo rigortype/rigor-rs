@@ -30,6 +30,13 @@ use ruby_rbs::node::{
 // index; sorted is chosen for reproducibility.
 include!(concat!(env!("OUT_DIR"), "/embedded_rbs.rs"));
 
+// `%a{rigor:v1:conforms-to _Interface}` (issue #129, ADR-0044).
+mod conformance;
+pub use conformance::{
+    parse_conforms_to, ConformanceFinding, ConformanceKind, RBS_EXTENDED_UNRESOLVED,
+    UNSATISFIED_CONFORMANCE,
+};
+
 /// The stdlib libraries loaded on top of `core/` — the reference's
 /// `DEFAULT_LIBRARIES` (`Rigor::Environment::DEFAULT_LIBRARIES`). Each name maps
 /// to `<RBS_ROOT>/stdlib/<lib>/0/*.rbs`. A lib whose dir is absent is skipped
@@ -710,6 +717,9 @@ pub struct CoreData {
     /// constant-receiver arm, which types the CALL's return, never the constant
     /// itself. So this adds no new witnessing surface for the constant.
     object_constants: HashMap<&'static str, &'static str>,
+    /// Issue #129: the `rigor:v1:conforms-to` scan tables (see
+    /// [`conformance`]). Read only by [`Self::conformance_findings`].
+    conformance: conformance::ConformanceData,
 }
 
 impl CoreData {
@@ -799,9 +809,15 @@ impl CoreData {
         let pre_sig: HashSet<&'static str> = builder.classes.keys().copied().collect();
         let pre_sig_qualified: HashSet<&'static str> =
             builder.qualified.keys().copied().collect();
+        builder.conformance_project_phase = true;
         for dir in sig_dirs {
             ingest_rbs_dir(&mut builder, dir);
         }
+        builder.conformance_project_phase = false;
+        // Issue #129: the capability-role catalogue goes in AFTER the project's
+        // own signatures, per declaration (conformance table only).
+        builder.conformance.ingest_capability_roles();
+        let conformance = std::mem::take(&mut builder.conformance).finish();
         let project_sig_classes: HashSet<&'static str> = builder
             .classes
             .keys()
@@ -842,6 +858,7 @@ impl CoreData {
                 qualified,
                 short_to_qualified,
                 object_constants,
+                conformance,
             };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
@@ -3322,6 +3339,7 @@ impl CoreData {
             short_to_qualified: HashMap::new(),
             // The stub carries no RBS object-constant declarations.
             object_constants: HashMap::new(),
+            conformance: conformance::ConformanceData::default(),
         }
     }
 
@@ -3373,6 +3391,11 @@ type BuiltData = (
 /// Accumulates parsed RBS declarations into per-class entries before flattening.
 #[derive(Default)]
 struct Builder {
+    /// Issue #129: the `conforms-to` side walk (see [`conformance`]).
+    conformance: conformance::ConformanceBuilder,
+    /// Set while the project `signature_paths:` / rbs-collection dirs are
+    /// ingested, so [`ingest_rbs_dir`] tags those files as PROJECT sources.
+    conformance_project_phase: bool,
     classes: HashMap<&'static str, ClassEntry>,
     /// Short names declared at GENUINE top level (empty namespace) in at least
     /// one declaration. Threaded out via [`Self::finish`] into
@@ -3422,6 +3445,7 @@ impl Builder {
         let Ok(sig) = parse(code) else {
             return;
         };
+        self.conformance.walk(sig.declarations());
         for decl in sig.declarations().iter() {
             // `false` = top-level (file-level) declaration: only these may enter
             // the `toplevel_classes` set. `code` is threaded so the ATM substrate
@@ -4159,7 +4183,12 @@ fn ingest_rbs_dir(builder: &mut Builder, dir: &std::path::Path) {
             ingest_rbs_dir(builder, &path);
         } else if path.extension().is_some_and(|e| e == "rbs") {
             if let Ok(code) = std::fs::read_to_string(&path) {
+                if builder.conformance_project_phase {
+                    let abs = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+                    builder.conformance.set_project_file(Some(intern(&abs.to_string_lossy())));
+                }
                 ingest_rbs_source(builder, &path.to_string_lossy(), &code);
+                builder.conformance.set_project_file(None);
             }
         }
     }

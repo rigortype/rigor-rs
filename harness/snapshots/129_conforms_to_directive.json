@@ -1,0 +1,61 @@
+{
+  "fixture": "harness/corpus/129_conforms_to_directive.rb",
+  "diagnostics": [
+    {
+      "rule": "dynamic.rbs-extended.unresolved",
+      "line": 8,
+      "column": 1,
+      "severity": "warning",
+      "message": "`Portal` declares `conforms-to _NoSuchRoleZzz` but interface `_NoSuchRoleZzz` is not loaded. Check for a typo or add the `sig`/library that declares it to the RBS load path.",
+      "file": "sig/a_roles.rbs"
+    },
+    {
+      "rule": "rbs_extended.unsatisfied-conformance",
+      "line": 2,
+      "column": 1,
+      "severity": "warning",
+      "message": "`Gate` declares `conforms-to _ClosableStream` but does not provide required method: `#closed?`. Implement the missing method(s) or remove the directive.",
+      "file": "sig/a_roles.rbs"
+    },
+    {
+      "rule": "rbs_extended.unsatisfied-conformance",
+      "line": 33,
+      "column": 1,
+      "severity": "warning",
+      "message": "`Double` declares `conforms-to _Closable` but does not provide 2 required methods: `#close`, `#shut_hard`. Implement the missing method(s) or remove the directive.",
+      "file": "sig/a_roles.rbs"
+    },
+    {
+      "rule": "rbs_extended.unsatisfied-conformance",
+      "line": 34,
+      "column": 1,
+      "severity": "warning",
+      "message": "`Double` declares `conforms-to _Callable` but does not provide required method: `#call`. Implement the missing method(s) or remove the directive.",
+      "file": "sig/a_roles.rbs"
+    },
+    {
+      "rule": "rbs_extended.unsatisfied-conformance",
+      "line": 45,
+      "column": 3,
+      "severity": "warning",
+      "message": "`Outer::Bar` declares `conforms-to _Inner` but does not provide required method: `#inner_m`. Implement the missing method(s) or remove the directive.",
+      "file": "sig/a_roles.rbs"
+    },
+    {
+      "rule": "rbs_extended.unsatisfied-conformance",
+      "line": 65,
+      "column": 1,
+      "severity": "warning",
+      "message": "`OrderCls` declares `conforms-to _Ordered` but does not provide 5 required methods: `#am`, `#zm`, `#aa`, `#bb`, `#cc`. Implement the missing method(s) or remove the directive.",
+      "file": "sig/a_roles.rbs"
+    },
+    {
+      "rule": "rbs_extended.unsatisfied-conformance",
+      "line": 9,
+      "column": 1,
+      "severity": "warning",
+      "message": "`ProjClosable` declares `conforms-to _Closable` but does not provide required method: `#shut_hard`. Implement the missing method(s) or remove the directive.",
+      "file": "sig/b_shadow.rbs"
+    }
+  ]
+}

@@ -1052,6 +1052,15 @@ fn analyze_files(
     // Restore input order (stage-1 panics and stage-3 findings interleave by order).
     findings.sort_by_key(|(order, _, _, _)| *order);
 
+    // Issue #129 — the `rigor:v1:conforms-to` rows. Run-level, not per-file:
+    // the reference appends them AFTER the per-file stream, positioned at the
+    // annotation in the project `.rbs`, re-stamped by the severity profile but
+    // NOT filtered by `disable:` (its `disable:` filter only sees per-file rows;
+    // oracle-measured, `disable: [all]` leaves both rows standing).
+    if conformance_scan_active(cfg, root) {
+        findings.extend(conformance_rows(&index, profile, &user_overrides, &bleeding_overrides));
+    }
+
     if timing {
         let t_end = std::time::Instant::now();
         let threads = rayon::current_num_threads();
@@ -1082,6 +1091,76 @@ fn analyze_files(
         );
     }
     (findings, had_io_error)
+}
+
+/// Issue #129 — whether the `conforms-to` scan runs at all. The reference gates
+/// it on the project CONFIGURING `signature_paths:` (`project_signature_paths?`:
+/// non-nil and non-empty — a defaulted `sig/` is loaded but not scanned), and
+/// rigor-rs additionally stands down whenever the reference's RBS environment
+/// may hold a source rigor-rs does not load: a declaration that source makes
+/// could resolve the interface ("not loaded" would then be a false positive)
+/// or give the class a member (`libraries: [json]` reopens `Object`). Those are
+/// `libraries:`, the bundler gem-`sig/` walk (`bundler:` / `.bundle/config` /
+/// `vendor/bundle`), an unbundled plugin, and `includes:` (whose merged keys
+/// rigor-rs does not read).
+fn conformance_scan_active(cfg: &Config, root: &Path) -> bool {
+    if cfg.explicit_signature_paths().is_none_or(<[String]>::is_empty) {
+        return false;
+    }
+    if ["libraries", "bundler", "includes"].iter().any(|k| cfg.declares_key(k)) {
+        return false;
+    }
+    if root.join(".bundle").join("config").exists() || root.join("vendor").join("bundle").is_dir() {
+        return false;
+    }
+    cfg.plugins.iter().all(|p| rigor_index::plugins::bundled_plugin(p).is_some())
+}
+
+/// Issue #129 — the scan's findings as `(order, path, source, diagnostic)`
+/// rows: the `.rbs` text rides along as the source so the annotation's byte
+/// offset resolves to its line/column like every other row. Authored
+/// `:warning`, re-stamped by the severity profile (`strict` makes the
+/// unsatisfied row an error), dropped when it resolves `:off`.
+fn conformance_rows(
+    index: &CoreIndex,
+    profile: severity::Profile,
+    user_overrides: &[(String, severity::ResolvedSeverity)],
+    bleeding_overrides: &[(&str, severity::ResolvedSeverity)],
+) -> Vec<(usize, String, String, Diagnostic)> {
+    let mut sources: std::collections::HashMap<&'static str, String> =
+        std::collections::HashMap::new();
+    let mut rows = Vec::new();
+    for f in index.conformance_findings() {
+        let resolved = severity::resolve(
+            f.rule_id(),
+            severity::ResolvedSeverity::Warning,
+            profile,
+            user_overrides,
+            bleeding_overrides,
+        );
+        let severity = match resolved {
+            severity::ResolvedSeverity::Off => continue,
+            severity::ResolvedSeverity::Error => rigor_rules::Severity::Error,
+            severity::ResolvedSeverity::Warning => rigor_rules::Severity::Warning,
+            severity::ResolvedSeverity::Info => rigor_rules::Severity::Info,
+        };
+        let source = sources
+            .entry(f.file)
+            .or_insert_with(|| std::fs::read_to_string(f.file).unwrap_or_default())
+            .clone();
+        let diag = Diagnostic {
+            rule_id: f.rule_id(),
+            start_offset: f.start_offset,
+            end_offset: f.end_offset,
+            message: f.message(),
+            severity,
+            source_family: "builtin",
+            receiver_type: None,
+            method_name: None,
+        };
+        rows.push((usize::MAX, f.file.to_string(), source, diag));
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------
