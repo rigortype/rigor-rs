@@ -1931,18 +1931,18 @@ fn check_wrong_arity(
         return None;
     }
 
-    // A block selects a DIFFERENT RBS overload, which usually has a different
-    // positional arity (`arr.select { } / arr.map { }` take 0 positional args,
-    // but the no-block envelope spans the Enumerator overloads). The reference
-    // DOES witness block-form arity by reading the block overload's own arity;
-    // we only store a single arity envelope collapsed over ALL overloads, so we
-    // cannot isolate the block overload's positional count here. Rather than
-    // witness against the wrong (collapsed) envelope — which would risk a false
-    // positive — we stay silent on arity for any block-bearing call. This is the
-    // zero-FP-safe conservative choice (a missed witness, never an extra one);
-    // block-form RETURN typing IS modeled (see `Typer::type_block_call`), so
-    // chained undefined-method on a block result is still witnessed — only the
-    // block-call's own arity is deferred until per-overload arity is stored.
+    // The reference arity-checks a block-bearing call too: its
+    // `compute_arity_envelope` is a min/max collapse over EVERY overload and
+    // the oracle fires that collapsed message on a block call (measured:
+    // `[1, 2].map(1) { |z| z }` -> `given 1, expected 0`). We store the same
+    // collapsed envelope but stay silent on any block-bearing call: firing a
+    // collapse that includes block-less overloads against a call the runtime
+    // will dispatch on the block overload has not been verified FP-safe, so
+    // until per-overload arity is stored this is a conservative coverage gap
+    // (a missed witness, never an extra one). Block-form RETURN typing IS
+    // modeled (see `Typer::type_block_call`), so chained undefined-method on
+    // a block result is still witnessed — only the block-call's own arity is
+    // deferred.
     if has_block {
         return None;
     }

@@ -447,11 +447,13 @@ pub enum Node {
         /// (unlike `first_arg_nonplain`, which is first-only) plus Prism's
         /// `block()` being absent or a `BlockNode`. An ordinary trailing
         /// block (`foo(a) { }`) does NOT count. Consumed by
-        /// `call.argument-type-mismatch`, which bails when this is `false`
-        /// (its per-argument positional matching declines a block-pass call
-        /// even though the reference's `plain_positional_call?` cannot see
-        /// `&blk`; the oracle is silent on those calls anyway — measured
-        /// `center("x", &b)` silent on both).
+        /// `call.argument-type-mismatch`, which bails when this is `false`.
+        /// The `!block_is_pass` term is a conservative decline, not oracle
+        /// parity: the reference cannot see `&blk` in `arguments()` but still
+        /// fires ATM on a block-pass call — measured `[1, 2, 3].fetch("x", &b)`
+        /// and anonymous `fetch("x", &)` emit `call.argument-type-mismatch`
+        /// on the reference and stay silent here. A safe-side coverage gap;
+        /// `center("x", &b)` cannot show it (`center("x")` is silent on both).
         args_all_plain: bool,
         /// Span of the whole call expression.
         span: Span,
