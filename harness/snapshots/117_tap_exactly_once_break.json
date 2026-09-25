@@ -1,0 +1,103 @@
+{
+  "fixture": "harness/corpus/117_tap_exactly_once_break.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 40,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 116,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 121,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 125,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 129,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 134,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 139,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 143,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 148,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 150,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"s\""
+    },
+    {
+      "rule": "flow.unreachable-branch",
+      "line": 147,
+      "column": 19,
+      "severity": "warning",
+      "message": "unreachable branch: literal predicate is always falsey"
+    },
+    {
+      "rule": "flow.unreachable-branch",
+      "line": 149,
+      "column": 29,
+      "severity": "warning",
+      "message": "unreachable branch: literal predicate is always falsey"
+    }
+  ]
+}
