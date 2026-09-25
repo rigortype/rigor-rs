@@ -9,7 +9,7 @@ Usage:
 
 Snippet mode writes each source to `a.rb` in a fresh directory per engine, runs
 `check --format json a.rb`, and compares the full diagnostic tuples
-(rule, line, column, message) plus the exit code. With `--dir`, each probe
+(rule, line, column, severity, message) plus the exit code. With `--dir`, each probe
 directory starts as a copy of PROJ, which is how to probe project `sig/` and
 `.rigor.yml` behaviour that the fixture harness and the sweep cannot see.
 
@@ -86,7 +86,8 @@ def diagnostics(stdout):
     except json.JSONDecodeError:
         return None
     rows = obj.get("diagnostics", []) if isinstance(obj, dict) else obj
-    return [(d.get("rule"), d.get("line"), d.get("column"), d.get("message")) for d in rows]
+    return [(d.get("rule"), d.get("line"), d.get("column"), d.get("severity"), d.get("message"))
+            for d in rows]
 
 
 def fmt(rows):
@@ -94,7 +95,7 @@ def fmt(rows):
         return "(no JSON)"
     if not rows:
         return "silent"
-    return "; ".join(f"{r}@{l}:{c} {m}" for r, l, c, m in rows)
+    return "; ".join(f"{r}@{l}:{c} [{s}] {m}" for r, l, c, s, m in rows)
 
 
 def probe_snippet(rs, label, src, root, base):
@@ -160,7 +161,8 @@ def main():
                     help="Ruby source to probe (repeatable)")
     ap.add_argument("-f", dest="files", action="append", default=[],
                     help="Ruby file to probe (repeatable)")
-    ap.add_argument("--dir", help="project directory to copy per engine (raw mode)")
+    ap.add_argument("--dir", help="project directory copied into each probe directory "
+                    "(with -e/-f: the snippet runs inside it; with -- ARGS: raw mode)")
     ap.add_argument("--ignore-stderr", action="store_true",
                     help="raw mode: compare exit code and stdout only")
     ap.add_argument("--keep", action="store_true",

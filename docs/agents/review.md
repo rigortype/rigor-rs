@@ -28,8 +28,9 @@ harness/review.sh <PR number>
 
 It builds the PR head and its merge base once, each in its own worktree,
 starts the passes at once
-(`pi -p`, read-only tools, this checkout's copy of this file as the appended
-prompt), and prints each verdict. A pass takes about 15 minutes. Both ids are
+(`pi -p` without its edit and write tools, with this file as of the PR's base
+commit as the appended prompt), and prints each verdict. `bash` stays available,
+so the prompt is what confines a pass's writes to its probe directory. A pass takes about 15 minutes. Both ids are
 subscription-backed. If either stops resolving (`pi --list-models grok-4.6`),
 report `Blocked — need human`. Neither a pay-per-use provider route nor a
 cheaper model stands in for it.

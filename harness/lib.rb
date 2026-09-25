@@ -382,8 +382,8 @@ module RigorHarness
   end
 
   # Parse rigor-rs's JSON stdout (falling back to stderr) into the normalized
-  # diagnostic array shared by both run paths. rigor-rs omits `severity`, so it
-  # defaults to `"error"`; diagnostics are filtered to parity severities and the
+  # diagnostic array shared by both run paths. A diagnostic without `severity`
+  # (older port builds) defaults to `"error"`; diagnostics are filtered to parity severities and the
   # fixture file.
   def parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path, tmpdir = nil)
     # Tag UTF-8 (Open3 returns ASCII-8BIT) so a non-ASCII message byte such as

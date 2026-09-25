@@ -14,9 +14,10 @@
 #    measures the PR; run from $OUT/base it measures the pre-PR port. The
 #    passes get both, so neither builds its own copy.
 # 2. Starts the passes at once: Grok 4.6:high and Opus 5.5:high (`pi -p`,
-#    read-only tools, cwd $OUT/head). The contract is THIS checkout's
-#    docs/agents/review.md, never the PR's copy, so a PR cannot edit the gate
-#    it is judged by.
+#    no edit/write tools, cwd $OUT/head). The contract is docs/agents/review.md
+#    as of the PR's base commit, never the PR's copy, so a PR cannot edit the
+#    gate it is judged by (a PR that introduces the file falls back to this
+#    checkout's copy, with a warning).
 # 3. Waits, then prints each pass's verdict line and where its report is.
 #
 # $OUT defaults to ${TMPDIR:-/tmp}/rigor-review/pr-<N>-<sha>. Every worktree
@@ -34,16 +35,32 @@ for a in "$@"; do
 done
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
-CONTRACT="$REPO/docs/agents/review.md"
 
 read -r SHA BASE_REF < <(gh pr view "$PR" --repo rigortype/rigor-rs \
   --json headRefOid,baseRefOid --jq '"\(.headRefOid) \(.baseRefOid)"')
 OUT=${OUT:-${TMPDIR:-/tmp}/rigor-review/pr-$PR-${SHA:0:7}}
 mkdir -p "$OUT"
+# git records worktrees under their real path; macOS's $TMPDIR is a symlinked
+# /var path ending in "/", so normalise or the cleanup below matches nothing.
+OUT=$(cd "$OUT" && pwd -P)
+
+cleanup() {
+  [[ $KEEP == 1 ]] && return
+  git -C "$REPO" worktree list --porcelain | sed -n "s|^worktree \($OUT/.*\)|\1|p" |
+    while read -r w; do git -C "$REPO" worktree remove --force "$w"; done
+  git -C "$REPO" worktree prune
+}
+trap cleanup EXIT
 echo "PR #$PR at $SHA -> $OUT" >&2
 
 git -C "$REPO" fetch -q origin "pull/$PR/head" "$BASE_REF"
 BASE=$(git -C "$REPO" merge-base "$SHA" "$BASE_REF")
+
+CONTRACT=$OUT/contract.md
+if ! git -C "$REPO" show "$BASE_REF:docs/agents/review.md" >"$CONTRACT" 2>/dev/null; then
+  echo "warning: the PR's base has no docs/agents/review.md; using this checkout's copy" >&2
+  cp "$REPO/docs/agents/review.md" "$CONTRACT"
+fi
 
 # Engine changes get both passes; they catch different things (on PR #154 only
 # the Opus pass found the message regressions, and Grok found shapes Opus did
@@ -104,9 +121,4 @@ for p in "${PASSES[@]}"; do
   [[ $verdict == Approved ]] || status=1
 done
 
-if [[ $KEEP == 0 ]]; then
-  git -C "$REPO" worktree list --porcelain | sed -n "s|^worktree \($OUT/.*\)|\1|p" |
-    while read -r w; do git -C "$REPO" worktree remove --force "$w"; done
-  git -C "$REPO" worktree prune
-fi
 exit $status

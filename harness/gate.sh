@@ -12,8 +12,9 @@
 #      unregistered FP), when any crate or the harness changed.
 #
 # Left to CI on push (AGENTS.md → Gates): the full workspace test on Linux and
-# macOS, clippy 1.88 with --all-targets, and the live-reference snapshot
-# check. Left to the pre-ready step: the FP sweep and the review gate.
+# macOS (it also covers the dependents of a changed crate, and a change to only
+# the root Cargo.toml / Cargo.lock, which run no tests here), clippy 1.88 with
+# --all-targets, and the live-reference snapshot check. Left to the pre-ready step: the FP sweep and the review gate.
 # Quiet on success; on the first failing step, prints its last 30 lines and
 # exits with its status.
 set -euo pipefail
@@ -26,7 +27,8 @@ cd "$(dirname "$0")/.."
 MB=$(git merge-base HEAD "$BASE")
 CHANGED=$( { git diff --name-only "$MB"; git ls-files --others --exclude-standard; } | sort -u)
 
-LOG=$(mktemp -t rigor-gate)
+LOG=$(mktemp "${TMPDIR:-/tmp}/rigor-gate.XXXXXX")   # BSD and GNU mktemp alike
+trap 'rm -f "$LOG"' EXIT
 step() {
   local label=$1; shift
   local start=$SECONDS
@@ -37,7 +39,6 @@ step() {
     local code=$?
     echo "FAILED (exit $code)"
     tail -30 "$LOG"
-    echo "(full output: $LOG)"
     exit "$code"
   fi
 }
