@@ -13,8 +13,11 @@ merges.
 | `pi` | `xai/grok-4.6` | `high` | external pass A |
 | `pi` | `claude-bridge/claude-opus-5-5` | `high` | external pass B |
 
-The two external passes run on every PR as independent reviews. Neither sees
-the other's output, and **both must return `Approved`**. A `Needs fix` from
+The two external passes run as independent reviews of every PR that changes
+`crates/`. Neither sees the other's output, and **both must return
+`Approved`**. A PR that changes only `harness/`, `docs/` or CI gets the Opus
+pass alone (`harness/review.sh N --full` forces both). The gate runs once per
+PR, on the final head after CI is green, not on every push. A `Needs fix` from
 either sends the PR back to the implementer, and both passes run again on the
 new head. The two catch different things: on PR #154, Grok approved while Opus
 found six message regressions the PR text denied.
@@ -23,7 +26,8 @@ found six message regressions the PR text denied.
 harness/review.sh <PR number>
 ```
 
-It builds the PR head once in a worktree, starts both passes there at once
+It builds the PR head and its merge base once, each in its own worktree,
+starts the passes at once
 (`pi -p`, read-only tools, this checkout's copy of this file as the appended
 prompt), and prints each verdict. A pass takes about 15 minutes. Both ids are
 subscription-backed. If either stops resolving (`pi --list-models grok-4.6`),

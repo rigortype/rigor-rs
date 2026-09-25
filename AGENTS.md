@@ -39,13 +39,15 @@ thing that stops two agents taking the same issue.
    `push.default = tracking` sends a bare `git push -u` to **master**. Then run
    `gh pr create --draft` with `Closes #N` in the body, and remove
    `in-progress`. From here the draft PR is the in-flight state.
-6. **Implement until every gate is green** (see *Gates*). Record the measured
-   outcome in the PR body: the probe tables and the gate numbers.
-7. **Review, then ready.** The orchestrator (or maintainer) re-runs the
-   gates and gets `Approved` from the review gate (`harness/review.sh N`;
-   contract in `docs/agents/review.md`), whose passes re-probe the parity
-   claims themselves. Only then
-   `gh pr ready`. A non-draft PR means "reviewed, mergeable".
+6. **Implement, push, keep going.** Run `harness/gate.sh` before each push,
+   push, and read CI with `gh pr checks` while you work on (see *Gates*).
+   Record the measured outcome in the PR body: the probe tables and the gate
+   numbers.
+7. **Review, then ready.** Once CI is green on the final head, run the
+   pre-ready gates, then `harness/review.sh N` once (contract in
+   `docs/agents/review.md`); its passes re-probe the parity claims
+   themselves. Only on `Approved` run `gh pr ready`. A non-draft PR means
+   "reviewed, mergeable".
 8. **Fold after merge.** Write the detail into a dated `docs/notes/` file or
    an ADR, then add one ledger line to `docs/CURRENT_WORK.md`.
 
@@ -55,24 +57,32 @@ is the durable record; a branch alone is not.
 
 ## Gates
 
-Each must exit 0. Run it bare and read its exit code: a pipe (`| tail -1`)
-reports the last command's status, and a `grep` count misses clippy's
-ANSI-coloured lines. Both have let a failing gate through.
+Three tiers, cheapest first. Run each bare and read its exit code: a pipe
+(`| tail -1`) reports the last command's status, and a `grep` count misses
+clippy's ANSI-coloured lines. Both have let a failing gate through.
 
-- `cargo test --workspace --locked`
-- `cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings`,
-  in a fresh `CARGO_TARGET_DIR`. CI pins 1.88, and a newer local clippy
-  disagrees (e.g. `only_used_in_recursion`). An incremental target hides
-  warnings.
-- `ruby harness/run.rb` and `ruby harness/run_snapshot.rb`: 0 unregistered FP.
+**Every push (local, under a minute): `harness/gate.sh`.** It runs
+`docs_check.py`, `cargo test -p` for each crate the branch changed, and
+`run_snapshot.rb` (0 unregistered FP). Alongside it, run **fresh-dir parity
+probes** (`harness/probe.py`) on every row the change touches, plus
+**must-still-fire controls**. A suppression is only proven when a nearby row
+still fires.
+
+**Every push (CI on the draft, about 6 minutes, `gh pr checks`).** Workspace
+tests on Linux and macOS; `cargo clippy --workspace --all-targets -- -D
+warnings` on the pinned 1.88 toolchain; `run_snapshot.rb`; `snapshot.rb
+--check` against the live reference (the two together are `run.rb`); the docs
+budget. CI is the authority for clippy: a newer local clippy disagrees with
+1.88 (e.g. `only_used_in_recursion`).
+
+**Once, before ready (local).**
 - `cargo build --release` then `python3 harness/fp_audit.py --gaps --sweep`:
-  0 FP over the standing set (`harness/sweep-corpora.yml`). It measures
+  0 FP over the standing set (`harness/sweep-corpora.yml`), about 3 minutes.
+  The corpora are local checkouts, so this cannot run in CI. It measures
   `target/release` and scores a crashing port as `[]`, so a stale binary
   passes silently.
-- `python3 harness/docs_check.py` whenever docs change (CI `docs` job).
-- **Fresh-dir parity probes** (`harness/probe.py`) on every row the change
-  touches, plus **must-still-fire controls**. A suppression is only proven
-  when a nearby row still fires.
+- The review gate, `harness/review.sh N`, about 20 minutes. Both passes for
+  a `crates/` change, the Opus pass alone otherwise.
 
 What the gates cannot see, so probe it by hand:
 

@@ -2,14 +2,18 @@
 # Run the review gate (docs/agents/review.md) on a PR: both external passes,
 # in parallel, against one shared build of the PR head.
 #
-# Usage: harness/review.sh <PR number> [--keep]
+# Usage: harness/review.sh <PR number> [--full] [--keep]
+#
+# Run it once per PR, on the final head, after the draft's CI is green — not
+# on every push. A PR that changes crates/ gets both passes; a PR that changes
+# only harness/, docs/ or CI gets the Opus pass alone. --full forces both.
 #
 # 1. Checks out the PR head ($OUT/head) and its merge base ($OUT/base) in
 #    detached worktrees, populates their reference/rigor submodules, and
 #    builds target/release in each. harness/probe.py run from $OUT/head
 #    measures the PR; run from $OUT/base it measures the pre-PR port. The
 #    passes get both, so neither builds its own copy.
-# 2. Starts the Grok 4.6:high and Opus 5.5:high passes at once (`pi -p`,
+# 2. Starts the passes at once: Grok 4.6:high and Opus 5.5:high (`pi -p`,
 #    read-only tools, cwd $OUT/head). The contract is THIS checkout's
 #    docs/agents/review.md, never the PR's copy, so a PR cannot edit the gate
 #    it is judged by.
@@ -21,15 +25,16 @@
 # Exit status: 0 when both passes return Approved, 1 otherwise.
 set -euo pipefail
 
-usage() { echo "usage: $0 <PR number> [--keep]" >&2; exit 2; }
+usage() { echo "usage: $0 <PR number> [--full] [--keep]" >&2; exit 2; }
 [[ $# -ge 1 && $1 =~ ^[0-9]+$ ]] || usage
 PR=$1; shift
-KEEP=0
-for a in "$@"; do [[ $a == --keep ]] && KEEP=1 || usage; done
+KEEP=0; FULL=0
+for a in "$@"; do
+  case $a in --keep) KEEP=1 ;; --full) FULL=1 ;; *) usage ;; esac
+done
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 CONTRACT="$REPO/docs/agents/review.md"
-PASSES=("grok=xai/grok-4.6:high" "opus=claude-bridge/claude-opus-5-5:high")
 
 read -r SHA BASE_REF < <(gh pr view "$PR" --repo rigortype/rigor-rs \
   --json headRefOid,baseRefOid --jq '"\(.headRefOid) \(.baseRefOid)"')
@@ -39,6 +44,15 @@ echo "PR #$PR at $SHA -> $OUT" >&2
 
 git -C "$REPO" fetch -q origin "pull/$PR/head" "$BASE_REF"
 BASE=$(git -C "$REPO" merge-base "$SHA" "$BASE_REF")
+
+# Engine changes get both passes; they catch different things (on PR #154 only
+# the Opus pass found the message regressions, and Grok found shapes Opus did
+# not probe). Harness, docs and CI changes get the Opus pass alone.
+PASSES=("opus=claude-bridge/claude-opus-5-5:high")
+if [[ $FULL == 1 ]] || git -C "$REPO" diff --name-only "$BASE" "$SHA" | grep -q '^crates/'; then
+  PASSES=("grok=xai/grok-4.6:high" "${PASSES[@]}")
+fi
+echo "passes: ${PASSES[*]%%=*}" >&2
 for side in head base; do
   rev=$SHA; [[ $side == base ]] && rev=$BASE
   if [[ ! -d $OUT/$side ]]; then
