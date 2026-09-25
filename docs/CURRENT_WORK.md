@@ -16,8 +16,8 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 `upstream-pin-master-e59b7b89`), with 0 FP / 9,337 files and 111 fixtures. It carries
 TEN retractions no gate sees, **#133–#138**, the next port work (each is its own
 inference mechanism). Pre-existing FPs: #139, #140, #146. Coverage: #141 (`fb781023`,
-3,002 of the 3,829 gaps; COUPLED to the ported carve-out), #142–#145. Still open:
-#121, #124, #129, #130, #132. `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
+3,002 of the 3,829 gaps, ready-for-agent), #144 (unmeasured); #142/#143/#145 closed at
+0 rows (`.out-of-scope/`). Still open: #121, #129, #130, #132 (ready-for-agent). `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
 
 - Measurement-tool lesson (binding): audit at NODE granularity — per-file
   histograms net over-claims against under-claims.
