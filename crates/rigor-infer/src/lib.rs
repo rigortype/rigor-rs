@@ -2527,16 +2527,25 @@ impl<'i> Typer<'i> {
                     // unescaped bytes were not valid UTF-8 carries U+FFFD
                     // where Ruby has the real byte — a position or comparison
                     // fold on it mints the wrong constant (#164 review:
-                    // `"\xFFabc".getbyte(0)` is `255`, not `0xEF`). The
-                    // nilable lookups and `<=>` decline to `Dynamic` (the
-                    // String lookups also carry the check inside
+                    // `"\xFFabc".getbyte(0)` is `255`, not `0xEF`). A
+                    // non-UTF-8 script encoding (`# encoding: binary`,
+                    // `us-ascii`, …) is the same hazard one level up: Ruby
+                    // reads the literal's BYTES under that encoding's char
+                    // width, so the UTF-8 text the scalar carries does not
+                    // share Ruby's positions or slice contents (`"é"[1]` is
+                    // `"\xA9"` under binary, not `"a"`). The nilable lookups
+                    // and `<=>` decline to `Dynamic` on either mark (the
+                    // String lookups also carry the U+FFFD check inside
                     // `fold_str_lookup` as `Opaque`); other folds keep their
                     // standing behaviour on the normalized text.
                     if (folding::is_str_lookup(&scalar, method)
                         || folding::is_nilable_cmp(&scalar, method))
                         && std::iter::once(&scalar)
                             .chain(arg_scalars.iter())
-                            .any(folding::scalar_has_replacement_char)
+                            .any(|s| {
+                                folding::scalar_has_replacement_char(s)
+                                    || (!ast.utf8_source() && folding::scalar_is_non_ascii(s))
+                            })
                     {
                         return interner.untyped();
                     }
@@ -8230,6 +8239,68 @@ mod tests {
         case(b"[1, 2].empty?\n", Type::Constant(Scalar::Bool(false)));
         case(b"[].first\n", Type::Constant(Scalar::Nil));
         case(b"[1, 2][9]\n", Type::Constant(Scalar::Nil)); // out of bounds → nil
+    }
+
+    /// A magic `encoding:` comment naming anything other than UTF-8 flips
+    /// `LoweredAst::utf8_source`, and the nilable-lookup / `<=>` gate then
+    /// declines every non-ASCII `Str`/`Sym` scalar like an invalid-UTF-8 one:
+    /// under `# encoding: binary` `"\xC3\xA9"` is two one-byte characters, so
+    /// the UTF-8 read (`[1]` → `nil`, `index("l")` → 2) would mint the wrong
+    /// constant (issue #164 fix round). ASCII literals fold unchanged.
+    #[test]
+    fn non_utf8_source_declines_non_ascii_scalar_folds() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let last_call_ty = |src: &[u8]| -> String {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let call_id = ast
+                .iter()
+                .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+                .last()
+                .unwrap();
+            let ty = typer.type_of(&ast, call_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+        // UTF-8 controls: the fold still fires, absent a comment or with an
+        // explicit `utf-8`, and an `encoding:` comment in a position CRuby
+        // does not honor (line 2 under a magic-comment line) stays inert.
+        assert_eq!(last_call_ty(b"\"\\xC3\\xA9\"[1]\n"), "nil");
+        assert_eq!(last_call_ty(b"# encoding: utf-8\n\"\\xC3\\xA9\"[1]\n"), "nil");
+        assert_eq!(
+            last_call_ty(b"# frozen_string_literal: true\n# encoding: binary\n\"\\xC3\\xA9\"[1]\n"),
+            "nil"
+        );
+        // Honored non-UTF-8 names (`binary`, `us-ascii`, `coding:` too) send
+        // every non-ASCII scalar's lookups to `Dynamic`.
+        assert_eq!(last_call_ty(b"# encoding: binary\n\"\\xC3\\xA9\"[1]\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"# encoding: us-ascii\n\"\\xC3\\xA9\"[1]\n"), "Dynamic[top]");
+        assert_eq!(
+            last_call_ty(b"#!/usr/bin/env ruby\n# encoding: binary\n\"\\xC3\\xA9\"[1]\n"),
+            "Dynamic[top]"
+        );
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"h\\xC3\\xA9llo\".index(\"l\")\n"),
+            "Dynamic[top]"
+        );
+        // The scalar `<=>`s decline alongside the lookups; a non-ASCII
+        // argument declines the call even on an ASCII receiver.
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"\\xC3\\xA9\" <=> \"a\"\n"),
+            "Dynamic[top]"
+        );
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"abc\".index(\"\\xC3\")\n"),
+            "Dynamic[top]"
+        );
+        // ASCII literals are encoding-proof — byte = char under every script
+        // encoding — so these folds keep firing in a binary file.
+        assert_eq!(last_call_ty(b"# encoding: binary\n\"e\"[1]\n"), "nil");
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"abc\".index(\"b\")\n"),
+            "Constant[1]"
+        );
     }
 
     /// Kernel `#p` / `#pp` identity typing on the implicit-self (`receiver:

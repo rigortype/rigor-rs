@@ -1009,6 +1009,9 @@ pub struct LoweredAst {
     /// The spans of every [`StatementsKind::Inert`] carrier, for
     /// [`LoweredAst::in_inert_carrier`].
     inert_spans: Vec<Span>,
+    /// Whether the file's magic encoding comment names UTF-8 — or is absent,
+    /// UTF-8 being the default script encoding. See [`LoweredAst::utf8_source`].
+    utf8_source: bool,
 }
 
 /// One site where a CONSTANT-shaped receiver is mutated — the raw material of
@@ -1076,6 +1079,21 @@ impl LoweredAst {
     /// [`ConstMutation`].
     pub fn const_mutations(&self) -> &[ConstMutation] {
         &self.const_mutations
+    }
+
+    /// Whether this file's script encoding is UTF-8 — no magic `encoding` /
+    /// `coding` comment at all (the default), or one naming `utf-8`/`utf8`.
+    ///
+    /// A `false` here means Ruby reads every string/symbol literal's BYTES
+    /// under a different character width than the UTF-8 text the lowered
+    /// scalar carries: under `# encoding: binary` `"é"[1]` is the second
+    /// byte `"\xA9"` where the UTF-8 read answers `"a"` — so a char-position
+    /// or content fold on a non-ASCII scalar would mint the wrong constant
+    /// (issue #164 fix round: the reference executes real Ruby and is
+    /// correct there; the port declines instead). The literal text itself
+    /// is kept — diagnostics still print it.
+    pub fn utf8_source(&self) -> bool {
+        self.utf8_source
     }
 }
 
@@ -1147,6 +1165,38 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
             line_starts.push(i + 1);
         }
     }
+    // The file's script encoding, from its magic `encoding`/`coding` comment.
+    // UTF-8 is the default; an explicit `utf-8`/`utf8` keeps it. ANY other
+    // name — `binary`, `us-ascii`, `shift_jis`, an unresolvable alias — means
+    // Ruby reads a literal's bytes under a different character width than
+    // the UTF-8 text the lowering decodes, and the fold gate in rigor-infer
+    // treats a non-ASCII scalar from such a file like an invalid-UTF-8 one
+    // (declines position/content reads rather than minting a wrong constant).
+    // Recording a flag — never rewriting the literal text — keeps the
+    // diagnostic messages truthful (issue #164 fix round).
+    //
+    // A magic-shaped comment only takes effect where CRuby reads the script
+    // encoding: line 1, or line 2 when line 1 is a shebang. Prism reports it
+    // in `magic_comments()` regardless, so the position is recovered from the
+    // key's pointer into the parse buffer (probed: `# encoding: binary`
+    // under a `frozen_string_literal` line is inert — the file stays UTF-8 —
+    // while the same comment under a `#!` line applies).
+    let shebang = source.starts_with(b"#!");
+    let utf8_source = result.magic_comments().all(|c| {
+        let key = c.key();
+        if !key.eq_ignore_ascii_case(b"encoding") && !key.eq_ignore_ascii_case(b"coding") {
+            return true;
+        }
+        let offset = (key.as_ptr() as usize).wrapping_sub(source.as_ptr() as usize);
+        // `key_start` points into `source`; an out-of-buffer offset keeps the
+        // honored reading so a position the flag cannot place still declines.
+        let line = line_starts.partition_point(|&ls| ls <= offset);
+        if !(offset >= source.len() || line == 1 || (line == 2 && shebang)) {
+            return true;
+        }
+        let value = c.value();
+        value.eq_ignore_ascii_case(b"utf-8") || value.eq_ignore_ascii_case(b"utf8")
+    });
     let mut builder = Builder {
         nodes: Vec::new(),
         source,
@@ -1176,6 +1226,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         const_mutations,
         local_read_starts,
         inert_spans,
+        utf8_source,
     }
 }
 
@@ -4133,5 +4184,40 @@ mod tests {
             })
             .expect("expected a named Definition");
         assert_eq!(&src[name_span.0..name_span.1], b"foo");
+    }
+
+    /// `utf8_source` reads the file's magic `encoding`/`coding` comment only
+    /// where CRuby honors it: line 1, or line 2 when line 1 is a shebang.
+    /// Every other declared name — `binary`, `us-ascii`, an alias — flips the
+    /// flag so rigor-infer declines folds the UTF-8 scalar text cannot answer.
+    #[test]
+    fn utf8_source_reads_honored_magic_encoding_comments() {
+        let cases: &[(&[u8], bool)] = &[
+            (b"puts 1\n", true),
+            (b"# just a comment\nputs 1\n", true),
+            (b"# encoding: utf-8\nputs 1\n", true),
+            (b"# encoding: UTF-8\nputs 1\n", true),
+            (b"# encoding: binary\nputs 1\n", false),
+            (b"# encoding: us-ascii\nputs 1\n", false),
+            (b"# encoding: ascii-8bit\nputs 1\n", false),
+            (b"# coding: binary\nputs 1\n", false),
+            (b"# ENCODING: BINARY\nputs 1\n", false),
+            (b"# -*- encoding: binary -*-\nputs 1\n", false),
+            // Honored on line 2 only after a shebang — under a plain or
+            // `frozen_string_literal` comment line it is inert (probed).
+            (b"#!/usr/bin/env ruby\n# encoding: binary\nputs 1\n", false),
+            (b"# frozen_string_literal: true\n# encoding: binary\nputs 1\n", true),
+            (b"# plain comment\n# encoding: binary\nputs 1\n", true),
+            (b"x = 1\n# encoding: binary\nputs 1\n", true),
+        ];
+        for (src, expected) in cases {
+            let ast = lower(&crate::parse(src));
+            assert_eq!(
+                ast.utf8_source(),
+                *expected,
+                "utf8_source for {:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
     }
 }
