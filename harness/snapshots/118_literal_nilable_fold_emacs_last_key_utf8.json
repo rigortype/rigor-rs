@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/118_literal_nilable_fold_emacs_last_key_utf8.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    }
+  ]
+}
