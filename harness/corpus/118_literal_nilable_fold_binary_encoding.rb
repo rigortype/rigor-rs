@@ -58,3 +58,30 @@ def c1 = "e"[1].upcase                     # `upcase` for nil
 def c2 = "abc".rindex("z").lenght          # `lenght` for nil
 def c3 = "abc".getbyte(9).to_a             # silent: `to_a` on nil exists
 def c4 = "abc".byteindex("b").lenght       # `lenght` for 1
+
+# --- (4) STAYS SILENT: the method-return fold declines too --------------------
+
+# The round-3 gate one level up: the literal tail of a `def` is pinned at
+# harvest time (`capture_fold_tail`), BEFORE any call site exists — so the
+# call-site encoding check could not see it. A non-ASCII `Str`/`Sym` from a
+# non-UTF-8 file now declines there as well: `Fold.b` cannot pin `nil` for a
+# body Ruby reads as `"\xA9"`, and `Fold.s` cannot hand a caller the UTF-8
+# text of a string Ruby holds as bytes. `Fold.b.upcase` and the `Fold.s`
+# lookups all fired `for nil` on the port before this gate (the cross-file
+# twin — a UTF-8 file calling these — is probe-only: a fixture is one file).
+class Fold
+  def self.b = "\xC3\xA9"[1]
+  def self.s = "a\xC3\xA9"
+  def self.a = "abc"
+end
+Fold.b.upcase                 # silent: declined body, `upcase` on String
+Fold.s.rindex("a", -3).abs    # silent: declined pin, `abs` on flat Integer
+Fold.s[-3].upcase             # silent: declined pin, `upcase` on flat String
+Fold.s.index("a").abs         # silent: `abs` on flat Integer either way
+Fold.s.slice(-3).upcase       # silent: `upcase` on flat String
+
+# And the controls proving the decline is keyed on the scalar's bytes, not on
+# the fold path existing: `Fold.a`'s ASCII literal still pins and still folds
+# — byte = char under every script encoding.
+Fold.a[3].upcase              # `upcase` for nil
+Fold.a.rindex("z").lenght     # `lenght` for nil

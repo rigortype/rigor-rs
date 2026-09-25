@@ -2758,11 +2758,34 @@ fn capture_fold_tail(ast: &LoweredAst, node_id: NodeId, depth: usize) -> FoldTai
     if depth > FOLD_DEPTH_CAP {
         return FoldTail::Decline;
     }
+    // #164 round 3 — the same non-UTF-8 script-encoding hazard the call-site
+    // fold gate covers, one level up: a non-ASCII `Str`/`Sym` literal from a
+    // non-UTF-8 file carries UTF-8 text whose char positions and contents Ruby
+    // does not share (under `# encoding: binary`, `"é"[1]` is `"\xA9"`). A
+    // tail that pins it folds the WRONG constant twice over — an in-body
+    // lookup (`def self.x; "é"[1]; end` minting `nil` where Ruby reads a
+    // byte) and a cross-file one (the UTF-8 caller file folds `Foo.s[-3]` on
+    // the pinned text where Ruby reads `Foo.s` under `binary`). The literal
+    // declines here — at capture — so `fold_tail` never sees the scalar and
+    // the def's return widens to its nominal class: silent, the safe side.
+    // ASCII literals are unaffected (byte = char under every encoding).
+    let non_utf8 = !ast.utf8_source();
+    let scalar_or_decline = |s: Scalar| {
+        if non_utf8 && crate::folding::scalar_is_non_ascii(&s) {
+            FoldTail::Decline
+        } else {
+            FoldTail::Expr(Box::new(FoldExpr::Scalar(s)))
+        }
+    };
     let expr = match ast.get(node_id) {
-        Node::StringLit { value, .. } => FoldExpr::Scalar(Scalar::Str(value.clone())),
+        Node::StringLit { value, .. } => {
+            return scalar_or_decline(Scalar::Str(value.clone()));
+        }
         Node::IntegerLit { value: Some(value), .. } => FoldExpr::Scalar(Scalar::Int(*value)),
         Node::FloatLit { value, .. } => FoldExpr::Scalar(Scalar::Float(*value)),
-        Node::SymbolLit { value, .. } => FoldExpr::Scalar(Scalar::Sym(value.clone())),
+        Node::SymbolLit { value, .. } => {
+            return scalar_or_decline(Scalar::Sym(value.clone()));
+        }
         Node::NilLit { .. } => FoldExpr::Scalar(Scalar::Nil),
         Node::TrueLit { .. } => FoldExpr::Scalar(Scalar::Bool(true)),
         Node::FalseLit { .. } => FoldExpr::Scalar(Scalar::Bool(false)),
@@ -4835,10 +4858,15 @@ mod probes_s92 {
             return None;
         }
         match ast.get(node_id) {
-            Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
+            // The `capture_fold_tail` #164 decline, kept in lockstep: a
+            // non-ASCII `Str`/`Sym` from a non-UTF-8 file folds nothing —
+            // its UTF-8 text does not share Ruby's char positions/contents.
+            Node::StringLit { value, .. } => Some(Scalar::Str(value.clone()))
+                .filter(|s| ast.utf8_source() || !crate::folding::scalar_is_non_ascii(s)),
             Node::IntegerLit { value, .. } => value.map(Scalar::Int),
             Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
-            Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+            Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone()))
+                .filter(|s| ast.utf8_source() || !crate::folding::scalar_is_non_ascii(s)),
             Node::NilLit { .. } => Some(Scalar::Nil),
             Node::TrueLit { .. } => Some(Scalar::Bool(true)),
             Node::FalseLit { .. } => Some(Scalar::Bool(false)),

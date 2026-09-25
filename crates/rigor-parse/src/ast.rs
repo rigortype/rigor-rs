@@ -1009,8 +1009,9 @@ pub struct LoweredAst {
     /// The spans of every [`StatementsKind::Inert`] carrier, for
     /// [`LoweredAst::in_inert_carrier`].
     inert_spans: Vec<Span>,
-    /// Whether the file's magic encoding comment names UTF-8 — or is absent,
-    /// UTF-8 being the default script encoding. See [`LoweredAst::utf8_source`].
+    /// Whether the script encoding Prism resolved for this file is UTF-8 —
+    /// absent a magic comment it is, UTF-8 being the default. See
+    /// [`LoweredAst::utf8_source`].
     utf8_source: bool,
 }
 
@@ -1081,8 +1082,10 @@ impl LoweredAst {
         &self.const_mutations
     }
 
-    /// Whether this file's script encoding is UTF-8 — no magic `encoding` /
-    /// `coding` comment at all (the default), or one naming `utf-8`/`utf8`.
+    /// Whether this file's script encoding is UTF-8 — the encoding Prism
+    /// actually resolved: no honored magic `encoding`/`coding` comment at all
+    /// (the default), one naming a UTF-8 entry (`utf-8`, `CP65001`, …), or an
+    /// unresolved name (which keeps the default with a parse error).
     ///
     /// A `false` here means Ruby reads every string/symbol literal's BYTES
     /// under a different character width than the UTF-8 text the lowered
@@ -1165,38 +1168,21 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
             line_starts.push(i + 1);
         }
     }
-    // The file's script encoding, from its magic `encoding`/`coding` comment.
-    // UTF-8 is the default; an explicit `utf-8`/`utf8` keeps it. ANY other
-    // name — `binary`, `us-ascii`, `shift_jis`, an unresolvable alias — means
-    // Ruby reads a literal's bytes under a different character width than
-    // the UTF-8 text the lowering decodes, and the fold gate in rigor-infer
-    // treats a non-ASCII scalar from such a file like an invalid-UTF-8 one
-    // (declines position/content reads rather than minting a wrong constant).
-    // Recording a flag — never rewriting the literal text — keeps the
-    // diagnostic messages truthful (issue #164 fix round).
+    // The file's script encoding, as Prism itself resolved it — the
+    // `encoding_comment_start` plumbing plus BOTH comment passes (the
+    // `key: value` scan with `-*-` markers and `;` separators, then the loose
+    // `coding` fallback that honors `vim: set fileencoding=`, `coding =` with
+    // spaces, and trailing tokens). See `encoding::resolved_utf8`.
     //
-    // A magic-shaped comment only takes effect where CRuby reads the script
-    // encoding: line 1, or line 2 when line 1 is a shebang. Prism reports it
-    // in `magic_comments()` regardless, so the position is recovered from the
-    // key's pointer into the parse buffer (probed: `# encoding: binary`
-    // under a `frozen_string_literal` line is inert — the file stays UTF-8 —
-    // while the same comment under a `#!` line applies).
-    let shebang = source.starts_with(b"#!");
-    let utf8_source = result.magic_comments().all(|c| {
-        let key = c.key();
-        if !key.eq_ignore_ascii_case(b"encoding") && !key.eq_ignore_ascii_case(b"coding") {
-            return true;
-        }
-        let offset = (key.as_ptr() as usize).wrapping_sub(source.as_ptr() as usize);
-        // `key_start` points into `source`; an out-of-buffer offset keeps the
-        // honored reading so a position the flag cannot place still declines.
-        let line = line_starts.partition_point(|&ls| ls <= offset);
-        if !(offset >= source.len() || line == 1 || (line == 2 && shebang)) {
-            return true;
-        }
-        let value = c.value();
-        value.eq_ignore_ascii_case(b"utf-8") || value.eq_ignore_ascii_case(b"utf8")
-    });
+    // A `false` here means Ruby reads every string/symbol literal's BYTES
+    // under a different character width than the UTF-8 text the lowered
+    // scalar carries: under `# encoding: binary` `"é"[1]` is the second
+    // byte `"\xA9"` where the UTF-8 read answers `"a"` — so a char-position
+    // or content fold on a non-ASCII scalar would mint the wrong constant
+    // (issue #164 fix round: the reference executes real Ruby and is
+    // correct there; the port declines instead). Recording a flag — never
+    // rewriting the literal text — keeps the diagnostic messages truthful.
+    let utf8_source = crate::encoding::resolved_utf8(source);
     let mut builder = Builder {
         nodes: Vec::new(),
         source,
@@ -4186,10 +4172,13 @@ mod tests {
         assert_eq!(&src[name_span.0..name_span.1], b"foo");
     }
 
-    /// `utf8_source` reads the file's magic `encoding`/`coding` comment only
-    /// where CRuby honors it: line 1, or line 2 when line 1 is a shebang.
-    /// Every other declared name — `binary`, `us-ascii`, an alias — flips the
-    /// flag so rigor-infer declines folds the UTF-8 scalar text cannot answer.
+    /// `utf8_source` is the encoding Prism resolves: the `key: value` pass on
+    /// the ONE honored comment (line 1, or line 2 after a `ruby` shebang),
+    /// then — only when that pass does not consume the comment — the loose
+    /// `coding` fallback scan. Every resolved non-UTF-8 name flips the flag so
+    /// rigor-infer declines folds the UTF-8 scalar text cannot answer; the
+    /// `expected` column is each form's resolved UTF-8-ness, verified against
+    /// `ruby`'s own `"é".length` read for every row (issue #164 round 3).
     #[test]
     fn utf8_source_reads_honored_magic_encoding_comments() {
         let cases: &[(&[u8], bool)] = &[
@@ -4203,12 +4192,49 @@ mod tests {
             (b"# coding: binary\nputs 1\n", false),
             (b"# ENCODING: BINARY\nputs 1\n", false),
             (b"# -*- encoding: binary -*-\nputs 1\n", false),
-            // Honored on line 2 only after a shebang — under a plain or
-            // `frozen_string_literal` comment line it is inert (probed).
+            // The emacs `-*-` pairs apply in order — the LAST encoding key
+            // wins (probed: `coding: binary; encoding: utf-8` stays UTF-8).
+            (b"# -*- coding: binary; encoding: utf-8 -*-\nputs 1\n", true),
+            (b"# -*- encoding: utf-8; coding: binary -*-\nputs 1\n", false),
+            // `CP65001` resolves to the UTF-8 entry.
+            (b"# encoding: CP65001\nputs 1\n", true),
+            // `;`-separated and free-`coding` forms reach the fallback scan.
+            (b"# encoding: binary; frozen_string_literal: true\nputs 1\n", false),
+            (b"# frozen_string_literal: true; encoding: binary\nputs 1\n", false),
+            (b"# typed: strict; encoding: binary\nputs 1\n", false),
+            (b"# this file has coding: binary\nputs 1\n", false),
+            // `=` needs surrounding whitespace to reach the fallback: the
+            // no-space form is ONE magic-comment key (`encoding=binary`),
+            // which the pass consumes and leaves UTF-8 (probed on `ruby`).
+            (b"# encoding = binary\nputs 1\n", false),
+            (b"# coding = binary\nputs 1\n", false),
+            (b"# encoding=binary\nputs 1\n", true),
+            (b"# coding=binary\nputs 1\n", true),
+            // Trailing tokens keep the pass from consuming the comment, so
+            // the fallback still reads `encoding: binary`.
+            (b"# encoding: binary extra\nputs 1\n", false),
+            (b"# encoding: binary # ascii-8bit\nputs 1\n", false),
+            // Vim modelines: `set` breaks the key:value pass → fallback
+            // finds `filecoding`'s `coding` tail. Without `set` the pass
+            // swallows `fileencoding=binary` as the `vim` VALUE → UTF-8.
+            (b"# vim: set fileencoding=binary :\nputs 1\n", false),
+            (b"# vi: set fileencoding=us-ascii :\nputs 1\n", false),
+            (b"# vim: fileencoding=binary\nputs 1\n", true),
+            // Honored on line 2 only after a shebang CONTAINING `ruby` —
+            // `#!/bin/sh` and `#!/usr/bin/env perl` leave line 2 inert
+            // (probed; no shebang search outside `main_script`/`-x`).
             (b"#!/usr/bin/env ruby\n# encoding: binary\nputs 1\n", false),
+            (b"#!/bin/sh\n# encoding: binary\nputs 1\n", true),
+            (b"#!/usr/bin/env perl\n# encoding: binary\nputs 1\n", true),
+            // Under a plain/`frozen_string_literal`/code/blank line it is
+            // inert (probed).
             (b"# frozen_string_literal: true\n# encoding: binary\nputs 1\n", true),
             (b"# plain comment\n# encoding: binary\nputs 1\n", true),
             (b"x = 1\n# encoding: binary\nputs 1\n", true),
+            (b"\n# encoding: binary\nputs 1\n", true),
+            // Leading inline whitespace is fine — the honored comment need
+            // not start the line's first byte.
+            (b"   # encoding: binary\nputs 1\n", false),
         ];
         for (src, expected) in cases {
             let ast = lower(&crate::parse(src));
