@@ -9,6 +9,7 @@
 pub use ruby_prism;
 
 pub mod ast;
+mod encoding;
 
 pub use ast::{
     lower, lower_with_key, ConstMutation, FileKey, HashKey, HashKeyTag, LoweredAst, MethodBody,

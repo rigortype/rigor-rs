@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/118_literal_nilable_fold_spaced_equals_encoding.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    }
+  ]
+}
