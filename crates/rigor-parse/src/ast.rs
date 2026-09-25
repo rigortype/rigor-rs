@@ -510,6 +510,16 @@ pub enum Node {
         /// impossible), so a toplevel `def Foo.bar` resolves a later bare `bar`
         /// there — and `call.unresolved-toplevel` must match.
         receiver_def_name: Option<String>,
+        /// The RENDERED constant path of a non-`self` def receiver
+        /// (`def Foo::Bar.baz` -> `Some("Foo::Bar")`, `def obj.x` -> `None` —
+        /// a dynamic receiver names no constant). Set whenever
+        /// `receiver_def_name` is; the reference's `def_singleton?` skips a
+        /// receiver-bearing def whose rendered path equals the def-owner
+        /// prefix's tail (`Object.class_eval { def Object.x }` is a singleton
+        /// def, NOT `Object#x`), so the def walk needs the path itself, not
+        /// just the method name (`Source::ConstantPath.render` —
+        /// `fb781023`).
+        def_receiver_path: Option<String>,
         /// The span of the method's PARAMETER LIST (Prism `DefNode#parameters`),
         /// or `None` when the def takes no parameters.
         ///
@@ -544,6 +554,14 @@ pub enum Node {
         /// `def.override-visibility-reduced` rule anchors its diagnostic here
         /// (matching the reference's `Diagnostic.from_name_loc`).
         name_span: Option<Span>,
+        /// For a singleton-class body (`is_singleton_class`), the lowered
+        /// `class << <expr>` operand — `Some` always, since Prism requires the
+        /// expression. `None` on every other Definition. The def-attribution
+        /// walk needs it to tell `class << self` (body methods belong to the
+        /// enclosing self's singleton) from `class << Const` (that constant's
+        /// singleton) from `class << <expr>` (a singleton nothing names),
+        /// mirroring the reference's `singleton_class_prefix` (fb781023).
+        singleton_operand: Option<NodeId>,
         body: Vec<NodeId>,
         span: Span,
     },
@@ -796,7 +814,29 @@ pub enum Node {
     /// is the reference's `Source::ConstantPath.qualified_name_or_nil`
     /// answering nil, which a consumer that must not read through a runtime
     /// receiver (the version-guard operand reader) tests.
-    ConstantRead { name: String, span: Span, dynamic_base: bool },
+    ///
+    /// `self_anchored` is `true` for a `self::X` / `self::X::Y` path — the
+    /// reference's `self_anchored_tail` arm of `eval_receiver_prefix`
+    /// (fb781023): such a path resolves against the enclosing SELF (the eval
+    /// block's rebound owner), never the lexical nesting, so the
+    /// def-attribution walk needs it told apart from a plain `X`. `name` still
+    /// renders `"X"`. `dynamic_base` stays `true` for this spelling too (a
+    /// `self` parent is not a constant), which is what its existing consumers
+    /// already assumed.
+    ConstantRead {
+        name: String,
+        span: Span,
+        dynamic_base: bool,
+        self_anchored: bool,
+        /// `rooted` is `true` for a `::X` / `::X::Y` path — the reference's
+        /// `Source::ConstantPath.rooted?` (its `eval_constant_receiver_prefix`
+        /// consults it FIRST, before the lexical walk): a rooted spelling
+        /// re-anchors at the top level, so `::Object` inside `module M` names
+        /// `Object`, never `M::Object` — even when the file declares
+        /// `M::Object`. `name` still renders unrooted (`"Object"`): the flag
+        /// carries the anchoring, exactly like `self_anchored` does.
+        rooted: bool,
+    },
     /// A constant write (`FOO = v`). The value is lowered. Not a value itself.
     /// `name` is the WRITTEN constant name (`"FOO"`; the last component for a
     /// `Foo::Bar = v` path-write, else empty for an un-namable dynamic form) —
@@ -1584,7 +1624,15 @@ impl<'src> Builder<'src> {
                 .receiver()
                 .filter(|r| r.as_self_node().is_some())
                 .map(|_| constant_string(def.name().as_slice()));
-            // The mirror for a NON-self receiver (`def IO.console_size`).
+            // The mirror for a NON-self receiver (`def IO.console_size`). Its
+            // rendered constant path rides along so the def-attribution walk
+            // can apply `def_receiver_targets_lexical_self?` (`def Object.x`
+            // inside `Object.class_eval` is a singleton def, not `Object#x`).
+            let def_receiver_path = def
+                .receiver()
+                .filter(|r| r.as_self_node().is_none())
+                .map(|r| constant_path_string(&r))
+                .filter(|p| !p.is_empty());
             let receiver_def_name = def
                 .receiver()
                 .filter(|r| r.as_self_node().is_none())
@@ -1594,12 +1642,14 @@ impl<'src> Builder<'src> {
                 is_singleton_class: false,
                 singleton_name,
                 receiver_def_name,
+                def_receiver_path,
                 param_span: def.parameters().as_ref().map(|p| span_of(&p.location())),
                 has_explicit_return,
                 params,
                 param_shape,
                 param_names: all_param_names(def.parameters().as_ref()),
                 name_span,
+                singleton_operand: None,
                 body,
                 span: span_of(&def.location()),
             });
@@ -1679,18 +1729,21 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(sclass) = node.as_singleton_class_node() {
+            let operand = self.lower_node(&sclass.expression());
             let body = self.lower_optional_body(sclass.body().as_ref());
             return self.push(Node::Definition {
                 name: None, // `class << self` has no single method name.
                 is_singleton_class: true, // a CLASS scope, not a method def.
                 singleton_name: None, // the BODY's inner defs are the singletons.
                 receiver_def_name: None,
+                def_receiver_path: None,
                 param_span: None,
                 has_explicit_return: false,
                 params: None,    // no single method ⇒ no param binding.
                 param_shape: ParamShape::default(),
                 param_names: Vec::new(),
                 name_span: None, // no single name ⇒ no name span.
+                singleton_operand: Some(operand),
                 body,
                 span: span_of(&sclass.location()),
             });
@@ -2109,6 +2162,8 @@ impl<'src> Builder<'src> {
                 name: constant_string(cr.name().as_slice()),
                 span: span_of(&cr.location()),
                 dynamic_base: false,
+                self_anchored: false,
+                rooted: false,
             });
         }
         if let Some(cp) = node.as_constant_path_node() {
@@ -2120,6 +2175,8 @@ impl<'src> Builder<'src> {
                 name: constant_path_string(node),
                 span: span_of(&cp.location()),
                 dynamic_base: strict_constant_path_string(node).is_none(),
+                self_anchored: self_anchored_constant_path(node),
+                rooted: rooted_constant_path(node),
             });
         }
 
@@ -2487,6 +2544,48 @@ fn constant_path_string(node: &PrismNode<'_>) -> String {
         }
     } else {
         String::new()
+    }
+}
+
+/// Whether a constant-path node's leftmost ancestor is `self` (`self::X`,
+/// `self::X::Y`). Mirrors the reference's `self_anchored_tail` recognition
+/// (fb781023): the chain is walked to its base, which must be a
+/// `Prism::SelfNode` — every other base (`::`, a constant, a dynamic
+/// expression) answers `false`.
+fn self_anchored_constant_path(node: &PrismNode<'_>) -> bool {
+    let Some(mut cp) = node.as_constant_path_node() else {
+        return false;
+    };
+    while let Some(parent) = cp.parent() {
+        if parent.as_self_node().is_some() {
+            return true;
+        }
+        match parent.as_constant_path_node() {
+            Some(next) => cp = next,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Whether a constant-path node is written with a leading `::` (`::Foo`,
+/// `::Foo::Bar`) — the reference's `Source::ConstantPath.rooted?`. Prism spells
+/// the root as a `ConstantPathNode` with a nil parent, so the answer lives at
+/// the LEFTMOST segment: the walk reaches it and asks whether the chain ends
+/// on no parent (rooted) or on a non-path base — a `ConstantReadNode` (bare
+/// `Foo`), a `SelfNode` (`self::Foo`) or a dynamic expression — which is not.
+fn rooted_constant_path(node: &PrismNode<'_>) -> bool {
+    let Some(mut cp) = node.as_constant_path_node() else {
+        return false;
+    };
+    loop {
+        match cp.parent() {
+            None => return true,
+            Some(parent) => match parent.as_constant_path_node() {
+                Some(next) => cp = next,
+                None => return false,
+            },
+        }
     }
 }
 

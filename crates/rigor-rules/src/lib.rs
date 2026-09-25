@@ -550,7 +550,9 @@ pub fn analyze_with_source_and_folder(
     // `ConstantRead` arm resolves each use site's lexical prefix (span
     // containment) and applies the precise constant-shadow gate.
     let scopes = rigor_infer::lexical_scopes(ast);
-    let typer = Typer::with_source_and_folder(index, source, folder).with_lexical_scopes(&scopes);
+    let typer = Typer::with_source_and_folder(index, source, folder)
+        .with_lexical_scopes(&scopes)
+        .with_file_key(ast.file_key());
     let env = ScopedEnv::build(&typer, ast, interner);
     // ADR-0038 Slice 1: the per-call nil-receiver snapshot map (call node id ->
     // non-nil core arm), computed ONCE over the whole program via the threaded
@@ -912,7 +914,7 @@ fn unresolved_toplevel_diagnostics(
             // silent. Cross-file (not just same-file) matches the reference's
             // project-mode resolution — a `def` in a required file resolves the
             // call — which is what keeps the multi-file corpus zero-FP.
-            if source.is_toplevel_def(method) {
+            if source.is_toplevel_def(Some(ast.file_key()), method) {
                 continue;
             }
             // Present on the Object/Kernel instance surface ⇒ silent. (`false`
@@ -1664,7 +1666,7 @@ fn check_call(
     // class contributes methods RBS cannot know about — rake's `class String`
     // adds `#ext` and `#pathmap_explode` — and witnessing their absence against
     // RBS alone is a false positive.
-    if typer.source().project_declares_method(class_name, method) {
+    if typer.source().project_declares_method(typer.file_key(), class_name, method) {
         return None;
     }
 
@@ -1794,7 +1796,7 @@ fn check_narrowed_call(
     // A project reopen MERGES with the RBS surface rather than replacing it
     // (probe q6): the reopened method silences, the still-absent one still
     // fires. Keyed as written, so `Proj::Thing` matches.
-    if typer.source().project_declares_method(class_name, method) {
+    if typer.source().project_declares_method(typer.file_key(), class_name, method) {
         return None;
     }
     // Render the narrowed receiver as the reference does — the FULL resolved
@@ -1869,7 +1871,7 @@ fn check_collection_call(
     if index.class_has_method(class_name, method) {
         return None;
     }
-    if typer.source().project_declares_method(class_name, method) {
+    if typer.source().project_declares_method(typer.file_key(), class_name, method) {
         return None;
     }
     let class = index.class_id(class_name)?;
@@ -2794,7 +2796,7 @@ fn raise_redefined_in_scope(
 ) -> bool {
     // Covers the toplevel `def raise` and the Object/Kernel/BasicObject reopen
     // (`toplevel_defs` folds both — see `SourceIndex::build_project` pass 1c).
-    if source.is_toplevel_def(name) {
+    if source.is_toplevel_def(Some(ast.file_key()), name) {
         return true;
     }
     let call_span = ast.get(call_id).span();

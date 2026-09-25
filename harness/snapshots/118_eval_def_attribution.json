@@ -1,0 +1,152 @@
+{
+  "fixture": "harness/corpus/118_eval_def_attribution.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 80,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `class_eval`. If a project file defines `class_eval` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 87,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `eval_def`. If a project file defines `eval_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 88,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `module_eval_def`. If a project file defines `module_eval_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 89,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `singleton_side_def`. If a project file defines `singleton_side_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 90,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `exec_side_def`. If a project file defines `exec_side_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 91,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `kernel_eval_def`. If a project file defines `kernel_eval_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 92,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `basic_eval_def`. If a project file defines `basic_eval_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 93,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `object_instance_def`. If a project file defines `object_instance_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 94,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `string_singleton_def`. If a project file defines `string_singleton_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 95,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `inside_singleton_class_def`. If a project file defines `inside_singleton_class_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 96,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `object_receiver_def`. If a project file defines `object_receiver_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 97,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `object_singleton_body_def`. If a project file defines `object_singleton_body_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 98,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `target_eval_attr`. If a project file defines `target_eval_attr` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 99,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `target_eval_dm`. If a project file defines `target_eval_dm` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 100,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `target_eval_alias`. If a project file defines `target_eval_alias` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 101,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `dynamic_receiver_def`. If a project file defines `dynamic_receiver_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 102,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `unresolved_receiver_def`. If a project file defines `unresolved_receiver_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 103,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `named_factory_def`. If a project file defines `named_factory_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 104,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `bare_eval_def`. If a project file defines `bare_eval_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 105,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `self_eval_def`. If a project file defines `self_eval_def` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 144,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `undefined_anywhere`. If a project file defines `undefined_anywhere` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}
