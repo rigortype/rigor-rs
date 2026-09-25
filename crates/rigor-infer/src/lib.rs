@@ -53,7 +53,7 @@ fn static_shape_key_of_node(node: &Node) -> Option<ShapeKey> {
     match node {
         Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
         Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
-        Node::IntegerLit { value, .. } => Some(ShapeKey::Int(*value)),
+        Node::IntegerLit { value, .. } => value.map(ShapeKey::Int),
         Node::FloatLit { value, .. } => Some(ShapeKey::Float(value.to_bits())),
         Node::TrueLit { .. } => Some(ShapeKey::Bool(true)),
         Node::FalseLit { .. } => Some(ShapeKey::Bool(false)),
@@ -456,9 +456,11 @@ impl<'i> Typer<'i> {
             // twin of `InterpolatedString` above, differing only in the
             // nominal type name, so it never mis-types as a `String`.
             Node::InterpolatedSymbol { .. } => self.nominal_or_untyped("Symbol", interner),
-            Node::IntegerLit { value, .. } => {
+            Node::IntegerLit { value: Some(value), .. } => {
                 interner.intern(Type::Constant(Scalar::Int(*value)))
             }
+            // A Bignum: the reference pins it, but no `i64` scalar can.
+            Node::IntegerLit { value: None, .. } => self.nominal_or_untyped("Integer", interner),
             Node::FloatLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Float(*value)))
             }
@@ -1690,7 +1692,7 @@ impl<'i> Typer<'i> {
             // Range is what its two Range overloads take: either member keeps a
             // second overload in `rand`'s join (see [`Reach`]).
             Node::IntegerLit { value, .. } => {
-                if *value == 0 {
+                if *value == Some(0) {
                     Reach::OPAQUE
                 } else {
                     Reach::LITERAL
@@ -1751,7 +1753,7 @@ impl<'i> Typer<'i> {
         }
         seen.push(key);
         let reach = match root {
-            UntypedRoot::Local(name) => self.local_reach(ast, name, use_span, seen),
+            UntypedRoot::Local(name) => self.local_reach(ast, name, use_span, seen, false),
             UntypedRoot::Ivar(name) => self.ivar_reach(ast, name, use_span, seen),
             UntypedRoot::Cvar(name) => self.cvar_reach(ast, name, use_span, seen),
             UntypedRoot::Gvar(name) => self.gvar_reach(ast, name, seen),
@@ -1809,13 +1811,18 @@ impl<'i> Typer<'i> {
     ///   "x"` still fires (row l06).
     ///
     /// A `rescue => name` binding and a class guard refuse the whole test (the
-    /// reference types both precisely).
+    /// reference types both precisely). With `skip_class_guards` a guard of the
+    /// exact shape `root.is_a?(C)` / `kind_of?` / `instance_of?` is instead
+    /// stepped over, so the caller can ask what reaches the root BEFORE the
+    /// guard narrows it ([`Typer::arg_is_guarded_parameter`]); every other guard
+    /// shape (`C === root`, a `case`) still refuses.
     fn local_reach(
         &self,
         ast: &LoweredAst,
         root: &str,
         use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
+        skip_class_guards: bool,
     ) -> Reach {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
         // One pass for the scope shapes: every `def` span, every `->` span, the
@@ -1925,6 +1932,12 @@ impl<'i> Typer<'i> {
                 {
                     return Reach::OPAQUE;
                 }
+                Node::Call { receiver, method, args, span, .. }
+                    if skip_class_guards
+                        && guards_here(*span)
+                        && matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?")
+                        && receiver.is_some_and(reads_root)
+                        && matches!(args.as_slice(), [c] if matches!(ast.get(*c), Node::ConstantRead { .. })) => {}
                 Node::Call { receiver, method, args, span, .. }
                     if guards_here(*span)
                         && matches!(
@@ -2492,7 +2505,18 @@ impl<'i> Typer<'i> {
         // guess). The nullary case (`args` empty) folds the no-arg core.
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
             if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
-                if let Some(folded) = folding::fold(&scalar, method, &arg_scalars) {
+                // A String lookup can answer `nil`, so a stale value flips the
+                // result's CLASS. The top-level flat env keeps a local's first
+                // literal across `<<`, `+=`, branch and block writes, so a lookup
+                // that reads a local declines to the RBS answer (#149 review:
+                // `buf = ""; buf << "x"; buf[0].upcase` fired `for nil`).
+                let stale_risk = folding::is_str_lookup(&scalar, method)
+                    && std::iter::once(receiver)
+                        .chain(args.iter().copied())
+                        .any(|id| ast.reads_local_within(ast.get(id).span()));
+                if let Some(folded) =
+                    (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
+                {
                     return interner.intern(Type::Constant(folded));
                 }
                 // ADR-0008 sidecar fallback: the Rust core declined, but if this
@@ -2500,7 +2524,9 @@ impl<'i> Typer<'i> {
                 // wired (full-fidelity mode), execute it there. A declined /
                 // absent folder leaves the value widened (sound subset).
                 if let Some(folder) = self.folder {
-                    if folding::sidecar_foldable(folding::scalar_class(&scalar), method) {
+                    if folding::sidecar_foldable(folding::scalar_class(&scalar), method)
+                        && !folding::sidecar_blows_up(method, &arg_scalars)
+                    {
                         if let Some(folded) = folder.fold(&scalar, method, &arg_scalars) {
                             return interner.intern(Type::Constant(folded));
                         }
@@ -2669,10 +2695,17 @@ impl<'i> Typer<'i> {
     /// is at risk: `arg_reach` is two arena scans per root visited (see its own
     /// COST note), and tier 3 is the hot dispatch path.
     ///
+    /// A class-GUARDED parameter is refused by that allow-list (the reference
+    /// types it precisely), but for a NILABLE return it declines anyway through
+    /// [`Typer::arg_is_guarded_parameter`] (issue #121): a guarded parameter is
+    /// never a value the reference can fold, so its join keeps the nil arm —
+    /// `return unless u.is_a?(Integer); "abc"[u].typo` is reference-silent.
+    ///
     /// Known withholdings, recorded not chased: an argument the reference types
-    /// but rigor-rs cannot see as such stays firing (a class-GUARDED parameter —
-    /// `return unless u.is_a?(Integer); "abc"[u].typo` is reference-silent and
-    /// still fires here), because the allow-list is deliberately syntactic; and
+    /// but rigor-rs cannot see as such stays firing (a `case`/`when` or
+    /// `C === u` guard, a chain over a guarded root, a guard after a
+    /// conditional rebind — see fixture 106's trailer), because the allow-list
+    /// is deliberately syntactic; and
     /// an overload written as an untyped function (`(?) -> untyped`) is not
     /// retained in `method_overloads` at all, so it cannot contribute a
     /// disagreement (18 occurrences in the vendored RBS, none of them a
@@ -2689,10 +2722,41 @@ impl<'i> Typer<'i> {
         if args.is_empty() || self.rbs_join_is_one_bare_nominal(class_name, method, args.len()) {
             return false;
         }
+        let nilable = matches!(self.index.method_return_nilable(class_name, method), Some((_, true)));
         let untyped = interner.untyped();
         args.iter().any(|&a| {
-            self.type_of(ast, a, env, interner) == untyped && self.arg_reach(ast, a).untyped
+            self.type_of(ast, a, env, interner) == untyped
+                && (self.arg_reach(ast, a).untyped
+                    || (nilable && self.arg_is_guarded_parameter(ast, a)))
         })
+    }
+
+    /// Issue #121 — the NILABLE half of tier 3's decline, for the argument the
+    /// untyped allow-list deliberately refuses: a bare local that a class guard
+    /// narrows (`return unless u.is_a?(Integer); "abc"[u]`).
+    ///
+    /// The reference types that argument as the guard's `Nominal` (or leaves it
+    /// `Dynamic` where the guard does not dominate the read) — never a value it
+    /// can constant-fold — so the call cannot fold and the carrier stays the RBS
+    /// join. When every overload returns `C?` that join is `C | nil`, on which
+    /// no negative rule fires (`"abc"[u].frobnicate` and `"abc"[u].upcase` are
+    /// both reference-silent). The flat slot's bare `C` is what fired here.
+    ///
+    /// The test is "only the untyped carrier reaches the root once the class
+    /// guards are stepped over": a parameter the region never rebinds. Any
+    /// precise write reaching the read (`u = 1; return unless u.is_a?(Integer)`)
+    /// could leave the reference a `Constant` to fold, and the rows a25/a31 of
+    /// the Kernel-fold arc ride exactly that — so it does not qualify, and
+    /// neither does a chain over the root (`u <=> 1` can answer a union of
+    /// literals the reference does fold). Only the nilable case asks: a guarded
+    /// argument can narrow the erasure family (`Array#product`) back to one
+    /// overload, and the reference then fires.
+    fn arg_is_guarded_parameter(&self, ast: &LoweredAst, arg: NodeId) -> bool {
+        let Node::LocalVariableRead { name, span, .. } = ast.get(arg) else {
+            return false;
+        };
+        let reach = self.local_reach(ast, name, *span, &mut vec![format!("{name}@{}", span.0)], true);
+        reach.untyped && !reach.precise
     }
 
     /// The index half of [`Typer::rbs_dispatch_declines_on_untyped_arg`]:
@@ -9173,8 +9237,39 @@ mod m2_go_slice_tests {
         );
         // (4) CONTROL — a LITERAL argument is not reference-untyped, and the
         // reference constant-folds the call to a `String` value, so withholding
-        // here would LOSE a matched row.
-        assert_eq!(ty_of_last_recv_call(b"def f\n  \"abc\"[0]\nend\n"), "Class<0>");
+        // here would LOSE a matched row. Since issue #121 the port folds it too.
+        assert_eq!(ty_of_last_recv_call(b"def f\n  \"abc\"[0]\nend\n"), "Constant[\"a\"]");
+    }
+
+    /// Issue #121 — a class-GUARDED parameter is refused by the untyped
+    /// allow-list, but a NILABLE return still gives up the flat slot for it: the
+    /// reference cannot fold a guarded parameter, so its join keeps the nil arm.
+    /// The controls keep their answers: a precise write reaching the read, a
+    /// non-nilable return, and the erasure family (a typed argument can narrow
+    /// `Array#product` back to overloads the reference fires on).
+    #[test]
+    fn nilable_dispatch_declines_under_a_guarded_parameter() {
+        let guarded = |body: &str| {
+            let src = format!("def f(u)\n  return unless u.is_a?(Integer)\n  {body}\nend\n");
+            ty_of_last_recv_call(src.as_bytes())
+        };
+        assert_eq!(guarded("\"abc\"[u]"), "Dynamic[top]");
+        assert_eq!(guarded("\"abc\".byteslice(u)"), "Dynamic[top]");
+        assert_eq!(guarded("[1, 2].index(u)"), "Dynamic[top]");
+        // CONTROLS.
+        assert_eq!(guarded("\"abc\".center(u)"), "Class<0>");
+        assert_ne!(guarded("[1, 2].product(u)"), "Dynamic[top]");
+        assert_eq!(
+            ty_of_last_recv_call(
+                b"def f(u)\n  u = 1\n  return unless u.is_a?(Integer)\n  \"abc\"[u]\nend\n"
+            ),
+            "Class<0>"
+        );
+        // A `case` guard still refuses (recorded, not chased).
+        assert_eq!(
+            ty_of_last_recv_call(b"def f(u)\n  case u\n  when Integer then \"abc\"[u]\n  end\nend\n"),
+            "Class<0>"
+        );
     }
 
     /// Slice 2/3: Kernel#Array folds by argument type; rand types by arity.

@@ -367,8 +367,9 @@ pub enum Node {
     /// carries the lowered interpolation segments so calls inside `#{ … }`
     /// stay reachable for the walk, exactly like `InterpolatedString`.
     InterpolatedSymbol { parts: Vec<NodeId>, span: Span },
-    /// An integer literal (`42`).
-    IntegerLit { value: i64, span: Span },
+    /// An integer literal (`42`). `value` is `None` for a literal outside
+    /// `i64` (a Bignum): no consumer may pin it, since every scalar is `i64`.
+    IntegerLit { value: Option<i64>, span: Span },
     /// A float literal (`3.14`); `value` is the parsed `f64`.
     FloatLit { value: f64, span: Span },
     /// A symbol literal (`:foo`); `value` is the symbol name (no leading colon).
@@ -921,6 +922,9 @@ pub struct LoweredAst {
     /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
     /// table rather than owned nodes.
     const_mutations: Vec<ConstMutation>,
+    /// Sorted start offsets of every `LocalVariableRead`, so
+    /// [`LoweredAst::reads_local_within`] is a binary search, not an arena scan.
+    local_read_starts: Vec<usize>,
 }
 
 /// One site where a CONSTANT-shaped receiver is mutated — the raw material of
@@ -992,6 +996,13 @@ impl LoweredAst {
 }
 
 impl LoweredAst {
+    /// Whether some `LocalVariableRead` starts inside `span`. A read is a leaf,
+    /// so starting inside a node's span means lying inside its subtree.
+    pub fn reads_local_within(&self, (lo, hi): Span) -> bool {
+        let i = self.local_read_starts.partition_point(|&s| s < lo);
+        self.local_read_starts.get(i).is_some_and(|&s| s < hi)
+    }
+
     /// Resolve a handle to its owned node.
     pub fn get(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
@@ -1053,7 +1064,13 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
     let const_mutations = collect_const_mutations(&root_prism);
-    LoweredAst { nodes: builder.nodes, root, file_key, const_mutations }
+    let mut local_read_starts: Vec<usize> = builder
+        .nodes
+        .iter()
+        .filter_map(|n| matches!(n, Node::LocalVariableRead { .. }).then(|| n.span().0))
+        .collect();
+    local_read_starts.sort_unstable();
+    LoweredAst { nodes: builder.nodes, root, file_key, const_mutations, local_read_starts }
 }
 
 /// Mutable accumulator for the owned arena during the lowering walk.
@@ -1235,13 +1252,10 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(int) = node.as_integer_node() {
-            // Prism's `Integer` exposes only `TryInto<i32>` in this binding;
-            // for the tracer-bullet literal subset that range suffices.
-            // TODO(spec): widen to full bignum / i64 once a wider accessor is
-            // available (or via to_u32_digits) — value-lattice Constant[Int].
-            let value: i64 = TryInto::<i32>::try_into(int.value())
-                .map(i64::from)
-                .unwrap_or(0);
+            // Prism's `TryInto<i32>` covers only `i32`; the digit view widens
+            // that to all of `i64`. A Bignum lowers to `None` — never to a
+            // wrong value (`3_000_000_000` once lowered to `0` and folded).
+            let value = integer_value(&int.value());
             return self.push(Node::IntegerLit {
                 value,
                 span: span_of(&int.location()),
@@ -2198,6 +2212,17 @@ impl<'src> Builder<'src> {
 /// total on exotic encodings.
 fn constant_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// A prism integer's value when it fits `i64`, from its little-endian `u32`
+/// digits; `None` for a Bignum.
+fn integer_value(int: &ruby_prism::Integer<'_>) -> Option<i64> {
+    let (negative, digits) = int.to_u32_digits();
+    let mut mag: i128 = 0;
+    for &d in digits.iter().rev() {
+        mag = mag.checked_mul(1 << 32)?.checked_add(i128::from(d))?;
+    }
+    i64::try_from(if negative { -mag } else { mag }).ok()
 }
 
 /// Parse a Ruby integer literal's source slice to its `i128` value for
@@ -3157,6 +3182,38 @@ mod tests {
             });
             assert!(found, "expected LocalVariableOpWrite for `{name}` in {src:?}");
         }
+    }
+
+    #[test]
+    fn reads_local_within_finds_reads_inside_a_span_only() {
+        let src = b"s = 1\n\"abc\"[s]\n\"abc\"[0]\n";
+        let ast = lower(&crate::parse(src));
+        let span_of = |needle: &[u8]| {
+            let lo = src.windows(needle.len()).position(|w| w == needle).unwrap();
+            (lo, lo + needle.len())
+        };
+        assert!(ast.reads_local_within(span_of(b"\"abc\"[s]")));
+        assert!(!ast.reads_local_within(span_of(b"\"abc\"[0]")));
+        assert!(!ast.reads_local_within(span_of(b"s = 1")));
+    }
+
+    #[test]
+    fn integer_literals_lower_across_i64_and_decline_bignums() {
+        // Beyond `i32` used to lower to `0`; beyond `i64` must not pin at all.
+        let src = b"[1, -2, 3_000_000_000, 0x7fff_ffff_ffff_ffff, \
+                    -9223372036854775808, 9223372036854775808, 100000000000000000000]\n";
+        let ast = lower(&crate::parse(src));
+        let values: Vec<Option<i64>> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::IntegerLit { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            values,
+            [Some(1), Some(-2), Some(3_000_000_000), Some(i64::MAX), Some(i64::MIN), None, None]
+        );
     }
 
     #[test]

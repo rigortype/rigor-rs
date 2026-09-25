@@ -631,7 +631,16 @@ pub fn analyze_with_source_and_folder(
         // `def` never reads the file's top-level locals (`ScopedEnv::at`).
         let gate_env = env.gate_at(message_span);
         let env = env.at(message_span);
-        let diag = check_call(ast, recv, &method, message_span, env, &typer, interner, index)
+        // `nil&.m` never dispatches: the reference's `safe_navigation_receiver`
+        // turns a receiver that is exactly nil into `bot` for undefined-method.
+        // A `T | nil` union still flows through unchanged, as it does there.
+        let nil_skip = safe_nav && {
+            let recv_ty = typer.type_of(ast, recv, env, interner);
+            arg_is_pure_nil(interner, index, typer.source(), recv_ty)
+        };
+        let diag = (!nil_skip)
+            .then(|| check_call(ast, recv, &method, message_span, env, &typer, interner, index))
+            .flatten()
             .or_else(|| {
                 check_narrowed_call(
                     call_id, ast, recv, &method, message_span, safe_nav, gate_env, &typer,

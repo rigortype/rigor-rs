@@ -100,10 +100,14 @@ def g32(u) = { a: 1 }.merge(u).frobnicate_g32
 def g33(u) = 1.gcd(u).frobnicate_g33
 
 # A class-GUARDED parameter (`return unless u.is_a?(Integer)` then `"abc"[u]`)
-# is deliberately NOT here: the allow-list refuses it, the reference is silent
-# on it, and it stays a pre-existing false positive this slice does not close —
-# see `docs/notes/20260909-generic-dispatch-untyped-arg.md` residue 1. It is out
-# of the corpus because a fixture may not carry an unregistered extra.
+# is deliberately NOT here: the allow-list refuses it on purpose. Issue #121
+# closed it separately for NILABLE returns — fixture 113 section 4 — after the
+# fold core learned `String#[]` / `#slice` / `#byteslice` / `#index`. What
+# still fires here and is reference-silent, each held out of the corpus because
+# a fixture may not carry an unregistered extra: a `case u when Integer` or
+# `Integer === u` guard, a chain over the guarded root (`"abc"[u.to_i]`), and
+# a guard after a conditional rebind (`u = 1 if u.nil?`) — see
+# `docs/notes/20260925-string-lookup-fold-guarded-arg.md`.
 
 # --- #1021: a UNION with an untyped member is imprecise too -----------------
 

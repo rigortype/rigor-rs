@@ -1,0 +1,320 @@
+{
+  "fixture": "harness/corpus/113_string_lookup_fold_guarded_arg.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 19,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s1' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s2' for \"c\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s3' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s4' for \"\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 31,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s5' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 32,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s6' for \"b\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s7' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 34,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s8' for \"b\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 35,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s9' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 33,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s10' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s11' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s12' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 39,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s13' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 40,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `frobnicate_s14' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 46,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n1' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 47,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n2' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 48,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n3' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 49,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n4' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n5' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n6' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n7' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n8' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 54,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_n9' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 58,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 85,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_d1' for \"b\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 86,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_d2' for \"b\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 87,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_d3' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 88,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_d4' for \"\\u00E9\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 89,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `frobnicate_d5' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 159,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c1' for \"b\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 166,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c2' for \"c\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 172,
+      "column": 19,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c3' for literal-string"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 179,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c4' for Array[[1 | 2, Dynamic[top]]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 184,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c5' for Array[[1 | 2, Dynamic[top]?]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 189,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c6' for Array[String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 196,
+      "column": 18,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c7' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 201,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frobnicate_c8' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 208,
+      "column": 37,
+      "severity": "error",
+      "message": "undefined method `frobnicate_i1' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 209,
+      "column": 40,
+      "severity": "error",
+      "message": "undefined method `frobnicate_i2' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 210,
+      "column": 49,
+      "severity": "error",
+      "message": "undefined method `frobnicate_i3' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 217,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `frobnicate_f4' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 237,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_p1' for literal-string"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 63,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 69,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 75,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}
