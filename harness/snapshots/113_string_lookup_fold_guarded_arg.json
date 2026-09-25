@@ -1,5 +1,5 @@
 {
-  "fixture": "harness/corpus/112_string_lookup_fold_guarded_arg.rb",
+  "fixture": "harness/corpus/113_string_lookup_fold_guarded_arg.rb",
   "diagnostics": [
     {
       "rule": "call.undefined-method",

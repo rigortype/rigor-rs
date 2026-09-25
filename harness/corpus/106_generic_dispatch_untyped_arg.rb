@@ -101,7 +101,7 @@ def g33(u) = 1.gcd(u).frobnicate_g33
 
 # A class-GUARDED parameter (`return unless u.is_a?(Integer)` then `"abc"[u]`)
 # is deliberately NOT here: the allow-list refuses it on purpose. Issue #121
-# closed it separately for NILABLE returns — fixture 112 section 4 — after the
+# closed it separately for NILABLE returns — fixture 113 section 4 — after the
 # fold core learned `String#[]` / `#slice` / `#byteslice` / `#index`. What
 # still fires here and is reference-silent, each held out of the corpus because
 # a fixture may not carry an unregistered extra: a `case u when Integer` or

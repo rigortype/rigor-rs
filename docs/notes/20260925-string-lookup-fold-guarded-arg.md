@@ -53,7 +53,7 @@ What the fold changes, measured:
   `(rule, line, column)`. Only the rendered receiver moves (`for "a"`,
   `for nil`, `for 1`), and it now matches the reference's text.
 * A folded `nil` fires **`call.undefined-method` for nil**, not
-  `call.possible-nil-receiver`. That is the reference's rule, and fixture 112
+  `call.possible-nil-receiver`. That is the reference's rule, and fixture 113
   section 2 asserts it by rule id. `"abc"[99].upcase` is a new matched row,
   because the bare `String` answer knew `upcase`.
 * `if "abc"[99]`, `if "abc".index("z")` (always falsey) and `if "abc"[0]`
@@ -93,7 +93,7 @@ Why the gate is narrower than "the argument is guarded":
 
 ## Rows
 
-Fixture `harness/corpus/112_string_lookup_fold_guarded_arg.rb` has 45 firing
+Fixture `harness/corpus/113_string_lookup_fold_guarded_arg.rb` has 45 firing
 rows and 19 silent ones, every one oracle-measured at the pin. Sections 6 and 7
 were added by the local verification pass and the adversarial review below.
 
@@ -235,5 +235,5 @@ Re-run locally after the fixes:
 * `ruby harness/run.rb` and `ruby harness/run_snapshot.rb`: PASS, 602 matched,
   0 unregistered, with the gap count unchanged from master.
 * `ruby harness/snapshot.rb` reproduced every committed snapshot on ruby 4.0.6.
-  Only 112 was rewritten, for sections 6 and 7.
+  The fixture was renumbered 112 → 113 after #148 took 112, and its snapshot regenerated.
 * `python3 harness/docs_check.py`: PASS.
