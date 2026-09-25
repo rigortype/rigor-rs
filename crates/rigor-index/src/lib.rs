@@ -112,13 +112,34 @@ impl CoreIndex {
     /// [`Self::with_plugins`], and with no `sig/` on disk the ingestion is inert,
     /// so the default no-config path stays unchanged.
     pub fn for_project(enabled: &[String], sig_dirs: &[std::path::PathBuf]) -> Self {
+        Self::for_project_parts(enabled, sig_dirs, &[])
+    }
+
+    /// [`Self::for_project`] with the rbs-collection gem dirs passed apart
+    /// from the `signature_paths:` dirs. Every rule sees both alike; the
+    /// `conforms-to` scan (issue #129) stays silent on classes a collection
+    /// gem declares first.
+    pub fn for_project_parts(
+        enabled: &[String],
+        sig_dirs: &[std::path::PathBuf],
+        collection_dirs: &[std::path::PathBuf],
+    ) -> Self {
         let resolved: Vec<&'static plugins::BundledPlugin> = enabled
             .iter()
             .filter_map(|id| plugins::bundled_plugin(id))
             .collect();
         Self {
-            data: rbs::CoreData::load_for_project(&resolved, sig_dirs),
+            data: rbs::CoreData::load_for_project_parts(&resolved, sig_dirs, collection_dirs),
         }
+    }
+
+    /// The port's recorded RBS model as `harness/conformance_load_set.rb`
+    /// compares it with the reference's default environment (issue #129).
+    /// A harness seam, not an API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn conformance_surface_dump(&self) -> String {
+        self.data.conformance_surface_dump()
     }
 
     /// Which RBS signature source backs this index (embedded vendored set, the

@@ -1,6 +1,6 @@
 # Read `%a{rigor:v1:conforms-to _Interface}`: presence tier only, silent wherever the reference may not load, build or resolve
 
-Status: accepted 2026-09-25 (issue [#129](https://github.com/rigortype/rigor-rs/issues/129); pin `e59b7b89`)
+Status: accepted 2026-09-25 (issue [#129](https://github.com/rigortype/rigor-rs/issues/129); pin `e59b7b89`); amended the same day by the second review round (the allow-list)
 
 ## Context
 
@@ -51,55 +51,121 @@ false positive.
    error), and so do `severity_overrides:`, family keys included. `disable:`
    does NOT drop them, not even `disable: [all]`, because the reference's
    `disable:` filter only sees the per-file stream.
-3. **Required members** follow `RBS::DefinitionBuilder#build_interface`
-   (pinned with rbs 4.2.0): the included interfaces' members first, LAST
-   include first and recursively; then the interface's own members in
-   declaration order, with an alias's target placed before the alias.
+3. **Required members** are `RBS::DefinitionBuilder#build_interface`'s
+   `methods` keys (pinned with rbs 4.2.0): the interface ANCESTORS in
+   `interface_ancestors` order — the LAST include first, each followed by
+   its own ancestors (pre-order: `_I` including `_B` including `_C` lists
+   `b, c, i`) — each contributing its own members in `MethodBuilder` tsort
+   order (an alias after its target), then the interface's own. An ancestor
+   met twice is imported once: `interface_methods` keys its hash by
+   `Ancestor::Instance`, whose equality ignores the include that reached it.
 4. **Provided members** are what `RBS::DefinitionBuilder#build_instance`
-   returns, ported as its own walk (`rbs_instance_has`): own defs (private
-   ones included), `self?` defs, attributes and aliases, then included and
-   prepended modules and interfaces recursively (`define_instance`). A class
-   adds its superclass's whole definition. A module adds only its self
-   types' OWN definitions, default `Object`, which brings `Kernel` but not
-   `BasicObject`: `#==` and `#!` are missing on a module. A member the walk
-   cannot decide (an unresolvable reference, an unknown entry) silences the
-   whole row, because a shorter or longer list is as wrong as a spurious
-   row. The shared `qualified_class_has_method` is NOT used: it answers
-   "present" when unsure, which is safe for an undefined-method witness but
-   shortens the list here.
+   returns: own defs (private ones included), `self?` defs, attributes and
+   aliases, then included and prepended modules and interfaces recursively
+   (`define_instance`). A class adds its superclass's whole definition. A
+   module adds only its self types' OWN definitions, default `Object`, which
+   brings `Kernel` but not `BasicObject`: `#==` and `#!` are missing on a
+   module.
 5. **Resolution** follows the directive's class namespace prefixes, longest
-   first, then the bare name, with a leading `::` stripped.
-   `Outer::_I` is not visible from a top-level class.
+   first, then the bare name, with a leading `::` stripped. The reference
+   takes the first candidate that BUILDS: a candidate that exists but fails
+   to build falls through to the next.
 
-### Silences the port must reproduce (all oracle-measured)
+### The allow-list (PR #150, second review round)
 
-| the reference is silent because… | port mechanism |
+The first implementation enumerated the reference's build failures and
+silenced each. The review found seven families it had missed (unmodelled
+RBS errors, unbuildable interfaces, the load set, declaration order, the
+file walk, `--config`, `target_ruby`), and the audit below found four more
+(nested include order, stub interfaces, an interface under an undeclared
+namespace, a project file redeclaring a constant only the reference has). The failure set is open-ended, so the decision flips: **a row
+fires only when the reference's build is PROVABLY successful**.
+
+`conformance.rs` records its own model of every declaration, bundled and
+project alike: headers (superclass, self types, type parameters with
+variance / `unchecked` / bound / default), every instance member, the named
+types in every method and attribute signature, and an `unsupported` bit for
+any member kind or type form it does not model. `conformance/closure.rs`
+then walks the BUILD CLOSURE: `build_instance(C)` is `C`, its superclass's
+whole build, a module's self types, and `define_instance(C)`, which reaches
+the included and prepended modules (recursively), their self types' builds,
+and the included interfaces with their ancestors. Every entity on it must
+pass:
+
+| check | reference error it rules out |
 |---|---|
-| the class's definition fails to build: a member (def / attr / alias name) declared twice across its declarations, core reopens included (`class String; def upcase: …`); an alias to nothing; an unknown superclass or mixin; a failure on any ancestor | `ConformanceBuilder` records every instance member name per class across ALL sources. A duplicate, or a superclass written two ways, marks the class unbuildable, and so does any unbuildable class on its ancestor chain. Aliases are resolved at scan time. An incomplete chain reads as "present". |
-| the whole `sig/` FILE is quarantined (`add_project_parsed_decls` rescues `DuplicatedDeclarationError`): a class/module kind clash, or a redeclared interface, type alias, constant (top-level or nested) or global | Any duplicate of those kinds marks the file suspect, and the prior declarer too when it is a project file, since the port's `read_dir` order is not the reference's sorted order. Suspect files lose their annotations; their classes turn unbuildable and their interfaces ambiguous. |
-| a class/module reopened with different type parameters (`class Set` against core's `Set[unchecked out A]`: `GenericParameterMismatchError`), and every class below it (`Hash` / `Struct` subclasses through `Enumerable`) | each declaration's `(variance, unchecked)` shape is compared with the first one's, across all sources; a bound or default on either side counts as a mismatch |
-| an interface whose definition fails to build (the reference then reports "not loaded") | the port stays silent instead, which is a gap |
+| every written name resolves by RBS's own rule (head segment innermost scope outward, then the root; no fallback on a later segment), to something that provably exists THERE: not a load-set divergence, a class alias, a possible stub or a synthesized namespace | `NoTypeFoundError`, `NoMixinFoundError`, `NoSuperclassFoundError`, a name bound elsewhere upstream |
+| a superclass is a class, a mixin a module, a self type a class, module or interface; `prepend` of an interface stands the whole scan down (upstream the build raises a non-RBS error and the run dies) | `InheritModuleError`, `MixinClassError`, `NoSelfTypeFoundError` |
+| type-argument count within `[params without default, params]`, every name in the arguments present | `InvalidTypeApplicationError`, `validate_type_presence` |
+| every declaration of a class repeats the first one's parameters (a bound or default counts as a mismatch); a mismatched class also fails every build whose `validate_type_params` names it | `GenericParameterMismatchError` |
+| a project class's parameters are invariant or `unchecked`, without bound or default; a built class's method and attribute types (not `initialize`) name only present, consistent classes | `InvalidVarianceAnnotationError`, `NoTypeFoundError` in `validate_type_params` |
+| one original per member name across every declaration, no alias cycle, no own def over an included interface's member | `DuplicatedMethodDefinitionError`, `RecursiveAliasDefinitionError` |
+| an alias's target and an overloading def's base are present when the member is defined (own members, included interfaces and modules, and on the class's OWN build its superclass / a module's self types) | `UnknownMethodAliasError`, `InvalidOverloadMethodError` |
+| included interfaces' members pairwise distinct (an interface met again with the same arguments is imported once) | `DuplicatedInterfaceMethodDefinitionError` |
+| no instance variable inserted twice by one declarer into one definition (a diamond include of a module declaring `@x`) | `InstanceVariableDuplicationError` |
+| no ancestor cycle, every enclosing namespace declared | `RecursiveAncestorError`, `ensure_namespace!` |
 
-The reference collects project files into a set of expanded paths, so a file
-reached through two `signature_paths:` entries (`[sig, ./sig]`,
-`[sig, sig/sub]`) loads once. The port dedupes the same way.
+An entity declared ONLY by bundled RBS (core / stdlib / overlay / catalogue /
+a bundled plugin) is trusted: the pinned oracle builds every one of them,
+and the load-set list below names each whose surface differs. A project
+file carrying a directive (`use`, `resolve-type-names`) is not modelled. The
+member sets come from the same walk, so presence is exact wherever the build
+is provable. Earlier silences (duplicate members, file quarantine, generic
+reopens) are now rows of that table.
 
-Two things do NOT silence the row, and the port matches both: an overloading
-reopen (`def to_s: … | ...`) and a singleton-side duplicate.
+### Load set: a generated list, plus the config stand-downs
 
-### Load-set guard (port-only)
+The reference's default libraries load `prism`, `rbs` (and `rdoc` through
+it), and on the gate host read the installed `bigdecimal` / `base64` /
+`mutex_m` gems' `sig/` where the port vendors rbs's stdlib copies.
+`harness/conformance_load_set.rb` builds the reference's configless
+environment (`RbsLoader.build_env_for(DEFAULT_LIBRARIES, [])`), dumps the
+port's model through the scan's own walk (an ignored test), and writes
+`conformance/load_set.rs`: every class, interface, type alias, class alias,
+constant or global only one side has, every class whose kind, arity,
+buildability or instance-method NAME SET differs, and every interface whose
+member LIST differs. At `e59b7b89` on the gate host: **897 names** (639
+reference-only declarations — 534 classes, 80 modules, 25 interfaces — 151
+type aliases, 103 constants, 2 class aliases, and the `BigDecimal` /
+`BigMath` surfaces). No core class (`Object`, `Kernel`, `BasicObject`) and
+no bundled interface differs. The scan never resolves through, trusts, or
+orders by a listed name, and a project file DECLARING one is treated as
+possibly quarantined (upstream it may collide with a declaration the port
+cannot see: `Prism::VERSION: String` drops the whole file there). `--check` verifies it; `--check --plugin activesupport-core-ext`
+verifies the bundled plugin adds nothing (it adds nothing). Like
+`UNBUILDABLE_DEFINITIONS`, the list depends on the host's installed gems.
 
-"Not loaded" is a false positive if the reference's environment holds an
-interface the port never reads. A presence row is a false positive if that
-environment gives the class a member the port cannot see: `libraries: [json]`
-reopens `Object`. So the whole scan stands down when the config names any of:
+Config inputs the port does not mirror still stand the whole scan down:
+`libraries:`, `bundler:`, `includes:`, a `.bundle/config` or
+`vendor/bundle/`, a plugin the port does not bundle, and a `target_ruby:`
+outside `3.3` / `3.4` / `4.0` (with or without a patch level) and `latest`.
+The reference rejects a malformed `target_ruby` before the run (exit 64) and
+one its Prism cannot parse with a lone `configuration-error` row (exit 1;
+the message embeds Prism's own error text, so the port does not reproduce
+it).
 
-- `libraries:`, `bundler:` or `includes:`;
-- a `.bundle/config` or `vendor/bundle/`, which trigger the gem-`sig/` walk;
-- a plugin the port does not bundle.
+### Order: project-first classes only
 
-A bundled plugin keeps the scan on; the oracle agrees with activesupport
-loaded.
+`env.class_decls` puts bundled classes first in the loader's order, which the
+port's embed order does not reproduce (292 of 1,361 bundled-class reopens
+were displaced). A directive on a class first declared by bundled RBS, a
+plugin (the reference defers plugin `sig/` after the project), an rbs
+collection, a possibly-quarantined file, or a load-set-listed name is
+silent. Project-first classes keep `(sorted file, offset)` order: they
+follow every bundled class upstream, and synthesized namespaces and stubs
+are appended after them.
+
+### Project files: `Dir.glob` and the config's directory
+
+The project walk is `Dir.glob("<dir>/**/*.rbs")` exactly: no dot-files or
+dot-directories, no descent into a symlinked directory, a symlinked or
+dangling `*.rbs` entry matched by name (a read failure skips it, as
+upstream), `*.RBS` only on a case-insensitive volume (Ruby folds case there).
+Files are expanded, deduped and ingested sorted, rbs-collection dirs
+included. A relative `signature_paths:` entry resolves against the directory
+of the config file actually read (`Configuration.resolve_paths_in`), so
+`--config conf/custom.yml` reads `conf/sig`. This moves every rule's
+project-sig loading, as intended.
 
 ### Scope boundaries
 
@@ -133,9 +199,13 @@ coverage gap.
 
 ## Consequences
 
-- A project that configures `signature_paths:` and writes the directive now
-  gets the reference's rows byte for byte (message, line:column, order,
-  severity, `source_family: builtin`), except under the stand-downs above.
+- A project that configures `signature_paths:` and writes the directive gets
+  the reference's rows byte for byte (message, line:column, order, severity,
+  `source_family: builtin`) wherever the allow-list proves the build, and
+  nothing elsewhere.
+- `UPSTREAM.md` step 3 gains `ruby harness/conformance_load_set.rb --check`
+  (and `--check --plugin activesupport-core-ext`) beside
+  `unbuildable_classes.rb`.
 - `harness/lib.rb` learns PROJECT fixtures. A fixture shipping both a sidecar
   and a `.sig/` stages the sidecar as the cwd's `.rigor.yml`, because the
   reference resolves a `--config` file's relative `signature_paths:` against
@@ -162,7 +232,8 @@ compared field by field (path, line, column, rule, severity, message,
   module's surface included `BasicObject`, so its list was too short.
   Third, an incomplete chain read as "present", which also shortened lists.
   Fourth, a file reached twice was reported twice.
-- After the fixes, **no probe has a port-only row**. The remaining
+- After the fixes, **no probe had a port-only row** (the second review round
+  below found seven families these 47 projects missed). The remaining
   differences are all reference-only rows (gaps):
   - quarantine ordering: the port marks both files suspect, and an
     ambiguous interface silences its users;
@@ -176,3 +247,36 @@ compared field by field (path, line, column, rule, severity, message,
   Every pre-existing snapshot is byte-identical under the project-fixture
   harness. `fp_audit.py --gaps --sweep` reports 0 FP / 9,337 files /
   3,829 gaps, identical to master.
+
+### Second round: the allow-list (2026-09-25, same pin and host)
+
+The first round's probes (54 projects), the reviewer's (`pa`–`pj` plus the
+all-classes and all-interfaces generators, 118) and this round's own (50:
+the families below, `target_ruby`, the glob and `--config` edges, interface
+diamonds, real-world shapes) were re-run against the release build, each in
+a fresh cwd with `--no-cache`: **222 projects, 124 identical, 93 gap-only,
+0 port-only rows, 0 order differences on common rows.** The other 5 differ
+in exit code with no port row: the reference crashes (`prepend _Z`, 1) or
+rejects `target_ruby` (`"3.2"` twice, `"x"`), and in the unbundled
+`rigor-rails` stand-down it reports 2 rows and exits 1. Every reproducer of
+families 1–7 is now silent or identical, and so are four new families:
+
+| new family (found by this audit) | reference | port before |
+|---|---|---|
+| nested include order | `b, c, i` | `c, b, i` (post-order) |
+| a written but undeclared `_Missing` in a method type | stubbed empty interface: no row | "not loaded" |
+| `interface Nope::_I` under an undeclared namespace | "not loaded" | a missing-member row |
+| a project file redeclaring a reference-only constant (`Prism::VERSION: String`) or kind-clashing with a reference-only module (`class RDoc`) | the file is quarantined: no row | its rows |
+
+Accepted gaps (reference-only rows), each a deliberate refusal: a class
+first declared by bundled RBS (all 1,361 reopened: 15,134 rows); a method
+type naming an undeclared class (the reference stubs it); an alias in an
+included module targeting the includer's superclass; an instance variable
+declared twice where a third declaration defuses the check; bounds, defaults
+and variance on project parameters; an interface redeclared across files;
+`use` directives; `target_ruby` 3.5 / 4.1; tier B. `fp_audit.py --gaps
+--sweep`: 0 FP / 9,337 files / 3,829 gaps, identical to master. Index load
+grows about 2.5 ms (28.5 → 31 ms) for the model. `run.rb` live and
+`run_snapshot.rb`: 0 unregistered; fixture 112 keeps its 8 rows MATCHED and
+byte-identical (`snapshot.rb --check`: up to date). Details:
+[`docs/notes/20260925-conforms-to-audit.md`](../notes/20260925-conforms-to-audit.md).

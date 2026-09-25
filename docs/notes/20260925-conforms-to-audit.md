@@ -73,3 +73,91 @@ setters in messages; overlapping `signature_paths:`.
 The fixture was renumbered from `129_` (the issue number) to the next free
 number, `112_`. It gained `d_surface.rbs` (the module row, plus the
 `ClsEq` / `SetSub` silences), for 8 rows in total.
+
+## Second round: seven families the 47 projects missed, and the allow-list
+
+An adversarial review of the fixed branch reproduced seven more families of
+port-only rows on the same host. Every one is a case where the reference's
+environment or build differs from what the port assumed:
+
+| # | family | reference | port (first round) |
+|---|---|---|---|
+| 1 | an RBS error the port did not model (variance, duplicate `@x`, duplicate interface member, `\| ...` with no base, `include Integer`, `< Kernel`, wrong type-argument count, an included module whose self type does not build) | silent (`instance_definition` is `nil`) | a missing-member row |
+| 2 | an interface whose build fails (`include _Each` without arguments, `\| ...`, `[out T]` misuse) | "not loaded" | a missing-member row |
+| 3 | the load set (`prism`, `rbs`, `rdoc` via rbs; the host's `bigdecimal` gem) | `Prism::_Visitor` resolves; `RDoc::Constant#value` exists | "not loaded"; `#value` missing |
+| 4 | declaration order of bundled classes (292 of 1,361 reopens displaced) | `OptionParser` first | `JSON` first |
+| 5 | the file walk | `Dir.glob`: no dot-files, no symlinked dirs | loaded them |
+| 6 | `--config conf/custom.yml` with `signature_paths: [sig]` | reads `conf/sig` | read `sig` |
+| 7 | `target_ruby: "3.2"` | one `configuration-error`, exit 1 | rows, exit 0 |
+
+This round's own probes found four more, all port-only:
+
+- **Nested include order.** `build_interface` lists the ANCESTORS pre-order
+  (the last include first, each followed by its own ancestors): `_I`
+  including `_B` including `_C` lists `b, c, i`. The port listed `c, b, i`.
+- **Stub interfaces.** `stub_missing_referenced_types` declares an empty
+  interface for a `_Missing` written in a project method type (not in
+  `initialize`, which `validate_type_params` skips). The reference then
+  resolves it and reports nothing; the port said "not loaded".
+- **An interface under an undeclared namespace** (`interface Nope::_I`)
+  fails `ensure_namespace!` upstream, so it reports "not loaded"; the port
+  listed the member.
+- **A duplicate declaration only the reference can see.** A project file
+  declaring `Prism::VERSION: String`, or `class RDoc` against the rbs gem's
+  `module RDoc`, is quarantined upstream (`rbs.coverage.quarantined-signature`)
+  and its directives vanish; the port, which does not load prism or rdoc,
+  kept them (3 port-only rows over 2 probes).
+
+And one silence the first round had wrong in the other direction: an
+interface DIAMOND does not raise. `interface_methods` keys its hash by
+`Ancestor::Instance`, whose equality ignores the include that reached it,
+so `_Za` reached twice is imported once (`am, zm, aa`).
+
+**The fix** flips the design to an allow-list (ADR-0044 § "The
+allow-list"): the port records its own model of every declaration and fires
+only when the whole build closure is provably buildable and every name it
+resolves provably resolves the same way upstream. Family 3 is a generated
+list (`harness/conformance_load_set.rb`, 897 names: 639 reference-only
+declarations, 151 type aliases, 103 constants, 2 class aliases, the
+`BigDecimal` / `BigMath` surfaces); a project file declaring a listed name
+counts as possibly quarantined. No core class and no bundled interface
+differs, so the list costs no ordinary row. Family 4 silences every class first declared outside a
+project file. Families 5–7 are fixed where they live: the project walk is
+`Dir.glob` (including case folding on a case-insensitive volume, measured:
+`b.RBS` loads on this host), relative `signature_paths:` resolve against the
+config file's directory, and the scan stands down on a `target_ruby` outside
+3.3 / 3.4 / 4.0 / `latest`.
+
+Two facts the modelling rests on, both read in rbs 4.2.0 and probed:
+
+- `validate_type_params` runs only for an entity that is BUILT
+  (`build_instance`), not one merely included. A generic reopen (`class
+  Set`) therefore poisons every build whose own method types name `Set`, but
+  not `Array` through `Enumerable#to_set` (oracle: `class C < Array[Integer]`
+  still fires beside `class Set`).
+- The reference's `InstanceVariableDuplicationError` fires only when the
+  FIRST two non-attribute insertions of a name share a declarer; a third
+  defuses it (`@x` in a superclass and twice in the class builds). The port
+  asks for all to be distinct, a gap on the safe side.
+
+### Tallies (release build, one fresh cwd per project, `--no-cache`)
+
+| probe set | projects | identical | gap-only | exit code only | port-only rows |
+|---|---|---|---|---|---|
+| first round (`probes1`–`6`) | 54 | 29 | 24 | 1 | 0 |
+| reviewer (`pa`–`pj`, all-classes, all-interfaces) | 118 | 66 | 51 | 1 | 0 |
+| this round (`q1`–`q6`) | 50 | 29 | 18 | 3 | 0 |
+| **total** | **222** | **124** | **93** | **5** | **0** |
+
+The five exit-code projects carry no port row: the reference
+crashes on `prepend _Z`, rejects `target_ruby` (`"3.2"` twice, `"x"` with
+exit 64), or exits 1 on its rows in the unbundled-`rigor-rails` stand-down.
+No common row changed order.
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | pass (1,335 tests, 1 ignored: the load-set dump) |
+| clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered; fixture 112 8/8 MATCHED, byte-identical |
+| `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps, identical to master |
+| `conformance_load_set.rb --check` (+ `--plugin activesupport-core-ext`) | OK, 897 names (plugin adds none) |

@@ -117,6 +117,16 @@ pub struct Config {
     /// [`Config::load`]; never (de)serialized.
     #[serde(skip)]
     present_keys: std::collections::BTreeSet<String>,
+    /// `target_ruby:` as written (untyped: YAML reads `3.4` as a float). Read
+    /// only by [`Config::target_ruby_supported`].
+    #[serde(default)]
+    target_ruby: serde_yaml::Value,
+    /// The directory of the config file actually read, when it is not the
+    /// cwd: the reference resolves a relative `signature_paths:` entry against
+    /// it (`Configuration.resolve_paths_in`, `File.expand_path(p, base_dir)`).
+    /// Set by [`Config::read`]; never (de)serialized.
+    #[serde(skip)]
+    base_dir: Option<std::path::PathBuf>,
 }
 
 /// ADR-0036: the `rigor_rs:` namespace for rigor-rs-specific config keys — those
@@ -201,6 +211,8 @@ impl Default for Config {
             bundler: BundlerConfig::default(),
             rigor_rs: RigorRsConfig::default(),
             present_keys: std::collections::BTreeSet::new(),
+            target_ruby: serde_yaml::Value::Null,
+            base_dir: None,
         }
     }
 }
@@ -229,6 +241,15 @@ fn top_level_keys(text: &str) -> std::collections::BTreeSet<String> {
             .collect(),
         _ => std::collections::BTreeSet::new(),
     }
+}
+
+/// The directory a config file's relative `signature_paths:` resolve against
+/// (the reference's `File.dirname(File.expand_path(path))`), or `None` when
+/// that is the cwd itself — the entries then stay exactly as written.
+fn config_base_dir(path: &Path) -> Option<std::path::PathBuf> {
+    path.parent()
+        .filter(|d| !d.as_os_str().is_empty() && *d != Path::new("."))
+        .map(Path::to_path_buf)
 }
 
 /// What reading a `.rigor.yml` actually found — the four outcomes
@@ -267,6 +288,7 @@ impl Config {
             Ok(text) => match serde_yaml::from_str::<Config>(&text) {
                 Ok(mut cfg) => {
                     cfg.present_keys = top_level_keys(&text);
+                    cfg.base_dir = config_base_dir(path);
                     ConfigRead::Parsed(Box::new(cfg))
                 }
                 Err(e) => ConfigRead::Malformed(e.to_string()),
@@ -551,15 +573,68 @@ impl Config {
     }
 
     /// The project's own RBS signature directories from `signature_paths:`
-    /// (ADR-0033), as paths resolved relative to the process cwd. An entry naming
-    /// a non-existent directory is inert — ingestion skips it — so the default
-    /// `["sig"]` costs nothing when a project ships no signatures.
+    /// (ADR-0033). A relative entry resolves against the directory of the
+    /// config file that named it, as the reference's does (issue #129: with
+    /// `--config conf/custom.yml`, `sig` is `conf/sig`); for the discovered
+    /// `.rigor.yml` that directory is the cwd, so the entry stays as written.
+    /// An entry naming a non-existent directory is inert — ingestion skips
+    /// it — so the default `["sig"]` costs nothing when a project ships no
+    /// signatures.
     #[must_use]
     pub fn signature_dirs(&self) -> Vec<std::path::PathBuf> {
         self.signature_paths
             .iter()
-            .map(std::path::PathBuf::from)
+            .map(|entry| match &self.base_dir {
+                Some(base) => base.join(entry),
+                None => std::path::PathBuf::from(entry),
+            })
             .collect()
+    }
+
+    /// The `rbs collection` gem dirs discovered under `rbs_collection.lock.yaml`
+    /// (ADR-0034) for a project rooted at `project_root`.
+    #[must_use]
+    pub fn collection_signature_dirs(&self, project_root: &Path) -> Vec<std::path::PathBuf> {
+        crate::rbs_collection::discover(
+            self.rbs_collection.lockfile.as_deref().map(Path::new),
+            project_root,
+            self.rbs_collection.auto_detect,
+        )
+    }
+
+    /// Issue #129 / ADR-0044: whether the reference accepts this
+    /// `target_ruby:`. It formats the value (`to_s`, so YAML's float `3.4`
+    /// reads `"3.4"`), rejects a malformed one before the run (exit 64), and
+    /// rejects one its Prism does not parse with a lone `configuration-error`
+    /// row (exit 1): in both cases it emits no other row. The port does not
+    /// reproduce either outcome; it accepts only the absent key and the
+    /// versions every Prism the reference supports parses (3.3, 3.4, 4.0, with
+    /// or without a patch level, and `latest`), and the `conforms-to` scan
+    /// stands down otherwise.
+    #[must_use]
+    pub fn target_ruby_supported(&self) -> bool {
+        let text = match &self.target_ruby {
+            serde_yaml::Value::Null => return !self.present_keys.contains("target_ruby"),
+            serde_yaml::Value::String(s) => s.clone(),
+            serde_yaml::Value::Number(n) => match n.as_f64() {
+                Some(f) if n.is_f64() => format!("{f:?}"),
+                _ => n.to_string(),
+            },
+            _ => return false,
+        };
+        if text == "latest" {
+            return true;
+        }
+        let mut parts = text.split('.');
+        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+            return false;
+        };
+        let patch_ok = match (parts.next(), parts.next()) {
+            (None, None) => true,
+            (Some(p), None) => !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
+            _ => false,
+        };
+        patch_ok && matches!((major, minor), ("3", "3") | ("3", "4") | ("4", "0"))
     }
 
     /// Every RBS signature directory to ingest for a project rooted at
@@ -571,11 +646,7 @@ impl Config {
     #[must_use]
     pub fn all_signature_dirs(&self, project_root: &Path) -> Vec<std::path::PathBuf> {
         let mut dirs = self.signature_dirs();
-        dirs.extend(crate::rbs_collection::discover(
-            self.rbs_collection.lockfile.as_deref().map(Path::new),
-            project_root,
-            self.rbs_collection.auto_detect,
-        ));
+        dirs.extend(self.collection_signature_dirs(project_root));
         dirs
     }
 
@@ -799,6 +870,70 @@ mod tests {
         let none: Config = serde_yaml::from_str("signature_paths: []\n").unwrap();
         assert!(none.signature_paths.is_empty());
         assert!(none.signature_dirs().is_empty());
+    }
+
+    /// Issue #129 (PR #150 review, family 6): the reference resolves a
+    /// relative `signature_paths:` entry against the directory of the config
+    /// file that named it (`Configuration.resolve_paths_in`); oracle-measured
+    /// with `--config conf/custom.yml` → `conf/sig`.
+    #[test]
+    fn signature_paths_resolve_against_the_config_dir() {
+        let dir = std::env::temp_dir().join(format!("rigor_cfg_base_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        let yml = "signature_paths:\n  - sig\n  - ../shared\n  - /abs/sig\n";
+        std::fs::write(dir.join("conf/custom.yml"), yml).unwrap();
+        std::fs::write(dir.join(".rigor.yml"), yml).unwrap();
+        let ConfigRead::Parsed(cfg) = Config::read(&dir.join("conf/custom.yml")) else {
+            panic!("config did not parse");
+        };
+        assert_eq!(
+            cfg.signature_dirs(),
+            vec![
+                dir.join("conf").join("sig"),
+                dir.join("conf").join("../shared"),
+                std::path::PathBuf::from("/abs/sig"),
+            ]
+        );
+        // The discovered `.rigor.yml` (a bare relative path) keeps the entries
+        // as written: its directory IS the cwd they are read against.
+        assert_eq!(config_base_dir(Path::new(".rigor.yml")), None);
+        assert_eq!(config_base_dir(Path::new("./.rigor.yml")), None);
+        assert_eq!(config_base_dir(Path::new("conf/x.yml")), Some(std::path::PathBuf::from("conf")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #129 (family 7): the `conforms-to` scan runs only on a
+    /// `target_ruby:` the reference accepts (oracle: `"3.2"` is a lone
+    /// `configuration-error`, exit 1; `"x"` exits 64 before the run).
+    #[test]
+    fn target_ruby_supported_matches_the_reference_floor() {
+        let ok = |yml: &str| serde_yaml::from_str::<Config>(yml).unwrap().target_ruby_supported();
+        assert!(Config::default().target_ruby_supported());
+        for accepted in [
+            "target_ruby: \"3.3\"\n",
+            "target_ruby: \"3.4.1\"\n",
+            "target_ruby: 3.4\n",
+            "target_ruby: 4.0\n",
+            "target_ruby: \"4.0.2\"\n",
+            "target_ruby: latest\n",
+        ] {
+            assert!(ok(accepted), "{accepted}");
+        }
+        for rejected in [
+            "target_ruby: \"3.2\"\n",
+            "target_ruby: \"x\"\n",
+            "target_ruby: 3\n",
+            "target_ruby: 3.10\n",
+            "target_ruby: \"4.2\"\n",
+            "target_ruby: \"3.4.\"\n",
+            "target_ruby: [3.4]\n",
+        ] {
+            assert!(!ok(rejected), "{rejected}");
+        }
+        // Present but null: the reference formats `nil` as "" and rejects it.
+        let mut null: Config = serde_yaml::from_str("target_ruby:\n").unwrap();
+        null.present_keys = top_level_keys("target_ruby:\n");
+        assert!(!null.target_ruby_supported());
     }
 
     #[test]

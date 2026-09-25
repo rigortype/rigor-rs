@@ -347,7 +347,14 @@ chasing a non-bug.)
    `PROVENANCE.md`; `vendored_catalogue_matches_the_pin` fails until you do. A NEW
    file there is a new decision, not a copy. **Neither sweep tool can see this
    surface** (both run configless, and the scan needs a configured
-   `signature_paths:`): harness fixture 129 is the gate.
+   `signature_paths:`): harness fixture 112 is the gate. The scan also trusts
+   the port's bundled surfaces only where they match the reference's default
+   environment; re-derive the names where they do not (ADR-0044, host-gem
+   dependent exactly like the table below):
+   ```sh
+   ruby harness/conformance_load_set.rb --check                                  # else: --write
+   ruby harness/conformance_load_set.rb --check --plugin activesupport-core-ext  # must add nothing
+   ```
 
    Then re-derive the classes whose DEFINITION the reference cannot build —
    `DEFAULT_LIBRARIES`, the vendored gem sigs and the host's own gem `sig/`

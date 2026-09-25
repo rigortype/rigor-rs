@@ -671,7 +671,13 @@ fn analyze_files(
     // (incl. the config-less differential harness) get exactly `cfg.plugins`.
     let root = std::path::Path::new(".");
     let effective_plugins = cfg.effective_plugins(root);
-    let index = CoreIndex::for_project(&effective_plugins, &cfg.all_signature_dirs(root));
+    // The rbs-collection gem dirs ride apart from `signature_paths:` so the
+    // `conforms-to` scan can tell them apart (issue #129); every rule reads both.
+    let index = CoreIndex::for_project_parts(
+        &effective_plugins,
+        &cfg.signature_dirs(),
+        &cfg.collection_signature_dirs(root),
+    );
     let t_index = std::time::Instant::now();
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).
     let mut findings: Vec<(usize, String, String, Diagnostic)> = Vec::new();
@@ -1102,9 +1108,13 @@ fn analyze_files(
 /// or give the class a member (`libraries: [json]` reopens `Object`). Those are
 /// `libraries:`, the bundler gem-`sig/` walk (`bundler:` / `.bundle/config` /
 /// `vendor/bundle`), an unbundled plugin, and `includes:` (whose merged keys
-/// rigor-rs does not read).
+/// rigor-rs does not read). It also stands down on a `target_ruby:` the
+/// reference may reject: that run emits no row but its own error.
 fn conformance_scan_active(cfg: &Config, root: &Path) -> bool {
     if cfg.explicit_signature_paths().is_none_or(<[String]>::is_empty) {
+        return false;
+    }
+    if !cfg.target_ruby_supported() {
         return false;
     }
     if ["libraries", "bundler", "includes"].iter().any(|k| cfg.declares_key(k)) {
