@@ -410,6 +410,16 @@ pub enum Node {
         /// a block-parameter default sits inside the node but outside every
         /// body statement's span).
         block_span: Option<Span>,
+        /// The local names the attached literal block BINDS in its own scope —
+        /// Prism's `BlockNode#locals`: every parameter form (required,
+        /// optional, splat, post, destructured, keyword, keyword-rest, `&`
+        /// block), the `;`-declared block-locals, numbered parameters, and
+        /// locals first written inside the block body — but NOT a captured
+        /// outer local. Empty for a call with no block and for a `&expr`
+        /// block-pass. Read by `toplevel_rebinds` (rigor-rs#166): a write to
+        /// one of these names is a block-scoped write, not a rebind of the
+        /// top-level local of the same name.
+        block_locals: Vec<String>,
         /// Span of the method-name token (`lenght`), the diagnostic anchor.
         message_span: Span,
         /// `true` for a safe-navigation call (`x&.foo`), `false` for a plain
@@ -684,8 +694,15 @@ pub enum Node {
     /// [`Node::Other`]). A lambda opens a NEW return frame: `flow.return-in-ensure`
     /// treats it as a BARRIER (a `return` inside exits the lambda, not the method
     /// whose `ensure` is being scanned). Typed `Dynamic[top]` (no `Proc` typing in
-    /// this slice).
-    Lambda { body: Vec<NodeId>, span: Span },
+    /// this slice). `locals` is Prism's `LambdaNode#locals` — the names the
+    /// lambda binds in its own scope (parameters + lambda-scoped writes, not
+    /// captured outer locals), the `toplevel_rebinds` shadow set
+    /// ([`Node::Call::block_locals`], rigor-rs#166).
+    Lambda {
+        body: Vec<NodeId>,
+        locals: Vec<String>,
+        span: Span,
+    },
     /// `&&` / `||` / `and` / `or`. Both operands are lowered (so a call on
     /// either side is analysed). Typed `Dynamic[top]` — the result is one of the
     /// two operand types, which we don't union here.
@@ -1464,6 +1481,16 @@ impl<'src> Builder<'src> {
             let block_span = call
                 .block()
                 .and_then(|b| b.as_block_node().map(|bn| span_of(&bn.location())));
+            // The block's OWN local names (Prism's `BlockNode#locals`): params
+            // of every form + `;`-declared block-locals + block-scoped writes,
+            // never a captured outer local — the exact shadow set
+            // `toplevel_rebinds` needs (rigor-rs#166). Empty when there is no
+            // literal block (a `&expr` pass binds nothing).
+            let block_locals = call
+                .block()
+                .and_then(|b| b.as_block_node())
+                .map(|bn| constant_list_names(&bn.locals()))
+                .unwrap_or_default();
             // The message_loc is the method-name token; fall back to the whole
             // call span if Prism elides it (e.g. operator-ish forms).
             let message_span = call
@@ -1476,6 +1503,7 @@ impl<'src> Builder<'src> {
                 args,
                 block_body,
                 block_span,
+                block_locals,
                 message_span,
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
@@ -2163,6 +2191,7 @@ impl<'src> Builder<'src> {
             let body = self.lower_optional_body(lambda.body().as_ref());
             return self.push(Node::Lambda {
                 body,
+                locals: constant_list_names(&lambda.locals()),
                 span: span_of(&lambda.location()),
             });
         }
@@ -2343,6 +2372,14 @@ impl<'src> Builder<'src> {
 /// total on exotic encodings.
 fn constant_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The names a Prism scope's `locals` constant list holds (`BlockNode` /
+/// `LambdaNode` — the names that scope BINDS: parameters of every form,
+/// `;`-declared block-locals, and locals first written inside it; never a
+/// captured outer local), decoded to owned `String`s.
+fn constant_list_names(list: &ruby_prism::ConstantList<'_>) -> Vec<String> {
+    list.iter().map(|c| constant_string(c.as_slice())).collect()
 }
 
 /// A prism integer's value when it fits `i64`, from its little-endian `u32`

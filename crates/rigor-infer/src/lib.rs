@@ -2982,7 +2982,10 @@ impl<'i> Typer<'i> {
     ///
     /// A write inside a `def` / `class` / `module` body is a different local
     /// scope and widens nothing. A write in a `->` or block body does widen: a
-    /// closure may run and rebind a captured local.
+    /// closure may run and rebind a CAPTURED local. A write to a name the
+    /// block/lambda binds itself (a parameter or `;`-declared block-local —
+    /// [`Node::Call::block_locals`], rigor-rs#166) shadows the top-level name
+    /// and widens nothing either.
     pub fn build_toplevel_check_env(&self, ast: &LoweredAst, interner: &mut Interner) -> TypeEnv {
         let mut env = TypeEnv::new();
         let body = match ast.get(ast.root()) {
@@ -7619,12 +7622,42 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
 /// `def` / `class` / `module` body (each its own local scope). Unlike
 /// [`collect_flow_writes`] it carries no receiver mutation — a mutator changes a
 /// value's contents, not which value the local names.
+///
+/// A block (`foo { |w| … }` / `do…end`) or lambda (`->(w) { … }`) opens a
+/// SHADOW scope rather than an excluded one: a write inside it to a name the
+/// block binds — any parameter form, a `;`-declared block-local, a numbered
+/// param, or a name first assigned in the body — is a block-scoped write, not
+/// a rebind of the top-level local it shadows (rigor-rs#166, a #148 coverage
+/// regression). Prism's `locals` list for the block/lambda node is the exact
+/// bound set: it already excludes captured outer locals, so a write to a
+/// name the block does NOT bind (`{ |x| w = 2 }`, `w` top-level) still counts
+/// as a rebind — the must-stay-declined rows. The scope's SPAN covers the
+/// nested-block case: a write in an inner block to a name an enclosing block
+/// binds is shadowed by the enclosing `locals` list.
 fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     let scopes: Vec<rigor_parse::Span> = ast
         .iter()
         .filter_map(|(_, n)| match n {
             Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
                 Some(n.span())
+            }
+            _ => None,
+        })
+        .collect();
+    // `(scope span, names the scope binds)` for every literal block / lambda.
+    // A block's span is its `BlockNode` span (parameters included); a lambda's
+    // is the whole `LambdaNode`. Only scopes that bind at least one name can
+    // shadow a write, so empty `locals` lists are skipped.
+    let shadow_scopes: Vec<(rigor_parse::Span, &[String])> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call {
+                block_span: Some(span),
+                block_locals,
+                ..
+            } if !block_locals.is_empty() => Some((*span, block_locals.as_slice())),
+            Node::Lambda { span, locals, .. } if !locals.is_empty() => {
+                Some((*span, locals.as_slice()))
             }
             _ => None,
         })
@@ -7644,7 +7677,12 @@ fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
             _ => {}
         }
     }
-    out.retain(|(w, _)| !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1));
+    out.retain(|(w, name)| {
+        !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
+            && !shadow_scopes.iter().any(|(s, bound)| {
+                s.0 <= w.0 && w.1 <= s.1 && bound.iter().any(|b| b == name)
+            })
+    });
     drop_inert_writes(ast, &mut out);
     out
 }
