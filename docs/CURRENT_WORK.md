@@ -12,18 +12,12 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-21): the `v0.3.9` re-pin is DONE** (branch `upstream-pin-v0.3.9`)
-— 0 FP / 9,337 files, 108 fixtures, three families ported. **#122 came due and is
-closed** with it (#877's rooted version guard). Upstream master is **344 commits
-past `v0.3.9`** and `v0.3.9` is the last 0.3 release, so the next move is a
-**0.4.0 survey, bisect-first** — ADR-109 already renamed the integer-range
-spelling (`int<min,max>` deprecated, `Integer[1..10]`) and that alias is removed
-at the next compatibility break. The effect-system arc stays at its clean stop
-(slices 4/6 CLOSED by measurement; 20 resolvable-`super` rows are slice-4 debt);
-the narrowing frontier stays OUT OF CARRIER LEVERS. Open from this bump: **#129**
-(`conforms-to` unread, which is why `data/capability_roles/` is unvendored) and
-**#130** (ADR-109 bounded ranges); #121 and #124 still stand. **#128** closed
-same-day (PR #131).
+▶ **NEXT (2026-09-25): pin is upstream MASTER `e59b7b89`** (branch
+`upstream-pin-master-e59b7b89`), with 0 FP / 9,337 files and 111 fixtures. It carries
+TEN retractions no gate sees, **#133–#138**, the next port work (each is its own
+inference mechanism). Pre-existing FPs: #139, #140, #146. Coverage: #141 (`fb781023`,
+3,002 of the 3,829 gaps; COUPLED to the ported carve-out), #142–#145. Still open:
+#121, #124, #129, #130, #132. `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
 
 - Measurement-tool lesson (binding): audit at NODE granularity — per-file
   histograms net over-claims against under-claims.
@@ -34,7 +28,7 @@ same-day (PR #131).
   profile/overrides + `coverage` precision mode DONE; remaining: plugins
   inflection probe. `--protection`/`--mutation` (ADR-63/70) + `type-scan`
   deferred by [scoping call](notes/20260719-coverage-command-scoping.md).
-- **Pin is `v0.3.9`** (`d0c370f7`; + vendored rbs 4.2.0; re-pinned 2026-09-21). Both
+- **Pin is master `e59b7b89`** (+ vendored rbs 4.2.0; re-pinned 2026-09-25). Both
   standing exception tables are EMPTY — `UNBUILDABLE_DEFINITIONS` and the divergence
   registry (#437 retired) — so a new entry in either is a real finding, not maintenance
   (`UPSTREAM.md`: three hazards + the overlay/`sig/shims` trap). The version-guard
@@ -43,9 +37,9 @@ same-day (PR #131).
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); the RC inference deltas sit in the compat plan (M2).
 
-State (verified 2026-09-21, at the `v0.3.9` pin): harness **108 fixtures / 0
-unregistered extras / 0 registered divergences**, coverage 529/578; standing
-sweep **0 FP / 9,337 files / 892 gaps**, 8 corpora, baselines in
+State (verified 2026-09-25, at `e59b7b89`): harness **111 fixtures / 0
+unregistered extras / 0 registered divergences**, coverage 557/605; standing
+sweep **0 FP / 9,337 files / 3,829 gaps** (3,002 = #141), 8 corpora, baselines in
 `harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). `--sweep` is a
 3-MINUTE gate again (upstream #874); read per-corpus MATCHED counts, not only FPs. Gap totals move mostly with upstream retractions, not
 coverage. Neither sweep tool sees project-`sig/` behaviour. EVERY grading
@@ -108,8 +102,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-25 re-pin `v0.3.9 → e59b7b89` (master, 1,030 commits)**: **0 FP / 9,337, 111 fixtures**, effects 0 OVER. The raw bump had 8 fixture FPs and 9 sweep FPs in two families: #1021 `imprecise_arg?` (now a reach analysis) and #1135's eval-block carve-out (its companion `fb781023` is unported = +3,002 gaps, #141). Re-synced `core_overlay/` (`hash_rbs3` excluded), the plugin sig (23 FPs) and the mutator sets (hash **20**). The fragment probe found 10 invisible retractions (#133–#138). [note](notes/20260925-repin-e59b7b89.md).
 - **2026-09-21 #128 CLOSED — store values named by their TYPED answer** (PR #131) — the SYNTACTIC classifier lost rows and left latent FPs; the member is now the erased class of the value's `stmt_value_type` answer off its sparse env, and union-carrier stores widen per-arm (review FP). **0 FP / 9,337, matched=master**; fixture +r19–r23; #132. [note](notes/20260921-issue-128-store-value-typing.md).
-- **2026-09-21 upstream re-pin `v0.3.8 → v0.3.9`** (447 commits, upstream's largest `Fixed` list; branch `upstream-pin-v0.3.9`) — **0 FP / 9,337 files, gaps 799→892**, harness 107→**108** fixtures (527 matched), effects gate 0 OVER, exception tables + registry still EMPTY. Raw bump = 3 fixture FPs + **1 sweep FP** = THREE families (`6cde8381` `declines_bot?` reaches the SHAPED carriers; `152f7c9f` rooted `::RUBY_VERSION` folds — now a lowering bit; `1ad7351e` `MutationRejoin` — its F-C first cut passed 0-FP while costing a matched row, mastodon 420→419). `--sweep` is 3 minutes again (#874). Residues filed: #128 / #129 / #130. [note](notes/20260921-repin-v039.md).
+- **2026-09-21 upstream re-pin `v0.3.8 → v0.3.9`** (447 commits): **0 FP / 9,337 files, gaps 799→892**, 108 fixtures, effects 0 OVER. The raw bump had 3 fixture FPs and 1 sweep FP in THREE families: `6cde8381` `declines_bot?` on shaped carriers, `152f7c9f` rooted `::RUBY_VERSION` (a lowering bit), and `1ad7351e` `MutationRejoin`, whose first cut passed 0-FP while costing a matched row. Residues: #128/#129/#130. [note](notes/20260921-repin-v039.md).
 - **2026-09-09 #123 CLOSED — 26 holes = THREE defects, none an ordering bug** — `overlay/` loads LAST and the chain is built LAZILY; load order cannot strand a member. **22** `module ::Kernel` in `Gem` keyed `Gem::Kernel` (`qualified_name` ignored `absolute()`); **5** `prepend` never ingested; **6** module SELF-TYPE recorded nowhere. **26→0**, witnessable 590→590, 0 FP / 9204, self-diff **byte-identical** — DORMANT until `check_call`'s declaration-only conjunct drops, killing a `Bundler::Dependency#gem` FP no sweep sees. [note](notes/20260909-qualified-ancestor-closure-holes.md).
 - **2026-09-09 the 799 gaps ADJUDICATED, and the two findings that beat the coverage slice** — all 799 partitioned by MECHANISM: **395 sit behind decisions**, and the only bucket above 13 rows (nested-scope receiver typing, 71) rests on ONE over-narrow rbs signature an upstream fix would retract. The audit found better: (a) `rigor check` answered `[]` and **exited 0** on a file Prism cannot parse; ported as `rule: null` rows (PR #125). (b) the ADR-0033 declaration-only leniency's **premise expired** — its 29 rows are FOUR mechanisms → **#123** / **#124** (no arity/ATM check on a SINGLETON receiver). [799](notes/20260909-gap-adjudication-799.md) / [gems](notes/20260909-declared-unwitnessed-gem-classes.md) / [parse](notes/20260909-parse-error-reporting.md).
 - **2026-09-09 #118 CLOSED — the generic dispatch stops pinning the flat slot** (PR #120) — the issue's premise was half wrong: the port has no per-call-site overload selector, so the defect is tier 3's flat slot DROPPING the nil bit (`String#[]`'s arms all return `String?`, they "agree", the class survives and the optionality does not) and measuring agreement AFTER erasure. Declines to `Dynamic[top]` when the join is at risk AND an argument is reference-untyped: **13 FPs closed, 0 matched rows lost, 9204 corpus files byte-identical** (the 0 FP / 799 gaps baseline is unchanged). **The narrowing IS the finding**: a blanket "nilable declines" closed the same FPs, left the harness unmoved, and silently cost TEN matched rows — the folded-literal ones the reference reports by CONSTANT-FOLDING; untypedness is exactly what stops it folding. Residue **#121**. Same PR: fixture 103's live-equality row tested `RUBY_VERSION == "4.0.5"`, which flips verdict on a host patch bump while the port folds the baked constant — now `RUBY_ENGINE`, hazard in `UPSTREAM.md`. [note](notes/20260909-generic-dispatch-untyped-arg.md).

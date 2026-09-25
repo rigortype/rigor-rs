@@ -15,8 +15,24 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.3.9`** (tag, released 2026-09-12) |
-| Commit | `d0c370f7` |
+| **Pinned ref** | **upstream master `e59b7b89`** (2026-09-25; no tag, `version.rb` still `0.3.9`) |
+| Commit | `e59b7b89` |
+
+> **`v0.3.9 → e59b7b89` (2026-09-25): 1,030 commits, the first non-tag pin since
+> the `v0.3.0` RC.** rbs stays 4.2.0. Three re-sync halves moved:
+> - `core_overlay/` gained three files. `hash_rbs3.rbs` is **excluded**: the
+>   reference gates it to rbs `< 4.0`.
+> - The plugin sig went 1,840 → 2,006 lines, with 23 live FPs on a plugin project.
+> - The effects mutator sets went hash 15 → **20** and string 26 → 35, and the
+>   string set moved to `inference/string_mutation.rb`.
+>
+> **`rsync -a` keeps old mtimes, so cargo does not re-embed a re-synced overlay;
+> `touch` it.** The raw bump measured 8 fixture FPs + 9 sweep FPs in two
+> families: `5496acd6` (#1021 `imprecise_arg?`) and `ee33407e` (#1135, eval-block
+> carve-out). The carve-out's companion `fb781023` is NOT ported (#141) and
+> accounts for 3,002 of the 3,829 sweep gaps. The fragment probe found **ten
+> retractions no gate can see**, filed as #133–#138. See the
+> [note](docs/notes/20260925-repin-e59b7b89.md).
 
 > **`v0.3.8 → v0.3.9` (2026-09-21): 447 commits, the largest `Fixed` list
 > upstream has shipped — and the gentlest bump since `v0.3.1`.** rbs does NOT
