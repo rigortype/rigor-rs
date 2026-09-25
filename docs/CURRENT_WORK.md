@@ -12,12 +12,12 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-25): pin is upstream MASTER `e59b7b89`** (branch
-`upstream-pin-master-e59b7b89`), with 0 FP / 9,337 files and 111 fixtures. It carries
-retractions no gate sees, **#134–#138**, the next port work (each is its own
-inference mechanism). Pre-existing FPs: #139, #140, #146, #153 (row 4). Coverage: #141 (`fb781023`,
-3,002 of the 3,829 gaps, ready-for-agent), #144 (unmeasured); #142/#143/#145 closed at
-0 rows (`.out-of-scope/`). Still open: #130, #132 (ready-for-agent); #155–#163 (triage). `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
+▶ **NEXT (2026-09-25): pin is upstream MASTER `e59b7b89`**, 0 FP / 9,337 files.
+Retractions no gate sees, **#134–#138**, are the next port work (each its own inference
+mechanism). Pre-existing FPs: #139, #140, #146, #164, #165. Coverage: #141 (`fb781023`,
+3,002 of the 3,829 gaps), #166 (#148's shadow regression); #142–#145 and #152 closed at
+0 rows (`.out-of-scope/`). CLI/config parity (#129 follow-ups): #155–#159, #162, #163
+ready-for-agent, #160/#161 ready-for-human. Also #130, #132. `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
 
 - Measurement-tool lesson (binding): audit at NODE granularity — per-file
   histograms net over-claims against under-claims.
