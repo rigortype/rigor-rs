@@ -394,6 +394,16 @@ pub enum Node {
         /// so calls inside the block reach the rule walk. Empty for a call with
         /// no block. Not a *value* of the call — purely a reachability handle.
         block_body: Vec<NodeId>,
+        /// Span of the attached LITERAL block (`{ … }` / `do … end`) — Prism's
+        /// `BlockNode` location, parameters and delimiters included. `None` for
+        /// a call with no block AND for a `&expr` block-pass (a
+        /// `BlockArgumentNode`), whose expression still rides `block_body`.
+        /// Read by `call.unresolved-toplevel`'s receiver-eval carve-out, which
+        /// mirrors the reference's `receiver_eval_block_ranges` offset test —
+        /// the whole block node, not just its body statements (a heredoc body or
+        /// a block-parameter default sits inside the node but outside every
+        /// body statement's span).
+        block_span: Option<Span>,
         /// Span of the method-name token (`lenght`), the diagnostic anchor.
         message_span: Span,
         /// `true` for a safe-navigation call (`x&.foo`), `false` for a plain
@@ -932,7 +942,7 @@ pub struct LoweredAst {
 /// where the Prism tree is still in hand — and consumed by the SourceIndex.
 ///
 /// The census is deliberately RAW: it names the receiver and the mutating method
-/// and leaves the `ARRAY_MUTATORS` / `HASH_MUTATORS` membership test to
+/// and leaves the `SHAPE_MUTATORS` membership test (`is_shape_mutator`) to
 /// `rigor-infer`, which owns those tables.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstMutation {
@@ -1344,6 +1354,9 @@ impl<'src> Builder<'src> {
                     }
                 }
             };
+            let block_span = call
+                .block()
+                .and_then(|b| b.as_block_node().map(|bn| span_of(&bn.location())));
             // The message_loc is the method-name token; fall back to the whole
             // call span if Prism elides it (e.g. operator-ish forms).
             let message_span = call
@@ -1355,6 +1368,7 @@ impl<'src> Builder<'src> {
                 method,
                 args,
                 block_body,
+                block_span,
                 message_span,
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.

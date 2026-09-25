@@ -4958,6 +4958,31 @@ mod embedded_tests {
         );
     }
 
+    /// The `e59b7b89` re-sync's three new `data/core_overlay/` files parse (a
+    /// parse failure drops the WHOLE file silently in `Builder::ingest`), and
+    /// `hash_rbs3.rbs` stays out: the reference loads it only on the rbs `< 4.0`
+    /// line (`RbsLoader::RBS_LINE_CORE_OVERLAYS`), and this tree is rbs 4.2,
+    /// which declares its `transform_keys` overloads upstream — loading the
+    /// `| ...` continuation here would duplicate them.
+    #[test]
+    fn e59b_core_overlays_parse_and_hash_rbs3_is_excluded() {
+        for name in ["string_io.rbs", "enumerable.rbs", "enumerator.rbs"] {
+            let (_, contents) = EMBEDDED_RBS
+                .iter()
+                .find(|(p, _)| *p == format!("overlay/core_overlay/{name}"))
+                .unwrap_or_else(|| panic!("overlay/core_overlay/{name} not embedded"));
+            assert!(parse(contents).is_ok(), "{name} must parse");
+        }
+        assert!(
+            !EMBEDDED_RBS.iter().any(|(p, _)| p.ends_with("hash_rbs3.rbs")),
+            "hash_rbs3.rbs is gated to rbs < 4.0 upstream and must stay out"
+        );
+        // `string_io.rbs`: StringIO includes Enumerable[String].
+        let idx = CoreData::load();
+        assert!(idx.class_has_method("StringIO", "detect"));
+        assert!(!idx.class_has_method("StringIO", "totally_bogus_name"));
+    }
+
     /// Step 1 (nilable-RBS-return): an `Optional` return (`String?`) is
     /// preserved as `(class, nilable=true)`; a plain return is `(class, false)`;
     /// and overloads that DISAGREE on nilability collapse to `None` (never

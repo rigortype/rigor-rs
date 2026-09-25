@@ -46,16 +46,23 @@ assertions below, and a drift against the pin fails
 
 - **Source path:** `reference/rigor/data/effects/core.yml` — the PINNED
   submodule.
-- **Vendored:** 2026-09-09 at the `v0.3.8` pin (`ffb456b0`); was 2026-08-26 at
+- **Vendored:** 2026-09-25 at the upstream-master pin (`e59b7b89`); the delta
+  from `v0.3.8` is three `why:` strings only (the `Object#instance_variable_set`
+  ownership note, and the `Hash` / `String` postures citing the new
+  `MutationClassifier::HASH_MUTATORS` / `StringMutation::MUTATORS` owners) — no
+  row, label or posture moved, but the digest, and with it upstream's
+  `Catalog#identity`, did. Was 2026-09-09 at the `v0.3.8` pin (`ffb456b0`,
+  sha256 `651445b7…`); was 2026-08-26 at
   `v0.3.4` (`b10bd5df`, sha256 `85778dd3…`, 843 lines, 80 classes / 420 rows).
   The `v0.3.4 → v0.3.8` delta is semantic, not cosmetic: `Socket` gains four
   singleton rows that DEMOTE `gethostname` / `getifaddrs` / `ip_address_list`
   from the `net` posture's `io.net` to plain `io` (#458 — a hostname lookup is
   not network traffic), and `Net::IMAP` / `Net::POP3` are new `net`-posture
   classes (#463).
-- **`sha256`** `651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2`
-  (860 lines, 54,214 bytes).
-- **Upstream's own identity anchor:** `1:651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2`.
+- **`sha256`** `cbad6511fd1825bf770f5050eb36542cdc22271ac9bb373e0cf44b192fe367a3`
+  (860 lines, 54,263 bytes).
+- **Upstream's own identity anchor:** `1:cbad6511fd1825bf770f5050eb36542cdc22271ac9bb373e0cf44b192fe367a3`
+  (measured through the pinned Ruby loader, `Catalog.default.identity`).
   Upstream's effects cache keys on `Catalog#identity` = `schema:sha256(core.yml)`
   (`lib/rigor/effects/catalog.rb:158`) — i.e. **upstream already treats this
   file's digest as the catalogue's identity**, so the provenance anchor and
@@ -74,21 +81,35 @@ assertions below, and a drift against the pin fails
 
 ### `mutators.yml` — the three by-reference mutator sets (DERIVED)
 
-- **Source paths:** `reference/rigor/lib/rigor/inference/mutation_widening.rb`
-  (`ARRAY_MUTATORS`, `HASH_MUTATORS`) and
-  `reference/rigor/lib/rigor/effects/mutation_classifier.rb`
-  (`STRING_MUTATORS`) — the PINNED submodule.
+- **Source paths:** the definition sites of `Catalog::MUTATOR_SETS`' three
+  values, in the PINNED submodule: `lib/rigor/inference/mutation_widening.rb`
+  (`ARRAY_MUTATORS`), `lib/rigor/effects/mutation_classifier.rb`
+  (`HASH_MUTATORS`, a UNION: `MutationWidening::HASH_MUTATORS |
+  HashLookupMutation::MUTATORS | Set[:rehash]`, followed into
+  `lib/rigor/inference/hash_lookup_mutation.rb`) and
+  `lib/rigor/inference/string_mutation.rb` (`MUTATORS`). The generator also
+  checks `catalog.rb`'s `MUTATOR_SETS` still names exactly those constants.
 - **Vendored:** 2026-08-26 at the `v0.3.4` pin (`b10bd5df`), ADR-0043 slice 2;
   re-derived 2026-09-09 at `v0.3.8` (`ffb456b0`) — **byte-identical**, all three
   `%i[…]` literals unmoved (the `v0.3.7` mutation-widening rewrite added
   `SHAPE_MUTATORS` / `VALUE_REWRITING_MUTATORS` beside them, not inside them).
-- **`sha256`** `5bd8091db9ce2cf593ffe6409154482a38c452967b5d0ad075403e5525915ed7`.
+  Re-derived 2026-09-25 at the upstream-master pin (`e59b7b89`) — a SEMANTIC
+  move: `hash` 15 → 20 (`495a7458` adds `shift` to the widening table;
+  `c6aba2c9` re-points the set to the classifier's union, adding `default=`,
+  `default_proc=`, `compare_by_identity` and `rehash`), `string` 26 → 35
+  (`4a6b43f6` retires the classifier's own `STRING_MUTATORS`, which had drifted
+  and missed `force_encoding`, in favour of `StringMutation::MUTATORS`, adding
+  `setbyte`, `bytesplice`, `append_as_bytes`, `force_encoding`, `delete_prefix!`,
+  `delete_suffix!`, `encode!`, `scrub!`, `unicode_normalize!`). Every set was
+  cross-checked member-for-member and in order against the pinned Ruby loader's
+  `Catalog::MUTATOR_SETS`. Was sha256 `5bd8091d…` from `v0.3.4` to `v0.3.9`.
+- **`sha256`** `dc7d009df9ccbbb092c98867814aae08252fcfd6807b2e2be49ae1b8996b631f`.
   This digests the GENERATOR'S OUTPUT, not an upstream file: `--check`
   regenerates the document in memory from the pinned Ruby and compares bytes, so
   a `%i[…]` literal that moves upstream fails the gate exactly as an edited copy
   would.
-- **What it is:** `schema: 1` and three sets — **array 31**, **hash 15**,
-  **string 26** selectors, each with the `lib/…: CONSTANT` it was lifted from.
+- **What it is:** `schema: 1` and three sets — **array 31**, **hash 20**,
+  **string 35** selectors, each with the `lib/…: CONSTANT` it was lifted from.
 - **Why it is derived rather than copied:** upstream has no data file for it.
   `core.yml` names the sets BY REFERENCE (`mutators: array`) and upstream's
   internal spec makes that normative — "The data file MUST NOT re-spell a
@@ -158,7 +179,7 @@ that moves `IO#write` from `io` to `io.fs.write` changes every summary with no
 source change on either side. A `mutators.yml` diff is the same kind of event
 one layer down: a selector entering `ARRAY_MUTATORS` makes that call a proven
 `mutate.*` in every project that makes it, so the generator REFUSES to write a
-set whose size moved and the crate pins 31 / 15 / 26 in a test.
+set whose size moved and the crate pins 31 / 20 / 35 in a test.
 
 Never source this from a local rigor checkout — that is `UPSTREAM.md` hazard 3,
 and the vendored plugin RBS is the recorded case of that hazard applied to a
@@ -179,7 +200,7 @@ Three layers, and only the middle one is coverage-independent:
 3. **The embedded-bytes digest assertion** — `src/lib.rs`'s
    `the_embedded_bytes_match_the_provenance_digests`, which catches a hand-edit
    of any of the three files under plain `cargo test`, in a checkout whose
-   `reference/rigor` is empty. `mutators.rs`'s count test (31 / 15 / 26) sits
+   `reference/rigor` is empty. `mutators.rs`'s count test (31 / 20 / 35) sits
    beside it and is what a truncated extraction fails.
 
 `harness/effects_diff.py` is the *behavioural* gate and grades **6 of the 420

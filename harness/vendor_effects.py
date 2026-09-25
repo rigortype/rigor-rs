@@ -63,23 +63,43 @@ SOURCE = os.path.join(REPO, "reference/rigor/data/effects")
 # upstream ADDS must be a deliberate decision here, not a silent copy.
 FILES = ("registry.yml", "core.yml")
 
-# The DERIVED file, and the three `%i[…]` literals it is extracted from —
+# The DERIVED file, and the three constants it is extracted from —
 # `(set name, ruby file relative to lib/, constant)`, in the order the generated
 # document lists them. Upstream's own reference table is `Catalog::MUTATOR_SETS`
-# (`lib/rigor/effects/catalog.rb:43`); this is that table with each value
-# resolved to the source that defines it.
+# (`lib/rigor/effects/catalog.rb`); this is that table with each value resolved
+# to the source that defines it, and `CATALOG_REFS` below is the table as
+# upstream spells it, checked so a re-pointed set cannot go unnoticed.
+#
+# A constant is either a `%i[…]` literal or — since the `e59b7b89` pin, where
+# `hash` became `MutationClassifier::HASH_MUTATORS` — a `(A | B | Set[:x])`
+# UNION of other constants and literal sets, which `resolve_constant` follows
+# into each term's own file.
 DERIVED = "mutators.yml"
 MUTATOR_SETS = (
     ("array", "rigor/inference/mutation_widening.rb", "ARRAY_MUTATORS"),
-    ("hash", "rigor/inference/mutation_widening.rb", "HASH_MUTATORS"),
-    ("string", "rigor/effects/mutation_classifier.rb", "STRING_MUTATORS"),
+    ("hash", "rigor/effects/mutation_classifier.rb", "HASH_MUTATORS"),
+    ("string", "rigor/inference/string_mutation.rb", "MUTATORS"),
 )
 
+# `Catalog::MUTATOR_SETS`' right-hand sides verbatim, as written inside
+# `Rigor::Effects`. A mismatch means upstream re-pointed a set: update
+# `MUTATOR_SETS` above to the new definition site and re-read the diff.
+CATALOG_FILE = "rigor/effects/catalog.rb"
+CATALOG_REFS = {
+    "array": "Inference::MutationWidening::ARRAY_MUTATORS",
+    "hash": "MutationClassifier::HASH_MUTATORS",
+    "string": "Inference::StringMutation::MUTATORS",
+}
+
 # The counts the slice-2 probe measured through the pinned Ruby loader
-# (`docs/notes/20260826-effects-s2-probe.md` § 8). A set that changes SIZE under
-# a re-pin is a semantic change to what counts as a receiver mutation, so it is
-# refused here rather than written and noticed later.
-EXPECTED_COUNTS = {"array": 31, "hash": 15, "string": 26}
+# (`docs/notes/20260826-effects-s2-probe.md` § 8), moved at the `e59b7b89` pin:
+# hash 15 -> 20 (`495a7458` lists `shift`; `c6aba2c9` makes the set the
+# classifier's union with `HashLookupMutation::MUTATORS` + `rehash`), string
+# 26 -> 35 (`4a6b43f6` makes `StringMutation::MUTATORS` the one String table).
+# A set that changes SIZE under a re-pin is a semantic change to what counts as
+# a receiver mutation, so it is refused here rather than written and noticed
+# later.
+EXPECTED_COUNTS = {"array": 31, "hash": 20, "string": 35}
 
 # Authored, not generated — carried across a regeneration (the `vendor_rbs.py`
 # precedent for `PROVENANCE.md` + `overlay/`).
@@ -123,6 +143,86 @@ def extract_symbol_array(source, constant):
     return source[start:index - 1].split()
 
 
+def constant_rhs(source, constant):
+    """The right-hand side of `CONSTANT = …`, up to the first newline outside
+    any bracket — so a parenthesised multi-line union reads whole."""
+    match = re.search(rf"^\s*{re.escape(constant)}\s*=\s*", source, re.MULTILINE)
+    if not match:
+        raise ValueError(f"{constant}: no definition found")
+    depth, index = 0, match.end()
+    while index < len(source):
+        char = source[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "\n" and depth == 0:
+            break
+        index += 1
+    return source[match.end():index].strip()
+
+
+def module_file(path):
+    """`["Inference", "MutationWidening"]` -> `rigor/inference/mutation_widening.rb`."""
+    snake = [re.sub(r"(?<!^)(?=[A-Z])", "_", part).lower() for part in path]
+    return os.path.join("rigor", *snake) + ".rb"
+
+
+def resolve_constant(lib_dir, relative, constant, seen=()):
+    """The selectors `CONSTANT` (defined in `lib/<relative>`) holds, in Ruby
+    `Set#|` order (the left operand's members, then each NEW member of the next).
+
+    A `%i[…]` literal is read directly. A union `(A::B::C | D::E | Set[:x])` is
+    followed term by term: a constant path resolves to `lib/rigor/<module
+    path>.rb`, first against the defining file's own namespace (`rigor/effects/`
+    names a sibling `MutationClassifier`), then from `Rigor` (`Inference::…`);
+    a `Set[:a, :b]` literal contributes its symbols. Any other shape is refused,
+    never guessed.
+    """
+    key = (relative, constant)
+    if key in seen:
+        raise ValueError(f"{constant}: cyclic definition")
+    with open(os.path.join(lib_dir, relative), encoding="utf-8") as handle:
+        source = handle.read()
+    if re.search(rf"^\s*{re.escape(constant)}\s*=\s*%i\[", source, re.MULTILINE):
+        return extract_symbol_array(source, constant)
+    body = re.sub(r"\.freeze\s*$", "", constant_rhs(source, constant)).strip()
+    if body.startswith("(") and body.endswith(")"):
+        body = body[1:-1]
+    selectors = []
+    for term in (t.strip() for t in body.split("|")):
+        literal = re.fullmatch(r"Set\[(.*)\]", term, re.DOTALL)
+        if literal:
+            members = [m.strip().lstrip(":") for m in literal.group(1).split(",") if m.strip()]
+        elif re.fullmatch(r"(?:[A-Z]\w*::)+[A-Z_][A-Z0-9_]*", term):
+            *path, name = term.split("::")
+            namespace = os.path.dirname(relative).split(os.sep)[1:]
+            candidates = [module_file(namespace + path), module_file(path)]
+            target = next(
+                (c for c in candidates if os.path.isfile(os.path.join(lib_dir, c))), None
+            )
+            if target is None:
+                raise ValueError(f"{constant}: cannot locate `{term}` (tried {candidates})")
+            members = resolve_constant(lib_dir, target, name, seen + (key,))
+        else:
+            raise ValueError(f"{constant}: unsupported union term `{term}`")
+        selectors.extend(m for m in members if m not in selectors)
+    return selectors
+
+
+def check_catalog_refs(lib_dir):
+    """Refuse when `Catalog::MUTATOR_SETS` names a different constant than the
+    one `MUTATOR_SETS` resolves — a re-pointed set is a semantic change."""
+    with open(os.path.join(lib_dir, CATALOG_FILE), encoding="utf-8") as handle:
+        source = handle.read()
+    found = dict(re.findall(r'"(\w+)"\s*=>\s*([\w:]+)', constant_rhs(source, "MUTATOR_SETS")))
+    if found != CATALOG_REFS:
+        raise ValueError(
+            f"Catalog::MUTATOR_SETS moved: {found} (expected {CATALOG_REFS}) — "
+            "re-point MUTATOR_SETS / CATALOG_REFS and re-read the diff"
+        )
+
+
 def render_mutators(lib_dir):
     """The `mutators.yml` document, as bytes. Deterministic: same pin, same file."""
     lines = [
@@ -141,10 +241,9 @@ def render_mutators(lib_dir):
         "schema: 1",
         "sets:",
     ]
+    check_catalog_refs(lib_dir)
     for name, relative, constant in MUTATOR_SETS:
-        path = os.path.join(lib_dir, relative)
-        with open(path, encoding="utf-8") as handle:
-            selectors = extract_symbol_array(handle.read(), constant)
+        selectors = resolve_constant(lib_dir, relative, constant)
         if len(selectors) != EXPECTED_COUNTS[name]:
             raise ValueError(
                 f"{constant}: extracted {len(selectors)} selectors, expected "

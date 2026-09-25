@@ -33,8 +33,10 @@
 //!
 //! 1. ~~Mutator sets.~~ **Closed.** A class names
 //!    `mutators: array | hash | string` and upstream resolves the name to
-//!    `MutationWidening::ARRAY_MUTATORS` (31) / `HASH_MUTATORS` (15) /
-//!    `MutationClassifier::STRING_MUTATORS` (26). Upstream keeps those as Ruby
+//!    `MutationWidening::ARRAY_MUTATORS` (31) /
+//!    `MutationClassifier::HASH_MUTATORS` (20 — the widening's `HASH_MUTATORS`
+//!    ∪ `HashLookupMutation::MUTATORS` ∪ `rehash`, since the `e59b7b89` pin) /
+//!    `StringMutation::MUTATORS` (35). Upstream keeps those as Ruby
 //!    literals and its internal spec forbids `core.yml` re-spelling them, so
 //!    `harness/vendor_effects.py` EXTRACTS them into
 //!    `vendor/effects/mutators.yml` ([`mutators`]) and [`Catalog`] expands the
@@ -78,7 +80,7 @@ pub use registry::Registry;
 
 /// The reference pin these bytes were taken at. Moves only with
 /// `UPSTREAM.md`'s pin, via `harness/vendor_effects.py`.
-pub const PIN: &str = "v0.3.8 (ffb456b0)";
+pub const PIN: &str = "master (e59b7b89)";
 
 /// `data/effects/registry.yml`, verbatim.
 pub const REGISTRY_YML: &str =
@@ -105,14 +107,14 @@ pub const REGISTRY_SHA256: &str =
 /// provenance anchor and upstream's invalidation key are one value — see
 /// [`Catalog::identity`].
 pub const CORE_SHA256: &str =
-    "651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2";
+    "cbad6511fd1825bf770f5050eb36542cdc22271ac9bb373e0cf44b192fe367a3";
 
 /// `sha256(mutators.yml)` as `harness/vendor_effects.py` renders it at [`PIN`],
 /// recorded in `PROVENANCE.md`. The file is DERIVED, so this digest pins the
 /// extraction's output rather than an upstream file's bytes — which is exactly
 /// what has to stay stable: a re-pin that moves a `%i[…]` literal moves this.
 pub const MUTATORS_SHA256: &str =
-    "5bd8091db9ce2cf593ffe6409154482a38c452967b5d0ad075403e5525915ed7";
+    "dc7d009df9ccbbb092c98867814aae08252fcfd6807b2e2be49ae1b8996b631f";
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     Registry::from_yaml_str(REGISTRY_YML).expect("vendored registry.yml must parse")
@@ -272,7 +274,7 @@ mod tests {
         // Ruby loader in the slice-1 probe § 1c.
         assert_eq!(
             catalog().identity(),
-            "1:651445b75eaaa6ee8390a08f0cfd43b12132268bc92940457ece60b95509c6b2"
+            "1:cbad6511fd1825bf770f5050eb36542cdc22271ac9bb373e0cf44b192fe367a3"
         );
     }
 }

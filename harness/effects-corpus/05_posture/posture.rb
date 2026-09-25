@@ -2,7 +2,7 @@
 #
 # Source: crates/rigor-effects/vendor/effects/core.yml — the VENDORED catalogue,
 # i.e. the bytes the measured binary compiles in.
-# schema 1, vocabulary 1, 80 classes.
+# schema 1, vocabulary 1, 82 classes.
 #
 # The POSTURE-TIER over-claim gate (issue #106). Upstream gates a class's
 # default `posture:` on the receiver's typing — `posture_allowed?` refuses it
@@ -22,7 +22,7 @@
 
 # --- the posture tier, isolated ----------------------------------------------
 #
-# One method per class carrying a `posture:` (80 of 80).
+# One method per class carrying a `posture:` (82 of 82).
 # `zz_uncatalogued_zz` is rowed by no class and is not a universal name, so a
 # proven label here can only have come from the class default. A class whose
 # posture resolves to ∅ is included anyway: it is an exhaustiveness probe for
@@ -207,6 +207,16 @@ class Posture
   # posture: http
   def c_net__http
     Net::HTTP.zz_uncatalogued_zz
+  end
+
+  # posture: net
+  def c_net__imap
+    Net::IMAP.zz_uncatalogued_zz
+  end
+
+  # posture: net
+  def c_net__pop3
+    Net::POP3.zz_uncatalogued_zz
   end
 
   # posture: net
@@ -518,6 +528,11 @@ class Row
     Signal.trap
   end
 
+  # Socket: io.net
+  def r_socket
+    Socket.gethostbyname
+  end
+
   # Tempfile: io.fs.write
   def r_tempfile
     Tempfile.create
@@ -593,6 +608,14 @@ class Universal
 
   def u_net__http
     Net::HTTP.class
+  end
+
+  def u_net__imap
+    Net::IMAP.class
+  end
+
+  def u_net__pop3
+    Net::POP3.class
   end
 
   def u_net__smtp

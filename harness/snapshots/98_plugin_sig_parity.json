@@ -3,28 +3,28 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 60,
+      "line": 77,
       "column": 7,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for \"abc\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 64,
+      "line": 81,
       "column": 14,
       "severity": "error",
       "message": "undefined method `frobsquish_zzz' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 81,
+      "line": 99,
       "column": 12,
       "severity": "error",
       "message": "undefined method `frobdate_zzz' for Date"
     },
     {
       "rule": "call.undefined-method",
-      "line": 82,
+      "line": 100,
       "column": 14,
       "severity": "error",
       "message": "undefined method `frobdatetime_zzz' for DateTime"
