@@ -152,6 +152,9 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         ("to_s", []) => return Some(Scalar::Str(a.to_string())),
         // `rb_int_cmp`: `-1`/`0`/`1` against a numeric literal, `nil` against
         // NaN or anything else — one of the nilable lookups of issue #164.
+        // A U+FFFD argument marks an unrepresentable literal; decline rather
+        // than compare the replacement text.
+        ("<=>", [s]) if scalar_has_replacement_char(s) => return None,
         ("<=>", [s]) => return Some(int_cmp_scalar(a, s)),
         _ => {}
     }
@@ -297,9 +300,10 @@ fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         return Some(Scalar::Float(a.abs()));
     }
     // `flo_cmp`: `-1`/`0`/`1` against a numeric literal, `nil` against NaN or
-    // a non-numeric argument (`1.0 <=> "x"`) — issue #164's head row.
+    // a non-numeric argument (`1.0 <=> "x"`) — issue #164's head row. A U+FFFD
+    // argument marks an unrepresentable literal; decline.
     if let ("<=>", [s]) = (method, args) {
-        return Some(float_cmp_scalar(a, s));
+        return if scalar_has_replacement_char(s) { None } else { Some(float_cmp_scalar(a, s)) };
     }
     // Binary on a single Float argument. We deliberately do NOT fold
     // Float op Integer (mixed coercion) here — that stays simple and exact.
@@ -373,7 +377,9 @@ fn fold_sym(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
         ("==", [Scalar::Sym(b)]) => Some(Scalar::Bool(a == b)),
         ("==", [_]) => Some(Scalar::Bool(false)),
         // `Symbol#<=>` (`SYMBOL_BINARY`): orders against another Symbol by its
-        // text, `nil` against anything else.
+        // text, `nil` against anything else. A U+FFFD input marks an
+        // unrepresentable literal; decline.
+        ("<=>", [b]) if a.contains('\u{FFFD}') || scalar_has_replacement_char(b) => None,
         ("<=>", [Scalar::Sym(b)]) => Some(Scalar::Int(a.cmp(b.as_str()) as i64)),
         ("<=>", [_]) => Some(Scalar::Nil),
         _ => None,
@@ -411,6 +417,9 @@ fn fold_str(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
         ("==", [_]) => Some(Scalar::Bool(false)),
         // `String#<=>` (`STRING_BINARY`): byte-order comparison — for UTF-8
         // strings that is also codepoint order, so `str::cmp` is byte-exact.
+        // A U+FFFD input marks an unrepresentable literal; decline rather
+        // than compare the replacement text.
+        ("<=>", [b]) if a.contains('\u{FFFD}') || scalar_has_replacement_char(b) => None,
         ("<=>", [Scalar::Str(b)]) => Some(Scalar::Int(a.cmp(b.as_str()) as i64)),
         ("<=>", [_]) => Some(Scalar::Nil),
         ("[]" | "slice" | "byteslice" | "index" | "rindex" | "byteindex"
@@ -468,6 +477,14 @@ pub enum LookupFold {
     /// the flat RBS answer: `for String` where the reference says `for
     /// "<byte>"` — same row.
     Decline,
+    /// A scalar INPUT cannot be faithfully represented: a string literal
+    /// whose unescaped bytes were not valid UTF-8 lowers with U+FFFD where
+    /// Ruby keeps the real byte, so a position or content read folded on the
+    /// scalar mints the wrong constant (`"\xFFabc".getbyte(0)` is `255`, not
+    /// `0xEF`). The reference folds on the real bytes — it fires the hit
+    /// (`for 255`) and withholds the miss — so the caller declines to
+    /// `Dynamic`: a coverage gap on the hits, never the wrong value.
+    Opaque,
 }
 
 impl LookupFold {
@@ -479,6 +496,16 @@ impl LookupFold {
             _ => None,
         }
     }
+}
+
+/// Whether `s` is a `Str`/`Sym` carrying U+FFFD — the mark a string literal
+/// leaves when its unescaped bytes were not valid UTF-8 (the lowering
+/// substitutes U+FFFD for the bad bytes). Position- and content-sensitive
+/// folds cannot reproduce Ruby's answer on that text: Ruby reads the real
+/// byte; the scalar reads the replacement. A literal `"\uFFFD"` shares the
+/// mark and declines with it — the safe side.
+pub fn scalar_has_replacement_char(s: &Scalar) -> bool {
+    matches!(s, Scalar::Str(t) | Scalar::Sym(t) if t.contains('\u{FFFD}'))
 }
 
 /// `NUM2LONG` on a scalar argument: an Integer is itself; a Float truncates
@@ -577,30 +604,41 @@ fn fold_rindex(a: &str, sub: &str, pos: i64) -> Scalar {
 }
 
 /// `String#byteindex` — byte-domain twin of [`fold_index`]. The offset is in
-/// bytes and may legitimately land inside a multibyte character, so the search
-/// runs on `as_bytes`, never on `&str` slices.
-fn fold_byteindex(a: &str, sub: &str, offset: i64) -> Scalar {
+/// bytes BUT must land on a character boundary: Ruby raises `IndexError:
+/// offset 2 does not land on character boundary` inside a multibyte char
+/// (verified on CRuby 4.0.6), which the reference rescues into the `C?`
+/// union — [`LookupFold::Raises`]. An out-of-range offset is `nil`, no raise.
+fn fold_byteindex(a: &str, sub: &str, offset: i64) -> LookupFold {
     let len = a.len() as i64;
     let offset = if offset < 0 { offset + len } else { offset };
     if !(0..=len).contains(&offset) {
-        return Scalar::Nil;
+        return LookupFold::Value(Scalar::Nil);
+    }
+    if !a.is_char_boundary(offset as usize) {
+        return LookupFold::Raises;
     }
     match byte_find(&a.as_bytes()[offset as usize..], sub.as_bytes()) {
-        Some(p) => Scalar::Int(offset + p as i64),
-        None => Scalar::Nil,
+        Some(p) => LookupFold::Value(Scalar::Int(offset + p as i64)),
+        None => LookupFold::Value(Scalar::Nil),
     }
 }
 
-/// `String#byterindex` — byte-domain twin of [`fold_rindex`].
-fn fold_byterindex(a: &str, sub: &str, offset: i64) -> Scalar {
+/// `String#byterindex` — byte-domain twin of [`fold_rindex`], with the same
+/// character-boundary raise as [`fold_byteindex`] — but only for an offset
+/// that still lands INSIDE the string: a past-end offset clamps to the end
+/// (`"héllo".byterindex("o", 6)` is `5`), which is always a boundary.
+fn fold_byterindex(a: &str, sub: &str, offset: i64) -> LookupFold {
     let len = a.len() as i64;
     let offset = if offset < 0 { offset + len } else { offset };
     if offset < 0 {
-        return Scalar::Nil;
+        return LookupFold::Value(Scalar::Nil);
+    }
+    if offset < len && !a.is_char_boundary(offset as usize) {
+        return LookupFold::Raises;
     }
     match byte_rfind(a.as_bytes(), sub.as_bytes(), offset.min(len) as usize) {
-        Some(p) => Scalar::Int(p as i64),
-        None => Scalar::Nil,
+        Some(p) => LookupFold::Value(Scalar::Int(p as i64)),
+        None => LookupFold::Value(Scalar::Nil),
     }
 }
 
@@ -610,14 +648,23 @@ fn fold_byterindex(a: &str, sub: &str, offset: i64) -> Scalar {
 ///
 /// The folds are char-exact for `[]` / `slice` / `index` / `rindex` and
 /// byte-exact for `byteslice` / `byteindex` / `byterindex` / `getbyte`, so
-/// they hold on multibyte receivers too — a result only stops being
+/// they hold on VALID multibyte receivers too — a result only stops being
 /// representable when `byteslice` cuts inside a character
-/// ([`LookupFold::Decline`]). Everything else a pinned-scalar argument can do
-/// is a Ruby raise (`TypeError` / `ArgumentError` / `RangeError`), which the
-/// reference rescues into the withholding `C?` union — [`LookupFold::Raises`].
-/// Non-scalar argument kinds (`Range`, `Regexp`) never reach this function:
-/// they do not pin, and the dispatch site handles them.
+/// ([`LookupFold::Decline`]), and `byteindex` / `byterindex` raise when the
+/// offset does ([`LookupFold::Raises`]). Everything else a pinned-scalar
+/// argument can do is a Ruby raise (`TypeError` / `ArgumentError` /
+/// `RangeError`), which the reference rescues into the withholding `C?`
+/// union. Non-scalar argument kinds (`Range`, `Regexp`) never reach this
+/// function: they do not pin, and the dispatch site handles them.
 pub fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> LookupFold {
+    // A literal whose unescaped bytes were not valid UTF-8 lowers with U+FFFD
+    // where Ruby has the real byte; folding a position or content read on the
+    // corrupted text mints the wrong constant. The reference answers on the
+    // real bytes — it may fire the hit — so decline to `Dynamic`, never the
+    // wrong value (#164 review: `"\xFFabc".getbyte(0)` is `255`, not `0xEF`).
+    if a.contains('\u{FFFD}') || args.iter().any(scalar_has_replacement_char) {
+        return LookupFold::Opaque;
+    }
     let char_len = a.chars().count() as i64;
     // `rb_str_subpos` in characters (`[]` / `slice`): a negative start counts
     // from the end; a start past the end or a negative count is `nil`; a start
@@ -677,25 +724,21 @@ pub fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> LookupFold {
             _ => LookupFold::Raises,
         },
         ("index" | "rindex" | "byteindex" | "byterindex", [Scalar::Str(sub)]) => {
-            let v = match method {
-                "index" => fold_index(a, sub, 0),
-                "rindex" => fold_rindex(a, sub, a.chars().count() as i64),
+            match method {
+                "index" => LookupFold::Value(fold_index(a, sub, 0)),
+                "rindex" => LookupFold::Value(fold_rindex(a, sub, a.chars().count() as i64)),
                 "byteindex" => fold_byteindex(a, sub, 0),
                 _ => fold_byterindex(a, sub, a.len() as i64),
-            };
-            LookupFold::Value(v)
+            }
         }
         ("index" | "rindex" | "byteindex" | "byterindex", [Scalar::Str(sub), off]) => {
             match to_int(off) {
-                Some(o) => {
-                    let v = match method {
-                        "index" => fold_index(a, sub, o),
-                        "rindex" => fold_rindex(a, sub, o),
-                        "byteindex" => fold_byteindex(a, sub, o),
-                        _ => fold_byterindex(a, sub, o),
-                    };
-                    LookupFold::Value(v)
-                }
+                Some(o) => match method {
+                    "index" => LookupFold::Value(fold_index(a, sub, o)),
+                    "rindex" => LookupFold::Value(fold_rindex(a, sub, o)),
+                    "byteindex" => fold_byteindex(a, sub, o),
+                    _ => fold_byterindex(a, sub, o),
+                },
                 None => LookupFold::Raises,
             }
         }
@@ -846,7 +889,9 @@ mod tests {
         }
         // `"abcabc".rindex("ca", 2)` bounds the match's START, not its end.
         assert_eq!(fold(&s("abcabc"), "rindex", &[s("ca"), i(2)]), Some(i(2)));
-        // Byte-domain lookups answer BYTE offsets on multibyte receivers.
+        // Byte-domain lookups answer BYTE offsets on valid multibyte
+        // receivers — but only while the OFFSET itself lands on a character
+        // boundary (Ruby raises `IndexError` otherwise; see the Raises test).
         let hel = s("héllo");
         assert_eq!(fold(&hel, "index", &[s("l")]), Some(i(2)));
         assert_eq!(fold(&hel, "byteindex", &[s("l")]), Some(i(3)));
@@ -856,6 +901,78 @@ mod tests {
         assert_eq!(fold(&hel, "[]", &[i(1)]), Some(s("é")));
         assert_eq!(fold(&abc, "index", &[s("é")]), Some(Scalar::Nil));
         assert_eq!(fold(&abc, "index", &[s("b"), Scalar::Float(1.5)]), Some(i(1)));
+    }
+
+    /// `byteindex` / `byterindex` raise `IndexError` when the byte offset
+    /// lands inside a multibyte character (verified on CRuby 4.0.6) — the
+    /// reference rescues into the `C?` union, so the fold answers `Raises`.
+    /// A past-end `byterindex` offset clamps to the end instead of raising.
+    #[test]
+    fn byte_lookups_raise_on_a_mid_character_offset() {
+        let s = |v: &str| Scalar::Str(v.into());
+        let i = Scalar::Int;
+        let hel = "héllo"; // 6 bytes: h é(2) l l o
+        for (method, off) in [
+            ("byteindex", 2),   // inside é
+            ("byterindex", 2),  // inside é
+            ("byteindex", -4),  // normalizes to 2 — inside é
+        ] {
+            match fold_str_lookup(hel, method, &[s("l"), i(off)]) {
+                LookupFold::Raises => {}
+                other => panic!("{method}(l, {off}): expected Raises, got {other:?}"),
+            }
+        }
+        // Boundary-adjacent cases that do NOT raise.
+        assert_eq!(fold(&s(hel), "byteindex", &[s("l"), i(1)]), Some(i(3)));
+        assert_eq!(fold(&s(hel), "byteindex", &[s("l"), i(3)]), Some(i(3)));
+        assert_eq!(fold(&s(hel), "byteindex", &[s("l"), i(6)]), Some(Scalar::Nil)); // at end
+        assert_eq!(fold(&s(hel), "byteindex", &[s("l"), i(7)]), Some(Scalar::Nil)); // past end
+        assert_eq!(fold(&s(hel), "byterindex", &[s("o"), i(6)]), Some(i(5)));   // clamps
+        assert_eq!(fold(&s(hel), "byterindex", &[s("o"), i(100)]), Some(i(5))); // clamps
+        assert_eq!(fold(&s(hel), "byterindex", &[s("h"), i(-6)]), Some(i(0)));
+        assert_eq!(fold(&s(hel), "byterindex", &[s("h"), i(-7)]), Some(Scalar::Nil));
+    }
+
+    /// A string literal whose unescaped bytes are not valid UTF-8 lowers with
+    /// U+FFFD where Ruby has the real byte — the scalar minted from it cannot
+    /// answer a position or content read, so the lookups go `Opaque`
+    /// (decline to `Dynamic`) and `<=>` declines. The reference folds on the
+    /// real bytes, so a firing answer there is a coverage gap, never a wrong
+    /// value (#164 review).
+    #[test]
+    fn invalid_utf8_literals_are_opaque_to_the_folds() {
+        let s = |v: &str| Scalar::Str(v.into());
+        // "\xFFabc" lowers as "\u{FFFD}abc".
+        let corrupted = s("\u{FFFD}abc");
+        for (method, args) in [
+            ("getbyte", vec![Scalar::Int(0)]),
+            ("getbyte", vec![Scalar::Int(9)]),
+            ("index", vec![s("a")]),
+            ("rindex", vec![s("a"), Scalar::Int(1)]),
+            ("byteindex", vec![s("a")]),
+            ("byterindex", vec![s("a"), Scalar::Int(1)]),
+            ("[]", vec![Scalar::Int(0)]),
+            ("slice", vec![Scalar::Int(0), Scalar::Int(1)]),
+            ("byteslice", vec![Scalar::Int(0)]),
+        ] {
+            match fold_str_lookup("\u{FFFD}abc", method, &args) {
+                LookupFold::Opaque => {}
+                other => panic!("{method}{args:?}: expected Opaque, got {other:?}"),
+            }
+        }
+        // A corrupted string ARGUMENT declines the lookup too.
+        match fold_str_lookup("abc", "index", &[s("\u{FFFD}")]) {
+            LookupFold::Opaque => {}
+            other => panic!("expected Opaque, got {other:?}"),
+        }
+        // `<=>` declines rather than comparing the replacement text.
+        assert_eq!(fold(&corrupted, "<=>", &[s("\u{FFFE}a")]), None);
+        assert_eq!(fold(&Scalar::Float(1.0), "<=>", &[s("\u{FFFD}a")]), None);
+        assert_eq!(fold(&Scalar::Int(1), "<=>", &[s("\u{FFFD}a")]), None);
+        assert_eq!(fold(&Scalar::Sym("\u{FFFD}".into()), "<=>", &[Scalar::Sym("a".into())]), None);
+        // A literal U+FFFD in source also declines — the safe side.
+        assert!(scalar_has_replacement_char(&corrupted));
+        assert!(!scalar_has_replacement_char(&s("abc")));
     }
 
     /// A pinned argument list Ruby raises on is [`LookupFold::Raises`] — the
