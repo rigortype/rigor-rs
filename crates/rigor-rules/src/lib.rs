@@ -592,6 +592,7 @@ pub fn analyze_with_source_and_folder(
                 message_span,
                 safe_nav,
                 args_all_plain,
+                args_plain_positional,
                 ..
             } => Some((
                 id,
@@ -602,12 +603,13 @@ pub fn analyze_with_source_and_folder(
                 *message_span,
                 *safe_nav,
                 *args_all_plain,
+                *args_plain_positional,
             )),
             _ => None,
         })
         .collect();
 
-    for (call_id, recv, method, args, has_block, message_span, safe_nav, args_all_plain) in calls {
+    for (call_id, recv, method, args, has_block, message_span, safe_nav, args_all_plain, args_plain_positional) in calls {
         // DEAD RECEIVER (disjoint-guard suppression): the reference's guarded
         // scope binds this receiver to `Bot`, which responds to no method and
         // carries no signature, so no receiver-driven rule of the reference can
@@ -654,7 +656,10 @@ pub fn analyze_with_source_and_folder(
                 )
             })
             .or_else(|| {
-                check_wrong_arity(ast, recv, &method, &args, has_block, message_span, env, &typer, interner, index)
+                check_wrong_arity(
+                    ast, recv, &method, &args, args_plain_positional, has_block, message_span,
+                    env, &typer, interner, index,
+                )
             })
             .or_else(|| {
                 check_nil_receiver(call_id, &method, message_span, safe_nav, &nil_snaps, index)
@@ -1906,6 +1911,7 @@ fn check_wrong_arity(
     receiver: rigor_parse::NodeId,
     method: &str,
     args: &[rigor_parse::NodeId],
+    args_plain_positional: bool,
     has_block: bool,
     message_span: (usize, usize),
     env: &rigor_infer::TypeEnv,
@@ -1913,6 +1919,18 @@ fn check_wrong_arity(
     interner: &mut Interner,
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
+    // The reference's `plain_positional_call?` gate (`check_rules.rb:1510`,
+    // `simple_positional?`): a call carrying ANY non-positional argument
+    // shape — a `*splat`, a bare keyword-hash `a: 1`, or forwarded `...` —
+    // is never arity-checked, because `args.len()` is then not the runtime
+    // positional count. A `&blk` block-pass does NOT disqualify (the
+    // reference reads only `call_node.arguments`, and the oracle fires on
+    // `first(1, 2, &)`); `has_block` below handles the block shapes the
+    // port cannot yet arity-check.
+    if !args_plain_positional {
+        return None;
+    }
+
     // A block selects a DIFFERENT RBS overload, which usually has a different
     // positional arity (`arr.select { } / arr.map { }` take 0 positional args,
     // but the no-block envelope spans the Enumerator overloads). The reference
@@ -5134,6 +5152,64 @@ mod tests {
         // where many args are still legal.)
         let diags = run(b"s = \"x\"\ns.concat(\"a\", \"b\")\n");
         assert!(diags.is_empty(), "expected no diagnostics, got {diags:?}");
+    }
+
+    #[test]
+    fn wrong_arity_declines_splat_args() {
+        // Issue #165 — the reference's `plain_positional_call?` declines ANY
+        // call with a splat argument; the port must not count each `*a` as one
+        // positional. Every shape below is silent on the oracle at `e59b7b89`.
+        for src in [
+            &b"[1, 2].first(*[5], *[5])\n"[..],
+            b"w = [5]\n[1, 2].first(*w, *w)\n",
+            b"def m(w) = [1, 2].first(*w, *w)\n",
+            b"[1, 2].first(*[5], 1)\n",
+            b"[1, 2].first(1, *[5])\n",
+            b"[1, 2].first(*[], *[])\n",
+            b"\"abc\".center(*[5], *[5], *[5])\n",
+            b"[1, 2]&.first(1, *[5])\n",
+        ] {
+            let diags = run(src);
+            assert!(
+                diags.iter().all(|d| d.rule_id != CALL_WRONG_ARITY),
+                "splat call must not fire wrong-arity: {diags:?} for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_arity_declines_keyword_hash_and_forwarding() {
+        // The same `simple_positional?` gate declines a bare keyword-hash and a
+        // `...` forwarding argument — both silent on the oracle.
+        for src in [
+            &b"[1, 2].first(1, a: 2)\n"[..],
+            b"[1, 2].first(1, 2, a: 3)\n",
+            b"def m(...) = [1, 2].first(1, ...)\n",
+        ] {
+            let diags = run(src);
+            assert!(
+                diags.iter().all(|d| d.rule_id != CALL_WRONG_ARITY),
+                "non-plain-positional call must not fire wrong-arity: {diags:?} for {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wrong_arity_still_fires_with_anonymous_block_pass() {
+        // The `&` anonymous block-pass rides Prism's `block()`, not
+        // `arguments()`, so `plain_positional_call?` does not see it: the
+        // oracle fires `first(1, 2, &)` (given 2, expected 0..1) and the port
+        // must keep firing the same tuple.
+        let src = b"def m(&) = [1, 2].first(1, 2, &)\n";
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        let d = &diags[0];
+        assert_eq!(d.rule_id, CALL_WRONG_ARITY);
+        assert_eq!(
+            d.message,
+            "wrong number of arguments to `first' on Array (given 2, expected 0..1)"
+        );
+        assert_eq!(&src[d.start_offset..d.end_offset], b"first");
     }
 
     #[test]
