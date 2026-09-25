@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use rigor_index::{ClassOrdering, CoreIndex};
-use rigor_parse::{LoweredAst, Node, NodeId};
+use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
@@ -1659,7 +1659,12 @@ impl<'i> Typer<'i> {
             Node::Logical { left, right, .. } => {
                 self.expr_reach(ast, *left, seen).join(self.expr_reach(ast, *right, seen))
             }
-            Node::Statements { body, .. } => self.body_value_reach(ast, body, seen),
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+                self.body_value_reach(ast, body, seen)
+            }
+            // A recovery / inert carrier's value is not its last recovered child
+            // (`s rescue nil` may be `nil`; `defined?(s)` is a String or `nil`).
+            Node::Statements { .. } => Reach::UNKNOWN,
             // Also the carrier an `if`'s `else` clause lowers to (no clauses).
             Node::BeginRescue { body, clauses, .. } => {
                 let mut reach = self.body_value_reach(ast, body, seen);
@@ -1909,11 +1914,23 @@ impl<'i> Typer<'i> {
         };
         let mut writes: Vec<(rigor_parse::Span, LocalWrite)> = Vec::new();
         for (_, n) in ast.iter() {
+            // A write under `defined?` / `END` / `BEGIN` never runs in sequence
+            // on the reference, so it contributes no value (rigor-rs#153).
+            if ast.in_inert_carrier(n.span()) {
+                continue;
+            }
             match n {
                 Node::LocalVariableWrite { name, value, span, .. }
                     if name == root && in_region(*span) =>
                 {
                     writes.push((*span, LocalWrite::Plain(*value)));
+                }
+                // A `for` index binds the element type, which this analysis
+                // cannot see into: decline (rigor-rs#151).
+                Node::Loop { index, .. }
+                    if index.iter().any(|(n, s)| n == root && in_region(*s)) =>
+                {
+                    return Reach::UNKNOWN;
                 }
                 Node::LocalVariableOpWrite { name, value, span }
                     if name == root && in_region(*span) =>
@@ -2997,7 +3014,12 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(rebinds, vspan, env, interner);
                 self.bind_statement(ast, id, env, interner);
             }
-            Node::Statements { body, .. } => {
+            // Only a real statement sequence is straight-line code. A recovery
+            // carrier (a `rescue` modifier, `super(…)`, …) runs its writes
+            // conditionally or out of order, so it widens; an inert one
+            // (`defined?`, `END`, `BEGIN`) has no writes in `rebinds` and so
+            // changes nothing (rigor-rs#153).
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for s in body.clone() {
                     self.bind_check_statement(ast, s, env, rebinds, interner);
                 }
@@ -3094,7 +3116,10 @@ impl<'i> Typer<'i> {
         out: &mut HashMap<NodeId, TypeId>,
     ) {
         match ast.get(id) {
-            Node::Statements { body, .. } => {
+            // A recovery / inert carrier is not straight-line code: it goes to
+            // the widening arm below (rigor-rs#153). An inert carrier's writes
+            // are not in `writes`, so it leaves `env` as the reference does.
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 let body = body.clone();
                 self.flow_eval_scope(ast, &body, env, in_loop_or_block, self_qual, self_kind, writes, interner, out);
             }
@@ -3245,6 +3270,12 @@ impl<'i> Typer<'i> {
                     env.insert(name, ty);
                 }
             }
+            // A write under `defined?` / `END` / `BEGIN` / `super` / `yield`
+            // never reaches the scope on the reference (rigor-rs#153), so the
+            // flat env does not bind it either (`type-of` on the later read
+            // says the earlier type, as the reference does). A recovery
+            // carrier is still bound as before: this env has no widening.
+            Node::Statements { kind: StatementsKind::Inert, .. } => {}
             Node::Statements { body, .. } => {
                 for s in body.clone() {
                     self.bind_statement(ast, s, env, interner);
@@ -3353,9 +3384,42 @@ impl<'i> Typer<'i> {
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         match ast.get(id) {
-            Node::Statements { body, .. } => {
-                let body = body.clone();
-                self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+            // A carrier is descended so the uses in it are recorded, as before;
+            // what differs by kind is the state it leaves behind (rigor-rs#153).
+            Node::Statements { body, kind, span } => {
+                let (body, kind, span) = (body.clone(), *kind, *span);
+                match kind {
+                    StatementsKind::Sequence => {
+                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+                    }
+                    // Its writes may not run, or not in this order: widen them
+                    // and drop their facts after the descent.
+                    StatementsKind::Recovered => {
+                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+                        widen_flow_writes(writes, span, tenv, interner);
+                        widen_penv_writes(writes, span, penv);
+                        for (w, name) in writes {
+                            if span.0 <= w.0 && w.1 <= span.1 {
+                                nenv.remove(name);
+                            }
+                        }
+                    }
+                    // Its writes never reach the scope: record the uses in a
+                    // written value, bind nothing.
+                    StatementsKind::Inert => {
+                        for s in body {
+                            match ast.get(s) {
+                                Node::LocalVariableWrite { value, .. }
+                                | Node::LocalVariableOpWrite { value, .. }
+                                | Node::MultiWrite { value, .. } => {
+                                    let value = *value;
+                                    self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                                }
+                                _ => self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, interner, out),
+                            }
+                        }
+                    }
+                }
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
@@ -3854,6 +3918,32 @@ impl<'i> Typer<'i> {
         stmt_position: bool,
     ) {
         match ast.get(id) {
+            // An inert carrier (`defined?` operand, `END` / `BEGIN` body,
+            // `super(…)` / `yield(…)` arguments) leaves the reference's scope
+            // unchanged, so a write in it neither binds nor kills here
+            // (rigor-rs#153). Its USES are still recorded under the facts in
+            // force, as before: `yield v.use` / `super(v.use)` under a guard
+            // fire on the reference (stage 3b-1 rows d23/g2). A recovery
+            // carrier is still descended as a sequence — its reads and calls
+            // are this pass's load-bearing `cache[v] ||= v.use` coverage (see
+            // the leaf arm).
+            Node::Statements { body, kind: StatementsKind::Inert, .. } => {
+                for s in body.clone() {
+                    match ast.get(s) {
+                        Node::LocalVariableWrite { value, .. }
+                        | Node::LocalVariableOpWrite { value, .. }
+                        | Node::MultiWrite { value, .. } => {
+                            let value = *value;
+                            self.class_flow_expr(
+                                ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position,
+                            );
+                        }
+                        _ => self.class_flow_stmt(
+                            ast, s, tenv, cenv, coarse, writes, interner, out, stmt_position,
+                        ),
+                    }
+                }
+            }
             Node::Statements { body, .. } => {
                 let body = body.clone();
                 self.class_flow_scope(ast, &body, tenv, cenv, coarse, writes, interner, out, stmt_position);
@@ -4029,12 +4119,14 @@ impl<'i> Typer<'i> {
             // local (probes g1/g1b/g1c/g1d — the collection is evaluated before
             // the rebind).
             //
-            // The BODY is DECLINED. `Node::Loop` cannot distinguish `for`,
-            // whose index rebind is INVISIBLE in the arena (`ast.rs:1501` drops
-            // the index target) and where the reference is measured SILENT
-            // (probe f10a: `for v in list` then `v.use`), from `while`/`until`,
-            // where it fires (f10b/d21). Descending would be a live FP. Stage
-            // 3b-2 lands an arena discriminator first.
+            // The BODY is DECLINED. `Node::Loop` did not distinguish `for`,
+            // whose index rebinds the local and where the reference is measured
+            // SILENT (probe f10a: `for v in list` then `v.use`), from
+            // `while`/`until`, where it fires (f10b/d21). Descending would be a
+            // live FP. The index names are now carried (`Node::Loop::index`,
+            // rigor-rs#151) and reach this arm only through `writes`, so the
+            // span kill below drops a fact the index rebinds; descending the
+            // body is still a separate slice.
             Node::Loop { predicate, span, .. } => {
                 let (predicate, span) = (*predicate, *span);
                 if let Some(p) = predicate {
@@ -5638,9 +5730,30 @@ impl<'i> Typer<'i> {
         stmt_position: bool,
     ) {
         match ast.get(id) {
-            Node::Statements { body, .. } => {
-                let body = body.clone();
+            // An inert carrier leaves the reference's scope unchanged
+            // (rigor-rs#153): a write in it does not bind, but the uses in it
+            // are still recorded, as before.
+            Node::Statements { body, kind: StatementsKind::Inert, .. } => {
+                for s in body.clone() {
+                    match ast.get(s) {
+                        Node::LocalVariableWrite { value, .. }
+                        | Node::LocalVariableOpWrite { value, .. }
+                        | Node::MultiWrite { value, .. } => {
+                            let value = *value;
+                            self.coll_flow_expr(ast, value, tenv, ctx, interner, out, stmt_position);
+                        }
+                        _ => self.coll_flow_stmt(ast, s, tenv, ctx, interner, out, stmt_position),
+                    }
+                }
+            }
+            Node::Statements { body, kind, span } => {
+                let (body, kind, span) = (body.clone(), *kind, *span);
                 self.coll_flow_scope(ast, &body, tenv, ctx, interner, out, stmt_position);
+                // A recovery carrier's writes may not run, or not in this order:
+                // the uses in it are recorded as before, then its writes widen.
+                if kind == StatementsKind::Recovered {
+                    widen_flow_writes(ctx.writes, span, tenv, interner);
+                }
             }
             Node::LocalVariableWrite { .. }
             | Node::MultiWrite { .. }
@@ -6521,7 +6634,8 @@ pub(crate) fn is_shape_mutator(method: &str) -> bool {
 /// apart: a mutation KEEPS the nominal while a rebind kills it, and the merged
 /// table cannot tell them apart.
 fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    ast.iter()
+    let mut out: Vec<(rigor_parse::Span, String)> = ast
+        .iter()
         .flat_map(|(_, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
             | Node::LocalVariableOpWrite { name, span, .. } => vec![(*span, name.clone())],
@@ -6530,9 +6644,28 @@ fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
                 .into_iter()
                 .map(|(name, _)| (*span, name))
                 .collect(),
+            Node::Loop { index, .. } => for_index_rebinds(index),
             _ => Vec::new(),
         })
-        .collect()
+        .collect();
+    drop_inert_writes(ast, &mut out);
+    out
+}
+
+/// A `for` index's bound names as rebind entries, each keyed by its own target
+/// span — which lies inside the loop's span, so the loop widens them at its exit
+/// exactly as it widens a body write (rigor-rs#151). The reference binds the
+/// element type; widening is the FP-safe floor of that.
+fn for_index_rebinds(index: &[(String, rigor_parse::Span)]) -> Vec<(rigor_parse::Span, String)> {
+    index.iter().map(|(name, span)| (*span, name.clone())).collect()
+}
+
+/// Drop every write that sits inside a [`StatementsKind::Inert`] carrier (a
+/// `defined?` operand, an `END` / `BEGIN` body): the reference never evaluates
+/// it in sequence, so it neither binds nor widens (rigor-rs#153). With the
+/// entry gone, the construct that holds it widens nothing for it.
+fn drop_inert_writes(ast: &LoweredAst, writes: &mut Vec<(rigor_parse::Span, String)>) {
+    writes.retain(|(span, _)| !ast.in_inert_carrier(*span));
 }
 
 /// Whether a branch body's final statement EXITS the surrounding control flow
@@ -6574,7 +6707,10 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         {
             branch_terminates(ast, body)
         }
-        Node::Statements { body, .. } => branch_terminates(ast, body),
+        // A recovery carrier's children are flattened out of expression
+        // structure (`raise X rescue nil` recovers the `raise` call), so only a
+        // real sequence ends where its last child does.
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => branch_terminates(ast, body),
         _ => false,
     }
 }
@@ -7045,7 +7181,8 @@ fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
             })
             .chain(std::iter::once(else_body.as_slice()))
             .collect(),
-        Node::Loop { body, .. } | Node::Statements { body, .. } => vec![body],
+        Node::Loop { body, .. }
+        | Node::Statements { body, kind: StatementsKind::Sequence, .. } => vec![body],
         Node::BeginRescue { body, ensure_body, clauses, .. } => [body.as_slice(), ensure_body]
             .into_iter()
             .chain(clauses.iter().map(|c| c.body.as_slice()))
@@ -7092,7 +7229,12 @@ fn definitely_assigns(ast: &LoweredAst, id: NodeId, is_target: &dyn Fn(&Node) ->
                         _ => false,
                     }))
         }
-        Node::Statements { body, .. } => body.iter().any(|&s| definitely_assigns(ast, s, is_target)),
+        // Only a real sequence: a write in a `rescue` modifier or another
+        // recovery carrier may be skipped, and one under `defined?` / `END`
+        // never runs in sequence (rigor-rs#153).
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+            body.iter().any(|&s| definitely_assigns(ast, s, is_target))
+        }
         // A clause-less `begin` — which is also the carrier an `if`'s `else`
         // clause lowers to — runs its body to the end.
         Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
@@ -7446,7 +7588,8 @@ const MUTATOR_METHODS: &[&str] = &[
 ///   the enclosing construct; a straight-line mutation is its own containing span
 ///   and widens through the catch-all/`If` arms.
 pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    ast.iter()
+    let mut out: Vec<(rigor_parse::Span, String)> = ast
+        .iter()
         .flat_map(|(_, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
             | Node::LocalVariableOpWrite { name, span, .. } => vec![(*span, name.clone())],
@@ -7463,9 +7606,12 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
                     _ => Vec::new(),
                 }
             }
+            Node::Loop { index, .. } => for_index_rebinds(index),
             _ => Vec::new(),
         })
-        .collect()
+        .collect();
+    drop_inert_writes(ast, &mut out);
+    out
 }
 
 /// Every rebind of a TOP-LEVEL local, span-keyed for [`widen_flow_writes`]: a
@@ -7494,10 +7640,12 @@ fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
             Node::BeginRescue { clauses, .. } => out.extend(
                 clauses.iter().filter_map(|c| c.bound_name.clone().map(|name| (c.span, name))),
             ),
+            Node::Loop { index, .. } => out.extend(for_index_rebinds(index)),
             _ => {}
         }
     }
     out.retain(|(w, _)| !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1));
+    drop_inert_writes(ast, &mut out);
     out
 }
 
@@ -7566,6 +7714,7 @@ fn indexed_flow_writes(
         }
     }
 
+    drop_inert_writes(ast, &mut out);
     out
 }
 
@@ -8342,6 +8491,63 @@ mod tests {
         assert_eq!(get("k", &i), Some(Type::Constant(Scalar::Str("s".into()))));
         assert_eq!(get("r", &i), Some(Type::Constant(Scalar::Str("t".into()))));
         assert_eq!(get("d", &i), Some(Type::Constant(Scalar::Str("s".into()))));
+    }
+
+    /// rigor-rs#151 / #153: a `for` index and a write in a recovery carrier
+    /// widen; a write under `defined?`, `END`, `BEGIN` or `super(…)` neither
+    /// binds nor widens; a `for` whose index is not a local, and a `for` over
+    /// another local, leave the local alone.
+    #[test]
+    fn toplevel_check_env_for_index_and_carrier_writes() {
+        let ast = lower_src(
+            b"f = \"s\"\nfor f in [1]; end\n\
+              a = \"s\"\nb = \"s\"\nfor a, (b, *c) in [[1, [2]]]; end\n\
+              r = \"s\"\n(r = 1) rescue nil\n\
+              d = \"s\"\ndefined?(d = 1)\n\
+              e = \"s\"\nEND { e = 1 }\n\
+              g = \"s\"\nBEGIN { g = 1 }\n\
+              s = \"s\"\nsuper(s = 1)\n\
+              k = \"s\"\nfor i in [1]; end\nfor @k in [1]; end\n",
+        );
+        let mut i = Interner::new();
+        let empty = CoreIndex::new();
+        let env = Typer::new(&empty).build_toplevel_check_env(&ast, &mut i);
+        let get = |name: &str, i: &Interner| env.get(name).map(|&t| i.get(t).clone());
+        let untyped = i.untyped();
+        let s = Some(Type::Constant(Scalar::Str("s".into())));
+        for widened in ["f", "a", "b", "r"] {
+            assert_eq!(env.get(widened), Some(&untyped), "{widened}");
+        }
+        for kept in ["d", "e", "g", "s", "k"] {
+            assert_eq!(get(kept, &i), s, "{kept}");
+        }
+        // The flat env (`type-of`, and the rules' `gate_at`) skips an inert
+        // write too; it still binds a recovery carrier's write as before.
+        let flat = build_toplevel_env(&ast, &mut i);
+        let flat_get = |name: &str, i: &Interner| flat.get(name).map(|&t| i.get(t).clone());
+        for kept in ["d", "e", "g", "s"] {
+            assert_eq!(flat_get(kept, &i), s, "flat {kept}");
+        }
+        assert_eq!(flat_get("r", &i), Some(Type::Constant(Scalar::Int(1))));
+    }
+
+    /// rigor-rs#153: the always-truthy constant propagation folds past a write
+    /// that never runs in sequence, and declines past a conditional one.
+    #[test]
+    fn always_truthy_snapshots_skip_inert_and_widen_recovered_writes() {
+        let empty = CoreIndex::new();
+        let typer = Typer::new(&empty);
+        let fold = |src: &[u8]| {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+            let (&_, &t) = snaps.iter().next().expect("one predicate");
+            i.get(t).clone()
+        };
+        assert_eq!(fold(b"w = 1\nEND { w = nil }\nif w\n  1\nend\n"), Type::Constant(Scalar::Int(1)));
+        assert_eq!(fold(b"w = nil\ndefined?(w = 1)\nif w\n  1\nend\n"), Type::Constant(Scalar::Nil));
+        assert!(matches!(fold(b"w = nil\n(w = 1) rescue nil\nif w\n  1\nend\n"), Type::Dynamic(_)));
+        assert!(matches!(fold(b"w = nil\nfor w in [1]; end\nif w\n  1\nend\n"), Type::Dynamic(_)));
     }
 
     #[test]
@@ -10199,9 +10405,10 @@ mod class_narrowing_tests {
             ("g2", guarded("  super(v.frobnicate_zzz)\n"), Some("String")),
             ("g5", guarded("  v.frobnicate_zzz rescue nil\n"), Some("String")),
             // --- DECLINES (each load-bearing) --------------------------------
-            // f10a: the `for` index rebind is INVISIBLE in the arena and the
-            // reference is SILENT here. This row is why `Loop` bodies are not
-            // descended at all — `Node::Loop` cannot tell `for` from `while`.
+            // f10a: the `for` index rebinds `v` and the reference is SILENT
+            // here. This row is why `Loop` bodies are not descended at all
+            // (`Node::Loop::index` now names the rebind, rigor-rs#151, but the
+            // body descent is a separate slice).
             ("f10a", guarded("  for v in list\n    v.frobnicate_zzz\n  end\n"), None),
             // f10b/d21/g3: `for` with a distinct index, a `while` body and a
             // `break` operand — the reference FIRES on all three; declined as
