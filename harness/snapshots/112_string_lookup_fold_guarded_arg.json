@@ -289,6 +289,13 @@
       "message": "undefined method `frobnicate_f4' for \"a\""
     },
     {
+      "rule": "call.undefined-method",
+      "line": 237,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `frobnicate_p1' for literal-string"
+    },
+    {
       "rule": "flow.always-truthy-condition",
       "line": 63,
       "column": 6,
