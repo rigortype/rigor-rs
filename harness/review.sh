@@ -74,7 +74,9 @@ fi
 # the Opus pass found the message regressions, and Grok found shapes Opus did
 # not probe). Harness, docs and CI changes get the Opus pass alone.
 PASSES=("opus=claude-bridge/claude-opus-5-5:high")
-if [[ $FULL == 1 ]] || git -C "$REPO" diff --name-only "$BASE" "$SHA" | grep -q '^crates/'; then
+# `diff --quiet` rather than `diff --name-only | grep -q`: under pipefail, grep
+# exiting early kills git with SIGPIPE and a large crates/ change read as none.
+if [[ $FULL == 1 ]] || ! git -C "$REPO" diff --quiet "$BASE" "$SHA" -- crates/; then
   PASSES=("grok=xai/grok-4.6:high" "${PASSES[@]}")
 fi
 echo "passes: ${PASSES[*]%%=*}" >&2

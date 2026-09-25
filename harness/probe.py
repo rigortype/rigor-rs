@@ -49,6 +49,7 @@ import subprocess
 import sys
 import tempfile
 
+sys.dont_write_bytecode = True  # importing fp_audit must not litter harness/__pycache__
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import fp_audit  # noqa: E402  (shares binary resolution and the reference paths)
 
@@ -139,7 +140,7 @@ def probe_raw(rs, proj, args, root, ignore_stderr):
     same = all(results["ref"][i] == results["port"][i] for _, i in channels)
     if not same and any(results[e][0] < 0 for e in ("ref", "port")):
         same = "error"  # killed by a signal
-    print(f"{'=' if same else '≠'} rigor {' '.join(args)}  (from {proj})")
+    print(f"{'=' if same is True else '≠'} rigor {' '.join(args)}  (from {proj})")
     for name, i in channels:
         rv, pv = results["ref"][i], results["port"][i]
         if rv == pv:

@@ -79,8 +79,8 @@ budget. CI is the authority for clippy: a newer local clippy disagrees with
 - `cargo build --release` then `python3 harness/fp_audit.py --gaps --sweep`:
   0 FP over the standing set (`harness/sweep-corpora.yml`), about 3 minutes.
   The corpora are local checkouts, so this cannot run in CI. It measures
-  `target/release` and scores a crashing port as `[]`, so a stale binary
-  passes silently.
+  `target/release`, not the debug build `gate.sh` makes, and refuses a release
+  binary older than the crate sources.
 - The review gate, `harness/review.sh N`, about 20 minutes. Both passes for
   a `crates/` change, the Opus pass alone otherwise.
 
