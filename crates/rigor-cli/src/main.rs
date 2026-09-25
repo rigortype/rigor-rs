@@ -267,7 +267,15 @@ fn cmd_check(args: &[String]) -> ExitCode {
 
     // Run the analysis pipeline (config `exclude:`/`disable:` + inline
     // `# rigor:disable` applied). Shared with `baseline generate`.
-    let ref_has_files = reference_has_ruby_files(&cfg, &files);
+    // Issue #129 (ADR-0044 § "Environment-parity gate"): the CLI half of the
+    // gate — every flag one the port parses exactly as the reference does,
+    // the config path the file the reference reads, no baseline in effect
+    // (the reference regroups its output by (file, rule) bin under one, and
+    // matches paths the port renders differently).
+    let ref_has_files = reference_has_ruby_files(&cfg, &files)
+        && conformance_gate::check_args_ok(args)
+        && conformance_gate::config_path_ok(explicit_config.unwrap_or(".rigor.yml"))
+        && resolve_baseline_path(&baseline_arg, &cfg).is_none();
     let (mut findings, had_io_error) =
         analyze_files(&expanded, &cfg, "check", folder_ref, &bleeding_edge, ref_has_files);
 
@@ -1155,7 +1163,7 @@ fn conformance_scan_active(cfg: &Config, root: &Path, ref_has_files: bool) -> bo
     if ["libraries", "bundler", "includes"].iter().any(|k| cfg.declares_key(k)) {
         return false;
     }
-    if root.join(".bundle").join("config").exists() || root.join("vendor").join("bundle").is_dir() {
+    if conformance_gate::bundle_sources_present(root, std::env::var_os("HOME").as_deref()) {
         return false;
     }
     cfg.plugins.iter().all(|p| rigor_index::plugins::bundled_plugin(p).is_some())
@@ -1172,8 +1180,6 @@ fn conformance_rows(
     user_overrides: &[(String, severity::ResolvedSeverity)],
     bleeding_overrides: &[(&str, severity::ResolvedSeverity)],
 ) -> Vec<(usize, String, String, Diagnostic)> {
-    let mut sources: std::collections::HashMap<&'static str, String> =
-        std::collections::HashMap::new();
     let mut rows = Vec::new();
     for f in index.conformance_findings() {
         let resolved = severity::resolve(
@@ -1189,10 +1195,11 @@ fn conformance_rows(
             severity::ResolvedSeverity::Warning => rigor_rules::Severity::Warning,
             severity::ResolvedSeverity::Info => rigor_rules::Severity::Info,
         };
-        let source = sources
-            .entry(f.file)
-            .or_insert_with(|| std::fs::read_to_string(f.file).unwrap_or_default())
-            .clone();
+        // The bytes the index parsed — a re-read could see a file changed
+        // since, and position the row against other text.
+        let Some(source) = index.conformance_source(f.file).map(str::to_string) else {
+            continue;
+        };
         // RBS reports the annotation's column in CHARACTERS (Unicode scalar
         // values: oracle-measured with 2-, 3- and 4-byte characters and a
         // combining mark before it), where `line_col` counts bytes. Shift the

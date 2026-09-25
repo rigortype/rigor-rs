@@ -46,6 +46,15 @@ enum Node {
 /// duplicate keys, a second document — is `None`: the gate cannot prove
 /// what Psych makes of it.
 fn parse_subset(text: &str) -> Option<Vec<(String, Node)>> {
+    // libyaml (Psych) also BREAKS lines on NEL U+0085, LS U+2028 and PS
+    // U+2029 — even inside a comment, so `# note<LS>cache: 5` hides a key
+    // from a `\n`-only reader (oracle: the reference then rejects the
+    // config) — and rejects every non-printable character. The subset is
+    // `\n`, a CR only before it, and printable characters without those
+    // three or a BOM.
+    if !text.chars().all(yaml_char_ok) {
+        return None;
+    }
     let mut lines: Vec<(usize, &str)> = Vec::new();
     for (i, raw) in text.split('\n').enumerate() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -102,6 +111,16 @@ fn parse_subset(text: &str) -> Option<Vec<(String, Node)>> {
         out.push((key.to_string(), node));
     }
     Some(out)
+}
+
+/// A character both YAML readers treat as ordinary text (libyaml's
+/// `is_printable` minus its extra line breaks and the BOM), or `\n` / `\r`.
+fn yaml_char_ok(c: char) -> bool {
+    matches!(c, '\n' | '\r' | ' '..='~')
+        || (c >= '\u{a0}'
+            && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{feff}')
+            && c != '\u{fffe}'
+            && c != '\u{ffff}')
 }
 
 fn block_node(children: &[(usize, &str)]) -> Option<Node> {
@@ -356,6 +375,12 @@ pub(crate) fn signature_entry_ok(entry: &str, base: Option<&Path>) -> bool {
     if entry.starts_with('~') {
         return false;
     }
+    if !spelled_case_is_on_disk(&expand_path(&match base {
+        Some(b) => b.join(entry),
+        None => PathBuf::from(entry),
+    })) {
+        return false;
+    }
     let port_path = match base {
         Some(b) => b.join(entry),
         None => PathBuf::from(entry),
@@ -372,6 +397,115 @@ pub(crate) fn signature_entry_ok(entry: &str, base: Option<&Path>) -> bool {
         };
     }
     true
+}
+
+/// Whether every component of the absolute path `path` that exists is
+/// spelled with its on-disk case. On a case-insensitive volume a
+/// differently-cased spelling reaches the same directory, but Ruby's
+/// `Dir.glob` reports the ON-DISK case of each literal segment where the port
+/// prints the spelled one (oracle: `signature_paths: [Sig]` over `sig/`, a
+/// `--config <D>/CONF/.rigor.yml`, an absolute prefix in another case).
+pub(crate) fn spelled_case_is_on_disk(path: &Path) -> bool {
+    let mut cur = PathBuf::new();
+    for c in path.components() {
+        if let Component::Normal(name) = c {
+            if cur.join(name).symlink_metadata().is_err() {
+                return true; // the rest does not exist: nothing is read there
+            }
+            let Ok(entries) = std::fs::read_dir(&cur) else {
+                return false;
+            };
+            if !entries.flatten().any(|e| e.file_name() == name) {
+                return false;
+            }
+        }
+        cur.push(c.as_os_str());
+    }
+    true
+}
+
+/// Whether the `--config` path names, for the reference, the file the port
+/// reads, in the directory the port resolves against. The reference reads
+/// `File.expand_path(path)`: `~` expanded and `..` folded LEXICALLY, where
+/// the OS follows a symlink before `..` (oracle: `--config <D>/lnk/../x.yml`
+/// read a different file there), and the case of each segment matters (see
+/// [`spelled_case_is_on_disk`]).
+pub(crate) fn config_path_ok(path: &str) -> bool {
+    if path.starts_with('~') || path.starts_with('-') {
+        return false;
+    }
+    let lexical = expand_path(Path::new(path));
+    if !spelled_case_is_on_disk(&lexical) {
+        return false;
+    }
+    if Path::new(path).components().any(|c| c == Component::ParentDir) {
+        return matches!(
+            (std::fs::canonicalize(path), std::fs::canonicalize(&lexical)),
+            (Ok(a), Ok(b)) if a == b
+        );
+    }
+    true
+}
+
+/// Whether every `check` argument that starts with `-` is one the port parses
+/// EXACTLY as the reference's `OptionParser` does. Anything else — an
+/// unknown flag (exit 64 there), an abbreviation (`--basel=…` is
+/// `--baseline=` there), the `--opt=VALUE` spellings the port does not parse
+/// (`--config=PATH`), `--`, a `-file.rb`, a reference-only flag
+/// (`--verify-incremental`, `--workers`) or a port-only one (`--ruby`) — is a
+/// run the port cannot prove it models. Verified against
+/// `lib/rigor/cli/check_command.rb` + `options.rb` at the pin: `--format` and
+/// `--config` take a REQUIRED argument (the separate-word form is accepted),
+/// `--bleeding-edge=[LIST]` takes an OPTIONAL one only in the `=` form.
+pub(crate) fn check_args_ok(args: &[String]) -> bool {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if !a.starts_with('-') {
+            continue;
+        }
+        match a.as_str() {
+            "--format" => {
+                if !it.next().is_some_and(|v| {
+                    matches!(
+                        v.as_str(),
+                        "text" | "json" | "github" | "sarif" | "gitlab" | "checkstyle" | "junit" | "teamcity"
+                    )
+                }) {
+                    return false;
+                }
+            }
+            "--config" => {
+                if !it.next().is_some_and(|v| config_path_ok(v)) {
+                    return false;
+                }
+            }
+            "--no-baseline" | "--bleeding-edge" | "--no-bleeding-edge" => {}
+            // `--bleeding-edge=` (empty) adopts NOTHING there, everything here.
+            other => match other.strip_prefix("--bleeding-edge=") {
+                Some(list) if list.split(',').any(|id| !id.trim().is_empty()) => {}
+                _ => return false,
+            },
+        }
+    }
+    true
+}
+
+/// Whether a bundle-`sig/` discovery source the reference reads is present
+/// (`BundleSigDiscovery.auto_detect`, read at the pin): the project's
+/// `.bundle/config`, a `vendor/bundle/` directory, or the user-GLOBAL
+/// `$HOME/.bundle/config` (its `BUNDLE_PATH` resolves against the project
+/// root; oracle: a global `BUNDLE_PATH` loads that bundle's gem `sig/`).
+/// Bundler's environment variables are not read there. `Dir.home` falls back
+/// to the password database when `HOME` is unset: then the port cannot
+/// check, and the source counts as present.
+pub(crate) fn bundle_sources_present(root: &Path, home: Option<&std::ffi::OsStr>) -> bool {
+    if root.join(".bundle").join("config").exists() || root.join("vendor").join("bundle").is_dir() {
+        return true;
+    }
+    match home {
+        Some(home) if !home.is_empty() => Path::new(home).join(".bundle").join("config").exists(),
+        _ => true,
+    }
 }
 
 /// Ruby's `File.fnmatch?(pattern, path)` with NO flags, over-approximated:
@@ -573,6 +707,75 @@ mod tests {
         assert!(lockfile_ok(&dir));
         std::fs::write(dir.join("Gemfile.lock"), "GIT\n  remote: x\n  specs:\n    activesupport (8)\n\nGEM\n  specs:\n").unwrap();
         assert!(!lockfile_ok(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Round 4, family A: a Unicode line break hides a key from a
+    /// `\n`-only reader; the subset refuses those characters.
+    #[test]
+    fn subset_refuses_unicode_breaks_and_non_printables() {
+        for br in ['\u{85}', '\u{2028}', '\u{2029}', '\u{feff}', '\u{7}'] {
+            let text = format!("signature_paths:\n  - sig\n# note{br}cache: 5\n");
+            assert!(!config_text_ok(&text), "{br:?}");
+        }
+        assert!(config_text_ok("signature_paths:\n  - sig # 日本語のコメント\n"));
+        assert!(!config_text_ok("signature_paths:\r  - sig\n"));
+    }
+
+    /// Round 4, family E: only exact spellings the port parses as the
+    /// reference does.
+    #[test]
+    fn check_args_allow_list() {
+        let ok = |a: &[&str]| check_args_ok(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
+        assert!(ok(&["app.rb", "--format", "json"]));
+        assert!(ok(&["--bleeding-edge", "app.rb", "--no-baseline", "--bleeding-edge=a,b"]));
+        for bad in [
+            &["--config=x.yml", "app.rb"][..],
+            &["--baseline=bl.yml", "app.rb"],
+            &["--bogus", "app.rb"],
+            &["-q", "app.rb"],
+            &["-app.rb"],
+            &["app.rb", "--workers"],
+            &["--no", "app.rb"],
+            &["--basel=bl.yml", "app.rb"],
+            &["--verify-incremental", "app.rb"],
+            &["--", "app.rb"],
+            &["--bleeding-edge=", "app.rb"],
+            &["--ruby", "off", "app.rb"],
+            &["--format", "yaml"],
+            &["--config", "~/x.yml"],
+        ] {
+            assert!(!ok(bad), "{bad:?}");
+        }
+    }
+
+    /// Round 4, family B: the user-global `$HOME/.bundle/config` is a
+    /// bundle-`sig/` source upstream.
+    #[test]
+    fn global_bundle_config_counts() {
+        let dir = std::env::temp_dir().join(format!("rigor_gate_bundle_{}", std::process::id()));
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join(".bundle")).unwrap();
+        let h = Some(home.as_os_str());
+        assert!(!bundle_sources_present(&dir, h));
+        std::fs::write(home.join(".bundle/config"), "---\nBUNDLE_PATH: \"vendor/gems\"\n").unwrap();
+        assert!(bundle_sources_present(&dir, h));
+        assert!(bundle_sources_present(&dir.join("x"), None));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Round 4, family G: a spelling whose case differs from the on-disk
+    /// name (only observable on a case-insensitive volume).
+    #[test]
+    fn case_mismatch_is_detected_where_the_volume_folds_case() {
+        let dir = std::env::temp_dir().join(format!("rigor_gate_case_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sig")).unwrap();
+        let dir = std::fs::canonicalize(&dir).unwrap();
+        assert!(spelled_case_is_on_disk(&dir.join("sig")));
+        assert!(spelled_case_is_on_disk(&dir.join("nope/deeper")));
+        if dir.join("SIG").exists() {
+            assert!(!spelled_case_is_on_disk(&dir.join("SIG")));
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

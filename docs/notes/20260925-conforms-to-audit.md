@@ -246,3 +246,125 @@ loaded as a project signature path upstream but as a plugin here. `exclude:`
 matching also differs: the reference uses `File.fnmatch?` with no flags and
 does not appear to apply `exclude:` to explicit file arguments; the port
 uses `glob::Pattern` on every file. That last point was read, not probed.
+
+## Fourth round: the CLI, the baseline and the host
+
+A third independent review (`rv4/c0`–`c16`, 217 projects) found no
+false positive from the build model. It found 10 families that reached the
+scan through the environment, the config text or the CLI:
+
+| family | what the reference does | port before |
+|---|---|---|
+| A. NEL / LS / PS in `.rigor.yml` | libyaml breaks lines on them, even inside a comment: `# note<LS>cache: 5` is a `cache: 5` it rejects | the `\n`-only subset reader saw one comment |
+| B. `$HOME/.bundle/config` | `BundleSigDiscovery.auto_detect` step 3 loads the global `BUNDLE_PATH`'s gem `sig/` | not read |
+| C. `--config <D>/lnk/../conf.yml`, `--config '~/x.yml'` | `File.expand_path`: `..` folded lexically, `~` expanded | the OS path |
+| D. a baseline | regroups output by (file, rule) bin; message-mode baselines use folded scalars; `../` paths for a sig dir outside the cwd | order, parse and path differences |
+| E. unparsed flags | unknown flags and `-file.rb` exit 64; abbreviations (`--basel=`); `--config=PATH`, `--baseline=PATH`, `--`, `--verify-incremental`, a trailing `--workers` | taken as paths |
+| G. case-insensitive volume | `Dir.glob` reports the on-disk case of literal segments | the spelled case |
+| (concern) non-UTF-8 entry names | seen by Ruby's glob | skipped |
+| (concern) row offsets | against the parsed text | a re-read of the file |
+| I. rbs-inline in the reference's Ruby | folds inline `#:` signatures into the class | not modelled (accepted) |
+| J. newer default-library gems on `GEM_PATH` | their `sig/` replaces rbs's stdlib copy | not modelled (accepted) |
+
+**Fix.** Each family A–G became a gate clause (ADR-0044 § "Environment-parity
+gate", round-4 rows):
+- A: the config must contain only characters both YAML readers treat as
+  text;
+- B: no bundle source, the global config included;
+- C: the config path passes the `~` / lexical-`..` / case checks;
+- D: no baseline in effect;
+- E: every dash argument is on an allow-list of spellings verified against
+  `check_command.rb`'s `OptionParser`;
+- G: every existing path component (signature paths, config path, absolute
+  prefix) is spelled as on disk.
+
+In the index, a non-UTF-8 name under a sig dir stands the scan down, and
+rows are positioned against the text the index parsed. I and J are
+recorded as accepted divergences in the ADR, with their reproducers.
+
+### Tallies (release build, one fresh cwd per project, `--no-cache`)
+
+| probe set | projects | identical | same rows, other diffs | gap-only | exit code only | port-only |
+|---|---|---|---|---|---|---|
+| rv4 `c0`–`c16` | 217 | 120 | 35 | 59 | — | 3 (the accepted I/J reproducers only) |
+| rv3 `b1`–`b15` + `fuzz` seed 1 | 320 | 179 | 63 | 78 | — | 0 |
+| rv3 `fuzz` seeds 2–11 | 400 | 173 | 159 | 68 | — | 0 |
+| first-round `probes1`–`8`, `/tmp/rv150`, `al/q1`–`q7` | 239 | 128 | — | 105 | 6 | 0 |
+
+- Every rv4 port-only or order-differing project that is not an I/J
+  reproducer is now silent or identical: 45 of 48, the other 3 being those
+  reproducers. That is 26 same-rows, 5 identical and 14 gaps. No common row
+  changed order anywhere.
+- `probes7.rb`'s `w_realistic` (3 rows) and fixture 112 (8 rows) are
+  identical.
+- The six exit-code differences carry no port row and are the ones round 3
+  listed.
+- Cost this round: 32 former agreements became gaps.
+  - rv4 (30):
+    - the three `effects:` keys behind an LS / NEL / PS comment;
+    - ten baseline probes (reference-generated rule baseline, Ruby-regex
+      message rows);
+    - 15 CLI-flag probes (reference-only flags, `=` forms);
+    - `--no-basel`;
+    - `g_nfc_quoted` (an NFC spelling of an NFD directory).
+  - Elsewhere (2): `b3_bad_baseline` and `f_baseline` (baselines).
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | 1,349 passed, 0 failed, 1 ignored |
+| clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 112 8/8 MATCHED |
+| `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps |
+| `conformance_load_set.rb --check` | OK, 897 names |
+
+### Consolidated follow-ups: divergences that also affect OTHER rules (rounds 2–4)
+
+None is fixed here. The `conforms-to` scan stands down on each; every other
+rule still runs through them.
+
+1. **CLI parsing.** The port takes every unrecognised argument as a path:
+   unknown flags and `-file.rb` (exit 64 there), `OptionParser`
+   abbreviations (`--basel=` = `--baseline=`, `--no-basel`), the `=` forms
+   `--config=PATH` / `--baseline=PATH` / `--format=json`, `--`, a trailing
+   `--workers`, the reference-only flags (`--workers`, `--incremental`,
+   `--verify-incremental`, `--explain`, `--no-cache`, `--fail-on`,
+   `--treat-all-as-inline-rbs`, `--tmp-file` / `--instead-of`, …) and the
+   port-only `--ruby` / `--no-ruby` (unknown there).
+2. **Config YAML dialect.** YAML 1.1 (Psych) against 1.2 (`serde_yaml`):
+   bare `on` / `off` / `yes` / `no`, `1_0`, `3.3e0`, dates (Psych
+   `DisallowedClass`), symbols, aliases, NEL / LS / PS line breaks,
+   duplicate keys.
+3. **Config validation.** The reference rejects values the port accepts
+   (exit 64 / 1, no rows): an unknown `severity_profile` or override value,
+   `parallel.workers < 0`, bogus `plugins_isolation`, a non-mapping `cache`
+   or `dependencies`, an unsupported or malformed `target_ruby` (a lone
+   `configuration-error` there). The port reads some values it does not
+   reject differently: a scalar `signature_paths: sig`, a bare plugin id.
+4. **Config paths.** `paths:`, `pre_eval`, `plugins_io.allowed_paths` and
+   `includes` resolve against the config file's directory upstream and the
+   cwd here. `~` is expanded upstream. `..` folds lexically upstream, in
+   signature paths AND in the `--config` path. `.rigor.dist.yml` is not
+   discovered.
+5. **Glob and filesystem semantics.** Glob metacharacters in a signature
+   path (project root included) are interpreted upstream. On a
+   case-insensitive volume the reference renders on-disk case, and NFC/NFD
+   spellings of a name differ (`g_nfc_quoted`). The port skipped non-UTF-8
+   names. `exclude:` is `File.fnmatch?` with no flags upstream, and was not
+   read as applying to explicit file arguments there (read, not probed);
+   the port uses `glob::Pattern` on every file.
+6. **Project RBS the port does not read as the reference does.** `use`
+   directives (stubs included), `resolve-type-names`, non-ASCII identifiers
+   (`ruby-rbs` 0.3.0 rejects them and the file drops for every rule), NUL
+   bytes (a crash there).
+7. **Load set and bundler.** The rbs collection skip list
+   (`DEFAULT_LIBRARIES` + vendored gem names) is not applied. GIT / PATH
+   lockfile sources don't select overlays. The Gemfile.lock overlay is a
+   signature path upstream and a plugin here. The deferred plugin arity
+   stand-down is missing in the main index. `$HOME/.bundle/config`
+   `BUNDLE_PATH` is not read.
+8. **Baseline.** Output order under a non-empty baseline (the reference
+   regroups by (file, rule) bin); reference-generated message-mode baselines
+   (folded double-quoted scalars) don't parse; `../` relative paths for a
+   file outside the cwd; Ruby-only regex syntax in message rows.
+9. **Host dependence** (accepted in the ADR): rbs-inline in the reference's
+   Ruby, and default-library gem versions on `GEM_PATH`.

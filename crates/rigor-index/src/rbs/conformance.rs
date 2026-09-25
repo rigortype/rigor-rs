@@ -352,6 +352,9 @@ pub(super) struct ConformanceBuilder {
     walks: usize,
     /// The source text being walked (for header argument spellings).
     code: String,
+    /// The exact text of every project file carrying an annotation: rows are
+    /// positioned against THESE bytes, never a re-read of the file.
+    sources: HashMap<&'static str, String>,
     first_seen: HashMap<&'static str, (Seen, Origin)>,
     annotations: Vec<AnnotationRecord>,
 }
@@ -378,6 +381,7 @@ pub(super) struct ConformanceData {
     pub(super) maybe_synthetic: HashSet<&'static str>,
     pub(super) crash_risk: bool,
     pub(super) blocked: bool,
+    pub(super) sources: HashMap<&'static str, String>,
     /// Annotations in the reference's `env.class_decls` order, restricted to
     /// classes first declared in a (non-quarantined) project file.
     pub(super) annotations: Vec<AnnotationRecord>,
@@ -736,6 +740,9 @@ impl ConformanceBuilder {
         };
         for a in annotations.iter() {
             if let Node::Annotation(an) = a {
+                if !self.sources.contains_key(file) {
+                    self.sources.insert(file, self.code.clone());
+                }
                 let loc = an.location();
                 self.annotations.push(AnnotationRecord {
                     class: q,
@@ -1129,6 +1136,7 @@ impl ConformanceBuilder {
             maybe_synthetic,
             crash_risk: self.crash_risk,
             blocked: self.blocked,
+            sources: self.sources,
             constants,
             globals,
             annotations,
@@ -1144,6 +1152,13 @@ impl CoreData {
     #[must_use]
     pub fn conformance_findings(&self) -> Vec<ConformanceFinding> {
         closure::findings(&self.conformance)
+    }
+
+    /// The text of a project signature file exactly as the index parsed it,
+    /// for positioning a [`ConformanceFinding`] in `file`.
+    #[must_use]
+    pub fn conformance_source(&self, file: &str) -> Option<&str> {
+        self.conformance.sources.get(file).map(String::as_str)
     }
 
     /// The port's side of `harness/conformance_load_set.rb` (read through the

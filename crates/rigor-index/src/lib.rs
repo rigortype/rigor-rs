@@ -159,6 +159,12 @@ impl CoreIndex {
         self.data.conformance_findings()
     }
 
+    /// The text of a project signature file exactly as the index parsed it
+    /// (issue #129: conformance rows are positioned against these bytes).
+    pub fn conformance_source(&self, file: &str) -> Option<&str> {
+        self.data.conformance_source(file)
+    }
+
     /// How many distinct classes the loaded RBS surface registered — a coarse
     /// coverage signal reported by `rigor doctor`.
     pub fn class_count(&self) -> usize {

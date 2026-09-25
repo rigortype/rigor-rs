@@ -187,7 +187,14 @@ means no conformance row at all for the run.
 | no `rbs_collection.lock.yaml` and no discovered collection dir | the reference skips collection gems named in `DEFAULT_LIBRARIES` or vendored (`json`, `redis`, `prism`, `rbs`, …); the skip list is not modelled |
 | a `Gemfile.lock` has only `GEM` / `PLATFORMS` / `DEPENDENCIES` / `RUBY VERSION` / `BUNDLED WITH` / `CHECKSUMS` sections | Bundler reads a `GIT` / `PATH` gem as locked and loads its overlay; the port reads `GEM` only |
 | every project `.rbs` is readable, parses with the port's parser, and holds no NUL byte, no directive and no `resolve-type-names` comment (index side) | `ruby-rbs` 0.3.0 rejects non-ASCII identifiers rbs 4.2 accepts, and the file used to be dropped silently; a NUL crashes the reference; `use Foo::_Bar as _Baz` stubs `Foo::_Bar` in EVERY file; the magic comment is read Ruby-side only |
-| (kept) `signature_paths:` configured and non-empty, `target_ruby` accepted, no `.bundle/config` or `vendor/bundle/`, only bundled plugins, no `prepend` of an interface | rounds 1 and 2 |
+| (kept) `signature_paths:` configured and non-empty, `target_ruby` accepted, only bundled plugins, no `prepend` of an interface | rounds 1 and 2 |
+| (round 4) the config text has no NEL / LS / PS / BOM and no non-printable character | libyaml breaks lines on NEL, LS and PS even inside a comment: `# note<LS>cache: 5` hid a key the reference then rejected |
+| (round 4) no bundle-`sig/` source: the project's `.bundle/config`, a `vendor/bundle/` directory, or the user-global `$HOME/.bundle/config` (an unset `HOME` counts as present) | `BundleSigDiscovery.auto_detect` step 3 reads the global `BUNDLE_PATH` against the project root and loads its gems' `sig/` |
+| (round 4) every `check` argument starting with `-` is on an allow-list of spellings the port parses exactly as `OptionParser` does: `--format <fmt>`, `--config <path>`, `--no-baseline`, `--bleeding-edge`, `--no-bleeding-edge`, `--bleeding-edge=<non-empty list>` | the port took everything else as a path: unknown flags and `-file.rb` exit 64 there, `--basel=` is an abbreviation of `--baseline=`, `--config=PATH` / `--baseline=PATH` / `--verify-incremental` / `--` / a trailing `--workers` behave otherwise |
+| (round 4) no baseline in effect (`baseline:` or `--baseline`; `--no-baseline` clears it) | under a baseline the reference regroups its output by (file, rule) bin, a reference-generated message-mode baseline uses folded double-quoted scalars the port cannot read, and `../` relative paths for a signature dir outside the cwd are rendered differently |
+| (round 4) the config path: no leading `~`, a `..` only where the lexical fold (`File.expand_path`) names the file the OS reaches | `--config <D>/lnk/../conf.yml` and `--config '~/proj.yml'` read another file upstream |
+| (round 4) every existing component of the config path and of each signature path (absolute prefix included) is spelled with its on-disk case (and normalization) | on a case-insensitive volume Ruby's `Dir.glob` reports the on-disk case of literal segments (`signature_paths: [Sig]` over `sig/`, `--config <D>/CONF/…`) |
+| (round 4, index side) no non-UTF-8 entry name under a signature dir, and rows positioned against the bytes the index parsed (not a re-read) | the port's walk skipped such names while Ruby's glob sees them |
 
 **The config subset.** `conformance_gate.rs` parses the file itself: top-level
 `key: scalar`, `key: []` / `{}`, or ONE level of block sequence or mapping,
@@ -241,6 +248,26 @@ port used to agree on became gaps:
 
 Ordinary projects keep their rows: `probes7.rb`'s `w_realistic` (3 rows) and
 fixture 112 (8 rows) are identical. The sweep is configless and unchanged.
+
+### Accepted divergences (host-dependent, recorded with their reproducers)
+
+Two environment inputs are not gated, because the reference picks them up
+from the host Ruby it runs on, and the gate cannot inspect that Ruby. Both
+are the same class as the load-set list and `UNBUILDABLE_DEFINITIONS`:
+properties of the host's installed gems. They are visible here, and the
+rv4 probes reproduce them:
+
+- **rbs-inline in the reference's Ruby** (`rv4/c10.rb`, `i_405_inline_def`).
+  On this host Ruby 4.0.5 has `rbs-inline-0.14.0` and the harness Ruby 4.0.6
+  does not. Under 4.0.5 the reference folds `#: () -> bool` on a Ruby `def`
+  into the class and drops the member from the row; the port reports it.
+  This extends the rbs-inline entry under "Scope boundaries" below.
+- **Newer DEFAULT_LIBRARIES gem versions on `GEM_PATH`** (`rv4/c11.rb`,
+  `j_newer_gem_iface`, `j_newer_gem_object_member`). A newer `mutex_m`
+  (any default library shipping its own `sig/`) is preferred over rbs's
+  stdlib copy. Its signatures can declare an interface or reopen `Object`,
+  which moves both rows. `harness/conformance_load_set.rb --check` catches
+  this for the gate host's own gem set, not for another host's.
 
 ### Scope boundaries
 
@@ -375,3 +402,19 @@ unregistered (fixture 112 8/8); `fp_audit.py --gaps --sweep` 0 FP / 9,337
 files / 3,829 gaps; `conformance_load_set.rb --check` OK. The divergences
 these families expose for OTHER rules are listed in the audit note as
 follow-ups.
+
+### Fourth round: the CLI, the baseline and the host (2026-09-25, same pin and host)
+
+The fourth review found no false positive from the build model, and 10
+families through the environment, the config text or the CLI:
+- Unicode line breaks in YAML;
+- the global bundle config;
+- the config path (`~`, symlink + `..`);
+- baselines;
+- CLI flags the port does not parse (including `--opt=VALUE`);
+- case-insensitive volumes;
+- plus rbs-inline and host gem versions (accepted above).
+
+The gate gained the round-4 clauses in the table above. Measured outcome
+and the new costs: [`docs/notes/20260925-conforms-to-audit.md`](../notes/20260925-conforms-to-audit.md)
+§ "Fourth round".

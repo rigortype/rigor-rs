@@ -428,6 +428,26 @@ fn unprovable_project_files_stand_the_scan_down() {
     }
 }
 
+/// Round 4: a non-UTF-8 entry name under a signature dir is skipped by the
+/// port's walk but seen by Ruby's glob — the scan stands down; and a row is
+/// positioned against the text the index parsed.
+#[cfg(unix)]
+#[test]
+fn non_utf8_names_stand_down_and_sources_are_kept() {
+    use std::os::unix::ffi::OsStrExt;
+    let gate = "interface _Cl\n  def close: () -> void\nend\n%a{rigor:v1:conforms-to _Cl}\nclass Gate\nend\n";
+    let (data, dir) = project(&[("a.rbs", gate)]);
+    let found = data.conformance_findings();
+    assert_eq!(found.len(), 1);
+    assert_eq!(data.conformance_source(found[0].file), Some(gate));
+    let odd = std::ffi::OsStr::from_bytes(b"\xff.rbs");
+    if std::fs::write(dir.join("sig").join(odd), "class X\nend\n").is_ok() {
+        let again = CoreData::load_for_project(&[], &[dir.join("sig")]);
+        assert!(again.conformance_findings().is_empty());
+    }
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// Round 3, family 6: a bundled plugin's `sig/` is DEFERRED upstream and
 /// dropped whole when one of its classes clashes in arity with that class's
 /// FIRST declaration — bundled, else the first project one. The port used to

@@ -4215,7 +4215,10 @@ fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_d
                 continue;
             }
             let mut found = Vec::new();
-            glob_rbs(dir, &mut found);
+            if !glob_rbs(dir, &mut found) {
+                // A name the port cannot read as UTF-8: Ruby's glob sees it.
+                builder.conformance.block();
+            }
             for f in found {
                 // A file both a `signature_paths:` dir and a collection reach
                 // counts as the project's.
@@ -4260,13 +4263,18 @@ fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_d
 /// symlink, a dangling link, even a directory — the caller's read skips the
 /// unreadable ones). On a case-insensitive volume Ruby folds case, so
 /// `b.RBS` matches there and only there.
-fn glob_rbs(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+///
+/// Returns `false` when an entry's name is not UTF-8 (skipped here, seen by
+/// Ruby), so the caller can stand the `conforms-to` scan down.
+fn glob_rbs(dir: &std::path::Path, out: &mut Vec<PathBuf>) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return true;
     };
+    let mut clean = true;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
+            clean = false;
             continue;
         };
         if name.starts_with('.') {
@@ -4277,9 +4285,10 @@ fn glob_rbs(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
             out.push(path.clone());
         }
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            glob_rbs(&path, out);
+            clean &= glob_rbs(&path, out);
         }
     }
+    clean
 }
 
 /// Whether `*.rbs` matches the entry `name` in `dir` (see [`glob_rbs`]).
