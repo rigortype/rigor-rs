@@ -1,9 +1,13 @@
 # Continuous integration: build + test on every push and pull request.
 #
-# This gates the checks that run WITHOUT the reference Ruby implementation —
-# `cargo build` and `cargo test`. The differential parity harnesses
-# (`harness/run.rb`, `harness/run_corpus.rb`) need the reference checkout and
-# real corpora and so stay a LOCAL pre-merge gate, not a CI job.
+# This gates build, test, clippy and fixture parity on every push to a draft
+# PR, so an agent pushes and keeps working instead of running them locally
+# (AGENTS.md → Gates). Fixture parity is split in two reference-free/port-free
+# halves that together equal `harness/run.rb`: `parity` compares the port with
+# the committed snapshots, and `reference-snapshots` checks those snapshots
+# against the live reference at the pinned submodule. The FP sweep
+# (`harness/fp_audit.py --sweep`) needs machine-local corpora and stays a
+# LOCAL pre-ready gate.
 #
 # rustfmt is intentionally not enforced (the codebase is hand-formatted; a
 # recorded decision — see docs/adr/0032-source-formatting-policy.md and the
@@ -63,8 +67,10 @@ jobs:
       # Blocking: the workspace is clippy-clean, so `-D warnings` fails CI on any
       # new finding. `clippy.toml` holds the suggestion-MSRV at 1.85 (below the
       # 1.88 build floor) so clippy never proposes let-chain rewrites of our code.
+      # --all-targets: tests and benches are linted too, so no local fresh-target
+      # clippy run is needed before pushing.
       - name: Clippy
-        run: cargo clippy --workspace --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   # Snapshot-mode parity gate (ADR-0002, §14 quality-management track c).
   #
@@ -101,3 +107,34 @@ jobs:
       # reference, runs the binary, fails on any unregistered false positive.
       - name: Snapshot parity gate
         run: ruby harness/run_snapshot.rb
+
+  # The committed snapshots must still be what the live reference says, at the
+  # pinned submodule. Together with `parity` this is `harness/run.rb`, split so
+  # neither half needs the other's toolchain: this job runs the reference only
+  # (no Rust build). It fails when a fixture was added or the pin moved without
+  # `ruby harness/snapshot.rb` being re-run.
+  reference-snapshots:
+    name: snapshots match the live reference
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # The reference requires Ruby 4.0 (its Gemfile: ">= 4.0.0", "< 4.1").
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      # The harness runs the reference with plain `ruby -I`, not Bundler, so its
+      # runtime gems go in the global gem dir, at the versions its lockfile pins.
+      - name: Install the reference's runtime gems
+        run: |
+          for g in prism rbs language_server-protocol; do
+            v=$(sed -n "s/^    $g (\\(.*\\))$/\\1/p" reference/rigor/Gemfile.lock)
+            test -n "$v" || { echo "no $g pin in reference/rigor/Gemfile.lock"; exit 1; }
+            gem install --no-document "$g:$v"
+          done
+
+      - name: Snapshots are current
+        run: ruby harness/snapshot.rb --check

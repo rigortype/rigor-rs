@@ -1,145 +1,162 @@
 # AGENTS.md
 
-## Agent skills
+rigor-rs is a faithful Rust port of the Ruby reference (`reference/rigor`, a
+pinned submodule). **The reference is the oracle.** For any behaviour, read the
+reference source AND probe the oracle; never reconstruct semantics from memory.
 
-### Issue tracker
+## Where things live
 
-Issues live in GitHub Issues (via the `gh` CLI); external PRs are also a triage surface. See `docs/agents/issue-tracker.md`.
+- **Issues** (GitHub, `gh` CLI; external PRs are also a triage surface):
+  `docs/agents/issue-tracker.md`. Triage labels: `docs/agents/triage-labels.md`.
+- **Domain language + decisions**: `CONTEXT.md`, `docs/adr/`
+  (`docs/agents/domain.md`).
+- **Oracle invocation + pin bumps**: `UPSTREAM.md`. Read its three "Oracle
+  invocation hazard" sections before your first probe.
+- **What to pull next**: `docs/CURRENT_WORK.md` (the baton). Subsystem map:
+  `docs/PORT_BACKLOG.md`. Measured outcomes: `docs/notes/`.
 
-### Triage labels
+## Work loop (one issue → one PR)
 
-The five canonical triage roles use their default label strings (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`). See `docs/agents/triage-labels.md`.
+Async agents share one GitHub account, so the claim protocol below is the only
+thing that stops two agents taking the same issue.
 
-### Domain docs
+1. **Pick.** An open `ready-for-agent` issue without `in-progress` and without
+   a linked open PR:
+   `gh issue list --label ready-for-agent --search '-label:in-progress'`, then
+   `gh issue view N --json closedByPullRequestsReferences`. The agent brief
+   comment on the issue is the contract; the body is context.
+2. **Claim.** `gh issue edit N --add-label in-progress`, then comment
+   `Claimed: branch claude/issue-N-<slug>`. Re-read the comments: if an earlier
+   claim exists with no abandon comment after it, the earlier one wins. Remove
+   your comment and return to step 1.
+3. **Branch.** A fresh worktree on `claude/issue-N-<slug>` cut from
+   `origin/master`.
+4. **Investigate.** Read the reference code path, probe both engines on the
+   brief's rows (see *Probing*), and confirm the claim reproduces on master
+   before writing code.
+5. **Open the draft early.** After the first commit, push with an explicit
+   refspec: `git push origin HEAD:refs/heads/claude/issue-N-<slug>`.
+   `push.default = tracking` sends a bare `git push -u` to **master**. Then run
+   `gh pr create --draft` with `Closes #N` in the body, and remove
+   `in-progress`. From here the draft PR is the in-flight state.
+6. **Implement, push, keep going.** Run `harness/gate.sh` before each push,
+   push, and read CI with `gh pr checks` while you work on (see *Gates*).
+   Record the measured outcome in the PR body: the probe tables and the gate
+   numbers.
+7. **Review, then ready.** Once CI is green on the final head, run the
+   pre-ready gates, then get the review (`docs/agents/review.md`), whose
+   reviewers re-probe the parity claims themselves. Only on `Approved` run
+   `gh pr ready`. A non-draft PR means "reviewed, mergeable".
+8. **Fold after merge.** Write the detail into a dated `docs/notes/` file or
+   an ADR, then add one ledger line to `docs/CURRENT_WORK.md`.
 
-Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+**Abandoning a claim:** remove `in-progress`, and comment on the issue with what
+you learned and the branch holding any work worth keeping. The ADR or issue text
+is the durable record; a branch alone is not.
 
-## Working discipline (hard-won; 2026-07-06 session)
+## Gates
 
-These are load-bearing lessons paid for in this codebase — violating them wastes a
-session. Read before doing coverage/parity or productization work.
+Three tiers, cheapest first. Run each bare and read its exit code: a pipe
+(`| tail -1`) reports the last command's status, and a `grep` count misses
+clippy's ANSI-coloured lines. Both have let a failing gate through.
 
-### Measure before you build; never ship a speculative slice
+**Every push (local, under a minute): `harness/gate.sh`.** It runs
+`docs_check.py`, `cargo test -p` for each crate the branch changed, and
+`run_snapshot.rb` (0 unregistered FP). Alongside it, run **fresh-dir parity
+probes** (`harness/probe.py`) on every row the change touches, plus
+**must-still-fire controls**. A suppression is only proven when a nearby row
+still fires.
 
-- **The zero-FP bar is measured against the oracle, not argued.** A slice is
-  gated by `harness/run.rb` + `harness/run_snapshot.rb` (fixtures, 0 unregistered
-  FP) AND `python3 harness/fp_audit.py --gaps --sweep` — the STANDING sweep set
-  (`harness/sweep-corpora.yml`), not a hand-typed directory list. The hand-typed
-  version drifted and left 24 FPs unmeasured; `--sweep` is why that cannot
-  recur. Neither tool sees project-`sig/` behaviour (both run core+stdlib only) —
-  probe that with a hand-built project.
-- **Do NOT build a coverage slice without a valid-mode `fp_audit --gaps` count
-  predicting it closes gaps.** Three consecutive FP-safe flow slices closed 0
-  survey gaps this session (shape `Type::Tuple`, project-method nilable-return) —
-  each correct, each paying nothing, because the real gaps are all deep clusters.
-  See [[possible-nil-fold-gated]] memory + `docs/notes/20260706-flow-frontier-exhausted.md`.
-- The flow frontier (possible-nil / always-truthy) has **no cheap FP-safe wins
-  left**; the residual is param-dependent return typing, ActiveSupport RBS,
-  project-class arms, ivar whole-class flow, loop narrowing — each a deep,
-  opt-in, ADR-backed, one-at-a-time effort. **Default new work to
-  productization**, which has demonstrably higher ROI (directory support,
-  config `paths:`, the ADR-22 baseline subcommands all landed clean).
+**Every push (CI on the draft, about 6 minutes, `gh pr checks`).** Workspace
+tests on Linux and macOS; `cargo clippy --workspace --all-targets -- -D
+warnings` on the pinned 1.88 toolchain; `run_snapshot.rb`; `snapshot.rb
+--check` against the live reference (the two together are `run.rb`); the docs
+budget. CI is the authority for clippy: a newer local clippy disagrees with
+1.88 (e.g. `only_used_in_recursion`).
 
-### Measurement is treacherous — three artifacts burned this session
+**Once, before ready (local).**
+- `cargo build --release` then `python3 harness/fp_audit.py --gaps --sweep`:
+  0 FP over the standing set (`harness/sweep-corpora.yml`), about 3 minutes.
+  The corpora are local checkouts, so this cannot run in CI. It measures
+  `target/release`, not the debug build `gate.sh` makes, and refuses a release
+  binary older than the crate sources.
+- The review (`docs/agents/review.md`).
 
-Ad-hoc measurement lied three times; always distrust a surprising number until
-the harness reproduces it:
+What the gates cannot see, so probe it by hand:
 
-1. **Invocation mode.** `rigor check <dir>` did nothing before ADR-0040 (errored
-   on a directory), so every "dir-mode rigor-rs" number was 0-because-nothing-ran,
-   NOT leniency. The valid gate (`fp_audit.py`) passes explicit **file lists**.
-2. **Reference on-disk cache.** The reference has a `.rigor/cache` that returns
-   **stale cross-path results** in the same cwd. Use a **FRESH scratch dir per
-   probe scenario** (or `rm -rf .rigor` between edits). A "reference is buggy"
-   finding was 100% cache pollution once.
-3. **Shell quoting / evaluation order.** `find … | check $FILES` collapsed a
-   newline list into one arg; `$(pwd)` evaluated *inside* a `cd` subshell resolved
-   the reference path wrong (LoadError → empty output → false "identical"). Fix
-   the harness, re-run, before believing a diff.
+- **Project `sig/`**: the harness and the sweep run core+stdlib only. Probe
+  a small project with `harness/probe.py --dir`.
+- **Message drift**: the harness keys on (rule, line, col). Diff the full
+  tuple, message included.
+- **Retractions**: a site the reference stops flagging is invisible to the
+  snapshot diff. Only the sweep sees it.
+- **Source the fixtures cannot hold**: the fixtures are small, well-formed,
+  all-ASCII files. They cannot contain a multi-byte character left of a
+  token, a syntax error, or a name that driver code and a later `def` share.
+  After a change to scoping, positions or lowering, also run `fp_audit.py` on
+  the survey corpora (`harness/README.md`).
 
-### Generative-tool parity: track the reference's endpoint, don't encode its gaps
+## Probing
 
-`check` is a DIAGNOSTIC tool → strict zero-FP subset (never emit a diagnostic the
-reference doesn't). `sig-gen` (and future GENERATIVE tools that produce code/RBS,
-not bug reports) obey a DIFFERENT bar, decided 2026-07-10 on the
-minimize-long-term-divergence criterion:
+- **Probe with `harness/probe.py`**:
+  - `-e 'SRC'` / `-f FILE` compare `check` diagnostics as full tuples plus the
+    exit code.
+  - `--dir PROJ -e 'SRC'` runs the same inside a copy of a project, for
+    project `sig/` and `.rigor.yml`.
+  - `--dir PROJ -- ARGS` compares any subcommand's stdout, stderr and exit
+    code: CLI, config, baseline and output formats. Channels are a contract:
+    baseline `generate` writes to stderr, `drift` to stdout.
 
-- **Emit wherever rigor-rs's SOUND inference yields a concrete type. The one hard
-  guarantee is byte-identity on the methods BOTH tools emit** (verified vs the
-  oracle). The emitted SETS may differ by inference precision.
-- Where rigor-rs is LESS precise (Dynamic where the reference pins) it emits fewer
-  (a coverage gap). Where rigor-rs is MORE precise/robust (the reference's
-  inference degrades to `untyped`/nil — `%i[]`, string-interpolation returns,
-  project-class `.new`, recursion) it emits a SOUND signature the reference skips.
-  **That excess is coverage, NOT a false positive** — a generative tool's extra
-  *correct* output is not a false bug report.
-- **Do NOT add guards that suppress rigor-rs's sound extra precision just to match
-  the reference's CURRENT inference gaps.** Those gaps are transient — the
-  reference trends toward MORE precision (its own ADR-48/55/56/57), so it will
-  CONVERGE toward rigor-rs's output. Encoding a gap as a guard is anti-convergence:
-  when the reference improves, rigor-rs lags and the guard must be removed. That
-  MAXIMIZES eventual divergence — the opposite of the goal — and the gap set is
-  open-ended (unenumerable), so the guards are fragile whack-a-mole.
-- Add a guard ONLY to (1) fix rigor-rs UNSOUNDNESS (a wrong signature — a
-  constructor `initialize` typed as its body); (2) match a reference PERMANENT
-  design decision, not a gap (`initialize -> void`, `dynamic_top?`'s `untyped`
-  skip); or (3) avoid a WRONG emit from a rigor-rs LIMITATION not yet ported (a
-  bare generic nominal the reference *elaborates* to `Array[untyped]` — skip until
-  `TypeElaborator` lands, else the emit byte-diverges on a shared method).
-- **The deepest divergence reducer is porting the reference's inference faithfully
-  at the source** (e.g. `DefReturnTyper`'s explicit-`return` union) so the SETS
-  converge — prefer that over per-case output guards.
-- **Keep divergence VISIBLE**: a differential audit surfaces over-emissions for
-  human adjudication (sound-extra = accept, unsound = fix at the root).
+  It gives each engine a fresh cwd, pins the checkout plugin, passes
+  `--no-cache` to the reference only, and refuses a stale port binary. Each of
+  those has produced a false result in a hand-rolled loop.
+- By hand, the oracle command is
+  `ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib reference/rigor/exe/rigor check --no-cache …`,
+  run from a fresh cwd with explicit file lists.
+- Distrust a surprising number until the harness reproduces it. The audit
+  harness itself has been wrong.
+- **Measure before you build.** A coverage slice needs a `fp_audit --gaps`
+  count predicting that it closes gaps. FP-safe flow slices have repeatedly
+  closed 0 gaps (`docs/notes/20260706-flow-frontier-exhausted.md`). Predict by
+  type, not text: a call chain dies at its first unresolved link, so the
+  method named near a gap's column is often not the one to fix. Build the
+  slice on a scratch branch and diff the gap set.
 
-### Faithful port: read the reference, don't guess
+## Parity bars
 
-- rigor-rs is a faithful Rust port of the Ruby reference (`reference/rigor`,
-  pinned submodule). For any behavior, **read the reference source AND probe the
-  oracle empirically** — do not reconstruct semantics from memory. The reference
-  is the oracle; match it (fix upstream only if a behavior is genuinely
-  unreasonable — verified reasonable every time this session).
-- Probe both tools: `ruby -I reference/rigor/lib reference/rigor/exe/rigor check …`
-  vs `target/release/rigor check …`, comparing **stdout + stderr + exit code**
-  (channels are a contract; e.g. baseline `generate` writes to stderr, `drift` to
-  stdout).
+- **`check` is diagnostic**: a strict zero-FP subset of the reference. Never
+  emit a diagnostic the reference doesn't. Declining (a coverage loss) is always
+  the safe side.
+- **`sig-gen` and other generative tools**: byte-identity on the methods BOTH
+  tools emit. Where the port's sound inference is more precise than the
+  reference's current gaps, the extra signature is coverage, not an FP. Add a
+  guard only to fix port unsoundness, to match a permanent reference design
+  decision, or to skip an emit the port cannot yet elaborate. Prefer porting the
+  reference's inference at the source over per-case output guards; the
+  reference converges toward more precision.
 
-### Delegation protocol (main = design/coordinate/audit; subagents = investigate/implement)
+## Orchestrating subagents
 
-When splitting work to subagents:
-- **Investigate with Sonnet** (read reference + oracle probes → a precise data
-  report). Run **two independent investigations** where stakes are high; agreement
-  is cross-validation. Warn every investigator about the cache-pollution trap.
-- **Implement with Opus** on a NEW branch from a spec that names the
-  誤実装しやすい pitfalls explicitly. Require gates in the prompt: full tests +
-  clippy + both harnesses + **fresh-dir E2E parity probes** vs the reference.
-  **Run clippy as `cargo +1.88.0 clippy --workspace --locked -- -D warnings`** —
-  CI pins that toolchain (`dtolnay/rust-toolchain@1.88`) and a newer local
-  clippy is not a substitute: 1.88 flags `only_used_in_recursion` on a `self`
-  that only the recursive call uses, 1.95 does not, and the difference took a
-  green local run to a red CI one.
-- **Open PRs as DRAFT** (`gh pr create --draft`); `gh pr ready` only once the
-  audit below passes. A non-draft PR means "reviewed, mergeable" — nothing else.
-  Push with an explicit refspec (`git push origin HEAD:refs/heads/<branch>`):
-  this repo's `push.default = tracking` + a branch cut from `origin/master`
-  resolves a bare `git push -u` to **master** (it happened, unreviewed, once).
-- **Audit before merge, always.** Re-run gates yourself, review the diff scope,
-  and **byte-verify the subagent's parity claims with your own probes** — the
-  implementer may resolve a spec-vs-oracle conflict toward the oracle (correct)
-  but you confirm it; and your *audit harness itself* can be buggy (see artifact
-  #3) — a broken audit nearly rejected a correct implementation this session.
-- Preserve deferred-but-built work on its branch and point the ADR at it (e.g.
-  `tier-bc-nilable-return` holds the FP-safe-but-0-gap piece A). Branches are
-  local until a remote exists — the ADR text is the durable record.
+- Claude Code subagents run on Opus 5.5 for every role: investigation,
+  implementation and review. Leave `model` unset so they inherit the session
+  model. Where the stakes are high, run two independent investigations.
+- An implementer works in an isolated worktree, from a spec that names the
+  likely mis-implementations and requires the full *Gates* list. It may
+  resolve a spec-vs-oracle conflict toward the oracle; the review confirms it.
+- Reviewers from other agents are Grok 4.6 and Opus 5.5, both at `high`,
+  run together (`docs/agents/review.md`).
+- A new worktree starts with an empty `reference/rigor`. Populate it with
+  `git submodule update --init reference/rigor`, which reads the main
+  checkout's module store at the pin. Never point `REFERENCE_RIGOR_DIR` at
+  another checkout (UPSTREAM.md hazard 3).
+- To wait for a long run, have its command write a marker file and poll that
+  file, or wait on its PID. Two `pgrep -f` waiters match each other's command
+  lines and never exit.
 
-### ADR / doc hygiene
+## Docs hygiene
 
-- Record hard-to-reverse + surprising + real-tradeoff decisions as ADRs; record
-  a slice's MEASURED outcome (even "0 gaps, deferred") in the ADR, not just the
-  plan. Audit findings get absorbed into the ADR + a dated note in `docs/notes/`.
-- `docs/CURRENT_WORK.md` is the session-to-session baton: Now/Next on top, and
-  a landed/closed arc gets ONE ledger line (verdict + numbers + link) — write
-  the detail into a dated `docs/notes/` file or ADR FIRST, then fold. No status
-  essays; the subsystem map lives in `docs/PORT_BACKLOG.md`. Budgets are
-  mechanical: `python3 harness/docs_check.py` (CI `docs` job) — hand-pruning
-  alone does not hold (issue #21; upstream rigor#119 measured the same ratchet).
+- Record hard-to-reverse, surprising, real-tradeoff decisions as ADRs, with
+  the slice's **measured** outcome (even "0 gaps, deferred").
+- `docs/CURRENT_WORK.md` holds Now/Next plus one ledger line per closed arc.
+  Byte budgets are enforced by `harness/docs_check.py`.
+- Small doc-only changes go straight to master; code goes through a PR.

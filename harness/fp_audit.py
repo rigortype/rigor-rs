@@ -251,7 +251,8 @@ def run_ref(files):
     # results across invocations — surviving even a submodule pin bump.
     ref_plugin = os.path.join(REF_DIR, "plugins", "rigor-rbs-inline", "lib")
     with tempfile.TemporaryDirectory(prefix="rigor-fp-audit-ref") as tmpcwd:
-        r = subprocess.run(["ruby", "-I", REF_LIB, "-I", ref_plugin,
+        # -E UTF-8: see harness/lib.rb; String#inspect in messages depends on it.
+        r = subprocess.run(["ruby", "-E", "UTF-8", "-I", REF_LIB, "-I", ref_plugin,
                             REF_EXE, "check", "--format", "json", "--no-cache"]
                            + files,
                            capture_output=True, text=True, cwd=tmpcwd)

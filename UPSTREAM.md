@@ -210,8 +210,8 @@ ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
   reference/rigor/exe/rigor check <path>
 ```
 
-`harness/lib.rb` and `harness/fp_audit.py` do this unconditionally. Ad-hoc
-probes must too.
+`harness/lib.rb`, `harness/fp_audit.py`, `harness/probe.py` and
+`harness/run_corpus.rb` do this unconditionally. Ad-hoc probes must too.
 
 **Status (verified at the `v0.3.4` pin on 2026-08-26; the mechanism is unchanged
 at `v0.3.9`, where the same defensive `-I` is still passed):** upstream
