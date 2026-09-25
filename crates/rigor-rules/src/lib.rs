@@ -1523,6 +1523,52 @@ fn check_call(
         });
     }
 
+    // Union receiver — the join a rescue/`for` write leaves (`w = "s"; (w = 1)
+    // rescue nil` types `w` to `"s" | 1`, rigor-rs#167). The reference
+    // witnesses only a HETEROGENEOUS union whose every member resolves to a
+    // known surface that lacks the method: `"s" | 1` fires `for "s" | 1`,
+    // while `w.upcase` on it stays silent (String has it). A homogeneous
+    // union (`5 | 6`, `"a" | "b"`), a `nil` member (the
+    // `possible-nil-receiver` rule's territory), a `Dynamic`/`Top` member (it
+    // may answer anything), and an unresolvable member all stay silent.
+    if let Type::Union(members) = interner.get(recv_ty) {
+        let members = members.clone();
+        let mut class_names: Vec<&str> = Vec::new();
+        for m in &members {
+            let name = union_member_class_name(interner, index, typer.source(), *m)?;
+            class_names.push(name);
+        }
+        class_names.sort_unstable();
+        class_names.dedup();
+        if class_names.len() < 2 {
+            return None;
+        }
+        for name in &class_names {
+            if !index.knows_class(name)
+                || index.class_has_method(name, method)
+                || unenumerable_instance_receiver(index, name)
+                || typer.source().project_declares_method(name, method)
+            {
+                return None;
+            }
+        }
+        let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
+        let message = format!("undefined method `{method}' for {receiver_render}");
+        let severity = catalog(CALL_UNDEFINED_METHOD)
+            .map(|e| e.default_severity)
+            .unwrap_or(Severity::Error);
+        return Some(Diagnostic {
+            rule_id: CALL_UNDEFINED_METHOD,
+            start_offset: message_span.0,
+            end_offset: message_span.1,
+            message,
+            severity,
+            source_family: "builtin",
+            receiver_type: Some(receiver_render),
+            method_name: Some(method.to_string()),
+        });
+    }
+
     // RBS-known class instance carried by a source-registry `Nominal` that
     // `class_name_of` (core-id only) will not resolve — recover the name from
     // the source registry and witness when the loaded RBS models the class
@@ -3426,6 +3472,30 @@ fn ivar_write_mismatch_diagnostics(
 /// core RBS index then the project `sig/` registry. Presentation, not contract
 /// (ADR-0030); the harness keys diagnostics on `(rule, line, column)`, so the
 /// spelling never affects the zero-FP invariant.
+/// The class name a UNION member brings to the `check_call` union arm, or
+/// `None` when the member cannot offer a witnessable surface — a `nil`
+/// member (`possible-nil-receiver` owns those), `Dynamic`/`Top`/`Bottom`, a
+/// `Singleton`, or a nested union. `Constant` members name their scalar's
+/// class, `Tuple`/`HashShape` erase to `Array`/`Hash`, a `Nominal` resolves
+/// through the core then the source registry.
+fn union_member_class_name<'a>(
+    interner: &Interner,
+    index: &'a CoreIndex,
+    source: &'a rigor_infer::SourceIndex,
+    ty: rigor_types::TypeId,
+) -> Option<&'a str> {
+    match interner.get(ty) {
+        Type::Constant(Scalar::Nil) => None,
+        Type::Constant(s) => Some(rigor_infer::folding::scalar_class(s)),
+        Type::Nominal { class, .. } => index
+            .class_name_for_id(*class)
+            .or_else(|| source.class_name_for_id(*class)),
+        Type::Tuple(_) => Some("Array"),
+        Type::HashShape(_) => Some("Hash"),
+        _ => None,
+    }
+}
+
 fn render_receiver(
     interner: &Interner,
     index: &CoreIndex,

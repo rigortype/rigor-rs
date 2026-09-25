@@ -47,7 +47,7 @@ pub use rbs::{
 // the carrier for nominal round-tripping in the current slice (ADR-0004). It is
 // the surface the inference engine mints `Nominal { class }` ids against, so it
 // only lists the concrete value classes a return type can resolve TO.
-const CORE_CLASSES: [&str; 9] = [
+const CORE_CLASSES: [&str; 10] = [
     "String",
     "Integer",
     "Float",
@@ -57,6 +57,10 @@ const CORE_CLASSES: [&str; 9] = [
     "NilClass",
     "TrueClass",
     "FalseClass",
+    // The abstract numeric supertype — the reference reads it for a folded
+    // numeric op whose result is not pinned to a concrete class (`5 % 0.0`
+    // declines to `Numeric`). Appended last so existing ClassIds are stable.
+    "Numeric",
 ];
 
 /// A real, RBS-backed core index. For each loaded class it holds the resolved

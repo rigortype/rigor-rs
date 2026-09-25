@@ -367,7 +367,17 @@ fn named_float(f: f64) -> String {
 /// Ruby's `to_s` byte-for-byte. Non-finite inputs (`NaN`/`±Infinity`) fall to
 /// Rust's spelling; callers that fold must guard those out separately.
 pub fn ruby_float_to_s(f: f64) -> String {
-    if f.is_finite() && f == f.trunc() {
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    if f == f.trunc() {
         format!("{f:.1}")
     } else {
         f.to_string()
