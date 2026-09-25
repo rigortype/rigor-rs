@@ -262,3 +262,16 @@ eight classes behind issue #106's live over-claim
 ([note](../docs/notes/20260826-s106-posture-over-fix.md)) and touched two of the
 72 vendored mutator selectors
 ([note](../docs/notes/20260826-s110-mutator-corpus.md)).
+
+## Ad-hoc probes and the review gate
+
+`probe.py` runs one input on both engines, each in a fresh cwd. It compares
+`check` diagnostics as full tuples (`-e`, `-f`, optionally inside a copy of a
+project with `--dir`), or the raw stdout, stderr and exit code of any
+subcommand (`--dir PROJ -- ARGS`). It shares `fp_audit.py`'s binary resolution
+and reference paths, so it refuses a stale `target/release` build the same way.
+It exits 1 on any difference.
+
+`review.sh <PR>` runs the review gate (`docs/agents/review.md`): it builds the
+PR head once in a worktree and runs the two `pi` reviewer passes there in
+parallel.

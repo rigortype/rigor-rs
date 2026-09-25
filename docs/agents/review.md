@@ -16,23 +16,21 @@ merges.
 The two external passes run on every PR as independent reviews. Neither sees
 the other's output, and **both must return `Approved`**. A `Needs fix` from
 either sends the PR back to the implementer, and both passes run again on the
-new head.
+new head. The two catch different things: on PR #154, Grok approved while Opus
+found six message regressions the PR text denied.
 
 ```bash
-pi -p --model xai/grok-4.6:high --exclude-tools edit,write --append-system-prompt docs/agents/review.md "Review PR #N at head <sha>."
+harness/review.sh <PR number>
 ```
 
-```bash
-pi -p --model claude-bridge/claude-opus-5-5:high --exclude-tools edit,write --append-system-prompt docs/agents/review.md "Review PR #N at head <sha>."
-```
+It builds the PR head once in a worktree, starts both passes there at once
+(`pi -p`, read-only tools, this checkout's copy of this file as the appended
+prompt), and prints each verdict. A pass takes about 15 minutes. Both ids are
+subscription-backed. If either stops resolving (`pi --list-models grok-4.6`),
+report `Blocked — need human`. Neither a pay-per-use provider route nor a
+cheaper model stands in for it.
 
-`pi` loads `AGENTS.md` itself; `--exclude-tools edit,write` keeps the pass
-read-only. Both ids are subscription-backed. If
-either stops resolving (`pi --list-models grok-4.6`), report
-`Blocked — need human`. Neither a pay-per-use provider route nor a cheaper
-model stands in for it.
-
-A pass takes about 15 minutes, so start both at once. `claude-bridge` runs the
+`claude-bridge` runs the
 Claude Code bundled in its own `@anthropic-ai/claude-agent-sdk`, not the one on
 `PATH`. A `400 … does not support this model` means that bundle is too old.
 `pi update --extensions` leaves it pinned, so update it directly with
@@ -52,19 +50,25 @@ Claude Code bundled in its own `@anthropic-ai/claude-agent-sdk`, not the one on
 - **Counterexamples.** Construct shapes the PR does not test: other receivers,
   argument shapes, value edges, project `sig/`. A green gate is not evidence
   for a shape the gate cannot see.
+- **Negative claims.** Every "no regression", "identical" or "no new key" in
+  the PR body or its note needs a probe that could have falsified it. A
+  same-key message change is the usual miss: the (rule, line, col) gates and
+  the sweep diff both pass it.
 - **Scope.** The diff delivers the brief and nothing outside it.
 
 ## Output
 
-End with exactly one verdict:
+Report the verdict, and make the report's **last line** exactly one of
+`Verdict: Approved`, `Verdict: Needs fix` or `Verdict: Blocked — need human`
+(`harness/review.sh` reads that line and nothing else).
 
-- `Approved`, followed by:
+- `Approved` comes with:
   1. **a PR body revision draft**: title, summary, probe tables and gate
      numbers rewritten so every claim matches the diff, with `Closes #N` only
      when the brief is fully delivered (`Refs #N` otherwise);
   2. **suggested PR comments** for what the body cannot carry (caveats,
      non-goals, follow-ups), or `[]`.
-- `Needs fix`, followed by a checklist the implementer can act on. Each item
+- `Needs fix` comes with a checklist the implementer can act on. Each item
   carries its counterexample: input, expected (reference) output, actual (port)
   output.
 

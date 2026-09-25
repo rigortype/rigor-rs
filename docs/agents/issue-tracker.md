@@ -10,6 +10,7 @@ Issues and PRDs for this repo live as GitHub issues. Use the `gh` CLI for all op
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`
+- **Link a PR to its issue**: put `Closes #<number>` in the PR body (`Refs #<number>` when the PR delivers only part of the brief). `gh issue view <number> --json closedByPullRequestsReferences` finds the PR only through that line, and the claim protocol in `AGENTS.md` relies on it.
 
 Infer the repo from `git remote -v` — `gh` does this automatically when run inside a clone. The `origin` remote is `git@github.com:rigortype/rigor-rs.git` (published).
 

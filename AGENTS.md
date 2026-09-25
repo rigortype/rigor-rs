@@ -42,8 +42,9 @@ thing that stops two agents taking the same issue.
 6. **Implement until every gate is green** (see *Gates*). Record the measured
    outcome in the PR body: the probe tables and the gate numbers.
 7. **Review, then ready.** The orchestrator (or maintainer) re-runs the
-   gates and gets `Approved` from the review gate (`docs/agents/review.md`),
-   whose passes re-probe the parity claims themselves. Only then
+   gates and gets `Approved` from the review gate (`harness/review.sh N`;
+   contract in `docs/agents/review.md`), whose passes re-probe the parity
+   claims themselves. Only then
    `gh pr ready`. A non-draft PR means "reviewed, mergeable".
 8. **Fold after merge.** Write the detail into a dated `docs/notes/` file or
    an ADR, then add one ledger line to `docs/CURRENT_WORK.md`.
@@ -68,14 +69,14 @@ Clippy's ANSI-coloured lines defeat a line count.
   `target/release` and scores a crashing port as `[]`, so a stale binary
   passes silently.
 - `python3 harness/docs_check.py` whenever docs change (CI `docs` job).
-- **Fresh-dir parity probes** on every row the change touches, plus
-  **must-still-fire controls**. A suppression is only proven when a nearby
-  row still fires.
+- **Fresh-dir parity probes** (`harness/probe.py`) on every row the change
+  touches, plus **must-still-fire controls**. A suppression is only proven
+  when a nearby row still fires.
 
 What the gates cannot see, so probe it by hand:
 
-- **Project `sig/`**: the harness and the sweep run core+stdlib only. Build a
-  small project.
+- **Project `sig/`**: the harness and the sweep run core+stdlib only. Probe
+  a small project with `harness/probe.py --dir`.
 - **Message drift**: the harness keys on (rule, line, col). Diff the full
   tuple, message included.
 - **Retractions**: a site the reference stops flagging is invisible to the
@@ -83,15 +84,21 @@ What the gates cannot see, so probe it by hand:
 
 ## Probing
 
-- Compare **stdout + stderr + exit code**. Channels are a contract: baseline
-  `generate` writes to stderr, `drift` to stdout.
-- Oracle command, with the checkout plugin pinned:
-  `ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib reference/rigor/exe/rigor check --no-cache …`.
-  Use a **fresh cwd per probe**: the reference's `.rigor/cache` serves stale
-  cross-path results.
-- Pass explicit file lists. A newline list collapsed into one argument, or a
-  `$(pwd)` evaluated inside a `cd` subshell, has produced a false "identical"
-  before.
+- **Probe with `harness/probe.py`**:
+  - `-e 'SRC'` / `-f FILE` compare `check` diagnostics as full tuples plus the
+    exit code.
+  - `--dir PROJ -e 'SRC'` runs the same inside a copy of a project, for
+    project `sig/` and `.rigor.yml`.
+  - `--dir PROJ -- ARGS` compares any subcommand's stdout, stderr and exit
+    code: CLI, config, baseline and output formats. Channels are a contract:
+    baseline `generate` writes to stderr, `drift` to stdout.
+
+  It gives each engine a fresh cwd, pins the checkout plugin, passes
+  `--no-cache` to the reference only, and refuses a stale port binary. Each of
+  those has produced a false result in a hand-rolled loop.
+- By hand, the oracle command is
+  `ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib reference/rigor/exe/rigor check --no-cache …`,
+  run from a fresh cwd with explicit file lists.
 - Distrust a surprising number until the harness reproduces it. The audit
   harness itself has been wrong.
 - **Measure before you build.** A coverage slice needs a `fp_audit --gaps`
