@@ -200,6 +200,7 @@ def run_reference_batch(file_map, tmpdir_with_files)
     # all .rb files recursively.
     cmd = [
       "ruby",
+      "-E", "UTF-8", # see harness/lib.rb: messages inspect strings
       "-I", REFERENCE_LIB,
       REFERENCE_EXE,
       "check",

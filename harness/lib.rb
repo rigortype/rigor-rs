@@ -308,6 +308,12 @@ module RigorHarness
 
       cmd = [
         "ruby",
+        # The reference renders string receivers with `String#inspect`, which
+        # escapes non-ASCII (`"ex\u00E4mple"`) when Ruby's default external
+        # encoding is not UTF-8 (an unset LANG) and prints it raw (`"exämple"`)
+        # under a UTF-8 locale. Pin UTF-8 so a snapshot does not depend on the
+        # host locale; fp_audit.py and probe.py pin it too.
+        "-E", "UTF-8",
         "-I", REFERENCE_LIB,
         # Pin the CHECKOUT's bundled rigor-rbs-inline onto the load path
         # UNCONDITIONALLY (upstream issue #194): the ADR-93 auto-wire

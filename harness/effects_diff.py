@@ -261,7 +261,7 @@ def run_ref(project):
     ref_plugin = os.path.join(REF_DIR, "plugins", "rigor-rbs-inline", "lib")
     _clear_ref_cache(project)
     try:
-        r = subprocess.run(["ruby", "-I", REF_LIB, "-I", ref_plugin,
+        r = subprocess.run(["ruby", "-E", "UTF-8", "-I", REF_LIB, "-I", ref_plugin,
                             REF_EXE, "effects", "--full", "--format=json"],
                            capture_output=True, text=True, cwd=project,
                            stdin=subprocess.DEVNULL)
@@ -793,7 +793,7 @@ def run_ref_update(project, full=False):
     """
     ref_plugin = os.path.join(REF_DIR, "plugins", "rigor-rbs-inline", "lib")
     target = os.path.join(project, project_snapshot_path(project))
-    argv = ["ruby", "-I", REF_LIB, "-I", ref_plugin, REF_EXE, "effects", "update"]
+    argv = ["ruby", "-E", "UTF-8", "-I", REF_LIB, "-I", ref_plugin, REF_EXE, "effects", "update"]
     if full:
         argv.append("--full")
     with _preserving(target):

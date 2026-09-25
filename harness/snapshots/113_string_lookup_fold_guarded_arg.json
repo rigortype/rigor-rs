@@ -195,7 +195,7 @@
       "line": 88,
       "column": 22,
       "severity": "error",
-      "message": "undefined method `frobnicate_d4' for \"\\u00E9\""
+      "message": "undefined method `frobnicate_d4' for \"é\""
     },
     {
       "rule": "call.undefined-method",

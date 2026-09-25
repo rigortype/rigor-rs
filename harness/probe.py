@@ -64,7 +64,10 @@ def ref_cmd(args):
     args = list(args)
     if args and args[0] == "check" and "--no-cache" not in args:
         args.insert(1, "--no-cache")
-    return ["ruby", "-I", fp_audit.REF_LIB, "-I", REF_PLUGIN, fp_audit.REF_EXE] + args
+    # -E UTF-8 as harness/lib.rb: messages inspect strings, and an unset LANG
+    # would escape their non-ASCII.
+    return ["ruby", "-E", "UTF-8", "-I", fp_audit.REF_LIB, "-I", REF_PLUGIN,
+            fp_audit.REF_EXE] + args
 
 
 def run(cmd, cwd):
