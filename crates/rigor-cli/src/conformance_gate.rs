@@ -61,17 +61,17 @@ fn parse_subset(text: &str) -> Option<Vec<(String, Node)>> {
         if line.contains('\t') || line.contains('\r') {
             return None;
         }
-        let trimmed = line.trim_start();
+        let trimmed = line.trim_start_matches(' ');
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if i == 0 && line.trim_end() == "---" && lines.is_empty() {
+        if i == 0 && line.trim_end_matches(' ') == "---" && lines.is_empty() {
             continue;
         }
         if line.starts_with("---") || line.starts_with("...") {
             return None;
         }
-        lines.push((line.len() - trimmed.len(), line.trim_end()));
+        lines.push((line.len() - trimmed.len(), line.trim_end_matches(' ')));
     }
     let mut out: Vec<(String, Node)> = Vec::new();
     let mut i = 0;
@@ -93,7 +93,7 @@ fn parse_subset(text: &str) -> Option<Vec<(String, Node)>> {
             return None;
         }
         i += 1;
-        let rest = strip_comment(rest.trim());
+        let rest = strip_comment(rest.trim_matches(' '));
         let node = if rest.is_empty() {
             let mut children: Vec<(usize, &str)> = Vec::new();
             while i < lines.len() && (lines[i].0 > 0 || lines[i].1.starts_with('-')) {
@@ -130,11 +130,11 @@ fn block_node(children: &[(usize, &str)]) -> Option<Node> {
     if children.iter().any(|&(ind, _)| ind != indent) {
         return None;
     }
-    if first.trim_start().starts_with('-') {
+    if first.trim_start_matches(' ').starts_with('-') {
         let mut items = Vec::new();
         for &(_, line) in children {
-            let item = line.trim_start().strip_prefix("- ")?;
-            items.push(scalar(strip_comment(item.trim()))?);
+            let item = line.trim_start_matches(' ').strip_prefix("- ")?;
+            items.push(scalar(strip_comment(item.trim_matches(' ')))?);
         }
         return Some(Node::Seq(items));
     }
@@ -143,8 +143,8 @@ fn block_node(children: &[(usize, &str)]) -> Option<Node> {
     }
     let mut entries: Vec<(Scalar, Scalar)> = Vec::new();
     for &(_, line) in children {
-        let (k, v) = split_map_entry(line.trim_start())?;
-        let v = strip_comment(v.trim());
+        let (k, v) = split_map_entry(line.trim_start_matches(' '))?;
+        let v = strip_comment(v.trim_matches(' '));
         if v.is_empty() || entries.iter().any(|(ek, _)| ek.text == k.text) {
             return None;
         }
@@ -178,7 +178,7 @@ fn strip_comment(s: &str) -> &str {
             Some(q) if c == q => quote = None,
             Some(_) => {}
             None if (c == '"' || c == '\'') && i == 0 => quote = Some(c),
-            None if c == '#' && prev_space => return s[..i].trim_end(),
+            None if c == '#' && prev_space => return s[..i].trim_end_matches(' '),
             None => {}
         }
         prev_space = c == ' ';
@@ -189,7 +189,7 @@ fn strip_comment(s: &str) -> &str {
 /// One scalar in the subset: a quoted string without escapes or embedded
 /// quotes, or a plain scalar that does not open with a YAML indicator.
 fn scalar(s: &str) -> Option<Scalar> {
-    let s = s.trim();
+    let s = s.trim_matches(' ');
     if let Some(q) = s.chars().next().filter(|c| *c == '"' || *c == '\'') {
         let inner = s.strip_prefix(q)?.strip_suffix(q)?;
         if inner.contains(q) || inner.contains('\\') {
@@ -409,8 +409,11 @@ pub(crate) fn spelled_case_is_on_disk(path: &Path) -> bool {
     let mut cur = PathBuf::new();
     for c in path.components() {
         if let Component::Normal(name) = c {
-            if cur.join(name).symlink_metadata().is_err() {
-                return true; // the rest does not exist: nothing is read there
+            match cur.join(name).symlink_metadata() {
+                Ok(_) => {}
+                // The rest does not exist: nothing is read there.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => return false,
             }
             let Ok(entries) = std::fs::read_dir(&cur) else {
                 return false;
@@ -505,6 +508,25 @@ pub(crate) fn bundle_sources_present(root: &Path, home: Option<&std::ffi::OsStr>
     match home {
         Some(home) if !home.is_empty() => Path::new(home).join(".bundle").join("config").exists(),
         _ => true,
+    }
+}
+
+/// Whether the process environment is one the reference runs in as the port
+/// models (rv5, oracle-measured): `POSIXLY_CORRECT` present (even empty)
+/// makes Ruby's `OptionParser` stop at the first non-option, so a later
+/// `--config` becomes a path there; a `RIGOR_RACTOR_WORKERS` that is not a
+/// plain decimal crashes the run (`Integer("abc")`, `"2x"`, `"1.5"`). The
+/// accepted value is conservative: digits only.
+pub(crate) fn process_env_ok(
+    posixly_correct: Option<&std::ffi::OsStr>,
+    ractor_workers: Option<&std::ffi::OsStr>,
+) -> bool {
+    if posixly_correct.is_some() {
+        return false;
+    }
+    match ractor_workers {
+        None => true,
+        Some(v) => v.to_str().is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())),
     }
 }
 
@@ -777,6 +799,27 @@ mod tests {
             assert!(!spelled_case_is_on_disk(&dir.join("SIG")));
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Round 5: `POSIXLY_CORRECT` (any value) and a non-decimal
+    /// `RIGOR_RACTOR_WORKERS` stand the scan down.
+    #[test]
+    fn process_environment() {
+        use std::ffi::OsStr;
+        assert!(process_env_ok(None, None));
+        assert!(process_env_ok(None, Some(OsStr::new("4"))));
+        assert!(!process_env_ok(Some(OsStr::new("")), None));
+        for bad in ["abc", "2x", "1.5", "", " 2", "0x2", "-1"] {
+            assert!(!process_env_ok(None, Some(OsStr::new(bad))), "{bad:?}");
+        }
+    }
+
+    /// Round 5: indentation and trailing space are ASCII space only (a
+    /// U+00A0 stays part of a plain scalar in libyaml).
+    #[test]
+    fn subset_trims_ascii_space_only() {
+        assert!(!config_text_ok("signature_paths:\n\u{3000}- sig\n"));
+        assert!(!config_text_ok("signature_paths:\n  - sig\u{a0}\n"));
     }
 
     #[test]

@@ -195,6 +195,10 @@ means no conformance row at all for the run.
 | (round 4) the config path: no leading `~`, a `..` only where the lexical fold (`File.expand_path`) names the file the OS reaches | `--config <D>/lnk/../conf.yml` and `--config '~/proj.yml'` read another file upstream |
 | (round 4) every existing component of the config path and of each signature path (absolute prefix included) is spelled with its on-disk case (and normalization) | on a case-insensitive volume Ruby's `Dir.glob` reports the on-disk case of literal segments (`signature_paths: [Sig]` over `sig/`, `--config <D>/CONF/…`) |
 | (round 4, index side) no non-UTF-8 entry name under a signature dir, and rows positioned against the bytes the index parsed (not a re-read) | the port's walk skipped such names while Ruby's glob sees them |
+| (round 5) the scan runs for `check` only: `diff`, `triage` and `baseline generate` / `regenerate` / `drift` / `prune` never carry a conformance row. There is ONE gate function (`conformance_scan_active`, reached only through `analyze_files` with verb `check`) and no bypass | those subcommands have their own option parsers upstream (`--config=` forms, `POSIXLY_CORRECT`, unknown flags), which the gate does not model |
+| (round 5) no `POSIXLY_CORRECT` in the environment (any value, even empty) | Ruby's `OptionParser` then stops at the first non-option, so a later `--config` is a path there |
+| (round 5) `RIGOR_RACTOR_WORKERS` unset or plain decimal digits | `Integer("abc")`, `"2x"`, `"1.5"` crash the run (exit 1) |
+| (round 5, index side) every project signature path is valid UTF-8 as a whole (a component ABOVE the sig dir included) | the lossy key used to drop the file silently (Linux) |
 
 **The config subset.** `conformance_gate.rs` parses the file itself: top-level
 `key: scalar`, `key: []` / `{}`, or ONE level of block sequence or mapping,
@@ -268,6 +272,15 @@ rv4 probes reproduce them:
   stdlib copy. Its signatures can declare an interface or reopen `Object`,
   which moves both rows. `harness/conformance_load_set.rb --check` catches
   this for the gate host's own gem set, not for another host's.
+
+**Environments where the reference cannot start** (rv5 `d5.rb` / `d2.rb`:
+`i_disable_gems` with `RUBYOPT=--disable-gems`, `i_gem_path_empty` with an
+empty `GEM_PATH`, `i_rubyopt_rbundler_setup` with `RUBYOPT=-rbundler/setup`,
+`i_ruby_box_no_ruby` with `RUBY_BOX=1`, `g_lc_all_posix_ext` with
+`RUBYOPT=-Eascii-8bit:ascii-8bit`). The reference process dies before it
+reads anything. These are properties of the Ruby interpreter's
+environment, which the port does not run; the port's rows are what a
+working reference would print.
 
 ### Scope boundaries
 
@@ -418,3 +431,17 @@ families through the environment, the config text or the CLI:
 The gate gained the round-4 clauses in the table above. Measured outcome
 and the new costs: [`docs/notes/20260925-conforms-to-audit.md`](../notes/20260925-conforms-to-audit.md)
 § "Fourth round".
+
+### Fifth round: subcommands and the process environment (2026-09-25, same pin and host)
+
+A fourth review of the delta found that the round-4 clauses held, and
+found four small families:
+- `POSIXLY_CORRECT`;
+- the non-`check` subcommands bypassing the CLI half of the gate;
+- a non-decimal `RIGOR_RACTOR_WORKERS`;
+- non-UTF-8 components above a sig dir.
+
+Each is now a gate clause (the round-5 rows above). The config reader
+trims ASCII spaces only, and a path-case check that fails for any reason
+other than "not found" stands the scan down. Outcome:
+[`docs/notes/20260925-conforms-to-audit.md`](../notes/20260925-conforms-to-audit.md) § "Fifth round".

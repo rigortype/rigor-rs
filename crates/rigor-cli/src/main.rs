@@ -275,7 +275,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let ref_has_files = reference_has_ruby_files(&cfg, &files)
         && conformance_gate::check_args_ok(args)
         && conformance_gate::config_path_ok(explicit_config.unwrap_or(".rigor.yml"))
-        && resolve_baseline_path(&baseline_arg, &cfg).is_none();
+        && resolve_baseline_path(&baseline_arg, &cfg).is_none()
+        && conformance_gate::process_env_ok(
+            std::env::var_os("POSIXLY_CORRECT").as_deref(),
+            std::env::var_os("RIGOR_RACTOR_WORKERS").as_deref(),
+        );
     let (mut findings, had_io_error) =
         analyze_files(&expanded, &cfg, "check", folder_ref, &bleeding_edge, ref_has_files);
 
@@ -1074,7 +1078,10 @@ fn analyze_files(
     // annotation in the project `.rbs`, re-stamped by the severity profile but
     // NOT filtered by `disable:` (its `disable:` filter only sees per-file rows;
     // oracle-measured, `disable: [all]` leaves both rows standing).
-    if conformance_scan_active(cfg, root, ref_has_files) {
+    // Round 5: the scan runs for `check` ONLY. `diff`, `triage` and the
+    // `baseline` subcommands have their own option parsers upstream that the
+    // gate does not model, so they never carry a conformance row.
+    if verb == "check" && conformance_scan_active(cfg, root, ref_has_files) {
         findings.extend(conformance_rows(&index, profile, &user_overrides, &bleeding_overrides));
     }
 

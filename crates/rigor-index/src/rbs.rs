@@ -4221,8 +4221,15 @@ fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_d
             }
             for f in found {
                 // A file both a `signature_paths:` dir and a collection reach
-                // counts as the project's.
-                files.insert(expand_path(&f).to_string_lossy().into_owned(), phase);
+                // counts as the project's. A path that is not UTF-8 (a
+                // component ABOVE the sig dir, on Linux) would be keyed and
+                // re-read lossily here: stand the scan down instead.
+                let abs = expand_path(&f);
+                let Some(abs) = abs.to_str() else {
+                    builder.conformance.block();
+                    continue;
+                };
+                files.insert(abs.to_string(), phase);
             }
         }
     }

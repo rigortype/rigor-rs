@@ -368,3 +368,68 @@ rule still runs through them.
    file outside the cwd; Ruby-only regex syntax in message rows.
 9. **Host dependence** (accepted in the ADR): rbs-inline in the reference's
    Ruby, and default-library gem versions on `GEM_PATH`.
+
+## Fifth round: subcommands and the process environment
+
+A fourth review of the round-4 delta (`rv5/d1`–`d6`, `repro1`–`2`,
+`tri*`) found that the round-4 clauses held, and found four small families:
+
+| family | reference | port before |
+|---|---|---|
+| `POSIXLY_CORRECT` present (even empty) | `OptionParser` stops at the first non-option: `app.rb --config x.yml` makes `--config` a path | read `--config` |
+| `diff`, `triage`, `baseline *` | their own parsers upstream | carried conformance rows past the CLI half of the gate (only `cmd_check` applied it) |
+| `RIGOR_RACTOR_WORKERS=abc` / `2x` / `1.5` | the run crashes (`Integer()`, exit 1) | rows |
+| a non-UTF-8 component above a sig dir (Linux) | reads the file | a lossy key dropped it silently |
+
+**Fix.**
+- The scan runs for `check` only. There is one gate function with no bypass:
+  `conformance_scan_active` is reached only through `analyze_files` with
+  verb `check`.
+- `POSIXLY_CORRECT` present, or a `RIGOR_RACTOR_WORKERS` that is not plain
+  decimal digits, stands the scan down.
+- A project signature path that is not valid UTF-8 stands the scan down.
+- The config reader now trims ASCII spaces only. `parse_subset` had
+  trimmed Unicode whitespace, which libyaml keeps inside a plain scalar.
+- The path-case check treats only "not found" as missing; any other error
+  stands the scan down.
+- The environments where the reference cannot start are recorded in the
+  ADR as accepted divergences:
+  - `RUBYOPT=--disable-gems`;
+  - an empty `GEM_PATH`;
+  - `-rbundler/setup`;
+  - `-Eascii-8bit:ascii-8bit`;
+  - `RUBY_BOX=1`.
+
+### Tallies (release build, one fresh cwd per project, `--no-cache`)
+
+| probe set | projects | identical | same rows, other diffs | gap-only | exit code only | port-only |
+|---|---|---|---|---|---|---|
+| rv5 `d1`–`d6` + `repro1`–`2` | 141 | 93 | 13 | 30 | — | 5 (the accepted can't-start environments only) |
+| rv5 `tri` / `tri2` / `tri3` (`diff` / `triage`) | 18 | — | — | — | — | 0 (no port conformance row in any) |
+| rv4 `c0`–`c16` | 217 | 120 | 35 | 59 | — | 3 (the accepted I/J reproducers only) |
+| first-round `probes1`–`8`, `/tmp/rv150`, `al/q1`–`q7` | 239 | 128 | — | 105 | 6 | 0 |
+
+- Every rv5 port-only project that the ADR does not list as accepted is
+  now silent: the three `POSIXLY_CORRECT` ones (`a1`, `a3`, `a5`) and the
+  three `RIGOR_RACTOR_WORKERS` ones.
+- No common row changed order.
+- `probes7.rb`'s `w_realistic` (3 rows) and fixture 112 (8 rows) are
+  identical.
+
+| gate | result |
+|---|---|
+| `cargo test --workspace` | 1,351 passed, 0 failed, 1 ignored |
+| clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 112 8/8 MATCHED |
+| `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps |
+| `conformance_load_set.rb --check` | OK, 897 names |
+
+**Follow-ups added to the consolidated list:**
+
+10. **Non-JSON output formats.** `text`, `github`, `sarif` and the other
+    non-JSON formats render every rule's rows differently from the
+    reference (`rv5/fmt.rb`). This is not conformance-specific.
+11. **Process environment for other rules.** `POSIXLY_CORRECT` argument
+    parsing, `RIGOR_RACTOR_WORKERS` validation, and the non-`check`
+    subcommands' parsers (`diff`, `triage`, `baseline`) share the round-4
+    CLI divergences.
