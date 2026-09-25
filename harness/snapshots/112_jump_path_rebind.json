@@ -1,0 +1,61 @@
+{
+  "fixture": "harness/corpus/112_jump_path_rebind.rb",
+  "diagnostics": [
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 97,
+      "column": 4,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `even?' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 71,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `even?' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 83,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `even?' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 192,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_133' for \"t\""
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 128,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 142,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 164,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

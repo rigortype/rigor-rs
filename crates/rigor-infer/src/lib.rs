@@ -2882,6 +2882,66 @@ impl<'i> Typer<'i> {
         env
     }
 
+    /// [`Self::build_toplevel_env`] for the `check` rules: the same straight-line
+    /// binder, except that every statement it does not bind WIDENS (to
+    /// `Dynamic`) each top-level local rebound inside it, in statement order.
+    ///
+    /// The flat binder sees only a top-level `x = …` / `a, b = …`; a rebind
+    /// nested in an `if`, a loop, a block, a `begin`, or an `x += …` is
+    /// invisible to it, so the local kept its FIRST type past the construct.
+    /// The reference joins every path that leaves the construct — including a
+    /// `next` / `break` path, since upstream #1248 (loops) and #1215 (blocks) —
+    /// so `w = String.new; while …; w = i; next; end; w.even?` and
+    /// `n = String.new; xs.each { |e| n = e; next }; n.even?` are silent there
+    /// while the flat env still fired `for String` (rigor-rs#133). The port has
+    /// no flow evaluator behind this env to join into, so it declines instead:
+    /// a strict loss of information, which cannot add a diagnostic. A local
+    /// the construct does not rebind keeps its type, so the no-rebind controls
+    /// still fire.
+    ///
+    /// A write inside a `def` / `class` / `module` body is a different local
+    /// scope and widens nothing. A write in a `->` or block body does widen: a
+    /// closure may run and rebind a captured local.
+    pub fn build_toplevel_check_env(&self, ast: &LoweredAst, interner: &mut Interner) -> TypeEnv {
+        let mut env = TypeEnv::new();
+        let body = match ast.get(ast.root()) {
+            Node::Program { body, .. } => body.clone(),
+            _ => return env,
+        };
+        let rebinds = toplevel_rebinds(ast);
+        for stmt in body {
+            self.bind_check_statement(ast, stmt, &mut env, &rebinds, interner);
+        }
+        env
+    }
+
+    /// One statement of [`Self::build_toplevel_check_env`]: a direct write binds
+    /// as [`Self::bind_statement`] does, after widening the rebinds nested in
+    /// its value (`x = xs.each { |e| w = e }`); any other statement widens every
+    /// rebind inside it.
+    fn bind_check_statement(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &mut TypeEnv,
+        rebinds: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+    ) {
+        match ast.get(id) {
+            Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
+                let vspan = ast.get(*value).span();
+                widen_flow_writes(rebinds, vspan, env, interner);
+                self.bind_statement(ast, id, env, interner);
+            }
+            Node::Statements { body, .. } => {
+                for s in body.clone() {
+                    self.bind_check_statement(ast, s, env, rebinds, interner);
+                }
+            }
+            other => widen_flow_writes(rebinds, other.span(), env, interner),
+        }
+    }
+
     /// Flow-sensitive local CONSTANT propagation (ADR-0022 first substrate
     /// slice). For every `if`/`unless`/ternary predicate NOT lexically inside a
     /// loop / block, record the [`TypeId`] the predicate folds to under the
@@ -7344,6 +7404,39 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
         .collect()
 }
 
+/// Every rebind of a TOP-LEVEL local, span-keyed for [`widen_flow_writes`]: a
+/// plain, operator or multiple write, and a `rescue => e` binding, outside any
+/// `def` / `class` / `module` body (each its own local scope). Unlike
+/// [`collect_flow_writes`] it carries no receiver mutation — a mutator changes a
+/// value's contents, not which value the local names.
+fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    let scopes: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                Some(n.span())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out: Vec<(rigor_parse::Span, String)> = Vec::new();
+    for (_, n) in ast.iter() {
+        match n {
+            Node::LocalVariableWrite { name, span, .. }
+            | Node::LocalVariableOpWrite { name, span, .. } => out.push((*span, name.clone())),
+            Node::MultiWrite { targets, span, .. } => {
+                out.extend(targets.bound_names().into_iter().map(|(name, _)| (*span, name)));
+            }
+            Node::BeginRescue { clauses, .. } => out.extend(
+                clauses.iter().filter_map(|c| c.bound_name.clone().map(|name| (c.span, name))),
+            ),
+            _ => {}
+        }
+    }
+    out.retain(|(w, _)| !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1));
+    out
+}
+
 /// The flow writes that need the project index or a cross-node lookup, appended
 /// to [`collect_flow_writes`]'s per-node set. Two kinds, both pure widening:
 ///
@@ -8161,6 +8254,30 @@ mod tests {
             env.get("s").copied().map(|t| i.get(t).clone()),
             Some(Type::Constant(Scalar::Str("Hello".into())))
         );
+    }
+
+    /// rigor-rs#133: the check env widens a local a nested construct rebinds (a
+    /// loop's or a block's `next` path included), keeps one nothing rebinds, and
+    /// lets a later straight-line write re-establish the type.
+    #[test]
+    fn toplevel_check_env_widens_nested_rebinds() {
+        let ast = lower_src(
+            b"w = \"s\"\nwhile $c\n  if $d\n    w = 1\n    next\n  end\nend\n\
+              n = \"s\"\n[1].each { |e| n = e; next }\n\
+              k = \"s\"\nwhile $c\n  next if $d\nend\n\
+              r = \"s\"\nr = 1 if $c\nr = \"t\"\n\
+              d = \"s\"\ndef m\n  d = 1\nend\n",
+        );
+        let mut i = Interner::new();
+        let empty = CoreIndex::new();
+        let env = Typer::new(&empty).build_toplevel_check_env(&ast, &mut i);
+        let get = |name: &str, i: &Interner| env.get(name).map(|&t| i.get(t).clone());
+        let untyped = i.untyped();
+        assert_eq!(env.get("w"), Some(&untyped));
+        assert_eq!(env.get("n"), Some(&untyped));
+        assert_eq!(get("k", &i), Some(Type::Constant(Scalar::Str("s".into()))));
+        assert_eq!(get("r", &i), Some(Type::Constant(Scalar::Str("t".into()))));
+        assert_eq!(get("d", &i), Some(Type::Constant(Scalar::Str("s".into()))));
     }
 
     #[test]
