@@ -251,7 +251,7 @@ port used to agree on became gaps:
 - the `Gemfile.lock` overlay treated as a deferred plugin (1).
 
 Ordinary projects keep their rows: `probes7.rb`'s `w_realistic` (3 rows) and
-fixture 112 (8 rows) are identical. The sweep is configless and unchanged.
+fixture 115 (8 rows) are identical. The sweep is configless and unchanged.
 
 ### Accepted divergences (host-dependent, recorded with their reproducers)
 
@@ -326,7 +326,7 @@ coverage gap.
   reference resolves a `--config` file's relative `signature_paths:` against
   that file's directory. Rows positioned in the staged `sig/` are compared,
   keyed by `file`. Pre-existing snapshots are byte-identical.
-- Fixture `112_conforms_to_directive` is the gate: 8 rows plus 9 silent
+- Fixture `115_conforms_to_directive` is the gate: 8 rows plus 9 silent
   controls, all MATCHED live. `fp_audit.py` cannot see this surface, because
   it runs configless.
 - `UPSTREAM.md` step 3 now re-syncs `crates/rigor-index/vendor/capability_roles/`.
@@ -342,7 +342,7 @@ compared field by field (path, line, column, rule, severity, message,
 [`docs/notes/20260925-conforms-to-audit.md`](../notes/20260925-conforms-to-audit.md).
 
 - The audit found **four FP families**, all now fixed and gated by fixture
-  112 and unit tests. First, generic reopens (`class Set`, `module
+  115 and unit tests. First, generic reopens (`class Set`, `module
   Enumerable`) did not silence the class or its descendants. Second, a
   module's surface included `BasicObject`, so its list was too short.
   Third, an incomplete chain read as "present", which also shortened lists.
@@ -392,7 +392,7 @@ and variance on project parameters; an interface redeclared across files;
 `use` directives; `target_ruby` 3.5 / 4.1; tier B. `fp_audit.py --gaps
 --sweep`: 0 FP / 9,337 files / 3,829 gaps, identical to master. Index load
 grows about 2.5 ms (28.5 → 31 ms) for the model. `run.rb` live and
-`run_snapshot.rb`: 0 unregistered; fixture 112 keeps its 8 rows MATCHED and
+`run_snapshot.rb`: 0 unregistered; fixture 115 keeps its 8 rows MATCHED and
 byte-identical (`snapshot.rb --check`: up to date). Details:
 [`docs/notes/20260925-conforms-to-audit.md`](../notes/20260925-conforms-to-audit.md).
 
@@ -411,7 +411,7 @@ Across the 959 there are **0 port-only rows and 0 order differences**. The
 cost is the 23 agreements listed under "Measured cost". Gates:
 `cargo test --workspace` 1,344 passed; clippy 1.88 clean in both modes;
 `snapshot.rb --check` up to date; `run_snapshot.rb` and `run.rb` 0
-unregistered (fixture 112 8/8); `fp_audit.py --gaps --sweep` 0 FP / 9,337
+unregistered (fixture 115 8/8); `fp_audit.py --gaps --sweep` 0 FP / 9,337
 files / 3,829 gaps; `conformance_load_set.rb --check` OK. The divergences
 these families expose for OTHER rules are listed in the audit note as
 follow-ups.

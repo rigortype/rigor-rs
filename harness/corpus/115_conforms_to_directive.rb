@@ -5,7 +5,7 @@
 # `.rigor.yml` and compares the rows positioned in the staged `sig/*.rbs`
 # (the rows are at the ANNOTATION; there is no Ruby `def` to report at).
 #
-# Every row and every silence in `112_conforms_to_directive.sig/` was measured
+# Every row and every silence in `115_conforms_to_directive.sig/` was measured
 # on the reference at the `e59b7b89` pin (one fresh temp cwd per case,
 # `--no-cache`); see the comments there. This Ruby file itself is clean.
 

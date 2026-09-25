@@ -71,7 +71,7 @@ setters in messages; overlapping `signature_paths:`.
 | `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps, identical to master (configless, so the scan is gated off) |
 
 The fixture was renumbered from `129_` (the issue number) to the next free
-number, `112_`. It gained `d_surface.rbs` (the module row, plus the
+number, `115_` (siblings #148, #149 and #154 took 112–114 first). It gained `d_surface.rbs` (the module row, plus the
 `ClsEq` / `SetSub` silences), for 8 rows in total.
 
 ## Second round: seven families the 47 projects missed, and the allow-list
@@ -158,7 +158,7 @@ No common row changed order.
 |---|---|
 | `cargo test --workspace` | pass (1,335 tests, 1 ignored: the load-set dump) |
 | clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
-| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered; fixture 112 8/8 MATCHED, byte-identical |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered; fixture 115 8/8 MATCHED, byte-identical |
 | `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps, identical to master |
 | `conformance_load_set.rb --check` (+ `--plugin activesupport-core-ext`) | OK, 897 names (plugin adds none) |
 
@@ -219,7 +219,7 @@ mark all count as one scalar each).
   `target_ruby` rejections, a bare-`off` override (exit 64), and the
   unbundled `rigor-rails` stand-down.
 - No common row changed order.
-- `probes7.rb`'s `w_realistic` (3 rows) and fixture 112 (8 rows) are
+- `probes7.rb`'s `w_realistic` (3 rows) and fixture 115 (8 rows) are
   identical.
 - Measured cost: 23 rv3 projects the two tools used to agree on became gaps
   (listed in the ADR).
@@ -228,7 +228,7 @@ mark all count as one scalar each).
 |---|---|
 | `cargo test --workspace` | 1,344 passed, 0 failed, 1 ignored |
 | clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
-| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 112 8/8 MATCHED |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 115 8/8 MATCHED |
 | `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps |
 | `conformance_load_set.rb --check` | OK, 897 names |
 
@@ -295,7 +295,7 @@ recorded as accepted divergences in the ADR, with their reproducers.
   reproducer is now silent or identical: 45 of 48, the other 3 being those
   reproducers. That is 26 same-rows, 5 identical and 14 gaps. No common row
   changed order anywhere.
-- `probes7.rb`'s `w_realistic` (3 rows) and fixture 112 (8 rows) are
+- `probes7.rb`'s `w_realistic` (3 rows) and fixture 115 (8 rows) are
   identical.
 - The six exit-code differences carry no port row and are the ones round 3
   listed.
@@ -313,7 +313,7 @@ recorded as accepted divergences in the ADR, with their reproducers.
 |---|---|
 | `cargo test --workspace` | 1,349 passed, 0 failed, 1 ignored |
 | clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
-| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 112 8/8 MATCHED |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 115 8/8 MATCHED |
 | `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps |
 | `conformance_load_set.rb --check` | OK, 897 names |
 
@@ -413,14 +413,14 @@ A fourth review of the round-4 delta (`rv5/d1`–`d6`, `repro1`–`2`,
   now silent: the three `POSIXLY_CORRECT` ones (`a1`, `a3`, `a5`) and the
   three `RIGOR_RACTOR_WORKERS` ones.
 - No common row changed order.
-- `probes7.rb`'s `w_realistic` (3 rows) and fixture 112 (8 rows) are
+- `probes7.rb`'s `w_realistic` (3 rows) and fixture 115 (8 rows) are
   identical.
 
 | gate | result |
 |---|---|
 | `cargo test --workspace` | 1,351 passed, 0 failed, 1 ignored |
 | clippy 1.88, fresh target dir, lib and `--all-targets` | clean |
-| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 112 8/8 MATCHED |
+| `snapshot.rb --check` / `run_snapshot.rb` / `run.rb` live | up to date / 0 unregistered / 0 unregistered, coverage 565/613; fixture 115 8/8 MATCHED |
 | `fp_audit.py --gaps --sweep` | 0 FP / 9,337 files / 3,829 gaps |
 | `conformance_load_set.rb --check` | OK, 897 names |
 

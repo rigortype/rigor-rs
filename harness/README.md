@@ -124,7 +124,7 @@ current rigor-rs support status. Fixtures are numbered:
   `--config`: the reference resolves a config file's relative
   `signature_paths:` against that file's directory). Rows positioned in the
   staged `sig/*.rbs` are compared too, keyed by their `sig/`-relative `file`
-  (e.g. `112_conforms_to_directive`, whose rows sit at `.rbs` annotations).
+  (e.g. `115_conforms_to_directive`, whose rows sit at `.rbs` annotations).
 - **rbs collection** (ADR-0034) — `corpus/NN_name.rb` may ship a sibling
   `corpus/NN_name.collection/` whose CONTENTS (an `rbs_collection.lock.yaml` +
   a `.gem_rbs_collection/` tree) are copied into each tool's cwd root, so the

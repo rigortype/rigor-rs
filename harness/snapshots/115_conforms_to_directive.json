@@ -1,5 +1,5 @@
 {
-  "fixture": "harness/corpus/112_conforms_to_directive.rb",
+  "fixture": "harness/corpus/115_conforms_to_directive.rb",
   "diagnostics": [
     {
       "rule": "dynamic.rbs-extended.unresolved",
