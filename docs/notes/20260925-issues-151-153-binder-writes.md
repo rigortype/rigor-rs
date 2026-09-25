@@ -79,8 +79,12 @@ Two design choices are load-bearing:
 `bind_statement` is shared with `type-of`, hover and `sig-gen`. Only the inert skip was
 added there. `w = "s"; defined?(w = 1); w` now hovers `"s"` (reference `"s"`, master `1`).
 `Float(s)` after `(s = "x") rescue nil` hovers `Dynamic[top]` (reference `Dynamic[Float?]`,
-master `Float`), through `definitely_assigns`. `sig-gen` output does not change on the probe
-file.
+master `Float`), through `definitely_assigns`. `sig-gen` output does change, contrary to this
+note's first draft. Take a method that does `yield(w = u)` / `defined?(w = u)` and then `Float(w)`:
+it now emits `-> Float`, byte-identical to the reference, where master emitted nothing. The
+`Integer(w)` form emits `-> Integer` where the reference says `-> 12`. The same method without
+the inert write already mismatches that way on master. This is sound extra coverage under the
+generative-tool bar, and it adds no new kind of byte mismatch (adversarial review).
 
 ## Three-way probes
 
@@ -126,6 +130,26 @@ stands for always-truthy/falsey (`flow.always-truthy-condition`). "um" stands fo
 
 Fixtures 112 and 113 are unchanged: both harnesses show the same 609 matched / 48 gaps
 on the old fixtures.
+
+## Adversarial review (before merge)
+
+An Opus reviewer ran about 190 three-way probes. They covered:
+- inert writes under `super`/`yield`/`defined?`/`BEGIN`/`END` in every flow pass
+- span edges, heredocs and multibyte source
+- every `for` index form
+- `type-of`, hover and `sig-gen`
+- dead-assignment
+
+**No branch-only key, no message regression at a key where master matched the reference.** The
+branch reaches some new key-matched sites where it carries master's existing wording gap, for
+example `for Integer` where the reference says `for 12`. It also removes more master FPs than
+this note lists: the `defined?(foo(v = nil))` shape, `is_a?` guards after `BEGIN`/`END`, and the
+nested and in-block `for` forms. It found no code defects.
+
+The orchestrator re-derived the "#148 widening is not FP-safe" residual against a pre-#148
+binary (877ff4f). `w = 5; while $c; w = 1; end; "abc".center(w).lenght` fired there too, as
+`for " abc "`. It is the union-of-literals argument FP, recorded on rigor-rs#146, and not a
+product of the widening.
 
 ## Residuals (all pre-existing or FP-safe; none adds a key)
 
