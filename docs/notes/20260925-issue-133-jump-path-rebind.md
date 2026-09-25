@@ -50,14 +50,44 @@ Fixture `112_jump_path_rebind.rb`: on master, 7 FPs (rows 1, 3, 4, 6, 8, 16, 17)
 branch, 0 FPs. One gap remains, row 8: the reference reports `possible-nil` for `nil |
 String`, which the port does not model.
 
+Verified 2026-09-25 on the standard environment (Ruby 4.0.6, submodule at the pin, release
+binaries of both master and the branch):
+
 | gate | result |
 |---|---|
+| `cargo test --workspace`, `cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings` (fresh target) | pass / clean |
 | `run_snapshot.rb` | 564 matched / 48 gaps / **0 FP** |
-| sweep, rigor-rs master vs branch (8 corpora, 8,933 files, local clones) | **identical**: 173,835 diagnostics, 0 added, 0 removed |
+| `run.rb` (live) | 564 matched / 48 gaps / **0 FP**; fixture 82 `:20:29` matches |
+| `snapshot.rb` regen | **no drift** in any committed snapshot |
+| `fp_audit.py --gaps --sweep` (standing set, 8/8 corpora, 9,337 files) | **0 FP** on the branch and on master; output identical apart from timings, gap totals included |
+| `docs_check.py` | pass |
 
-The live `run.rb` under a locally installed Ruby 4.0.6 shows one FP, fixture 82 `:20:29`. It
-is identical on master: that environment's reference is silent there, while the committed
-snapshot fires.
+The first run of this slice was on a machine that did not have the standing corpora. It used
+shallow clones of 8,933 files and saw three things that do not reproduce here: one FP in live
+`run.rb` (fixture 82), three drifted snapshots, and one sweep candidate (gitlab-foss
+`environment.rb:51:61`). All three came from that environment. None is a property of the slice.
+
+Every row 1–18 was re-probed in its own fresh cwd, with `--no-cache` on the reference. Each
+row reproduces the PR's table, and every control (2, 5, 7, 10, 12, 14, 18) fires with a message
+byte-identical to the reference's.
+
+## Design review: other `Dynamic`-only gates
+
+The widened env reaches `check_call`, `check_wrong_arity`, `check_always_raises`,
+`check_argument_type_mismatch`, the `raise`-operand rule and `static.value-use.void`. Each of
+them declines on a `Dynamic` receiver or operand; `faithful_param_rejects_arg` treats a
+`Dynamic` argument as a gradual `maybe`. `class_narrowing_pass`,
+`collection_shape_snapshots` and `nilable_receiver_snapshots` build their own envs, and the
+diff does not touch them. `check_narrowed_call` and `check_collection_call` are the only
+rules that fire on a `Dynamic`/`Top` receiver, and they read the unwidened `gate_at`.
+
+Adversarial probes found no new FP. On these shapes the branch also removes master FPs that
+the fixture does not name:
+- `w = 1; [1].each { w = "s" }; if w.is_a?(Float); w.zzz; end`: the reference is silent,
+  master fires `for 1`.
+- `e = 1; e = StandardError if $c; raise e`: master fires `raise-non-exception`.
+- `w = [1]; [1].each { w = nil }; w.first(1, 2, 3)`: master fires wrong-arity where the
+  reference says possible-nil.
 
 ## Coverage traded (FP-safe losses, all at top level)
 
@@ -70,11 +100,12 @@ silent now:
 - a copy of a widened local: `x = w`.
 
 A position-aware top-level env would recover all of them. That is the real port of #1248 /
-#1215 onto the port's flow substrate, and it is out of this slice's scope.
+#1215 onto the port's flow substrate, and it is out of this slice's scope. Tracked, together with
+row 8, as rigor-rs#152.
 
 ## Residual FP found in passing
 
 `w = "s"; for w in [1, 2]; end; w.even?` still fires `for "s"`, while the reference is silent.
 The arena drops the `for` index target (`ast.rs`, `Node::Loop`), so no widening can see the
 rebind. This is pre-existing and unrelated to jumps. It needs an index-target field on the
-lowered loop.
+lowered loop. Tracked as rigor-rs#151.
