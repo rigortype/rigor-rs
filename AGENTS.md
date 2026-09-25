@@ -27,8 +27,8 @@ thing that stops two agents taking the same issue.
    comment on the issue is the contract; the body is context.
 2. **Claim.** `gh issue edit N --add-label in-progress`, then comment
    `Claimed: branch claude/issue-N-<slug>`. Re-read the comments: if an earlier
-   unreleased claim exists, the earlier one wins. Remove your comment and
-   return to step 1.
+   claim exists with no abandon comment after it, the earlier one wins. Remove
+   your comment and return to step 1.
 3. **Branch.** A fresh worktree on `claude/issue-N-<slug>` cut from
    `origin/master`.
 4. **Investigate.** Read the reference code path, probe both engines on the
@@ -41,10 +41,10 @@ thing that stops two agents taking the same issue.
    `in-progress`. From here the draft PR is the in-flight state.
 6. **Implement until every gate is green** (see *Gates*). Record the measured
    outcome in the PR body: the probe tables and the gate numbers.
-7. **Audit, then ready.** The orchestrator (or maintainer) re-runs the gates,
-   reviews the diff scope, and byte-verifies the parity claims with their own
-   probes. Only then `gh pr ready`. A non-draft PR means "audited,
-   mergeable".
+7. **Review, then ready.** The orchestrator (or maintainer) re-runs the
+   gates and gets `Approved` from the review gate (`docs/agents/review.md`),
+   whose passes re-probe the parity claims themselves. Only then
+   `gh pr ready`. A non-draft PR means "reviewed, mergeable".
 8. **Fold after merge.** Write the detail into a dated `docs/notes/` file or
    an ADR, then add one ledger line to `docs/CURRENT_WORK.md`.
 
@@ -95,8 +95,8 @@ What the gates cannot see, so probe it by hand:
 - Distrust a surprising number until the harness reproduces it. The audit
   harness itself has been wrong.
 - **Measure before you build.** A coverage slice needs a `fp_audit --gaps`
-  count predicting that it closes gaps. FP-safe flow slices have repeatedly closed 0 gaps
-  (`docs/notes/20260706-flow-frontier-exhausted.md`).
+  count predicting that it closes gaps. FP-safe flow slices have repeatedly
+  closed 0 gaps (`docs/notes/20260706-flow-frontier-exhausted.md`).
 
 ## Parity bars
 
@@ -113,12 +113,14 @@ What the gates cannot see, so probe it by hand:
 
 ## Orchestrating subagents
 
-- Investigate with Sonnet (reference reading + oracle probes → a data report).
-  Where the stakes are high, run two independent investigations.
-- Implement with Opus in an isolated worktree, from a spec that names the
-  likely mis-implementations and requires the full *Gates* list.
-- An implementer may resolve a spec-vs-oracle conflict toward the oracle. That
-  is correct, but confirm it in the audit.
+- Claude Code subagents run on Opus 5.5 for every role: investigation,
+  implementation and review. Leave `model` unset so they inherit the session
+  model. Where the stakes are high, run two independent investigations.
+- An implementer works in an isolated worktree, from a spec that names the
+  likely mis-implementations and requires the full *Gates* list. It may
+  resolve a spec-vs-oracle conflict toward the oracle; the review confirms it.
+- Reviewers from other harnesses are Grok 4.6 and Opus 5.5, both at `high`,
+  run together (`docs/agents/review.md`).
 
 ## Docs hygiene
 
