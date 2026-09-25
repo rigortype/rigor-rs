@@ -70,7 +70,7 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
         "String" => matches!(
             method,
             "upcase" | "downcase" | "reverse" | "length" | "size" | "+" | "*"
-                | "==" | "empty?"
+                | "==" | "empty?" | "[]" | "slice" | "byteslice" | "index"
         ),
         _ => false,
     }
@@ -328,6 +328,63 @@ fn fold_str(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
         }
         ("==", [Scalar::Str(b)]) => Some(Scalar::Bool(a == b)),
         ("==", [_]) => Some(Scalar::Bool(false)),
+        ("[]" | "slice" | "byteslice" | "index", _) => fold_str_lookup(a, method, args),
+        _ => None,
+    }
+}
+
+/// `String#[]` / `#slice` / `#byteslice` / `#index` on pinned scalars (issue
+/// #121 step 1). The reference folds all four by running the real method, so a
+/// fold here must be exactly Ruby's answer — including `nil` for an index out of
+/// range or an absent substring, which the reference witnesses on as `nil`.
+///
+/// ASCII-only on BOTH sides, so a character offset is a byte offset: that makes
+/// `byteslice` coincide with `slice` and keeps every arm trivially byte-exact.
+/// Everything else declines and leaves the RBS answer standing — a `Float` index
+/// or offset (Ruby truncates it), a `Range` or `Regexp` argument (not a
+/// [`Scalar`]), a multibyte string, and every argument kind Ruby raises on
+/// (`"abc".byteslice("a")`, `"abc"[nil]`, `"abc".index(1)`).
+fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
+    if !a.is_ascii() {
+        return None;
+    }
+    let len = a.len() as i64;
+    // Ruby's `rb_str_subpos`: a negative start counts from the end; a start past
+    // the end, or a negative length, is `nil`; a start AT the end is `""`.
+    let substr = |start: i64, count: i64| -> Scalar {
+        let start = if start < 0 { start + len } else { start };
+        if count < 0 || start < 0 || start > len {
+            return Scalar::Nil;
+        }
+        let end = start.saturating_add(count).min(len);
+        Scalar::Str(a[start as usize..end as usize].to_owned())
+    };
+    match (method, args) {
+        ("[]" | "slice" | "byteslice", [Scalar::Int(i)]) => {
+            let i = if *i < 0 { i + len } else { *i };
+            Some(if (0..len).contains(&i) {
+                Scalar::Str(a[i as usize..=i as usize].to_owned())
+            } else {
+                Scalar::Nil
+            })
+        }
+        ("[]" | "slice" | "byteslice", [Scalar::Int(start), Scalar::Int(count)]) => {
+            Some(substr(*start, *count))
+        }
+        ("[]" | "slice", [Scalar::Str(sub)]) if sub.is_ascii() => {
+            Some(if a.contains(sub.as_str()) { Scalar::Str(sub.clone()) } else { Scalar::Nil })
+        }
+        ("index", [Scalar::Str(sub)]) if sub.is_ascii() => {
+            Some(a.find(sub.as_str()).map_or(Scalar::Nil, |p| Scalar::Int(p as i64)))
+        }
+        ("index", [Scalar::Str(sub), Scalar::Int(offset)]) if sub.is_ascii() => {
+            let offset = if *offset < 0 { offset + len } else { *offset };
+            if !(0..=len).contains(&offset) {
+                return Some(Scalar::Nil);
+            }
+            let from = offset as usize;
+            Some(a[from..].find(sub.as_str()).map_or(Scalar::Nil, |p| Scalar::Int((from + p) as i64)))
+        }
         _ => None,
     }
 }
@@ -388,6 +445,68 @@ mod tests {
             fold(&Scalar::Sym("a".into()), "==", &[Scalar::Sym("a".into())]),
             Some(Scalar::Bool(true))
         );
+    }
+
+    /// Issue #121 step 1 — every expectation is the pinned reference's measured
+    /// fold (and plain Ruby's answer).
+    #[test]
+    fn folds_string_lookups() {
+        let s = |v: &str| Scalar::Str(v.into());
+        let abc = s("abc");
+        let i = Scalar::Int;
+        let cases: &[(&str, Vec<Scalar>, Scalar)] = &[
+            ("[]", vec![i(0)], s("a")),
+            ("[]", vec![i(-1)], s("c")),
+            ("[]", vec![i(3)], Scalar::Nil),
+            ("[]", vec![i(99)], Scalar::Nil),
+            ("[]", vec![i(-4)], Scalar::Nil),
+            ("[]", vec![i(1), i(2)], s("bc")),
+            ("[]", vec![i(3), i(1)], s("")),
+            ("[]", vec![i(4), i(1)], Scalar::Nil),
+            ("[]", vec![i(-2), i(5)], s("bc")),
+            ("[]", vec![i(-4), i(1)], Scalar::Nil),
+            ("[]", vec![i(1), i(-1)], Scalar::Nil),
+            ("[]", vec![s("b")], s("b")),
+            ("[]", vec![s("z")], Scalar::Nil),
+            ("slice", vec![i(0)], s("a")),
+            ("slice", vec![i(1), i(1)], s("b")),
+            ("slice", vec![s("bc")], s("bc")),
+            ("byteslice", vec![i(0)], s("a")),
+            ("byteslice", vec![i(-1)], s("c")),
+            ("byteslice", vec![i(5)], Scalar::Nil),
+            ("byteslice", vec![i(1), i(2)], s("bc")),
+            ("index", vec![s("b")], i(1)),
+            ("index", vec![s("z")], Scalar::Nil),
+            ("index", vec![s("b"), i(1)], i(1)),
+            ("index", vec![s("b"), i(2)], Scalar::Nil),
+            ("index", vec![s(""), i(3)], i(3)),
+            ("index", vec![s(""), i(4)], Scalar::Nil),
+            ("index", vec![s("c"), i(-1)], i(2)),
+            ("index", vec![s("a"), i(-9)], Scalar::Nil),
+        ];
+        for (method, args, want) in cases {
+            assert_eq!(fold(&abc, method, args).as_ref(), Some(want), "{method}{args:?}");
+        }
+        assert_eq!(fold(&s(""), "index", &[s("")]), Some(i(0)));
+    }
+
+    #[test]
+    fn string_lookups_decline_what_they_cannot_pin() {
+        let s = |v: &str| Scalar::Str(v.into());
+        let abc = s("abc");
+        // Ruby raises on each of these, so the reference does not fold them.
+        assert_eq!(fold(&abc, "byteslice", &[s("a")]), None);
+        assert_eq!(fold(&abc, "[]", &[Scalar::Nil]), None);
+        assert_eq!(fold(&abc, "[]", &[Scalar::Sym("b".into())]), None);
+        assert_eq!(fold(&abc, "[]", &[Scalar::Bool(true)]), None);
+        assert_eq!(fold(&abc, "index", &[Scalar::Int(1)]), None);
+        // Ruby truncates a Float; the core leaves that to the RBS answer.
+        assert_eq!(fold(&abc, "[]", &[Scalar::Float(1.5)]), None);
+        assert_eq!(fold(&abc, "index", &[s("b"), Scalar::Float(1.5)]), None);
+        // Multibyte: a character offset is not a byte offset.
+        assert_eq!(fold(&s("héllo"), "[]", &[Scalar::Int(1)]), None);
+        assert_eq!(fold(&s("héllo"), "index", &[s("l")]), None);
+        assert_eq!(fold(&abc, "index", &[s("é")]), None);
     }
 
     #[test]
