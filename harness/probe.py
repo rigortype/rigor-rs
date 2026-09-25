@@ -34,8 +34,9 @@ What it gets right so a hand-rolled loop does not have to (AGENTS.md → Probing
     auto-built when absent, refused when older than the crate sources);
   * `POSIXLY_CORRECT` removed from both environments.
 
-Exit status: 0 when every probe matches, 1 when any differs, 2 on a usage or
-engine error. `--keep` leaves the probe directories in place and prints them.
+Exit status: 0 when every probe matches, 1 when any differs, 2 on a usage
+error or when an engine produced no parseable JSON (snippet mode) or died on a
+signal (raw mode). `--keep` leaves the probe directories in place and prints them.
 
 Env: RIGOR_RS_BIN, REFERENCE_RIGOR_DIR (as fp_audit.py).
 """
@@ -113,7 +114,8 @@ def probe_snippet(rs, label, src, root, base):
         code, out, err = run(cmd, d)
         results[eng] = (code, diagnostics(out), err)
     (rc, rrows, rerr), (pc, prows, perr) = results["ref"], results["port"]
-    same = rrows is not None and prows is not None and rrows == prows and rc == pc
+    failed = rrows is None or prows is None
+    same = not failed and rrows == prows and rc == pc
     print(f"{'=' if same else '≠'} {label}: {src.strip()}")
     if same:
         print(f"    both  exit={rc}  {fmt(rrows)}")
@@ -123,7 +125,7 @@ def probe_snippet(rs, label, src, root, base):
         for eng, rows, err in (("ref", rrows, rerr), ("port", prows, perr)):
             if rows is None and err.strip():
                 print(f"    {eng} stderr: {err.strip().splitlines()[-1]}")
-    return same
+    return "error" if failed else ("same" if same else "diff")
 
 
 def probe_raw(rs, proj, args, root, ignore_stderr):
@@ -135,6 +137,8 @@ def probe_raw(rs, proj, args, root, ignore_stderr):
         results[eng] = run(cmd, d)
     channels = (("exit", 0), ("stdout", 1)) + (() if ignore_stderr else (("stderr", 2),))
     same = all(results["ref"][i] == results["port"][i] for _, i in channels)
+    if not same and any(results[e][0] < 0 for e in ("ref", "port")):
+        same = "error"  # killed by a signal
     print(f"{'=' if same else '≠'} rigor {' '.join(args)}  (from {proj})")
     for name, i in channels:
         rv, pv = results["ref"][i], results["port"][i]
@@ -182,25 +186,28 @@ def main():
         rs = fp_audit.resolve_rs()
 
     root = tempfile.mkdtemp(prefix="rigor-probe-")
-    ok = True
+    outcomes = []
     try:
         if not snippet_mode:
-            ok = probe_raw(rs, os.path.abspath(ns.dir), raw_args, os.path.join(root, "raw"),
-                           ns.ignore_stderr)
+            r = probe_raw(rs, os.path.abspath(ns.dir), raw_args, os.path.join(root, "raw"),
+                          ns.ignore_stderr)
+            outcomes.append("error" if r == "error" else ("same" if r else "diff"))
         else:
             probes = [(f"e{i + 1}", s) for i, s in enumerate(ns.snippets)]
             for path in ns.files:
                 with open(path) as f:
                     probes.append((os.path.basename(path), f.read()))
             for i, (label, src) in enumerate(probes):
-                ok &= probe_snippet(rs, label, src, os.path.join(root, f"{i + 1:03d}"),
-                                    os.path.abspath(ns.dir) if ns.dir else None)
+                outcomes.append(probe_snippet(rs, label, src, os.path.join(root, f"{i + 1:03d}"),
+                                              os.path.abspath(ns.dir) if ns.dir else None))
     finally:
         if ns.keep:
             print(f"probe dirs: {root}", file=sys.stderr)
         else:
             shutil.rmtree(root, ignore_errors=True)
-    return 0 if ok else 1
+    if "error" in outcomes:
+        return 2
+    return 1 if "diff" in outcomes else 0
 
 
 if __name__ == "__main__":

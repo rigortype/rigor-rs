@@ -48,11 +48,11 @@ step "docs_check" python3 harness/docs_check.py
 CRATES=$(grep -o '^crates/[^/]*' <<<"$CHANGED" | sort -u | sed 's|^crates/||' || true)
 for c in $CRATES; do
   [[ -f crates/$c/Cargo.toml ]] || continue
-  step "cargo test -p $c" cargo test -q --locked --offline -p "$c"
+  step "cargo test -p $c" cargo test -q --locked -p "$c"
 done
 
 if [[ -n $CRATES ]] || grep -q '^harness/' <<<"$CHANGED"; then
-  step "build rigor-cli (debug)" cargo build -q --locked --offline -p rigor-cli
+  step "build rigor-cli (debug)" cargo build -q --locked -p rigor-cli
   step "run_snapshot.rb" ruby harness/run_snapshot.rb
 else
   echo "== run_snapshot.rb skipped (no crates/ or harness/ change since ${MB:0:7})"

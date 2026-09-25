@@ -38,6 +38,14 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 
 read -r SHA BASE_REF < <(gh pr view "$PR" --repo rigortype/rigor-rs \
   --json headRefOid,baseRefOid --jq '"\(.headRefOid) \(.baseRefOid)"')
+# Run from the PR's own checkout right after a push, GitHub can still report
+# the previous head; refuse rather than review a stale commit.
+LOCAL=$(git -C "$REPO" rev-parse HEAD)
+if [[ $LOCAL != "$SHA" ]] && git -C "$REPO" merge-base --is-ancestor "$SHA" "$LOCAL" 2>/dev/null; then
+  echo "GitHub reports head ${SHA:0:7} for #$PR, but this checkout is at ${LOCAL:0:7}," \
+       "a descendant: the push has not propagated yet. Retry in a minute." >&2
+  exit 2
+fi
 OUT=${OUT:-${TMPDIR:-/tmp}/rigor-review/pr-$PR-${SHA:0:7}}
 mkdir -p "$OUT"
 # git records worktrees under their real path; macOS's $TMPDIR is a symlinked
@@ -77,7 +85,7 @@ for side in head base; do
   fi
   git -C "$OUT/$side" submodule update -q --init reference/rigor
   echo "building $side ${rev:0:7} (cargo build --release) ..." >&2
-  (cd "$OUT/$side" && cargo build -q --release --offline -p rigor-cli)
+  (cd "$OUT/$side" && cargo build -q --release --locked -p rigor-cli)
 done
 
 # The head's probe.py when it has one (it probes the head's own reference pin),
