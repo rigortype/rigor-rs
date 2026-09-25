@@ -118,11 +118,52 @@ def u7 = "abc".byteslice(0..1).frobnicate_u7
 
 # A Regexp argument folds on the reference (`"abc".index(/b/)` is `1`). The
 # port keeps the flat answer on the `[]`/`index` rows it already answered —
-# the hit set-matches — and declines the lookups it newly learned, matching
-# the silent untyped-arg path they had before (a coverage gap on the /b/ hit,
-# never an FP).
+# the hit set-matches — and declines the lookups it newly learned: their
+# `/z/` misses already fired `for Integer` (an FP), so declining the argument
+# loses the `/b/` hit's `for Integer` set-match to kill the miss FP.
 def u8 = "abc".index(/b/).to_a
 def u10 = "abc".rindex(/b/).to_a
 def u11 = "abc".rindex(/z/).to_a
 def u12 = "abc".getbyte(/x/).to_a
 def u13 = "abc"[/b/].frobnicate_u13
+
+# --- (6) OPAQUE: a literal whose unescaped bytes are not valid UTF-8 ----------
+
+# The lowering substitutes U+FFFD for invalid bytes, so a scalar minted from
+# such a literal cannot answer a position or content read — the reference
+# folds on the REAL bytes and fires the hits, which are registered coverage
+# gaps here; every miss stays silent on both engines (#164 review).
+def v1 = "\xFFabc".getbyte(5).to_a
+def v2 = "\xFFabc".getbyte(-6).to_a
+def v3 = "\xFFabc".byteindex("c", 4).to_a
+def v4 = "\xE3\x81a"[2].upcase
+def v5 = "\xFFa".byterindex("a", 1).succ
+def v6 = "\xFFabc".getbyte(0).lenght
+def v7 = "\xFFabc".byteindex("a").lenght
+def v8 = "\xE3\x81a".index("a").lenght
+def v9 = "\xE3\x81a"[2].lenght
+def v10 = "\xFFabc"[0].lenght
+def v11 = ("\xFFa" <=> "\xFEa").lenght
+
+# --- (7) `byteindex` / `byterindex`: the offset must land on a char boundary --
+
+# Inside a multibyte character Ruby raises `IndexError: offset N does not
+# land on character boundary`; the reference rescues into the `C?` union —
+# silent — where the port once minted `for Integer` or a wrong constant.
+def w1 = "héllo".byteindex("h", 2).succ
+def w2 = "héllo".byteindex("l", 2).to_a
+def w3 = "héllo".byterindex("h", 2).to_a
+def w4 = "héllo".byteindex("", 2).to_a
+def w5 = "héllo".byterindex("", 2).to_a
+def w6 = "héllo".byteindex("l", -4).to_a
+def w7 = "\u{1F600}x".byteindex("x", 1).to_a
+
+# The controls that still answer: boundary offsets fold, a past-end
+# `byterindex` clamps to the end, and a past-end `byteindex` is `nil` — none
+# of those raise.
+def w8 = "héllo".byteindex("l", 3).to_a
+def w9 = "héllo".byterindex("o", 6).to_a
+def w10 = "héllo".byterindex("o", 100).to_a
+def w11 = "héllo".byterindex("h", -6).to_a
+def w12 = "héllo".byteindex("l", 6).to_a
+def w13 = "héllo".byteindex("l", 7).to_a
