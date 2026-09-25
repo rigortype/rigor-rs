@@ -15,7 +15,7 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 ▶ **NEXT (2026-09-25): pin is upstream MASTER `e59b7b89`**, 0 FP / 9,337 files.
 Retractions no gate sees, **#134–#138**, are the next port work (each its own inference
 mechanism). Pre-existing FPs: #139, #140, #146, #164, #165. Coverage: #141 (`fb781023`,
-3,002 of the 3,829 gaps), #166 (#148's shadow regression); #142–#145 and #152 closed at
+3,002 of the 3,829 gaps), #166 and #167 (#148/#154 regressions); #142–#145 and #152 closed at
 0 rows (`.out-of-scope/`). CLI/config parity (#129 follow-ups): #155–#159, #162, #163
 ready-for-agent, #160/#161 ready-for-human. Also #130, #132. `0.4.0` is untagged; ADR-109 drops `int<min,max>` there.
 
