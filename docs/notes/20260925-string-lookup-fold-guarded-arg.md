@@ -186,6 +186,21 @@ well. The reference and master are silent on both. Two more fixes follow:
   brought `"abc".center(3_000_000_000)` into reach, and it took 70 s and 10 GB.
   The same problem existed on master with a width of 2e9.
 
+A re-review of the fix returned **MERGEABLE**, with no FP that is new against
+master in 22 attempts to reach a stale local without a `LocalVariableRead`
+(`(s += "x")[0]`, multi-assign, ivars/globals, mutated constants and others).
+It raised two further points:
+
+* **The first cut of the gate scanned the whole arena for every lookup.** That
+  is quadratic: 20,000 `x = "abc"[0]` lines took 15.4 s, against 1.2 s on master.
+  `LoweredAst` now keeps the sorted start offsets of its local reads, and
+  `reads_local_within` is a binary search. The same file now takes 0.9 s.
+* **The pad cap is slightly stricter than the reference.** The reference caps
+  only the one-argument form, so it still folds `"abc".ljust(4097, "-")`. The
+  port declines it too, deliberately. Otherwise the sidecar would build a
+  3e9-wide string. The diagnostic keeps its row, and only the rendered receiver
+  differs.
+
 The flat env's staleness is older than this PR and reaches other folds too.
 `s = "ab"; s << "c"; [1, 2][s.length].succ` is a port-only FP on master. The
 real fix is flow-sensitive top-level typing (ADR-0022), which is out of scope

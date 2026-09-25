@@ -922,6 +922,9 @@ pub struct LoweredAst {
     /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
     /// table rather than owned nodes.
     const_mutations: Vec<ConstMutation>,
+    /// Sorted start offsets of every `LocalVariableRead`, so
+    /// [`LoweredAst::reads_local_within`] is a binary search, not an arena scan.
+    local_read_starts: Vec<usize>,
 }
 
 /// One site where a CONSTANT-shaped receiver is mutated — the raw material of
@@ -993,6 +996,13 @@ impl LoweredAst {
 }
 
 impl LoweredAst {
+    /// Whether some `LocalVariableRead` starts inside `span`. A read is a leaf,
+    /// so starting inside a node's span means lying inside its subtree.
+    pub fn reads_local_within(&self, (lo, hi): Span) -> bool {
+        let i = self.local_read_starts.partition_point(|&s| s < lo);
+        self.local_read_starts.get(i).is_some_and(|&s| s < hi)
+    }
+
     /// Resolve a handle to its owned node.
     pub fn get(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
@@ -1054,7 +1064,13 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
     let const_mutations = collect_const_mutations(&root_prism);
-    LoweredAst { nodes: builder.nodes, root, file_key, const_mutations }
+    let mut local_read_starts: Vec<usize> = builder
+        .nodes
+        .iter()
+        .filter_map(|n| matches!(n, Node::LocalVariableRead { .. }).then(|| n.span().0))
+        .collect();
+    local_read_starts.sort_unstable();
+    LoweredAst { nodes: builder.nodes, root, file_key, const_mutations, local_read_starts }
 }
 
 /// Mutable accumulator for the owned arena during the lowering walk.
@@ -3166,6 +3182,19 @@ mod tests {
             });
             assert!(found, "expected LocalVariableOpWrite for `{name}` in {src:?}");
         }
+    }
+
+    #[test]
+    fn reads_local_within_finds_reads_inside_a_span_only() {
+        let src = b"s = 1\n\"abc\"[s]\n\"abc\"[0]\n";
+        let ast = lower(&crate::parse(src));
+        let span_of = |needle: &[u8]| {
+            let lo = src.windows(needle.len()).position(|w| w == needle).unwrap();
+            (lo, lo + needle.len())
+        };
+        assert!(ast.reads_local_within(span_of(b"\"abc\"[s]")));
+        assert!(!ast.reads_local_within(span_of(b"\"abc\"[0]")));
+        assert!(!ast.reads_local_within(span_of(b"s = 1")));
     }
 
     #[test]

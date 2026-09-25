@@ -2513,7 +2513,7 @@ impl<'i> Typer<'i> {
                 let stale_risk = folding::is_str_lookup(&scalar, method)
                     && std::iter::once(receiver)
                         .chain(args.iter().copied())
-                        .any(|id| reads_local(ast, id));
+                        .any(|id| ast.reads_local_within(ast.get(id).span()));
                 if let Some(folded) =
                     (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
                 {
@@ -7603,18 +7603,6 @@ fn set_difference(a: &[Scalar], b: &[Scalar]) -> Vec<Scalar> {
 pub fn type_of(ast: &LoweredAst, id: NodeId, env: &TypeEnv, interner: &mut Interner) -> TypeId {
     let empty = CoreIndex::new();
     Typer::new(&empty).type_of(ast, id, env, interner)
-}
-
-/// Whether `id`'s subtree reads a local variable: some `LocalVariableRead`
-/// lies inside its span.
-fn reads_local(ast: &LoweredAst, id: NodeId) -> bool {
-    let (lo, hi) = ast.get(id).span();
-    ast.iter().any(|(_, n)| {
-        matches!(n, Node::LocalVariableRead { .. }) && {
-            let (a, b) = n.span();
-            lo <= a && b <= hi
-        }
-    })
 }
 
 /// Walk the top-level statement sequence binding each local write. Free-function
