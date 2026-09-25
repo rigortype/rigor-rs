@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/116_splat_arg_arity.rb",
+  "diagnostics": [
+    {
+      "rule": "call.wrong-arity",
+      "line": 51,
+      "column": 28,
+      "severity": "error",
+      "message": "wrong number of arguments to `first' on Array (given 2, expected 0..1)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 52,
+      "column": 30,
+      "severity": "error",
+      "message": "wrong number of arguments to `first' on Array (given 2, expected 0..1)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 56,
+      "column": 8,
+      "severity": "error",
+      "message": "wrong number of arguments to `first' on Array (given 2, expected 0..1)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 57,
+      "column": 7,
+      "severity": "error",
+      "message": "wrong number of arguments to `center' on String (given 3, expected 1..2)"
+    }
+  ]
+}

@@ -390,8 +390,11 @@ pub enum Node {
         method: String,
         /// Positional argument expressions in source order (ADR-0023: needed
         /// for argument-contract rules such as `call.wrong-arity` and for
-        /// argument-dependent constant folding). Splat/keyword/block args are
-        /// intentionally not collected here in this slice.
+        /// argument-dependent constant folding). Splat/keyword/forwarding args
+        /// lower like any other node and are collected here too — the lowered
+        /// subtree does not preserve their shape, so rules that must
+        /// distinguish them read `args_plain_positional` / `args_all_plain` /
+        /// `first_arg_nonplain` rather than inspecting the children.
         args: Vec<NodeId>,
         /// Statements of an attached block (`foo { ... }` / `do…end`), lowered
         /// so calls inside the block reach the rule walk. Empty for a call with
@@ -425,16 +428,32 @@ pub enum Node {
         /// positional `raise({a: 1})` fires). `false` when there is no first
         /// argument or it is an ordinary expression.
         first_arg_nonplain: bool,
-        /// `true` iff EVERY positional argument is a plain expression (none is a
-        /// splat `*a`, a bare keyword-hash `a: 1`, a block-pass `&blk`, or
-        /// forwarded `...`) — a faithful mirror of the reference's
-        /// `plain_positional_call?` (`check_rules.rb:1072`), computed over ALL
-        /// arguments (unlike `first_arg_nonplain`, which is first-only) because
-        /// the lowered subtree does not preserve the splat/keyword distinction.
-        /// A block-pass (`&blk`, a `BlockArgumentNode` in Prism's `block()`)
-        /// counts as non-plain, but an ordinary trailing block (`foo(a) { }`)
-        /// does NOT (its args are still checkable). Consumed by
+        /// `true` iff every argument in the call's argument list is a plain
+        /// positional expression — none is a splat `*a`, a bare keyword-hash
+        /// `a: 1`, a `BlockArgumentNode`, or forwarded `...` — a faithful
+        /// mirror of the reference's `plain_positional_call?` /
+        /// `simple_positional?` (`check_rules.rb:1680`), computed over
+        /// `call.arguments()` exactly as the reference reads
+        /// `call_node.arguments.arguments`. A `&blk` block-pass does NOT
+        /// disqualify: Prism puts it in `block()`, never in `arguments()`, so
+        /// the oracle still arity-checks `first(1, 2, &)` (the
+        /// `BlockArgumentNode` arm of `simple_positional?` is unreachable at
+        /// this pin but is mirrored for faithfulness). An ordinary trailing
+        /// block (`foo(a) { }`) does not count either. Consumed by
+        /// `call.wrong-arity`, which declines when this is `false`.
+        args_plain_positional: bool,
+        /// `true` iff `args_plain_positional` AND the call carries no `&blk`
+        /// block-pass — the same plain-positional test over all arguments
+        /// (unlike `first_arg_nonplain`, which is first-only) plus Prism's
+        /// `block()` being absent or a `BlockNode`. An ordinary trailing
+        /// block (`foo(a) { }`) does NOT count. Consumed by
         /// `call.argument-type-mismatch`, which bails when this is `false`.
+        /// The `!block_is_pass` term is a conservative decline, not oracle
+        /// parity: the reference cannot see `&blk` in `arguments()` but still
+        /// fires ATM on a block-pass call — measured `[1, 2, 3].fetch("x", &b)`
+        /// and anonymous `fetch("x", &)` emit `call.argument-type-mismatch`
+        /// on the reference and stay silent here. A safe-side coverage gap;
+        /// `center("x", &b)` cannot show it (`center("x")` is silent on both).
         args_all_plain: bool,
         /// Span of the whole call expression.
         span: Span,
@@ -1371,11 +1390,10 @@ impl<'src> Builder<'src> {
             let receiver = call.receiver().map(|r| self.lower_node(&r));
             let method = constant_string(call.name().as_slice());
             // Lower positional arguments in source order (ADR-0023: argument
-            // contracts + arg-dependent folding). Splat/keyword/block args lower
-            // like any other node — a downstream rule that needs to distinguish
-            // them does so by inspecting the lowered child, never here.
-            // TODO(spec): mark splat/keyword/block args so the arity rule can
-            // bail on non-plain-positional shapes (it is conservative regardless).
+            // contracts + arg-dependent folding). Splat/keyword/forwarding args
+            // lower like any other node — a downstream rule that needs to
+            // distinguish them reads `args_plain_positional` / `args_all_plain`
+            // / `first_arg_nonplain`, never the lowered children.
             let args = call
                 .arguments()
                 .map(|a| self.lower_body(&a.arguments()))
@@ -1394,17 +1412,14 @@ impl<'src> Builder<'src> {
                         || first.as_forwarding_arguments_node().is_some()
                 }))
                 .unwrap_or(false);
-            // Whether EVERY positional argument is a plain expression — the
-            // reference `plain_positional_call?` (all args `simple_positional?`):
-            // no splat / bare keyword-hash / block-pass / forwarded-args shape.
-            // A block-pass rides Prism's `block()` (a `BlockArgumentNode`), not
-            // `arguments()`, so it is checked separately; an ordinary trailing
-            // block (a `BlockNode`) leaves the args checkable and does NOT count.
-            let block_is_pass = call
-                .block()
-                .map(|b| b.as_block_argument_node().is_some())
-                .unwrap_or(false);
-            let args_all_plain = call
+            // The reference's `plain_positional_call?` (`check_rules.rb:1680`):
+            // EVERY argument in `call.arguments()` is `simple_positional?` —
+            // no splat, no bare keyword-hash, no block-argument, no forwarded
+            // `...`. The check is over `arguments()` ONLY: a `&blk` block-pass
+            // rides Prism's `block()` and never enters `arguments()`, so it
+            // does not disqualify here (the oracle arity-checks `first(1, 2, &)`);
+            // an ordinary trailing block (a `BlockNode`) does not either.
+            let args_plain_positional = call
                 .arguments()
                 .map(|a| {
                     a.arguments().iter().all(|x| {
@@ -1414,8 +1429,15 @@ impl<'src> Builder<'src> {
                             && x.as_forwarding_arguments_node().is_none()
                     })
                 })
-                .unwrap_or(true)
-                && !block_is_pass;
+                .unwrap_or(true);
+            // `args_all_plain` adds the `&blk` block-pass decline
+            // `call.argument-type-mismatch` wants on top of the
+            // plain-positional argument test.
+            let block_is_pass = call
+                .block()
+                .map(|b| b.as_block_argument_node().is_some())
+                .unwrap_or(false);
+            let args_all_plain = args_plain_positional && !block_is_pass;
             // Lower an attached block so calls/reads inside it reach the walk.
             //   * a BlockNode (`{ … }` / `do…end`) — lower its body statements.
             //   * a `&expr` block-pass (BlockArgumentNode) — lower the passed
@@ -1459,6 +1481,7 @@ impl<'src> Builder<'src> {
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
                 safe_nav: call.is_safe_navigation(),
                 first_arg_nonplain,
+                args_plain_positional,
                 args_all_plain,
                 span: span_of(&call.location()),
             });
