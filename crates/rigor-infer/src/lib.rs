@@ -7631,9 +7631,10 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
 /// regression). Prism's `locals` list for the block/lambda node is the exact
 /// bound set: it already excludes captured outer locals, so a write to a
 /// name the block does NOT bind (`{ |x| w = 2 }`, `w` top-level) still counts
-/// as a rebind — the must-stay-declined rows. The scope's SPAN covers the
-/// nested-block case: a write in an inner block to a name an enclosing block
-/// binds is shadowed by the enclosing `locals` list.
+/// as a rebind — the must-stay-declined rows. The nested-block case is covered
+/// STRUCTURALLY, not by span: an inner block's body stays reachable from the
+/// enclosing block's body roots, so the enclosing `locals` list shadows a
+/// write there (a heredoc's body escapes its opener's span — see below).
 fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     let scopes: Vec<rigor_parse::Span> = ast
         .iter()
@@ -7710,9 +7711,10 @@ fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
 
 /// Every node reachable from `roots` through child links, roots included —
 /// the structural "inside a block body" test for [`toplevel_rebinds`]. Orphan
-/// arena nodes (a `def` parameter default, a `Range` bound — lowered for
-/// reachability but never linked under their node) are not reached; a write
-/// in one stays a rebind, which declines rather than risks a false positive.
+/// arena nodes (a `Range` bound — lowered for reachability but never linked
+/// under its node) are not reached; a write in one declines rather than risks
+/// a false positive. A `def` parameter default is likewise unreachable here,
+/// but the `def`-scope span filter already drops it before this test runs.
 fn descendants_of(ast: &LoweredAst, roots: &[NodeId]) -> HashSet<NodeId> {
     let mut seen = HashSet::new();
     let mut stack: Vec<NodeId> = roots.to_vec();
