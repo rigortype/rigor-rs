@@ -22,6 +22,8 @@
 # Env vars: same as harness/run.rb (REFERENCE_RIGOR_DIR, RIGOR_RS_BIN unused
 # here, CORPUS_DIR, SNAPSHOT_DIR).
 
+require "open3"
+require "tempfile"
 require_relative "lib"
 
 include RigorHarness
@@ -55,6 +57,14 @@ def main
     elsif check_only
       drifted << path
       puts "DRIFT"
+      # Show what moved: in CI this output is the only evidence of the cause.
+      Tempfile.create(["snapshot", ".json"]) do |tmp|
+        tmp.write(json)
+        tmp.flush
+        diff, = Open3.capture2("diff", "-u", "--label", "committed", "--label", "live reference",
+                               existing ? path : File::NULL, tmp.path)
+        diff.lines.first(60).each { |l| puts "    #{l}" }
+      end
     else
       File.write(path, json)
       written += 1
