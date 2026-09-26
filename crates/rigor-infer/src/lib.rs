@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use rigor_index::{ClassOrdering, CoreIndex};
-use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
+use rigor_parse::{BlockParamKind, JumpKind, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
@@ -512,15 +512,19 @@ impl<'i> Typer<'i> {
                 args,
                 block_body,
                 block_span,
+                block_params,
                 explicit_arg_list,
+                safe_nav,
                 ..
             } => {
-                let (r, method, block_body, block_span, explicit_arg_list) = (
+                let (r, method, block_body, block_span, block_params, explicit_arg_list, safe_nav) = (
                     *r,
                     method.clone(),
                     block_body.clone(),
                     *block_span,
+                    block_params.clone(),
                     *explicit_arg_list,
+                    *safe_nav,
                 );
                 if !block_body.is_empty() {
                     // A block changes which RBS overload applies: the reference
@@ -546,7 +550,9 @@ impl<'i> Typer<'i> {
                         &method,
                         &block_body,
                         block_span,
+                        &block_params,
                         explicit_arg_list,
+                        safe_nav,
                         env,
                         interner,
                     )
@@ -2928,8 +2934,10 @@ impl<'i> Typer<'i> {
     /// a concrete modeled class, the block form isn't modeled for the method, or
     /// the returned class isn't registered. We never fall back to the no-block
     /// return for a block call (that was the FP the placeholder guarded against).
-    // The `explicit_arg_list` addition took this to 9 params; all are call-site
-    // descriptors, so bundling them would be ceremony for a single caller.
+    // The `explicit_arg_list`/`block_params`/`safe_nav` additions took this
+    // past clippy's limit; all are call-site descriptors, so bundling them
+    // would be ceremony for a single caller (matches
+    // `exactly_once_block_call`'s allow above).
     #[allow(clippy::too_many_arguments)]
     fn type_block_call(
         &self,
@@ -2938,7 +2946,9 @@ impl<'i> Typer<'i> {
         method: &str,
         block_body: &[NodeId],
         block_span: Option<rigor_parse::Span>,
+        block_params: &[(String, BlockParamKind)],
         explicit_arg_list: bool,
+        safe_nav: bool,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
@@ -2955,6 +2965,69 @@ impl<'i> Typer<'i> {
             }
         }
         let recv_ty = self.type_of(ast, receiver, env, interner);
+        if safe_nav {
+            // `recv&.m { … }` — `safe_navigation_call_type`
+            // (`expression_typer.rb:1673`): a LITERAL `nil&.m` is the
+            // statically-skipped call and folds to nil without dispatching —
+            // `nil&.tap { break "s" }` is `nil`, not `"s"`. An INFERRED
+            // exactly-nil receiver deliberately does NOT fold (#540/#541 —
+            // the nil traces to a wrong uplink), so its `Bot` non-nil
+            // fragment keeps the plain pipeline on the unaltered receiver —
+            // `c = nil; c&.tap { break "s" }` answers `"s"` in the reference,
+            // and the probe that pins it is `x.frobnicate_zzz` firing
+            // `for "s"`. Everything else dispatches on the nil-stripped
+            // receiver and unions the skipped-call nil back in.
+            if matches!(ast.get(receiver), Node::NilLit { .. }) {
+                return interner.intern(Type::Constant(Scalar::Nil));
+            }
+            let non_nil = self.narrow_non_nil(recv_ty, interner);
+            if !matches!(interner.get(non_nil), Type::Bottom | Type::Dynamic(_))
+                && non_nil != recv_ty
+            {
+                let inner = self.block_call_result(
+                    ast,
+                    method,
+                    block_body,
+                    block_span,
+                    block_params,
+                    explicit_arg_list,
+                    non_nil,
+                    env,
+                    interner,
+                );
+                let nil_ty = interner.intern(Type::Constant(Scalar::Nil));
+                return rigor_types::Algebra::join(interner, inner, nil_ty);
+            }
+        }
+        self.block_call_result(
+            ast,
+            method,
+            block_body,
+            block_span,
+            block_params,
+            explicit_arg_list,
+            recv_ty,
+            env,
+            interner,
+        )
+    }
+
+    /// The block-overload dispatch shared by the plain and `&.` paths of
+    /// [`Self::type_block_call`]: the receiver class's `block_required` RBS
+    /// return plus the rigor-rs#140 exactly-once/break-arm adjustment.
+    #[allow(clippy::too_many_arguments)]
+    fn block_call_result(
+        &self,
+        ast: &LoweredAst,
+        method: &str,
+        block_body: &[NodeId],
+        block_span: Option<rigor_parse::Span>,
+        block_params: &[(String, BlockParamKind)],
+        explicit_arg_list: bool,
+        recv_ty: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
         // The receiver must resolve to a concrete class the index models; a
         // Dynamic / unknown receiver ⇒ silent (never guess the block return).
         let Some(class_name) = self.index.class_name_of(interner, recv_ty) else {
@@ -2981,8 +3054,10 @@ impl<'i> Typer<'i> {
             method,
             block_body,
             block_span,
+            block_params,
             explicit_arg_list,
             result,
+            recv_ty,
             env,
             interner,
         ) {
@@ -3016,8 +3091,10 @@ impl<'i> Typer<'i> {
         method: &str,
         block_body: &[NodeId],
         block_span: Option<rigor_parse::Span>,
+        block_params: &[(String, BlockParamKind)],
         explicit_arg_list: bool,
         result: Option<TypeId>,
+        recv_ty: TypeId,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<TypeId> {
@@ -3030,36 +3107,42 @@ impl<'i> Typer<'i> {
         // body to prove anything about.
         let block_span = block_span?;
         let jumps = self.block_level_jumps(ast, block_span);
-        // A `next` counts only where its branch can actually run: the
-        // reference's `bot` comes from EVALUATING the block, so a `next` a
-        // literal/constant predicate makes unreachable contributes nothing —
-        // the same dead-branch gate the arm collection applies.
-        let has_next = jumps.iter().any(|j| {
-            if !matches!(j.kind, JumpKind::Next) {
-                return false;
-            }
-            let benv = self.block_entry_env(ast, block_body, j.span.0, env, interner);
-            !self.span_on_dead_branch(ast, j.span, &benv, interner)
-        });
 
         // `exactly_once_block_never_completes?` — the reference ANDs four
         // proofs: candidate name (above), a literal block with a body, no
         // ArgumentsNode (`tap 1` / `tap(1)` declines — none of the three takes
         // an argument; `tap()` has no ArgumentsNode and does NOT decline, just
         // like the reference's `node.arguments` check), the syntactic
-        // never-completes walk, the resolved Kernel owner,
-        // and a block-return pass that must answer exactly `bot`. The port's
-        // `bot` approximation is `!has_next`: `never_completes` already rules
-        // out a normal-completion tail value, and a reachable `next` is the
-        // only other contributor the #841 join adds — a `next` the span scan
-        // sees but the evaluator would call unreachable only ever declines us
-        // back to the union, the safe side.
+        // never-completes walk, the resolved Kernel owner, and a block-return
+        // pass that must answer exactly `bot`. That last half is
+        // `block_return_type_for(...).is_a?(Type::Bot)` — what the body's
+        // evaluation types to, NOT whether it can complete: `tap { [raise
+        // "x"] }` never completes yet evaluates to `Array[Integer]`, and
+        // `tap { raise "x"; next "s" }` evaluates to `"s"` because a live
+        // block-level `next` joins the block's return. [`Self::block_value_bot`]
+        // is the port of that evaluation.
         if !explicit_arg_list
-            && !has_next
             && self.block_never_completes(ast, block_body)
+            && self.block_value_bot(
+                ast,
+                block_body,
+                &jumps,
+                block_params,
+                recv_ty,
+                env,
+                interner,
+            )
             && self.exactly_once_kernel_receiver(class_name, method)
         {
-            let arms = self.block_break_arm_types(ast, block_body, &jumps, env, interner);
+            let arms = self.block_break_arm_types(
+                ast,
+                block_body,
+                &jumps,
+                block_params,
+                recv_ty,
+                env,
+                interner,
+            );
             return Some(if arms.is_empty() {
                 interner.intern(Type::Bottom)
             } else {
@@ -3076,7 +3159,15 @@ impl<'i> Typer<'i> {
         // rather than minting an arms-only type the reference never computes.
         let result = result?;
         if jumps.iter().any(|j| matches!(j.kind, JumpKind::Break)) {
-            let arms = self.block_break_arm_types(ast, block_body, &jumps, env, interner);
+            let arms = self.block_break_arm_types(
+                ast,
+                block_body,
+                &jumps,
+                block_params,
+                recv_ty,
+                env,
+                interner,
+            );
             let combined = arms
                 .into_iter()
                 .fold(result, |acc, arm| rigor_types::Algebra::join(interner, acc, arm));
@@ -3189,7 +3280,7 @@ impl<'i> Typer<'i> {
     /// `::Kernel.`) and the project redefines the name nowhere. Anything else —
     /// including `loop`, which a `StopIteration` ends normally — proves nothing.
     fn call_never_returns(&self, ast: &LoweredAst, id: NodeId) -> bool {
-        let Node::Call { receiver, method, args, .. } = ast.get(id) else {
+        let Node::Call { receiver, args, .. } = ast.get(id) else {
             return false;
         };
         if receiver.is_some_and(|r| self.stmt_never_completes(ast, r)) {
@@ -3198,10 +3289,283 @@ impl<'i> Typer<'i> {
         if args.iter().any(|&a| self.stmt_never_completes(ast, a)) {
             return true;
         }
+        self.call_declares_bot(ast, id)
+    }
+
+    /// The callee half of [`Self::call_never_returns`]: does the call ITSELF
+    /// name a non-returning Kernel function? Receiver and argument evaluation
+    /// are deliberately NOT consulted — `x.push(raise "y")` can never complete
+    /// yet its VALUE is `push`'s return (`Array`), which is what
+    /// [`Self::expr_value_bot`] needs to know (probed: `tap { [1, 2].push(raise
+    /// "x") }` keeps the receiver, i.e. the call's value is non-bot).
+    fn call_declares_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
+        let Node::Call { receiver, method, .. } = ast.get(id) else {
+            return false;
+        };
         if !NON_RETURNING_KERNEL_CALLS.contains(&method.as_str()) {
             return false;
         }
         self.kernel_spelled_receiver(ast, *receiver) && !self.project_defines_anywhere(method)
+    }
+
+    /// The block's RETURN value — the `bot` half of the reference's
+    /// `exactly_once_block_never_completes?`, which asks
+    /// `block_return_type_for(...).is_a?(Type::Bot)` — i.e. what evaluating the
+    /// body types to, a different question from [`Self::block_never_completes`]
+    /// (control flow). Two things give the block a non-bot value
+    /// (`block_body_type_joining_nexts`):
+    ///
+    /// - the fall-through TAIL — the last statement's evaluated type, per
+    ///   [`Self::expr_value_bot`];
+    /// - every live block-level `next` arm, which the evaluator's next-sink
+    ///   joins into the return: `raise "x"; next "s"; raise "y"` still types
+    ///   the block `"s"`, and `next raise "x"` contributes nothing (bot). A
+    ///   `next` on a dead branch is never collected — the same
+    ///   [`Self::span_on_dead_branch`] gate the `break` arms use.
+    ///
+    /// `bot` only when the tail is `bot` AND every live `next` carries a `bot`
+    /// value — `tap { [raise "x"] }` keeps `Array[Integer]`, `tap { raise "x";
+    /// break "s" }` drops to `"s"`, `tap { break "s"; 1 }` keeps
+    /// `"s" | Array[Integer]`.
+    // Same allow as `type_block_call` — ast/body/jumps/params/receiver/env/
+    // interner are each a distinct call-site descriptor; bundling them is
+    // ceremony for single-caller helpers.
+    #[allow(clippy::too_many_arguments)]
+    fn block_value_bot(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        jumps: &[BlockJump],
+        block_params: &[(String, BlockParamKind)],
+        recv_ty: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        for jump in jumps {
+            if !matches!(jump.kind, JumpKind::Next) {
+                continue;
+            }
+            let benv = self.block_entry_env(
+                ast,
+                body,
+                jump.span.0,
+                block_params,
+                recv_ty,
+                env,
+                interner,
+            );
+            if self.span_on_dead_branch(ast, jump.span, &benv, interner) {
+                continue;
+            }
+            // A bare `next` carries nil and a multi-value `next` a tuple —
+            // both non-bot; only a single carried value can be bot.
+            let carried_bot = matches!(jump.values.as_slice(), [single] if
+                self.expr_value_bot(ast, *single, &benv, interner));
+            if !carried_bot {
+                return false;
+            }
+        }
+        // The tail reads the block-entry env at its own offset (`y = "a"; case
+        // y` folds `y` to its pinned constant).
+        let tail_offset = body.last().map(|&t| ast.get(t).span().0).unwrap_or(0);
+        let benv = self.block_entry_env(
+            ast,
+            body,
+            tail_offset,
+            block_params,
+            recv_ty,
+            env,
+            interner,
+        );
+        self.stmt_seq_value_bot(ast, body, &benv, interner)
+    }
+
+    /// Whether a statement sequence's VALUE — its last statement's evaluated
+    /// type — is `bot`. The tail-only view used by [`Self::block_value_bot`]
+    /// and the branch joins inside [`Self::expr_value_bot`].
+    fn stmt_seq_value_bot(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        body.last()
+            .is_some_and(|&tail| self.expr_value_bot(ast, tail, env, interner))
+    }
+
+    /// Whether the VALUE `id` evaluates to is `bot` — the evaluator's answer,
+    /// not [`Self::stmt_never_completes`]'s control-flow one. The two diverge
+    /// exactly where a non-completing PART still leaves the whole expression a
+    /// normal type: `[raise "x"]` is `Array[Integer]` (the array's own value),
+    /// `x.push(raise "y")` is `push`'s return, `if raise "x"; break "s"; else
+    /// 1; end` is `1`, and `break "s" if raise "x"` is `nil` — every one of
+    /// them keeps the ordinary `tap` result, per the reference's
+    /// `block_return_type_for` pass (probed at e59b7b89).
+    ///
+    /// The join-modelled constructs follow the evaluator's union of arm
+    /// values: `if`/`case` are `bot` only when EVERY arm's value is (a missing
+    /// `else` keeps the implicit `nil` arm — `break "s" unless false` keeps
+    /// `Array`), `a && b` / `a || b` join their operands (`raise("x") && 1`
+    /// and `raise("x") || 1` both keep `Array`), and `begin`/`rescue` joins
+    /// the protected tail with every rescue tail — `ensure` never contributes
+    /// a value (`begin 1; ensure raise "x"; end` still types the block's tail
+    /// `1`; its non-completion is [`Self::stmt_never_completes`]' question).
+    ///
+    /// A `break`/`redo`/`retry` tail is `bot`; a `next` tail is NOT — the
+    /// statement itself falls through to the block's return with `nil`
+    /// (`tap { next raise "x" }` keeps `Array`), its carried value reaching
+    /// the return through [`Self::block_value_bot`]'s arm join instead.
+    fn expr_value_bot(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        match ast.get(id) {
+            Node::Statements { kind: StatementsKind::Jump(kind), .. }
+            | Node::Other { jump: Some(kind), .. } => !matches!(kind, JumpKind::Next),
+            Node::Return { .. } => true,
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+                self.stmt_seq_value_bot(ast, body, env, interner)
+            }
+            Node::If { then_body, else_body, .. } => {
+                // The evaluator joins arm values without folding the predicate
+                // — `if 1; break "s"; else 1; end` still unions `1` in
+                // (probed), so a missing or non-bot arm keeps the block.
+                !then_body.is_empty()
+                    && !else_body.is_empty()
+                    && self.stmt_seq_value_bot(ast, then_body, env, interner)
+                    && self.stmt_seq_value_bot(ast, else_body, env, interner)
+            }
+            Node::Case { predicate, branches, else_body, .. } => {
+                let all_whens_bot = !branches.is_empty()
+                    && branches
+                        .iter()
+                        .all(|&b| self.when_tail_value_bot(ast, b, env, interner));
+                if !all_whens_bot {
+                    return false;
+                }
+                match predicate {
+                    Some(p) => {
+                        let pty = self.type_of(ast, *p, env, interner);
+                        match interner.get(pty) {
+                            // A value-pinned subject folds: a `when` whose
+                            // condition is the same constant is the definite
+                            // match and contributes its value alone
+                            // (`case 1; when 1 then break "b"` gives `bot`);
+                            // one provably matching NOTHING yields the `else`
+                            // — or `nil` when it is absent (`case 1; when 2
+                            // then …` keeps the ordinary result, probed).
+                            Type::Constant(s) => {
+                                let s = s.clone();
+                                let matched = branches.iter().copied().find(|&b| {
+                                    matches!(ast.get(b), Node::When { conditions, .. } if
+                                        conditions.iter().any(|&c| {
+                                            let cty = self.type_of(ast, c, env, interner);
+                                            matches!(
+                                                interner.get(cty),
+                                                Type::Constant(cs) if *cs == s
+                                            )
+                                        }))
+                                });
+                                match matched {
+                                    Some(b) => self.when_tail_value_bot(ast, b, env, interner),
+                                    None => {
+                                        !else_body.is_empty()
+                                            && self.stmt_seq_value_bot(
+                                                ast, else_body, env, interner,
+                                            )
+                                    }
+                                }
+                            }
+                            // An unanswerable subject (Dynamic / Top) lets the
+                            // evaluator join only the arm values it can see —
+                            // no no-match `nil` (`case <untyped>; when 1 then
+                            // break 1; end` drops, probed): `bot` iff every
+                            // `when` and the `else` (when present) are.
+                            Type::Dynamic(_) | Type::Top | Type::Bottom => {
+                                else_body.is_empty()
+                                    || self.stmt_seq_value_bot(ast, else_body, env, interner)
+                            }
+                            // A concrete-but-unpinned subject may match
+                            // nothing — the no-match path contributes the
+                            // `else` or `nil` (`case <Integer>; when 1 then
+                            // break 1; end` unions, probed).
+                            _ => {
+                                !else_body.is_empty()
+                                    && self.stmt_seq_value_bot(ast, else_body, env, interner)
+                            }
+                        }
+                    }
+                    None => {
+                        !else_body.is_empty()
+                            && self.stmt_seq_value_bot(ast, else_body, env, interner)
+                    }
+                }
+            }
+            Node::Logical { left, right, .. } => {
+                self.expr_value_bot(ast, *left, env, interner)
+                    && self.expr_value_bot(ast, *right, env, interner)
+            }
+            Node::BeginRescue { body, main_body, ensure_body, clauses, .. } => {
+                // The evaluator joins the protected tail — or the `else`'s
+                // when the body completes — with every rescue tail; `ensure`
+                // contributes NO value (`begin 1; ensure raise "x"; end`
+                // still types its tail `1`, probed — the non-completion it
+                // causes is `stmt_never_completes`' question). `body` is the
+                // flat carrier: the `else` statements are those past
+                // `main_body` that belong to neither a clause nor `ensure`.
+                let clause_ids: HashSet<NodeId> = clauses
+                    .iter()
+                    .flat_map(|c| c.body.iter().copied())
+                    .collect();
+                let ensure_ids: HashSet<NodeId> = ensure_body.iter().copied().collect();
+                let else_tail = body[main_body.len()..]
+                    .iter()
+                    .copied()
+                    .filter(|id| !clause_ids.contains(id) && !ensure_ids.contains(id))
+                    .next_back();
+                self.stmt_seq_value_bot(ast, main_body, env, interner)
+                    && clauses
+                        .iter()
+                        .all(|c| self.stmt_seq_value_bot(ast, &c.body, env, interner))
+                    && else_tail
+                        .is_none_or(|t| self.expr_value_bot(ast, t, env, interner))
+            }
+            Node::LocalVariableWrite { value, .. }
+            | Node::LocalVariableOpWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. } => {
+                self.expr_value_bot(ast, *value, env, interner)
+            }
+            Node::Call { .. } => self.call_declares_bot(ast, id),
+            _ => false,
+        }
+    }
+
+    /// One `when` clause's contribution to [`Self::expr_value_bot`]'s `case`
+    /// join: the clause's value is its last body statement — or, for a
+    /// bodiless `when X`, its last condition (the `When` node documents the
+    /// same rule for the typer).
+    fn when_tail_value_bot(
+        &self,
+        ast: &LoweredAst,
+        branch: NodeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        match ast.get(branch) {
+            Node::When { conditions, body, .. } => match body.last() {
+                Some(&tail) => self.expr_value_bot(ast, tail, env, interner),
+                None => conditions
+                    .last()
+                    .is_some_and(|&c| self.expr_value_bot(ast, c, env, interner)),
+            },
+            _ => false,
+        }
     }
 
     /// `kernel_spelled_receiver?` — implicit self or the `Kernel` module
@@ -3306,11 +3670,14 @@ impl<'i> Typer<'i> {
     /// reaches it". A write the flat overlay can't see (inside an `if`, a
     /// `begin`, a nested carrier) leaves the read to the outer env — the same
     /// Dynamic a miss yields everywhere else, never a wrong type.
+    #[allow(clippy::too_many_arguments)]
     fn block_break_arm_types(
         &self,
         ast: &LoweredAst,
         block_body: &[NodeId],
         jumps: &[BlockJump],
+        block_params: &[(String, BlockParamKind)],
+        recv_ty: TypeId,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Vec<TypeId> {
@@ -3320,7 +3687,15 @@ impl<'i> Typer<'i> {
                 continue;
             }
             // Block-entry env: outer env + every top-level write before this arm.
-            let benv = self.block_entry_env(ast, block_body, jump.span.0, env, interner);
+            let benv = self.block_entry_env(
+                ast,
+                block_body,
+                jump.span.0,
+                block_params,
+                recv_ty,
+                env,
+                interner,
+            );
             if self.span_on_dead_branch(ast, jump.span, &benv, interner) {
                 continue;
             }
@@ -3340,6 +3715,33 @@ impl<'i> Typer<'i> {
         arms
     }
 
+    /// `Narrowing.narrow_non_nil` (`narrowing.rb:112`) — the non-nil fragment
+    /// of a type: `Constant(nil)` and `Nominal[NilClass]` narrow to `bot`
+    /// (which `Algebra::join` drops out of a union), a `Union` distributes,
+    /// and every other shape — `Top`, `Dynamic`, `Singleton`, `Tuple`,
+    /// `HashShape`, `Bot` — is its own non-nil fragment. Used by the
+    /// `safe_navigation_call_type` port in [`Self::type_block_call`].
+    fn narrow_non_nil(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+        match interner.get(ty).clone() {
+            Type::Constant(Scalar::Nil) => interner.intern(Type::Bottom),
+            Type::Nominal { class, .. }
+                if self.index.class_name_for_id(class) == Some("NilClass") =>
+            {
+                interner.intern(Type::Bottom)
+            }
+            Type::Union(members) => {
+                let kept: Vec<TypeId> = members
+                    .into_iter()
+                    .map(|m| self.narrow_non_nil(m, interner))
+                    .collect();
+                kept.into_iter()
+                    .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                    .unwrap_or_else(|| interner.intern(Type::Bottom))
+            }
+            _ => ty,
+        }
+    }
+
     /// The env a statement at `offset` inside the block actually runs under:
     /// the caller's `env` overlaid with the block's own top-level
     /// `LocalVariableWrite`s that precede it — `y = "s"; break y` contributes
@@ -3347,15 +3749,56 @@ impl<'i> Typer<'i> {
     /// reaches it". A write the flat overlay can't see (inside an `if`, a
     /// `begin`, a nested carrier) leaves the read to the outer env — the same
     /// Dynamic a miss yields everywhere else, never a wrong type.
+    ///
+    /// Every block parameter name is REMOVED first: `|v|` redeclares `v`
+    /// inside the block, so an outer local by the same name must not leak
+    /// into arm typing — `v = "s"; [1].tap { |v| break v }` contributes the
+    /// receiver type, not `"s"` (the reference's `BlockParameterBinder` opens
+    /// a fresh scope for the parameter list). The params `tap`/`then`/
+    /// `yield_self` feed — a `yield self` — are then bound: the first
+    /// positional (`|v|`, `|v = 1|`, `it`, `_1`) gets the receiver and
+    /// `*rest` binds `Array`. Destructured `|(v, w)|` names stay unbound:
+    /// the reference's `MultiTargetBinder`
+    /// DOES project a Tuple receiver element-wise, but every destructure slot
+    /// bound from a nominal `Array[T]` — the shape a `tap` receiver actually
+    /// reaches the binder as — is reported OPTIMISTIC (issue #1093's
+    /// short-array pad), and an optimistic slot declines diagnostics wherever
+    /// it flows. Unbound ⇒ `Dynamic[top]` reproduces the observable
+    /// diagnostics exactly: probe `[1, 2].tap { |(f, w)| break f }; x.upcase`
+    /// is silent in the reference while a concrete `1` binding would fire.
+    /// `**kw` binds `Hash` and `&blk` binds `Proc` — the reference's nominal
+    /// answers for both. Later positionals, plain keywords, `_2..`, and
+    /// `|;local|` declarations stay unbound — the reference leaves them
+    /// `Dynamic[top]` too (a `|;local|` is bound nowhere, not even to `nil`).
+    #[allow(clippy::too_many_arguments)]
     fn block_entry_env(
         &self,
         ast: &LoweredAst,
         block_body: &[NodeId],
         offset: usize,
+        block_params: &[(String, BlockParamKind)],
+        recv_ty: TypeId,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeEnv {
         let mut benv = env.clone();
+        for (name, kind) in block_params {
+            benv.remove(name);
+            let bound = match kind {
+                BlockParamKind::SelfArg => Some(recv_ty),
+                // Destructured names hide the outer name but bind no type —
+                // see the doc comment above for why the reference's
+                // optimistic Array-slot read declines either way.
+                BlockParamKind::DestructuredSelfArg => None,
+                BlockParamKind::Rest => Some(self.nominal_or_untyped("Array", interner)),
+                BlockParamKind::KwRest => Some(self.nominal_or_untyped("Hash", interner)),
+                BlockParamKind::Block => Some(self.nominal_or_untyped("Proc", interner)),
+                BlockParamKind::Other | BlockParamKind::Local => None,
+            };
+            if let Some(ty) = bound {
+                benv.insert(name.clone(), ty);
+            }
+        }
         for &id in block_body {
             let Node::LocalVariableWrite { name, value, span, .. } = ast.get(id) else {
                 continue;
@@ -3378,13 +3821,16 @@ impl<'i> Typer<'i> {
     ///   `true`, integer, float, string and symbol literals are always truthy
     ///   (a regex literal is too, but it has no owned node here and declines);
     ///   `false` and `nil` are always falsey.
-    /// - **A bare local read pinned to a `Constant` scalar** — the
-    ///   `flow.unreachable-branch` RULE keeps its literal-only envelope for
-    ///   anti-FP reasons, but the arm-collecting evaluator is not that rule:
-    ///   it evaluates `a = nil` and knows the `if a` branch is dead, so the
-    ///   arm is never collected there either. The read must resolve through
-    ///   `env` to a `Constant` — an optimistic CALL fold (`x.nil?`) is not
-    ///   consulted, matching the caution the rule documents.
+    /// - **Any predicate expression that evaluates to a `Constant` scalar** —
+    ///   the arm-collecting pass is the reference's `StatementEvaluator`
+    ///   under a break-value sink, NOT the literal-only
+    ///   `flow.unreachable-branch` rule: the evaluator types `if P` itself
+    ///   and never enters a branch whose `P` folds to a known truthy/falsey
+    ///   constant. A bare local read pinned `a = nil` decides `if a`, and so
+    ///   does a tuple fold — `v = [1]; break "s" if v.empty?` never collects
+    ///   the arm because `[1].empty?` evaluates to `Constant(false)` in both
+    ///   engines (probe row: the reference types the call `Array[Integer]`,
+    ///   not the `Array[Integer] | "s"` a kept arm would union).
     ///
     /// `unless` swaps the branches: `unless false`'s `then` RUNS.
     fn span_on_dead_branch(
@@ -3398,6 +3844,7 @@ impl<'i> Typer<'i> {
             let Node::If { predicate, then_body, else_body, is_unless, .. } = node else {
                 continue;
             };
+            let pred_ty = self.type_of(ast, *predicate, env, interner);
             let truthy = matches!(
                 ast.get(*predicate),
                 Node::TrueLit { .. }
@@ -3405,32 +3852,20 @@ impl<'i> Typer<'i> {
                     | Node::FloatLit { .. }
                     | Node::StringLit { .. }
                     | Node::SymbolLit { .. }
-            ) || match ast.get(*predicate) {
-                Node::LocalVariableRead { .. } => {
-                    let ty = self.type_of(ast, *predicate, env, interner);
-                    matches!(
-                        interner.get(ty),
-                        Type::Constant(
-                            Scalar::Int(_) | Scalar::Float(_) | Scalar::Str(_) | Scalar::Sym(_)
-                                | Scalar::Bool(true)
-                        )
-                    )
-                }
-                _ => false,
-            };
+            ) || matches!(
+                interner.get(pred_ty),
+                Type::Constant(
+                    Scalar::Int(_) | Scalar::Float(_) | Scalar::Str(_) | Scalar::Sym(_)
+                        | Scalar::Bool(true)
+                )
+            );
             let falsey = matches!(
                 ast.get(*predicate),
                 Node::FalseLit { .. } | Node::NilLit { .. }
-            ) || match ast.get(*predicate) {
-                Node::LocalVariableRead { .. } => {
-                    let ty = self.type_of(ast, *predicate, env, interner);
-                    matches!(
-                        interner.get(ty),
-                        Type::Constant(Scalar::Nil | Scalar::Bool(false))
-                    )
-                }
-                _ => false,
-            };
+            ) || matches!(
+                interner.get(pred_ty),
+                Type::Constant(Scalar::Nil | Scalar::Bool(false))
+            );
             let (then_dead, else_dead) = match (*is_unless, truthy, falsey) {
                 // `if P`: a truthy literal kills `else`, a falsey one kills `then`.
                 (false, true, false) => (false, true),
@@ -10123,6 +10558,64 @@ mod tests {
             .iter()
             .any(|&m| idx.class_name_of(&i, m) == Some("Array"));
         assert!(arm_is_str && keeps_array, "union must carry \"s\" beside Array, got {:?}", i.get(ty));
+    }
+
+    #[test]
+    fn tap_block_param_binding_kinds() {
+        let idx = CoreIndex::new();
+        if !idx.class_has_method("Kernel", "tap") {
+            return;
+        }
+        // `|(a, b)|` destructures hide the outer name but stay UNBOUND —
+        // the reference's destructure read off a nominal `Array[T]` is
+        // optimistic, which never witnesses; `break a` is Dynamic.
+        let (i, ty) = bound_type(
+            &idx,
+            b"a = 1\nx = [1, 2].tap { |(a, b)| break a }\n",
+            "x",
+        );
+        assert!(
+            matches!(i.get(ty), Type::Dynamic(_)),
+            "destructured arm must stay Dynamic[top], got {:?}",
+            i.get(ty)
+        );
+        // `it` is the receiver-bound self-arg — `break it` is the receiver.
+        let (i, ty) = bound_type(&idx, b"x = [1, 2].tap { break it }\n", "x");
+        assert!(
+            idx.class_name_of(&i, ty) == Some("Array")
+                || matches!(i.get(ty), Type::Tuple(_)),
+            "`it` must read the receiver, got {:?}",
+            i.get(ty)
+        );
+        // `**kw` binds the captured keyword `Hash`; `&blk` binds `Proc`.
+        let (i, ty) = bound_type(&idx, b"x = [1, 2].tap { |**kw| break kw }\n", "x");
+        assert_eq!(idx.class_name_of(&i, ty), Some("Hash"));
+        let (i, ty) = bound_type(&idx, b"x = [1, 2].tap { |&blk| break blk }\n", "x");
+        assert_eq!(idx.class_name_of(&i, ty), Some("Proc"));
+    }
+
+    #[test]
+    fn tap_safe_navigation_split() {
+        let idx = CoreIndex::new();
+        if !idx.class_has_method("Kernel", "tap") {
+            return;
+        }
+        // `safe_navigation_call_type`: a LITERAL `nil&.tap` folds to nil;
+        // an INFERRED-exactly-nil receiver keeps the plain pipeline and its
+        // break arms — `x.frobnicate_zzz` fires `for "s"` in the reference.
+        let (i, ty) = bound_type(&idx, b"x = nil&.tap { break \"s\" }\n", "x");
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Nil));
+        let (i, ty) = bound_type(
+            &idx,
+            b"c = nil\nx = c&.tap { break \"s\" }\n",
+            "x",
+        );
+        assert_eq!(
+            i.get(ty),
+            &Type::Constant(Scalar::Str("s".to_string())),
+            "inferred-nil receiver keeps the plain pipeline, got {:?}",
+            i.get(ty)
+        );
     }
 
     #[test]

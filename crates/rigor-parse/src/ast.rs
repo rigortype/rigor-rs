@@ -474,6 +474,17 @@ pub enum Node {
         /// `x.tap { break v }` on both engines, while `x.tap(1) { break v }`
         /// declines.
         explicit_arg_list: bool,
+        /// Every local name the attached literal block's parameter list binds,
+        /// tagged with how it binds — the port of the reference's
+        /// `BlockParameterBinder` name set (rigor-rs#140). Covers required,
+        /// optional, rest, post, keyword, keyword-rest and `&blk` parameters,
+        /// destructured `|(v, w)|` targets, `|;local|` declarations, and the
+        /// implicit `it` / numbered `_1.._9` parameters. Empty for a call with
+        /// no literal block and for a `&expr` block-pass (which binds nothing
+        /// in the caller). A `break`/`next` arm typed under the block's entry
+        /// env must NOT read an outer local through one of these names —
+        /// `{ |v| break v }` reads the parameter, not an outer `v`.
+        block_params: Vec<(String, BlockParamKind)>,
         /// Span of the whole call expression.
         span: Span,
     },
@@ -922,6 +933,42 @@ pub enum JumpKind {
     Retry,
 }
 
+/// How one name in a literal block's parameter list binds — the tag half of
+/// [`Node::Call`]'s `block_params` (rigor-rs#140). `tap`/`then`/`yield_self`
+/// invoke their block as `yield self`, so the binding kind decides what the
+/// parameter's type is when a `break`/`next` arm reads it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockParamKind {
+    /// The FIRST positional parameter — `|v|`, `|v = 1|`, `|v, w|`, the
+    /// implicit `it`, or `_1` — fed the receiver by a `yield self` yielder,
+    /// so it binds to the receiver's own type.
+    SelfArg,
+    /// A name inside a destructured FIRST positional `|(v, w)|` — fed the
+    /// receiver destructured, so it binds to the receiver's element type(s).
+    DestructuredSelfArg,
+    /// A `*rest` parameter — binds the leftover argument list, `Array[untyped]`
+    /// for the exactly-once yielders (the reference binds
+    /// `Array[Dynamic[top]]`).
+    Rest,
+    /// A `**kw` keyword-rest parameter — binds the captured keyword hash,
+    /// `Hash` for the exactly-once yielders (the reference binds
+    /// `Hash[Symbol, Dynamic[top]]`, which erases to the same nominal).
+    KwRest,
+    /// Any other parameter — later positionals and posts, keyword
+    /// parameters, numbered `_2.._9` — hidden from the
+    /// enclosing env but bound to nothing modeled (a read types
+    /// `Dynamic[top]`, the answer the reference's own binder gives a
+    /// `|v, w|`'s `w` or a `|k:|`'s `k` under `yield self`).
+    Other,
+    /// A `|;local|` block-local declaration — hidden from the enclosing env
+    /// and left UNBOUND, exactly as the reference's binder declares it (a
+    /// read types `Dynamic[top]`, not `nil`).
+    Local,
+    /// A `&blk` block capture — hidden from the enclosing env and bound to
+    /// `Proc` (the reference's binder types the captured block `Proc`).
+    Block,
+}
+
 impl Node {
     /// The byte span of this node, regardless of variant.
     pub fn span(&self) -> Span {
@@ -1193,7 +1240,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let mut local_read_starts: Vec<usize> = builder
         .nodes
         .iter()
-        .filter_map(|n| matches!(n, Node::LocalVariableRead { .. }).then(|| n.span().0))
+        .filter(|n| matches!(n, Node::LocalVariableRead { .. }))
+        .map(|n| n.span().0)
         .collect();
     local_read_starts.sort_unstable();
     let inert_spans: Vec<Span> = builder
@@ -1384,6 +1432,16 @@ impl<'src> Builder<'src> {
             });
         }
 
+        if let Some(read) = node.as_it_local_variable_read_node() {
+            // Ruby 3.4 `it` — the node carries no `name`; the implicit local is
+            // always `it`, matching the binding `block_param_names` installs
+            // for `ItParametersNode` (`reference/rigor`'s `it_read`).
+            return self.push(Node::LocalVariableRead {
+                name: "it".to_string(),
+                span: span_of(&read.location()),
+            });
+        }
+
         if let Some(s) = node.as_string_node() {
             // `unescaped()` is the decoded contents (`"Hello"` -> Hello).
             let value = String::from_utf8_lossy(s.unescaped()).into_owned();
@@ -1526,6 +1584,11 @@ impl<'src> Builder<'src> {
                 .and_then(|b| b.as_block_node())
                 .map(|bn| constant_list_names(&bn.locals()))
                 .unwrap_or_default();
+            let block_params = call
+                .block()
+                .and_then(|b| b.as_block_node())
+                .map(|bn| block_param_names(&bn))
+                .unwrap_or_default();
             // The message_loc is the method-name token; fall back to the whole
             // call span if Prism elides it (e.g. operator-ish forms).
             let message_span = call
@@ -1539,6 +1602,7 @@ impl<'src> Builder<'src> {
                 block_body,
                 block_span,
                 block_locals,
+                block_params,
                 explicit_arg_list: call.arguments().is_some(),
                 message_span,
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
@@ -3023,6 +3087,180 @@ fn all_param_names(params: Option<&ruby_prism::ParametersNode<'_>>) -> Vec<Strin
     names.0
 }
 
+/// Every name a literal block's parameter list binds, tagged with its
+/// [`BlockParamKind`] — the lowered input to `Node::Call::block_params`
+/// (rigor-rs#140). `tap`/`then`/`yield_self` invoke their block as
+/// `yield self`, so the FIRST positional (a required or optional name, the
+/// implicit `it`, `_1`, or the members of a leading `|(v, w)|`) receives the
+/// receiver; a `*rest` collects leftovers into an `Array`; `|;local|`
+/// declarations seed `nil`; and every remaining name — later positionals,
+/// posts, keywords, `**kw`, `&blk`, `_2.._9` — is hidden from the enclosing
+/// env but bound to nothing modeled.
+fn block_param_names(bn: &ruby_prism::BlockNode<'_>) -> Vec<(String, BlockParamKind)> {
+    let mut out: Vec<(String, BlockParamKind)> = Vec::new();
+    let Some(params) = bn.parameters() else {
+        return out;
+    };
+    if let Some(bp) = params.as_block_parameters_node() {
+        if let Some(p) = bp.parameters() {
+            // The first POSITIONAL entry (required or optional) is the one a
+            // `yield self` call feeds — later positionals, the rest and the
+            // posts bind to `Other`/`Rest`.
+            let mut first_positional_taken = false;
+            for req in p.requireds().iter() {
+                push_block_positional(&req, &mut first_positional_taken, &mut out);
+            }
+            for opt in p.optionals().iter() {
+                push_block_positional(&opt, &mut first_positional_taken, &mut out);
+            }
+            if let Some(rest) = p.rest().and_then(|n| n.as_rest_parameter_node()) {
+                if let Some(name) = rest.name() {
+                    out.push((constant_string(name.as_slice()), BlockParamKind::Rest));
+                }
+            }
+            for post in p.posts().iter() {
+                push_block_other_positional(&post, &mut out);
+            }
+            for kw in p.keywords().iter() {
+                if let Some(kwr) = kw.as_required_keyword_parameter_node() {
+                    out.push((keyword_param_name(kwr.name().as_slice()), BlockParamKind::Other));
+                } else if let Some(kwo) = kw.as_optional_keyword_parameter_node() {
+                    out.push((keyword_param_name(kwo.name().as_slice()), BlockParamKind::Other));
+                }
+            }
+            if let Some(kwr) = p.keyword_rest().and_then(|n| n.as_keyword_rest_parameter_node()) {
+                if let Some(name) = kwr.name() {
+                    out.push((constant_string(name.as_slice()), BlockParamKind::KwRest));
+                }
+            }
+            if let Some(blk) = p.block() {
+                if let Some(name) = blk.name() {
+                    out.push((constant_string(name.as_slice()), BlockParamKind::Block));
+                }
+            }
+        }
+        for local in bp.locals().iter() {
+            if let Some(t) = local.as_local_variable_target_node() {
+                out.push((constant_string(t.name().as_slice()), BlockParamKind::Local));
+            }
+        }
+    } else if params.as_it_parameters_node().is_some() {
+        // `{ it }` — the implicit single parameter is fed the receiver.
+        out.push(("it".to_string(), BlockParamKind::SelfArg));
+    } else if let Some(np) = params.as_numbered_parameters_node() {
+        // `{ _1 + _2 }` — `_1` is fed the receiver; `_2..` bind nothing a
+        // one-argument yield provides.
+        for i in 1..=np.maximum() {
+            out.push((
+                format!("_{i}"),
+                if i == 1 { BlockParamKind::SelfArg } else { BlockParamKind::Other },
+            ));
+        }
+    }
+    out
+}
+
+/// One positional entry of a block's `ParametersNode` — a `RequiredParameterNode`
+/// or `OptionalParameterNode` binds its single name; a `MultiTargetNode` (a
+/// destructured `|(v, w)|`) binds every nested local-target name. The FIRST
+/// positional is a `yield self` argument ([`BlockParamKind::SelfArg`] /
+/// [`BlockParamKind::DestructuredSelfArg`]); every later one is [`BlockParamKind::Other`].
+fn push_block_positional(
+    node: &PrismNode<'_>,
+    first_positional_taken: &mut bool,
+    out: &mut Vec<(String, BlockParamKind)>,
+) {
+    if let Some(req) = node.as_required_parameter_node() {
+        let kind = if *first_positional_taken {
+            BlockParamKind::Other
+        } else {
+            BlockParamKind::SelfArg
+        };
+        *first_positional_taken = true;
+        out.push((constant_string(req.name().as_slice()), kind));
+    } else if let Some(opt) = node.as_optional_parameter_node() {
+        let kind = if *first_positional_taken {
+            BlockParamKind::Other
+        } else {
+            BlockParamKind::SelfArg
+        };
+        *first_positional_taken = true;
+        out.push((constant_string(opt.name().as_slice()), kind));
+    } else if let Some(mt) = node.as_multi_target_node() {
+        let kind = if *first_positional_taken {
+            BlockParamKind::Other
+        } else {
+            BlockParamKind::DestructuredSelfArg
+        };
+        *first_positional_taken = true;
+        multi_target_names(&mt.as_node(), out, kind);
+    }
+    // Any other positional shape binds no name (e.g. an anonymous `|` hole).
+}
+
+/// A NON-first positional — a post-parameter (`|*r, z|`'s `z`) or a nested
+/// destructured group behind the first. Every name binds [`BlockParamKind::Other`]:
+/// a `yield self` call has no second argument to feed it.
+fn push_block_other_positional(node: &PrismNode<'_>, out: &mut Vec<(String, BlockParamKind)>) {
+    if let Some(req) = node.as_required_parameter_node() {
+        out.push((constant_string(req.name().as_slice()), BlockParamKind::Other));
+    } else if let Some(mt) = node.as_multi_target_node() {
+        multi_target_names(&mt.as_node(), out, BlockParamKind::Other);
+    }
+}
+
+/// Every local-target name inside a destructured parameter (`|(v, (w, *r))|`),
+/// recursively — `lefts`, an optional `rest` (a `SplatNode` wrapping a target,
+/// or a nested `MultiTargetNode`), and `rights`.
+fn multi_target_names(node: &PrismNode<'_>, out: &mut Vec<(String, BlockParamKind)>, kind: BlockParamKind) {
+    // Inside a block-parameter list the destructured names are
+    // `RequiredParameterNode`s / `OptionalParameterNode`s / `RestParameterNode`s
+    // (they read as `|(a, b)|`, not as assignment targets); assignment-style
+    // destructures keep `LocalVariableTargetNode`.  Handle both shapes.
+    if let Some(r) = node.as_required_parameter_node() {
+        out.push((constant_string(r.name().as_slice()), kind));
+        return;
+    }
+    if let Some(o) = node.as_optional_parameter_node() {
+        out.push((constant_string(o.name().as_slice()), kind));
+        return;
+    }
+    if let Some(r) = node.as_rest_parameter_node() {
+        if let Some(nm) = r.name() {
+            out.push((constant_string(nm.as_slice()), kind));
+        }
+        return;
+    }
+    if let Some(t) = node.as_local_variable_target_node() {
+        out.push((constant_string(t.name().as_slice()), kind));
+        return;
+    }
+    if let Some(splat) = node.as_splat_node() {
+        if let Some(expr) = splat.expression() {
+            multi_target_names(&expr, out, kind);
+        }
+        return;
+    }
+    if let Some(mt) = node.as_multi_target_node() {
+        for l in mt.lefts().iter() {
+            multi_target_names(&l, out, kind);
+        }
+        if let Some(rest) = mt.rest() {
+            multi_target_names(&rest, out, kind);
+        }
+        for r in mt.rights().iter() {
+            multi_target_names(&r, out, kind);
+        }
+    }
+}
+
+/// A keyword parameter's LOCAL name — Prism's `name` constant is the full
+/// `k:` symbol, so strip the trailing colon the local binding never carries.
+fn keyword_param_name(raw: &[u8]) -> String {
+    let s = constant_string(raw);
+    s.strip_suffix(':').unwrap_or(&s).to_string()
+}
+
 /// Whether a Prism `def` body contains an explicit `return` statement ANYWHERE
 /// (ADR-0023 tier-4b decline gate). We only infer a return type from the body's
 /// TAIL expression; an explicit `return` could carry a different type on another
@@ -4333,4 +4571,5 @@ mod tests {
         assert_eq!(body.len(), 4, "flat body still appends every clause");
         assert_eq!(&body[..main_body.len()], &main_body[..]);
     }
+
 }

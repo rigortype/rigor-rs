@@ -11,9 +11,9 @@ pub use ruby_prism;
 pub mod ast;
 
 pub use ast::{
-    lower, lower_with_key, ConstMutation, FileKey, HashKey, HashKeyTag, JumpKind, LoweredAst,
-    MethodBody, MultiTarget, MultiTargets, Node, NodeId, ParamShape, RescueClause, Span,
-    StatementsKind, Visibility,
+    lower, lower_with_key, BlockParamKind, ConstMutation, FileKey, HashKey, HashKeyTag, JumpKind,
+    LoweredAst, MethodBody, MultiTarget, MultiTargets, Node, NodeId, ParamShape, RescueClause,
+    Span, StatementsKind, Visibility,
 };
 
 /// Parse Ruby source with Prism. The borrowed result is lowered into an owned,

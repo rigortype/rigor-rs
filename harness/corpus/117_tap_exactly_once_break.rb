@@ -162,3 +162,146 @@ e2.upcase
 # applies and the call is `"s"`. Only a NON-EMPTY argument list declines.
 e3 = [1, 2].tap() { break "s" }
 e3.upcase
+
+# --- block parameters hide (and bind over) the enclosing env -----------------
+
+# (27) `|v|` redeclares `v`: the arm is the RECEIVER, not the outer `"s"`.
+# `push` on it is valid — a leaked outer binding would fire here.
+w1 = "s"
+f1 = [1, 2].tap { |w1| break w1 }
+f1.push 3
+
+# (28) `|(v, w)|` destructures: the names hide the outer binding but stay
+# UNBOUND — the reference's destructure read off a nominal `Array[T]` is
+# optimistic (the runtime may pad `nil`), and an optimistic slot never
+# witnesses. `push` silent either way — a leaked outer `"s"` would fire.
+w2 = "s"
+f2 = [1, 2].tap { |(f2v, w2)| break w2 }
+f2.push 3
+
+# (29) `|*w|` binds the leftover array — `push` is valid. An outer leak would
+# fire here.
+w3 = "s"
+f3 = [1, 2].tap { |*w3| break w3 }
+f3.push 3
+
+# (30) A plain keyword parameter hides the outer name and stays unbound —
+# `push` silent on the Dynamic arm. A `&blk` capture binds `Proc` (the
+# reference's binder answer for the captured block) — FIRING on `Proc#push`.
+w4 = "s"
+f4 = [1, 2].tap { |w4:| break w4 }
+f4.push 3
+w5 = "s"
+f5 = [1, 2].tap { |&w5| break w5 }
+f5.push 3
+
+# (31) A `|;local|` declaration hides the outer name and stays unbound —
+# `push` silent on the Dynamic arm.
+w6 = "s"
+f6 = [1, 2].tap { |w6p; w6| break w6 }
+f6.push 3
+
+# --- the block's VALUE is not its reachability --------------------------------
+
+# (32) A non-completing PART still types the whole expression: the array's
+# value is `Array`, so `tap` keeps its receiver. FIRING.
+g1 = [1, 2].tap { [raise("x")] }
+g1.upcase
+
+# (33) Same for a call argument — `push(raise "x")` types to `push`'s
+# return, so the block's tail value is non-bot. FIRING.
+g2 = [1, 2].tap { [1, 2].push(raise "x") }
+g2.upcase
+
+# (34) `break "s" if raise "x"` — the `if`'s value joins its missing `else`
+# (`nil`), so the block return is non-bot and the arm still unions: the call
+# is `"s" | Array`. FIRING on a method every arm lacks.
+g3 = [1, 2].tap { break "s" if raise "x" }
+g3.frobnicate_zzz
+
+# (35) `raise "x"; break "s"` — the `break` tail IS bot, so the call is the
+# arm alone: `"s"`. FIRING on `push`, silent on `upcase`.
+g4 = [1, 2].tap { raise "x"; break "s" }
+g4.push 3
+
+# (36) A mid-body `next "s"` joins the block's return — the block's value is
+# `"s"`, not bot, so `tap` keeps its receiver even between two `raise`s.
+# FIRING.
+g5 = [1, 2].tap { raise "x"; next "s"; raise "y" }
+g5.upcase
+
+# (37) A `next` carrying a `bot` value contributes nothing — `bot` alone.
+g6 = [1, 2].tap { next raise "x"; raise "y" }
+g6.upcase
+
+# (38) `if c; break "s"; else; break 1; end` — every arm's value is `bot`, so
+# the call is the arms alone: `"s" | 1`. FIRING on a method all arms lack.
+g7 = [1, 2].tap { if c; break "s"; else; break 1; end }
+g7.push 3
+
+# (39) `case`/`when` arms join the same way: all-`break` branches plus an
+# `else` give `bot` — the call is the arms alone. FIRING.
+g8 = [1, 2].tap { break "a"; case c; when 1 then break 1; else break "s"; end }
+g8.push 3
+
+# (40) A `case` on a value-pinned subject with no `else`: the definite-match
+# `when` is the value, and `bot` still drops — `"a" | 1`. FIRING.
+g9 = [1, 2].tap { break "a"; case 1; when 1 then break 1; end }
+g9.push 3
+
+# (41) But a `case` tail alone never satisfies `never_completes_normally?` —
+# the syntactic walk has no `CaseNode` — so the union survives. FIRING on a
+# method every arm lacks.
+h1 = [1, 2].tap { case c; when 1 then break "s"; else break 1; end }
+h1.frobnicate_zzz
+
+# (42) `begin`/`else`: the `else` arm contributes the block's value when the
+# protected body completes — `begin raise; rescue break; else 1; end` is
+# non-bot, so `tap` keeps `Array` in the union. `push` is on it — silent.
+h2 = [1, 2].tap { break "a"; begin; raise "x"; rescue; break "b"; else; 1; end }
+h2.push 3
+
+# (43) And with every arm `bot` (`else break "s"`), it drops — `"a" | "s" | 1`.
+# FIRING on a method all arms lack.
+h3 = [1, 2].tap { break "a"; begin; raise "x"; rescue; break 1; else; break "s"; end }
+h3.push 3
+
+# --- safe navigation + union receivers ----------------------------------------
+
+# (44) `&.` splits on the receiver NODE, not its type: a literal `nil&.tap`
+# folds to `nil` without dispatching (`nil&.tap { break "s" }` is `nil`,
+# FIRING on `nil.upcase`), but an INFERRED-exactly-nil receiver keeps the
+# plain pipeline (upstream #540/#541 — the nil traces to a wrong uplink) —
+# `h4 = nil; h4&.tap { break "s" }` still answers `"s"`, and `h4` itself is
+# still `nil`. FIRING on both `for "s"` and `for nil`.
+h4z = nil&.tap { break "s" }
+h4z.upcase
+h4 = nil
+h4a = h4&.tap { break "s" }
+h4a.frobnicate_zzz
+h4.upcase
+
+# (45) A non-nil `&.` receiver still runs the block — `"s"`. FIRING.
+h5 = [1, 2]&.tap { break "s" }
+h5.push 3
+
+# (46) `break "s"; break 1` — a multi-class union arm: FIRING only where
+# EVERY arm lacks the method (`push`), silent on `upcase` (String has it).
+h6 = [1, 2].tap { break "s"; break 1 }
+h6.push 3
+h7 = [1, 2].tap { break "s"; break 1 }
+h7.upcase
+
+# (47) A nil-bearing union stays silent — the N3 decision.
+h8 = c ? "s" : nil
+h8.frobnicate_zzz
+
+# (48) The implicit `it` parameter is the receiver-bound self-arg — `break
+# it` is the receiver. FIRING on `Array#upcase`'s absence.
+i1 = [1, 2].tap { break it }
+i1.upcase
+
+# (49) `**kw` binds the captured keyword `Hash`. FIRING on `Hash#push`.
+w7 = "s"
+i2 = [1, 2].tap { |**w7| break w7 }
+i2.push 3
