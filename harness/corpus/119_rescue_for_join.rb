@@ -381,3 +381,47 @@ r41.frob
 # (42) a heterogeneous union in a def-body ternary witnesses in the
 # reference's `describe(:short)` order — fires `for "s" | 1`.
 def m42(c) = (c ? "s" : 1).frob
+
+# (43) a NESTED compound index write drops the receiver-chain index-arg
+# write too — `eval_index_or_write` sub-evaluates only `node.value`, so
+# `h[a = 3][b = 4] ||= 1` leaves `a` at `1` and `b` at `2` (fires
+# `for [1]`, `for [2]`, `for "s"`).
+i43a = 1
+i43b = 2
+h43 = {}
+h43[i43a = 3][i43b = 4] ||= 1
+[i43a].frob
+[i43b].frob
+i43c = "s"
+h43[i43c = 3][i43d = 4] ||= 1
+i43c.frob
+
+# (44) a multi-target `for` distributes a union-of-tuples element
+# across the slots (issue #1094): `for a, b in [[6, 7], [8, 9]]` joins
+# `6 | 8` into `a` and `7 | 9` into `b`, beside the pre-state —
+# fires `for [6 | 8 | 9]` / `for [7 | 8 | 9]`.
+f44a = 9
+f44b = 8
+for f44a, f44b in [[6, 7], [8, 9]]; end
+[f44a].frob
+[f44b].frob
+
+# (45) `&&` / `||` / `and` / `or` nil-inject their RHS scope into the
+# LHS scope (`eval_and_or` -> `join_with_nil_injection`), so a write
+# after a rescue modifier or inside the RHS unions rather than widens —
+# fires `for [5 | 6 | 7]`, `for [2?]`, `for "s" | 1 | :a`.
+l45a = 5
+(l45a = 6) rescue nil or (l45a = 7)
+[l45a].frob
+l45b = 5
+((l45b = 6) rescue nil) || (l45b = 7)
+[l45b].frob
+l45c = 5
+((l45c = 6) rescue nil) && (l45c = 7)
+[l45c].frob
+x45 = 1
+x45 && (y45 = 2)
+[y45].frob
+l45d = "s"
+(l45d = 1) rescue nil or (l45d = :a)
+l45d.frob

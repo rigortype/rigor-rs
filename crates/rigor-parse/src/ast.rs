@@ -1195,13 +1195,14 @@ impl LoweredAst {
         self.inert_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
 
-    /// Whether `span` lies inside an INDEX-ARGUMENT position of a
-    /// `recv[…] ||= v` / `recv[…] &&= v` / `recv[…] op= v` compound write. The
-    /// reference's `IndexWriteWidening` (`statement_evaluator.rb`
-    /// `eval_index_or_write` / `eval_index_write`) evaluates the store but does
-    /// not rebind a local an index expression writes — `h[w = 6] ||= 1` leaves
-    /// a pre-existing `w = 5` alone, so a write here is dropped from the write
-    /// collectors entirely (neither binds nor widens, rigor-rs#167). The
+    /// Whether `span` lies inside the RECEIVER or an INDEX-ARGUMENT position of
+    /// a `recv[…] ||= v` / `recv[…] &&= v` / `recv[…] op= v` compound write.
+    /// The reference's `eval_index_or_write` / `eval_index_write` sub-evaluates
+    /// only `node.value`, so it does not rebind a local the receiver or index
+    /// expressions write — `h[w = 6] ||= 1` leaves a pre-existing `w = 5`
+    /// alone and the nested `h[a = 3][b = 4] ||= 1` leaves `a` alone too, so a
+    /// write here is dropped from the write collectors entirely (neither binds
+    /// nor widens, rigor-rs#167). The
     /// reference's quirk is deliberate oracle behaviour, not a bug to
     /// generalise: a plain `recv[w = 6] = v` (`[]=` call) and a write in the
     /// VALUE position (`h[:k] ||= (w = 6)`) both bind normally.
@@ -2444,11 +2445,12 @@ impl<'src> Builder<'src> {
         //
         //  - RECEIVER + INDEX-ARGUMENT children stay flat in the carrier. The
         //    reference's `eval_index_or_write` / `eval_index_write` runs
-        //    `IndexWriteWidening`, which evaluates the store but does NOT
-        //    rebind a local the index expressions write (`h[w = 6] ||= 1`
-        //    leaves a pre-existing `w = 5` alone — the write is dropped, not
-        //    widened and not bound). Their spans go to `index_arg_spans` so the
-        //    write collectors drop them entirely.
+        //    `IndexWriteWidening` and sub-evaluates only `node.value`, so it
+        //    does NOT rebind a local the receiver or index expressions write
+        //    (`h[w = 6] ||= 1` leaves a pre-existing `w = 5` alone — and the
+        //    nested `h[a = 3][b = 4] ||= 1` leaves `a` alone too: the write is
+        //    dropped, not widened and not bound). Their spans go to
+        //    `index_arg_spans` so the write collectors drop them entirely.
         //  - VALUE children (`h[:k] ||= (w = 6)`) run unconditionally, so they
         //    are wrapped in a `Sequence` carrier — the binders descend it like
         //    an ordinary statement sequence (`for [6]`).
@@ -2457,6 +2459,11 @@ impl<'src> Builder<'src> {
         // its index arguments evaluate unconditionally and bind normally.
         if let Some(index_write) = index_write_parts(node) {
             let mut body: Vec<NodeId> = Vec::new();
+            // The reference only ever `sub_eval`s `node.value` — writes in the
+            // RECEIVER subtree drop exactly like index-argument writes
+            // (`h[a = 3][b = 4] ||= 1` leaves `a` at its pre-state too), so the
+            // whole receiver span joins `index_arg_spans`.
+            self.index_arg_spans.push(span_of(&index_write.receiver.location()));
             let side = collect_recoverable_children(&index_write.receiver);
             for c in &side {
                 body.push(self.lower_node(c));

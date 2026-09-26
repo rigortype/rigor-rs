@@ -3144,7 +3144,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.bind_check_statement(ast, value, env, rebinds, interner);
                 let rhs = self.type_of(ast, value, env, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner, &|c| self.class_name(c)) {
                     env.insert(name, ty);
                 }
             }
@@ -3248,7 +3248,7 @@ impl<'i> Typer<'i> {
                     self.bind_check_statement(ast, *e, &mut body_env, rebinds, interner);
                 }
                 if let Some(targets) = &for_targets {
-                    for (name, ty) in multi_target_binder::bind(targets, elem, interner) {
+                    for (name, ty) in multi_target_binder::bind(targets, elem, interner, &|c| self.class_name(c)) {
                         body_env.insert(name, ty);
                     }
                 } else {
@@ -3382,15 +3382,20 @@ impl<'i> Typer<'i> {
                     }
                 }
             }
-            // `a && b` / `a || b` — the LHS always evaluates, the RHS is
-            // conditional. Descend the LHS in place and widen the RHS's rebinds:
-            // `eval_and_or` nil-injects the RHS's writes, which the flat env
-            // declines to track (the narrower `6?` it would produce is a
-            // follow-up, not this slice).
+            // `a && b` / `a || b` / `a and b` / `a or b` — the LHS always
+            // evaluates, the RHS is conditional. `eval_and_or` /
+            // `and_or_with_edges` (statement_evaluator.rb:2220) exits with
+            // `join_with_nil_injection(left_scope, right_scope)`, so a write
+            // in the RHS unions its prior value with the written one instead
+            // of widening (`(w = 6) rescue nil or (w = 7)` -> `5 | 6 | 7`,
+            // rigor-rs#167). The RHS's truthy/falsey entry-edge narrowing is
+            // unmodeled — the flat env never narrows on predicates anyway.
             Node::Logical { left, right, .. } => {
                 let (left, right) = (*left, *right);
                 self.bind_check_statement(ast, left, env, rebinds, interner);
-                widen_flow_writes(rebinds, ast.get(right).span(), env, interner);
+                let mut right_env = env.clone();
+                self.bind_check_statement(ast, right, &mut right_env, rebinds, interner);
+                *env = self.join_with_nil_injection(env, &right_env, interner);
             }
             // Expression forms whose operands evaluate unconditionally — an
             // array/hash literal's elements, an interpolation's parts, a
@@ -3427,35 +3432,19 @@ impl<'i> Typer<'i> {
         self.union_of(members, interner)
     }
 
-    /// [`Self::union_named`] over an arbitrary member list.
+    /// [`Self::union_named`] over an arbitrary member list — delegates to
+    /// [`rigor_types::combinator_union`] with this typer's class-name resolver.
     fn union_of(&self, members: Vec<TypeId>, interner: &mut Interner) -> TypeId {
-        let mut flat: Vec<TypeId> = Vec::new();
-        for m in members {
-            match interner.get(m) {
-                Type::Union(ms) => flat.extend_from_slice(ms),
-                Type::Bottom => {}
-                Type::Top => return m,
-                _ => flat.push(m),
-            }
-        }
-        if flat.iter().any(|&m| matches!(interner.get(m), Type::Top)) {
-            return interner.intern(Type::Top);
-        }
-        flat.sort_by_key(|&m| {
-            let resolve = |class: rigor_types::ClassId| -> Option<String> {
-                self.index
-                    .class_name_for_id(class)
-                    .map(str::to_string)
-                    .or_else(|| self.source.class_name_for_id(class).map(str::to_string))
-            };
-            rigor_types::describe_named(interner, m, &resolve)
-        });
-        flat.dedup();
-        match flat[..] {
-            [] => interner.intern(Type::Bottom),
-            [one] => one,
-            _ => interner.intern(Type::Union(flat)),
-        }
+        rigor_types::combinator_union(interner, members, &|c| self.class_name(c))
+    }
+
+    /// The class-name resolver every `Combinator.union` surface shares — core
+    /// index first, then the source registry (project classes).
+    fn class_name(&self, class: rigor_types::ClassId) -> Option<String> {
+        self.index
+            .class_name_for_id(class)
+            .map(str::to_string)
+            .or_else(|| self.source.class_name_for_id(class).map(str::to_string))
     }
 
     /// `join_with_nil_injection` (statement_evaluator.rb:5075): a local bound
@@ -3722,7 +3711,7 @@ impl<'i> Typer<'i> {
                 let vspan = ast.get(value).span();
                 widen_flow_writes(writes, vspan, env, interner);
                 let rhs = self.type_of(ast, value, env, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner, &|c| self.class_name(c)) {
                     env.insert(name, ty);
                 }
             }
@@ -3831,7 +3820,7 @@ impl<'i> Typer<'i> {
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
                 let rhs = self.type_of(ast, value, env, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner, &|c| self.class_name(c)) {
                     env.insert(name, ty);
                 }
             }
@@ -4032,7 +4021,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner, &|c| self.class_name(c)) {
                     nenv.remove(&name);
                     penv.remove(&name);
                     tenv.insert(name, ty);
@@ -4541,7 +4530,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner, &|c| self.class_name(c)) {
                     cenv.kill_local(&name);
                     tenv.insert(name, ty);
                 }
@@ -4999,7 +4988,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner, &|c| self.class_name(c)) {
                     cenv.kill_local(&name);
                     tenv.insert(name, ty);
                 }
@@ -6557,7 +6546,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.coll_flow_expr(ast, value, tenv, ctx, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner, &|c| self.class_name(c)) {
                     tenv.insert(name, ty);
                 }
             }

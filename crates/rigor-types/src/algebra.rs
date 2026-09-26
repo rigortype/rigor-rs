@@ -14,11 +14,43 @@
 //! and `untyped == Dynamic[top]`.
 
 use crate::interner::Interner;
-use crate::ty::{Scalar, Type, TypeId};
+use crate::ty::{ClassId, Scalar, Type, TypeId};
 
 /// Operations are free functions taking the interner so callers keep a single
 /// shared arena.
 pub struct Algebra;
+
+/// `Type::Combinator.union` — the reference's literal union CONSTRUCTOR
+/// (`combinator.rb`'s `sort_members`), NOT [`Algebra::join`]: members flatten,
+/// `bot` drops, plain `top` absorbs, the survivors dedup and sort by
+/// `describe(:short)` with `resolve` supplying class names. No Dynamic
+/// algebra runs — `5 | Dynamic[top]` stays a union, matching the reference's
+/// scope-join (`w = 5; (w = 6) rescue nil` → `5 | 6`, rigor-rs#167).
+pub fn combinator_union(
+    i: &mut Interner,
+    members: Vec<TypeId>,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> TypeId {
+    let mut flat: Vec<TypeId> = Vec::new();
+    for m in members {
+        match i.get(m) {
+            Type::Union(ms) => flat.extend_from_slice(ms),
+            Type::Bottom => {} // T | bot = T : drop
+            Type::Top => return m,
+            _ => flat.push(m),
+        }
+    }
+    if flat.iter().any(|&m| matches!(i.get(m), Type::Top)) {
+        return i.top();
+    }
+    flat.sort_by_key(|&m| crate::display::describe_named(i, m, resolve));
+    flat.dedup();
+    match flat[..] {
+        [] => i.bottom(),
+        [one] => one,
+        _ => i.intern(Type::Union(flat)),
+    }
+}
 
 impl Algebra {
     /// Join (`A | B`): the least carrier containing both. Threads the Dynamic
