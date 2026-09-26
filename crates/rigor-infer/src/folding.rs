@@ -456,6 +456,21 @@ pub fn fold_can_go_nil(recv: &Scalar, method: &str) -> bool {
     is_str_lookup(recv, method) || is_nilable_cmp(recv, method)
 }
 
+/// Whether `method` on a pinned `recv` is one of the issue-#164 nilable
+/// folds — `rindex` / `byteindex` / `byterindex` / `getbyte` and the scalar
+/// `<=>`s. When the stale-local gate declines their fold, the caller must
+/// also decline the WHOLE call to `Dynamic`: the flat RBS slot below would
+/// still answer a bare `Integer`, which minted `call.undefined-method … for
+/// Integer` where the reference keeps the `C?` union and stays silent (or
+/// folds `getbyte` itself and names `nil`). The older lookups (`index`,
+/// `[]`, `slice`, `byteslice`) keep the flat answer — its `for Integer` on a
+/// fold HIT set-matches the reference, so it is standing behaviour.
+pub fn stale_declines_untyped(recv: &Scalar, method: &str) -> bool {
+    is_nilable_cmp(recv, method)
+        || (matches!(recv, Scalar::Str(_))
+            && matches!(method, "rindex" | "byteindex" | "byterindex" | "getbyte"))
+}
+
 /// The outcome of a String lookup fold on pinned scalar arguments.
 ///
 /// The reference folds these by *executing* the real method behind a purity

@@ -2559,6 +2559,18 @@ impl<'i> Typer<'i> {
                         && std::iter::once(receiver)
                             .chain(args.iter().copied())
                             .any(|id| ast.reads_local_within(ast.get(id).span()));
+                    // On a stale read the issue-#164 folds must decline the
+                    // WHOLE call, not just the fold: falling through to the
+                    // flat RBS slot answered a bare `Integer`, so
+                    // `s = "abc"; s.rindex("z").to_a` fired `to_a for
+                    // Integer` where the reference keeps the `C?` union and
+                    // stays silent (and `s.getbyte(9).lenght` reported `for
+                    // Integer` where the oracle folds `nil`). Coverage loss
+                    // only — the union cannot be carried. The older lookups
+                    // keep the flat answer (fold-hit `for Integer` set-match).
+                    if stale_risk && folding::stale_declines_untyped(&scalar, method) {
+                        return interner.untyped();
+                    }
                     // String lookups go through the typed `LookupFold` outcome
                     // so a pinned argument list Ruby RAISES on declines to
                     // `Dynamic` — the reference's fold rescues into the `C?`
@@ -8301,6 +8313,41 @@ mod tests {
             last_call_ty(b"# encoding: binary\n\"abc\".index(\"b\")\n"),
             "Constant[1]"
         );
+    }
+
+    /// The stale-local gate declines the fold, and for the issue-#164
+    /// lookups (`rindex`/`byteindex`/`byterindex`/`getbyte` and the scalar
+    /// `<=>`s) it must decline the whole CALL too: the flat RBS slot below
+    /// answers a bare `Integer`, so `s.rindex("z").to_a` fired `for Integer`
+    /// where the oracle is silent (`getbyte(9)` even names `nil`). The older
+    /// lookups keep the flat answer (fold-hit `for Integer` set-match).
+    #[test]
+    fn stale_local_nilable_fold_declines_the_call() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let last_call_ty = |src: &[u8]| -> String {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = typer.build_toplevel_env(&ast, &mut i);
+            let call_id = ast
+                .iter()
+                .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+                .last()
+                .unwrap();
+            let ty = typer.type_of(&ast, call_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.rindex(\"z\")\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.byteindex(\"z\")\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.byterindex(\"z\")\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.getbyte(9)\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"x = 1.0\nx <=> \"x\"\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns << \"z\"\ns.rindex(\"z\")\n"), "Dynamic[top]");
+        // The older lookups keep the flat `Integer` answer (standing
+        // behaviour); a literal receiver still folds — nothing reads a local.
+        assert!(last_call_ty(b"s = \"abc\"\ns.index(\"z\")\n").starts_with("Class<"));
+        assert_eq!(last_call_ty(b"\"abc\".rindex(\"z\")\n"), "nil");
+        assert_eq!(last_call_ty(b"\"abc\".rindex(\"b\")\n"), "Constant[1]");
     }
 
     /// Kernel `#p` / `#pp` identity typing on the implicit-self (`receiver:

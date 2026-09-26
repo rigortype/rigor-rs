@@ -4235,6 +4235,15 @@ mod tests {
             // Leading inline whitespace is fine — the honored comment need
             // not start the line's first byte.
             (b"   # encoding: binary\nputs 1\n", false),
+            // BOM rows: `pm_strnstr(parser->start, "ruby", length)` scans
+            // `length` bytes from the SOURCE start, so a BOM shrinks the
+            // shebang-search window by three — `ruby` inside the line's
+            // last three bytes is missed and line 2 stays inert (Prism
+            // literal-encoding probed).
+            (b"\xEF\xBB\xBF# encoding: binary\nputs 1\n", false),
+            (b"\xEF\xBB\xBF#!coding:binary ruby\nputs 1\n", false),
+            (b"\xEF\xBB\xBF#!/usr/bin/env ruby\n# encoding: binary\nputs 1\n", true),
+            (b"\xEF\xBB\xBF#!/usr/bin/env ruby -w\n# encoding: binary\nputs 1\n", false),
         ];
         for (src, expected) in cases {
             let ast = lower(&crate::parse(src));
