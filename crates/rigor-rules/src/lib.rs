@@ -641,7 +641,11 @@ pub fn analyze_with_source_and_folder(
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
         let diag = (!nil_skip)
-            .then(|| check_call(ast, recv, &method, message_span, env, &typer, interner, index))
+            .then(|| {
+                check_call(
+                    ast, recv, &method, message_span, safe_nav, env, &typer, interner, index,
+                )
+            })
             .flatten()
             .or_else(|| {
                 check_narrowed_call(
@@ -1472,6 +1476,7 @@ fn check_call(
     receiver: rigor_parse::NodeId,
     method: &str,
     message_span: (usize, usize),
+    safe_nav: bool,
     env: &rigor_infer::TypeEnv,
     typer: &Typer,
     interner: &mut Interner,
@@ -1544,6 +1549,20 @@ fn check_call(
     // fp_audit on gitlab app/models the first time this gate was
     // `knows_class`-wide).
     if index.class_name_of(interner, recv_ty).is_none() {
+        // UNION receiver — the reference's `union_undefined_method_diagnostic`
+        // (`check_rules.rb:1921`), reached exactly where the scalar path finds
+        // no single concrete class (`class_name.nil?`). Fire only when EVERY
+        // arm is a fully-known, bounded, non-nil instance class that lacks the
+        // method — `x = [1, 2].tap { break "s"; break 1 }; x.push 3` witnesses
+        // `"s" | 1` (rigor-rs#140). Any nil-bearing, safe-navigated,
+        // Dynamic/unknown, singleton, metaclass, or module-mixin arm — or a
+        // union whose arms collapse to ONE class — declines to silence, the
+        // zero-FP direction the same reference encodes (`any?` permissive on
+        // uncertainty). A single-class union (`"a" | "b"` — both String) is a
+        // join artifact the scalar rule already owns.
+        if let Type::Union(_) = interner.get(recv_ty) {
+            return check_union_call(recv_ty, method, message_span, safe_nav, typer, interner, index);
+        }
         if let Some(name) = typer.source().class_name_for_id_of(interner, recv_ty) {
             // `knows_toplevel_class` ALONE (ADR-0042 gate probe s5): a
             // TOPLEVEL project-sig class (`Widget`) is in the toplevel set via
@@ -1682,6 +1701,90 @@ fn check_call(
     // for a Constant receiver it is the rendered value (e.g. `"\"Hello\""` for
     // a String literal, `"nil"` for nil), not the bare class name. This matches
     // the reference's JSON output which sets `receiver_type` to `"\"Hello\""`.
+    Some(Diagnostic {
+        rule_id: CALL_UNDEFINED_METHOD,
+        start_offset: message_span.0,
+        end_offset: message_span.1,
+        message,
+        severity,
+        source_family: "builtin",
+        receiver_type: Some(receiver_render),
+        method_name: Some(method.to_string()),
+    })
+}
+
+/// `call.undefined-method` over a UNION receiver — the port of the reference's
+/// `union_undefined_method_diagnostic` (`check_rules.rb:1921`), reached where
+/// the scalar path finds no single concrete class. It fires only when EVERY
+/// arm is a fully-known, bounded, non-nil, instance-side class that lacks the
+/// method (`"s" | 1` calling `push`), mirroring the reference's gate order:
+///
+/// - `safe_navigation?` declines outright;
+/// - any nil arm (`Constant[nil]` / `NilClass`) keeps `T | nil` silent — the
+///   deliberate N3 decision (ADR-62);
+/// - any UNANSWERABLE arm — `class_name_of` resolving `None` (Dynamic / Top /
+///   Bot / Singleton / a non-core surface; `Singleton` covers the reference's
+///   explicit singleton bail), a metaclass (`Class` / `Module`), or an RBS
+///   module mixin — declines, since no sound "absent on every arm" verdict
+///   exists there;
+/// - a class the bundled surface does not model (`!knows_class`) is likewise
+///   unanswerable — the reference's permissive `return true` from
+///   `method_present_anywhere?`;
+/// - the method PRESENT on any arm (project `def` — `source_declared_method?`
+///   — or the conservative `class_has_method` surface) declines;
+/// - fewer than two DISTINCT arm classes (`"a" | "b"`, one `String`) is a
+///   join artifact — the scalar rule's job, never this one's.
+fn check_union_call(
+    recv_ty: rigor_types::TypeId,
+    method: &str,
+    message_span: (usize, usize),
+    safe_nav: bool,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+) -> Option<Diagnostic> {
+    let Type::Union(members) = interner.get(recv_ty) else {
+        return None;
+    };
+    let members = members.clone();
+    if safe_nav {
+        return None;
+    }
+    let mut arm_classes: Vec<&'static str> = Vec::new();
+    for member in members {
+        let is_nil_member = matches!(interner.get(member), Type::Constant(Scalar::Nil))
+            || index.class_name_of(interner, member) == Some("NilClass");
+        if is_nil_member {
+            return None;
+        }
+        let class_name = index.class_name_of(interner, member)?;
+        if unenumerable_instance_receiver(index, class_name) {
+            return None;
+        }
+        if !index.knows_class(class_name) {
+            return None;
+        }
+        if typer.source().project_declares_method(class_name, method)
+            || index.class_has_method(class_name, method)
+        {
+            return None;
+        }
+        arm_classes.push(class_name);
+    }
+    if arm_classes
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        < 2
+    {
+        return None;
+    }
+    let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
+    let message = format!("undefined method `{method}' for {receiver_render}");
+    let severity = catalog(CALL_UNDEFINED_METHOD)
+        .map(|e| e.default_severity)
+        .unwrap_or(Severity::Error);
     Some(Diagnostic {
         rule_id: CALL_UNDEFINED_METHOD,
         start_offset: message_span.0,
