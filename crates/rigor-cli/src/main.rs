@@ -768,6 +768,14 @@ fn analyze_files(
         /// The third field is the `RIGOR_TIMING` component split (all-zero when
         /// the env gate is unset).
         Prepared(Prepared, Box<rigor_infer::Harvest>, Stage1Times),
+        /// A discovery-ONLY file (upstream #684): parsed, lowered and
+        /// harvested into the project index, but never analyzed — it
+        /// contributes no findings.
+        Discovery {
+            ast: rigor_parse::LoweredAst,
+            harvest: Box<rigor_infer::Harvest>,
+            times: Stage1Times,
+        },
         IoError { path: String, msg: String },
         /// A file Prism could not parse: NOT analysed (see the guard below),
         /// but its parse errors are reported, one diagnostic per raw Prism
@@ -785,10 +793,70 @@ fn analyze_files(
         Parsed(rigor_parse::LoweredAst, Vec<(usize, usize, String)>),
         Unparseable(Vec<Diagnostic>),
     }
-    let stage1: Vec<Stage1> = files
+
+    /// One stage-1 work item: `order`/`analyze` mark the analyzed files
+    /// (keyed by their position in `files`); `analyze == false` items are
+    /// discovery-only.
+    struct WorkItem {
+        order: usize,
+        path: String,
+        analyze: bool,
+    }
+
+    // Upstream #684 — `widen_discovery_to_project?` /
+    // `project_discovery_expansion`: when the run targets an explicit file
+    // list, the cross-file DISCOVERY pass still walks
+    // `expand_paths(configuration.paths | argv)` — `rigor check a.rb`
+    // sees `class String; attr_accessor :zz` in an unlisted `lib/ext.rb`,
+    // so a project-declared method suppresses identically whether or not
+    // its file was named. Only the argv expansion is ANALYZED; the extra
+    // files are parsed + lowered + harvested but produce no findings (the
+    // reference's discovery is a parse pass, not an analysis). The widened
+    // order — config `paths:` expansion first, then the argv files it did
+    // not already name — is preserved so the merge replay matches the
+    // reference's file order.
+    let analyzed_order: std::collections::HashMap<&str, usize> =
+        files.iter().enumerate().map(|(i, p)| (*p, i)).collect();
+    let mut worklist: Vec<WorkItem> = Vec::with_capacity(files.len());
+    let mut config_paths_seen: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    {
+        let config_roots: Vec<&str> = cfg.paths.iter().map(String::as_str).collect();
+        // Expansion errors on the discovery side are dropped, exactly as
+        // `project_discovery_expansion` only reads `widened[:files]`.
+        let (config_files, _) = expand_check_paths(&config_roots);
+        for path in config_files {
+            let order = analyzed_order.get(path.as_str()).copied();
+            // An analyzed file is scheduled (analyzed) at its first widened
+            // occurrence; a duplicate merges again discovery-only, like the
+            // reference's un-deduplicated `expand_paths`.
+            let analyze = order.is_some() && config_paths_seen.insert(path.clone());
+            worklist.push(WorkItem {
+                order: order.unwrap_or(usize::MAX),
+                path,
+                analyze,
+            });
+        }
+    }
+    for (i, p) in files.iter().enumerate() {
+        // An analyzed file already scheduled at its config-`paths:`
+        // position (e.g. `check lib/a.rb`) is not re-listed; a bare argv
+        // repeat (`check a.rb a.rb`) still analyzes twice, as before.
+        if config_paths_seen.contains(*p) {
+            continue;
+        }
+        worklist.push(WorkItem {
+            order: i,
+            path: (*p).to_string(),
+            analyze: true,
+        });
+    }
+
+    let stage1: Vec<Stage1> = worklist
         .par_iter()
-        .enumerate()
-        .map(|(order, path)| {
+        .map(|item| {
+            let order = item.order;
+            let path = item.path.as_str();
             // `RIGOR_TIMING` component split: the clock is read ONLY under the
             // env gate, so an unset `RIGOR_TIMING` costs one already-hot
             // predicted branch per file and zero clock reads — the same
@@ -801,7 +869,13 @@ fn analyze_files(
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(e) => {
-                    return Stage1::IoError { path: path.to_string(), msg: e.to_string() };
+                    // A discovery-only file contributes nothing on a read
+                    // failure — no finding, no stderr line.
+                    return if item.analyze {
+                        Stage1::IoError { path: path.to_string(), msg: e.to_string() }
+                    } else {
+                        Stage1::Excluded
+                    };
                 }
             };
             // Skip ERB templates (`.rb` generator templates using `<%= … %>`):
@@ -846,12 +920,16 @@ fn analyze_files(
                 Lowered::Parsed(lower_with_key(&result, FileKey::for_path(Path::new(path))), comments)
             }));
             match lowered {
-                Ok(Lowered::Unparseable(diags)) => Stage1::ParseErrors {
+                // A discovery-only file that cannot be parsed contributes no
+                // harvest and no findings — the reference's discovery pass
+                // likewise only consumes parsed sources.
+                Ok(Lowered::Unparseable(diags)) if item.analyze => Stage1::ParseErrors {
                     order,
                     path: path.to_string(),
                     source,
                     diags,
                 },
+                Ok(Lowered::Unparseable(_)) => Stage1::Excluded,
                 Ok(Lowered::Parsed(ast, comments)) => {
                     // Issue #92: the per-file HARVEST — everything the project
                     // index derives from this file's AST + the already-frozen
@@ -874,17 +952,28 @@ fn analyze_files(
                         },
                         harvest: t_harvest.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                     };
-                    Stage1::Prepared(
-                        Prepared { order, path: path.to_string(), source, ast, comments },
-                        harvest,
-                        times,
-                    )
+                    if item.analyze {
+                        Stage1::Prepared(
+                            Prepared { order, path: path.to_string(), source, ast, comments },
+                            harvest,
+                            times,
+                        )
+                    } else {
+                        Stage1::Discovery {
+                            ast,
+                            harvest,
+                            times,
+                        }
+                    }
                 }
-                Err(panic_val) => Stage1::Panic {
+                // A discovery-only file that panics the lowerer contributes
+                // nothing — the same silent skip as an unparseable one.
+                Err(panic_val) if item.analyze => Stage1::Panic {
                     order,
                     path: path.to_string(),
                     msg: panic_message(&panic_val),
                 },
+                Err(_) => Stage1::Excluded,
             }
         })
         .collect();
@@ -893,6 +982,16 @@ fn analyze_files(
     // `prepared` and `harvests` stay INDEX-ALIGNED — both are pushed here, in
     // input order, and nothing reorders either afterwards.
     let mut prepared: Vec<Prepared> = Vec::new();
+    // Discovery-only ASTs (upstream #684), kept alive through the stage-2
+    // merge; `harvests` stays in WORKLIST order (config `paths:` files
+    // first), so `merge_entries[i]` says which vec `harvests[i]`'s AST
+    // lives in.
+    let mut discovery_asts: Vec<rigor_parse::LoweredAst> = Vec::new();
+    enum MergeAst {
+        Prepared(usize),
+        Discovery(usize),
+    }
+    let mut merge_entries: Vec<MergeAst> = Vec::new();
     let mut harvests: Vec<rigor_infer::Harvest> = Vec::new();
     // `RIGOR_TIMING` accumulators — folded into the drain that already runs, so
     // the split costs no extra pass and nothing inside the parallel region.
@@ -908,6 +1007,15 @@ fn analyze_files(
                 hv_cpu_max = hv_cpu_max.max(t.harvest);
                 prepared.push(p);
                 harvests.push(*h);
+                merge_entries.push(MergeAst::Prepared(prepared.len() - 1));
+            }
+            Stage1::Discovery { ast, harvest, times } => {
+                pl_cpu += times.parse_lower;
+                hv_cpu += times.harvest;
+                hv_cpu_max = hv_cpu_max.max(times.harvest);
+                discovery_asts.push(ast);
+                harvests.push(*harvest);
+                merge_entries.push(MergeAst::Discovery(discovery_asts.len() - 1));
             }
             Stage1::ParseErrors { order, path, source, diags } => {
                 // Pushed straight into `findings`, bypassing stage 3 — which is
@@ -941,10 +1049,22 @@ fn analyze_files(
     // project-wide source index. This is the cross-file join — it must see every
     // file's harvest, and it still takes the ASTs because two merge-resident
     // passes walk them (tier-4b return typing and the interprocedural literal
-    // fold; issue #92 §5). The pairing is positional: `harvests[i]` was harvested
-    // from `prepared[i].ast`.
-    let files: Vec<(rigor_infer::Harvest, &rigor_parse::LoweredAst)> =
-        harvests.into_iter().zip(prepared.iter().map(|p| &p.ast)).collect();
+    // fold; issue #92 §5). The pairing is positional in WORKLIST order:
+    // `harvests[i]` was harvested from the AST `merge_entries[i]` names (a
+    // `prepared` entry for analyzed files, a `discovery_asts` entry for the
+    // discovery-only ones).
+    let mut harvests_iter = harvests.into_iter();
+    let files: Vec<(rigor_infer::Harvest, &rigor_parse::LoweredAst)> = merge_entries
+        .iter()
+        .map(|entry| {
+            let harvest = harvests_iter.next().expect("merge_entries is harvest-aligned");
+            let ast = match entry {
+                MergeAst::Prepared(i) => &prepared[*i].ast,
+                MergeAst::Discovery(i) => &discovery_asts[*i],
+            };
+            (harvest, ast)
+        })
+        .collect();
     let project_source = rigor_infer::SourceIndex::merge(&files, &index);
     let t_stage2 = std::time::Instant::now();
 
@@ -2871,5 +2991,47 @@ mod tests {
         let drifted: Vec<&baseline::DriftRow> =
             rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
         assert!(drifted.is_empty());
+    }
+
+    /// Upstream #684 — an explicit `check a.rb` still scans the configured
+    /// `paths:` for DISCOVERY (`expand_paths(paths | argv)`): an accessor
+    /// declared by an unlisted `lib/` file suppresses `x.zz` exactly as in a
+    /// project-mode run, while a method nothing declares still fires (the
+    /// must-still-fire control).
+    #[test]
+    fn analyze_files_discovers_config_paths_declarations() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(
+            root.join("lib/ext.rb"),
+            b"class String\n  attr_accessor :zz\nend\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.rb"), b"x = \"s\"\nx.zz\nx.no_such_zz\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+        let (findings, io_err) = analyze_files(
+            &[a_rb.as_str()],
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(!io_err);
+        let messages: Vec<&str> = findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`zz'")),
+            "cross-file `attr_accessor :zz` suppresses; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`no_such_zz'")),
+            "an undeclared method still fires; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

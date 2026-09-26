@@ -224,10 +224,18 @@ fn lsp_saved_buffer_diagnostics_equal_project_check_diagnostics() {
     fs::write(dir.path().join("lib/base.rb"), BASE_RB).unwrap();
     fs::write(dir.path().join("lib/sub.rb"), SUB_RB).unwrap();
 
-    // (1) The single-file answer: SILENT. The fixture's finding is purely
-    // cross-file, so a pre-S4b (single-file-index) LSP fails the comparison below.
+    // (1) The single-file answer: the SAME finding. Upstream #684 widened
+    // `check`'s discovery pass to the configured `paths:` (default `["lib"]`)
+    // even for an explicit file list, so `lib/base.rb`'s visibility
+    // declaration is already seen here — the reference fires it identically.
+    // What stays cross-file is the LSP side: a pre-S4b (single-buffer-index)
+    // LSP still fails the comparison below.
     let single = check_findings(dir.path(), &["lib/sub.rb"], "lib/sub.rb");
-    assert!(single.is_empty(), "single-file `check` must be silent for this fixture: {single:?}");
+    assert_eq!(
+        single.len(),
+        1,
+        "single-file `check` sees the `paths:`-discovered declaration: {single:?}"
+    );
 
     // (2) The project answer: the override-visibility finding.
     let expected = check_findings(dir.path(), &["lib"], "lib/sub.rb");

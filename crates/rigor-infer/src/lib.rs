@@ -3798,8 +3798,9 @@ impl<'i> Typer<'i> {
     /// receiver type, not `"s"` (the reference's `BlockParameterBinder` opens
     /// a fresh scope for the parameter list). The params `tap`/`then`/
     /// `yield_self` feed — a `yield self` — are then bound: the first
-    /// positional (`|v|`, `|v = 1|`, `it`, `_1`) gets the receiver and
-    /// `*rest` binds `Array`. Destructured `|(v, w)|` names stay unbound:
+    /// positional (`|v|`, `|v = 1|`, `it`, `_1`) gets the receiver's
+    /// SELF-TYPE ([`Self::block_self_type`] — a nominal of its class, never
+    /// the value-pinned carrier) and `*rest` binds `Array`. Destructured `|(v, w)|` names stay unbound:
     /// the reference's `MultiTargetBinder`
     /// DOES project a Tuple receiver element-wise, but every destructure slot
     /// bound from a nominal `Array[T]` — the shape a `tap` receiver actually
@@ -3826,6 +3827,169 @@ impl<'i> Typer<'i> {
     /// `1 | 2` element. Optimistic-slot bookkeeping does not port: the
     /// observable answer it produces — `x = 1 | 2` declining the union rule
     /// as a same-class join — the port's own union check already makes.
+    /// The `self` a `tap` / `then` / `yield_self` block's first positional
+    /// binds — the reference's `extract_block_param_types` self slot
+    /// (`rbs_dispatch.rb:1617`): `Nominal[class_name]`, upgraded to
+    /// `Nominal[class_name, *receiver_args]` when the `SelfSubstitute`
+    /// keep-verdict holds — which for these three non-mutating names reduces
+    /// to "the receiver's own type args are non-empty and not every one
+    /// deep-widens to `Dynamic[top]`". The slot is NEVER the value-pinned
+    /// carrier: `receiver_descriptor` projects a `Constant` to its class's
+    /// raw nominal (`1.tap { |a| }` reads `a` as `Integer`, `nil` as
+    /// `NilClass`, `"ab"` as `String`, `:a` as `Symbol`, `true` as
+    /// `TrueClass`, `1.5` as `Float`), a `Tuple` / `HashShape` projects to
+    /// `Array` / `Hash` applied to its OWN unions — constants KEPT, so
+    /// `[1, 2]` → `Array[1 | 2]` and `{a: 1}` → `Hash[:a, 1]` — and a
+    /// `Singleton` receiver stays `Singleton` (`String.tap`). A `Refined` /
+    /// `Difference` / `Dynamic` unwraps to its base / static facet, the
+    /// substitute's `Dynamic` re-wrap being verdict-only (the built
+    /// `self_type` is the plain `nominal_of(class_name, type_args: …)`).
+    ///
+    /// A `Union` receiver answers the member-wise self type only when EVERY
+    /// member's probe agrees — `probe_block_param_types_union`'s all-equal
+    /// rule — so `[1] | [2]` or `[1, 2] | nil` produces the empty probe and
+    /// the slot defaults to `Dynamic[top]`. Anything the descriptor does not
+    /// project declines the same way.
+    fn block_self_type(&self, recv_ty: TypeId, interner: &mut Interner) -> TypeId {
+        match interner.get(recv_ty).clone() {
+            Type::Union(members) => {
+                let mut selves = members
+                    .iter()
+                    .map(|&m| self.block_self_member_type(m, interner));
+                let Some(first) = selves.next() else {
+                    return interner.untyped();
+                };
+                if selves.all(|t| t == first) {
+                    first
+                } else {
+                    interner.untyped()
+                }
+            }
+            _ => self.block_self_member_type(recv_ty, interner),
+        }
+    }
+
+    /// One member of [`Self::block_self_type`] — `receiver_descriptor`'s
+    /// `(class_name, kind, receiver_args)` triple plus the `SelfSubstitute`
+    /// keep-verdict, reduced for the always-non-mutating
+    /// `tap`/`then`/`yield_self` names (none is a `KNOWN_MUTATORS` /
+    /// `ARRAY_MUTATORS` / `HASH_MUTATORS` entry, none ends `!`, so
+    /// `preserves_type_args?` holds and the verdict is `projected_self`'s).
+    fn block_self_member_type(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+        let (class, singleton, receiver_args) = match interner.get(ty).clone() {
+            Type::Nominal { class, args } => (class, false, args),
+            Type::Singleton(class) => (class, true, Vec::new()),
+            Type::Tuple(elems) => {
+                let Some(class) = self.index.class_id("Array") else {
+                    return interner.untyped();
+                };
+                // `tuple_type_args` — `[union(*elements)]`, pins kept.
+                let args = if elems.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![elems
+                        .into_iter()
+                        .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                        .expect("non-empty tuple")]
+                };
+                (class, false, args)
+            }
+            Type::HashShape(members) => {
+                let Some(class) = self.index.class_id("Hash") else {
+                    return interner.untyped();
+                };
+                // `hash_shape_type_args` — `[union(constant keys),
+                // union(values)]`; an open shape's `untyped` arms have no
+                // port analogue (HashShape carries no open mark).
+                let args = if members.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut keys: Vec<TypeId> = Vec::with_capacity(members.len());
+                    for m in &members {
+                        keys.push(match shape_key_to_scalar(&m.key) {
+                            Some(s) => interner.intern(Type::Constant(s)),
+                            None => interner.untyped(),
+                        });
+                    }
+                    let vals: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                    vec![
+                        keys.into_iter()
+                            .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                            .expect("non-empty keys"),
+                        vals.into_iter()
+                            .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                            .expect("non-empty values"),
+                    ]
+                };
+                (class, false, args)
+            }
+            Type::Constant(_) | Type::IntegerRange { .. } => {
+                // `value.class.name` — the descriptor hands a Constant /
+                // bounded-integer receiver its class's RAW nominal.
+                let Some(class) = self
+                    .index
+                    .class_name_of(interner, ty)
+                    .and_then(|name| self.index.class_id(name))
+                else {
+                    return interner.untyped();
+                };
+                (class, false, Vec::new())
+            }
+            Type::DataInstance { class, .. } => (class, false, Vec::new()),
+            // The descriptor recurses through the wrapper to the base /
+            // static facet; `SelfSubstitute`'s matching arms do the same for
+            // the verdict, and the built `self_type` is the plain nominal.
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                return self.block_self_member_type(base, interner);
+            }
+            Type::Dynamic(facet) => return self.block_self_member_type(facet, interner),
+            _ => return interner.untyped(),
+        };
+        if singleton {
+            // `kind == :singleton` → `singleton_of(class_name)`; no
+            // `SelfSubstitute` arm matches a `Singleton` receiver.
+            return interner.intern(Type::Singleton(class));
+        }
+        // `SelfSubstitute.for` on a non-mutating name: nil when the args are
+        // empty (`return nil if receiver_args.empty?`) and when EVERY arg
+        // deep-widens to `Dynamic[top]` (`projected_self`'s bail). The kept
+        // args are the receiver's OWN — the substitute's widened copy is
+        // verdict-only.
+        let keep = receiver_args
+            .iter()
+            .any(|&a| self.self_substitute_arg_informative(a, interner));
+        interner.intern(Type::Nominal {
+            class,
+            args: if keep { receiver_args } else { Vec::new() },
+        })
+    }
+
+    /// `!untyped?(deep_widen(arg))` — `projected_self`'s informativeness
+    /// test. `deep_widen` produces `Dynamic[top]` only from a `Dynamic` arg
+    /// whose facet is — or unions a member that deep-widens to — `Top`;
+    /// every other shape maps to a non-Dynamic carrier and so counts as
+    /// informative (`Array[top]` keeps its `Top` arg: `widen_value_pinned`
+    /// leaves `Top` untouched and `untyped?` reads `Dynamic`, not `Top`).
+    fn self_substitute_arg_informative(&self, arg: TypeId, interner: &Interner) -> bool {
+        let Type::Dynamic(facet) = interner.get(arg) else {
+            return true;
+        };
+        !Self::deep_widen_is_top(*facet, interner)
+    }
+
+    /// `deep_widen(ty) == Top` — `Top` survives `widen_value_pinned`
+    /// unchanged and a union absorbs to `Top` when any member widens there;
+    /// a `Dynamic` facet re-wraps (`Dynamic[…]` is never bare `Top`).
+    fn deep_widen_is_top(ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Top => true,
+            Type::Union(members) => members
+                .iter()
+                .any(|&m| Self::deep_widen_is_top(m, interner)),
+            _ => false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn block_entry_env(
         &self,
@@ -3889,8 +4053,16 @@ impl<'i> Typer<'i> {
         }
         let mandatory = required + post;
         let splats = (mandatory > 0 || optional > 1) && !(mandatory == 1 && optional == 0 && !rest);
+        // The `yield self` value the three catalogued methods hand the block
+        // is the reference's `self_type` — `Nominal[class]` (plus the
+        // receiver's own type args when `SelfSubstitute` keeps them), never
+        // the value-pinned carrier — and it is also the auto-splat carrier:
+        // `BlockAutoSplat.for` reads `expected_param_types[0]`, the projected
+        // `Array[1 | 2]`, so a splatted slot keeps its pinned element
+        // constants.
+        let self_ty = self.block_self_type(recv_ty, interner);
         let splat = if splats {
-            self.block_splat_table(recv_ty, interner)
+            self.block_splat_table(self_ty, interner)
         } else {
             None
         };
@@ -3901,8 +4073,8 @@ impl<'i> Typer<'i> {
                     Some(match &splat {
                         // A splatted optional slot takes `Dynamic[top]`; a
                         // required/first-required slot takes the carrier's
-                        // element; no splat keeps the whole receiver.
-                        None => recv_ty,
+                        // element; no splat keeps the whole `self` type.
+                        None => self_ty,
                         Some((slot, _)) if matches!(kind, BlockParamKind::SelfArg) => *slot,
                         Some(_) => interner.untyped(),
                     })
@@ -10906,14 +11078,54 @@ mod tests {
             i.get(ty)
         );
         // A String receiver is not an array carrier — `|v, w|` leaves the
-        // first positional on the whole value.
+        // first positional on the whole SELF type, which is the receiver's
+        // nominal (`receiver_descriptor` projects `Constant("ab")` to
+        // `Nominal[String]`), never the value-pinned literal.
         let (i, ty) = bound_type(&idx, b"x = \"ab\".tap { |v, w| break v }\n", "x");
         assert_eq!(
-            i.get(ty),
-            &Type::Constant(Scalar::Str("ab".to_string())),
-            "non-array receiver keeps the first positional on the value, got {:?}",
+            idx.class_name_of(&i, ty),
+            Some("String"),
+            "non-array receiver binds the first positional to the nominal self type, got {:?}",
             i.get(ty)
         );
+        assert!(
+            !matches!(i.get(ty), Type::Constant(_)),
+            "self slot is not value-pinned, got {:?}",
+            i.get(ty)
+        );
+        // The same nominal-self rule for the single-parameter form: a scalar
+        // literal receiver binds `Integer`, not `Constant(1)` — the fix that
+        // closed the `x == 1` always-truthy false positive.
+        let (i, ty) = bound_type(&idx, b"x = 1.tap { |a| break a }\n", "x");
+        assert_eq!(
+            idx.class_name_of(&i, ty),
+            Some("Integer"),
+            "scalar self slot binds the class, got {:?}",
+            i.get(ty)
+        );
+        assert!(
+            !matches!(i.get(ty), Type::Constant(_)),
+            "scalar self slot is not value-pinned, got {:?}",
+            i.get(ty)
+        );
+        // And a tuple receiver's self type is `Array[union]` with the element
+        // pins kept: `[1, 2]` -> `Array[1 | 2]`.
+        let (i, ty) = bound_type(&idx, b"x = [1, 2].tap { |a| break a }\n", "x");
+        let Type::Nominal { class, args } = i.get(ty) else {
+            panic!("tuple self slot must be Nominal[Array[…]], got {:?}", i.get(ty));
+        };
+        assert_eq!(idx.class_name_for_id(*class), Some("Array"));
+        let Type::Union(members) = i.get(args[0]) else {
+            panic!("tuple self arg must be the element union, got {:?}", i.get(args[0]));
+        };
+        let pins: Vec<i64> = members
+            .iter()
+            .filter_map(|&m| match i.get(m) {
+                Type::Constant(Scalar::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pins, vec![1, 2], "element union must pin 1 and 2, got {:?}", i.get(ty));
     }
 
     #[test]

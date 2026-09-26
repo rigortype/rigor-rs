@@ -769,6 +769,11 @@ impl SourceIndex {
         // names a `def` hands the new name `old`'s def node — which the
         // merge's `subtract_def_methods` then strips cross-file. Resolving
         // against the COMPLETE per-file def table keeps it order-free.
+        // `adopted` remembers each def-backed alias so Pass 4a's fold table
+        // can adopt `old`'s captured tail for `new` below — the reference
+        // folds an alias through the shared def node, so `T.new.cb_al` types
+        // `upcase`'s return, not Dynamic (issue #187).
+        let mut adopted: Vec<(String, String, String)> = Vec::new();
         for (key, new_name, old_name) in std::mem::take(&mut tables.pending_aliases) {
             if tables.def_names.get(&key).is_some_and(|defs| defs.contains(&old_name)) {
                 tables.def_names.entry(key.clone()).or_default().insert(new_name.clone());
@@ -778,8 +783,9 @@ impl SourceIndex {
                     .or_default()
                     .insert(new_name.clone());
                 if key == "Object" {
-                    tables.file_toplevel.insert(new_name);
+                    tables.file_toplevel.insert(new_name.clone());
                 }
+                adopted.push((key, new_name, old_name));
             }
         }
         h.toplevel_defs = std::mem::take(&mut tables.toplevel);
@@ -890,6 +896,25 @@ impl SourceIndex {
         // `Gitlab::Database.read_only?` receiver). FILE-RELATIVE: the merge
         // stamps the slice position on to build each `FoldSite`.
         walk_fold_defs(ast, ast.root(), &[], &mut h.fold_defs);
+        // A def-backed `alias`/`alias_method` folds the TARGET's tail (the
+        // reference hands the new name the same DefNode): clone `old`'s
+        // captured site under `new`. The site clone is per-file — a reopen
+        // disagreement between two files still declines in `fold_key_sites`.
+        for (key, new_name, old_name) in &adopted {
+            let adoptions: Vec<HarvestedFoldDef> = h
+                .fold_defs
+                .iter()
+                .filter(|d| d.owner == *key && d.method == *old_name)
+                .map(|d| HarvestedFoldDef {
+                    owner: d.owner.clone(),
+                    method: new_name.clone(),
+                    kind: d.kind,
+                    tail: d.tail.clone(),
+                    has_explicit_return: d.has_explicit_return,
+                })
+                .collect();
+            h.fold_defs.extend(adoptions);
+        }
 
         h
     }

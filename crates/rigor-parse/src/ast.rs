@@ -3328,22 +3328,19 @@ fn block_param_names(bn: &ruby_prism::BlockNode<'_>) -> Vec<(String, BlockParamK
             // `rest` may be a named/anonymous `*r` (`RestParameterNode`) or
             // the trailing-comma `|v,|` (`ImplicitRestNode`) — the latter
             // binds no name but still counts as a rest for `splats?`.
-            match p.rest() {
-                Some(rest) => {
-                    if let Some(r) = rest.as_rest_parameter_node() {
-                        if let Some(name) = r.name() {
-                            out.push((
-                                constant_string(name.as_slice()),
-                                BlockParamKind::Rest,
-                            ));
-                        } else {
-                            out.push((String::new(), BlockParamKind::ImplicitRest));
-                        }
-                    } else if rest.as_implicit_rest_node().is_some() {
+            if let Some(rest) = p.rest() {
+                if let Some(r) = rest.as_rest_parameter_node() {
+                    if let Some(name) = r.name() {
+                        out.push((
+                            constant_string(name.as_slice()),
+                            BlockParamKind::Rest,
+                        ));
+                    } else {
                         out.push((String::new(), BlockParamKind::ImplicitRest));
                     }
+                } else if rest.as_implicit_rest_node().is_some() {
+                    out.push((String::new(), BlockParamKind::ImplicitRest));
                 }
-                None => {}
             }
             for post in p.posts().iter() {
                 push_block_other_positional(&post, &mut out);
