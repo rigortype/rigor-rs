@@ -816,9 +816,9 @@ pub fn analyze_with_source_and_folder(
     // (those predicates are absent from the snapshot map).
     let truthy_snapshots = typer.always_truthy_snapshots(ast, interner);
     for (id, node) in ast.iter() {
-        if let Node::If { predicate, .. } = node {
+        if let Node::If { predicate, predicate_span, .. } = node {
             if let Some(diag) =
-                check_always_truthy(ast, id, *predicate, &truthy_snapshots, interner)
+                check_always_truthy(ast, id, *predicate, *predicate_span, &truthy_snapshots, interner)
             {
                 out.push(diag);
             }
@@ -1126,6 +1126,7 @@ fn check_always_truthy(
     ast: &LoweredAst,
     if_id: rigor_parse::NodeId,
     predicate: rigor_parse::NodeId,
+    predicate_span: rigor_parse::Span,
     snapshots: &std::collections::HashMap<rigor_parse::NodeId, rigor_types::TypeId>,
     interner: &Interner,
 ) -> Option<Diagnostic> {
@@ -1140,7 +1141,10 @@ fn check_always_truthy(
     let ty = *snapshots.get(&if_id)?;
     let polarity = constant_polarity(interner, ty)?;
 
-    let span = ast.get(predicate).span();
+    // The reference anchors on the PRISM predicate node (`from_node`), which
+    // keeps a parenthesised predicate's `(` — `if (w = 1)` warns at the paren,
+    // one column left of the unwrapped write the lowered `predicate` holds.
+    let span = predicate_span;
     let severity = catalog(FLOW_ALWAYS_TRUTHY_CONDITION)
         .map(|e| e.default_severity)
         .unwrap_or(Severity::Warning);

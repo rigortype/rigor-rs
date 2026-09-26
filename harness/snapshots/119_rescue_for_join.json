@@ -700,6 +700,111 @@
       "column": 5,
       "severity": "error",
       "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 716,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for bool"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 722,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 735,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [\"s\" | 1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 743,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 759,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 761,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 763,
+      "column": 26,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 776,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 779,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 730,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo63`. If a project file defines `foo63` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 738,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo63`. If a project file defines `foo63` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 746,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo63`. If a project file defines `foo63` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 758,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo64`. If a project file defines `foo64` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.dead-assignment",
+      "line": 772,
+      "column": 3,
+      "severity": "warning",
+      "message": "local `w65' assigned in `m65' but never read"
+    },
+    {
+      "rule": "flow.dead-assignment",
+      "line": 773,
+      "column": 23,
+      "severity": "warning",
+      "message": "local `x65' assigned in `m65' but never read"
     }
   ]
 }

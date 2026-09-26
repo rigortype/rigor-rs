@@ -652,6 +652,13 @@ pub enum Node {
     // TODO(spec): branch-union typing (ADR-0022 flow narrowing).
     If {
         predicate: NodeId,
+        /// The source span of the PRISM predicate node — kept separately
+        /// because single-statement parentheses unwrap during lowering: for
+        /// `if (w = 1)` the lowered `predicate` is the `w = 1` write while
+        /// this span covers `(w = 1)`, the anchor the reference's
+        /// `flow.always-truthy-condition` uses (`from_node(predicate)` on the
+        /// `ParenthesesNode`, rigor-rs#167).
+        predicate_span: Span,
         then_body: Vec<NodeId>,
         else_body: Vec<NodeId>,
         /// `true` iff this came from the `unless` keyword (never for `if` or a
@@ -1284,7 +1291,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let mut local_read_starts: Vec<usize> = builder
         .nodes
         .iter()
-        .filter_map(|n| matches!(n, Node::LocalVariableRead { .. }).then(|| n.span().0))
+        .filter(|n| matches!(n, Node::LocalVariableRead { .. })).map(|n| n.span().0)
         .collect();
     local_read_starts.sort_unstable();
     let inert_spans: Vec<Span> = builder
@@ -1863,6 +1870,7 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             return self.push(Node::If {
                 predicate,
+                predicate_span: span_of(&if_node.predicate().location()),
                 then_body,
                 else_body,
                 is_unless: false,
@@ -1882,6 +1890,7 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             return self.push(Node::If {
                 predicate,
+                predicate_span: span_of(&unless_node.predicate().location()),
                 then_body,
                 else_body,
                 is_unless: true,

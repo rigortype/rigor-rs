@@ -674,3 +674,106 @@ x59 = (w59b = 2)
 w60 = "s"
 w60.frob
 w60 = 1
+
+# (61) a `next`-path rebind inside a loop joins the body's fall-through —
+# `loop_iteration` (statement_evaluator.rb:1868) ends each pass on the
+# fall-through unioned (nil-injected) with the scope at every `next`
+# targeting the loop, so `w`'s Integer write survives into the post-loop
+# `String | Integer` join and `.even?` stays silent (Integer answers it).
+# The no-rebind controls still fire `for String` (fixture 112 pairs).
+w61 = String.new
+i61 = 0
+while i61 < 3
+  i61 += 1
+  if i61.odd?
+    w61 = i61
+    next
+  end
+end
+w61.even?
+w61b = String.new
+for i61b in [1, 2, 3]
+  if i61b.odd?
+    w61b = i61b
+    next
+  end
+end
+w61b.even?
+n61 = String.new
+[1, 2, 3].each { |e61| if e61.odd?; n61 = e61; next; end }
+n61.even?
+
+# (62) a `break` arm's body-written bindings recover into the post-loop
+# continuation (`join_break_scopes`) — `flag` reads `false | true`, not the
+# stale `false`; `w` unions `"s"` with the break-path `1`.
+flag62 = false
+i62 = 0
+while i62 < 3
+  i62 += 1
+  flag62 = true
+  break if i62 == 2
+end
+flag62.frob
+w62 = "s"
+until false
+  w62 = 1
+  break
+end
+w62.frob
+
+# (63) a `retry` re-enters the protected body under a WIDENED entry — the
+# retrying clause's scope unions per local into the re-run (`retry_edge_for`
+# / `eval_retried_begin`): `w` reads `"s" | 1` after the begin and inside
+# `else`; a clause-FIRST local nil-injects (`w63c.frob` stays silent).
+w63 = 1
+begin
+  foo63
+rescue
+  w63 = "s"
+  retry
+end
+[w63].frob
+w63b = 1
+begin
+  foo63
+rescue
+  w63b = "s"
+  retry
+else
+  w63b.frob
+end
+begin
+  foo63
+rescue
+  w63c = "s"
+  retry
+end
+w63c.frob
+
+# (64) expression-interior envs thread in source order: a call's receiver and
+# arguments, an array/hash literal's elements — a write binds for the next
+# operand (`foo64(w64 = 1)` then `w64.frob` reads `1`; `{ a: (w64c = 1), b:
+# w64c.frob }` reads `1` at the second pair).
+w64 = "s"
+foo64(w64 = 1)
+w64.frob
+w64b = "s"
+[w64b = 1, w64b.frob]
+w64c = "s"
+{ a: (w64c = 1), b: w64c.frob }
+
+# (65) a `return`'s operands evaluate inside the jump — the continuation is
+# unreachable so a write there never leaks out (`w.frob` reads `"s"`, fires
+# `for "s"`), while interior reads still order (`return (w65b = 1), x65 = w65b`
+# reads `1` — silent `x65` arm since `return` never falls through). `raise`
+# DOES write through — it is an ordinary call (`w65c.frob` fires `for 1`).
+w65 = "s"
+def m65
+  w65 = "s"
+  return (w65b = 1), (x65 = w65b)
+end
+m65
+w65.frob
+w65c = "s"
+raise (w65c = 1)
+w65c.frob
