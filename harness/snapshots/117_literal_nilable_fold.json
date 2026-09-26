@@ -1,0 +1,341 @@
+{
+  "fixture": "harness/corpus/117_literal_nilable_fold.rb",
+  "diagnostics": [
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 93,
+      "column": 24,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `index' of `getbyte' on String: expected int, got nil"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 98,
+      "column": 32,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `offset' of `byterindex' on String: expected int, got nil"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 102,
+      "column": 27,
+      "severity": "error",
+      "message": "argument type mismatch at `byteslice' on String: expected int | range[::int?], got \"a\""
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 111,
+      "column": 16,
+      "severity": "error",
+      "message": "argument type mismatch at `[]' on String: expected int | range[::int?] | Regexp | String, got {}"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `lenght' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `lenght' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `lenght' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `lenght' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 54,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `lenght' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 60,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `to_a' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 61,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `to_a' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 62,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `to_a' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 63,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `to_a' for 97"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 64,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `to_a' for 99"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 65,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `to_a' for -1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 66,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `to_a' for -1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 67,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `to_a' for -1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 68,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `to_a' for -1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 72,
+      "column": 33,
+      "severity": "error",
+      "message": "undefined method `to_a' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 73,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `to_a' for 0"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 74,
+      "column": 37,
+      "severity": "error",
+      "message": "undefined method `to_a' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 75,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `to_a' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 79,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `to_a' for 98"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 80,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `to_a' for 169"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 81,
+      "column": 35,
+      "severity": "error",
+      "message": "undefined method `to_a' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 82,
+      "column": 36,
+      "severity": "error",
+      "message": "undefined method `to_a' for 4"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 83,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `to_a' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 84,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `to_a' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 85,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `to_a' for \"é\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 115,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_u5' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 116,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `frobnicate_u6' for \"bc\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 117,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `frobnicate_u7' for \"ab\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 124,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `to_a' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 125,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `to_a' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 128,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frobnicate_u13' for \"b\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 141,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `lenght' for 255"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 142,
+      "column": 35,
+      "severity": "error",
+      "message": "undefined method `lenght' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 143,
+      "column": 33,
+      "severity": "error",
+      "message": "undefined method `lenght' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 144,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 145,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `lenght' for \"\\xFF\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 146,
+      "column": 33,
+      "severity": "error",
+      "message": "undefined method `lenght' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 164,
+      "column": 37,
+      "severity": "error",
+      "message": "undefined method `to_a' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 165,
+      "column": 38,
+      "severity": "error",
+      "message": "undefined method `to_a' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 166,
+      "column": 41,
+      "severity": "error",
+      "message": "undefined method `to_a' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 167,
+      "column": 40,
+      "severity": "error",
+      "message": "undefined method `to_a' for 0"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 94,
+      "column": 16,
+      "severity": "error",
+      "message": "wrong number of arguments to `getbyte' on String (given 2, expected 1)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 97,
+      "column": 16,
+      "severity": "error",
+      "message": "wrong number of arguments to `rindex' on String (given 3, expected 1..2)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 101,
+      "column": 17,
+      "severity": "error",
+      "message": "wrong number of arguments to `index' on String (given 0, expected 1..2)"
+    }
+  ]
+}

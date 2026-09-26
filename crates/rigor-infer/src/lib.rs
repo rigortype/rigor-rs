@@ -2521,32 +2521,116 @@ impl<'i> Typer<'i> {
         // decline and widen to the nominal return / Dynamic below — never
         // guess). The nullary case (`args` empty) folds the no-arg core.
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
-            if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
-                // A String lookup can answer `nil`, so a stale value flips the
-                // result's CLASS. The top-level flat env keeps a local's first
-                // literal across `<<`, `+=`, branch and block writes, so a lookup
-                // that reads a local declines to the RBS answer (#149 review:
-                // `buf = ""; buf << "x"; buf[0].upcase` fired `for nil`).
-                let stale_risk = folding::is_str_lookup(&scalar, method)
-                    && std::iter::once(receiver)
-                        .chain(args.iter().copied())
-                        .any(|id| ast.reads_local_within(ast.get(id).span()));
-                if let Some(folded) =
-                    (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
-                {
-                    return interner.intern(Type::Constant(folded));
-                }
-                // ADR-0008 sidecar fallback: the Rust core declined, but if this
-                // is a `sidecar_foldable` pure call and a real-Ruby folder is
-                // wired (full-fidelity mode), execute it there. A declined /
-                // absent folder leaves the value widened (sound subset).
-                if let Some(folder) = self.folder {
-                    if folding::sidecar_foldable(folding::scalar_class(&scalar), method)
-                        && !folding::sidecar_blows_up(method, &arg_scalars)
+            match self.pin_arg_scalars(ast, args, env, interner) {
+                Some(arg_scalars) => {
+                    // A `Str`/`Sym` scalar minted from a literal whose
+                    // unescaped bytes were not valid UTF-8 carries U+FFFD
+                    // where Ruby has the real byte — a position or comparison
+                    // fold on it mints the wrong constant (#164 review:
+                    // `"\xFFabc".getbyte(0)` is `255`, not `0xEF`). A
+                    // non-UTF-8 script encoding (`# encoding: binary`,
+                    // `us-ascii`, …) is the same hazard one level up: Ruby
+                    // reads the literal's BYTES under that encoding's char
+                    // width, so the UTF-8 text the scalar carries does not
+                    // share Ruby's positions or slice contents (`"é"[1]` is
+                    // `"\xA9"` under binary, not `"a"`). The nilable lookups
+                    // and `<=>` decline to `Dynamic` on either mark (the
+                    // String lookups also carry the U+FFFD check inside
+                    // `fold_str_lookup` as `Opaque`); other folds keep their
+                    // standing behaviour on the normalized text.
+                    if (folding::is_str_lookup(&scalar, method)
+                        || folding::is_nilable_cmp(&scalar, method))
+                        && std::iter::once(&scalar)
+                            .chain(arg_scalars.iter())
+                            .any(|s| {
+                                folding::scalar_has_replacement_char(s)
+                                    || (!ast.utf8_source() && folding::scalar_is_non_ascii(s))
+                            })
                     {
-                        if let Some(folded) = folder.fold(&scalar, method, &arg_scalars) {
-                            return interner.intern(Type::Constant(folded));
+                        return interner.untyped();
+                    }
+                    // A fold that can answer `nil` flips the result's CLASS, so
+                    // it must not trust a value read from the flat env: the
+                    // top-level env keeps a local's first literal across `<<`,
+                    // `+=`, branch and block writes (#149 review: `buf = "";
+                    // buf << "x"; buf[0].upcase` fired `for nil`). #164 extends
+                    // the set past the String lookups to the scalar `<=>`s.
+                    let stale_risk = folding::fold_can_go_nil(&scalar, method)
+                        && std::iter::once(receiver)
+                            .chain(args.iter().copied())
+                            .any(|id| ast.reads_local_within(ast.get(id).span()));
+                    // On a stale read the issue-#164 folds must decline the
+                    // WHOLE call, not just the fold: falling through to the
+                    // flat RBS slot answered a bare `Integer`, so
+                    // `s = "abc"; s.rindex("z").to_a` fired `to_a for
+                    // Integer` where the reference keeps the `C?` union and
+                    // stays silent (and `s.getbyte(9).lenght` reported `for
+                    // Integer` where the oracle folds `nil`). Coverage loss
+                    // only — the union cannot be carried. The older lookups
+                    // keep the flat answer (fold-hit `for Integer` set-match).
+                    if stale_risk && folding::stale_declines_untyped(&scalar, method) {
+                        return interner.untyped();
+                    }
+                    // String lookups go through the typed `LookupFold` outcome
+                    // so a pinned argument list Ruby RAISES on declines to
+                    // `Dynamic` — the reference's fold rescues into the `C?`
+                    // union, on which no negative rule fires — instead of
+                    // minting the flat `C` the tier-3 slot would produce.
+                    let outcome = (!stale_risk).then(|| {
+                        if let (Scalar::Str(text), true) =
+                            (&scalar, folding::is_str_lookup(&scalar, method))
+                        {
+                            match folding::fold_str_lookup(text, method, &arg_scalars) {
+                                folding::LookupFold::Value(s) => Some(Ok(s)),
+                                folding::LookupFold::Raises
+                                | folding::LookupFold::Opaque => Some(Err(())),
+                                folding::LookupFold::Decline => None,
+                            }
+                        } else {
+                            folding::fold(&scalar, method, &arg_scalars).map(Ok)
                         }
+                    }).flatten();
+                    match outcome {
+                        Some(Ok(folded)) => return interner.intern(Type::Constant(folded)),
+                        Some(Err(())) => return interner.untyped(),
+                        // ADR-0008 sidecar fallback: the Rust core declined,
+                        // but if this is a `sidecar_foldable` pure call and a
+                        // real-Ruby folder is wired (full-fidelity mode),
+                        // execute it there. A declined / absent folder leaves
+                        // the value widened (sound subset).
+                        None => {
+                            if let Some(folder) = self.folder {
+                                if folding::sidecar_foldable(
+                                    folding::scalar_class(&scalar),
+                                    method,
+                                ) && !folding::sidecar_blows_up(method, &arg_scalars)
+                                {
+                                    if let Some(folded) =
+                                        folder.fold(&scalar, method, &arg_scalars)
+                                    {
+                                        return interner.intern(Type::Constant(folded));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // A non-pinnable argument cannot anchor an exact `Scalar`
+                // fold. On the nilable lookups (String lookups + scalar
+                // `<=>`s) the reference then either folds a constant the port
+                // cannot carry (a `Range`/`Regexp` argument) or withholds on
+                // the `C?` union — it never answers the bare flat `C` on a
+                // LITERAL call, so a literal argument list that provably rides
+                // the union declines to `Dynamic` here (issue #164). Anything
+                // else keeps the flat RBS answer below.
+                None => {
+                    if (folding::is_str_lookup(&scalar, method)
+                        || folding::is_nilable_cmp(&scalar, method))
+                        && args
+                            .iter()
+                            .all(|&a| self.arg_withholds_nilable(ast, a, method))
+                    {
+                        return interner.untyped();
                     }
                 }
             }
@@ -2940,6 +3024,64 @@ impl<'i> Typer<'i> {
             }
         }
         Some(out)
+    }
+
+    /// Whether a *literal* argument node — one whose `Scalar` pin failed —
+    /// provably rides the reference's withholding `C?` union for `method` (a
+    /// raise or a `nil` answer), letting the call decline to `Dynamic` instead
+    /// of minting the flat `C` the RBS slot would produce (issue #164).
+    /// Reached only for the nilable lookups (`String` lookups + scalar `<=>`s).
+    ///
+    /// Literal kinds that can still fold to a *firing* constant keep the flat
+    /// answer: a `Range` argument on `[]` / `slice` / `byteslice`
+    /// (`"abc"[1..]` folds `"abc"` — and `nil` still fires on
+    /// `undefined-method`), and a `Regexp`-shaped `Other` on those three plus
+    /// `index` (`"abc".index(/b/)` folds `1`). When such a literal reads a
+    /// local (`x..y`, `/#{x}/`) the port cannot prove the local is stable —
+    /// `a = 1; b = 2; a = 9; "abc"[a..b]` is what the reference withholds on,
+    /// and the port cannot tell it apart from the stable `a = 1; b = 2` case
+    /// the reference DOES fold (`for "bc"`). Declining both loses that one
+    /// set-match; it is the safe side of a distinction the flat env cannot
+    /// make.
+    ///
+    /// On the remaining nilable lookups — `rindex` / `byteindex` /
+    /// `byterindex` / `getbyte` and the scalar `<=>`s — NO literal kind is
+    /// fire-capable: every non-pinnable literal is a raise-or-`nil` answer in
+    /// Ruby (`"abc".rindex(/z/)` is `nil`, `"abc".getbyte(1..2)` raises).
+    /// Declining them here trades the old `for Integer` set-match on a hit
+    /// (`rindex(/b/)` did fire before, weaker message) for silence on the
+    /// miss — a small coverage loss taken to kill the miss FP.
+    /// Interpolations and containers ride the union on every family — the
+    /// reference does not constant-fold an interpolated argument, so
+    /// `"abc".index("a#{x}")` withholds too.
+    fn arg_withholds_nilable(&self, ast: &LoweredAst, arg: NodeId, method: &str) -> bool {
+        let fire_capable = match ast.get(arg) {
+            Node::Range { .. } => matches!(method, "[]" | "slice" | "byteslice"),
+            // `Other` covers Regexp literals (which fold) alongside `__LINE__`
+            // / backticks / lambdas (which ride the union). `index` keeps it
+            // fire-capable — the `for Integer` hit set-match is standing
+            // behaviour — while the newer lookups withhold: their `/z/` misses
+            // were flat-`Integer` FPs, and losing the `/b/` set-match is the
+            // trade that kills them.
+            Node::Other { .. } => matches!(method, "[]" | "slice" | "byteslice" | "index"),
+            // Scalar literals pin and never reach this path; interpolated and
+            // container literals ride the union on every family.
+            Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::SymbolLit { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::NilLit { .. }
+            | Node::TrueLit { .. }
+            | Node::FalseLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::HashLit { .. } => false,
+            // A non-literal argument (local read, call, conditional) leaves
+            // the flat answer to the reference-untyped machinery.
+            _ => return false,
+        };
+        !fire_capable || ast.reads_local_within(ast.get(arg).span())
     }
 
     /// Walk the top-level statement sequence in source order, binding each
@@ -8109,6 +8251,103 @@ mod tests {
         case(b"[1, 2].empty?\n", Type::Constant(Scalar::Bool(false)));
         case(b"[].first\n", Type::Constant(Scalar::Nil));
         case(b"[1, 2][9]\n", Type::Constant(Scalar::Nil)); // out of bounds → nil
+    }
+
+    /// A magic `encoding:` comment naming anything other than UTF-8 flips
+    /// `LoweredAst::utf8_source`, and the nilable-lookup / `<=>` gate then
+    /// declines every non-ASCII `Str`/`Sym` scalar like an invalid-UTF-8 one:
+    /// under `# encoding: binary` `"\xC3\xA9"` is two one-byte characters, so
+    /// the UTF-8 read (`[1]` → `nil`, `index("l")` → 2) would mint the wrong
+    /// constant (issue #164 fix round). ASCII literals fold unchanged.
+    #[test]
+    fn non_utf8_source_declines_non_ascii_scalar_folds() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let last_call_ty = |src: &[u8]| -> String {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = TypeEnv::new();
+            let call_id = ast
+                .iter()
+                .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+                .last()
+                .unwrap();
+            let ty = typer.type_of(&ast, call_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+        // UTF-8 controls: the fold still fires, absent a comment or with an
+        // explicit `utf-8`, and an `encoding:` comment in a position CRuby
+        // does not honor (line 2 under a magic-comment line) stays inert.
+        assert_eq!(last_call_ty(b"\"\\xC3\\xA9\"[1]\n"), "nil");
+        assert_eq!(last_call_ty(b"# encoding: utf-8\n\"\\xC3\\xA9\"[1]\n"), "nil");
+        assert_eq!(
+            last_call_ty(b"# frozen_string_literal: true\n# encoding: binary\n\"\\xC3\\xA9\"[1]\n"),
+            "nil"
+        );
+        // Honored non-UTF-8 names (`binary`, `us-ascii`, `coding:` too) send
+        // every non-ASCII scalar's lookups to `Dynamic`.
+        assert_eq!(last_call_ty(b"# encoding: binary\n\"\\xC3\\xA9\"[1]\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"# encoding: us-ascii\n\"\\xC3\\xA9\"[1]\n"), "Dynamic[top]");
+        assert_eq!(
+            last_call_ty(b"#!/usr/bin/env ruby\n# encoding: binary\n\"\\xC3\\xA9\"[1]\n"),
+            "Dynamic[top]"
+        );
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"h\\xC3\\xA9llo\".index(\"l\")\n"),
+            "Dynamic[top]"
+        );
+        // The scalar `<=>`s decline alongside the lookups; a non-ASCII
+        // argument declines the call even on an ASCII receiver.
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"\\xC3\\xA9\" <=> \"a\"\n"),
+            "Dynamic[top]"
+        );
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"abc\".index(\"\\xC3\")\n"),
+            "Dynamic[top]"
+        );
+        // ASCII literals are encoding-proof — byte = char under every script
+        // encoding — so these folds keep firing in a binary file.
+        assert_eq!(last_call_ty(b"# encoding: binary\n\"e\"[1]\n"), "nil");
+        assert_eq!(
+            last_call_ty(b"# encoding: binary\n\"abc\".index(\"b\")\n"),
+            "Constant[1]"
+        );
+    }
+
+    /// The stale-local gate declines the fold, and for the issue-#164
+    /// lookups (`rindex`/`byteindex`/`byterindex`/`getbyte` and the scalar
+    /// `<=>`s) it must decline the whole CALL too: the flat RBS slot below
+    /// answers a bare `Integer`, so `s.rindex("z").to_a` fired `for Integer`
+    /// where the oracle is silent (`getbyte(9)` even names `nil`). The older
+    /// lookups keep the flat answer (fold-hit `for Integer` set-match).
+    #[test]
+    fn stale_local_nilable_fold_declines_the_call() {
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let last_call_ty = |src: &[u8]| -> String {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let env = typer.build_toplevel_env(&ast, &mut i);
+            let call_id = ast
+                .iter()
+                .filter_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+                .last()
+                .unwrap();
+            let ty = typer.type_of(&ast, call_id, &env, &mut i);
+            rigor_types::describe(&i, ty)
+        };
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.rindex(\"z\")\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.byteindex(\"z\")\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.byterindex(\"z\")\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns.getbyte(9)\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"x = 1.0\nx <=> \"x\"\n"), "Dynamic[top]");
+        assert_eq!(last_call_ty(b"s = \"abc\"\ns << \"z\"\ns.rindex(\"z\")\n"), "Dynamic[top]");
+        // The older lookups keep the flat `Integer` answer (standing
+        // behaviour); a literal receiver still folds — nothing reads a local.
+        assert!(last_call_ty(b"s = \"abc\"\ns.index(\"z\")\n").starts_with("Class<"));
+        assert_eq!(last_call_ty(b"\"abc\".rindex(\"z\")\n"), "nil");
+        assert_eq!(last_call_ty(b"\"abc\".rindex(\"b\")\n"), "Constant[1]");
     }
 
     /// Kernel `#p` / `#pp` identity typing on the implicit-self (`receiver:
