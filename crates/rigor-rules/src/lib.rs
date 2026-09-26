@@ -643,7 +643,9 @@ pub fn analyze_with_source_and_folder(
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
         let diag = (!nil_skip)
-            .then(|| check_call(ast, recv, &method, message_span, env, &typer, interner, index))
+            .then(|| {
+                check_call(ast, recv, &method, message_span, safe_nav, env, &typer, interner, index)
+            })
             .flatten()
             .or_else(|| {
                 check_narrowed_call(
@@ -1474,6 +1476,7 @@ fn check_call(
     receiver: rigor_parse::NodeId,
     method: &str,
     message_span: (usize, usize),
+    safe_nav: bool,
     env: &rigor_infer::TypeEnv,
     typer: &Typer,
     interner: &mut Interner,
@@ -1532,6 +1535,13 @@ fn check_call(
     // `possible-nil-receiver` rule's territory), a `Dynamic`/`Top` member (it
     // may answer anything), and an unresolvable member all stay silent.
     if let Type::Union(members) = interner.get(recv_ty) {
+        // A safe-navigation call declines outright — the reference's
+        // `union_undefined_method_diagnostic` early-returns on
+        // `call_node.safe_navigation?` (`w&.frob` never fires on a union;
+        // a scalar receiver `5&.frob` still does).
+        if safe_nav {
+            return None;
+        }
         let members = members.clone();
         let mut class_names: Vec<&str> = Vec::new();
         for m in &members {
@@ -1548,11 +1558,28 @@ fn check_call(
                 || index.class_has_method(name, method)
                 || unenumerable_instance_receiver(index, name)
                 || typer.source().project_declares_method(name, method)
+                // A project REOPENING also extends a core class's surface:
+                // `class Integer; include K; end` gives `1` every method `K`
+                // declares. The override index's MRO walk (`nearest_ancestor_
+                // defining`) sees include/prepend modules AND superclasses —
+                // `project_declares_method` alone misses them.
+                || typer
+                    .source()
+                    .nearest_ancestor_defining(name, method)
+                    .is_some()
             {
                 return None;
             }
         }
-        let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
+        // Render in the reference's `Combinator.union` canonical order — the
+        // members sort by `describe(:short)` (`(c ? "s" : 1)` prints `"s" | 1`,
+        // not `1 | "s"`), not by intern order.
+        let mut member_desc: Vec<String> = members
+            .iter()
+            .map(|&m| render_receiver(interner, index, typer.source(), m))
+            .collect();
+        member_desc.sort();
+        let receiver_render = member_desc.join(" | ");
         let message = format!("undefined method `{method}' for {receiver_render}");
         let severity = catalog(CALL_UNDEFINED_METHOD)
             .map(|e| e.default_severity)
@@ -3463,15 +3490,6 @@ fn ivar_write_mismatch_diagnostics(
     }
 }
 
-/// Render the receiver for the diagnostic message: the bare literal value for a
-/// value-pinned `Constant`, else the resolved class name.
-/// Render a receiver for a diagnostic's `message` / `receiver_type` field in the
-/// reference's spelling, via the shared `describe_named` display layer: a
-/// `Constant` renders its value (`"Hello"`, `3`), a `Tuple` value-pinned
-/// (`[1, 2, 3]`), a `Nominal` its class name — resolving class ids through the
-/// core RBS index then the project `sig/` registry. Presentation, not contract
-/// (ADR-0030); the harness keys diagnostics on `(rule, line, column)`, so the
-/// spelling never affects the zero-FP invariant.
 /// The class name a UNION member brings to the `check_call` union arm, or
 /// `None` when the member cannot offer a witnessable surface — a `nil`
 /// member (`possible-nil-receiver` owns those), `Dynamic`/`Top`/`Bottom`, a
@@ -3496,6 +3514,13 @@ fn union_member_class_name<'a>(
     }
 }
 
+/// Render a receiver for a diagnostic's `message` / `receiver_type` field in the
+/// reference's spelling, via the shared `describe_named` display layer: a
+/// `Constant` renders its value (`"Hello"`, `3`), a `Tuple` value-pinned
+/// (`[1, 2, 3]`), a `Nominal` its class name — resolving class ids through the
+/// core RBS index then the project `sig/` registry. Presentation, not contract
+/// (ADR-0030); the harness keys diagnostics on `(rule, line, column)`, so the
+/// spelling never affects the zero-FP invariant.
 fn render_receiver(
     interner: &Interner,
     index: &CoreIndex,
@@ -3519,7 +3544,7 @@ fn render_scalar(scalar: &Scalar) -> String {
         Scalar::Str(s) => format!("{s:?}"),
         Scalar::Sym(s) => format!(":{s}"),
         Scalar::Int(n) => n.to_string(),
-        Scalar::Float(f) => f.to_string(),
+        Scalar::Float(f) => rigor_types::ruby_float_to_s(*f),
         Scalar::Bool(b) => b.to_string(),
         Scalar::Nil => "nil".to_string(),
     }

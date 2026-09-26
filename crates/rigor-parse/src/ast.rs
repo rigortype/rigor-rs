@@ -979,6 +979,10 @@ pub enum JumpKind {
     Next,
     /// `break` — leave the enclosing block / loop.
     Break,
+    /// `retry` — re-enter the enclosing `begin`'s primary body. The reference
+    /// types it `bot` (`type_of_jump`), so a `rescue` arm ending in one is a
+    /// terminating branch and contributes nothing to the post-`begin` join.
+    Retry,
 }
 
 impl Node {
@@ -2407,6 +2411,13 @@ impl<'src> Builder<'src> {
             if n.arguments().is_none() {
                 return self.push(Node::Other { span, jump: Some(JumpKind::Break) });
             }
+        }
+        // `retry` carries no value and lives only inside a `rescue` clause: tag
+        // it as a jump so the binders' terminating-branch filter can exclude
+        // the arm — the reference reaches the same verdict through the
+        // `bot`-typed `RetryNode` half of `branch_terminates?` (rigor-rs#167).
+        if node.as_retry_node().is_some() {
+            return self.push(Node::Other { span, jump: Some(JumpKind::Retry) });
         }
 
         // `expr rescue arm` — a `Rescue` carrier with exactly two children:

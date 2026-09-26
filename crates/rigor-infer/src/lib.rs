@@ -3115,10 +3115,6 @@ impl<'i> Typer<'i> {
         env
     }
 
-    /// One statement of [`Self::build_toplevel_check_env`]: a direct write binds
-    /// as [`Self::bind_statement`] does, after widening the rebinds nested in
-    /// its value (`x = xs.each { |e| w = e }`); any other statement widens every
-    /// rebind inside it.
     /// One node of [`Self::build_toplevel_check_env`], applied to `env` in
     /// source order. This is the flat env's port of the reference's
     /// `eval_statement` for the constructs it can model exactly (rigor-rs#167):
@@ -3152,27 +3148,18 @@ impl<'i> Typer<'i> {
                     env.insert(name, ty);
                 }
             }
-            // `x += v` / `x ||= v` / `x &&= v` — the reference dispatches the
-            // read-modify-write (`eval_local_variable_operator_write`), so the
-            // local takes the op's RESULT type: `w = 5; w += 1` rebinds `6`,
-            // `w ||= v` unions the truthy fragment with `v`, `w &&= v` unions
-            // the falsey fragment. A bare `x` on the RHS keeps its read.
-            Node::LocalVariableOpWrite { name, op, value, .. } => {
-                let (name, op, value) = (name.clone(), op.clone(), *value);
-                self.bind_check_statement(ast, value, env, rebinds, interner);
-                let vty = self.type_of(ast, value, env, interner);
-                let ty = self.op_write_type(&name, &op, vty, env, interner);
-                env.insert(name, ty);
-            }
-            // An ivar / cvar / constant / global write evaluates its RHS
-            // unconditionally — the local writes inside it bind (`@x = (w = 6)`
-            // leaves `w` at `6`, as `eval_instance_variable_write` does).
+            // An ivar / cvar / global write evaluates its RHS unconditionally —
+            // the local writes inside it bind (`@x = (w = 6)` leaves `w` at `6`,
+            // as `eval_instance_variable_write` does). A CONSTANT write's RHS
+            // does not: the reference's const-write path never re-enters the
+            // local binder (`X = (w = 6)` leaves a prior `w = 5` at `5`), so the
+            // writes inside are neither bound nor widened.
             Node::VariableWrite { value, .. }
-            | Node::InstanceVariableWrite { value, .. }
-            | Node::ConstantWrite { value, .. } => {
+            | Node::InstanceVariableWrite { value, .. } => {
                 let value = *value;
                 self.bind_check_statement(ast, value, env, rebinds, interner);
             }
+            Node::ConstantWrite { .. } => {}
             // A real statement sequence is straight-line code.
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for s in body.clone() {
@@ -3334,10 +3321,14 @@ impl<'i> Typer<'i> {
             // A call's receiver and arguments evaluate unconditionally, so a
             // write in one binds (`foo(w = 6)`, `h[w = 6] = 1` — the `[]=`
             // call's index arg — keeps `6`). A literal BLOCK body is a closure:
-            // it may run zero or more times, so its effect joins the
-            // nil-injected way (a `xs.each { |e| w = e }` leaves
-            // `entry | e-type`). A `&expr` block-pass sits outside the block
-            // span and evaluates at call time, so it binds directly.
+            // the reference joins only a NON-ESCAPING block's writes and widens
+            // an escaping or unknown one (`record_closure_escape_if_any`,
+            // statement_evaluator.rb:3151). Distinguishing them needs the
+            // escape classification this slice declines (a follow-up), so a
+            // literal block's writes WIDEN — the zero-FP floor master's
+            // blanket widening already sat on. A `&expr` block-pass sits
+            // outside the block span and evaluates at call time, so it binds
+            // directly.
             Node::Call {
                 receiver,
                 args,
@@ -3360,26 +3351,25 @@ impl<'i> Typer<'i> {
                     self.bind_check_statement(ast, *a, env, rebinds, interner);
                 }
                 let entry = env.clone();
-                let mut block_env = env.clone();
                 for s in &block_body {
                     let in_literal_block = block_span.is_some_and(|bs| {
                         let sp = ast.get(*s).span();
                         bs.0 <= sp.0 && sp.1 <= bs.1
                     });
                     if in_literal_block {
-                        self.bind_check_statement(ast, *s, &mut block_env, rebinds, interner);
+                        let sp = ast.get(*s).span();
+                        widen_flow_writes(rebinds, sp, env, interner);
                     } else {
                         self.bind_check_statement(ast, *s, env, rebinds, interner);
                     }
                 }
                 if block_span.is_some() {
-                    *env = self.join_with_nil_injection(env, &block_env, interner);
                     // A block-local name (a `|param|`, a `;`-local, a local first
                     // written inside the block — Prism's `BlockNode#locals`) is
                     // block-scoped: its write must not leak back onto the outer
                     // local of the same name (`x = "s"; [1].each { |x| x = 1 }`
                     // leaves `"s"`, rigor-rs#166). Restore the entry binding (or
-                    // drop a name only the block bound) after the join.
+                    // drop a name only the block bound) after the widen.
                     for name in &block_locals {
                         match entry.get(name) {
                             Some(&v) => {
@@ -3418,60 +3408,6 @@ impl<'i> Typer<'i> {
                 }
             }
             other => widen_flow_writes(rebinds, other.span(), env, interner),
-        }
-    }
-
-    /// The type a `name op= value` writes — `eval_local_variable_operator_write`
-    /// ports. `||=` keeps the truthy fragment beside the RHS (`w = 5; w ||= 6`
-    /// → `5 | 6`; `w = nil; w ||= 6` → `6`); `&&=` keeps the falsey fragment
-    /// (`w = nil; w &&= 6` → `6?`; `w = 5; w &&= 6` → `6`). Every other op is a
-    /// real dispatch `w op v`: folded when both sides are value-pinned
-    /// (`w = 5; w += 1` → `6`), else the receiver's class nominal
-    /// (`w = "s"; w += 1` → `String`), else `Dynamic[top]`. An unbound name
-    /// reads `Dynamic[top]` (the flat env's `unbound_read` convention).
-    fn op_write_type(
-        &self,
-        name: &str,
-        op: &str,
-        vty: TypeId,
-        env: &TypeEnv,
-        interner: &mut Interner,
-    ) -> TypeId {
-        let cur = env.get(name).copied().unwrap_or_else(|| interner.untyped());
-        match op {
-            "||=" => {
-                let mut ms = truthy_fragments(interner, cur);
-                ms.push(vty);
-                self.union_of(ms, interner)
-            }
-            "&&=" => {
-                let mut ms = falsey_fragments(interner, cur);
-                ms.push(vty);
-                self.union_of(ms, interner)
-            }
-            _ => {
-                let Type::Constant(scalar) = interner.get(cur).clone() else {
-                    return interner.untyped();
-                };
-                let Type::Constant(arg) = interner.get(vty).clone() else {
-                    return nominal_or_scalar_class(self.index, &scalar, interner);
-                };
-                if let Some(folded) = folding::fold(&scalar, op, std::slice::from_ref(&arg)) {
-                    return interner.intern(Type::Constant(folded));
-                }
-                if let Some(promoted) = numeric_promoted_fold(&scalar, op, &arg, self.index, interner) {
-                    return promoted;
-                }
-                // The unfolded `w op v` is a real dispatch: the receiver keeps
-                // its class nominal when the method EXISTS (`"s" + 1` stays
-                // `String`; `1 / 0` stays `Integer`) and reads `Dynamic[top]`
-                // when it does not (`:a + 1` — `Symbol#+` is undefined).
-                if self.index.class_has_method(folding::scalar_class(&scalar), op) {
-                    nominal_or_scalar_class(self.index, &scalar, interner)
-                } else {
-                    interner.untyped()
-                }
-            }
         }
     }
 
@@ -3576,7 +3512,15 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeId {
         match interner.get(ty).clone() {
+            // An EMPTY collection yields no element — the reference's element
+            // type is `Dynamic[top]`, so `for y in []; end` binds `y` to
+            // `Dynamic[top]?` (nil-injected), never `bot`/`nil`.
+            Type::Tuple(elems) if elems.is_empty() => interner.untyped(),
             Type::Tuple(elems) => self.union_of(elems, interner),
+            Type::HashShape(members) if members.is_empty() => {
+                let u = interner.untyped();
+                interner.intern(Type::Tuple(vec![u, u]))
+            }
             Type::HashShape(members) => {
                 let pairs: Vec<TypeId> = members
                     .iter()
@@ -8544,123 +8488,6 @@ fn qualify_self(prefix: Option<&str>, name: &str) -> String {
     }
 }
 
-/// Widen (to `Dynamic`) every tracked local whose write span is contained in
-/// `span` — the conservative invalidation a control-flow construct applies.
-/// The members of `ty` that can be TRUTHY — `nil`/`false` drop out; everything
-/// else (including `Dynamic`, which may be) stays. The `w ||= v` lhs half:
-/// `w = 5` contributes `5`, `w = nil` contributes nothing.
-fn truthy_fragments(i: &Interner, ty: TypeId) -> Vec<TypeId> {
-    match i.get(ty).clone() {
-        Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => Vec::new(),
-        Type::Union(ms) => ms.iter().flat_map(|&m| truthy_fragments(i, m)).collect(),
-        _ => vec![ty],
-    }
-}
-
-/// The members of `ty` that can be FALSEY — `nil`/`false`/`Dynamic` only; a
-/// pinned non-nil constant and every nominal are always truthy so contribute
-/// nothing. The `w &&= v` lhs half: `w = nil` contributes `nil` (`6?` result),
-/// `w = 5` contributes nothing (`6` result).
-fn falsey_fragments(i: &Interner, ty: TypeId) -> Vec<TypeId> {
-    match i.get(ty).clone() {
-        Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => vec![ty],
-        Type::Union(ms) => ms.iter().flat_map(|&m| falsey_fragments(i, m)).collect(),
-        Type::Dynamic(_) => vec![ty],
-        _ => Vec::new(),
-    }
-}
-
-/// The class nominal a pinned scalar belongs to — the `w op v` fallback when
-/// the fold declines (`w = "s"; w += 1` → `String`). Unresolvable ⇒ untyped.
-fn nominal_or_scalar_class(index: &CoreIndex, scalar: &Scalar, interner: &mut Interner) -> TypeId {
-    index
-        .class_id(folding::scalar_class(scalar))
-        .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
-        .unwrap_or_else(|| interner.untyped())
-}
-
-/// The `Int`/`Float` coercion half of an operator write: `1 + 1.5` folds to
-/// `2.5` on the reference even though the core `fold_int`/`fold_float` each
-/// insist on a same-kind operand. Retry through `Float`, fold `/` for a
-/// nonzero divisor, and fall back to the `Float` nominal for an op the
-/// promoted fold declines (`5 ** 1.5`). `None` when the pair is not numeric
-/// or both are `Int` (the caller's receiver-class path owns `Int op Int`).
-fn numeric_promoted_fold(
-    scalar: &Scalar,
-    op: &str,
-    arg: &Scalar,
-    index: &CoreIndex,
-    interner: &mut Interner,
-) -> Option<TypeId> {
-    let as_f64 = |s: &Scalar| -> Option<f64> {
-        match s {
-            Scalar::Int(v) => Some(*v as f64),
-            Scalar::Float(v) => Some(*v),
-            _ => None,
-        }
-    };
-    let (a, b) = (as_f64(scalar)?, as_f64(arg)?);
-    if !matches!(scalar, Scalar::Float(_)) && !matches!(arg, Scalar::Float(_)) {
-        return None;
-    }
-    // Shift ops keep the `Int` result with a truncated float arg
-    // (`1 << 1.5` folds `1 << 1` → `2` on the reference; `1 | 1.5` does
-    // NOT coerce — it declines to the `Integer` nominal like any other
-    // non-folding op).
-    if matches!(scalar, Scalar::Int(_)) && matches!(op, "<<" | ">>") {
-        if let Some(folded) = folding::fold(scalar, op, &[Scalar::Int(b as i64)]) {
-            return Some(interner.intern(Type::Constant(folded)));
-        }
-    }
-    match op {
-        // `/` folds through zero (`1 / 0.0` → `Infinity`); `%` by zero
-        // declines and reads the `Numeric` supertype nominal.
-        "/" => {
-            // `1 / 0.0` folds to `Infinity`; `0 / 0.0` is NaN, which the
-            // reference declines to pin — the `Float` nominal reads instead.
-            let v = a / b;
-            return Some(if v.is_nan() {
-                index
-                    .class_id("Float")
-                    .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
-                    .unwrap_or_else(|| interner.untyped())
-            } else {
-                interner.intern(Type::Constant(Scalar::Float(v)))
-            });
-        }
-        "%" if b != 0.0 => {
-            return Some(interner.intern(Type::Constant(Scalar::Float(a % b))));
-        }
-        "%" => {
-            return Some(
-                index
-                    .class_id("Numeric")
-                    .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
-                    .unwrap_or_else(|| interner.untyped()),
-            );
-        }
-        "**" => return Some(interner.intern(Type::Constant(Scalar::Float(a.powf(b))))),
-        _ => {}
-    }
-    if let Some(folded) = folding::fold(&Scalar::Float(a), op, &[Scalar::Float(b)]) {
-        return Some(interner.intern(Type::Constant(folded)));
-    }
-    // The promoted fold declined: keep the receiver's class nominal when the
-    // op really exists on it (`1.5 / 0` keeps `Float`); `Dynamic[top]` when it
-    // does not (`1.5 << 1` — `Float#<<` is undefined).
-    let class = folding::scalar_class(scalar);
-    if index.class_has_method(class, op) {
-        Some(
-            index
-                .class_id(class)
-                .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
-                .unwrap_or_else(|| interner.untyped()),
-        )
-    } else {
-        Some(interner.untyped())
-    }
-}
-
 /// The class name a literal node contributes to a literal range's element
 /// type (`for w in (1..3)` → `Integer`; `constant_element_type`'s
 /// `first.class.name` — a `nil` bound is not a class, so it yields nothing).
@@ -8725,6 +8552,8 @@ fn rescue_clause_exits(ast: &LoweredAst, clause: &rigor_parse::RescueClause) -> 
     seq_exits(ast, &clause.body)
 }
 
+/// Widen (to `Dynamic`) every tracked local whose write span is contained in
+/// `span` — the conservative invalidation a control-flow construct applies.
 fn widen_flow_writes(
     writes: &[(rigor_parse::Span, String)],
     span: rigor_parse::Span,
@@ -9481,14 +9310,11 @@ mod tests {
         let get = |name: &str, i: &Interner| env.get(name).map(|&t| i.get(t).clone());
         let untyped = i.untyped();
         assert_eq!(env.get("w"), Some(&untyped));
-        // `n`'s block write now JOINS (rigor-rs#167): the `each` body runs the
-        // write `n = e` under an unbound `e` (`Dynamic[top]`), which the
-        // nil-injected join keeps beside the entry value — `"s" | Dynamic[top]`
-        // — rather than widening `n` outright.
-        let s = i.intern(Type::Constant(Scalar::Str("s".into())));
-        let dyn_top = i.untyped();
-        let n_join = i.intern(Type::Union(vec![s, dyn_top]));
-        assert_eq!(env.get("n"), Some(&n_join));
+        // `n`'s block write widens (rigor-rs#167): the reference joins only a
+        // NON-ESCAPING block's writes (`record_closure_escape_if_any`), and the
+        // escape classification is unmodelled — the flat env declines every
+        // literal block to `Dynamic`.
+        assert_eq!(env.get("n"), Some(&untyped));
         assert_eq!(get("k", &i), Some(Type::Constant(Scalar::Str("s".into()))));
         assert_eq!(get("r", &i), Some(Type::Constant(Scalar::Str("t".into()))));
         assert_eq!(get("d", &i), Some(Type::Constant(Scalar::Str("s".into()))));

@@ -77,22 +77,21 @@ r12.frob
 
 # --- operator writes --------------------------------------------------------
 
-# (13) `w op= v` folds a value-pinned receiver — fires `for [6]`.
+# (13) `w op= v` — the flat env declines the op's result fold, so `w` reads
+# `Dynamic[top]` where the reference folds `w += 1` to `6` (a coverage gap —
+# same position fires `for [Dynamic[top]]`; the fold is follow-up coverage).
 o13 = 5
 o13 += 1
 [o13].frob
 
-# (14) `w ||= v` unions the truthy fragment — `5 | 6`; a `nil` receiver
-# contributes nothing — `6`.
+# (14) `w ||= v` / `w &&= v` likewise widen to `Dynamic[top]` — the
+# truthy/falsey-fragment union (`5 | 6`, `6?`) is unmodelled coverage.
 o14a = 5
 o14a ||= 6
 [o14a].frob
 o14b = nil
 o14b ||= 6
 [o14b].frob
-
-# (15) `w &&= v` unions the FALSEY fragment — `6?` for a `nil` receiver,
-# `6` for a truthy one.
 o15a = nil
 o15a &&= 6
 [o15a].frob
@@ -100,8 +99,8 @@ o15b = 5
 o15b &&= 6
 [o15b].frob
 
-# (16) operator writes inside a rescue modifier join the same way —
-# fires `for [5 | 6]`.
+# (16) an op-write inside a rescue modifier still JOINS the entry value —
+# `for [5 | Dynamic[top]]` where the reference's fold gives `5 | 6`.
 o16 = 5
 (o16 += 1) rescue nil
 [o16].frob
@@ -276,9 +275,12 @@ c32 = 5
 1.fdiv(c32 = 6)
 [c32].frob
 
-# (33) a block body write joins the nil-injected way — fires
-# `for ["s" | 1]`; a block-PARAMETER name stays block-scoped — fires
-# `for ["s"]` (rigor-rs#166 preserved).
+# (33) a literal block's writes WIDEN, not join — the reference's
+# escape classification (`record_closure_escape_if_any`) is unmodelled,
+# so even a non-escaping `each`/`tap` block declines (`for
+# [Dynamic[top]]` where the reference joins `"s" | 1` — a coverage gap).
+# A block-PARAMETER name stays block-scoped either way — `for ["s"]`
+# (rigor-rs#166 preserved).
 c33 = "s"
 [1].each { |e| c33 = 1 }
 [c33].frob
@@ -299,3 +301,83 @@ BEGIN { q35b = 6 }
 q35c = 5
 super(q35c = 6)
 [q35c].frob
+
+# --- review counterexample controls -------------------------------------------
+
+# (36) a union receiver under `&.` never witnesses — the reference's
+# `union_undefined_method_diagnostic` early-returns on safe navigation
+# (both rows silent); the scalar `5&.frob` still fires `for 5`.
+r36 = "s"
+(r36 = 1) rescue nil
+r36&.frob
+r36b = 5
+r36b&.frob
+
+# (37) a project `include`/`prepend` extends a union member's surface —
+# `1` gains `K167#k167_added`, so the union stays silent. (A unique
+# method name: `frob` here would silence every Integer `.frob` control.)
+module K167
+  def k167_added
+    1
+  end
+end
+class Integer
+  include K167
+end
+r37 = "s"
+(r37 = 1) rescue nil
+r37.k167_added
+
+# (38) an escaping / unknown block widens, it does not join — all four
+# rows silent on the reference.
+r38a = "s"
+loop { r38a = 1 }
+r38a.frob
+r38b = "s"
+proc { r38b = 1 }
+r38b.frob
+r38c = "s"
+Thread.new { r38c = 1 }
+r38c.frob
+r38d = "s"
+Class.new { r38d = 1 }
+r38d.frob
+
+# (39) a `rescue` clause ending in `retry` never falls through — the
+# primary body's write dominates, fires `for [6]` / `for 1`.
+r39 = 5
+begin
+  r39 = 6
+rescue
+  retry
+end
+[r39].frob
+r39b = "s"
+begin
+  r39b = 1
+rescue
+  retry
+end
+r39b.frob
+
+# (40) an EMPTY collection's element is `Dynamic[top]`, not `bot` —
+# `for [5 | Dynamic[top]]`; a `for`-first local nil-injects to
+# `Dynamic[top]?` (`y.succ` / `y.frob` both stay silent).
+r40 = 5
+for r40 in []
+end
+[r40].frob
+for y40 in []
+end
+y40.succ
+[y40].frob
+
+# (41) a CONSTANT write's RHS does not rebind locals — `X = (w = 1)`
+# leaves `w` at `"s"` — fires `for "s"`.
+r41 = "s"
+X41 = (r41 = 1)
+r41.frob
+
+# (42) a heterogeneous union in a def-body ternary witnesses in the
+# reference's `describe(:short)` order — fires `for "s" | 1`.
+def m42(c) = (c ? "s" : 1).frob

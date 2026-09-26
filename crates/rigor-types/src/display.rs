@@ -359,13 +359,15 @@ fn named_float(f: f64) -> String {
     ruby_float_to_s(f)
 }
 
-/// Ruby `Float#to_s` / `Float#inspect` spelling of a finite float: a decimal
-/// point is always present (`3.0.to_s == "3.0"`, `3.14.to_s == "3.14"`), and
-/// non-integral values use Rust's shortest round-trip (which matches Ruby's
-/// `flo_to_s` dtoa for the overwhelming majority of values). Exposed for the
-/// Kernel `String()` / `sprintf` folds (`kernel_fold`), which must reproduce
-/// Ruby's `to_s` byte-for-byte. Non-finite inputs (`NaN`/`±Infinity`) fall to
-/// Rust's spelling; callers that fold must guard those out separately.
+/// Ruby `Float#to_s` / `Float#inspect` spelling: a decimal point is always
+/// present (`3.0.to_s == "3.0"`, `3.14.to_s == "3.14"`); magnitudes outside
+/// `1e-4 <= |f| < 1e15` render scientific with a signed two-or-more-digit
+/// exponent (`1e20.to_s == "1.0e+20"`, `1e-5.to_s == "1.0e-05"`), and
+/// non-finite inputs spell `NaN` / `±Infinity` as Ruby does. Non-integral
+/// values use Rust's shortest round-trip (which matches Ruby's `flo_to_s`
+/// dtoa for the overwhelming majority of values). Exposed for the Kernel
+/// `String()` / `sprintf` folds (`kernel_fold`), which must reproduce Ruby's
+/// `to_s` byte-for-byte.
 pub fn ruby_float_to_s(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -377,10 +379,33 @@ pub fn ruby_float_to_s(f: f64) -> String {
             "-Infinity".to_string()
         };
     }
-    if f == f.trunc() {
-        format!("{f:.1}")
+    if f == 0.0 {
+        // Preserves `-0.0` (Ruby: `(-0.0).to_s == "-0.0"`).
+        return format!("{f:.1}");
+    }
+    let exp10 = f.abs().log10().floor() as i32;
+    if (-4..15).contains(&exp10) {
+        if f == f.trunc() {
+            format!("{f:.1}")
+        } else {
+            f.to_string()
+        }
     } else {
-        f.to_string()
+        // `{:e}` is Rust's shortest-round-trip scientific ("1e20", "1.5e-7");
+        // re-dress it as Ruby's: a decimal point in the mantissa and a signed
+        // at-least-two-digit exponent.
+        let s = format!("{f:e}");
+        let Some((mant, exp)) = s.split_once('e') else {
+            return s;
+        };
+        let exp: i32 = exp.parse().unwrap_or(0);
+        let sign = if exp < 0 { "-" } else { "+" };
+        let mantissa = if mant.contains('.') {
+            mant.to_string()
+        } else {
+            format!("{mant}.0")
+        };
+        format!("{mantissa}e{sign}{:02}", exp.abs())
     }
 }
 
