@@ -32,3 +32,29 @@ cd = false
 unless cd
   puts "d"
 end
+
+# A PARENTHESES-wrapped predicate anchors on the `(` column, not the
+# unwrapped node: `ce` sits at col 5 but the diagnostic lands at col 4.
+ce = 5
+if (ce)
+  puts "e"
+end
+
+# Nested parens anchor on the OUTERMOST `(`. A compound predicate inside
+# parens anchors the same way.
+cf = 5
+if ((cf))
+  puts "f"
+end
+
+cg = 5
+if (cg + 1)
+  puts "g"
+end
+
+# Ternary and modifier-if predicates anchor identically.
+ch = true
+(ch) ? (puts "h") : nil
+
+ci = 5
+puts "i" if (ci)

@@ -1119,7 +1119,10 @@ const DEFENSIVE_PREDICATES: &[&str] =
 ///   - a loop/block-nested predicate → already absent from `snapshots`.
 ///
 /// The diagnostic anchors on the predicate node span (the reference's
-/// `Diagnostic.from_node(predicate_node)`).
+/// `Diagnostic.from_node(predicate_node)`). The reference's predicate node is
+/// the Prism `ParenthesesNode` when the predicate is written `(expr)`, so a
+/// parenthesised predicate anchors at the `(` — the port's single-statement
+/// parens unwrap loses that hull, which [`LoweredAst::paren_hull`] restores.
 fn check_always_truthy(
     ast: &LoweredAst,
     if_id: rigor_parse::NodeId,
@@ -1138,7 +1141,9 @@ fn check_always_truthy(
     let ty = *snapshots.get(&if_id)?;
     let polarity = constant_polarity(interner, ty)?;
 
-    let span = ast.get(predicate).span();
+    let span = ast
+        .paren_hull(predicate)
+        .unwrap_or_else(|| ast.get(predicate).span());
     let severity = catalog(FLOW_ALWAYS_TRUTHY_CONDITION)
         .map(|e| e.default_severity)
         .unwrap_or(Severity::Warning);
