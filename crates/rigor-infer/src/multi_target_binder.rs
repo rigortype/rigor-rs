@@ -16,7 +16,8 @@
 //!
 //! | reference | here |
 //! | --- | --- |
-//! | `visit` | [`visit`] |
+//! | `visit` (a `Type::Union` distributes first, issue #1094) | [`visit`] / [`visit_union`] |
+//! | `join_member_bindings` | [`join_member_bindings`] |
 //! | `decompose` | [`decompose`] |
 //! | `decompose_tuple` | [`decompose_tuple`] |
 //! | `decompose_default` (non-tuple RHS ⇒ every slot `Dynamic[top]`) | [`decompose_default`] |
@@ -25,58 +26,236 @@
 //! | `bind_target` / `bind_rest_target` | [`bind_target`] / [`bind_rest_target`] |
 
 use rigor_parse::{MultiTarget, MultiTargets};
-use rigor_types::{Algebra, Interner, Scalar, Type, TypeId};
+use rigor_types::{combinator_union, Algebra, ClassId, Interner, Scalar, Type, TypeId};
 
 /// Bind a multi-assignment target tree against the right-hand side's type.
 /// Returns the `(name, type)` pairs in source order (reference `bind`).
+/// `resolve` supplies class names for the union constructor's
+/// `describe(:short)` sort (the reference's `Combinator.union` member order).
 #[must_use]
-pub fn bind(targets: &MultiTargets, rhs_type: TypeId, interner: &mut Interner) -> Vec<(String, TypeId)> {
+pub fn bind(
+    targets: &MultiTargets,
+    rhs_type: TypeId,
+    interner: &mut Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> Vec<(String, TypeId)> {
+    bind_marked(targets, rhs_type, interner, resolve)
+        .into_iter()
+        .map(|(name, ty, _optimistic)| (name, ty))
+        .collect()
+}
+
+/// Reference `bind_marked` (`Result#optimistic`): same bindings as [`bind`],
+/// with each name flagged when its type is the reference's OPTIMISTIC
+/// short-array bet — a name some union member bound to a bare `nil` while
+/// another member bound a value (`join_member_bindings`' `softened`). The
+/// mark only ever WITHHOLDS a diagnostic on the reference: the bound type is
+/// the firm join either way, but flow rules (`flow.always-truthy-condition`,
+/// `call.possible-nil-receiver`) decline to reason about a marked name —
+/// `s, v = (c ? [:ok, 1] : [:err]); if v` is silent upstream. Callers whose
+/// env feeds a flow rule must treat a marked name as `Dynamic[top]`; the
+/// check env keeps the firm type, since the reference still witnesses it
+/// (`[v].frob` fires `for [1]`).
+#[must_use]
+pub fn bind_marked(
+    targets: &MultiTargets,
+    rhs_type: TypeId,
+    interner: &mut Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> Vec<(String, TypeId, bool)> {
     let mut out = Vec::new();
-    visit(targets, rhs_type, interner, &mut out);
+    visit(targets, rhs_type, interner, resolve, &mut out);
     out
 }
 
-/// Reference `visit`: split the RHS into per-slot types, then bind each slot.
+/// Reference `visit`: a `Type::Union` RHS distributes member-wise FIRST
+/// (issue #1094 — every member walks the same target tree and each name's
+/// type is the join across members); otherwise split the RHS into per-slot
+/// types, then bind each slot.
 fn visit(
     node: &MultiTargets,
     rhs_type: TypeId,
     interner: &mut Interner,
-    out: &mut Vec<(String, TypeId)>,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+    out: &mut Vec<(String, TypeId, bool)>,
 ) {
+    if let Type::Union(members) = interner.get(rhs_type) {
+        let members = members.clone();
+        return visit_union(node, &members, interner, resolve, out);
+    }
     let (fronts, rest_type, backs) = decompose(
         rhs_type,
         node.lefts.len(),
         node.rights.len(),
         node.rest.is_some(),
         interner,
+        resolve,
     );
     for (t, ty) in node.lefts.iter().zip(fronts) {
-        bind_target(t, ty, interner, out);
+        bind_target(t, ty, interner, resolve, out);
     }
     if let (Some(rest), Some(ty)) = (node.rest.as_deref(), rest_type) {
         bind_rest_target(rest, ty, out);
     }
     for (t, ty) in node.rights.iter().zip(backs) {
-        bind_target(t, ty, interner, out);
+        bind_target(t, ty, interner, resolve, out);
     }
 }
 
-/// Reference `decompose`: a `Type::Tuple` RHS decomposes element-wise; every
-/// other carrier (`Nominal[Array]`, `Dynamic[top]`, `Top`, `Bot`, a union, …)
-/// collapses to `Dynamic[top]` per slot.
+/// Reference `visit_union` (issue #1094): each union member walks the same
+/// target tree, so each binds the same names; the first member's order is the
+/// declaration order. Every member's walk runs on its OWN binding list, and
+/// each name's type joins across members via [`join_member_bindings`].
+fn visit_union(
+    node: &MultiTargets,
+    members: &[TypeId],
+    interner: &mut Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+    out: &mut Vec<(String, TypeId, bool)>,
+) {
+    let walks: Vec<Vec<(String, TypeId, bool)>> = members
+        .iter()
+        .map(|&m| {
+            let mut member_out = Vec::new();
+            visit(node, m, interner, resolve, &mut member_out);
+            member_out
+        })
+        .collect();
+    let Some(first) = walks.first() else {
+        return;
+    };
+    for (name, _ty, member_marked) in first.clone() {
+        let types: Vec<TypeId> = walks
+            .iter()
+            .map(|w| {
+                w.iter()
+                    .find(|(n, _, _)| n == &name)
+                    .map(|(_, t, _)| *t)
+                    // Every member binds the same names; a missing one reads
+                    // as a bare `nil` binding (reference `member_bindings[name]`
+                    // → nil), which `join_member_bindings` firms away.
+                    .unwrap_or_else(|| interner.intern(Type::Constant(Scalar::Nil)))
+            })
+            .collect();
+        let (joined, softened) = join_member_bindings(types, interner, resolve);
+        // "A name is also optimistic when any member marked it" — the mark
+        // inherits through the member walks the same way the reference's
+        // `member_marked.include?(name)` does.
+        let marked = softened
+            || member_marked
+            || walks
+                .iter()
+                .any(|w| w.iter().any(|(n, _, m)| n == &name && *m));
+        out.push((name.clone(), joined, marked));
+    }
+}
+
+/// Reference `join_member_bindings`, returning `[type, softened]`:
+/// `Dynamic[top]` from any member is the whole answer — the join must not
+/// let a decomposable member's precise type stand for a member nothing is
+/// known about. A bare `nil` member (a `nil` slot or a slot past a short
+/// member) drops out of the join when another member binds a value — the
+/// ADR-57 softening across members — and `softened` reports it so the
+/// caller can mark the name optimistic (see [`bind_marked`]).
+fn join_member_bindings(
+    types: Vec<TypeId>,
+    interner: &mut Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> (TypeId, bool) {
+    let untyped = interner.untyped();
+    if types.contains(&untyped) {
+        return (untyped, false);
+    }
+    let firm: Vec<TypeId> =
+        types.iter().copied().filter(|&t| !is_nil_literal(interner, t)).collect();
+    if firm.is_empty() || firm.len() == types.len() {
+        (combinator_union(interner, types, resolve), false)
+    } else {
+        (combinator_union(interner, firm, resolve), true)
+    }
+}
+
+/// Reference `decompose`: a `Type::Tuple` RHS decomposes element-wise; a
+/// member that provably has no implicit `to_ary` conversion decomposes as the
+/// ONE-ELEMENT tuple `[rhs]` — the wrap Ruby itself performs
+/// (`a, b = 1` binds `1` and `nil`, `multi_target_binder.rb`'s
+/// `wraps_as_single_element?`, issue #1094) — and the wrap is EXACT, so it
+/// carries no optimistic mark. Everything else (`Nominal[Array]`,
+/// `Dynamic[top]`, `Top`, `Bot`, a type naming no single class, …) collapses
+/// to `Dynamic[top]` per slot. The union members a statement-level RHS
+/// commonly produces are CONSTANTS (`c ? 1 : [2, 3]`), all of which name a
+/// `to_ary`-free class; the reference additionally consults the scope for
+/// project-defined conversion hooks and RBS-known non-core classes — neither
+/// is reachable from this binder's context, so those stay `Dynamic[top]`
+/// (a decline, never a wrong binding).
 fn decompose(
     rhs_type: TypeId,
     front_count: usize,
     back_count: usize,
     rest_present: bool,
     interner: &mut Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
 ) -> (Vec<TypeId>, Option<TypeId>, Vec<TypeId>) {
     match interner.get(rhs_type) {
         Type::Tuple(elements) => {
             let elements = elements.clone();
             decompose_tuple(&elements, front_count, back_count, rest_present, interner)
         }
+        _ if wraps_as_single_element(rhs_type, interner, resolve) => {
+            decompose_tuple(&[rhs_type], front_count, back_count, rest_present, interner)
+        }
         _ => decompose_default(front_count, back_count, rest_present, interner),
+    }
+}
+
+/// Reference `wraps_as_single_element?` restricted to the closed core list
+/// (`ARRAY_CONVERSION_FREE_CORE_CLASSES` — `Integer`, `Float`, `Symbol`,
+/// `String`, `Hash`, `Range`, `Regexp`, `Proc`, `NilClass`, `TrueClass`,
+/// `FalseClass`), the only half of `array_conversion_free?` a scope-less
+/// binder can answer. A class outside the list declines to `Dynamic[top]`
+/// per slot — the same answer `array_conversion_free?` gives with a nil
+/// scope.
+fn wraps_as_single_element(
+    rhs_type: TypeId,
+    interner: &Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> bool {
+    const CORE: &[&str] = &[
+        "Integer", "Float", "Symbol", "String", "Hash", "Range", "Regexp", "Proc", "NilClass",
+        "TrueClass", "FalseClass",
+    ];
+    conversion_class_name(rhs_type, interner, resolve).is_some_and(|n| CORE.contains(&n.as_str()))
+}
+
+/// Reference `conversion_class_name`: the class whose instances `ty`
+/// describes, for the `to_ary` question — `None` when `ty` names no single
+/// class (`Dynamic`, `Top`, `Singleton`, `Intersection`, …). A union never
+/// reaches here; [`visit_union`] distributes it first.
+fn conversion_class_name(
+    ty: TypeId,
+    interner: &Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> Option<String> {
+    match interner.get(ty) {
+        Type::Constant(s) => Some(
+            match s {
+                Scalar::Int(_) => "Integer",
+                Scalar::Float(_) => "Float",
+                Scalar::Str(_) => "String",
+                Scalar::Sym(_) => "Symbol",
+                Scalar::Nil => "NilClass",
+                Scalar::Bool(true) => "TrueClass",
+                Scalar::Bool(false) => "FalseClass",
+            }
+            .to_string(),
+        ),
+        Type::Nominal { class, .. } => resolve(*class),
+        Type::HashShape(_) => Some("Hash".to_string()),
+        Type::IntegerRange { .. } => Some("Integer".to_string()),
+        Type::Refined { base, .. } | Type::Difference { base, .. } => {
+            conversion_class_name(*base, interner, resolve)
+        }
+        _ => None,
     }
 }
 
@@ -181,11 +360,12 @@ fn bind_target(
     target: &MultiTarget,
     ty: TypeId,
     interner: &mut Interner,
-    out: &mut Vec<(String, TypeId)>,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+    out: &mut Vec<(String, TypeId, bool)>,
 ) {
     match target {
-        MultiTarget::Local { name, .. } => out.push((name.clone(), ty)),
-        MultiTarget::Nested(inner) => visit(inner, ty, interner, out),
+        MultiTarget::Local { name, .. } => out.push((name.clone(), ty, false)),
+        MultiTarget::Nested(inner) => visit(inner, ty, interner, resolve, out),
         MultiTarget::Ignored { .. } => {}
     }
 }
@@ -194,9 +374,9 @@ fn bind_target(
 /// anonymous `*`, an implicit rest, and a non-local splat target are skipped —
 /// and a nested multi-target is NOT recursed into (the reference's rest arm
 /// handles only the two local-ish node kinds).
-fn bind_rest_target(rest: &MultiTarget, ty: TypeId, out: &mut Vec<(String, TypeId)>) {
+fn bind_rest_target(rest: &MultiTarget, ty: TypeId, out: &mut Vec<(String, TypeId, bool)>) {
     if let MultiTarget::Local { name, .. } = rest {
-        out.push((name.clone(), ty));
+        out.push((name.clone(), ty, false));
     }
 }
 
@@ -224,6 +404,13 @@ mod tests {
 
     const NOWHERE: Span = (0, 0);
 
+    /// Tests bind no nominal unions, so a no-name resolver suffices.
+    fn no_resolve(_: ClassId) -> Option<String> {
+        None
+    }
+
+    const NO_RESOLVE: &dyn Fn(ClassId) -> Option<String> = &no_resolve;
+
     fn local(name: &str) -> MultiTarget {
         MultiTarget::Local { name: name.to_string(), name_span: NOWHERE }
     }
@@ -234,7 +421,7 @@ mod tests {
         let (a, b) = (i.int(1), i.int(2));
         let rhs = i.intern(Type::Tuple(vec![a, b]));
         let t = targets("a, b = [1, 2]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(names(&out), ["a", "b"]);
         assert_eq!(out[0].1, a);
         assert_eq!(out[1].1, b);
@@ -246,7 +433,7 @@ mod tests {
         let a = i.int(1);
         let rhs = i.intern(Type::Tuple(vec![a]));
         let t = targets("a, b = [1]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(out[1].1, i.nil());
     }
 
@@ -255,7 +442,7 @@ mod tests {
         let mut i = Interner::new();
         let rhs = i.intern(Type::Nominal { class: rigor_types::ClassId(1), args: vec![] });
         let t = targets("a, b = xs\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         let u = i.untyped();
         assert!(out.iter().all(|(_, ty)| *ty == u));
     }
@@ -266,7 +453,7 @@ mod tests {
         let (a, b, c, d) = (i.int(1), i.int(2), i.int(3), i.int(4));
         let rhs = i.intern(Type::Tuple(vec![a, b, c, d]));
         let t = targets("a, *m, z = [1, 2, 3, 4]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(names(&out), ["a", "m", "z"]);
         assert_eq!(out[0].1, a);
         assert_eq!(out[1].1, i.intern(Type::Tuple(vec![b, c])));
@@ -280,7 +467,7 @@ mod tests {
         let rhs = i.intern(Type::Tuple(vec![a]));
         // front=1, back=1, tuple has 1 element: middle_end = max(1-1, 1) = 1.
         let t = targets("a, *m, z = [1]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(out[0].1, a);
         assert_eq!(out[1].1, i.intern(Type::Tuple(vec![])));
         assert_eq!(out[2].1, i.nil(), "the over-destructured trailing slot is nil");
@@ -294,7 +481,7 @@ mod tests {
         let a = i.int(1);
         let rhs = i.intern(Type::Tuple(vec![a, inner]));
         let t = targets("a, (b, c) = [1, [2, 3]]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(names(&out), ["a", "b", "c"]);
         assert_eq!(out[1].1, b);
         assert_eq!(out[2].1, c);
@@ -307,7 +494,7 @@ mod tests {
         let rhs = i.intern(Type::Tuple(vec![a, b]));
         // `@x` is an ivar target — skipped, but slot 0 must still be ITS slot.
         let t = targets("@x, b = [1, 2]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(names(&out), ["b"]);
         assert_eq!(out[0].1, b, "b takes slot 1, not slot 0");
     }
@@ -318,7 +505,7 @@ mod tests {
         let (a, b, c) = (i.int(1), i.int(2), i.int(3));
         let rhs = i.intern(Type::Tuple(vec![a, b, c]));
         let t = targets("a, *, z = [1, 2, 3]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(names(&out), ["a", "z"]);
         assert_eq!(out[1].1, c, "the rest slot still consumed the middle");
     }
@@ -332,7 +519,7 @@ mod tests {
         assert!(matches!(i.get(opt), Type::Union(_)), "precondition: a union");
         let rhs = i.intern(Type::Tuple(vec![opt]));
         let t = targets("a, = xs\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(out[0].1, s, "the nil arm is dropped");
     }
 
@@ -342,7 +529,7 @@ mod tests {
         let nil = i.nil();
         let rhs = i.intern(Type::Tuple(vec![nil]));
         let t = targets("a, b = [nil, nil]\n");
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(out[0].1, nil);
     }
 
@@ -357,7 +544,7 @@ mod tests {
             rights: vec![],
             span: NOWHERE,
         };
-        let out = bind(&t, rhs, &mut i);
+        let out = bind(&t, rhs, &mut i, &NO_RESOLVE);
         assert_eq!(out.last().unwrap().1, b);
     }
 }

@@ -1,0 +1,810 @@
+{
+  "fixture": "harness/corpus/119_rescue_for_join.rb",
+  "diagnostics": [
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 32,
+      "column": 8,
+      "severity": "error",
+      "message": "argument type mismatch at `fdiv' on Integer: expected Numeric, got [5]"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 618,
+      "column": 10,
+      "severity": "error",
+      "message": "argument type mismatch at `fdiv' on Integer: expected Numeric, got \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 13,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 18,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 24,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `frob' for { a: 5 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frob' for [5, 1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [[5]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frob' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for [6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 47,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for [6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 58,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 64,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 85,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 91,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 94,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 97,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 100,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 106,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 115,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 123,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 126,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 129,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 136,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 139,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 149,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 159,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 170,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [8]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 180,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 191,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [7 | 8]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 201,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 207,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 215,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [7 | 8]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 221,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 228,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 231,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 236,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [1 | 2 | nil]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 243,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 246,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 251,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [1?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 252,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [2?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 257,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [:a?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 258,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [1?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 265,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [7?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 268,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 276,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 286,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [\"s\" | 1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 289,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [\"s\"]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 297,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 300,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 303,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 314,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 354,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 361,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 369,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 373,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [Dynamic[top]?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 379,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 383,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 393,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 394,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 397,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 406,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [6 | 8 | 9]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 407,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [7 | 8 | 9]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 415,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 418,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 421,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 424,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [2?]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 427,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1 | :a"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 438,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 446,
+      "column": 34,
+      "severity": "error",
+      "message": "undefined method `frob' for bool"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 447,
+      "column": 44,
+      "severity": "error",
+      "message": "undefined method `frob' for bool | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 448,
+      "column": 46,
+      "severity": "error",
+      "message": "undefined method `frob' for bool | \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 457,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 485,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 488,
+      "column": 26,
+      "severity": "error",
+      "message": "undefined method `frob' for [Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 490,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [1 | Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 495,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 524,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for :a"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 531,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frob' for [5]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 555,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `upcase' for StandardError"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 570,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [6 | 7]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 573,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 575,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [1 | 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 580,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frob' for [-1.0e+20]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 581,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frob' for [-1.0e+15]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 582,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frob' for [-1.0e-05]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 583,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frob' for [-1.25e-07]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 584,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `frob' for [-1.234567890123456e+15]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 593,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [1 | 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 594,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [3]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 596,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [3]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 597,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for [2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 649,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for :a"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 650,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 659,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 661,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 661,
+      "column": 35,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 667,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frob' for [2, \"s\"]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 669,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 675,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 716,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for bool"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 722,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 735,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [\"s\" | 1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 743,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 759,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 761,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 763,
+      "column": 26,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 776,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 779,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 730,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo63`. If a project file defines `foo63` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 738,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo63`. If a project file defines `foo63` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 746,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo63`. If a project file defines `foo63` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 758,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `foo64`. If a project file defines `foo64` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.dead-assignment",
+      "line": 772,
+      "column": 3,
+      "severity": "warning",
+      "message": "local `w65' assigned in `m65' but never read"
+    },
+    {
+      "rule": "flow.dead-assignment",
+      "line": 773,
+      "column": 23,
+      "severity": "warning",
+      "message": "local `x65' assigned in `m65' but never read"
+    }
+  ]
+}

@@ -643,7 +643,9 @@ pub fn analyze_with_source_and_folder(
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
         let diag = (!nil_skip)
-            .then(|| check_call(ast, recv, &method, message_span, env, &typer, interner, index))
+            .then(|| {
+                check_call(ast, recv, &method, message_span, safe_nav, env, &typer, interner, index)
+            })
             .flatten()
             .or_else(|| {
                 check_narrowed_call(
@@ -814,9 +816,9 @@ pub fn analyze_with_source_and_folder(
     // (those predicates are absent from the snapshot map).
     let truthy_snapshots = typer.always_truthy_snapshots(ast, interner);
     for (id, node) in ast.iter() {
-        if let Node::If { predicate, .. } = node {
+        if let Node::If { predicate, predicate_span, .. } = node {
             if let Some(diag) =
-                check_always_truthy(ast, id, *predicate, &truthy_snapshots, interner)
+                check_always_truthy(ast, id, *predicate, *predicate_span, &truthy_snapshots, interner)
             {
                 out.push(diag);
             }
@@ -1124,6 +1126,7 @@ fn check_always_truthy(
     ast: &LoweredAst,
     if_id: rigor_parse::NodeId,
     predicate: rigor_parse::NodeId,
+    predicate_span: rigor_parse::Span,
     snapshots: &std::collections::HashMap<rigor_parse::NodeId, rigor_types::TypeId>,
     interner: &Interner,
 ) -> Option<Diagnostic> {
@@ -1138,7 +1141,10 @@ fn check_always_truthy(
     let ty = *snapshots.get(&if_id)?;
     let polarity = constant_polarity(interner, ty)?;
 
-    let span = ast.get(predicate).span();
+    // The reference anchors on the PRISM predicate node (`from_node`), which
+    // keeps a parenthesised predicate's `(` — `if (w = 1)` warns at the paren,
+    // one column left of the unwrapped write the lowered `predicate` holds.
+    let span = predicate_span;
     let severity = catalog(FLOW_ALWAYS_TRUTHY_CONDITION)
         .map(|e| e.default_severity)
         .unwrap_or(Severity::Warning);
@@ -1474,6 +1480,7 @@ fn check_call(
     receiver: rigor_parse::NodeId,
     method: &str,
     message_span: (usize, usize),
+    safe_nav: bool,
     env: &rigor_infer::TypeEnv,
     typer: &Typer,
     interner: &mut Interner,
@@ -1507,6 +1514,84 @@ fn check_call(
             return None;
         }
         let receiver_render = format!("singleton({name})");
+        let message = format!("undefined method `{method}' for {receiver_render}");
+        let severity = catalog(CALL_UNDEFINED_METHOD)
+            .map(|e| e.default_severity)
+            .unwrap_or(Severity::Error);
+        return Some(Diagnostic {
+            rule_id: CALL_UNDEFINED_METHOD,
+            start_offset: message_span.0,
+            end_offset: message_span.1,
+            message,
+            severity,
+            source_family: "builtin",
+            receiver_type: Some(receiver_render),
+            method_name: Some(method.to_string()),
+        });
+    }
+
+    // Union receiver — the join a rescue/`for` write leaves (`w = "s"; (w = 1)
+    // rescue nil` types `w` to `"s" | 1`, rigor-rs#167). The reference
+    // witnesses only a HETEROGENEOUS union whose every member resolves to a
+    // known surface that lacks the method: `"s" | 1` fires `for "s" | 1`,
+    // while `w.upcase` on it stays silent (String has it). A homogeneous
+    // union (`5 | 6`, `"a" | "b"`), a `nil` member (the
+    // `possible-nil-receiver` rule's territory), a `Dynamic`/`Top` member (it
+    // may answer anything), and an unresolvable member all stay silent.
+    if let Type::Union(members) = interner.get(recv_ty) {
+        // A safe-navigation call declines outright — the reference's
+        // `union_undefined_method_diagnostic` early-returns on
+        // `call_node.safe_navigation?` (`w&.frob` never fires on a union;
+        // a scalar receiver `5&.frob` still does).
+        if safe_nav {
+            return None;
+        }
+        let members = members.clone();
+        let mut class_names: Vec<&str> = Vec::new();
+        for m in &members {
+            let name = union_member_class_name(interner, index, typer.source(), *m)?;
+            class_names.push(name);
+        }
+        class_names.sort_unstable();
+        class_names.dedup();
+        if class_names.len() < 2 {
+            return None;
+        }
+        for name in &class_names {
+            if !index.knows_class(name)
+                || index.class_has_method(name, method)
+                || unenumerable_instance_receiver(index, name)
+                || typer.source().project_declares_method(typer.file_key(), name, method)
+                // A project REOPENING also extends a core class's surface:
+                // `class Integer; include K; end` gives `1` every method `K`
+                // declares. The override index's MRO walk (`nearest_ancestor_
+                // defining`) sees include/prepend modules AND superclasses —
+                // `project_declares_method` alone misses them.
+                || typer
+                    .source()
+                    .nearest_ancestor_defining(name, method)
+                    .is_some()
+            {
+                return None;
+            }
+        }
+        // The reference's `build_undefined_method_diagnostic` renders
+        // `receiver_type.describe` — `Union#describe`: a `true | false` pair
+        // collapses to `bool` rendered FIRST (`(c ? 1 : (c ? true : false))`
+        // prints `for bool | 1`), `T | nil` collapses to `T?`, the rest keep
+        // `Combinator.union`'s `describe(:short)` member order. Canonicalise
+        // the members through `combinator_union` (same constructor the scope
+        // join uses) so a union built on another path renders identically.
+        let receiver_render = {
+            let resolve = |class: rigor_types::ClassId| -> Option<String> {
+                index
+                    .class_name_for_id(class)
+                    .map(str::to_string)
+                    .or_else(|| typer.source().class_name_for_id(class).map(str::to_string))
+            };
+            let canon = rigor_types::combinator_union(interner, members.clone(), &resolve);
+            render_receiver(interner, index, typer.source(), canon)
+        };
         let message = format!("undefined method `{method}' for {receiver_render}");
         let severity = catalog(CALL_UNDEFINED_METHOD)
             .map(|e| e.default_severity)
@@ -3089,28 +3174,54 @@ struct ScopedEnv {
     top: rigor_infer::TypeEnv,
     gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
+    /// `(span, env)` pairs recording the env an in-order scope stood in —
+    /// one per top-level statement and per statement of every threading body
+    /// (`for`, `begin`/`rescue`/`else`/`ensure`, clause, parens sequence), plus
+    /// whole-span entries for rescue-modifier arms (frozen at entry — the
+    /// reference records arm operand types on the entry scope via
+    /// `OperandWalk.type_of(scope, node)`) and widened carriers (a post-widen
+    /// env, so `if`/`while`/literal-block interiors read `Dynamic`, not the
+    /// enclosing statement's env). Overlapping entries resolve
+    /// innermost-first — see [`Self::at`].
+    arm_entries: Vec<(rigor_parse::Span, rigor_infer::TypeEnv)>,
     method_bodies: Vec<rigor_parse::Span>,
 }
 
 impl ScopedEnv {
     fn build(typer: &Typer, ast: &LoweredAst, interner: &mut Interner) -> Self {
+        let (top, arm_entries) = typer.build_toplevel_check_env(ast, interner);
         ScopedEnv {
-            top: typer.build_toplevel_check_env(ast, interner),
+            top,
             gate_top: typer.build_toplevel_env(ast, interner),
             empty: rigor_infer::TypeEnv::new(),
+            arm_entries,
             method_bodies: rigor_infer::method_body_spans(ast),
         }
     }
 
-    /// The env a use site at `span` may read: the top-level env at file scope (or
-    /// inside a block, which DOES capture the enclosing locals), an empty env
-    /// inside any method body.
+    /// The env a use site at `span` may read: the recorded env at its program
+    /// point — every in-order statement records the env as it stood when that
+    /// statement began, and INNERMOST-first resolution lets a nested scope's
+    /// entry (rescue-modifier arm frozen at entry, clause body threading from
+    /// the `begin` entry, widened carrier) shadow the enclosing statement —
+    /// an empty env inside any method body, and the post-program env as the
+    /// fallback for unrecorded positions.
     fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
         if self.in_method_body(span) {
-            &self.empty
-        } else {
-            &self.top
+            return &self.empty;
         }
+        // Innermost containing entry wins; on a TIE (a statement that is
+        // itself a widened carrier — `if c; …; end` at statement level pushes
+        // both its own snapshot and the post-widen entry for the same span)
+        // the LAST-pushed entry wins, so the widened env shadows the
+        // pre-statement one.
+        self.arm_entries
+            .iter()
+            .enumerate()
+            .filter(|(_, (arm_span, _))| span.0 >= arm_span.0 && span.1 <= arm_span.1)
+            .min_by_key(|(i, (arm_span, _))| (arm_span.1 - arm_span.0, usize::MAX - i))
+            .map(|(_, (_, entry))| entry)
+            .unwrap_or(&self.top)
     }
 
     /// [`Self::at`] for the `Dynamic`-only gates of the class-narrowing and
@@ -3417,8 +3528,30 @@ fn ivar_write_mismatch_diagnostics(
     }
 }
 
-/// Render the receiver for the diagnostic message: the bare literal value for a
-/// value-pinned `Constant`, else the resolved class name.
+/// The class name a UNION member brings to the `check_call` union arm, or
+/// `None` when the member cannot offer a witnessable surface — a `nil`
+/// member (`possible-nil-receiver` owns those), `Dynamic`/`Top`/`Bottom`, a
+/// `Singleton`, or a nested union. `Constant` members name their scalar's
+/// class, `Tuple`/`HashShape` erase to `Array`/`Hash`, a `Nominal` resolves
+/// through the core then the source registry.
+fn union_member_class_name<'a>(
+    interner: &Interner,
+    index: &'a CoreIndex,
+    source: &'a rigor_infer::SourceIndex,
+    ty: rigor_types::TypeId,
+) -> Option<&'a str> {
+    match interner.get(ty) {
+        Type::Constant(Scalar::Nil) => None,
+        Type::Constant(s) => Some(rigor_infer::folding::scalar_class(s)),
+        Type::Nominal { class, .. } => index
+            .class_name_for_id(*class)
+            .or_else(|| source.class_name_for_id(*class)),
+        Type::Tuple(_) => Some("Array"),
+        Type::HashShape(_) => Some("Hash"),
+        _ => None,
+    }
+}
+
 /// Render a receiver for a diagnostic's `message` / `receiver_type` field in the
 /// reference's spelling, via the shared `describe_named` display layer: a
 /// `Constant` renders its value (`"Hello"`, `3`), a `Tuple` value-pinned
@@ -3449,7 +3582,7 @@ fn render_scalar(scalar: &Scalar) -> String {
         Scalar::Str(s) => format!("{s:?}"),
         Scalar::Sym(s) => format!(":{s}"),
         Scalar::Int(n) => n.to_string(),
-        Scalar::Float(f) => f.to_string(),
+        Scalar::Float(f) => rigor_types::ruby_float_to_s(*f),
         Scalar::Bool(b) => b.to_string(),
         Scalar::Nil => "nil".to_string(),
     }
