@@ -483,8 +483,22 @@ impl<'i> Typer<'i> {
                 let value = *value;
                 self.type_of(ast, value, env, interner)
             }
-            Node::Call { receiver: Some(r), method, args, block_body, .. } => {
+            Node::Call { receiver: Some(r), method, args, block_body, safe_nav, .. } => {
                 let (r, method) = (*r, method.clone());
+                // `expression_typer.rb` `attribute_write_value` (#520): a plain
+                // attribute / index write's RESULT is its last argument's
+                // type — `h.default = 0` types `0`, `h[:k] = v` types `v` —
+                // the declared setter return is discarded. A safe-navigation
+                // write (`x&.attr = v`) is `v | nil` on the reference, a union
+                // the port doesn't model — keep the dispatch result there.
+                if !safe_nav
+                    && block_body.is_empty()
+                    && is_attribute_write(&method)
+                    && args.last().is_some()
+                {
+                    let rhs = *args.last().unwrap();
+                    return self.type_of(ast, rhs, env, interner);
+                }
                 if !block_body.is_empty() {
                     // A block changes which RBS overload applies: the reference
                     // selects the block-bearing overload (`block_required: true`)
@@ -3056,42 +3070,29 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
                 let vspan = ast.get(*value).span();
+                // A value-position lookup mutation still applies —
+                // `r = (counts.default = 0)` opens the shape before `r`
+                // binds — so capture the pre-statement env, widen the
+                // contained writes (a conditional-position mutation inside
+                // stays Dynamic), then apply the unconditional ones.
+                let pre = env.clone();
                 widen_flow_writes(rebinds, vspan, env, interner);
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
                 self.bind_statement(ast, id, env, interner);
             }
-            // A bare call: widen every contained write (an arg-position rebind
-            // or lookup mutation is unmodeled here — `f(counts.default = 0)`
-            // opens on the reference but this env declines, strictly fewer
-            // diagnostics), then apply the modeled receiver effect
-            // (`counts.default = 0` opens the shape) and the
-            // `widen_after_block` re-apply for lookup mutations inside a block
-            // body.
-            Node::Call { receiver, method, block_body, span, .. } => {
-                let (receiver, method, block_body, span) =
-                    (*receiver, method.clone(), block_body.clone(), *span);
+            // A bare call: widen every contained write, then apply the
+            // unconditional lookup mutations inside it — the call itself
+            // (`counts.default = 0` opens the shape), arg / receiver positions
+            // (`p(counts.default = 0)`), and the `widen_after_block` re-apply
+            // for mutations inside a block body.
+            Node::Call { span, .. } => {
+                let span = *span;
                 // The mutator effect reads the PRE-call carrier — capture the
                 // binding BEFORE the span-widen clobbers it (the call's own
                 // lookup-write entry sits inside its own span).
                 let pre = env.clone();
                 widen_flow_writes(rebinds, span, env, interner);
-                if let Some(Node::LocalVariableRead { name, .. }) =
-                    receiver.map(|r| ast.get(r))
-                {
-                    let name = name.clone();
-                    if let Some(&ty) = pre.get(&name) {
-                        // `widen_shape` returning `nil` leaves the scope
-                        // UNCHANGED — restore the pre-call binding rather
-                        // than the span-widen's Dynamic (an identity-stable
-                        // `compare_by_identity` keeps the closed shape, a
-                        // non-shape receiver was never a write).
-                        if HASH_LOOKUP_MUTATORS.contains(&method.as_str()) {
-                            let widened =
-                                self.lookup_widened(interner, ty, &method).unwrap_or(ty);
-                            env.insert(name, widened);
-                        }
-                    }
-                }
-                self.apply_block_lookup_mutations(ast, &block_body, lookup, &pre, env, interner);
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
             }
             // Only a real statement sequence is straight-line code. A recovery
             // carrier (a `rescue` modifier, `super(…)`, …) runs its writes
@@ -3103,7 +3104,15 @@ impl<'i> Typer<'i> {
                     self.bind_check_statement(ast, s, env, rebinds, lookup, interner);
                 }
             }
-            other => widen_flow_writes(rebinds, other.span(), env, interner),
+            // Every other statement — `if`/`case`/loop/begin/logical and the
+            // carriers — widens its contained writes; unconditional lookup
+            // mutations inside it still apply (an `if`/`case` predicate, a
+            // `for` collection).
+            other => {
+                let pre = env.clone();
+                widen_flow_writes(rebinds, other.span(), env, interner);
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
+            }
         }
     }
 
@@ -3215,8 +3224,12 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 // A value expression may itself write OTHER locals (`x = (y = 5)`)
                 // or capture-write via a block — widen those first, then bind.
+                // A value-position lookup mutation (`r = (counts.default = 0)`)
+                // still applies, so re-apply the modeled effect over the widen.
                 let vspan = ast.get(value).span();
+                let pre = env.clone();
                 widen_flow_writes(writes, vspan, env, interner);
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
                 // An if-EXPRESSION assigned to a local (`strategies = if
                 // Gitlab::Database.read_write?; …`) still carries a predicate the
                 // always-truthy rule visits — record its snapshot here (the
@@ -3243,7 +3256,9 @@ impl<'i> Typer<'i> {
                 // Same discipline as the single-target arm: the RHS may itself
                 // write other locals — widen those first, then bind.
                 let vspan = ast.get(value).span();
+                let pre = env.clone();
                 widen_flow_writes(writes, vspan, env, interner);
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
                 let rhs = self.type_of(ast, value, env, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     env.insert(name, ty);
@@ -3253,12 +3268,23 @@ impl<'i> Typer<'i> {
                 // `x += 1` / `x ||= 5` reads-then-writes; the result is not a
                 // tracked constant in this slice — widen.
                 let name = name.clone();
+                // A lookup mutation inside the value (`x += (h.default = 0)`)
+                // still runs unconditionally.
+                let pre = env.clone();
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
                 let u = interner.untyped();
                 env.insert(name, u);
             }
             Node::If { predicate, then_body, else_body, .. } => {
                 let (predicate, then_body, else_body) =
                     (*predicate, then_body.clone(), else_body.clone());
+                // A predicate-position lookup mutation (`if counts.default = 0`)
+                // evaluates once, BEFORE either branch — apply it so both
+                // branch envs see the post-mutation carrier.
+                let pre = env.clone();
+                self.apply_lookup_mutations_in(
+                    ast, predicate, lookup, &pre, env, interner,
+                );
                 if !in_loop_or_block {
                     let pty = self.flow_predicate_type(
                         ast, predicate, env, self_qual, self_kind, interner,
@@ -3276,9 +3302,14 @@ impl<'i> Typer<'i> {
                     ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, lookup, interner, out,
                 );
                 *env = join_flow_envs(&then_env, &else_env, interner);
-                // A predicate may contain a write (`if (x = f)`); widen post-join.
+                // A predicate may contain a write (`if (x = f)`); widen post-join,
+                // then re-apply the unconditional predicate mutations the widen
+                // would otherwise clobber.
                 let pspan = ast.get(predicate).span();
                 widen_flow_writes(writes, pspan, env, interner);
+                self.apply_lookup_mutations_in(
+                    ast, predicate, lookup, &pre, env, interner,
+                );
             }
             Node::Definition { body, singleton_name, .. } => {
                 // Independent scope: fresh local env, inherited suppression flag.
@@ -3307,42 +3338,29 @@ impl<'i> Typer<'i> {
             }
             // A bare call — the `other` widening applies (every write its span
             // contains: arg-position effects, and a lookup mutation is itself a
-            // span write the census carries), then the modeled
-            // `HashLookupMutation` effect on a bare-local receiver
-            // (`counts.default = 0` opens the shape so `counts[:b]` stops
-            // folding `nil`), and the `widen_after_block` re-apply for lookup
-            // mutations inside a block body.
-            Node::Call { receiver, method, block_body, span, .. } => {
-                let (receiver, method, block_body, span) =
-                    (*receiver, method.clone(), block_body.clone(), *span);
+            // span write the census carries), then the unconditional
+            // `HashLookupMutation` effects inside it — the call's own
+            // bare-local receiver (`counts.default = 0` opens the shape so
+            // `counts[:b]` stops folding `nil`), arg / receiver positions, and
+            // the `widen_after_block` re-apply for mutations inside a block
+            // body.
+            Node::Call { span, .. } => {
+                let span = *span;
                 // The mutator effect reads the PRE-call carrier — capture the
                 // binding BEFORE the span-widen clobbers it (the call's own
                 // lookup-write entry sits inside its own span).
                 let pre = env.clone();
                 widen_flow_writes(writes, span, env, interner);
-                if let Some(Node::LocalVariableRead { name, .. }) =
-                    receiver.map(|r| ast.get(r))
-                {
-                    let name = name.clone();
-                    if let Some(&ty) = pre.get(&name) {
-                        // `widen_shape` returning `nil` leaves the scope
-                        // UNCHANGED — restore the pre-call binding rather
-                        // than the span-widen's Dynamic (an identity-stable
-                        // `compare_by_identity` keeps the closed shape, a
-                        // non-shape receiver was never a write).
-                        if HASH_LOOKUP_MUTATORS.contains(&method.as_str()) {
-                            let widened =
-                                self.lookup_widened(interner, ty, &method).unwrap_or(ty);
-                            env.insert(name, widened);
-                        }
-                    }
-                }
-                self.apply_block_lookup_mutations(ast, &block_body, lookup, &pre, env, interner);
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
             }
             // Loop / case / begin-rescue / logical / any other node:
-            // widen every local written in the span, do not descend for snapshots.
+            // widen every local written in the span, do not descend for
+            // snapshots — then apply the unconditional lookup mutations (a
+            // `case` subject, a `for` collection).
             other => {
+                let pre = env.clone();
                 widen_flow_writes(writes, other.span(), env, interner);
+                self.apply_lookup_mutations_in(ast, id, lookup, &pre, env, interner);
             }
         }
     }
@@ -3433,31 +3451,36 @@ impl<'i> Typer<'i> {
         }
     }
 
-    /// The `widen_after_block` half (`mutation_widening.rb:144`): every
-    /// `local.<lookup-mutator>` call inside a block body applies to the OUTER
-    /// binding, unconditionally — the reference walks the block body
-    /// syntactically, so a branch-contained mutation inside a block still
-    /// applies. `pre` is the env the call was made under (the mutations read
-    /// off their PRE-call carrier, like `widen_for_mutator`); results land in
-    /// `env`. `lookup` is the (already scope-appropriate) census for this env.
-    fn apply_block_lookup_mutations(
+    /// Apply every `local.<lookup-mutator>` call the node `id` evaluates
+    /// UNCONDITIONALLY — the statement's own mutator call
+    /// (`counts.default = 0`), expression positions (`r = (counts.default = 0)`,
+    /// `p(counts.default = 0)`, an `if`/`case` predicate), and — through the
+    /// syntactic `widen_after_block` walk (`mutation_widening.rb:144`) — every
+    /// mutation inside a block body it carries. `pre` is the env the statement
+    /// was reached under (the mutations read off their PRE-call carrier, like
+    /// `widen_for_mutator`); results land in `env`. `lookup` is the (already
+    /// scope-appropriate) census for this env.
+    fn apply_lookup_mutations_in(
         &self,
         ast: &LoweredAst,
-        block_body: &[NodeId],
+        id: NodeId,
         lookup: &[(rigor_parse::Span, String, String)],
         pre: &TypeEnv,
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
-        if block_body.is_empty() {
+        let span = ast.get(id).span();
+        if !lookup.iter().any(|(s, _, _)| span.0 <= s.0 && s.1 <= span.1) {
             return;
         }
-        let Some(hull) = span_hull(ast, block_body) else {
+        let apply_spans: HashSet<rigor_parse::Span> =
+            apply_lookup_spans(ast, id).into_iter().collect();
+        if apply_spans.is_empty() {
             return;
-        };
+        }
         let mut hits: Vec<&(rigor_parse::Span, String, String)> = lookup
             .iter()
-            .filter(|(s, _, _)| hull.0 <= s.0 && s.1 <= hull.1)
+            .filter(|(s, _, _)| apply_spans.contains(s))
             .collect();
         hits.sort_by_key(|(s, _, _)| *s);
         let mut carriers: HashMap<String, TypeId> = HashMap::new();
@@ -6916,8 +6939,10 @@ const HASH_MUTATORS: &[&str] = &[
 /// the Hash methods that change what a READ of the pairs answers without
 /// changing the pair set. Upstream keeps them off [`HASH_MUTATORS`] on purpose
 /// (`HashLookupMutation.widen_shape` opens a shape instead of widening it to a
-/// nominal — issue #1280, not ported: a local's shape is left as-is here). Read
-/// only through [`is_shape_mutator`], the constant-mutation census.
+/// nominal — upstream issue #1280, ported as the `open` flag on
+/// `Type::HashShape` and applied through [`Typer::apply_lookup_mutations_in`]
+/// / [`Typer::lookup_widened`]). Also read through [`is_shape_mutator`], the
+/// constant-mutation census.
 const HASH_LOOKUP_MUTATORS: &[&str] = &["default=", "default_proc=", "compare_by_identity"];
 
 /// `reference/rigor/lib/rigor/inference/string_mutation.rb:25` verbatim — the
@@ -8047,13 +8072,30 @@ fn hash_key_identity_stable(key: &ShapeKey) -> bool {
 /// `safe_nav` does NOT filter. These are not rebinds (the local names the same
 /// value), so they live outside [`collect_flow_writes`]'s `MUTATOR_METHODS`
 /// census — the flows that model them carry the method name.
+/// Prism `CallNode#attribute_write?` — a plain attribute / index write
+/// (`foo=` / `[]=`). The comparison operators also end in `=` but are plain
+/// reads, so they stay out.
+fn is_attribute_write(method: &str) -> bool {
+    method.ends_with('=') && !matches!(method, "==" | "!=" | "<=" | ">=" | "=~" | "!~" | "===")
+}
+
 fn lookup_mutation_calls(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, String)> {
+    // A literal `-> { … }` body is never evaluated by the reference's
+    // statement evaluator, so a mutation inside one is a NO-OP
+    // (`-> { counts.default = 0 }` leaves `counts[:b]` folding `nil`) — unless
+    // the lambda itself sits inside a block body, where the syntactic
+    // `widen_after_block` walk reaches through it
+    // (`xs.each { -> { counts.default = 0 } }` opens).
+    let dead = dead_lambda_regions(ast);
     ast.iter()
         .filter_map(|(id, n)| {
             let Node::Call { receiver: Some(r), method, span, .. } = n else {
                 return None;
             };
             if !HASH_LOOKUP_MUTATORS.contains(&method.as_str()) {
+                return None;
+            }
+            if dead.iter().any(|d| d.0 <= span.0 && span.1 <= d.1) {
                 return None;
             }
             match ast.get(*r) {
@@ -8064,6 +8106,165 @@ fn lookup_mutation_calls(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, St
             }
         })
         .collect()
+}
+
+/// The spans of literal `-> { … }` lambdas no `widen_after_block` walk can
+/// reach — a `Node::Lambda` outside every call's block body. The reference
+/// never evaluates a lambda body, so a lookup mutation inside one has no
+/// effect on the binding (probe `-> { h.default = 0 }; h[:b] + 1` →
+/// `+ ' for nil`); a lambda INSIDE a block is reached by the syntactic block
+/// walk instead (`[1].each { -> { h.default = 0 } }; h[:a].upcase` →
+/// `upcase ' for 1`). Note `lambda { … }` / `Proc.new { … }` are ordinary
+/// calls with a block body, not `Node::Lambda` — their bodies stay reachable.
+fn dead_lambda_regions(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+    let block_hulls: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call { block_body, .. } if !block_body.is_empty() => {
+                span_hull(ast, block_body)
+            }
+            _ => None,
+        })
+        .collect();
+    ast.iter()
+        .filter_map(|(_, n)| match n {
+            Node::Lambda { span, .. }
+                if !block_hulls.iter().any(|h| h.0 <= span.0 && span.1 <= h.1) =>
+            {
+                Some(*span)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The spans of `local.<lookup-mutator>` calls the node `id` evaluates
+/// UNCONDITIONALLY when it runs, in walk (≈source) order — the reference's
+/// statement-evaluator reach (`r = (counts.default = 0)`,
+/// `p(counts.default = 0)`, an `if`/`case` predicate, a `for` collection, an
+/// interpolation part), plus — once inside a call's block body — the
+/// syntactic `widen_after_block` walk, which reaches EVERY contained mutator
+/// call through nested `if`s and lambdas alike. Conditional positions are
+/// skipped: `if`/`case`/`when` arms, loop bodies and `while`/`until`
+/// predicates, `&&`/`||` right operands, real `begin`/`rescue` bodies,
+/// recovery and inert carriers, a safe-nav call's arguments (never evaluated
+/// when the receiver is nil), literal lambda bodies, and `def`/`class`/
+/// `module` scopes (their own census handles those).
+fn apply_lookup_spans(ast: &LoweredAst, id: NodeId) -> Vec<rigor_parse::Span> {
+    let mut out = Vec::new();
+    collect_apply_spans(ast, id, false, &mut out);
+    out
+}
+
+fn collect_apply_spans(
+    ast: &LoweredAst,
+    id: NodeId,
+    in_block: bool,
+    out: &mut Vec<rigor_parse::Span>,
+) {
+    let n = ast.get(id);
+    // Inside a block body the reference walks syntactically — every
+    // `local.<lookup-mutator>` call applies to the outer binding,
+    // unconditionally, through nested `if`s and lambdas (`xs.each { if c;
+    // counts.default = 0; end }` opens). A `def`/`class`/`module` body is a
+    // different scope and is not descended.
+    if in_block {
+        if let Node::Call { receiver: Some(r), method, span, .. } = n {
+            if HASH_LOOKUP_MUTATORS.contains(&method.as_str())
+                && matches!(ast.get(*r), Node::LocalVariableRead { .. })
+            {
+                out.push(*span);
+            }
+        }
+        if matches!(
+            n,
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. }
+        ) {
+            return;
+        }
+
+        let mut kids = Vec::new();
+        node_child_ids(n, &mut kids);
+        for k in kids {
+            collect_apply_spans(ast, k, true, out);
+        }
+        return;
+    }
+    match n {
+        Node::Call { receiver, args, block_body, safe_nav, method, span, .. } => {
+            // The call itself may be the mutator (`counts.default = 0`, also
+            // under `&.`, which the reference applies unconditionally).
+            if HASH_LOOKUP_MUTATORS.contains(&method.as_str())
+                && receiver.is_some_and(|r| {
+                    matches!(ast.get(r), Node::LocalVariableRead { .. })
+                })
+            {
+                out.push(*span);
+            }
+            if let Some(r) = receiver {
+                collect_apply_spans(ast, *r, false, out);
+            }
+            // `x&.foo(…)` may not dispatch — its arguments and block are
+            // conditional positions, not evaluated ones.
+            if !safe_nav {
+                for &a in args {
+                    collect_apply_spans(ast, a, false, out);
+                }
+                for &b in block_body {
+                    collect_apply_spans(ast, b, true, out);
+                }
+            }
+        }
+        // `if`/`unless`/ternary and `case` evaluate their predicate/subject
+        // once, unconditionally; the branch bodies are conditional.
+        Node::If { predicate, .. } => collect_apply_spans(ast, *predicate, false, out),
+        Node::Case { predicate: Some(p), .. } => {
+            collect_apply_spans(ast, *p, false, out)
+        }
+        // A `for` evaluates its collection once; a `while`/`until` predicate
+        // re-evaluates and every loop body is conditional.
+        Node::Loop { predicate: Some(p), index, .. } if !index.is_empty() => {
+            collect_apply_spans(ast, *p, false, out)
+        }
+        // A clause-less BeginRescue is a reused carrier (a parenthesized
+        // group, a plain `begin … end`): its children run straight-line. With
+        // clauses the protected body is conditional.
+        Node::BeginRescue { clauses, body, ensure_body, .. } if clauses.is_empty() => {
+            for &b in body.iter().chain(ensure_body) {
+                collect_apply_spans(ast, b, false, out);
+            }
+        }
+        // `a && b` / `a || b`: only the left operand runs unconditionally.
+        Node::Logical { left, .. } => collect_apply_spans(ast, *left, false, out),
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+            for &s in body {
+                collect_apply_spans(ast, s, false, out);
+            }
+        }
+        // Conditional-or-never positions, all skipped: `if`/`case`/`when`
+        // arms, loop bodies and `while`/`until` predicates, real
+        // `begin`/`rescue`, recovery and inert carriers, literal lambda
+        // bodies, nested scopes.
+        Node::When { .. }
+        | Node::Case { .. }
+        | Node::Loop { .. }
+        | Node::BeginRescue { .. }
+        | Node::Statements { .. }
+        | Node::Lambda { .. }
+        | Node::Definition { .. }
+        | Node::ClassDef { .. }
+        | Node::ModuleDef { .. } => {}
+        // Ordinary expression positions — write and op-write values,
+        // multi-write values and target expressions, interpolation parts,
+        // literal elements — evaluate unconditionally: descend the children.
+        _ => {
+            let mut kids = Vec::new();
+            node_child_ids(n, &mut kids);
+            for k in kids {
+                collect_apply_spans(ast, k, false, out);
+            }
+        }
+    }
 }
 
 /// [`lookup_mutation_calls`] filtered the way [`toplevel_rebinds`] filters its
@@ -9776,6 +9977,109 @@ mod tests {
             "counts",
         );
         assert_eq!(described, "{ a: 1, ... }");
+    }
+
+    #[test]
+    fn expression_position_lookup_mutation_opens() {
+        // The mutator call applies wherever it sits — a write value
+        // (`r = (counts.default = 0)`), a call argument (`p(counts.default = 0)`),
+        // a block inside a value (`r = xs.each { … }`), an interpolation part —
+        // the reference's evaluator runs them all before the statement's own
+        // effect.
+        for (src, want) in [
+            (
+                b"counts = { a: 1 }\nr = (counts.default = 0)\n" as &[u8],
+                "{ a: 1, ... }",
+            ),
+            (b"counts = { a: 1 }\np(counts.default = 0)\n", "{ a: 1, ... }"),
+            (
+                b"counts = { a: 1 }\nr = [1].each { counts.default = 0 }\n",
+                "{ a: 1, ... }",
+            ),
+            (
+                b"counts = { a: 1 }\nr = \"a#{counts.default = 0}b\"\n",
+                "{ a: 1, ... }",
+            ),
+            (
+                b"counts = { a: 1 }\nif counts.default = 0\n  1\nend\n",
+                "{ a: 1, ... }",
+            ),
+            (
+                b"counts = { a: 1 }\ncase (counts.default = 0)\nwhen 1 then nil\nend\n",
+                "{ a: 1, ... }",
+            ),
+            // `begin … end` without a rescue clause runs its body
+            // unconditionally too.
+            (
+                b"counts = { a: 1 }\nbegin\n  counts.default = 0\nend\n",
+                "{ a: 1, ... }",
+            ),
+            // The syntactic block walk reaches through a nested `if` and a
+            // nested literal lambda alike.
+            (
+                b"counts = { a: 1 }\n[1].each { if rand > 0\n  counts.default = 0\nend }\n",
+                "{ a: 1, ... }",
+            ),
+            (
+                b"counts = { a: 1 }\n[1].each { -> { counts.default = 0 } }\n",
+                "{ a: 1, ... }",
+            ),
+            // `lambda { }` / `Proc.new { }` are ordinary calls — their block
+            // bodies widen_after_block like any other.
+            (
+                b"counts = { a: 1 }\nx = lambda { counts.default = 0 }\n",
+                "{ a: 1, ... }",
+            ),
+        ] {
+            assert_eq!(check_env_describe(src, "counts"), want, "src: {:?}", std::str::from_utf8(src));
+        }
+    }
+
+    #[test]
+    fn literal_lambda_body_lookup_mutation_is_a_noop() {
+        // A `-> { … }` body is never evaluated by the reference's statement
+        // evaluator: the mutation inside does not open AND does not widen —
+        // `counts[:b]` keeps folding `nil`.
+        assert_eq!(
+            check_env_describe(
+                b"counts = { a: 1 }\n-> { counts.default = 0 }\n",
+                "counts",
+            ),
+            "{ a: 1 }"
+        );
+        assert_eq!(
+            check_env_describe(
+                b"counts = { a: 1 }\nx = -> { counts.default = 0 }\n",
+                "counts",
+            ),
+            "{ a: 1 }"
+        );
+    }
+
+    #[test]
+    fn conditional_positions_still_widen() {
+        // `if`/`when` arms, `&&` right operands, `while` bodies and recovery
+        // carriers keep the conservative widen (Dynamic — silent either way).
+        for src in [
+            b"counts = { a: 1 }\ncounts.default = 0 if flag\n" as &[u8],
+            b"counts = { a: 1 }\nx = if flag\n  counts.default = 0\nend\n",
+            b"counts = { a: 1 }\nx = 1 && (counts.default = 0)\n",
+            b"counts = { a: 1 }\nwhile flag\n  counts.default = 0\nend\n",
+            b"counts = { a: 1 }\n(counts.default = 0) rescue nil\n",
+            b"counts = { a: 1 }\ncase flag\nwhen 1 then counts.default = 0\nend\n",
+        ] {
+            let ast = lower_src(src);
+            let idx = CoreIndex::new();
+            let typer = Typer::new(&idx);
+            let mut i = Interner::new();
+            let env = typer.build_toplevel_check_env(&ast, &mut i);
+            let ty = env.get("counts").copied().unwrap();
+            assert!(
+                matches!(i.get(ty), Type::Dynamic(_)),
+                "expected Dynamic for {src:?}, got {:?}",
+                i.get(ty)
+            );
+        }
     }
 
     #[test]

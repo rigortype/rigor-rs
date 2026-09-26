@@ -84,6 +84,90 @@
       "column": 11,
       "severity": "error",
       "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 127,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 132,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 136,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 142,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 148,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 152,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 158,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 162,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 169,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 170,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 175,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 139,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
     }
   ]
 }

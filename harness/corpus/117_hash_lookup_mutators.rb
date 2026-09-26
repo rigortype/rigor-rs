@@ -116,3 +116,60 @@ plain[:b] + 1
 navigated = { a: 1 }
 navigated&.default = 0
 navigated.foo
+
+# (15) the mutator applies wherever the call sits — every evaluated position
+# opens the shape: a write value, a call argument, a block carried inside a
+# value expression, an `if`/`case` predicate, an interpolation part, a
+# clause-less `begin` body, and `lambda`/`Proc.new` block bodies (the
+# syntactic `widen_after_block` walk reaches all of them).
+vpos = { a: 1 }
+r = (vpos.default = 0)
+vpos[:a].upcase
+vpos[:b] + 1
+
+apos = { a: 1 }
+p(apos.default = 0)
+apos[:a].upcase
+
+bpos = { a: 1 }
+r2 = [1].each { bpos.default = 0 }
+bpos[:a].upcase
+
+ppos = { a: 1 }
+if ppos.default = 0
+  1
+end
+ppos[:a].upcase
+
+cpos = { a: 1 }
+case (cpos.default = 0)
+when 1 then nil
+end
+cpos[:a].upcase
+
+ipos = { a: 1 }
+s = "a#{ipos.default = 0}b"
+ipos[:a].upcase
+
+bgn = { a: 1 }
+begin
+  bgn.default = 0
+end
+bgn[:a].upcase
+
+lam = { a: 1 }
+x = lambda { lam.default = 0 }
+lam[:a].upcase
+
+# (16) a literal `-> { }` body is never evaluated by the reference — the
+# mutation inside is a NO-OP: the closed shape keeps folding `nil` (it stays
+# a no-op even through a later `.call`, and inside a conditional branch).
+laz = { a: 1 }
+-> { laz.default = 0 }
+laz[:b] + 1
+laz[:a].upcase
+
+laz2 = { a: 1 }
+runner = -> { laz2.default = 0 }
+runner.call
+laz2[:b] + 1
