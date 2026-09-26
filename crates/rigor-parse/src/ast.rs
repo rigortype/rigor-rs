@@ -785,7 +785,20 @@ pub enum Node {
     /// the compound-predicate narrowing (stage 3a-1,
     /// docs/notes/20260807-narrowing-stage3-spec.md) needs the operator because
     /// `&&` and `||` swap which edge concatenates and which joins.
-    Logical { left: NodeId, right: NodeId, is_and: bool, span: Span },
+    Logical {
+        left: NodeId,
+        right: NodeId,
+        is_and: bool,
+        /// `true` when the operator was written inside parentheses —
+        /// `(x && (w = 1))`. The reference's `and_or_right_effects?` is a
+        /// SYNTACTIC `node.is_a?(Prism::AndNode)` test, so a parenthesized
+        /// `&&`/`||` never builds operand edges: `eval_with_edges` falls back
+        /// to `sub_eval` + `Narrowing.predicate_scopes` on the JOINED scope
+        /// (`(x && (w = 1)) || w.frob` reads `"s" | 1`, not the edge-narrowed
+        /// `"s"`, rigor-rs#167 round-5).
+        parenthesized: bool,
+        span: Span,
+    },
     /// An array literal (`[a, b]`). Elements are lowered. Typed `Nominal Array`
     /// so a typo'd method on an array literal flags via the real Array RBS.
     // TODO(spec): Tuple precision (element types) per ADR-0023.
@@ -2135,6 +2148,7 @@ impl<'src> Builder<'src> {
                 left,
                 right,
                 is_and: true,
+                parenthesized: false,
                 span: span_of(&and_node.location()),
             });
         }
@@ -2146,6 +2160,7 @@ impl<'src> Builder<'src> {
                 left,
                 right,
                 is_and: false,
+                parenthesized: false,
                 span: span_of(&or_node.location()),
             });
         }
@@ -2233,6 +2248,17 @@ impl<'src> Builder<'src> {
             // which the wrapper types as Dynamic — unchanged).
             let body = self.lower_optional_body(parens.body().as_ref());
             if let [only] = body[..] {
+                // …except a single `&&`/`||`: the reference keys operand-edge
+                // building on `node.is_a?(Prism::AndNode | OrNode)`, which a
+                // `ParenthesesNode` never satisfies, so `(a && b)` takes the
+                // joined-scope narrowing path a bare `a && b` does not. Keep
+                // the syntactic distinction on the node itself
+                // (rigor-rs#167 round-5).
+                if let Node::Logical { parenthesized, .. } =
+                    &mut self.nodes[only.0 as usize]
+                {
+                    *parenthesized = true;
+                }
                 return only;
             }
             return self.push(Node::BeginRescue {

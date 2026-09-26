@@ -3,7 +3,8 @@
 # scope joins (`join_with_nil_injection`) — where the #154 port widened the
 # local to `Dynamic[top]` (rigor-rs#167). One scope: every row uses its own
 # locals. Measured against the pinned reference (e59b7b89, fresh cwd,
-# `--no-cache`); every row below is a full-tuple match.
+# `--no-cache`); every row below is a full-tuple match EXCEPT the two sites
+# called out in row (76) — message-only drift at the same (rule, line, col).
 
 # --- rescue modifier --------------------------------------------------------
 
@@ -777,3 +778,130 @@ w65.frob
 w65c = "s"
 raise (w65c = 1)
 w65c.frob
+
+# (66) `retry` entry widening sees only the PROTECTED body — `else` runs
+# after the rescue flow and a `retry` cannot re-enter it, so `w66.frob`
+# fires `for 5`, never `"s" | 5` (rigor-rs#167 round-5).
+w66 = 5
+begin
+  foo66
+rescue
+  w66.frob
+  retry
+else
+  w66 = "s"
+end
+
+# (67) a PARENTHESIZED `&&`/`||` takes the joined-scope narrowing path —
+# `and_or_right_effects?` is a syntactic `Prism::AndNode`/`OrNode` test a
+# `ParenthesesNode` never satisfies — `(x67 && (w67 = 1)) || w67.frob` fires
+# `for "s" | 1` (rigor-rs#167 round-5)...
+w67 = "s"
+(x67 && (w67 = 1)) || w67.frob
+
+# (68) ...while the same expression WITHOUT the parentheses keeps operand-edge
+# narrowing — fires `for "s"`.
+w68 = "s"
+x68 && (w68 = 1) || w68.frob
+
+# (69) a write in a `when` CONDITION is scratch — `Narrowing.case_when_scopes`
+# reads condition shapes only, so it binds neither for its own body nor for
+# the post-case scope: `[w69].frob` fires `for [Dynamic[top]]`
+# (rigor-rs#167 round-5).
+case rand
+when (w69 = 1)
+  w69.frob
+end
+[w69].frob
+
+# (70) same through a call argument — `foo70(w70 = 1)` still diagnoses the
+# unresolved call, but `w70` never binds — `for [Dynamic[top]]`.
+case rand
+when foo70(w70 = 1)
+  nil
+end
+[w70].frob
+
+# (71) assignment-RHS operands type in SOURCE ORDER — each sees the env the
+# operand before it left (`OperandWalk` records per-operand types): `x71`
+# binds `["s", 1]`, `x71b` `{ a: "s", b: 1 }`, `a71`/`b71` `"s"`/`1`
+# (rigor-rs#167 round-5).
+w71 = "s"
+x71 = [w71, w71 = 1]
+[x71].frob
+w71b = "s"
+x71b = { a: w71b, b: w71b = 1 }
+[x71b].frob
+w71c = "s"
+a71, b71 = w71c, (w71c = 1)
+[a71].frob
+[b71].frob
+
+# (72) `next` leaving a `begin…ensure` carries the ensure's writes to the
+# jump sink — `[w72].frob` fires `for ["s" | "x"]`, never `1`
+# (rigor-rs#167 round-5).
+i72 = 0
+w72 = "x"
+while i72 < 3
+  begin
+    w72 = 1
+    next
+  ensure
+    w72 = "s"
+  end
+end
+[w72].frob
+
+# (73) same through `break`, and through a literal block's `next`.
+i73 = 0
+w73 = "x"
+while i73 < 3
+  begin
+    w73 = 1
+    break
+  ensure
+    w73 = "s"
+  end
+end
+[w73].frob
+w73b = "x"
+[1].each do |e73|
+  begin
+    w73b = 1
+    next
+  ensure
+    w73b = "s"
+  end
+end
+[w73b].frob
+
+# (74) a rescue modifier's VALUE types the primary tail under the
+# post-primary scope while the arm types under the entry scope —
+# `type_of_rescue_modifier` via `OperandWalk.type_of(scope, node, tracer,
+# walk.types)`: `x74` binds `"s" | 1`, so `x74.upcase` stays silent and
+# `[x74].frob` fires `for ["s" | 1]` (rigor-rs#167 round-5).
+w74 = 1
+x74 = ((w74 = "s"; w74) rescue w74)
+x74.upcase
+[x74].frob
+
+# (75) same without the outer parens, and with a non-local arm —
+# `"s" | :a`.
+w75 = 1
+x75 = (w75 = "s"; w75) rescue w75
+[x75].frob
+w75b = 1
+x75b = ((w75b = "s"; w75b) rescue :a75)
+[x75b].frob
+
+# (76) KNOWN DRIFT (non-blocking, message-only): `y76 = [gets && "s"]`
+# renders `["s"?]` in the reference vs `["s" | Dynamic[top]]` in the port —
+# the same `?`-vs-union render drift as elsewhere; both fire
+# `call.undefined-method` at the same site. Also `"s".itself` types `String`
+# where the reference keeps the literal `"s"` (`x76` binds `1 | String` vs
+# `"s" | 1`) — a `-> self` return widening that predates this branch.
+y76 = [gets && "s"]
+[y76].frob
+w76 = 1
+x76 = ((w76 = "s"; w76.itself) rescue w76)
+[x76].frob
