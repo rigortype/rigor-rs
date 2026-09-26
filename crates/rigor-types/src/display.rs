@@ -60,11 +60,14 @@ pub fn describe_named(
             }
         }
 
-        Type::HashShape(members) => {
-            if members.is_empty() {
+        Type::HashShape { members, open } => {
+            // Reference `HashShape#describe`: a closed empty shape renders
+            // `{}`; every other shape renders its pairs, and an OPEN shape
+            // appends a `...` entry (`{ a: 1, ... }`, `{ ... }`).
+            if members.is_empty() && !open {
                 "{}".to_string()
             } else {
-                let inner: Vec<String> = members
+                let mut inner: Vec<String> = members
                     .iter()
                     .map(|m| {
                         let key = named_key(&m.key);
@@ -79,6 +82,9 @@ pub fn describe_named(
                         format!("{key}{sep} {}", describe_named(i, m.value, resolve))
                     })
                     .collect();
+                if *open {
+                    inner.push("...".to_string());
+                }
                 format!("{{ {} }}", inner.join(", "))
             }
         }
@@ -174,7 +180,7 @@ pub fn erase_to_rbs_named(
             }
         }
 
-        Type::HashShape(members) => erase_hash_shape(i, members, resolve),
+        Type::HashShape { members, open } => erase_hash_shape(i, members, *open, resolve),
 
         // A refined integer range generalizes to the nominal `Integer` (the RBS
         // has no `int<lo, hi>` spelling).
@@ -242,19 +248,24 @@ fn erase_union(
     uniq_join(erased)
 }
 
-/// A `HashShape` erased (reference `HashShape#erase_to_rbs`). rigor-rs only ever
-/// builds a value-pinned `HashShape` from static keys (an open / splat hash
-/// degrades to the `Hash` nominal upstream), so it is always effectively
-/// *closed*: an empty shape erases to `{}`; a shape with any non-symbol key
-/// generalizes to `Hash[K, V]` (RBS record keys must be symbols); an all-symbol
-/// shape keeps the record spelling `{ key: T, ?opt: T }`.
+/// A `HashShape` erased (reference `HashShape#erase_to_rbs`). A closed empty
+/// shape erases to `{}`; an OPEN shape cannot claim a record bound (its unseen
+/// keys hold anything — reference `hash_erasure` returns `Hash[top, top]`
+/// before the empty/member tests, so even `{ a: 1, ... }` generalizes
+/// completely); a shape with any non-symbol key generalizes to `Hash[K, V]`
+/// (RBS record keys must be symbols); a closed all-symbol shape keeps the
+/// record spelling `{ key: T, ?opt: T }`.
 fn erase_hash_shape(
     i: &Interner,
     members: &[ShapeMember],
+    open: bool,
     resolve: &dyn Fn(ClassId) -> Option<String>,
 ) -> String {
-    if members.is_empty() {
+    if members.is_empty() && !open {
         return "{}".to_string();
+    }
+    if open {
+        return "Hash[top, top]".to_string();
     }
     if !members.iter().all(|m| matches!(m.key, ShapeKey::Sym(_))) {
         return hash_erasure(i, members, resolve);
@@ -486,14 +497,17 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
             format!("Tuple[{}]", inner.join(", "))
         }
 
-        Type::HashShape(members) => {
-            let inner: Vec<String> = members
+        Type::HashShape { members, open } => {
+            let mut inner: Vec<String> = members
                 .iter()
                 .map(|m| {
                     let opt = if m.optional { "?" } else { "" };
                     format!("{}{} => {}", shape_key(&m.key), opt, describe(i, m.value))
                 })
                 .collect();
+            if *open {
+                inner.push("...".to_string());
+            }
             format!("{{{}}}", inner.join(", "))
         }
 
@@ -681,10 +695,10 @@ mod named_tests {
     fn hash_shape_keyword_style() {
         let mut i = Interner::new();
         let int = nominal(&mut i, 1, vec![]);
-        let shape = i.intern(Type::HashShape(vec![
+        let shape = i.intern(Type::HashShape { members: vec![
             ShapeMember { key: ShapeKey::Sym("name".to_string()), value: int, optional: false },
             ShapeMember { key: ShapeKey::Sym("age".to_string()), value: int, optional: true },
-        ]));
+        ], open: false });
         assert_eq!(describe_named(&i, shape, &resolver), "{ name: Integer, ?age: Integer }");
     }
 
@@ -695,7 +709,7 @@ mod named_tests {
         let mut i = Interner::new();
         let (one, two, three) = (i.int(1), i.int(2), i.int(3));
         let sym = i.intern(Type::Constant(Scalar::Sym("v".to_string())));
-        let shape = i.intern(Type::HashShape(vec![
+        let shape = i.intern(Type::HashShape { members: vec![
             ShapeMember { key: ShapeKey::Sym("a".to_string()), value: one, optional: false },
             ShapeMember { key: ShapeKey::Str("k".to_string()), value: two, optional: false },
             ShapeMember { key: ShapeKey::Int(3), value: three, optional: false },
@@ -706,11 +720,55 @@ mod named_tests {
             },
             ShapeMember { key: ShapeKey::Bool(true), value: one, optional: false },
             ShapeMember { key: ShapeKey::Nil, value: two, optional: false },
-        ]));
+        ], open: false });
         assert_eq!(
             describe_named(&i, shape, &resolver),
             "{ a: 1, \"k\": 2, 3 => 3, 1.5 => :v, true => 1, nil => 2 }"
         );
+    }
+}
+
+#[cfg(test)]
+mod open_named_tests {
+    use super::*;
+
+    fn resolver(class: ClassId) -> Option<String> {
+        match class.0 {
+            1 => Some("Integer".to_string()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn open_hash_shape_appends_ellipsis() {
+        // Reference `HashShape#describe`: an open shape renders its pairs then
+        // a `...` entry (`{ a: 1, ... }`); an empty open shape is `{ ... }`.
+        let mut i = Interner::new();
+        let one = i.int(1);
+        let open = i.intern(Type::HashShape {
+            members: vec![ShapeMember {
+                key: ShapeKey::Sym("a".to_string()),
+                value: one,
+                optional: false,
+            }],
+            open: true,
+        });
+        assert_eq!(describe_named(&i, open, &resolver), "{ a: 1, ... }");
+        let open_empty =
+            i.intern(Type::HashShape { members: vec![], open: true });
+        assert_eq!(describe_named(&i, open_empty, &resolver), "{ ... }");
+        // The internal `describe` marks openness the same way.
+        assert_eq!(describe(&i, open), "{:a => Constant[1], ...}");
+        // Open and closed carriers are distinct types (interning sees `open`).
+        let closed = i.intern(Type::HashShape {
+            members: vec![ShapeMember {
+                key: ShapeKey::Sym("a".to_string()),
+                value: one,
+                optional: false,
+            }],
+            open: false,
+        });
+        assert_ne!(open, closed);
     }
 }
 
@@ -816,13 +874,33 @@ mod erase_tests {
         assert_eq!(erase_to_rbs_named(&i, empty_tup, &resolver), "[]");
 
         let int = nominal(&mut i, 1, vec![]);
-        let rec = i.intern(Type::HashShape(vec![
+        let rec = i.intern(Type::HashShape { members: vec![
             ShapeMember { key: ShapeKey::Sym("name".to_string()), value: int, optional: false },
             ShapeMember { key: ShapeKey::Sym("age".to_string()), value: int, optional: true },
-        ]));
+        ], open: false });
         assert_eq!(erase_to_rbs_named(&i, rec, &resolver), "{ name: Integer, ?age: Integer }");
-        let empty_hash = i.intern(Type::HashShape(vec![]));
+        let empty_hash = i.intern(Type::HashShape { members: vec![], open: false });
         assert_eq!(erase_to_rbs_named(&i, empty_hash, &resolver), "{}");
+    }
+
+    #[test]
+    fn open_shape_erases_to_unbounded_hash() {
+        // Reference `hash_erasure`: an open shape's unseen keys hold anything,
+        // so even `{ a: 1, ... }` generalizes fully — before the record test.
+        let mut i = Interner::new();
+        let int = nominal(&mut i, 1, vec![]);
+        let open = i.intern(Type::HashShape {
+            members: vec![ShapeMember {
+                key: ShapeKey::Sym("a".to_string()),
+                value: int,
+                optional: false,
+            }],
+            open: true,
+        });
+        assert_eq!(erase_to_rbs_named(&i, open, &resolver), "Hash[top, top]");
+        let open_empty =
+            i.intern(Type::HashShape { members: vec![], open: true });
+        assert_eq!(erase_to_rbs_named(&i, open_empty, &resolver), "Hash[top, top]");
     }
 
     #[test]
@@ -830,11 +908,11 @@ mod erase_tests {
         let mut i = Interner::new();
         let two = i.int(2);
         // A string key cannot be an RBS record key → `Hash[String, 2]`.
-        let str_keyed = i.intern(Type::HashShape(vec![ShapeMember {
+        let str_keyed = i.intern(Type::HashShape { members: vec![ShapeMember {
             key: ShapeKey::Str("k".to_string()),
             value: two,
             optional: false,
-        }]));
+        }], open: false });
         assert_eq!(erase_to_rbs_named(&i, str_keyed, &resolver), "Hash[String, 2]");
     }
 
@@ -847,11 +925,11 @@ mod erase_tests {
         // union `false | nil | true`.
         let mut i = Interner::new();
         let (one, two, three) = (i.int(1), i.int(2), i.int(3));
-        let bool_nil = i.intern(Type::HashShape(vec![
+        let bool_nil = i.intern(Type::HashShape { members: vec![
             ShapeMember { key: ShapeKey::Bool(true), value: one, optional: false },
             ShapeMember { key: ShapeKey::Bool(false), value: two, optional: false },
             ShapeMember { key: ShapeKey::Nil, value: three, optional: false },
-        ]));
+        ], open: false });
         assert_eq!(
             erase_to_rbs_named(&i, bool_nil, &resolver),
             "Hash[false | nil | true, 1 | 2 | 3]"
@@ -861,10 +939,10 @@ mod erase_tests {
         // `:i` / `:f` → `:f | :i` (sorted by describe).
         let si = i.intern(Type::Constant(Scalar::Sym("i".to_string())));
         let sf = i.intern(Type::Constant(Scalar::Sym("f".to_string())));
-        let int_float = i.intern(Type::HashShape(vec![
+        let int_float = i.intern(Type::HashShape { members: vec![
             ShapeMember { key: ShapeKey::Int(1), value: si, optional: false },
             ShapeMember { key: ShapeKey::Float(1.0f64.to_bits()), value: sf, optional: false },
-        ]));
+        ], open: false });
         assert_eq!(erase_to_rbs_named(&i, int_float, &resolver), "Hash[Float | Integer, :f | :i]");
     }
 }

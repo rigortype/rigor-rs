@@ -175,9 +175,16 @@ pub enum Type {
     Constant(Scalar),
     /// Per-position array shape (`Tuple[Constant[1], Constant["a"]]`).
     Tuple(Vec<TypeId>),
-    /// Per-key hash shape. Members preserve openness and optional/present-nil
-    /// distinction (see [`ShapeMember`]).
-    HashShape(Vec<ShapeMember>),
+    /// Per-key hash shape. Members preserve the optional/present-nil
+    /// distinction (see [`ShapeMember`]); `open` is the extra-key policy
+    /// (reference `Type::HashShape#extra_keys`).
+    ///
+    /// `open: false` — every key outside `members` is provably absent, so a
+    /// static miss reads `nil`. `open: true` — the `HashLookupMutation`
+    /// mutators (`Hash#default=` / `Hash#default_proc=`) opened the shape: a
+    /// key outside `members` may hit a default the shape cannot state, so it
+    /// reads `untyped`, while a declared member keeps its value.
+    HashShape { members: Vec<ShapeMember>, open: bool },
     /// A bounded integer range. `None` bound means open in that direction.
     IntegerRange { min: Option<i64>, max: Option<i64> },
     /// A base type restricted by a refinement predicate.
@@ -218,7 +225,7 @@ impl Type {
             Type::IntegerRange { .. } => 3,
             Type::Nominal { .. } => 4,
             Type::Tuple(_) => 5,
-            Type::HashShape(_) => 6,
+            Type::HashShape { .. } => 6,
             Type::DataInstance { .. } => 7,
             Type::Refined { .. } => 8,
             Type::App { .. } => 9,

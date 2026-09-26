@@ -136,7 +136,17 @@ impl Interner {
             // Singleton has no args: order solely by its ClassId.
             (Type::Singleton(ac), Type::Singleton(bc)) => ac.cmp(bc),
             (Type::Tuple(x), Type::Tuple(y)) => self.cmp_slice(x, y),
-            (Type::HashShape(x), Type::HashShape(y)) => {
+            (
+                Type::HashShape { members: x, open: xo },
+                Type::HashShape { members: y, open: yo },
+            ) => {
+                // The open policy is part of identity — a closed and an open
+                // shape with the same pairs are different types (the reference
+                // carries `extra_keys` in `value_fields`).
+                let by_open = xo.cmp(yo);
+                if by_open != Ordering::Equal {
+                    return by_open;
+                }
                 // Compare keys/optional structurally, values recursively.
                 let by_len = x.len().cmp(&y.len());
                 if by_len != Ordering::Equal {
