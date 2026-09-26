@@ -317,6 +317,31 @@ pub struct Typer<'i> {
     /// / `is_toplevel_def` consult `file_defs` through it). `None` for callers
     /// that do not set it ⇒ the union-over-all-files answer.
     file_key: Option<&'i rigor_parse::FileKey>,
+    /// How a `LocalVariableRead` resolves its binding; see [`ReadFlow`].
+    /// `Absent` unless the `check` walk attached the per-read map.
+    read_flow: ReadFlow,
+}
+
+/// How [`Typer::type_of`] resolves a `LocalVariableRead`.
+enum ReadFlow {
+    /// No per-read map: the caller's `env` decides — the flat file-end env for
+    /// `check`, the pass's own threaded env inside the flow walks. A local read
+    /// inside a nilable fold's receiver or arguments can then carry a STALE pin
+    /// (a later write or an in-place mutator falsified it), so the old
+    /// decline-the-call guard (`folding::stale_declines_untyped`) stays on for
+    /// this mode.
+    Absent,
+    /// `env` IS the point-in-time flow env — used only while
+    /// [`Typer::local_read_flow_types`] builds the map below, where the env is
+    /// threaded sequentially by construction.
+    Inline,
+    /// The point-in-time binding of every `LocalVariableRead` node, recorded by
+    /// [`Typer::local_read_flow_types`] — the port of the reference's
+    /// `scope.local(name)` at the read (`expression_typer.rb` `local_read`),
+    /// which the single end-of-file `TypeEnv` cannot express (rigor-rs#164,
+    /// review round 5). A read the walk never reached maps to `untyped`, the
+    /// conservative side.
+    Map(HashMap<NodeId, TypeId>),
 }
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a
@@ -327,13 +352,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, read_flow: ReadFlow::Absent }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, read_flow: ReadFlow::Absent }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -344,7 +369,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, read_flow: ReadFlow::Absent }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from
@@ -369,6 +394,38 @@ impl<'i> Typer<'i> {
     /// The analyzed file's [`rigor_parse::FileKey`], `None` when unset.
     pub fn file_key(&self) -> Option<&rigor_parse::FileKey> {
         self.file_key
+    }
+
+    /// Attach the per-read point-in-time flow map computed by
+    /// [`Self::local_read_flow_types`] — a consuming builder. `check` builds it
+    /// once per file so a local read — the receiver or an argument of a nilable
+    /// fold — resolves to the binding in effect AT the read rather than the
+    /// file's end-state env (rigor-rs#164, review round 5).
+    pub fn with_local_read_flows(mut self, reads: HashMap<NodeId, TypeId>) -> Self {
+        self.read_flow = ReadFlow::Map(reads);
+        self
+    }
+
+    /// A copy of this typer WITHOUT the per-read flow map: the flow passes
+    /// (`flow_eval` family — always-truthy / nilable-receiver / narrowing /
+    /// collection-shape snapshots) thread their OWN env, which already models
+    /// point-in-time bindings; running the map there would bypass it.
+    fn without_local_read_flows(&self) -> Typer<'i> {
+        Typer {
+            index: self.index,
+            source: self.source,
+            folder: self.folder,
+            lexical_scopes: self.lexical_scopes,
+            file_key: self.file_key,
+            read_flow: ReadFlow::Absent,
+        }
+    }
+
+    /// `true` while [`ReadFlow::Absent`] — the flat-env mode in which a local
+    /// read inside a fold's receiver or arguments may carry a stale pin and the
+    /// nilable folds still need the old decline-the-call guard.
+    fn env_reads_can_go_stale(&self) -> bool {
+        matches!(self.read_flow, ReadFlow::Absent)
     }
 
     /// C5: re-intern a harvested [`ConstLit`] against the local interner into the
@@ -487,10 +544,22 @@ impl<'i> Typer<'i> {
             Node::NilLit { .. } => interner.intern(Type::Constant(Scalar::Nil)),
             Node::TrueLit { .. } => interner.intern(Type::Constant(Scalar::Bool(true))),
             Node::FalseLit { .. } => interner.intern(Type::Constant(Scalar::Bool(false))),
-            Node::LocalVariableRead { name, .. } => env
-                .get(name)
-                .copied()
-                .unwrap_or_else(|| interner.untyped()),
+            Node::LocalVariableRead { name, .. } => match &self.read_flow {
+                // With the per-read map attached, the local resolves to the
+                // binding in effect AT THIS READ — `scope.local(name)` at the
+                // read, which the caller's env only approximates (the flat
+                // `check` env is the file's END state: a later write or an
+                // in-place mutator may have falsified its pin). A read the
+                // walk never reached resolves `untyped`, the safe side.
+                ReadFlow::Map(reads) => reads
+                    .get(&id)
+                    .copied()
+                    .unwrap_or_else(|| interner.untyped()),
+                ReadFlow::Absent | ReadFlow::Inline => env
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| interner.untyped()),
+            },
             // `a, b = rhs` AS AN EXPRESSION is its right-hand side (Ruby: `(a, b
             // = [1, 2])` evaluates to `[1, 2]`). The reference routes
             // `Prism::MultiWriteNode` to `type_of_assignment_write`
@@ -1949,7 +2018,7 @@ impl<'i> Typer<'i> {
                 {
                     return Reach::UNKNOWN;
                 }
-                Node::LocalVariableOpWrite { name, value, span }
+                Node::LocalVariableOpWrite { name, value, span, .. }
                     if name == root && in_region(*span) =>
                 {
                     writes.push((*span, LocalWrite::Op(*value)));
@@ -2572,7 +2641,15 @@ impl<'i> Typer<'i> {
                     // `+=`, branch and block writes (#149 review: `buf = "";
                     // buf << "x"; buf[0].upcase` fired `for nil`). #164 extends
                     // the set past the String lookups to the scalar `<=>`s.
-                    let stale_risk = folding::fold_can_go_nil(&scalar, method)
+                    //
+                    // With the per-read flow map attached (`check`), those
+                    // reads already resolved to the binding in effect AT the
+                    // read — the reference's `scope.local` — so a pinned local
+                    // folds normally and only a mutated or unpinnable one
+                    // (resolved to `Dynamic`) drops the fold. The blanket
+                    // decline is needed only for flat-env (`Absent`) callers.
+                    let stale_risk = self.env_reads_can_go_stale()
+                        && folding::fold_can_go_nil(&scalar, method)
                         && std::iter::once(receiver)
                             .chain(args.iter().copied())
                             .any(|id| ast.reads_local_within(ast.get(id).span()));
@@ -3094,12 +3171,17 @@ impl<'i> Typer<'i> {
             | Node::FalseLit { .. }
             | Node::ArrayLit { .. }
             | Node::HashLit { .. } => false,
-            // A non-literal argument (local read, call, conditional) leaves
-            // the flat answer to the reference-untyped machinery.
-            _ => return false,
+            // A non-literal argument (call, conditional, local read) is
+            // unpinnable and rides the reference's `C?` union — decline it,
+            // but only once the per-read flow map is attached: the map has
+            // already proven the arg unpinnable at its read point, while a
+            // flat-env caller's `stale_risk` decline covered this case, so it
+            // keeps the standing `_ => false` path.
+            _ => return matches!(self.read_flow, ReadFlow::Map(_)),
         };
         !fire_capable || ast.reads_local_within(ast.get(arg).span())
     }
+
 
     /// Walk the top-level statement sequence in source order, binding each
     /// `LocalVariableWrite`'s name to the type of its value expression, and
@@ -3236,7 +3318,10 @@ impl<'i> Typer<'i> {
             _ => return out,
         };
         let mut env = TypeEnv::new();
-        self.flow_eval_scope(ast, &body, &mut env, false, None, DefKind::Instance, &writes, interner, &mut out);
+        // This pass threads its OWN flow env — an attached per-read map would
+        // bypass it — so it runs the env-driven (`Absent`) typer.
+        let typer = self.without_local_read_flows();
+        typer.flow_eval_scope(ast, &body, &mut env, false, None, DefKind::Instance, &writes, interner, &mut out);
         out
     }
 
@@ -3447,6 +3532,400 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// The type a `LocalVariableOpWrite` binds — the port of the reference's
+    /// `compound_eval` (`statement_evaluator.rb`): `x op= v` dispatches
+    /// `cur.send(op, rhs)` (a pinned pair lands in the literal call fold —
+    /// `s += "z"` binds `"abcz"`, so #164's `s += "z"; s.rindex("z")` folds to
+    /// index 3); `x ||= v` binds `union(narrow_truthy(cur), rhs)` and
+    /// `x &&= v` `union(narrow_falsey(cur), rhs)` — a pinned LHS decides
+    /// whether the narrowed arm is empty (scalar truthiness is decidable —
+    /// only `nil` and `false` are falsy); a pinned truthy `||=` keeps a
+    /// `cur | rhs` union rather than `cur` alone, which is what keeps
+    /// `s ||= "z"; s.rindex("b")` silent where the bare pin would fire
+    /// `for 1`. An unbound name reads `Dynamic[Top]` there, and any
+    /// unprovable operand widens.
+    fn op_write_result(
+        &self,
+        name: &str,
+        op: &str,
+        vt: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let Some(cur) = env.get(name).copied() else {
+            return interner.untyped();
+        };
+        match (interner.get(cur), op) {
+            (Type::Constant(lhs), "||") => {
+                if matches!(lhs, Scalar::Nil | Scalar::Bool(false)) {
+                    vt
+                } else {
+                    union_two(cur, vt, interner)
+                }
+            }
+            (Type::Constant(lhs), "&&") => {
+                if matches!(lhs, Scalar::Nil | Scalar::Bool(false)) {
+                    union_two(cur, vt, interner)
+                } else {
+                    vt
+                }
+            }
+            (Type::Constant(lhs), _) => match interner.get(vt) {
+                Type::Constant(rhs) => match folding::fold(lhs, op, std::slice::from_ref(rhs)) {
+                    Some(r) => interner.intern(Type::Constant(r)),
+                    None => interner.untyped(),
+                },
+                _ => interner.untyped(),
+            },
+            _ => interner.untyped(),
+        }
+    }
+
+    /// The point-in-time flow type of every `LocalVariableRead` node — the
+    /// port of `scope.local(name)` at the read (`expression_typer.rb`
+    /// `local_read`), keyed by node so `type_of` can answer it under
+    /// [`ReadFlow::Map`]. `check` attaches it via [`Self::with_local_read_flows`]
+    /// so a nilable fold sees the binding in effect AT the call — `s = "abc";
+    /// s.rindex("b")` folds — while a mutated or reassigned local resolves to
+    /// what the read really sees (`s << "z"` drops its pin the way
+    /// `StringMutation.widen_constant` does).
+    ///
+    /// One straight-line walk threads `env` in source order:
+    ///
+    ///   * a `LocalVariableWrite` binds the value type immediately (the
+    ///     reference's `flow` write semantics), a `LocalVariableOpWrite`
+    ///     through [`Self::op_write_result`];
+    ///   * a `def`/`class`/`module` body is an independent scope — descended
+    ///     into with a FRESH env so locals assigned inside still fold at their
+    ///     own read points (the reference's `Scope::Definition` walks the body
+    ///     with fresh locals);
+    ///   * a literal block or lambda binds every Prism `locals` name `Dynamic`
+    ///     in a cloned env, then walks the body so its reads see the right
+    ///     env; afterwards every write the body made to a CAPTURED name widens
+    ///     it (`closure_bindings`'s nuke-captured-writes — names the block
+    ///     itself binds are already excluded from the event lists);
+    ///   * an `if`/`case`/`when` walks each arm on a clone and joins — a name
+    ///     bound only one side, or bound to differing types, widens — while a
+    ///     write or mutation inside ANY arm widens unconditionally (the arms
+    ///     run conditionally, so the write is not guaranteed);
+    ///   * a `Loop` (while/until/for) walks its predicate and body on a clone
+    ///     (reads inside still see the pre-loop env — a `for` index rebinds to
+    ///     `Dynamic` first, `bind_for_index`'s FP-safe floor) and widens its
+    ///     span's writes — the loop may run zero times;
+    ///   * a rescue carrier and a `Logical`'s right operand run on a clone and
+    ///     widen their span (conditional execution);
+    ///   * every other statement descends its children in order against the
+    ///     LIVE env — a write in argument position binds sequentially
+    ///     (`x = g(x = 1)` reads `x = 1`'s "1"), matching the
+    ///     calls-then-propagate order `flow_eval` uses for `Node::Other`;
+    ///   * an in-place MUTATOR call on a local receiver (`s << "z"`) drops the
+    ///     pin per the carrier's mutator table — `String` pins under
+    ///     `STRING_MUTATORS`, `Tuple`/`HashShape` under theirs — the port of
+    ///     `StringMutation.widen_constant` (the reference lands the bare
+    ///     `String` nominal; `Dynamic` is strictly wider and strictly safer).
+    ///     A binding the call cannot mutate (`1 << 2` reads `Integer#<<`)
+    ///     keeps its pin.
+    ///
+    /// The event lists come from [`local_flow_events`]: the rebind set
+    /// [`collect_flow_writes`]'s shape knows (filtered for block-literal
+    /// shadowing the way [`toplevel_rebinds`] does, but WITHOUT its `def`
+    /// barrier — the walk descends `def` bodies with a fresh env) plus
+    /// [`indexed_flow_writes`], and the receiver-side mutations
+    /// `collect_flow_writes` knows — so `def` bodies, `inert` carriers and
+    /// block-literal shadowing reuse the exact same span machinery as the
+    /// flow passes.
+    pub fn local_read_flow_types(
+        &self,
+        ast: &LoweredAst,
+        interner: &mut Interner,
+    ) -> HashMap<NodeId, TypeId> {
+        let mut out = HashMap::new();
+        let events = local_flow_events(ast, self.source);
+        let stmts = match ast.get(ast.root()) {
+            Node::Program { body, .. } => body.clone(),
+            _ => return out,
+        };
+        let typer = Typer {
+            index: self.index,
+            source: self.source,
+            folder: self.folder,
+            lexical_scopes: self.lexical_scopes,
+            file_key: self.file_key,
+            read_flow: ReadFlow::Inline,
+        };
+        let mut env = TypeEnv::new();
+        for st in stmts {
+            typer.flow_record_node(ast, st, &mut env, &events, &mut out, interner);
+        }
+        out
+    }
+
+    /// The [`Self::local_read_flow_types`] statement walker — see its doc for
+    /// the per-node semantics. `env` is the LIVE flow env; `out` collects
+    /// `LocalVariableRead node -> its current binding`.
+    fn flow_record_node(
+        &self,
+        ast: &LoweredAst,
+        node: NodeId,
+        env: &mut TypeEnv,
+        events: &LocalFlowEvents,
+        out: &mut HashMap<NodeId, TypeId>,
+        interner: &mut Interner,
+    ) {
+        match ast.get(node) {
+            Node::LocalVariableRead { name, .. } => {
+                let t = env
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| interner.untyped());
+                out.insert(node, t);
+            }
+            Node::LocalVariableWrite { name, value, .. } => {
+                self.flow_record_node(ast, *value, env, events, out, interner);
+                env.insert(name.clone(), self.type_of(ast, *value, env, interner));
+            }
+            Node::LocalVariableOpWrite { name, value, op, .. } => {
+                self.flow_record_node(ast, *value, env, events, out, interner);
+                let vt = self.type_of(ast, *value, env, interner);
+                env.insert(
+                    name.clone(),
+                    self.op_write_result(name, op, vt, env, interner),
+                );
+            }
+            Node::MultiWrite { targets, value, target_exprs, .. } => {
+                self.flow_record_node(ast, *value, env, events, out, interner);
+                for te in target_exprs.clone() {
+                    self.flow_record_node(ast, te, env, events, out, interner);
+                }
+                widen_flow_events(events, ast.get(*value).span(), env, interner);
+                let rhs = self.type_of(ast, *value, env, interner);
+                for (name, ty) in multi_target_binder::bind(targets, rhs, interner) {
+                    env.insert(name, ty);
+                }
+            }
+            // A `def`/`class`/`module` body is a fresh local scope: descend
+            // with an empty env so locals assigned inside fold at their own
+            // read points, without touching the outer env.
+            Node::Definition { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => {
+                let mut inner = TypeEnv::new();
+                for c in body.clone() {
+                    self.flow_record_node(ast, c, &mut inner, events, out, interner);
+                }
+            }
+            Node::If { predicate, then_body, else_body, is_unless, .. } => {
+                self.flow_record_node(ast, *predicate, env, events, out, interner);
+                // A literal predicate decides the branch — `s = "z" if false`
+                // keeps `s` pinned, matching `flow.unreachable-branch`'s own
+                // dead-arm reading: the dead arm is still walked (its reads
+                // are checked) but its writes neither bind nor widen.
+                let pty = self.type_of(ast, *predicate, env, interner);
+                let decided = match interner.get(pty) {
+                    Type::Constant(sc) => Some(!matches!(sc, Scalar::Nil | Scalar::Bool(false))),
+                    _ => None,
+                };
+                // `unless` runs its then-arm on the FALSEY edge.
+                let then_live = decided.map(|t| t != *is_unless);
+                let mut aenv = env.clone();
+                let mut benv = env.clone();
+                for st in then_body.clone() {
+                    self.flow_record_node(ast, st, &mut aenv, events, out, interner);
+                }
+                for st in else_body.clone() {
+                    self.flow_record_node(ast, st, &mut benv, events, out, interner);
+                }
+                // An undecided arm's writes are conditional — widen them in
+                // its env. A decided arm's writes are either guaranteed (the
+                // live side; already bound) or never run (the dead side).
+                if then_live.is_none() {
+                    if let Some(s) = stmts_span(ast, then_body) {
+                        widen_flow_events(events, s, &mut aenv, interner);
+                    }
+                }
+                if decided.map(|t| t == *is_unless).is_none() {
+                    if let Some(s) = stmts_span(ast, else_body) {
+                        widen_flow_events(events, s, &mut benv, interner);
+                    }
+                }
+                *env = match then_live {
+                    Some(true) => aenv,
+                    Some(false) => benv,
+                    None => join_flow_envs(&aenv, &benv, interner),
+                };
+            }
+            Node::Case { predicate, branches, else_body, .. } => {
+                if let Some(sub) = predicate {
+                    self.flow_record_node(ast, *sub, env, events, out, interner);
+                }
+                let mut arms: Vec<TypeEnv> = Vec::with_capacity(branches.len() + 1);
+                for b in branches {
+                    let mut arm = env.clone();
+                    self.flow_record_node(ast, *b, &mut arm, events, out, interner);
+                    widen_flow_events(events, ast.get(*b).span(), &mut arm, interner);
+                    arms.push(arm);
+                }
+                let mut eenv = env.clone();
+                for st in else_body.clone() {
+                    self.flow_record_node(ast, st, &mut eenv, events, out, interner);
+                }
+                if let Some(s) = stmts_span(ast, else_body) {
+                    widen_flow_events(events, s, &mut eenv, interner);
+                }
+                arms.push(eenv);
+                let mut merged = arms.remove(0);
+                for arm in &arms {
+                    merged = join_flow_envs(&merged, arm, interner);
+                }
+                *env = merged;
+            }
+            Node::When { conditions, body, .. } => {
+                for c in conditions.clone() {
+                    self.flow_record_node(ast, c, env, events, out, interner);
+                }
+                for st in body.clone() {
+                    self.flow_record_node(ast, st, env, events, out, interner);
+                }
+            }
+            // Rescue/ensure bodies and a `Logical`'s right operand run
+            // conditionally: walk them on a clone so their reads record
+            // against the live env, then widen every write inside the span.
+            Node::BeginRescue { span, .. } => {
+                let mut inner = env.clone();
+                let mut children = Vec::new();
+                node_child_ids(ast.get(node), &mut children);
+                children.sort_unstable();
+                children.dedup();
+                for c in children {
+                    self.flow_record_node(ast, c, &mut inner, events, out, interner);
+                }
+                widen_flow_events(events, *span, env, interner);
+            }
+            Node::Logical { left, right, .. } => {
+                self.flow_record_node(ast, *left, env, events, out, interner);
+                let mut renv = env.clone();
+                self.flow_record_node(ast, *right, &mut renv, events, out, interner);
+                widen_flow_events(events, ast.get(*right).span(), env, interner);
+            }
+            Node::Loop { predicate, body, index, span, .. } => {
+                let mut benv = env.clone();
+                // A `for` index binds the element type every iteration —
+                // `Dynamic` is the FP-safe floor (`bind_for_index`): the
+                // body's reads must NOT see the outer pin (`for f in [1];
+                // f.even?` is silent on the reference).
+                for (name, _) in index {
+                    benv.insert(name.clone(), interner.untyped());
+                }
+                if let Some(p) = predicate {
+                    self.flow_record_node(ast, *p, &mut benv, events, out, interner);
+                }
+                for st in body.clone() {
+                    self.flow_record_node(ast, st, &mut benv, events, out, interner);
+                }
+                widen_flow_events(events, *span, env, interner);
+            }
+            Node::Statements { body, kind, .. } => {
+                match kind {
+                    StatementsKind::Sequence => {
+                        for st in body.clone() {
+                            self.flow_record_node(ast, st, env, events, out, interner);
+                        }
+                    }
+                    // Inert (`defined?`, `END`/`BEGIN`, `super`/`yield`
+                    // operands) carriers only record — reads inside resolve
+                    // against the current env; their writes are already out
+                    // of `events` and the scratch env stops any nested real
+                    // write escaping. `Recovered` children may or may not run
+                    // — walk them on a clone too, then widen the span.
+                    _ => {
+                        let mut scratch = env.clone();
+                        for st in body.clone() {
+                            self.flow_record_node(ast, st, &mut scratch, events, out, interner);
+                        }
+                        widen_flow_events(events, ast.get(node).span(), env, interner);
+                    }
+                }
+            }
+            Node::Call { .. } => self.flow_record_call(ast, node, env, events, out, interner),
+            Node::Lambda { body, locals, span } => {
+                let mut benv = env.clone();
+                for l in locals {
+                    benv.insert(l.clone(), interner.untyped());
+                }
+                for st in body.clone() {
+                    self.flow_record_node(ast, st, &mut benv, events, out, interner);
+                }
+                widen_flow_events(events, *span, env, interner);
+            }
+            _ => {
+                let mut children = Vec::new();
+                node_child_ids(ast.get(node), &mut children);
+                for c in children {
+                    self.flow_record_node(ast, c, env, events, out, interner);
+                }
+            }
+        }
+    }
+
+    /// The `Call` arm of [`Self::flow_record_node`]: receiver and arguments
+    /// run in call order against the live env — a write in argument position
+    /// binds sequentially (`x = g(x = 1)` reads `x = 1`'s "1"), matching the
+    /// calls-then-propagate order `flow_eval` uses for `Node::Other`. A
+    /// literal block (`block_span`) then opens a shadow scope like
+    /// `flow_eval`'s `Node::Other` arm: every name in the block's `locals`
+    /// binds `Dynamic`, the body is walked so its reads see the right env,
+    /// and afterwards every write the body made to a CAPTURED name widens it
+    /// (`closure_bindings`'s nuke-captured-writes). A `&expr` block-pass has
+    /// no `block_span`; its expression still rides `block_body` and evaluates
+    /// eagerly in the outer env. Last, a receiver-side mutator (`s << "z"`)
+    /// drops the pin per the carrier's mutator table —
+    /// [`widen_flow_mutation_events`].
+    fn flow_record_call(
+        &self,
+        ast: &LoweredAst,
+        node: NodeId,
+        env: &mut TypeEnv,
+        events: &LocalFlowEvents,
+        out: &mut HashMap<NodeId, TypeId>,
+        interner: &mut Interner,
+    ) {
+        let Node::Call {
+            receiver,
+            args,
+            block_body,
+            block_span,
+            block_locals,
+            span,
+            ..
+        } = ast.get(node)
+        else {
+            return;
+        };
+        if let Some(r) = receiver {
+            self.flow_record_node(ast, *r, env, events, out, interner);
+        }
+        for a in args.clone() {
+            self.flow_record_node(ast, a, env, events, out, interner);
+        }
+        if let Some(bspan) = block_span {
+            let mut benv = env.clone();
+            for l in block_locals {
+                benv.insert(l.clone(), interner.untyped());
+            }
+            for st in block_body.clone() {
+                self.flow_record_node(ast, st, &mut benv, events, out, interner);
+            }
+            widen_flow_events(events, *bspan, env, interner);
+        } else {
+            // `&expr` block-pass or no block: `block_body` holds the pass
+            // expression, an argument-position evaluation in the outer env.
+            for st in block_body.clone() {
+                self.flow_record_node(ast, st, env, events, out, interner);
+            }
+        }
+        widen_flow_mutation_events(events, *span, env, interner);
+    }
+
     // -----------------------------------------------------------------------
     // ADR-0038 Slice 1 — `call.possible-nil-receiver` on the threaded flow-eval
     // -----------------------------------------------------------------------
@@ -3506,7 +3985,8 @@ impl<'i> Typer<'i> {
         let mut tenv = TypeEnv::new();
         let mut nenv: HashMap<String, &'static str> = HashMap::new();
         let mut penv: HashSet<String> = HashSet::new();
-        self.nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, interner, &mut out);
+        self.without_local_read_flows()
+            .nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, interner, &mut out);
         out
     }
 
@@ -4026,7 +4506,7 @@ impl<'i> Typer<'i> {
         let mut tenv = TypeEnv::new();
         let mut cenv = Facts::default();
         let coarse = coarse_locals(ast, &body);
-        self.class_flow_scope(
+        self.without_local_read_flows().class_flow_scope(
             ast, &body, &mut tenv, &mut cenv, &coarse, &writes, interner, &mut out, true,
         );
         out
@@ -5038,6 +5518,40 @@ impl<'i> Typer<'i> {
                     ) {
                         continue;
                     }
+                    // The precise-carrier meet — the LOCAL arm's
+                    // `guard_meet_precise`, run on the chain call's own type.
+                    // The carrier gate below declines a precise `chain_call`
+                    // (it mints only off Dynamic/Top), which used to leave the
+                    // collapse silent for free: `check_call` could not reach
+                    // the carrier's class either. With the read-flow map the
+                    // call CAN type `h.last` to `Integer`, so the collapse the
+                    // reference applies (`k_root_array_lit`) must be recorded:
+                    // `h.last.is_a?(String)` meets `Integer` disjoint and the
+                    // address goes `Bot` — the use site then records into
+                    // `dead` and emits nothing, exactly as the LOCAL arm's.
+                    let chain_met: Vec<Option<ClassFact>> = g
+                        .classes
+                        .iter()
+                        .map(|class| {
+                            g.chain_call.and_then(|n| {
+                                let ty = self.type_of(ast, n, tenv, interner);
+                                self.guard_meet_precise_ty(ty, class, g.exact, interner)
+                            })
+                        })
+                        .collect();
+                    if chain_met
+                        .iter()
+                        .any(|m| m.as_ref() == Some(&ClassFact::Widened))
+                    {
+                        c.chains.insert(addr, ClassFact::Widened);
+                        continue;
+                    }
+                    if !chain_met.is_empty()
+                        && chain_met.iter().all(|m| m.as_ref() == Some(&ClassFact::Bot))
+                    {
+                        c.chains.insert(addr, ClassFact::Bot);
+                        continue;
+                    }
                     if conflicts {
                         c.chains.remove(&addr);
                         continue;
@@ -5422,6 +5936,20 @@ impl<'i> Typer<'i> {
             _ => {}
         }
         let &ty = tenv.get(local)?;
+        self.guard_meet_precise_ty(ty, class_name, exact, interner)
+    }
+
+    /// The carrier half of [`Self::guard_meet_precise`], taking the carrier
+    /// TYPE directly so the CHAIN arm of [`Self::apply_guards`] can meet the
+    /// guard against `type_of(chain_call)` — the reference routes the chain
+    /// call's carrier through the same `narrow_class_dispatch` table.
+    fn guard_meet_precise_ty(
+        &self,
+        ty: TypeId,
+        class_name: &str,
+        exact: bool,
+        interner: &Interner,
+    ) -> Option<ClassFact> {
         // The carrier must be one the reference's `narrow_class_dispatch`
         // (`narrowing.rb:2311`) routes to a COLLAPSING helper. Its table is
         // Constant / Nominal / Union / Tuple / HashShape / Singleton, and
@@ -5858,7 +6386,8 @@ impl<'i> Typer<'i> {
         let rebinds = collect_rebind_writes(ast);
         let ctx = CollCtx { writes: &writes, rebinds: &rebinds };
         let mut tenv = TypeEnv::new();
-        self.coll_flow_scope(ast, &body, &mut tenv, &ctx, interner, &mut out, true);
+        self.without_local_read_flows()
+            .coll_flow_scope(ast, &body, &mut tenv, &ctx, interner, &mut out, true);
         out
     }
 
@@ -7795,41 +8324,7 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
 /// enclosing block's body roots, so the enclosing `locals` list shadows a
 /// write there (a heredoc's body escapes its opener's span — see below).
 fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    let scopes: Vec<rigor_parse::Span> = ast
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
-                Some(n.span())
-            }
-            _ => None,
-        })
-        .collect();
-    // `(body descendant ids, names the scope binds)` for every literal block /
-    // lambda. The membership test must be STRUCTURAL, never span-based: a
-    // heredoc's body lines follow its opener, so a `#{w = 2}` inside a heredoc
-    // that sits in the call's arguments (or a sibling statement) lies inside
-    // the block's SPAN while evaluating in the outer scope — and the same
-    // escaping `#{…}` span makes a genuinely block-scoped interpolation write
-    // reachable only through the arg's child links, not through any body
-    // root's span (rigor-rs#166 review). Only scopes that bind at least one
-    // name can shadow a write, so empty `locals` lists are skipped.
-    let shadow_scopes: Vec<(HashSet<NodeId>, &[String])> = ast
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Node::Call {
-                block_body,
-                block_locals,
-                ..
-            } if !block_locals.is_empty() => Some((
-                descendants_of(ast, block_body),
-                block_locals.as_slice(),
-            )),
-            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
-                Some((descendants_of(ast, body), locals.as_slice()))
-            }
-            _ => None,
-        })
-        .collect();
+    let scopes = flow_event_scopes(ast);
     let mut out: Vec<(NodeId, rigor_parse::Span, String)> = Vec::new();
     for (id, n) in ast.iter() {
         match n {
@@ -7856,12 +8351,7 @@ fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
             _ => {}
         }
     }
-    out.retain(|(id, w, name)| {
-        !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
-            && !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.iter().any(|b| b == name)
-            })
-    });
+    out.retain(|(id, w, name)| scopes.admits(*id, *w, name));
     let mut out: Vec<(rigor_parse::Span, String)> =
         out.into_iter().map(|(_, s, n)| (s, n)).collect();
     drop_inert_writes(ast, &mut out);
@@ -8058,6 +8548,201 @@ fn qualify_self(prefix: Option<&str>, name: &str) -> String {
 
 /// Widen (to `Dynamic`) every tracked local whose write span is contained in
 /// `span` — the conservative invalidation a control-flow construct applies.
+/// The span covering a statement list's nodes — `None` when empty. Used by
+/// the per-read walk's conditional constructs, where the widened region is a
+/// BRANCH BODY (an `if`'s arm, an `else`) whose containing node span would
+/// wrongly include the predicate.
+fn stmts_span(ast: &LoweredAst, stmts: &[NodeId]) -> Option<rigor_parse::Span> {
+    let (first, last) = (stmts.first()?, stmts.last()?);
+    Some((ast.get(*first).span().0, ast.get(*last).span().1))
+}
+
+/// The flow events [`Typer::local_read_flow_types`] widens on: the rebind
+/// spans of [`collect_flow_writes`]'s shape (block-shadow filtered like
+/// [`toplevel_rebinds`], minus its `def` barrier) and
+/// [`indexed_flow_writes`], plus the receiver-side mutator calls
+/// `collect_flow_writes` knows — kept with their method so the read-env walk
+/// falsifies a pin only when its carrier answers the table
+/// ([`widen_flow_mutation_events`], the `StringMutation.widen_constant`
+/// port).
+struct LocalFlowEvents {
+    rebinds: Vec<(rigor_parse::Span, String)>,
+    mutations: Vec<(rigor_parse::Span, String, String)>,
+}
+
+fn local_flow_events(ast: &LoweredAst, source: &SourceIndex) -> LocalFlowEvents {
+    let scopes = flow_event_scopes(ast);
+    // The rebind half of [`collect_flow_writes`]'s node set, filtered the way
+    // [`toplevel_rebinds`] filters it EXCEPT for the `def` barrier:
+    // `flow_record_node` descends `def` bodies with a fresh env, so a write or
+    // mutation inside a `def` is a real flow event for that inner env — a
+    // `def`-internal `output << 'a' if c` must still join `Tuple | Dynamic`,
+    // never leave the dead `[]` pin readable. The extra entries can only ever
+    // WIDEN the enclosing env — the `Definition` arm never merges its inner
+    // env back — the same conservative shape `collect_flow_writes` takes.
+    let mut rebinds: Vec<(rigor_parse::Span, String)> = Vec::new();
+    for (id, n) in ast.iter() {
+        match n {
+            Node::LocalVariableWrite { name, span, .. }
+            | Node::LocalVariableOpWrite { name, span, .. }
+                if scopes.shadow_admits(id, name) =>
+            {
+                rebinds.push((*span, name.clone()));
+            }
+            Node::MultiWrite { targets, span, .. } => {
+                for (name, _) in targets.bound_names() {
+                    if scopes.shadow_admits(id, &name) {
+                        rebinds.push((*span, name));
+                    }
+                }
+            }
+            Node::BeginRescue { clauses, .. } => {
+                for c in clauses {
+                    if let Some(name) = &c.bound_name {
+                        if scopes.shadow_admits(id, name) {
+                            rebinds.push((c.span, name.clone()));
+                        }
+                    }
+                }
+            }
+            Node::Loop { index, .. } => {
+                for (s, name) in for_index_rebinds(index) {
+                    if scopes.shadow_admits(id, &name) {
+                        rebinds.push((s, name));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    rebinds.extend(indexed_flow_writes(ast, source));
+    drop_inert_writes(ast, &mut rebinds);
+    let mut mutations: Vec<(rigor_parse::Span, String, String)> = Vec::new();
+    for (id, n) in ast.iter() {
+        let Node::Call { receiver: Some(r), method, span, .. } = n else {
+            continue;
+        };
+        if !MUTATOR_METHODS.contains(&method.as_str()) {
+            continue;
+        }
+        let Node::LocalVariableRead { name, .. } = ast.get(*r) else {
+            continue;
+        };
+        if !scopes.shadow_admits(id, name) || ast.in_inert_carrier(*span) {
+            continue;
+        }
+        mutations.push((*span, name.clone(), method.clone()));
+    }
+    LocalFlowEvents { rebinds, mutations }
+}
+
+/// The scope filters every top-level flow-event list applies (see
+/// [`toplevel_rebinds`]): `def`/`class`/`module` body spans — each an
+/// independent local scope — and the `(body descendant ids, bound names)`
+/// shadow scopes every literal block/lambda opens (rigor-rs#166). [`Self::admits`]
+/// answers whether the event `(node id, span, name)` is a write to a
+/// top-level local: not inside an independent scope, and not shadowed by a
+/// block/lambda that binds the name.
+struct FlowEventScopes<'a> {
+    def_spans: Vec<rigor_parse::Span>,
+    shadow_scopes: Vec<(HashSet<NodeId>, &'a [String])>,
+}
+
+impl<'a> FlowEventScopes<'a> {
+    /// A write is a TOP-LEVEL rebind when no `def`/`class`/`module` body span
+    /// contains it and no block/lambda that binds its name owns it.
+    fn admits(&self, id: NodeId, span: rigor_parse::Span, name: &str) -> bool {
+        !self.def_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
+            && self.shadow_admits(id, name)
+    }
+
+    /// The block/lambda half of [`Self::admits`], WITHOUT the `def` barrier —
+    /// the per-read walk descends `def` bodies with a fresh env, where the
+    /// body's own writes are its inner env's flow events.
+    fn shadow_admits(&self, id: NodeId, name: &str) -> bool {
+        !self.shadow_scopes.iter().any(|(descendants, bound)| {
+            descendants.contains(&id) && bound.iter().any(|b| b.as_str() == name)
+        })
+    }
+}
+
+fn flow_event_scopes(ast: &LoweredAst) -> FlowEventScopes<'_> {
+    let def_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                Some(n.span())
+            }
+            _ => None,
+        })
+        .collect();
+    // `(body descendant ids, names the scope binds)` for every literal block /
+    // lambda — see `toplevel_rebinds` for why membership is STRUCTURAL
+    // (heredocs escape their opener's span; a block-scoped interpolation write
+    // is reachable only through child links).
+    let shadow_scopes: Vec<(HashSet<NodeId>, &[String])> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call {
+                block_body,
+                block_locals,
+                ..
+            } if !block_locals.is_empty() => Some((
+                descendants_of(ast, block_body),
+                block_locals.as_slice(),
+            )),
+            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
+                Some((descendants_of(ast, body), locals.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
+    FlowEventScopes { def_spans, shadow_scopes }
+}
+
+/// Widen every flow event inside `span` in `env` — rebinds unconditionally,
+/// a receiver-side mutation only when the current binding is a carrier the
+/// method's mutator table answers for ([`widen_flow_mutation_events`]). Used
+/// by the per-read walk's conditional constructs (branch arms, rescued
+/// bodies, loops, blocks whose writes capture).
+fn widen_flow_events(
+    events: &LocalFlowEvents,
+    span: rigor_parse::Span,
+    env: &mut TypeEnv,
+    interner: &mut Interner,
+) {
+    widen_flow_writes(&events.rebinds, span, env, interner);
+    widen_flow_mutation_events(events, span, env, interner);
+}
+
+/// The mutator half of [`widen_flow_events`]: `s << "z"` drops a
+/// `Constant[String]` pin to `Dynamic` (the port of
+/// `StringMutation.widen_constant` — the reference lands the bare `String`
+/// nominal, `Dynamic` is strictly wider and strictly safer); `Tuple` and
+/// `HashShape` pins drop under their own tables. A binding the call cannot
+/// mutate keeps its pin — `1 << 2` reads `Integer#<<`, a pure method.
+fn widen_flow_mutation_events(
+    events: &LocalFlowEvents,
+    span: rigor_parse::Span,
+    env: &mut TypeEnv,
+    interner: &mut Interner,
+) {
+    for (mspan, name, method) in &events.mutations {
+        if !(span.0 <= mspan.0 && mspan.1 <= span.1) {
+            continue;
+        }
+        let dominated = match env.get(name.as_str()).map(|&t| interner.get(t)) {
+            Some(Type::Constant(Scalar::Str(_))) => STRING_MUTATORS.contains(&method.as_str()),
+            Some(Type::Tuple(_)) => ARRAY_MUTATORS.contains(&method.as_str()),
+            Some(Type::HashShape(_)) => HASH_MUTATORS.contains(&method.as_str()),
+            _ => false,
+        };
+        if dominated {
+            env.insert(name.clone(), interner.untyped());
+        }
+    }
+}
+
 fn widen_flow_writes(
     writes: &[(rigor_parse::Span, String)],
     span: rigor_parse::Span,
@@ -8084,6 +8769,30 @@ fn widen_penv_writes(
         if span.0 <= wspan.0 && wspan.1 <= span.1 {
             penv.remove(name);
         }
+    }
+}
+
+/// `union(a, b)` the `compound_eval` way: flatten `a`'s union arms, append
+/// `b`, dedup and sort for a canonical interner key. A single live arm
+/// returns it bare.
+fn union_two(a: TypeId, b: TypeId, interner: &mut Interner) -> TypeId {
+    let mut members: Vec<TypeId> = match interner.get(a) {
+        Type::Union(ms) => ms.clone(),
+        _ => vec![a],
+    };
+    for m in match interner.get(b) {
+        Type::Union(ms) => ms.clone(),
+        _ => vec![b],
+    } {
+        if !members.contains(&m) {
+            members.push(m);
+        }
+    }
+    members.sort_unstable();
+    match members.len() {
+        0 => interner.untyped(),
+        1 => members[0],
+        _ => interner.intern(Type::Union(members)),
     }
 }
 

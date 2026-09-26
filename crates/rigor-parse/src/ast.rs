@@ -320,8 +320,13 @@ pub enum Node {
     /// READS its target (it reads-then-writes), so the dead-assignment walk counts
     /// this `name` as a READ — and it is NOT itself a fireable dead-write candidate
     /// (the reference's collector fires only on plain `LocalVariableWriteNode`).
-    /// `value` is lowered for call reachability.
-    LocalVariableOpWrite { name: String, value: NodeId, span: Span },
+    /// `value` is lowered for call reachability. `op` is the written operator:
+    /// the binary operator for an operator-write (`"+="` records `"+"`), and
+    /// `"&&"` / `"||"` for the and/or writes — the point-in-time flow env needs
+    /// it because `x &&= v` / `x ||= v` are control-flow writes (the prior
+    /// binding's truthiness decides which operand lands) while `x op= v` is
+    /// `x = x op v`, a foldable call when both sides pin.
+    LocalVariableOpWrite { name: String, value: NodeId, op: String, span: Span },
     /// A multiple assignment (`a, b = rhs`, `a, (b, c), *rest = rhs`) — Prism's
     /// `MultiWriteNode`. `targets` is the `lefts`/`rest`/`rights` triple; `value`
     /// is the lowered right-hand side.
@@ -1381,10 +1386,12 @@ impl<'src> Builder<'src> {
         // sight of the target read — the one false-positive risk this rule has.
         if let Some(opw) = node.as_local_variable_operator_write_node() {
             let name = constant_string(opw.name().as_slice());
+            let op = constant_string(opw.binary_operator().as_slice());
             let value = self.lower_node(&opw.value());
             return self.push(Node::LocalVariableOpWrite {
                 name,
                 value,
+                op,
                 span: span_of(&opw.location()),
             });
         }
@@ -1394,6 +1401,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::LocalVariableOpWrite {
                 name,
                 value,
+                op: "&&".to_string(),
                 span: span_of(&andw.location()),
             });
         }
@@ -1403,6 +1411,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::LocalVariableOpWrite {
                 name,
                 value,
+                op: "||".to_string(),
                 span: span_of(&orw.location()),
             });
         }

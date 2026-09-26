@@ -553,6 +553,13 @@ pub fn analyze_with_source_and_folder(
     let typer = Typer::with_source_and_folder(index, source, folder)
         .with_lexical_scopes(&scopes)
         .with_file_key(ast.file_key());
+    // rigor-rs#164 (review round 5): the per-read point-in-time flow map —
+    // the port of `scope.local(name)` at each local read — so a nilable
+    // fold's local receiver or argument resolves the binding in effect
+    // THERE (`s = "abc"; s.rindex("b")` folds), while a mutated or
+    // conditionally-rebound local resolves to the type the read really sees.
+    let read_flows = typer.local_read_flow_types(ast, interner);
+    let typer = typer.with_local_read_flows(read_flows);
     let env = ScopedEnv::build(&typer, ast, interner);
     // ADR-0038 Slice 1: the per-call nil-receiver snapshot map (call node id ->
     // non-nil core arm), computed ONCE over the whole program via the threaded
@@ -4820,13 +4827,13 @@ mod tests {
             // NON-disjoint guards: a superclass/module the carrier includes, the
             // same class, Object (probes n_super_enumerable, n_same_class,
             // n_object, x_*_ok, tripleeq_nondisj, elsif_nondisj)
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Object)\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.kind_of?(Enumerable)\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-            (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Hash"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Object)\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.kind_of?(Enumerable)\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "{ a: 1 }"),
             // (The two `ClassOrdering::Unknown`-on-a-NOMINAL rows that used to
             // sit here moved to the silence test at the `v0.3.8` re-pin —
             // upstream #533 item 4 widens that arm to `untyped`. The rows below
@@ -4838,7 +4845,7 @@ mod tests {
             // twin of this row moved to the silence test at the `v0.3.9` re-pin:
             // `6cde8381` gave `narrow_shape_to_class` the same `declines_bot?`
             // the nominal arm had.)
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(Comparable)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(Comparable)\n  h.frobnicate_zzz\nend\n"[..], "[1, 2]"),
             // A TERMINATING truthy edge widens only the path that returns; the
             // code after runs on the untouched falsey edge.
             (&b"def f\n  h = Array.new\n  return if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
@@ -4849,30 +4856,30 @@ mod tests {
             // S3 anti-over-suppression: a SHAPED carrier under a guard it IS a
             // subclass of survives and still witnesses. All three measured
             // firing on the reference (`… for [1, 2]` / `… for { a: 1 }`).
-            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
-            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Object)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
-            (&b"def f\n  v = { a: 1 }\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Hash"),
+            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Object)\n  v.frobnicate_zzz\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  v = { a: 1 }\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "{ a: 1 }"),
             // the FALSEY edge of a disjoint guard is NOT narrowed
             // (`narrow_nominal_not_class` preserves it) — probes s_unless_body,
             // s_negated_if, s_case_when_else_branch
-            (&b"def f\n  h = [1, 2]\n  unless h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  if !h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  case h\n  when Hash then 0\n  else h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  unless h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  if !h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  case h\n  when Hash then 0\n  else h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
             // a `when` clause whose conditions do NOT all collapse — the
             // reference unions them (probe case_multi_mixed)
-            (&b"def f\n  h = [1, 2]\n  case h\n  when Hash, Array then h.frobnicate_zzz\n  else 0\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  case h\n  when Hash, Array then h.frobnicate_zzz\n  else 0\n  end\nend\n"[..], "[1, 2]"),
             // a use BEFORE the guard, and AFTER the conditional (probes
             // before_guard_fires, after_branch)
-            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz\n  0 if h.is_a?(Hash)\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    0\n  end\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz\n  0 if h.is_a?(Hash)\nend\n"[..], "[1, 2]"),
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    0\n  end\n  h.frobnicate_zzz\nend\n"[..], "[1, 2]"),
             // a REBIND kills the fact — in the branch and inside a block
             // (probes bot_rebind_use, rebind_in_branch, bot_block_rebind)
-            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h = [3, 4]\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each do\n      h = [3, 4]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h = [3, 4]\n    h.frobnicate_zzz\n  end\nend\n"[..], "[3, 4]"),
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each do\n      h = [3, 4]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "[3, 4]"),
             // a non-disjoint guard's early-return propagation still witnesses
-            (&b"def f\n  h = [1, 2]\n  return 0 unless h.is_a?(Enumerable)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  return 0 unless h.is_a?(Enumerable)\n  h.frobnicate_zzz\nend\n"[..], "[1, 2]"),
             // a nested `def` is an independent scope (probe bot_nested_def)
-            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    def g\n      h = [5, 6]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "Array"),
+            (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    def g\n      h = [5, 6]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "[5, 6]"),
         ] {
             let diags = run(src);
             assert_eq!(
@@ -4949,6 +4956,69 @@ mod tests {
         assert_eq!(diags[0].receiver_type.as_deref(), Some("15"));
         // A valid method through the parens stays silent.
         assert!(run(b"(15).succ\n").is_empty(), "valid method must be silent");
+    }
+
+    /// rigor-rs#164 review round 5: a nilable fold resolves a local receiver
+    /// or argument's CURRENT literal through the per-read flow env — the port
+    /// of `scope.local(name)` at the read — instead of declining on the mere
+    /// presence of a local read. Every row below is oracle-probed.
+    #[test]
+    fn nilable_fold_resolves_the_read_point_flow_env() {
+        // A pinned local receiver folds exactly like the literal; a `nil`
+        // answer still sees NilClass's own methods.
+        for (src, expect) in [
+            ("s = \"abc\"; s.rindex(\"b\").to_a", "undefined method `to_a' for 1"),
+            ("s = \"abc\"; s.rindex(\"z\").lenght", "undefined method `lenght' for nil"),
+            ("s = \"abc\"; s.getbyte(0).to_a", "undefined method `to_a' for 97"),
+            ("s = \"abc\"; s.byteindex(\"b\").to_a", "undefined method `to_a' for 1"),
+            // The LATEST straight-line binding wins.
+            ("s = \"abc\"; s = \"zzz\"; s.rindex(\"z\").to_a", "undefined method `to_a' for 2"),
+            ("s = \"zzz\"; s = \"abc\"; s.rindex(\"b\").to_a", "undefined method `to_a' for 1"),
+            // A computed result binding survives a later source rebind.
+            ("s = \"abc\"; y = s.rindex(\"b\"); s = \"z\"; y.lenght", "undefined method `lenght' for 1"),
+            ("s = \"abc\"; y = s.rindex(\"z\"); s = \"zzz\"; y.lenght", "undefined method `lenght' for nil"),
+            // A `def` body is its own scope — inside and out.
+            ("s = \"abc\"; def m; s = 1; end; s.rindex(\"b\").to_a", "undefined method `to_a' for 1"),
+            ("def m; s = \"abc\"; s.rindex(\"b\").to_a; end", "undefined method `to_a' for 1"),
+            // A block parameter shadows, not writes, the outer local.
+            ("s = \"abc\"; 1.times { |s| s = \"z\" }; s.rindex(\"b\").to_a", "undefined method `to_a' for 1"),
+            // Pinned local arguments fold too.
+            ("needle = \"b\"; \"abc\".rindex(needle).to_a", "undefined method `to_a' for 1"),
+            ("i = 0; \"abc\".getbyte(i).to_a", "undefined method `to_a' for 97"),
+            ("i = 9; \"abc\".getbyte(i).lenght", "undefined method `lenght' for nil"),
+            // Scalar `<=>` locals, and safe navigation.
+            ("x = 1.0; (x <=> 2).to_a", "undefined method `to_a' for -1"),
+            ("s = \"abc\"; s&.rindex(\"b\")&.to_a", "undefined method `to_a' for 1"),
+            // `x op= v` is `x.op(v)` — the pinned pair folds.
+            ("s = \"abc\"; s += \"z\"; s.rindex(\"z\").to_a", "undefined method `to_a' for 3"),
+            ("i = 0; i += 1; \"abc\".getbyte(i).to_a", "undefined method `to_a' for 98"),
+            ("x = false; x ||= \"abc\"; x.rindex(\"b\").to_a", "undefined method `to_a' for 1"),
+        ] {
+            let diags = run(src.as_bytes());
+            assert_eq!(
+                diags.iter().map(|d| d.message.as_str()).collect::<Vec<_>>(),
+                vec![expect],
+                "wrong diagnostics for {src:?}"
+            );
+        }
+        // Real mutations falsify the pin — `<<`, `replace`, `[]=`, `upcase!`
+        // — and a write inside a captured block or conditional arm widens:
+        // all stay silent, matching the reference.
+        for src in [
+            "s = \"abc\"; s << \"z\"; s.rindex(\"z\").lenght",
+            "s = \"abc\"; s << \"z\"; \"abc\".rindex(s).to_a",
+            "s = \"abc\"; s.replace(\"zz\"); s.rindex(\"b\").lenght",
+            "s = \"abc\"; s.upcase!; s.rindex(\"A\").lenght",
+            "s = \"abc\"; xs = [1]; xs.each { s = \"z\" }; s.rindex(\"b\").to_a",
+            "s = \"abc\"; s = \"z\" if rand > 0; s.rindex(\"b\").to_a",
+            // `nil.to_a` is a real method — the folded `nil` answer is silent.
+            "s = \"abc\"; s.rindex(\"z\").to_a",
+            // A `||=` union never pins a single literal.
+            "s = \"abc\"; s ||= \"z\"; s.rindex(\"b\").to_a",
+        ] {
+            let diags = run(src.as_bytes());
+            assert!(diags.is_empty(), "expected silence for {src:?}, got {diags:?}");
+        }
     }
 
     #[test]
