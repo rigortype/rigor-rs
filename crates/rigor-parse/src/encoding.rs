@@ -8,7 +8,8 @@
 //!
 //!   * the `pm_parser_init` plumbing that computes `encoding_comment_start`
 //!     (the BOM skip, the `#!`-shebang handling — line 2 is honored ONLY when
-//!     the shebang contains `ruby`, and the inline-whitespace advance);
+//!     the `pm_strnstr` window over the source start finds `ruby` in the
+//!     shebang, and the inline-whitespace advance);
 //!   * [`magic_comment_pass`] — `parser_lex_magic_comment`, the `key: value`
 //!     scanner with `-*-` emacs markers and `;` separators, whose return value
 //!     also decides whether the fallback runs;
@@ -463,11 +464,15 @@ static NON_UTF8_NAMES: &[&[u8]] = &[
 ///
 /// Mirrors `pm_parser_init` + the two magic-comment passes: the encoding
 /// comment is honored ONLY at `encoding_comment_start` — line 1 (after a BOM
-/// and leading inline whitespace), or line 2 when line 1 is a `#!` line that
-/// contains `ruby`. A shebang WITHOUT `ruby` (`#!/bin/sh`, `#!/usr/bin/env
-/// perl`) does not unlock line 2; Prism runs no shebang search outside
-/// `main_script`/`-x` (the `ruby` CLI then reports "no Ruby script found",
-/// but a library file simply keeps UTF-8 — probed).
+/// and leading inline whitespace), or line 2 when line 1 is a `#!` line whose
+/// `ruby` search hits. That search is `pm_strnstr(parser->start, "ruby",
+/// length)`: `length` counts the line-1 bytes AFTER the BOM but the scan
+/// starts at byte 0, so under a BOM the window covers the BOM plus the line
+/// minus its last three bytes — a `ruby` in the shebang's last three bytes
+/// does NOT unlock line 2. A shebang WITHOUT `ruby` (`#!/bin/sh`,
+/// `#!/usr/bin/env perl`) does not unlock line 2 either; Prism runs no
+/// shebang search outside `main_script`/`-x` (the `ruby` CLI then reports
+/// "no Ruby script found", but a library file simply keeps UTF-8 — probed).
 pub(crate) fn resolved_utf8(source: &[u8]) -> bool {
     let mut comment_start = 0usize;
     // UTF-8 BOM skip.
@@ -482,11 +487,17 @@ pub(crate) fn resolved_utf8(source: &[u8]) -> bool {
         .map(|i| comment_start + i);
     let line1_end = line1_nl.unwrap_or(source.len());
     let line1 = &source[comment_start..line1_end];
-    // `pm_strnstr(…, "ruby", …)` — a case-SENSITIVE substring search.
+    // `pm_strnstr(parser->start, "ruby", length)` — a case-SENSITIVE
+    // substring search whose window is `length` bytes measured from the
+    // SOURCE start, not from the shebang: `parser->start` stays at byte 0
+    // across the BOM skip while `length` is the line-1 length after it. A
+    // BOM therefore shrinks the searched slice of the line by three bytes
+    // (`#!ruby` under a BOM never matches; `#!/usr/bin/env ruby` under a
+    // BOM keeps `y` out of the window — probed: line 2 stays inert).
     if line1.len() > 2
         && line1[0] == b'#'
         && line1[1] == b'!'
-        && line1.windows(4).any(|w| w == b"ruby")
+        && source[..line1.len()].windows(4).any(|w| w == b"ruby")
         && line1_nl.is_some()
     {
         comment_start = line1_end + 1;
