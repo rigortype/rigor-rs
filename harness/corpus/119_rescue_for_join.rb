@@ -595,3 +595,82 @@ a55, b55 = (c55 ? 1 : [2, 3])
 a55b, (b55b, d55) = (c55 ? [1, [2, 3]] : [4])
 [d55].frob
 [b55b].frob
+
+# (56) reads inside a `for` body resolve the IN-ORDER body env — the
+# reference evaluates the body on a scope cloned at the loop head (with the
+# index bindings), not the nil-injected exit join: `w` reads `1` (the body's
+# own write) so `fdiv` stays silent, and `x = w` on the FIRST body
+# statement still sees the entry `"s"` (fires `got "s"`, not `"s"?`).
+# `for w in [1]` rebinds `w` to the ELEMENT type inside the body (`1`), so
+# `1.fdiv(w)` is silent there too.
+w56 = "s"
+for i56 in [1]
+  w56 = 1
+  1.fdiv(w56)
+end
+w56b = "s"
+for w56b in [1]
+  1.fdiv(w56b)
+end
+w56c = "s"
+for i56c in [1]
+  x56 = w56c
+  1.fdiv(x56)
+end
+
+# (57) a `begin`/`rescue` PRIMARY body threads like an ordinary scope —
+# `eval_begin` `eval_statement`s the body through the entry scope, so
+# `w = 1` is visible to the next statement (silent) while the `rescue`
+# arm still reads the `begin`-entry env. The `else` body continues the
+# post-primary scope (silent), and an `ensure` body sees the joined scope
+# (fires `for :a` — its own write, `for "s" | 1` — the join).
+w57 = "s"
+begin
+  w57 = 1
+  1.fdiv(w57)
+rescue
+end
+w57b = "s"
+x57 = begin
+  w57b = 1
+  1.fdiv(w57b)
+rescue
+  nil
+end
+w57c = "s"
+begin
+  w57c = 1
+rescue
+  2
+else
+  1.fdiv(w57c)
+ensure
+  w57d = :a
+  w57d.frob
+  w57.frob
+end
+
+# (58) a rescued EXPR that is a parenthesized statement list still threads
+# its own statements in order — the rescue MODIFIER freezes only the ARM's
+# reads at the entry env: the left `(w = 1; w.frob)` sees `1` (fires
+# `for 1` at the inner call) while the arm `w.frob` reads the entry `"s"`
+# (fires `for "s"`).
+w58 = "s"
+((w58 = 1; w58.frob) rescue nil)
+w58b = "s"
+(w58b = 1; w58b.frob) rescue w58b.frob
+
+# (59) a write expression evaluates to its RHS (`expression_typer.rb`'s
+# shared write handler): `[w = 2]` is `[2]` and `x = (w = 2)` binds `2` —
+# fires `for [2, "s"]`, `for [2]`.
+w59 = "s"
+[w59 = 2, w59].frob
+x59 = (w59b = 2)
+[x59].frob
+
+# (60) TOP-LEVEL statements also read the env at their program point — a
+# later write cannot leak back into an earlier read: `w.frob` before the
+# `w = 1` rebind sees `"s"` (fires `for "s"`), not the post-program `1`.
+w60 = "s"
+w60.frob
+w60 = 1

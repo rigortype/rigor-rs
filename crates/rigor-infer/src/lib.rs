@@ -500,6 +500,17 @@ impl<'i> Typer<'i> {
                 let value = *value;
                 self.type_of(ast, value, env, interner)
             }
+            // A single-target write evaluates to its RHS (`[w = 2]` is
+            // `[2]`, `x = (w = 2)` binds `2`) — the same rule
+            // `stmt_value_type` applies. An OP-write's value is the
+            // operator's result, not the operand, so it stays declined.
+            Node::LocalVariableWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. } => {
+                let value = *value;
+                self.type_of(ast, value, env, interner)
+            }
             Node::Call { receiver: Some(r), method, args, block_body, .. } => {
                 let (r, method) = (*r, method.clone());
                 if !block_body.is_empty() {
@@ -3126,7 +3137,12 @@ impl<'i> Typer<'i> {
         };
         let rebinds = toplevel_rebinds(ast);
         for stmt in body {
-            self.bind_check_statement(ast, stmt, &mut env, &rebinds, interner, &mut arm_entries, false);
+            // Every top-level statement records the env as it stood when the
+            // statement began — a read inside the statement resolves THAT env,
+            // not the post-program one (the reference evaluates statements in
+            // order on one scope; `w = "s"; w.upcase; w = 1` reads `"s"`).
+            arm_entries.push((ast.get(stmt).span(), env.clone()));
+            self.bind_check_statement(ast, stmt, &mut env, &rebinds, interner, &mut arm_entries, true);
         }
         (env, arm_entries)
     }
@@ -3153,10 +3169,11 @@ impl<'i> Typer<'i> {
         rebinds: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         arm_entries: &mut Vec<(rigor_parse::Span, TypeEnv)>,
-        // `true` inside a `begin`/`rescue` CLAUSE body: the clause scope
-        // starts at the `begin`-entry env but threads like an ordinary
-        // scope, so every contained statement records a `(span, env)`
-        // snapshot for `ScopedEnv::at`. A rescue-MODIFIER arm binds with
+        // `true` in an IN-ORDER scope — top-level statements, a statement
+        // sequence, a `for`/`begin`/`else`/`ensure`/clause body: every
+        // contained statement records a `(span, env)` snapshot for
+        // `ScopedEnv::at`, so a read resolves the env at its program point
+        // rather than the post-program env. A rescue-MODIFIER arm binds with
         // `false` — the reference records its operand types wholly on the
         // entry scope (`(w = "s") rescue (w = 1; w.frob)` reads `"s"`), so
         // its interior stays frozen.
@@ -3257,7 +3274,12 @@ impl<'i> Typer<'i> {
                                 | StatementsKind::Recovered,
                             ..
                         } => self.bind_check_statement(ast, s, env, rebinds, interner, arm_entries, threading),
-                        other => widen_flow_writes(rebinds, other.span(), env, interner),
+                        other => {
+                            widen_flow_writes(rebinds, other.span(), env, interner);
+                            if threading {
+                                arm_entries.push((other.span(), env.clone()));
+                            }
+                        }
                     }
                 }
             }
@@ -3432,9 +3454,20 @@ impl<'i> Typer<'i> {
                         bs.0 <= sp.0 && sp.1 <= bs.1
                     });
                     if in_literal_block {
+                        // The literal block's writes widen — its interior
+                        // reads resolve the POST-WIDEN env (`Dynamic`), never
+                        // the enclosing statement's precise env, which would
+                        // fire FPs the widening exists to suppress
+                        // (`[1].each { w = 1; 1.fdiv(w) }` stays silent).
                         let sp = ast.get(*s).span();
                         widen_flow_writes(rebinds, sp, env, interner);
+                        if threading {
+                            arm_entries.push((sp, env.clone()));
+                        }
                     } else {
+                        if threading {
+                            arm_entries.push((ast.get(*s).span(), env.clone()));
+                        }
                         self.bind_check_statement(ast, *s, env, rebinds, interner, arm_entries, threading);
                     }
                 }
@@ -3487,7 +3520,19 @@ impl<'i> Typer<'i> {
                     self.bind_check_statement(ast, p, env, rebinds, interner, arm_entries, threading);
                 }
             }
-            other => widen_flow_writes(rebinds, other.span(), env, interner),
+            // Anything else — `if`/`case`/`while`/`until`/`begin`-less arms,
+            // `defined?`, `super`/`yield`, `class`/`def` bodies — widens its
+            // contained rebinds; the span records the POST-WIDEN env so reads
+            // inside it see `Dynamic` rather than the enclosing statement's
+            // pre-statement env leaking a precise-but-invalid type in
+            // (`w = "s"; if c; w = 1; 1.fdiv(w); end` reads `Dynamic[top]`,
+            // not `"s"`).
+            other => {
+                widen_flow_writes(rebinds, other.span(), env, interner);
+                if threading {
+                    arm_entries.push((other.span(), env.clone()));
+                }
+            }
         }
     }
 

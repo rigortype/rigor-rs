@@ -1557,7 +1557,7 @@ fn check_call(
             if !index.knows_class(name)
                 || index.class_has_method(name, method)
                 || unenumerable_instance_receiver(index, name)
-                || typer.source().project_declares_method(name, method)
+                || typer.source().project_declares_method(typer.file_key(), name, method)
                 // A project REOPENING also extends a core class's surface:
                 // `class Integer; include K; end` gives `1` every method `K`
                 // declares. The override index's MRO walk (`nearest_ancestor_
@@ -3170,15 +3170,14 @@ struct ScopedEnv {
     top: rigor_infer::TypeEnv,
     gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
-    /// `(span, env)` pairs for `expr rescue arm` arms and `begin`/`rescue`
-    /// clause bodies — their interior reads type from the env the construct
-    /// was ENTERED under, not the joined post-scope (reference
-    /// `eval_rescue_modifier`: the arm's operand types come from
-    /// `OperandWalk.type_of(scope, node)` on the entry scope). A modifier arm
-    /// records ONE whole-span entry (frozen); a `begin`/`rescue` clause records
-    /// its head span plus one snapshot per body statement, so the clause scope
-    /// threads its own writes (`eval_begin` clones the entry scope per clause
-    /// and `eval_statement`s through it). Overlapping entries resolve
+    /// `(span, env)` pairs recording the env an in-order scope stood in —
+    /// one per top-level statement and per statement of every threading body
+    /// (`for`, `begin`/`rescue`/`else`/`ensure`, clause, parens sequence), plus
+    /// whole-span entries for rescue-modifier arms (frozen at entry — the
+    /// reference records arm operand types on the entry scope via
+    /// `OperandWalk.type_of(scope, node)`) and widened carriers (a post-widen
+    /// env, so `if`/`while`/literal-block interiors read `Dynamic`, not the
+    /// enclosing statement's env). Overlapping entries resolve
     /// innermost-first — see [`Self::at`].
     arm_entries: Vec<(rigor_parse::Span, rigor_infer::TypeEnv)>,
     method_bodies: Vec<rigor_parse::Span>,
@@ -3196,23 +3195,28 @@ impl ScopedEnv {
         }
     }
 
-    /// The env a use site at `span` may read: the top-level env at file scope (or
-    /// inside a block, which DOES capture the enclosing locals), the recorded
-    /// env inside a rescue arm / clause body, an empty env inside any method
-    /// body. A clause body records one snapshot PER STATEMENT — the clause's
-    /// scope starts at the `begin` entry but threads the body's own writes —
-    /// so the INNERMOST containing entry wins (a statement's span sits inside
-    /// the clause's span), while a rescue-modifier arm records only its
-    /// whole-span entry: its interior stays frozen at the entry env.
+    /// The env a use site at `span` may read: the recorded env at its program
+    /// point — every in-order statement records the env as it stood when that
+    /// statement began, and INNERMOST-first resolution lets a nested scope's
+    /// entry (rescue-modifier arm frozen at entry, clause body threading from
+    /// the `begin` entry, widened carrier) shadow the enclosing statement —
+    /// an empty env inside any method body, and the post-program env as the
+    /// fallback for unrecorded positions.
     fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
         if self.in_method_body(span) {
             return &self.empty;
         }
+        // Innermost containing entry wins; on a TIE (a statement that is
+        // itself a widened carrier — `if c; …; end` at statement level pushes
+        // both its own snapshot and the post-widen entry for the same span)
+        // the LAST-pushed entry wins, so the widened env shadows the
+        // pre-statement one.
         self.arm_entries
             .iter()
-            .filter(|(arm_span, _)| span.0 >= arm_span.0 && span.1 <= arm_span.1)
-            .min_by_key(|(arm_span, _)| arm_span.1 - arm_span.0)
-            .map(|(_, entry)| entry)
+            .enumerate()
+            .filter(|(_, (arm_span, _))| span.0 >= arm_span.0 && span.1 <= arm_span.1)
+            .min_by_key(|(i, (arm_span, _))| (arm_span.1 - arm_span.0, usize::MAX - i))
+            .map(|(_, (_, entry))| entry)
             .unwrap_or(&self.top)
     }
 

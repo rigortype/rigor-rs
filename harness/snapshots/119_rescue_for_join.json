@@ -9,6 +9,13 @@
       "message": "argument type mismatch at `fdiv' on Integer: expected Numeric, got [5]"
     },
     {
+      "rule": "call.argument-type-mismatch",
+      "line": 618,
+      "column": 10,
+      "severity": "error",
+      "message": "argument type mismatch at `fdiv' on Integer: expected Numeric, got \"s\""
+    },
+    {
       "rule": "call.undefined-method",
       "line": 13,
       "column": 6,
@@ -637,6 +644,62 @@
       "column": 8,
       "severity": "error",
       "message": "undefined method `frob' for [2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 649,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for :a"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 650,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 659,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 661,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 661,
+      "column": 35,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 667,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frob' for [2, \"s\"]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 669,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 675,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
     }
   ]
 }
