@@ -12,9 +12,9 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-26): pin `e59b7b89`, 0 FP / 9,337.** Retractions no gate sees:
-**#134–#138** (a mechanism each). FPs: #139, #140, #146, #164. Coverage: #141 (`fb781023`,
-3,002/3,829 gaps), #167; #142–#145/#152 closed (0).
+▶ **NEXT (2026-09-26): pin `e59b7b89`, 0 FP / 9,337, gaps 827.** Retractions no gate sees:
+**#134–#137** (a mechanism each). FPs: #139, #146. In flight: #140, #164, #167;
+coverage #141 done (3,002); #142–#145/#152 closed (0).
 CLI/config: #155–#159, #162–#163, #168–#171; #160 blocked upstream. Also
 #130 (waits `0.4.0`; ADR-109 drops `int<min,max>`), #132.
 
@@ -23,22 +23,21 @@ CLI/config: #155–#159, #162–#163, #168–#171; #160 blocked upstream. Also
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
   (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
   [plan](notes/20260718-compat-next-stage-plan.md)).
-- **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity profile/overrides,
-  `coverage` precision DONE; remaining: plugins inflection probe.
-  `--protection`/`--mutation` (ADR-63/70) + `type-scan` deferred
+- **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage`
+  precision done; remaining: plugins probe. `--protection`/`--mutation`
+  (ADR-63/70) + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
 - **Pin is master `e59b7b89`** (+ vendored rbs 4.2.0; re-pinned 2026-09-25). Both
   standing exception tables EMPTY (`UNBUILDABLE_DEFINITIONS`, divergence registry
   — #437 retired); a new entry is a real finding, not maintenance (`UPSTREAM.md`
-  hazards + overlay/`sig/shims` trap). Version-guard folds against
-  `HOST_RUBY_VERSION` 4.0.5/`ruby` (`RIGOR_RUBY_VERSION`/`RIGOR_RUBY_ENGINE`) —
-  the oracle's host dependence, mirrored.
+  hazards + overlay/`sig/shims` trap). Version-guard folds mirror the oracle's
+  host dependence (`HOST_RUBY_VERSION` 4.0.5/`ruby`, `RIGOR_RUBY_*`).
 - Deferred RC deltas: interprocedural mutation floor (P6), plugin-only changes
   (no plugin engine); RC inference deltas in the compat plan (M2).
 
-State (verified 2026-09-26, at `e59b7b89`): harness **117 fixtures / 0
+State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
 unregistered extras / 0 registered divergences**, coverage 651/708; standing
-sweep **0 FP / 9,337 files / 3,829 gaps** (3,002 = #141), 8 corpora, baselines in
+sweep **0 FP / 9,337 files / 827 gaps** (#141 closed 3,002), 8 corpora, baselines in
 `harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). `--sweep` is a
 3-MINUTE gate again (upstream #874); read per-corpus MATCHED counts, not only FPs. Neither sweep tool sees project-`sig/` behaviour. Grading
 tools print binary path + build time and REFUSE one older than the rigor-cli
@@ -60,8 +59,8 @@ harness debug. Clippy: workspace `-D warnings`, FRESH `CARGO_TARGET_DIR`.
   rdoc is **93 rows**, all naming a class the port's RBS does not declare (vendoring
   it is anti-parity); plus `Class.new(X) do…end` bodies read at TOP-LEVEL scope,
   nested `def` never indexed, gvar/OpenStruct. **395 of 799 sit behind decisions;
-  the only mechanism above 13 rows is nested-scope receiver typing, 71 rows sized
-  with no build by LIFTING the block body to top level.**
+  biggest mechanism = nested-scope receiver typing, 71 rows, only unblocked by
+  lifting the block body to top level.**
 - **Five consecutive FP-safe flow slices closed 0 survey gaps** — never build a
   coverage slice without a valid-mode `fp_audit --gaps` prediction (AGENTS.md;
   [flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
@@ -70,7 +69,7 @@ harness debug. Clippy: workspace `-D warnings`, FRESH `CARGO_TARGET_DIR`.
   rule, and four slices closed **47 rows** on shapes the port already had signatures
   for. Pick from mechanism buckets; re-run `gap_census.py --sweep` after each — the
   gap set's SHAPE moves even when its total barely does.
-- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (2026-08-26 slice-4 probe). Four progressively stricter typer-free rules were MEASURED; the best is still 5 OVER on gitlab-foss/lib. Upstream's edge set IS the set of call nodes its typer visited, and that set is not characterisable — the blind positions depend on the condition FOLDING, sometimes THROUGH A CALL. The inversion that settles it: more edges ⇒ more TAINT (sound) but more edges ⇒ more LABELS (unsound), and `absorb` moves both in ONE pass. The ~2,000-method prize would need a registered-divergence device weakening the OVER gate — **REJECTED 2026-08-26: matching the reference outranks coverage**. Labels stay UNDER permanently; any future proposal must show it MATCHES the oracle, not merely scores better. [probe](notes/20260826-effects-s4-probe.md).
+- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (2026-08-26 s4). Four stricter typer-free rules measured; best still 5 OVER on gitlab-foss/lib. Upstream's edge set = the call nodes its typer visited, not characterisable (blind spots depend on condition folding, sometimes THROUGH A CALL). Inversion: more edges ⇒ more TAINT (sound) AND more LABELS (unsound); `absorb` moves both in one pass. **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER; proposals must MATCH the oracle. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen arc is closed** — byte-mismatch surface 0, `--write` sound;
   remaining items are thin coverage-only. Parity model: sound-superset
   (AGENTS.md "Generative-tool parity").
@@ -99,6 +98,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver — `declaration_prefix` re-anchors rooted/self::, multi-segment names = ONE rung, per-file `Object` slice keeps cross-file `unresolved-toplevel`. **3,002 gaps (→827), 0 FP**; fx 118; → #185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
 - **2026-09-26 #166 CLOSED** (PR #174): block/lambda params shadow toplevel locals — bound set = Prism `locals`; membership STRUCTURAL not span (heredoc `#{w=…}` = review FP). 0 FP; fx 116b. [note](notes/20260926-issue-166-block-param-shadow.md).
 - **2026-09-26 #165 CLOSED** (PR #175): `wrong-arity` declines on splat/kwarg/`...`; `&b`→#176. 0 FP; fx 116. [note](notes/20260926-issue-165-splat-arity.md).
 - **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 4 review rounds found 39 FP families no gate saw; **0 FP / 9,337, = master**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
