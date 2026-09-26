@@ -116,6 +116,26 @@ const NON_RETURNING_KERNEL_CALLS: &[&str] = &["raise", "fail", "throw", "exit", 
 /// A block-level jump the [`Typer::block_level_jumps`] scan collected: its
 /// span, its control-flow kind, and the lowered VALUE expressions of a valued
 /// `break e` / `next e` (empty for the argument-less forms).
+/// One union member's auto-splat arm — the `arm_of` half of the reference's
+/// `BlockAutoSplat` (rigor-rs#140).
+enum SplatArm {
+    /// `Array[T]` or a Tuple member — fills the fixed positions with its
+    /// element type; the second slot is the named `*r` rest element
+    /// (`Some` only for `Array[T]`; a Tuple leaves the `Array[Dynamic[top]]`
+    /// default, as in the reference's `tuple_table`).
+    Elem(TypeId, Option<TypeId>),
+    /// An array the table cannot decompose — a raw `Array`, an
+    /// `Array[untyped]`/`Array[top]`, or a `Dynamic` over any array — every
+    /// slot takes `Dynamic[top]`.
+    Opaque,
+    /// A `nil` member — fills every slot with `nil`, softened away whenever
+    /// a firm member fills the same slot.
+    Nilish,
+    /// Any other member — fills every slot with `Dynamic[top]` but does not
+    /// license the spread on its own.
+    Unknown,
+}
+
 struct BlockJump {
     span: rigor_parse::Span,
     kind: JumpKind,
@@ -2994,7 +3014,12 @@ impl<'i> Typer<'i> {
             // and the probe that pins it is `x.frobnicate_zzz` firing
             // `for "s"`. Everything else dispatches on the nil-stripped
             // receiver and unions the skipped-call nil back in.
-            if matches!(ast.get(receiver), Node::NilLit { .. }) {
+            // `(nil)` unwraps to `NilLit` but is NOT a `NilNode` in the
+            // reference's syntax-level reading — `(nil)&.tap` follows the
+            // inferred-nil path, not the literal fold (rigor-rs#140).
+            if matches!(ast.get(receiver), Node::NilLit { .. })
+                && !ast.paren_unwrapped(receiver)
+            {
                 return interner.intern(Type::Constant(Scalar::Nil));
             }
             let non_nil = self.narrow_non_nil(recv_ty, interner);
@@ -3784,9 +3809,23 @@ impl<'i> Typer<'i> {
     /// diagnostics exactly: probe `[1, 2].tap { |(f, w)| break f }; x.upcase`
     /// is silent in the reference while a concrete `1` binding would fire.
     /// `**kw` binds `Hash` and `&blk` binds `Proc` — the reference's nominal
-    /// answers for both. Later positionals, plain keywords, `_2..`, and
-    /// `|;local|` declarations stay unbound — the reference leaves them
-    /// `Dynamic[top]` too (a `|;local|` is bound nowhere, not even to `nil`).
+    /// answers for both. Plain keywords and `|;local|` declarations stay
+    /// unbound — the reference leaves them `Dynamic[top]` too (a `|;local|`
+    /// is bound nowhere, not even to `nil`).
+    ///
+    /// ## Auto-splat (`BlockAutoSplat`, upstream #1116/#1093)
+    ///
+    /// When the parameter list is one CRuby spreads a lone array argument
+    /// across (`ParameterShape.splats?` — a required/post positional, or two
+    /// optionals, except a bare `|a|`) AND the receiver carries an array
+    /// member, the positions bind from [`Self::block_splat_table`] instead:
+    /// `[1, 2].tap { |v, w| break v }` reads `v` as the array's element type
+    /// (`1 | 2`), not the whole `[1, 2]`. The element type the port binds is
+    /// the JOIN of a Tuple's members — the reference reaches the same shape
+    /// because its array literal is `Array[1 | 2]`, whose slots all take the
+    /// `1 | 2` element. Optimistic-slot bookkeeping does not port: the
+    /// observable answer it produces — `x = 1 | 2` declining the union rule
+    /// as a same-class join — the port's own union check already makes.
     #[allow(clippy::too_many_arguments)]
     fn block_entry_env(
         &self,
@@ -3799,18 +3838,99 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeEnv {
         let mut benv = env.clone();
+        // `ParameterShape.splats?` — the parameter-shape counts CRuby's
+        // `setup_parameters_complex` spreads on: `required + post > 0`, or
+        // more than one optional, minus the ambiguous `|a|` case. `Other`
+        // names are non-first destructure members; each contiguous group
+        // holds one positional slot (adjacent groups merge harmlessly — an
+        // undercount there can never produce the `mandatory == 1` boundary
+        // case the gate distinguishes).
+        let (mut required, mut optional, mut post, mut rest) = (0usize, 0usize, 0usize, false);
+        let mut counted_destructure = false;
+        let mut in_other_group = false;
+        for (_, kind) in block_params {
+            match kind {
+                BlockParamKind::SelfArg | BlockParamKind::RequiredArg => {
+                    required += 1;
+                    in_other_group = false;
+                }
+                BlockParamKind::DestructuredSelfArg => {
+                    if !counted_destructure {
+                        required += 1;
+                        counted_destructure = true;
+                    }
+                    in_other_group = true;
+                }
+                BlockParamKind::SelfOpt | BlockParamKind::OptionalArg => {
+                    optional += 1;
+                    in_other_group = false;
+                }
+                BlockParamKind::PostArg => {
+                    post += 1;
+                    in_other_group = false;
+                }
+                BlockParamKind::Other => {
+                    if !in_other_group {
+                        required += 1;
+                    }
+                    in_other_group = true;
+                }
+                BlockParamKind::Rest | BlockParamKind::ImplicitRest => {
+                    rest = true;
+                    in_other_group = false;
+                }
+                BlockParamKind::Keyword
+                | BlockParamKind::KwRest
+                | BlockParamKind::Block
+                | BlockParamKind::Local => {
+                    in_other_group = false;
+                }
+            }
+        }
+        let mandatory = required + post;
+        let splats = (mandatory > 0 || optional > 1) && !(mandatory == 1 && optional == 0 && !rest);
+        let splat = if splats {
+            self.block_splat_table(recv_ty, interner)
+        } else {
+            None
+        };
         for (name, kind) in block_params {
             benv.remove(name);
             let bound = match kind {
-                BlockParamKind::SelfArg => Some(recv_ty),
+                BlockParamKind::SelfArg | BlockParamKind::SelfOpt => {
+                    Some(match &splat {
+                        // A splatted optional slot takes `Dynamic[top]`; a
+                        // required/first-required slot takes the carrier's
+                        // element; no splat keeps the whole receiver.
+                        None => recv_ty,
+                        Some((slot, _)) if matches!(kind, BlockParamKind::SelfArg) => *slot,
+                        Some(_) => interner.untyped(),
+                    })
+                }
+                BlockParamKind::RequiredArg | BlockParamKind::PostArg => {
+                    splat.map(|(slot, _)| slot)
+                }
+                BlockParamKind::OptionalArg => splat.map(|_| interner.untyped()),
                 // Destructured names hide the outer name but bind no type —
                 // see the doc comment above for why the reference's
                 // optimistic Array-slot read declines either way.
-                BlockParamKind::DestructuredSelfArg => None,
-                BlockParamKind::Rest => Some(self.nominal_or_untyped("Array", interner)),
+                BlockParamKind::DestructuredSelfArg
+                | BlockParamKind::Other
+                | BlockParamKind::Keyword
+                | BlockParamKind::Local
+                | BlockParamKind::ImplicitRest => None,
+                BlockParamKind::Rest => Some(match &splat {
+                    Some((_, rest_elem)) => self
+                        .index
+                        .class_id("Array")
+                        .map(|class| {
+                            interner.intern(Type::Nominal { class, args: vec![*rest_elem] })
+                        })
+                        .unwrap_or_else(|| self.nominal_or_untyped("Array", interner)),
+                    None => self.nominal_or_untyped("Array", interner),
+                }),
                 BlockParamKind::KwRest => Some(self.nominal_or_untyped("Hash", interner)),
                 BlockParamKind::Block => Some(self.nominal_or_untyped("Proc", interner)),
-                BlockParamKind::Other | BlockParamKind::Local => None,
             };
             if let Some(ty) = bound {
                 benv.insert(name.clone(), ty);
@@ -3826,6 +3946,134 @@ impl<'i> Typer<'i> {
             }
         }
         benv
+    }
+
+    /// `BlockAutoSplat.for` (`block_auto_splat.rb`) over the port's type
+    /// shapes: the `(positional, rest-element)` pair a splatted block binds
+    /// when the one yielded value decomposes, or `None` when no receiver
+    /// member is an array carrier — a lone non-array carrier leaves the
+    /// declared binding alone (the first positional takes the whole value).
+    ///
+    /// Member arms (`arm_of`): a `Tuple` and an `Array[T]` both fill the
+    /// fixed positions with their element — for a `Tuple` the port joins the
+    /// members, matching the reference where an array literal types
+    /// `Array[1 | 2]` (a real per-position `Tuple` carrier is the one case
+    /// the join over-approximates, and only ever toward silence). An OPAQUE
+    /// carrier — a raw `Array`, an `Array[untyped]`/`Array[top]`, a
+    /// `Refined`/`Difference` over either, or a `Dynamic` over any array —
+    /// fills the positions with `Dynamic[top]`. A `nil` member contributes
+    /// `nil`, which drops out of any position a firm member fills (the
+    /// reference's cross-member softening). Every other member fills the
+    /// positions with `Dynamic[top]` but does not license the spread on its
+    /// own.
+    ///
+    /// The `rest` element is the member's element type only when EVERY
+    /// member supplies one (a sole `Array[T]`); the reference's named-rest
+    /// default `Array[Dynamic[top]]` stands otherwise.
+    fn block_splat_table(&self, recv_ty: TypeId, interner: &mut Interner) -> Option<(TypeId, TypeId)> {
+        let members: Vec<TypeId> = match interner.get(recv_ty).clone() {
+            Type::Union(m) => m,
+            _ => vec![recv_ty],
+        };
+        let arms: Vec<SplatArm> = members
+            .iter()
+            .map(|&m| self.splat_member_arm(m, interner))
+            .collect();
+        // `arms_of` — the spread needs at least one Tuple / Array / opaque
+        // carrier; a union of non-array members leaves the binding alone.
+        if !arms
+            .iter()
+            .any(|a| matches!(a, SplatArm::Elem(..) | SplatArm::Opaque))
+        {
+            return None;
+        }
+        let slot = if arms
+            .iter()
+            .any(|a| matches!(a, SplatArm::Opaque | SplatArm::Unknown))
+        {
+            interner.untyped()
+        } else {
+            let firm: Vec<TypeId> = arms
+                .iter()
+                .filter_map(|a| match a {
+                    SplatArm::Elem(t, _) => Some(*t),
+                    _ => None,
+                })
+                .collect();
+            firm.into_iter()
+                .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                .unwrap_or_else(|| interner.intern(Type::Constant(Scalar::Nil)))
+        };
+        // `join`'s named-rest rule: only when every member supplies one;
+        // otherwise the binder's `Array[Dynamic[top]]` default stands.
+        let rest_elems: Vec<TypeId> = arms
+            .iter()
+            .filter_map(|a| match a {
+                SplatArm::Elem(_, Some(r)) => Some(*r),
+                _ => None,
+            })
+            .collect();
+        let rest_elem = if rest_elems.len() == arms.len() && !arms.is_empty() {
+            rest_elems
+                .into_iter()
+                .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                .expect("non-empty")
+        } else {
+            interner.untyped()
+        };
+        Some((slot, rest_elem))
+    }
+
+    /// `arm_of` — one union member's auto-splat arm.
+    fn splat_member_arm(&self, ty: TypeId, interner: &mut Interner) -> SplatArm {
+        match interner.get(ty).clone() {
+            // A Tuple's port element is the join of its members — the shape
+            // the reference's `Array[union]` literal yields on every slot.
+            Type::Tuple(elems) => {
+                let slot = elems
+                    .into_iter()
+                    .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                    .unwrap_or_else(|| interner.untyped());
+                SplatArm::Elem(slot, None)
+            }
+            Type::Nominal { class, args }
+                if self.index.class_name_for_id(class) == Some("Array") =>
+            {
+                match args.as_slice() {
+                    // `array_element_type` declines an untyped / top element —
+                    // that carrier is OPAQUE, not `Elem(untyped)`.
+                    [t] => match interner.get(*t) {
+                        Type::Dynamic(_) | Type::Top => SplatArm::Opaque,
+                        _ => SplatArm::Elem(*t, Some(*t)),
+                    },
+                    _ => SplatArm::Opaque,
+                }
+            }
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                self.splat_member_arm(base, interner)
+            }
+            // `opaque_array_carrier?` — a `Dynamic` over ANY array carrier is
+            // opaque; over anything else it is just an unknown member.
+            Type::Dynamic(facet) => {
+                let members: Vec<TypeId> = match interner.get(facet).clone() {
+                    Type::Union(m) => m,
+                    _ => vec![facet],
+                };
+                let array_facet = members.iter().any(|&m| {
+                    matches!(
+                        self.splat_member_arm(m, interner),
+                        SplatArm::Elem(..) | SplatArm::Opaque
+                    )
+                });
+                if array_facet {
+                    SplatArm::Opaque
+                } else {
+                    SplatArm::Unknown
+                }
+            }
+            Type::Constant(Scalar::Nil) => SplatArm::Nilish,
+            _ => SplatArm::Unknown,
+        }
     }
 
     /// Whether `span` sits inside an `if`/`unless` branch the analysis proves
@@ -10622,6 +10870,48 @@ mod tests {
         assert!(
             matches!(i.get(ty), Type::Dynamic(_)),
             "a `;`-local arm must hide the outer binding, got {:?}",
+            i.get(ty)
+        );
+    }
+
+    #[test]
+    fn tap_block_param_autosplat() {
+        let idx = CoreIndex::new();
+        if !idx.class_has_method("Kernel", "tap") {
+            return;
+        }
+        // `|v, w|` over an array receiver spreads the element type across the
+        // positionals (`BlockAutoSplat`), so `break v` contributes the
+        // element union `1 | 2`, not the whole `[1, 2]` — the shape whose
+        // same-class union the rule declines (upstream #1116 probe row:
+        // `x.upcase` is silent in the reference).
+        let (i, ty) = bound_type(&idx, b"x = [1, 2].tap { |v, w| break v }\n", "x");
+        let Type::Union(members) = i.get(ty) else {
+            panic!("autosplatted arm must be the element union, got {:?}", i.get(ty));
+        };
+        let pins: Vec<i64> = members
+            .iter()
+            .filter_map(|&m| match i.get(m) {
+                Type::Constant(Scalar::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pins, vec![1, 2], "element union must pin 1 and 2, got {:?}", i.get(ty));
+        // A single-parameter `|v|` does NOT splat — `break v` keeps the
+        // receiver type (the ambiguous_param0 case of `splats?`).
+        let (i, ty) = bound_type(&idx, b"x = [1, 2].tap { |v| break v }\n", "x");
+        assert!(
+            idx.class_name_of(&i, ty) == Some("Array") || matches!(i.get(ty), Type::Tuple(_)),
+            "|v| must keep the receiver, got {:?}",
+            i.get(ty)
+        );
+        // A String receiver is not an array carrier — `|v, w|` leaves the
+        // first positional on the whole value.
+        let (i, ty) = bound_type(&idx, b"x = \"ab\".tap { |v, w| break v }\n", "x");
+        assert_eq!(
+            i.get(ty),
+            &Type::Constant(Scalar::Str("ab".to_string())),
+            "non-array receiver keeps the first positional on the value, got {:?}",
             i.get(ty)
         );
     }

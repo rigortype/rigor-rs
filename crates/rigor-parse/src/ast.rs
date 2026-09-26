@@ -929,6 +929,16 @@ pub enum Node {
     /// recorded DECLINE (probes `p16_next_with_value` / `p16b_break_with_value`
     /// — the reference narrows through them), not an oversight.
     Other { span: Span, jump: Option<JumpKind> },
+    /// `alias new_name old_name` (Prism `AliasMethodNode`). Both operands are
+    /// lowered so an interpolated name's calls stay reachable to the rule
+    /// walk; the def-attribution walk reads the literal symbol names through
+    /// `literal_method_name` (only a `SymbolLit` names a method — mirroring
+    /// `record_alias_method`'s `new_name.is_a?(Prism::SymbolNode)` gate).
+    Alias {
+        new_name: NodeId,
+        old_name: NodeId,
+        span: Span,
+    },
 }
 
 /// What a [`Node::Statements`] carrier is, for the passes that thread a local
@@ -992,30 +1002,59 @@ pub enum JumpKind {
 /// How one name in a literal block's parameter list binds — the tag half of
 /// [`Node::Call`]'s `block_params` (rigor-rs#140). `tap`/`then`/`yield_self`
 /// invoke their block as `yield self`, so the binding kind decides what the
-/// parameter's type is when a `break`/`next` arm reads it.
+/// parameter's type is when a `break`/`next` arm reads it. The kind also
+/// records which SLOT class a positional occupies — required, optional or
+/// post — so the entry env can apply the reference's `BlockAutoSplat` spread
+/// when the yielded value is array-shaped and the parameter list is one
+/// CRuby auto-splats (`splats?`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockParamKind {
-    /// The FIRST positional parameter — `|v|`, `|v = 1|`, `|v, w|`, the
-    /// implicit `it`, or `_1` — fed the receiver by a `yield self` yielder,
-    /// so it binds to the receiver's own type.
+    /// The FIRST positional parameter — `|v|`, `|v, w|`, the implicit `it`,
+    /// or `_1` — fed the receiver by a `yield self` yielder, so it binds to
+    /// the receiver's own type. Under an auto-splat it binds the carrier's
+    /// per-slot element type instead (a required slot).
     SelfArg,
+    /// The first positional when it is OPTIONAL (`|v = 1|` with no required
+    /// parameter ahead of it) — binds the receiver like [`SelfArg`], but
+    /// under an auto-splat the reference fills optional slots with
+    /// `Dynamic[top]`, not the element type.
+    SelfOpt,
     /// A name inside a destructured FIRST positional `|(v, w)|` — fed the
     /// receiver destructured, so it binds to the receiver's element type(s).
+    /// Counts as one required slot for `splats?`; the names themselves stay
+    /// unbound (the reference marks destructure slots optimistic).
     DestructuredSelfArg,
+    /// A non-first REQUIRED positional (`|v, w|`'s `w`), or a numbered
+    /// `_2.._9` parameter (the reference's `ParameterShape.of_arity` makes
+    /// every `_N` a required slot) — unbound without an auto-splat, bound to
+    /// the carrier's element type under one.
+    RequiredArg,
+    /// A non-first OPTIONAL positional (`|a = 1, b = 2|`'s `b`) — unbound
+    /// without an auto-splat, bound `Dynamic[top]` under one.
+    OptionalArg,
+    /// A post-rest positional (`|*r, z|`'s `z`) — unbound without an
+    /// auto-splat, bound to the carrier's element type under one.
+    PostArg,
+    /// A name inside a destructured NON-first positional — `|a, (x, y)|`'s
+    /// `x` and `y`, or the names of a post-rest destructure. Hidden from the
+    /// enclosing env but bound to nothing modeled; each contiguous group
+    /// occupies one positional slot for `splats?`.
+    Other,
     /// A `*rest` parameter — binds the leftover argument list, `Array[untyped]`
     /// for the exactly-once yielders (the reference binds
-    /// `Array[Dynamic[top]]`).
+    /// `Array[Dynamic[top]]`, or `Array[element]` under an `Array[T]` splat).
     Rest,
+    /// The anonymous rest of a `|v,|` trailing-comma parameter list (Prism's
+    /// `ImplicitRestNode`) — binds no name but counts as a rest for
+    /// `splats?`, which is what makes `|v,|` splat a lone array argument.
+    ImplicitRest,
+    /// A keyword parameter `|k:|` / `|k: 1|` — hidden from the enclosing
+    /// env but bound to nothing modeled, and contributes no positional slot.
+    Keyword,
     /// A `**kw` keyword-rest parameter — binds the captured keyword hash,
     /// `Hash` for the exactly-once yielders (the reference binds
     /// `Hash[Symbol, Dynamic[top]]`, which erases to the same nominal).
     KwRest,
-    /// Any other parameter — later positionals and posts, keyword
-    /// parameters, numbered `_2.._9` — hidden from the
-    /// enclosing env but bound to nothing modeled (a read types
-    /// `Dynamic[top]`, the answer the reference's own binder gives a
-    /// `|v, w|`'s `w` or a `|k:|`'s `k` under `yield self`).
-    Other,
     /// A `|;local|` block-local declaration — hidden from the enclosing env
     /// and left UNBOUND, exactly as the reference's binder declares it (a
     /// read types `Dynamic[top]`, not `nil`).
@@ -1065,7 +1104,8 @@ impl Node {
             | Node::ConstantWrite { span, .. }
             | Node::SelfExpr { span }
             | Node::Return { span, .. }
-            | Node::Other { span, .. } => *span,
+            | Node::Other { span, .. }
+            | Node::Alias { span, .. } => *span,
         }
     }
 }
@@ -1147,6 +1187,13 @@ pub struct LoweredAst {
     /// The spans of every [`StatementsKind::Inert`] carrier, for
     /// [`LoweredAst::in_inert_carrier`].
     inert_spans: Vec<Span>,
+    /// Nodes a single-statement `(e)` parens was UNWRAPPED to. The reference
+    /// reads the receiver's SYNTAX node — `(nil)` is a `ParenthesesNode`, not
+    /// a `NilNode` — so a consumer that discriminates literal syntax (the
+    /// `nil&.m` fold) must decline on these ids even though the inner node is
+    /// a literal. Sorted for a binary-search read via
+    /// [`LoweredAst::paren_unwrapped`].
+    paren_unwrapped: Vec<u32>,
 }
 
 /// One site where a CONSTANT-shaped receiver is mutated — the raw material of
@@ -1232,6 +1279,16 @@ impl LoweredAst {
         self.inert_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
 
+    /// Whether `id` is a node a `(e)` single-statement parens unwrapped to —
+    /// the reference's syntax-level test (`ParenthesesNode` is not `NilNode`)
+    /// a literal-discriminating consumer must honor. See
+    /// [`Self::paren_unwrapped`].
+    pub fn paren_unwrapped(&self, id: NodeId) -> bool {
+        self.paren_unwrapped
+            .binary_search(&id.0)
+            .is_ok()
+    }
+
     /// Resolve a handle to its owned node.
     pub fn get(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
@@ -1289,6 +1346,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         nodes: Vec::new(),
         source,
         line_starts,
+        paren_unwrapped: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -1308,6 +1366,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
             _ => None,
         })
         .collect();
+    let mut paren_unwrapped = builder.paren_unwrapped;
+    paren_unwrapped.sort_unstable();
     LoweredAst {
         nodes: builder.nodes,
         root,
@@ -1315,6 +1375,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         const_mutations,
         local_read_starts,
         inert_spans,
+        paren_unwrapped,
     }
 }
 
@@ -1325,6 +1386,9 @@ struct Builder<'src> {
     source: &'src [u8],
     /// Byte offset of every line start (index 0 = line 1).
     line_starts: Vec<usize>,
+    /// Arena ids a `(e)` unwrap returned — see
+    /// [`LoweredAst::paren_unwrapped`].
+    paren_unwrapped: Vec<u32>,
 }
 
 impl<'src> Builder<'src> {
@@ -2220,6 +2284,10 @@ impl<'src> Builder<'src> {
             // which the wrapper types as Dynamic — unchanged).
             let body = self.lower_optional_body(parens.body().as_ref());
             if let [only] = body[..] {
+                // Mark the unwrapped id: `(nil)` is NOT a NilNode in the
+                // reference's syntax-level reading, so the `nil&.m` literal
+                // fold must not see through the parens.
+                self.paren_unwrapped.push(only.0);
                 return only;
             }
             let main_body = body.clone();
@@ -2399,6 +2467,19 @@ impl<'src> Builder<'src> {
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
             return self.push(Node::Return { values, span });
+        }
+
+        if let Some(alias) = node.as_alias_method_node() {
+            // `alias new old` — the operand expressions are lowered so calls
+            // inside interpolated names stay reachable; `record_alias_method`'s
+            // name extraction reads `SymbolLit`/`StringLit` back off them.
+            let new_name = self.lower_node(&alias.new_name());
+            let old_name = self.lower_node(&alias.old_name());
+            return self.push(Node::Alias {
+                new_name,
+                old_name,
+                span,
+            });
         }
 
         // `next` / `break` / `redo` / `retry`. An ARGUMENT-LESS `next` / `break`
@@ -3223,28 +3304,55 @@ fn block_param_names(bn: &ruby_prism::BlockNode<'_>) -> Vec<(String, BlockParamK
     if let Some(bp) = params.as_block_parameters_node() {
         if let Some(p) = bp.parameters() {
             // The first POSITIONAL entry (required or optional) is the one a
-            // `yield self` call feeds — later positionals, the rest and the
-            // posts bind to `Other`/`Rest`.
+            // `yield self` call feeds. Each later positional keeps its SLOT
+            // class (required / optional / post) so the block-entry env can
+            // apply the reference's `BlockAutoSplat` when the receiver is
+            // array-shaped and the parameter list is one CRuby splats.
             let mut first_positional_taken = false;
             for req in p.requireds().iter() {
-                push_block_positional(&req, &mut first_positional_taken, &mut out);
+                push_block_positional(
+                    &req,
+                    &mut first_positional_taken,
+                    BlockParamKind::RequiredArg,
+                    &mut out,
+                );
             }
             for opt in p.optionals().iter() {
-                push_block_positional(&opt, &mut first_positional_taken, &mut out);
+                push_block_positional(
+                    &opt,
+                    &mut first_positional_taken,
+                    BlockParamKind::OptionalArg,
+                    &mut out,
+                );
             }
-            if let Some(rest) = p.rest().and_then(|n| n.as_rest_parameter_node()) {
-                if let Some(name) = rest.name() {
-                    out.push((constant_string(name.as_slice()), BlockParamKind::Rest));
+            // `rest` may be a named/anonymous `*r` (`RestParameterNode`) or
+            // the trailing-comma `|v,|` (`ImplicitRestNode`) — the latter
+            // binds no name but still counts as a rest for `splats?`.
+            match p.rest() {
+                Some(rest) => {
+                    if let Some(r) = rest.as_rest_parameter_node() {
+                        if let Some(name) = r.name() {
+                            out.push((
+                                constant_string(name.as_slice()),
+                                BlockParamKind::Rest,
+                            ));
+                        } else {
+                            out.push((String::new(), BlockParamKind::ImplicitRest));
+                        }
+                    } else if rest.as_implicit_rest_node().is_some() {
+                        out.push((String::new(), BlockParamKind::ImplicitRest));
+                    }
                 }
+                None => {}
             }
             for post in p.posts().iter() {
                 push_block_other_positional(&post, &mut out);
             }
             for kw in p.keywords().iter() {
                 if let Some(kwr) = kw.as_required_keyword_parameter_node() {
-                    out.push((keyword_param_name(kwr.name().as_slice()), BlockParamKind::Other));
+                    out.push((keyword_param_name(kwr.name().as_slice()), BlockParamKind::Keyword));
                 } else if let Some(kwo) = kw.as_optional_keyword_parameter_node() {
-                    out.push((keyword_param_name(kwo.name().as_slice()), BlockParamKind::Other));
+                    out.push((keyword_param_name(kwo.name().as_slice()), BlockParamKind::Keyword));
                 }
             }
             if let Some(kwr) = p.keyword_rest().and_then(|n| n.as_keyword_rest_parameter_node()) {
@@ -3274,12 +3382,14 @@ fn block_param_names(bn: &ruby_prism::BlockNode<'_>) -> Vec<(String, BlockParamK
         // `{ it }` — the implicit single parameter is fed the receiver.
         out.push(("it".to_string(), BlockParamKind::SelfArg));
     } else if let Some(np) = params.as_numbered_parameters_node() {
-        // `{ _1 + _2 }` — `_1` is fed the receiver; `_2..` bind nothing a
-        // one-argument yield provides.
+        // `{ _1 + _2 }` — every `_N` is a REQUIRED positional in the
+        // reference's `ParameterShape.of_arity`, so `_2..` are
+        // `RequiredArg`: they auto-splat an array receiver exactly as
+        // `|a, b|` does.
         for i in 1..=np.maximum() {
             out.push((
                 format!("_{i}"),
-                if i == 1 { BlockParamKind::SelfArg } else { BlockParamKind::Other },
+                if i == 1 { BlockParamKind::SelfArg } else { BlockParamKind::RequiredArg },
             ));
         }
     }
@@ -3290,15 +3400,19 @@ fn block_param_names(bn: &ruby_prism::BlockNode<'_>) -> Vec<(String, BlockParamK
 /// or `OptionalParameterNode` binds its single name; a `MultiTargetNode` (a
 /// destructured `|(v, w)|`) binds every nested local-target name. The FIRST
 /// positional is a `yield self` argument ([`BlockParamKind::SelfArg`] /
-/// [`BlockParamKind::DestructuredSelfArg`]); every later one is [`BlockParamKind::Other`].
+/// [`BlockParamKind::SelfOpt`] / [`BlockParamKind::DestructuredSelfArg`]);
+/// every later one keeps its slot class (`later_kind` — `RequiredArg` /
+/// `OptionalArg`), except a nested destructure, whose names bind
+/// [`BlockParamKind::Other`].
 fn push_block_positional(
     node: &PrismNode<'_>,
     first_positional_taken: &mut bool,
+    later_kind: BlockParamKind,
     out: &mut Vec<(String, BlockParamKind)>,
 ) {
     if let Some(req) = node.as_required_parameter_node() {
         let kind = if *first_positional_taken {
-            BlockParamKind::Other
+            later_kind
         } else {
             BlockParamKind::SelfArg
         };
@@ -3306,9 +3420,9 @@ fn push_block_positional(
         out.push((constant_string(req.name().as_slice()), kind));
     } else if let Some(opt) = node.as_optional_parameter_node() {
         let kind = if *first_positional_taken {
-            BlockParamKind::Other
+            later_kind
         } else {
-            BlockParamKind::SelfArg
+            BlockParamKind::SelfOpt
         };
         *first_positional_taken = true;
         out.push((constant_string(opt.name().as_slice()), kind));
@@ -3325,11 +3439,12 @@ fn push_block_positional(
 }
 
 /// A NON-first positional — a post-parameter (`|*r, z|`'s `z`) or a nested
-/// destructured group behind the first. Every name binds [`BlockParamKind::Other`]:
-/// a `yield self` call has no second argument to feed it.
+/// destructured group behind the first. A single name binds
+/// [`BlockParamKind::PostArg`]; a destructure's names bind
+/// [`BlockParamKind::Other`].
 fn push_block_other_positional(node: &PrismNode<'_>, out: &mut Vec<(String, BlockParamKind)>) {
     if let Some(req) = node.as_required_parameter_node() {
-        out.push((constant_string(req.name().as_slice()), BlockParamKind::Other));
+        out.push((constant_string(req.name().as_slice()), BlockParamKind::PostArg));
     } else if let Some(mt) = node.as_multi_target_node() {
         multi_target_names(&mt.as_node(), out, BlockParamKind::Other);
     }

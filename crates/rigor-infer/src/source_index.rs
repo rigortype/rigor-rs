@@ -1708,6 +1708,48 @@ impl SourceIndex {
         None
     }
 
+    /// `discovered_method_through_ancestors?` (upstream `check_rules.rb`
+    /// `ancestry_declares_method?`, asked late from
+    /// `last_resort_surface_answers?`): whether the instance method `method`
+    /// is project-declared on `class_name` OR on any project ancestor —
+    /// included / prepended modules first, then the superclass, in
+    /// [`Self::override_ancestor_names`]'s MRO order. `file` threads the same
+    /// per-file contract as [`Self::project_declares_method`]: a cross-file
+    /// `def` on an ancestor stays invisible (the ADR-17 monkey-patch case)
+    /// while a cross-file macro (`attr_reader` in `lib/b.rb`) still counts.
+    ///
+    /// Past [`OVERRIDE_ANCESTOR_WALK_LIMIT`] returns `true`, mirroring the
+    /// reference exactly: budget exhaustion is uncertainty, and "not
+    /// declared" would hand `call.undefined-method` a fired verdict it has
+    /// no evidence for (suppression is the safe side).
+    pub fn project_declares_method_through_ancestors(
+        &self,
+        file: Option<&FileKey>,
+        class_name: &str,
+        method: &str,
+    ) -> bool {
+        let mut queue: Vec<String> = vec![class_name.to_string()];
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut visited = 0usize;
+        while !queue.is_empty() {
+            let current = queue.remove(0);
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            visited += 1;
+            if visited > OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return true;
+            }
+            if self.project_declares_method(file, &current, method) {
+                return true;
+            }
+            for next in self.override_ancestor_names(&current) {
+                queue.push(next);
+            }
+        }
+        false
+    }
+
     /// The direct PROJECT ancestors of the QUALIFIED `class`, resolved + ordered:
     /// each `include` / `prepend` (in source order) FIRST, then the `superclass`
     /// — Ruby's MRO ordering. Names that resolve to no project class (RBS /
@@ -3072,6 +3114,18 @@ fn walk_defs(
                 walk_defs(ast, declared, tables, visited, *value, cx);
             }
         }
+        Node::Alias {
+            new_name, old_name, ..
+        } => {
+            // `record_alias_method` — the `alias` keyword registers the NEW
+            // name under the effective owner exactly like `alias_method :n, :o`
+            // does; `apply_alias_def_nodes` adoption rides `pending_aliases`
+            // the same way (an `alias` of a `def` is per-file, an `alias` of a
+            // core method stays in the cross-file seed). The reference returns
+            // WITHOUT descending into the operands — a `def` buried in an
+            // interpolated name files nowhere here.
+            file_alias(cx, ast, *new_name, *old_name, tables);
+        }
         node => {
             let mut children = Vec::new();
             def_walk_children(node, &mut children);
@@ -3178,6 +3232,59 @@ fn file_def(
         if let Some(nm) = receiver_def_name {
             file_instance(nm);
         }
+    }
+}
+
+/// File one `alias new old` — the `AliasMethodNode` arm of
+/// `record_alias_or_undef`. The NEW name joins the instance-kind existence
+/// table under the effective owner whenever `new_name` is a literal symbol,
+/// with the same owner/side gates as [`file_def`] (`unnameable`, explicit-
+/// empty override, `qualified_prefix.empty?`, singleton-side), and the same
+/// `pending_aliases` queueing as `alias_method`: an `old` that names a `def`
+/// hands `new` its def node, which `subtract_def_methods` then strips from
+/// the cross-file seed — a def-backed alias is per-file like the def it wraps,
+/// while `alias zz upcase` (a core-method target) stays cross-file.
+fn file_alias(
+    cx: &DefCx,
+    ast: &LoweredAst,
+    new_name: NodeId,
+    old_name: NodeId,
+    tables: &mut DefTables,
+) {
+    if cx.defs_side == DefsSide::Unnameable {
+        return;
+    }
+    let owner: &[String] = match &cx.owner {
+        Some(o) if o.is_empty() => return,
+        Some(o) => o,
+        None => &cx.lexical,
+    };
+    if cx.singleton_cref && owner.is_empty() {
+        return;
+    }
+    // `return if qualified_prefix.empty?` — a toplevel `alias` records nothing
+    // in the reference's class-keyed table either.
+    if owner.is_empty() {
+        return;
+    }
+    // `in_singleton_class || defs_singleton` ⇒ `:singleton` kind — the port's
+    // instance-side table files it nowhere, exactly like [`file_def`].
+    if cx.defs_side != DefsSide::Instance {
+        return;
+    }
+    // `record_alias_method` registers the new name only when it is a literal
+    // `Prism::SymbolNode` — `literal_method_name` reads `SymbolLit`/`StringLit`.
+    let Some(new) = literal_method_name(ast, new_name) else {
+        return;
+    };
+    let key = owner.join("::");
+    tables.macro_methods.entry(key.clone()).or_default().insert(new.clone());
+    tables.file_methods.entry(key.clone()).or_default().insert(new.clone());
+    if key == "Object" {
+        tables.file_toplevel.insert(new.clone());
+    }
+    if let Some(old) = literal_method_name(ast, old_name) {
+        tables.pending_aliases.push((key, new, old));
     }
 }
 
@@ -6634,12 +6741,14 @@ mod probes_s92 {
         println!("names = {:?}", idx.names);
     }
 
-    /// PROBE 7 — the `names` (ClassId) ORDER LEAK CHANNEL. `Interner::cmp`
-    /// canonicalises union members by `ClassId` for `Nominal`/`Singleton`
-    /// (`crates/rigor-types/src/interner.rs:135,137`) and `named_union` renders
-    /// members in that canonical order (`crates/rigor-types/src/display.rs:446`
-    /// — only `nil` floats to the end). So file order → registration order →
-    /// ClassId order → rendered union order.
+    /// PROBE 7 — the `names` (ClassId) ORDER LEAK CHANNEL, now CLOSED at the
+    /// renderer. `Interner::cmp` still canonicalises union members by
+    /// `ClassId` for `Nominal`/`Singleton` (`crates/rigor-types/src/
+    /// interner.rs:135,137`), but `named_union` now sorts members by their
+    /// rendered short description — the reference's `Union#describe`
+    /// (`members.sort_by { |m| m.describe(:short) }`) — so file order →
+    /// registration order → ClassId order no longer reaches the rendered
+    /// union.
     #[test]
     fn probe_classid_order_reaches_union_rendering() {
         use rigor_types::{Algebra, Type};
@@ -6666,9 +6775,10 @@ mod probes_s92 {
         println!("order [b,a]: Alpha={ida} Beta={idb} union renders as {sba:?}");
         assert!(ida > idb);
         assert_eq!(
-            sba, "Beta | Alpha",
-            "the ClassId channel is LIVE: the merge closes it by assigning ids in \
-             file order, not by the rendering being order-free"
+            sba, "Alpha | Beta",
+            "the ClassId channel is CLOSED: members sort by rendered short \
+             description (the reference's `Union#describe`), so the same \
+             union renders identically regardless of registration order"
         );
     }
 

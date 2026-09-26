@@ -1688,6 +1688,17 @@ fn check_call(
     if typer.source().project_declares_method(typer.file_key(), class_name, method) {
         return None;
     }
+    // `last_resort_surface_answers?`'s `ancestry_declares_method?` — the same
+    // question asked through the project's OWN ancestry (`class String;
+    // include M` makes `String#m` exist for Rigor without touching RBS).
+    // Asked last, exactly like the reference: this is the one probe that
+    // walks the class graph.
+    if typer
+        .source()
+        .project_declares_method_through_ancestors(typer.file_key(), class_name, method)
+    {
+        return None;
+    }
 
     // We have witnessed absence over a core/RBS class. Render the receiver in the
     // reference's spelling (value-pinned for a Constant/Tuple, else the class
@@ -1766,8 +1777,11 @@ fn check_union_call(
         if !index.knows_class(class_name) {
             return None;
         }
-        if typer.source().project_declares_method(class_name, method)
+        if typer.source().project_declares_method(typer.file_key(), class_name, method)
             || index.class_has_method(class_name, method)
+            || typer
+                .source()
+                .project_declares_method_through_ancestors(typer.file_key(), class_name, method)
         {
             return None;
         }
