@@ -312,6 +312,11 @@ pub struct Typer<'i> {
     /// every use site reads as toplevel, so only TOPLEVEL project definitions
     /// suppress, matching the conservative default.
     lexical_scopes: &'i [(rigor_parse::Span, Vec<String>)],
+    /// The analyzed file's [`rigor_parse::FileKey`] — the per-file
+    /// def-attribution overlay index (`SourceIndex::project_declares_method`
+    /// / `is_toplevel_def` consult `file_defs` through it). `None` for callers
+    /// that do not set it ⇒ the union-over-all-files answer.
+    file_key: Option<&'i rigor_parse::FileKey>,
 }
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a
@@ -322,13 +327,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -339,7 +344,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from
@@ -352,6 +357,18 @@ impl<'i> Typer<'i> {
     ) -> Self {
         self.lexical_scopes = scopes;
         self
+    }
+
+    /// Attach the analyzed file's [`rigor_parse::FileKey`] so the
+    /// source-index def queries resolve its per-file overlay.
+    pub fn with_file_key(mut self, key: &'i rigor_parse::FileKey) -> Self {
+        self.file_key = Some(key);
+        self
+    }
+
+    /// The analyzed file's [`rigor_parse::FileKey`], `None` when unset.
+    pub fn file_key(&self) -> Option<&rigor_parse::FileKey> {
+        self.file_key
     }
 
     /// C5: re-intern a harvested [`ConstLit`] against the local interner into the

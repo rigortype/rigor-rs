@@ -41,7 +41,7 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rigor_index::CoreIndex;
-use rigor_parse::{FileKey, LoweredAst, MethodBody, Node, NodeId, Visibility};
+use rigor_parse::{FileKey, LoweredAst, MethodBody, Node, NodeId, Span, Visibility};
 use rigor_types::{ClassId, Interner, Scalar, ShapeKey};
 
 /// C5 (const-literal harvest): an owned, interner-INDEPENDENT representation of a
@@ -372,13 +372,42 @@ struct HarvestedFoldDef {
 /// Nothing derived from OTHER files is in here — the literal-constant gates, the
 /// declaration-only set, the tier-4b returns, the definers inversion and the
 /// interprocedural fold are all computed by the merge.
+/// One file's slice of the def-attribution tables — the reference's per-file
+/// `file_methods` overlay plus the `Object`-owner names a bare call resolves.
+/// [`SourceIndex`] keeps these index-aligned with the merge's `files` order
+/// and the rules pass the analyzed file's position in.
+#[derive(Clone, Debug, Default)]
+pub struct FileDefs {
+    /// Instance-kind method names this file's own defs and macros bind on
+    /// `Object` — the per-file half of `call.unresolved-toplevel`'s
+    /// `Object`-reopen suppression. (`source_declared_method?` reads
+    /// `Object` through the per-file overlay too, so `Object.class_eval
+    /// { def m }` resolves `m` ONLY in the file that declares it.)
+    pub toplevel: HashSet<String>,
+    /// Qualified owner -> instance-kind method names this file declares
+    /// (defs AND call-introduced) — the reference's per-file
+    /// `file_methods` deep-merged over the def-stripped cross-file seed.
+    pub methods: HashMap<String, HashSet<String>>,
+}
+
 #[derive(Default)]
 pub struct Harvest {
     // --- pure unions (order-free) ------------------------------------------
     /// Pass 1c: this file's toplevel `def` names ⇒ `toplevel_defs`.
     toplevel_defs: HashSet<String>,
-    /// Pass 1d: qualified owner -> this file's own `def` names ⇒ per-key union.
-    discovered_methods: HashMap<String, HashSet<String>>,
+    /// Pass 1d, cross-file half: CALL-INTRODUCED instance-method names per
+    /// qualified owner (`define_method`/`attr_*`/module-attr/`alias_method`)
+    /// ⇒ `discovered_methods` after the merge's `subtract_def_methods`.
+    macro_methods: HashMap<String, HashSet<String>>,
+    /// Pass 1d, subtraction set: instance-kind names carrying a `def` node
+    /// (incl. `alias`-of-def names) ⇒ the names the merge removes from the
+    /// cross-file `discovered_methods` (`subtract_def_methods`: a cross-file
+    /// `def` is the ADR-17 monkey-patch case the check surfaces).
+    def_names: HashMap<String, HashSet<String>>,
+    /// Pass 1d, per-file half: this file's own instance-kind existence
+    /// overlay (defs AND macros) plus its `Object`-owner slice — replays
+    /// index-aligned into [`SourceIndex::file_defs`].
+    file_defs: FileDefs,
     /// Pass 1e: method name -> mutated positional param indices ⇒ per-key union.
     mutated_params: HashMap<String, HashSet<usize>>,
     /// Stage 2b: the BARE name of every constant this file writes ⇒
@@ -554,7 +583,27 @@ pub struct SourceIndex {
     /// chain walk and tier-4b harvest): this map is a pure SILENCER — it is only
     /// ever read to suppress, never to witness absence — so widening it to nested
     /// defs cannot manufacture a diagnostic.
+    ///
+    /// Two layers, mirroring the reference (`finalize_def_index` +
+    /// `seed_discovered_methods`): this map holds the CROSS-FILE seed —
+    /// call-introduced names minus every name a project `def` declares
+    /// (`subtract_def_methods`: a cross-file `def` is the ADR-17
+    /// monkey-patch case the check surfaces) — while [`Self::file_defs`]
+    /// carries each file's own overlay (defs and macros), which
+    /// [`Self::project_declares_method`] consults for the analyzed file.
+    /// Singleton-kind names (`def self.x`, `class <<`, `instance_eval` defs)
+    /// are filed NEITHER place (the reference stamps them `:singleton`; the
+    /// port's consumers only ever ask `:instance`).
     discovered_methods: HashMap<String, HashSet<String>>,
+    /// The per-file def-attribution overlay, index-aligned with the `files`
+    /// order [`Self::merge`] receives (and `asts` order for
+    /// [`Self::build_project`]). The rules pass the analyzed file's position
+    /// as `file` into [`Self::is_toplevel_def`] /
+    /// [`Self::project_declares_method`].
+    file_defs: Vec<FileDefs>,
+    /// Analyzed file [`rigor_parse::FileKey`] → its index in
+    /// [`Self::file_defs`], built alongside the vector in [`Self::merge`].
+    file_index: HashMap<FileKey, usize>,
     /// PROJECT-WIDE `method name -> the POSITIONAL PARAMETER INDICES its body
     /// mutates in place`. A parameter is "mutated" when the body calls a
     /// [`crate::MUTATOR_METHODS`] method on a bare read of it (`def fill(a); a <<
@@ -675,75 +724,57 @@ impl SourceIndex {
         // no other rule is affected.
         collect_override_classes(ast, ast.root(), &[], &mut h.override_classes);
 
-        // Pass 1c (ADR-34): PROJECT-WIDE toplevel method names for
-        // `call.unresolved-toplevel`. A `def` OUTSIDE any class/module body is a
-        // toplevel def (an Object private method); an in-source reopen of
-        // Object/Kernel/BasicObject injects toplevel-callable methods too. Toplevel
-        // detection is span-containment against the file's class/module spans
-        // (orphan-proof) — a WITHIN-file comparison, which is why the pass is
-        // per-file. The merge unions across files so a `def` in one file resolves
-        // a call in another (the reference's project-mode resolution).
-        let scope_spans: Vec<rigor_parse::Span> = ast
-            .iter()
-            .filter_map(|(_, n)| match n {
-                Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => Some(*span),
-                _ => None,
-            })
-            .collect();
-        for (_, node) in ast.iter() {
-            match node {
-                Node::Definition { name: Some(nm), span, .. }
-                    if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
-                {
-                    h.toplevel_defs.insert(nm.clone());
+        // Passes 1c + 1d (ADR-34; upstream `fb781023` / rigortype/rigor#1135 /
+        // issue #141): PROJECT-WIDE toplevel method names (`toplevel_defs`,
+        // for `call.unresolved-toplevel`) and per-class instance-method
+        // declarations (`discovered_methods`) in ONE def-attribution walk —
+        // the port of `walk_methods_and_def_nodes`. A `def`'s owner is not
+        // always its lexical enclosure: inside `Recv.class_eval { def m }`
+        // `m` belongs to `Recv` (it is NOT a toplevel def), inside
+        // `K = Class.new { def m }` it belongs to `K`, inside an anonymous
+        // factory block it stays toplevel (#319), and only an `Object` owner
+        // collapses back to bare-callable. The merge still unions across
+        // files so a `def` in one file resolves a call in another.
+        let declared = collect_declared_names(ast);
+        let mut tables = DefTables::default();
+        let mut visited = HashSet::new();
+        walk_defs(
+            ast,
+            &declared,
+            &mut tables,
+            &mut visited,
+            ast.root(),
+            &def_root_cx(),
+        );
+        // Orphan positions: defs lowered into the arena WITHOUT a child edge
+        // `walk_defs` follows (range endpoints, def receivers, parameter
+        // defaults, dynamic constant-path parents). The reference's
+        // Prism-child walk reaches them; the port mirrors it span-wise.
+        file_orphan_defs(ast, &declared, &visited, &mut tables);
+        // `apply_alias_def_nodes`: an `alias_method :new, :old` whose `old`
+        // names a `def` hands the new name `old`'s def node — which the
+        // merge's `subtract_def_methods` then strips cross-file. Resolving
+        // against the COMPLETE per-file def table keeps it order-free.
+        for (key, new_name, old_name) in std::mem::take(&mut tables.pending_aliases) {
+            if tables.def_names.get(&key).is_some_and(|defs| defs.contains(&old_name)) {
+                tables.def_names.entry(key.clone()).or_default().insert(new_name.clone());
+                tables
+                    .file_methods
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(new_name.clone());
+                if key == "Object" {
+                    tables.file_toplevel.insert(new_name);
                 }
-                // A TOPLEVEL receiver-bearing `def Foo.bar` registers `bar`
-                // as a toplevel name too. That is not Ruby's runtime
-                // semantics — `bar` is on `Foo`'s singleton — but it is the
-                // reference's: `ScopeIndexer#record_def_node` keys a def
-                // under `<toplevel>` whenever its lexical prefix is empty,
-                // and `def_singleton?` excludes only a `self` receiver and a
-                // receiver naming the lexically enclosing class (impossible
-                // with an empty prefix). Parity is the contract, so rigor-rs
-                // matches it: rigor-survey `io-console-0.8.2`'s `size.rb`
-                // calls `default_console_size` from inside `def
-                // IO.console_size`, where the reference is silent.
-                // `def self.x` at toplevel is NOT registered (the reference
-                // excludes it, and so does this arm — a self receiver leaves
-                // `receiver_def_name` `None`, see the lowering).
-                Node::Definition { receiver_def_name: Some(nm), span, .. }
-                    if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
-                {
-                    h.toplevel_defs.insert(nm.clone());
-                }
-                Node::ClassDef { name, methods, .. } | Node::ModuleDef { name, methods, .. }
-                    if matches!(name.as_str(), "Object" | "Kernel" | "BasicObject") =>
-                {
-                    h.toplevel_defs.extend(methods.iter().cloned());
-                }
-                _ => {}
             }
         }
-
-        // Pass 1d: the project's own instance-method declarations per QUALIFIED
-        // class/module (`discovered_methods`), the port of the reference's
-        // `Scope#discovered_method?` suppression gate. A def counts for the
-        // INNERMOST lexical class/module whose span contains it, so a def in a
-        // block or a conditional inside the body still lands on the right class
-        // and a def in a nested class does not leak to the outer one.
-        let scopes = lexical_scopes(ast);
-        for (_, node) in ast.iter() {
-            let Node::Definition { name: Some(nm), span, .. } = node else {
-                continue;
-            };
-            let innermost = scopes
-                .iter()
-                .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
-                .min_by_key(|(s, _)| s.1 - s.0);
-            if let Some((_, segs)) = innermost {
-                h.discovered_methods.entry(segs.join("::")).or_default().insert(nm.clone());
-            }
-        }
+        h.toplevel_defs = std::mem::take(&mut tables.toplevel);
+        h.macro_methods = std::mem::take(&mut tables.macro_methods);
+        h.def_names = std::mem::take(&mut tables.def_names);
+        h.file_defs = FileDefs {
+            toplevel: std::mem::take(&mut tables.file_toplevel),
+            methods: std::mem::take(&mut tables.file_methods),
+        };
 
         // Pass 1e: the caller-side half of `MutationWidening` — which positional
         // parameter of each project method the method mutates in place. See
@@ -908,17 +939,28 @@ impl SourceIndex {
             }
         }
 
-        // Passes 1c / 1d / 1e + stage 2b's bare-name set: pure unions. Order-free
-        // (commutative + idempotent), merged in file order anyway.
-        for (h, _) in files {
+        // Passes 1c / 1d / 1e + stage 2b's bare-name set: unions — the two
+        // def-attribution halves need the COMPLETE project census before the
+        // `subtract_def_methods` barrier, so the union collects both tables
+        // first and subtracts once (order-free either way).
+        let mut union_def_names: HashMap<String, HashSet<String>> = HashMap::new();
+        for (i, (h, ast)) in files.iter().enumerate() {
             let h = h.borrow();
+            idx.file_index.insert(ast.file_key().clone(), i);
             idx.toplevel_defs.extend(h.toplevel_defs.iter().cloned());
-            for (owner, methods) in &h.discovered_methods {
+            for (owner, methods) in &h.macro_methods {
                 idx.discovered_methods
                     .entry(owner.clone())
                     .or_default()
                     .extend(methods.iter().cloned());
             }
+            for (owner, defs) in &h.def_names {
+                union_def_names
+                    .entry(owner.clone())
+                    .or_default()
+                    .extend(defs.iter().cloned());
+            }
+            idx.file_defs.push(h.file_defs.clone());
             for (method, indices) in &h.mutated_params {
                 idx.mutated_params
                     .entry(method.clone())
@@ -927,6 +969,24 @@ impl SourceIndex {
             }
             idx.project_constant_write_names.extend(h.constant_write_bare_names.iter().cloned());
         }
+        // `subtract_def_methods` (`finalize_def_index`): cross-file method
+        // suppression is for the project's OWN accessors/aliases — NOT plain
+        // `def`s, a cross-file `def` being the ADR-17 monkey-patch case the
+        // check surfaces. The `Object` slice feeds `toplevel_defs` under the
+        // same rule — an `Object.class_eval { attr_reader :a }` name is
+        // bare-callable in EVERY file, while an `Object.class_eval { def a }`
+        // name is per-file only (it lives in `file_defs.toplevel`).
+        for (owner, defs) in &union_def_names {
+            if let Some(methods) = idx.discovered_methods.get_mut(owner) {
+                methods.retain(|m| !defs.contains(m));
+            }
+        }
+        let object_macros: Vec<String> = idx
+            .discovered_methods
+            .get("Object")
+            .map(|ms| ms.iter().cloned().collect())
+            .unwrap_or_default();
+        idx.toplevel_defs.extend(object_macros);
 
         // Pass 2: register the RBS-known constant reads. Runs AFTER Pass 1's
         // registrations, exactly as before — the two share the `names` vector, so
@@ -1077,18 +1137,42 @@ impl SourceIndex {
         idx
     }
 
-    /// Whether `name` is a PROJECT-WIDE toplevel method (a toplevel `def` in any
-    /// analyzed file, or an in-source Object/Kernel/BasicObject reopen method) —
-    /// the `call.unresolved-toplevel` cross-file suppression surface.
     /// Whether the PROJECT declares instance method `method` on `class_name`
-    /// (qualified) with an in-source `def` — including a def nested in a block or
-    /// a conditional inside the class body. See [`Self::discovered_methods`].
+    /// (qualified) — the reference's `source_declared_method?` reading the
+    /// def-stripped cross-file `methods` seed overlaid by THIS file's own
+    /// `file_methods` (`seed_discovered_methods` deep-merges the file's raw
+    /// table). `file` is the analyzed file's [`rigor_parse::FileKey`]; `None`
+    /// — and a key the merge never saw — consults the UNION of every file's
+    /// overlay, the pre-overlay "project-wide" answer tests still assert.
+    /// See [`Self::discovered_methods`].
     ///
     /// A pure SILENCER: `true` means "do not witness absence here". It is never
     /// consulted to prove a method exists for any positive inference, so a false
     /// `true` costs coverage, never correctness.
-    pub fn project_declares_method(&self, class_name: &str, method: &str) -> bool {
-        self.discovered_methods.get(class_name).is_some_and(|m| m.contains(method))
+    pub fn project_declares_method(
+        &self,
+        file: Option<&FileKey>,
+        class_name: &str,
+        method: &str,
+    ) -> bool {
+        if self
+            .discovered_methods
+            .get(class_name)
+            .is_some_and(|m| m.contains(method))
+        {
+            return true;
+        }
+        match file.and_then(|k| self.file_index.get(k)).copied() {
+            Some(i) => self.file_defs[i]
+                .methods
+                .get(class_name)
+                .is_some_and(|m| m.contains(method)),
+            None => self.file_defs.iter().any(|fd| {
+                fd.methods
+                    .get(class_name)
+                    .is_some_and(|m| m.contains(method))
+            }),
+        }
     }
 
     /// Whether SOME project method named `method` mutates its positional
@@ -1097,8 +1181,25 @@ impl SourceIndex {
         self.mutated_params.get(method).is_some_and(|s| s.contains(&index))
     }
 
-    pub fn is_toplevel_def(&self, name: &str) -> bool {
-        self.toplevel_defs.contains(name)
+    /// Whether `name` is a toplevel method the analyzed file can call bare —
+    /// a toplevel `def` in any file (the reference's project-seeded
+    /// `top_level_def_for`), an `Object`-owner call-introduced method
+    /// surviving `subtract_def_methods`, OR an `Object`-owner `def`/`macro`
+    /// this file declares itself (`file_defs[file].toplevel` — the per-file
+    /// half of `source_declared_method?`'s `Object` read). `file` is the
+    /// analyzed file's [`rigor_parse::FileKey`]; `None` consults the union
+    /// over every file.
+    pub fn is_toplevel_def(&self, file: Option<&FileKey>, name: &str) -> bool {
+        if self.toplevel_defs.contains(name) {
+            return true;
+        }
+        match file.and_then(|k| self.file_index.get(k)).copied() {
+            Some(i) => self.file_defs[i].toplevel.contains(name),
+            None => self
+                .file_defs
+                .iter()
+                .any(|fd| fd.toplevel.contains(name)),
+        }
     }
 
     /// Register a name in the id registry (idempotent), returning nothing.
@@ -2452,6 +2553,1502 @@ fn collect_lexical_scopes(
         _ => {}
     }
 }
+
+// ==========================================================================
+// Pass 1c/1d — def-attribution walk (upstream `fb781023`, rigortype/rigor#1135,
+// rigor-rs issue #141).
+//
+// A `def` is filed under the class that OWNS it, which is not always the
+// lexical enclosure: inside a `Recv.class_eval { … }` block `Module.nesting`
+// stays lexical but `self` (and therefore `def`) belongs to the receiver. The
+// reference threads two prefixes through `walk_methods_and_def_nodes` —
+// `qualified_prefix` (lexical, for declarations) and `def_owner_prefix` (the
+// rebound self, for `def`-family leaves) — plus the `in_singleton_class`,
+// `singleton_cref` and `defs_singleton` flags. [`walk_defs`] is the port of
+// that walk, limited to the two tables the port carries: `toplevel_defs`
+// (the reference's `discovered_def_nodes["<toplevel>"]`, what
+// `call.unresolved-toplevel` resolves a bare call against) and
+// `discovered_methods` (the kind-less `record_def_method` existence table).
+// ==========================================================================
+
+/// The six `*_eval` / `*_exec` spellings whose block rebinding the walk
+/// honours (`RECEIVER_EVAL_CALLS` upstream). The rules layer's
+/// `receiver_eval_block_spans` carve-out recognises the same set for the
+/// unrelated purpose of suppressing calls INSIDE the block; this set decides
+/// who owns a `def` written inside one.
+const RECEIVER_EVAL_METHODS: &[&str] = &[
+    "class_eval",
+    "module_eval",
+    "class_exec",
+    "module_exec",
+    "instance_eval",
+    "instance_exec",
+];
+
+/// `instance_eval` / `instance_exec` (`INSTANCE_EVAL_CALLS`): their block's
+/// `def`s bind on the receiver's SINGLETON — `X.instance_eval { def m }` is
+/// `X.m`, not `X#m` — which matters only for the `Object` toplevel collapse
+/// (an `Object` singleton method is not bare-callable; probes `oi_eval` /
+/// `oi_exec` fire on the oracle).
+const INSTANCE_EVAL_METHODS: &[&str] = &["instance_eval", "instance_exec"];
+
+/// The class-creating calls a constant write can name — the reference's
+/// `meta_new_constant_rvalue?` (`Class.new` / `Module.new` / `Struct.new` /
+/// `Data.define`). `K = Class.new { def m }` files `m` under `K`; the same
+/// call anywhere else is anonymous (`ANONYMOUS_META_OWNER`).
+const META_NEW_SELECTORS: &[(&str, &str)] = &[
+    ("Class", "new"),
+    ("Module", "new"),
+    ("Struct", "new"),
+    ("Data", "define"),
+];
+
+/// Marker def-owner for a `Class.new`/`Module.new`/`Struct.new`/`Data.define`
+/// block no constant write names — the reference's `AnonymousMetaClass`
+/// synthetic name. It is a single segment that matches
+/// `Type::AnonymousClassName`, which is the `record_anonymous_body_def_as_toplevel`
+/// (upstream #319) condition: a `def` inside an anonymous factory block ALSO
+/// stays in `<toplevel>`, so `Module.new { def m }; m` is silent on the
+/// oracle. The marker keeps that case out of `discovered_methods` while
+/// routing the def to `toplevel_defs`.
+const ANONYMOUS_META_OWNER: &str = "<anonymous-meta>";
+
+/// Which side of the owner a position binds `def`s on —
+/// `eval_body_def_context`'s `defs_singleton`/`unnameable` answer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DefsSide {
+    /// Ordinary instance-side binding (`class_eval`/`module_eval`, class
+    /// bodies). `Object` ownership collapses to `<toplevel>` here.
+    Instance,
+    /// Singleton-side binding (`instance_eval`/`instance_exec`, `class <<`
+    /// bodies, `def self.x`/`def Owner.x`). Never reaches `<toplevel>`.
+    Singleton,
+    /// No nameable owner at all (`instance_eval` under an already-singleton
+    /// self — `class << S; instance_eval { def m }`). Files nowhere.
+    Unnameable,
+}
+
+/// The def-attribution walk's per-position context — the reference's
+/// `qualified_prefix` + `def_owner_prefix` + flags, carried as one struct so
+/// a single signature stays readable.
+///
+/// `lexical` is the declaration prefix (`Module.nesting`-style, advanced only
+/// by `class`/`module` headers). `owner` is the `def`-owner override an eval
+/// block, `class <<` body or `K = Class.new` write installs: `None` means
+/// "own whatever `lexical` says", `Some([])` means "explicitly nowhere" (an
+/// eval on an un-nameable receiver — its `def`s file under NO owner, not
+/// `<toplevel>`). The distinction is the whole issue: before this walk every
+/// def outside a class/module span landed on `<toplevel>` unconditionally.
+struct DefCx {
+    lexical: Vec<String>,
+    owner: Option<Vec<String>>,
+    /// `in_singleton_class` — inside a `class <<` body or a singleton-side
+    /// eval context (the CALL side; a `def` here is a singleton def).
+    in_singleton: bool,
+    /// `singleton_cref` — the cref itself is an unnameable singleton class
+    /// (`class << …`), so a BARE `class D`/`K =` inside names nothing.
+    singleton_cref: bool,
+    /// `defs_singleton`/`unnameable` — which side `def` leaves bind on.
+    defs_side: DefsSide,
+}
+
+impl DefCx {
+    /// The enclosing `self`'s prefix — the owner override when one is
+    /// installed (an eval block's rebound self, a `class <<` prefix), else the
+    /// lexical prefix (`eval_receiver_prefix`'s `self_prefix` argument).
+    fn self_prefix(&self) -> Vec<String> {
+        match &self.owner {
+            Some(o) => o.clone(),
+            None => self.lexical.clone(),
+        }
+    }
+}
+
+/// The root context — toplevel: lexical `[]`, no owner override, instance side.
+fn def_root_cx() -> DefCx {
+    DefCx {
+        lexical: Vec::new(),
+        owner: None,
+        in_singleton: false,
+        singleton_cref: false,
+        defs_side: DefsSide::Instance,
+    }
+}
+
+/// The per-file def-attribution accumulators [`walk_defs`] (and the
+/// orphan-position post-pass [`file_orphan_defs`]) fill — the port of the
+/// reference's `methods` / `def_nodes` split (`build_methods_and_def_nodes`
+/// feeding `finalize_def_index`):
+///
+/// * `toplevel` — `def_nodes["<toplevel>"]`: real toplevel `def`s and
+///   anonymous-factory defs. Merged CROSS-FILE (`top_level_def_for` is
+///   project-wide: a `def helper` in `a.rb` resolves `helper` in `b.rb`).
+/// * `macro_methods` — the instance-kind names CALLS introduce
+///   (`define_method`, `attr_*`, `mattr_*`/`cattr_*`/`class_attribute`,
+///   `alias_method`), keyed by qualified owner. These are what survives the
+///   merge's `subtract_def_methods` into the cross-file `methods` table: an
+///   accessor declared in `a.rb` suppresses `obj.a` in `b.rb`, while a plain
+///   `def` is deliberately per-file (a cross-file `def` on a class IS the
+///   ADR-17 monkey-patch case `undefined-method` surfaces).
+/// * `def_names` — the instance-kind names that carry a `def` node (plain
+///   instance defs, non-self `def Foo.x` receiver forms, `alias`-of-def
+///   names) — the name sets `subtract_def_methods` removes from the
+///   cross-file table.
+/// * `file_methods` — this file's OWN instance-kind existence overlay (defs
+///   AND macros): `seed_discovered_methods` deep-merges the file's raw table
+///   over the def-stripped seed, so a name this file defines suppresses a
+///   diagnostic in THIS file even when a def elsewhere kept it out of the
+///   cross-file table.
+/// * `file_toplevel` — the `Object`-owner slice of `file_methods`: the
+///   per-file half of the `Object` → bare-callable collapse
+///   (`source_declared_method?` reads `Object` through the same two-layer
+///   table). A bare `m` in the defining file resolves
+///   `Object.class_eval { def m }`; the same call in a sibling file
+///   surfaces (probed: the reference fires; the pre-fix project-wide
+///   collapse stayed silent).
+/// * `pending_aliases` — `(owner, new, old)` `alias`/`alias_method` pairs,
+///   resolved AFTER the whole walk: `apply_alias_def_nodes` consults the
+///   file's COMPLETE def-node table, so an alias may precede its target
+///   `def`.
+#[derive(Default)]
+struct DefTables {
+    toplevel: HashSet<String>,
+    macro_methods: HashMap<String, HashSet<String>>,
+    def_names: HashMap<String, HashSet<String>>,
+    file_methods: HashMap<String, HashSet<String>>,
+    file_toplevel: HashSet<String>,
+    pending_aliases: Vec<(String, String, String)>,
+}
+
+/// The body `DefCx` a `class`/`module` header opens — the reference's
+/// `decl_body_context`:
+///
+/// * A `self::`-anchored header rides the REBOUND self
+///   (`self_anchored_decl_prefix`): `self_base` is the singleton marker's
+///   `[]` under `class <<`, else the def-owner override (eval/meta-new
+///   block), else nil — so `Object.class_eval { class self::String }` names
+///   `Object::String`, `class <<` makes it unnameable, and a bare `class
+///   self::X` inside `module M` stays lexical (`M::X`). An EMPTY `self_decl`
+///   marks the body ownerless.
+/// * Otherwise `Source::ConstantPath.declaration_prefix` — a `::`-rooted
+///   header RESETS the lexical prefix to the header's own name rather than
+///   appending (`class ::Object` inside `module M` opens `Object`, not
+///   `M::Object`).
+/// * `unnameable_decl?` — an empty `self_decl` is unnameable; a non-empty one
+///   re-anchors even under `class <<`; otherwise a bare/`self::` header under
+///   an unnameable cref opens `#<singleton>::Name` while a constant path
+///   (rooted or explicit non-self base) still re-anchors lexically
+///   (`decl_nameable_under_cref?`).
+fn decl_body_cx(cx: &DefCx, name: &str, rooted: bool, self_anchored: bool) -> DefCx {
+    let self_decl = if self_anchored {
+        let self_base: Option<Vec<String>> = if cx.in_singleton {
+            Some(Vec::new())
+        } else {
+            cx.owner.clone()
+        };
+        self_base.map(|base| {
+            if base.is_empty() {
+                // `return [] if self_base.empty?` — a `self::` header under a
+                // self nothing names (anonymous factory, `class <<`) is
+                // unnameable, NOT `<base>::Name`.
+                Vec::new()
+            } else {
+                // `self_anchored_decl_prefix` — `self_base + tail` where
+                // `self_anchored_tail` returns one ELEMENT PER SEGMENT
+                // (`self::A::B` ⇒ `["A", "B"]`), unlike `declaration_prefix`'s
+                // single-element push below. The intermediate `base::A` rung
+                // this creates is the reference's own shape.
+                let mut p = base;
+                p.extend(name.split("::").map(str::to_string));
+                p
+            }
+        })
+    } else {
+        None
+    };
+    let child_prefix: Vec<String> = match &self_decl {
+        Some(p) => p.clone(),
+        None => {
+            // `Source::ConstantPath.declaration_prefix` — the rendered name is
+            // pushed as ONE element (`rooted ? [name] : outer + [name]`), so
+            // `lexical_nesting_for_prefix` yields a rung only at declaration
+            // boundaries: `class ::M::N` inside `module Outer` nests as
+            // `M::N` alone (NEVER a bare `M` rung — #141 round 3), and
+            // `class A::B` inside `module M` nests `M::A::B`, `M` — never a
+            // `M::A` partial-segment rung.
+            if rooted {
+                vec![name.to_string()]
+            } else {
+                let mut lexical = cx.lexical.clone();
+                lexical.push(name.to_string());
+                lexical
+            }
+        }
+    };
+    let decl_nameable = rooted || (name.contains("::") && !self_anchored);
+    let child_cref = match &self_decl {
+        Some(d) => d.is_empty(),
+        None => cx.singleton_cref && !decl_nameable,
+    };
+    DefCx {
+        lexical: if child_cref { Vec::new() } else { child_prefix },
+        owner: None,
+        in_singleton: false,
+        singleton_cref: child_cref,
+        defs_side: DefsSide::Instance,
+    }
+}
+
+/// `walk_methods_and_def_nodes` / `walk_eval_methods_and_defs`: file every
+/// `def`-family name under the owner that binds it, threading lexical vs
+/// rebound-self prefixes the way the reference does. `declared` is the file's
+/// own qualified constant-name census (`eval_file_declared_names`) — a
+/// constant a receiver names resolves through lexical rungs only when the
+/// FILE declares it. `visited` collects every `Definition` this
+/// edge-following walk reaches, so [`file_orphan_defs`] can file the
+/// arena-resident defs it cannot.
+fn walk_defs(
+    ast: &LoweredAst,
+    declared: &HashSet<String>,
+    tables: &mut DefTables,
+    visited: &mut HashSet<NodeId>,
+    node: NodeId,
+    cx: &DefCx,
+) {
+    match ast.get(node) {
+        Node::ClassDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        }
+        | Node::ModuleDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        } => {
+            if name.is_empty() {
+                // An un-renderable header keeps the enclosing context (the
+                // reference falls through to the generic child walk).
+                for &child in body {
+                    walk_defs(ast, declared, tables, visited, child, cx);
+                }
+                return;
+            }
+            let inner = decl_body_cx(cx, name, *rooted, *self_anchored);
+            for &child in body {
+                walk_defs(ast, declared, tables, visited, child, &inner);
+            }
+        }
+        Node::Definition {
+            is_singleton_class: true,
+            singleton_operand,
+            body,
+            ..
+        } => {
+            visited.insert(node);
+            // `class << <expr>` — the SingletonClassNode arm: the operand is
+            // walked for its own contents, then the body walks under the
+            // operand's resolved singleton prefix (`singleton_body_prefix` /
+            // `singleton_class_prefix`).
+            if let Some(op) = singleton_operand {
+                walk_defs(ast, declared, tables, visited, *op, cx);
+            }
+            let prefix = singleton_operand_prefix(ast, *singleton_operand, cx, declared);
+            let inner = DefCx {
+                lexical: cx.lexical.clone(),
+                owner: Some(prefix),
+                in_singleton: true,
+                singleton_cref: true,
+                // Defs in a `class <<` body bind on the singleton
+                // (`singleton_def = in_singleton_class || …`) — which keeps
+                // them OUT of the `Object` toplevel collapse (`class << self`
+                // inside `Object.class_eval` leaves a bare call firing,
+                // oracle `oss`/`ois`).
+                defs_side: DefsSide::Singleton,
+            };
+            for &child in body {
+                walk_defs(ast, declared, tables, visited, child, &inner);
+            }
+        }
+        Node::Definition {
+            name,
+            receiver_def_name,
+            singleton_name,
+            def_receiver_path,
+            ..
+        } => {
+            visited.insert(node);
+            // A `def` leaf records under its effective owner and does NOT
+            // descend: the reference's DefNode arm returns without walking the
+            // body, so a `def` nested in a method body files nowhere.
+            file_def(
+                cx,
+                name.as_deref(),
+                receiver_def_name.as_deref(),
+                singleton_name.as_deref(),
+                def_receiver_path.as_deref(),
+                tables,
+            );
+        }
+        Node::Call {
+            receiver,
+            method,
+            args,
+            block_body,
+            block_span,
+            ..
+        } => {
+            // A literal block only: `X.class_eval(&blk)` passes a
+            // `BlockArgumentNode` the reference does NOT treat as an eval body
+            // (`receiver_eval_call?` requires a `BlockNode`). `block_span`
+            // distinguishes the two — it is `None` for `&expr`.
+            if block_span.is_some() && RECEIVER_EVAL_METHODS.contains(&method.as_str()) {
+                // `walk_eval_methods_and_defs`: the receiver and arguments
+                // evaluate in the ENCLOSING context; only the block body
+                // rebinds.
+                if let Some(r) = receiver {
+                    walk_defs(ast, declared, tables, visited, *r, cx);
+                }
+                for &arg in args {
+                    walk_defs(ast, declared, tables, visited, arg, cx);
+                }
+                let self_prefix = cx.self_prefix();
+                let unnameable = cx.in_singleton
+                    || cx.owner.as_ref().is_some_and(|o| o.is_empty())
+                    || (cx.singleton_cref && self_prefix.is_empty());
+                let eval_prefix = eval_receiver_prefix(
+                    ast,
+                    *receiver,
+                    &self_prefix,
+                    &cx.lexical,
+                    unnameable,
+                    declared,
+                )
+                .unwrap_or_default();
+                let named = receiver.is_some_and(|r| {
+                    !matches!(ast.get(r), Node::SelfExpr { .. })
+                });
+                let is_instance_eval = INSTANCE_EVAL_METHODS.contains(&method.as_str());
+                // `eval_body_def_context`: the block's `in_singleton_class`
+                // (call side) collapses to `in_singleton && !named` on this
+                // subset; `defs_singleton` is `:unnameable` for an unnamed
+                // `instance_eval` under an already-singleton self.
+                let in_singleton_child = cx.in_singleton && !named;
+                let defs_side = if is_instance_eval && cx.in_singleton && !named {
+                    DefsSide::Unnameable
+                } else if is_instance_eval || in_singleton_child {
+                    DefsSide::Singleton
+                } else {
+                    DefsSide::Instance
+                };
+                let inner = DefCx {
+                    lexical: cx.lexical.clone(),
+                    owner: Some(eval_prefix),
+                    in_singleton: in_singleton_child,
+                    singleton_cref: cx.singleton_cref,
+                    defs_side,
+                };
+                for &child in block_body {
+                    walk_defs(ast, declared, tables, visited, child, &inner);
+                }
+                return;
+            }
+            // The anonymous factory arm (`walk_anonymous_meta_block`): a
+            // `Class.new`/`Module.new`/`Struct.new`/`Data.define` literal block
+            // NOT under a recognised constant write. Its defs belong to the
+            // anonymous class — keyed by the synthetic name — and stay in
+            // `<toplevel>` via `record_anonymous_body_def_as_toplevel`.
+            if block_span.is_some() && is_meta_new_call(ast, *receiver, method) {
+                if let Some(r) = receiver {
+                    walk_defs(ast, declared, tables, visited, *r, cx);
+                }
+                for &arg in args {
+                    walk_defs(ast, declared, tables, visited, arg, cx);
+                }
+                let inner = DefCx {
+                    lexical: cx.lexical.clone(),
+                    owner: Some(vec![ANONYMOUS_META_OWNER.to_string()]),
+                    in_singleton: false,
+                    singleton_cref: cx.singleton_cref,
+                    defs_side: DefsSide::Instance,
+                };
+                for &child in block_body {
+                    walk_defs(ast, declared, tables, visited, child, &inner);
+                }
+                return;
+            }
+            // `record_call_node_methods`: method-introducing macros file their
+            // generated names under the owner — `X.class_eval { attr_reader :a }`
+            // registers `X#a` (and `Object.class_eval { attr_reader :a }` keeps
+            // `a` bare-callable), so a later `a` call is not unresolved.
+            file_call_methods(ast, cx, method, *receiver, args, tables);
+            if let Some(r) = receiver {
+                walk_defs(ast, declared, tables, visited, *r, cx);
+            }
+            for &arg in args {
+                walk_defs(ast, declared, tables, visited, arg, cx);
+            }
+            for &child in block_body {
+                walk_defs(ast, declared, tables, visited, child, cx);
+            }
+        }
+        Node::ConstantWrite { name, value, .. } => {
+            // `K = Class.new { def m }` (`meta_new_block_split`): the factory
+            // call's receiver and arguments keep the enclosing context; the
+            // block's defs belong to the class the WRITE names — `K`, not the
+            // enclosing owner — while `Module.nesting` stays lexical.
+            if let Some(call_id) = meta_new_rvalue(ast, name, *value) {
+                let Node::Call {
+                    receiver,
+                    args,
+                    block_body,
+                    ..
+                } = ast.get(call_id)
+                else {
+                    unreachable!("meta_new_rvalue only returns calls");
+                };
+                if let Some(r) = receiver {
+                    walk_defs(ast, declared, tables, visited, *r, cx);
+                }
+                for &arg in args {
+                    walk_defs(ast, declared, tables, visited, arg, cx);
+                }
+                // A bare `K =` under an unnameable cref names nothing; its
+                // block's defs file nowhere (`meta_ownerless`).
+                let body_owner = if cx.singleton_cref {
+                    Vec::new()
+                } else {
+                    qualify_vec(&cx.lexical, name)
+                };
+                let inner = DefCx {
+                    lexical: cx.lexical.clone(),
+                    owner: Some(body_owner),
+                    in_singleton: false,
+                    singleton_cref: cx.singleton_cref,
+                    defs_side: DefsSide::Instance,
+                };
+                for &child in block_body {
+                    walk_defs(ast, declared, tables, visited, child, &inner);
+                }
+            } else {
+                walk_defs(ast, declared, tables, visited, *value, cx);
+            }
+        }
+        node => {
+            let mut children = Vec::new();
+            def_walk_children(node, &mut children);
+            for child in children {
+                walk_defs(ast, declared, tables, visited, child, cx);
+            }
+        }
+    }
+}
+
+/// File one `def`'s names under the effective owner — the port's combined
+/// `record_def_method` / `record_def_node`. A `def` records under the def-owner
+/// override when one exists, else the lexical prefix; an EMPTY effective owner
+/// is `<toplevel>` for the instance names, and an explicit-empty override or
+/// `:unnameable` side is NOWHERE (never `<toplevel>`).
+fn file_def(
+    cx: &DefCx,
+    name: Option<&str>,
+    receiver_def_name: Option<&str>,
+    singleton_name: Option<&str>,
+    def_receiver_path: Option<&str>,
+    tables: &mut DefTables,
+) {
+    let _ = singleton_name; // always `:singleton` kind — see the filing below.
+    if cx.defs_side == DefsSide::Unnameable {
+        return;
+    }
+    let owner: &[String] = match &cx.owner {
+        Some(o) if o.is_empty() => return,
+        Some(o) => o,
+        None => &cx.lexical,
+    };
+    if cx.singleton_cref && owner.is_empty() {
+        return;
+    }
+
+    // `<toplevel>`: a bare `def m`, and — matching `record_def_node` filing
+    // `def Foo.bar` under the toplevel key whenever its receiver does not
+    // name `self` or the enclosing class — a receiver-bearing `def`.
+    // `def self.x` is excluded (the reference's `def_singleton?` skip).
+    // `def_nodes["<toplevel>"]` merges PROJECT-WIDE: a `def helper` in one
+    // file resolves `helper` in a sibling (`top_level_def_for`).
+    if owner.is_empty() {
+        for nm in [name, receiver_def_name].into_iter().flatten() {
+            tables.toplevel.insert(nm.to_string());
+        }
+        return;
+    }
+
+    // The anonymous-factory owner: its instance defs join `<toplevel>` too
+    // (`record_anonymous_body_def_as_toplevel` — a `Module.new { def m }`
+    // method still resolves a bare call, upstream #319).
+    if owner.len() == 1 && owner[0] == ANONYMOUS_META_OWNER {
+        for nm in [name, receiver_def_name].into_iter().flatten() {
+            tables.toplevel.insert(nm.to_string());
+        }
+        return;
+    }
+
+    // `def_singleton?`'s last clause — `def_receiver_targets_lexical_self?`:
+    // a receiver-bearing def whose rendered constant path equals the def-owner
+    // prefix's tail is a SINGLETON def (`Object.class_eval { def Object.x }`
+    // binds `Object.x`, never `Object#x`), so it is kept out of the instance
+    // table entirely.
+    let targets_self = def_receiver_path.is_some_and(|p| {
+        let segs: Vec<&str> = p.split("::").collect();
+        owner.len() >= segs.len() && owner[owner.len() - segs.len()..] == segs[..]
+    });
+    let key = owner.join("::");
+    // `record_def_method`'s kind stamp: `:instance` for a receiver-less def on
+    // the instance side and for a receiver-bearing def that does not name the
+    // enclosing class; `:singleton` for `def self.x`, for anything under a
+    // singleton-side body (`class <<`, `instance_eval`), and for the
+    // self-targeting receiver form. The port's existence table answers
+    // `:instance` queries only (the singleton branch of `check_call` never
+    // consults it), so singleton-kind names file NOWHERE — the Blocking-3
+    // fix: `class String; def self.m` / `Float.instance_eval { def m }` must
+    // not suppress `"x".m` / `1.5.m` (reference + master both fire).
+    if cx.defs_side != DefsSide::Instance {
+        return;
+    }
+    let mut file_instance = |nm: &str| {
+        // `def_names` — the name has a project `def` node, so it is per-file
+        // only at the merge (`subtract_def_methods` drops it from the
+        // cross-file `methods` seed; `file_methods` keeps it for THIS file).
+        // `file_toplevel` — `Object`'s instance surface is the toplevel
+        // surface (`source_declared_method?` consults `Object` for
+        // implicit-self calls), but the same per-file rule holds: the
+        // `Object` slice of `file_methods` is what a bare call in THIS file
+        // resolves (oracle `oi_eval` / `oi_exec` / `osm2` / `oss` /
+        // `helper_orecv` pin the singleton-side exclusions;
+        // `helper_kern`/`helper_bo`/`dk_m`/`db_m` pin the missing
+        // Kernel/BasicObject collapse).
+        tables.def_names.entry(key.clone()).or_default().insert(nm.to_string());
+        tables.file_methods.entry(key.clone()).or_default().insert(nm.to_string());
+        if key == "Object" {
+            tables.file_toplevel.insert(nm.to_string());
+        }
+    };
+    if let Some(nm) = name {
+        file_instance(nm);
+    }
+    if !targets_self {
+        if let Some(nm) = receiver_def_name {
+            file_instance(nm);
+        }
+    }
+}
+
+/// The module-level accessor macros (ActiveSupport's `Module` extensions) —
+/// `MODULE_ATTR_MACROS`, `[reader, writer, predicate]` per name.
+fn module_attr_shape(method: &str) -> Option<(bool, bool, bool)> {
+    match method {
+        "mattr_reader" | "cattr_reader" => Some((true, false, false)),
+        "mattr_writer" | "cattr_writer" => Some((false, true, false)),
+        "mattr_accessor" | "cattr_accessor" => Some((true, true, false)),
+        "class_attribute" => Some((true, true, true)),
+        _ => None,
+    }
+}
+
+/// A `SymbolLit`/`StringLit` argument's method name —
+/// `literal_method_name`.
+fn literal_method_name(ast: &LoweredAst, id: NodeId) -> Option<String> {
+    match ast.get(id) {
+        Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// The `record_call_node_methods` half of the def walk's CallNode arm: the
+/// names `define_method` / `attr_*` / `mattr_*` / `cattr_*` / `class_attribute`
+/// / `alias_method` introduce, filed under the current owner. Every recorder
+/// declines an empty owner prefix, so the toplevel set is untouched by a bare
+/// `attr_reader` at file scope (exactly as the reference's
+/// `return if qualified_prefix.empty?`). The `Object` collapse uses the
+/// `in_singleton_class` kind the reference assigns these calls — instance
+/// unless the position is already singleton-side (an `instance_eval` block
+/// stays instance-side for its calls: only `def`/`alias` bind on the
+/// singleton there).
+fn file_call_methods(
+    ast: &LoweredAst,
+    cx: &DefCx,
+    method: &str,
+    receiver: Option<NodeId>,
+    args: &[NodeId],
+    tables: &mut DefTables,
+) {
+    let owner: &[String] = match &cx.owner {
+        Some(o) if o.is_empty() => return,
+        Some(o) => o,
+        None => &cx.lexical,
+    };
+    if owner.is_empty() || (owner.len() == 1 && owner[0] == ANONYMOUS_META_OWNER) {
+        return;
+    }
+    let key = owner.join("::");
+    // `kind = in_singleton_class ? :singleton : :instance` — the module-attr
+    // macros are the exception, recording BOTH kinds so they file under
+    // either side (`record_module_attr_methods`). Instance-kind names join
+    // BOTH the file's own overlay and the cross-file macro table — unlike a
+    // `def`, an accessor survives `subtract_def_methods` unless a project
+    // `def` shares its name — and under an `Object` owner they stay
+    // bare-callable through `file_toplevel` (the per-file half; the merge
+    // adds the cross-file half).
+    let singleton_side = cx.in_singleton;
+    let mut file = |name: String, both_kinds: bool| {
+        if singleton_side && !both_kinds {
+            return;
+        }
+        tables.macro_methods.entry(key.clone()).or_default().insert(name.clone());
+        tables.file_methods.entry(key.clone()).or_default().insert(name.clone());
+        if key == "Object" {
+            tables.file_toplevel.insert(name);
+        }
+    };
+
+    if method == "define_method" {
+        // `record_define_method` — no receiver check upstream: the call is the
+        // macro wherever it appears under a named owner.
+        if let Some(name) = args.first().and_then(|a| literal_method_name(ast, *a)) {
+            file(name, false);
+        }
+        return;
+    }
+    if receiver.is_some() {
+        return; // `attr_*` / module-attr / `alias_method` are implicit-self macros.
+    }
+    if matches!(method, "attr_reader" | "attr_writer" | "attr_accessor") {
+        let reader = method != "attr_writer";
+        let writer = method != "attr_reader";
+        for &arg in args {
+            let Some(base) = literal_method_name(ast, arg) else {
+                continue;
+            };
+            if reader {
+                file(base.clone(), false);
+            }
+            if writer {
+                file(format!("{base}="), false);
+            }
+        }
+        return;
+    }
+    if let Some((reader, writer, predicate)) = module_attr_shape(method) {
+        for &arg in args {
+            let Some(base) = literal_method_name(ast, arg) else {
+                continue;
+            };
+            if reader {
+                file(base.clone(), true);
+            }
+            if writer {
+                file(format!("{base}="), true);
+            }
+            if predicate {
+                file(format!("{base}?"), true);
+            }
+        }
+        return;
+    }
+    // `record_alias_method_call` — `alias_method :new, :old` registers the NEW
+    // name as a call-introduced method (the `alias` keyword is a different
+    // node kind the lowered tree does not preserve as a call). When `old` is
+    // a `def`, `apply_alias_def_nodes` gives the new name `old`'s def node —
+    // which `subtract_def_methods` strips cross-file — so the pair is queued
+    // for resolution against the COMPLETE per-file def table.
+    if method == "alias_method" {
+        let mut names = args.iter().filter_map(|a| literal_method_name(ast, *a));
+        if let (Some(new), Some(old)) = (names.next(), names.next()) {
+            if !singleton_side {
+                tables.macro_methods.entry(key.clone()).or_default().insert(new.clone());
+                tables.file_methods.entry(key.clone()).or_default().insert(new.clone());
+                if key == "Object" {
+                    tables.file_toplevel.insert(new.clone());
+                }
+                tables.pending_aliases.push((key.clone(), new, old));
+            }
+        }
+    }
+}
+
+/// The `class << <expr>` body's def-owner prefix — `singleton_body_prefix` /
+/// `singleton_class_prefix`. `class << self` names the enclosing self's
+/// prefix; `class << Const` resolves like an eval receiver; `self::X` keeps
+/// the enclosing-self + tail resolution (declining under an unnameable self);
+/// anything else (`class << obj`, `class << expr()`) names nothing.
+fn singleton_operand_prefix(
+    ast: &LoweredAst,
+    operand: Option<NodeId>,
+    cx: &DefCx,
+    declared: &HashSet<String>,
+) -> Vec<String> {
+    let Some(op) = operand else {
+        return Vec::new();
+    };
+    match ast.get(op) {
+        Node::SelfExpr { .. } => cx.self_prefix(),
+        Node::ConstantRead {
+            name,
+            self_anchored: true,
+            ..
+        } => {
+            let self_prefix = cx.self_prefix();
+            if cx.singleton_cref && self_prefix.is_empty() {
+                Vec::new()
+            } else {
+                let mut prefix = self_prefix;
+                prefix.extend(name.split("::").map(str::to_string));
+                collapse_object_owner(prefix)
+            }
+        }
+        Node::ConstantRead {
+            name,
+            dynamic_base: false,
+            rooted,
+            ..
+        } => eval_const_prefix(name, *rooted, &cx.lexical, declared),
+        _ => Vec::new(),
+    }
+}
+
+/// `eval_receiver_prefix`: the owner a `*eval`/`*exec` block rebinds `self`
+/// to. `None` when the receiver names nothing the file can see (a local, a
+/// call result, a dynamic constant) — the block's defs then file NOWHERE, not
+/// toplevel.
+fn eval_receiver_prefix(
+    ast: &LoweredAst,
+    receiver: Option<NodeId>,
+    self_prefix: &[String],
+    lexical: &[String],
+    unnameable: bool,
+    declared: &HashSet<String>,
+) -> Option<Vec<String>> {
+    // `return self_prefix if receiver.nil? || receiver.is_a?(SelfNode)` — a
+    // BARE `class_eval` keeps the enclosing self exactly like `self.class_eval`
+    // (`Object.class_eval { class_eval { def m } }` still lands on `Object`,
+    // while the same bare eval at toplevel names nothing and files nowhere).
+    let Some(receiver) = receiver else {
+        return Some(self_prefix.to_vec());
+    };
+    match ast.get(receiver) {
+        Node::SelfExpr { .. } => Some(self_prefix.to_vec()),
+        Node::ConstantRead {
+            name,
+            self_anchored: true,
+            ..
+        } => {
+            // `self::Foo` names the enclosing self's path; when that self is
+            // unnameable the read raises at runtime, so the receiver declines.
+            if unnameable {
+                None
+            } else {
+                let mut prefix = self_prefix.to_vec();
+                prefix.extend(name.split("::").map(str::to_string));
+                Some(collapse_object_owner(prefix))
+            }
+        }
+        Node::ConstantRead {
+            name,
+            dynamic_base: false,
+            rooted,
+            ..
+        } => Some(eval_const_prefix(name, *rooted, lexical, declared)),
+        _ => None,
+    }
+}
+
+/// The constant-receiver tail of `eval_receiver_prefix` —
+/// `eval_constant_receiver_prefix`. `rendered` is already the lenient name.
+/// `rooted` is `Source::ConstantPath.rooted?`: a `::`-rooted spelling names
+/// the TOP LEVEL — `::B` inside `class A::B` is still `B` — so the root check
+/// precedes BOTH the self-reopen shortcut and the lexical walk (the reference
+/// checks `rooted?(path_node)` first; [`Node::ConstantRead`] carries the flag
+/// the `::` spelling lowered with). A receiver spelling the lexically
+/// enclosing class keeps the enclosing prefix; otherwise the first
+/// `<nesting>::<first segment>` the file's own declared constants answer,
+/// innermost first, wins — falling back to the name as written (never a
+/// lexical guess).
+fn eval_const_prefix(
+    rendered: &str,
+    rooted: bool,
+    lexical: &[String],
+    declared: &HashSet<String>,
+) -> Vec<String> {
+    let segments: Vec<&str> = rendered.split("::").collect();
+    if rooted || lexical.is_empty() {
+        return segments.iter().map(|s| (*s).to_string()).collect();
+    }
+    if lexical.last().map(String::as_str) == Some(rendered) {
+        return lexical.to_vec();
+    }
+    // `lexical_nesting_for_prefix`: innermost rung first — for ["M", "A::B"]
+    // the rungs are "M::A::B" then "M".
+    for n in (1..=lexical.len()).rev() {
+        let entry = lexical[..n].join("::");
+        let candidate = format!("{entry}::{}", segments[0]);
+        if declared.contains(&candidate) {
+            let mut prefix: Vec<String> = candidate.split("::").map(str::to_string).collect();
+            prefix.extend(segments[1..].iter().map(|s| (*s).to_string()));
+            return prefix;
+        }
+    }
+    segments.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// `collapse_object_owner` — a `self::`-anchored receiver under `Object`
+/// drops the `Object` segment (`Object`'s constants ARE the toplevel
+/// constants).
+fn collapse_object_owner(prefix: Vec<String>) -> Vec<String> {
+    if prefix.first().map(String::as_str) == Some("Object") {
+        prefix[1..].to_vec()
+    } else {
+        prefix
+    }
+}
+
+/// `meta_new_call?`: `Class.new`/`Module.new`/`Struct.new`/`Data.define` on
+/// the bare constant receiver — a dynamic (`expr::Class`) or `self::`-rooted
+/// base does not name the factory, matching the reference's constant-receiver
+/// requirement.
+fn is_meta_new_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
+    let Some(recv) = receiver else {
+        return false;
+    };
+    let Node::ConstantRead {
+        name,
+        dynamic_base: false,
+        self_anchored: false,
+        ..
+    } = ast.get(recv)
+    else {
+        return false;
+    };
+    META_NEW_SELECTORS
+        .iter()
+        .any(|&(k, m)| k == name.as_str() && m == method)
+}
+
+/// `meta_new_rvalue`: the write-target recognition for `K = Class.new do …
+/// end`. The reference accepts a direct factory call, a `K = K || Factory`
+/// fallback (`Left or SameConst` — Prism `||`), and a repeated receiverful
+/// `.freeze` tail (`K = Class.new { }.freeze.freeze`). Returns the factory
+/// CALL's id so the arm can split receiver/args (enclosing context) from the
+/// block (the written owner).
+fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> Option<NodeId> {
+    // `K = K || <factory>` — an `||` whose left operand reads the written
+    // constant.
+    if let Node::Logical {
+        left,
+        right,
+        is_and: false,
+        ..
+    } = ast.get(value)
+    {
+        if let Node::ConstantRead {
+            name,
+            dynamic_base: false,
+            self_anchored: false,
+            ..
+        } = ast.get(*left)
+        {
+            if name == write_name {
+                value = *right;
+            }
+        }
+    }
+    // A `.freeze` tail, repeated — only a receiverful, argument-less,
+    // block-less call unwraps.
+    loop {
+        match ast.get(value) {
+            Node::Call {
+                receiver: Some(recv),
+                method,
+                args,
+                block_body,
+                ..
+            } if method == "freeze" && args.is_empty() && block_body.is_empty() => {
+                value = *recv;
+            }
+            _ => break,
+        }
+    }
+    let Node::Call {
+        receiver,
+        method,
+        block_span,
+        ..
+    } = ast.get(value)
+    else {
+        return None;
+    };
+    if block_span.is_some() && is_meta_new_call(ast, *receiver, method) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// `qualify` for an already-segmented write target: `K =` inside `Outer`
+/// names `Outer::K`.
+fn qualify_vec(lexical: &[String], name: &str) -> Vec<String> {
+    let mut out = lexical.to_vec();
+    out.extend(name.split("::").map(str::to_string));
+    out
+}
+
+/// A span-indexed context transformer for the orphan post-pass: each variant
+/// is the arena-side residue of one [`walk_defs`] arm, recovered by span
+/// containment instead of child edges.
+enum DefFrame {
+    /// `class`/`module` header — `decl_body_cx`: pushes the path onto
+    /// `lexical`, RESETS it when `::`-rooted, or rides the rebound self when
+    /// `self::`-anchored.
+    Cref {
+        name: String,
+        rooted: bool,
+        self_anchored: bool,
+    },
+    /// `class << <operand>` — singleton context for the body; a `def` inside
+    /// the OPERAND's span keeps the enclosing context instead.
+    SingletonBody {
+        operand: Option<NodeId>,
+        operand_span: Option<Span>,
+    },
+    /// A `*eval`/`*exec` literal-block body — rebinds `self` to the receiver.
+    EvalBody {
+        receiver: Option<NodeId>,
+        method: String,
+        block: Span,
+    },
+    /// An anonymous `Class.new`/`Module.new`/`Struct.new`/`Data.define`
+    /// literal-block body — defs stay toplevel (`ANONYMOUS_META_OWNER`).
+    MetaBlock { call: NodeId, block: Span },
+    /// `K = Class.new { … }` — the block's defs belong to `K`, not the
+    /// anonymous owner; shadows the [`DefFrame::MetaBlock`] for the same call.
+    MetaWrite { name: String, block: Span, call: NodeId },
+    /// Any `def` subtree — the reference's DefNode arm never descends, so a
+    /// def ANYWHERE inside another def's span files nowhere.
+    DefBody,
+}
+
+/// Blocking-1 post-pass — file every `Definition` node lowered into the arena
+/// but never reached by [`walk_defs`]'s edge following. The reference's
+/// `compact_child_nodes` traversal reaches EVERY Prism child; the lowered
+/// tree's recoverable-child list omits positions the lowering keeps outside
+/// its child slots — range endpoints, `def` receiver expressions, parameter
+/// defaults, dynamic constant-path parents — so a `def` in one of those
+/// positions silently vanished from every def table (issue #141 blocker 1).
+/// The context that `walk_defs` would have built is recovered SPAN-WISE: the
+/// context-shaping ancestors of a `def` are exactly the nodes whose spans
+/// strictly contain it, applied outermost-first.
+fn file_orphan_defs(
+    ast: &LoweredAst,
+    declared: &HashSet<String>,
+    visited: &HashSet<NodeId>,
+    tables: &mut DefTables,
+) {
+    // Frame collection — one arena pass. `(outer span for containment and
+    // outermost-first ordering, transform)`.
+    let mut frames: Vec<(Span, DefFrame)> = Vec::new();
+    let mut orphans: Vec<NodeId> = Vec::new();
+    for (id, node) in ast.iter() {
+        match node {
+            Node::ClassDef {
+                name,
+                rooted,
+                self_anchored,
+                ..
+            }
+            | Node::ModuleDef {
+                name,
+                rooted,
+                self_anchored,
+                ..
+            } if !name.is_empty() =>
+            {
+                frames.push((
+                    node.span(),
+                    DefFrame::Cref {
+                        name: name.clone(),
+                        rooted: *rooted,
+                        self_anchored: *self_anchored,
+                    },
+                ));
+            }
+            Node::Definition {
+                is_singleton_class: true,
+                singleton_operand,
+                ..
+            } => {
+                let operand_span = singleton_operand.map(|op| ast.get(op).span());
+                frames.push((
+                    node.span(),
+                    DefFrame::SingletonBody {
+                        operand: *singleton_operand,
+                        operand_span,
+                    },
+                ));
+            }
+            Node::Definition { .. } => {
+                frames.push((node.span(), DefFrame::DefBody));
+                if !visited.contains(&id) {
+                    orphans.push(id);
+                }
+            }
+            Node::Call {
+                receiver,
+                method,
+                block_span: Some(block),
+                ..
+            } => {
+                if RECEIVER_EVAL_METHODS.contains(&method.as_str()) {
+                    frames.push((
+                        node.span(),
+                        DefFrame::EvalBody {
+                            receiver: *receiver,
+                            method: method.clone(),
+                            block: *block,
+                        },
+                    ));
+                } else if is_meta_new_call(ast, *receiver, method) {
+                    frames.push((
+                        node.span(),
+                        DefFrame::MetaBlock {
+                            call: id,
+                            block: *block,
+                        },
+                    ));
+                }
+            }
+            Node::ConstantWrite { name, value, .. } => {
+                if let Some(call_id) = meta_new_rvalue(ast, name, *value) {
+                    if let Node::Call {
+                        block_span: Some(block),
+                        ..
+                    } = ast.get(call_id)
+                    {
+                        frames.push((
+                            node.span(),
+                            DefFrame::MetaWrite {
+                                name: name.clone(),
+                                block: *block,
+                                call: call_id,
+                            },
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if orphans.is_empty() {
+        return;
+    }
+    let contains = |outer: Span, inner: Span| outer.0 <= inner.0 && inner.1 <= outer.1;
+    for id in orphans {
+        let Node::Definition {
+            name,
+            receiver_def_name,
+            singleton_name,
+            def_receiver_path,
+            ..
+        } = ast.get(id)
+        else {
+            unreachable!("orphans only collects Definition nodes");
+        };
+        let dspan = ast.get(id).span();
+        let mut enclosing: Vec<&(Span, DefFrame)> = frames
+            .iter()
+            .filter(|(outer, _)| *outer != dspan && contains(*outer, dspan))
+            .collect();
+        // Outermost-first: earlier start wins; equal starts take the LARGER
+        // end (a strictly containing span always starts no later and ends no
+        // sooner than its interior).
+        enclosing.sort_by_key(|(outer, _)| (outer.0, std::cmp::Reverse(outer.1)));
+        // A def anywhere inside another def's subtree files nowhere — the
+        // reference's DefNode arm returns without walking children.
+        if enclosing
+            .iter()
+            .any(|(_, k)| matches!(k, DefFrame::DefBody))
+        {
+            continue;
+        }
+        let mut cx = def_root_cx();
+        // Constant writes whose meta-call frame is shadowed — applying the
+        // `K =` owner instead of the anonymous factory's.
+        let mut meta_writes: HashSet<NodeId> = HashSet::new();
+        for (_, kind) in enclosing {
+            match kind {
+                DefFrame::DefBody => unreachable!("def-in-def filtered above"),
+                DefFrame::Cref {
+                    name,
+                    rooted,
+                    self_anchored,
+                } => {
+                    cx = decl_body_cx(&cx, name, *rooted, *self_anchored);
+                }
+                DefFrame::SingletonBody {
+                    operand,
+                    operand_span,
+                } => {
+                    if operand_span.is_some_and(|s| contains(s, dspan)) {
+                        continue; // a def in the operand keeps the enclosing cx.
+                    }
+                    let prefix = singleton_operand_prefix(ast, *operand, &cx, declared);
+                    cx = DefCx {
+                        lexical: cx.lexical.clone(),
+                        owner: Some(prefix),
+                        in_singleton: true,
+                        singleton_cref: true,
+                        defs_side: DefsSide::Singleton,
+                    };
+                }
+                DefFrame::EvalBody {
+                    receiver,
+                    method,
+                    block,
+                } => {
+                    if !contains(*block, dspan) {
+                        continue; // receiver/args keep the enclosing cx.
+                    }
+                    let self_prefix = cx.self_prefix();
+                    let unnameable = cx.in_singleton
+                        || cx.owner.as_ref().is_some_and(|o| o.is_empty())
+                        || (cx.singleton_cref && self_prefix.is_empty());
+                    let eval_prefix = eval_receiver_prefix(
+                        ast,
+                        *receiver,
+                        &self_prefix,
+                        &cx.lexical,
+                        unnameable,
+                        declared,
+                    )
+                    .unwrap_or_default();
+                    let named = receiver
+                        .is_some_and(|r| !matches!(ast.get(r), Node::SelfExpr { .. }));
+                    let is_instance_eval = INSTANCE_EVAL_METHODS.contains(&method.as_str());
+                    let in_singleton_child = cx.in_singleton && !named;
+                    let defs_side = if is_instance_eval && cx.in_singleton && !named {
+                        DefsSide::Unnameable
+                    } else if is_instance_eval || in_singleton_child {
+                        DefsSide::Singleton
+                    } else {
+                        DefsSide::Instance
+                    };
+                    cx = DefCx {
+                        lexical: cx.lexical.clone(),
+                        owner: Some(eval_prefix),
+                        in_singleton: in_singleton_child,
+                        singleton_cref: cx.singleton_cref,
+                        defs_side,
+                    };
+                }
+                DefFrame::MetaWrite { name, block, call } => {
+                    if !contains(*block, dspan) {
+                        continue;
+                    }
+                    let body_owner = if cx.singleton_cref {
+                        Vec::new()
+                    } else {
+                        qualify_vec(&cx.lexical, name)
+                    };
+                    meta_writes.insert(*call);
+                    cx = DefCx {
+                        lexical: cx.lexical.clone(),
+                        owner: Some(body_owner),
+                        in_singleton: false,
+                        singleton_cref: cx.singleton_cref,
+                        defs_side: DefsSide::Instance,
+                    };
+                }
+                DefFrame::MetaBlock { call, block } => {
+                    if meta_writes.contains(call) || !contains(*block, dspan) {
+                        continue;
+                    }
+                    cx = DefCx {
+                        lexical: cx.lexical.clone(),
+                        owner: Some(vec![ANONYMOUS_META_OWNER.to_string()]),
+                        in_singleton: false,
+                        singleton_cref: cx.singleton_cref,
+                        defs_side: DefsSide::Instance,
+                    };
+                }
+            }
+        }
+        file_def(
+            &cx,
+            name.as_deref(),
+            receiver_def_name.as_deref(),
+            singleton_name.as_deref(),
+            def_receiver_path.as_deref(),
+            tables,
+        );
+    }
+}
+
+/// Every child id the generic walk descends — the lowered tree's recoverable
+/// children for the variants that do not get a dedicated arm. Mirrors the
+/// reference's `node.compact_child_nodes.each` fallback: anything it does not
+/// explicitly context-shift keeps the enclosing context.
+fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
+    match node {
+        Node::Program { body, .. } | Node::Statements { body, .. } => {
+            out.extend_from_slice(body);
+        }
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. } => out.push(*value),
+        Node::MultiWrite {
+            value, target_exprs, ..
+        } => {
+            out.push(*value);
+            out.extend_from_slice(target_exprs);
+        }
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            out.extend_from_slice(parts);
+        }
+        Node::Call {
+            receiver,
+            args,
+            block_body,
+            ..
+        } => {
+            if let Some(r) = receiver {
+                out.push(*r);
+            }
+            out.extend_from_slice(args);
+            out.extend_from_slice(block_body);
+        }
+        Node::Definition { body, .. }
+        | Node::ClassDef { body, .. }
+        | Node::ModuleDef { body, .. } => out.extend_from_slice(body),
+        Node::If {
+            predicate,
+            then_body,
+            else_body,
+            ..
+        } => {
+            out.push(*predicate);
+            out.extend_from_slice(then_body);
+            out.extend_from_slice(else_body);
+        }
+        Node::Case {
+            predicate,
+            branches,
+            else_body,
+            ..
+        } => {
+            if let Some(p) = predicate {
+                out.push(*p);
+            }
+            out.extend_from_slice(branches);
+            out.extend_from_slice(else_body);
+        }
+        Node::When {
+            conditions, body, ..
+        } => {
+            out.extend_from_slice(conditions);
+            out.extend_from_slice(body);
+        }
+        Node::Loop {
+            predicate, body, ..
+        } => {
+            if let Some(p) = predicate {
+                out.push(*p);
+            }
+            out.extend_from_slice(body);
+        }
+        Node::BeginRescue {
+            body,
+            ensure_body,
+            clauses,
+            ..
+        } => {
+            out.extend_from_slice(body);
+            out.extend_from_slice(ensure_body);
+            for c in clauses {
+                out.extend_from_slice(&c.exceptions);
+                out.extend_from_slice(&c.body);
+            }
+        }
+        Node::Lambda { body, .. } | Node::Return { values: body, .. } => {
+            out.extend_from_slice(body);
+        }
+        Node::Logical { left, right, .. } => {
+            out.push(*left);
+            out.push(*right);
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            out.extend_from_slice(elements);
+        }
+        _ => {}
+    }
+}
+
+/// The file's own qualified constant-name census —
+/// `eval_file_declared_names` (`collect_declared_constant_names`): every
+/// `class`/`module` header and `CONST =` write's qualified name, keyed so
+/// `eval_const_prefix` can tell `<nesting>::X` resolvable rungs from
+/// as-written guesses. `def` bodies are skipped (a constant declaration
+/// inside one is a SyntaxError); bare declarations under an unnameable cref
+/// (`class <<`, anonymous factory blocks) name nothing, while explicit-base
+/// paths still re-anchor lexically.
+fn collect_declared_names(ast: &LoweredAst) -> HashSet<String> {
+    let mut out = HashSet::new();
+    collect_declared_names_at(ast, ast.root(), &[], false, &mut out);
+    out
+}
+
+/// `add_declared_name` — every enclosing prefix joins the census: a file
+/// declaring `S::A::B` necessarily has `S` and `S::A` to declare it under, so
+/// an `A::B` eval receiver inside `class S` resolves `S::A::B`.
+fn add_declared(out: &mut HashSet<String>, prefix: &[String]) {
+    for i in 1..=prefix.len() {
+        out.insert(prefix[..i].join("::"));
+    }
+}
+
+fn collect_declared_names_at(
+    ast: &LoweredAst,
+    node: NodeId,
+    prefix: &[String],
+    unnameable_cref: bool,
+    out: &mut HashSet<String>,
+) {
+    match ast.get(node) {
+        Node::ClassDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        }
+        | Node::ModuleDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        } => {
+            if name.is_empty() {
+                for &child in body {
+                    collect_declared_names_at(ast, child, prefix, unnameable_cref, out);
+                }
+                return;
+            }
+            // `declared_constant_path_prefix`: a `::`-rooted header re-anchors
+            // at the top level (always named, even below an unnameable cref);
+            // a bare or `self::` header under an unnameable cref names NOTHING
+            // (nil — the body keeps the enclosing prefix); every other path
+            // qualifies lexically.
+            let declines =
+                !*rooted && unnameable_cref && (*self_anchored || !name.contains("::"));
+            let child_prefix: Vec<String> = if *rooted {
+                name.split("::").map(str::to_string).collect()
+            } else if declines {
+                prefix.to_vec()
+            } else {
+                qualify_vec(prefix, name)
+            };
+            if !declines {
+                add_declared(out, &child_prefix);
+            }
+            for &child in body {
+                collect_declared_names_at(ast, child, &child_prefix, unnameable_cref, out);
+            }
+        }
+        Node::Definition {
+            is_singleton_class: true,
+            singleton_operand,
+            body,
+            ..
+        } => {
+            // `class <<` — the operand is inspected; the body's cref is the
+            // unnameable singleton.
+            if let Some(op) = singleton_operand {
+                collect_declared_names_at(ast, *op, prefix, unnameable_cref, out);
+            }
+            for &child in body {
+                collect_declared_names_at(ast, child, prefix, true, out);
+            }
+        }
+        Node::Definition { .. } => {} // a `def` body cannot declare constants.
+        Node::ConstantWrite { name, value, .. } => {
+            if !unnameable_cref && !name.is_empty() {
+                add_declared(out, &qualify_vec(prefix, name));
+            }
+            if let Some(call_id) = meta_new_rvalue(ast, name, *value) {
+                // `collect_rvalue_declared_names`: the factory's non-block
+                // children keep the enclosing context; the block's cref is the
+                // written class.
+                if let Node::Call {
+                    receiver,
+                    args,
+                    block_body,
+                    ..
+                } = ast.get(call_id)
+                {
+                    if let Some(r) = receiver {
+                        collect_declared_names_at(ast, *r, prefix, unnameable_cref, out);
+                    }
+                    for &arg in args {
+                        collect_declared_names_at(ast, arg, prefix, unnameable_cref, out);
+                    }
+                    let block_prefix = if unnameable_cref {
+                        prefix.to_vec()
+                    } else {
+                        qualify_vec(prefix, name)
+                    };
+                    for &child in block_body {
+                        collect_declared_names_at(ast, child, &block_prefix, unnameable_cref, out);
+                    }
+                }
+            } else {
+                collect_declared_names_at(ast, *value, prefix, unnameable_cref, out);
+            }
+        }
+        Node::Call {
+            receiver,
+            method,
+            args,
+            block_body,
+            block_span,
+            ..
+        } if block_span.is_some() && is_meta_new_call(ast, *receiver, method) => {
+            // `collect_declared_anonymous_factory?`: an anonymous factory's
+            // non-block children keep context; the block's cref is the
+            // unnameable anonymous class.
+            if let Some(r) = receiver {
+                collect_declared_names_at(ast, *r, prefix, unnameable_cref, out);
+            }
+            for &arg in args {
+                collect_declared_names_at(ast, arg, prefix, unnameable_cref, out);
+            }
+            for &child in block_body {
+                collect_declared_names_at(ast, child, prefix, true, out);
+            }
+        }
+        node => {
+            let mut children = Vec::new();
+            def_walk_children(node, &mut children);
+            for child in children {
+                collect_declared_names_at(ast, child, prefix, unnameable_cref, out);
+            }
+        }
+    }
+}
+
+
 
 /// C5: the static scalar key a hash-key NODE denotes, or `None` when dynamic.
 /// Mirrors the Typer's `static_shape_key_of_node` (the reference's
@@ -3919,18 +5516,18 @@ mod tests {
             b"class String\n  def direct; 1; end\n  [1].each do\n    def in_block; 2; end\n  end\n  if true\n    def in_if; 3; end\n  end\nend\n",
             &core,
         );
-        assert!(idx.project_declares_method("String", "direct"));
-        assert!(idx.project_declares_method("String", "in_block"));
-        assert!(idx.project_declares_method("String", "in_if"));
-        assert!(!idx.project_declares_method("String", "never_defined"));
+        assert!(idx.project_declares_method(None, "String", "direct"));
+        assert!(idx.project_declares_method(None, "String", "in_block"));
+        assert!(idx.project_declares_method(None, "String", "in_if"));
+        assert!(!idx.project_declares_method(None, "String", "never_defined"));
         // Keyed by the QUALIFIED name — a nested class does not leak outward.
         let (_b, idx2) = build_one(
             b"module Outer\n  class Inner\n    def only_here; 1; end\n  end\nend\n",
             &core,
         );
-        assert!(idx2.project_declares_method("Outer::Inner", "only_here"));
-        assert!(!idx2.project_declares_method("Outer", "only_here"));
-        assert!(!idx2.project_declares_method("Inner", "only_here"));
+        assert!(idx2.project_declares_method(None, "Outer::Inner", "only_here"));
+        assert!(!idx2.project_declares_method(None, "Outer", "only_here"));
+        assert!(!idx2.project_declares_method(None, "Inner", "only_here"));
     }
 
     #[test]
@@ -3961,12 +5558,629 @@ mod tests {
             b"def IO.recv_def; 1; end\ndef self.self_def; 2; end\ndef plain_def; 3; end\n",
             &core,
         );
-        assert!(idx.is_toplevel_def("recv_def"));
-        assert!(idx.is_toplevel_def("plain_def"));
-        assert!(!idx.is_toplevel_def("self_def"));
+        assert!(idx.is_toplevel_def(None, "recv_def"));
+        assert!(idx.is_toplevel_def(None, "plain_def"));
+        assert!(!idx.is_toplevel_def(None, "self_def"));
         // Inside a class body the lexical prefix is non-empty ⇒ not toplevel.
         let (_b, idx2) = build_one(b"class K\n  def self.klass_singleton; 1; end\nend\n", &core);
-        assert!(!idx2.is_toplevel_def("klass_singleton"));
+        assert!(!idx2.is_toplevel_def(None, "klass_singleton"));
+    }
+
+    // --- issue #141: receiver-eval def attribution (upstream `fb781023`) ----
+
+    #[test]
+    fn class_eval_def_belongs_to_receiver_not_toplevel() {
+        // The motivating bug: `Minitest::Test.class_eval { def expect }` put
+        // `expect` in the project-wide toplevel table, silently resolving
+        // every unrelated bare `expect(...)`. The def belongs to the
+        // receiver.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class Minitest::Test\nend\nMinitest::Test.class_eval do\n  def expect; 1; end\nend\n",
+            &core,
+        );
+        assert!(!idx.is_toplevel_def(None, "expect"));
+        assert!(idx.project_declares_method(None, "Minitest::Test", "expect"));
+    }
+
+    #[test]
+    fn eval_receiver_resolution_variants() {
+        let core = CoreIndex::new();
+        // An undeclared receiver still names itself: `Missing.class_eval`
+        // files under `Missing` (the as-written fallback), never toplevel.
+        let (_a, idx) = build_one(b"Missing.class_eval do\n  def m; 1; end\nend\n", &core);
+        assert!(!idx.is_toplevel_def(None, "m"));
+        assert!(idx.project_declares_method(None, "Missing", "m"));
+        // A DYNAMIC receiver (a local) names nothing: the block's def files
+        // nowhere — not toplevel, not the enclosing lexical class.
+        let (_b, idx2) = build_one(
+            b"class Outer\n  def setup(x)\n    x.class_eval do\n      def leaked; 1; end\n    end\n  end\nend\n",
+            &core,
+        );
+        assert!(!idx2.is_toplevel_def(None, "leaked"));
+        assert!(!idx2.project_declares_method(None, "Outer", "leaked"));
+        // Receiver resolution is through the LEXICAL nesting only —
+        // `Module.nesting` does not change under `class_eval`, so a `B`
+        // inside `A.class_eval` names `B`, not `A::B` (the as-written
+        // fallback when no rung declares it).
+        let (_c, idx3) = build_one(
+            b"class A\n  class B\n  end\nend\nA.class_eval do\n  B.class_eval do\n    def deep; 1; end\n  end\nend\n",
+            &core,
+        );
+        assert!(!idx3.is_toplevel_def(None, "deep"));
+        assert!(idx3.project_declares_method(None, "B", "deep"));
+        // When the lexical nesting does declare the rung it wins: `B` under
+        // `class A` resolves to `A::B`.
+        let (_d, idx4) = build_one(
+            b"class A\n  class B\n  end\n  B.class_eval do\n    def deep; 1; end\n  end\nend\n",
+            &core,
+        );
+        assert!(!idx4.is_toplevel_def(None, "deep"));
+        assert!(idx4.project_declares_method(None, "A::B", "deep"));
+    }
+
+    #[test]
+    fn instance_eval_def_is_singleton_side() {
+        // `X.instance_eval { def m }` binds `X.m` — singleton side
+        // (`kind = :singleton`). The port's existence table answers
+        // `:instance` queries only, so the name files NOWHERE — an instance
+        // call `x.sm` must still witness absent (Blocking-3 fix) — and it is
+        // never toplevel even for `X == Object`.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class X; end\nX.instance_eval do\n  def sm; 1; end\nend\nObject.instance_eval do\n  def osm; 1; end\nend\n",
+            &core,
+        );
+        assert!(!idx.is_toplevel_def(None, "sm"));
+        assert!(!idx.project_declares_method(None, "X", "sm"));
+        assert!(!idx.is_toplevel_def(None, "osm"));
+        assert!(!idx.project_declares_method(None, "Object", "osm"));
+    }
+
+    #[test]
+    fn object_class_eval_def_stays_toplevel() {
+        // The Object collapse: instance-side defs owned by `Object` are the
+        // toplevel methods. `Object.class_eval { def m }` keeps `m`
+        // bare-callable; `Object.instance_eval`, `class << self` inside one,
+        // and a self-targeting `def Object.m` are singleton-side and do not.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"Object.class_eval do\n  def via_eval; 1; end\nend\nObject.class_exec do\n  def via_exec; 1; end\nend\n",
+            &core,
+        );
+        assert!(idx.is_toplevel_def(None, "via_eval"));
+        assert!(idx.is_toplevel_def(None, "via_exec"));
+        let (_b, idx2) = build_one(
+            b"Object.class_eval do\n  class << self\n    def oss; 1; end\n  end\n  def Object.orecv; 1; end\nend\n",
+            &core,
+        );
+        assert!(!idx2.is_toplevel_def(None, "oss"));
+        assert!(!idx2.is_toplevel_def(None, "orecv"));
+        // The self-targeting receiver def is `:singleton` kind — filed
+        // nowhere, so an `Object.new.orecv` call witnesses absent.
+        assert!(!idx2.project_declares_method(None, "Object", "orecv"));
+        // Kernel / BasicObject get NO collapse — instance methods under them
+        // are not bare-callable (oracle: `helper_kern` / `helper_bo` fire).
+        let (_c, idx3) = build_one(
+            b"Kernel.class_eval do\n  def helper_kern; 1; end\nend\nBasicObject.class_eval do\n  def helper_bo; 1; end\nend\n",
+            &core,
+        );
+        assert!(!idx3.is_toplevel_def(None, "helper_kern"));
+        assert!(!idx3.is_toplevel_def(None, "helper_bo"));
+    }
+
+    #[test]
+    fn singleton_class_body_defs_are_singleton_side() {
+        // `class << C` binds defs on `C`'s singleton — the names file
+        // NOWHERE in the instance-side tables (`kind = :singleton`), never
+        // toplevel; the same inside `Object.class_eval` does not collapse.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class C; end\nclass << C\n  def csing; 1; end\nend\n",
+            &core,
+        );
+        assert!(!idx.is_toplevel_def(None, "csing"));
+        assert!(!idx.project_declares_method(None, "C", "csing"));
+        // `class << self` inside a class body: the self prefix is `D`.
+        let (_b, idx2) = build_one(
+            b"class D\n  class << self\n    def dsing; 1; end\n  end\nend\n",
+            &core,
+        );
+        assert!(!idx2.is_toplevel_def(None, "dsing"));
+        assert!(!idx2.project_declares_method(None, "D", "dsing"));
+    }
+
+    #[test]
+    fn rooted_eval_receiver_ignores_lexical_nesting() {
+        // Blocking-2 — `Source::ConstantPath.rooted?`: a `::`-spelled receiver
+        // re-anchors at the top level BEFORE the lexical walk, so `::String`
+        // inside `module A` names `String`, while a bare `String` rung still
+        // resolves through the file's own lexical declarations.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module A
+  ::String.class_eval do
+    def rm; 1; end
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.project_declares_method(None, "String", "rm"));
+        assert!(!idx.project_declares_method(None, "A::String", "rm"));
+        // Lexical control: a bare `String` under `module A` where the file
+        // declares `A::String` names `A::String`, not the core class.
+        let (_b, idx2) = build_one(
+            b"class A::String
+end
+module A
+  String.class_eval do
+    def lm; 1; end
+  end
+end
+",
+            &core,
+        );
+        assert!(idx2.project_declares_method(None, "A::String", "lm"));
+        assert!(!idx2.project_declares_method(None, "String", "lm"));
+        // `class << ::C` resolves rooted too.
+        let (_c, idx3) = build_one(
+            b"module A
+  class << ::String
+    def rs; 1; end
+  end
+end
+",
+            &core,
+        );
+        // Singleton side — files nowhere in the instance table.
+        assert!(!idx3.project_declares_method(None, "String", "rs"));
+        assert!(!idx3.project_declares_method(None, "A::String", "rs"));
+    }
+
+    #[test]
+    fn singleton_defs_do_not_pollute_instance_table() {
+        // Blocking-3 — `kind = :singleton` names (`def self.x`, `class <<`,
+        // `instance_eval` defs, a self-targeting receiver def) file NOWHERE
+        // in the instance-kind existence tables, so `obj.m` still witnesses
+        // absent (the reference's `discovered_method?(:instance)` never sees
+        // them either).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class String
+  def self.sing1; 1; end
+end
+Float.instance_eval do
+  def sing2; 1; end
+end
+class Array
+  class << self
+    def sing3; 1; end
+  end
+end
+",
+            &core,
+        );
+        assert!(!idx.project_declares_method(None, "String", "sing1"));
+        assert!(!idx.project_declares_method(None, "Float", "sing2"));
+        assert!(!idx.project_declares_method(None, "Array", "sing3"));
+        // The instance-side control still files.
+        let (_b, idx2) = build_one(
+            b"class String
+  def inst1; 1; end
+end
+",
+            &core,
+        );
+        assert!(idx2.project_declares_method(None, "String", "inst1"));
+    }
+
+    #[test]
+    fn orphan_arena_defs_file_under_span_context() {
+        // Blocking-1 — defs lowered into the arena without a
+        // `def_walk_children` edge (range endpoints are lowered for
+        // reachability then dropped) still file under the context their span
+        // sits in; the reference's `compact_child_nodes` walk reaches every
+        // Prism child.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"(def rlo; 0; end)..(def rhi; 9; end)
+",
+            &core,
+        );
+        assert!(idx.is_toplevel_def(None, "rlo"));
+        assert!(idx.is_toplevel_def(None, "rhi"));
+        // Under an eval block the same orphan lands on the receiver.
+        let (_b, idx2) = build_one(
+            b"String.class_eval do
+  x = (def ev_orph; 1; end)..2
+end
+",
+            &core,
+        );
+        assert!(idx2.project_declares_method(None, "String", "ev_orph"));
+        // Inside a class body the orphan is an instance method.
+        let (_c, idx3) = build_one(
+            b"class K
+  y = (def km_orph; 1; end)..2
+end
+",
+            &core,
+        );
+        assert!(idx3.project_declares_method(None, "K", "km_orph"));
+        // A def inside another def's span files nowhere — the reference's
+        // DefNode arm never descends.
+        let (_d, idx4) = build_one(
+            b"def outer_orph
+  (def in_range_orph; 1; end)..2
+end
+",
+            &core,
+        );
+        assert!(idx4.is_toplevel_def(None, "outer_orph"));
+        assert!(!idx4.is_toplevel_def(None, "in_range_orph"));
+        // Under an orphan singleton context the def files nowhere (singleton
+        // side), not the enclosing class.
+        let (_e, idx5) = build_one(
+            b"class << Object
+  (def sing_orph; 1; end)..2
+end
+",
+            &core,
+        );
+        assert!(!idx5.project_declares_method(None, "Object", "sing_orph"));
+        assert!(!idx5.is_toplevel_def(None, "sing_orph"));
+    }
+
+    #[test]
+    fn rooted_class_header_resets_lexical_prefix() {
+        // `Source::ConstantPath.declaration_prefix` — a `::`-rooted header
+        // RESETS the body's lexical prefix to the header's own name:
+        // `module M; class ::Object` opens `Object` (its defs collapse to
+        // bare-callable), `class ::String` reopens `String` — never
+        // `M::Object` / `M::String` (review round 2, blocking 1).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module M
+  class ::Object
+    def rooted_obj = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.is_toplevel_def(None, "rooted_obj"));
+        // `::Kernel` / `::BasicObject` reset too but get NO Object collapse —
+        // the reference fires on the bare call (must-still-fire control).
+        let (_b, idx2) = build_one(
+            b"module M
+  module ::Kernel
+    def rooted_kern = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(!idx2.is_toplevel_def(None, "rooted_kern"));
+        assert!(idx2.project_declares_method(None, "Kernel", "rooted_kern"));
+        assert!(!idx2.project_declares_method(None, "M::Kernel", "rooted_kern"));
+        // `class ::String` files under `String` — the lexical-`M::String`
+        // mis-key was a pre-existing FP this also closes.
+        let (_c, idx3) = build_one(
+            b"module M
+  class ::String
+    def rooted_str = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx3.project_declares_method(None, "String", "rooted_str"));
+        assert!(!idx3.project_declares_method(None, "M::String", "rooted_str"));
+        // Lexical control: a NON-rooted `class Object` inside `module M`
+        // still names `M::Object` — the bare call keeps firing.
+        let (_d, idx4) = build_one(
+            b"module M
+  class Object
+    def lexobj = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(!idx4.is_toplevel_def(None, "lexobj"));
+        assert!(idx4.project_declares_method(None, "M::Object", "lexobj"));
+        // `private` does not change the filing (the reference records the
+        // running default without removing the name).
+        let (_e, idx5) = build_one(
+            b"module M
+  class ::Object
+    private
+    def ro_priv = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx5.is_toplevel_def(None, "ro_priv"));
+    }
+
+    #[test]
+    fn self_anchored_header_rides_rebound_self() {
+        // `self_anchored_decl_prefix` — a `class self::X` header under a
+        // REBOUND self names `owner::X`, not the lexical `X`: inside
+        // `Object.class_eval` it records `Object::String` (so `"s".m` still
+        // fires), inside `class <<` it is unnameable, and inside a plain
+        // `module M` it resolves lexically (`M::String`).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"Object.class_eval do
+  class self::String
+    def self_hdr = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.project_declares_method(None, "Object::String", "self_hdr"));
+        assert!(!idx.project_declares_method(None, "String", "self_hdr"));
+        let (_b, idx2) = build_one(
+            b"class << Object
+  class self::String
+    def u_self = 1
+  end
+end
+",
+            &core,
+        );
+        // Unnameable under `class <<` — files nowhere.
+        assert!(!idx2.project_declares_method(None, "Object::String", "u_self"));
+        assert!(!idx2.project_declares_method(None, "String", "u_self"));
+        // Lexical fallback with no rebound self: `module M` makes self `M`.
+        let (_c, idx3) = build_one(
+            b"module M
+  class self::String
+    def lex_self = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx3.project_declares_method(None, "M::String", "lex_self"));
+        assert!(!idx3.project_declares_method(None, "String", "lex_self"));
+    }
+
+    #[test]
+    fn rooted_header_under_singleton_cref_reanchors() {
+        // `decl_nameable_under_cref?` — a `::`-rooted header escapes an
+        // unnameable `class <<` cref (its name is still reachable), while a
+        // bare header stays ownerless.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class << Object
+  class ::String
+    def rr_s = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.project_declares_method(None, "String", "rr_s"));
+        let (_b, idx2) = build_one(
+            b"class << Object
+  class Bare
+    def rr_b = 1
+  end
+end
+",
+            &core,
+        );
+        // A bare header below `class <<` names `#<singleton>::Bare` — nothing.
+        assert!(!idx2.project_declares_method(None, "Bare", "rr_b"));
+        assert!(!idx2.project_declares_method(None, "Object::Bare", "rr_b"));
+    }
+
+    #[test]
+    fn multi_segment_header_contributes_one_rung() {
+        // `Source::ConstantPath.declaration_prefix` pushes the rendered name
+        // as ONE prefix element, so `lexical_nesting_for_prefix` yields a
+        // rung only at DECLARATION boundaries — `class ::M::N` inside
+        // `module Outer` nests `M::N` alone (no bare `M` rung), and
+        // `class A::B` inside `module M` nests `M::A::B`, `M` (never a
+        // partial-segment `M::A` rung). Round-3: the split made `String`
+        // resolve to `M::String`, a port-only `call.undefined-method`.
+        let core = CoreIndex::new();
+        // Rooted multi-segment header: the `M` rung must NOT exist.
+        let (_a, idx) = build_one(
+            b"module M
+  class String
+  end
+end
+module Outer
+  class ::M::N
+                  String.class_eval do
+      def injected = 1
+    end
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.project_declares_method(None, "String", "injected"));
+        assert!(!idx.project_declares_method(None, "M::String", "injected"));
+        // Same for a `class <<` operand — resolved against the same rungs.
+        let (_b, idx2) = build_one(
+            b"module M
+  class String
+  end
+end
+module Outer
+  class ::M::N
+                  class << String
+      def s_inj = 1
+    end
+  end
+end
+",
+            &core,
+        );
+        // Singleton-side defs file nowhere on the instance side regardless —
+        // assert only that the M::String instance table saw nothing.
+        assert!(!idx2.project_declares_method(None, "M::String", "s_inj"));
+        // Unrooted multi-segment: the enclosing `M` rung stays live (the
+        // header pushes ONE `A::B` element) — `M::String` resolves — while
+        // a PARTIAL segment `M::A` is never a rung: `M::A::String` declared
+        // but unreachable from `class A::B`'s body.
+        let (_c, idx3) = build_one(
+            b"module A3
+end
+module M
+  class String
+  end
+  class A3::String
+  end
+end
+              module M
+  class A3::B
+    String.class_eval do
+      def mid = 1
+    end
+  end
+              class A::B
+    String.class_eval do
+      def via_m = 1
+    end
+  end
+end
+",
+            &core,
+        );
+        // `class A::B` inside `module M`: rungs M::A::B, M — `M::String` wins.
+        assert!(idx3.project_declares_method(None, "M::String", "via_m"));
+        assert!(!idx3.project_declares_method(None, "String", "via_m"));
+        // `class A3::B`: rungs M::A3::B, M — `M::String` wins over both
+        // `M::A3::String` (M::A3 is NOT a rung) and `String`.
+        assert!(idx3.project_declares_method(None, "M::String", "mid"));
+        assert!(!idx3.project_declares_method(None, "M::A3::String", "mid"));
+    }
+
+    #[test]
+    fn def_attribution_is_per_file_macros_are_cross_file() {
+        // `finalize_def_index` + `seed_discovered_methods`: a plain `def`
+        // suppresses only in the file declaring it (a cross-file `def` is the
+        // ADR-17 monkey-patch case `undefined-method` surfaces), while a
+        // call-introduced name (`attr_reader`) survives `subtract_def_methods`
+        // and suppresses cross-file.
+        let core = CoreIndex::new();
+        let a = lower_src(b"class String
+  def xs_def; 1; end
+  attr_reader :xs_attr
+end
+");
+        let b = lower_src(b"\"s\".xs_def\n\"s\".xs_attr\n");
+        let idx = SourceIndex::build_project(&[&a, &b], &core);
+        // The declaring file's overlay sees both.
+        assert!(idx.project_declares_method(Some(a.file_key()), "String", "xs_def"));
+        assert!(idx.project_declares_method(Some(a.file_key()), "String", "xs_attr"));
+        // The sibling file sees the macro but NOT the plain def.
+        assert!(!idx.project_declares_method(Some(b.file_key()), "String", "xs_def"));
+        assert!(idx.project_declares_method(Some(b.file_key()), "String", "xs_attr"));
+        // `None` keeps the union-over-all-files answer for legacy callers.
+        assert!(idx.project_declares_method(None, "String", "xs_def"));
+    }
+
+    #[test]
+    fn object_eval_def_is_per_file_only() {
+        // `Object.class_eval { def m }` resolves a bare `m` ONLY in the file
+        // that declares it — `source_declared_method?` reads `Object` through
+        // the per-file overlay — while a toplevel `def` is project-wide
+        // (`top_level_def_for`) and an `Object` macro is cross-file
+        // (`subtract_def_methods` keeps it).
+        let core = CoreIndex::new();
+        let a = lower_src(b"Object.class_eval do
+  def obj_m; 1; end
+end
+def top_m; 1; end
+");
+        let b = lower_src(b"obj_m
+top_m
+");
+        let idx = SourceIndex::build_project(&[&a, &b], &core);
+        assert!(idx.is_toplevel_def(Some(a.file_key()), "obj_m"));
+        assert!(!idx.is_toplevel_def(Some(b.file_key()), "obj_m"));
+        // A real toplevel `def` resolves in BOTH files.
+        assert!(idx.is_toplevel_def(Some(a.file_key()), "top_m"));
+        assert!(idx.is_toplevel_def(Some(b.file_key()), "top_m"));
+        // An `Object` macro survives the def subtraction → cross-file.
+        let c = lower_src(b"Object.class_eval do
+  attr_reader :obj_attr
+end
+");
+        let d = lower_src(b"obj_attr
+");
+        let idx2 = SourceIndex::build_project(&[&c, &d], &core);
+        assert!(idx2.is_toplevel_def(Some(c.file_key()), "obj_attr"));
+        assert!(idx2.is_toplevel_def(Some(d.file_key()), "obj_attr"));
+    }
+
+    #[test]
+    fn factory_block_def_attribution() {
+        let core = CoreIndex::new();
+        // `K = Class.new { def m }` — the block's def belongs to the class
+        // the WRITE names, not the enclosing lexical scope and not toplevel.
+        let (_a, idx) = build_one(b"K = Class.new do\n  def km; 1; end\nend\n", &core);
+        assert!(!idx.is_toplevel_def(None, "km"));
+        assert!(idx.project_declares_method(None, "K", "km"));
+        // An anonymous factory block keeps the reference's toplevel leniency
+        // (upstream #319): `Module.new { def m }` still resolves a bare call.
+        let (_b, idx2) = build_one(b"Module.new do\n  def anon_m; 1; end\nend\n", &core);
+        assert!(idx2.is_toplevel_def(None, "anon_m"));
+    }
+
+    #[test]
+    fn eval_block_macros_file_under_receiver() {
+        // `record_call_node_methods`: `attr_reader`, `define_method`,
+        // `alias_method` and the module-attr macros introduce methods under
+        // the eval block's receiver — `Object` collapses them to toplevel.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class W; end\nW.class_eval do\n  attr_reader :wattr\n  define_method(:wdm) { 1 }\n  attr_accessor :wacc\n  alias_method :walias, :wattr\nend\n",
+            &core,
+        );
+        for m in ["wattr", "wdm", "wacc", "wacc=", "walias"] {
+            assert!(idx.project_declares_method(None, "W", m), "missing {m}");
+            assert!(!idx.is_toplevel_def(None, m), "{m} leaked to toplevel");
+        }
+        let (_b, idx2) = build_one(
+            b"Object.class_eval do\n  attr_reader :oattr\n  define_method(:odm) { 1 }\nend\n",
+            &core,
+        );
+        assert!(idx2.is_toplevel_def(None, "oattr"));
+        assert!(idx2.is_toplevel_def(None, "odm"));
+        // A toplevel `attr_reader` records nothing (the reference declines an
+        // empty prefix) — must-still-fire control.
+        let (_c, idx3) = build_one(b"attr_reader :tl_attr\n", &core);
+        assert!(!idx3.is_toplevel_def(None, "tl_attr"));
+    }
+
+    #[test]
+    fn class_eval_bare_and_self_receivers() {
+        // A bare `class_eval` / `self.class_eval` keeps the enclosing self:
+        // inside `Object.class_eval` the nested bare eval still owns Object;
+        // at file toplevel the self is unnameable — defs file nowhere.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"Object.class_eval do\n  class_eval do\n    def nested_bare; 1; end\n  end\n  self.class_eval do\n    def nested_self; 1; end\n  end\nend\n",
+            &core,
+        );
+        assert!(idx.is_toplevel_def(None, "nested_bare"));
+        assert!(idx.is_toplevel_def(None, "nested_self"));
+        let (_b, idx2) = build_one(
+            b"class_eval do\n  def tl_eval_def; 1; end\nend\nself.class_eval do\n  def tl_self_eval_def; 1; end\nend\n",
+            &core,
+        );
+        assert!(!idx2.is_toplevel_def(None, "tl_eval_def"));
+        assert!(!idx2.is_toplevel_def(None, "tl_self_eval_def"));
     }
 }
 
@@ -4165,6 +6379,49 @@ mod probes_s92 {
                     })
                     .collect(),
             ),
+        ));
+        // `file_defs` is index-aligned with `files` (the per-file def overlay
+        // the toplevel/owner suppression reads) — keep the FILE ORDER in the
+        // ordered fingerprint, sort in the canonical one. Without it a merge
+        // that drops or misorders a file's `def` attribution can still
+        // fingerprint equal on every other field (issue #141).
+        out.push((
+            "file_defs",
+            {
+                let mut per_file: Vec<String> = idx
+                    .file_defs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, fd)| {
+                        let mut tl: Vec<&str> =
+                            fd.toplevel.iter().map(|s| s.as_str()).collect();
+                        tl.sort();
+                        let mut owners: Vec<String> = fd
+                            .methods
+                            .iter()
+                            .map(|(k, v)| {
+                                let mut ms: Vec<&str> =
+                                    v.iter().map(|s| s.as_str()).collect();
+                                ms.sort();
+                                format!("{k}->{{{}}}", ms.join(","))
+                            })
+                            .collect();
+                        owners.sort();
+                        // Canonical mode drops the `f{i}` index so a file
+                        // PERMUTATION renders the same content set; the
+                        // ordered form keeps it to pin the alignment.
+                        if sorted {
+                            format!("tl[{}]m[{}]", tl.join(","), owners.join(","))
+                        } else {
+                            format!("f{i}tl[{}]m[{}]", tl.join(","), owners.join(","))
+                        }
+                    })
+                    .collect();
+                if sorted {
+                    per_file.sort();
+                }
+                per_file.join(" | ")
+            },
         ));
         out.push((
             "mutated_params",
@@ -4457,56 +6714,66 @@ mod probes_s92 {
             }
         }
 
-        // Pass 1c.
-        for ast in asts {
-            let scope_spans: Vec<rigor_parse::Span> = ast
-                .iter()
-                .filter_map(|(_, n)| match n {
-                    Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => Some(*span),
-                    _ => None,
-                })
-                .collect();
-            for (_, node) in ast.iter() {
-                match node {
-                    Node::Definition { name: Some(nm), span, .. }
-                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
-                    {
-                        idx.toplevel_defs.insert(nm.clone());
-                    }
-                    Node::Definition { receiver_def_name: Some(nm), span, .. }
-                        if !scope_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) =>
-                    {
-                        idx.toplevel_defs.insert(nm.clone());
-                    }
-                    Node::ClassDef { name, methods, .. } | Node::ModuleDef { name, methods, .. }
-                        if matches!(name.as_str(), "Object" | "Kernel" | "BasicObject") =>
-                    {
-                        idx.toplevel_defs.extend(methods.iter().cloned());
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Pass 1d.
-        for ast in asts {
-            let scopes = lexical_scopes(ast);
-            for (_, node) in ast.iter() {
-                let Node::Definition { name: Some(nm), span, .. } = node else {
-                    continue;
-                };
-                let innermost = scopes
-                    .iter()
-                    .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
-                    .min_by_key(|(s, _)| s.1 - s.0);
-                if let Some((_, segs)) = innermost {
-                    idx.discovered_methods
-                        .entry(segs.join("::"))
+        // Passes 1c + 1d: the same def-attribution walk as `harvest` —
+        // a `def` inside `Recv.class_eval` belongs to `Recv`, not toplevel —
+        // plus the same `subtract_def_methods` barrier `merge` runs.
+        let mut union_def_names: HashMap<String, HashSet<String>> = HashMap::new();
+        for (i, ast) in asts.iter().enumerate() {
+            let declared = collect_declared_names(ast);
+            let mut tables = DefTables::default();
+            let mut visited = HashSet::new();
+            walk_defs(
+                ast,
+                &declared,
+                &mut tables,
+                &mut visited,
+                ast.root(),
+                &def_root_cx(),
+            );
+            file_orphan_defs(ast, &declared, &visited, &mut tables);
+            for (key, new_name, old_name) in std::mem::take(&mut tables.pending_aliases) {
+                if tables.def_names.get(&key).is_some_and(|defs| defs.contains(&old_name)) {
+                    tables.def_names.entry(key.clone()).or_default().insert(new_name.clone());
+                    tables
+                        .file_methods
+                        .entry(key.clone())
                         .or_default()
-                        .insert(nm.clone());
+                        .insert(new_name.clone());
+                    if key == "Object" {
+                        tables.file_toplevel.insert(new_name);
+                    }
                 }
             }
+            idx.file_index.insert(ast.file_key().clone(), i);
+            idx.toplevel_defs.extend(std::mem::take(&mut tables.toplevel));
+            for (owner, methods) in std::mem::take(&mut tables.macro_methods) {
+                idx.discovered_methods
+                    .entry(owner)
+                    .or_default()
+                    .extend(methods);
+            }
+            for (owner, defs) in std::mem::take(&mut tables.def_names) {
+                union_def_names
+                    .entry(owner)
+                    .or_default()
+                    .extend(defs);
+            }
+            idx.file_defs.push(FileDefs {
+                toplevel: std::mem::take(&mut tables.file_toplevel),
+                methods: std::mem::take(&mut tables.file_methods),
+            });
         }
+        for (owner, defs) in &union_def_names {
+            if let Some(methods) = idx.discovered_methods.get_mut(owner) {
+                methods.retain(|m| !defs.contains(m));
+            }
+        }
+        let object_macros: Vec<String> = idx
+            .discovered_methods
+            .get("Object")
+            .map(|ms| ms.iter().cloned().collect())
+            .unwrap_or_default();
+        idx.toplevel_defs.extend(object_macros);
 
         // Pass 1e.
         for ast in asts {
@@ -5014,7 +7281,8 @@ mod probes_s92 {
     /// already unstable between processes on identical input (§3.4) — comparing
     /// them ordered would pin noise, so they are compared CANONICALISED, which
     /// is the whole content either way.
-    const ORDER_BEARING: [&str; 3] = ["names", "name_to_id", "override_classes"];
+    const ORDER_BEARING: [&str; 4] =
+        ["names", "name_to_id", "override_classes", "file_defs"];
 
     /// Assert `SourceIndex::build_project` (harvest + merge) and the pre-#92
     /// inline path agree on every field: canonicalised for content, and
@@ -5024,7 +7292,7 @@ mod probes_s92 {
         let old_idx = build_project_legacy(asts, core);
 
         let (fresh, legacy) = (fingerprint(&new_idx, true), fingerprint(&old_idx, true));
-        assert_eq!(fresh.len(), 17, "the fingerprint must cover every field");
+        assert_eq!(fresh.len(), 18, "the fingerprint must cover every field");
         if let Some((field, x, y)) = diff(&fresh, &legacy).into_iter().next() {
             panic!("[{label}] canonical field `{field}` diverged\n  merge  : {x}\n  legacy : {y}");
         }
