@@ -195,8 +195,10 @@ w5 = "s"
 f5 = [1, 2].tap { |&w5| break w5 }
 f5.push 3
 
-# (31) A `|;local|` declaration hides the outer name and stays unbound —
-# `push` silent on the Dynamic arm.
+# (31) A `|;local|` declaration hides the outer name and binds nothing —
+# `break w6` types Dynamic, so `push` declines. The reference leaks the
+# outer binding through the `;`-local and fires `for "s"` here; the port's
+# silence is the safe side of that oracle leak.
 w6 = "s"
 f6 = [1, 2].tap { |w6p; w6| break w6 }
 f6.push 3
