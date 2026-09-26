@@ -745,6 +745,13 @@ pub enum Node {
         /// `primary_body` equals `body` and `else_body` is empty.
         primary_body: Vec<NodeId>,
         else_body: Vec<NodeId>,
+        /// `true` only for the multi-statement PARENTHESIZED-group carrier
+        /// (`(a; b)`). The reference's `branch_unconditionally_exits?` unwraps
+        /// `Prism::ParenthesesNode` in every caller but never lists
+        /// `Prism::BeginNode`, so `rescue (1; raise)` exits while
+        /// `rescue begin; raise; end` does not — a distinction the shared
+        /// carrier shape would otherwise erase (rigor-rs#167).
+        is_parens: bool,
         span: Span,
     },
     /// A lambda literal (`-> { … }` / `->(x) { … }`). Its `body` statements are
@@ -1894,6 +1901,7 @@ impl<'src> Builder<'src> {
                 body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                is_parens: false,
                 span: span_of(&else_node.location()),
             });
         }
@@ -1971,6 +1979,7 @@ impl<'src> Builder<'src> {
                 body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                is_parens: false,
                 span: span_of(&in_node.location()),
             });
         }
@@ -2105,6 +2114,7 @@ impl<'src> Builder<'src> {
                 clauses,
                 primary_body,
                 else_body,
+                is_parens: false,
                 span: span_of(&begin_node.location()),
             });
         }
@@ -2222,6 +2232,7 @@ impl<'src> Builder<'src> {
                 body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                is_parens: true,
                 span: span_of(&parens.location()),
             });
         }

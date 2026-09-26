@@ -89,6 +89,7 @@ fn visit(
         node.rights.len(),
         node.rest.is_some(),
         interner,
+        resolve,
     );
     for (t, ty) in node.lefts.iter().zip(fronts) {
         bind_target(t, ty, interner, resolve, out);
@@ -174,22 +175,87 @@ fn join_member_bindings(
     }
 }
 
-/// Reference `decompose`: a `Type::Tuple` RHS decomposes element-wise; every
-/// other carrier (`Nominal[Array]`, `Dynamic[top]`, `Top`, `Bot`, a union, …)
-/// collapses to `Dynamic[top]` per slot.
+/// Reference `decompose`: a `Type::Tuple` RHS decomposes element-wise; a
+/// member that provably has no implicit `to_ary` conversion decomposes as the
+/// ONE-ELEMENT tuple `[rhs]` — the wrap Ruby itself performs
+/// (`a, b = 1` binds `1` and `nil`, `multi_target_binder.rb`'s
+/// `wraps_as_single_element?`, issue #1094) — and the wrap is EXACT, so it
+/// carries no optimistic mark. Everything else (`Nominal[Array]`,
+/// `Dynamic[top]`, `Top`, `Bot`, a type naming no single class, …) collapses
+/// to `Dynamic[top]` per slot. The union members a statement-level RHS
+/// commonly produces are CONSTANTS (`c ? 1 : [2, 3]`), all of which name a
+/// `to_ary`-free class; the reference additionally consults the scope for
+/// project-defined conversion hooks and RBS-known non-core classes — neither
+/// is reachable from this binder's context, so those stay `Dynamic[top]`
+/// (a decline, never a wrong binding).
 fn decompose(
     rhs_type: TypeId,
     front_count: usize,
     back_count: usize,
     rest_present: bool,
     interner: &mut Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
 ) -> (Vec<TypeId>, Option<TypeId>, Vec<TypeId>) {
     match interner.get(rhs_type) {
         Type::Tuple(elements) => {
             let elements = elements.clone();
             decompose_tuple(&elements, front_count, back_count, rest_present, interner)
         }
+        _ if wraps_as_single_element(rhs_type, interner, resolve) => {
+            decompose_tuple(&[rhs_type], front_count, back_count, rest_present, interner)
+        }
         _ => decompose_default(front_count, back_count, rest_present, interner),
+    }
+}
+
+/// Reference `wraps_as_single_element?` restricted to the closed core list
+/// (`ARRAY_CONVERSION_FREE_CORE_CLASSES` — `Integer`, `Float`, `Symbol`,
+/// `String`, `Hash`, `Range`, `Regexp`, `Proc`, `NilClass`, `TrueClass`,
+/// `FalseClass`), the only half of `array_conversion_free?` a scope-less
+/// binder can answer. A class outside the list declines to `Dynamic[top]`
+/// per slot — the same answer `array_conversion_free?` gives with a nil
+/// scope.
+fn wraps_as_single_element(
+    rhs_type: TypeId,
+    interner: &Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> bool {
+    const CORE: &[&str] = &[
+        "Integer", "Float", "Symbol", "String", "Hash", "Range", "Regexp", "Proc", "NilClass",
+        "TrueClass", "FalseClass",
+    ];
+    conversion_class_name(rhs_type, interner, resolve).is_some_and(|n| CORE.contains(&n.as_str()))
+}
+
+/// Reference `conversion_class_name`: the class whose instances `ty`
+/// describes, for the `to_ary` question — `None` when `ty` names no single
+/// class (`Dynamic`, `Top`, `Singleton`, `Intersection`, …). A union never
+/// reaches here; [`visit_union`] distributes it first.
+fn conversion_class_name(
+    ty: TypeId,
+    interner: &Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> Option<String> {
+    match interner.get(ty) {
+        Type::Constant(s) => Some(
+            match s {
+                Scalar::Int(_) => "Integer",
+                Scalar::Float(_) => "Float",
+                Scalar::Str(_) => "String",
+                Scalar::Sym(_) => "Symbol",
+                Scalar::Nil => "NilClass",
+                Scalar::Bool(true) => "TrueClass",
+                Scalar::Bool(false) => "FalseClass",
+            }
+            .to_string(),
+        ),
+        Type::Nominal { class, .. } => resolve(*class),
+        Type::HashShape(_) => Some("Hash".to_string()),
+        Type::IntegerRange { .. } => Some("Integer".to_string()),
+        Type::Refined { base, .. } | Type::Difference { base, .. } => {
+            conversion_class_name(*base, interner, resolve)
+        }
+        _ => None,
     }
 }
 

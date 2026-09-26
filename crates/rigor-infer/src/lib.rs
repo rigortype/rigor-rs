@@ -3126,7 +3126,7 @@ impl<'i> Typer<'i> {
         };
         let rebinds = toplevel_rebinds(ast);
         for stmt in body {
-            self.bind_check_statement(ast, stmt, &mut env, &rebinds, interner, &mut arm_entries);
+            self.bind_check_statement(ast, stmt, &mut env, &rebinds, interner, &mut arm_entries, false);
         }
         (env, arm_entries)
     }
@@ -3141,6 +3141,10 @@ impl<'i> Typer<'i> {
     /// `5 | 6`). Anything it cannot model — an `if`/`case`/`while` arm, a
     /// `super`/`yield` argument — still widens every rebind inside it, the
     /// zero-FP floor.
+    // too_many_arguments: a statement-walk fn threading the full binding
+    // context (ast, env, rebinds, interner, arm-entry recorder, clause
+    // threading flag) — same shape as the rule-check fns in rigor-rules.
+    #[allow(clippy::too_many_arguments)]
     fn bind_check_statement(
         &self,
         ast: &LoweredAst,
@@ -3149,6 +3153,14 @@ impl<'i> Typer<'i> {
         rebinds: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         arm_entries: &mut Vec<(rigor_parse::Span, TypeEnv)>,
+        // `true` inside a `begin`/`rescue` CLAUSE body: the clause scope
+        // starts at the `begin`-entry env but threads like an ordinary
+        // scope, so every contained statement records a `(span, env)`
+        // snapshot for `ScopedEnv::at`. A rescue-MODIFIER arm binds with
+        // `false` — the reference records its operand types wholly on the
+        // entry scope (`(w = "s") rescue (w = 1; w.frob)` reads `"s"`), so
+        // its interior stays frozen.
+        threading: bool,
     ) {
         match ast.get(id) {
             Node::LocalVariableWrite { name, value, .. } => {
@@ -3160,7 +3172,7 @@ impl<'i> Typer<'i> {
                 // `x = ((y = 1) rescue y)` reads the arm's `y` as unbound
                 // (`Dynamic[top]`), not the `1?` the joined scope would give.
                 let pre_env = env.clone();
-                self.bind_check_statement(ast, value, env, rebinds, interner, arm_entries);
+                self.bind_check_statement(ast, value, env, rebinds, interner, arm_entries, threading);
                 let ty = self
                     .rescue_modifier_value(ast, value, &pre_env, interner)
                     .unwrap_or_else(|| self.type_of(ast, value, env, interner));
@@ -3170,7 +3182,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 // Same entry-env rule for a rescue-modifier RHS as above.
                 let pre_env = env.clone();
-                self.bind_check_statement(ast, value, env, rebinds, interner, arm_entries);
+                self.bind_check_statement(ast, value, env, rebinds, interner, arm_entries, threading);
                 let rhs = self
                     .rescue_modifier_value(ast, value, &pre_env, interner)
                     .unwrap_or_else(|| self.type_of(ast, value, env, interner));
@@ -3187,13 +3199,16 @@ impl<'i> Typer<'i> {
             Node::VariableWrite { value, .. }
             | Node::InstanceVariableWrite { value, .. } => {
                 let value = *value;
-                self.bind_check_statement(ast, value, env, rebinds, interner, arm_entries);
+                self.bind_check_statement(ast, value, env, rebinds, interner, arm_entries, threading);
             }
             Node::ConstantWrite { .. } => {}
             // A real statement sequence is straight-line code.
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for s in body.clone() {
-                    self.bind_check_statement(ast, s, env, rebinds, interner, arm_entries);
+                    if threading {
+                        arm_entries.push((ast.get(s).span(), env.clone()));
+                    }
+                    self.bind_check_statement(ast, s, env, rebinds, interner, arm_entries, threading);
                 }
             }
             // `expr rescue arm` — `eval_rescue_modifier`
@@ -3211,13 +3226,15 @@ impl<'i> Typer<'i> {
                     // thread from the nil-injected entry|post-expr join.
                     arm_entries.push((ast.get(arm).span(), env.clone()));
                     let mut after_expr = env.clone();
-                    self.bind_check_statement(ast, expr, &mut after_expr, rebinds, interner, arm_entries);
+                    self.bind_check_statement(ast, expr, &mut after_expr, rebinds, interner, arm_entries, threading);
                     if carrier_arm_exits(ast, arm, false) {
                         *env = after_expr;
                     } else {
                         let mut after_arm =
                             self.join_with_nil_injection(env, &after_expr, interner);
-                        self.bind_check_statement(ast, arm, &mut after_arm, rebinds, interner, arm_entries);
+                        // `false`: the arm's interior reads are frozen at the
+                        // recorded entry env even as its writes thread.
+                        self.bind_check_statement(ast, arm, &mut after_arm, rebinds, interner, arm_entries, false);
                         *env = self.join_with_nil_injection(&after_expr, &after_arm, interner);
                     }
                 } else {
@@ -3239,7 +3256,7 @@ impl<'i> Typer<'i> {
                                 | StatementsKind::Rescue
                                 | StatementsKind::Recovered,
                             ..
-                        } => self.bind_check_statement(ast, s, env, rebinds, interner, arm_entries),
+                        } => self.bind_check_statement(ast, s, env, rebinds, interner, arm_entries, threading),
                         other => widen_flow_writes(rebinds, other.span(), env, interner),
                     }
                 }
@@ -3271,7 +3288,7 @@ impl<'i> Typer<'i> {
                     index_exprs.clone(),
                 );
                 if let Some(coll) = predicate {
-                    self.bind_check_statement(ast, coll, env, rebinds, interner, arm_entries);
+                    self.bind_check_statement(ast, coll, env, rebinds, interner, arm_entries, threading);
                 }
                 let coll_ty = predicate
                     .map(|c| self.type_of(ast, c, env, interner))
@@ -3279,7 +3296,7 @@ impl<'i> Typer<'i> {
                 let elem = self.collection_element_type(ast, predicate, coll_ty, interner);
                 let mut body_env = env.clone();
                 for e in &index_exprs {
-                    self.bind_check_statement(ast, *e, &mut body_env, rebinds, interner, arm_entries);
+                    self.bind_check_statement(ast, *e, &mut body_env, rebinds, interner, arm_entries, threading);
                 }
                 if let Some(targets) = &for_targets {
                     for (name, ty) in multi_target_binder::bind(targets, elem, interner, &|c| self.class_name(c)) {
@@ -3291,7 +3308,10 @@ impl<'i> Typer<'i> {
                     }
                 }
                 for s in &body {
-                    self.bind_check_statement(ast, *s, &mut body_env, rebinds, interner, arm_entries);
+                    if threading {
+                        arm_entries.push((ast.get(*s).span(), body_env.clone()));
+                    }
+                    self.bind_check_statement(ast, *s, &mut body_env, rebinds, interner, arm_entries, threading);
                 }
                 *env = self.join_with_nil_injection(env, &body_env, interner);
             }
@@ -3318,35 +3338,48 @@ impl<'i> Typer<'i> {
                 );
                 let entry = env.clone();
                 let mut primary = env.clone();
-                for s in &primary_body {
-                    self.bind_check_statement(ast, *s, &mut primary, rebinds, interner, arm_entries);
-                }
-                for s in &else_body {
-                    self.bind_check_statement(ast, *s, &mut primary, rebinds, interner, arm_entries);
+                for s in primary_body.iter().chain(&else_body) {
+                    if threading {
+                        arm_entries.push((ast.get(*s).span(), primary.clone()));
+                    }
+                    self.bind_check_statement(ast, *s, &mut primary, rebinds, interner, arm_entries, threading);
                 }
                 let mut scopes = vec![primary];
                 for clause in &clauses {
-                    // A clause body's reads type from the `begin`-ENTRY env,
-                    // same as a rescue modifier's arm (see
-                    // `build_toplevel_check_env`) — record it even for an
-                    // exiting clause; its interior is still diagnosed.
+                    // A clause body's reads type from the `begin`-ENTRY env —
+                    // the reference evaluates each clause on a fresh scope
+                    // cloned at the `begin` — but the body still THREADS: a
+                    // statement sees the writes earlier statements of the SAME
+                    // clause made (`rescue; w = "s"; w.upcase; end` reads
+                    // `"s"`). The whole-clause entry covers the `rescue E`
+                    // head; each statement's own span-entry snapshots the env
+                    // as it stood when that statement began — the `=> e`
+                    // binding included (`rescue => e; e.message` reads
+                    // `StandardError`). Recorded even for an exiting clause;
+                    // its interior is still diagnosed.
                     arm_entries.push((clause.span, entry.clone()));
-                    if rescue_clause_exits(ast, clause) {
-                        continue;
-                    }
                     let mut arm = entry.clone();
                     if let Some(name) = &clause.bound_name {
                         let exc = self.rescue_exception_type(ast, &clause.exceptions, &entry, interner);
                         arm.insert(name.clone(), exc);
                     }
                     for s in &clause.body {
-                        self.bind_check_statement(ast, *s, &mut arm, rebinds, interner, arm_entries);
+                        arm_entries.push((ast.get(*s).span(), arm.clone()));
+                        // `true`: the clause scope threads like an ordinary
+                        // scope — nested constructs inside it see the writes
+                        // earlier statements of this clause made.
+                        self.bind_check_statement(ast, *s, &mut arm, rebinds, interner, arm_entries, true);
                     }
-                    scopes.push(arm);
+                    if !rescue_clause_exits(ast, clause) {
+                        scopes.push(arm);
+                    }
                 }
                 *env = self.reduce_scopes_with_nil_injection(&scopes, interner);
                 for s in &ensure_body {
-                    self.bind_check_statement(ast, *s, env, rebinds, interner, arm_entries);
+                    if threading {
+                        arm_entries.push((ast.get(*s).span(), env.clone()));
+                    }
+                    self.bind_check_statement(ast, *s, env, rebinds, interner, arm_entries, threading);
                 }
             }
             // A transparent carrier — multi-statement parens or an
@@ -3354,7 +3387,10 @@ impl<'i> Typer<'i> {
             // in order, so it descends like a sequence.
             Node::BeginRescue { body, .. } => {
                 for s in body.clone() {
-                    self.bind_check_statement(ast, s, env, rebinds, interner, arm_entries);
+                    if threading {
+                        arm_entries.push((ast.get(s).span(), env.clone()));
+                    }
+                    self.bind_check_statement(ast, s, env, rebinds, interner, arm_entries, threading);
                 }
             }
             // A call's receiver and arguments evaluate unconditionally, so a
@@ -3384,10 +3420,10 @@ impl<'i> Typer<'i> {
                     block_locals.clone(),
                 );
                 if let Some(r) = receiver {
-                    self.bind_check_statement(ast, r, env, rebinds, interner, arm_entries);
+                    self.bind_check_statement(ast, r, env, rebinds, interner, arm_entries, threading);
                 }
                 for a in &args {
-                    self.bind_check_statement(ast, *a, env, rebinds, interner, arm_entries);
+                    self.bind_check_statement(ast, *a, env, rebinds, interner, arm_entries, threading);
                 }
                 let entry = env.clone();
                 for s in &block_body {
@@ -3399,7 +3435,7 @@ impl<'i> Typer<'i> {
                         let sp = ast.get(*s).span();
                         widen_flow_writes(rebinds, sp, env, interner);
                     } else {
-                        self.bind_check_statement(ast, *s, env, rebinds, interner, arm_entries);
+                        self.bind_check_statement(ast, *s, env, rebinds, interner, arm_entries, threading);
                     }
                 }
                 if block_span.is_some() {
@@ -3431,9 +3467,9 @@ impl<'i> Typer<'i> {
             // unmodeled — the flat env never narrows on predicates anyway.
             Node::Logical { left, right, .. } => {
                 let (left, right) = (*left, *right);
-                self.bind_check_statement(ast, left, env, rebinds, interner, arm_entries);
+                self.bind_check_statement(ast, left, env, rebinds, interner, arm_entries, threading);
                 let mut right_env = env.clone();
-                self.bind_check_statement(ast, right, &mut right_env, rebinds, interner, arm_entries);
+                self.bind_check_statement(ast, right, &mut right_env, rebinds, interner, arm_entries, threading);
                 *env = self.join_with_nil_injection(env, &right_env, interner);
             }
             // Expression forms whose operands evaluate unconditionally — an
@@ -3441,14 +3477,14 @@ impl<'i> Typer<'i> {
             // `return`'s operands.
             Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
                 for e in elements.clone() {
-                    self.bind_check_statement(ast, e, env, rebinds, interner, arm_entries);
+                    self.bind_check_statement(ast, e, env, rebinds, interner, arm_entries, threading);
                 }
             }
             Node::InterpolatedString { parts, .. }
             | Node::InterpolatedSymbol { parts, .. }
             | Node::Return { values: parts, .. } => {
                 for p in parts.clone() {
-                    self.bind_check_statement(ast, p, env, rebinds, interner, arm_entries);
+                    self.bind_check_statement(ast, p, env, rebinds, interner, arm_entries, threading);
                 }
             }
             other => widen_flow_writes(rebinds, other.span(), env, interner),
@@ -3603,7 +3639,18 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeId {
         if exceptions.is_empty() {
-            return self.nominal_or_untyped("StandardError", interner);
+            // Bare `rescue => e` binds `StandardError`. The SOURCE-registry id
+            // is preferred so it union-merges with the `rescue StandardError
+            // => e` path's `Singleton → Nominal` mint when both appear in one
+            // file; the core id covers a file that never reads the constant.
+            let class = self
+                .source
+                .class_id("StandardError")
+                .or_else(|| self.index.class_id("StandardError"));
+            return match class {
+                Some(class) => interner.intern(Type::Nominal { class, args: vec![] }),
+                None => interner.untyped(),
+            };
         }
         let types: Vec<TypeId> = exceptions
             .iter()
@@ -8590,18 +8637,20 @@ fn shape_key_type(k: &ShapeKey, interner: &mut Interner) -> TypeId {
 /// 5027) exits on `return`/`next`/`break`, a receiverless
 /// `raise`/`throw`/`exit`/`abort`/`fail`, and a `Statements`/`Parentheses`
 /// tail only — it does NOT list `retry` (`(w = 6) rescue retry` still joins
-/// the pre-state → `for [5 | 6]`), and its `IfNode`/`UnlessNode` arm reads
-/// `node.subsequent`, which is a `Prism::ElseNode` the function does not
-/// unwrap, so an `if`/`ternary` can never exit the modifier (a chain of
-/// `elsif`s still bottoms out at an ElseNode or nil), and neither can a
-/// `begin; …; end`.
+/// the pre-state → `for [5 | 6]`), has no `RescueModifierNode` arm (a nested
+/// `… rescue raise` joins rather than exits), and its `IfNode`/`UnlessNode`
+/// arm reads `node.subsequent`, which is a `Prism::ElseNode` the function
+/// does not unwrap, so an `if`/`ternary` can never exit the modifier (a
+/// chain of `elsif`s still bottoms out at an ElseNode or nil), and neither
+/// can a `begin; …; end`.
 ///
 /// The `begin`/`rescue` CLAUSE check (`live_rescue_results` →
 /// `branch_terminates?`, statement_evaluator.rb:1345/5060) additionally
 /// counts a branch whose TYPE is `bot`. The port has no cheap bot-typing
 /// here, so clause mode approximates it syntactically: `retry` (re-enters the
 /// primary body — `begin; w = 6; rescue; retry; end` → `for [6]`), an `if`
-/// whose both arms exit, and a bare `begin` whose tail exits.
+/// whose both arms exit, and a `begin` whose every path (primary, else, each
+/// clause) exits.
 fn carrier_arm_exits(ast: &LoweredAst, id: NodeId, clause_mode: bool) -> bool {
     match ast.get(id) {
         Node::Return { .. } => true,
@@ -8612,11 +8661,30 @@ fn carrier_arm_exits(ast: &LoweredAst, id: NodeId, clause_mode: bool) -> bool {
         Node::Call { receiver: None, method, .. } => {
             matches!(method.as_str(), "raise" | "throw" | "exit" | "abort" | "fail")
         }
-        Node::Statements { body, kind: StatementsKind::Sequence | StatementsKind::Rescue, .. } => {
+        // A rescue MODIFIER is never an exit — `branch_unconditionally_exits?`
+        // has no `RescueModifierNode` arm, so `(w = 7) rescue raise` joins its
+        // own writes in either mode (`begin; w = 6; rescue; (w = 7) rescue
+        // raise; end` → `6 | 7`). Only the real statement SEQUENCE threads.
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
             seq_exits(ast, body, clause_mode)
         }
-        Node::BeginRescue { body, clauses, .. } if clause_mode && clauses.is_empty() => {
-            seq_exits(ast, body, clause_mode)
+        Node::BeginRescue { primary_body, else_body, clauses, is_parens, .. } => {
+            if *is_parens {
+                // `ParenthesesNode` is unwrapped in BOTH modes
+                // (statement_evaluator.rb:5038): `(w = 1) rescue (1; raise)`
+                // exits where `rescue begin; raise; end` does not.
+                seq_exits(ast, primary_body, clause_mode)
+            } else {
+                // A `BeginNode` is not in the syntactic list; in clause mode
+                // it stands in for `branch_terminates?`'s bot-type half —
+                // approximated as "every path exits": the protected body, the
+                // `else` when present (an absent else falls through as `nil`),
+                // and every rescue clause. Modifier mode never exits.
+                clause_mode
+                    && seq_exits(ast, primary_body, clause_mode)
+                    && (else_body.is_empty() || seq_exits(ast, else_body, clause_mode))
+                    && clauses.iter().all(|c| seq_exits(ast, &c.body, clause_mode))
+            }
         }
         Node::If { then_body, else_body, .. } if clause_mode => {
             seq_exits(ast, then_body, clause_mode) && seq_exits(ast, else_body, clause_mode)

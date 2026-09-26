@@ -388,8 +388,9 @@ pub fn ruby_float_to_s(f: f64) -> String {
         return format!("{f:.1}");
     }
     // `{:e}` is Rust's shortest-round-trip scientific ("1e20", "3.14e0",
-    // "9.999999999999999e14") — the same digits Ruby's dtoa emits.
-    let sci = format!("{:e}", f.abs());
+    // "-9.999999999999999e14") — the same digits Ruby's dtoa emits, sign
+    // included (`-1e20` must render `-1.0e+20`, not `1.0e+20`).
+    let sci = format!("{f:e}");
     let Some((_, exp_str)) = sci.split_once('e') else {
         return f.to_string();
     };

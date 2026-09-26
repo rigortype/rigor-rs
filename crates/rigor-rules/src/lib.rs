@@ -3170,12 +3170,16 @@ struct ScopedEnv {
     top: rigor_infer::TypeEnv,
     gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
-    /// `(span, entry-env)` pairs for `expr rescue arm` arms and `begin`/`rescue`
-    /// clause bodies — their interior reads type from the env the construct was
-    /// ENTERED under, not the joined post-scope (reference `eval_rescue_modifier`:
-    /// the arm's operand types come from `OperandWalk.type_of(scope, node)` on
-    /// the entry scope). Outer constructs are recorded first, so the first
-    /// containing span is the outermost entry — matching nested arms.
+    /// `(span, env)` pairs for `expr rescue arm` arms and `begin`/`rescue`
+    /// clause bodies — their interior reads type from the env the construct
+    /// was ENTERED under, not the joined post-scope (reference
+    /// `eval_rescue_modifier`: the arm's operand types come from
+    /// `OperandWalk.type_of(scope, node)` on the entry scope). A modifier arm
+    /// records ONE whole-span entry (frozen); a `begin`/`rescue` clause records
+    /// its head span plus one snapshot per body statement, so the clause scope
+    /// threads its own writes (`eval_begin` clones the entry scope per clause
+    /// and `eval_statement`s through it). Overlapping entries resolve
+    /// innermost-first — see [`Self::at`].
     arm_entries: Vec<(rigor_parse::Span, rigor_infer::TypeEnv)>,
     method_bodies: Vec<rigor_parse::Span>,
 }
@@ -3193,18 +3197,23 @@ impl ScopedEnv {
     }
 
     /// The env a use site at `span` may read: the top-level env at file scope (or
-    /// inside a block, which DOES capture the enclosing locals), the entry env
-    /// inside a rescue arm / clause body, an empty env inside any method body.
+    /// inside a block, which DOES capture the enclosing locals), the recorded
+    /// env inside a rescue arm / clause body, an empty env inside any method
+    /// body. A clause body records one snapshot PER STATEMENT — the clause's
+    /// scope starts at the `begin` entry but threads the body's own writes —
+    /// so the INNERMOST containing entry wins (a statement's span sits inside
+    /// the clause's span), while a rescue-modifier arm records only its
+    /// whole-span entry: its interior stays frozen at the entry env.
     fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
         if self.in_method_body(span) {
             return &self.empty;
         }
-        for (arm_span, entry) in &self.arm_entries {
-            if span.0 >= arm_span.0 && span.1 <= arm_span.1 {
-                return entry;
-            }
-        }
-        &self.top
+        self.arm_entries
+            .iter()
+            .filter(|(arm_span, _)| span.0 >= arm_span.0 && span.1 <= arm_span.1)
+            .min_by_key(|(arm_span, _)| arm_span.1 - arm_span.0)
+            .map(|(_, entry)| entry)
+            .unwrap_or(&self.top)
     }
 
     /// [`Self::at`] for the `Dynamic`-only gates of the class-narrowing and

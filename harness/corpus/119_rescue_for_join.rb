@@ -494,3 +494,104 @@ begin
 rescue
   r50e.frob
 end
+
+# (51) a `begin`/`rescue` clause body starts at the `begin`-ENTRY env but
+# THREADS like an ordinary scope — a statement sees the writes earlier
+# statements of the SAME clause made, at any nesting depth (`eval_begin`
+# clones the entry scope and `eval_statement`s the body through it). Silent
+# below: `w` reads the clause's own write, not the `1`/`"s"` entry bindings.
+# Fires `for :a` (the clause's later write wins) and `for [5]` (`x = w`
+# reads the entry `w`, then `x` threads to the next statement).
+w51 = 1
+begin
+  nil
+rescue
+  w51 = "s"
+  w51.upcase
+end
+w51b = "s"
+begin
+  1
+rescue
+  w51b = 1
+  1.fdiv(w51b)
+end
+w51c = "s"
+begin
+  w51c = 1
+rescue
+  w51c = :a
+  w51c.frob
+end
+w51d = 5
+begin
+  w51d = "s"
+rescue
+  x51 = w51d
+  [x51].frob
+end
+w51e = 1
+begin
+  nil
+rescue
+  (w51e = "s"; w51e.upcase)
+end
+
+# (52) `rescue => e` binds the clause's exception class (`StandardError`
+# for a bare `rescue`) into the clause scope BEFORE its body threads —
+# `e.message` resolves (silent), `e.upcase` fires `for StandardError`,
+# and a clause-local write afterwards still threads (`e.frob` sees the
+# bound type, not `"s"`).
+e52 = 1
+begin
+  raise
+rescue => e52
+  e52.message
+end
+e52b = "s"
+begin
+  1
+rescue => e52b
+  e52b.upcase
+end
+
+# (53) the reference's `branch_unconditionally_exits?` has no
+# `RescueModifierNode` arm but DOES unwrap `ParenthesesNode` in every
+# caller: a NESTED rescue modifier as an arm/clause tail still joins its
+# writes (`[6 | 7]`), while a multi-statement PARENS tail exits
+# (`(1; raise)` — contrast `begin; raise; end` at (49), which does not).
+# Fires `for [6 | 7]`, `for 1`, `for [1 | 2]`.
+w53 = 5
+begin
+  w53 = 6
+rescue
+  (w53 = 7) rescue raise
+end
+[w53].frob
+w53b = "s"
+(w53b = 1) rescue (1; raise)
+w53b.frob
+(w53c = 1) rescue ((w53c = 2) rescue raise)
+[w53c].frob
+
+# (54) `ruby_float_to_s` keeps the minus sign in scientific notation —
+# fires `for [-1.0e+20]`, `for [-1.0e+15]`, `for [-1.0e-05]`,
+# `for [-1.25e-07]`, `for [-1.234567890123456e+15]`.
+[-1e20].frob
+[-1e15].frob
+[-1e-5].frob
+[-1.25e-7].frob
+[-1234567890123456.0].frob
+
+# (55) a union member with no implicit `to_ary` conversion decomposes as the
+# ONE-ELEMENT tuple `[rhs]` (Ruby's own wrap — `multi_target_binder.rb`'s
+# `wraps_as_single_element?`), so `a, b = (c ? 1 : [2, 3])` binds `a` to
+# `1 | 2` and `b` to `3` (softened), not `Dynamic[top]`. Fires
+# `for [1 | 2]`, `for [3]`, `for [3]`, `for [2]`.
+c55 = rand > 0.5
+a55, b55 = (c55 ? 1 : [2, 3])
+[a55].frob
+[b55].frob
+a55b, (b55b, d55) = (c55 ? [1, [2, 3]] : [4])
+[d55].frob
+[b55b].frob
