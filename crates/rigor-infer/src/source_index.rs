@@ -2720,6 +2720,73 @@ struct DefTables {
     pending_aliases: Vec<(String, String, String)>,
 }
 
+/// The body `DefCx` a `class`/`module` header opens — the reference's
+/// `decl_body_context`:
+///
+/// * A `self::`-anchored header rides the REBOUND self
+///   (`self_anchored_decl_prefix`): `self_base` is the singleton marker's
+///   `[]` under `class <<`, else the def-owner override (eval/meta-new
+///   block), else nil — so `Object.class_eval { class self::String }` names
+///   `Object::String`, `class <<` makes it unnameable, and a bare `class
+///   self::X` inside `module M` stays lexical (`M::X`). An EMPTY `self_decl`
+///   marks the body ownerless.
+/// * Otherwise `Source::ConstantPath.declaration_prefix` — a `::`-rooted
+///   header RESETS the lexical prefix to the header's own name rather than
+///   appending (`class ::Object` inside `module M` opens `Object`, not
+///   `M::Object`).
+/// * `unnameable_decl?` — an empty `self_decl` is unnameable; a non-empty one
+///   re-anchors even under `class <<`; otherwise a bare/`self::` header under
+///   an unnameable cref opens `#<singleton>::Name` while a constant path
+///   (rooted or explicit non-self base) still re-anchors lexically
+///   (`decl_nameable_under_cref?`).
+fn decl_body_cx(cx: &DefCx, name: &str, rooted: bool, self_anchored: bool) -> DefCx {
+    let self_decl = if self_anchored {
+        let self_base: Option<Vec<String>> = if cx.in_singleton {
+            Some(Vec::new())
+        } else {
+            cx.owner.clone()
+        };
+        self_base.map(|base| {
+            if base.is_empty() {
+                // `return [] if self_base.empty?` — a `self::` header under a
+                // self nothing names (anonymous factory, `class <<`) is
+                // unnameable, NOT `<base>::Name`.
+                Vec::new()
+            } else {
+                let mut p = base;
+                p.extend(name.split("::").map(str::to_string));
+                p
+            }
+        })
+    } else {
+        None
+    };
+    let child_prefix: Vec<String> = match &self_decl {
+        Some(p) => p.clone(),
+        None => {
+            if rooted {
+                name.split("::").map(str::to_string).collect()
+            } else {
+                let mut lexical = cx.lexical.clone();
+                lexical.extend(name.split("::").map(str::to_string));
+                lexical
+            }
+        }
+    };
+    let decl_nameable = rooted || (name.contains("::") && !self_anchored);
+    let child_cref = match &self_decl {
+        Some(d) => d.is_empty(),
+        None => cx.singleton_cref && !decl_nameable,
+    };
+    DefCx {
+        lexical: if child_cref { Vec::new() } else { child_prefix },
+        owner: None,
+        in_singleton: false,
+        singleton_cref: child_cref,
+        defs_side: DefsSide::Instance,
+    }
+}
+
 /// `walk_methods_and_def_nodes` / `walk_eval_methods_and_defs`: file every
 /// `def`-family name under the owner that binds it, threading lexical vs
 /// rebound-self prefixes the way the reference does. `declared` is the file's
@@ -2737,7 +2804,20 @@ fn walk_defs(
     cx: &DefCx,
 ) {
     match ast.get(node) {
-        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+        Node::ClassDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        }
+        | Node::ModuleDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        } => {
             if name.is_empty() {
                 // An un-renderable header keeps the enclosing context (the
                 // reference falls through to the generic child walk).
@@ -2746,20 +2826,7 @@ fn walk_defs(
                 }
                 return;
             }
-            // A bare header under an unnameable cref opens `#<singleton>::Name`
-            // — `class D` below `class <<` — whose body walks ownerless. An
-            // explicit-base path (`A::B`) still re-anchors lexically
-            // (`declaration_prefix` declines only for the bare form).
-            let child_cref = cx.singleton_cref && !name.contains("::");
-            let mut lexical = cx.lexical.clone();
-            lexical.extend(name.split("::").map(str::to_string));
-            let inner = DefCx {
-                lexical: if child_cref { Vec::new() } else { lexical },
-                owner: None,
-                in_singleton: false,
-                singleton_cref: child_cref,
-                defs_side: DefsSide::Instance,
-            };
+            let inner = decl_body_cx(cx, name, *rooted, *self_anchored);
             for &child in body {
                 walk_defs(ast, declared, tables, visited, child, &inner);
             }
@@ -3430,8 +3497,14 @@ fn qualify_vec(lexical: &[String], name: &str) -> Vec<String> {
 /// is the arena-side residue of one [`walk_defs`] arm, recovered by span
 /// containment instead of child edges.
 enum DefFrame {
-    /// `class`/`module` header — pushes the path onto `lexical`.
-    Cref { name: String },
+    /// `class`/`module` header — `decl_body_cx`: pushes the path onto
+    /// `lexical`, RESETS it when `::`-rooted, or rides the rebound self when
+    /// `self::`-anchored.
+    Cref {
+        name: String,
+        rooted: bool,
+        self_anchored: bool,
+    },
     /// `class << <operand>` — singleton context for the body; a `def` inside
     /// the OPERAND's span keeps the enclosing context instead.
     SingletonBody {
@@ -3477,10 +3550,27 @@ fn file_orphan_defs(
     let mut orphans: Vec<NodeId> = Vec::new();
     for (id, node) in ast.iter() {
         match node {
-            Node::ClassDef { name, .. } | Node::ModuleDef { name, .. }
-                if !name.is_empty() =>
+            Node::ClassDef {
+                name,
+                rooted,
+                self_anchored,
+                ..
+            }
+            | Node::ModuleDef {
+                name,
+                rooted,
+                self_anchored,
+                ..
+            } if !name.is_empty() =>
             {
-                frames.push((node.span(), DefFrame::Cref { name: name.clone() }));
+                frames.push((
+                    node.span(),
+                    DefFrame::Cref {
+                        name: name.clone(),
+                        rooted: *rooted,
+                        self_anchored: *self_anchored,
+                    },
+                ));
             }
             Node::Definition {
                 is_singleton_class: true,
@@ -3587,17 +3677,12 @@ fn file_orphan_defs(
         for (_, kind) in enclosing {
             match kind {
                 DefFrame::DefBody => unreachable!("def-in-def filtered above"),
-                DefFrame::Cref { name } => {
-                    let child_cref = cx.singleton_cref && !name.contains("::");
-                    let mut lexical = cx.lexical.clone();
-                    lexical.extend(name.split("::").map(str::to_string));
-                    cx = DefCx {
-                        lexical: if child_cref { Vec::new() } else { lexical },
-                        owner: None,
-                        in_singleton: false,
-                        singleton_cref: child_cref,
-                        defs_side: DefsSide::Instance,
-                    };
+                DefFrame::Cref {
+                    name,
+                    rooted,
+                    self_anchored,
+                } => {
+                    cx = decl_body_cx(&cx, name, *rooted, *self_anchored);
                 }
                 DefFrame::SingletonBody {
                     operand,
@@ -3812,6 +3897,15 @@ fn collect_declared_names(ast: &LoweredAst) -> HashSet<String> {
     out
 }
 
+/// `add_declared_name` — every enclosing prefix joins the census: a file
+/// declaring `S::A::B` necessarily has `S` and `S::A` to declare it under, so
+/// an `A::B` eval receiver inside `class S` resolves `S::A::B`.
+fn add_declared(out: &mut HashSet<String>, prefix: &[String]) {
+    for i in 1..=prefix.len() {
+        out.insert(prefix[..i].join("::"));
+    }
+}
+
 fn collect_declared_names_at(
     ast: &LoweredAst,
     node: NodeId,
@@ -3820,22 +3914,42 @@ fn collect_declared_names_at(
     out: &mut HashSet<String>,
 ) {
     match ast.get(node) {
-        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
+        Node::ClassDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        }
+        | Node::ModuleDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        } => {
             if name.is_empty() {
                 for &child in body {
                     collect_declared_names_at(ast, child, prefix, unnameable_cref, out);
                 }
                 return;
             }
-            // `declared_constant_path_prefix`: a bare header under an
-            // unnameable cref names nothing; a path (`A::B`) re-anchors.
-            let child_prefix = if unnameable_cref && !name.contains("::") {
+            // `declared_constant_path_prefix`: a `::`-rooted header re-anchors
+            // at the top level (always named, even below an unnameable cref);
+            // a bare or `self::` header under an unnameable cref names NOTHING
+            // (nil — the body keeps the enclosing prefix); every other path
+            // qualifies lexically.
+            let declines =
+                !*rooted && unnameable_cref && (*self_anchored || !name.contains("::"));
+            let child_prefix: Vec<String> = if *rooted {
+                name.split("::").map(str::to_string).collect()
+            } else if declines {
                 prefix.to_vec()
             } else {
                 qualify_vec(prefix, name)
             };
-            if !unnameable_cref || name.contains("::") {
-                out.insert(child_prefix.join("::"));
+            if !declines {
+                add_declared(out, &child_prefix);
             }
             for &child in body {
                 collect_declared_names_at(ast, child, &child_prefix, unnameable_cref, out);
@@ -3859,7 +3973,7 @@ fn collect_declared_names_at(
         Node::Definition { .. } => {} // a `def` body cannot declare constants.
         Node::ConstantWrite { name, value, .. } => {
             if !unnameable_cref && !name.is_empty() {
-                out.insert(qualify_vec(prefix, name).join("::"));
+                add_declared(out, &qualify_vec(prefix, name));
             }
             if let Some(call_id) = meta_new_rvalue(ast, name, *value) {
                 // `collect_rvalue_declared_names`: the factory's non-block
@@ -5707,6 +5821,154 @@ end
     }
 
     #[test]
+    fn rooted_class_header_resets_lexical_prefix() {
+        // `Source::ConstantPath.declaration_prefix` — a `::`-rooted header
+        // RESETS the body's lexical prefix to the header's own name:
+        // `module M; class ::Object` opens `Object` (its defs collapse to
+        // bare-callable), `class ::String` reopens `String` — never
+        // `M::Object` / `M::String` (review round 2, blocking 1).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"module M
+  class ::Object
+    def rooted_obj = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.is_toplevel_def(None, "rooted_obj"));
+        // `::Kernel` / `::BasicObject` reset too but get NO Object collapse —
+        // the reference fires on the bare call (must-still-fire control).
+        let (_b, idx2) = build_one(
+            b"module M
+  module ::Kernel
+    def rooted_kern = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(!idx2.is_toplevel_def(None, "rooted_kern"));
+        assert!(idx2.project_declares_method(None, "Kernel", "rooted_kern"));
+        assert!(!idx2.project_declares_method(None, "M::Kernel", "rooted_kern"));
+        // `class ::String` files under `String` — the lexical-`M::String`
+        // mis-key was a pre-existing FP this also closes.
+        let (_c, idx3) = build_one(
+            b"module M
+  class ::String
+    def rooted_str = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx3.project_declares_method(None, "String", "rooted_str"));
+        assert!(!idx3.project_declares_method(None, "M::String", "rooted_str"));
+        // Lexical control: a NON-rooted `class Object` inside `module M`
+        // still names `M::Object` — the bare call keeps firing.
+        let (_d, idx4) = build_one(
+            b"module M
+  class Object
+    def lexobj = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(!idx4.is_toplevel_def(None, "lexobj"));
+        assert!(idx4.project_declares_method(None, "M::Object", "lexobj"));
+        // `private` does not change the filing (the reference records the
+        // running default without removing the name).
+        let (_e, idx5) = build_one(
+            b"module M
+  class ::Object
+    private
+    def ro_priv = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx5.is_toplevel_def(None, "ro_priv"));
+    }
+
+    #[test]
+    fn self_anchored_header_rides_rebound_self() {
+        // `self_anchored_decl_prefix` — a `class self::X` header under a
+        // REBOUND self names `owner::X`, not the lexical `X`: inside
+        // `Object.class_eval` it records `Object::String` (so `"s".m` still
+        // fires), inside `class <<` it is unnameable, and inside a plain
+        // `module M` it resolves lexically (`M::String`).
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"Object.class_eval do
+  class self::String
+    def self_hdr = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.project_declares_method(None, "Object::String", "self_hdr"));
+        assert!(!idx.project_declares_method(None, "String", "self_hdr"));
+        let (_b, idx2) = build_one(
+            b"class << Object
+  class self::String
+    def u_self = 1
+  end
+end
+",
+            &core,
+        );
+        // Unnameable under `class <<` — files nowhere.
+        assert!(!idx2.project_declares_method(None, "Object::String", "u_self"));
+        assert!(!idx2.project_declares_method(None, "String", "u_self"));
+        // Lexical fallback with no rebound self: `module M` makes self `M`.
+        let (_c, idx3) = build_one(
+            b"module M
+  class self::String
+    def lex_self = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx3.project_declares_method(None, "M::String", "lex_self"));
+        assert!(!idx3.project_declares_method(None, "String", "lex_self"));
+    }
+
+    #[test]
+    fn rooted_header_under_singleton_cref_reanchors() {
+        // `decl_nameable_under_cref?` — a `::`-rooted header escapes an
+        // unnameable `class <<` cref (its name is still reachable), while a
+        // bare header stays ownerless.
+        let core = CoreIndex::new();
+        let (_a, idx) = build_one(
+            b"class << Object
+  class ::String
+    def rr_s = 1
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.project_declares_method(None, "String", "rr_s"));
+        let (_b, idx2) = build_one(
+            b"class << Object
+  class Bare
+    def rr_b = 1
+  end
+end
+",
+            &core,
+        );
+        // A bare header below `class <<` names `#<singleton>::Bare` — nothing.
+        assert!(!idx2.project_declares_method(None, "Bare", "rr_b"));
+        assert!(!idx2.project_declares_method(None, "Object::Bare", "rr_b"));
+    }
+
+    #[test]
     fn def_attribution_is_per_file_macros_are_cross_file() {
         // `finalize_def_index` + `seed_discovered_methods`: a plain `def`
         // suppresses only in the file declaring it (a cross-file `def` is the
@@ -6021,6 +6283,49 @@ mod probes_s92 {
                     })
                     .collect(),
             ),
+        ));
+        // `file_defs` is index-aligned with `files` (the per-file def overlay
+        // the toplevel/owner suppression reads) — keep the FILE ORDER in the
+        // ordered fingerprint, sort in the canonical one. Without it a merge
+        // that drops or misorders a file's `def` attribution can still
+        // fingerprint equal on every other field (issue #141).
+        out.push((
+            "file_defs",
+            {
+                let mut per_file: Vec<String> = idx
+                    .file_defs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, fd)| {
+                        let mut tl: Vec<&str> =
+                            fd.toplevel.iter().map(|s| s.as_str()).collect();
+                        tl.sort();
+                        let mut owners: Vec<String> = fd
+                            .methods
+                            .iter()
+                            .map(|(k, v)| {
+                                let mut ms: Vec<&str> =
+                                    v.iter().map(|s| s.as_str()).collect();
+                                ms.sort();
+                                format!("{k}->{{{}}}", ms.join(","))
+                            })
+                            .collect();
+                        owners.sort();
+                        // Canonical mode drops the `f{i}` index so a file
+                        // PERMUTATION renders the same content set; the
+                        // ordered form keeps it to pin the alignment.
+                        if sorted {
+                            format!("tl[{}]m[{}]", tl.join(","), owners.join(","))
+                        } else {
+                            format!("f{i}tl[{}]m[{}]", tl.join(","), owners.join(","))
+                        }
+                    })
+                    .collect();
+                if sorted {
+                    per_file.sort();
+                }
+                per_file.join(" | ")
+            },
         ));
         out.push((
             "mutated_params",
@@ -6880,7 +7185,8 @@ mod probes_s92 {
     /// already unstable between processes on identical input (§3.4) — comparing
     /// them ordered would pin noise, so they are compared CANONICALISED, which
     /// is the whole content either way.
-    const ORDER_BEARING: [&str; 3] = ["names", "name_to_id", "override_classes"];
+    const ORDER_BEARING: [&str; 4] =
+        ["names", "name_to_id", "override_classes", "file_defs"];
 
     /// Assert `SourceIndex::build_project` (harvest + merge) and the pre-#92
     /// inline path agree on every field: canonicalised for content, and
@@ -6890,7 +7196,7 @@ mod probes_s92 {
         let old_idx = build_project_legacy(asts, core);
 
         let (fresh, legacy) = (fingerprint(&new_idx, true), fingerprint(&old_idx, true));
-        assert_eq!(fresh.len(), 17, "the fingerprint must cover every field");
+        assert_eq!(fresh.len(), 18, "the fingerprint must cover every field");
         if let Some((field, x, y)) = diff(&fresh, &legacy).into_iter().next() {
             panic!("[{label}] canonical field `{field}` diverged\n  merge  : {x}\n  legacy : {y}");
         }

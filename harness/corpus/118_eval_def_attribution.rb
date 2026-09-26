@@ -144,3 +144,70 @@ def control_toplevel_def = 23
 undefined_anywhere
 
 control_toplevel_def
+
+# --- rooted / self:: headers (review round 2) ---------------------------------
+
+# A `::`-rooted header RESETS the body's lexical prefix
+# (`Source::ConstantPath.declaration_prefix`): `class ::Object` inside
+# `module M` opens `Object`, not `M::Object`, so its defs stay bare-callable
+# (SILENT below). `::Kernel`/`::BasicObject` reset too but never collapse —
+# their bare calls FIRE. A `self::` header rides the rebound self
+# (`self_anchored_decl_prefix`): `Object.class_eval { class self::String }`
+# records `Object::String`, so the instance call on `"s"` FIRES.
+
+module M
+  class ::Object
+    def rooted_objhdr = 1
+  end
+  module ::Object
+    def rooted_mod_obj = 1
+  end
+  class ::String
+    def rooted_str_m = 1
+  end
+  class ::Object
+    private
+    def ro_priv = 1
+  end
+  class Object
+    def lexobj = 1
+  end
+  module ::Kernel
+    def rooted_kern = 1
+  end
+  class ::BasicObject
+    def rooted_bo = 1
+  end
+  Object.class_eval do
+    class self::String
+      def self_hdr_m = 1
+    end
+  end
+end
+class C
+  class ::Object
+    def rooted_in_c = 1
+  end
+end
+Object.class_eval do
+  class self::String
+    def self_hdr_tl = 1
+  end
+end
+
+# SILENT: rooted `::Object` defs collapse like every `Object` instance method.
+rooted_objhdr
+rooted_mod_obj
+ro_priv
+rooted_in_c
+# SILENT: `class ::String` under `module M` reopened `String`, not `M::String`.
+"s".rooted_str_m
+# FIRES: a `self::` header under a rebound self names `Object::String` —
+# `String` was never reopened.
+"s".self_hdr_tl
+"s".self_hdr_m
+# FIRES: `::Kernel`/`::BasicObject` reset the prefix but do NOT collapse.
+rooted_kern
+rooted_bo
+# FIRES: a NON-rooted `class Object` inside `module M` still names `M::Object`.
+lexobj

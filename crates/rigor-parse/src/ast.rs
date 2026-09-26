@@ -575,6 +575,16 @@ pub enum Node {
     /// SourceIndex so `X.new` can be typed as an instance of `X`.
     ClassDef {
         name: String,
+        /// `true` when the header is written `::`-rooted (`class ::Foo`) —
+        /// `Source::ConstantPath.rooted?`. A rooted header RESETS the lexical
+        /// prefix its body declares under (`declaration_prefix`), rather than
+        /// appending to it.
+        rooted: bool,
+        /// `true` when the header's leftmost base is `self` (`class self::Foo`)
+        /// — `self_anchored_tail`. A `self::` header under a REBOUND self (an
+        /// eval/meta-new body) names `owner::Name`; under a nameless self it is
+        /// unnameable; otherwise it resolves lexically like any other path.
+        self_anchored: bool,
         superclass: Option<String>,
         /// ADR-35 slice 1: the FULL written superclass path (`< Foo::Bar` ->
         /// `Some("Foo::Bar")`), distinct from `superclass` (which keeps only the
@@ -609,6 +619,12 @@ pub enum Node {
     /// (include resolution is future work; the name/methods are recorded now).
     ModuleDef {
         name: String,
+        /// `true` when the header is written `::`-rooted (`module ::Foo`) —
+        /// see [`Node::ClassDef::rooted`].
+        rooted: bool,
+        /// `true` when the header's leftmost base is `self` (`module self::Foo`)
+        /// — see [`Node::ClassDef::self_anchored`].
+        self_anchored: bool,
         methods: Vec<String>,
         /// Per direct instance method `(name, body ids, has_explicit_return)`.
         /// See [`Node::ClassDef::method_bodies`].
@@ -1692,6 +1708,8 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             return self.push(Node::ClassDef {
                 name,
+                rooted: rooted_constant_path(&class.constant_path()),
+                self_anchored: self_anchored_constant_path(&class.constant_path()),
                 superclass,
                 superclass_path,
                 methods,
@@ -1719,6 +1737,8 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             return self.push(Node::ModuleDef {
                 name,
+                rooted: rooted_constant_path(&module.constant_path()),
+                self_anchored: self_anchored_constant_path(&module.constant_path()),
                 methods,
                 method_bodies,
                 method_visibilities,

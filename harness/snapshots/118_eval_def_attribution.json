@@ -2,6 +2,20 @@
   "fixture": "harness/corpus/118_eval_def_attribution.rb",
   "diagnostics": [
     {
+      "rule": "call.undefined-method",
+      "line": 207,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `self_hdr_tl' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 208,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `self_hdr_m' for \"s\""
+    },
+    {
       "rule": "call.unresolved-toplevel",
       "line": 80,
       "column": 1,
@@ -147,6 +161,27 @@
       "column": 1,
       "severity": "warning",
       "message": "unresolved toplevel call to `undefined_anywhere`. If a project file defines `undefined_anywhere` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 210,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `rooted_kern`. If a project file defines `rooted_kern` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 211,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `rooted_bo`. If a project file defines `rooted_bo` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 213,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `lexobj`. If a project file defines `lexobj` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
     }
   ]
 }
