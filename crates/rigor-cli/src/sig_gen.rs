@@ -1091,7 +1091,7 @@ fn narrows_collection_to_shape(declared: &str, interner: &Interner, inferred: Ty
     if !GENERIC_COLLECTION_CLASSES.contains(&declared) {
         return false;
     }
-    matches!(interner.get(inferred), Type::Tuple(_) | Type::HashShape(_))
+    matches!(interner.get(inferred), Type::Tuple(_) | Type::HashShape { .. })
 }
 
 /// The reference `computed_literal_tightening?`: the inferred type is a

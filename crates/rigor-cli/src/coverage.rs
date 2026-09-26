@@ -1977,7 +1977,7 @@ fn classify_type(interner: &Interner, id: TypeId) -> Tier {
         Type::Top => Tier::Top,
         Type::Constant(_) => Tier::Constant,
         Type::Nominal { .. } | Type::Singleton(_) => Tier::Nominal,
-        Type::Tuple(_) | Type::HashShape(_) | Type::IntegerRange { .. } | Type::App { .. } => {
+        Type::Tuple(_) | Type::HashShape { .. } | Type::IntegerRange { .. } | Type::App { .. } => {
             Tier::Shaped
         }
         Type::Refined { .. } => Tier::Refined,
