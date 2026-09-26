@@ -376,7 +376,7 @@ impl<'i> Typer<'i> {
                         optional: false,
                     })
                     .collect();
-                interner.intern(Type::HashShape(ms))
+                interner.intern(Type::HashShape { members: ms, open: false })
             }
             // Range types to `Nominal[Range]` so witnessing resolves against
             // Range's RBS (an `IntegerRange` would erase to `Integer`).
@@ -780,7 +780,7 @@ impl<'i> Typer<'i> {
             Type::Constant(_)
             | Type::Nominal { .. }
             | Type::Tuple(_)
-            | Type::HashShape(_)
+            | Type::HashShape { .. }
             | Type::IntegerRange { .. }
             | Type::Singleton(_)
             | Type::DataInstance { .. } => Some(true),
@@ -883,7 +883,7 @@ impl<'i> Typer<'i> {
             }
             i += 2;
         }
-        interner.intern(Type::HashShape(members))
+        interner.intern(Type::HashShape { members, open: false })
     }
 
     /// Type a method call with a receiver, running the conservative head of the
@@ -1173,6 +1173,7 @@ impl<'i> Typer<'i> {
         &self,
         members: &[ShapeMember],
         key: &ShapeKey,
+        open: bool,
         interner: &mut Interner,
     ) -> TypeId {
         match members.iter().find(|m| &m.key == key) {
@@ -1182,6 +1183,10 @@ impl<'i> Typer<'i> {
                 let nil = interner.intern(Type::Constant(Scalar::Nil));
                 rigor_types::Algebra::join(interner, value, nil)
             }
+            // A CLOSED shape's missing key reads `Constant[nil]`; an OPEN one
+            // reads a default the shape cannot state — `untyped` (reference
+            // `HashLookupMutation.open_shape` / `ShapeDispatch#hash_lookup`).
+            None if open => interner.untyped(),
             None => interner.intern(Type::Constant(Scalar::Nil)),
         }
     }
@@ -1207,35 +1212,37 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<TypeId> {
-        let members = match interner.get(recv_ty) {
-            Type::HashShape(m) => m.clone(),
+        let (members, open) = match interner.get(recv_ty) {
+            Type::HashShape { members, open } => (members.clone(), *open),
             _ => return None,
         };
 
         match method {
             // `h[k]` / `h.fetch(k)` — a single static scalar key. `[]` surfaces
-            // `Constant[nil]` for a missing key; `fetch` declines on a miss (it
-            // would raise `KeyError`).
+            // `Constant[nil]` for a missing key on a CLOSED shape (`untyped`
+            // when open); `fetch` declines on a miss (it would raise
+            // `KeyError`).
             "[]" | "fetch" if args.len() == 1 => {
                 let key = self.hash_arg_key(ast, args[0], env, interner)?;
                 let present = members.iter().any(|m| m.key == key);
                 if method == "fetch" && !present {
                     return None;
                 }
-                Some(self.hash_read_step(&members, &key, interner))
+                Some(self.hash_read_step(&members, &key, open, interner))
             }
 
             // `h.dig(k, …)` — a chain of static keys. Each step reads the key
-            // (missing → `Constant[nil]`, Ruby's `Hash#dig` short-circuits on
-            // nil); an intermediate `HashShape` recurses, a `Constant[nil]`
-            // ends the chain, anything else declines.
+            // (missing → `Constant[nil]` closed / `untyped` open, Ruby's
+            // `Hash#dig` short-circuits on nil); an intermediate `HashShape`
+            // recurses, a `Constant[nil]` ends the chain, anything else
+            // declines.
             "dig" if !args.is_empty() => {
                 let key = self.hash_arg_key(ast, args[0], env, interner)?;
-                let step = self.hash_read_step(&members, &key, interner);
+                let step = self.hash_read_step(&members, &key, open, interner);
                 if args.len() == 1 {
                     return Some(step);
                 }
-                if matches!(interner.get(step), Type::HashShape(_)) {
+                if matches!(interner.get(step), Type::HashShape { .. }) {
                     return self
                         .fold_hash_shape_projection(step, "dig", ast, &args[1..], env, interner);
                 }
@@ -1245,30 +1252,41 @@ impl<'i> Typer<'i> {
                 None
             }
 
-            // `h.has_key?(k)` (and aliases) — folds to a precise bool from the
-            // statically known key set.
+            // `h.has_key?(k)` (and aliases) — a CLOSED shape folds to a precise
+            // bool from the statically known key set. On an OPEN shape the
+            // reference `hash_has_key?` declines (its extras could hold the
+            // key), leaving the RBS `Hash#key?` answer — `bool` — which we
+            // answer directly so `h.key?(x).upcase` still witnesses `for bool`.
             "has_key?" | "key?" | "member?" | "include?" if args.len() == 1 => {
+                if open {
+                    let t = interner.intern(Type::Constant(Scalar::Bool(true)));
+                    let f = interner.intern(Type::Constant(Scalar::Bool(false)));
+                    return Some(rigor_types::Algebra::join(interner, t, f));
+                }
                 let key = self.hash_arg_key(ast, args[0], env, interner)?;
                 let present = members.iter().any(|m| m.key == key);
                 Some(interner.intern(Type::Constant(Scalar::Bool(present))))
             }
 
             // `h.values_at(k, …)` — a `Tuple` of the per-key values (missing key
-            // → `Constant[nil]`), in ARGUMENT order.
+            // → `Constant[nil]` closed / `untyped` open), in ARGUMENT order.
             "values_at" if !args.is_empty() => {
                 let mut keys = Vec::with_capacity(args.len());
                 for &a in args {
                     keys.push(self.hash_arg_key(ast, a, env, interner)?);
                 }
-                let vals: Vec<TypeId> =
-                    keys.iter().map(|k| self.hash_read_step(&members, k, interner)).collect();
+                let vals: Vec<TypeId> = keys
+                    .iter()
+                    .map(|k| self.hash_read_step(&members, k, open, interner))
+                    .collect();
                 Some(interner.intern(Type::Tuple(vals)))
             }
 
             // `h.slice(k, …)` — a sub-shape of the requested keys that are
             // present, in ARGUMENT order (Ruby `Hash#slice` semantics); missing
-            // keys are silently omitted, duplicates deduped.
-            "slice" if !args.is_empty() => {
+            // keys are silently omitted, duplicates deduped. The reference
+            // `hash_slice` declines an open shape.
+            "slice" if !args.is_empty() && !open => {
                 let mut keys = Vec::with_capacity(args.len());
                 for &a in args {
                     keys.push(self.hash_arg_key(ast, a, env, interner)?);
@@ -1282,25 +1300,27 @@ impl<'i> Typer<'i> {
                         out.push(m.clone());
                     }
                 }
-                Some(interner.intern(Type::HashShape(out)))
+                Some(interner.intern(Type::HashShape { members: out, open: false }))
             }
 
             // `h.except(k, …)` — the receiver shape minus the named keys, keeping
-            // RECEIVER order; keys not present are ignored.
-            "except" if !args.is_empty() => {
+            // RECEIVER order; keys not present are ignored. The reference
+            // `hash_except` declines an open shape.
+            "except" if !args.is_empty() && !open => {
                 let mut excluded = Vec::with_capacity(args.len());
                 for &a in args {
                     excluded.push(self.hash_arg_key(ast, a, env, interner)?);
                 }
                 let out: Vec<ShapeMember> =
                     members.iter().filter(|m| !excluded.contains(&m.key)).cloned().collect();
-                Some(interner.intern(Type::HashShape(out)))
+                Some(interner.intern(Type::HashShape { members: out, open: false }))
             }
 
             // `h.invert` — swap keys and values. Folds only when every value is a
             // `Constant` usable as a key; a duplicate value would alias under
-            // inversion, so a collision DECLINES (matching the reference).
-            "invert" if args.is_empty() => {
+            // inversion, so a collision DECLINES (matching the reference). An
+            // open shape's unseen pairs defeat the inversion claim entirely.
+            "invert" if args.is_empty() && !open => {
                 let mut out: Vec<ShapeMember> = Vec::with_capacity(members.len());
                 for m in &members {
                     let vs = match interner.get(m.value) {
@@ -1315,7 +1335,22 @@ impl<'i> Typer<'i> {
                     let new_val = interner.intern(Type::Constant(orig));
                     out.push(ShapeMember { key: new_key, value: new_val, optional: false });
                 }
-                Some(interner.intern(Type::HashShape(out)))
+                Some(interner.intern(Type::HashShape { members: out, open: false }))
+            }
+
+            // `h.default` / `h.default_proc` — reference `hash_default`: a
+            // closed shape's default is `Constant[nil]` (its literal carried no
+            // default); an open shape's `default` is the unstateable configured
+            // value → `untyped`, while `default_proc` declines to the RBS
+            // `Proc` answer.
+            "default" | "default_proc" if args.len() <= 1 => {
+                if !open {
+                    Some(interner.intern(Type::Constant(Scalar::Nil)))
+                } else if method == "default" {
+                    Some(interner.untyped())
+                } else {
+                    None
+                }
             }
 
             _ => None,
@@ -2283,10 +2318,10 @@ impl<'i> Typer<'i> {
         };
         let arg_ty = self.type_of(ast, *only, env, interner);
         match interner.get(arg_ty).clone() {
-            Type::HashShape(_) => Some(arg_ty),
-            Type::Constant(Scalar::Nil) => Some(interner.intern(Type::HashShape(vec![]))),
+            Type::HashShape { .. } => Some(arg_ty),
+            Type::Constant(Scalar::Nil) => Some(interner.intern(Type::HashShape { members: vec![], open: false })),
             Type::Tuple(elems) if elems.is_empty() => {
-                Some(interner.intern(Type::HashShape(vec![])))
+                Some(interner.intern(Type::HashShape { members: vec![], open: false }))
             }
             _ => None,
         }
@@ -2992,9 +3027,11 @@ impl<'i> Typer<'i> {
             Node::Program { body, .. } => body.clone(),
             _ => return env,
         };
-        let rebinds = toplevel_rebinds(ast);
+        let mut rebinds = toplevel_rebinds(ast);
+        let lookup = toplevel_lookup_mutations(ast);
+        rebinds.extend(lookup.iter().map(|(s, n, _)| (*s, n.clone())));
         for stmt in body {
-            self.bind_check_statement(ast, stmt, &mut env, &rebinds, interner);
+            self.bind_check_statement(ast, stmt, &mut env, &rebinds, &lookup, interner);
         }
         env
     }
@@ -3002,13 +3039,18 @@ impl<'i> Typer<'i> {
     /// One statement of [`Self::build_toplevel_check_env`]: a direct write binds
     /// as [`Self::bind_statement`] does, after widening the rebinds nested in
     /// its value (`x = xs.each { |e| w = e }`); any other statement widens every
-    /// rebind inside it.
+    /// rebind inside it. `rebinds` additionally carries the top-level
+    /// lookup-mutation calls (`counts.default = 0` inside an `if` widens `counts`
+    /// like a rebind — the reference joins the open and closed edges into a
+    /// union `receiver_descriptor` declines); `lookup` keeps them separately
+    /// for the modeled effect at the call itself.
     fn bind_check_statement(
         &self,
         ast: &LoweredAst,
         id: NodeId,
         env: &mut TypeEnv,
         rebinds: &[(rigor_parse::Span, String)],
+        lookup: &[(rigor_parse::Span, String, String)],
         interner: &mut Interner,
     ) {
         match ast.get(id) {
@@ -3017,6 +3059,40 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(rebinds, vspan, env, interner);
                 self.bind_statement(ast, id, env, interner);
             }
+            // A bare call: widen every contained write (an arg-position rebind
+            // or lookup mutation is unmodeled here — `f(counts.default = 0)`
+            // opens on the reference but this env declines, strictly fewer
+            // diagnostics), then apply the modeled receiver effect
+            // (`counts.default = 0` opens the shape) and the
+            // `widen_after_block` re-apply for lookup mutations inside a block
+            // body.
+            Node::Call { receiver, method, block_body, span, .. } => {
+                let (receiver, method, block_body, span) =
+                    (*receiver, method.clone(), block_body.clone(), *span);
+                // The mutator effect reads the PRE-call carrier — capture the
+                // binding BEFORE the span-widen clobbers it (the call's own
+                // lookup-write entry sits inside its own span).
+                let pre = env.clone();
+                widen_flow_writes(rebinds, span, env, interner);
+                if let Some(Node::LocalVariableRead { name, .. }) =
+                    receiver.map(|r| ast.get(r))
+                {
+                    let name = name.clone();
+                    if let Some(&ty) = pre.get(&name) {
+                        // `widen_shape` returning `nil` leaves the scope
+                        // UNCHANGED — restore the pre-call binding rather
+                        // than the span-widen's Dynamic (an identity-stable
+                        // `compare_by_identity` keeps the closed shape, a
+                        // non-shape receiver was never a write).
+                        if HASH_LOOKUP_MUTATORS.contains(&method.as_str()) {
+                            let widened =
+                                self.lookup_widened(interner, ty, &method).unwrap_or(ty);
+                            env.insert(name, widened);
+                        }
+                    }
+                }
+                self.apply_block_lookup_mutations(ast, &block_body, lookup, &pre, env, interner);
+            }
             // Only a real statement sequence is straight-line code. A recovery
             // carrier (a `rescue` modifier, `super(…)`, …) runs its writes
             // conditionally or out of order, so it widens; an inert one
@@ -3024,7 +3100,7 @@ impl<'i> Typer<'i> {
             // changes nothing (rigor-rs#153).
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for s in body.clone() {
-                    self.bind_check_statement(ast, s, env, rebinds, interner);
+                    self.bind_check_statement(ast, s, env, rebinds, lookup, interner);
                 }
             }
             other => widen_flow_writes(rebinds, other.span(), env, interner),
@@ -3072,12 +3148,19 @@ impl<'i> Typer<'i> {
         let mut out = HashMap::new();
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
+        // The `HashLookupMutation` calls widen on the same "may not run"
+        // discipline as a rebind (a conditional `counts.default = 0` joins the
+        // open and closed edges — a union the flow env models as `Dynamic`),
+        // while the modeled open / identity effect applies at the call itself
+        // through [`Typer::apply_lookup_mutation`].
+        let lookup = lookup_mutations(ast);
+        writes.extend(lookup.iter().map(|(s, n, _)| (*s, n.clone())));
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
         };
         let mut env = TypeEnv::new();
-        self.flow_eval_scope(ast, &body, &mut env, false, None, DefKind::Instance, &writes, interner, &mut out);
+        self.flow_eval_scope(ast, &body, &mut env, false, None, DefKind::Instance, &writes, &lookup, interner, &mut out);
         out
     }
 
@@ -3096,11 +3179,12 @@ impl<'i> Typer<'i> {
         self_qual: Option<&str>,
         self_kind: DefKind,
         writes: &[(rigor_parse::Span, String)],
+        lookup: &[(rigor_parse::Span, String, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, TypeId>,
     ) {
         for &s in stmts {
-            self.flow_eval_stmt(ast, s, env, in_loop_or_block, self_qual, self_kind, writes, interner, out);
+            self.flow_eval_stmt(ast, s, env, in_loop_or_block, self_qual, self_kind, writes, lookup, interner, out);
         }
     }
 
@@ -3115,6 +3199,7 @@ impl<'i> Typer<'i> {
         self_qual: Option<&str>,
         self_kind: DefKind,
         writes: &[(rigor_parse::Span, String)],
+        lookup: &[(rigor_parse::Span, String, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, TypeId>,
     ) {
@@ -3124,7 +3209,7 @@ impl<'i> Typer<'i> {
             // are not in `writes`, so it leaves `env` as the reference does.
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 let body = body.clone();
-                self.flow_eval_scope(ast, &body, env, in_loop_or_block, self_qual, self_kind, writes, interner, out);
+                self.flow_eval_scope(ast, &body, env, in_loop_or_block, self_qual, self_kind, writes, lookup, interner, out);
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
@@ -3184,11 +3269,11 @@ impl<'i> Typer<'i> {
                 // join: a binding survives only if both branches agree exactly.
                 let mut then_env = env.clone();
                 self.flow_eval_scope(
-                    ast, &then_body, &mut then_env, in_loop_or_block, self_qual, self_kind, writes, interner, out,
+                    ast, &then_body, &mut then_env, in_loop_or_block, self_qual, self_kind, writes, lookup, interner, out,
                 );
                 let mut else_env = env.clone();
                 self.flow_eval_scope(
-                    ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, interner, out,
+                    ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, lookup, interner, out,
                 );
                 *env = join_flow_envs(&then_env, &else_env, interner);
                 // A predicate may contain a write (`if (x = f)`); widen post-join.
@@ -3206,7 +3291,7 @@ impl<'i> Typer<'i> {
                 );
                 let mut fresh = TypeEnv::new();
                 self.flow_eval_scope(
-                    ast, &body, &mut fresh, in_loop_or_block, self_qual, kind, writes, interner, out,
+                    ast, &body, &mut fresh, in_loop_or_block, self_qual, kind, writes, lookup, interner, out,
                 );
             }
             Node::ClassDef { body, name, .. } | Node::ModuleDef { body, name, .. } => {
@@ -3217,10 +3302,44 @@ impl<'i> Typer<'i> {
                 let (body, child_qual) = (body.clone(), qualify_self(self_qual, name));
                 let mut fresh = TypeEnv::new();
                 self.flow_eval_scope(
-                    ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Instance, writes, interner, out,
+                    ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Instance, writes, lookup, interner, out,
                 );
             }
-            // Loop / case / begin-rescue / logical / call(+block) / any other node:
+            // A bare call — the `other` widening applies (every write its span
+            // contains: arg-position effects, and a lookup mutation is itself a
+            // span write the census carries), then the modeled
+            // `HashLookupMutation` effect on a bare-local receiver
+            // (`counts.default = 0` opens the shape so `counts[:b]` stops
+            // folding `nil`), and the `widen_after_block` re-apply for lookup
+            // mutations inside a block body.
+            Node::Call { receiver, method, block_body, span, .. } => {
+                let (receiver, method, block_body, span) =
+                    (*receiver, method.clone(), block_body.clone(), *span);
+                // The mutator effect reads the PRE-call carrier — capture the
+                // binding BEFORE the span-widen clobbers it (the call's own
+                // lookup-write entry sits inside its own span).
+                let pre = env.clone();
+                widen_flow_writes(writes, span, env, interner);
+                if let Some(Node::LocalVariableRead { name, .. }) =
+                    receiver.map(|r| ast.get(r))
+                {
+                    let name = name.clone();
+                    if let Some(&ty) = pre.get(&name) {
+                        // `widen_shape` returning `nil` leaves the scope
+                        // UNCHANGED — restore the pre-call binding rather
+                        // than the span-widen's Dynamic (an identity-stable
+                        // `compare_by_identity` keeps the closed shape, a
+                        // non-shape receiver was never a write).
+                        if HASH_LOOKUP_MUTATORS.contains(&method.as_str()) {
+                            let widened =
+                                self.lookup_widened(interner, ty, &method).unwrap_or(ty);
+                            env.insert(name, widened);
+                        }
+                    }
+                }
+                self.apply_block_lookup_mutations(ast, &block_body, lookup, &pre, env, interner);
+            }
+            // Loop / case / begin-rescue / logical / any other node:
             // widen every local written in the span, do not descend for snapshots.
             other => {
                 widen_flow_writes(writes, other.span(), env, interner);
@@ -3285,6 +3404,190 @@ impl<'i> Typer<'i> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `HashLookupMutation.widen_shape` (`hash_lookup_mutation.rb:31`) computed
+    /// on a PRE-call binding: `default=` / `default_proc=` OPEN a closed
+    /// `HashShape` (present keys keep their values; a missing key reads
+    /// `untyped` from here on), `compare_by_identity` widens an
+    /// identity-sensitive shape to a `Hash[K, V | untyped]` nominal. A binding
+    /// that is not a `HashShape` (nominal, union, Dynamic, absent) and an
+    /// identity-stable shape answer `None` — `widen_shape` returns `nil`
+    /// there and the scope carries on.
+    fn lookup_widened(&self, interner: &mut Interner, ty: TypeId, method: &str) -> Option<TypeId> {
+        let Type::HashShape { members, open } = interner.get(ty) else {
+            return None;
+        };
+        let (members, open) = (members.clone(), *open);
+        match method {
+            "default=" | "default_proc=" if !open => {
+                Some(interner.intern(Type::HashShape { members, open: true }))
+            }
+            "compare_by_identity"
+                if members.iter().any(|m| !hash_key_identity_stable(&m.key)) =>
+            {
+                Some(self.hash_identity_widening(interner, &members, open))
+            }
+            _ => None,
+        }
+    }
+
+    /// The `widen_after_block` half (`mutation_widening.rb:144`): every
+    /// `local.<lookup-mutator>` call inside a block body applies to the OUTER
+    /// binding, unconditionally — the reference walks the block body
+    /// syntactically, so a branch-contained mutation inside a block still
+    /// applies. `pre` is the env the call was made under (the mutations read
+    /// off their PRE-call carrier, like `widen_for_mutator`); results land in
+    /// `env`. `lookup` is the (already scope-appropriate) census for this env.
+    fn apply_block_lookup_mutations(
+        &self,
+        ast: &LoweredAst,
+        block_body: &[NodeId],
+        lookup: &[(rigor_parse::Span, String, String)],
+        pre: &TypeEnv,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        if block_body.is_empty() {
+            return;
+        }
+        let Some(hull) = span_hull(ast, block_body) else {
+            return;
+        };
+        let mut hits: Vec<&(rigor_parse::Span, String, String)> = lookup
+            .iter()
+            .filter(|(s, _, _)| hull.0 <= s.0 && s.1 <= hull.1)
+            .collect();
+        hits.sort_by_key(|(s, _, _)| *s);
+        let mut carriers: HashMap<String, TypeId> = HashMap::new();
+        for (_, name, method) in hits {
+            let Some(&cur) = carriers.get(name).or_else(|| pre.get(name)) else {
+                continue;
+            };
+            // `widen_shape` returning `nil` leaves the binding at its pre-call
+            // carrier (a stable `compare_by_identity`, a non-shape receiver) —
+            // the span-widen's Dynamic is NOT the answer.
+            let next = self.lookup_widened(interner, cur, method).unwrap_or(cur);
+            carriers.insert(name.clone(), next);
+        }
+        for (name, ty) in carriers {
+            env.insert(name, ty);
+        }
+    }
+
+    /// `HashLookupMutation.identity_widening` (`hash_lookup_mutation.rb:73`):
+    /// `MutationWidening.widen_hash_shape(shape, values: :widen)` — an
+    /// `Hash[untyped, untyped]` degradation on an open or empty shape, else
+    /// `Hash[key_union, union(widened_values)]` — with a `Dynamic[top]` arm
+    /// unioned onto the value side, so a literal read that may hit or miss by
+    /// object identity never folds.
+    fn hash_identity_widening(
+        &self,
+        interner: &mut Interner,
+        members: &[ShapeMember],
+        open: bool,
+    ) -> TypeId {
+        let untyped = interner.untyped();
+        let Some(hash) = self.index.class_id("Hash") else {
+            return untyped;
+        };
+        let nominal = |args: Vec<TypeId>, interner: &mut Interner| {
+            interner.intern(Type::Nominal { class: hash, args })
+        };
+        if open || members.is_empty() {
+            return nominal(vec![untyped, untyped], interner);
+        }
+        // `ContentJoin.key_union_for`: `true` / `false` / `nil` keep their
+        // constant carrier, every other key class widens to its nominal.
+        let mut keys: Vec<TypeId> = Vec::new();
+        for m in members {
+            let k = self.shape_key_carrier(interner, &m.key);
+            if !keys.contains(&k) {
+                keys.push(k);
+            }
+        }
+        let key = self.union_describe_order(interner, keys);
+        let mut vals: Vec<TypeId> = vec![untyped];
+        for m in members {
+            let v = self.widen_value_pinned(interner, m.value);
+            if !vals.contains(&v) {
+                vals.push(v);
+            }
+        }
+        let value = self.union_describe_order(interner, vals);
+        nominal(vec![key, value], interner)
+    }
+
+    /// `ContentJoin.key_union_for`'s per-key carrier: a `true` / `false` /
+    /// `nil` literal keeps its `Constant` (the class's whole value set), every
+    /// other key widens to its class nominal.
+    fn shape_key_carrier(&self, interner: &mut Interner, key: &ShapeKey) -> TypeId {
+        match key {
+            ShapeKey::Bool(b) => interner.intern(Type::Constant(Scalar::Bool(*b))),
+            ShapeKey::Nil => interner.intern(Type::Constant(Scalar::Nil)),
+            ShapeKey::Sym(_) => self.nominal_or_untyped("Symbol", interner),
+            ShapeKey::Str(_) => self.nominal_or_untyped("String", interner),
+            ShapeKey::Int(_) => self.nominal_or_untyped("Integer", interner),
+            ShapeKey::Float(_) => self.nominal_or_untyped("Float", interner),
+            ShapeKey::Other => interner.untyped(),
+        }
+    }
+
+    /// `Combinator.widen_value_pinned` (`combinator.rb:89`): a `Constant`
+    /// loses its value pin to the class nominal (`nil` keeps its carrier — the
+    /// class's whole value set), an `IntegerRange` to `Integer`, a `Refined`
+    /// through its base, a `Union` memberwise; every other carrier keeps its
+    /// pin.
+    fn widen_value_pinned(&self, interner: &mut Interner, ty: TypeId) -> TypeId {
+        match interner.get(ty).clone() {
+            Type::Constant(Scalar::Nil) => ty,
+            Type::Constant(s) => {
+                let name = match s {
+                    Scalar::Int(_) => "Integer",
+                    Scalar::Str(_) => "String",
+                    Scalar::Sym(_) => "Symbol",
+                    Scalar::Float(_) => "Float",
+                    Scalar::Bool(true) => "TrueClass",
+                    Scalar::Bool(false) => "FalseClass",
+                    Scalar::Nil => unreachable!(),
+                };
+                self.nominal_or_untyped(name, interner)
+            }
+            Type::IntegerRange { .. } => self.nominal_or_untyped("Integer", interner),
+            Type::Refined { base, .. } => self.widen_value_pinned(interner, base),
+            Type::Union(members) => {
+                let widened: Vec<TypeId> = members
+                    .iter()
+                    .map(|&m| self.widen_value_pinned(interner, m))
+                    .collect();
+                self.union_describe_order(interner, widened)
+            }
+            _ => ty,
+        }
+    }
+
+    /// `Combinator.union`'s collapse (`combinator.rb:936` + `sort_members`):
+    /// members deduped (structural) and sorted by `describe(:short)`, a single
+    /// member unwrapped, an empty set `bot`. Building the `Union` directly —
+    /// not through `Algebra::join` — keeps the reference's describe-sorted
+    /// member order, which `describe_named` renders verbatim
+    /// (`Hash[String, Dynamic[top] | Integer]`).
+    fn union_describe_order(&self, interner: &mut Interner, members: Vec<TypeId>) -> TypeId {
+        let mut uniq: Vec<TypeId> = Vec::with_capacity(members.len());
+        for m in members {
+            if !uniq.contains(&m) {
+                uniq.push(m);
+            }
+        }
+        let resolve = |class: rigor_types::ClassId| {
+            self.index.class_name_for_id(class).map(str::to_string)
+        };
+        uniq.sort_by_key(|&t| rigor_types::describe_named(interner, t, &resolve));
+        match uniq.as_slice() {
+            [] => interner.bottom(),
+            [only] => *only,
+            _ => interner.intern(Type::Union(uniq)),
         }
     }
 
@@ -5272,7 +5575,7 @@ impl<'i> Typer<'i> {
         // `subclass_of?("Class", …)`) are declined here as unprobed.
         if !matches!(
             interner.get(ty),
-            Type::Constant(_) | Type::Nominal { .. } | Type::Tuple(_) | Type::HashShape(_)
+            Type::Constant(_) | Type::Nominal { .. } | Type::Tuple(_) | Type::HashShape { .. }
         ) {
             return None;
         }
@@ -5319,7 +5622,7 @@ impl<'i> Typer<'i> {
         // witness to remove.
         let ordering = self.index.class_ordering(carrier, class_name);
         match interner.get(ty) {
-            Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) => {
+            Type::Constant(_) | Type::Tuple(_) | Type::HashShape { .. } => {
                 match ordering {
                     ClassOrdering::Subclass | ClassOrdering::Equal => None,
                     // Upstream `6cde8381` (#657 item 2, `v0.3.9`) lifted the
@@ -6096,7 +6399,7 @@ impl<'i> Typer<'i> {
     fn coll_carrier(&self, interner: &Interner, ty: TypeId) -> Option<&'static str> {
         match interner.get(ty) {
             Type::Tuple(_) => Some("Array"),
-            Type::HashShape(_) => Some("Hash"),
+            Type::HashShape { .. } => Some("Hash"),
             Type::Nominal { .. } => self.coll_nominal_carrier(interner, ty),
             _ => None,
         }
@@ -6136,7 +6439,21 @@ impl<'i> Typer<'i> {
     ) -> Option<&'static str> {
         match interner.get(ty) {
             Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => Some("Array"),
-            Type::HashShape(_) if HASH_MUTATORS.contains(&method) => Some("Hash"),
+            Type::HashShape { .. } if HASH_MUTATORS.contains(&method) => Some("Hash"),
+            // `HashLookupMutation`: `default=` / `default_proc=` open the
+            // shape — the carrier still projects to `Hash` for witnessing; a
+            // `compare_by_identity` widens only when some key can miss under
+            // identity comparison (a stable-keyed shape reads exactly as
+            // before and keeps its carrier).
+            Type::HashShape { members, .. } => match method {
+                "default=" | "default_proc=" => Some("Hash"),
+                "compare_by_identity"
+                    if members.iter().any(|m| !hash_key_identity_stable(&m.key)) =>
+                {
+                    Some("Hash")
+                }
+                _ => None,
+            },
             Type::Nominal { .. } => match self.coll_nominal_carrier(interner, ty)? {
                 "Array" if ARRAY_MUTATORS.contains(&method) => Some("Array"),
                 "Hash" if HASH_MUTATORS.contains(&method) => Some("Hash"),
@@ -7709,6 +8026,99 @@ fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     out
 }
 
+/// `HashLookupMutation.identity_stable_key?` (`hash_lookup_mutation.rb:79`) —
+/// the keys a literal read still finds after `compare_by_identity`: `Symbol`,
+/// `true` / `false` / `nil`, and a fixnum-range Integer (`bit_length <= 62`,
+/// CRuby's `-(2**62)..(2**62 - 1)`). A `String`, a heap `Float`, a bignum, or
+/// anything else is a fresh object per literal and may miss.
+fn hash_key_identity_stable(key: &ShapeKey) -> bool {
+    match key {
+        ShapeKey::Sym(_) | ShapeKey::Bool(_) | ShapeKey::Nil => true,
+        ShapeKey::Int(v) => (-(1i64 << 62)..=(1i64 << 62) - 1).contains(v),
+        _ => false,
+    }
+}
+
+/// The `(id, span, receiver-name, method)` of every
+/// `default=` / `default_proc=` / `compare_by_identity`, the
+/// `HashLookupMutation::MUTATORS` table — whose receiver is a bare local read.
+/// A `&.` call still runs the mutator when the receiver is non-nil, and the
+/// reference opens the shape unconditionally (probe `counts&.default = 0`), so
+/// `safe_nav` does NOT filter. These are not rebinds (the local names the same
+/// value), so they live outside [`collect_flow_writes`]'s `MUTATOR_METHODS`
+/// census — the flows that model them carry the method name.
+fn lookup_mutation_calls(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, String)> {
+    ast.iter()
+        .filter_map(|(id, n)| {
+            let Node::Call { receiver: Some(r), method, span, .. } = n else {
+                return None;
+            };
+            if !HASH_LOOKUP_MUTATORS.contains(&method.as_str()) {
+                return None;
+            }
+            match ast.get(*r) {
+                Node::LocalVariableRead { name, .. } => {
+                    Some((id, *span, name.clone(), method.clone()))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// [`lookup_mutation_calls`] filtered the way [`toplevel_rebinds`] filters its
+/// writes: a call inside a `def` / `class` / `module` body belongs to that
+/// scope's own locals, and a call on a name a block/lambda binds (any
+/// parameter form or `;`-declared local) touches the block's local, not the
+/// top-level one it shadows. Entries inside an inert carrier are dropped: a
+/// `defined?(counts.default = 0)` never runs the mutation (rigor-rs#153).
+fn toplevel_lookup_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String, String)> {
+    let scopes: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                Some(n.span())
+            }
+            _ => None,
+        })
+        .collect();
+    let shadow_scopes: Vec<(HashSet<NodeId>, &[String])> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call { block_body, block_locals, .. } if !block_locals.is_empty() => {
+                Some((descendants_of(ast, block_body), block_locals.as_slice()))
+            }
+            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
+                Some((descendants_of(ast, body), locals.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
+    lookup_mutation_calls(ast)
+        .into_iter()
+        .filter(|(id, w, name, _)| {
+            !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
+                && !shadow_scopes.iter().any(|(descendants, bound)| {
+                    descendants.contains(id) && bound.iter().any(|b| b == name)
+                })
+        })
+        .map(|(_, s, n, m)| (s, n, m))
+        .filter(|(s, _, _)| !ast.in_inert_carrier(*s))
+        .collect()
+}
+
+/// [`toplevel_lookup_mutations`] with NO scope filter — for the flow
+/// evaluator, which descends every scope with its own env and wants the
+/// in-scope calls (a `def`-local `counts` widens inside the def's fresh env,
+/// never the top-level one). Inert-carrier entries are still dropped.
+fn lookup_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String, String)> {
+    lookup_mutation_calls(ast)
+        .into_iter()
+        .map(|(_, s, n, m)| (s, n, m))
+        .filter(|(s, _, _)| !ast.in_inert_carrier(*s))
+        .collect()
+}
+
 /// Every node reachable from `roots` through child links, roots included —
 /// the structural "inside a block body" test for [`toplevel_rebinds`]. Orphan
 /// arena nodes (a `Range` bound — lowered for reachability but never linked
@@ -8949,7 +9359,7 @@ mod tests {
 
     fn hash_members(ty: &Type) -> &[ShapeMember] {
         match ty {
-            Type::HashShape(m) => m,
+            Type::HashShape { members, .. } => members,
             other => panic!("expected HashShape, got {other:?}"),
         }
     }
@@ -9157,7 +9567,7 @@ mod tests {
         // A duplicate VALUE would alias under inversion → decline (falls to RBS,
         // not a folded HashShape).
         let (i, ty) = type_of_projection(b"v = { a: 1, b: 1 }.invert\n", "invert");
-        assert!(!matches!(i.get(ty), Type::HashShape(_)), "collision must not fold to a HashShape");
+        assert!(!matches!(i.get(ty), Type::HashShape { .. }), "collision must not fold to a HashShape");
     }
 
     #[test]
@@ -9177,6 +9587,245 @@ mod tests {
         // value-pinned Constant key), so the RBS Hash tier answers.
         let (i, ty) = type_of_projection(b"v = { a: 1 }[foo]\n", "[]");
         assert!(!matches!(i.get(ty), Type::Constant(Scalar::Int(1))));
+    }
+
+    // ---------------------------------------------------------------------
+    // Open HashShape + `HashLookupMutation` effects (rigor-rs#138; reference
+    // `hash_lookup_mutation.rb`, pin `e59b7b89`)
+    // ---------------------------------------------------------------------
+
+    /// The diagnostic top-level env's binding for `name`, human-rendered with
+    /// class names resolved (the same surface `call.undefined-method` prints).
+    fn check_env_describe(src: &[u8], name: &str) -> String {
+        let ast = lower_src(src);
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = *env.get(name).unwrap_or_else(|| panic!("{name} unbound"));
+        let resolve =
+            |c: rigor_types::ClassId| idx.class_name_for_id(c).map(str::to_string);
+        rigor_types::describe_named(&i, ty, &resolve)
+    }
+
+    /// Type the LAST call to `method` under the diagnostic check env.
+    fn type_last_call_check_env(src: &[u8], method: &str) -> (Interner, TypeId) {
+        let ast = lower_src(src);
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let call = ast
+            .iter()
+            .filter_map(|(id, n)| match n {
+                Node::Call { method: m, .. } if m == method => Some(id),
+                _ => None,
+            })
+            .last()
+            .unwrap_or_else(|| panic!("expected a call to `{method}`"));
+        let ty = typer.type_of(&ast, call, &env, &mut i);
+        (i, ty)
+    }
+
+    #[test]
+    fn default_assignment_opens_the_shape() {
+        // `counts.default = 0` runs `HashLookupMutation.open_shape`: members
+        // are kept, the extra-key policy flips to open.
+        let described = check_env_describe(
+            b"counts = { a: 1 }\ncounts.default = 0\n",
+            "counts",
+        );
+        assert_eq!(described, "{ a: 1, ... }");
+    }
+
+    #[test]
+    fn default_proc_assignment_opens_even_for_nil() {
+        // `default_proc = nil` opens unconditionally — the mutator's effect is
+        // not value-dependent.
+        let described = check_env_describe(
+            b"counts = { a: 1 }\ncounts.default_proc = nil\n",
+            "counts",
+        );
+        assert_eq!(described, "{ a: 1, ... }");
+    }
+
+    #[test]
+    fn safe_nav_lookup_mutation_still_opens() {
+        // `counts&.default = 0` runs `open_shape` whenever the receiver is
+        // non-nil — the reference applies the mutation on `&.` too.
+        let described = check_env_describe(
+            b"counts = { a: 1 }\ncounts&.default = 0\n",
+            "counts",
+        );
+        assert_eq!(described, "{ a: 1, ... }");
+    }
+
+    #[test]
+    fn compare_by_identity_keeps_identity_stable_shape() {
+        // Symbol / nil / fixnum keys read identically under `compare_by_identity`
+        // — `widen_shape` returns nil and the closed shape is PRESERVED, not
+        // generically widened (the port's old answer lost `s[:k]` to Dynamic).
+        assert_eq!(
+            check_env_describe(
+                b"s = { k: 1 }\ns.compare_by_identity\n",
+                "s",
+            ),
+            "{ k: 1 }"
+        );
+        assert_eq!(
+            check_env_describe(
+                b"s = { nil => 1, 5 => \"x\" }\ns.compare_by_identity\n",
+                "s",
+            ),
+            "{ nil => 1, 5 => \"x\" }"
+        );
+    }
+
+    #[test]
+    fn compare_by_identity_widens_identity_sensitive_keys() {
+        // A String key is a fresh object per literal: the shape degrades to the
+        // reference's `Hash[String, Dynamic[top] | Integer]` — key class
+        // nominal, widened values plus an untyped arm.
+        let described = check_env_describe(
+            b"s = { \"k\" => 1 }\ns.compare_by_identity\n",
+            "s",
+        );
+        assert_eq!(described, "Hash[String, Dynamic[top] | Integer]");
+    }
+
+    #[test]
+    fn compare_by_identity_widens_float_key_and_open_sensitive_shape() {
+        // A heap Float key is identity-sensitive. An OPEN shape still only
+        // widens when a DECLARED key is sensitive (`identity_sensitive?` walks
+        // `pairs` only): `{ a: 1, ... }` stays open, while an open shape
+        // holding a String key degrades fully to `Hash[untyped, untyped]`
+        // (`widen_hash_shape` on an open shape loses every bound).
+        assert_eq!(
+            check_env_describe(
+                b"f = { 1.5 => \"x\" }\nf.compare_by_identity\n",
+                "f",
+            ),
+            "Hash[Float, Dynamic[top] | String]"
+        );
+        assert_eq!(
+            check_env_describe(
+                b"s = { a: 1 }\ns.default = 0\ns.compare_by_identity\n",
+                "s",
+            ),
+            "{ a: 1, ... }"
+        );
+        assert_eq!(
+            check_env_describe(
+                b"s = { \"k\" => 1 }\ns.default = 0\ns.compare_by_identity\n",
+                "s",
+            ),
+            "Hash[Dynamic[top], Dynamic[top]]"
+        );
+    }
+
+    #[test]
+    fn open_shape_missing_key_reads_untyped_known_key_keeps() {
+        // The load-bearing pair: `counts[:b]` on an open shape reads `untyped`
+        // (silent `+ 1`), while `counts[:a]` keeps its pin (`upcase` fires).
+        let (mut i, ty) = type_last_call_check_env(
+            b"counts = { a: 1 }\ncounts.default = 0\ncounts[:b]\n",
+            "[]",
+        );
+        assert_eq!(ty, i.untyped());
+        let (i, ty) = type_last_call_check_env(
+            b"counts = { a: 1 }\ncounts.default = 0\ncounts[:a]\n",
+            "[]",
+        );
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
+    }
+
+    #[test]
+    fn open_shape_defers_dig_values_at_and_key_predicate() {
+        // `dig` on a missing key reads `untyped`; `values_at` wraps it in a
+        // Tuple; `key?` declines the fold — the RBS `bool` answer, which
+        // `.upcase` witnesses against (reference `hash_has_key?` open arm).
+        let (mut i, ty) = type_last_call_check_env(
+            b"counts = { a: 1 }\ncounts.default = 0\ncounts.dig(:b)\n",
+            "dig",
+        );
+        assert_eq!(ty, i.untyped());
+
+        let (mut i, ty) = type_last_call_check_env(
+            b"counts = { a: 1 }\ncounts.default = 0\ncounts.values_at(:b)\n",
+            "values_at",
+        );
+        let untyped = i.untyped();
+        let Type::Tuple(elems) = i.get(ty) else {
+            panic!("expected Tuple, got {:?}", i.get(ty))
+        };
+        assert_eq!(elems.as_slice(), &[untyped]);
+
+        let (i, ty) = type_last_call_check_env(
+            b"counts = { a: 1 }\ncounts.default = 0\ncounts.key?(:b)\n",
+            "key?",
+        );
+        assert!(matches!(i.get(ty), Type::Union(_)), "expected bool union, got {:?}", i.get(ty));
+    }
+
+    #[test]
+    fn block_contained_lookup_mutation_opens_outer_binding() {
+        // `widen_after_block`: a lookup mutation inside a block body applies to
+        // the OUTER binding unconditionally.
+        let described = check_env_describe(
+            b"xs = [1]\ncounts = { a: 1 }\nxs.each { counts.default = 0 }\n",
+            "counts",
+        );
+        assert_eq!(described, "{ a: 1, ... }");
+    }
+
+    #[test]
+    fn conditional_lookup_mutation_widens_conservatively() {
+        // `counts.default = 0 if c` may not run: the reference joins the open
+        // and closed edges into a union `receiver_descriptor` declines — the
+        // port models it as Dynamic (silent reads either way).
+        let ast = lower_src(b"counts = { a: 1 }\ncounts.default = 0 if flag\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = env.get("counts").copied().unwrap();
+        assert!(matches!(i.get(ty), Type::Dynamic(_)), "got {:?}", i.get(ty));
+    }
+
+    #[test]
+    fn lookup_mutation_on_non_shape_binding_is_a_noop() {
+        // `widen_shape` on a non-HashShape answers nil — the pre-call binding
+        // is restored, never clobbered by the span-widen's Dynamic.
+        let ast = lower_src(b"counts = 5\ncounts.default = 0\n");
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = env.get("counts").copied().unwrap();
+        assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(5)));
+    }
+
+    #[test]
+    fn lookup_mutation_flow_snapshot_keeps_known_key_constant() {
+        // The always-truthy snapshot env applies the same mutation: a known key
+        // still folds (`if counts[:a]` fires), a missing key goes Dynamic.
+        let idx = CoreIndex::new();
+        let typer = Typer::new(&idx);
+        let fold = |src: &[u8]| {
+            let ast = lower_src(src);
+            let mut i = Interner::new();
+            let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+            let (&_, &t) = snaps.iter().next().expect("one predicate");
+            i.get(t).clone()
+        };
+        assert_eq!(
+            fold(b"counts = { a: 1 }\ncounts.default = 0\nif counts[:a]\n  1\nend\n"),
+            Type::Constant(Scalar::Int(1))
+        );
+        assert!(matches!(
+            fold(b"counts = { a: 1 }\ncounts.default = 0\nif counts[:b]\n  1\nend\n"),
+            Type::Dynamic(_)
+        ));
     }
 
     #[test]
