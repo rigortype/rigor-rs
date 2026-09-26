@@ -425,3 +425,24 @@ x45 && (y45 = 2)
 l45d = "s"
 (l45d = 1) rescue nil or (l45d = :a)
 l45d.frob
+
+# (46) a rescue MODIFIER arm ending in `retry` is NOT unconditionally
+# exiting — `branch_unconditionally_exits?` (statement_evaluator.rb:5027)
+# lists `return`/`next`/`break`/`raise`/`throw`/`exit`/`abort`/`fail`,
+# never `retry` — so the arm still joins the pre-state: fires
+# `for [5 | 6]`; `w.upcase` stays silent on `"s" | 1`. (Contrast (39): a
+# `begin`/`rescue` CLAUSE ending in `retry` IS terminating — `retry`
+# loops back into the primary body, so the arm contributes nothing.)
+r46 = 5
+(r46 = 6) rescue retry
+[r46].frob
+r46b = "s"
+(r46b = 1) rescue retry
+r46b.upcase
+
+# (47) the union receiver's witness uses `Union#describe` — a
+# `true | false` pair collapses to `bool`, rendered FIRST — fires
+# `for bool`, `for bool | 1`.
+def m47a(c) = (c ? true : false).frob
+def m47b(c) = (c ? 1 : (c ? true : false)).frob
+def m47c(c) = (c ? "s" : (c ? true : false)).frob

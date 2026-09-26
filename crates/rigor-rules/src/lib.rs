@@ -1571,15 +1571,23 @@ fn check_call(
                 return None;
             }
         }
-        // Render in the reference's `Combinator.union` canonical order — the
-        // members sort by `describe(:short)` (`(c ? "s" : 1)` prints `"s" | 1`,
-        // not `1 | "s"`), not by intern order.
-        let mut member_desc: Vec<String> = members
-            .iter()
-            .map(|&m| render_receiver(interner, index, typer.source(), m))
-            .collect();
-        member_desc.sort();
-        let receiver_render = member_desc.join(" | ");
+        // The reference's `build_undefined_method_diagnostic` renders
+        // `receiver_type.describe` — `Union#describe`: a `true | false` pair
+        // collapses to `bool` rendered FIRST (`(c ? 1 : (c ? true : false))`
+        // prints `for bool | 1`), `T | nil` collapses to `T?`, the rest keep
+        // `Combinator.union`'s `describe(:short)` member order. Canonicalise
+        // the members through `combinator_union` (same constructor the scope
+        // join uses) so a union built on another path renders identically.
+        let receiver_render = {
+            let resolve = |class: rigor_types::ClassId| -> Option<String> {
+                index
+                    .class_name_for_id(class)
+                    .map(str::to_string)
+                    .or_else(|| typer.source().class_name_for_id(class).map(str::to_string))
+            };
+            let canon = rigor_types::combinator_union(interner, members.clone(), &resolve);
+            render_receiver(interner, index, typer.source(), canon)
+        };
         let message = format!("undefined method `{method}' for {receiver_render}");
         let severity = catalog(CALL_UNDEFINED_METHOD)
             .map(|e| e.default_severity)

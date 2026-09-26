@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use rigor_index::{ClassOrdering, CoreIndex};
-use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
+use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
@@ -757,7 +757,7 @@ impl<'i> Typer<'i> {
             // join of the arms' WRITES happens separately in
             // `bind_check_statement`.
             Node::Statements { body, kind: StatementsKind::Rescue, .. } => match &body[..] {
-                [expr, arm] if !carrier_arm_exits(ast, *arm) => {
+                [expr, arm] if !carrier_arm_exits(ast, *arm, false) => {
                     let a = self.stmt_value_type(ast, *expr, env, interner);
                     let b = self.stmt_value_type(ast, *arm, env, interner);
                     self.union_named(a, b, interner)
@@ -807,7 +807,7 @@ impl<'i> Typer<'i> {
             // is `6 | 7`) — the generic tail-descent below would see only the
             // arm. Same rule as `type_of`'s rescue-modifier arm.
             Node::Statements { body, kind: StatementsKind::Rescue, .. } => match &body[..] {
-                [expr, arm] if !carrier_arm_exits(ast, *arm) => {
+                [expr, arm] if !carrier_arm_exits(ast, *arm, false) => {
                     let a = self.stmt_value_type(ast, *expr, env, interner);
                     let b = self.stmt_value_type(ast, *arm, env, interner);
                     self.union_named(a, b, interner)
@@ -3178,7 +3178,7 @@ impl<'i> Typer<'i> {
                 if let [expr, arm] = body[..] {
                     let mut after_expr = env.clone();
                     self.bind_check_statement(ast, expr, &mut after_expr, rebinds, interner);
-                    if carrier_arm_exits(ast, arm) {
+                    if carrier_arm_exits(ast, arm, false) {
                         *env = after_expr;
                     } else {
                         let mut after_arm =
@@ -8511,34 +8511,49 @@ fn shape_key_type(k: &ShapeKey, interner: &mut Interner) -> TypeId {
 /// statement sequence (or multi-statement parens carrier) whose LAST statement
 /// exits, or an `if`/`unless` whose BOTH arms exit. Used to decide whether a
 /// `rescue` arm contributes to the post-scope join.
-fn carrier_arm_exits(ast: &LoweredAst, id: NodeId) -> bool {
+///
+/// `retry_is_exit` splits the reference's two callers: the rescue-MODIFIER
+/// arm check (`branch_unconditionally_exits?`, statement_evaluator.rb:2353)
+/// does NOT list `retry`, so `(w = 6) rescue retry` still joins the pre-state
+/// (`for [5 | 6]`); a `begin`/`rescue` CLAUSE check
+/// (`live_rescue_results`/`branch_terminates?`, statement_evaluator.rb:1345)
+/// counts `retry` — an arm ending in one leaves back into the primary body and
+/// contributes nothing (`begin; w = 6; rescue; retry; end` → `for [6]`).
+fn carrier_arm_exits(ast: &LoweredAst, id: NodeId, retry_is_exit: bool) -> bool {
     match ast.get(id) {
-        Node::Return { .. } | Node::Other { jump: Some(_), .. } => true,
+        Node::Return { .. } => true,
+        Node::Other { jump: Some(kind), .. } => {
+            matches!(kind, JumpKind::Next | JumpKind::Break)
+                || (retry_is_exit && matches!(kind, JumpKind::Retry))
+        }
         Node::Call { receiver: None, method, .. } => {
             matches!(method.as_str(), "raise" | "throw" | "exit" | "abort" | "fail")
         }
         Node::Statements { body, kind: StatementsKind::Sequence | StatementsKind::Rescue, .. } => {
-            seq_exits(ast, body)
+            seq_exits(ast, body, retry_is_exit)
         }
-        Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => seq_exits(ast, body),
+        Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
+            seq_exits(ast, body, retry_is_exit)
+        }
         Node::If { then_body, else_body, .. } => {
-            seq_exits(ast, then_body) && seq_exits(ast, else_body)
+            seq_exits(ast, then_body, retry_is_exit) && seq_exits(ast, else_body, retry_is_exit)
         }
         _ => false,
     }
 }
 
 /// Whether a statement list's last statement exits (empty ⇒ not exiting).
-fn seq_exits(ast: &LoweredAst, body: &[NodeId]) -> bool {
-    body.last().is_some_and(|&s| carrier_arm_exits(ast, s))
+fn seq_exits(ast: &LoweredAst, body: &[NodeId], retry_is_exit: bool) -> bool {
+    body.last().is_some_and(|&s| carrier_arm_exits(ast, s, retry_is_exit))
 }
 
 /// Whether a `begin`/`rescue` clause never falls through — the syntactic half
 /// of the reference's `live_rescue_results` filter (`branch_terminates?`; its
 /// `bot`-type half has no cheap port, so a divergent-helper arm stays joined —
-/// the conservative direction).
+/// the conservative direction). `retry` exits here (see
+/// [`carrier_arm_exits`]).
 fn rescue_clause_exits(ast: &LoweredAst, clause: &rigor_parse::RescueClause) -> bool {
-    seq_exits(ast, &clause.body)
+    seq_exits(ast, &clause.body, true)
 }
 
 /// Widen (to `Dynamic`) every tracked local whose write span is contained in

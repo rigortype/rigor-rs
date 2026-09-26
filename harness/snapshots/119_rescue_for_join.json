@@ -469,6 +469,34 @@
       "column": 6,
       "severity": "error",
       "message": "undefined method `frob' for \"s\" | 1 | :a"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 438,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [5 | 6]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 446,
+      "column": 34,
+      "severity": "error",
+      "message": "undefined method `frob' for bool"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 447,
+      "column": 44,
+      "severity": "error",
+      "message": "undefined method `frob' for bool | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 448,
+      "column": 46,
+      "severity": "error",
+      "message": "undefined method `frob' for bool | \"s\""
     }
   ]
 }
