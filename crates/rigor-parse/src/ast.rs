@@ -3093,9 +3093,9 @@ fn all_param_names(params: Option<&ruby_prism::ParametersNode<'_>>) -> Vec<Strin
 /// `yield self`, so the FIRST positional (a required or optional name, the
 /// implicit `it`, `_1`, or the members of a leading `|(v, w)|`) receives the
 /// receiver; a `*rest` collects leftovers into an `Array`; `|;local|`
-/// declarations seed `nil`; and every remaining name — later positionals,
-/// posts, keywords, `**kw`, `&blk`, `_2.._9` — is hidden from the enclosing
-/// env but bound to nothing modeled.
+/// declarations hide without binding; and every remaining name — later
+/// positionals, posts, keywords, `**kw`, `&blk`, `_2.._9` — is hidden from
+/// the enclosing env but bound to nothing modeled.
 fn block_param_names(bn: &ruby_prism::BlockNode<'_>) -> Vec<(String, BlockParamKind)> {
     let mut out: Vec<(String, BlockParamKind)> = Vec::new();
     let Some(params) = bn.parameters() else {
@@ -3139,8 +3139,15 @@ fn block_param_names(bn: &ruby_prism::BlockNode<'_>) -> Vec<(String, BlockParamK
                 }
             }
         }
+        // `|;local|` declarations: Prism reports them as
+        // `BlockLocalVariableNode`s. They bind nothing the yield provides
+        // (each starts nil at runtime), but they must still be hidden from
+        // the enclosing env — `block_entry_env` removes `Local` names so a
+        // body read of `local` cannot see the outer binding. The reference
+        // leaves them readable through `block_entry_scope`, a leak that
+        // produces extra outer-typed arms; hiding is the safe side.
         for local in bp.locals().iter() {
-            if let Some(t) = local.as_local_variable_target_node() {
+            if let Some(t) = local.as_block_local_variable_node() {
                 out.push((constant_string(t.name().as_slice()), BlockParamKind::Local));
             }
         }

@@ -10592,6 +10592,21 @@ mod tests {
         assert_eq!(idx.class_name_of(&i, ty), Some("Hash"));
         let (i, ty) = bound_type(&idx, b"x = [1, 2].tap { |&blk| break blk }\n", "x");
         assert_eq!(idx.class_name_of(&i, ty), Some("Proc"));
+        // `|;local|` declarations hide the outer name and bind nothing —
+        // `break v` reads the hidden local as Dynamic, so the whole result
+        // declines. The reference's entered-block scope leaves `;`-locals
+        // readable (it types this `x`'s arm through the outer binding, an
+        // FP-shaped leak in its own output); hiding is the safe side.
+        let (i, ty) = bound_type(
+            &idx,
+            b"v = [1]\nx = [1, 2].tap { |p; v| break v }\n",
+            "x",
+        );
+        assert!(
+            matches!(i.get(ty), Type::Dynamic(_)),
+            "a `;`-local arm must hide the outer binding, got {:?}",
+            i.get(ty)
+        );
     }
 
     #[test]
