@@ -2741,7 +2741,7 @@ fn concrete_class_name(
     match interner.get(ty) {
         Type::Nominal { class, .. } => resolve_class_name(index, source, *class),
         Type::Tuple(_) => Some("Array".to_string()),
-        Type::HashShape(_) => Some("Hash".to_string()),
+        Type::HashShape { .. } => Some("Hash".to_string()),
         Type::Constant(scalar) => Some(constant_class_name(scalar).to_string()),
         Type::IntegerRange { .. } => Some("Integer".to_string()),
         Type::Refined { base, .. } | Type::Difference { base, .. } => {

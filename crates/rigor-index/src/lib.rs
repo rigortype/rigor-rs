@@ -524,7 +524,7 @@ impl CoreIndex {
             // `describe_named`. Any core-modeled Array/Hash/Integer method stays
             // silent, so this only ever witnesses a genuinely-absent method.
             Type::Tuple(_) => Some("Array"),
-            Type::HashShape(_) => Some("Hash"),
+            Type::HashShape { .. } => Some("Hash"),
             Type::IntegerRange { .. } => Some("Integer"),
             _ => None,
         }
