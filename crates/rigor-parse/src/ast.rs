@@ -485,6 +485,24 @@ pub enum Node {
         /// env must NOT read an outer local through one of these names —
         /// `{ |v| break v }` reads the parameter, not an outer `v`.
         block_params: Vec<(String, BlockParamKind)>,
+        /// Prism's `CallNode#attribute_write?` — `true` only when the call is
+        /// written in assignment syntax (`x.attr = v`, `h[k] = v`), `false` for
+        /// the explicit call form (`x.attr=(v)`, `h.[]=(k, v)` — note a NAMED
+        /// setter keeps `true` even in call form: `o.x=(1)` parses as
+        /// `attribute_write?` == `true`; only the `[]=` call-form flips it).
+        /// The reference's `attribute_write_value` fold (`x.attr = v` evaluates
+        /// to `v`, whatever the writer returns) keys on exactly this flag, so a
+        /// call-form `d.[]=(1, nil)` types to the DISPATCH result instead of the
+        /// RHS — `if d.[]=(1, nil)` on a `def []=(k,v); 42; end` is always
+        /// truthy, not falsey.
+        attribute_write: bool,
+        /// `true` when the call's LAST positional argument is a Prism
+        /// `SplatNode` — the `return result if rhs.is_a?(Prism::SplatNode)`
+        /// decline inside the reference's `attribute_write_value` (a splat RHS
+        /// is not a single value, so the write folds the dispatch result).
+        /// Meaningful only when [`Node::Call::attribute_write`] is `true`.
+        rhs_splat: bool,
+
         /// Span of the whole call expression.
         span: Span,
     },
@@ -1194,6 +1212,11 @@ pub struct LoweredAst {
     /// a literal. Sorted for a binary-search read via
     /// [`LoweredAst::paren_unwrapped`].
     paren_unwrapped: Vec<u32>,
+    /// `(inner_id, parens_span)` for every single-statement `(e)` group the
+    /// lowering UNWRAPPED to `e` — several entries stack for `((e))`, recorded
+    /// inside-out. See [`LoweredAst::paren_hull`].
+    paren_hulls: Vec<(NodeId, Span)>,
+
 }
 
 /// One site where a CONSTANT-shaped receiver is mutated — the raw material of
@@ -1289,6 +1312,23 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// The span of a `( … )` group that lowered away around `id`, or `None`.
+    /// Single-statement parens are unwrapped to their inner node (the inner
+    /// node keeps its own span), but the reference still anchors some
+    /// diagnostics on the `ParenthesesNode` — `flow.always-truthy-condition`
+    /// keys on `node.predicate`, which for `if (x)` is the parens node, so a
+    /// predicate written `(expr)` anchors at the `(`, not at `expr`'s start.
+    /// When parens nest (`((x))`) the WIDEST (outermost) hull answers — the
+    /// reference reads the predicate's outermost `ParenthesesNode`.
+    pub fn paren_hull(&self, id: NodeId) -> Option<Span> {
+        self.paren_hulls
+            .iter()
+            .filter(|(i, _)| *i == id)
+            .map(|(_, s)| *s)
+            .max_by_key(|s| s.1 - s.0)
+    }
+
+
     /// Resolve a handle to its owned node.
     pub fn get(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
@@ -1347,6 +1387,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         source,
         line_starts,
         paren_unwrapped: Vec::new(),
+        paren_hulls: Vec::new(),
+
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -1376,6 +1418,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         local_read_starts,
         inert_spans,
         paren_unwrapped,
+        paren_hulls: builder.paren_hulls,
+
     }
 }
 
@@ -1389,6 +1433,10 @@ struct Builder<'src> {
     /// Arena ids a `(e)` unwrap returned — see
     /// [`LoweredAst::paren_unwrapped`].
     paren_unwrapped: Vec<u32>,
+    /// `(inner_id, parens_span)` for every single-statement parens group the
+    /// walk unwrapped — see [`LoweredAst::paren_hull`].
+    paren_hulls: Vec<(NodeId, Span)>,
+
 }
 
 impl<'src> Builder<'src> {
@@ -1715,6 +1763,15 @@ impl<'src> Builder<'src> {
                 .message_loc()
                 .map(|l| span_of(&l))
                 .unwrap_or(span);
+            // `attribute_write?` + the `attribute_write_value` splat decline:
+            // `d.[]=(1, nil)` is call syntax (`false`) while `d[1] = nil` is
+            // write syntax (`true`); a splat RHS keeps the dispatch result.
+            let attribute_write = call.is_attribute_write();
+            let rhs_splat = call
+                .arguments()
+                .and_then(|a| a.arguments().iter().last())
+                .map(|last| last.as_splat_node().is_some())
+                .unwrap_or(false);
             return self.push(Node::Call {
                 receiver,
                 method,
@@ -1731,6 +1788,8 @@ impl<'src> Builder<'src> {
                 first_arg_nonplain,
                 args_plain_positional,
                 args_all_plain,
+                attribute_write,
+                rhs_splat,
                 span: span_of(&call.location()),
             });
         }
@@ -2281,13 +2340,18 @@ impl<'src> Builder<'src> {
             // parenthesized receiver then types precisely (`(15).foo` witnesses on
             // Integer — real-corpus coverage-gap audit). Multi-statement / empty
             // parens keep the block wrapper (their value is the last statement,
-            // which the wrapper types as Dynamic — unchanged).
+            // which the wrapper types as Dynamic — unchanged). On unwrap, record
+            // the parens span in `paren_hulls`: the reference still anchors
+            // `flow.always-truthy-condition` on the `ParenthesesNode` itself, so
+            // `if (x = 5)` reports at the `(`, one column left of `x`'s start.
             let body = self.lower_optional_body(parens.body().as_ref());
             if let [only] = body[..] {
                 // Mark the unwrapped id: `(nil)` is NOT a NilNode in the
                 // reference's syntax-level reading, so the `nil&.m` literal
                 // fold must not see through the parens.
                 self.paren_unwrapped.push(only.0);
+                self.paren_hulls.push((only, span));
+
                 return only;
             }
             let main_body = body.clone();

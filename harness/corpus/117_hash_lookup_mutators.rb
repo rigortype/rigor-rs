@@ -173,3 +173,71 @@ laz2 = { a: 1 }
 runner = -> { laz2.default = 0 }
 runner.call
 laz2[:b] + 1
+
+# (17) structural reachability, not span hulls: a `->` inside heredoc
+# interpolation nested in a block body still APPLIES — `widen_after_block`
+# reaches it even though the interpolated node sits outside the block's
+# byte span on disk.
+heredoc = { a: 1 }
+[1].each do
+  <<~END
+  #{-> { heredoc.default = 0 }}
+  END
+end
+heredoc[:a].upcase
+heredoc[:b] + 1
+heredoc.foo
+
+# (18) `ReceiverAlias` candidates: a mutator on a transparent receiver
+# expression applies to EVERY local it may evaluate to — `||`, ternary and
+# statement-tail receivers each open both/inner shapes.
+alog = { a: 1 }
+blog = { b: 2 }
+(alog || blog).default = 0
+alog[:a].upcase
+blog[:b].upcase
+alog[:z] + 1
+blog[:z] + 1
+
+cond = rand > 0
+cter = { a: 1 }
+dter = { b: 2 }
+(cond ? cter : dter).default = 0
+cter[:a].upcase
+cter[:z] + 1
+dter[:b].upcase
+
+stail = { a: 1 }
+(nil; stail).default = 0
+stail[:a].upcase
+stail[:z] + 1
+
+# (19) nested mutators apply innermost/argument-first (Ruby evaluation
+# order): the `compare_by_identity` widens to `Hash[String, Integer|untyped]`
+# BEFORE `default=` reopens it, so `nested.foo` witnesses the widened-open
+# nominal rather than `Hash[untyped, untyped]`.
+nested = { "k" => 1 }
+nested.default = nested.compare_by_identity
+nested.foo
+nested["k"].upcase
+
+# (20) `&->` block-pass is a no-op (the lambda body is never evaluated),
+# but `&proc`/`&lambda` blocks DO apply — the reference walks non-lambda
+# block bodies.
+blkp = { a: 1 }
+blkp.tap(&-> { blkp.default = 0 })
+blkp[:a].upcase
+blkp[:b] + 1
+
+blkl = { a: 1 }
+blkl.tap(&lambda { blkl.default = 0 })
+blkl[:b] + 1
+
+# (21) a constant write's RHS is evaluated for its own type only: the
+# mutation does NOT escape into the surrounding local scope (`eval_constant_write`
+# returns the entry scope unchanged), so `cwrite` stays closed.
+cwrite = { a: 1 }
+CW = (cwrite.default = 0)
+cwrite[:a].upcase
+cwrite[:b] + 1
+cwrite.foo

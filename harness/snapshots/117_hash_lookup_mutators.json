@@ -163,6 +163,97 @@
       "message": "undefined method `+' for nil"
     },
     {
+      "rule": "call.undefined-method",
+      "line": 187,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 189,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 197,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 198,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 206,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 208,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 212,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 221,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for Hash[String, Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 229,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 230,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 241,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 242,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 243,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1 }"
+    },
+    {
       "rule": "flow.always-truthy-condition",
       "line": 139,
       "column": 4,
