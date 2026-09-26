@@ -497,6 +497,41 @@
       "column": 46,
       "severity": "error",
       "message": "undefined method `frob' for bool | \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 457,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 485,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 488,
+      "column": 26,
+      "severity": "error",
+      "message": "undefined method `frob' for [Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 490,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for [1 | Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 495,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frob' for 5"
     }
   ]
 }

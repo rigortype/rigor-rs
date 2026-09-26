@@ -39,6 +39,30 @@ pub fn bind(
     interner: &mut Interner,
     resolve: &dyn Fn(ClassId) -> Option<String>,
 ) -> Vec<(String, TypeId)> {
+    bind_marked(targets, rhs_type, interner, resolve)
+        .into_iter()
+        .map(|(name, ty, _optimistic)| (name, ty))
+        .collect()
+}
+
+/// Reference `bind_marked` (`Result#optimistic`): same bindings as [`bind`],
+/// with each name flagged when its type is the reference's OPTIMISTIC
+/// short-array bet — a name some union member bound to a bare `nil` while
+/// another member bound a value (`join_member_bindings`' `softened`). The
+/// mark only ever WITHHOLDS a diagnostic on the reference: the bound type is
+/// the firm join either way, but flow rules (`flow.always-truthy-condition`,
+/// `call.possible-nil-receiver`) decline to reason about a marked name —
+/// `s, v = (c ? [:ok, 1] : [:err]); if v` is silent upstream. Callers whose
+/// env feeds a flow rule must treat a marked name as `Dynamic[top]`; the
+/// check env keeps the firm type, since the reference still witnesses it
+/// (`[v].frob` fires `for [1]`).
+#[must_use]
+pub fn bind_marked(
+    targets: &MultiTargets,
+    rhs_type: TypeId,
+    interner: &mut Interner,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+) -> Vec<(String, TypeId, bool)> {
     let mut out = Vec::new();
     visit(targets, rhs_type, interner, resolve, &mut out);
     out
@@ -53,7 +77,7 @@ fn visit(
     rhs_type: TypeId,
     interner: &mut Interner,
     resolve: &dyn Fn(ClassId) -> Option<String>,
-    out: &mut Vec<(String, TypeId)>,
+    out: &mut Vec<(String, TypeId, bool)>,
 ) {
     if let Type::Union(members) = interner.get(rhs_type) {
         let members = members.clone();
@@ -86,9 +110,9 @@ fn visit_union(
     members: &[TypeId],
     interner: &mut Interner,
     resolve: &dyn Fn(ClassId) -> Option<String>,
-    out: &mut Vec<(String, TypeId)>,
+    out: &mut Vec<(String, TypeId, bool)>,
 ) {
-    let walks: Vec<Vec<(String, TypeId)>> = members
+    let walks: Vec<Vec<(String, TypeId, bool)>> = members
         .iter()
         .map(|&m| {
             let mut member_out = Vec::new();
@@ -99,45 +123,54 @@ fn visit_union(
     let Some(first) = walks.first() else {
         return;
     };
-    for (name, _) in first.clone() {
+    for (name, _ty, member_marked) in first.clone() {
         let types: Vec<TypeId> = walks
             .iter()
             .map(|w| {
                 w.iter()
-                    .find(|(n, _)| n == &name)
-                    .map(|(_, t)| *t)
+                    .find(|(n, _, _)| n == &name)
+                    .map(|(_, t, _)| *t)
                     // Every member binds the same names; a missing one reads
                     // as a bare `nil` binding (reference `member_bindings[name]`
                     // → nil), which `join_member_bindings` firms away.
                     .unwrap_or_else(|| interner.intern(Type::Constant(Scalar::Nil)))
             })
             .collect();
-        out.push((name.clone(), join_member_bindings(types, interner, resolve)));
+        let (joined, softened) = join_member_bindings(types, interner, resolve);
+        // "A name is also optimistic when any member marked it" — the mark
+        // inherits through the member walks the same way the reference's
+        // `member_marked.include?(name)` does.
+        let marked = softened
+            || member_marked
+            || walks
+                .iter()
+                .any(|w| w.iter().any(|(n, _, m)| n == &name && *m));
+        out.push((name.clone(), joined, marked));
     }
 }
 
-/// Reference `join_member_bindings`: `Dynamic[top]` from any member is the
-/// whole answer — the join must not let a decomposable member's precise type
-/// stand for a member nothing is known about. A bare `nil` member (a `nil`
-/// slot or a slot past a short member) drops out of the join when another
-/// member binds a value — the ADR-57 softening across members; the port has
-/// no optimistic-mark channel to report the softening, but the union itself
-/// is the same type.
+/// Reference `join_member_bindings`, returning `[type, softened]`:
+/// `Dynamic[top]` from any member is the whole answer — the join must not
+/// let a decomposable member's precise type stand for a member nothing is
+/// known about. A bare `nil` member (a `nil` slot or a slot past a short
+/// member) drops out of the join when another member binds a value — the
+/// ADR-57 softening across members — and `softened` reports it so the
+/// caller can mark the name optimistic (see [`bind_marked`]).
 fn join_member_bindings(
     types: Vec<TypeId>,
     interner: &mut Interner,
     resolve: &dyn Fn(ClassId) -> Option<String>,
-) -> TypeId {
+) -> (TypeId, bool) {
     let untyped = interner.untyped();
     if types.contains(&untyped) {
-        return untyped;
+        return (untyped, false);
     }
     let firm: Vec<TypeId> =
         types.iter().copied().filter(|&t| !is_nil_literal(interner, t)).collect();
     if firm.is_empty() || firm.len() == types.len() {
-        combinator_union(interner, types, resolve)
+        (combinator_union(interner, types, resolve), false)
     } else {
-        combinator_union(interner, firm, resolve)
+        (combinator_union(interner, firm, resolve), true)
     }
 }
 
@@ -262,10 +295,10 @@ fn bind_target(
     ty: TypeId,
     interner: &mut Interner,
     resolve: &dyn Fn(ClassId) -> Option<String>,
-    out: &mut Vec<(String, TypeId)>,
+    out: &mut Vec<(String, TypeId, bool)>,
 ) {
     match target {
-        MultiTarget::Local { name, .. } => out.push((name.clone(), ty)),
+        MultiTarget::Local { name, .. } => out.push((name.clone(), ty, false)),
         MultiTarget::Nested(inner) => visit(inner, ty, interner, resolve, out),
         MultiTarget::Ignored { .. } => {}
     }
@@ -275,9 +308,9 @@ fn bind_target(
 /// anonymous `*`, an implicit rest, and a non-local splat target are skipped —
 /// and a nested multi-target is NOT recursed into (the reference's rest arm
 /// handles only the two local-ish node kinds).
-fn bind_rest_target(rest: &MultiTarget, ty: TypeId, out: &mut Vec<(String, TypeId)>) {
+fn bind_rest_target(rest: &MultiTarget, ty: TypeId, out: &mut Vec<(String, TypeId, bool)>) {
     if let MultiTarget::Local { name, .. } = rest {
-        out.push((name.clone(), ty));
+        out.push((name.clone(), ty, false));
     }
 }
 

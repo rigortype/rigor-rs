@@ -360,14 +360,18 @@ fn named_float(f: f64) -> String {
 }
 
 /// Ruby `Float#to_s` / `Float#inspect` spelling: a decimal point is always
-/// present (`3.0.to_s == "3.0"`, `3.14.to_s == "3.14"`); magnitudes outside
-/// `1e-4 <= |f| < 1e15` render scientific with a signed two-or-more-digit
-/// exponent (`1e20.to_s == "1.0e+20"`, `1e-5.to_s == "1.0e-05"`), and
-/// non-finite inputs spell `NaN` / `±Infinity` as Ruby does. Non-integral
-/// values use Rust's shortest round-trip (which matches Ruby's `flo_to_s`
-/// dtoa for the overwhelming majority of values). Exposed for the Kernel
-/// `String()` / `sprintf` folds (`kernel_fold`), which must reproduce Ruby's
-/// `to_s` byte-for-byte.
+/// present (`3.0.to_s == "3.0"`, `3.14.to_s == "3.14"`); non-finite inputs
+/// spell `NaN` / `±Infinity` as Ruby does. The scientific switch is CRuby's
+/// `flo_to_s` rule over the shortest round-trip digits (`d.ddd` with decimal
+/// exponent `E`): exponential when `E <= -5` (`1e-5` → `"1.0e-05"`) or when
+/// `E >= 16` (`1e16` → `"1.0e+16"`), plus the integral corner at `E == 15` —
+/// `1e15` and `1234567890123456.0` print `"...e+15"` while a value with real
+/// fraction digits at the same magnitude stays decimal
+/// (`1234567890123456.8`, `999999999999999.9`). The exponent comes from
+/// `{:e}`'s shortest-round-trip digits, NOT `log10().floor()` — the latter
+/// rounds `999999999999999.9` up to `1e15` and picks scientific wrongly.
+/// Exposed for the Kernel `String()` / `sprintf` folds (`kernel_fold`), which
+/// must reproduce Ruby's `to_s` byte-for-byte.
 pub fn ruby_float_to_s(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -383,29 +387,33 @@ pub fn ruby_float_to_s(f: f64) -> String {
         // Preserves `-0.0` (Ruby: `(-0.0).to_s == "-0.0"`).
         return format!("{f:.1}");
     }
-    let exp10 = f.abs().log10().floor() as i32;
-    if (-4..15).contains(&exp10) {
+    // `{:e}` is Rust's shortest-round-trip scientific ("1e20", "3.14e0",
+    // "9.999999999999999e14") — the same digits Ruby's dtoa emits.
+    let sci = format!("{:e}", f.abs());
+    let Some((_, exp_str)) = sci.split_once('e') else {
+        return f.to_string();
+    };
+    let exp10: i32 = exp_str.parse().unwrap_or(0);
+    let use_exp = exp10 <= -5 || exp10 >= 16 || (exp10 == 15 && f == f.trunc());
+    if !use_exp {
         if f == f.trunc() {
             format!("{f:.1}")
         } else {
             f.to_string()
         }
     } else {
-        // `{:e}` is Rust's shortest-round-trip scientific ("1e20", "1.5e-7");
-        // re-dress it as Ruby's: a decimal point in the mantissa and a signed
-        // at-least-two-digit exponent.
-        let s = format!("{f:e}");
-        let Some((mant, exp)) = s.split_once('e') else {
-            return s;
+        // Re-dress the shortest-round-trip mantissa as Ruby's: a decimal
+        // point in the mantissa and a signed at-least-two-digit exponent.
+        let Some((mant, _)) = sci.split_once('e') else {
+            return sci;
         };
-        let exp: i32 = exp.parse().unwrap_or(0);
-        let sign = if exp < 0 { "-" } else { "+" };
+        let sign = if exp10 < 0 { "-" } else { "+" };
         let mantissa = if mant.contains('.') {
             mant.to_string()
         } else {
             format!("{mant}.0")
         };
-        format!("{mantissa}e{sign}{:02}", exp.abs())
+        format!("{mantissa}e{sign}{:02}", exp10.abs())
     }
 }
 

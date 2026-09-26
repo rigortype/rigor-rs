@@ -3170,28 +3170,41 @@ struct ScopedEnv {
     top: rigor_infer::TypeEnv,
     gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
+    /// `(span, entry-env)` pairs for `expr rescue arm` arms and `begin`/`rescue`
+    /// clause bodies — their interior reads type from the env the construct was
+    /// ENTERED under, not the joined post-scope (reference `eval_rescue_modifier`:
+    /// the arm's operand types come from `OperandWalk.type_of(scope, node)` on
+    /// the entry scope). Outer constructs are recorded first, so the first
+    /// containing span is the outermost entry — matching nested arms.
+    arm_entries: Vec<(rigor_parse::Span, rigor_infer::TypeEnv)>,
     method_bodies: Vec<rigor_parse::Span>,
 }
 
 impl ScopedEnv {
     fn build(typer: &Typer, ast: &LoweredAst, interner: &mut Interner) -> Self {
+        let (top, arm_entries) = typer.build_toplevel_check_env(ast, interner);
         ScopedEnv {
-            top: typer.build_toplevel_check_env(ast, interner),
+            top,
             gate_top: typer.build_toplevel_env(ast, interner),
             empty: rigor_infer::TypeEnv::new(),
+            arm_entries,
             method_bodies: rigor_infer::method_body_spans(ast),
         }
     }
 
     /// The env a use site at `span` may read: the top-level env at file scope (or
-    /// inside a block, which DOES capture the enclosing locals), an empty env
-    /// inside any method body.
+    /// inside a block, which DOES capture the enclosing locals), the entry env
+    /// inside a rescue arm / clause body, an empty env inside any method body.
     fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
         if self.in_method_body(span) {
-            &self.empty
-        } else {
-            &self.top
+            return &self.empty;
         }
+        for (arm_span, entry) in &self.arm_entries {
+            if span.0 >= arm_span.0 && span.1 <= arm_span.1 {
+                return entry;
+            }
+        }
+        &self.top
     }
 
     /// [`Self::at`] for the `Dynamic`-only gates of the class-narrowing and

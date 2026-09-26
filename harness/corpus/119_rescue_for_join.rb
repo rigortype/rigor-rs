@@ -446,3 +446,51 @@ r46b.upcase
 def m47a(c) = (c ? true : false).frob
 def m47b(c) = (c ? 1 : (c ? true : false)).frob
 def m47c(c) = (c ? "s" : (c ? true : false)).frob
+
+# (48) multi-assign union distribution SOFTENS a name a member binds to bare
+# `nil` (join_member_bindings → the reference's optimistic mark): the firm
+# join still binds for witnesses (`[v].frob` → `for [1]`) but flow rules
+# decline on it — `if v` / `v ?` stay silent. The port stands the mark in as
+# `Dynamic[top]` inside the flow-snapshot pass only.
+c48 = rand > 0.5
+s48, v48 = (c48 ? [:ok, 1] : [:err])
+[v48].frob
+if v48 then p 1 end
+s48b, v48b = (c48 ? [:ok, false] : [:err])
+if v48b then 1 end
+
+# (49) a rescue-MODIFIER arm only exits on return/next/break and receiverless
+# raise/throw/exit/abort/fail (plus a statements/parens tail) —
+# `branch_unconditionally_exits?` reads an `IfNode`'s `subsequent`, which is
+# an `ElseNode` it does not unwrap, and a bare `begin`/`retry` are not listed
+# at all — so each arm below still joins the pre-state and `upcase` stays
+# silent. (`begin`/`rescue` CLAUSES still treat the same shapes as
+# terminating via `branch_terminates?`'s bot-type half — pinned at (39).)
+r49a = "s"
+(r49a = 1) rescue (rand > 0.5 ? raise : raise)
+r49a.upcase
+r49b = "s"
+(r49b = 1) rescue (if rand > 0.5 then raise else raise end)
+r49b.upcase
+r49c = "s"
+(r49c = 1) rescue begin; raise; end
+r49c.upcase
+
+# (50) reads INSIDE a rescue-modifier arm (or a `begin`/`rescue` clause) type
+# from the ENTRY scope — the reference records the arm's operand types from
+# `OperandWalk.type_of(scope, node)` on the entry scope — while the arm's
+# WRITES still thread the nil-injected `entry | write` join. Fires `for "s"`,
+# `for [Dynamic[top]]`, `for [1 | Dynamic[top]]`, `for 5`.
+r50 = "s"
+(r50 = 1) rescue r50.frob
+r50b = 5
+(r50b = "s") rescue 1.fdiv(r50b)
+(r50c = 1) rescue [r50c].frob
+x50 = ((r50d = 1) rescue r50d)
+[x50].frob
+r50e = 5
+begin
+  r50e = "s"
+rescue
+  r50e.frob
+end
