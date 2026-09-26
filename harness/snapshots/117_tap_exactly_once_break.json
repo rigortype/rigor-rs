@@ -86,6 +86,139 @@
       "message": "undefined method `push' for \"s\""
     },
     {
+      "rule": "call.undefined-method",
+      "line": 196,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for Proc"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 202,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 209,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 214,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 220,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for \"s\" | Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 225,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 231,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 240,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 245,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"a\" | \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 250,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"a\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 256,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for \"s\" | 1 | Array[Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 267,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"a\" | \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 278,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 281,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 282,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 286,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 291,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 302,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `upcase' for Array[1 | 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 307,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for Hash[Symbol, Dynamic[top]]"
+    },
+    {
       "rule": "flow.unreachable-branch",
       "line": 147,
       "column": 19,
