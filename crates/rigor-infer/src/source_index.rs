@@ -2753,6 +2753,11 @@ fn decl_body_cx(cx: &DefCx, name: &str, rooted: bool, self_anchored: bool) -> De
                 // unnameable, NOT `<base>::Name`.
                 Vec::new()
             } else {
+                // `self_anchored_decl_prefix` — `self_base + tail` where
+                // `self_anchored_tail` returns one ELEMENT PER SEGMENT
+                // (`self::A::B` ⇒ `["A", "B"]`), unlike `declaration_prefix`'s
+                // single-element push below. The intermediate `base::A` rung
+                // this creates is the reference's own shape.
                 let mut p = base;
                 p.extend(name.split("::").map(str::to_string));
                 p
@@ -2764,11 +2769,18 @@ fn decl_body_cx(cx: &DefCx, name: &str, rooted: bool, self_anchored: bool) -> De
     let child_prefix: Vec<String> = match &self_decl {
         Some(p) => p.clone(),
         None => {
+            // `Source::ConstantPath.declaration_prefix` — the rendered name is
+            // pushed as ONE element (`rooted ? [name] : outer + [name]`), so
+            // `lexical_nesting_for_prefix` yields a rung only at declaration
+            // boundaries: `class ::M::N` inside `module Outer` nests as
+            // `M::N` alone (NEVER a bare `M` rung — #141 round 3), and
+            // `class A::B` inside `module M` nests `M::A::B`, `M` — never a
+            // `M::A` partial-segment rung.
             if rooted {
-                name.split("::").map(str::to_string).collect()
+                vec![name.to_string()]
             } else {
                 let mut lexical = cx.lexical.clone();
-                lexical.extend(name.split("::").map(str::to_string));
+                lexical.push(name.to_string());
                 lexical
             }
         }
@@ -5966,6 +5978,90 @@ end
         // A bare header below `class <<` names `#<singleton>::Bare` — nothing.
         assert!(!idx2.project_declares_method(None, "Bare", "rr_b"));
         assert!(!idx2.project_declares_method(None, "Object::Bare", "rr_b"));
+    }
+
+    #[test]
+    fn multi_segment_header_contributes_one_rung() {
+        // `Source::ConstantPath.declaration_prefix` pushes the rendered name
+        // as ONE prefix element, so `lexical_nesting_for_prefix` yields a
+        // rung only at DECLARATION boundaries — `class ::M::N` inside
+        // `module Outer` nests `M::N` alone (no bare `M` rung), and
+        // `class A::B` inside `module M` nests `M::A::B`, `M` (never a
+        // partial-segment `M::A` rung). Round-3: the split made `String`
+        // resolve to `M::String`, a port-only `call.undefined-method`.
+        let core = CoreIndex::new();
+        // Rooted multi-segment header: the `M` rung must NOT exist.
+        let (_a, idx) = build_one(
+            b"module M
+  class String
+  end
+end
+module Outer
+  class ::M::N
+                  String.class_eval do
+      def injected = 1
+    end
+  end
+end
+",
+            &core,
+        );
+        assert!(idx.project_declares_method(None, "String", "injected"));
+        assert!(!idx.project_declares_method(None, "M::String", "injected"));
+        // Same for a `class <<` operand — resolved against the same rungs.
+        let (_b, idx2) = build_one(
+            b"module M
+  class String
+  end
+end
+module Outer
+  class ::M::N
+                  class << String
+      def s_inj = 1
+    end
+  end
+end
+",
+            &core,
+        );
+        // Singleton-side defs file nowhere on the instance side regardless —
+        // assert only that the M::String instance table saw nothing.
+        assert!(!idx2.project_declares_method(None, "M::String", "s_inj"));
+        // Unrooted multi-segment: the enclosing `M` rung stays live (the
+        // header pushes ONE `A::B` element) — `M::String` resolves — while
+        // a PARTIAL segment `M::A` is never a rung: `M::A::String` declared
+        // but unreachable from `class A::B`'s body.
+        let (_c, idx3) = build_one(
+            b"module A3
+end
+module M
+  class String
+  end
+  class A3::String
+  end
+end
+              module M
+  class A3::B
+    String.class_eval do
+      def mid = 1
+    end
+  end
+              class A::B
+    String.class_eval do
+      def via_m = 1
+    end
+  end
+end
+",
+            &core,
+        );
+        // `class A::B` inside `module M`: rungs M::A::B, M — `M::String` wins.
+        assert!(idx3.project_declares_method(None, "M::String", "via_m"));
+        assert!(!idx3.project_declares_method(None, "String", "via_m"));
+        // `class A3::B`: rungs M::A3::B, M — `M::String` wins over both
+        // `M::A3::String` (M::A3 is NOT a rung) and `String`.
+        assert!(idx3.project_declares_method(None, "M::String", "mid"));
+        assert!(!idx3.project_declares_method(None, "M::A3::String", "mid"));
     }
 
     #[test]

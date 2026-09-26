@@ -211,3 +211,57 @@ rooted_kern
 rooted_bo
 # FIRES: a NON-rooted `class Object` inside `module M` still names `M::Object`.
 lexobj
+
+# --- multi-segment headers (review round 3) -----------------------------------
+
+# `declaration_prefix` pushes a header's rendered name as ONE nesting rung, so
+# `lexical_nesting_for_prefix` joins at declaration boundaries only:
+# `class ::M3::N` inside `module Outer3` nests `M3::N` (NO phantom `M3` rung —
+# the `String.class_eval` below resolves `String`, never `M3::String`), while
+# `class A3::B` inside `module M3` nests `M3::A3::B`, `M3` — the real `M3`
+# rung stays live but a partial-segment `M3::A3` rung is never invented.
+
+module M3
+  class String
+  end
+end
+module Outer3
+  class ::M3::N
+    String.class_eval do
+      def rooted_ms_injected = 1
+    end
+    class << String
+      def rooted_ms_sing = 1
+    end
+  end
+end
+module M3
+  class A3::B
+    String.class_eval do
+      def lexical_ms = 1
+    end
+  end
+end
+module A4
+end
+module P3
+  class A4::B::String
+  end
+  class A4::B::C
+    String.class_eval do
+      def partial_ms = 1
+    end
+  end
+end
+
+# SILENT: rooted `::M3::N` drops `Outer3` and contributes no `M3` rung —
+# `String` resolves as written. And `P3::A4::B` is never a rung, so
+# `P3::A4::B::String` does not steal the receiver.
+"s".rooted_ms_injected
+"s".partial_ms
+# FIRES: the `class << String` def is singleton-side (`String.rooted_ms_sing`
+# is the deferred #186 surface — the instance call fires on both engines).
+"s".rooted_ms_sing
+# FIRES: `class A3::B` inside `module M3` DOES keep the `M3` rung, so
+# `M3::String` resolves — which is a different class than `String`.
+"s".lexical_ms

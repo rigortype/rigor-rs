@@ -16,6 +16,20 @@
       "message": "undefined method `self_hdr_m' for \"s\""
     },
     {
+      "rule": "call.undefined-method",
+      "line": 264,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `rooted_ms_sing' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 267,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `lexical_ms' for \"s\""
+    },
+    {
       "rule": "call.unresolved-toplevel",
       "line": 80,
       "column": 1,
