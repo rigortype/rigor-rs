@@ -3255,7 +3255,7 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
                 let vspan = ast.get(*value).span();
-                widen_flow_writes(rebinds, vspan, env, interner);
+                widen_flow_writes(rebinds, vspan, env, interner, &[]);
                 self.bind_statement(ast, id, env, interner);
             }
             // Only a real statement sequence is straight-line code. A recovery
@@ -3268,7 +3268,7 @@ impl<'i> Typer<'i> {
                     self.bind_check_statement(ast, s, env, rebinds, interner);
                 }
             }
-            other => widen_flow_writes(rebinds, other.span(), env, interner),
+            other => widen_flow_writes(rebinds, other.span(), env, interner, &[]),
         }
     }
 
@@ -3375,7 +3375,7 @@ impl<'i> Typer<'i> {
                 // A value expression may itself write OTHER locals (`x = (y = 5)`)
                 // or capture-write via a block — widen those first, then bind.
                 let vspan = ast.get(value).span();
-                widen_flow_writes(writes, vspan, env, interner);
+                widen_flow_writes(writes, vspan, env, interner, &[]);
                 // An if-EXPRESSION assigned to a local (`strategies = if
                 // Gitlab::Database.read_write?; …`) still carries a predicate the
                 // always-truthy rule visits — record its snapshot here (the
@@ -3402,7 +3402,7 @@ impl<'i> Typer<'i> {
                 // Same discipline as the single-target arm: the RHS may itself
                 // write other locals — widen those first, then bind.
                 let vspan = ast.get(value).span();
-                widen_flow_writes(writes, vspan, env, interner);
+                widen_flow_writes(writes, vspan, env, interner, &[]);
                 let rhs = self.type_of(ast, value, env, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     env.insert(name, ty);
@@ -3437,7 +3437,7 @@ impl<'i> Typer<'i> {
                 *env = join_flow_envs(&then_env, &else_env, interner);
                 // A predicate may contain a write (`if (x = f)`); widen post-join.
                 let pspan = ast.get(predicate).span();
-                widen_flow_writes(writes, pspan, env, interner);
+                widen_flow_writes(writes, pspan, env, interner, &[]);
             }
             Node::Definition { body, singleton_name, .. } => {
                 // Independent scope: fresh local env, inherited suppression flag.
@@ -3467,7 +3467,7 @@ impl<'i> Typer<'i> {
             // Loop / case / begin-rescue / logical / call(+block) / any other node:
             // widen every local written in the span, do not descend for snapshots.
             other => {
-                widen_flow_writes(writes, other.span(), env, interner);
+                widen_flow_writes(writes, other.span(), env, interner, &[]);
             }
         }
     }
@@ -3697,7 +3697,7 @@ impl<'i> Typer<'i> {
                 for te in target_exprs.clone() {
                     self.flow_record_node(ast, te, env, events, out, interner);
                 }
-                widen_flow_events(events, ast.get(*value).span(), env, interner);
+                widen_flow_events(events, ast.get(*value).span(), env, interner, &[]);
                 let rhs = self.type_of(ast, *value, env, interner);
                 for (name, ty) in multi_target_binder::bind(targets, rhs, interner) {
                     env.insert(name, ty);
@@ -3729,6 +3729,13 @@ impl<'i> Typer<'i> {
                 let then_live = decided.map(|t| t != *is_unless);
                 let mut aenv = env.clone();
                 let mut benv = env.clone();
+                // Each arm's reads see the predicate's narrowed binding —
+                // `unless k … k + 1` and `if k.nil? … else k + 1` type `k` on
+                // its edge the way `predicate_scopes` scopes the arms. The
+                // then-arm runs on the truthy edge for `if`, the falsey edge
+                // for `unless` — and vice versa for the else-arm.
+                self.flow_narrow_condition(ast, *predicate, !*is_unless, &mut aenv, interner);
+                self.flow_narrow_condition(ast, *predicate, *is_unless, &mut benv, interner);
                 for st in then_body.clone() {
                     self.flow_record_node(ast, st, &mut aenv, events, out, interner);
                 }
@@ -3740,12 +3747,12 @@ impl<'i> Typer<'i> {
                 // live side; already bound) or never run (the dead side).
                 if then_live.is_none() {
                     if let Some(s) = stmts_span(ast, then_body) {
-                        widen_flow_events(events, s, &mut aenv, interner);
+                        widen_flow_events(events, s, &mut aenv, interner, &[]);
                     }
                 }
                 if decided.map(|t| t == *is_unless).is_none() {
                     if let Some(s) = stmts_span(ast, else_body) {
-                        widen_flow_events(events, s, &mut benv, interner);
+                        widen_flow_events(events, s, &mut benv, interner, &[]);
                     }
                 }
                 *env = match then_live {
@@ -3762,7 +3769,7 @@ impl<'i> Typer<'i> {
                 for b in branches {
                     let mut arm = env.clone();
                     self.flow_record_node(ast, *b, &mut arm, events, out, interner);
-                    widen_flow_events(events, ast.get(*b).span(), &mut arm, interner);
+                    widen_flow_events(events, ast.get(*b).span(), &mut arm, interner, &[]);
                     arms.push(arm);
                 }
                 let mut eenv = env.clone();
@@ -3770,7 +3777,7 @@ impl<'i> Typer<'i> {
                     self.flow_record_node(ast, st, &mut eenv, events, out, interner);
                 }
                 if let Some(s) = stmts_span(ast, else_body) {
-                    widen_flow_events(events, s, &mut eenv, interner);
+                    widen_flow_events(events, s, &mut eenv, interner, &[]);
                 }
                 arms.push(eenv);
                 let mut merged = arms.remove(0);
@@ -3799,13 +3806,19 @@ impl<'i> Typer<'i> {
                 for c in children {
                     self.flow_record_node(ast, c, &mut inner, events, out, interner);
                 }
-                widen_flow_events(events, *span, env, interner);
+                widen_flow_events(events, *span, env, interner, &[]);
             }
-            Node::Logical { left, right, .. } => {
+            Node::Logical {
+                left, right, is_and, ..
+            } => {
                 self.flow_record_node(ast, *left, env, events, out, interner);
                 let mut renv = env.clone();
+                // The right operand runs on ONE edge of the left — `k &&
+                // k + 1` reads `k` truthy-narrowed, `k.nil? || k.foo` reads
+                // `k` non-nil — the `predicate_scopes` short-circuit edge.
+                self.flow_narrow_condition(ast, *left, *is_and, &mut renv, interner);
                 self.flow_record_node(ast, *right, &mut renv, events, out, interner);
-                widen_flow_events(events, ast.get(*right).span(), env, interner);
+                widen_flow_events(events, ast.get(*right).span(), env, interner, &[]);
             }
             Node::Loop { predicate, body, index, span, .. } => {
                 let mut benv = env.clone();
@@ -3822,7 +3835,7 @@ impl<'i> Typer<'i> {
                 for st in body.clone() {
                     self.flow_record_node(ast, st, &mut benv, events, out, interner);
                 }
-                widen_flow_events(events, *span, env, interner);
+                widen_flow_events(events, *span, env, interner, &[]);
             }
             Node::Statements { body, kind, .. } => {
                 match kind {
@@ -3842,7 +3855,7 @@ impl<'i> Typer<'i> {
                         for st in body.clone() {
                             self.flow_record_node(ast, st, &mut scratch, events, out, interner);
                         }
-                        widen_flow_events(events, ast.get(node).span(), env, interner);
+                        widen_flow_events(events, ast.get(node).span(), env, interner, &[]);
                     }
                 }
             }
@@ -3855,7 +3868,7 @@ impl<'i> Typer<'i> {
                 for st in body.clone() {
                     self.flow_record_node(ast, st, &mut benv, events, out, interner);
                 }
-                widen_flow_events(events, *span, env, interner);
+                widen_flow_events(events, *span, env, interner, locals);
             }
             _ => {
                 let mut children = Vec::new();
@@ -3915,7 +3928,7 @@ impl<'i> Typer<'i> {
             for st in block_body.clone() {
                 self.flow_record_node(ast, st, &mut benv, events, out, interner);
             }
-            widen_flow_events(events, *bspan, env, interner);
+            widen_flow_events(events, *bspan, env, interner, block_locals);
         } else {
             // `&expr` block-pass or no block: `block_body` holds the pass
             // expression, an argument-position evaluation in the outer env.
@@ -3923,7 +3936,106 @@ impl<'i> Typer<'i> {
                 self.flow_record_node(ast, st, env, events, out, interner);
             }
         }
-        widen_flow_mutation_events(events, *span, env, interner);
+        widen_flow_mutation_events(events, *span, env, interner, &[]);
+    }
+
+    /// Narrow `env` along one edge of a flow predicate, `truthy = true` picking
+    /// the edge where the condition is truthy. A small slice of the
+    /// reference's `Inference::Narrowing.predicate_scopes` (narrowing.rb)
+    /// restricted to the carrier the read-map needs — a bare LOCAL's binding:
+    ///
+    ///   * `x` — truthiness: the edge's fragment of `x`'s pin
+    ///     (`flow_narrow_value` below);
+    ///   * `x.nil?` — the nil fragment on the truthy edge, the non-nil
+    ///     fragment on the falsey edge;
+    ///   * `!x` — the negated edge;
+    ///   * `x == lit` / `x != lit` — trusted scalar equality pins `x` to the
+    ///     literal on its matched edge (the reference's
+    ///     TRUSTED_EQUALITY_LITERAL_CLASSES set, minus what the interner
+    ///     cannot hold);
+    ///   * `a && b` / `a || b` — the conjunctive edge narrows BOTH sides
+    ///     (`&&` truthy, `||` falsey); the mixed edges are unions of worlds
+    ///     and narrow nothing.
+    ///
+    /// Anything else narrows nothing — the reference's wider catalogue
+    /// (`is_a?`, `respond_to?`, `case`/`when`, index predicates) is left to
+    /// the narrowing snapshot passes, whose Dynamic-carrier machinery already
+    /// covers it.
+    fn flow_narrow_condition(
+        &self,
+        ast: &LoweredAst,
+        cond: NodeId,
+        truthy: bool,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        match ast.get(cond) {
+            Node::LocalVariableRead { name, .. } => {
+                if let Some(&t) = env.get(name.as_str()) {
+                    let nt = flow_unbottom(flow_narrow_value(t, truthy, interner), interner);
+                    env.insert(name.clone(), nt);
+                }
+            }
+            Node::Call {
+                receiver: Some(r),
+                method,
+                args,
+                block_body,
+                ..
+            } => {
+                // `!x` / `!(expr)` negates the edge — recursed FIRST since its
+                // receiver need not be a bare local.
+                if method == "!" && args.is_empty() && block_body.is_empty() {
+                    self.flow_narrow_condition(ast, *r, !truthy, env, interner);
+                    return;
+                }
+                let Node::LocalVariableRead { name, .. } = ast.get(*r) else {
+                    return;
+                };
+                if method == "nil?" && args.is_empty() && block_body.is_empty() {
+                    if let Some(&t) = env.get(name.as_str()) {
+                        let nt = flow_unbottom(flow_narrow_nil_edge(t, truthy, interner), interner);
+                        env.insert(name.clone(), nt);
+                    }
+                } else if (method == "==" || method == "!=")
+                    && args.len() == 1
+                    && block_body.is_empty()
+                {
+                    // `x == lit` pins on the truthy edge, `x != lit` on the
+                    // falsey — the same `x == lit` world. Only an already-
+                    // bound local narrows: an unbound read stays unbound.
+                    let lit = self.type_of(ast, args[0], env, interner);
+                    let equality = truthy == (method == "==");
+                    if equality
+                        && matches!(interner.get(lit), Type::Constant(_))
+                        && env.contains_key(name.as_str())
+                    {
+                        env.insert(name.clone(), lit);
+                    }
+                }
+            }
+            Node::Logical {
+                left, right, is_and, ..
+            } => {
+                match (truthy, is_and) {
+                    // `a && b` truthy ⇒ a truthy, then b truthy under it.
+                    (true, true) => {
+                        self.flow_narrow_condition(ast, *left, true, env, interner);
+                        self.flow_narrow_condition(ast, *right, true, env, interner);
+                    }
+                    // `a || b` falsey ⇒ a falsey, then b falsey under it.
+                    (false, false) => {
+                        self.flow_narrow_condition(ast, *left, false, env, interner);
+                        self.flow_narrow_condition(ast, *right, false, env, interner);
+                    }
+                    // `a && b` falsey is `a falsey` | `a truthy & b falsey`;
+                    // `a || b` truthy mirrors it — a union of worlds narrows
+                    // nothing a subsequent read can rely on.
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4038,7 +4150,7 @@ impl<'i> Typer<'i> {
                     // and drop their facts after the descent.
                     StatementsKind::Recovered => {
                         self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
-                        widen_flow_writes(writes, span, tenv, interner);
+                        widen_flow_writes(writes, span, tenv, interner, &[]);
                         widen_penv_writes(writes, span, penv);
                         for (w, name) in writes {
                             if span.0 <= w.0 && w.1 <= span.1 {
@@ -4133,7 +4245,7 @@ impl<'i> Typer<'i> {
             // backstop — no fact survives an unmodeled construct). No descent.
             other => {
                 let span = other.span();
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes, span, tenv, interner, &[]);
                 widen_penv_writes(writes, span, penv);
                 nenv.clear();
             }
@@ -4204,7 +4316,7 @@ impl<'i> Typer<'i> {
                         ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, interner, out,
                     );
                     nenv.clear();
-                    widen_flow_writes(writes, call_span, tenv, interner);
+                    widen_flow_writes(writes, call_span, tenv, interner, &[]);
                     widen_penv_writes(writes, call_span, penv);
                 }
             }
@@ -4717,7 +4829,7 @@ impl<'i> Typer<'i> {
             | Node::VariableWrite { span, .. }
             | Node::ConstantWrite { span, .. } => {
                 let span = *span;
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes, span, tenv, interner, &[]);
                 kill_cenv_writes(writes, span, cenv);
             }
             // `begin`/`rescue`/`else`/`ensure`. The flat `body` holds the
@@ -4747,7 +4859,7 @@ impl<'i> Typer<'i> {
                     cenv.kill_local(name);
                 }
                 self.class_flow_scope(ast, &body, tenv, cenv, coarse, writes, interner, out, stmt_position);
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes, span, tenv, interner, &[]);
                 // The body was DESCENDED into `cenv` itself, so a rebind inside
                 // already removed the fact: no edge evidence is needed and no
                 // span kill either (probes `bot_in_begin`, `bot_after_begin`).
@@ -4774,7 +4886,7 @@ impl<'i> Typer<'i> {
                 if let Some(p) = predicate {
                     self.class_flow_expr(ast, p, tenv, cenv, coarse, writes, interner, out, false);
                 }
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes, span, tenv, interner, &[]);
                 // The BODY is not descended, so a rebind inside it is invisible
                 // to the edge evidence: keep the entry `Bot` but kill by span
                 // (probe `bot_after_while`).
@@ -4795,7 +4907,7 @@ impl<'i> Typer<'i> {
                 let (left, right, span) = (*left, *right, *span);
                 self.class_flow_expr(ast, left, tenv, cenv, coarse, writes, interner, out, false);
                 self.class_flow_expr(ast, right, tenv, cenv, coarse, writes, interner, out, false);
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes, span, tenv, interner, &[]);
                 kill_cenv_narrowed(writes, span, cenv);
             }
             // Any other statement (`case`/`in`/lambda/range/…) is UNMODELED:
@@ -4803,7 +4915,7 @@ impl<'i> Typer<'i> {
             // (decline backstop). No descent.
             other => {
                 let span = other.span();
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes, span, tenv, interner, &[]);
                 // No descent, so no edge evidence: the entry `Bot` rides through
                 // (nothing inside can widen it) and a rebind in the span kills.
                 join_cenv(cenv, &[]);
@@ -5021,7 +5133,7 @@ impl<'i> Typer<'i> {
                             kill_cenv_writes(writes, call_span, cenv);
                         }
                     }
-                    widen_flow_writes(writes, call_span, tenv, interner);
+                    widen_flow_writes(writes, call_span, tenv, interner, &[]);
                 }
                 // Invalidation: kill the fact of every local with a recorded
                 // write/mutation span INSIDE this call — covers a
@@ -5231,7 +5343,7 @@ impl<'i> Typer<'i> {
         // and clear the branch-established facts (a `Narrowed` fact never
         // survives a branch merge in this slice; an entry `Bot` does, unless an
         // edge rebound the local) …
-        widen_flow_writes(writes, if_span, tenv, interner);
+        widen_flow_writes(writes, if_span, tenv, interner, &[]);
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
         // the propagation's re-seed below (see there for why).
         // S2: the LOCAL twin of the same snapshot. See the re-seed below.
@@ -6278,7 +6390,7 @@ impl<'i> Typer<'i> {
             edges.push(c);
             edge_terminates.push(!else_body.is_empty() && branch_terminates(ast, &else_body));
         }
-        widen_flow_writes(writes, case_span, tenv, interner);
+        widen_flow_writes(writes, case_span, tenv, interner, &[]);
         // A `case`/`in` clause is not descended, so its rebinds are invisible to
         // the edge evidence — kill by span as well as by edge.
         join_cenv(cenv, &edges);
@@ -6443,7 +6555,7 @@ impl<'i> Typer<'i> {
                 // A recovery carrier's writes may not run, or not in this order:
                 // the uses in it are recorded as before, then its writes widen.
                 if kind == StatementsKind::Recovered {
-                    widen_flow_writes(ctx.writes, span, tenv, interner);
+                    widen_flow_writes(ctx.writes, span, tenv, interner, &[]);
                 }
             }
             Node::LocalVariableWrite { .. }
@@ -6478,7 +6590,7 @@ impl<'i> Typer<'i> {
             // writes, …): widen every local it writes and do NOT descend.
             other => {
                 let span = other.span();
-                widen_flow_writes(ctx.writes, span, tenv, interner);
+                widen_flow_writes(ctx.writes, span, tenv, interner, &[]);
             }
         }
     }
@@ -6608,7 +6720,7 @@ impl<'i> Typer<'i> {
                     // mutator entry itself, and argument-position mutations via
                     // `indexed_flow_writes`); the modeled mutator effect is
                     // re-applied below.
-                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    widen_flow_writes(ctx.writes, call_span, tenv, interner, &[]);
                 } else if stmt_position {
                     // The block body evaluates in a CHILD env seeded from the
                     // outer one (uses inside the block are recorded there) …
@@ -6618,7 +6730,7 @@ impl<'i> Typer<'i> {
                     // … then every write the call span contains widens (a block
                     // REBIND of a captured local is visible outside and kills the
                     // carrier — probe m15) …
-                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    widen_flow_writes(ctx.writes, call_span, tenv, interner, &[]);
                     // … and finally `widen_after_block` (`mutation_widening.rb:144`)
                     // re-applies the mutations. That routine is a SYNTACTIC walk
                     // of the block body against the OUTER scope, NOT a join of the
@@ -6637,7 +6749,7 @@ impl<'i> Typer<'i> {
                 } else {
                     // Expression-position block: no descent (the position rule),
                     // and every contained write widens.
-                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    widen_flow_writes(ctx.writes, call_span, tenv, interner, &[]);
                 }
                 // Keep-nominal widening — unless something inside the call
                 // REBOUND the same local (`output << (output = x)`).
@@ -6655,7 +6767,7 @@ impl<'i> Typer<'i> {
                 let mut scratch = tenv.clone();
                 self.coll_flow_expr(ast, left, &mut scratch, ctx, interner, out, false);
                 self.coll_flow_expr(ast, right, &mut scratch, ctx, interner, out, false);
-                widen_flow_writes(ctx.writes, lspan, tenv, interner);
+                widen_flow_writes(ctx.writes, lspan, tenv, interner, &[]);
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
@@ -6693,7 +6805,7 @@ impl<'i> Typer<'i> {
             // literal, an interpolation, a pattern, …).
             other => {
                 let span = other.span();
-                widen_flow_writes(ctx.writes, span, tenv, interner);
+                widen_flow_writes(ctx.writes, span, tenv, interner, &[]);
             }
         }
     }
@@ -6760,7 +6872,7 @@ impl<'i> Typer<'i> {
         for br in branches {
             let Node::When { conditions, body, .. } = ast.get(br) else {
                 // `case`/`in` pattern carrier — unmodeled, no descent.
-                widen_flow_writes(ctx.writes, case_span, tenv, interner);
+                widen_flow_writes(ctx.writes, case_span, tenv, interner, &[]);
                 return;
             };
             let (conditions, body) = (conditions.clone(), body.clone());
@@ -8571,45 +8683,42 @@ struct LocalFlowEvents {
 }
 
 fn local_flow_events(ast: &LoweredAst, source: &SourceIndex) -> LocalFlowEvents {
-    let scopes = flow_event_scopes(ast);
-    // The rebind half of [`collect_flow_writes`]'s node set, filtered the way
-    // [`toplevel_rebinds`] filters it EXCEPT for the `def` barrier:
-    // `flow_record_node` descends `def` bodies with a fresh env, so a write or
-    // mutation inside a `def` is a real flow event for that inner env — a
-    // `def`-internal `output << 'a' if c` must still join `Tuple | Dynamic`,
-    // never leave the dead `[]` pin readable. The extra entries can only ever
-    // WIDEN the enclosing env — the `Definition` arm never merges its inner
-    // env back — the same conservative shape `collect_flow_writes` takes.
+    // The rebind half of [`collect_flow_writes`]'s node set — EVERY write, at
+    // every scope depth. The scope filters `toplevel_rebinds` carries (the
+    // `def` barrier and the block/lambda shadow test) belong to the WIDEN
+    // call sites, not the list: `flow_record_node` descends `def` bodies and
+    // block bodies with an env per lexical scope, so a write inside a `def`,
+    // a captured write inside a nested block (`it { field = nil; expect {
+    // field = 1 } }` — `field` sits in `it`'s `locals` yet still rebinds it),
+    // or a block's own write (`it { error = nil; begin raise rescue => e;
+    // error = e end }`) is a real flow event for the enclosing env's
+    // conditional constructs. The only place a write must NOT widen is the
+    // env OUTSIDE the block that owns the name — and that is answered at the
+    // block/lambda exit call of [`widen_flow_events`], which excludes the
+    // names that scope binds. The extra entries can only ever WIDEN an env —
+    // the same conservative shape `collect_flow_writes` takes.
     let mut rebinds: Vec<(rigor_parse::Span, String)> = Vec::new();
-    for (id, n) in ast.iter() {
+    for (_, n) in ast.iter() {
         match n {
             Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. }
-                if scopes.shadow_admits(id, name) =>
-            {
+            | Node::LocalVariableOpWrite { name, span, .. } => {
                 rebinds.push((*span, name.clone()));
             }
             Node::MultiWrite { targets, span, .. } => {
                 for (name, _) in targets.bound_names() {
-                    if scopes.shadow_admits(id, &name) {
-                        rebinds.push((*span, name));
-                    }
+                    rebinds.push((*span, name));
                 }
             }
             Node::BeginRescue { clauses, .. } => {
                 for c in clauses {
                     if let Some(name) = &c.bound_name {
-                        if scopes.shadow_admits(id, name) {
-                            rebinds.push((c.span, name.clone()));
-                        }
+                        rebinds.push((c.span, name.clone()));
                     }
                 }
             }
             Node::Loop { index, .. } => {
                 for (s, name) in for_index_rebinds(index) {
-                    if scopes.shadow_admits(id, &name) {
-                        rebinds.push((s, name));
-                    }
+                    rebinds.push((s, name));
                 }
             }
             _ => {}
@@ -8618,7 +8727,7 @@ fn local_flow_events(ast: &LoweredAst, source: &SourceIndex) -> LocalFlowEvents 
     rebinds.extend(indexed_flow_writes(ast, source));
     drop_inert_writes(ast, &mut rebinds);
     let mut mutations: Vec<(rigor_parse::Span, String, String)> = Vec::new();
-    for (id, n) in ast.iter() {
+    for (_, n) in ast.iter() {
         let Node::Call { receiver: Some(r), method, span, .. } = n else {
             continue;
         };
@@ -8628,7 +8737,7 @@ fn local_flow_events(ast: &LoweredAst, source: &SourceIndex) -> LocalFlowEvents 
         let Node::LocalVariableRead { name, .. } = ast.get(*r) else {
             continue;
         };
-        if !scopes.shadow_admits(id, name) || ast.in_inert_carrier(*span) {
+        if ast.in_inert_carrier(*span) {
             continue;
         }
         mutations.push((*span, name.clone(), method.clone()));
@@ -8653,17 +8762,11 @@ impl<'a> FlowEventScopes<'a> {
     /// contains it and no block/lambda that binds its name owns it.
     fn admits(&self, id: NodeId, span: rigor_parse::Span, name: &str) -> bool {
         !self.def_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
-            && self.shadow_admits(id, name)
+            && !self.shadow_scopes.iter().any(|(descendants, bound)| {
+                descendants.contains(&id) && bound.iter().any(|b| b.as_str() == name)
+            })
     }
 
-    /// The block/lambda half of [`Self::admits`], WITHOUT the `def` barrier —
-    /// the per-read walk descends `def` bodies with a fresh env, where the
-    /// body's own writes are its inner env's flow events.
-    fn shadow_admits(&self, id: NodeId, name: &str) -> bool {
-        !self.shadow_scopes.iter().any(|(descendants, bound)| {
-            descendants.contains(&id) && bound.iter().any(|b| b.as_str() == name)
-        })
-    }
 }
 
 fn flow_event_scopes(ast: &LoweredAst) -> FlowEventScopes<'_> {
@@ -8705,14 +8808,23 @@ fn flow_event_scopes(ast: &LoweredAst) -> FlowEventScopes<'_> {
 /// method's mutator table answers for ([`widen_flow_mutation_events`]). Used
 /// by the per-read walk's conditional constructs (branch arms, rescued
 /// bodies, loops, blocks whose writes capture).
+///
+/// `exclude` names the locals the EXITED scope owns — passed only by the
+/// literal-block/lambda exit calls, where a write to a name the block binds
+/// (`1.times { |s| s = "z" }`'s `s`, or a `;`-declared / first-assigned
+/// block-local in Prism's `locals`) is block-SCOPED and must not touch the
+/// enclosing env's pin. Conditional constructs pass `&[]`: inside one scope's
+/// walk every write binds that scope or a captured outer name, so all of
+/// them widen.
 fn widen_flow_events(
     events: &LocalFlowEvents,
     span: rigor_parse::Span,
     env: &mut TypeEnv,
     interner: &mut Interner,
+    exclude: &[String],
 ) {
-    widen_flow_writes(&events.rebinds, span, env, interner);
-    widen_flow_mutation_events(events, span, env, interner);
+    widen_flow_writes(&events.rebinds, span, env, interner, exclude);
+    widen_flow_mutation_events(events, span, env, interner, exclude);
 }
 
 /// The mutator half of [`widen_flow_events`]: `s << "z"` drops a
@@ -8726,9 +8838,12 @@ fn widen_flow_mutation_events(
     span: rigor_parse::Span,
     env: &mut TypeEnv,
     interner: &mut Interner,
+    exclude: &[String],
 ) {
     for (mspan, name, method) in &events.mutations {
-        if !(span.0 <= mspan.0 && mspan.1 <= span.1) {
+        if !(span.0 <= mspan.0 && mspan.1 <= span.1)
+            || exclude.iter().any(|e| e == name)
+        {
             continue;
         }
         let dominated = match env.get(name.as_str()).map(|&t| interner.get(t)) {
@@ -8748,10 +8863,11 @@ fn widen_flow_writes(
     span: rigor_parse::Span,
     env: &mut TypeEnv,
     interner: &mut Interner,
+    exclude: &[String],
 ) {
     let u = interner.untyped();
     for (wspan, name) in writes {
-        if span.0 <= wspan.0 && wspan.1 <= span.1 {
+        if span.0 <= wspan.0 && wspan.1 <= span.1 && !exclude.iter().any(|e| e == name) {
             env.insert(name.clone(), u);
         }
     }
@@ -8769,6 +8885,124 @@ fn widen_penv_writes(
         if span.0 <= wspan.0 && wspan.1 <= span.1 {
             penv.remove(name);
         }
+    }
+}
+
+/// The truthiness fragment of a flow binding — the `narrow_truthy` /
+/// `narrow_falsey` pair of `Inference::Narrowing` restricted to the carriers
+/// the read env can pin. A `Constant` keeps itself on the edge its Ruby
+/// truthiness satisfies and empties to `Bottom` on the other (the member
+/// rebuild drops it like `Combinator.union` drops `Bot`; the env insert
+/// upgrades a top-level `Bottom` to `Dynamic`); a `Union` maps memberwise;
+/// carriers truthy by inhabitance (Tuple, HashShape, Nominal, Singleton,
+/// IntegerRange, DataInstance) keep on the truthy edge and empty on the
+/// falsey; `Top`, `Dynamic` and anything unrecognized pass through
+/// unchanged — the facet cannot express the difference.
+fn flow_narrow_value(t: TypeId, truthy: bool, interner: &mut Interner) -> TypeId {
+    match interner.get(t).clone() {
+        Type::Constant(sc) => {
+            let falsey = matches!(sc, Scalar::Nil | Scalar::Bool(false));
+            if falsey != truthy {
+                t
+            } else {
+                interner.bottom()
+            }
+        }
+        Type::Union(members) => {
+            let narrowed: Vec<TypeId> = members
+                .iter()
+                .map(|&m| flow_narrow_value(m, truthy, interner))
+                .collect();
+            let kept: Vec<TypeId> = narrowed
+                .into_iter()
+                .filter(|&m| !matches!(interner.get(m), Type::Bottom))
+                .collect();
+            flow_union_members(kept, interner)
+        }
+        Type::Tuple(_)
+        | Type::HashShape(_)
+        | Type::Nominal { .. }
+        | Type::Singleton(_)
+        | Type::IntegerRange { .. }
+        | Type::DataInstance { .. } => {
+            if truthy {
+                t
+            } else {
+                interner.bottom()
+            }
+        }
+        _ => t,
+    }
+}
+
+/// The `x.nil?` fragment of a flow binding (`narrow_nil` / `narrow_non_nil`):
+/// the nil edge keeps `Constant[nil]` and empties everything provably
+/// non-nil; the non-nil edge drops the nil member and keeps the rest.
+/// `Top`/`Dynamic` pass through on both edges — the reference's conservative
+/// answer for carriers whose nil-ness is undecided.
+fn flow_narrow_nil_edge(t: TypeId, is_nil: bool, interner: &mut Interner) -> TypeId {
+    match interner.get(t).clone() {
+        Type::Constant(Scalar::Nil) => {
+            if is_nil {
+                t
+            } else {
+                interner.bottom()
+            }
+        }
+        Type::Constant(_) => {
+            if is_nil {
+                interner.bottom()
+            } else {
+                t
+            }
+        }
+        Type::Union(members) => {
+            let narrowed: Vec<TypeId> = members
+                .iter()
+                .map(|&m| flow_narrow_nil_edge(m, is_nil, interner))
+                .collect();
+            let kept: Vec<TypeId> = narrowed
+                .into_iter()
+                .filter(|&m| !matches!(interner.get(m), Type::Bottom))
+                .collect();
+            flow_union_members(kept, interner)
+        }
+        Type::Tuple(_)
+        | Type::HashShape(_)
+        | Type::Nominal { .. }
+        | Type::Singleton(_)
+        | Type::IntegerRange { .. }
+        | Type::DataInstance { .. } => {
+            if is_nil {
+                interner.bottom()
+            } else {
+                t
+            }
+        }
+        _ => t,
+    }
+}
+
+/// Rebuild a union from narrowed members — `Combinator.union`'s
+/// drop-empty / collapse-singleton semantics.
+fn flow_union_members(mut members: Vec<TypeId>, interner: &mut Interner) -> TypeId {
+    members.sort_unstable();
+    members.dedup();
+    match members.len() {
+        0 => interner.bottom(),
+        1 => members[0],
+        _ => interner.intern(Type::Union(members)),
+    }
+}
+
+/// The env-insert answer for a binding a guard emptied (`Bottom` is the
+/// internal emptied-sentinel; a read never dispatches on it — `Dynamic` is
+/// strictly wider and strictly safer).
+fn flow_unbottom(t: TypeId, interner: &mut Interner) -> TypeId {
+    if matches!(interner.get(t), Type::Bottom) {
+        interner.untyped()
+    } else {
+        t
     }
 }
 
@@ -9681,6 +9915,125 @@ mod tests {
         assert_eq!(fold(b"w = nil\ndefined?(w = 1)\nif w\n  1\nend\n"), Type::Constant(Scalar::Nil));
         assert!(matches!(fold(b"w = nil\n(w = 1) rescue nil\nif w\n  1\nend\n"), Type::Dynamic(_)));
         assert!(matches!(fold(b"w = nil\nfor w in [1]; end\nif w\n  1\nend\n"), Type::Dynamic(_)));
+    }
+
+    /// The last `LocalVariableRead` of `name` in `src`, typed by
+    /// [`Typer::local_read_flow_types`]'s per-read map.
+    fn read_flow_last(src: &[u8], name: &str) -> (Interner, TypeId) {
+        let empty = CoreIndex::new();
+        let typer = Typer::new(&empty);
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let map = typer.local_read_flow_types(&ast, &mut i);
+        let (read, t) = map
+            .iter()
+            .filter(|(id, _)| matches!(ast.get(**id), Node::LocalVariableRead { name: n, .. } if n == name))
+            .max_by_key(|(id, _)| *id)
+            .map(|(id, t)| (*id, *t))
+            .expect("a read of the local exists");
+        let _ = read;
+        (i, t)
+    }
+
+    /// A write inside a NESTED literal block to a name the inner block does
+    /// not own is a CAPTURED write: it widens the enclosing block-scope
+    /// binding once the inner call's block may have run (`it { field = nil;
+    /// expect { field = 1 }; field.name }` — `field` sits in `it`'s `locals`
+    /// yet `expect`'s block still rebinds it). The earlier shadow filter
+    /// dropped the event through the OUTER block's ownership and left the
+    /// dead `nil` pin readable — the mail/gitlab captured-write FP class the
+    /// sweep measured (issue #164 fix round 2).
+    #[test]
+    fn read_flow_captured_write_inside_nested_block_widens() {
+        let (i, t) = read_flow_last(
+            b"it do\n  field = nil\n  expect { field = 1 }\n  field.name\nend\n",
+            "field",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+    }
+
+    /// A write a block/lambda OWNS (its params, `;`-declared and
+    /// first-assigned `locals`) is block-scoped: it neither widens the outer
+    /// pin at block exit nor invalidates it — the `1.times { |s| s = "z" }`
+    /// shadowing contract the exclusion list carries at the block-exit widen.
+    #[test]
+    fn read_flow_block_owned_write_keeps_outer_pin() {
+        let (i, t) = read_flow_last(
+            b"s = \"abc\"\n1.times { |s| s = \"z\" }\ns.rindex(\"b\")\n",
+            "s",
+        );
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("abc".into())),
+            "{:?}",
+            i.get(t)
+        );
+    }
+
+    /// A block-owned name written through a NESTED block still rebinds the
+    /// owning block's local (`it { |s| expect { s = 1 } }` rebinds `it`'s
+    /// `s` — the innermost-scope test answers the write's OWNER, not just its
+    /// enclosing block). At `it`'s own level the write is visible: a
+    /// conditional inside `it`'s body must widen `s` in `it`'s env.
+    #[test]
+    fn read_flow_outer_block_owned_write_still_widens_inside() {
+        let (i, t) = read_flow_last(
+            b"it do |s|\n  expect { s = 1 }\n  if $c\n    t = s\n  end\nend\n",
+            "s",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+    }
+
+    /// A write inside a `begin`/`rescue` clause is a conditional write for
+    /// the enclosing scope — `error = e` after `rescue => e` widens `error`
+    /// so a later read declines (`expect(error.element)` in mail's
+    /// field_spec, the same FP class as the nested-block capture).
+    #[test]
+    fn read_flow_rescue_clause_write_widens() {
+        let (i, t) = read_flow_last(
+            b"it do\n  error = nil\n  begin\n    raise\n  rescue => e\n    error = e\n  end\n  error.element\nend\n",
+            "error",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+    }
+
+    /// Predicate narrowing on the flow env: a `nil?` / truthiness / `&&`-`||`
+    /// guard narrows the pinned local on the edge its arm runs, the way
+    /// `predicate_scopes` scopes the reference's arms — `prev + 1 unless
+    /// prev.nil?`, `if k && k + 1`, `unless total … else total.first` and
+    /// `x.name if x` are all silent on the reference.
+    #[test]
+    fn read_flow_guard_narrows_pinned_local() {
+        // `unless prev.nil?` — the body reads `prev` non-nil.
+        let (i, t) = read_flow_last(
+            b"prev = nil\n[1].each { |i| prev + 1 unless prev.nil? }\n",
+            "prev",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+        // `k && k + 1` — the right operand reads `k` truthy-narrowed.
+        let (i, t) = read_flow_last(
+            b"k = nil\n[1].each { |j| y = (k && (k + 1 > j)) }\n",
+            "k",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+        // `unless total … else` — the else arm reads `total` truthy.
+        let (i, t) = read_flow_last(
+            b"total = nil\n[1].each { |m| unless total\n  total = [1]\nelse\n  total.first\nend }\n",
+            "total",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+        // `x.name if x` — the modifier's truthy arm narrows `x`.
+        let (i, t) = read_flow_last(b"prompter = nil\nprompter.success if prompter\n", "prompter");
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+        // The matched edge keeps the pin: `x` truthy under `if x` keeps its
+        // literal so the read still folds.
+        let (i, t) = read_flow_last(b"s = \"abc\"\ns.rindex(\"b\") if s\n", "s");
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("abc".into())),
+            "{:?}",
+            i.get(t)
+        );
     }
 
     #[test]
