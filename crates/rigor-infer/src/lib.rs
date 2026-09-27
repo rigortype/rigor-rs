@@ -3820,7 +3820,7 @@ impl<'i> Typer<'i> {
                 self.flow_record_node(ast, *right, &mut renv, events, out, interner);
                 widen_flow_events(events, ast.get(*right).span(), env, interner, &[]);
             }
-            Node::Loop { predicate, body, index, span, .. } => {
+            Node::Loop { predicate, body, index, is_until, span, .. } => {
                 let mut benv = env.clone();
                 // A `for` index binds the element type every iteration —
                 // `Dynamic` is the FP-safe floor (`bind_for_index`): the
@@ -3829,13 +3829,57 @@ impl<'i> Typer<'i> {
                 for (name, _) in index {
                     benv.insert(name.clone(), interner.untyped());
                 }
-                if let Some(p) = predicate {
+                // A `while`/`until` body runs 0..n times, so a write LATER in
+                // the body reaches an earlier read on the next pass — the
+                // reference converges the pre-existing names' bindings through
+                // `eval_loop`'s `BodyFixpoint` (statement_evaluator.rb:1714).
+                // The body's reads then sit on the predicate's RUN edge —
+                // truthy for `while`, falsey for `until` (`x = nil; while
+                // x.nil?; x.upcase …` reads `nil`, matching the reference's
+                // narrowed pass-entry scope). A `for` (`index` non-empty)
+                // has NO fixpoint (`eval_for` is a single pass), its
+                // `predicate` is the iterated collection — not a truthiness
+                // condition — and stays as it was.
+                if index.is_empty() {
+                    if let Some(bs) = stmts_span(ast, &body) {
+                        self.backedge_seed_read_flow(
+                            ast, events, bs, &mut benv, interner, &[], &body,
+                        );
+                    }
+                    if let Some(p) = predicate {
+                        self.flow_record_node(ast, *p, &mut benv, events, out, interner);
+                        self.flow_narrow_condition(ast, *p, !is_until, &mut benv, interner);
+                    }
+                } else if let Some(p) = predicate {
                     self.flow_record_node(ast, *p, &mut benv, events, out, interner);
                 }
                 for st in body.clone() {
                     self.flow_record_node(ast, st, &mut benv, events, out, interner);
                 }
-                widen_flow_events(events, *span, env, interner, &[]);
+                if index.is_empty() {
+                    // A `while`/`until` writes its captured rebinds BACK as
+                    // `entry ∪ post` — `x = nil; while true; x = "s"; end`
+                    // leaves `nil | "s"` — then narrows the env onto the
+                    // loop's EXIT edge, the opposite of its run edge:
+                    // `until x.nil?` exits knowing `x` is nil.
+                    let u = interner.untyped();
+                    let written = backedge_written_names(events, *span, env, &[]);
+                    let excl: Vec<String> =
+                        written.iter().map(|(n, _)| n.clone()).collect();
+                    widen_flow_events(events, *span, env, interner, &excl);
+                    for (name, pre) in written {
+                        let post = benv.get(name.as_str()).copied().unwrap_or(u);
+                        env.insert(
+                            name,
+                            flow_collapse_dynamic(union_two(pre, post, interner), interner),
+                        );
+                    }
+                    if let Some(p) = predicate {
+                        self.flow_narrow_condition(ast, *p, *is_until, env, interner);
+                    }
+                } else {
+                    widen_flow_events(events, *span, env, interner, &[]);
+                }
             }
             Node::Statements { body, kind, .. } => {
                 match kind {
@@ -3904,6 +3948,7 @@ impl<'i> Typer<'i> {
     ) {
         let Node::Call {
             receiver,
+            method,
             args,
             block_body,
             block_span,
@@ -3925,10 +3970,46 @@ impl<'i> Typer<'i> {
             for l in block_locals {
                 benv.insert(l.clone(), interner.untyped());
             }
+            // A `:non_escaping` block (ClosureEscapeAnalyzer) may invoke its
+            // body more than once before the call returns, so the body's own
+            // captured rebinds reach its earlier reads on a later pass — the
+            // reference converges them through `write_back_block_captures`'
+            // `BodyFixpoint` (statement_evaluator.rb:3478); `Dynamic` is the
+            // safe floor. A `:unknown` call — a bare `loop {}`/`foo {}` or a
+            // receiver the catalogue does not name — stays single-pass,
+            // matching the reference (its fixpoint runs only for
+            // `:non_escaping`).
+            let non_escaping =
+                self.block_call_non_escaping(ast, *receiver, method, env, interner);
+            if non_escaping {
+                self.backedge_seed_read_flow(
+                    ast, events, *bspan, &mut benv, interner, block_locals, &block_body,
+                );
+            }
             for st in block_body.clone() {
                 self.flow_record_node(ast, st, &mut benv, events, out, interner);
             }
-            widen_flow_events(events, *bspan, env, interner, block_locals);
+            if non_escaping {
+                // …and on EXIT the captured rebinds write BACK as
+                // `entry ∪ post`: `x = nil; [1,2].each { x = "s" }` leaves
+                // `x` bound `nil | "s"` so a later read sees both arms (the
+                // fixpoint's converged state), where a Dynamic widen would
+                // lose the `nil` arm `possible-nil-receiver` fires on.
+                let u = interner.untyped();
+                let written = backedge_written_names(events, *bspan, env, block_locals);
+                let mut excl = block_locals.clone();
+                excl.extend(written.iter().map(|(n, _)| n.clone()));
+                widen_flow_events(events, *bspan, env, interner, &excl);
+                for (name, pre) in written {
+                    let post = benv.get(name.as_str()).copied().unwrap_or(u);
+                    env.insert(
+                        name,
+                        flow_collapse_dynamic(union_two(pre, post, interner), interner),
+                    );
+                }
+            } else {
+                widen_flow_events(events, *bspan, env, interner, block_locals);
+            }
         } else {
             // `&expr` block-pass or no block: `block_body` holds the pass
             // expression, an argument-position evaluation in the outer env.
@@ -3937,6 +4018,212 @@ impl<'i> Typer<'i> {
             }
         }
         widen_flow_mutation_events(events, *span, env, interner, &[]);
+    }
+
+    /// `ClosureEscapeAnalyzer.classify(call) == :non_escaping`
+    /// (closure_escape_analyzer.rb): the block-accepting call is proven to
+    /// invoke the block immediately, without retaining it — the receiver
+    /// types to ONE class (`receiver_class_name`: `Nominal`/`Singleton` to
+    /// their class, `Tuple`/`HashShape` to their erased container, a scalar
+    /// `Constant` to its class — every other carrier, and a receiver-less
+    /// call, resolve `:unknown`) and the method is in that class's
+    /// `NON_ESCAPING` entry or the universal `tap`/`then`/`yield_self` set.
+    /// The port widens on exactly this answer — an `:unknown`/`escaping`
+    /// block keeps the single-pass reading because the reference runs its
+    /// `BodyFixpoint` only for `:non_escaping`.
+    fn block_call_non_escaping(
+        &self,
+        ast: &LoweredAst,
+        receiver: Option<NodeId>,
+        method: &str,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        let Some(r) = receiver else { return false };
+        let rty = self.type_of(ast, r, env, interner);
+        let class: Option<&str> = match interner.get(rty) {
+            Type::Nominal { class, .. } | Type::Singleton(class) => self
+                .index
+                .class_name_for_id(*class)
+                .or_else(|| self.source.class_name_for_id(*class)),
+            Type::Tuple(_) => Some("Array"),
+            Type::HashShape(_) => Some("Hash"),
+            // `receiver_class_name`'s `CONSTANT_CLASS_NAMES` — Float is
+            // deliberately absent there, so a Float receiver is `:unknown`.
+            Type::Constant(Scalar::Int(_)) => Some("Integer"),
+            Type::Constant(Scalar::Str(_)) => Some("String"),
+            Type::Constant(Scalar::Sym(_)) => Some("Symbol"),
+            Type::Constant(Scalar::Bool(true)) => Some("TrueClass"),
+            Type::Constant(Scalar::Bool(false)) => Some("FalseClass"),
+            Type::Constant(Scalar::Nil) => Some("NilClass"),
+            _ => None,
+        };
+        let Some(class) = class else { return false };
+        non_escaping_block_call(class, method)
+    }
+
+    /// The back-edge a repeatable body presents to its earlier reads — the
+    /// reference's `BodyFixpoint` (body_fixpoint.rb; `eval_loop`'s
+    /// `loop_pass_entry` for `while`/`until`, `write_back_block_captures` for
+    /// a `:non_escaping` literal block). For every PRE-EXISTING local the
+    /// body rebinds, the body's POST binding is the UNION of its writes'
+    /// values — `x = nil; each { x.upcase; x = "s" }` reads `nil | "s"` —
+    /// iterated `entry ∪ post` three passes, the fixpoint's own cap, so a
+    /// self-referential `x = x + 1` compounds the way the reference's
+    /// successive passes do instead of pinning a stale `1`.
+    ///
+    /// Two write kinds diverge from a raw union:
+    ///
+    /// - A STRAIGHT-LINE write is shadowed by a later straight-line write to
+    ///   the same name — `each { x.frob; x = "s"; x = 2.5 }` rebinds `x` to
+    ///   `2.5` for the next pass (`1 | 2.5`, the reference's answer), not to
+    ///   `"s" | 2.5`. A write is straight-line when it IS one of the body's
+    ///   direct statements; a `return`/`break`/`next` between two writes
+    ///   keeps the earlier one (the later may never run). A write nested in
+    ///   an `if`/`rescue`/inner block is always a contribution — the
+    ///   conditional arm may not have run, so its value joins the union.
+    /// - A write whose VALUE the port cannot carry (`OpWrite`, `MultiWrite`,
+    ///   a rescue slot, a `for` index) floors the name at `Dynamic` — the
+    ///   fixpoint's non-converging answer. A `Dynamic`/`Top` member of the
+    ///   union collapses the join to `Dynamic` outright for the same reason.
+    ///
+    /// A name with NO entry binding is skipped: a local FIRST assigned inside
+    /// the body is deliberately not overlaid (`loop_pass_entry`'s `body_first`
+    /// exclusion — when the body runs, the write precedes any local read of
+    /// it). `exclude` names the scope's OWN bindings (a literal block's
+    /// `locals`). A receiver-side mutation (`x << "b"`) is NOT a capture —
+    /// the fixpoint unions writes only, so `each { x.frob; x << "b" }` reads
+    /// the unchanged `"a"` pin on the next pass exactly as the reference
+    /// does. Returns the `(name, unioned binding)` pairs installed, so the
+    /// nilable receiver pass can seed/drop its per-local facts from the same
+    /// answer.
+    #[allow(clippy::too_many_arguments)]
+    fn backedge_seed_read_flow(
+        &self,
+        ast: &LoweredAst,
+        events: &LocalFlowEvents,
+        span: rigor_parse::Span,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+        exclude: &[String],
+        top_level: &[NodeId],
+    ) -> Vec<(String, TypeId)> {
+        let written = backedge_written_names(events, span, env, exclude);
+        if written.is_empty() {
+            return written;
+        }
+        let u = interner.untyped();
+        // `top_level[i]`'s descendants — the span a terminator must sit in to
+        // stand between two straight-line writes.
+        let top_desc: Vec<HashSet<NodeId>> = top_level
+            .iter()
+            .map(|&st| descendants_of(ast, &[st]))
+            .collect();
+        let terminates = |idx: usize| -> bool {
+            top_desc[idx].iter().any(|&d| {
+                matches!(
+                    ast.get(d),
+                    Node::Return { .. } | Node::Other { jump: Some(_), .. }
+                )
+            })
+        };
+        let mut contribs: Vec<(String, Vec<NodeId>, bool)> =
+            Vec::with_capacity(written.len());
+        for (name, _) in &written {
+            // The name's writes inside the body span, in program order, each
+            // with its RHS node (a plain `LocalVariableWrite`) or a Dynamic
+            // floor (any other write kind).
+            let mut rhs: Vec<(rigor_parse::Span, NodeId, Option<usize>)> = Vec::new();
+            let mut floored = false;
+            for (wspan, wname) in &events.rebinds {
+                if wname != name || !(span.0 <= wspan.0 && wspan.1 <= span.1) {
+                    continue;
+                }
+                match events
+                    .write_values
+                    .iter()
+                    .find(|(vspan, vname, _)| vname == wname && vspan == wspan)
+                {
+                    Some((_, _, value)) => {
+                        let top_idx =
+                            top_level.iter().position(|&st| ast.get(st).span() == *wspan);
+                        rhs.push((*wspan, *value, top_idx));
+                    }
+                    None => floored = true,
+                }
+            }
+            // Drop a straight-line write shadowed by a LATER straight-line
+            // write with no terminator between them.
+            let mut kept: Vec<NodeId> = Vec::with_capacity(rhs.len());
+            for (wspan, value, top_idx) in &rhs {
+                let dominated = match top_idx {
+                    Some(ai) => rhs.iter().any(|(_, _, bi)| {
+                        bi.map(|bi| {
+                            bi > *ai && !(ai + 1..bi).any(&terminates)
+                        })
+                        .unwrap_or(false)
+                    }),
+                    None => false,
+                };
+                if !dominated {
+                    kept.push(*value);
+                }
+                let _ = wspan;
+            }
+            contribs.push((name.clone(), kept, floored));
+        }
+        for _ in 0..3 {
+            for (name, rhss, floored) in &contribs {
+                if *floored {
+                    env.insert(name.clone(), u);
+                    continue;
+                }
+                let mut acc = env.get(name.as_str()).copied().unwrap_or(u);
+                for rhs in rhss {
+                    acc = union_two(acc, self.type_of(ast, *rhs, env, interner), interner);
+                }
+                env.insert(name.clone(), flow_collapse_dynamic(acc, interner));
+            }
+        }
+        written
+            .into_iter()
+            .map(|(name, _)| {
+                let ty = env.get(name.as_str()).copied().unwrap_or(u);
+                (name, ty)
+            })
+            .collect()
+    }
+
+    /// The possible-nil arm a back-edge-unioned binding carries: `C` when the
+    /// type is `nil | C` — every non-nil member resolving to the SAME class
+    /// (`nil | "s"` ⇒ `String`, `String | nil | "zzz"` ⇒ `String`). Any
+    /// richer union, a nil-free union, or a member with no resolvable class
+    /// answers `None` — the caller DROPS the fact, matching
+    /// `nil_bearing_union_witnesses?`'s "supported on every non-nil arm",
+    /// which a two-class union cannot evidence through a single arm.
+    fn backedge_nil_arm(&self, t: TypeId, interner: &Interner) -> Option<&'static str> {
+        let Type::Union(members) = interner.get(t) else {
+            return None;
+        };
+        let mut saw_nil = false;
+        let mut arm: Option<&'static str> = None;
+        for &m in members {
+            if matches!(interner.get(m), Type::Constant(Scalar::Nil)) {
+                saw_nil = true;
+                continue;
+            }
+            let c = self.index.class_name_of(interner, m)?;
+            match arm {
+                None => arm = Some(c),
+                Some(a) if a == c => {}
+                _ => return None,
+            }
+        }
+        if saw_nil {
+            arm
+        } else {
+            None
+        }
     }
 
     /// Narrow `env` along one edge of a flow predicate, `truthy = true` picking
@@ -3949,10 +4236,11 @@ impl<'i> Typer<'i> {
     ///   * `x.nil?` — the nil fragment on the truthy edge, the non-nil
     ///     fragment on the falsey edge;
     ///   * `!x` — the negated edge;
-    ///   * `x == lit` / `x != lit` — trusted scalar equality pins `x` to the
-    ///     literal on its matched edge (the reference's
-    ///     TRUSTED_EQUALITY_LITERAL_CLASSES set, minus what the interner
-    ///     cannot hold);
+    ///   * `x == lit` / `x != lit` — the reference's equality narrowing
+    ///     (`analyse_equality_predicate`): a literal NODE operand only, the
+    ///     `nil`/`true`/`false` singletons extracted from a mixed union, and
+    ///     String/Symbol/Integer pins confined to an already-finite trusted
+    ///     literal domain (`narrow_equal`/`narrow_not_equal`);
     ///   * `a && b` / `a || b` — the conjunctive edge narrows BOTH sides
     ///     (`&&` truthy, `||` falsey); the mixed edges are unions of worlds
     ///     and narrow nothing.
@@ -3989,10 +4277,10 @@ impl<'i> Typer<'i> {
                     self.flow_narrow_condition(ast, *r, !truthy, env, interner);
                     return;
                 }
-                let Node::LocalVariableRead { name, .. } = ast.get(*r) else {
-                    return;
-                };
                 if method == "nil?" && args.is_empty() && block_body.is_empty() {
+                    let Node::LocalVariableRead { name, .. } = ast.get(*r) else {
+                        return;
+                    };
                     if let Some(&t) = env.get(name.as_str()) {
                         let nt = flow_unbottom(flow_narrow_nil_edge(t, truthy, interner), interner);
                         env.insert(name.clone(), nt);
@@ -4001,16 +4289,30 @@ impl<'i> Typer<'i> {
                     && args.len() == 1
                     && block_body.is_empty()
                 {
-                    // `x == lit` pins on the truthy edge, `x != lit` on the
-                    // falsey — the same `x == lit` world. Only an already-
-                    // bound local narrows: an unbound read stays unbound.
-                    let lit = self.type_of(ast, args[0], env, interner);
-                    let equality = truthy == (method == "==");
-                    if equality
-                        && matches!(interner.get(lit), Type::Constant(_))
-                        && env.contains_key(name.as_str())
-                    {
-                        env.insert(name.clone(), lit);
+                    // `analyse_equality_predicate` (narrowing.rb:1687): the
+                    // local may be the RECEIVER or the ARGUMENT (`1 == x`),
+                    // the other side a trusted literal NODE
+                    // (`equality_local_literal` → `static_literal_type` —
+                    // Integer/String/Symbol/true/false/nil nodes only, so a
+                    // Float literal or a non-literal operand never narrows).
+                    // BOTH edges narrow: the `x == lit` world on `==`-truthy /
+                    // `!=`-falsey, its complement on the other — and only an
+                    // already-bound local narrows (`return nil if
+                    // current.nil?`).
+                    let matched = if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                        equality_literal_operand(ast, args[0])
+                            .map(|lit| (name.clone(), lit))
+                    } else if let Node::LocalVariableRead { name, .. } = ast.get(args[0]) {
+                        equality_literal_operand(ast, *r).map(|lit| (name.clone(), lit))
+                    } else {
+                        None
+                    };
+                    if let Some((name, lit)) = matched {
+                        if let Some(&t) = env.get(name.as_str()) {
+                            let equal_edge = truthy == (method == "==");
+                            let nt = self.flow_narrow_equality(t, &lit, equal_edge, interner);
+                            env.insert(name, flow_unbottom(nt, interner));
+                        }
                     }
                 }
             }
@@ -4036,6 +4338,149 @@ impl<'i> Typer<'i> {
             }
             _ => {}
         }
+    }
+
+
+    /// The read-flow port of `Narrowing.narrow_equal` / `narrow_not_equal`
+    /// (narrowing.rb:187-212), one local's CURRENT binding `t` against a
+    /// trusted literal `lit` (the caller's `equality_literal_operand` gate
+    /// already restricted `lit` to String/Symbol/Integer/true/false/nil —
+    /// `TRUSTED_EQUALITY_LITERAL_CLASSES` — so a Float never reaches here).
+    /// `equal` selects the edge.
+    ///
+    /// A String/Symbol/Integer literal narrows ONLY a domain that is already
+    /// a finite union of trusted literals (`finite_trusted_literal_domain?`):
+    /// `Dynamic`, a bare `Nominal`, or a union containing one pass through
+    /// unchanged — the predicate manufactures no positive knowledge. Inside a
+    /// finite domain the `==` edge keeps the matching constant and collapses
+    /// the rest to `Bottom`; the `!=` edge removes it.
+    ///
+    /// The `nil`/`true`/`false` singletons are different: they can be
+    /// EXTRACTED from a mixed union (`Integer | nil`), they match or empty a
+    /// `Nominal` on its singleton class (`Nominal[NilClass] == nil`), and on
+    /// the equal edge they empty the always-non-nil structured carriers
+    /// (`Singleton`/`Tuple`/`HashShape`). `Top`/`Dynamic`/`Bottom` and the
+    /// remaining carriers pass through — the `!=` edge's `else` keeps them,
+    /// `narrow_singleton_equal_other` declines to narrow them either.
+    fn flow_narrow_equality(
+        &self,
+        t: TypeId,
+        lit: &Scalar,
+        equal: bool,
+        interner: &mut Interner,
+    ) -> TypeId {
+        if singleton_equality_scalar(lit) {
+            self.flow_narrow_singleton_equality(t, lit, equal, interner)
+        } else if flow_finite_trusted_domain(t, interner) {
+            self.flow_narrow_finite_equality(t, lit, equal, interner)
+        } else {
+            t
+        }
+    }
+
+    /// `narrow_singleton_equal` / `narrow_singleton_not_equal`
+    /// (narrowing.rb:748-773): a `Constant` keeps itself on the edge its value
+    /// satisfies and empties on the other; a `Nominal` answers on the
+    /// singleton's carrier class (`singleton_nominal_matches?`); a `Union`
+    /// maps memberwise (`Combinator.union` drops the emptied members);
+    /// `Singleton`/`Tuple`/`HashShape` empty on the equal edge only; every
+    /// other carrier passes through on both.
+    fn flow_narrow_singleton_equality(
+        &self,
+        t: TypeId,
+        lit: &Scalar,
+        equal: bool,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match interner.get(t).clone() {
+            Type::Constant(sc) => {
+                if (sc == *lit) == equal {
+                    t
+                } else {
+                    interner.bottom()
+                }
+            }
+            Type::Nominal { .. } => {
+                let matched = self.singleton_nominal_matches(t, lit, interner);
+                if matched == equal {
+                    t
+                } else {
+                    interner.bottom()
+                }
+            }
+            Type::Union(members) => {
+                let narrowed: Vec<TypeId> = members
+                    .iter()
+                    .map(|&m| self.flow_narrow_singleton_equality(m, lit, equal, interner))
+                    .collect();
+                let kept: Vec<TypeId> = narrowed
+                    .into_iter()
+                    .filter(|&m| !matches!(interner.get(m), Type::Bottom))
+                    .collect();
+                flow_union_members(kept, interner)
+            }
+            Type::Singleton(_) | Type::Tuple(_) | Type::HashShape(_) if equal => {
+                interner.bottom()
+            }
+            _ => t,
+        }
+    }
+
+    /// `narrow_finite_equal` / `narrow_finite_not_equal`
+    /// (narrowing.rb:729-746): memberwise over a finite trusted-literal
+    /// domain. `Bottom` is its own fragment on both edges; a `Constant` keeps
+    /// or empties on the match; a non-literal carrier (unreachable under the
+    /// domain gate) collapses on the equal edge and survives the complement.
+    fn flow_narrow_finite_equality(
+        &self,
+        t: TypeId,
+        lit: &Scalar,
+        equal: bool,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match interner.get(t).clone() {
+            Type::Bottom => t,
+            Type::Constant(sc) => {
+                if (sc == *lit) == equal {
+                    t
+                } else {
+                    interner.bottom()
+                }
+            }
+            Type::Union(members) => {
+                let narrowed: Vec<TypeId> = members
+                    .iter()
+                    .map(|&m| self.flow_narrow_finite_equality(m, lit, equal, interner))
+                    .collect();
+                let kept: Vec<TypeId> = narrowed
+                    .into_iter()
+                    .filter(|&m| !matches!(interner.get(m), Type::Bottom))
+                    .collect();
+                flow_union_members(kept, interner)
+            }
+            _ => {
+                if equal {
+                    interner.bottom()
+                } else {
+                    t
+                }
+            }
+        }
+    }
+
+    /// `singleton_nominal_matches?` (narrowing.rb:775): a `Nominal` matches a
+    /// singleton literal iff its class IS the singleton's carrier —
+    /// `NilClass`/`TrueClass`/`FalseClass`. Resolved through the same
+    /// `class_name_of` the dispatch gates use; an unresolvable id cannot
+    /// match (never one of the three singleton classes).
+    fn singleton_nominal_matches(&self, t: TypeId, lit: &Scalar, interner: &Interner) -> bool {
+        let want = match lit {
+            Scalar::Nil => "NilClass",
+            Scalar::Bool(true) => "TrueClass",
+            Scalar::Bool(false) => "FalseClass",
+            _ => return false,
+        };
+        self.index.class_name_of(interner, t) == Some(want)
     }
 
     // -----------------------------------------------------------------------
@@ -4094,11 +4539,13 @@ impl<'i> Typer<'i> {
         };
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
+        let events = local_flow_events(ast, self.source);
         let mut tenv = TypeEnv::new();
         let mut nenv: HashMap<String, &'static str> = HashMap::new();
         let mut penv: HashSet<String> = HashSet::new();
-        self.without_local_read_flows()
-            .nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, interner, &mut out);
+        self.without_local_read_flows().nil_flow_scope(
+            ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, &events, interner, &mut out,
+        );
         out
     }
 
@@ -4116,11 +4563,12 @@ impl<'i> Typer<'i> {
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
+        events: &LocalFlowEvents,
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         for &s in stmts {
-            self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, interner, out);
+            self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, events, interner, out);
         }
     }
 
@@ -4134,6 +4582,7 @@ impl<'i> Typer<'i> {
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
+        events: &LocalFlowEvents,
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
@@ -4144,12 +4593,12 @@ impl<'i> Typer<'i> {
                 let (body, kind, span) = (body.clone(), *kind, *span);
                 match kind {
                     StatementsKind::Sequence => {
-                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, events, interner, out);
                     }
                     // Its writes may not run, or not in this order: widen them
                     // and drop their facts after the descent.
                     StatementsKind::Recovered => {
-                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, events, interner, out);
                         widen_flow_writes(writes, span, tenv, interner, &[]);
                         widen_penv_writes(writes, span, penv);
                         for (w, name) in writes {
@@ -4167,9 +4616,9 @@ impl<'i> Typer<'i> {
                                 | Node::LocalVariableOpWrite { value, .. }
                                 | Node::MultiWrite { value, .. } => {
                                     let value = *value;
-                                    self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                                    self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, events, interner, out);
                                 }
-                                _ => self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, interner, out),
+                                _ => self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, events, interner, out),
                             }
                         }
                     }
@@ -4179,7 +4628,7 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 // Record uses in the RHS (and descend any block it carries) BEFORE
                 // rebinding — a use of a currently-nilable local reads the fact.
-                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, events, interner, out);
                 let src = self.nilable_source_class(ast, value, tenv, penv, interner);
                 let prov = self.array_new_nominal_provenance(ast, value, tenv, interner);
                 let vty = self.type_of(ast, value, tenv, interner);
@@ -4208,7 +4657,7 @@ impl<'i> Typer<'i> {
             // anyway: a destructured slot never carries a manufactured nil.
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
-                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, events, interner, out);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     nenv.remove(&name);
@@ -4226,7 +4675,7 @@ impl<'i> Typer<'i> {
                 tenv.insert(name, u);
             }
             Node::Call { .. } => {
-                self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, events, interner, out);
             }
             Node::Definition { body, .. }
             | Node::ClassDef { body, .. }
@@ -4237,9 +4686,108 @@ impl<'i> Typer<'i> {
                 let mut t = TypeEnv::new();
                 let mut n: HashMap<String, &'static str> = HashMap::new();
                 let mut p: HashSet<String> = HashSet::new();
-                self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, writes, interner, out);
+                self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, writes, events, interner, out);
             }
-            // Any other statement (`if`/`unless`/`while`/`case`/logical/begin/
+            // A `while`/`until` body runs 0..n times in the SAME local scope —
+            // descend it (unlike the `other` catch-all) so a `C | nil` receiver
+            // the back-edge installs witnesses inside the body, the way the
+            // reference's `eval_loop` `BodyFixpoint` scope does. The envs are
+            // CLONED (the body may never run), its pre-existing written locals
+            // unioned against their own writes
+            // ([`Self::widen_backedge_writes`]), and afterwards the outer env
+            // widens for the loop's writes while their facts drop (a write
+            // that may not have run can only make a fact stale). A `for`
+            // (`index` non-empty) keeps the unmodeled decline — its
+            // `eval_for` is single-pass and the possible-nil slice never
+            // descended it.
+            Node::Loop { predicate, body, index, is_until, span, .. } if index.is_empty() => {
+                let (predicate, body, is_until, span) =
+                    (*predicate, body.clone(), *is_until, *span);
+                let mut btenv = tenv.clone();
+                let mut bnenv = nenv.clone();
+                let mut bpenv = penv.clone();
+                if let Some(bs) = stmts_span(ast, &body) {
+                    let bound = self.backedge_seed_read_flow(
+                        ast, events, bs, &mut btenv, interner, &[], &body,
+                    );
+                    for (name, joined) in bound {
+                        bpenv.remove(&name);
+                        match self.backedge_nil_arm(joined, interner) {
+                            Some(arm) => {
+                                bnenv.insert(name, arm);
+                            }
+                            None => {
+                                bnenv.remove(&name);
+                            }
+                        }
+                    }
+                }
+                if let Some(pr) = predicate {
+                    self.nil_flow_expr(
+                        ast, pr, &mut btenv, &mut bnenv, &mut bpenv,
+                        writes, events, interner, out,
+                    );
+                    // The body runs on the predicate's RUN edge — truthy for
+                    // `while`, falsey for `until`. Narrow `btenv` onto it
+                    // (`while x.nil?` binds `x` to nil inside) and drop any
+                    // nilability fact whose `C | nil` premise the edge just
+                    // emptied — a stale fact would fire `possible-nil` where
+                    // the reference sees a narrowed receiver.
+                    self.flow_narrow_condition(ast, pr, !is_until, &mut btenv, interner);
+                    bnenv.retain(|name, _| match btenv.get(name) {
+                        Some(&ty) => flow_type_has_nil(ty, interner),
+                        None => true,
+                    });
+                }
+                self.nil_flow_scope(
+                    ast, &body, &mut btenv, &mut bnenv, &mut bpenv,
+                    writes, events, interner, out,
+                );
+                // Write-back `entry ∪ post` per captured name — `x = nil;
+                // while true; x = "s"; end` leaves `nil | "s"`, so a later
+                // `x.upcase` still sees the nil arm — then narrow `tenv` onto
+                // the loop's EXIT edge (`until x.nil?` leaves `x` nil), and
+                // reseed each unioned name's fact from the narrowed binding:
+                // `nil | C` keeps `possible-nil-receiver` live past the loop,
+                // anything else drops it.
+                let written = backedge_written_names(events, span, tenv, &[]);
+                let excl: Vec<String> =
+                    written.iter().map(|(n, _)| n.clone()).collect();
+                widen_flow_writes(writes, span, tenv, interner, &excl);
+                widen_penv_writes(writes, span, penv);
+                for (w, name) in writes {
+                    if span.0 <= w.0 && w.1 <= span.1
+                        && !written.iter().any(|(n, _)| n == name)
+                    {
+                        nenv.remove(name);
+                    }
+                }
+                let u = interner.untyped();
+                for (name, pre) in &written {
+                    let post = btenv.get(name.as_str()).copied().unwrap_or(u);
+                    tenv.insert(
+                        name.clone(),
+                        flow_collapse_dynamic(union_two(*pre, post, interner), interner),
+                    );
+                }
+                if let Some(pr) = predicate {
+                    self.flow_narrow_condition(ast, pr, is_until, tenv, interner);
+                }
+                for (name, _) in &written {
+                    match tenv
+                        .get(name)
+                        .and_then(|&t| self.backedge_nil_arm(t, interner))
+                    {
+                        Some(arm) => {
+                            nenv.insert(name.clone(), arm);
+                        }
+                        None => {
+                            nenv.remove(name);
+                        }
+                    }
+                }
+            }
+            // Any other statement (`if`/`unless`/`for`/`case`/logical/begin/
             // multi-assign/ivar-write/…) is UNMODELED in Slice 1: widen `tenv` and
             // `penv` for the locals it writes, and CLEAR ALL `nenv` facts (decline
             // backstop — no fact survives an unmodeled construct). No descent.
@@ -4264,20 +4812,25 @@ impl<'i> Typer<'i> {
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
+        events: &LocalFlowEvents,
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         match ast.get(id) {
-            Node::Call { receiver, method, args, block_body, safe_nav, span, .. } => {
+            Node::Call {
+                receiver, method, args, block_body, block_span, block_locals, safe_nav, span, ..
+            } => {
                 let receiver = *receiver;
                 let method = method.clone();
                 let args = args.clone();
                 let block_body = block_body.clone();
+                let block_span = *block_span;
+                let block_locals = block_locals.clone();
                 let safe_nav = *safe_nav;
                 let call_span = *span;
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
                 if let Some(r) = receiver {
-                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, events, interner, out);
                 }
                 if let Some(r) = receiver {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
@@ -4301,7 +4854,7 @@ impl<'i> Typer<'i> {
                     }
                 }
                 for a in &args {
-                    self.nil_flow_expr(ast, *a, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, *a, tenv, nenv, penv, writes, events, interner, out);
                 }
                 if !block_body.is_empty() {
                     // Same-block locality: descend with a FRESH `nenv`, inheriting
@@ -4312,12 +4865,76 @@ impl<'i> Typer<'i> {
                     let mut btenv = tenv.clone();
                     let mut bnenv: HashMap<String, &'static str> = HashMap::new();
                     let mut bpenv = penv.clone();
+                    // A `:non_escaping` block (ClosureEscapeAnalyzer) may run
+                    // its body more than once: a pre-existing local the body
+                    // rebinds reaches its earlier body-reads as
+                    // `entry | writes` on a later pass — the reference's
+                    // `write_back_block_captures` `BodyFixpoint`
+                    // (statement_evaluator.rb). The unioned binding seeds the
+                    // body's nilability fact iff it is `C | nil` for a single
+                    // class C (`backedge_nil_arm`); anything else drops it.
+                    let non_escaping = block_span.is_some()
+                        && self.block_call_non_escaping(ast, receiver, &method, tenv, interner);
+                    if let Some(bspan) = block_span {
+                        if non_escaping {
+                            let bound = self.backedge_seed_read_flow(
+                                ast, events, bspan, &mut btenv, interner, &block_locals,
+                                &block_body,
+                            );
+                            for (name, joined) in bound {
+                                bpenv.remove(&name);
+                                match self.backedge_nil_arm(joined, interner) {
+                                    Some(arm) => {
+                                        bnenv.insert(name, arm);
+                                    }
+                                    None => {
+                                        bnenv.remove(&name);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     self.nil_flow_scope(
-                        ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, interner, out,
+                        ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, events, interner, out,
                     );
                     nenv.clear();
-                    widen_flow_writes(writes, call_span, tenv, interner, &[]);
-                    widen_penv_writes(writes, call_span, penv);
+                    // A `:non_escaping` block writes its captured rebinds
+                    // back as `entry ∪ post` — `x = nil; [1,2].each {
+                    // x = "s" }` leaves `x` bound `nil | "s"`, so the
+                    // nilability fact reseeds (`possible-nil-receiver` still
+                    // fires after the block, matching the reference) instead
+                    // of dying with the generic widen. Every other block
+                    // keeps the capture-write widening.
+                    if non_escaping {
+                        let bspan = block_span.expect("non_escaping implies a block");
+                        let written =
+                            backedge_written_names(events, bspan, tenv, &block_locals);
+                        let mut excl = block_locals.clone();
+                        excl.extend(written.iter().map(|(n, _)| n.clone()));
+                        widen_flow_writes(writes, call_span, tenv, interner, &excl);
+                        widen_penv_writes(writes, call_span, penv);
+                        let u = interner.untyped();
+                        for (name, pre) in written {
+                            let post = btenv.get(name.as_str()).copied().unwrap_or(u);
+                            let joined = flow_collapse_dynamic(
+                                union_two(pre, post, interner),
+                                interner,
+                            );
+                            tenv.insert(name.clone(), joined);
+                            penv.remove(&name);
+                            match self.backedge_nil_arm(joined, interner) {
+                                Some(arm) => {
+                                    nenv.insert(name, arm);
+                                }
+                                None => {
+                                    nenv.remove(&name);
+                                }
+                            }
+                        }
+                    } else {
+                        widen_flow_writes(writes, call_span, tenv, interner, &[]);
+                        widen_penv_writes(writes, call_span, penv);
+                    }
                 }
             }
             Node::Logical { left, right, .. } => {
@@ -4325,8 +4942,8 @@ impl<'i> Typer<'i> {
                 // (decline), then recurse for block/call reachability.
                 let (left, right) = (*left, *right);
                 nenv.clear();
-                self.nil_flow_expr(ast, left, tenv, nenv, penv, writes, interner, out);
-                self.nil_flow_expr(ast, right, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, left, tenv, nenv, penv, writes, events, interner, out);
+                self.nil_flow_expr(ast, right, tenv, nenv, penv, writes, events, interner, out);
             }
             _ => {}
         }
@@ -8680,6 +9297,13 @@ fn stmts_span(ast: &LoweredAst, stmts: &[NodeId]) -> Option<rigor_parse::Span> {
 struct LocalFlowEvents {
     rebinds: Vec<(rigor_parse::Span, String)>,
     mutations: Vec<(rigor_parse::Span, String, String)>,
+    /// `(write span, name, RHS value node)` for every plain
+    /// `LocalVariableWrite` — the half of a rebind a back-edge union needs:
+    /// the VALUE the write installs, so a later pass's type joins the
+    /// pre-state instead of replacing it. Other write kinds (`OpWrite`,
+    /// `MultiWrite`, rescue slots, `for` index binds) have no entry here —
+    /// their rebind widens `Dynamic`-ward (the fixpoint floor).
+    write_values: Vec<(rigor_parse::Span, String, NodeId)>,
 }
 
 fn local_flow_events(ast: &LoweredAst, source: &SourceIndex) -> LocalFlowEvents {
@@ -8724,6 +9348,14 @@ fn local_flow_events(ast: &LoweredAst, source: &SourceIndex) -> LocalFlowEvents 
             _ => {}
         }
     }
+    let mut write_values: Vec<(rigor_parse::Span, String, NodeId)> = Vec::new();
+    for (_, n) in ast.iter() {
+        if let Node::LocalVariableWrite { name, value, span, .. } = n {
+            if !ast.in_inert_carrier(*span) {
+                write_values.push((*span, name.clone(), *value));
+            }
+        }
+    }
     rebinds.extend(indexed_flow_writes(ast, source));
     drop_inert_writes(ast, &mut rebinds);
     let mut mutations: Vec<(rigor_parse::Span, String, String)> = Vec::new();
@@ -8742,7 +9374,7 @@ fn local_flow_events(ast: &LoweredAst, source: &SourceIndex) -> LocalFlowEvents 
         }
         mutations.push((*span, name.clone(), method.clone()));
     }
-    LocalFlowEvents { rebinds, mutations }
+    LocalFlowEvents { rebinds, mutations, write_values }
 }
 
 /// The scope filters every top-level flow-event list applies (see
@@ -8858,6 +9490,48 @@ fn widen_flow_mutation_events(
     }
 }
 
+/// The pre-EXISTING locals (names bound in `env`, minus `exclude`) that
+/// `span` rebinds — the set a repeatable body's back-edge widens. Returns
+/// `(name, entry binding)` pairs.
+fn backedge_written_names(
+    events: &LocalFlowEvents,
+    span: rigor_parse::Span,
+    env: &TypeEnv,
+    exclude: &[String],
+) -> Vec<(String, TypeId)> {
+    let mut out: Vec<(String, TypeId)> = Vec::new();
+    for (wspan, name) in &events.rebinds {
+        if span.0 <= wspan.0
+            && wspan.1 <= span.1
+            && !exclude.iter().any(|e| e == name)
+            && !out.iter().any(|(n, _)| n == name)
+        {
+            if let Some(&pre) = env.get(name.as_str()) {
+                out.push((name.clone(), pre));
+            }
+        }
+    }
+    out
+}
+
+/// A `Dynamic`/`Top` member of a back-edge union collapses the whole binding
+/// to `Dynamic` outright — the fixpoint floor; a `Dynamic | C` spelling would
+/// only ever mislead a read.
+fn flow_collapse_dynamic(t: TypeId, interner: &mut Interner) -> TypeId {
+    let arms: Vec<TypeId> = match interner.get(t) {
+        Type::Union(ms) => ms.clone(),
+        _ => vec![t],
+    };
+    if arms
+        .iter()
+        .any(|&m| matches!(interner.get(m), Type::Dynamic(_) | Type::Top))
+    {
+        interner.untyped()
+    } else {
+        t
+    }
+}
+
 fn widen_flow_writes(
     writes: &[(rigor_parse::Span, String)],
     span: rigor_parse::Span,
@@ -8871,6 +9545,69 @@ fn widen_flow_writes(
             env.insert(name.clone(), u);
         }
     }
+}
+
+
+/// `ClosureEscapeAnalyzer`'s catalogue answer (closure_escape_analyzer.rb):
+/// `method` invoked on `class` runs the block immediately and synchronously.
+/// Mirrors `NON_ESCAPING` + `OBJECT_NON_ESCAPING` verbatim — including the
+/// reference's known defect #1311 (the deferred Enumerator methods ARE listed
+/// for the collection classes; only the stream entries subtract them).
+fn non_escaping_block_call(class: &str, method: &str) -> bool {
+    // `OBJECT_NON_ESCAPING` — inherited by every class.
+    if matches!(method, "tap" | "then" | "yield_self") {
+        return true;
+    }
+    // `ENUMERABLE_NON_ESCAPING`.
+    const ENUMERABLE: &[&str] = &[
+        "each", "map", "collect", "flat_map", "collect_concat",
+        "select", "filter", "reject", "filter_map",
+        "find", "detect", "find_index", "find_all",
+        "any?", "all?", "none?", "one?", "count", "tally", "sum",
+        "inject", "reduce",
+        "each_with_index", "each_with_object",
+        "min_by", "max_by", "sort_by", "minmax_by",
+        "partition", "group_by", "chunk", "chunk_while", "slice_when",
+        "slice_before", "slice_after",
+        "take_while", "drop_while",
+        "zip",
+    ];
+    // `ENUMERABLE - DEFERRED_ENUMERATOR_METHODS` — the stream classes' set.
+    const STREAM: &[&str] = &[
+        "each", "map", "collect", "flat_map", "collect_concat",
+        "select", "filter", "reject", "filter_map",
+        "find", "detect", "find_index", "find_all",
+        "any?", "all?", "none?", "one?", "count", "tally", "sum",
+        "inject", "reduce",
+        "each_with_index", "each_with_object",
+        "min_by", "max_by", "sort_by", "minmax_by",
+        "partition", "group_by",
+        "take_while", "drop_while",
+        "zip",
+    ];
+    const HASH_EXTRA: &[&str] = &[
+        "each_pair", "each_key", "each_value",
+        "transform_keys", "transform_values",
+        "delete_if", "keep_if",
+        "any?", "all?", "none?", "one?",
+    ];
+    const IO_ITERATION: &[&str] =
+        &["each_line", "each", "each_byte", "each_char", "each_codepoint"];
+    let hit = match class {
+        "Array" => ENUMERABLE.contains(&method) || method == "each_index",
+        "Hash" => ENUMERABLE.contains(&method) || HASH_EXTRA.contains(&method),
+        "Range" => ENUMERABLE.contains(&method) || method == "step",
+        "Set" | "Enumerator" | "Enumerator::Lazy" => ENUMERABLE.contains(&method),
+        "Integer" => matches!(method, "times" | "upto" | "downto"),
+        "IO" | "File" => {
+            STREAM.contains(&method)
+                || IO_ITERATION.contains(&method)
+                || method == "foreach"
+        }
+        "StringIO" => STREAM.contains(&method) || IO_ITERATION.contains(&method),
+        _ => false,
+    };
+    hit
 }
 
 /// Drop the `Array.new`-provenance of every local whose write span is contained
@@ -8983,6 +9720,56 @@ fn flow_narrow_nil_edge(t: TypeId, is_nil: bool, interner: &mut Interner) -> Typ
     }
 }
 
+/// The literal NODE an `==`/`!=` operand must be for the equality predicate
+/// to narrow — `static_literal_type` (narrowing.rb:1912): Integer, String,
+/// Symbol, `true`, `false`, `nil` nodes only. A `Float` literal is NOT
+/// trusted (`1 == 1.0` narrows nothing on the reference), an interpolated
+/// literal, a Range, or any non-literal operand declines, and a Bignum
+/// (`IntegerLit` with no `i64`) declines because the pin cannot carry it.
+/// The returned [`Scalar`] interned to `Constant` is the literal TYPE
+/// `equality_local_literal` hands to `narrow_equal`.
+fn equality_literal_operand(ast: &LoweredAst, id: NodeId) -> Option<Scalar> {
+    match ast.get(id) {
+        Node::IntegerLit { value: Some(v), .. } => Some(Scalar::Int(*v)),
+        Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
+        Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+        Node::TrueLit { .. } => Some(Scalar::Bool(true)),
+        Node::FalseLit { .. } => Some(Scalar::Bool(false)),
+        Node::NilLit { .. } => Some(Scalar::Nil),
+        _ => None,
+    }
+}
+
+/// `SINGLETON_LITERAL_CLASSES` (narrowing.rb:45) — the literals that extract
+/// from a mixed domain: `nil`, `true`, `false`.
+fn singleton_equality_scalar(sc: &Scalar) -> bool {
+    matches!(sc, Scalar::Nil | Scalar::Bool(_))
+}
+
+/// `trusted_equality_literal?` (narrowing.rb:711) over a domain member —
+/// `TRUSTED_EQUALITY_LITERAL_CLASSES` is String/Symbol/Integer plus the three
+/// singletons; `Float` (and a Range/`Scalar` the port cannot mint) is not.
+fn trusted_equality_scalar(sc: &Scalar) -> bool {
+    matches!(
+        sc,
+        Scalar::Str(_) | Scalar::Sym(_) | Scalar::Int(_) | Scalar::Bool(_) | Scalar::Nil
+    )
+}
+
+/// `finite_trusted_literal_domain?` (narrowing.rb:720): `Bot` counts, a
+/// `Constant` must be a trusted literal, a `Union` must be finite-and-trusted
+/// memberwise; every other carrier disqualifies the whole domain.
+fn flow_finite_trusted_domain(t: TypeId, interner: &Interner) -> bool {
+    match interner.get(t) {
+        Type::Bottom => true,
+        Type::Constant(sc) => trusted_equality_scalar(sc),
+        Type::Union(members) => members
+            .iter()
+            .all(|&m| flow_finite_trusted_domain(m, interner)),
+        _ => false,
+    }
+}
+
 /// Rebuild a union from narrowed members — `Combinator.union`'s
 /// drop-empty / collapse-singleton semantics.
 fn flow_union_members(mut members: Vec<TypeId>, interner: &mut Interner) -> TypeId {
@@ -8992,6 +9779,21 @@ fn flow_union_members(mut members: Vec<TypeId>, interner: &mut Interner) -> Type
         0 => interner.bottom(),
         1 => members[0],
         _ => interner.intern(Type::Union(members)),
+    }
+}
+
+/// Whether a flow binding can still BE nil — `Constant(nil)`, a `Union`
+/// carrying it, or an undecided carrier (`Dynamic`/`Top`). A `Nominal`, a
+/// non-nil `Constant`, a `Tuple`/`HashShape`/`IntegerRange`/`Singleton`, and
+/// `Bottom` are provably nil-free.
+fn flow_type_has_nil(t: TypeId, interner: &Interner) -> bool {
+    match interner.get(t) {
+        Type::Constant(Scalar::Nil) => true,
+        Type::Union(members) => members
+            .iter()
+            .any(|&m| matches!(interner.get(m), Type::Constant(Scalar::Nil))),
+        Type::Dynamic(_) | Type::Top => true,
+        _ => false,
     }
 }
 
@@ -10016,12 +10818,17 @@ mod tests {
             "k",
         );
         assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
-        // `unless total … else` — the else arm reads `total` truthy.
+        // `unless total … else` — the else arm reads `total` truthy. The
+        // block's back-edge union first makes the entry binding `nil | [1]`
+        // (`total = [1]` reaches earlier reads on a later pass —
+        // `BodyFixpoint`), so the truthy edge keeps the `Tuple` arm: the
+        // reference's body-entry scope answers the same, and `total.frist`
+        // in the arm reports `for [1]` there (probe-verified).
         let (i, t) = read_flow_last(
             b"total = nil\n[1].each { |m| unless total\n  total = [1]\nelse\n  total.first\nend }\n",
             "total",
         );
-        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+        assert!(matches!(i.get(t), Type::Tuple(_)), "{:?}", i.get(t));
         // `x.name if x` — the modifier's truthy arm narrows `x`.
         let (i, t) = read_flow_last(b"prompter = nil\nprompter.success if prompter\n", "prompter");
         assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
@@ -10034,6 +10841,233 @@ mod tests {
             "{:?}",
             i.get(t)
         );
+    }
+
+    /// The constant members of a (possibly non-)union type, in interner
+    /// order — the assertion shape the back-edge/equality rows share.
+    fn union_scalars(i: &Interner, t: TypeId) -> Vec<Scalar> {
+        match i.get(t) {
+            Type::Union(ms) => ms
+                .iter()
+                .map(|&m| match i.get(m) {
+                    Type::Constant(s) => s.clone(),
+                    other => panic!("non-constant union arm {other:?}"),
+                })
+                .collect(),
+            other => panic!("expected a union, got {other:?}"),
+        }
+    }
+
+    /// The `BodyFixpoint` back-edge (issue #164 r6): a pre-existing local a
+    /// `:non_escaping` literal block rebinds reads `entry ∪ post` — the
+    /// reference's `write_back_block_captures` converges the body and the
+    /// capture writes BACK to the outer env on exit. Every row
+    /// oracle-measured at `e59b7b89` (harness/probe.py, fresh cwd).
+    #[test]
+    fn read_flow_backedge_unions_block_writes() {
+        // In-body read before the write sees `nil | "s"`.
+        let (i, t) = read_flow_last(
+            b"x = nil\n[1].each { |i| y = x; x = \"s\" }\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // Exit write-back: the read AFTER the block sees the same union.
+        let (i, t) = read_flow_last(
+            b"x = nil\n[1].each { |i| x = \"s\" }\ny = x\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // A later straight-line write supersedes an earlier one — `1 | 2.5`,
+        // never `"s"`.
+        let (i, t) = read_flow_last(
+            b"x = 1\n[1].each { |i| x = \"s\"; x = 2.5 }\ny = x\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Int(1), Scalar::Float(2.5)],
+            "{:?}",
+            i.get(t)
+        );
+        // A receiver mutator is NOT a capture — `x << "b"` does not rebind,
+        // so the pin survives the pass (`for "a"` on the oracle).
+        let (i, t) = read_flow_last(
+            b"x = \"a\"\n[1].each { |i| y = x; x << \"b\" }\n",
+            "x",
+        );
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("a".into())),
+            "{:?}",
+            i.get(t)
+        );
+        // A local FIRST assigned inside the body is not overlaid into the
+        // entry (`loop_pass_entry`'s `body_first` exclusion): `y` reads
+        // `nil` — the union only carries names bound BEFORE the body.
+        let (i, t) = read_flow_last(
+            b"x = nil\n[1].each { |i| y = x; y = \"s\" }\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Nil), "{:?}", i.get(t));
+    }
+
+    /// `while`/`until` back-edges plus the EXIT edge: the body runs on the
+    /// predicate's run edge (truthy for `while`, falsey for `until`) and the
+    /// loop's exit narrows the outer env the opposite way — `until x.nil?`
+    /// leaves `x` bound `nil`, `while x.nil?` leaves it `"s"`.
+    #[test]
+    fn read_flow_backedge_while_until_edges() {
+        // `while true` — `entry ∪ post` (`nil | "s"`) survives the exit.
+        let (i, t) = read_flow_last(
+            b"x = nil\nwhile true\n  x = \"s\"\nend\ny = x\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // `until x.nil?` exits on the truthy edge — `x` is `nil` after.
+        let (i, t) = read_flow_last(
+            b"x = nil\nuntil x.nil?\n  x = \"s\"\nend\ny = x\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Nil), "{:?}", i.get(t));
+        // `while x.nil?` exits on the falsey edge — `x` is `"s"` after.
+        let (i, t) = read_flow_last(
+            b"x = nil\nwhile x.nil?\n  x = \"s\"\nend\ny = x\n",
+            "x",
+        );
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("s".into())),
+            "{:?}",
+            i.get(t)
+        );
+        // The body reads the RUN edge: `while x.nil?` binds `x` to `nil`
+        // inside.
+        let (i, t) = read_flow_last(
+            b"x = nil\nwhile x.nil?\n  y = x\n  x = \"s\"\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Nil), "{:?}", i.get(t));
+        // `until x.nil?` runs the body on the falsey edge — `"s"`.
+        let (i, t) = read_flow_last(
+            b"x = nil\nuntil x.nil?\n  y = x\n  x = \"s\"\nend\n",
+            "x",
+        );
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("s".into())),
+            "{:?}",
+            i.get(t)
+        );
+    }
+
+    /// `for` has no `BodyFixpoint` (`eval_for` is a single pass), and a call
+    /// the `NON_ESCAPING` catalogue does not name widens its captured writes
+    /// rather than unioning them.
+    #[test]
+    fn read_flow_backedge_declines_for_and_unknown_blocks() {
+        // `for` — the body read keeps the entry pin.
+        let (i, t) = read_flow_last(
+            b"x = nil\nfor i in [1,2]\n  y = x\n  x = \"s\"\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Nil), "{:?}", i.get(t));
+        // An unresolved callee (`foo`) is `:unknown` — no fixpoint, so the
+        // in-block read keeps the `nil` pin.
+        let (i, t) = read_flow_last(
+            b"x = nil\nfoo { |i| y = x; x = \"s\" }\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Nil), "{:?}", i.get(t));
+        // `map` IS `:non_escaping` — the captured write unions into the
+        // body env, so the in-block read sees `nil | "s"`.
+        let (i, t) = read_flow_last(
+            b"x = nil\n[1].map { |i| y = x; x = \"s\" }\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+    }
+
+    /// Literal `==`/`!=` narrowing — the reference's
+    /// `analyse_equality_predicate`: trusted literal NODE operands only,
+    /// `nil`/`true`/`false` extract from a mixed domain, and
+    /// String/Symbol/Integer literals narrow only an already-FINITE trusted
+    /// domain. Both edges, both operand orders; Float and non-literal
+    /// operands decline.
+    #[test]
+    fn read_flow_equality_narrows_only_trusted_domains() {
+        // `nil`/`true`/`false` extract from a mixed domain.
+        let (i, t) = read_flow_last(
+            b"x = c ? nil : \"s\"\nif x == nil\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Nil), "{:?}", i.get(t));
+        // A finite trusted literal domain narrows on both `==` edges…
+        let (i, t) = read_flow_last(
+            b"x = c ? 1 : 2\nif x == 1\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Int(1)), "{:?}", i.get(t));
+        // …and on the `!=` edge.
+        let (i, t) = read_flow_last(
+            b"x = c ? 1 : 2\nif x != 1\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Int(2)), "{:?}", i.get(t));
+        // Reversed operand order narrows the same.
+        let (i, t) = read_flow_last(
+            b"x = c ? 1 : 2\nif 1 == x\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Int(1)), "{:?}", i.get(t));
+        // A Float literal is NOT trusted — the domain survives untouched.
+        let (i, t) = read_flow_last(
+            b"x = c ? 1 : 2\nif x == 1.5\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Int(1), Scalar::Int(2)],
+            "{:?}",
+            i.get(t)
+        );
+        // A non-literal operand declines.
+        let (i, t) = read_flow_last(
+            b"x = c ? 1 : 2\ny = 1\nif x == y\n  z = x\nend\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Int(1), Scalar::Int(2)],
+            "{:?}",
+            i.get(t)
+        );
+        // A broad carrier is never manufactured into a literal — `gets` is
+        // `String?`, not a finite literal domain.
+        let (i, t) = read_flow_last(
+            b"x = gets\nif x == 1\n  y = x\nend\n",
+            "x",
+        );
+        assert!(!matches!(i.get(t), Type::Constant(_)), "{:?}", i.get(t));
     }
 
     #[test]

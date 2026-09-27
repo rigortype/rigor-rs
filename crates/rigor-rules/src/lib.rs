@@ -650,7 +650,9 @@ pub fn analyze_with_source_and_folder(
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
         let diag = (!nil_skip)
-            .then(|| check_call(ast, recv, &method, message_span, env, &typer, interner, index))
+            .then(|| {
+                check_call(ast, recv, &method, message_span, safe_nav, env, &typer, interner, index)
+            })
             .flatten()
             .or_else(|| {
                 check_narrowed_call(
@@ -1481,12 +1483,96 @@ fn check_call(
     receiver: rigor_parse::NodeId,
     method: &str,
     message_span: (usize, usize),
+    safe_nav: bool,
     env: &rigor_infer::TypeEnv,
     typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
     let recv_ty = typer.type_of(ast, receiver, env, interner);
+
+    // Union receiver (`A | B`): the scalar path cannot name one class, so the
+    // reference's `union_undefined_method_diagnostic`
+    // (check_rules.rb:1921) handles it — fire only when the method is absent
+    // on EVERY arm. The port keeps a stricter subset of the reference's
+    // envelope: every member must resolve to ONE core-known class
+    // (`class_name_of` — a `Dynamic`/`Top`/`Bot`/`Singleton`/project-class arm
+    // declines the whole union, covering `union_arm_blocks_undefined_fire?`),
+    // the arms must span at least two distinct classes (a one-class join is a
+    // shape artifact — the scalar rule's job), no `nil` member (a `T | nil`
+    // union is `possible-nil-receiver`'s — the deliberate N3 silence), and no
+    // arm may declare the method in the project's own source
+    // (`project_declares_method`, the reference's `source_declared_method?`).
+    // `x&.m` bails — safe navigation dispatches on the non-nil arms only.
+    if let Type::Union(members) = interner.get(recv_ty) {
+        if safe_nav {
+            return None;
+        }
+        let members = members.clone();
+        let mut classes: Vec<&'static str> = Vec::new();
+        for &m in &members {
+            if matches!(interner.get(m), Type::Constant(Scalar::Nil)) {
+                return None;
+            }
+            let Some(cls) = index.class_name_of(interner, m) else {
+                return None;
+            };
+            classes.push(cls);
+        }
+        {
+            let mut distinct: Vec<&'static str> = classes.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() < 2 {
+                return None;
+            }
+        }
+        if classes.iter().any(|cls| {
+            unenumerable_instance_receiver(index, cls)
+                || !index.knows_class(cls)
+                || index.class_has_method(cls, method)
+                || typer.source().project_declares_method(typer.file_key(), cls, method)
+        }) {
+            return None;
+        }
+        // The reference renders the union describe-sorted (`sort_members`,
+        // combinator.rb:994), with the `true | false` pair collapsed to a
+        // leading `bool` (`Union#describe`'s `boolean_pair?` arm).
+        let has_true = members
+            .iter()
+            .any(|&m| matches!(interner.get(m), Type::Constant(Scalar::Bool(true))));
+        let has_false = members
+            .iter()
+            .any(|&m| matches!(interner.get(m), Type::Constant(Scalar::Bool(false))));
+        let mut parts: Vec<String> = members
+            .iter()
+            .filter(|&&m| {
+                !(has_true
+                    && has_false
+                    && matches!(interner.get(m), Type::Constant(Scalar::Bool(_))))
+            })
+            .map(|&m| render_receiver(interner, index, typer.source(), m))
+            .collect();
+        parts.sort();
+        if has_true && has_false {
+            parts.insert(0, "bool".to_string());
+        }
+        let receiver_render = parts.join(" | ");
+        let message = format!("undefined method `{method}' for {receiver_render}");
+        let severity = catalog(CALL_UNDEFINED_METHOD)
+            .map(|e| e.default_severity)
+            .unwrap_or(Severity::Error);
+        return Some(Diagnostic {
+            rule_id: CALL_UNDEFINED_METHOD,
+            start_offset: message_span.0,
+            end_offset: message_span.1,
+            message,
+            severity,
+            source_family: "builtin",
+            receiver_type: Some(receiver_render),
+            method_name: Some(method.to_string()),
+        });
+    }
 
     // Singleton (class-object) receiver: a bare constant `C` typed to
     // `Type::Singleton(class)` (see the typer's `ConstantRead` arm + its zero-FP
