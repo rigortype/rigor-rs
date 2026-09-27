@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, LoweredAst};
 use rigor_types::Type;
 
 fn run(src: &[u8]) -> Vec<Diagnostic> {
