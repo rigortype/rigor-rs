@@ -193,9 +193,7 @@ pub const CALL_WRONG_ARITY: &str = "call.wrong-arity";
 /// reference emits it alongside `call.wrong-arity` at the same site). Two
 /// channels, both zero-FP-gated: a `nil` argument a param that rejects nil, and
 /// a non-nil argument whose concrete class the param rejects. See
-/// [`check_argument_type_mismatch`].
-///
-/// [`check_argument_type_mismatch`]: crate::check_argument_type_mismatch
+/// `check_argument_type_mismatch`.
 pub const CALL_ARGUMENT_TYPE_MISMATCH: &str = "call.argument-type-mismatch";
 
 /// `call.possible-nil-receiver`: a call whose receiver may be nil on some path
@@ -376,7 +374,7 @@ pub const CALL_RAISE_NON_EXCEPTION: &str = "call.raise-non-exception";
 /// already catches a superclass (or the same class) of every exception class the
 /// later clause names (`rescue StandardError => e … rescue ArgumentError` — the
 /// ArgumentError arm is dead). A faithful port of the reference
-/// `ShadowedRescueCollector` (see [`shadowed_rescue`]). Purely syntactic + class
+/// `ShadowedRescueCollector` (see `shadowed_rescue`). Purely syntactic + class
 /// ancestry — no Typer.
 ///
 /// Zero-FP envelope (each gate load-bearing): only ConstantRead/ConstantPath
@@ -385,6 +383,4 @@ pub const CALL_RAISE_NON_EXCEPTION: &str = "call.raise-non-exception";
 /// a project class certifies ONLY with a discovered `class Foo < Bar` superclass;
 /// a later clause naming a superclass of an earlier one (narrow→wide) stays
 /// silent; comparisons never cross a nested `begin`.
-///
-/// [`shadowed_rescue`]: crate::shadowed_rescue
 pub const FLOW_SHADOWED_RESCUE_CLAUSE: &str = "flow.shadowed-rescue-clause";
