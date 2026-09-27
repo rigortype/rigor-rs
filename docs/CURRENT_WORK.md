@@ -16,7 +16,8 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 **#134–#137** (a mechanism each). FPs: #139, #146. #138/#164/#167 abandoned
 2026-09-27 (branches keep work; see note). #142–#145/#152 closed (0). CLI/config:
 #155–#159, #162–#163, #168–#171; #160 blocked upstream. Also #130, #132.
-lib.rs module split is now UNBLOCKED — no open infer PRs.
+lib.rs module split is now UNBLOCKED — no open infer PRs; spec + hazards →
+#204 / [split spec](notes/20260927-lib-rs-module-split-spec.md).
 
 - Measurement-tool lesson: audit at NODE granularity — per-file
   histograms net over-claims vs under-claims.
