@@ -1,5 +1,8 @@
 # lib.rs module split — handoff spec
 
+**Landed 2026-09-27** (PRs #205–#216). The line numbers below are pre-split; for the end state, the
+recipe and the hazards this spec missed, see [the outcome note](20260927-lib-rs-split-outcome.md).
+
 2026-09-27. `crates/rigor-infer/src/lib.rs` is **14,084 lines / 736 KB**, one
 file holding every inference pass. Split it into per-pass modules. This is a
 **move-only refactor**: no behaviour change, no new machinery, no renames
