@@ -91,7 +91,7 @@ In the top three files those modules are 44–56% of the lines:
 
 | file | lines | inline `mod` bodies |
 |---|---|---|
-| `rigor-infer/src/source_index.rs` | 8,456 | 3,812 (3) |
+| `rigor-infer/src/source_index.rs` | 8,456 | 3,812 (3) — moved out in #220 (→ 4,650 lines) |
 | `rigor-rules/src/lib.rs` | 7,985 | 3,494 (3) |
 | `rigor-cli/src/lsp.rs` | 7,809 | 4,340 (1) |
 | `rigor-index/src/rbs.rs` | 6,399 | 1,287 (8) |
@@ -102,3 +102,24 @@ In the top three files those modules are 44–56% of the lines:
 Outside a crate root, `mod tests;` resolves to `src/<file>/tests.rs`. Raw
 string fixtures (LSP JSON, Ruby sources) must not be de-indented, so check
 multi-line literals before moving.
+
+## Follow-on (2026-09-27)
+
+- **#219** committed the tooling as `harness/split/`, generalised beyond
+  `lib.rs`. Its first review round found four ways it could silently
+  produce a wrong result or pass a wrong one:
+  - blank-line tidying reached inside string literals;
+  - `fixvis` edited imports with a file-wide regex;
+  - `verify_move` judged scaffold by line shape, so it passed `true` →
+    `false`;
+  - a glob that only the tests used was dropped, with exit 0.
+  All four were fixed in round 2. `verify_move` now tags each line by its
+  syntactic place. A replay of the merged steps still passes all ten.
+- **#220** used `split_tests.py` on `source_index.rs`. The 151 interior
+  lines of Ruby-source byte strings with literal newlines stayed
+  byte-for-byte. The reviewer re-proved the move without the tool.
+- **#221** holds the limits round 2 left open: impl attributes are not
+  copied onto method wrappers; the impl-frame tag over-reaches; one-line
+  impls crash; `use P::self`. None of these shapes is in `crates/` today, so
+  land #221 before splitting a file that has them.
+
