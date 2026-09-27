@@ -3091,7 +3091,7 @@ fn span_within(inner: rigor_parse::Span, outer: rigor_parse::Span) -> bool {
 /// type closed. They read the unwidened env through [`Self::gate_at`], exactly
 /// as before.
 struct ScopedEnv {
-    top: rigor_infer::TypeEnv,
+    top: rigor_infer::CheckEnvs,
     gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
     method_bodies: Vec<rigor_parse::Span>,
@@ -3100,21 +3100,22 @@ struct ScopedEnv {
 impl ScopedEnv {
     fn build(typer: &Typer, ast: &LoweredAst, interner: &mut Interner) -> Self {
         ScopedEnv {
-            top: typer.build_toplevel_check_env(ast, interner),
+            top: typer.build_check_envs(ast, interner),
             gate_top: typer.build_toplevel_env(ast, interner),
             empty: rigor_infer::TypeEnv::new(),
             method_bodies: rigor_infer::method_body_spans(ast),
         }
     }
 
-    /// The env a use site at `span` may read: the top-level env at file scope (or
-    /// inside a block, which DOES capture the enclosing locals), an empty env
-    /// inside any method body.
+    /// The env a use site at `span` may read: the POSITION-indexed top-level
+    /// env at file scope (`CheckEnvs::at` answers the env live at the span's
+    /// own position — a read before a statement's mutation sees the
+    /// pre-mutation binding), an empty env inside any method body.
     fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
         if self.in_method_body(span) {
             &self.empty
         } else {
-            &self.top
+            self.top.at(span)
         }
     }
 
