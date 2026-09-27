@@ -1,6 +1,8 @@
 use super::*;
-use rigor_parse::{lower, parse, NodeId};
+use rigor_parse::{lower, parse, LoweredAst, Node, NodeId};
 use rigor_types::Interner;
+use rigor_index::CoreIndex;
+use super::harvest::def_names;
 
 /// A per-FIELD rendering of the whole index. `sorted = true` canonicalises
 /// every collection (the SEMANTIC content); `sorted = false` renders the
