@@ -221,7 +221,11 @@ def fix(crate, modfile, prefix):
             elif c in ("E0603", "E0624") or (c is None and " is private" in m["message"]):
                 edits += make_pub(modfile, first)
             elif c in ("E0616", "E0451") and len(ns) >= 2:
-                edits += make_field_pub(modfile, ns[1].split("::")[-1].split("<")[0], ns[0])
+                # "field `f` of struct `S` is private", or grouped:
+                # "fields `a`, `b` and `c` of struct `S` are private"
+                struct = ns[-1].split("::")[-1].split("<")[0]
+                for field in ns[:-1]:
+                    edits += make_field_pub(modfile, struct, field)
             elif c == "E0432" and first in names:
                 edits += make_pub(modfile, first)
         if want:
