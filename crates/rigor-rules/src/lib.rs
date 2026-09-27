@@ -1514,9 +1514,7 @@ fn check_call(
             if matches!(interner.get(m), Type::Constant(Scalar::Nil)) {
                 return None;
             }
-            let Some(cls) = index.class_name_of(interner, m) else {
-                return None;
-            };
+            let cls = index.class_name_of(interner, m)?;
             classes.push(cls);
         }
         {

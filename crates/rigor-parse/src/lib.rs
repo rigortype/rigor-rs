@@ -12,9 +12,9 @@ pub mod ast;
 mod encoding;
 
 pub use ast::{
-    lower, lower_with_key, ConstMutation, FileKey, HashKey, HashKeyTag, LoweredAst, MethodBody,
-    MultiTarget, MultiTargets, Node, NodeId, ParamShape, RescueClause, Span, StatementsKind,
-    Visibility,
+    lower, lower_with_key, ConstMutation, FileKey, HashKey, HashKeyTag, JumpKind, LoweredAst,
+    MethodBody, MultiTarget, MultiTargets, Node, NodeId, ParamShape, RescueClause, Span,
+    StatementsKind, Visibility,
 };
 
 /// Parse Ruby source with Prism. The borrowed result is lowered into an owned,

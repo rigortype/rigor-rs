@@ -26,7 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use rigor_index::{ClassOrdering, CoreIndex};
-use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
+use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 pub use folding::RubyFolder;
@@ -3797,8 +3797,41 @@ impl<'i> Typer<'i> {
             // Rescue/ensure bodies and a `Logical`'s right operand run
             // conditionally: walk them on a clone so their reads record
             // against the live env, then widen every write inside the span.
-            Node::BeginRescue { span, .. } => {
+            Node::BeginRescue { body, clauses, span, .. } => {
                 let mut inner = env.clone();
+                // `retry` re-enters the BEGIN body — the reference's
+                // `RetryWidening` (`eval_begin`'s `widen_entry_for_retry` /
+                // `absorb_retry_rebinds`) re-runs the body with each
+                // pre-existing local bound to `entry ∪ its writes at the
+                // body's raise points ∪ its writes in the retrying clauses
+                // up to their `retry`. Seed `inner` with that union — the
+                // begin body span for the raise-point writes, each retrying
+                // clause's body for the retry-point writes — so
+                // `x = 1; begin; x.frob; rescue; x = "s"; retry; end` reads
+                // `x` as `1 | "s"` inside, not the stale `1` pin. A `retry`
+                // nested inside a `def`/`lambda`, a literal block, or a
+                // nested begin's own `rescue` chain belongs to THAT scope
+                // (`subtree_has_retry` prunes them), matching the
+                // reference's scope boundary for `retry_edge_for`.
+                if clauses
+                    .iter()
+                    .any(|c| c.body.iter().any(|&st| subtree_has_retry(ast, st)))
+                {
+                    if let Some(bs) = stmts_span(ast, body) {
+                        self.backedge_seed_read_flow(
+                            ast, events, bs, &mut inner, interner, &[], body,
+                        );
+                    }
+                    for c in clauses.iter().filter(|c| {
+                        c.body.iter().any(|&st| subtree_has_retry(ast, st))
+                    }) {
+                        if let Some(cs) = stmts_span(ast, &c.body) {
+                            self.backedge_seed_read_flow(
+                                ast, events, cs, &mut inner, interner, &[], &c.body,
+                            );
+                        }
+                    }
+                }
                 let mut children = Vec::new();
                 node_child_ids(ast.get(node), &mut children);
                 children.sort_unstable();
@@ -3833,22 +3866,38 @@ impl<'i> Typer<'i> {
                 // the body reaches an earlier read on the next pass — the
                 // reference converges the pre-existing names' bindings through
                 // `eval_loop`'s `BodyFixpoint` (statement_evaluator.rb:1714).
-                // The body's reads then sit on the predicate's RUN edge —
-                // truthy for `while`, falsey for `until` (`x = nil; while
-                // x.nil?; x.upcase …` reads `nil`, matching the reference's
-                // narrowed pass-entry scope). A `for` (`index` non-empty)
-                // has NO fixpoint (`eval_for` is a single pass), its
-                // `predicate` is the iterated collection — not a truthiness
-                // condition — and stays as it was.
+                // That fixpoint runs ONLY when the body writes a local
+                // (`loop_body_local_writes` counts every write descendant,
+                // nested blocks included): a write-free body keeps its single
+                // historical pass from the un-narrowed `post_pred`, so
+                // `while x` / `until x.nil?` narrow the body env ONLY when
+                // the body rebinds — `x = c ? nil : "s"; while x; x.frob;
+                // end` is silent on the reference because `x` still reads
+                // `nil | "s"` inside. The body's reads then sit on the
+                // predicate's RUN edge — truthy for `while`, falsey for
+                // `until`. A `for` (`index` non-empty) has NO fixpoint
+                // (`eval_for` is a single pass), its `predicate` is the
+                // iterated collection — not a truthiness condition — and
+                // stays as it was.
                 if index.is_empty() {
-                    if let Some(bs) = stmts_span(ast, &body) {
-                        self.backedge_seed_read_flow(
-                            ast, events, bs, &mut benv, interner, &[], &body,
-                        );
-                    }
+                    // The predicate is evaluated once, from the pre-loop
+                    // scope — record its reads BEFORE the body seed overlays
+                    // the body-written names.
                     if let Some(p) = predicate {
                         self.flow_record_node(ast, *p, &mut benv, events, out, interner);
-                        self.flow_narrow_condition(ast, *p, !is_until, &mut benv, interner);
+                    }
+                    let body_writes = stmts_span(ast, body).is_some_and(|bs| {
+                        events.rebinds.iter().any(|(w, _)| bs.0 <= w.0 && w.1 <= bs.1)
+                    });
+                    if body_writes {
+                        if let Some(bs) = stmts_span(ast, body) {
+                            self.backedge_seed_read_flow(
+                                ast, events, bs, &mut benv, interner, &[], body,
+                            );
+                        }
+                        if let Some(p) = predicate {
+                            self.flow_narrow_condition(ast, *p, !is_until, &mut benv, interner);
+                        }
                     }
                 } else if let Some(p) = predicate {
                     self.flow_record_node(ast, *p, &mut benv, events, out, interner);
@@ -3975,16 +4024,33 @@ impl<'i> Typer<'i> {
             // captured rebinds reach its earlier reads on a later pass — the
             // reference converges them through `write_back_block_captures`'
             // `BodyFixpoint` (statement_evaluator.rb:3478); `Dynamic` is the
-            // safe floor. A `:unknown` call — a bare `loop {}`/`foo {}` or a
-            // receiver the catalogue does not name — stays single-pass,
-            // matching the reference (its fixpoint runs only for
-            // `:non_escaping`).
+            // safe floor.
+            let recv_class =
+                self.block_call_receiver_class(ast, *receiver, env, interner);
             let non_escaping =
-                self.block_call_non_escaping(ast, *receiver, method, env, interner);
+                recv_class.as_deref().is_some_and(|c| non_escaping_block_call(c, method));
             if non_escaping {
                 self.backedge_seed_read_flow(
-                    ast, events, *bspan, &mut benv, interner, block_locals, &block_body,
+                    ast, events, *bspan, &mut benv, interner, block_locals, block_body,
                 );
+            } else if receiver.is_some() && recv_class.is_none() {
+                // The receiver exists but types to no class here — `ARGV`,
+                // `File.open(f)`, `(1..3)`, `arr.lazy`, `each_slice`, `map`'s
+                // result — where the reference's own typing MAY still classify
+                // the call `:non_escaping` and run the fixpoint. A stale
+                // pre-block pin is then a false hit (`x = nil; (1..3).each {
+                // x.upcase; x = "s" }` flagged `upcase` for nil where the
+                // oracle reads `nil | "s"`), so floor the body-captured names
+                // to `Dynamic`: the safe side both ways. A receiver-LESS call
+                // (`loop {}`, `foo {}`) and a receiver resolved to a class the
+                // catalogue does not name (`[1].shuffle {}`) keep the
+                // reference's single-pass reading.
+                let u = interner.untyped();
+                for (name, _) in
+                    backedge_written_names(events, *bspan, &benv, block_locals)
+                {
+                    benv.insert(name, u);
+                }
             }
             for st in block_body.clone() {
                 self.flow_record_node(ast, st, &mut benv, events, out, interner);
@@ -4039,27 +4105,61 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> bool {
-        let Some(r) = receiver else { return false };
+        let Some(class) = self.block_call_receiver_class(ast, receiver, env, interner)
+        else {
+            return false;
+        };
+        non_escaping_block_call(&class, method)
+    }
+
+    /// The `receiver_class_name` half of [`Self::block_call_non_escaping`]:
+    /// the receiver's single class name, or `None` when the call is
+    /// receiver-less or the receiver types to no one class (`Dynamic`, a
+    /// union, `IntegerRange`, …) — the `:unknown` arm of the reference's
+    /// catalogue lookup, where the port cannot prove the fixpoint would NOT
+    /// have run.
+    fn block_call_receiver_class(
+        &self,
+        ast: &LoweredAst,
+        receiver: Option<NodeId>,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<String> {
+        let r = receiver?;
+        // Node shapes the port's `type_of` cannot class but the reference's
+        // receiver typing resolves: a range literal is `Nominal[Range]` /
+        // `Constant(Range)` there (`receiver_class_name` — the port's
+        // `Node::Range` types `Dynamic`), and a bare constant read resolves
+        // through the core object-constant table (`ARGV` → `Array`).
+        match ast.get(r) {
+            Node::Range { .. } => return Some("Range".to_string()),
+            Node::ConstantRead { name, .. } => {
+                if let Some(c) = self.index.object_constant_class(name) {
+                    return Some(c.to_string());
+                }
+            }
+            _ => {}
+        }
         let rty = self.type_of(ast, r, env, interner);
-        let class: Option<&str> = match interner.get(rty) {
+        let class: Option<String> = match interner.get(rty) {
             Type::Nominal { class, .. } | Type::Singleton(class) => self
                 .index
                 .class_name_for_id(*class)
-                .or_else(|| self.source.class_name_for_id(*class)),
-            Type::Tuple(_) => Some("Array"),
-            Type::HashShape(_) => Some("Hash"),
+                .or_else(|| self.source.class_name_for_id(*class))
+                .map(str::to_string),
+            Type::Tuple(_) => Some("Array".to_string()),
+            Type::HashShape(_) => Some("Hash".to_string()),
             // `receiver_class_name`'s `CONSTANT_CLASS_NAMES` — Float is
             // deliberately absent there, so a Float receiver is `:unknown`.
-            Type::Constant(Scalar::Int(_)) => Some("Integer"),
-            Type::Constant(Scalar::Str(_)) => Some("String"),
-            Type::Constant(Scalar::Sym(_)) => Some("Symbol"),
-            Type::Constant(Scalar::Bool(true)) => Some("TrueClass"),
-            Type::Constant(Scalar::Bool(false)) => Some("FalseClass"),
-            Type::Constant(Scalar::Nil) => Some("NilClass"),
+            Type::Constant(Scalar::Int(_)) => Some("Integer".to_string()),
+            Type::Constant(Scalar::Str(_)) => Some("String".to_string()),
+            Type::Constant(Scalar::Sym(_)) => Some("Symbol".to_string()),
+            Type::Constant(Scalar::Bool(true)) => Some("TrueClass".to_string()),
+            Type::Constant(Scalar::Bool(false)) => Some("FalseClass".to_string()),
+            Type::Constant(Scalar::Nil) => Some("NilClass".to_string()),
             _ => None,
         };
-        let Some(class) = class else { return false };
-        non_escaping_block_call(class, method)
+        class
     }
 
     /// The back-edge a repeatable body presents to its earlier reads — the
@@ -4113,6 +4213,21 @@ impl<'i> Typer<'i> {
             return written;
         }
         let u = interner.untyped();
+        // A RHS whose value DEPENDS on a name this span rebinds (`y` in
+        // `each { y = "s"; x = y }`, or the seed name itself in `x = x + 1`)
+        // cannot be typed from the pre-body pin: the reference's fixpoint
+        // converges `y` to its body writes FIRST and `x` joins the result,
+        // where typing `y`'s stale pin — or compounding `x` per pass —
+        // drifts the union off the oracle. Floor those contributions to
+        // `Dynamic`; the union collapse then takes the whole binding to
+        // `Dynamic`, the safe side for both a missing and a surplus member.
+        let mut unstable: HashSet<String> = events
+            .rebinds
+            .iter()
+            .filter(|(w, _)| span.0 <= w.0 && w.1 <= span.1)
+            .map(|(_, n)| n.clone())
+            .collect();
+        unstable.extend(exclude.iter().cloned());
         // `top_level[i]`'s descendants — the span a terminator must sit in to
         // stand between two straight-line writes.
         let top_desc: Vec<HashSet<NodeId>> = top_level
@@ -4147,6 +4262,7 @@ impl<'i> Typer<'i> {
                     Some((_, _, value)) => {
                         let top_idx =
                             top_level.iter().position(|&st| ast.get(st).span() == *wspan);
+                        floored |= subtree_reads_any(ast, *value, &unstable);
                         rhs.push((*wspan, *value, top_idx));
                     }
                     None => floored = true,
@@ -4172,17 +4288,34 @@ impl<'i> Typer<'i> {
             }
             contribs.push((name.clone(), kept, floored));
         }
-        for _ in 0..3 {
+        for pass in 0..3 {
+            let mut pending: Vec<(String, TypeId)> = Vec::with_capacity(contribs.len());
             for (name, rhss, floored) in &contribs {
                 if *floored {
-                    env.insert(name.clone(), u);
+                    pending.push((name.clone(), u));
                     continue;
                 }
                 let mut acc = env.get(name.as_str()).copied().unwrap_or(u);
                 for rhs in rhss {
                     acc = union_two(acc, self.type_of(ast, *rhs, env, interner), interner);
                 }
-                env.insert(name.clone(), flow_collapse_dynamic(acc, interner));
+                pending.push((name.clone(), flow_collapse_dynamic(acc, interner)));
+            }
+            let mut changed = false;
+            for (name, ty) in pending {
+                changed |= env.get(name.as_str()).copied() != Some(ty);
+                env.insert(name, ty);
+            }
+            if !changed {
+                break;
+            }
+            if pass == 2 {
+                // Still moving at the fixpoint's own three-pass cap — floor
+                // rather than hand body reads a union the reference's
+                // converged scope never produced.
+                for (name, _) in &written {
+                    env.insert(name.clone(), u);
+                }
             }
         }
         written
@@ -4269,8 +4402,55 @@ impl<'i> Typer<'i> {
                 method,
                 args,
                 block_body,
+                safe_nav,
                 ..
             } => {
+                // `v&.foo` (`analyse_safe_nav_receiver`, narrowing.rb:2965):
+                // a TRUTHY safe-nav result can only come from a non-nil
+                // receiver, so the receiver narrows to its non-nil fragment;
+                // the FALSEY edge could be a nil receiver OR a falsey result
+                // and narrows nothing. This pre-empts every method-specific
+                // rule below — `x&.==(1)` truthy proves only `x` non-nil (the
+                // equality never ran on a nil receiver).
+                //
+                // `v&.nil?` is the one predicate whose own nil edge refines
+                // that (measured at the pin): on a NIL PIN the truthy arm
+                // keeps `nil` (the oracle still fires `for nil` there and
+                // empties the FALSEY arm — the call folds to a falsey
+                // constant); on a nil-bearing UNION the safe-nav layer
+                // (`apply_safe_nav_non_nil`) overwrites the truthy arm with
+                // the non-nil fragment (`x = c ? nil : "s"; if x&.nil?;
+                // x.frob` fires `for "s"`); on a pin with NO nil member the
+                // `nil?`-edge truthy fragment is empty — a dead arm.
+                if *safe_nav {
+                    if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                        if let Some(&t) = env.get(name.as_str()) {
+                            let nil_pred =
+                                method == "nil?" && args.is_empty() && block_body.is_empty();
+                            let pure_nil =
+                                matches!(interner.get(t), Type::Constant(Scalar::Nil));
+                            let nt = if !truthy {
+                                if nil_pred && pure_nil {
+                                    interner.bottom()
+                                } else {
+                                    t
+                                }
+                            } else if nil_pred {
+                                if pure_nil {
+                                    t
+                                } else if flow_type_has_nil(t, interner) {
+                                    flow_narrow_nil_edge(t, false, interner)
+                                } else {
+                                    flow_narrow_nil_edge(t, true, interner)
+                                }
+                            } else {
+                                flow_narrow_nil_edge(t, false, interner)
+                            };
+                            env.insert(name.clone(), flow_unbottom(nt, interner));
+                        }
+                    }
+                    return;
+                }
                 // `!x` / `!(expr)` negates the edge — recursed FIRST since its
                 // receiver need not be a bare local.
                 if method == "!" && args.is_empty() && block_body.is_empty() {
@@ -4372,7 +4552,7 @@ impl<'i> Typer<'i> {
         if singleton_equality_scalar(lit) {
             self.flow_narrow_singleton_equality(t, lit, equal, interner)
         } else if flow_finite_trusted_domain(t, interner) {
-            self.flow_narrow_finite_equality(t, lit, equal, interner)
+            Self::flow_narrow_finite_equality(t, lit, equal, interner)
         } else {
             t
         }
@@ -4432,7 +4612,6 @@ impl<'i> Typer<'i> {
     /// or empties on the match; a non-literal carrier (unreachable under the
     /// domain gate) collapses on the equal edge and survives the complement.
     fn flow_narrow_finite_equality(
-        &self,
         t: TypeId,
         lit: &Scalar,
         equal: bool,
@@ -4450,7 +4629,7 @@ impl<'i> Typer<'i> {
             Type::Union(members) => {
                 let narrowed: Vec<TypeId> = members
                     .iter()
-                    .map(|&m| self.flow_narrow_finite_equality(m, lit, equal, interner))
+                    .map(|&m| Self::flow_narrow_finite_equality(m, lit, equal, interner))
                     .collect();
                 let kept: Vec<TypeId> = narrowed
                     .into_iter()
@@ -4706,18 +4885,26 @@ impl<'i> Typer<'i> {
                 let mut btenv = tenv.clone();
                 let mut bnenv = nenv.clone();
                 let mut bpenv = penv.clone();
-                if let Some(bs) = stmts_span(ast, &body) {
-                    let bound = self.backedge_seed_read_flow(
-                        ast, events, bs, &mut btenv, interner, &[], &body,
-                    );
-                    for (name, joined) in bound {
-                        bpenv.remove(&name);
-                        match self.backedge_nil_arm(joined, interner) {
-                            Some(arm) => {
-                                bnenv.insert(name, arm);
-                            }
-                            None => {
-                                bnenv.remove(&name);
+                // Same `loop_body_local_writes` gate as the read-flow arm:
+                // the fixpoint — and with it the predicate's run-edge
+                // narrowing — exists only when the body writes a local.
+                let body_writes = stmts_span(ast, &body).is_some_and(|bs| {
+                    events.rebinds.iter().any(|(w, _)| bs.0 <= w.0 && w.1 <= bs.1)
+                });
+                if body_writes {
+                    if let Some(bs) = stmts_span(ast, &body) {
+                        let bound = self.backedge_seed_read_flow(
+                            ast, events, bs, &mut btenv, interner, &[], &body,
+                        );
+                        for (name, joined) in bound {
+                            bpenv.remove(&name);
+                            match self.backedge_nil_arm(joined, interner) {
+                                Some(arm) => {
+                                    bnenv.insert(name, arm);
+                                }
+                                None => {
+                                    bnenv.remove(&name);
+                                }
                             }
                         }
                     }
@@ -4728,16 +4915,21 @@ impl<'i> Typer<'i> {
                         writes, events, interner, out,
                     );
                     // The body runs on the predicate's RUN edge — truthy for
-                    // `while`, falsey for `until`. Narrow `btenv` onto it
-                    // (`while x.nil?` binds `x` to nil inside) and drop any
-                    // nilability fact whose `C | nil` premise the edge just
-                    // emptied — a stale fact would fire `possible-nil` where
-                    // the reference sees a narrowed receiver.
-                    self.flow_narrow_condition(ast, pr, !is_until, &mut btenv, interner);
-                    bnenv.retain(|name, _| match btenv.get(name) {
-                        Some(&ty) => flow_type_has_nil(ty, interner),
-                        None => true,
-                    });
+                    // `while`, falsey for `until` — but the reference only
+                    // puts it there when the fixpoint ran (`loop_pass_entry`
+                    // narrows the pass entry; a write-free body's single
+                    // historical pass stays un-narrowed). Narrow `btenv` onto
+                    // the edge and drop any nilability fact whose `C | nil`
+                    // premise the edge just emptied — a stale fact would fire
+                    // `possible-nil` where the reference sees a narrowed
+                    // receiver.
+                    if body_writes {
+                        self.flow_narrow_condition(ast, pr, !is_until, &mut btenv, interner);
+                        bnenv.retain(|name, _| match btenv.get(name) {
+                            Some(&ty) => flow_type_has_nil(ty, interner),
+                            None => true,
+                        });
+                    }
                 }
                 self.nil_flow_scope(
                     ast, &body, &mut btenv, &mut bnenv, &mut bpenv,
@@ -4873,8 +5065,11 @@ impl<'i> Typer<'i> {
                     // (statement_evaluator.rb). The unioned binding seeds the
                     // body's nilability fact iff it is `C | nil` for a single
                     // class C (`backedge_nil_arm`); anything else drops it.
+                    let recv_class = receiver.and_then(|_| {
+                        self.block_call_receiver_class(ast, receiver, tenv, interner)
+                    });
                     let non_escaping = block_span.is_some()
-                        && self.block_call_non_escaping(ast, receiver, &method, tenv, interner);
+                        && recv_class.as_deref().is_some_and(|c| non_escaping_block_call(c, &method));
                     if let Some(bspan) = block_span {
                         if non_escaping {
                             let bound = self.backedge_seed_read_flow(
@@ -4891,6 +5086,22 @@ impl<'i> Typer<'i> {
                                         bnenv.remove(&name);
                                     }
                                 }
+                            }
+                        } else if receiver.is_some() && recv_class.is_none() {
+                            // A receiver the port cannot type to a class
+                            // (see `flow_record_call`): the reference may
+                            // still have classified the call `:non_escaping`
+                            // and run its fixpoint. Floor the body's
+                            // captured writes rather than let its reads see
+                            // a stale pre-block pin — a `possible-nil` hit
+                            // on the narrow arm is the safe side either way.
+                            let u = interner.untyped();
+                            for (name, _) in backedge_written_names(
+                                events, bspan, &btenv, &block_locals,
+                            ) {
+                                bpenv.remove(&name);
+                                bnenv.remove(&name);
+                                btenv.insert(name, u);
                             }
                         }
                     }
@@ -8120,7 +8331,10 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         // (`Node::Loop`), a fact never escapes the block (`join_cenv` keeps
         // only `Bot` — probes `p9`/`p9b`/`p13`/`q10`/`r13`, all
         // reference-silent), and a rebind BEFORE the use kills it (`q17`).
-        Node::Other { jump: Some(_), .. } => true,
+        // `Next`/`Break` only: the reference's `branch_unconditionally_exits?`
+        // (statement_evaluator.rb:5027) does NOT accept a `RetryNode` — a
+        // `retry` re-enters the begin, it does not exit the branch.
+        Node::Other { jump: Some(JumpKind::Next | JumpKind::Break), .. } => true,
         Node::Call { receiver: None, method, .. } if method == "raise" => true,
         Node::BeginRescue { body, ensure_body, clauses, .. }
             if clauses.is_empty() && ensure_body.is_empty() =>
@@ -9108,6 +9322,58 @@ fn descendants_of(ast: &LoweredAst, roots: &[NodeId]) -> HashSet<NodeId> {
 /// into the arena. Used only by [`descendants_of`]; missing a variant can only
 /// under-mark a body descendant, which keeps the write a rebind and declines
 /// (the zero-FP-safe direction).
+/// Whether `id`'s subtree READS any of `names` — a bare
+/// `LocalVariableRead`, or a `LocalVariableOpWrite` (`x += 1` reads `x`).
+/// All descendants count: an over-wide answer only floors a back-edge
+/// contribution to `Dynamic`, the safe side.
+fn subtree_reads_any(ast: &LoweredAst, id: NodeId, names: &HashSet<String>) -> bool {
+    match ast.get(id) {
+        Node::LocalVariableRead { name, .. }
+        | Node::LocalVariableOpWrite { name, .. } => names.contains(name),
+        node => {
+            let mut children = Vec::new();
+            node_child_ids(node, &mut children);
+            children.iter().any(|&c| subtree_reads_any(ast, c, names))
+        }
+    }
+}
+
+/// Whether `id`'s subtree holds a `retry` (`JumpKind::Retry`) belonging to
+/// the `begin` this is asked about — the reference's `RetryEdge` discovery
+/// (`retry_edge_for`, statement_evaluator.rb). A nested `def`/`class`/
+/// `module`/`->` body, a literal block's body, or a NESTED `begin … rescue`
+/// chain with its own clauses owns its own `retry`, so those subtrees are
+/// pruned — the same scope boundary `JumpTargets`/`retry_edge_for` observe.
+fn subtree_has_retry(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::Other { jump: Some(JumpKind::Retry), .. } => true,
+        Node::Definition { .. }
+        | Node::ClassDef { .. }
+        | Node::ModuleDef { .. }
+        | Node::Lambda { .. } => false,
+        Node::BeginRescue { clauses, .. } if !clauses.is_empty() => false,
+        Node::Call {
+            receiver,
+            args,
+            block_body,
+            block_span,
+            ..
+        } => {
+            receiver.is_some_and(|r| subtree_has_retry(ast, r))
+                || args.iter().any(|&a| subtree_has_retry(ast, a))
+                // A `&expr` block-pass is argument-position — it shares this
+                // scope; a literal block body opens the block's own.
+                || (block_span.is_none()
+                    && block_body.iter().any(|&b| subtree_has_retry(ast, b)))
+        }
+        node => {
+            let mut children = Vec::new();
+            node_child_ids(node, &mut children);
+            children.iter().any(|&c| subtree_has_retry(ast, c))
+        }
+    }
+}
+
 fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
     match n {
         Node::Program { body, .. }
@@ -9593,7 +9859,7 @@ fn non_escaping_block_call(class: &str, method: &str) -> bool {
     ];
     const IO_ITERATION: &[&str] =
         &["each_line", "each", "each_byte", "each_char", "each_codepoint"];
-    let hit = match class {
+    match class {
         "Array" => ENUMERABLE.contains(&method) || method == "each_index",
         "Hash" => ENUMERABLE.contains(&method) || HASH_EXTRA.contains(&method),
         "Range" => ENUMERABLE.contains(&method) || method == "step",
@@ -9606,8 +9872,7 @@ fn non_escaping_block_call(class: &str, method: &str) -> bool {
         }
         "StringIO" => STREAM.contains(&method) || IO_ITERATION.contains(&method),
         _ => false,
-    };
-    hit
+    }
 }
 
 /// Drop the `Array.new`-provenance of every local whose write span is contained
@@ -11005,6 +11270,189 @@ mod tests {
             "{:?}",
             i.get(t)
         );
+    }
+
+    /// `eval_loop` runs the `BodyFixpoint` — and therefore the predicate's
+    /// run-edge narrowing — ONLY when the body writes a local
+    /// (`loop_body_local_writes`): a write-free `while`/`until` body keeps
+    /// the un-narrowed `post_pred` scope, so `x` still reads `nil | "s"`
+    /// inside `while x`.
+    #[test]
+    fn read_flow_loop_narrows_only_when_body_writes() {
+        // No body writes → un-narrowed `nil | "s"` (the oracle is silent on
+        // `x.frob` there — the union's nil arm declines). A bare `x.upcase`
+        // reads `x` without itself being a body write.
+        let (i, t) = read_flow_last(
+            b"x = c ? nil : \"s\"\nwhile x\n  x.upcase\nend\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // A body write engages the fixpoint and the run edge: `while x`
+        // binds `x` to `"s"`.
+        let (i, t) = read_flow_last(
+            b"x = c ? nil : \"s\"\nwhile x\n  x.upcase\n  z = 1\nend\n",
+            "x",
+        );
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("s".into())),
+            "{:?}",
+            i.get(t)
+        );
+        // The gate is over EVERY local write in the body subtree — `z` is
+        // body-first and still engages the fixpoint.
+        let (i, t) = read_flow_last(
+            b"x = c ? nil : \"s\"\nuntil x.nil?\n  x.upcase\n  z = 1\nend\n",
+            "x",
+        );
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("s".into())),
+            "{:?}",
+            i.get(t)
+        );
+    }
+
+    /// A `:non_escaping` call needs a receiver the catalogue can class:
+    /// the port's `block_call_receiver_class` declines a receiver that types
+    /// to no class (`foo`, `arr.lazy`, …) where the reference's own typing
+    /// may still prove `:non_escaping` — the safe answer is to FLOOR the
+    /// body's captured writes to `Dynamic` rather than let its reads see a
+    /// stale pre-block pin. A range literal (`Nominal[Range]`/`Constant`
+    /// there) and a core object constant (`ARGV` → `Array`) still classify.
+    #[test]
+    fn read_flow_backedge_unclassed_receiver_floors_captured_writes() {
+        // `(1..3).each` — Range is in the catalogue, the fixpoint unions.
+        let (i, t) = read_flow_last(
+            b"x = nil\n(1..3).each { |i| y = x; x = \"s\" }\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // `ARGV.each` — `ARGV` classes `Array` through the object-constant
+        // table, same fixpoint union.
+        let (i, t) = read_flow_last(
+            b"x = nil\nARGV.each { |a| y = x; x = \"s\" }\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // `foo.each` — `foo` types `Dynamic`, so the receiver cannot be
+        // classed: the captured write floors to `Dynamic` instead of letting
+        // the in-block read see the stale `nil` pin.
+        let (i, t) = read_flow_last(
+            b"x = nil\nfoo.each { |i| y = x; x = \"s\" }\n",
+            "x",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+    }
+
+    /// A back-edge RHS that READS a name the body itself rebinds (`x = y`
+    /// where `y = "s"` is another body write) cannot be typed from the
+    /// pre-body pin — the reference's fixpoint converges `y` first. Floor
+    /// the contribution to `Dynamic`; the in-body read is the safe decline.
+    /// The EXIT write-back still unions `entry ∪ post`, so the post-block
+    /// read keeps the oracle's `"s" | 1`.
+    #[test]
+    fn read_flow_backedge_rhs_reading_body_write_floors() {
+        let (i, t) = read_flow_last(
+            b"x = 1\n[1,2].each { |i| y = \"s\"; x = y }\nz = x\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Int(1), Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // In-body, the read BEFORE `x = y` sees the floored seed.
+        let (i, t) = read_flow_last(
+            b"x = 1\n[1,2].each { |i| y = \"s\"; z = x; x = y }\n",
+            "x",
+        );
+        assert!(matches!(i.get(t), Type::Dynamic(_)), "{:?}", i.get(t));
+    }
+
+    /// `retry` re-enters the `begin` body — the reference's `RetryWidening`
+    /// rebinds each pre-existing local to `entry ∪ its writes at the body's
+    /// raise points ∪ its writes in the retrying rescue clause`
+    /// (`eval_begin`'s `widen_entry_for_retry`). The in-body read sees the
+    /// union (`"s" | 1`), not the stale `1` pin.
+    #[test]
+    fn read_flow_retry_re_entry_seeds_arm_writes() {
+        let (i, t) = read_flow_last(
+            b"x = 1\nbegin\n  y = x\nrescue\n  x = \"s\"\n  retry\nend\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Int(1), Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // A clause that does NOT retry keeps the conditional-write widen —
+        // `x` still reads the entry pin in the body.
+        let (i, t) = read_flow_last(
+            b"x = 1\nbegin\n  y = x\nrescue\n  x = \"s\"\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Int(1)), "{:?}", i.get(t));
+    }
+
+    /// `v&.m` narrows the receiver to its non-nil fragment on the TRUTHY
+    /// edge only (`analyse_safe_nav_receiver`), and `x&.nil?` refines that:
+    /// a nil-bearing union narrows to `C`, a nil pin keeps `nil`, a pin with
+    /// no nil member makes the truthy arm dead.
+    #[test]
+    fn read_flow_safe_nav_narrows_receiver_non_nil() {
+        // `x&.nil?` on `nil | "s"` → `"s"` on the truthy edge.
+        let (i, t) = read_flow_last(
+            b"x = c ? nil : \"s\"\nif x&.nil?\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(
+            i.get(t),
+            &Type::Constant(Scalar::Str("s".into())),
+            "{:?}",
+            i.get(t)
+        );
+        // The falsey edge passes through unchanged (`nil | "s"`).
+        let (i, t) = read_flow_last(
+            b"x = c ? nil : \"s\"\nif x&.nil?\n  1\nelse\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(
+            union_scalars(&i, t),
+            vec![Scalar::Nil, Scalar::Str("s".into())],
+            "{:?}",
+            i.get(t)
+        );
+        // `x&.nil?` on a nil pin keeps `nil` on the truthy edge.
+        let (i, t) = read_flow_last(
+            b"x = nil\nif x&.nil?\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Nil), "{:?}", i.get(t));
+        // `x&.==(1)` never ran the equality on a nil receiver — truthy edge
+        // narrows only to the non-nil fragment.
+        let (i, t) = read_flow_last(
+            b"x = c ? nil : 1\nif x&.==(1)\n  y = x\nend\n",
+            "x",
+        );
+        assert_eq!(i.get(t), &Type::Constant(Scalar::Int(1)), "{:?}", i.get(t));
     }
 
     /// Literal `==`/`!=` narrowing — the reference's

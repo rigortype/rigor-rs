@@ -176,3 +176,55 @@ def e6
   [1,2].each { |i| x = nil; x = 1 }
   x.upcase
 end
+
+# --- (4) retry back-edges ------------------------------------------------------
+#
+# `eval_begin`'s `RetryWidening` collects each `retry` clause's writes up to
+# the retry and unions them into the body's re-entry scope.
+
+# No retrying-clause write — the body pin is undisturbed, `upcase` on nil
+# fires on both engines.
+def f1
+  x = nil
+  begin
+    x.upcase
+  rescue
+    retry
+  end
+end
+
+# `x = "s"` before `retry` converges the body read to `nil | "s"` — `frob`
+# is undefined on `String`, so `undefined-method` fires on both engines.
+def f2
+  x = nil
+  begin
+    x.frob
+  rescue
+    x = "s"
+    retry
+  end
+end
+
+# The union reaches back across the begin body — a post-entry `x = 1`
+# pin and the clause's `"s"` write converge to `"s" | 1`.
+def f3
+  x = 1
+  begin
+    x.frob
+  rescue
+    x = "s"
+    retry
+  end
+end
+
+# `upcase` on the `nil | "s"` union is a `possible-nil-receiver` on both
+# engines — the fact survives the `nil | C` single-class arm.
+def f4
+  x = nil
+  begin
+    x.upcase
+  rescue
+    x = "s"
+    retry
+  end
+end

@@ -951,6 +951,13 @@ pub enum JumpKind {
     Next,
     /// `break` — leave the enclosing block / loop.
     Break,
+    /// `retry` — re-run the enclosing `begin`'s body. Not a plain
+    /// unconditional exit for narrowing purposes — the reference's
+    /// `branch_unconditionally_exits?` accepts `ReturnNode`/`NextNode`/
+    /// `BreakNode`/`raise`/`throw` only — but the `rescue` clause that
+    /// reaches it re-enters the begin body under widened bindings
+    /// (`RetryWidening`), which the read-flow pass models per-site.
+    Retry,
 }
 
 impl Node {
@@ -2360,6 +2367,15 @@ impl<'src> Builder<'src> {
             if n.arguments().is_none() {
                 return self.push(Node::Other { span, jump: Some(JumpKind::Break) });
             }
+        }
+        // `retry` never carries an argument — tag it outright so the
+        // read-flow `begin … rescue` arm can tell a clause that re-enters
+        // the body (`RetryEdge`) from one that merely handles. It is
+        // deliberately NOT in `stmt_terminates`' accepted set — the
+        // reference's `branch_unconditionally_exits?` does not list
+        // `RetryNode` either.
+        if node.as_retry_node().is_some() {
+            return self.push(Node::Other { span, jump: Some(JumpKind::Retry) });
         }
 
         // `defined?(expr)` — the operand is NEVER EVALUATED (`defined?` inspects
