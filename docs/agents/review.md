@@ -5,19 +5,41 @@ loop, step 7). A reviewer is adversarial and read-only: it builds the input that
 would make the change wrong, probes it on both engines, and never edits or
 merges.
 
+## Merge bar (2026-09-27 policy)
+
+A PR's purpose is resolving the scope in its issue's agent brief. Per-PR full
+parity with the reference is NOT required — convergence is measured across the
+release, not inside one PR. The reviewer's job is to *surface* concerns, not to
+veto on them:
+
+- **Blocks landing**: the brief's rows still diverge, a gate is red, or the
+  diff causes harm OUTSIDE any reasonable reading of the brief (a broad new-FP
+  family on ordinary code — e.g. an env-model change firing on plain locals).
+- **Does not block**: new FPs in edge shapes adjacent to the fix, message
+  drift at the same key, coverage lost vs master, missing precision. These get
+  filed as issues, disclosed in the PR body, and the PR lands. When a finding
+  could be either, prefer filing + landing over another fix round — a `Needs
+  fix` round costs more than a filed issue and a small follow-up PR.
+
+Cap review rounds at two per PR. After that, everything outstanding is filed
+and the PR lands or is abandoned; it does not loop. The full-parity review
+that produced the 2026-09-27 abandoned stream is recorded as an anti-pattern
+in `docs/notes/20260927-abandoned-infer-pr-stream.md`.
+
 ## Who reviews
 
-- **Claude Code subagents**: Opus 5.5, inheriting the session model.
-- **Reviewers from other agents**: Grok 4.6 and Opus 5.5, both at `high`
-  thinking, run as two independent reviews. Neither sees the other's output,
-  and **both must return `Approved`**. They catch different things: on
-  PR #154, Grok approved while Opus found six message regressions the PR text
-  denied.
+- **Claude Code subagents**: Opus 5.5, inheriting the session model. Opus is
+  the review gate; one `Approved` is enough.
+- **Reviewers from other agents**: Grok 4.6 (`high`) may run as a second
+  independent review when available — it catches different things (on PR #154
+  it approved while Opus found six message regressions), but its verdict is
+  advisory, not blocking.
 
 Review once per PR, on the final head after CI is green, not on every push. A
-`Needs fix` sends the PR back to the implementer, and the review runs again on
-the new head. Read CI (`gh pr checks`) rather than re-running its gates; spend
-the time on probes and counterexamples.
+`Needs fix` sends the PR back to the implementer only for landing-blocking
+items; every other finding in it is filed as an issue and disclosed in the PR
+body, and the review does not re-run on them. Read CI (`gh pr checks`) rather
+than re-running its gates; spend the time on probes and counterexamples.
 
 Alongside each adversarial review, run a **Fable 5.1 design companion**
 (`claude -p … --model claude-fable-5-1`, or `opencode/claude-fable-5-1`), fed
