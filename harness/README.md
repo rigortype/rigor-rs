@@ -275,3 +275,11 @@ It exits 1 on any difference.
 `gate.sh` is the quick gate before each push: `docs_check.py`, `cargo test -p`
 for the crates the branch changed, and `run_snapshot.rb`. It prints one line per
 step and the tail of the first failure. The rest runs in CI on the draft PR.
+
+## Module splits
+
+`split/` holds the tooling for move-only module splits: moving a file's
+inline test modules out, extracting items into a child module, rustc-driven
+import and visibility fixes, and the line-multiset proof that nothing but
+scaffolding changed. It is how the #204 `lib.rs` split was done. Usage and
+hazards are in [split/README.md](split/README.md).

@@ -34,6 +34,8 @@ or reached by method.
 
 ## How each step was proved move-only
 
+The scripts are now in `harness/split/` (see its README).
+
 Each step used the same mechanical pipeline:
 
 1. **Extraction.** A syn-based span lister found each item, with its
