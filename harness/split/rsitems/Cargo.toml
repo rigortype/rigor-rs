@@ -1,0 +1,17 @@
+# The item/span lister behind harness/split/*.py. Standalone on purpose: its
+# own `[workspace]` keeps it out of the rigor-rs workspace (so the
+# `span-locations` feature it needs never unifies into the product's
+# proc-macro2), and its own Cargo.lock pins the same syn/proc-macro2 the
+# product lock already carries, so it builds `--offline`.
+[package]
+name = "rsitems"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+syn = { version = "=2.0.117", features = ["full", "parsing", "printing"] }
+proc-macro2 = { version = "=1.0.106", features = ["span-locations"] }
+quote = "=1.0.45"
+
+[workspace]
