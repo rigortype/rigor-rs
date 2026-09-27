@@ -346,7 +346,7 @@ fn inert_value_ok(node: &Node) -> bool {
 
 /// Ruby's `File.expand_path` for a path without `~`: absolute, with `.` and
 /// `..` folded lexically.
-fn expand_path(path: &Path) -> PathBuf {
+pub(crate) fn expand_path(path: &Path) -> PathBuf {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = PathBuf::new();
     for c in abs.components() {

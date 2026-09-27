@@ -280,8 +280,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
             std::env::var_os("POSIXLY_CORRECT").as_deref(),
             std::env::var_os("RIGOR_RACTOR_WORKERS").as_deref(),
         );
-    let (mut findings, had_io_error) =
-        analyze_files(&expanded, &cfg, "check", folder_ref, &bleeding_edge, ref_has_files);
+    let (mut findings, had_io_error) = analyze_files(
+        &expanded,
+        // `None` on the `paths:` fallback ⇒ `paths == configuration.paths`
+        // ⇒ the reference never widens discovery for a bare `check`.
+        if files.is_empty() { None } else { Some(files.as_slice()) },
+        &cfg,
+        "check",
+        folder_ref,
+        &bleeding_edge,
+        ref_has_files,
+    );
 
     // ADR-22 slice 5 — snapshot the RAW (pre-baseline-filter) findings for the
     // `--baseline-strict` audit. The reference audits `raw_result.diagnostics`
@@ -523,6 +532,35 @@ struct PathError {
     not_found: bool,
 }
 
+/// The config `paths:` in the spelling the reference's `Configuration`
+/// actually stores (`resolve_path_key!`): a DECLARED entry is
+/// `File.expand_path(entry, config_dir)` — an ABSOLUTE string, with `.`/`..`
+/// folded lexically (a cwd `.rigor.yml` expands against the cwd itself).
+/// The absolute spelling is load-bearing upstream, not cosmetic: `exclude:` is
+/// `File.fnmatch?`'d against the expanded file list, so a project-relative
+/// pattern like `lib/ext.rb` NEVER matches a declared `paths:` file there —
+/// a relative spelling would over-exclude and manufacture FPs. The `["lib"]`
+/// DEFAULT is not in the file, so it stays exactly as written
+/// (cwd-relative). `~` is not expanded — the port never resolves it (the
+/// same documented hole as `conformance_gate::signature_entry_ok`).
+fn effective_config_paths(cfg: &Config) -> Vec<String> {
+    if !cfg.paths_explicitly_declared() {
+        return cfg.paths.clone();
+    }
+    let base = cfg
+        .config_base_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    cfg.paths
+        .iter()
+        .map(|p| {
+            conformance_gate::expand_path(&base.join(p))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
 /// Expand raw `check`/`baseline` path arguments into the concrete `.rb` files to
 /// analyze plus any bad-path errors — a faithful port of the reference's
 /// `Runner#expand_paths` (ADR-0040):
@@ -634,8 +672,16 @@ fn prepend_path_errors(
     *findings = injected;
 }
 
+/// `files`: the expanded `.rb` file list to ANALYZE (one work item per entry,
+/// duplicates kept). `argv_roots`: the path arguments as the user wrote them,
+/// or `None` when the run's roots came from the config `paths:` fallback —
+/// the reference's `widen_discovery_to_project?` gate (`paths !=
+/// configuration.paths`) is then unconditionally false and discovery never
+/// widens beyond the analyzed set (bare `check`, and `baseline` without
+/// positionals — the reference's baseline always analyzes `paths:`).
 fn analyze_files(
     files: &[&str],
+    argv_roots: Option<&[&str]>,
     cfg: &Config,
     verb: &str,
     folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
@@ -815,20 +861,24 @@ fn analyze_files(
     // `files` entry, each with its own `order` slot, exactly as the
     // reference's `expand_paths(argv)` keeps duplicates: `check a.rb a.rb`
     // analyzes twice, and an argv file that also sits under `paths:` still
-    // reports at its argv position (`check lib lib/a.rb` → a,b,c,a). Files
-    // the config-`paths:` expansion adds BEYOND the analyzed set are
-    // appended as discovery-only items: parsed + lowered + harvested into
-    // the project index but producing no findings (the reference's
-    // discovery is a parse pass, not an analysis).
+    // reports at its argv position (`check lib lib/a.rb` → a,b,c,a).
     //
-    // Two approximations of the reference's `expand_paths(paths | argv)`:
-    // it unions at the ROOT level before expanding (the port receives the
-    // already-expanded argv, so overlapping roots expand twice — an argv
-    // file under `paths:` merges at its argv position rather than its
-    // `paths:` position), and it `File.expand_path`s declared `paths:`
-    // entries to ABSOLUTE strings while the port joins them relative —
-    // identical on disk, different only if a spelled path ever surfaced
-    // in output, which discovery-only items never do.
+    // The widening gate is the reference's, verbatim:
+    // `widened.files.size > expansion.files.size`, where `widened` expands
+    // the ROOT-LEVEL union `configuration.paths | argv`. Repeated argv
+    // strings dedup out of the union, so `check a.rb a.rb`'s widened set
+    // ([lib…, a.rb]) is the same size as its expansion and discovery does
+    // NOT widen — oracle-visible: the `Foo` decl in `lib/` stays unseen and
+    // `Foo.new.bar.upcase` goes silent where a single `check a.rb` (widened
+    // strictly larger) resolves `bar` and fires on `Integer#upcase`. And
+    // `argv_roots == None` — the `paths:` fallback (bare `check`, bare
+    // `baseline`) — means `paths == configuration.paths` upstream, which is
+    // `widen_discovery_to_project?` false: no discovery items at all.
+    //
+    // Files the widened expansion adds BEYOND the analyzed set are appended
+    // as discovery-only items: parsed + lowered + harvested into the
+    // project index but producing no findings (the reference's discovery is
+    // a parse pass, not an analysis).
     let analyzed_paths: std::collections::HashSet<&str> =
         files.iter().copied().collect();
     let mut worklist: Vec<WorkItem> = Vec::with_capacity(files.len());
@@ -839,39 +889,30 @@ fn analyze_files(
             analyze: true,
         });
     }
-    {
-        // `Configuration.resolve_path_key!` — a DECLARED `paths:` entry is
-        // `File.expand_path(p, base_dir)`'d against the config file's
-        // directory (so `--config cfg/.rigor.yml` + `paths: ["lib"]` scans
-        // `cfg/lib`, not cwd's `lib`); the `["lib"]` DEFAULT stays
-        // cwd-relative. `signature_dirs` applies the same rule to
-        // `signature_paths:`.
-        let config_roots_owned: Vec<String> = if cfg.paths_explicitly_declared() {
-            match cfg.config_base_dir() {
-                Some(base) => cfg
-                    .paths
-                    .iter()
-                    .map(|p| base.join(p).to_string_lossy().into_owned())
-                    .collect(),
-                None => cfg.paths.clone(),
+    if let Some(argv_roots) = argv_roots {
+        // `configuration.paths | paths` — a ROOT-level union, in order.
+        let mut union_roots: Vec<String> = effective_config_paths(cfg);
+        for &root in argv_roots {
+            if !union_roots.iter().any(|u| u == root) {
+                union_roots.push((*root).to_string());
             }
-        } else {
-            cfg.paths.clone()
-        };
-        let config_roots: Vec<&str> =
-            config_roots_owned.iter().map(String::as_str).collect();
+        }
+        let union_root_refs: Vec<&str> =
+            union_roots.iter().map(String::as_str).collect();
         // Expansion errors on the discovery side are dropped, exactly as
         // `project_discovery_expansion` only reads `widened[:files]`.
-        let (config_files, _) = expand_check_paths(&config_roots);
-        for path in config_files {
-            if analyzed_paths.contains(path.as_str()) {
-                continue;
+        let (widened_files, _) = expand_check_paths(&union_root_refs);
+        if widened_files.len() > files.len() {
+            for path in widened_files {
+                if analyzed_paths.contains(path.as_str()) {
+                    continue;
+                }
+                worklist.push(WorkItem {
+                    order: usize::MAX,
+                    path,
+                    analyze: false,
+                });
             }
-            worklist.push(WorkItem {
-                order: usize::MAX,
-                path,
-                analyze: false,
-            });
         }
     }
 
@@ -1563,6 +1604,9 @@ fn baseline_analysis(
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _had_io_error) = analyze_files(
         &expanded,
+        // `None` when the roots are the config `paths:` fallback — the
+        // reference's baseline always analyzes `paths:` and never widens.
+        if roots_given { Some(roots) } else { None },
         &cfg,
         verb,
         folder_ref,
@@ -1731,8 +1775,11 @@ fn write_baseline(
         entries.len()
     );
     if cfg.baseline_path().is_none() {
+        // The reference names the config file actually read — the explicit
+        // `--config` path when given, else the auto-discovered `.rigor.yml`.
+        let config_label = explicit_config.unwrap_or(".rigor.yml");
         eprintln!(
-            "rigor: note — `.rigor.yml` does not declare `baseline:`; \
+            "rigor: note — `{config_label}` does not declare `baseline:`; \
              add `baseline: {output}` to activate the suppression."
         );
     }
@@ -3038,6 +3085,7 @@ mod tests {
         let a_rb = root.join("a.rb").to_string_lossy().into_owned();
         let (findings, io_err) = analyze_files(
             &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
             &cfg,
             "check",
             None,
@@ -3095,6 +3143,7 @@ mod tests {
         let a_rb = root.join("a.rb").to_string_lossy().into_owned();
         let (findings, io_err) = analyze_files(
             &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
             &cfg,
             "check",
             None,
@@ -3110,6 +3159,109 @@ mod tests {
         assert!(
             !messages.iter().any(|m| m.contains("`upcase'")),
             "cwd `lib/` is NOT walked for a declared `paths:`; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `project_discovery_expansion`'s size gate
+    /// (`widened.files.size > expansion.files.size`): `check a.rb a.rb`
+    /// expands to the same file set as the `paths | argv` union (the argv
+    /// repeat dedups at the ROOT level), so discovery does NOT widen and
+    /// `lib/`'s `Foo` decl stays unseen — where a single `check a.rb`
+    /// (strictly larger widened set) DOES discover it. The oracle fires
+    /// `upcase for 1` on the single-arg row and goes silent on the dup.
+    #[test]
+    fn analyze_files_dup_argv_does_not_widen() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_dup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        // `paths` spelled absolute so no `chdir` is needed (the cwd-relative
+        // default `["lib"]` would walk the test process's cwd, not `root`):
+        // a mutated `Config::default()` has no `present_keys`, so the entry
+        // is NOT "declared" and is used verbatim — exactly the default's
+        // resolution rule.
+        let mut cfg = Config::default();
+        cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        // Single arg: widened = [lib/foo.rb, a.rb] > [a.rb] ⇒ widens ⇒
+        // `Foo#bar` resolves to Integer ⇒ `upcase` fires (oracle: `for 1`).
+        let (one, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+            "widened discovery must see Foo#bar; got {one:?}"
+        );
+
+        // Dup arg: widened = expand(paths | [a.rb]) — the repeat dedups —
+        // same size as the expansion ⇒ no widen ⇒ Foo unseen ⇒ silent.
+        let (two, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            two.is_empty(),
+            "dup argv must not widen discovery; got {two:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bare `check` / `baseline` (`argv_roots == None` — the run's roots are
+    /// the config `paths:` fallback): upstream `paths == configuration.paths`
+    /// makes `widen_discovery_to_project?` unconditionally false, so
+    /// discovery never reaches beyond the analyzed set — even for a
+    /// `--config cfg/.rigor.yml` whose declared `paths:` names a DIFFERENT
+    /// directory than the analyzed roots.
+    #[test]
+    fn analyze_files_no_widen_on_config_fallback() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("cfg/.rigor.yml"), b"paths:\n  - lib\n").unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("lib/a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        // The analyzed file is the cwd-`lib` expansion of the fallback
+        // roots (#198 — the roots side stays cwd-relative). With no argv
+        // there must be NO discovery widening: `Foo` stays unresolved and
+        // `upcase` cannot fire.
+        let a_rb = root.join("lib/a.rb").to_string_lossy().into_owned();
+        let (findings, io_err) = analyze_files(
+            &[a_rb.as_str()],
+            None,
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(!io_err);
+        assert!(
+            findings.is_empty(),
+            "config-fallback runs never widen discovery; got {findings:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
