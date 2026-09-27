@@ -14,7 +14,7 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ▶ **NEXT (2026-09-27): pin `e59b7b89`, 0 FP / 9,337, gaps 827.** Retractions no gate sees:
 **#134–#137** (a mechanism each). FPs: #139, #146. #138/#164/#167 abandoned
-2026-09-27 (branches keep work; see note). #142–#145/#152 closed (0). CLI/config:
+(see ledger). #142–#145/#152 closed (0). CLI/config:
 #155–#159, #162–#163, #168–#171; #160 blocked upstream. Also #130, #132.
 
 - Measurement-tool lesson: audit at NODE granularity — per-file
@@ -91,7 +91,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-09-27 #204 CLOSED** (PRs #205–#216): infer `lib.rs` 14,084→144 lines, 10 modules, move-only, 0 FP. [note](notes/20260927-lib-rs-split-outcome.md).
+- **2026-09-27/28 module splits**: infer lib.rs 14,084→144 (#204), rules lib.rs 4,497→95 (#234), 8 files' tests out; `harness/split`. [note](notes/20260928-rules-lib-split-outcome.md)
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review bar met the deepest infer file — 6–8 rounds each, review discovered the reference's decision table one branch per round. Branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`, CI green); blockers listed in each closing comment. New merge bar: issue-scope resolution, findings get filed. [note](notes/20260927-abandoned-infer-pr-stream.md).
 - **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once — nominal self slot, `arm_of`/`join` auto-splat, reopen-aware union answering (`Node::Alias` + ancestor walk), `paths:` widen = `expand(paths|argv)>files` + excludes + undecidable-decline. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
 - **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver — `declaration_prefix` re-anchors rooted/self::, multi-segment names = ONE rung, per-file `Object` slice keeps cross-file `unresolved-toplevel`. **3,002 gaps (→827), 0 FP**; fx 118; → #185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
