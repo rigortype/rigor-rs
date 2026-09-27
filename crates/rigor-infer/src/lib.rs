@@ -159,16 +159,6 @@ const CLASS_RETURNING_NEW: &[&str] = &["Struct", "Data", "Class"];
 /// faithfully (ADR-0039); re-measured on every upstream bump (UPSTREAM.md).
 const ARRAY_NEW_TUPLE_LIMIT: i64 = 16;
 
-/// The expression typer (ADR-0023: the reference's `ExpressionTyper` /
-/// `MethodDispatcher` split). Holds a borrow of the [`CoreIndex`] so it can
-/// resolve a receiver's class and a method's return type — the data a CHAINED
-/// call needs to type correctly (`s.downcase : String`, so the next `.lenght`
-/// can be flagged).
-///
-/// The index is a *field*, not a per-call parameter, so the existing free
-/// [`type_of`] / [`build_toplevel_env`] signatures stay source-compatible: they
-/// are thin wrappers over a [`Typer`] built with an empty index. Callers that
-/// want chained-call result typing construct a [`Typer`] with the real index.
 /// One local's class fact inside the narrowing flow pass
 /// ([`Typer::class_narrowing_pass`]). `Narrowed` requires a `Dynamic`/`Top`
 /// carrier; `Bot` and `Widened` a precise one.
@@ -339,6 +329,16 @@ pub struct ClassNarrowing {
     pub dead: HashSet<NodeId>,
 }
 
+/// The expression typer (ADR-0023: the reference's `ExpressionTyper` /
+/// `MethodDispatcher` split). Holds a borrow of the [`CoreIndex`] so it can
+/// resolve a receiver's class and a method's return type — the data a CHAINED
+/// call needs to type correctly (`s.downcase : String`, so the next `.lenght`
+/// can be flagged).
+///
+/// The index is a *field*, not a per-call parameter, so the existing free
+/// [`type_of`] / [`build_toplevel_env`] signatures stay source-compatible: they
+/// are thin wrappers over a [`Typer`] built with an empty index. Callers that
+/// want chained-call result typing construct a [`Typer`] with the real index.
 pub struct Typer<'i> {
     index: &'i CoreIndex,
     /// The per-run in-source class index (ADR-0023 tier-4). Empty for a
