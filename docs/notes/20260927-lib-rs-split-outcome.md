@@ -1,6 +1,6 @@
 # lib.rs module split (#204) — outcome and recipe
 
-2026-09-27. `crates/rigor-infer/src/lib.rs` went from **14,084 lines to 142**
+2026-09-27. `crates/rigor-infer/src/lib.rs` went from **14,084 lines to 144**
 in eleven stacked move-only PRs (#205–#215), one extraction each, in one
 session. A doc-only follow-up (#216) came after them. The spec was
 `20260927-lib-rs-module-split-spec.md`. This note records the end state,

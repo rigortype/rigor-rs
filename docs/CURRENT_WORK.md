@@ -91,7 +91,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-09-27 #204 CLOSED** (PRs #205–#216): infer `lib.rs` 14,084→142 lines, 10 modules, move-only, 0 FP. [note](notes/20260927-lib-rs-split-outcome.md).
+- **2026-09-27 #204 CLOSED** (PRs #205–#216): infer `lib.rs` 14,084→144 lines, 10 modules, move-only, 0 FP. [note](notes/20260927-lib-rs-split-outcome.md).
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review bar met the deepest infer file — 6–8 rounds each, review discovered the reference's decision table one branch per round. Branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`, CI green); blockers listed in each closing comment. New merge bar: issue-scope resolution, findings get filed. [note](notes/20260927-abandoned-infer-pr-stream.md).
 - **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once — nominal self slot, `arm_of`/`join` auto-splat, reopen-aware union answering (`Node::Alias` + ancestor walk), `paths:` widen = `expand(paths|argv)>files` + excludes + undecidable-decline. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
 - **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver — `declaration_prefix` re-anchors rooted/self::, multi-segment names = ONE rung, per-file `Object` slice keeps cross-file `unresolved-toplevel`. **3,002 gaps (→827), 0 FP**; fx 118; → #185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
