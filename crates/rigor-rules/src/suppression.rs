@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     Diagnostic, CALL_ARGUMENT_TYPE_MISMATCH, CALL_POSSIBLE_NIL_RECEIVER, CALL_RAISE_NON_EXCEPTION,
-    CALL_UNDEFINED_METHOD, CALL_WRONG_ARITY, DEF_IVAR_WRITE_MISMATCH,
+    CALL_UNDEFINED_METHOD, CALL_UNRESOLVED_TOPLEVEL, CALL_WRONG_ARITY, DEF_IVAR_WRITE_MISMATCH,
     DEF_OVERRIDE_VISIBILITY_REDUCED, FLOW_ALWAYS_RAISES, FLOW_ALWAYS_TRUTHY_CONDITION,
     FLOW_DEAD_ASSIGNMENT, FLOW_DUPLICATE_HASH_KEY, FLOW_RETURN_IN_ENSURE,
     FLOW_SHADOWED_RESCUE_CLAUSE, FLOW_UNREACHABLE_BRANCH, STATIC_VALUE_USE_VOID, SUPPRESSION_EMPTY,
@@ -30,13 +30,16 @@ const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppr
 
 /// The canonical rule ids rigor-rs can actually emit. Family expansion and the
 /// `disable all` wildcard are checked against this set, so a `call` family token
-/// only ever expands to these three (the reference expands against its full
-/// `ALL_RULES`, but the extra ids it would add match no rigor-rs diagnostic).
+/// only ever expands to the `call.*` ids listed here (the reference expands
+/// against its full `ALL_RULES`, but the extra ids it would add match no
+/// rigor-rs diagnostic). A rule rigor-rs emits but this set omits escapes its
+/// family token — `call.unresolved-toplevel` did until #250.
 const IMPLEMENTED_RULES: &[&str] = &[
     CALL_UNDEFINED_METHOD,
     CALL_WRONG_ARITY,
     CALL_ARGUMENT_TYPE_MISMATCH,
     CALL_POSSIBLE_NIL_RECEIVER,
+    CALL_UNRESOLVED_TOPLEVEL,
     FLOW_DEAD_ASSIGNMENT,
     DEF_OVERRIDE_VISIBILITY_REDUCED,
     FLOW_ALWAYS_RAISES,
