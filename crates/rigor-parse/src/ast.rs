@@ -1024,7 +1024,72 @@ pub enum JumpKind {
     /// reaches it re-enters the begin body under widened bindings
     /// (`RetryWidening`), which the read-flow pass models per-site.
     Retry,
-}}
+}
+
+/// How one name in a literal block's parameter list binds — the tag half of
+/// [`Node::Call`]'s `block_params` (rigor-rs#140). `tap`/`then`/`yield_self`
+/// invoke their block as `yield self`, so the binding kind decides what the
+/// parameter's type is when a `break`/`next` arm reads it. The kind also
+/// records which SLOT class a positional occupies — required, optional or
+/// post — so the entry env can apply the reference's `BlockAutoSplat` spread
+/// when the yielded value is array-shaped and the parameter list is one
+/// CRuby auto-splats (`splats?`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BlockParamKind {
+    /// The FIRST positional parameter — `|v|`, `|v, w|`, the implicit `it`,
+    /// or `_1` — fed the receiver by a `yield self` yielder, so it binds to
+    /// the receiver's own type. Under an auto-splat it binds the carrier's
+    /// per-slot element type instead (a required slot).
+    SelfArg,
+    /// The first positional when it is OPTIONAL (`|v = 1|` with no required
+    /// parameter ahead of it) — binds the receiver like [`SelfArg`], but
+    /// under an auto-splat the reference fills optional slots with
+    /// `Dynamic[top]`, not the element type.
+    SelfOpt,
+    /// A name inside a destructured FIRST positional `|(v, w)|` — fed the
+    /// receiver destructured, so it binds to the receiver's element type(s).
+    /// Counts as one required slot for `splats?`; the names themselves stay
+    /// unbound (the reference marks destructure slots optimistic).
+    DestructuredSelfArg,
+    /// A non-first REQUIRED positional (`|v, w|`'s `w`), or a numbered
+    /// `_2.._9` parameter (the reference's `ParameterShape.of_arity` makes
+    /// every `_N` a required slot) — unbound without an auto-splat, bound to
+    /// the carrier's element type under one.
+    RequiredArg,
+    /// A non-first OPTIONAL positional (`|a = 1, b = 2|`'s `b`) — unbound
+    /// without an auto-splat, bound `Dynamic[top]` under one.
+    OptionalArg,
+    /// A post-rest positional (`|*r, z|`'s `z`) — unbound without an
+    /// auto-splat, bound to the carrier's element type under one.
+    PostArg,
+    /// A name inside a destructured NON-first positional — `|a, (x, y)|`'s
+    /// `x` and `y`, or the names of a post-rest destructure. Hidden from the
+    /// enclosing env but bound to nothing modeled; each contiguous group
+    /// occupies one positional slot for `splats?`.
+    Other,
+    /// A `*rest` parameter — binds the leftover argument list, `Array[untyped]`
+    /// for the exactly-once yielders (the reference binds
+    /// `Array[Dynamic[top]]`, or `Array[element]` under an `Array[T]` splat).
+    Rest,
+    /// The anonymous rest of a `|v,|` trailing-comma parameter list (Prism's
+    /// `ImplicitRestNode`) — binds no name but counts as a rest for
+    /// `splats?`, which is what makes `|v,|` splat a lone array argument.
+    ImplicitRest,
+    /// A keyword parameter `|k:|` / `|k: 1|` — hidden from the enclosing
+    /// env but bound to nothing modeled, and contributes no positional slot.
+    Keyword,
+    /// A `**kw` keyword-rest parameter — binds the captured keyword hash,
+    /// `Hash` for the exactly-once yielders (the reference binds
+    /// `Hash[Symbol, Dynamic[top]]`, which erases to the same nominal).
+    KwRest,
+    /// A `|;local|` block-local declaration — hidden from the enclosing env
+    /// and left UNBOUND, exactly as the reference's binder declares it (a
+    /// read types `Dynamic[top]`, not `nil`).
+    Local,
+    /// A `&blk` block capture — hidden from the enclosing env and bound to
+    /// `Proc` (the reference's binder types the captured block `Proc`).
+    Block,
+}
 
 impl Node {
     /// The byte span of this node, regardless of variant.

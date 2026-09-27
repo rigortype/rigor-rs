@@ -6035,8 +6035,10 @@ impl<'i> Typer<'i> {
                         self.retry_walk_stmt(ast, st, cur, interner, out);
                     }
                 }
-                // May-or-may-not run — union the writes back.
-                StatementsKind::Recovered => {
+                // May-or-may-not run — union the writes back. A `Jump`
+                // carrier's value expressions run only when the jump does,
+                // the same conditional shape as `Recovered` here.
+                StatementsKind::Recovered | StatementsKind::Jump(_) => {
                     let mut branch = cur.clone();
                     for &st in body.iter() {
                         self.retry_walk_stmt(ast, st, &mut branch, interner, out);
