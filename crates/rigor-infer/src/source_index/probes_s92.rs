@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, NodeId};
 use rigor_types::Interner;
 
 /// A per-FIELD rendering of the whole index. `sorted = true` canonicalises
