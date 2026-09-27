@@ -2004,6 +2004,7 @@ fn family_token_call_expands_to_all_call_rules() {
         (2, diag(CALL_UNDEFINED_METHOD)),
         (2, diag(CALL_WRONG_ARITY)),
         (2, diag(CALL_POSSIBLE_NIL_RECEIVER)),
+        (2, diag(CALL_UNRESOLVED_TOPLEVEL)),
     ];
     let comments = vec![(2, 0, "# rigor:disable call".to_string())];
     assert!(filter_suppressed(diags, &comments).is_empty());
@@ -2076,6 +2077,7 @@ fn suppress_set_from_tokens_call_family_and_canonical() {
     assert!(set.suppresses(CALL_UNDEFINED_METHOD));
     assert!(set.suppresses(CALL_WRONG_ARITY));
     assert!(set.suppresses(CALL_POSSIBLE_NIL_RECEIVER));
+    assert!(set.suppresses(CALL_UNRESOLVED_TOPLEVEL)); // #250
     // A canonical id passes through to itself.
     let set = SuppressSet::from_tokens(&[CALL_WRONG_ARITY]);
     assert!(set.suppresses(CALL_WRONG_ARITY));
