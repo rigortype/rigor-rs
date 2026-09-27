@@ -76,6 +76,11 @@ def main():
             if key in sel:
                 found.add(key)
                 moved_meth.setdefault(istart, []).append((gs, r))
+    for istart, ms in moved_meth.items():
+        kids = [r for r in rows if r.depth == 1 and r.parent == istart]
+        if len(ms) == len(kids):
+            splitlib.die(f"every item of impl {impls[istart].name} (line {istart}) is selected, "
+                         f"which would leave an empty impl behind: select impl:{impls[istart].name}")
     missing = [s for s in sel if s not in found]
     if missing:
         splitlib.die(f"no item for: {missing}")

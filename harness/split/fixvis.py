@@ -11,6 +11,8 @@ Loops `cargo check -p CRATE --all-targets` and, until nothing changes:
   * an item, method, field or type of MODFILE that rustc calls private
     anywhere, or that another file can no longer resolve  -> `pub(crate)`
     on its definition in MODFILE
+  * a type a `private_interfaces` warning names (a moved signature that
+    mentions it)  -> `pub(crate)` on it, in MODFILE or in the parent
 
 It never picks a visibility by hand: every `pub(crate)` it adds answers an
 error. With --prune it then removes the imports rustc reports unused, in
@@ -191,16 +193,21 @@ def errors(crate):
     return [m for m in splitlib.cargo_messages(crate) if m["level"] == "error"]
 
 
-def fix(crate, modfile, prefix):
+def fix(crate, modfile, prefix, parent):
     for _ in range(30):
         edits, want = 0, set()
         names = defined(modfile)
         for m in splitlib.cargo_messages(crate):
             if m["level"] == "warning" and splitlib.code(m) == "private_interfaces":
-                # `pub(crate) fn f() -> T` with T private to MODFILE
+                # `pub(crate) fn f() -> T` with T private to MODFILE, or to
+                # the PARENT (a moved fn whose signature names a type that
+                # stayed behind): either way T needs `pub(crate)`, or
+                # clippy's `-D warnings` fails where `cargo check` passes.
                 ns = splitlib.backticked(m["message"])
                 if ns and ns[0] in names:
                     edits += make_pub(modfile, ns[0])
+                elif ns and ns[0] in defined(parent):
+                    edits += make_pub(parent, ns[0])
                 continue
             if m["level"] != "error":
                 continue
@@ -278,7 +285,7 @@ def main():
     prefix = "crate" if os.path.basename(parent) in ("lib.rs", "main.rs") else "super"
     modname = os.path.basename(modfile)[:-3]
 
-    fix(a.crate, modfile, prefix)
+    fix(a.crate, modfile, prefix, parent)
     if a.prune and not errors(a.crate):
         prune(a.crate, modfile, parent, modname)
     msgs = splitlib.cargo_messages(a.crate)
