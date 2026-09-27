@@ -1,6 +1,6 @@
 # rigor-infer source_index.rs module split — handoff spec
 
-**Tooling note (2026-09-28):** #257 and #259 close the two tooling gaps this spec measured: the `private_interfaces` bumps done by hand (§3.2), and the refusal to leave an impl empty (PR 7 must use `impl:SourceIndex`). Run the split with them merged.
+**Tooling note (2026-09-28):** #257 and #259 (merged) close the two tooling gaps this spec measured. The 4 `private_interfaces` bumps that §3.2–§4 call "hand bumps" are now made by fixvis itself: the replays of PRs 3, 4 and 6 bump `HarvestedConstWrite`, `FoldSite`, `HarvestedFoldDef` and `HarvestedOverrideClass` with no hand step. split_mod refuses to leave an impl empty, so PR 7 must use `impl:SourceIndex`. Read "by hand" below as "by fixvis"; the counts do not change.
 
 2026-09-28. `crates/rigor-infer/src/source_index.rs` is **4,650 lines** at
 `origin/master` `4bec095`. Its three test modules left in #220 (to
