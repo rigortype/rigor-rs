@@ -19,6 +19,15 @@ Review once per PR, on the final head after CI is green, not on every push. A
 the new head. Read CI (`gh pr checks`) rather than re-running its gates; spend
 the time on probes and counterexamples.
 
+Alongside each adversarial review, run a **Fable 5.1 design companion**
+(`claude -p … --model claude-fable-5-1`, or `opencode/claude-fable-5-1`), fed
+the same diff and prior findings. Its job is not probing but design: for every
+repeated `Needs fix` family it proposes a root-cause remediation — the
+reference function to port wholesale rather than patch branch-by-branch — so
+the implementer gets a fix that closes the family, not the instance. Bounce
+the companion's proposal against the adversarial findings before it reaches
+the implementer.
+
 ## Input
 
 - The PR number and head SHA.
