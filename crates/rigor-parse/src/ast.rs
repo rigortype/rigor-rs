@@ -722,9 +722,21 @@ pub enum Node {
     /// `flow.return-in-ensure` rule dispatches on. Kept forward-compatible with a
     /// fuller per-clause `RescueClause` structure a later `flow.shadowed-rescue-clause`
     /// slice will need.
+    ///
+    /// `else_body` records JUST the else-clause statement ids (same additive
+    /// rule: the else statements remain appended to `body` between the rescue
+    /// clauses and `ensure_body`). The read-flow `BeginRescue` arm needs the
+    /// split because the else body runs on the post-BODY env (it runs only
+    /// when no exception was raised), while rescue clause bodies read the
+    /// begin's ENTRY env (`eval_begin_primary_under` /
+    /// `collect_rescue_chain_results`, statement_evaluator.rb).
     BeginRescue {
         body: Vec<NodeId>,
         ensure_body: Vec<NodeId>,
+        /// The else-clause statement ids (empty when the begin has no `else`,
+        /// and for every reused carrier). Purely additive — `body` is
+        /// byte-for-byte unchanged.
+        else_body: Vec<NodeId>,
         /// The per-clause rescue-chain structure (empty for the reused carriers —
         /// `else`/`when`/`in`/parenthesized groups — and for a `begin` with no
         /// `rescue`). Populated only from a real `BeginNode`'s rescue chain; see
@@ -1876,6 +1888,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body: Vec::new(),
+                else_body: Vec::new(),
                 clauses: Vec::new(),
                 span: span_of(&else_node.location()),
             });
@@ -1951,6 +1964,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body: Vec::new(),
+                else_body: Vec::new(),
                 clauses: Vec::new(),
                 span: span_of(&in_node.location()),
             });
@@ -2045,9 +2059,17 @@ impl<'src> Builder<'src> {
                 });
                 rescue = r.subsequent();
             }
-            if let Some(e) = begin_node.else_clause().and_then(|e| e.statements()) {
-                body.extend(self.lower_body(&e.body()));
-            }
+            // Same additive rule as `ensure_body`: the else statements stay in
+            // the flat `body` AND land in `else_body` so the read-flow
+            // `BeginRescue` arm can thread them on the post-body env rather
+            // than the rescue-clause entry env.
+            let else_body = if let Some(e) = begin_node.else_clause().and_then(|e| e.statements())
+            {
+                self.lower_body(&e.body())
+            } else {
+                Vec::new()
+            };
+            body.extend(else_body.iter().copied());
             // Lower the ensure statements ONCE, then record them BOTH in the flat
             // `body` (behavior-preserving for every existing consumer) AND in the
             // dedicated `ensure_body` (the `flow.return-in-ensure` dispatch view).
@@ -2061,6 +2083,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body,
+                else_body,
                 clauses,
                 span: span_of(&begin_node.location()),
             });
@@ -2176,6 +2199,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::BeginRescue {
                 body,
                 ensure_body: Vec::new(),
+                else_body: Vec::new(),
                 clauses: Vec::new(),
                 span: span_of(&parens.location()),
             });
