@@ -809,47 +809,70 @@ fn analyze_files(
     // `expand_paths(configuration.paths | argv)` — `rigor check a.rb`
     // sees `class String; attr_accessor :zz` in an unlisted `lib/ext.rb`,
     // so a project-declared method suppresses identically whether or not
-    // its file was named. Only the argv expansion is ANALYZED; the extra
-    // files are parsed + lowered + harvested but produce no findings (the
-    // reference's discovery is a parse pass, not an analysis). The widened
-    // order — config `paths:` expansion first, then the argv files it did
-    // not already name — is preserved so the merge replay matches the
-    // reference's file order.
-    let analyzed_order: std::collections::HashMap<&str, usize> =
-        files.iter().enumerate().map(|(i, p)| (*p, i)).collect();
+    // its file was named.
+    //
+    // The ANALYZED side is the argv expansion VERBATIM — one work item per
+    // `files` entry, each with its own `order` slot, exactly as the
+    // reference's `expand_paths(argv)` keeps duplicates: `check a.rb a.rb`
+    // analyzes twice, and an argv file that also sits under `paths:` still
+    // reports at its argv position (`check lib lib/a.rb` → a,b,c,a). Files
+    // the config-`paths:` expansion adds BEYOND the analyzed set are
+    // appended as discovery-only items: parsed + lowered + harvested into
+    // the project index but producing no findings (the reference's
+    // discovery is a parse pass, not an analysis).
+    //
+    // Two approximations of the reference's `expand_paths(paths | argv)`:
+    // it unions at the ROOT level before expanding (the port receives the
+    // already-expanded argv, so overlapping roots expand twice — an argv
+    // file under `paths:` merges at its argv position rather than its
+    // `paths:` position), and it `File.expand_path`s declared `paths:`
+    // entries to ABSOLUTE strings while the port joins them relative —
+    // identical on disk, different only if a spelled path ever surfaced
+    // in output, which discovery-only items never do.
+    let analyzed_paths: std::collections::HashSet<&str> =
+        files.iter().copied().collect();
     let mut worklist: Vec<WorkItem> = Vec::with_capacity(files.len());
-    let mut config_paths_seen: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    {
-        let config_roots: Vec<&str> = cfg.paths.iter().map(String::as_str).collect();
-        // Expansion errors on the discovery side are dropped, exactly as
-        // `project_discovery_expansion` only reads `widened[:files]`.
-        let (config_files, _) = expand_check_paths(&config_roots);
-        for path in config_files {
-            let order = analyzed_order.get(path.as_str()).copied();
-            // An analyzed file is scheduled (analyzed) at its first widened
-            // occurrence; a duplicate merges again discovery-only, like the
-            // reference's un-deduplicated `expand_paths`.
-            let analyze = order.is_some() && config_paths_seen.insert(path.clone());
-            worklist.push(WorkItem {
-                order: order.unwrap_or(usize::MAX),
-                path,
-                analyze,
-            });
-        }
-    }
     for (i, p) in files.iter().enumerate() {
-        // An analyzed file already scheduled at its config-`paths:`
-        // position (e.g. `check lib/a.rb`) is not re-listed; a bare argv
-        // repeat (`check a.rb a.rb`) still analyzes twice, as before.
-        if config_paths_seen.contains(*p) {
-            continue;
-        }
         worklist.push(WorkItem {
             order: i,
             path: (*p).to_string(),
             analyze: true,
         });
+    }
+    {
+        // `Configuration.resolve_path_key!` — a DECLARED `paths:` entry is
+        // `File.expand_path(p, base_dir)`'d against the config file's
+        // directory (so `--config cfg/.rigor.yml` + `paths: ["lib"]` scans
+        // `cfg/lib`, not cwd's `lib`); the `["lib"]` DEFAULT stays
+        // cwd-relative. `signature_dirs` applies the same rule to
+        // `signature_paths:`.
+        let config_roots_owned: Vec<String> = if cfg.paths_explicitly_declared() {
+            match cfg.config_base_dir() {
+                Some(base) => cfg
+                    .paths
+                    .iter()
+                    .map(|p| base.join(p).to_string_lossy().into_owned())
+                    .collect(),
+                None => cfg.paths.clone(),
+            }
+        } else {
+            cfg.paths.clone()
+        };
+        let config_roots: Vec<&str> =
+            config_roots_owned.iter().map(String::as_str).collect();
+        // Expansion errors on the discovery side are dropped, exactly as
+        // `project_discovery_expansion` only reads `widened[:files]`.
+        let (config_files, _) = expand_check_paths(&config_roots);
+        for path in config_files {
+            if analyzed_paths.contains(path.as_str()) {
+                continue;
+            }
+            worklist.push(WorkItem {
+                order: usize::MAX,
+                path,
+                analyze: false,
+            });
+        }
     }
 
     let stage1: Vec<Stage1> = worklist
@@ -983,9 +1006,9 @@ fn analyze_files(
     // input order, and nothing reorders either afterwards.
     let mut prepared: Vec<Prepared> = Vec::new();
     // Discovery-only ASTs (upstream #684), kept alive through the stage-2
-    // merge; `harvests` stays in WORKLIST order (config `paths:` files
-    // first), so `merge_entries[i]` says which vec `harvests[i]`'s AST
-    // lives in.
+    // merge; `harvests` stays in WORKLIST order (argv files first, then the
+    // config-`paths:` extras), so `merge_entries[i]` says which vec
+    // `harvests[i]`'s AST lives in.
     let mut discovery_asts: Vec<rigor_parse::LoweredAst> = Vec::new();
     enum MergeAst {
         Prepared(usize),
@@ -3030,6 +3053,63 @@ mod tests {
         assert!(
             messages.iter().any(|m| m.contains("`no_such_zz'")),
             "an undeclared method still fires; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `Configuration.resolve_path_key!` — a DECLARED `paths:` entry is
+    /// `File.expand_path`'d against the CONFIG FILE's directory, not the
+    /// process cwd: `--config cfg/.rigor.yml` + `paths: ["lib"]` discovers
+    /// `cfg/lib`, and a stray cwd `lib/` is NOT walked. The fixture puts
+    /// the accessor under `cfg/lib` and a bait decl under cwd `lib` —
+    /// cwd-relative resolution would read the bait and miss the accessor.
+    #[test]
+    fn analyze_files_declared_paths_resolve_against_config_dir() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("cfg/.rigor.yml"), b"paths:\n  - lib\n").unwrap();
+        // The file the DECLARED `paths:` must reach: `String#zz` accessor.
+        std::fs::write(
+            root.join("cfg/lib/ext.rb"),
+            b"class String\n  attr_accessor :zz\nend\n",
+        )
+        .unwrap();
+        // Bait only a cwd-relative `lib` expansion would walk: `Foo#bar`'s
+        // Integer return would FP `1.upcase` if discovered.
+        std::fs::write(root.join("lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(
+            root.join("a.rb"),
+            b"x = \"s\"\nx.zz\nFoo.new.bar.upcase\n",
+        )
+        .unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        assert!(cfg.paths_explicitly_declared());
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+        let (findings, io_err) = analyze_files(
+            &[a_rb.as_str()],
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(!io_err);
+        let messages: Vec<&str> = findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`zz'")),
+            "config-relative `paths:` sees cfg/lib's accessor; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("`upcase'")),
+            "cwd `lib/` is NOT walked for a declared `paths:`; got {messages:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
