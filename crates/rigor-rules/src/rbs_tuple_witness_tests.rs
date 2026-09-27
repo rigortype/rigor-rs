@@ -1,5 +1,7 @@
 use super::*;
+use rigor_index::CoreIndex;
 use rigor_parse::{lower, parse};
+use rigor_types::Interner;
 
 fn run(src: &[u8]) -> Vec<Diagnostic> {
     let ast = lower(&parse(src));
