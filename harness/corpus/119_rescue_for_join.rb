@@ -3,8 +3,14 @@
 # scope joins (`join_with_nil_injection`) — where the #154 port widened the
 # local to `Dynamic[top]` (rigor-rs#167). One scope: every row uses its own
 # locals. Measured against the pinned reference (e59b7b89, fresh cwd,
-# `--no-cache`); every row below is a full-tuple match EXCEPT the two sites
-# called out in row (76) — message-only drift at the same (rule, line, col).
+# `--no-cache`); every row below is a full-tuple match EXCEPT:
+#  - row (76) — message-only drift at the same (rule, line, col);
+#  - row (85) — the reference additionally emits a flow
+#    `always-truthy-condition` on the pattern guard (coverage gap; the flow
+#    pass does not yet descend into `case` conditions);
+#  - row (86) — the reference fires `for 1` on the pattern-bound local while
+#    the port stays silent (deferred pattern-binding deconstruction;
+#    rigor-rs#200).
 
 # --- rescue modifier --------------------------------------------------------
 
@@ -905,3 +911,106 @@ y76 = [gets && "s"]
 w76 = 1
 x76 = ((w76 = "s"; w76.itself) rescue w76)
 [x76].frob
+
+# --- operand-threaded interiors (rigor-rs#167 round-6) ----------------------
+#
+# A node the reference evaluates through `thread_operand` — an assignment
+# RHS, a call argument — runs on an operand evaluator whose `on_enter` is
+# nil: statement positions inside it record NO scope-index entry, so an
+# interior read resolves at the operand's entry scope, while its writes
+# still thread to the post state.
+
+# (77) a real `begin` operand freezes its interior: `w77.frob` reads the
+# ENTRY binding — fires `for 1`, not `"s"` — while the write still threads,
+# so the post-statement `w77.frob` fires `for "s" | 1`.
+w77 = 1
+x77 = (begin
+  w77 = "s"
+  w77.frob
+end rescue 2)
+w77.frob
+
+# (78) the parenthesized-sequence control: its children are operand-walk
+# records, so `w78.frob` still reads `"s"`; and `w78` was bound before the
+# modifier, so the rescue join binds both sides — `w78.upcase` stays
+# silent on `1 | "s"`.
+w78 = 1
+x78 = ((w78 = "s"; w78.frob) rescue 2)
+w78.upcase
+
+# (79) the unbound-entry half of (78): the modifier exit is
+# `join_with_nil_injection(after_expr, after_arm)`, so a name bound only on
+# the expr side joins `nil | "s"` — `call.possible-nil-receiver` fires on
+# `w79.upcase` (rigor-rs#167 round-6).
+x79 = ((w79 = "s"; w79.frob) rescue 2)
+w79.upcase
+
+# (80) the operand's VALUE tail types at the entry scope too —
+# `type_of_rescue_modifier`'s `type_of(node.expression)` resolves `w80`'s
+# tail read under the operand-entry record: `x80` binds `1 | 2`, so
+# `[x80].frob` fires `for [1 | 2]`.
+w80 = 1
+x80 = (begin; w80 = "s"; w80; end rescue 2)
+[x80].frob
+
+# (81) a `case` operand's value runs `type_of_case`'s `===`-certainty:
+# `when 1` never matches subject `2`, the branch drops, and with no else
+# the case contributes `Constant[nil]` — `x81` binds `3?`, firing
+# `for [3?]` (rigor-rs#167 round-6).
+w81 = 1
+x81 = (case 2
+when 1
+  w81 = "s"
+  w81
+end rescue 3)
+[x81].frob
+
+# (82) a loop operand types `Constant[nil]` (`type_of_loop` — `break VALUE`
+# is unmodeled there): `x82` binds `nil | 2`, firing `for [2?]`.
+w82 = 1
+x82 = (while false; w82 = "s"; w82; end rescue 2)
+[x82].frob
+
+# (83) a `&.` call's arguments run only when the receiver is non-nil —
+# `eval_call` joins their writes into the post-RECEIVER scope
+# nil-injected: `x83&.foo(w83 = 1)` leaves `w83` at `"s" | 1` (bound on both
+# sides ⇒ no nil member), so `w83.upcase` on `"s" | 1` fires neither rule —
+# `undefined-method` declines the union and `possible-nil` needs a nameable
+# arm the method is present on EVERY non-nil member of. `[w83].frob` fires
+# `for ["s" | 1]` (rigor-rs#167 round-6 — the pre-round-6 port wrongly
+# threaded the argument write, reporting `for 1` shapes on rows like
+# `x&.foo = (w = 1)`).
+w83 = "s"
+x83 = gets
+x83&.foo(w83 = 1)
+w83.upcase
+[w83].frob
+
+# (84) a rescue ARM's own write is likewise one-sided: `w84` binds only on
+# the arm path, so it joins `nil | 1` and `w84.upto` fires
+# `call.possible-nil-receiver` (rigor-rs#167 round-6).
+x84 = (foo84 rescue w84 = 1)
+w84.upto
+
+# (85) a `case … in` guard is evaluated on a SCRATCH scope —
+# `eval_when_or_in` `sub_eval`s `node.statements` only — so `(w85 = "s")`
+# inside the guard binds nowhere: `w85.upcase` reads unbound and stays
+# silent, `[w85].frob` fires `for [Dynamic[top]]` (rigor-rs#167 round-6 —
+# the pre-round-6 port leaked the guard write into the body and after).
+# KNOWN GAP: the reference additionally emits
+# `flow.always-truthy-condition` on the guard — the flow pass does not yet
+# descend into `case` conditions.
+case [1]
+in [a85] if (w85 = "s")
+  w85.frob
+end
+w85.upcase
+[w85].frob
+
+# (86) KNOWN GAP (deferred to rigor-rs#200): pattern binding deconstruction —
+# the reference types `w86` as the matched element `1` and fires `for 1`; the
+# port's pattern-binding pass does not yet thread that and stays silent.
+case [1]
+in [w86]
+  w86.frob
+end
