@@ -7,7 +7,9 @@
 //!
 //! One module per rule family, plus the shared infrastructure; `lib.rs` holds
 //! only declarations and re-exports. A new rule usually touches its family's
-//! module, `rule_catalog` (its id and entry) and `driver` (its pass).
+//! module, `rule_catalog` (its id and entry), `driver` (its pass) and
+//! `IMPLEMENTED_RULES` in `suppression` (without it, a family token such as
+//! `# rigor:disable call` and `rigor doctor` skip the rule).
 //!
 //! | module | holds |
 //! |---|---|
@@ -27,7 +29,8 @@
 //! | `void_value_use` | `static.value-use.void` |
 //! | `dead_version_guard` | the dead version-guard arm filter (public) |
 //!
-//! Unit tests live in the `*tests.rs` modules beside them (`use super::*`).
+//! Unit tests live in the `*tests.rs` modules beside them (`use super::*`), and
+//! inline in `shadowed_rescue` and `dead_version_guard`.
 #![allow(dead_code)]
 
 pub mod dead_version_guard;
