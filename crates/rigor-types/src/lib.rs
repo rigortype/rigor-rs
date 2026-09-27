@@ -20,7 +20,7 @@ pub mod relations;
 pub mod ty;
 
 // Re-export the everyday surface at the crate root.
-pub use algebra::{is_bool_pair, Algebra};
+pub use algebra::{combinator_union, is_bool_pair, Algebra};
 pub use certainty::{Certainty, Evidence, Relation};
 pub use display::{describe, describe_named, erase_to_rbs_named, ruby_float_to_s};
 pub use interner::Interner;

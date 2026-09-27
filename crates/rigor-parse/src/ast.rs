@@ -321,7 +321,7 @@ pub enum Node {
     /// this `name` as a READ — and it is NOT itself a fireable dead-write candidate
     /// (the reference's collector fires only on plain `LocalVariableWriteNode`).
     /// `value` is lowered for call reachability.
-    LocalVariableOpWrite { name: String, value: NodeId, span: Span },
+    LocalVariableOpWrite { name: String, op: String, value: NodeId, span: Span },
     /// A multiple assignment (`a, b = rhs`, `a, (b, c), *rest = rhs`) — Prism's
     /// `MultiWriteNode`. `targets` is the `lefts`/`rest`/`rights` triple; `value`
     /// is the lowered right-hand side.
@@ -672,6 +672,13 @@ pub enum Node {
     // TODO(spec): branch-union typing (ADR-0022 flow narrowing).
     If {
         predicate: NodeId,
+        /// The source span of the PRISM predicate node — kept separately
+        /// because single-statement parentheses unwrap during lowering: for
+        /// `if (w = 1)` the lowered `predicate` is the `w = 1` write while
+        /// this span covers `(w = 1)`, the anchor the reference's
+        /// `flow.always-truthy-condition` uses (`from_node(predicate)` on the
+        /// `ParenthesesNode`, rigor-rs#167).
+        predicate_span: Span,
         then_body: Vec<NodeId>,
         else_body: Vec<NodeId>,
         /// `true` iff this came from the `unless` keyword (never for `if` or a
@@ -718,6 +725,22 @@ pub enum Node {
         predicate: Option<NodeId>,
         body: Vec<NodeId>,
         index: Vec<(String, Span)>,
+        /// `true` for a `for` loop — the reference's `eval_for` binds the index
+        /// to the collection's element type and joins the zero-iteration scope
+        /// with the post-body scope, so the index local keeps the JOIN of its
+        /// before/after types (rigor-rs#167). `while` / `until` leave it false:
+        /// their body rebinds still widen.
+        is_for: bool,
+        /// The multi-target index of `for a, b in coll`, when the index is a
+        /// `MultiTargetNode` — decomposed by the same `multi_target_binder` the
+        /// reference's `bind_for_index` delegates to. `None` for a simple local
+        /// index, a non-local index (`for h[:k]`), a bare splat (`for *w`), and
+        /// every `while` / `until`.
+        for_targets: Option<MultiTargets>,
+        /// Expression nodes recovered from a non-local index target
+        /// (`for h[i = 1] in xs` — the `i = 1` and the `h` read evaluate before
+        /// each iteration); empty for local indices and `while` / `until`.
+        index_exprs: Vec<NodeId>,
         span: Span,
     },
     /// `begin`/`rescue`/`else`/`ensure`. The protected body, each rescue body,
@@ -751,6 +774,22 @@ pub enum Node {
         /// `rescue`). Populated only from a real `BeginNode`'s rescue chain; see
         /// [`RescueClause`]. Additive — leaves `body`/`ensure_body` untouched.
         clauses: Vec<RescueClause>,
+        /// The PROTECTED-body statement ids only (the reference's
+        /// `node.statements` in `eval_begin`), and the `else` clause's ids —
+        /// the two split views the join in `rigor-infer`'s check-env binder
+        /// needs: the protected path runs `body → else`, each rescue arm runs
+        /// from the entry scope, and the exit scope is the nil-injected join
+        /// (`eval_begin`, rigor-rs#167). For the reused carriers
+        /// `primary_body` equals `body` and `else_body` is empty.
+        primary_body: Vec<NodeId>,
+        else_body: Vec<NodeId>,
+        /// `true` only for the multi-statement PARENTHESIZED-group carrier
+        /// (`(a; b)`). The reference's `branch_unconditionally_exits?` unwraps
+        /// `Prism::ParenthesesNode` in every caller but never lists
+        /// `Prism::BeginNode`, so `rescue (1; raise)` exits while
+        /// `rescue begin; raise; end` does not — a distinction the shared
+        /// carrier shape would otherwise erase (rigor-rs#167).
+        is_parens: bool,
         span: Span,
     },
     /// A lambda literal (`-> { … }` / `->(x) { … }`). Its `body` statements are
@@ -777,7 +816,20 @@ pub enum Node {
     /// the compound-predicate narrowing (stage 3a-1,
     /// docs/notes/20260807-narrowing-stage3-spec.md) needs the operator because
     /// `&&` and `||` swap which edge concatenates and which joins.
-    Logical { left: NodeId, right: NodeId, is_and: bool, span: Span },
+    Logical {
+        left: NodeId,
+        right: NodeId,
+        is_and: bool,
+        /// `true` when the operator was written inside parentheses —
+        /// `(x && (w = 1))`. The reference's `and_or_right_effects?` is a
+        /// SYNTACTIC `node.is_a?(Prism::AndNode)` test, so a parenthesized
+        /// `&&`/`||` never builds operand edges: `eval_with_edges` falls back
+        /// to `sub_eval` + `Narrowing.predicate_scopes` on the JOINED scope
+        /// (`(x && (w = 1)) || w.frob` reads `"s" | 1`, not the edge-narrowed
+        /// `"s"`, rigor-rs#167 round-5).
+        parenthesized: bool,
+        span: Span,
+    },
     /// An array literal (`[a, b]`). Elements are lowered. Typed `Nominal Array`
     /// so a typo'd method on an array literal flags via the real Array RBS.
     // TODO(spec): Tuple precision (element types) per ADR-0023.
@@ -806,7 +858,11 @@ pub enum Node {
     /// `Dynamic[top]`. Note: an index read `a[i]` is a Prism `CallNode` named
     /// `[]`, so it lowers as a [`Node::Call`] (receiver + index args) and needs
     /// no dedicated variant.
-    Range { span: Span },
+    /// `lo .. hi` / `lo ... hi`. The bounds are linked (not orphans) so a
+    /// `for` collection typed as a literal range can read the element class
+    /// from `lo` (`statement_evaluator.rb` `constant_element_type`,
+    /// rigor-rs#167); the node itself still types `Dynamic[top]`.
+    Range { lo: Option<NodeId>, hi: Option<NodeId>, span: Span },
     /// An instance/class/global variable read (`@x`, `@@x`, `$x`). Typed
     /// `Dynamic[top]` — no ivar/cvar/gvar type tracking in this slice.
     ///
@@ -983,6 +1039,15 @@ pub enum StatementsKind {
     /// an argument position, not a sequence — so the kind reads like
     /// `Recovered` to every binder.
     Jump(JumpKind),
+    /// A `rescue` modifier (`expr rescue arm`). `body` is exactly two children:
+    /// the lowered `expr` first, then the lowered `arm`. The reference's
+    /// `eval_rescue_modifier` evaluates the expr, enters the arm on a
+    /// nil-injected join of the entry and post-expr scopes, and joins the two
+    /// exit scopes — a write in the expr keeps the JOIN of its before/after
+    /// types rather than widening (`(w = 6) rescue nil` leaves `w` as
+    /// `entry | 6`, rigor-rs#167). A carrier of this kind is what the flat-env
+    /// binders join on; the flow passes that cannot join still widen it.
+    Rescue,
 }
 
 /// Which control-flow jump an argument-less [`Node::Other`] or a
@@ -1096,7 +1161,7 @@ impl Node {
             | Node::Logical { span, .. }
             | Node::ArrayLit { span, .. }
             | Node::HashLit { span, .. }
-            | Node::Range { span }
+            | Node::Range { span, .. }
             | Node::VariableRead { span, .. }
             | Node::VariableWrite { span, .. }
             | Node::InstanceVariableWrite { span, .. }
@@ -1194,6 +1259,9 @@ pub struct LoweredAst {
     /// a literal. Sorted for a binary-search read via
     /// [`LoweredAst::paren_unwrapped`].
     paren_unwrapped: Vec<u32>,
+    /// The INDEX-ARGUMENT spans of every `recv[…] ||= v` / `&&= v` / `op= v`
+    /// compound write — see [`LoweredAst::in_index_arg_position`].
+    index_arg_spans: Vec<Span>,
 }
 
 /// One site where a CONSTANT-shaped receiver is mutated — the raw material of
@@ -1289,6 +1357,23 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// Whether `span` lies inside the RECEIVER or an INDEX-ARGUMENT position of
+    /// a `recv[…] ||= v` / `recv[…] &&= v` / `recv[…] op= v` compound write.
+    /// The reference's `eval_index_or_write` / `eval_index_write` sub-evaluates
+    /// only `node.value`, so it does not rebind a local the receiver or index
+    /// expressions write — `h[w = 6] ||= 1` leaves a pre-existing `w = 5`
+    /// alone and the nested `h[a = 3][b = 4] ||= 1` leaves `a` alone too, so a
+    /// write here is dropped from the write collectors entirely (neither binds
+    /// nor widens, rigor-rs#167). The
+    /// reference's quirk is deliberate oracle behaviour, not a bug to
+    /// generalise: a plain `recv[w = 6] = v` (`[]=` call) and a write in the
+    /// VALUE position (`h[:k] ||= (w = 6)`) both bind normally.
+    pub fn in_index_arg_position(&self, span: Span) -> bool {
+        self.index_arg_spans
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
     /// Resolve a handle to its owned node.
     pub fn get(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
@@ -1347,6 +1432,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         source,
         line_starts,
         paren_unwrapped: Vec::new(),
+        index_arg_spans: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -1369,6 +1455,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
     LoweredAst {
+        index_arg_spans: builder.index_arg_spans,
         nodes: builder.nodes,
         root,
         file_key,
@@ -1389,6 +1476,11 @@ struct Builder<'src> {
     /// Arena ids a `(e)` unwrap returned — see
     /// [`LoweredAst::paren_unwrapped`].
     paren_unwrapped: Vec<u32>,
+    /// Byte spans of every INDEX-ARGUMENT position of a `recv[…] ||= v` /
+    /// `recv[…] &&= v` / `recv[…] op= v` compound write — the spans the
+    /// reference's `IndexWriteWidening` never rebinds into the local scope
+    /// (rigor-rs#167). See [`LoweredAst::in_index_arg_position`].
+    index_arg_spans: Vec<Span>,
 }
 
 impl<'src> Builder<'src> {
@@ -1491,9 +1583,11 @@ impl<'src> Builder<'src> {
         // sight of the target read — the one false-positive risk this rule has.
         if let Some(opw) = node.as_local_variable_operator_write_node() {
             let name = constant_string(opw.name().as_slice());
+            let op = constant_string(opw.binary_operator().as_slice());
             let value = self.lower_node(&opw.value());
             return self.push(Node::LocalVariableOpWrite {
                 name,
+                op,
                 value,
                 span: span_of(&opw.location()),
             });
@@ -1503,6 +1597,7 @@ impl<'src> Builder<'src> {
             let value = self.lower_node(&andw.value());
             return self.push(Node::LocalVariableOpWrite {
                 name,
+                op: "&&=".to_string(),
                 value,
                 span: span_of(&andw.location()),
             });
@@ -1512,6 +1607,7 @@ impl<'src> Builder<'src> {
             let value = self.lower_node(&orw.value());
             return self.push(Node::LocalVariableOpWrite {
                 name,
+                op: "||=".to_string(),
                 value,
                 span: span_of(&orw.location()),
             });
@@ -1947,6 +2043,7 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             return self.push(Node::If {
                 predicate,
+                predicate_span: span_of(&if_node.predicate().location()),
                 then_body,
                 else_body,
                 is_unless: false,
@@ -1966,6 +2063,7 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             return self.push(Node::If {
                 predicate,
+                predicate_span: span_of(&unless_node.predicate().location()),
                 then_body,
                 else_body,
                 is_unless: true,
@@ -1981,10 +2079,13 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             let main_body = body.clone();
             return self.push(Node::BeginRescue {
+                primary_body: body.clone(),
+                else_body: Vec::new(),
                 body,
                 main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                is_parens: false,
                 span: span_of(&else_node.location()),
             });
         }
@@ -2058,10 +2159,13 @@ impl<'src> Builder<'src> {
             }
             let main_body = body.clone();
             return self.push(Node::BeginRescue {
+                primary_body: body.clone(),
+                else_body: Vec::new(),
                 body,
                 main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                is_parens: false,
                 span: span_of(&in_node.location()),
             });
         }
@@ -2076,6 +2180,9 @@ impl<'src> Builder<'src> {
                 predicate,
                 body,
                 index: Vec::new(),
+                is_for: false,
+                for_targets: None,
+                index_exprs: Vec::new(),
                 span: span_of(&while_node.location()),
             });
         }
@@ -2090,6 +2197,9 @@ impl<'src> Builder<'src> {
                 predicate,
                 body,
                 index: Vec::new(),
+                is_for: false,
+                for_targets: None,
+                index_exprs: Vec::new(),
                 span: span_of(&until_node.location()),
             });
         }
@@ -2105,16 +2215,29 @@ impl<'src> Builder<'src> {
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
             let index = for_index_names(&for_node.index());
+            // A `for a, b in` multi-target index also carries the binder's
+            // decomposition; a non-local index (`for h[i = 1] in`) contributes
+            // its receiver/index expressions so their reads and writes stay
+            // reachable (and evaluate before the body).
+            let (for_targets, index_exprs) = for_index_structure(&for_node.index());
+            let index_exprs: Vec<NodeId> =
+                index_exprs.iter().map(|c| self.lower_node(c)).collect();
             return self.push(Node::Loop {
                 predicate,
                 body,
                 index,
+                is_for: true,
+                for_targets,
+                index_exprs,
                 span: span_of(&for_node.location()),
             });
         }
 
         if let Some(begin_node) = node.as_begin_node() {
             // `begin`/`rescue`/`else`/`ensure`. Collect every sub-body's calls.
+            // The PROTECTED body is also recorded alone (`primary_body`) so the
+            // check-env binder can join the arm scopes against its post-scope
+            // (`eval_begin`, rigor-rs#167).
             let mut body: Vec<NodeId> = begin_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
@@ -2124,6 +2247,7 @@ impl<'src> Builder<'src> {
             // appended below (the `never_completes_normally?` walk must not
             // count an `else` clause's statements toward the body's).
             let main_body = body.clone();
+            let primary_body = body.clone();
             // Walk the rescue chain (each RescueNode links to the next). Build the
             // per-clause `RescueClause` view ALONGSIDE the flat `body`: every
             // `lower_node`/`lower_body` call happens in the exact same order as
@@ -2157,9 +2281,14 @@ impl<'src> Builder<'src> {
                 });
                 rescue = r.subsequent();
             }
-            if let Some(e) = begin_node.else_clause().and_then(|e| e.statements()) {
-                body.extend(self.lower_body(&e.body()));
-            }
+            let else_body = if let Some(e) = begin_node.else_clause().and_then(|e| e.statements())
+            {
+                let ids = self.lower_body(&e.body());
+                body.extend(ids.iter().copied());
+                ids
+            } else {
+                Vec::new()
+            };
             // Lower the ensure statements ONCE, then record them BOTH in the flat
             // `body` (behavior-preserving for every existing consumer) AND in the
             // dedicated `ensure_body` (the `flow.return-in-ensure` dispatch view).
@@ -2175,6 +2304,9 @@ impl<'src> Builder<'src> {
                 main_body,
                 ensure_body,
                 clauses,
+                primary_body,
+                else_body,
+                is_parens: false,
                 span: span_of(&begin_node.location()),
             });
         }
@@ -2186,6 +2318,7 @@ impl<'src> Builder<'src> {
                 left,
                 right,
                 is_and: true,
+                parenthesized: false,
                 span: span_of(&and_node.location()),
             });
         }
@@ -2197,6 +2330,7 @@ impl<'src> Builder<'src> {
                 left,
                 right,
                 is_and: false,
+                parenthesized: false,
                 span: span_of(&or_node.location()),
             });
         }
@@ -2235,14 +2369,14 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(range) = node.as_range_node() {
-            // Lower both bounds for reachability; the node itself types Dynamic.
-            if let Some(l) = range.left() {
-                self.lower_node(&l);
-            }
-            if let Some(r) = range.right() {
-                self.lower_node(&r);
-            }
+            // Lower both bounds AND keep the links: the node still types
+            // `Dynamic[top]`, but a `for` over a literal range reads its element
+            // class off `lo` (rigor-rs#167).
+            let lo = range.left().map(|l| self.lower_node(&l));
+            let hi = range.right().map(|r| self.lower_node(&r));
             return self.push(Node::Range {
+                lo,
+                hi,
                 span: span_of(&range.location()),
             });
         }
@@ -2288,14 +2422,28 @@ impl<'src> Builder<'src> {
                 // reference's syntax-level reading, so the `nil&.m` literal
                 // fold must not see through the parens.
                 self.paren_unwrapped.push(only.0);
+                // …except a single `&&`/`||`: the reference keys operand-edge
+                // building on `node.is_a?(Prism::AndNode | OrNode)`, which a
+                // `ParenthesesNode` never satisfies, so `(a && b)` takes the
+                // joined-scope narrowing path a bare `a && b` does not. Keep
+                // the syntactic distinction on the node itself
+                // (rigor-rs#167 round-5).
+                if let Node::Logical { parenthesized, .. } =
+                    &mut self.nodes[only.0 as usize]
+                {
+                    *parenthesized = true;
+                }
                 return only;
             }
             let main_body = body.clone();
             return self.push(Node::BeginRescue {
+                primary_body: body.clone(),
+                else_body: Vec::new(),
                 body,
                 main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                is_parens: true,
                 span: span_of(&parens.location()),
             });
         }
@@ -2531,6 +2679,88 @@ impl<'src> Builder<'src> {
                 body: Vec::new(),
                 span,
                 kind: StatementsKind::Jump(JumpKind::Retry),
+            });
+        }
+        // `retry` carries no value and lives only inside a `rescue` clause: tag
+        // it as a jump so the binders' terminating-branch filter can exclude
+        // the arm — the reference reaches the same verdict through the
+        // `bot`-typed `RetryNode` half of `branch_terminates?` (rigor-rs#167).
+        if node.as_retry_node().is_some() {
+            return self.push(Node::Other { span, jump: Some(JumpKind::Retry) });
+        }
+
+        // `expr rescue arm` — a `Rescue` carrier with exactly two children:
+        // the lowered `expr` and the lowered `arm`. The reference's
+        // `eval_rescue_modifier` joins the entry scope with the post-expr scope
+        // (nil-injected) to enter the arm, then joins the two exit scopes, so
+        // the flat-env binders keep a union of the before/after types instead
+        // of widening (rigor-rs#167). Keeping the expr as ONE lowered node
+        // preserves its own structure — a parenthesised statement sequence or
+        // a nested rescue modifier lands as the child it lowers to.
+        if let Some(rm) = node.as_rescue_modifier_node() {
+            let expr = self.lower_node(&rm.expression());
+            let arm = self.lower_node(&rm.rescue_expression());
+            return self.push(Node::Statements {
+                body: vec![expr, arm],
+                span,
+                kind: StatementsKind::Rescue,
+            });
+        }
+
+        // `recv[…] ||= v` / `recv[…] &&= v` / `recv[…] op= v` — the index
+        // compound-write family. Three different evaluation shapes hide behind
+        // one recovered carrier (rigor-rs#167):
+        //
+        //  - RECEIVER + INDEX-ARGUMENT children stay flat in the carrier. The
+        //    reference's `eval_index_or_write` / `eval_index_write` runs
+        //    `IndexWriteWidening` and sub-evaluates only `node.value`, so it
+        //    does NOT rebind a local the receiver or index expressions write
+        //    (`h[w = 6] ||= 1` leaves a pre-existing `w = 5` alone — and the
+        //    nested `h[a = 3][b = 4] ||= 1` leaves `a` alone too: the write is
+        //    dropped, not widened and not bound). Their spans go to
+        //    `index_arg_spans` so the write collectors drop them entirely.
+        //  - VALUE children (`h[:k] ||= (w = 6)`) run unconditionally, so they
+        //    are wrapped in a `Sequence` carrier — the binders descend it like
+        //    an ordinary statement sequence (`for [6]`).
+        //
+        // A plain `recv[…] = v` is a `CallNode` (`[]=`) and never reaches here:
+        // its index arguments evaluate unconditionally and bind normally.
+        if let Some(index_write) = index_write_parts(node) {
+            let mut body: Vec<NodeId> = Vec::new();
+            // The reference only ever `sub_eval`s `node.value` — writes in the
+            // RECEIVER subtree drop exactly like index-argument writes
+            // (`h[a = 3][b = 4] ||= 1` leaves `a` at its pre-state too), so the
+            // whole receiver span joins `index_arg_spans`.
+            self.index_arg_spans.push(span_of(&index_write.receiver.location()));
+            let side = collect_recoverable_children(&index_write.receiver);
+            for c in &side {
+                body.push(self.lower_node(c));
+            }
+            for arg in &index_write.args {
+                self.index_arg_spans.push(span_of(&arg.location()));
+                let recovered = collect_recoverable_children(arg);
+                for c in &recovered {
+                    body.push(self.lower_node(c));
+                }
+            }
+            let value_children = collect_recoverable_children(&index_write.value);
+            if !value_children.is_empty() {
+                let value_span = span_of(&index_write.value.location());
+                let ids: Vec<NodeId> = value_children
+                    .iter()
+                    .map(|c| self.lower_node(c))
+                    .collect();
+                let seq = self.push(Node::Statements {
+                    body: ids,
+                    span: value_span,
+                    kind: StatementsKind::Sequence,
+                });
+                body.push(seq);
+            }
+            return self.push(Node::Statements {
+                body,
+                span,
+                kind: StatementsKind::Recovered,
             });
         }
 
@@ -3625,6 +3855,67 @@ fn for_index_names(index: &PrismNode<'_>) -> Vec<(String, Span)> {
     Vec::new()
 }
 
+/// The `for` index as the binders need it: a `MultiTargetNode` lowers to the
+/// same [`MultiTargets`] a multi-assign carries (so `for a, b in` decomposes
+/// the element exactly like `a, b = elem`), and every NON-local index shape
+/// (`for h[i = 1] in`, `for *h[:a] in`, `for a.b in`) contributes its
+/// recoverable expressions — the receiver read and any index writes evaluate
+/// before each iteration (`statement_evaluator.rb` `bind_for_index`'s
+/// `widen_index_target`), so they must stay reachable.
+fn for_index_structure<'pr>(
+    index: &PrismNode<'pr>,
+) -> (Option<MultiTargets>, Vec<PrismNode<'pr>>) {
+    let mut recovered = Vec::new();
+    if let Some(t) = index.as_multi_target_node() {
+        let targets = lower_multi_targets(
+            &t.lefts(),
+            t.rest().as_ref(),
+            &t.rights(),
+            span_of(&t.location()),
+            &mut recovered,
+        );
+        return (Some(targets), recovered);
+    }
+    if index.as_local_variable_target_node().is_none() {
+        recovered.extend(collect_recoverable_children(index));
+    }
+    (None, recovered)
+}
+
+/// The operand triple of an index compound-write node — `recv[…] ||= v`,
+/// `recv[…] &&= v`, `recv[…] op= v` — factored across the three Prism types
+/// that share the shape.
+struct IndexWriteParts<'pr> {
+    receiver: PrismNode<'pr>,
+    args: Vec<PrismNode<'pr>>,
+    value: PrismNode<'pr>,
+}
+
+fn index_write_parts<'pr>(node: &PrismNode<'pr>) -> Option<IndexWriteParts<'pr>> {
+    macro_rules! parts {
+        ($w:expr) => {
+            IndexWriteParts {
+                receiver: $w.receiver()?,
+                args: $w
+                    .arguments()
+                    .map(|a| a.arguments().iter().collect())
+                    .unwrap_or_default(),
+                value: $w.value(),
+            }
+        };
+    }
+    if let Some(w) = node.as_index_or_write_node() {
+        return Some(parts!(w));
+    }
+    if let Some(w) = node.as_index_and_write_node() {
+        return Some(parts!(w));
+    }
+    if let Some(w) = node.as_index_operator_write_node() {
+        return Some(parts!(w));
+    }
+    None
+}
+
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
 /// node — a local read / write / operator-write / call — WITHOUT descending past
 /// one (so [`Builder::lower_node`] recurses into it once, normally). Used by the
@@ -3740,6 +4031,46 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
         }
         fn visit_retry_node(&mut self, node: &ruby_prism::RetryNode<'pr>) {
             self.out.push(node.as_node());
+        }
+        // A `rescue` modifier or index compound-write buried under an unhandled
+        // wrapper (`foo((w = 1) rescue nil)`) is recovered WHOLE too: its own
+        // lowering marks the carrier (`Rescue` / the index-write `Recovered`
+        // split), which the binders read to join rather than widen. Under a
+        // `defined?` operand the suppression contract wins instead — keep the
+        // default recursion so the operand's calls stay unreachable.
+        fn visit_rescue_modifier_node(
+            &mut self,
+            node: &ruby_prism::RescueModifierNode<'pr>,
+        ) {
+            if self.suppress_calls {
+                ruby_prism::visit_rescue_modifier_node(self, node);
+            } else {
+                self.out.push(node.as_node());
+            }
+        }
+        fn visit_index_or_write_node(&mut self, node: &ruby_prism::IndexOrWriteNode<'pr>) {
+            if self.suppress_calls {
+                ruby_prism::visit_index_or_write_node(self, node);
+            } else {
+                self.out.push(node.as_node());
+            }
+        }
+        fn visit_index_and_write_node(&mut self, node: &ruby_prism::IndexAndWriteNode<'pr>) {
+            if self.suppress_calls {
+                ruby_prism::visit_index_and_write_node(self, node);
+            } else {
+                self.out.push(node.as_node());
+            }
+        }
+        fn visit_index_operator_write_node(
+            &mut self,
+            node: &ruby_prism::IndexOperatorWriteNode<'pr>,
+        ) {
+            if self.suppress_calls {
+                ruby_prism::visit_index_operator_write_node(self, node);
+            } else {
+                self.out.push(node.as_node());
+            }
         }
     }
     let mut out = Vec::new();
@@ -4013,7 +4344,9 @@ mod tests {
         assert_eq!(kinds(b"BEGIN { w = 1 }\n"), [Inert]);
         assert_eq!(kinds(b"super(w = 1)\n"), [Inert]);
         assert_eq!(kinds(b"def m\n  yield(w = 1)\nend\n"), [Inert]);
-        assert_eq!(kinds(b"(w = 1) rescue nil\n"), [Recovered]);
+        // The rescue modifier gets its own carrier kind (rigor-rs#167): its
+        // two arms join under nil-injected scope rules rather than widening.
+        assert_eq!(kinds(b"(w = 1) rescue nil\n"), [Rescue]);
         assert_eq!(kinds(b"\"#{w = 1}\"\n"), [Sequence]);
         let ast = lower(&crate::parse(b"x = 1\ndefined?(w = 1)\n"));
         let writes: Vec<(Span, bool)> = ast
