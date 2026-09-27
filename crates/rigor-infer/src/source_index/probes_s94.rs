@@ -1,5 +1,6 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, LoweredAst};
+use rigor_index::CoreIndex;
 
 /// The `CoreIndex` is passed in, never built per project: it is the most
 /// expensive thing in this module by an order of magnitude (RBS load), and

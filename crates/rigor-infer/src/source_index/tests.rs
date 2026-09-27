@@ -1,6 +1,7 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, LoweredAst};
 use rigor_types::Interner;
+use rigor_index::CoreIndex;
 
 fn lower_src(src: &[u8]) -> LoweredAst {
     lower(&parse(src))
