@@ -54,7 +54,9 @@ script also warns about constructs whose meaning moves with the file:
    no banner belonging to a neighbour moved. Methods moved out of an impl get
    a wrapper that copies the impl's header and outer attributes (so a
    `#[cfg(test)] impl` stays test-only); an impl that opens and closes on
-   one line, or has text after its `{`, must move whole (`impl:TYPE`).
+   one line, or has text after its `{`, must move whole (`impl:TYPE`), and so
+   must one whose every item is selected (moving them one by one would leave
+   an empty `impl X {}` that no gate flags).
 2. `split_mod.py FILE MOD sel.txt doc.txt` writes the new module and wires
    `mod MOD;` / `pub(crate) use MOD::*;` / `pub use` (for moved `pub` items)
    into FILE.
@@ -63,8 +65,11 @@ script also warns about constructs whose meaning moves with the file:
    - A name the module cannot resolve is imported from `crate::` (or from
      `super::` below a non-root file).
    - Anything rustc reports as private gets `pub(crate)`: an item, a method,
-     a named or tuple field, a type used across the boundary, or a type in
-     a `private_interfaces` warning.
+     a named or tuple field (grouped E0451 included), a type used across the
+     boundary, or a type in a `private_interfaces` warning — in the new
+     module, or in the parent when a moved signature names a type that stayed
+     behind (clippy's `-D warnings` fails on that warning where `cargo check`
+     passes).
    - Unused imports in the module are dropped.
    - A parent import is dropped only when every target reports it unused.
      This includes the `MOD::*` glob. An import unused only outside the test

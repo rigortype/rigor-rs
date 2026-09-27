@@ -11,6 +11,8 @@ Loops `cargo check -p CRATE --all-targets` and, until nothing changes:
   * an item, method, field or type of MODFILE that rustc calls private
     anywhere, or that another file can no longer resolve  -> `pub(crate)`
     on its definition in MODFILE
+  * a type a `private_interfaces` warning names (a moved signature that
+    mentions it)  -> `pub(crate)` on it, in MODFILE or in the parent
 
 It never picks a visibility by hand: every `pub(crate)` it adds answers an
 error. With --prune it then removes the imports rustc reports unused, in
@@ -63,9 +65,16 @@ def defined(modfile):
     return out
 
 
-def make_pub(modfile, name):
+TYPE_KINDS = ("struct", "enum", "union", "type", "trait")
+
+
+def make_pub(modfile, name, top_level_kinds=None):
+    """`pub(crate)` on the first private definition of `name` in `modfile`;
+    with `top_level_kinds`, only a top-level item of one of those kinds."""
     L = read_lines(modfile)
     for r in defined(modfile).get(name, []):
+        if top_level_kinds and (r.depth != 0 or r.kind not in top_level_kinds):
+            continue
         if r.vis != "-":
             continue
         kw = KEYWORD[r.kind]
@@ -191,16 +200,26 @@ def errors(crate):
     return [m for m in splitlib.cargo_messages(crate) if m["level"] == "error"]
 
 
-def fix(crate, modfile, prefix):
+def fix(crate, modfile, prefix, parent):
     for _ in range(30):
         edits, want = 0, set()
         names = defined(modfile)
         for m in splitlib.cargo_messages(crate):
             if m["level"] == "warning" and splitlib.code(m) == "private_interfaces":
-                # `pub(crate) fn f() -> T` with T private to MODFILE
+                # `pub(crate) fn f() -> T` with T private to MODFILE, or to
+                # the PARENT (a moved fn whose signature names a type that
+                # stayed behind): either way T needs `pub(crate)`, or
+                # clippy's `-D warnings` fails where `cargo check` passes.
+                # rustc names the type with generics and/or a path
+                # (`FoldSite<'_>`, `outer::Entry`): match on the bare name,
+                # and only against top-level TYPE-namespace items, so a
+                # same-named fn, const or trait-impl assoc type is never hit.
                 ns = splitlib.backticked(m["message"])
-                if ns and ns[0] in names:
-                    edits += make_pub(modfile, ns[0])
+                t = re.sub(r"<.*", "", ns[0]).split("::")[-1] if ns else None
+                if t and make_pub(modfile, t, TYPE_KINDS):
+                    edits += 1
+                elif t and make_pub(parent, t, TYPE_KINDS):
+                    edits += 1
                 continue
             if m["level"] != "error":
                 continue
@@ -278,7 +297,7 @@ def main():
     prefix = "crate" if os.path.basename(parent) in ("lib.rs", "main.rs") else "super"
     modname = os.path.basename(modfile)[:-3]
 
-    fix(a.crate, modfile, prefix)
+    fix(a.crate, modfile, prefix, parent)
     if a.prune and not errors(a.crate):
         prune(a.crate, modfile, parent, modname)
     msgs = splitlib.cargo_messages(a.crate)
