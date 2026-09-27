@@ -36,6 +36,10 @@
 //! chain is INCOMPLETE ⇒ assume present ⇒ stay silent. This is what keeps real
 //! Rails models false-positive-free. For an RBS-only instance class (e.g.
 //! `Pathname`) existence defers entirely to RBS's own conservative gate.
+//!
+//! [`ClassId`]: rigor_types::ClassId
+//! [`Node::ClassDef`]: rigor_parse::Node::ClassDef
+//! [`Node::ModuleDef`]: rigor_parse::Node::ModuleDef
 
 use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -51,6 +55,8 @@ use rigor_types::{ClassId, Interner, Scalar, ShapeKey};
 /// exactly the carriers the Typer builds for the same inline literal so the
 /// resulting diagnostic renders identically — a scalar → `Constant`, an array →
 /// `Tuple`, a static-keyed hash → `HashShape`, a range → `Nominal[Range]`.
+///
+/// [`Interner`]: rigor_types::Interner
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConstLit {
     /// A value-pinned scalar (`42`, `"hi"`, `:sym`, `1.5`, `true`, `nil`).
@@ -111,6 +117,8 @@ pub enum ConstLit {
 /// the fixed core-class id space (`CORE_CLASSES`, currently 9 entries) so a
 /// registered instance's nominal id can never be mistaken for a core class by
 /// `CoreIndex::class_name_for_id`. A million-id gap is ample headroom.
+///
+/// [`ClassId`]: rigor_types::ClassId
 pub const SOURCE_CLASS_BASE: u32 = 1_000_000;
 
 /// ADR-35 slice 1: the visited-node cap on the override-visibility ancestor
@@ -285,6 +293,8 @@ type AncestorClosures = HashMap<String, HashSet<String>>;
 /// `ast.iter()` order. Replayed through [`SourceIndex::add_source`] at merge, so
 /// the slice order IS the first-`Some`-wins superclass order and the registration
 /// (⇒ [`ClassId`]) order.
+///
+/// [`ClassId`]: rigor_types::ClassId
 struct HarvestedClass {
     name: String,
     superclass: Option<String>,
@@ -389,6 +399,8 @@ pub struct FileDefs {
 /// Nothing derived from OTHER files is in here — the literal-constant gates, the
 /// declaration-only set, the tier-4b returns, the definers inversion and the
 /// interprocedural fold are all computed by the merge.
+///
+/// [`CoreIndex`]: rigor_index::CoreIndex
 #[derive(Default)]
 pub struct Harvest {
     // --- pure unions (order-free) ------------------------------------------
@@ -446,6 +458,8 @@ pub struct SourceIndex {
     /// Dense list of registered class names in id order; the slice index +
     /// [`SOURCE_CLASS_BASE`] IS the class's [`ClassId`] (reversible). Holds both
     /// source classes and registered RBS-only instance classes.
+    ///
+    /// [`ClassId`]: rigor_types::ClassId
     names: Vec<String>,
     /// Fast name -> registry position lookup.
     name_to_id: HashMap<String, u32>,
@@ -463,6 +477,8 @@ pub struct SourceIndex {
     /// Keyed by NAME (cross-file safe); the value is a core class NAME re-interned
     /// at the call site via [`CoreIndex::class_id`]. A method that fails ANY gate
     /// has NO entry ⇒ the call types Dynamic (silent).
+    ///
+    /// [`CoreIndex::class_id`]: rigor_index::CoreIndex::class_id
     method_returns: HashMap<(String, String), String>,
     /// ADR-0023 tier-4b call-site PARAMETER BINDING: `(class NAME, method NAME)
     /// -> ParamBoundReturn`. This is the param-DEPENDENT companion to
