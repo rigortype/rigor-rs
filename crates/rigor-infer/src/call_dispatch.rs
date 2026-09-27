@@ -9,6 +9,20 @@ use rigor_types::{Interner, Type, TypeId};
 use crate::{folding, ParamBoundReturn, TypeEnv, Typer};
 
 impl<'i> Typer<'i> {
+    /// Type a method call with a receiver, running the conservative head of the
+    /// dispatch cascade (ADR-0023):
+    ///
+    /// 1. **Constant folding** (ADR-0008 Rust core): if the receiver types to a
+    ///    value-pinned `Constant(scalar)` and [`folding::fold`] yields a result,
+    ///    return that pinned `Constant`.
+    /// 2. **RBS-ish return resolution**: else resolve the receiver's class via
+    ///    the index and look up [`rigor_index::method_return`]; intern the
+    ///    result as a `Nominal { class }` so the *next* call in a chain can be
+    ///    typed (and a typo on it flagged).
+    /// 3. **Fallback**: otherwise `Dynamic[top]` — silence over a guess.
+    ///
+    // TODO(spec): tier-2 shape dispatch, tier-4 in-source bodies, argument
+    // contracts, the Ruby sidecar for non-Rust-foldable calls (ADR-0008/0023).
     pub(crate) fn type_call(
         &self,
         ast: &LoweredAst,

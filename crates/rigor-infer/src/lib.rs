@@ -6,9 +6,10 @@
 //!
 //! ## Module map
 //!
-//! [`Typer`] is one struct whose `impl` is split by pass: each module below
-//! adds its own `impl<'i> Typer<'i>` block, so a change to one pass stays in
-//! one file. Cross-module calls are `pub(crate)`; `lib.rs` itself holds only
+//! [`Typer`] is one struct whose `impl` is split by pass: every module below
+//! except `flow_writes` (free functions) adds its own `impl<'i> Typer<'i>`
+//! block, so a change to one pass stays in one file. A method called from
+//! another module is at least `pub(crate)`; `lib.rs` itself holds only
 //! declarations, re-exports, [`TypeEnv`] and the free shims.
 //!
 //! | module | holds |
@@ -71,7 +72,8 @@ pub use source_index::{
 pub use typer::Typer;
 
 // Crate-internal names the sibling modules and `source_index.rs` reach as
-// `crate::NAME` (e.g. `crate::MUTATOR_METHODS`, `crate::shape_key_to_scalar`).
+// `crate::NAME` (e.g. `crate::MUTATOR_METHODS`, `crate::shape_key_to_scalar`),
+// and the test modules through `use super::*`.
 pub(crate) use expr_type::*;
 pub(crate) use flow_writes::*;
 

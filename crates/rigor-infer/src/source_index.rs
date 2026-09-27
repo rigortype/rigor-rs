@@ -248,7 +248,6 @@ struct OverrideClass {
     is_module: bool,
 }
 
-/// The per-run source-class index + instance-class registry. Built once per file.
 /// One harvested constant value: `(defining namespace segments, the
 /// [`FileKey`] of the ASSIGNING file, the value)`. The file key is slice A's
 /// per-file consumption gate; see [`SourceIndex::literal_constant`].
@@ -343,6 +342,24 @@ struct HarvestedFoldDef {
     has_explicit_return: bool,
 }
 
+/// One file's slice of the def-attribution tables — the reference's per-file
+/// `file_methods` overlay plus the `Object`-owner names a bare call resolves.
+/// [`SourceIndex`] keeps these index-aligned with the merge's `files` order
+/// and the rules pass the analyzed file's position in.
+#[derive(Clone, Debug, Default)]
+pub struct FileDefs {
+    /// Instance-kind method names this file's own defs and macros bind on
+    /// `Object` — the per-file half of `call.unresolved-toplevel`'s
+    /// `Object`-reopen suppression. (`source_declared_method?` reads
+    /// `Object` through the per-file overlay too, so `Object.class_eval
+    /// { def m }` resolves `m` ONLY in the file that declares it.)
+    pub toplevel: HashSet<String>,
+    /// Qualified owner -> instance-kind method names this file declares
+    /// (defs AND call-introduced) — the reference's per-file
+    /// `file_methods` deep-merged over the def-stripped cross-file seed.
+    pub methods: HashMap<String, HashSet<String>>,
+}
+
 /// **Issue #92** — ONE FILE's contribution to a project [`SourceIndex`], computed
 /// from that file's AST and the FROZEN [`CoreIndex`] alone. A harvest never reads
 /// another file's state, so [`SourceIndex::harvest`] is embarrassingly parallel
@@ -372,24 +389,6 @@ struct HarvestedFoldDef {
 /// Nothing derived from OTHER files is in here — the literal-constant gates, the
 /// declaration-only set, the tier-4b returns, the definers inversion and the
 /// interprocedural fold are all computed by the merge.
-/// One file's slice of the def-attribution tables — the reference's per-file
-/// `file_methods` overlay plus the `Object`-owner names a bare call resolves.
-/// [`SourceIndex`] keeps these index-aligned with the merge's `files` order
-/// and the rules pass the analyzed file's position in.
-#[derive(Clone, Debug, Default)]
-pub struct FileDefs {
-    /// Instance-kind method names this file's own defs and macros bind on
-    /// `Object` — the per-file half of `call.unresolved-toplevel`'s
-    /// `Object`-reopen suppression. (`source_declared_method?` reads
-    /// `Object` through the per-file overlay too, so `Object.class_eval
-    /// { def m }` resolves `m` ONLY in the file that declares it.)
-    pub toplevel: HashSet<String>,
-    /// Qualified owner -> instance-kind method names this file declares
-    /// (defs AND call-introduced) — the reference's per-file
-    /// `file_methods` deep-merged over the def-stripped cross-file seed.
-    pub methods: HashMap<String, HashSet<String>>,
-}
-
 #[derive(Default)]
 pub struct Harvest {
     // --- pure unions (order-free) ------------------------------------------
@@ -439,6 +438,7 @@ pub struct Harvest {
     fold_defs: Vec<HarvestedFoldDef>,
 }
 
+/// The per-run source-class index + instance-class registry. Built once per file.
 #[derive(Default)]
 pub struct SourceIndex {
     /// `class name -> source structure` (only for in-source class/module defs).

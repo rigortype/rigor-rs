@@ -25,9 +25,6 @@ const EXACTLY_ONCE_BLOCK_CALLS: &[&str] = &["tap", "then", "yield_self"];
 /// its declared `bot` notwithstanding, a `StopIteration` ends it normally.
 const NON_RETURNING_KERNEL_CALLS: &[&str] = &["raise", "fail", "throw", "exit", "exit!", "abort"];
 
-/// A block-level jump the [`Typer::block_level_jumps`] scan collected: its
-/// span, its control-flow kind, and the lowered VALUE expressions of a valued
-/// `break e` / `next e` (empty for the argument-less forms).
 /// One union member's auto-splat arm — the `arm_of` half of the reference's
 /// `BlockAutoSplat` (rigor-rs#140).
 enum SplatArm {
@@ -48,6 +45,9 @@ enum SplatArm {
     Unknown,
 }
 
+/// A block-level jump the [`Typer::block_level_jumps`] scan collected: its
+/// span, its control-flow kind, and the lowered VALUE expressions of a valued
+/// `break e` / `next e` (empty for the argument-less forms).
 struct BlockJump {
     span: rigor_parse::Span,
     kind: JumpKind,
@@ -879,49 +879,6 @@ impl<'i> Typer<'i> {
         }
     }
 
-    /// The env a statement at `offset` inside the block actually runs under:
-    /// the caller's `env` overlaid with the block's own top-level
-    /// `LocalVariableWrite`s that precede it — `y = "s"; break y` contributes
-    /// `"s"`, matching the reference's "typed in the scope that actually
-    /// reaches it". A write the flat overlay can't see (inside an `if`, a
-    /// `begin`, a nested carrier) leaves the read to the outer env — the same
-    /// Dynamic a miss yields everywhere else, never a wrong type.
-    ///
-    /// Every block parameter name is REMOVED first: `|v|` redeclares `v`
-    /// inside the block, so an outer local by the same name must not leak
-    /// into arm typing — `v = "s"; [1].tap { |v| break v }` contributes the
-    /// receiver type, not `"s"` (the reference's `BlockParameterBinder` opens
-    /// a fresh scope for the parameter list). The params `tap`/`then`/
-    /// `yield_self` feed — a `yield self` — are then bound: the first
-    /// positional (`|v|`, `|v = 1|`, `it`, `_1`) gets the receiver's
-    /// SELF-TYPE ([`Self::block_self_type`] — a nominal of its class, never
-    /// the value-pinned carrier) and `*rest` binds `Array`. Destructured `|(v, w)|` names stay unbound:
-    /// the reference's `MultiTargetBinder`
-    /// DOES project a Tuple receiver element-wise, but every destructure slot
-    /// bound from a nominal `Array[T]` — the shape a `tap` receiver actually
-    /// reaches the binder as — is reported OPTIMISTIC (issue #1093's
-    /// short-array pad), and an optimistic slot declines diagnostics wherever
-    /// it flows. Unbound ⇒ `Dynamic[top]` reproduces the observable
-    /// diagnostics exactly: probe `[1, 2].tap { |(f, w)| break f }; x.upcase`
-    /// is silent in the reference while a concrete `1` binding would fire.
-    /// `**kw` binds `Hash` and `&blk` binds `Proc` — the reference's nominal
-    /// answers for both. Plain keywords and `|;local|` declarations stay
-    /// unbound — the reference leaves them `Dynamic[top]` too (a `|;local|`
-    /// is bound nowhere, not even to `nil`).
-    ///
-    /// ## Auto-splat (`BlockAutoSplat`, upstream #1116/#1093)
-    ///
-    /// When the parameter list is one CRuby spreads a lone array argument
-    /// across (`ParameterShape.splats?` — a required/post positional, or two
-    /// optionals, except a bare `|a|`) AND the receiver carries an array
-    /// member, the positions bind from [`Self::block_splat_table`] instead:
-    /// `[1, 2].tap { |v, w| break v }` reads `v` as the array's element type
-    /// (`1 | 2`), not the whole `[1, 2]`. The element type the port binds is
-    /// the JOIN of a Tuple's members — the reference reaches the same shape
-    /// because its array literal is `Array[1 | 2]`, whose slots all take the
-    /// `1 | 2` element. Optimistic-slot bookkeeping does not port: the
-    /// observable answer it produces — `x = 1 | 2` declining the union rule
-    /// as a same-class join — the port's own union check already makes.
     /// The `self` a `tap` / `then` / `yield_self` block's first positional
     /// binds — the reference's `extract_block_param_types` self slot
     /// (`rbs_dispatch.rb:1617`): `Nominal[class_name]`, upgraded to
@@ -1085,6 +1042,49 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// The env a statement at `offset` inside the block actually runs under:
+    /// the caller's `env` overlaid with the block's own top-level
+    /// `LocalVariableWrite`s that precede it — `y = "s"; break y` contributes
+    /// `"s"`, matching the reference's "typed in the scope that actually
+    /// reaches it". A write the flat overlay can't see (inside an `if`, a
+    /// `begin`, a nested carrier) leaves the read to the outer env — the same
+    /// Dynamic a miss yields everywhere else, never a wrong type.
+    ///
+    /// Every block parameter name is REMOVED first: `|v|` redeclares `v`
+    /// inside the block, so an outer local by the same name must not leak
+    /// into arm typing — `v = "s"; [1].tap { |v| break v }` contributes the
+    /// receiver type, not `"s"` (the reference's `BlockParameterBinder` opens
+    /// a fresh scope for the parameter list). The params `tap`/`then`/
+    /// `yield_self` feed — a `yield self` — are then bound: the first
+    /// positional (`|v|`, `|v = 1|`, `it`, `_1`) gets the receiver's
+    /// SELF-TYPE ([`Self::block_self_type`] — a nominal of its class, never
+    /// the value-pinned carrier) and `*rest` binds `Array`. Destructured `|(v, w)|` names stay unbound:
+    /// the reference's `MultiTargetBinder`
+    /// DOES project a Tuple receiver element-wise, but every destructure slot
+    /// bound from a nominal `Array[T]` — the shape a `tap` receiver actually
+    /// reaches the binder as — is reported OPTIMISTIC (issue #1093's
+    /// short-array pad), and an optimistic slot declines diagnostics wherever
+    /// it flows. Unbound ⇒ `Dynamic[top]` reproduces the observable
+    /// diagnostics exactly: probe `[1, 2].tap { |(f, w)| break f }; x.upcase`
+    /// is silent in the reference while a concrete `1` binding would fire.
+    /// `**kw` binds `Hash` and `&blk` binds `Proc` — the reference's nominal
+    /// answers for both. Plain keywords and `|;local|` declarations stay
+    /// unbound — the reference leaves them `Dynamic[top]` too (a `|;local|`
+    /// is bound nowhere, not even to `nil`).
+    ///
+    /// ## Auto-splat (`BlockAutoSplat`, upstream #1116/#1093)
+    ///
+    /// When the parameter list is one CRuby spreads a lone array argument
+    /// across (`ParameterShape.splats?` — a required/post positional, or two
+    /// optionals, except a bare `|a|`) AND the receiver carries an array
+    /// member, the positions bind from [`Self::block_splat_table`] instead:
+    /// `[1, 2].tap { |v, w| break v }` reads `v` as the array's element type
+    /// (`1 | 2`), not the whole `[1, 2]`. The element type the port binds is
+    /// the JOIN of a Tuple's members — the reference reaches the same shape
+    /// because its array literal is `Array[1 | 2]`, whose slots all take the
+    /// `1 | 2` element. Optimistic-slot bookkeeping does not port: the
+    /// observable answer it produces — `x = 1 | 2` declining the union rule
+    /// as a same-class join — the port's own union check already makes.
     #[allow(clippy::too_many_arguments)]
     fn block_entry_env(
         &self,
