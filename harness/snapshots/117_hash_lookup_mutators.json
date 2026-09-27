@@ -387,6 +387,132 @@
       "message": "undefined method `+' for nil"
     },
     {
+      "rule": "call.undefined-method",
+      "line": 409,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 410,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 413,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `foo' for 0"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 414,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 415,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 419,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 420,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 424,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 425,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 429,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for 0"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 431,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 435,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 444,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for { b: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 449,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 458,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 470,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 489,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 493,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
       "rule": "flow.always-truthy-condition",
       "line": 139,
       "column": 4,
@@ -413,6 +539,13 @@
       "column": 4,
       "severity": "warning",
       "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 464,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
     }
   ]
 }

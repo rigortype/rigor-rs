@@ -398,3 +398,105 @@ cmph = { a: 1 }
 cmph.default ||= (cmpg.default = 0)
 cmpg[:b] + 1
 cmph[:b] + 1
+
+# (34) an attribute compound write in a `type_of` position never dispatches
+# its writer — a call argument, a receiver operand, an interpolation part, a
+# container element and a `return` operand are all typed scope-purely, so the
+# shape stays CLOSED and the literal read still folds `nil`; the same write
+# as a write's RHS (or a bare statement / predicate) still opens it.
+posarg = { a: 1 }
+p(posarg.default ||= 0)
+posarg[:b] + 1
+posarg.foo
+
+posrecv = { a: 1 }
+(posrecv.default ||= 0).foo
+posrecv[:b] + 1
+posrecv.foo
+
+posstr = { a: 1 }
+"a#{posstr.default ||= 0}b"
+posstr[:b] + 1
+posstr.foo
+
+posary = { a: 1 }
+_posary = [posary.default ||= 0]
+posary[:b] + 1
+posary.foo
+
+poswrhs = { a: 1 }
+boundw = (poswrhs.default ||= 0)
+boundw.foo
+poswrhs[:b] + 1
+poswrhs.foo
+
+posret = { a: 1 }
+return (posret.default ||= 0)
+posret[:b] + 1
+
+# (35) a destructure's call-target writers dispatch AFTER the local binds —
+# `bound.apply_to` before `widen_attribute_targets` — so `mwbind`'s
+# `default=` opens the JUST-BOUND `{ b: 1 }`, and nested / splat targets
+# dispatch too.
+mwbind = { a: 1 }
+mwbind.default, mwbind = 0, { b: 1 }
+mwbind[:b] + 1
+mwbind.foo
+
+mwnest = { a: 1 }
+_m1, (_m2, mwnest.default) = 1, [2, 0]
+mwnest[:b] + 1
+mwnest.foo
+
+# (36) a conditional-position mutation still JOINS — a read after it reads
+# the widened carrier, a read before it keeps the closed shape.
+cflag = ARGV[0]
+condord = { a: 1 }
+_condord = [cflag ? (condord.default = 0) : nil, condord[:b] + 1]
+
+condpre = { a: 1 }
+_condpre = [condpre[:b] + 1, (cflag ? condpre.default = 0 : nil)]
+
+# (37) an `if` arm reads the post-predicate env — the predicate's own
+# mutation already dispatched — and statements inside an arm see the arm's
+# own sequential env (a read BEFORE the arm's mutation still folds).
+predr = { a: 1 }
+if predr.default ||= 0
+  predr[:b] + 1
+end
+
+armr = { a: 1 }
+if cflag
+  armr[:b] + 1
+  armr.default = 0
+  armr[:c] + 1
+end
+
+# (38) a block body's OWN locals are rebindable / mutable through nested
+# constructs: the reference's `CapturedLocals.writes` widens a block-local
+# write inside a nested block (`blkmut`'s `inner` write opens the enclosing
+# block's `h` via `widen_after_block`), while a mutation inside a lambda that
+# sits in a body MEMBER position (`f = -> { … }`) is dead —
+# `escaping_closure_captures` never applies `HashLookupMutation`.
+outer_block = [1]
+outer_block.each do
+  blkhash = { a: 1 }
+  [1].each { blkhash.default = 0 }
+  blkhash[:z] + 1
+
+  blkdead = { a: 1 }
+  _f = -> { blkdead.default = 0 }
+  blkdead[:z] + 1
+
+  blkcmp = { a: 1 }
+  _g = -> { blkcmp.default ||= 0 }
+  blkcmp[:z] + 1
+
+  blknest = { a: 1 }
+  [1].each { _f2 = -> { blknest.default = 0 } }
+  blknest[:z] + 1
+
+  blkrebind = nil
+  [1].each { blkrebind = 1 }
+  blkrebind.foo
+end
