@@ -1,6 +1,6 @@
 use super::*;
-use rigor_parse::{lower, parse};
 use rigor_index::CoreIndex;
+use rigor_parse::{lower, parse};
 use rigor_types::Interner;
 
 fn void_diags(tag: &str, src: &[u8]) -> Vec<Diagnostic> {
