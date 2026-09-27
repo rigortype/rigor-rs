@@ -4,6 +4,28 @@
 //! splits between a conservative Rust core and the cached Ruby sidecar
 //! (ADR-0008); foldability is decided here from an embedded catalogue.
 //!
+//! ## Module map
+//!
+//! [`Typer`] is one struct whose `impl` is split by pass: each module below
+//! adds its own `impl<'i> Typer<'i>` block, so a change to one pass stays in
+//! one file. Cross-module calls are `pub(crate)`; `lib.rs` itself holds only
+//! declarations, re-exports, [`TypeEnv`] and the free shims.
+//!
+//! | module | holds |
+//! |---|---|
+//! | `typer` | the struct, its constructors and accessors |
+//! | `expr_type` | [`Typer::type_of`], the dispatch by node variant, projection folds |
+//! | `call_dispatch` | block-less call typing (`type_call`, the RBS return lookup) |
+//! | `block_call` | calls carrying a literal block (exactly-once, never-completes) |
+//! | `reach` | argument reach — the untyped-argument declines |
+//! | `flow_writes` | span-keyed rebind/mutation tables (free functions) |
+//! | `flow_eval` | top-level env builders, [`Typer::always_truthy_snapshots`] |
+//! | `nilable` | [`Typer::nilable_receiver_snapshots`] |
+//! | `class_narrowing` | [`Typer::class_narrowing_pass`] |
+//! | `collection_shape` | [`Typer::collection_shape_snapshots`] |
+//!
+//! Unit tests live in the `*tests.rs` modules beside them (`use super::*`).
+//!
 //! ## Tracer-bullet expression typer
 //!
 //! This slice ships the smallest [`type_of`] able to type the *receiver* of a
@@ -21,15 +43,16 @@ pub mod folding;
 pub mod kernel_fold;
 pub mod multi_target_binder;
 pub mod source_index;
-mod flow_writes;
+
+mod block_call;
+mod call_dispatch;
 mod class_narrowing;
 mod collection_shape;
-mod nilable;
-mod block_call;
-mod reach;
-mod call_dispatch;
 mod expr_type;
 mod flow_eval;
+mod flow_writes;
+mod nilable;
+mod reach;
 mod typer;
 
 use std::collections::HashMap;
@@ -38,16 +61,19 @@ use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, NodeId};
 use rigor_types::{Interner, TypeId};
 
+pub use class_narrowing::ClassNarrowing;
+pub use flow_writes::collect_flow_writes;
 pub use folding::RubyFolder;
 pub use source_index::{
     lexical_scopes, method_body_spans, ConstLit, DefKind, Harvest, ParamBoundReturn, SourceIndex,
     SOURCE_CLASS_BASE,
 };
-pub use flow_writes::collect_flow_writes;
-pub(crate) use flow_writes::*;
-pub use class_narrowing::ClassNarrowing;
-pub(crate) use expr_type::*;
 pub use typer::Typer;
+
+// Crate-internal names the sibling modules and `source_index.rs` reach as
+// `crate::NAME` (e.g. `crate::MUTATOR_METHODS`, `crate::shape_key_to_scalar`).
+pub(crate) use expr_type::*;
+pub(crate) use flow_writes::*;
 
 /// A flat name -> type binding environment, populated by `LocalVariableWrite`
 /// as the statement sequence is walked in order. Intentionally not
