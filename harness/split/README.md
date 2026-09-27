@@ -114,6 +114,11 @@ script also warns about constructs whose meaning moves with the file:
 - **Tidying is seam-only.** `split_mod.py` collapses a doubled blank line
   only where a dropped range was, never inside a literal (a string holding
   blank lines is data). Do the same by hand.
+- **Reviewing from `git archive` exports.** Exported files carry the commit
+  time, and cargo fingerprints are workspace-relative, so exports sharing one
+  `CARGO_TARGET_DIR` can silently reuse the first export's build: the tests and
+  checks then measure the wrong tree. Give each export its own target dir, or
+  `touch` its sources before building (found in the #258 review).
 - **Name resolution.** The proof counts lines, not meaning. Before trusting
   it, check for these in the moved code: a name that could now resolve to a
   different item (prelude shadowing, a glob), `self::`/`super::` paths,
