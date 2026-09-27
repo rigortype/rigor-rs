@@ -1,0 +1,68 @@
+{
+  "fixture": "harness/corpus/121_equality_predicate_narrowing.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 32,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for true"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 39,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 24,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 31,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 39,
+      "column": 7,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 44,
+      "column": 19,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 49,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 58,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

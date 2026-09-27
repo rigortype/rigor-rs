@@ -1,0 +1,103 @@
+{
+  "fixture": "harness/corpus/120_body_fixpoint_backedge.rb",
+  "diagnostics": [
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 30,
+      "column": 22,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 90,
+      "column": 5,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 98,
+      "column": 5,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 116,
+      "column": 5,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 155,
+      "column": 21,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 160,
+      "column": 24,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 44,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frob' for 1 | 2.5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 22,
+      "severity": "error",
+      "message": "undefined method `frob' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 59,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 69,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 78,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 108,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 146,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    }
+  ]
+}

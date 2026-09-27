@@ -723,6 +723,11 @@ pub enum Node {
         predicate: Option<NodeId>,
         body: Vec<NodeId>,
         index: Vec<(String, Span)>,
+        /// `true` on `until` — the body runs on the predicate's FALSEY edge,
+        /// so a flow-narrowed condition applies inverted. `while` and `for`
+        /// carry `false` (`for`'s `predicate` is the iterated collection, not
+        /// a truthiness condition — consumers gate on `index.is_empty()`).
+        is_until: bool,
         span: Span,
     },
     /// `begin`/`rescue`/`else`/`ensure`. The protected body, each rescue body,
@@ -2122,6 +2127,7 @@ impl<'src> Builder<'src> {
                 predicate,
                 body,
                 index: Vec::new(),
+                is_until: false,
                 span: span_of(&while_node.location()),
             });
         }
@@ -2136,6 +2142,7 @@ impl<'src> Builder<'src> {
                 predicate,
                 body,
                 index: Vec::new(),
+                is_until: true,
                 span: span_of(&until_node.location()),
             });
         }
@@ -2155,6 +2162,7 @@ impl<'src> Builder<'src> {
                 predicate,
                 body,
                 index,
+                is_until: false,
                 span: span_of(&for_node.location()),
             });
         }
