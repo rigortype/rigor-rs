@@ -321,7 +321,7 @@ pub enum Node {
     /// this `name` as a READ — and it is NOT itself a fireable dead-write candidate
     /// (the reference's collector fires only on plain `LocalVariableWriteNode`).
     /// `value` is lowered for call reachability.
-    LocalVariableOpWrite { name: String, value: NodeId, span: Span },
+    LocalVariableOpWrite { name: String, op: OpWriteOp, value: NodeId, span: Span },
     /// A multiple assignment (`a, b = rhs`, `a, (b, c), *rest = rhs`) — Prism's
     /// `MultiWriteNode`. `targets` is the `lefts`/`rest`/`rights` triple; `value`
     /// is the lowered right-hand side.
@@ -769,6 +769,8 @@ pub enum Node {
         /// `rescue`). Populated only from a real `BeginNode`'s rescue chain; see
         /// [`RescueClause`]. Additive — leaves `body`/`ensure_body` untouched.
         clauses: Vec<RescueClause>,
+        /// Which syntactic form produced this carrier — see [`BeginRescueKind`].
+        kind: BeginRescueKind,
         span: Span,
     },
     /// A lambda literal (`-> { … }` / `->(x) { … }`). Its `body` statements are
@@ -968,6 +970,43 @@ pub enum Node {
 /// sequence, so the env binders descended it as straight-line code and bound a
 /// write that runs conditionally, later, or never. Every structural walk ignores
 /// `kind`; only a pass that BINDS or WIDENS locals reads it.
+/// Which syntactic form produced a [`Node::BeginRescue`] carrier. The variant
+/// doubles as a real `begin … end` AND as the transparent wrapper the lowering
+/// reuses for clause bodies and multi-statement parenthesized groups — two
+/// shapes the reference's `ReceiverAlias.candidates` tells APART
+/// (`receiver_alias.rb`): it reads through `ElseNode`, `ParenthesesNode` and
+/// `StatementsNode` tails but has NO `BeginNode` arm, so a `(begin; h; end)`
+/// receiver names no binding a mutator can invalidate while `(nil; h)` names
+/// `h`. Only a pass that resolves a receiver EXPRESSION to the locals it may
+/// evaluate to reads `kind`; every binder and structural walk ignores it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BeginRescueKind {
+    /// A real `begin … end` (`Prism::BeginNode`), with or without rescue /
+    /// ensure clauses.
+    Begin,
+    /// A reused transparent carrier — an `else` clause body, a `case`/`in`
+    /// pattern branch, or a multi-statement parenthesized group.
+    Wrapper,
+}
+
+/// Which compound-assignment form a [`Node::LocalVariableOpWrite`] performs —
+/// the `op:` key of the reference's `compound_eval`
+/// (`statement_evaluator.rb`): it decides the result the variable rebinds to
+/// (`union(narrow_truthy(current), rhs)` for `||=`,
+/// `union(narrow_falsey(current), rhs)` for `&&=`,
+/// `current.send(op, rhs)` for the rest) and so which carrier a lookup
+/// mutation dispatched on the write's value sees.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpWriteOp {
+    /// `x ||= v`
+    Or,
+    /// `x &&= v`
+    And,
+    /// `x <op>= v` (`+=`, `-=`, `*=`, …)
+    Operator,
+}
+
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StatementsKind {
     /// A real statement sequence: a Prism `StatementsNode`, or the `#{ … }` of
@@ -1212,6 +1251,15 @@ pub struct LoweredAst {
     /// a literal. Sorted for a binary-search read via
     /// [`LoweredAst::paren_unwrapped`].
     paren_unwrapped: Vec<u32>,
+    /// The spans of the constant-write family BEYOND `ConstantWriteNode`
+    /// (`Foo::K = v`, `K ||= v`, `K &&= v`, `K += v`, and the `::`-path
+    /// spellings) — nodes the statement evaluator types through
+    /// `scope.type_of` (`eval_constant_write` for the path/or-writes, the
+    /// expression-typed default for the and/operator forms) and returns the
+    /// ENTRY scope for, so a local write or lookup mutation inside never
+    /// reaches the env. See [`LoweredAst::in_typed_only_carrier`].
+    typed_only_spans: Vec<Span>,
+
     /// `(inner_id, parens_span)` for every single-statement `(e)` group the
     /// lowering UNWRAPPED to `e` — several entries stack for `((e))`, recorded
     /// inside-out. See [`LoweredAst::paren_hull`].
@@ -1312,6 +1360,20 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// Whether `span` lies inside a constant-write family rvalue the reference
+    /// types but never applies scope effects from (`eval_constant_write` /
+    /// the expression-typed default handler): `Foo::K = v`, `K ||= v`,
+    /// `K &&= v`, `K += v`, `Foo::K ||= v`, `Foo::K &&= v`, `Foo::K += v`.
+    /// Unlike [`Self::in_inert_carrier`] the rvalue IS evaluated — calls and
+    /// reads inside still type — only its writes and mutations don't reach
+    /// the local env.
+    pub fn in_typed_only_carrier(&self, span: Span) -> bool {
+        self.typed_only_spans
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
+
     /// The span of a `( … )` group that lowered away around `id`, or `None`.
     /// Single-statement parens are unwrapped to their inner node (the inner
     /// node keeps its own span), but the reference still anchors some
@@ -1389,6 +1451,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         paren_unwrapped: Vec::new(),
         paren_hulls: Vec::new(),
 
+        typed_only_spans: Vec::new(),
+
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -1410,6 +1474,16 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         .collect();
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
+    // `ConstantWriteNode` (`X = v`) is an owned variant, not a recovered
+    // carrier, so its span is appended to the same table here — the
+    // reference's `eval_constant_write` handles it identically (rvalue typed,
+    // entry scope returned).
+    let mut typed_only_spans = builder.typed_only_spans;
+    typed_only_spans.extend(builder.nodes.iter().filter_map(|n| match n {
+        Node::ConstantWrite { span, .. } => Some(*span),
+        _ => None,
+    }));
+
     LoweredAst {
         nodes: builder.nodes,
         root,
@@ -1418,6 +1492,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         local_read_starts,
         inert_spans,
         paren_unwrapped,
+        typed_only_spans,
+
         paren_hulls: builder.paren_hulls,
 
     }
@@ -1436,6 +1512,10 @@ struct Builder<'src> {
     /// `(inner_id, parens_span)` for every single-statement parens group the
     /// walk unwrapped — see [`LoweredAst::paren_hull`].
     paren_hulls: Vec<(NodeId, Span)>,
+
+    /// Spans of the typed-only constant-write family — see
+    /// [`LoweredAst::in_typed_only_carrier`].
+    typed_only_spans: Vec<Span>,
 
 }
 
@@ -1542,6 +1622,7 @@ impl<'src> Builder<'src> {
             let value = self.lower_node(&opw.value());
             return self.push(Node::LocalVariableOpWrite {
                 name,
+                op: OpWriteOp::Operator,
                 value,
                 span: span_of(&opw.location()),
             });
@@ -1551,6 +1632,7 @@ impl<'src> Builder<'src> {
             let value = self.lower_node(&andw.value());
             return self.push(Node::LocalVariableOpWrite {
                 name,
+                op: OpWriteOp::And,
                 value,
                 span: span_of(&andw.location()),
             });
@@ -1560,6 +1642,7 @@ impl<'src> Builder<'src> {
             let value = self.lower_node(&orw.value());
             return self.push(Node::LocalVariableOpWrite {
                 name,
+                op: OpWriteOp::Or,
                 value,
                 span: span_of(&orw.location()),
             });
@@ -2044,6 +2127,7 @@ impl<'src> Builder<'src> {
                 main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                kind: BeginRescueKind::Wrapper,
                 span: span_of(&else_node.location()),
             });
         }
@@ -2121,6 +2205,7 @@ impl<'src> Builder<'src> {
                 main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                kind: BeginRescueKind::Wrapper,
                 span: span_of(&in_node.location()),
             });
         }
@@ -2234,6 +2319,7 @@ impl<'src> Builder<'src> {
                 main_body,
                 ensure_body,
                 clauses,
+                kind: BeginRescueKind::Begin,
                 span: span_of(&begin_node.location()),
             });
         }
@@ -2360,6 +2446,7 @@ impl<'src> Builder<'src> {
                 main_body,
                 ensure_body: Vec::new(),
                 clauses: Vec::new(),
+                kind: BeginRescueKind::Wrapper,
                 span: span_of(&parens.location()),
             });
         }
@@ -2659,6 +2746,29 @@ impl<'src> Builder<'src> {
             }
             let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
             return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
+        }
+
+        // The constant-write family beyond `ConstantWriteNode` — `Foo::K = v`,
+        // `K ||= v`, `K &&= v`, `K += v` and the `::`-path spellings — has no
+        // owned variant, so it lowers to the recovered carrier below like any
+        // unhandled node. But the reference evaluates it DIFFERENTLY from an
+        // ordinary recovery: `eval_constant_write` and the expression-typed
+        // default (`statement_evaluator.rb` HANDLERS has no `Constant{,Path}
+        // {And,Operator}WriteNode` entry) type the rvalue through
+        // `scope.type_of` and return the ENTRY scope, so a local write or a
+        // `HashLookupMutation` inside never reaches the env — and never even
+        // WIDENS it (`X::Y = (h.default = 0); h[:b] + 1` still folds `nil`).
+        // Record the span so the flow write/mutation censuses can drop what
+        // only a real evaluation could produce.
+        if node.as_constant_path_write_node().is_some()
+            || node.as_constant_or_write_node().is_some()
+            || node.as_constant_and_write_node().is_some()
+            || node.as_constant_operator_write_node().is_some()
+            || node.as_constant_path_or_write_node().is_some()
+            || node.as_constant_path_and_write_node().is_some()
+            || node.as_constant_path_operator_write_node().is_some()
+        {
+            self.typed_only_spans.push(span);
         }
 
         // Anything outside the handled subset: RECOVER any meaningful descendant

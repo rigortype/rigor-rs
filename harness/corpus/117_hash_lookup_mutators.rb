@@ -241,3 +241,103 @@ CW = (cwrite.default = 0)
 cwrite[:a].upcase
 cwrite[:b] + 1
 cwrite.foo
+
+# (22) a same-statement rebind of the mutated local is seen at dispatch:
+# `eval_send` threads scope through receiver → arguments → the call's own
+# `dispatch`, so the argument write binds `{ b: "x" }` BEFORE `default=` is
+# evaluated — the mutation opens the NEW shape (`foo` witnesses
+# `{ b: "x", ... }`, the opened extra read declines).
+seqarg = { a: 1 }
+seqarg.default = (seqarg = { b: "x" })
+seqarg[:a].upcase
+seqarg.foo
+seqarg[:z] + 1
+
+# (23) the argument-write value is what the predicate sees: after
+# `seqnil.default = (seqnil = { a: nil })` the binding holds `{ a: nil }`
+# opened, so `seqnil[:a]` folds `nil` — falsey.
+seqnil = { a: 1 }
+seqnil.default = (seqnil = { a: nil })
+if seqnil[:a]
+  1
+end
+
+# (24) a parenthesized receiver group evaluates before the dispatch, so the
+# mutation lands on the rebound `{ b: "x" }` — both later reads stay silent.
+precv = { a: 1 }
+(precv = { b: "x" }; precv).default = 0
+precv[:a].upcase
+precv[:z] + 1
+
+# (25) `&&=` / `||=` receivers are writes too — the compound result binds the
+# local BEFORE `default=` dispatches on it.
+andw = { a: 1 }
+(andw &&= { b: "x" }).default = 0
+andw[:a].upcase
+andw[:z] + 1
+
+ornil = nil
+(ornil ||= { a: 1 }).default = 0
+ornil[:a].upcase
+ornil[:z] + 1
+
+ortruthy = { a: 1 }
+(ortruthy ||= { b: 1 }).default = 0
+ortruthy.foo
+ortruthy[:a].upcase
+
+# (26) argument position matters: a write BEFORE the mutation widens the
+# mutation's carrier to `untyped`; a write AFTER it wins the binding (the
+# mutation opened a shape the write then replaced, so `argrev[:z]` folds
+# `nil`).
+def twargs(a, b); end
+argord = { a: 1 }
+twargs(argord = { b: "x" }, argord.default = 0)
+argord[:a].upcase
+argord[:z] + 1
+
+argrev = { a: 1 }
+twargs(argrev.default = 0, argrev = { b: "x" })
+argrev[:z] + 1
+argrev[:b].upcase
+
+# (27) a write inside a deferred block poisons the replayed carrier — the
+# block may never run, so `blkw` declines on every key.
+blkw = { a: 1 }
+xs2 = [1]
+xs2.each { blkw.default = (blkw = { b: "x" }) }
+blkw[:a].upcase
+blkw[:z] + 1
+
+# (28) the rest of the constant-write family is typed-only too: const-path,
+# `+=`, and `||=` writes evaluate the RHS for its own type without letting the
+# mutation reach the surrounding local scope.
+cpath = { a: 1 }
+OUTER::INNER = (cpath.default = 0)
+cpath[:b] + 1
+cpath.foo
+
+corw = { a: 1 }
+CONW ||= (corw.default = 0)
+corw[:b] + 1
+
+copw = { a: 1 }
+COPW += (copw.default = 0)
+copw[:b] + 1
+
+# (29) a bare `begin … end` receiver is NOT a ReceiverAlias candidate
+# (`BEGIN_RESCUE` declines `begin...end`), so the mutation names nothing and
+# `bgres` keeps folding as a closed shape.
+bgres = { a: 1 }
+(begin; bgres; end).default = 0
+bgres[:b] + 1
+bgres.foo
+
+# (30) a statement-group predicate folds to its TAIL: `(x; y)` has the type of
+# `y`, so the opened-shape `default=` call (truthy) keeps
+# `flow.always-truthy-condition` firing on `if`.
+ifgr = { a: 1 }
+if (ifgr = { b: "x" }; ifgr.default = 0)
+  1
+end
+ifgr[:a].upcase
