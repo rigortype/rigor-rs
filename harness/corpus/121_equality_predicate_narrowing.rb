@@ -110,3 +110,28 @@ def b6
     x.frob
   end
 end
+
+# --- (3) `v&.m` safe-nav predicates --------------------------------------------
+#
+# A truthy `v&.m` proves the receiver non-nil (`analyse_safe_nav_receiver`):
+# the `==`/`!=`/`nil?` method narrowing NEVER applies to a safe-nav call —
+# `x&.==(1)` only shows the comparison ran, i.e. `x` was non-nil.
+
+# `x&.==(1)` on a `nil | 1` union narrows `x` to `1` — `frob` names it.
+def c1
+  x = rand(2) == 0 ? nil : 1
+  x.frob if x&.==(1)
+end
+
+# `x&.nil?` on `nil | "s"` narrows `x` to `"s"` on the truthy edge — `upcase`
+# is defined there, so this stays silent.
+def c2
+  x = rand(2) == 0 ? nil : "s"
+  x.upcase if x&.nil?
+end
+
+# …and `frob` on the `"s"` arm fires `undefined-method` on both engines.
+def c3
+  x = rand(2) == 0 ? nil : "s"
+  x.frob if x&.nil?
+end

@@ -23,6 +23,20 @@
       "message": "undefined method `upcase' for nil"
     },
     {
+      "rule": "call.undefined-method",
+      "line": 123,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 136,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\""
+    },
+    {
       "rule": "flow.always-truthy-condition",
       "line": 24,
       "column": 6,

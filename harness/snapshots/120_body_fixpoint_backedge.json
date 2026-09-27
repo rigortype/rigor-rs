@@ -44,6 +44,13 @@
       "message": "possible nil receiver: `upcase' is undefined on NilClass"
     },
     {
+      "rule": "call.possible-nil-receiver",
+      "line": 225,
+      "column": 7,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
       "rule": "call.undefined-method",
       "line": 37,
       "column": 22,
@@ -98,6 +105,20 @@
       "column": 7,
       "severity": "error",
       "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 190,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `upcase' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 213,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob' for \"s\" | 1"
     }
   ]
 }
