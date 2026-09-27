@@ -254,6 +254,8 @@ impl MultiTarget {
 /// (`multi_target_binder.rb:20-22`).
 ///
 /// A composite child-group struct in the style of [`RescueClause`].
+///
+/// [`RescueClause`]: crate::ast::RescueClause
 #[derive(Clone, Debug)]
 pub struct MultiTargets {
     /// Targets before the splat (all of them when there is no splat).
@@ -327,7 +329,7 @@ pub enum Node {
     /// is the lowered right-hand side.
     ///
     /// Before this variant existed the node fell through
-    /// [`collect_recoverable_children`] into a `Statements` carrier (or
+    /// `collect_recoverable_children` into a `Statements` carrier (or
     /// `Node::Other`) and the LHS names were DROPPED from the arena entirely, so
     /// a multi-write rebind was invisible to `collect_flow_writes` and never
     /// widened an earlier straight-line binding — a live `flow.always-truthy-
@@ -855,7 +857,7 @@ pub enum Node {
     /// the zero-FP-safe choice). Empty for an un-namable dynamic constant.
     // TODO(spec): constant resolution (ADR-0019).
     /// A constant reference. `name` is the LENIENT rendering
-    /// ([`constant_path_string`]): `::Foo` renders bare as `"Foo"`, and a
+    /// (`constant_path_string`): `::Foo` renders bare as `"Foo"`, and a
     /// dynamic base (`expr::Bar`) contributes nothing, so `k::LIMIT` also
     /// renders as `"LIMIT"`. `dynamic_base` is what separates those two — it
     /// is the reference's `Source::ConstantPath.qualified_name_or_nil`
@@ -972,6 +974,8 @@ pub enum StatementsKind {
     /// inside neither binds nor widens (probes r2/c2, r1/c1, b1/b2, g1/g2,
     /// s1-s5, m1/m3/m4/m5). The write collectors drop every write inside one;
     /// see [`LoweredAst::in_inert_carrier`].
+    ///
+    /// [`LoweredAst::in_inert_carrier`]: crate::ast::LoweredAst::in_inert_carrier
     Inert,
     /// A jump statement that carries (or could carry) VALUE expressions:
     /// `break e` / `next e` hold their argument list in `body`, and `redo` /
@@ -1007,6 +1011,8 @@ pub enum JumpKind {
 /// post — so the entry env can apply the reference's `BlockAutoSplat` spread
 /// when the yielded value is array-shaped and the parameter list is one
 /// CRuby auto-splats (`splats?`).
+///
+/// [`Node::Call`]: crate::ast::Node::Call
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BlockParamKind {
     /// The FIRST positional parameter — `|v|`, `|v, w|`, the implicit `it`,
@@ -1217,6 +1223,9 @@ pub struct LoweredAst {
 /// The census is deliberately RAW: it names the receiver and the mutating method
 /// and leaves the `SHAPE_MUTATORS` membership test (`is_shape_mutator`) to
 /// `rigor-infer`, which owns those tables.
+///
+/// [`Node::Call`]: crate::ast::Node::Call
+/// [`Node::Other`]: crate::ast::Node::Other
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConstMutation {
     /// The enclosing `class`/`module` header names, outermost first, each the
@@ -1262,9 +1271,7 @@ impl LoweredAst {
     pub fn const_mutations(&self) -> &[ConstMutation] {
         &self.const_mutations
     }
-}
 
-impl LoweredAst {
     /// Whether some `LocalVariableRead` starts inside `span`. A read is a leaf,
     /// so starting inside a node's span means lying inside its subtree.
     pub fn reads_local_within(&self, (lo, hi): Span) -> bool {
@@ -1388,6 +1395,8 @@ struct Builder<'src> {
     line_starts: Vec<usize>,
     /// Arena ids a `(e)` unwrap returned — see
     /// [`LoweredAst::paren_unwrapped`].
+    ///
+    /// [`LoweredAst::paren_unwrapped`]: crate::ast::LoweredAst::paren_unwrapped
     paren_unwrapped: Vec<u32>,
 }
 
@@ -2868,6 +2877,8 @@ fn strict_constant_path_string(node: &PrismNode<'_>) -> Option<String> {
 /// port's lowering has no cvar index to widen (`@@x` lowers to the nameless
 /// [`Node::VariableRead`], already `Dynamic[top]`), so the reference's cvar half
 /// is a no-op here.
+///
+/// [`Node::VariableRead`]: crate::ast::Node::VariableRead
 fn collect_const_mutations(root: &PrismNode<'_>) -> Vec<ConstMutation> {
     use ruby_prism::Visit;
 
@@ -3635,6 +3646,8 @@ fn for_index_names(index: &PrismNode<'_>) -> Vec<(String, Span)> {
 /// We deliberately do NOT collect a `def`/`class`/`module` here: those are not
 /// found inside expression wrappers in practice, and recovering one flatly (no
 /// owned `Definition`) would confuse the dead-assignment nested-unit barrier.
+///
+/// [`Builder::lower_node`]: crate::ast::Builder::lower_node
 fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
     collect_recoverable(node, false)
 }
