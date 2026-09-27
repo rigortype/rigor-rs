@@ -320,6 +320,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::InstanceVariableWrite { .. } => "InstanceVariableWrite",
         Node::ConstantRead { .. } => "ConstantRead",
         Node::ConstantWrite { .. } => "ConstantWrite",
+        Node::AttributeCompoundWrite { .. } => "AttributeCompoundWrite",
         Node::SelfExpr { .. } => "SelfExpr",
         Node::Return { .. } => "Return",
         Node::Other { .. } => "Other",
