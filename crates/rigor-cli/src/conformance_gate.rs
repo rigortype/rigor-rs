@@ -346,7 +346,7 @@ fn inert_value_ok(node: &Node) -> bool {
 
 /// Ruby's `File.expand_path` for a path without `~`: absolute, with `.` and
 /// `..` folded lexically.
-fn expand_path(path: &Path) -> PathBuf {
+pub(crate) fn expand_path(path: &Path) -> PathBuf {
     let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let mut out = PathBuf::new();
     for c in abs.components() {
@@ -532,9 +532,18 @@ pub(crate) fn process_env_ok(
 
 /// Ruby's `File.fnmatch?(pattern, path)` with NO flags, over-approximated:
 /// `true` whenever it MIGHT match. `*` spans `/` (no `FNM_PATHNAME`), `?` is
-/// one character; a bracket expression or an escape counts as "might match",
-/// and the leading-period rule is ignored (both only widen the answer).
-fn fnmatch_may(pattern: &str, path: &str) -> bool {
+/// one character; a bracket expression or an escape counts as "might match".
+/// The leading-period rule IS modelled (oracle: `File.fnmatch?` applies it
+/// even with no flags — `*gen.rb` vs `./app/gen.rb` is `false`, `?`/`[` obey
+/// it too) — but only at path position 0: `lib/*.rb` vs `lib/.x.rb` is `true`
+/// (the rule does not fire after a `/`).
+pub(crate) fn fnmatch_may(pattern: &str, path: &str) -> bool {
+    // A `*`, `?` or `[` at pattern position 0 never matches a `.` at path
+    // position 0 (oracle-measured truth table). A leading `\` escapes to a
+    // literal, which can never be `.` anyway.
+    if path.starts_with('.') && matches!(pattern.chars().next(), Some('*' | '?' | '[')) {
+        return false;
+    }
     if pattern.contains(['[', '\\']) {
         return true;
     }
@@ -552,7 +561,8 @@ fn fnmatch_may(pattern: &str, path: &str) -> bool {
 }
 
 /// `Configuration::BUILTIN_EXCLUDES`, always appended upstream.
-const BUILTIN_EXCLUDES: &[&str] = &["**/vendor/bundle/**", "**/.bundle/**", "**/node_modules/**"];
+pub(crate) const BUILTIN_EXCLUDES: &[&str] =
+    &["**/vendor/bundle/**", "**/.bundle/**", "**/node_modules/**"];
 
 /// Whether the reference's run has at least one Ruby file (`expand_paths`
 /// of its roots is non-empty). Without one it builds no environment and
@@ -693,6 +703,15 @@ mod tests {
         assert!(fnmatch_may("lib/*", "lib/a/b.rb"));
         assert!(!fnmatch_may("lib/*.rb", "app/a.rb"));
         assert!(fnmatch_may("[a]pp.rb", "zzz"));
+        // Leading-period rule, position-0 only (oracle-measured truth table).
+        assert!(!fnmatch_may("*gen.rb", "./app/gen.rb"));
+        assert!(!fnmatch_may("*gen.rb", ".gen.rb"));
+        assert!(!fnmatch_may("?gen.rb", ".gen.rb"));
+        assert!(!fnmatch_may("[g]en.rb", ".gen.rb"));
+        assert!(fnmatch_may("*gen.rb", "lib/.gen.rb"));
+        assert!(fnmatch_may("lib/*.rb", "lib/.x.rb"));
+        assert!(fnmatch_may(".*gen.rb", "./app/gen.rb"));
+        assert!(fnmatch_may("./app/*.rb", "./app/gen.rb"));
     }
 
     /// Family 9: no Ruby file ⇒ the reference builds no environment and

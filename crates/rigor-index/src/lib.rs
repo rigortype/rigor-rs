@@ -47,7 +47,7 @@ pub use rbs::{
 // the carrier for nominal round-tripping in the current slice (ADR-0004). It is
 // the surface the inference engine mints `Nominal { class }` ids against, so it
 // only lists the concrete value classes a return type can resolve TO.
-const CORE_CLASSES: [&str; 9] = [
+const CORE_CLASSES: [&str; 10] = [
     "String",
     "Integer",
     "Float",
@@ -57,6 +57,7 @@ const CORE_CLASSES: [&str; 9] = [
     "NilClass",
     "TrueClass",
     "FalseClass",
+    "Proc",
 ];
 
 /// A real, RBS-backed core index. For each loaded class it holds the resolved
@@ -427,6 +428,20 @@ impl CoreIndex {
         self.data.object_constant_class(name)
     }
 
+    /// rigor-rs#140 (upstream rigor#1105): `class_name`'s flattened ancestor
+    /// names, or `None` when the chain is incomplete. See
+    /// [`rbs::CoreData::ancestor_names`].
+    pub fn ancestor_names(&self, class_name: &str) -> Option<Vec<&'static str>> {
+        self.data.ancestor_names(class_name)
+    }
+
+    /// rigor-rs#140 (upstream rigor#1105): the first ancestor that DIRECTLY
+    /// declares `method` (its own `methods` or `aliases` table) — the resolved
+    /// declaration's owner. See [`rbs::CoreData::declaring_ancestor`].
+    pub fn declaring_ancestor(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        self.data.declaring_ancestor(class_name, method)
+    }
+
     /// The RETURN class of a core method together with whether the RBS return is
     /// nilable (`Optional`, `String?`) — `(class, nilable)`, or `None` when the
     /// return is not a resolvable concrete class. Used ONLY by
@@ -775,6 +790,21 @@ mod tests {
         assert!(idx.instance_method_names("Integer").contains(&"times"));
         // Unknown class ⇒ empty.
         assert!(idx.instance_method_names("MyWidget").is_empty());
+    }
+
+    #[test]
+    fn declaring_ancestor_finds_the_owner_of_an_inherited_method() {
+        // rigor-rs#140: `tap` is declared on Kernel (`def tap`); `then` reaches
+        // the same ancestor through `alias then yield_self`. Both report
+        // Kernel as the resolved declaration's owner for `Array`.
+        let idx = CoreIndex::new();
+        assert_eq!(idx.declaring_ancestor("Array", "tap"), Some("Kernel"));
+        assert_eq!(idx.declaring_ancestor("Array", "then"), Some("Kernel"));
+        // A directly-declared method answers with the class itself.
+        assert_eq!(idx.declaring_ancestor("String", "upcase"), Some("String"));
+        // No ancestor declares it ⇒ None; an unknown class declines to None.
+        assert_eq!(idx.declaring_ancestor("Array", "frobnicate_xyz"), None);
+        assert_eq!(idx.declaring_ancestor("MyWidget", "tap"), None);
     }
 
     #[test]

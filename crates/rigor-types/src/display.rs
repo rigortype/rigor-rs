@@ -437,17 +437,26 @@ fn named_union(
     }
 
     if bool_pair {
-        let rest =
-            members.iter().filter(|&&m| !is_bool_lit(m)).map(|&m| describe_named(i, m, resolve));
+        // `bool` leads the rendering (the literal pair collapses); the rest
+        // keep `sort_members`'s `describe(:short)` order, as below.
+        let mut rest: Vec<String> = members
+            .iter()
+            .filter(|&&m| !is_bool_lit(m))
+            .map(|&m| describe_named(i, m, resolve))
+            .collect();
+        rest.sort();
         return std::iter::once("bool".to_string()).chain(rest).collect::<Vec<_>>().join(" | ");
     }
 
-    // Float `nil` to the end (the common `T | … | nil` reading), keeping every
-    // other member in its canonical order — matching the reference's union order.
-    let mut rendered: Vec<(bool, String)> =
-        members.iter().map(|&m| (is_nil(m), describe_named(i, m, resolve))).collect();
-    rendered.sort_by_key(|(nil, _)| *nil);
-    rendered.into_iter().map(|(_, s)| s).collect::<Vec<_>>().join(" | ")
+    // `Combinator.sort_members` (combinator.rb) orders a union's members by
+    // `describe(:short)` at CONSTRUCTION — `Union#describe` just joins them.
+    // The interner's canonical member order is structural, not rendered, so
+    // reproduce the reference's order by sorting the rendered strings
+    // (`"s" | 1`, not `1 | "s"`).
+    let mut rendered: Vec<String> =
+        members.iter().map(|&m| describe_named(i, m, resolve)).collect();
+    rendered.sort();
+    rendered.join(" | ")
 }
 
 /// Render `id` as a human-readable string.
@@ -547,15 +556,13 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
             if is_bool_pair(i, id) {
                 return "bool".to_string();
             }
-            // Render `T | nil` with nil last for the common optional spelling.
-            let mut rendered: Vec<(bool, String)> = members
-                .iter()
-                .map(|&m| (is_nil(i, m), describe(i, m)))
-                .collect();
-            // Stable: keep canonical order but float nil to the end so the
-            // common case reads `T | nil`.
-            rendered.sort_by_key(|(is_nil, _)| *is_nil);
-            let parts: Vec<String> = rendered.into_iter().map(|(_, s)| s).collect();
+            // `Combinator.sort_members` order: members sorted by their
+            // `describe(:short)` string at construction — `Union#describe`
+            // joins them as-is. The interner's canonical order is structural,
+            // so sort the rendered strings to reproduce it.
+            let mut parts: Vec<String> =
+                members.iter().map(|&m| describe(i, m)).collect();
+            parts.sort();
             parts.join(" | ")
         }
     }

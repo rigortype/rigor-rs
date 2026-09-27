@@ -280,8 +280,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
             std::env::var_os("POSIXLY_CORRECT").as_deref(),
             std::env::var_os("RIGOR_RACTOR_WORKERS").as_deref(),
         );
-    let (mut findings, had_io_error) =
-        analyze_files(&expanded, &cfg, "check", folder_ref, &bleeding_edge, ref_has_files);
+    let (mut findings, had_io_error) = analyze_files(
+        &expanded,
+        // `None` on the `paths:` fallback ⇒ `paths == configuration.paths`
+        // ⇒ the reference never widens discovery for a bare `check`.
+        if files.is_empty() { None } else { Some(files.as_slice()) },
+        &cfg,
+        "check",
+        folder_ref,
+        &bleeding_edge,
+        ref_has_files,
+    );
 
     // ADR-22 slice 5 — snapshot the RAW (pre-baseline-filter) findings for the
     // `--baseline-strict` audit. The reference audits `raw_result.diagnostics`
@@ -523,17 +532,70 @@ struct PathError {
     not_found: bool,
 }
 
+/// The config `paths:` in the spelling the reference's `Configuration`
+/// actually stores (`resolve_path_key!`): a DECLARED entry is
+/// `File.expand_path(entry, config_dir)` — an ABSOLUTE string, with `.`/`..`
+/// folded lexically (a cwd `.rigor.yml` expands against the cwd itself).
+/// The absolute spelling is load-bearing upstream, not cosmetic: `exclude:` is
+/// `File.fnmatch?`'d against the expanded file list, so a project-relative
+/// pattern like `lib/ext.rb` NEVER matches a declared `paths:` file there —
+/// a relative spelling would over-exclude and manufacture FPs. The `["lib"]`
+/// DEFAULT is not in the file, so it stays exactly as written
+/// (cwd-relative). `~` is not expanded — the port never resolves it (the
+/// same documented hole as `conformance_gate::signature_entry_ok`).
+fn effective_config_paths(cfg: &Config) -> Vec<String> {
+    if !cfg.paths_explicitly_declared() {
+        return cfg.paths.clone();
+    }
+    let base = cfg
+        .config_base_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    cfg.paths
+        .iter()
+        .map(|p| {
+            conformance_gate::expand_path(&base.join(p))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
 /// Expand raw `check`/`baseline` path arguments into the concrete `.rb` files to
 /// analyze plus any bad-path errors — a faithful port of the reference's
 /// `Runner#expand_paths` (ADR-0040):
 /// - a DIRECTORY → its `**/*.rb` (recursive; hidden dirs and symlinks skipped;
-///   `.gitignore` ignored — only config `exclude:` prunes, via the per-file gate
-///   in [`analyze_files`]); each directory's files sorted, concatenated in arg
-///   order.
+///   `.gitignore` ignored — the analysis path prunes `exclude:` via the
+///   per-file gate in [`analyze_files`]; the WIDENING expansion prunes
+///   `BUILTIN_EXCLUDES + exclude:` inside
+///   [`expand_check_paths_excluding`]); each directory's files sorted,
+///   concatenated in arg order.
 /// - a FILE ending in `.rb` → kept as-is.
 /// - an existing non-`.rb` file → a `PathError { not_found: false }`.
 /// - a missing path → a `PathError { not_found: true }`.
 fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
+    expand_check_paths_excluding(raw, &[])
+}
+
+/// `expand_check_paths` with the reference's `reject_excluded` applied to
+/// DIRECTORY-expanded entries only (`PathExpansion.directory_files` drops any
+/// glob hit matching `exclude_patterns`; an explicit `.rb` file root is kept
+/// verbatim — `accept_as_ruby_file?` never consults the list).
+///
+/// `excludes` is `Configuration#exclude_patterns` (`BUILTIN_EXCLUDES +
+/// exclude:`), matched with `File.fnmatch?` and NO flags — `*` spans `/`, so
+/// `*zz.rb` matches `lib/zz.rb` (this is NOT the `glob::Pattern` semantics
+/// `Config::is_excluded` uses on the analyze path). Callers must only pass
+/// patterns [`conformance_gate::fnmatch_may`] can decide exactly — the
+/// widening path declines entirely when any pattern is undecidable rather
+/// than guess: a wrong guess in EITHER direction can fire (`exclude:`d decl
+/// kept → widened/discovery see a file the reference dropped; legit decl
+/// dropped → widened/extra decls missing), and a discovered decl can CAUSE a
+/// diagnostic, not only suppress one.
+fn expand_check_paths_excluding(
+    raw: &[&str],
+    excludes: &[String],
+) -> (Vec<String>, Vec<PathError>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
     for &p in raw {
@@ -542,6 +604,7 @@ fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
             let mut in_dir = Vec::new();
             collect_rb_files(path, &mut in_dir);
             in_dir.sort();
+            in_dir.retain(|f| !exclude_fnmatch(excludes, f));
             files.extend(in_dir);
         } else if path.is_file() && p.ends_with(".rb") {
             files.push(p.to_string());
@@ -552,6 +615,30 @@ fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
         }
     }
     (files, errors)
+}
+
+/// `Configuration#exclude_patterns` — `BUILTIN_EXCLUDES + exclude:` — the
+/// list `expand_paths`' `reject_excluded` applies to directory expansions
+/// (the analysis-side per-file `exclude:` filter stays the pre-existing
+/// `cfg.is_excluded` glob gate in `analyze_files`).
+fn discovery_exclude_patterns(cfg: &Config) -> Vec<String> {
+    conformance_gate::BUILTIN_EXCLUDES
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(cfg.exclude.iter().cloned())
+        .collect()
+}
+
+/// `File.fnmatch?(pattern, path)`-with-no-flags exclusion for one expanded
+/// path. `fnmatch_may` is exact for patterns without `[` or `\` (the caller
+/// declines widening when any pattern is undecidable, so this only ever sees
+/// decidable input) — and models the leading-period rule: a `*`/`?`/`[` at
+/// pattern position 0 never matches a `.` at path position 0 (`./app/gen.rb`
+/// is NOT excluded by `*gen.rb`).
+fn exclude_fnmatch(patterns: &[String], path: &str) -> bool {
+    patterns
+        .iter()
+        .any(|p| conformance_gate::fnmatch_may(p, path))
 }
 
 /// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
@@ -634,8 +721,16 @@ fn prepend_path_errors(
     *findings = injected;
 }
 
+/// `files`: the expanded `.rb` file list to ANALYZE (one work item per entry,
+/// duplicates kept). `argv_roots`: the path arguments as the user wrote them,
+/// or `None` when the run's roots came from the config `paths:` fallback —
+/// the reference's `widen_discovery_to_project?` gate (`paths !=
+/// configuration.paths`) is then unconditionally false and discovery never
+/// widens beyond the analyzed set (bare `check`, and `baseline` without
+/// positionals — the reference's baseline always analyzes `paths:`).
 fn analyze_files(
     files: &[&str],
+    argv_roots: Option<&[&str]>,
     cfg: &Config,
     verb: &str,
     folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
@@ -768,6 +863,14 @@ fn analyze_files(
         /// The third field is the `RIGOR_TIMING` component split (all-zero when
         /// the env gate is unset).
         Prepared(Prepared, Box<rigor_infer::Harvest>, Stage1Times),
+        /// A discovery-ONLY file (upstream #684): parsed, lowered and
+        /// harvested into the project index, but never analyzed — it
+        /// contributes no findings.
+        Discovery {
+            ast: rigor_parse::LoweredAst,
+            harvest: Box<rigor_infer::Harvest>,
+            times: Stage1Times,
+        },
         IoError { path: String, msg: String },
         /// A file Prism could not parse: NOT analysed (see the guard below),
         /// but its parse errors are reported, one diagnostic per raw Prism
@@ -785,23 +888,143 @@ fn analyze_files(
         Parsed(rigor_parse::LoweredAst, Vec<(usize, usize, String)>),
         Unparseable(Vec<Diagnostic>),
     }
-    let stage1: Vec<Stage1> = files
+
+    /// One stage-1 work item: `order`/`analyze` mark the analyzed files
+    /// (keyed by their position in `files`); `analyze == false` items are
+    /// discovery-only.
+    struct WorkItem {
+        order: usize,
+        path: String,
+        analyze: bool,
+    }
+
+    // Upstream #684 — `widen_discovery_to_project?` /
+    // `project_discovery_expansion`: when the run targets an explicit file
+    // list, the cross-file DISCOVERY pass still walks
+    // `expand_paths(configuration.paths | argv)` — `rigor check a.rb`
+    // sees `class String; attr_accessor :zz` in an unlisted `lib/ext.rb`,
+    // so a project-declared method suppresses identically whether or not
+    // its file was named.
+    //
+    // The ANALYZED side is the argv expansion VERBATIM — one work item per
+    // `files` entry, each with its own `order` slot, exactly as the
+    // reference's `expand_paths(argv)` keeps duplicates: `check a.rb a.rb`
+    // analyzes twice, and an argv file that also sits under `paths:` still
+    // reports at its argv position (`check lib lib/a.rb` → a,b,c,a).
+    //
+    // The widening gate is the reference's, verbatim:
+    // `widened.files.size > expansion.files.size`, where `widened` expands
+    // the ROOT-LEVEL union `configuration.paths | argv`. Repeated argv
+    // strings dedup out of the union, so `check a.rb a.rb`'s widened set
+    // ([lib…, a.rb]) is the same size as its expansion and discovery does
+    // NOT widen — oracle-visible: the `Foo` decl in `lib/` stays unseen and
+    // `Foo.new.bar.upcase` goes silent where a single `check a.rb` (widened
+    // strictly larger) resolves `bar` and fires on `Integer#upcase`. And
+    // `argv_roots == None` — the `paths:` fallback (bare `check`, bare
+    // `baseline`) — means `paths == configuration.paths` upstream, which is
+    // `widen_discovery_to_project?` false: no discovery items at all.
+    //
+    // Files the widened expansion adds BEYOND the analyzed set are appended
+    // as discovery-only items: parsed + lowered + harvested into the
+    // project index but producing no findings (the reference's discovery is
+    // a parse pass, not an analysis).
+    let analyzed_paths: std::collections::HashSet<&str> =
+        files.iter().copied().collect();
+    let mut worklist: Vec<WorkItem> = Vec::with_capacity(files.len());
+    for (i, p) in files.iter().enumerate() {
+        worklist.push(WorkItem {
+            order: i,
+            path: (*p).to_string(),
+            analyze: true,
+        });
+    }
+    if let Some(argv_roots) = argv_roots {
+        // `configuration.paths | paths` — a ROOT-level ORDERED-SET union: the
+        // receiver's own repeats dedup out too (`paths: [lib, lib]` and the
+        // `File.expand_path`-identical `[./lib, lib/]` are ONE root upstream),
+        // and so do repeat argv strings.
+        let mut union_roots: Vec<String> = Vec::new();
+        for root in effective_config_paths(cfg)
+            .into_iter()
+            .chain(argv_roots.iter().map(|s| (*s).to_string()))
+        {
+            if !union_roots.contains(&root) {
+                union_roots.push(root);
+            }
+        }
+        let union_root_refs: Vec<&str> =
+            union_roots.iter().map(String::as_str).collect();
+        // Both sides of `widened.files.size > expansion.files.size` are the
+        // post-`reject_excluded` expansions: directory entries matching
+        // `BUILTIN_EXCLUDES + exclude:` (fnmatch, no flags) never count and
+        // never become discovery items. The `expansion` side re-expands
+        // `argv_roots` rather than reading `files.len()` because exclusion
+        // needs the dir-vs-file provenance only the roots carry.
+        //
+        // `fnmatch_may` is exact only for patterns without `[` or `\` — when
+        // ANY exclude pattern is undecidable, decline widening entirely (the
+        // same no-widening as the pre-#684 behaviour, so a config the matcher
+        // can't decide falls back instead of guessing: either lean direction
+        // can FIRE, not just suppress — an `exclude:`d decl kept in the
+        // widened set discovers `Foo#bar` upstream would never see, and a
+        // legit decl dropped loses suppression the reference had).
+        // Expansion errors on the discovery side are dropped, exactly as
+        // `project_discovery_expansion` only reads `widened[:files]`.
+        let excludes = discovery_exclude_patterns(cfg);
+        let all_decidable = excludes.iter().all(|p| !p.contains(['[', '\\']));
+        // Both expansions only run when every pattern is decidable;
+        // undecidable ⇒ both stay empty ⇒ `0 > 0` ⇒ no widening.
+        let (widened_files, expanded_files) = if all_decidable {
+            (
+                expand_check_paths_excluding(&union_root_refs, &excludes).0,
+                expand_check_paths_excluding(argv_roots, &excludes).0,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        if widened_files.len() > expanded_files.len() {
+            for path in widened_files {
+                if analyzed_paths.contains(path.as_str()) {
+                    continue;
+                }
+                worklist.push(WorkItem {
+                    order: usize::MAX,
+                    path,
+                    analyze: false,
+                });
+            }
+        }
+    }
+
+    let stage1: Vec<Stage1> = worklist
         .par_iter()
-        .enumerate()
-        .map(|(order, path)| {
+        .map(|item| {
+            let order = item.order;
+            let path = item.path.as_str();
             // `RIGOR_TIMING` component split: the clock is read ONLY under the
             // env gate, so an unset `RIGOR_TIMING` costs one already-hot
             // predicted branch per file and zero clock reads — the same
             // "invisible by default" contract the stage markers have.
             let t_file = timing.then(std::time::Instant::now);
             // Config `exclude:` — skip the file entirely before reading it.
-            if cfg.is_excluded(path) {
+            // Analyzed items only: discovery items arrived already filtered
+            // by the widening expansion's `reject_excluded` (fnmatch, no
+            // flags) — a `glob::Pattern` that over-matches fnmatch here
+            // (e.g. `a/**/b` vs `a/b`) would strip a decl the reference
+            // discovers.
+            if item.analyze && cfg.is_excluded(path) {
                 return Stage1::Excluded;
             }
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(e) => {
-                    return Stage1::IoError { path: path.to_string(), msg: e.to_string() };
+                    // A discovery-only file contributes nothing on a read
+                    // failure — no finding, no stderr line.
+                    return if item.analyze {
+                        Stage1::IoError { path: path.to_string(), msg: e.to_string() }
+                    } else {
+                        Stage1::Excluded
+                    };
                 }
             };
             // Skip ERB templates (`.rb` generator templates using `<%= … %>`):
@@ -846,12 +1069,16 @@ fn analyze_files(
                 Lowered::Parsed(lower_with_key(&result, FileKey::for_path(Path::new(path))), comments)
             }));
             match lowered {
-                Ok(Lowered::Unparseable(diags)) => Stage1::ParseErrors {
+                // A discovery-only file that cannot be parsed contributes no
+                // harvest and no findings — the reference's discovery pass
+                // likewise only consumes parsed sources.
+                Ok(Lowered::Unparseable(diags)) if item.analyze => Stage1::ParseErrors {
                     order,
                     path: path.to_string(),
                     source,
                     diags,
                 },
+                Ok(Lowered::Unparseable(_)) => Stage1::Excluded,
                 Ok(Lowered::Parsed(ast, comments)) => {
                     // Issue #92: the per-file HARVEST — everything the project
                     // index derives from this file's AST + the already-frozen
@@ -874,17 +1101,28 @@ fn analyze_files(
                         },
                         harvest: t_harvest.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                     };
-                    Stage1::Prepared(
-                        Prepared { order, path: path.to_string(), source, ast, comments },
-                        harvest,
-                        times,
-                    )
+                    if item.analyze {
+                        Stage1::Prepared(
+                            Prepared { order, path: path.to_string(), source, ast, comments },
+                            harvest,
+                            times,
+                        )
+                    } else {
+                        Stage1::Discovery {
+                            ast,
+                            harvest,
+                            times,
+                        }
+                    }
                 }
-                Err(panic_val) => Stage1::Panic {
+                // A discovery-only file that panics the lowerer contributes
+                // nothing — the same silent skip as an unparseable one.
+                Err(panic_val) if item.analyze => Stage1::Panic {
                     order,
                     path: path.to_string(),
                     msg: panic_message(&panic_val),
                 },
+                Err(_) => Stage1::Excluded,
             }
         })
         .collect();
@@ -893,6 +1131,16 @@ fn analyze_files(
     // `prepared` and `harvests` stay INDEX-ALIGNED — both are pushed here, in
     // input order, and nothing reorders either afterwards.
     let mut prepared: Vec<Prepared> = Vec::new();
+    // Discovery-only ASTs (upstream #684), kept alive through the stage-2
+    // merge; `harvests` stays in WORKLIST order (argv files first, then the
+    // config-`paths:` extras), so `merge_entries[i]` says which vec
+    // `harvests[i]`'s AST lives in.
+    let mut discovery_asts: Vec<rigor_parse::LoweredAst> = Vec::new();
+    enum MergeAst {
+        Prepared(usize),
+        Discovery(usize),
+    }
+    let mut merge_entries: Vec<MergeAst> = Vec::new();
     let mut harvests: Vec<rigor_infer::Harvest> = Vec::new();
     // `RIGOR_TIMING` accumulators — folded into the drain that already runs, so
     // the split costs no extra pass and nothing inside the parallel region.
@@ -908,6 +1156,15 @@ fn analyze_files(
                 hv_cpu_max = hv_cpu_max.max(t.harvest);
                 prepared.push(p);
                 harvests.push(*h);
+                merge_entries.push(MergeAst::Prepared(prepared.len() - 1));
+            }
+            Stage1::Discovery { ast, harvest, times } => {
+                pl_cpu += times.parse_lower;
+                hv_cpu += times.harvest;
+                hv_cpu_max = hv_cpu_max.max(times.harvest);
+                discovery_asts.push(ast);
+                harvests.push(*harvest);
+                merge_entries.push(MergeAst::Discovery(discovery_asts.len() - 1));
             }
             Stage1::ParseErrors { order, path, source, diags } => {
                 // Pushed straight into `findings`, bypassing stage 3 — which is
@@ -941,10 +1198,22 @@ fn analyze_files(
     // project-wide source index. This is the cross-file join — it must see every
     // file's harvest, and it still takes the ASTs because two merge-resident
     // passes walk them (tier-4b return typing and the interprocedural literal
-    // fold; issue #92 §5). The pairing is positional: `harvests[i]` was harvested
-    // from `prepared[i].ast`.
-    let files: Vec<(rigor_infer::Harvest, &rigor_parse::LoweredAst)> =
-        harvests.into_iter().zip(prepared.iter().map(|p| &p.ast)).collect();
+    // fold; issue #92 §5). The pairing is positional in WORKLIST order:
+    // `harvests[i]` was harvested from the AST `merge_entries[i]` names (a
+    // `prepared` entry for analyzed files, a `discovery_asts` entry for the
+    // discovery-only ones).
+    let mut harvests_iter = harvests.into_iter();
+    let files: Vec<(rigor_infer::Harvest, &rigor_parse::LoweredAst)> = merge_entries
+        .iter()
+        .map(|entry| {
+            let harvest = harvests_iter.next().expect("merge_entries is harvest-aligned");
+            let ast = match entry {
+                MergeAst::Prepared(i) => &prepared[*i].ast,
+                MergeAst::Discovery(i) => &discovery_asts[*i],
+            };
+            (harvest, ast)
+        })
+        .collect();
     let project_source = rigor_infer::SourceIndex::merge(&files, &index);
     let t_stage2 = std::time::Instant::now();
 
@@ -1420,6 +1689,9 @@ fn baseline_analysis(
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _had_io_error) = analyze_files(
         &expanded,
+        // `None` when the roots are the config `paths:` fallback — the
+        // reference's baseline always analyzes `paths:` and never widens.
+        if roots_given { Some(roots) } else { None },
         &cfg,
         verb,
         folder_ref,
@@ -1588,8 +1860,11 @@ fn write_baseline(
         entries.len()
     );
     if cfg.baseline_path().is_none() {
+        // The reference names the config file actually read — the explicit
+        // `--config` path when given, else the auto-discovered `.rigor.yml`.
+        let config_label = explicit_config.unwrap_or(".rigor.yml");
         eprintln!(
-            "rigor: note — `.rigor.yml` does not declare `baseline:`; \
+            "rigor: note — `{config_label}` does not declare `baseline:`; \
              add `baseline: {output}` to activate the suppression."
         );
     }
@@ -2871,5 +3146,495 @@ mod tests {
         let drifted: Vec<&baseline::DriftRow> =
             rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
         assert!(drifted.is_empty());
+    }
+
+    /// Upstream #684 — an explicit `check a.rb` still scans the configured
+    /// `paths:` for DISCOVERY (`expand_paths(paths | argv)`): an accessor
+    /// declared by an unlisted `lib/` file suppresses `x.zz` exactly as in a
+    /// project-mode run, while a method nothing declares still fires (the
+    /// must-still-fire control).
+    #[test]
+    fn analyze_files_discovers_config_paths_declarations() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(
+            root.join("lib/ext.rb"),
+            b"class String\n  attr_accessor :zz\nend\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.rb"), b"x = \"s\"\nx.zz\nx.no_such_zz\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+        let (findings, io_err) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(!io_err);
+        let messages: Vec<&str> = findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`zz'")),
+            "cross-file `attr_accessor :zz` suppresses; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`no_such_zz'")),
+            "an undeclared method still fires; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `Configuration.resolve_path_key!` — a DECLARED `paths:` entry is
+    /// `File.expand_path`'d against the CONFIG FILE's directory, not the
+    /// process cwd: `--config cfg/.rigor.yml` + `paths: ["lib"]` discovers
+    /// `cfg/lib`, and a stray cwd `lib/` is NOT walked. The fixture puts
+    /// the accessor under `cfg/lib` and a bait decl under cwd `lib` —
+    /// cwd-relative resolution would read the bait and miss the accessor.
+    #[test]
+    fn analyze_files_declared_paths_resolve_against_config_dir() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("cfg/.rigor.yml"), b"paths:\n  - lib\n").unwrap();
+        // The file the DECLARED `paths:` must reach: `String#zz` accessor.
+        std::fs::write(
+            root.join("cfg/lib/ext.rb"),
+            b"class String\n  attr_accessor :zz\nend\n",
+        )
+        .unwrap();
+        // Bait only a cwd-relative `lib` expansion would walk: `Foo#bar`'s
+        // Integer return would FP `1.upcase` if discovered.
+        std::fs::write(root.join("lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(
+            root.join("a.rb"),
+            b"x = \"s\"\nx.zz\nFoo.new.bar.upcase\n",
+        )
+        .unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        assert!(cfg.paths_explicitly_declared());
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+        let (findings, io_err) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(!io_err);
+        let messages: Vec<&str> = findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`zz'")),
+            "config-relative `paths:` sees cfg/lib's accessor; got {messages:?}"
+        );
+        assert!(
+            !messages.iter().any(|m| m.contains("`upcase'")),
+            "cwd `lib/` is NOT walked for a declared `paths:`; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `project_discovery_expansion`'s size gate
+    /// (`widened.files.size > expansion.files.size`): `check a.rb a.rb`
+    /// expands to the same file set as the `paths | argv` union (the argv
+    /// repeat dedups at the ROOT level), so discovery does NOT widen and
+    /// `lib/`'s `Foo` decl stays unseen — where a single `check a.rb`
+    /// (strictly larger widened set) DOES discover it. The oracle fires
+    /// `upcase for 1` on the single-arg row and goes silent on the dup.
+    #[test]
+    fn analyze_files_dup_argv_does_not_widen() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_dup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        // `paths` spelled absolute so no `chdir` is needed (the cwd-relative
+        // default `["lib"]` would walk the test process's cwd, not `root`):
+        // a mutated `Config::default()` has no `present_keys`, so the entry
+        // is NOT "declared" and is used verbatim — exactly the default's
+        // resolution rule.
+        let mut cfg = Config::default();
+        cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        // Single arg: widened = [lib/foo.rb, a.rb] > [a.rb] ⇒ widens ⇒
+        // `Foo#bar` resolves to Integer ⇒ `upcase` fires (oracle: `for 1`).
+        let (one, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+            "widened discovery must see Foo#bar; got {one:?}"
+        );
+
+        // Dup arg: widened = expand(paths | [a.rb]) — the repeat dedups —
+        // same size as the expansion ⇒ no widen ⇒ Foo unseen ⇒ silent.
+        let (two, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            two.is_empty(),
+            "dup argv must not widen discovery; got {two:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Bare `check` / `baseline` (`argv_roots == None` — the run's roots are
+    /// the config `paths:` fallback): upstream `paths == configuration.paths`
+    /// makes `widen_discovery_to_project?` unconditionally false, so
+    /// discovery never reaches beyond the analyzed set — even for a
+    /// `--config cfg/.rigor.yml` whose declared `paths:` names a DIFFERENT
+    /// directory than the analyzed roots.
+    #[test]
+    fn analyze_files_no_widen_on_config_fallback() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_bare_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("cfg/.rigor.yml"), b"paths:\n  - lib\n").unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("lib/a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        // The analyzed file is the cwd-`lib` expansion of the fallback
+        // roots (#198 — the roots side stays cwd-relative). With no argv
+        // there must be NO discovery widening: `Foo` stays unresolved and
+        // `upcase` cannot fire.
+        let a_rb = root.join("lib/a.rb").to_string_lossy().into_owned();
+        let (findings, io_err) = analyze_files(
+            &[a_rb.as_str()],
+            None,
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(!io_err);
+        assert!(
+            findings.is_empty(),
+            "config-fallback runs never widen discovery; got {findings:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `reject_excluded` applies INSIDE `expand_paths`, so an `exclude:`d
+    /// (or `BUILTIN_EXCLUDES`d) file shrinks BOTH the widened count and the
+    /// discovery set. Here `exclude: ["*zz.rb"]` (fnmatch-no-flags: `*` spans
+    /// `/`) drops `cfg/lib/zz.rb` from the widened expansion, making
+    /// `check a.rb a.rb`'s widened set the same size as its expansion — no
+    /// widening, `Foo` unseen, `upcase` silent. The single-arg row still
+    /// widens and fires (the must-still-fire control).
+    #[test]
+    fn analyze_files_exclude_shrinks_widened_count() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_excl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\nexclude:\n  - \"*zz.rb\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("cfg/lib/zz.rb"), b"class Zz\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        // Single arg: widened = [foo.rb, a.rb] > [a.rb] ⇒ widens ⇒ fires.
+        let (one, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+            "widened discovery must see Foo#bar; got {one:?}"
+        );
+
+        // Dup arg: widened = [foo.rb, a.rb] (zz.rb excluded inside the
+        // expansion) — same size as [a.rb, a.rb] ⇒ no widen ⇒ silent.
+        let (two, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            two.is_empty(),
+            "excluded files must shrink the widened count; got {two:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `BUILTIN_EXCLUDES` prune discovery too: a decl under
+    /// `lib/node_modules/` must neither count toward the widened set nor be
+    /// discovered. `lib/ok.rb` keeps the widened set strictly larger (so
+    /// widening DOES run — the assertion is about the discovery SET, not the
+    /// count), `node_modules/x.rb`'s `Foo#bar` stays unseen, and the
+    /// `Ok.new.qqq` control proves discovery ran and analysis still fires.
+    #[test]
+    fn analyze_files_builtin_excludes_drop_discovery_items() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_bex_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib/node_modules")).unwrap();
+        std::fs::write(root.join("lib/ok.rb"), b"class Ok\n  def zz = 1\nend\n").unwrap();
+        std::fs::write(
+            root.join("lib/node_modules/x.rb"),
+            b"class Foo\n  def bar = 1\nend\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\nOk.new.zz.upcase\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        let (findings, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        let messages: Vec<&str> =
+            findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        // `Ok.new.zz.upcase` firing (Integer#upcase) proves ok.rb WAS
+        // discovered; the absence of a SECOND `upcase` (Foo#bar's) proves
+        // node_modules/x.rb was not.
+        let upcase = messages.iter().filter(|m| m.contains("`upcase'")).count();
+        assert_eq!(
+            upcase, 1,
+            "exactly the Ok-row `upcase` fires; node_modules decl must not be \
+             discovered; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `configuration.paths | paths` dedups the RECEIVER too: `paths:`
+    /// entries that `File.expand_path` to the same root (`lib`, `./lib`,
+    /// `lib/`) are ONE union element, so the widened expansion is not
+    /// inflated by repeating a directory.
+    #[test]
+    fn analyze_files_repeated_paths_dedup_in_union() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_dupp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\n  - ./lib\n  - lib/\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        assert!(cfg.paths_explicitly_declared());
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        // Dup argv with a deduped union: widened = [foo.rb, a.rb] == size of
+        // the [a.rb, a.rb] expansion ⇒ no widen ⇒ silent. (Without the
+        // receiver-side dedup the triple `lib` roots count foo.rb thrice.)
+        let (two, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            two.is_empty(),
+            "repeated `paths:` roots must dedup out of the union; got {two:?}"
+        );
+
+        // Control: the single-arg row still widens and fires.
+        let (one, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+            "single-arg row still widens; got {one:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An `exclude:` pattern `fnmatch_may` cannot decide (`[`/`\`) declines
+    /// widening ENTIRELY — the pre-#684 no-widening behaviour — rather than
+    /// lean: an `exclude:`d decl kept in the widened set (or dropped from
+    /// the expansion count) FIRES, not just suppresses. Here
+    /// `exclude: ["lib/[f]oo.rb"]` makes `check a.rb` see no `lib/` decls at
+    /// all (`Foo.new.bar.upcase` silent — the `"s".nope` control proves the
+    /// file was still analysed); guessing would either wrongly keep foo.rb
+    /// (port fires where ref is silent) or wrongly empty the expansion.
+    #[test]
+    fn analyze_files_undecidable_exclude_declines_widening() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_und_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\nexclude:\n  - \"lib/[f]oo.rb\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n\"s\".nope\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+        let (findings, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        let messages: Vec<&str> =
+            findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`upcase'")),
+            "undecidable `exclude:` must decline widening; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`nope'")),
+            "a.rb still analysed; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same decline on the dup-argv shape (`check app app`): with
+    /// `exclude: ["[q]zz.rb"]` (matches nothing upstream, but undecidable for
+    /// `fnmatch_may`) the widened set must not be computed — before the fix
+    /// the "drop undecidable" lean emptied the expansion count (2 vs 0 →
+    /// widen → `upcase` ×2 where the reference counts 2 vs 2 and stays
+    /// silent).
+    #[test]
+    fn analyze_files_undecidable_exclude_declines_on_dup_argv() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_und2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\nexclude:\n  - \"[q]zz.rb\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(
+            root.join("app/a.rb"),
+            b"Foo.new.bar.upcase\n\"s\".nope\n",
+        )
+        .unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        let a_rb = root.join("app/a.rb").to_string_lossy().into_owned();
+        let (findings, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        let messages: Vec<&str> =
+            findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`upcase'")),
+            "undecidable `exclude:` must decline widening; got {messages:?}"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.contains("`nope'")).count(),
+            2,
+            "both argv occurrences analysed; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The leading-period half of the fnmatch fix is exercised at the
+    /// matcher level (`conformance_gate::fnmatch_over_approximates_ruby`);
+    /// the e2e `check ./app ./app` row is probe-verified because a
+    /// `./`-spelled root needs a controlled cwd.
+    #[test]
+    fn exclude_fnmatch_leading_period_rule() {
+        let excludes = vec!["*gen.rb".to_string()];
+        // `File.fnmatch?("*gen.rb", "./app/gen.rb")` is false — `./app/gen.rb`
+        // must NOT be excluded from the widened/expansion counts.
+        assert!(!exclude_fnmatch(&excludes, "./app/gen.rb"));
+        assert!(exclude_fnmatch(&excludes, "app/gen.rb"));
     }
 }

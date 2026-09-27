@@ -185,6 +185,9 @@ fn run_current(explicit_config: Option<&str>, paths: &[&str]) -> Vec<Value> {
     // ADR-0037, and keeps `diff` Ruby-free / hard-error-free.
     let (findings, _io) = crate::analyze_files(
         &expanded,
+        // `None` on the `paths:` fallback — same no-widening rule as
+        // `check` (`paths == configuration.paths` upstream).
+        if paths.is_empty() { None } else { Some(paths) },
         &cfg,
         "diff",
         None,
