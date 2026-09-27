@@ -1,5 +1,6 @@
 use super::*;
 use rigor_parse::{lower, parse};
+use rigor_types::Interner;
 
 /// A per-FIELD rendering of the whole index. `sorted = true` canonicalises
 /// every collection (the SEMANTIC content); `sorted = false` renders the
