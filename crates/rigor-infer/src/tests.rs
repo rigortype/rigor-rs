@@ -1,6 +1,6 @@
 use super::*;
-use rigor_parse::{lower, parse};
-use rigor_types::{Scalar, ShapeKey, ShapeMember};
+use rigor_parse::{lower, parse, Node};
+use rigor_types::{Scalar, ShapeKey, ShapeMember, Type};
 
 fn lower_src(src: &[u8]) -> LoweredAst {
     lower(&parse(src))

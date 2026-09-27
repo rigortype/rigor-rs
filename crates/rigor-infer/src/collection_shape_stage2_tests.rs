@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, Node};
 
 /// The type of the LAST receiver-bearing call in `src`, rendered. Wired like
 /// the analyze pass (source index + lexical scopes) so the shadow/lexical
