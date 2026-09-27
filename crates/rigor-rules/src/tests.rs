@@ -2711,6 +2711,13 @@ fn suppression_known_tokens_stay_silent() {
     assert!(sup("# rigor:disable flow.duplicate-hash-key").is_empty()); // new canonical id
     assert!(sup("# rigor:disable flow.shadowed-rescue-clause").is_empty()); // known-but-unimplemented
     assert!(sup("# rigor:disable suppression.unknown-rule").is_empty()); // self
+    // #252: the reference's `effect` family and ids, `plugin_trust`, and the
+    // sixth bare runtime id are known vocabulary too.
+    assert!(sup("# rigor:disable effect").is_empty());
+    assert!(sup("# rigor:disable effect.envelope-exceeded").is_empty());
+    assert!(sup("# rigor:disable effect.annotations-unchecked").is_empty());
+    assert!(sup("# rigor:disable plugin_trust.foo").is_empty());
+    assert!(sup("# rigor:disable source-rbs-annotation-not-honoured").is_empty());
 }
 
 #[test]

@@ -24,12 +24,15 @@ pub(crate) const INTERNAL_ERROR_RULE: &str = "internal-error";
 
 /// Family-wildcard tokens (`call`, `flow`, …). A token in this set expands to
 /// every canonical rule whose id starts with `<token>.` (reference
-/// `RULE_FAMILIES`). Only `call` can match an implemented rule today; the rest
-/// are carried for forward-compat with the reference's catalogue.
-const RULE_FAMILIES: &[&str] = &["call", "flow", "assert", "dump", "def", "suppression", "static"];
+/// `RULE_FAMILIES`, `check_rules/rule_ids.rb`). `assert`, `dump` and `effect`
+/// match no rule rigor-rs emits yet; they are carried so the tokens stay known
+/// vocabulary, as in the reference.
+const RULE_FAMILIES: &[&str] =
+    &["call", "flow", "assert", "dump", "def", "suppression", "static", "effect"];
 
-/// The canonical rule ids rigor-rs can actually emit. Family expansion and the
-/// `disable all` wildcard are checked against this set, so a `call` family token
+/// The canonical rule ids rigor-rs can actually emit. Family expansion is
+/// checked against this set (`all` is the separate `SuppressSet::all` flag), so a
+/// `call` family token
 /// only ever expands to the `call.*` ids listed here (the reference expands
 /// against its full `ALL_RULES`, but the extra ids it would add match no
 /// rigor-rs diagnostic). A rule rigor-rs emits but this set omits escapes its
@@ -63,8 +66,8 @@ pub fn implemented_rules() -> &'static [&'static str] {
     IMPLEMENTED_RULES
 }
 
-/// The reference's FULL `ALL_RULES` canonical catalogue (all 19 built-in ids,
-/// `check_rules.rb` lines 58–76). Deliberately BROADER than [`IMPLEMENTED_RULES`]:
+/// The reference's FULL `ALL_RULES` canonical catalogue (31 ids,
+/// `check_rules/rule_ids.rb`). Deliberately BROADER than [`IMPLEMENTED_RULES`]:
 /// the config audit ([`is_inert_builtin_token`]) uses it to decide whether a
 /// `disable:`/`severity_overrides:` token names a real rule, so it must never
 /// flag an id the reference recognizes — even one rigor-rs does not yet emit.
@@ -100,6 +103,11 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "suppression.empty",
     "suppression.unknown-marker",
     "static.value-use.void",
+    // ADR-103 effect rules: vocabulary only, rigor-rs emits none of them yet.
+    "effect.envelope-exceeded",
+    "effect.liskov-widened",
+    "effect.unknown-label",
+    "effect.annotations-unchecked",
 ];
 
 /// True when `token` looks like a built-in-family rule id but matches none — its
@@ -160,7 +168,7 @@ fn legacy_alias(token: &str) -> Option<&'static str> {
 /// the engine-heavy runner and cannot be enumerated here). Reference
 /// `NON_CHECK_DIAGNOSTIC_FAMILIES`.
 const NON_CHECK_DIAGNOSTIC_FAMILIES: &[&str] =
-    &["rbs_extended", "dynamic", "rbs", "pre-eval", "plugin"];
+    &["rbs_extended", "dynamic", "rbs", "pre-eval", "plugin", "plugin_trust"];
 
 /// Bare (dot-less) diagnostic ids the engine emits outside the catalogue. A token
 /// equal to one of these is KNOWN even without a family prefix. Reference
@@ -171,6 +179,7 @@ const NON_CHECK_DIAGNOSTIC_IDS: &[&str] = &[
     "pool-degraded",
     "runtime-error",
     "source-rbs-synthesis-failed",
+    "source-rbs-annotation-not-honoured",
 ];
 
 /// True when a suppression token resolves to a diagnostic identifier some producer
