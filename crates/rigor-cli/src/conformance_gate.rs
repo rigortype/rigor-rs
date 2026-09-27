@@ -534,7 +534,7 @@ pub(crate) fn process_env_ok(
 /// `true` whenever it MIGHT match. `*` spans `/` (no `FNM_PATHNAME`), `?` is
 /// one character; a bracket expression or an escape counts as "might match",
 /// and the leading-period rule is ignored (both only widen the answer).
-fn fnmatch_may(pattern: &str, path: &str) -> bool {
+pub(crate) fn fnmatch_may(pattern: &str, path: &str) -> bool {
     if pattern.contains(['[', '\\']) {
         return true;
     }
@@ -552,7 +552,8 @@ fn fnmatch_may(pattern: &str, path: &str) -> bool {
 }
 
 /// `Configuration::BUILTIN_EXCLUDES`, always appended upstream.
-const BUILTIN_EXCLUDES: &[&str] = &["**/vendor/bundle/**", "**/.bundle/**", "**/node_modules/**"];
+pub(crate) const BUILTIN_EXCLUDES: &[&str] =
+    &["**/vendor/bundle/**", "**/.bundle/**", "**/node_modules/**"];
 
 /// Whether the reference's run has at least one Ruby file (`expand_paths`
 /// of its roots is non-empty). Without one it builds no environment and

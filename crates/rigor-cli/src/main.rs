@@ -565,13 +565,40 @@ fn effective_config_paths(cfg: &Config) -> Vec<String> {
 /// analyze plus any bad-path errors — a faithful port of the reference's
 /// `Runner#expand_paths` (ADR-0040):
 /// - a DIRECTORY → its `**/*.rb` (recursive; hidden dirs and symlinks skipped;
-///   `.gitignore` ignored — only config `exclude:` prunes, via the per-file gate
-///   in [`analyze_files`]); each directory's files sorted, concatenated in arg
-///   order.
+///   `.gitignore` ignored — the analysis path prunes `exclude:` via the
+///   per-file gate in [`analyze_files`]; the WIDENING expansion prunes
+///   `BUILTIN_EXCLUDES + exclude:` inside
+///   [`expand_check_paths_excluding`]); each directory's files sorted,
+///   concatenated in arg order.
 /// - a FILE ending in `.rb` → kept as-is.
 /// - an existing non-`.rb` file → a `PathError { not_found: false }`.
 /// - a missing path → a `PathError { not_found: true }`.
 fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
+    expand_check_paths_excluding(raw, &[], false)
+}
+
+/// `expand_check_paths` with the reference's `reject_excluded` applied to
+/// DIRECTORY-expanded entries only (`PathExpansion.directory_files` drops any
+/// glob hit matching `exclude_patterns`; an explicit `.rb` file root is kept
+/// verbatim — `accept_as_ruby_file?` never consults the list).
+///
+/// `excludes` is `Configuration#exclude_patterns` (`BUILTIN_EXCLUDES +
+/// exclude:`), matched with `File.fnmatch?` and NO flags — `*` spans `/`, so
+/// `*zz.rb` matches `lib/zz.rb` (this is NOT the `glob::Pattern` semantics
+/// `Config::is_excluded` uses on the analyze path). [`conformance_gate::
+/// fnmatch_may`] is exact for patterns without `[` or `\` and answers "might
+/// match" for the rest; `drop_undecidable` picks the lean there:
+/// - `true` — the `expansion` side of the widening size gate, where a LOW
+///   count is the safe side (undercounting the analyzed set can only widen
+///   MORE, adding decls that suppress);
+/// - `false` — the `widened` side, where a KEPT file is the safe side (a file
+///   retained only adds discovery decls; dropping one the reference kept
+///   loses decls it suppressed with).
+fn expand_check_paths_excluding(
+    raw: &[&str],
+    excludes: &[String],
+    drop_undecidable: bool,
+) -> (Vec<String>, Vec<PathError>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
     for &p in raw {
@@ -580,6 +607,7 @@ fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
             let mut in_dir = Vec::new();
             collect_rb_files(path, &mut in_dir);
             in_dir.sort();
+            in_dir.retain(|f| !exclude_fnmatch(excludes, f, drop_undecidable));
             files.extend(in_dir);
         } else if path.is_file() && p.ends_with(".rb") {
             files.push(p.to_string());
@@ -590,6 +618,32 @@ fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
         }
     }
     (files, errors)
+}
+
+/// `Configuration#exclude_patterns` — `BUILTIN_EXCLUDES + exclude:` — the
+/// list `expand_paths`' `reject_excluded` applies to directory expansions
+/// (the analysis-side per-file `exclude:` filter stays the pre-existing
+/// `cfg.is_excluded` glob gate in `analyze_files`).
+fn discovery_exclude_patterns(cfg: &Config) -> Vec<String> {
+    conformance_gate::BUILTIN_EXCLUDES
+        .iter()
+        .map(|s| (*s).to_string())
+        .chain(cfg.exclude.iter().cloned())
+        .collect()
+}
+
+/// `File.fnmatch?(pattern, path)`-with-no-flags exclusion for one expanded
+/// path. Exact for patterns without `[` or `\` (`fnmatch_may` is a precise
+/// no-flags matcher there); undecidable patterns fall to `drop_undecidable`
+/// — see [`expand_check_paths_excluding`] for which side leans which way.
+fn exclude_fnmatch(patterns: &[String], path: &str, drop_undecidable: bool) -> bool {
+    patterns.iter().any(|p| {
+        if p.contains(['[', '\\']) {
+            drop_undecidable
+        } else {
+            conformance_gate::fnmatch_may(p, path)
+        }
+    })
 }
 
 /// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
@@ -890,19 +944,37 @@ fn analyze_files(
         });
     }
     if let Some(argv_roots) = argv_roots {
-        // `configuration.paths | paths` — a ROOT-level union, in order.
-        let mut union_roots: Vec<String> = effective_config_paths(cfg);
-        for &root in argv_roots {
-            if !union_roots.iter().any(|u| u == root) {
-                union_roots.push((*root).to_string());
+        // `configuration.paths | paths` — a ROOT-level ORDERED-SET union: the
+        // receiver's own repeats dedup out too (`paths: [lib, lib]` and the
+        // `File.expand_path`-identical `[./lib, lib/]` are ONE root upstream),
+        // and so do repeat argv strings.
+        let mut union_roots: Vec<String> = Vec::new();
+        for root in effective_config_paths(cfg)
+            .into_iter()
+            .chain(argv_roots.iter().map(|s| (*s).to_string()))
+        {
+            if !union_roots.contains(&root) {
+                union_roots.push(root);
             }
         }
         let union_root_refs: Vec<&str> =
             union_roots.iter().map(String::as_str).collect();
+        // Both sides of `widened.files.size > expansion.files.size` are the
+        // post-`reject_excluded` expansions: directory entries matching
+        // `BUILTIN_EXCLUDES + exclude:` (fnmatch, no flags) never count and
+        // never become discovery items. The `expansion` side re-expands
+        // `argv_roots` rather than reading `files.len()` because exclusion
+        // needs the dir-vs-file provenance only the roots carry — and the
+        // undecidable-pattern lean differs per side (a low analyzed count can
+        // only widen more; a kept widened file only adds suppressing decls).
         // Expansion errors on the discovery side are dropped, exactly as
         // `project_discovery_expansion` only reads `widened[:files]`.
-        let (widened_files, _) = expand_check_paths(&union_root_refs);
-        if widened_files.len() > files.len() {
+        let excludes = discovery_exclude_patterns(cfg);
+        let (widened_files, _) =
+            expand_check_paths_excluding(&union_root_refs, &excludes, false);
+        let (expanded_files, _) =
+            expand_check_paths_excluding(argv_roots, &excludes, true);
+        if widened_files.len() > expanded_files.len() {
             for path in widened_files {
                 if analyzed_paths.contains(path.as_str()) {
                     continue;
@@ -927,7 +999,12 @@ fn analyze_files(
             // "invisible by default" contract the stage markers have.
             let t_file = timing.then(std::time::Instant::now);
             // Config `exclude:` — skip the file entirely before reading it.
-            if cfg.is_excluded(path) {
+            // Analyzed items only: discovery items arrived already filtered
+            // by the widening expansion's `reject_excluded` (fnmatch, no
+            // flags) — a `glob::Pattern` that over-matches fnmatch here
+            // (e.g. `a/**/b` vs `a/b`) would strip a decl the reference
+            // discovers.
+            if item.analyze && cfg.is_excluded(path) {
                 return Stage1::Excluded;
             }
             let source = match std::fs::read_to_string(path) {
@@ -3262,6 +3339,175 @@ mod tests {
         assert!(
             findings.is_empty(),
             "config-fallback runs never widen discovery; got {findings:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `reject_excluded` applies INSIDE `expand_paths`, so an `exclude:`d
+    /// (or `BUILTIN_EXCLUDES`d) file shrinks BOTH the widened count and the
+    /// discovery set. Here `exclude: ["*zz.rb"]` (fnmatch-no-flags: `*` spans
+    /// `/`) drops `cfg/lib/zz.rb` from the widened expansion, making
+    /// `check a.rb a.rb`'s widened set the same size as its expansion — no
+    /// widening, `Foo` unseen, `upcase` silent. The single-arg row still
+    /// widens and fires (the must-still-fire control).
+    #[test]
+    fn analyze_files_exclude_shrinks_widened_count() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_excl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\nexclude:\n  - \"*zz.rb\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("cfg/lib/zz.rb"), b"class Zz\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        // Single arg: widened = [foo.rb, a.rb] > [a.rb] ⇒ widens ⇒ fires.
+        let (one, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+            "widened discovery must see Foo#bar; got {one:?}"
+        );
+
+        // Dup arg: widened = [foo.rb, a.rb] (zz.rb excluded inside the
+        // expansion) — same size as [a.rb, a.rb] ⇒ no widen ⇒ silent.
+        let (two, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            two.is_empty(),
+            "excluded files must shrink the widened count; got {two:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `BUILTIN_EXCLUDES` prune discovery too: a decl under
+    /// `lib/node_modules/` must neither count toward the widened set nor be
+    /// discovered. `lib/ok.rb` keeps the widened set strictly larger (so
+    /// widening DOES run — the assertion is about the discovery SET, not the
+    /// count), `node_modules/x.rb`'s `Foo#bar` stays unseen, and the
+    /// `Ok.new.qqq` control proves discovery ran and analysis still fires.
+    #[test]
+    fn analyze_files_builtin_excludes_drop_discovery_items() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_bex_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("lib/node_modules")).unwrap();
+        std::fs::write(root.join("lib/ok.rb"), b"class Ok\n  def zz = 1\nend\n").unwrap();
+        std::fs::write(
+            root.join("lib/node_modules/x.rb"),
+            b"class Foo\n  def bar = 1\nend\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\nOk.new.zz.upcase\n").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        let (findings, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        let messages: Vec<&str> =
+            findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        // `Ok.new.zz.upcase` firing (Integer#upcase) proves ok.rb WAS
+        // discovered; the absence of a SECOND `upcase` (Foo#bar's) proves
+        // node_modules/x.rb was not.
+        let upcase = messages.iter().filter(|m| m.contains("`upcase'")).count();
+        assert_eq!(
+            upcase, 1,
+            "exactly the Ok-row `upcase` fires; node_modules decl must not be \
+             discovered; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `configuration.paths | paths` dedups the RECEIVER too: `paths:`
+    /// entries that `File.expand_path` to the same root (`lib`, `./lib`,
+    /// `lib/`) are ONE union element, so the widened expansion is not
+    /// inflated by repeating a directory.
+    #[test]
+    fn analyze_files_repeated_paths_dedup_in_union() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_dupp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\n  - ./lib\n  - lib/\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        assert!(cfg.paths_explicitly_declared());
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+
+        // Dup argv with a deduped union: widened = [foo.rb, a.rb] == size of
+        // the [a.rb, a.rb] expansion ⇒ no widen ⇒ silent. (Without the
+        // receiver-side dedup the triple `lib` roots count foo.rb thrice.)
+        let (two, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            two.is_empty(),
+            "repeated `paths:` roots must dedup out of the union; got {two:?}"
+        );
+
+        // Control: the single-arg row still widens and fires.
+        let (one, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        assert!(
+            one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+            "single-arg row still widens; got {one:?}"
         );
 
         let _ = std::fs::remove_dir_all(&root);
