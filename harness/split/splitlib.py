@@ -31,11 +31,14 @@ def _tool():
 
 class Item:
     """One rsitems row. `start` includes attributes and doc comments; `vis`
-    is the written visibility (`pub`, `pub(crate)`, …) or `-`."""
+    is the written visibility (`pub`, `pub(crate)`, …) or `-`; `kw`/`brace`
+    locate an impl's `impl` keyword and body `{` (0 for other rows)."""
 
-    def __init__(self, depth, kind, name, start, end, parent, vis="-"):
+    def __init__(self, depth, kind, name, start, end, parent, vis="-", kw=0, brace=0):
         self.depth, self.kind, self.name = int(depth), kind, name
         self.start, self.end, self.parent, self.vis = int(start), int(end), int(parent), vis
+        # impls only: the `impl` keyword line and the body's opening-brace line
+        self.kw, self.brace = int(kw), int(brace)
 
     def __repr__(self):
         return f"Item({self.depth} {self.kind} {self.name} {self.start}-{self.end} {self.vis})"
@@ -179,7 +182,9 @@ def name_key(name):
 
 def fmt_use(prefix, names, width=100):
     """A rustfmt-shaped `use PREFIX::{…};` wrapped at `width` columns."""
-    names = sorted(set(names), key=name_key)
+    names = sorted(set(names), key=lambda n: (n != "self", name_key(n)))
+    if names == ["self"]:
+        return f"use {prefix};"
     if len(names) == 1:
         return f"use {prefix}::{names[0]};"
     one = f"use {prefix}::{{{', '.join(names)}}};"
@@ -193,6 +198,22 @@ def fmt_use(prefix, names, width=100):
         cur += f" {n},"
     lines.append(cur)
     return f"use {prefix}::{{\n" + "\n".join(lines) + "\n};"
+
+
+def ignored(paths):
+    """The subset of `paths` git would ignore (repo or global excludes): a
+    new file there is silently skipped by `git add`."""
+    if not paths:
+        return []
+    p = subprocess.run(["git", "check-ignore", "--stdin"], input="\n".join(paths), text=True,
+                       capture_output=True, cwd=REPO)
+    return [l for l in p.stdout.splitlines() if l]
+
+
+def impl_attr_lines(L, imp):
+    """An impl's outer attribute lines (1-based), docs and comments excluded."""
+    return [i for i in range(imp.start, imp.kw)
+            if L[i - 1].strip() and not L[i - 1].lstrip().startswith("//")]
 
 
 def rel(path):

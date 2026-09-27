@@ -20,8 +20,9 @@ outside the test build is still reached by the tests through `use super::*`:
 it is reported as test-only, and `testimports.py` moves it into the test
 files that use it.
 
-Only top-level `use` items are edited, located by the syn lister — never a
-text search over the file — so string literals and code are never touched.
+Only top-level `use` items are edited, located by the syn lister (and, for
+the glob, the exact `pub(crate) use MOD::*;` line split_mod wrote), so string
+literals and code are never touched.
 Anything it cannot fix is printed; the exit status is 1 while errors remain.
 """
 import argparse
@@ -161,16 +162,18 @@ def add_imports(modfile, prefix, names):
         L[at:at] = [""] + splitlib.fmt_use(prefix, names).split("\n")
         write_lines(modfile, L)
         have = []
-    print(f"  import {prefix}::{{{', '.join(sorted(set(names) - set(have), key=splitlib.name_key))}}}")
+    added = sorted(set(names) - set(have), key=splitlib.name_key)
+    print(f"  import {prefix}::" + (added[0] if len(added) == 1 else "{" + ", ".join(added) + "}"))
 
 
-def remove_import(path, name):
-    """Drop `name` (a bare name or a full path, as rustc words it) from a
-    private top-level use item. False when no such item holds it."""
+def remove_import(path, name, line=None):
+    """Drop `name` (a bare name or a full path, as rustc words it) from the
+    private top-level use item on `line` (the warning's line; any item holding
+    the name when `line` is None). False when no such item holds it."""
     L = read_lines(path)
     last = name.split("::")[-1]
     for s, e, vis in splitlib.use_items(path):
-        if vis != "-":
+        if vis != "-" or (line is not None and not s <= line <= e):
             continue
         p = splitlib.parse_use("\n".join(L[s - 1:e]))
         if not p or last not in p[1]:
@@ -230,17 +233,20 @@ def fix(crate, modfile, prefix):
 
 def prune(crate, modfile, parent, modname):
     for _ in range(10):
-        warns = {}   # (file, name) -> number of targets reporting it unused
+        warns = {}   # (file, name, line) -> number of targets reporting it unused
         for m in splitlib.cargo_messages(crate):
-            sp = splitlib.primary_span(m)
-            if m["level"] != "warning" or splitlib.code(m) != "unused_imports" or not sp:
+            if m["level"] != "warning" or splitlib.code(m) != "unused_imports" or not m["spans"]:
                 continue
-            f = os.path.abspath(os.path.join(splitlib.REPO, sp["file_name"]))
-            for n in splitlib.backticked(m["message"]):
-                warns[(f, n)] = warns.get((f, n), 0) + 1
+            names = splitlib.backticked(m["message"])
+            # rustc gives one span per unused name, in the message's order
+            spans = m["spans"] if len(m["spans"]) == len(names) else [splitlib.primary_span(m)] * len(names)
+            for n, sp in zip(names, spans):
+                f = os.path.abspath(os.path.join(splitlib.REPO, sp["file_name"]))
+                key = (f, n, sp["line_start"])
+                warns[key] = warns.get(key, 0) + 1
         changed = False
-        for (f, n), times in sorted(warns.items()):
-            if f == modfile and remove_import(f, n):
+        for (f, n, line), times in sorted(warns.items()):
+            if f == modfile and times >= 2 and remove_import(f, n, line):
                 print(f"  prune {n}")
                 changed = True
             elif f == parent and times >= 2 and n == f"{modname}::*":
@@ -250,7 +256,7 @@ def prune(crate, modfile, parent, modname):
                     write_lines(f, L)
                     print(f"  drop unused re-export {modname}::* from {splitlib.rel(f)}")
                     changed = True
-            elif f == parent and times >= 2 and remove_import(f, n):
+            elif f == parent and times >= 2 and remove_import(f, n, line):
                 print(f"  prune {n} from {splitlib.rel(f)} (unused in every target)")
                 changed = True
         if not changed:
@@ -280,6 +286,9 @@ def main():
         if splitlib.code(m) == "unused_imports" and sp and os.path.abspath(
                 os.path.join(splitlib.REPO, sp["file_name"])) == parent:
             hint = "  <- unused in one build only: if the tests need it, move it with testimports.py"
+        elif splitlib.code(m) == "unused_imports" and sp and os.path.abspath(
+                os.path.join(splitlib.REPO, sp["file_name"])) == modfile:
+            hint = "  <- unused in one build only (cfg-gated code?): gate the import or the module by hand"
         print(m["level"].upper(), splitlib.code(m), m["message"],
               sp and f"{sp['file_name']}:{sp['line_start']}", hint)
     if any(m["level"] == "error" for m in msgs):

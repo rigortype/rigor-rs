@@ -51,7 +51,10 @@ script also warns about constructs whose meaning moves with the file:
    item), `impl:TYPE` (a whole inherent impl, e.g. `impl:Typer<'i>`) or
    `TYPE::method` (e.g. `Typer::type_of`). Each item takes the comment gap
    above it with it; the script prints any non-blank gap so you can check that
-   no banner belonging to a neighbour moved.
+   no banner belonging to a neighbour moved. Methods moved out of an impl get
+   a wrapper that copies the impl's header and outer attributes (so a
+   `#[cfg(test)] impl` stays test-only); an impl that opens and closes on
+   one line, or has text after its `{`, must move whole (`impl:TYPE`).
 2. `split_mod.py FILE MOD sel.txt doc.txt` writes the new module and wires
    `mod MOD;` / `pub(crate) use MOD::*;` / `pub use` (for moved `pub` items)
    into FILE.
@@ -67,10 +70,10 @@ script also warns about constructs whose meaning moves with the file:
      This includes the `MOD::*` glob. An import unused only outside the test
      build is still used by the tests: it is reported, not dropped. Remove
      it from the parent, then run `testimports.py`.
-   - It edits only top-level `use` items, found by the syn lister, never
-     through a text search. It stops with status 1 while errors remain, or
-     when cargo fails without a compiler error (a stale lock, a bad
-     `--crate`).
+   - It edits only top-level `use` items, found by the syn lister and
+     picked by the warning's line, plus the exact glob line split_mod
+     wrote. It stops with status 1 while errors remain, or when cargo fails
+     without a compiler error (a stale lock, a bad `--crate`).
 4. **Doc links.** Diff the rustdoc warnings from before and after the move:
    `cargo doc -p C --no-deps --document-private-items 2>&1 | grep '^warning' | sort`.
    For each new "unresolved link to `X`", run `doclinks.py src/MOD.rs X=path`.

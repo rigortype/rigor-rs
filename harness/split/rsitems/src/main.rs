@@ -4,7 +4,7 @@
 //! top-level `impl` block:
 //!
 //! ```text
-//! depth  kind  name  start_line  end_line  parent_start_line  vis
+//! depth  kind  name  start_line  end_line  parent_start_line  vis  kw_line  brace_line
 //! ```
 //!
 //! `depth` is 0 for a top-level item and 1 for an impl item (whose
@@ -12,7 +12,10 @@
 //! item's outer attributes, doc comments among them; plain `//` comments are
 //! not items, so the callers attribute them by gap. An impl's `name` is its
 //! self type (`Typer<'i>`), or `Trait for Type`. `vis` is the item's written
-//! visibility (`pub`, `pub(crate)`, …) or `-` when it has none.
+//! visibility (`pub`, `pub(crate)`, …) or `-` when it has none. For an impl,
+//! `kw_line` is the line of its `impl` keyword and `brace_line` the line of
+//! the `{` that opens its body (so lines `start..kw_line` are its outer
+//! attributes and docs); both are 0 for every other row.
 //!
 //! `rsitems FILE --literals` prints every literal that spans lines:
 //!
@@ -91,7 +94,11 @@ fn print_items(file: &syn::File) {
         let (kind, name, attrs) = describe(it);
         let (s, e) = lines(it.span());
         let s = first_line(attrs, s);
-        println!("0\t{kind}\t{name}\t{s}\t{e}\t0\t{}", item_vis(it));
+        let (kw, brace) = match it {
+            Item::Impl(x) => (x.impl_token.span.start().line, x.brace_token.span.open().start().line),
+            _ => (0, 0),
+        };
+        println!("0\t{kind}\t{name}\t{s}\t{e}\t0\t{}\t{kw}\t{brace}", item_vis(it));
         if let Item::Impl(imp) = it {
             for ii in &imp.items {
                 let (kind, name, attrs, v) = match ii {
@@ -101,7 +108,7 @@ fn print_items(file: &syn::File) {
                     _ => ("other", "-".into(), &[][..], "-".into()),
                 };
                 let (is, ie) = lines(ii.span());
-                println!("1\t{kind}\t{name}\t{}\t{ie}\t{s}\t{v}", first_line(attrs, is));
+                println!("1\t{kind}\t{name}\t{}\t{ie}\t{s}\t{v}\t0\t0", first_line(attrs, is));
             }
         }
     }
