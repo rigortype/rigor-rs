@@ -94,10 +94,10 @@ In the top three files those modules are 44–56% of the lines:
 | `rigor-infer/src/source_index.rs` | 8,456 | 3,812 (3) — moved out in #220 (→ 4,650 lines) |
 | `rigor-rules/src/lib.rs` | 7,985 | 3,494 (3) — moved out in #224 (→ 4,497 lines) |
 | `rigor-cli/src/lsp.rs` | 7,809 | 4,340 (1) — moved out in #225 (→ 3,471 lines) |
-| `rigor-index/src/rbs.rs` | 6,399 | 1,287 (8) |
-| `rigor-parse/src/ast.rs` | 4,813 | 1,059 (1) |
-| `rigor-cli/src/sig_gen.rs` | 3,535 | 1,086 (1) |
-| `rigor-cli/src/main.rs` | 3,640 | 983 (1) |
+| `rigor-index/src/rbs.rs` | 6,399 | 1,268 (8) — moved out in #229 (→ 5,139 lines) |
+| `rigor-parse/src/ast.rs` | 4,813 | 1,059 (1) — moved out in #230 (→ 3,756 lines) |
+| `rigor-cli/src/sig_gen.rs` | 3,535 | 1,086 (1) — moved out in #231 (→ 2,451 lines) |
+| `rigor-cli/src/main.rs` | 3,640 | 983 (1) — moved out in #231 (→ 2,659 lines) |
 
 Outside a crate root, `mod tests;` resolves to `src/<file>/tests.rs`. Raw
 string fixtures (LSP JSON, Ruby sources) must not be de-indented, so check
@@ -127,4 +127,10 @@ multi-line literals before moving.
   `\`-continued, so none stayed verbatim. A global git exclude with a bare
   `lsp/` hid the new `src/lsp/tests.rs` from `git add`, so check new paths
   with `git check-ignore` (noted on #221).
+- **#229 / #230 / #231** (2026-09-28) finished the test-module moves
+  listed above. Every large file in the workspace now keeps its unit tests
+  in separate files. `ast.rs` kept 4 literal lines verbatim, which its
+  reviewer's own lexer confirmed independently. Next is splitting the
+  production code of rigor-rules `lib.rs` (4,497 lines), which starts from
+  a spec, as #204 did.
 
