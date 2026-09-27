@@ -79,8 +79,13 @@ def main():
     for istart, ms in moved_meth.items():
         kids = [r for r in rows if r.depth == 1 and r.parent == istart]
         if len(ms) == len(kids):
-            splitlib.die(f"every item of impl {impls[istart].name} (line {istart}) is selected, "
-                         f"which would leave an empty impl behind: select impl:{impls[istart].name}")
+            name = impls[istart].name
+            twins = sum(1 for i in impls.values() if i.name == name)
+            hint = (f"select impl:{name}" if twins == 1 else
+                    f"this file has {twins} `impl {name}` blocks, so impl:{name} is ambiguous: "
+                    "merge them first (a prep commit), then select impl:" + name)
+            splitlib.die(f"every item of impl {name} (line {istart}) is selected, "
+                         f"which would leave an empty impl behind: {hint}")
     missing = [s for s in sel if s not in found]
     if missing:
         splitlib.die(f"no item for: {missing}")
