@@ -532,9 +532,18 @@ pub(crate) fn process_env_ok(
 
 /// Ruby's `File.fnmatch?(pattern, path)` with NO flags, over-approximated:
 /// `true` whenever it MIGHT match. `*` spans `/` (no `FNM_PATHNAME`), `?` is
-/// one character; a bracket expression or an escape counts as "might match",
-/// and the leading-period rule is ignored (both only widen the answer).
+/// one character; a bracket expression or an escape counts as "might match".
+/// The leading-period rule IS modelled (oracle: `File.fnmatch?` applies it
+/// even with no flags — `*gen.rb` vs `./app/gen.rb` is `false`, `?`/`[` obey
+/// it too) — but only at path position 0: `lib/*.rb` vs `lib/.x.rb` is `true`
+/// (the rule does not fire after a `/`).
 pub(crate) fn fnmatch_may(pattern: &str, path: &str) -> bool {
+    // A `*`, `?` or `[` at pattern position 0 never matches a `.` at path
+    // position 0 (oracle-measured truth table). A leading `\` escapes to a
+    // literal, which can never be `.` anyway.
+    if path.starts_with('.') && matches!(pattern.chars().next(), Some('*' | '?' | '[')) {
+        return false;
+    }
     if pattern.contains(['[', '\\']) {
         return true;
     }
@@ -694,6 +703,15 @@ mod tests {
         assert!(fnmatch_may("lib/*", "lib/a/b.rb"));
         assert!(!fnmatch_may("lib/*.rb", "app/a.rb"));
         assert!(fnmatch_may("[a]pp.rb", "zzz"));
+        // Leading-period rule, position-0 only (oracle-measured truth table).
+        assert!(!fnmatch_may("*gen.rb", "./app/gen.rb"));
+        assert!(!fnmatch_may("*gen.rb", ".gen.rb"));
+        assert!(!fnmatch_may("?gen.rb", ".gen.rb"));
+        assert!(!fnmatch_may("[g]en.rb", ".gen.rb"));
+        assert!(fnmatch_may("*gen.rb", "lib/.gen.rb"));
+        assert!(fnmatch_may("lib/*.rb", "lib/.x.rb"));
+        assert!(fnmatch_may(".*gen.rb", "./app/gen.rb"));
+        assert!(fnmatch_may("./app/*.rb", "./app/gen.rb"));
     }
 
     /// Family 9: no Ruby file ⇒ the reference builds no environment and

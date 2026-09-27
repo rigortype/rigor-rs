@@ -574,7 +574,7 @@ fn effective_config_paths(cfg: &Config) -> Vec<String> {
 /// - an existing non-`.rb` file → a `PathError { not_found: false }`.
 /// - a missing path → a `PathError { not_found: true }`.
 fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
-    expand_check_paths_excluding(raw, &[], false)
+    expand_check_paths_excluding(raw, &[])
 }
 
 /// `expand_check_paths` with the reference's `reject_excluded` applied to
@@ -585,19 +585,16 @@ fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
 /// `excludes` is `Configuration#exclude_patterns` (`BUILTIN_EXCLUDES +
 /// exclude:`), matched with `File.fnmatch?` and NO flags — `*` spans `/`, so
 /// `*zz.rb` matches `lib/zz.rb` (this is NOT the `glob::Pattern` semantics
-/// `Config::is_excluded` uses on the analyze path). [`conformance_gate::
-/// fnmatch_may`] is exact for patterns without `[` or `\` and answers "might
-/// match" for the rest; `drop_undecidable` picks the lean there:
-/// - `true` — the `expansion` side of the widening size gate, where a LOW
-///   count is the safe side (undercounting the analyzed set can only widen
-///   MORE, adding decls that suppress);
-/// - `false` — the `widened` side, where a KEPT file is the safe side (a file
-///   retained only adds discovery decls; dropping one the reference kept
-///   loses decls it suppressed with).
+/// `Config::is_excluded` uses on the analyze path). Callers must only pass
+/// patterns [`conformance_gate::fnmatch_may`] can decide exactly — the
+/// widening path declines entirely when any pattern is undecidable rather
+/// than guess: a wrong guess in EITHER direction can fire (`exclude:`d decl
+/// kept → widened/discovery see a file the reference dropped; legit decl
+/// dropped → widened/extra decls missing), and a discovered decl can CAUSE a
+/// diagnostic, not only suppress one.
 fn expand_check_paths_excluding(
     raw: &[&str],
     excludes: &[String],
-    drop_undecidable: bool,
 ) -> (Vec<String>, Vec<PathError>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
@@ -607,7 +604,7 @@ fn expand_check_paths_excluding(
             let mut in_dir = Vec::new();
             collect_rb_files(path, &mut in_dir);
             in_dir.sort();
-            in_dir.retain(|f| !exclude_fnmatch(excludes, f, drop_undecidable));
+            in_dir.retain(|f| !exclude_fnmatch(excludes, f));
             files.extend(in_dir);
         } else if path.is_file() && p.ends_with(".rb") {
             files.push(p.to_string());
@@ -633,17 +630,15 @@ fn discovery_exclude_patterns(cfg: &Config) -> Vec<String> {
 }
 
 /// `File.fnmatch?(pattern, path)`-with-no-flags exclusion for one expanded
-/// path. Exact for patterns without `[` or `\` (`fnmatch_may` is a precise
-/// no-flags matcher there); undecidable patterns fall to `drop_undecidable`
-/// — see [`expand_check_paths_excluding`] for which side leans which way.
-fn exclude_fnmatch(patterns: &[String], path: &str, drop_undecidable: bool) -> bool {
-    patterns.iter().any(|p| {
-        if p.contains(['[', '\\']) {
-            drop_undecidable
-        } else {
-            conformance_gate::fnmatch_may(p, path)
-        }
-    })
+/// path. `fnmatch_may` is exact for patterns without `[` or `\` (the caller
+/// declines widening when any pattern is undecidable, so this only ever sees
+/// decidable input) — and models the leading-period rule: a `*`/`?`/`[` at
+/// pattern position 0 never matches a `.` at path position 0 (`./app/gen.rb`
+/// is NOT excluded by `*gen.rb`).
+fn exclude_fnmatch(patterns: &[String], path: &str) -> bool {
+    patterns
+        .iter()
+        .any(|p| conformance_gate::fnmatch_may(p, path))
 }
 
 /// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
@@ -964,16 +959,29 @@ fn analyze_files(
         // `BUILTIN_EXCLUDES + exclude:` (fnmatch, no flags) never count and
         // never become discovery items. The `expansion` side re-expands
         // `argv_roots` rather than reading `files.len()` because exclusion
-        // needs the dir-vs-file provenance only the roots carry — and the
-        // undecidable-pattern lean differs per side (a low analyzed count can
-        // only widen more; a kept widened file only adds suppressing decls).
+        // needs the dir-vs-file provenance only the roots carry.
+        //
+        // `fnmatch_may` is exact only for patterns without `[` or `\` — when
+        // ANY exclude pattern is undecidable, decline widening entirely (the
+        // same no-widening as the pre-#684 behaviour, so a config the matcher
+        // can't decide falls back instead of guessing: either lean direction
+        // can FIRE, not just suppress — an `exclude:`d decl kept in the
+        // widened set discovers `Foo#bar` upstream would never see, and a
+        // legit decl dropped loses suppression the reference had).
         // Expansion errors on the discovery side are dropped, exactly as
         // `project_discovery_expansion` only reads `widened[:files]`.
         let excludes = discovery_exclude_patterns(cfg);
-        let (widened_files, _) =
-            expand_check_paths_excluding(&union_root_refs, &excludes, false);
-        let (expanded_files, _) =
-            expand_check_paths_excluding(argv_roots, &excludes, true);
+        let all_decidable = excludes.iter().all(|p| !p.contains(['[', '\\']));
+        // Both expansions only run when every pattern is decidable;
+        // undecidable ⇒ both stay empty ⇒ `0 > 0` ⇒ no widening.
+        let (widened_files, expanded_files) = if all_decidable {
+            (
+                expand_check_paths_excluding(&union_root_refs, &excludes).0,
+                expand_check_paths_excluding(argv_roots, &excludes).0,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
         if widened_files.len() > expanded_files.len() {
             for path in widened_files {
                 if analyzed_paths.contains(path.as_str()) {
@@ -3511,5 +3519,122 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An `exclude:` pattern `fnmatch_may` cannot decide (`[`/`\`) declines
+    /// widening ENTIRELY — the pre-#684 no-widening behaviour — rather than
+    /// lean: an `exclude:`d decl kept in the widened set (or dropped from
+    /// the expansion count) FIRES, not just suppresses. Here
+    /// `exclude: ["lib/[f]oo.rb"]` makes `check a.rb` see no `lib/` decls at
+    /// all (`Foo.new.bar.upcase` silent — the `"s".nope` control proves the
+    /// file was still analysed); guessing would either wrongly keep foo.rb
+    /// (port fires where ref is silent) or wrongly empty the expansion.
+    #[test]
+    fn analyze_files_undecidable_exclude_declines_widening() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_und_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\nexclude:\n  - \"lib/[f]oo.rb\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(root.join("a.rb"), b"Foo.new.bar.upcase\n\"s\".nope\n").unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+        let (findings, _) = analyze_files(
+            &[a_rb.as_str()],
+            Some(&[a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        let messages: Vec<&str> =
+            findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`upcase'")),
+            "undecidable `exclude:` must decline widening; got {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("`nope'")),
+            "a.rb still analysed; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Same decline on the dup-argv shape (`check app app`): with
+    /// `exclude: ["[q]zz.rb"]` (matches nothing upstream, but undecidable for
+    /// `fnmatch_may`) the widened set must not be computed — before the fix
+    /// the "drop undecidable" lean emptied the expansion count (2 vs 0 →
+    /// widen → `upcase` ×2 where the reference counts 2 vs 2 and stays
+    /// silent).
+    #[test]
+    fn analyze_files_undecidable_exclude_declines_on_dup_argv() {
+        let root = std::env::temp_dir().join(format!("rigor_widen_und2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("cfg/.rigor.yml"),
+            b"paths:\n  - lib\nexclude:\n  - \"[q]zz.rb\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
+        std::fs::write(
+            root.join("app/a.rb"),
+            b"Foo.new.bar.upcase\n\"s\".nope\n",
+        )
+        .unwrap();
+
+        let crate::config::ConfigRead::Parsed(cfg) =
+            Config::read(&root.join("cfg/.rigor.yml"))
+        else {
+            panic!("config must parse");
+        };
+        let a_rb = root.join("app/a.rb").to_string_lossy().into_owned();
+        let (findings, _) = analyze_files(
+            &[a_rb.as_str(), a_rb.as_str()],
+            Some(&[a_rb.as_str(), a_rb.as_str()]),
+            &cfg,
+            "check",
+            None,
+            &config::BleedingEdgeSelector::None,
+            false,
+        );
+        let messages: Vec<&str> =
+            findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        assert!(
+            !messages.iter().any(|m| m.contains("`upcase'")),
+            "undecidable `exclude:` must decline widening; got {messages:?}"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.contains("`nope'")).count(),
+            2,
+            "both argv occurrences analysed; got {messages:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The leading-period half of the fnmatch fix is exercised at the
+    /// matcher level (`conformance_gate::fnmatch_over_approximates_ruby`);
+    /// the e2e `check ./app ./app` row is probe-verified because a
+    /// `./`-spelled root needs a controlled cwd.
+    #[test]
+    fn exclude_fnmatch_leading_period_rule() {
+        let excludes = vec!["*gen.rb".to_string()];
+        // `File.fnmatch?("*gen.rb", "./app/gen.rb")` is false — `./app/gen.rb`
+        // must NOT be excluded from the widened/expansion counts.
+        assert!(!exclude_fnmatch(&excludes, "./app/gen.rb"));
+        assert!(exclude_fnmatch(&excludes, "app/gen.rb"));
     }
 }
