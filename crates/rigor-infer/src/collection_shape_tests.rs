@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, Node};
 
 /// The collection-shape snapshot map for `src`, wired exactly as the analyze
 /// pass wires it (per-file source index + lexical scopes).

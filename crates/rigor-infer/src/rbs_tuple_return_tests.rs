@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, Node};
 
 /// The rendered type of the LAST receiver-bearing call in `src`.
 fn last_call_ty(src: &[u8]) -> String {

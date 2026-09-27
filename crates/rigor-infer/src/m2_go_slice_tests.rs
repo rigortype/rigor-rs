@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, Node};
 
 fn ty_of_last_recv_call(src: &[u8]) -> String {
     let ast = lower(&parse(src));

@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse};
+use rigor_parse::{lower, parse, Node};
 
 fn lower_src(src: &[u8]) -> LoweredAst {
     lower(&parse(src))
