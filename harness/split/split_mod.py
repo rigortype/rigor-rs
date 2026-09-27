@@ -34,12 +34,6 @@ import splitlib  # noqa: E402
 
 ITEM_KINDS = ("fn", "const", "static", "struct", "enum", "type", "trait", "union")
 
-def header_line(L, imp):
-    """The line of an impl block that opens its body (`impl … {`)."""
-    return next(i for i in range(imp.start, imp.end + 1)
-                if L[i - 1].rstrip().endswith("{") and not L[i - 1].lstrip().startswith(("//", "#")))
-
-
 def main():
     if len(sys.argv) != 5:
         splitlib.die(__doc__)
@@ -77,7 +71,7 @@ def main():
             continue
         bare = re.sub(r"<.*", "", imp.name)
         kids = [r for r in rows if r.depth == 1 and r.parent == istart]
-        for gs, r in extents(kids, header_line(L, imp) + 1):
+        for gs, r in extents(kids, imp.brace + 1):
             key = f"{bare}::{r.name}"
             if key in sel:
                 found.add(key)
@@ -112,11 +106,20 @@ def main():
     pieces = [(r.start, chunk(gs, r.end, True)) for gs, r in moved_top]
     for istart, ms in moved_meth.items():
         imp = impls[istart]
-        hdr = header_line(L, imp)
+        if imp.brace == imp.end:
+            splitlib.die(f"impl {imp.name} (line {imp.start}) opens and closes on one line; "
+                         "move it whole with impl:TYPE")
+        head = L[imp.kw - 1:imp.brace]
+        if not head[-1].rstrip().endswith("{"):
+            splitlib.die(f"impl {imp.name}: text after its opening brace on line {imp.brace}; "
+                         "move it whole with impl:TYPE, or split that line first")
+        # Outer attributes (`#[cfg(test)]`, `#[allow(…)]`) govern every method
+        # in the block, so each wrapper carries a copy; docs stay behind.
+        attrs = [L[i - 1] for i in splitlib.impl_attr_lines(L, imp)]
         body = []
         for n, (gs, r) in enumerate(ms):
             body += chunk(gs, r.end, n == 0)
-        pieces.append((istart, L[hdr - 1:hdr] + body + ["}"]))
+        pieces.append((istart, attrs + head + body + ["}"]))
     out = open(docfile).read().rstrip("\n").split("\n") + [""] + (uses + [""] if uses else [])
     for _, lines in sorted(pieces, key=lambda p: p[0]):
         out += lines + [""]
@@ -171,6 +174,8 @@ def main():
     res[at:at] = wiring
     with open(path, "w") as f:
         f.write("\n".join(res) + "\n")
+    for p in splitlib.ignored([target]):
+        print(f"WARNING {p} is git-ignored: `git add` will skip it silently (use -f)")
     nm = sum(len(ms) for ms in moved_meth.values())
     print(f"moved {len(moved_top)} top-level items and {nm} impl items "
           f"({len(drop)} lines) -> {splitlib.rel(target)}")

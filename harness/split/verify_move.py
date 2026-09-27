@@ -9,7 +9,9 @@ syntactic place, using the syn lister, at BASE_REV and in the working tree:
   use         a line of a top-level `use` item
   mod         a line of a top-level body-less `mod NAME;` item (attributes
               such as `#[cfg(test)]` included)
-  impl-frame  a top-level `impl` block's header lines or its closing `}`
+  impl-frame  a top-level `impl` block's header (from the `impl` keyword to
+              the body's `{`, located by syn) or its closing `}`
+  impl-attr   a top-level `impl` block's outer attribute line
   inner-doc   a `//!` line of the file header
   blank       an empty line outside any literal
   literal     a line inside a multi-line literal
@@ -19,7 +21,9 @@ syntactic place, using the syn lister, at BASE_REV and in the working tree:
 multisets of (line, tag) are compared. A moved line cancels out wherever it
 lands; what is left is what the split added or removed:
 
-  scaffold    use / mod / impl-frame / inner-doc / blank rows
+  scaffold    use / mod / impl-frame / inner-doc / blank rows, and an ADDED
+              impl-attr row identical to one the base already had (a copy
+              onto a method wrapper)
   doclink     a `code` row that is a `///` or a reference-style intra-doc
               target (`/// [`X`]: path`)
   UNEXPECTED  every other row: code, prose, or a literal's interior
@@ -69,14 +73,15 @@ def tag_lines(path):
             for i in span:
                 tags[i] = "mod"
         elif r.kind == "impl":
-            hdr = next(i for i in span if L[i].rstrip().endswith("{")
-                       and not L[i].lstrip().startswith(("//", "#")))
-            j = hdr
-            while j >= r.start - 1 and not L[j].lstrip().startswith(("//", "#")) and L[j] != "":
-                tags[j] = "impl-frame"
-                j -= 1
-            if L[r.end - 1] == "}":
+            # the header from the `impl` keyword to the body's `{` (from syn),
+            # its closing `}`, and its outer attributes (tagged apart: a split
+            # may COPY them onto a method wrapper, never change or drop them)
+            for i in range(r.kw - 1, r.brace):
+                tags[i] = "impl-frame"
+            if L[r.end - 1].strip() == "}" or r.end == r.brace:
                 tags[r.end - 1] = "impl-frame"
+            for n in splitlib.impl_attr_lines(L, r):
+                tags[n - 1] = "impl-attr"
     for n in splitlib.literal_interior(path):
         tags[n - 1] = "literal"
     return [(l.replace("pub(crate) ", ""), t) for l, t in zip(L, tags)]
@@ -107,6 +112,9 @@ def main():
     for sign, diff in (("+", new - old), ("-", old - new)):
         for (line, tag), count in sorted(diff.items()):
             kind = ("scaffold" if tag in SCAFFOLD_TAGS
+                    # an added impl attribute is scaffold only as a copy of one
+                    # that already existed on an impl (a method wrapper's)
+                    else "scaffold" if tag == "impl-attr" and sign == "+" and old[(line, tag)] > 0
                     else "doclink" if tag == "code" and DOCLINK.match(line) else "UNEXPECTED")
             bad += kind == "UNEXPECTED"
             print(f"{sign}{count:4d} [{kind}:{tag}] {line!r}")

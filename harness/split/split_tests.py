@@ -95,6 +95,8 @@ def main():
             f.write("\n".join(body) + "\n")
     with open(path, "w") as f:
         f.write(new)
+    for p in splitlib.ignored([m[3] for m in moved]):
+        print(f"WARNING {p} is git-ignored: `git add` will skip it silently (use -f)")
     for name, open_ln, close_ln, target, body in moved:
         v = sum(1 for n in keep if open_ln < n < close_ln)
         print(f"{name}: {len(body)} lines -> {splitlib.rel(target)}"
