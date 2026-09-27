@@ -4,6 +4,8 @@
 //! bullet's first rule is `call.undefined-method`.
 #![allow(dead_code)]
 
+use std::collections::{HashMap, HashSet};
+
 use rigor_index::{CoreIndex, OverloadSignature, RetainedParamType};
 use rigor_infer::Typer;
 use rigor_parse::{HashKeyTag, LoweredAst, Node, NodeId};
@@ -301,6 +303,8 @@ pub const CALL_WRONG_ARITY: &str = "call.wrong-arity";
 /// channels, both zero-FP-gated: a `nil` argument a param that rejects nil, and
 /// a non-nil argument whose concrete class the param rejects. See
 /// [`check_argument_type_mismatch`].
+///
+/// [`check_argument_type_mismatch`]: crate::check_argument_type_mismatch
 pub const CALL_ARGUMENT_TYPE_MISMATCH: &str = "call.argument-type-mismatch";
 
 /// `call.possible-nil-receiver`: a call whose receiver may be nil on some path
@@ -424,6 +428,8 @@ pub const SUPPRESSION_UNKNOWN_MARKER: &str = "suppression.unknown-marker";
 /// only through the `use-of-void-value` bleeding-edge feature (ADR-50 WD1), so
 /// the CLI runs [`void_value_use_diagnostics`] only when that feature is
 /// active (the observable equivalent of the reference's severity gate).
+///
+/// [`void_value_use_diagnostics`]: crate::void_value_use_diagnostics
 pub const STATIC_VALUE_USE_VOID: &str = "static.value-use.void";
 
 /// `def.ivar-write-mismatch` (since 0.1.2): within one class's instance methods,
@@ -488,6 +494,8 @@ pub const CALL_RAISE_NON_EXCEPTION: &str = "call.raise-non-exception";
 /// a project class certifies ONLY with a discovered `class Foo < Bar` superclass;
 /// a later clause naming a superclass of an earlier one (narrow→wide) stays
 /// silent; comparisons never cross a nested `begin`.
+///
+/// [`shadowed_rescue`]: crate::shadowed_rescue
 pub const FLOW_SHADOWED_RESCUE_CLAUSE: &str = "flow.shadowed-rescue-clause";
 
 /// The Integer division/modulo operators that raise `ZeroDivisionError` on a
@@ -863,6 +871,14 @@ pub fn analyze_with_source_and_folder(
     out
 }
 
+/// Toplevel `Kernel` methods that the RUNTIME Ruby injects but the vendored
+/// RBS does not model, so `class_has_method("Object", …)` misses them. The
+/// reference resolves these via runtime reflection on `Object`; rigor-rs mirrors
+/// that result with this small, FP-safe allowlist. `gem` is RubyGems' `Kernel#gem`
+/// (the only core-only case the corpus FP audit surfaced). Extend as real signal
+/// appears — never a false positive, only a missed witness if wrong.
+const RUNTIME_KERNEL_TOPLEVEL: &[&str] = &["gem"];
+
 /// Emit `call.unresolved-toplevel` for every toplevel implicit-self call whose
 /// name is unresolved. Zero-FP gate (fires ⊆ the reference): suppress on the
 /// `Object` RBS surface (`class_has_method("Object", …)` — witnessed-absent only
@@ -873,14 +889,6 @@ pub fn analyze_with_source_and_folder(
 /// injects toplevel methods that way would see a firing — the reference routes the
 /// same case to `pre_eval:` in the message; on the config-less corpus/harness the
 /// two agree exactly.
-/// Toplevel `Kernel` methods that the RUNTIME Ruby injects but the vendored
-/// RBS does not model, so `class_has_method("Object", …)` misses them. The
-/// reference resolves these via runtime reflection on `Object`; rigor-rs mirrors
-/// that result with this small, FP-safe allowlist. `gem` is RubyGems' `Kernel#gem`
-/// (the only core-only case the corpus FP audit surfaced). Extend as real signal
-/// appears — never a false positive, only a missed witness if wrong.
-const RUNTIME_KERNEL_TOPLEVEL: &[&str] = &["gem"];
-
 fn unresolved_toplevel_diagnostics(
     ast: &LoweredAst,
     index: &CoreIndex,
@@ -1956,6 +1964,8 @@ fn check_narrowed_call(
 ///    it; only a use inside a `def` body (empty scoped env ⇒ Dynamic) reaches
 ///    here, which is exactly the coverage gap the slice closes.
 /// 4. The witnessing tail mirrors [`check_call`]'s core path over `Nominal[C]`.
+///
+/// [`ScopedEnv`]: crate::ScopedEnv
 #[allow(clippy::too_many_arguments)]
 fn check_collection_call(
     call_id: rigor_parse::NodeId,
@@ -4141,8 +4151,6 @@ fn empty_suppression_diagnostic(marker: &str, offset: usize) -> Diagnostic {
 // ---------------------------------------------------------------------------
 // In-source diagnostic suppression (reference `filter_suppressed`)
 // ---------------------------------------------------------------------------
-
-use std::collections::{HashMap, HashSet};
 
 /// The sentinel rule id of the synthetic internal-error diagnostic emitted on a
 /// per-file panic (ADR-0016). Such diagnostics carry no real rule and MUST NEVER
