@@ -222,8 +222,15 @@ pub enum MultiTarget {
     /// A nested multi-target (`(b, c)` in `a, (b, c) = …`). The binder recurses
     /// with this slot's type as the new right-hand side.
     Nested(MultiTargets),
+    /// A `CallTargetNode` (`h.default` in `x, h.default = …`) — binds no
+    /// local, but its writer dispatch widens the receiver exactly as the
+    /// plain call `h.default = …` does (the reference's
+    /// `widen_attribute_targets`, `statement_evaluator.rb`): `x, h.default = 1, 0`
+    /// opens `h`'s shape. `receiver` is the lowered receiver expression and
+    /// `name` the WRITER name (`default=`), exactly as Prism reports it.
+    Call { receiver: NodeId, name: String, span: Span },
     /// A target with no observable local binding (ivar / constant / index /
-    /// call / const-path target, an implicit rest `a, = …`, an anonymous `*`).
+    /// const-path target, an implicit rest `a, = …`, an anonymous `*`).
     Ignored { span: Span },
 }
 
@@ -233,7 +240,7 @@ impl MultiTarget {
         match self {
             MultiTarget::Local { name_span, .. } => *name_span,
             MultiTarget::Nested(t) => t.span,
-            MultiTarget::Ignored { span } => *span,
+            MultiTarget::Call { span, .. } | MultiTarget::Ignored { span } => *span,
         }
     }
 
@@ -243,7 +250,7 @@ impl MultiTarget {
         match self {
             MultiTarget::Local { name, name_span } => out.push((name.clone(), *name_span)),
             MultiTarget::Nested(t) => t.collect_bound_names(out),
-            MultiTarget::Ignored { .. } => {}
+            MultiTarget::Call { .. } | MultiTarget::Ignored { .. } => {}
         }
     }
 }
@@ -286,6 +293,32 @@ impl MultiTargets {
     pub fn bound_names(&self) -> Vec<(String, Span)> {
         let mut out = Vec::new();
         self.collect_bound_names(&mut out);
+        out
+    }
+
+    /// Every [`MultiTarget::Call`] under this group as `(span, writer name,
+    /// receiver)` triples, in `lefts`/`rest`/`rights` binding order — the
+    /// writer dispatches the reference's `widen_attribute_targets` applies.
+    pub fn call_targets(&self) -> Vec<(Span, String, NodeId)> {
+        fn walk(t: &MultiTarget, out: &mut Vec<(Span, String, NodeId)>) {
+            match t {
+                MultiTarget::Call { receiver, name, span } => {
+                    out.push((*span, name.clone(), *receiver));
+                }
+                MultiTarget::Nested(inner) => out.extend(inner.call_targets()),
+                MultiTarget::Local { .. } | MultiTarget::Ignored { .. } => {}
+            }
+        }
+        let mut out = Vec::new();
+        for t in &self.lefts {
+            walk(t, &mut out);
+        }
+        if let Some(rest) = &self.rest {
+            walk(rest, &mut out);
+        }
+        for t in &self.rights {
+            walk(t, &mut out);
+        }
         out
     }
 }
@@ -350,6 +383,33 @@ pub enum Node {
         targets: MultiTargets,
         value: NodeId,
         target_exprs: Vec<NodeId>,
+        span: Span,
+    },
+    /// A compound write through an attribute accessor (`recv.attr ||= v`,
+    /// `recv.attr &&= v`, `recv.attr <op>= v`) — Prism's `CallOrWriteNode` /
+    /// `CallAndWriteNode` / `CallOperatorWriteNode`. The reference routes all
+    /// three to `eval_attribute_compound_write` (`statement_evaluator.rb`):
+    /// the node's own type comes from the compound read-op-write typing
+    /// (`call_{or,and,operator}_write_type_for`), and its scope effect is
+    /// `widen_attribute_write(receiver, write_name)` — the same widening the
+    /// plain writer call `recv.attr = …` performs, so `h.default ||= 0` opens
+    /// `h`'s shape exactly like `h.default = 0`.
+    AttributeCompoundWrite {
+        /// The receiver expression — a `LocalVariableRead` for
+        /// `h.default ||= 0`, `None` for the implicit-self form
+        /// (`default ||= 0` writes `self.default`).
+        receiver: Option<NodeId>,
+        /// The attribute's read name (`default`) — types the read half of the
+        /// compound result.
+        read_name: String,
+        /// The writer name (`default=`) — the mutation census keys on it.
+        write_name: String,
+        /// Which compound form — decides the result typing.
+        op: OpWriteOp,
+        /// The right-hand side.
+        value: NodeId,
+        /// `&.` — the write runs only when the receiver is non-nil.
+        safe_nav: bool,
         span: Span,
     },
     /// A read of a previously-written local (`s`).
@@ -1039,6 +1099,7 @@ impl Node {
             | Node::ConstantWrite { span, .. }
             | Node::SelfExpr { span }
             | Node::Return { span, .. }
+            | Node::AttributeCompoundWrite { span, .. }
             | Node::Other { span, .. } => *span,
         }
     }
@@ -1489,12 +1550,88 @@ impl<'src> Builder<'src> {
             });
         }
 
+        // `recv.attr ||= v` / `recv.attr &&= v` / `recv.attr <op>= v` — the
+        // three Call*WriteNode shapes share the same lowering, differing only
+        // in the compound `op`. The reference routes all three to
+        // `eval_attribute_compound_write`: its scope effect widens the receiver
+        // as the plain writer call would (`widen_attribute_write`), so the
+        // mutation census keys on `write_name` (`h.default ||= 0` opens `h`).
+        if let Some(cw) = node.as_call_or_write_node() {
+            let receiver = cw.receiver().map(|r| self.lower_node(&r));
+            let value = self.lower_node(&cw.value());
+            // `eval_attribute_compound_write` types the whole node through
+            // `scope.type_of` — scope-pure: a write or lookup mutation inside
+            // the receiver or the value never reaches the env
+            // (`h.default ||= (h = {b:1})` keeps the entry binding;
+            // `h.default ||= (g.default = 0)` leaves `g` closed), so both
+            // sub-spans are typed-only carriers like the constant-write
+            // rvalue.
+            for &sub in receiver.iter().chain(std::iter::once(&value)) {
+                self.typed_only_spans.push(self.nodes[sub.0 as usize].span());
+            }
+            return self.push(Node::AttributeCompoundWrite {
+                receiver,
+                read_name: constant_string(cw.read_name().as_slice()),
+                write_name: constant_string(cw.write_name().as_slice()),
+                op: OpWriteOp::Or,
+                value,
+                safe_nav: cw.is_safe_navigation(),
+                span: span_of(&cw.location()),
+            });
+        }
+        if let Some(cw) = node.as_call_and_write_node() {
+            let receiver = cw.receiver().map(|r| self.lower_node(&r));
+            let value = self.lower_node(&cw.value());
+            // `eval_attribute_compound_write` types the whole node through
+            // `scope.type_of` — scope-pure: a write or lookup mutation inside
+            // the receiver or the value never reaches the env
+            // (`h.default ||= (h = {b:1})` keeps the entry binding;
+            // `h.default ||= (g.default = 0)` leaves `g` closed), so both
+            // sub-spans are typed-only carriers like the constant-write
+            // rvalue.
+            for &sub in receiver.iter().chain(std::iter::once(&value)) {
+                self.typed_only_spans.push(self.nodes[sub.0 as usize].span());
+            }
+            return self.push(Node::AttributeCompoundWrite {
+                receiver,
+                read_name: constant_string(cw.read_name().as_slice()),
+                write_name: constant_string(cw.write_name().as_slice()),
+                op: OpWriteOp::And,
+                value,
+                safe_nav: cw.is_safe_navigation(),
+                span: span_of(&cw.location()),
+            });
+        }
+        if let Some(cw) = node.as_call_operator_write_node() {
+            let receiver = cw.receiver().map(|r| self.lower_node(&r));
+            let value = self.lower_node(&cw.value());
+            // `eval_attribute_compound_write` types the whole node through
+            // `scope.type_of` — scope-pure: a write or lookup mutation inside
+            // the receiver or the value never reaches the env
+            // (`h.default ||= (h = {b:1})` keeps the entry binding;
+            // `h.default ||= (g.default = 0)` leaves `g` closed), so both
+            // sub-spans are typed-only carriers like the constant-write
+            // rvalue.
+            for &sub in receiver.iter().chain(std::iter::once(&value)) {
+                self.typed_only_spans.push(self.nodes[sub.0 as usize].span());
+            }
+            return self.push(Node::AttributeCompoundWrite {
+                receiver,
+                read_name: constant_string(cw.read_name().as_slice()),
+                write_name: constant_string(cw.write_name().as_slice()),
+                op: OpWriteOp::Operator,
+                value,
+                safe_nav: cw.is_safe_navigation(),
+                span: span_of(&cw.location()),
+            });
+        }
+
         // `a, b = rhs` / `a, (b, c), *rest = rhs`. The target tree is lowered
         // structurally (NOT into the arena — targets bind names, they are not
         // value expressions) and the RHS is lowered as a normal child.
         if let Some(mw) = node.as_multi_write_node() {
             let mut recovered = Vec::new();
-            let targets = lower_multi_targets(
+            let targets = self.lower_multi_targets(
                 &mw.lefts(),
                 mw.rest().as_ref(),
                 &mw.rights(),
@@ -2559,6 +2696,109 @@ impl<'src> Builder<'src> {
         body.iter().map(|n| self.lower_node(&n)).collect()
     }
 
+    /// Lower a Prism `lefts` / `rest` / `rights` target triple (shared by
+    /// `MultiWriteNode` and the nested `MultiTargetNode`) into the owned
+    /// [`MultiTargets`] group.
+    ///
+    /// Targets are lowered STRUCTURALLY, not into the node arena: a target
+    /// binds a name, it is not a value expression, so materialising one as an
+    /// arena node would make it look like a read/write to the span-scanning
+    /// structural walks. Every target that lowers to [`MultiTarget::Ignored`]
+    /// contributes its RECOVERABLE descendants (local reads / writes / calls)
+    /// to `recovered`, so the caller can lower them into the arena and keep
+    /// them visible to the structural walks — the old recovered-children
+    /// carrier did exactly this. A `CallTargetNode` lowers its receiver into
+    /// the arena itself ([`MultiTarget::Call`]) — `widen_attribute_targets`
+    /// widens the binding the receiver expression names.
+    fn lower_multi_targets<'pr>(
+        &mut self,
+        lefts: &ruby_prism::NodeList<'pr>,
+        rest: Option<&PrismNode<'pr>>,
+        rights: &ruby_prism::NodeList<'pr>,
+        span: Span,
+        recovered: &mut Vec<PrismNode<'pr>>,
+    ) -> MultiTargets {
+        MultiTargets {
+            lefts: lefts
+                .iter()
+                .map(|t| self.lower_multi_target(&t, recovered))
+                .collect(),
+            // `rest` is recorded whenever Prism reports one — an anonymous `*`
+            // and an implicit rest (`a, = xs`) become `Ignored`, because the
+            // reference's `rest_present:` keys on PRESENCE, not on bindability.
+            rest: rest.map(|t| Box::new(self.lower_multi_target(t, recovered))),
+            rights: rights
+                .iter()
+                .map(|t| self.lower_multi_target(&t, recovered))
+                .collect(),
+            span,
+        }
+    }
+
+    /// Lower one target slot. A `LocalVariableTargetNode` binds its name, a
+    /// nested `MultiTargetNode` recurses, a `SplatNode` unwraps to its
+    /// expression (so a `*rest` slot carries the inner local name), a
+    /// `CallTargetNode` keeps its receiver + writer name for
+    /// `widen_attribute_targets` (`statement_evaluator.rb` —
+    /// `x, h.default = 1, 0` opens `h`'s shape as `h.default = 0` does), and
+    /// everything else is [`MultiTarget::Ignored`] — exactly the reference's
+    /// recognised set (`multi_target_binder.rb:29-46`).
+    fn lower_multi_target<'pr>(
+        &mut self,
+        node: &PrismNode<'pr>,
+        recovered: &mut Vec<PrismNode<'pr>>,
+    ) -> MultiTarget {
+        if let Some(t) = node.as_local_variable_target_node() {
+            return MultiTarget::Local {
+                name: constant_string(t.name().as_slice()),
+                name_span: span_of(&t.location()),
+            };
+        }
+        if let Some(t) = node.as_multi_target_node() {
+            return MultiTarget::Nested(self.lower_multi_targets(
+                &t.lefts(),
+                t.rest().as_ref(),
+                &t.rights(),
+                span_of(&t.location()),
+                recovered,
+            ));
+        }
+        if let Some(s) = node.as_splat_node() {
+            // `*rest` — unwrap to the inner target. An anonymous `*` (no
+            // expression) or a non-local inner target stays `Ignored`.
+            return match s.expression() {
+                Some(e) => match self.lower_multi_target(&e, recovered) {
+                    // A splat's expression is never a nested multi-target in
+                    // valid Ruby; guard anyway so the binder's rest slot only
+                    // ever sees the two shapes the reference's
+                    // `bind_rest_target` handles.
+                    MultiTarget::Nested(_) => {
+                        MultiTarget::Ignored { span: span_of(&s.location()) }
+                    }
+                    other => other,
+                },
+                None => MultiTarget::Ignored { span: span_of(&s.location()) },
+            };
+        }
+        if let Some(t) = node.as_call_target_node() {
+            // `h.default` — the writer dispatch widens whatever local the
+            // receiver expression evaluates to (`widen_receiver_aliases`).
+            // `self.attr` and constant-path/ivar receivers resolve to no
+            // local candidate and widen nothing — matching the reference.
+            let receiver = self.lower_node(&t.receiver());
+            return MultiTarget::Call {
+                receiver,
+                name: constant_string(t.name().as_slice()),
+                span: span_of(&t.location()),
+            };
+        }
+        // A non-local target can still EMBED expressions that READ locals or
+        // CALL methods (`item[3] = …` reads `item`; `obj.foo, bar = …` calls
+        // `obj`).
+        recovered.extend(collect_recoverable_children(node));
+        MultiTarget::Ignored { span: span_of(&node.location()) }
+    }
+
     /// Lower an *optional* body node (a `def`/`class`/`module`/block body, which
     /// Prism types as `Option<Node>`). A `StatementsNode` body is flattened to
     /// its statement ids so each lands in the arena individually; a `BeginNode`
@@ -3251,78 +3491,6 @@ fn span_of(loc: &ruby_prism::Location<'_>) -> Span {
     (loc.start_offset(), loc.end_offset())
 }
 
-/// Lower a Prism `lefts` / `rest` / `rights` target triple (shared by
-/// `MultiWriteNode` and the nested `MultiTargetNode`) into the owned
-/// [`MultiTargets`] group.
-///
-/// Targets are lowered STRUCTURALLY, not into the node arena: a target binds a
-/// name, it is not a value expression, so materialising one as an arena node
-/// would make it look like a read/write to the span-scanning structural walks.
-/// Every target that lowers to [`MultiTarget::Ignored`] contributes its
-/// RECOVERABLE descendants (local reads / writes / calls) to `recovered`, so the
-/// caller can lower them into the arena and keep them visible to the structural
-/// walks — the old recovered-children carrier did exactly this.
-fn lower_multi_targets<'pr>(
-    lefts: &ruby_prism::NodeList<'pr>,
-    rest: Option<&PrismNode<'pr>>,
-    rights: &ruby_prism::NodeList<'pr>,
-    span: Span,
-    recovered: &mut Vec<PrismNode<'pr>>,
-) -> MultiTargets {
-    MultiTargets {
-        lefts: lefts.iter().map(|t| lower_multi_target(&t, recovered)).collect(),
-        // `rest` is recorded whenever Prism reports one — an anonymous `*` and
-        // an implicit rest (`a, = xs`) become `Ignored`, because the reference's
-        // `rest_present:` keys on PRESENCE, not on bindability.
-        rest: rest.map(|t| Box::new(lower_multi_target(t, recovered))),
-        rights: rights.iter().map(|t| lower_multi_target(&t, recovered)).collect(),
-        span,
-    }
-}
-
-/// Lower one target slot. A `LocalVariableTargetNode` binds its name, a nested
-/// `MultiTargetNode` recurses, a `SplatNode` unwraps to its expression (so a
-/// `*rest` slot carries the inner local name), and everything else is
-/// [`MultiTarget::Ignored`] — exactly the reference's recognised set
-/// (`multi_target_binder.rb:29-46`).
-fn lower_multi_target<'pr>(
-    node: &PrismNode<'pr>,
-    recovered: &mut Vec<PrismNode<'pr>>,
-) -> MultiTarget {
-    if let Some(t) = node.as_local_variable_target_node() {
-        return MultiTarget::Local {
-            name: constant_string(t.name().as_slice()),
-            name_span: span_of(&t.location()),
-        };
-    }
-    if let Some(t) = node.as_multi_target_node() {
-        return MultiTarget::Nested(lower_multi_targets(
-            &t.lefts(),
-            t.rest().as_ref(),
-            &t.rights(),
-            span_of(&t.location()),
-            recovered,
-        ));
-    }
-    if let Some(s) = node.as_splat_node() {
-        // `*rest` — unwrap to the inner target. An anonymous `*` (no
-        // expression) or a non-local inner target stays `Ignored`.
-        return match s.expression() {
-            Some(e) => match lower_multi_target(&e, recovered) {
-                // A splat's expression is never a nested multi-target in valid
-                // Ruby; guard anyway so the binder's rest slot only ever sees
-                // the two shapes the reference's `bind_rest_target` handles.
-                MultiTarget::Nested(_) => MultiTarget::Ignored { span: span_of(&s.location()) },
-                other => other,
-            },
-            None => MultiTarget::Ignored { span: span_of(&s.location()) },
-        };
-    }
-    // A non-local target can still EMBED expressions that READ locals or CALL
-    // methods (`item[3] = …` reads `item`; `obj.foo, bar = …` calls `obj`).
-    recovered.extend(collect_recoverable_children(node));
-    MultiTarget::Ignored { span: span_of(&node.location()) }
-}
 
 /// The local names a `for` index target binds, each with its target span — the
 /// reference's `bind_for_index` set (`statement_evaluator.rb`): a
@@ -3335,17 +3503,39 @@ fn for_index_names(index: &PrismNode<'_>) -> Vec<(String, Span)> {
         return vec![(constant_string(t.name().as_slice()), span_of(&t.location()))];
     }
     if let Some(t) = index.as_multi_target_node() {
-        let mut ignored = Vec::new();
-        return lower_multi_targets(
-            &t.lefts(),
-            t.rest().as_ref(),
-            &t.rights(),
-            span_of(&t.location()),
-            &mut ignored,
-        )
-        .bound_names();
+        let mut out = Vec::new();
+        for_index_bound_names(&t, &mut out);
+        return out;
     }
     Vec::new()
+}
+
+/// The local names under a `for` index's `MultiTargetNode`, matching
+/// [`Builder::lower_multi_target`]'s recognised set: a local target binds, a
+/// nested `MultiTargetNode` recurses, a `SplatNode` unwraps, and everything
+/// else (a `CallTargetNode` included — it widens a receiver but binds no
+/// local) yields nothing.
+fn for_index_bound_names(t: &ruby_prism::MultiTargetNode<'_>, out: &mut Vec<(String, Span)>) {
+    fn bound(node: &PrismNode<'_>, out: &mut Vec<(String, Span)>) {
+        if let Some(t) = node.as_local_variable_target_node() {
+            out.push((constant_string(t.name().as_slice()), span_of(&t.location())));
+        } else if let Some(t) = node.as_multi_target_node() {
+            for_index_bound_names(&t, out);
+        } else if let Some(s) = node.as_splat_node() {
+            if let Some(e) = s.expression() {
+                bound(&e, out);
+            }
+        }
+    }
+    for target in t.lefts().iter() {
+        bound(&target, out);
+    }
+    if let Some(rest) = t.rest() {
+        bound(&rest, out);
+    }
+    for target in t.rights().iter() {
+        bound(&target, out);
+    }
 }
 
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled

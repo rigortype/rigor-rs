@@ -763,11 +763,12 @@ fn analyze_files(
         Excluded,
         /// The lowered file plus its per-file [`rigor_infer::Harvest`], kept
         /// side by side so the serial drain can fill the two index-aligned Vecs.
-        /// The harvest is BOXED to keep this variant close to the others in size
-        /// (`clippy::large_enum_variant`); one allocation per file, in parallel.
-        /// The third field is the `RIGOR_TIMING` component split (all-zero when
-        /// the env gate is unset).
-        Prepared(Prepared, Box<rigor_infer::Harvest>, Stage1Times),
+        /// Both payloads are BOXED to keep this variant close to the others in
+        /// size (`clippy::large_enum_variant` — `LoweredAst` alone outgrew the
+        /// limit once it carried the paren/typed-only span tables); one
+        /// allocation per file, in parallel. The third field is the
+        /// `RIGOR_TIMING` component split (all-zero when the env gate is unset).
+        Prepared(Box<Prepared>, Box<rigor_infer::Harvest>, Stage1Times),
         IoError { path: String, msg: String },
         /// A file Prism could not parse: NOT analysed (see the guard below),
         /// but its parse errors are reported, one diagnostic per raw Prism
@@ -875,7 +876,7 @@ fn analyze_files(
                         harvest: t_harvest.map_or(std::time::Duration::ZERO, |t| t.elapsed()),
                     };
                     Stage1::Prepared(
-                        Prepared { order, path: path.to_string(), source, ast, comments },
+                        Box::new(Prepared { order, path: path.to_string(), source, ast, comments }),
                         harvest,
                         times,
                     )
@@ -906,7 +907,7 @@ fn analyze_files(
                 pl_cpu += t.parse_lower;
                 hv_cpu += t.harvest;
                 hv_cpu_max = hv_cpu_max.max(t.harvest);
-                prepared.push(p);
+                prepared.push(*p);
                 harvests.push(*h);
             }
             Stage1::ParseErrors { order, path, source, diags } => {

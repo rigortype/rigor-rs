@@ -515,12 +515,35 @@ impl<'i> Typer<'i> {
                 Some(&tail) => self.type_of(ast, tail, env, interner),
                 None => interner.intern(Type::Constant(Scalar::Nil)),
             },
+            // A clause-less `begin … end`'s value is its MAIN body's tail —
+            // the ensure statements appended to `body` at lowering run for
+            // side effects and never supply the value (`(begin; "s"; ensure;
+            // 1; end)` is `"s"`, not `1`).
             Node::BeginRescue {
-                body, clauses, ..
-            } if clauses.is_empty() => match body.last() {
+                body, ensure_body, clauses, ..
+            } if clauses.is_empty() => match begin_value_body(body, ensure_body).last() {
                 Some(&tail) => self.type_of(ast, tail, env, interner),
                 None => interner.intern(Type::Constant(Scalar::Nil)),
             },
+            // `recv.attr ||= v` / `&&= v` / `<op>= v` types by
+            // `call_{or,and}_write_type_for`: `union(narrow_<side>(recv.attr),
+            // type_of(v))` — `x = (h.default ||= 0)` types `0` when the closed
+            // shape's `default` reads `nil`. The operator form dispatches
+            // `recv.attr <op> v` — declined to `Dynamic` (a `nil`/`untyped`
+            // read makes the reference answer `dynamic_top` anyway).
+            Node::AttributeCompoundWrite {
+                receiver, read_name, op, value, ..
+            } => {
+                let rhs = self.type_of(ast, *value, env, interner);
+                let Some(r) = receiver else { return rhs };
+                let current = self.type_call(ast, *r, read_name, &[], env, interner);
+                match op {
+                    OpWriteOp::Or | OpWriteOp::And => {
+                        self.compound_write_union(*op, current, rhs, interner)
+                    }
+                    OpWriteOp::Operator => interner.untyped(),
+                }
+            }
             Node::Call { receiver: Some(r), method, args, block_body, safe_nav, attribute_write, rhs_splat, .. } => {
                 let (r, method) = (*r, method.clone());
                 // `expression_typer.rb` `attribute_write_value` (#520): a plain
@@ -788,8 +811,16 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeId {
         match ast.get(id) {
-            Node::Statements { body, .. } | Node::BeginRescue { body, .. } => {
+            Node::Statements { body, .. } => {
                 match body.clone().last() {
+                    Some(&tail) => self.stmt_value_type(ast, tail, env, interner),
+                    None => interner.intern(Type::Constant(Scalar::Nil)),
+                }
+            }
+            // A `begin` carrier's flat `body` ends with the ensure statements;
+            // they never supply the value.
+            Node::BeginRescue { body, ensure_body, .. } => {
+                match begin_value_body(body, ensure_body).last() {
                     Some(&tail) => self.stmt_value_type(ast, tail, env, interner),
                     None => interner.intern(Type::Constant(Scalar::Nil)),
                 }
@@ -1757,8 +1788,9 @@ impl<'i> Typer<'i> {
             // (`s rescue nil` may be `nil`; `defined?(s)` is a String or `nil`).
             Node::Statements { .. } => Reach::UNKNOWN,
             // Also the carrier an `if`'s `else` clause lowers to (no clauses).
-            Node::BeginRescue { body, clauses, .. } => {
-                let mut reach = self.body_value_reach(ast, body, seen);
+            Node::BeginRescue { body, ensure_body, clauses, .. } => {
+                let mut reach =
+                    self.body_value_reach(ast, begin_value_body(body, ensure_body), seen);
                 for c in clauses {
                     reach = reach.join(self.body_value_reach(ast, &c.body, seen));
                 }
@@ -3547,9 +3579,27 @@ impl<'i> Typer<'i> {
         let Some(&cur) = env.get(name) else {
             return interner.untyped();
         };
-        let members = match interner.get(cur) {
+        self.compound_write_union(op, cur, rhs, interner)
+    }
+
+    /// `union(narrow_<side>(current), rhs)` — the compound-value member split
+    /// of `statement_evaluator.rb`'s `compound_eval` /
+    /// `call_{or,and}_write_type_for`, shared by a LOCAL op-write
+    /// ([`Typer::op_write_result`]) and an ATTRIBUTE compound write's own
+    /// value (`x = (h.default ||= 0)`): `||=` keeps the provably-truthy members
+    /// of `current`, `&&=` the provably-falsey ones, an undecidable member
+    /// survives (widening direction), and a surviving `Dynamic`/`Top` member
+    /// dissolves the result to `untyped`.
+    fn compound_write_union(
+        &self,
+        op: OpWriteOp,
+        current: TypeId,
+        rhs: TypeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let members = match interner.get(current) {
             Type::Union(ms) => ms.clone(),
-            _ => vec![cur],
+            _ => vec![current],
         };
         let mut kept: Vec<TypeId> = members
             .into_iter()
@@ -4459,6 +4509,11 @@ impl<'i> Typer<'i> {
                     cenv.kill_local(&name);
                     tenv.insert(name, ty);
                 }
+                // Attribute-target receivers evaluate with the targets —
+                // `x, v.default = 1, 0` reads `v`.
+                for (_, _, recv) in targets.call_targets() {
+                    self.class_flow_expr(ast, recv, tenv, cenv, coarse, writes, interner, out, false);
+                }
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
@@ -4466,6 +4521,21 @@ impl<'i> Typer<'i> {
                 cenv.kill_local(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
+            }
+            // `recv.attr ||= v` — `eval_attribute_compound_write` types the
+            // whole node in the current scope (so a narrowed receiver use in
+            // the rvalue records, like an op-write RHS per probe x4), then
+            // widens the receiver binding. The rvalue keeps the statement's
+            // own position; writes/mutations inside it are typed-only drops,
+            // so the span-based widens below no-op on them.
+            Node::AttributeCompoundWrite { receiver, value, span, .. } => {
+                let (receiver, value, span) = (*receiver, *value, *span);
+                if let Some(r) = receiver {
+                    self.class_flow_expr(ast, r, tenv, cenv, coarse, writes, interner, out, false);
+                }
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
+                widen_flow_writes(writes, span, tenv, interner);
+                kill_cenv_narrowed(writes, span, cenv);
             }
             Node::Call { .. } => {
                 self.class_flow_expr(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
@@ -4917,6 +4987,9 @@ impl<'i> Typer<'i> {
                     cenv.kill_local(&name);
                     tenv.insert(name, ty);
                 }
+                for (_, _, recv) in targets.call_targets() {
+                    self.class_flow_expr(ast, recv, tenv, cenv, coarse, writes, interner, out, false);
+                }
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
@@ -4924,6 +4997,17 @@ impl<'i> Typer<'i> {
                 cenv.kill_local(&name);
                 let u = interner.untyped();
                 tenv.insert(name, u);
+            }
+            // `recv.attr ||= v` in expression position: receiver and rvalue
+            // evaluate left-to-right in the current facts; the compound's own
+            // scope effect is the receiver widening (the mutation census),
+            // not a local rebind.
+            Node::AttributeCompoundWrite { receiver, value, .. } => {
+                let (receiver, value) = (*receiver, *value);
+                if let Some(r) = receiver {
+                    self.class_flow_expr(ast, r, tenv, cenv, coarse, writes, interner, out, false);
+                }
+                self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
             }
             // A ternary is an expression-position `Node::If` (Prism parses it as
             // an IfNode); `propagate_if_branches` (`scope_indexer.rb:2742`)
@@ -7702,10 +7786,15 @@ fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
             .collect(),
         Node::Loop { body, .. }
         | Node::Statements { body, kind: StatementsKind::Sequence, .. } => vec![body],
-        Node::BeginRescue { body, ensure_body, clauses, .. } => [body.as_slice(), ensure_body]
-            .into_iter()
-            .chain(clauses.iter().map(|c| c.body.as_slice()))
-            .collect(),
+        // `body` already ENDS with the ensure statements — split them out so
+        // the section listing doesn't visit them twice.
+        Node::BeginRescue { body, ensure_body, clauses, .. } => [
+            begin_value_body(body, ensure_body),
+            ensure_body.as_slice(),
+        ]
+        .into_iter()
+        .chain(clauses.iter().map(|c| c.body.as_slice()))
+        .collect(),
         Node::Call { block_body, .. } => vec![block_body],
         _ => Vec::new(),
     }
@@ -7855,6 +7944,7 @@ fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
     fn any_ignored(t: &rigor_parse::MultiTarget) -> bool {
         match t {
             rigor_parse::MultiTarget::Ignored { .. } => true,
+            rigor_parse::MultiTarget::Call { .. } => true,
             rigor_parse::MultiTarget::Local { .. } => false,
             rigor_parse::MultiTarget::Nested(inner) => has_non_local_target(inner),
         }
@@ -8317,23 +8407,60 @@ fn lookup_mutation_calls(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, St
     let dead = dead_lambda_nodes(ast);
     let mut out = Vec::new();
     for (id, n) in ast.iter() {
-        let Node::Call { receiver: Some(r), method, span, .. } = n else {
-            continue;
-        };
-        if !HASH_LOOKUP_MUTATORS.contains(&method.as_str()) || dead.contains(&id) {
-            continue;
-        }
-        // The receiver is resolved through `ReceiverAlias.candidates` —
-        // `(h || g).default = 0` opens EVERY local the expression can name.
-        let mut names = Vec::new();
-        receiver_alias_local_candidates(ast, *r, 0, &mut names);
-        names.sort();
-        names.dedup();
-        for name in names {
-            out.push((id, *span, name, method.clone()));
+        match n {
+            Node::Call { receiver: Some(r), method, span, .. } => {
+                if !HASH_LOOKUP_MUTATORS.contains(&method.as_str()) || dead.contains(&id) {
+                    continue;
+                }
+                // The receiver is resolved through `ReceiverAlias.candidates` —
+                // `(h || g).default = 0` opens EVERY local the expression can name.
+                push_lookup_aliases(ast, id, *span, *r, method, &mut out);
+            }
+            // `h.default ||= 0` / `&&=` / `+=` — `eval_attribute_compound_write`
+            // widens the receiver through `widen_attribute_write`, the same
+            // alias-resolved widening the plain `h.default = 0` call takes.
+            Node::AttributeCompoundWrite { receiver: Some(r), write_name, span, .. } => {
+                if !HASH_LOOKUP_MUTATORS.contains(&write_name.as_str()) || dead.contains(&id) {
+                    continue;
+                }
+                push_lookup_aliases(ast, id, *span, *r, write_name, &mut out);
+            }
+            // `x, h.default = 1, 0` — `widen_attribute_targets` applies the
+            // writer widening to every `CallTargetNode` in the target list,
+            // splats and nested groups included.
+            Node::MultiWrite { targets, .. } => {
+                if dead.contains(&id) {
+                    continue;
+                }
+                for (tspan, writer, recv) in targets.call_targets() {
+                    if HASH_LOOKUP_MUTATORS.contains(&writer.as_str()) {
+                        push_lookup_aliases(ast, id, tspan, recv, &writer, &mut out);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out
+}
+
+/// Resolve `receiver` through `ReceiverAlias.candidates` and push one census
+/// entry per local it may name — `(h || g).default = 0` opens EVERY candidate.
+fn push_lookup_aliases(
+    ast: &LoweredAst,
+    id: NodeId,
+    span: rigor_parse::Span,
+    receiver: NodeId,
+    writer: &str,
+    out: &mut Vec<(NodeId, rigor_parse::Span, String, String)>,
+) {
+    let mut names = Vec::new();
+    receiver_alias_local_candidates(ast, receiver, 0, &mut names);
+    names.sort();
+    names.dedup();
+    for name in names {
+        out.push((id, span, name, writer.to_string()));
+    }
 }
 
 /// The node ids inside literal `-> { … }` lambdas no `widen_after_block` walk
@@ -8378,6 +8505,14 @@ fn dead_lambda_nodes(ast: &LoweredAst) -> HashSet<NodeId> {
         })
         .collect();
     descendants_of(ast, &dead_roots)
+}
+
+/// The `begin` body's VALUE statements — the flat `body` minus the appended
+/// `ensure_body` tail. An ensure clause runs for side effects and its last
+/// statement is never the `begin`'s value (`(begin; "s"; ensure; 1; end)` is
+/// `"s"`), so tail readers must not see it.
+fn begin_value_body<'a>(body: &'a [NodeId], ensure_body: &[NodeId]) -> &'a [NodeId] {
+    &body[..body.len().saturating_sub(ensure_body.len())]
 }
 
 /// One step of a statement's sequential evaluation, in dispatch order — the
@@ -8499,6 +8634,31 @@ fn collect_apply_events(
             // A destructure binds unconditionally, but per-target splitting is
             // a wider slice than this fix needs — decline the carrier instead.
             conditional.extend(targets.bound_names().into_iter().map(|(n, _)| n));
+            // The writer dispatch on an attribute target
+            // (`x, h.default = 1, 0`) widens the receiver binding exactly like
+            // the plain call — `widen_attribute_targets`
+            // (`statement_evaluator.rb`), applied in `lefts`/`rest`/`rights`
+            // binding order.
+            for (_, _, recv) in targets.call_targets() {
+                collect_apply_events(ast, recv, false, events, conditional);
+            }
+            for (tspan, writer, _) in targets.call_targets() {
+                if HASH_LOOKUP_MUTATORS.contains(&writer.as_str()) {
+                    events.push(ApplyEvent::Mutate(tspan));
+                }
+            }
+        }
+        // `recv.attr ||= v` / `&&= v` / `<op>= v` — `eval_attribute_compound_write`
+        // types the WHOLE node through `scope.type_of` (scope-pure: a write or
+        // lookup mutation inside the receiver or value never binds — the
+        // lowering marks both sub-spans typed-only) and then widens the
+        // receiver as the plain writer call would. So the only event is the
+        // writer dispatch itself; `safe_nav` does not gate it (the reference's
+        // `widen_attribute_write` applies unconditionally).
+        Node::AttributeCompoundWrite { write_name, span, .. } => {
+            if HASH_LOOKUP_MUTATORS.contains(&write_name.as_str()) {
+                events.push(ApplyEvent::Mutate(*span));
+            }
         }
         Node::Call { receiver, args, block_body, block_span, safe_nav, method, span, .. } => {
             // Ruby evaluates receiver → arguments → the call's own dispatch →
@@ -8596,13 +8756,11 @@ fn collect_apply_events(
         // A clause-less BeginRescue is a reused carrier (a parenthesized
         // group, a plain `begin … end`, an `else`/`in` body): its children run
         // straight-line. With clauses the protected body is conditional.
-        Node::BeginRescue {
-            clauses,
-            body,
-            ensure_body,
-            ..
-        } if clauses.is_empty() => {
-            for &b in body.iter().chain(ensure_body) {
+        Node::BeginRescue { clauses, body, .. } if clauses.is_empty() => {
+            // `body` already ends with the ensure statements (appended at
+            // lowering); an ensure runs unconditionally, so walking `body`
+            // once covers it.
+            for &b in body {
                 collect_apply_events(ast, b, false, events, conditional);
             }
         }
@@ -8770,7 +8928,18 @@ fn lookup_pseudo_writes(
     let live = live_block_descendants(ast);
     calls
         .iter()
-        .filter(|(id, s, _, _)| !ast.in_typed_only_carrier(*s) || live.contains(id))
+        .filter(|(id, s, _, _)| {
+            // A compound-write or multi-write-target mutation applies only
+            // where the statement evaluator RUNS it — `widen_after_block`
+            // fires `widen_for_outer_receiver` for `Prism::CallNode` alone, so
+            // inside a literal block body these forms never reach the outer
+            // scope (`xs.each { h.default ||= 0 }` and
+            // `xs.each { x, h.default = 1, 0 }` both leave `h` closed).
+            if !matches!(ast.get(*id), Node::Call { .. }) && live.contains(id) {
+                return false;
+            }
+            !ast.in_typed_only_carrier(*s) || live.contains(id)
+        })
         .map(|(_, s, n, _)| (*s, n.clone()))
         .collect()
 }
@@ -8809,9 +8978,12 @@ fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => out.push(*value),
-        Node::MultiWrite { value, target_exprs, .. } => {
+        Node::MultiWrite { value, target_exprs, targets, .. } => {
             out.push(*value);
             out.extend_from_slice(target_exprs);
+            // A call target's receiver is a real arena expression — the
+            // target `h.default` reads `h`, and `dead-assignment` must see it.
+            out.extend(targets.call_targets().into_iter().map(|(_, _, r)| r));
         }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             out.extend_from_slice(parts);
@@ -8870,6 +9042,10 @@ fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
                 out.extend_from_slice(&clause.exceptions);
                 out.extend_from_slice(&clause.body);
             }
+        }
+        Node::AttributeCompoundWrite { receiver, value, .. } => {
+            out.extend(receiver.iter().copied());
+            out.push(*value);
         }
         Node::Logical { left, right, .. } => {
             out.push(*left);

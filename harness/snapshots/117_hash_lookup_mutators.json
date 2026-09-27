@@ -317,6 +317,76 @@
       "message": "undefined method `foo' for { a: 1 }"
     },
     {
+      "rule": "call.undefined-method",
+      "line": 350,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `foo' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 351,
+      "column": 38,
+      "severity": "error",
+      "message": "undefined method `foo' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 354,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 362,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 363,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 372,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 377,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 382,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 387,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `foo' for { a: 1, ... }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 399,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `+' for nil"
+    },
+    {
       "rule": "flow.always-truthy-condition",
       "line": 139,
       "column": 4,
@@ -336,6 +406,13 @@
       "column": 4,
       "severity": "warning",
       "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 356,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
     }
   ]
 }

@@ -186,7 +186,9 @@ fn bind_target(
     match target {
         MultiTarget::Local { name, .. } => out.push((name.clone(), ty)),
         MultiTarget::Nested(inner) => visit(inner, ty, interner, out),
-        MultiTarget::Ignored { .. } => {}
+        // A call target binds no local — its writer dispatch is the mutation
+        // side channel handled by `collect_apply_events`.
+        MultiTarget::Call { .. } | MultiTarget::Ignored { .. } => {}
     }
 }
 

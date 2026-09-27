@@ -341,3 +341,60 @@ if (ifgr = { b: "x" }; ifgr.default = 0)
   1
 end
 ifgr[:a].upcase
+
+# (31) a `begin … ensure … end`'s value is its MAIN body's tail — the ensure
+# statements run for side effects and never supply it, so the receiver types
+# `"s"` (silent upcase), `nil` (fires), and the begin's own value `1` on the
+# write below.
+(begin; "s"; ensure; 1; end).upcase
+(begin; nil; ensure; 1; end).foo
+(begin; [1]; ensure; nil; end).first.foo
+
+enbind = (begin; 1; ensure; nil; end)
+enbind.foo
+
+if begin; nil; ensure; 1; end
+  1
+end
+
+enres = { a: 1 }
+(begin; enres; ensure; nil; end).default = 0
+enres[:b] + 1
+enres.foo
+
+# (32) compound and multi-write attribute targets widen the receiver through
+# the same lookup-mutator path as `h.default = 0` —
+# `eval_attribute_compound_write` and `widen_attribute_targets` both reach
+# `widen_receiver_aliases`, so each of these opens its shape.
+cwor = { a: 1 }
+cwor.default ||= 0
+cwor[:b] + 1
+cwor.foo
+
+cwop = { a: 1 }
+cwop.default += 1
+cwop[:b] + 1
+cwop.foo
+
+mwcall = { a: 1 }
+_mw, mwcall.default = 1, 0
+mwcall[:b] + 1
+mwcall.foo
+
+mwsplat = { a: 1 }
+*_rest, mwsplat.default = [1, 0]
+mwsplat[:b] + 1
+mwsplat.foo
+
+# (33) the compound write's rvalue is typed scope-pure: a rebind or a lookup
+# mutation inside it never reaches the surrounding scope — `cmpure` keeps its
+# entry binding (opened by the `||=`), and `cmpg` stays closed.
+cmpure = { a: 1 }
+cmpure.default ||= (cmpure = { b: "x" })
+cmpure[:b].upcase
+
+cmpg = { a: 1 }
+cmph = { a: 1 }
+cmph.default ||= (cmpg.default = 0)
+cmpg[:b] + 1
+cmph[:b] + 1
