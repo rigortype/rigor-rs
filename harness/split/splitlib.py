@@ -30,14 +30,15 @@ def _tool():
 
 
 class Item:
-    """One rsitems row. `start` includes attributes and doc comments."""
+    """One rsitems row. `start` includes attributes and doc comments; `vis`
+    is the written visibility (`pub`, `pub(crate)`, …) or `-`."""
 
-    def __init__(self, depth, kind, name, start, end, parent):
+    def __init__(self, depth, kind, name, start, end, parent, vis="-"):
         self.depth, self.kind, self.name = int(depth), kind, name
-        self.start, self.end, self.parent = int(start), int(end), int(parent)
+        self.start, self.end, self.parent, self.vis = int(start), int(end), int(parent), vis
 
     def __repr__(self):
-        return f"Item({self.depth} {self.kind} {self.name} {self.start}-{self.end})"
+        return f"Item({self.depth} {self.kind} {self.name} {self.start}-{self.end} {self.vis})"
 
 
 def items(path):
@@ -49,6 +50,36 @@ def literals(path):
     """Multi-line literals as (start_line, start_col, end_line, end_col)."""
     out = subprocess.check_output([_tool(), path, "--literals"], text=True)
     return [tuple(int(x) for x in l.split("\t")) for l in out.splitlines()]
+
+
+def literal_interior(path):
+    """Lines (1-based) that sit inside a multi-line literal: every line after
+    its first. No edit may add, drop or re-indent these blindly."""
+    keep = set()
+    for sl, _, el, _ in literals(path):
+        keep.update(range(sl + 1, el + 1))
+    return keep
+
+
+def use_items(path):
+    """Top-level `use` items as (start, end, vis), in file order."""
+    return [(r.start, r.end, r.vis) for r in items(path) if r.depth == 0 and r.kind == "use"]
+
+
+def parse_use(text):
+    """`use P::{a, b};` / `use P::a;` / `use a;` -> (P or None, [names]),
+    or None for any other shape (renames, nested braces, globs)."""
+    t = " ".join(text.split())
+    m = re.match(r"^use ([\w:]+)::\{([\w, ]*)\};$", t)
+    if m:
+        return m.group(1), [x.strip() for x in m.group(2).split(",") if x.strip()]
+    m = re.match(r"^use ([\w:]+)::(\w+);$", t)
+    if m:
+        return m.group(1), [m.group(2)]
+    m = re.match(r"^use (\w+);$", t)
+    if m:
+        return None, [m.group(1)]
+    return None
 
 
 def _string_body_keeps_indent(text):
@@ -93,7 +124,11 @@ def child_dir(path):
 
 
 def cargo_messages(crate):
-    """rustc's JSON diagnostics for `cargo check -p CRATE --all-targets`."""
+    """rustc's JSON diagnostics for `cargo check -p CRATE --all-targets`.
+
+    Dies when cargo itself fails without a compiler error to show for it (a
+    stale lockfile, an unknown package): an empty diagnostic list must mean
+    a clean build, never "cargo did not run"."""
     p = subprocess.run(["cargo", "check", "-q", "-p", crate, "--all-targets", "--locked",
                         "--message-format=json"], capture_output=True, text=True, cwd=REPO)
     msgs = []
@@ -104,7 +139,21 @@ def cargo_messages(crate):
             continue
         if j.get("reason") == "compiler-message":
             msgs.append(j["message"])
+    if p.returncode != 0 and not any(m["level"] == "error" for m in msgs):
+        die(f"cargo check -p {crate} failed without a compiler error:\n{p.stderr.strip()}")
     return msgs
+
+
+def header_end(lines):
+    """Number of leading lines that are the file's inner docs / attributes
+    (`//!`, `#![…]`) or blanks among them — never part of an item's gap."""
+    n = 0
+    for i, l in enumerate(lines):
+        if l.startswith("//!") or l.startswith("#!["):
+            n = i + 1
+        elif l.strip():
+            break
+    return n
 
 
 def primary_span(msg):

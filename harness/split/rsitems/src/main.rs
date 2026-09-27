@@ -4,14 +4,15 @@
 //! top-level `impl` block:
 //!
 //! ```text
-//! depth  kind  name  start_line  end_line  parent_start_line
+//! depth  kind  name  start_line  end_line  parent_start_line  vis
 //! ```
 //!
 //! `depth` is 0 for a top-level item and 1 for an impl item (whose
 //! `parent_start_line` is its impl's `start_line`). `start_line` includes the
 //! item's outer attributes, doc comments among them; plain `//` comments are
 //! not items, so the callers attribute them by gap. An impl's `name` is its
-//! self type (`Typer<'i>`), or `Trait for Type`.
+//! self type (`Typer<'i>`), or `Trait for Type`. `vis` is the item's written
+//! visibility (`pub`, `pub(crate)`, …) or `-` when it has none.
 //!
 //! `rsitems FILE --literals` prints every literal that spans lines:
 //!
@@ -36,6 +37,29 @@ fn tokens(t: &impl quote::ToTokens) -> String {
     t.to_token_stream().to_string().replace(' ', "")
 }
 
+fn vis(v: &syn::Visibility) -> String {
+    match v {
+        syn::Visibility::Inherited => "-".into(),
+        v => tokens(v),
+    }
+}
+
+fn item_vis(it: &Item) -> String {
+    match it {
+        Item::Fn(x) => vis(&x.vis),
+        Item::Struct(x) => vis(&x.vis),
+        Item::Enum(x) => vis(&x.vis),
+        Item::Union(x) => vis(&x.vis),
+        Item::Const(x) => vis(&x.vis),
+        Item::Static(x) => vis(&x.vis),
+        Item::Type(x) => vis(&x.vis),
+        Item::Mod(x) => vis(&x.vis),
+        Item::Trait(x) => vis(&x.vis),
+        Item::Use(x) => vis(&x.vis),
+        _ => "-".into(),
+    }
+}
+
 fn describe(it: &Item) -> (&'static str, String, &[syn::Attribute]) {
     match it {
         Item::Fn(x) => ("fn", x.sig.ident.to_string(), &x.attrs),
@@ -53,7 +77,7 @@ fn describe(it: &Item) -> (&'static str, String, &[syn::Attribute]) {
         }
         Item::Impl(x) => {
             let name = match &x.trait_ {
-                Some((_, path, _)) => format!("{}for{}", tokens(path), tokens(&x.self_ty)),
+                Some((_, path, _)) => format!("{} for {}", tokens(path), tokens(&x.self_ty)),
                 None => tokens(&x.self_ty),
             };
             ("impl", name, &x.attrs)
@@ -67,17 +91,17 @@ fn print_items(file: &syn::File) {
         let (kind, name, attrs) = describe(it);
         let (s, e) = lines(it.span());
         let s = first_line(attrs, s);
-        println!("0\t{kind}\t{name}\t{s}\t{e}\t0");
+        println!("0\t{kind}\t{name}\t{s}\t{e}\t0\t{}", item_vis(it));
         if let Item::Impl(imp) = it {
             for ii in &imp.items {
-                let (kind, name, attrs) = match ii {
-                    ImplItem::Fn(f) => ("fn", f.sig.ident.to_string(), &f.attrs[..]),
-                    ImplItem::Const(c) => ("const", c.ident.to_string(), &c.attrs[..]),
-                    ImplItem::Type(t) => ("type", t.ident.to_string(), &t.attrs[..]),
-                    _ => ("other", "-".into(), &[][..]),
+                let (kind, name, attrs, v) = match ii {
+                    ImplItem::Fn(f) => ("fn", f.sig.ident.to_string(), &f.attrs[..], vis(&f.vis)),
+                    ImplItem::Const(c) => ("const", c.ident.to_string(), &c.attrs[..], vis(&c.vis)),
+                    ImplItem::Type(t) => ("type", t.ident.to_string(), &t.attrs[..], vis(&t.vis)),
+                    _ => ("other", "-".into(), &[][..], "-".into()),
                 };
                 let (is, ie) = lines(ii.span());
-                println!("1\t{kind}\t{name}\t{}\t{ie}\t{s}", first_line(attrs, is));
+                println!("1\t{kind}\t{name}\t{}\t{ie}\t{s}\t{v}", first_line(attrs, is));
             }
         }
     }

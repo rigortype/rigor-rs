@@ -16,7 +16,7 @@ the module boundaries and write the `//!` headers.
 | `fixvis.py --crate C MODFILE [--prune]` | adds the imports and `pub(crate)`s rustc asks for, then prunes unused imports |
 | `doclinks.py FILE NAME=PATH…` | adds `/// [`NAME`]: PATH` targets for intra-doc links the move broke |
 | `testimports.py --crate C NAME=PATH…` | imports, in the test files, names they had reached through the parent's `use`s |
-| `verify_move.py BASE_REV DIR…` | the line-multiset proof: what is left after moved lines cancel out |
+| `verify_move.py BASE_REV DIR…` | the line-multiset proof: tags every line by its syntactic place, lets moved lines cancel, flags what is left |
 
 `rsitems/` is the Rust item lister the scripts call (syn with
 `span-locations`). It is standalone: its own `[workspace]` and `Cargo.lock`,
@@ -37,7 +37,12 @@ literal are left byte-for-byte whenever re-indenting them would change the
 value: a raw string, a string holding a literal newline, or a `/** */` doc. A
 `\`-continued string is de-indented, because the escape drops the leading
 whitespace. The script refuses to write anything unless re-inlining the new
-files gives back the original bytes.
+files gives back the original bytes. That check shows the rewrite can be
+undone. It does not show the verbatim/de-indent choice for each literal was
+right; that classifier was tested separately on 20 literal forms (raw,
+byte, C, doc, `\\`-before-newline, continuation) in the #219 review. The
+script also warns about constructs whose meaning moves with the file:
+`line!`, `column!`, `file!`, `module_path!`, `include*!` and `#[path]`.
 
 ## Step 2+: one module per PR
 
@@ -54,13 +59,18 @@ files gives back the original bytes.
    build:
    - A name the module cannot resolve is imported from `crate::` (or from
      `super::` below a non-root file).
-   - An item, method, field or type that rustc reports as private gets
-     `pub(crate)`.
-   - Unused imports in the module are dropped, and so is an unused glob
-     re-export in the parent.
-   - A parent import that is unused in every target is dropped. One unused
-     only outside the test build is reported as **test-only**: remove it from
-     the parent, then run `testimports.py`.
+   - Anything rustc reports as private gets `pub(crate)`: an item, a method,
+     a named or tuple field, a type used across the boundary, or a type in
+     a `private_interfaces` warning.
+   - Unused imports in the module are dropped.
+   - A parent import is dropped only when every target reports it unused.
+     This includes the `MOD::*` glob. An import unused only outside the test
+     build is still used by the tests: it is reported, not dropped. Remove
+     it from the parent, then run `testimports.py`.
+   - It edits only top-level `use` items, found by the syn lister, never
+     through a text search. It stops with status 1 while errors remain, or
+     when cargo fails without a compiler error (a stale lock, a bad
+     `--crate`).
 4. **Doc links.** Diff the rustdoc warnings from before and after the move:
    `cargo doc -p C --no-deps --document-private-items 2>&1 | grep '^warning' | sort`.
    For each new "unresolved link to `X`", run `doclinks.py src/MOD.rs X=path`.
@@ -68,7 +78,9 @@ files gives back the original bytes.
    instead.
 5. **Proof and gates:**
    - `verify_move.py origin/master crates/C/src` must report nothing
-     UNEXPECTED;
+     UNEXPECTED, **and every printed `scaffold` row must be read**. A row is
+     accepted by its place, not its meaning: a changed `use` line can point
+     a name at a different item, and swapped lines leave no row;
    - `cargo test -p C -- --list` must be identical to the base;
    - the rustdoc warning set must be identical;
    - `harness/gate.sh` must pass;
@@ -91,6 +103,9 @@ files gives back the original bytes.
 - **Glob shadowing.** A parent item or import that is later added with the
   same name as a globbed item shadows the glob silently. Check this whenever
   a glob re-export is kept.
+- **Tidying is seam-only.** `split_mod.py` collapses a doubled blank line
+  only where a dropped range was, never inside a literal (a string holding
+  blank lines is data). Do the same by hand.
 - **Name resolution.** The proof counts lines, not meaning. Before trusting
   it, check for these in the moved code: a name that could now resolve to a
   different item (prelude shadowing, a glob), `self::`/`super::` paths,

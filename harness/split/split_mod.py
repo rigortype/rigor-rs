@@ -34,15 +34,10 @@ import splitlib  # noqa: E402
 
 ITEM_KINDS = ("fn", "const", "static", "struct", "enum", "type", "trait", "union")
 
-
-def is_pub(L, it):
-    for line in L[it.start - 1:it.end]:
-        t = line.strip()
-        if not t or t.startswith("//") or t.startswith("#["):
-            continue
-        return re.match(r"pub (unsafe |async |const )*(fn|const|static|struct|enum|type|trait|union) ",
-                        t) is not None
-    return False
+def header_line(L, imp):
+    """The line of an impl block that opens its body (`impl … {`)."""
+    return next(i for i in range(imp.start, imp.end + 1)
+                if L[i - 1].rstrip().endswith("{") and not L[i - 1].lstrip().startswith(("//", "#")))
 
 
 def main():
@@ -69,7 +64,7 @@ def main():
         return out
 
     moved_top = []                      # (gap_start, item)
-    for gs, r in extents(top, 1):
+    for gs, r in extents(top, splitlib.header_end(L) + 1):
         key = f"impl:{r.name}" if r.kind == "impl" else r.name
         if key in sel and (r.kind == "impl" or r.kind in ITEM_KINDS):
             if key in found:
@@ -82,7 +77,7 @@ def main():
             continue
         bare = re.sub(r"<.*", "", imp.name)
         kids = [r for r in rows if r.depth == 1 and r.parent == istart]
-        for gs, r in extents(kids, istart + 1):
+        for gs, r in extents(kids, header_line(L, imp) + 1):
             key = f"{bare}::{r.name}"
             if key in sel:
                 found.add(key)
@@ -117,12 +112,12 @@ def main():
     pieces = [(r.start, chunk(gs, r.end, True)) for gs, r in moved_top]
     for istart, ms in moved_meth.items():
         imp = impls[istart]
-        hdr = next(i for i in range(imp.start, imp.end + 1) if L[i - 1].rstrip().endswith("{"))
+        hdr = header_line(L, imp)
         body = []
         for n, (gs, r) in enumerate(ms):
             body += chunk(gs, r.end, n == 0)
         pieces.append((istart, L[hdr - 1:hdr] + body + ["}"]))
-    out = open(docfile).read().rstrip("\n").split("\n") + [""] + uses + [""]
+    out = open(docfile).read().rstrip("\n").split("\n") + [""] + (uses + [""] if uses else [])
     for _, lines in sorted(pieces, key=lambda p: p[0]):
         out += lines + [""]
     while out and out[-1] == "":
@@ -132,11 +127,24 @@ def main():
         f.write("\n".join(out) + "\n")
 
     # The parent: drop the moved lines, collapse doubled blanks, wire the module.
-    res = []
+    # Tidy only at the seams of the dropped ranges, never inside a literal:
+    # a doubled blank line, a blank right after an `impl … {` whose first
+    # method left, and one right before a `}` whose last method left.
+    res, nums, at_seam = [], [], False
+    inside = splitlib.literal_interior(path)
     for i, l in enumerate(L, 1):
-        if i in drop or (l == "" and res and res[-1] == ""):
+        if i in drop:
+            at_seam = True
             continue
+        if at_seam and i not in inside and res:
+            if l == "" and (res[-1] == "" or res[-1].rstrip().endswith("{")):
+                continue
+            if l.strip() == "}" and res[-1] == "" and nums[-1] not in inside:
+                res.pop()
+                nums.pop()
+        at_seam = False
         res.append(l)
+        nums.append(i)
     def first_body(ls):
         return next((i for i, l in enumerate(ls)
                      if re.match(r"^(pub(\(crate\))? )?(fn|struct|enum|const|static|type|trait|impl)\b", l)
@@ -156,7 +164,7 @@ def main():
         res[first_use:first_use] = [f"mod {mod};", ""]
     ue = use_ends(res)
     at = (ue[-1] + 1) if ue else (res.index(f"mod {mod};") + 1)
-    pubs = sorted(r.name for _, r in moved_top if r.kind != "impl" and is_pub(L, r))
+    pubs = sorted(r.name for _, r in moved_top if r.kind != "impl" and r.vis == "pub")
     wiring = [f"pub(crate) use {mod}::*;"]
     if pubs:
         wiring.insert(0, splitlib.fmt_use(mod, pubs).replace("use ", "pub use ", 1))

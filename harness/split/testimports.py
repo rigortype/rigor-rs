@@ -16,7 +16,6 @@ file's top-level `use PATH::{…};` (or adds one after its leading `use` block).
 """
 import argparse
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -27,16 +26,15 @@ UNRESOLVED = {"E0425", "E0433", "E0412", "E0422", "E0531", "E0532", "E0574", "E0
 
 def add(path, prefix, names):
     L = open(path).read().split("\n")
-    pat = re.compile(r"^use " + re.escape(prefix) + r"::(\{([^}]*)\}|(\w+));$")
-    for i, line in enumerate(L):
-        m = pat.match(line)
-        if m:
-            have = {x.strip() for x in (m.group(2) or m.group(3)).split(",") if x.strip()}
-            L[i] = splitlib.fmt_use(prefix, have | names)
+    uses = splitlib.use_items(path)
+    for st, en, vis in uses:
+        p = splitlib.parse_use("\n".join(L[st - 1:en]))
+        if vis == "-" and p and p[0] == prefix:
+            L[st - 1:en] = splitlib.fmt_use(prefix, set(p[1]) | names).split("\n")
             break
     else:
-        last = max(i for i, line in enumerate(L[:60]) if line.startswith("use "))
-        L.insert(last + 1, splitlib.fmt_use(prefix, names))
+        at = uses[-1][1] if uses else next((i for i, l in enumerate(L) if not l.startswith("//!")), 0)
+        L[at:at] = splitlib.fmt_use(prefix, names).split("\n")
     open(path, "w").write("\n".join(L))
 
 

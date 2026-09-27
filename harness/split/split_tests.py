@@ -19,6 +19,7 @@ the rewritten FILE must reproduce the original bytes. On a mismatch nothing is
 left written. Comments and attributes on or above a `mod` stay in FILE.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -61,6 +62,14 @@ def main():
         moved.append((it.name, open_ln, it.end, target, body))
     if not moved:
         splitlib.die(f"{path}: no inline #[cfg(test)] mod to move")
+    # Position-dependent constructs mean something else once the body moves
+    # (lines shift; include paths and `#[path]` resolve from the new file).
+    for name, open_ln, close_ln, target, body in moved:
+        for off, b in enumerate(body):
+            hit = re.search(r"\b(line|column|file|module_path|include|include_str|include_bytes)!|#\[path\b", b)
+            if hit:
+                print(f"WARNING {splitlib.rel(path)}:{open_ln + 1 + off}: position-dependent "
+                      f"`{hit.group(0)}` in moved mod {name}: check it by hand")
     out.extend(L[cur - 1:])
     new = "\n".join(out)
 
