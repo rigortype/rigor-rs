@@ -62,7 +62,7 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
         ),
         "Float" => matches!(
             method,
-            "+" | "-" | "*" | "<" | "<=" | ">" | ">=" | "==" | "abs"
+            "+" | "-" | "*" | "<" | "<=" | ">" | ">=" | "==" | "abs" | "<=>"
         ),
         "TrueClass" | "FalseClass" => matches!(method, "!" | "&" | "|" | "=="),
         "NilClass" => matches!(method, "!" | "&" | "|" | "=="),
@@ -71,6 +71,7 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
             method,
             "upcase" | "downcase" | "reverse" | "length" | "size" | "+" | "*"
                 | "==" | "empty?" | "[]" | "slice" | "byteslice" | "index"
+                | "getbyte" | "rindex" | "byteindex" | "byterindex"
         ),
         _ => false,
     }
@@ -233,6 +234,9 @@ fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
     if method == "abs" && args.is_empty() {
         return Some(Scalar::Float(a.abs()));
     }
+    if method == "<=>" {
+        return float_cmp(a, args);
+    }
     // Binary on a single Float argument. We deliberately do NOT fold
     // Float op Integer (mixed coercion) here — that stays simple and exact.
     let b = match args {
@@ -253,6 +257,45 @@ fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         _ => return None,
     };
     Some(res)
+}
+
+/// `Float#<=>` (`flo_cmp`), which the reference folds by calling it
+/// (`NUMERIC_BINARY`). An Integer operand compares EXACTLY, not through a lossy
+/// `i64 -> f64` cast: `9007199254740992.0 <=> 9007199254740993` is `-1`. A
+/// non-numeric operand has no `coerce`, so Ruby answers `nil`. A NaN or infinite
+/// receiver/operand declines: the reference never holds a NaN `Constant`
+/// (`foldable_constant_value?`), and a non-finite port scalar is not proven to
+/// be one the reference also pins.
+fn float_cmp(a: f64, args: &[Scalar]) -> Option<Scalar> {
+    if !a.is_finite() {
+        return None;
+    }
+    let ord = |o: std::cmp::Ordering| Scalar::Int(o as i64);
+    match args {
+        [Scalar::Float(b)] if b.is_finite() => a.partial_cmp(b).map(ord),
+        [Scalar::Float(_)] => None,
+        [Scalar::Int(b)] => {
+            // 2^63 is exactly representable; every finite `a` below it and at or
+            // above -2^63 truncates to an in-range i64 without loss.
+            const TWO_63: f64 = 9_223_372_036_854_775_808.0;
+            if a >= TWO_63 {
+                return Some(Scalar::Int(1));
+            }
+            if a < -TWO_63 {
+                return Some(Scalar::Int(-1));
+            }
+            let whole = a.trunc();
+            Some(ord((whole as i64).cmp(b).then(if a > whole {
+                std::cmp::Ordering::Greater
+            } else if a < whole {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            })))
+        }
+        [Scalar::Str(_) | Scalar::Sym(_) | Scalar::Bool(_) | Scalar::Nil] => Some(Scalar::Nil),
+        _ => None,
+    }
 }
 
 // --- Bool -------------------------------------------------------------------
@@ -337,7 +380,11 @@ fn fold_str(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
         }
         ("==", [Scalar::Str(b)]) => Some(Scalar::Bool(a == b)),
         ("==", [_]) => Some(Scalar::Bool(false)),
-        ("[]" | "slice" | "byteslice" | "index", _) => fold_str_lookup(a, method, args),
+        (
+            "[]" | "slice" | "byteslice" | "index" | "getbyte" | "rindex" | "byteindex"
+            | "byterindex",
+            _,
+        ) => fold_str_lookup(a, method, args),
         _ => None,
     }
 }
@@ -345,11 +392,45 @@ fn fold_str(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
 /// Whether `method` on `recv` is one of the String lookups, which can fold to
 /// `nil` and so change the receiver's class downstream.
 pub fn is_str_lookup(recv: &Scalar, method: &str) -> bool {
-    matches!(recv, Scalar::Str(_)) && matches!(method, "[]" | "slice" | "byteslice" | "index")
+    matches!(recv, Scalar::Str(_))
+        && matches!(
+            method,
+            "[]" | "slice"
+                | "byteslice"
+                | "index"
+                | "getbyte"
+                | "rindex"
+                | "byteindex"
+                | "byterindex"
+        )
+}
+
+/// Issue #164 — the literal calls whose tier-1 fold OWNS the answer: a call
+/// that pins every argument but does not fold must not fall through to the
+/// tier-3 flat slot. Each returns `Integer?`, and the reference, which folds
+/// these by running the method, either lands on a value the port does not model
+/// (a multibyte receiver, a Float index) or, when Ruby raises (`"abc".getbyte("a")`,
+/// a wrong arity), declines to the `Integer | nil` RBS join no rule fires on.
+/// The flat slot's bare `Integer` is wrong both ways, so the caller answers
+/// `Dynamic` instead: a coverage loss, never a false positive.
+pub fn declines_unfolded(recv: &Scalar, method: &str) -> bool {
+    match recv {
+        Scalar::Str(_) => matches!(method, "getbyte" | "rindex" | "byteindex" | "byterindex"),
+        Scalar::Float(_) => method == "<=>",
+        _ => false,
+    }
+}
+
+/// Whether a stale pinned value could change the fold's CLASS (a lookup's
+/// `nil`, or `Float#<=>`'s `nil` against a receiver a later write retypes), so
+/// the tier-1 fold must decline when the call reads a local.
+pub fn is_nilable_fold(recv: &Scalar, method: &str) -> bool {
+    is_str_lookup(recv, method) || matches!((recv, method), (Scalar::Float(_), "<=>"))
 }
 
 /// `String#[]` / `#slice` / `#byteslice` / `#index` on pinned scalars (issue
-/// #121 step 1). The reference folds all four by running the real method, so a
+/// #121 step 1), and `#getbyte` / `#rindex` / `#byteindex` / `#byterindex`
+/// (issue #164). The reference folds them all by running the real method, so a
 /// fold here must be exactly Ruby's answer — including `nil` for an index out of
 /// range or an absent substring, which the reference witnesses on as `nil`.
 ///
@@ -376,7 +457,7 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
     };
     match (method, args) {
         ("[]" | "slice" | "byteslice", [Scalar::Int(i)]) => {
-            let i = if *i < 0 { i + len } else { *i };
+            let i = if *i < 0 { *i + len } else { *i };
             Some(if (0..len).contains(&i) {
                 Scalar::Str(a[i as usize..=i as usize].to_owned())
             } else {
@@ -389,11 +470,49 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
         ("[]" | "slice", [Scalar::Str(sub)]) if sub.is_ascii() => {
             Some(if a.contains(sub.as_str()) { Scalar::Str(sub.clone()) } else { Scalar::Nil })
         }
-        ("index", [Scalar::Str(sub)]) if sub.is_ascii() => {
+        // `rb_str_getbyte`: a negative index counts from the end; out of range
+        // is `nil`. Only an Integer index — Ruby truncates a Float and raises
+        // on anything else.
+        ("getbyte", [Scalar::Int(i)]) => {
+            let i = if *i < 0 { *i + len } else { *i };
+            Some(if (0..len).contains(&i) {
+                Scalar::Int(i64::from(a.as_bytes()[i as usize]))
+            } else {
+                Scalar::Nil
+            })
+        }
+        // `byteindex` is `index` counted in bytes (`rb_str_byteindex_m`: a
+        // negative offset counts from the end, one outside `0..=len` is `nil`),
+        // and on an ASCII receiver bytes are characters. Its only extra failure,
+        // an offset off a character boundary, cannot happen here.
+        ("index" | "byteindex", [Scalar::Str(sub)]) if sub.is_ascii() => {
             Some(a.find(sub.as_str()).map_or(Scalar::Nil, |p| Scalar::Int(p as i64)))
         }
-        ("index", [Scalar::Str(sub), Scalar::Int(offset)]) if sub.is_ascii() => {
-            let offset = if *offset < 0 { offset + len } else { *offset };
+        // `rb_str_rindex_m` / `rb_str_byterindex_m`: the start defaults to the
+        // end; a negative one counts from the end (`nil` if still negative); one
+        // past the end clamps to it. The match is the LAST one starting at or
+        // before it, so an empty needle answers the start itself.
+        ("rindex" | "byterindex", [Scalar::Str(sub), rest @ ..]) if sub.is_ascii() => {
+            let start = match rest {
+                [] => len,
+                [Scalar::Int(p)] => {
+                    let p = if *p < 0 { *p + len } else { *p };
+                    if p < 0 {
+                        return Some(Scalar::Nil);
+                    }
+                    p.min(len)
+                }
+                _ => return None,
+            };
+            let slen = sub.len() as i64;
+            if slen > len {
+                return Some(Scalar::Nil);
+            }
+            let end = (start + slen).min(len) as usize;
+            Some(a[..end].rfind(sub.as_str()).map_or(Scalar::Nil, |p| Scalar::Int(p as i64)))
+        }
+        ("index" | "byteindex", [Scalar::Str(sub), Scalar::Int(offset)]) if sub.is_ascii() => {
+            let offset = if *offset < 0 { *offset + len } else { *offset };
             if !(0..=len).contains(&offset) {
                 return Some(Scalar::Nil);
             }
@@ -522,6 +641,76 @@ mod tests {
         assert_eq!(fold(&s("héllo"), "[]", &[Scalar::Int(1)]), None);
         assert_eq!(fold(&s("héllo"), "index", &[s("l")]), None);
         assert_eq!(fold(&abc, "index", &[s("é")]), None);
+    }
+
+    /// Issue #164 — each expectation is plain Ruby's answer, which the pinned
+    /// reference folds to.
+    #[test]
+    fn folds_nilable_byte_and_reverse_lookups() {
+        let s = |v: &str| Scalar::Str(v.into());
+        let abc = s("abc");
+        let i = Scalar::Int;
+        let nil = Scalar::Nil;
+        let cases: &[(&str, Vec<Scalar>, Scalar)] = &[
+            ("getbyte", vec![i(0)], i(97)),
+            ("getbyte", vec![i(-3)], i(97)),
+            ("getbyte", vec![i(3)], nil.clone()),
+            ("getbyte", vec![i(9)], nil.clone()),
+            ("getbyte", vec![i(-9)], nil.clone()),
+            ("rindex", vec![s("b")], i(1)),
+            ("rindex", vec![s("z")], nil.clone()),
+            ("rindex", vec![s("")], i(3)),
+            ("rindex", vec![s(""), i(1)], i(1)),
+            ("rindex", vec![s("c"), i(-1)], i(2)),
+            ("rindex", vec![s("a"), i(-3)], i(0)),
+            ("rindex", vec![s("a"), i(-4)], nil.clone()),
+            ("rindex", vec![s("c"), i(9)], i(2)),
+            ("rindex", vec![s("c"), i(1)], nil.clone()),
+            ("rindex", vec![s("abcd")], nil.clone()),
+            ("byterindex", vec![s("b")], i(1)),
+            ("byterindex", vec![s("z")], nil.clone()),
+            ("byterindex", vec![s("c"), i(-1)], i(2)),
+            ("byterindex", vec![s(""), i(5)], i(3)),
+            ("byteindex", vec![s("b")], i(1)),
+            ("byteindex", vec![s("z")], nil.clone()),
+            ("byteindex", vec![s("c"), i(-1)], i(2)),
+            ("byteindex", vec![s("b"), i(5)], nil.clone()),
+            ("byteindex", vec![s(""), i(3)], i(3)),
+        ];
+        for (method, args, want) in cases {
+            assert_eq!(fold(&abc, method, args).as_ref(), Some(want), "{method}{args:?}");
+        }
+        let abcabc = s("abcabc");
+        assert_eq!(fold(&abcabc, "rindex", &[s("bc"), i(3)]), Some(i(1)));
+        assert_eq!(fold(&abcabc, "rindex", &[s("bc"), i(4)]), Some(i(4)));
+        assert_eq!(fold(&s(""), "rindex", &[s("")]), Some(i(0)));
+        // Declines: multibyte, a non-Integer index, a raising argument kind.
+        assert_eq!(fold(&s("é"), "getbyte", &[i(0)]), None);
+        assert_eq!(fold(&s("éa"), "rindex", &[s("a")]), None);
+        assert_eq!(fold(&abc, "getbyte", &[Scalar::Float(1.9)]), None);
+        assert_eq!(fold(&abc, "getbyte", &[s("a")]), None);
+        assert_eq!(fold(&abc, "rindex", &[Scalar::Sym("b".into())]), None);
+        assert_eq!(fold(&abc, "rindex", &[s("b"), Scalar::Float(1.0)]), None);
+    }
+
+    #[test]
+    fn folds_float_spaceship() {
+        let f = Scalar::Float;
+        let i = Scalar::Int;
+        assert_eq!(fold(&f(1.0), "<=>", &[i(2)]), Some(i(-1)));
+        assert_eq!(fold(&f(2.0), "<=>", &[i(2)]), Some(i(0)));
+        assert_eq!(fold(&f(-0.5), "<=>", &[i(0)]), Some(i(-1)));
+        assert_eq!(fold(&f(1.5), "<=>", &[f(1.0)]), Some(i(1)));
+        // Exact, not through an `as f64` cast of the Integer.
+        assert_eq!(fold(&f(9_007_199_254_740_992.0), "<=>", &[i(9_007_199_254_740_993)]), Some(i(-1)));
+        assert_eq!(fold(&f(1e19), "<=>", &[i(i64::MAX)]), Some(i(1)));
+        assert_eq!(fold(&f(-1e19), "<=>", &[i(i64::MIN)]), Some(i(-1)));
+        for other in [Scalar::Str("x".into()), Scalar::Sym("x".into()), Scalar::Nil, Scalar::Bool(true)] {
+            assert_eq!(fold(&f(1.0), "<=>", &[other]), Some(Scalar::Nil));
+        }
+        assert_eq!(fold(&f(f64::NAN), "<=>", &[i(1)]), None);
+        assert_eq!(fold(&f(1.0), "<=>", &[f(f64::INFINITY)]), None);
+        assert_eq!(fold(&f(1.0), "<=>", &[]), None);
     }
 
     #[test]
