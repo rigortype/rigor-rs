@@ -127,14 +127,22 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
     }
 
     let cfg = crate::Config::load(explicit_config.map(std::path::Path::new));
+    let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
     let roots: &[&str] = if paths.is_empty() {
-        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        // `runner.run(configuration.paths)` — declared `paths:` are
+        // absolutized upstream, and the exclusion match runs on that
+        // spelling.
+        config_path_strings = crate::effective_config_paths(&cfg);
+        config_paths = config_path_strings.iter().map(String::as_str).collect();
         &config_paths
     } else {
         &paths
     };
-    let (expanded_owned, _errs) = crate::expand_check_paths(roots);
+    // Same exclusion-aware expansion `check` runs (upstream triage goes
+    // through `runner.run` → `expand_paths` → `reject_excluded` too).
+    let (expanded_owned, _errs) =
+        crate::expand_check_paths_excluding(roots, &crate::exclude_patterns(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _io) = crate::analyze_files(
         &expanded,

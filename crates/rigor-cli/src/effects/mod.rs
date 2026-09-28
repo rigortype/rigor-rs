@@ -180,16 +180,21 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
 
     let config_path = explicit_config.map_or_else(|| PathBuf::from(".rigor.yml"), PathBuf::from);
     let cfg = crate::Config::load(explicit_config.map(Path::new));
-    // Paths: positional args, or config `paths:` when none are supplied —
-    // upstream's `@argv.empty? ? configuration.paths : @argv`.
-    let config_paths: Vec<&str>;
-    let raw: &[&str] = if positional.is_empty() {
-        config_paths = cfg.paths.iter().map(String::as_str).collect();
-        &config_paths
-    } else {
-        &positional
-    };
-    let files = resolve_paths(raw, &cfg);
+    // The analysed set is the configured `paths:` PLUS the positional scope —
+    // upstream's `runner.run((configuration.paths + scope).uniq)` (#439: an
+    // effect summary is transitive over whatever was analysed, so analysing
+    // only the arguments lowers every answer). `uniq` is a first-wins string
+    // dedup, and declared `paths:` arrive absolutized (`resolve_paths_in`), so
+    // the `exclude:` match inside `resolve_paths` sees the same spelling
+    // `check` does.
+    let mut raw_strings = crate::effective_config_paths(&cfg);
+    for &p in &positional {
+        if !raw_strings.iter().any(|e| e.as_str() == p) {
+            raw_strings.push(p.to_string());
+        }
+    }
+    let raw: Vec<&str> = raw_strings.iter().map(String::as_str).collect();
+    let files = resolve_paths(&raw, &cfg);
 
     let project_root =
         std::env::current_dir().and_then(|dir| dir.canonicalize()).unwrap_or_else(|_| ".".into());
@@ -228,25 +233,17 @@ fn help() -> String {
     )
 }
 
-/// Resolve path args to the `.rb` files to scan: a directory expands to its
-/// sorted `**/*.rb`, a `.rb` file passes through, anything else is skipped, and
-/// the config's `exclude:` prunes — the same file set `check` analyses, which is
-/// what makes the two arms of the differential describe one project.
+/// Resolve path args to the `.rb` files to scan — the same expansion `check`
+/// runs (upstream's `effects` is a `runner.run` → `expand_paths` too): a
+/// directory expands to its sorted `**/*.rb` minus the
+/// `BUILTIN_EXCLUDES + exclude:` rejects, a `.rb` file root passes through
+/// verbatim (never `exclude:`d), anything else is skipped. That is the file
+/// set `check` analyses, which is what makes the two arms of the
+/// differential describe one project.
 fn resolve_paths(raw: &[&str], cfg: &crate::Config) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for &path in raw {
-        let candidate = Path::new(path);
-        if candidate.is_dir() {
-            let mut in_dir = Vec::new();
-            crate::collect_rb_files(candidate, &mut in_dir);
-            in_dir.sort();
-            out.extend(in_dir);
-        } else if candidate.is_file() && path.ends_with(".rb") {
-            out.push(path.to_string());
-        }
-    }
+    let (mut out, _path_errors) =
+        crate::expand_check_paths_excluding(raw, &crate::exclude_patterns(cfg));
     out.dedup();
-    out.retain(|path| !cfg.is_excluded(path));
     out
 }
 

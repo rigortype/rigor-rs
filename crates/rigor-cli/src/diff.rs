@@ -171,15 +171,24 @@ fn load_diagnostics(path: &str) -> Option<Vec<Value>> {
 fn run_current(explicit_config: Option<&str>, paths: &[&str]) -> Vec<Value> {
     let cfg = crate::Config::load(explicit_config.map(Path::new));
 
+    let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
     let roots: &[&str] = if paths.is_empty() {
-        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        // `runner.run(configuration.paths)` — declared `paths:` are
+        // absolutized upstream, and the exclusion match runs on that
+        // spelling.
+        config_path_strings = crate::effective_config_paths(&cfg);
+        config_paths = config_path_strings.iter().map(String::as_str).collect();
         &config_paths
     } else {
         paths
     };
 
-    let (expanded_owned, _path_errors) = crate::expand_check_paths(roots);
+    // Same exclusion-aware expansion `check` runs (`runner.run` →
+    // `expand_paths` → `reject_excluded` upstream): directory entries past
+    // `BUILTIN_EXCLUDES + exclude:`, explicit `.rb` roots verbatim.
+    let (expanded_owned, _path_errors) =
+        crate::expand_check_paths_excluding(roots, &crate::exclude_patterns(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     // Sound subset (folder = None): diagnostic-identical to full fidelity per
     // ADR-0037, and keeps `diff` Ruby-free / hard-error-free.

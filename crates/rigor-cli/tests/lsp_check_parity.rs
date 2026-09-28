@@ -417,8 +417,8 @@ fn lsp_honours_config_exclude_exactly_as_check_does() {
     assert_eq!(lsp_findings(dir.path(), "lib/typo.rb", TYPO_RB), control_typo);
 
     // …now exclude ONE of them. The pattern is spelled the way `check` matches it:
-    // bare `check` expands `paths: ["lib"]` to `lib/sub.rb` and applies
-    // `cfg.is_excluded` to that string (`main.rs` stage 1).
+    // `check lib` expands the argv dir to `lib/sub.rb` and `reject_excluded`
+    // drops it inside `expand_paths` (issue #201: no later per-file gate).
     fs::write(dir.path().join(".rigor.yml"), "exclude:\n  - \"lib/sub.rb\"\n").unwrap();
 
     // (1) The excluded buffer: `check` reports nothing, and the LSP publishes an
@@ -509,10 +509,13 @@ fn lsp_analyses_a_symlink_whose_target_spelling_is_excluded() {
     );
 }
 
-/// B3 — OVERLAPPING `paths:` roots. Discovery yields both `./lib/a.rb` (pruned by
-/// `./lib/**`) and `lib/a.rb` (kept), so `check` analyses the file. The first cut
-/// returned on the first containing root, making the answer depend on config order
-/// — so both orders are driven.
+/// B3 — OVERLAPPING `paths:` roots. DECLARED `paths:` entries resolve to
+/// absolute strings (`Configuration.resolve_paths_in`), so both roots spell
+/// the file `<abs>/lib/a.rb` — `./lib/**` prunes NEITHER spelling and `check`
+/// analyses it (twice: `expand_paths` does not dedupe — verified against the
+/// reference, which emits two identical rows). The first cut returned on the
+/// first containing root, making the answer depend on config order — so both
+/// orders are driven.
 #[test]
 fn lsp_analyses_a_file_kept_by_one_of_two_overlapping_roots() {
     for (tag, order) in [
@@ -527,14 +530,22 @@ fn lsp_analyses_a_file_kept_by_one_of_two_overlapping_roots() {
         )
         .unwrap();
 
-        // Bare `check` (no path args) — the invocation `paths:` governs.
-        let expected = check_findings(dir.path(), &[], "lib/a.rb");
+        // Bare `check` (no path args) — the invocation `paths:` governs, and
+        // its rows carry the ABSOLUTE path spelling a declared `paths:` root
+        // produces.
+        let abs = dir.path().join("lib/a.rb");
+        let mut expected = check_findings(dir.path(), &[], abs.to_str().unwrap());
         assert_eq!(
             expected.len(),
-            1,
-            "[{order:?}] the control: the `lib` root's spelling survives, so `check` \
-             analyses the file: {expected:?}"
+            2,
+            "[{order:?}] the control: `./lib/**` matches neither absolute \
+             spelling, so `check` analyses the file under both roots: {expected:?}"
         );
+        // The LSP publishes one row per buffer; `check` reports the file once
+        // per containing root. The parity claim is the CONTENT, so compare the
+        // de-duplicated row set.
+        expected.sort();
+        expected.dedup();
         assert_eq!(
             lsp_findings(dir.path(), "lib/a.rb", TYPO_RB),
             expected,

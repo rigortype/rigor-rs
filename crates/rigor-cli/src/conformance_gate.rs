@@ -540,34 +540,193 @@ pub(crate) fn process_env_ok(
     }
 }
 
-/// Ruby's `File.fnmatch?(pattern, path)` with NO flags, over-approximated:
-/// `true` whenever it MIGHT match. `*` spans `/` (no `FNM_PATHNAME`), `?` is
-/// one character; a bracket expression or an escape counts as "might match".
-/// The leading-period rule IS modelled (oracle: `File.fnmatch?` applies it
-/// even with no flags — `*gen.rb` vs `./app/gen.rb` is `false`, `?`/`[` obey
-/// it too) — but only at path position 0: `lib/*.rb` vs `lib/.x.rb` is `true`
-/// (the rule does not fire after a `/`).
-pub(crate) fn fnmatch_may(pattern: &str, path: &str) -> bool {
-    // A `*`, `?` or `[` at pattern position 0 never matches a `.` at path
-    // position 0 (oracle-measured truth table). A leading `\` escapes to a
-    // literal, which can never be `.` anyway.
-    if path.starts_with('.') && matches!(pattern.chars().next(), Some('*' | '?' | '[')) {
-        return false;
-    }
-    if pattern.contains(['[', '\\']) {
-        return true;
-    }
-    fn go(p: &[char], s: &[char]) -> bool {
-        match p.split_first() {
-            None => s.is_empty(),
-            Some(('*', rest)) => (0..=s.len()).any(|i| go(rest, &s[i..])),
-            Some(('?', rest)) => !s.is_empty() && go(rest, &s[1..]),
-            Some((c, rest)) => s.first() == Some(c) && go(rest, &s[1..]),
-        }
-    }
+/// Ruby's `File.fnmatch?(pattern, path)` with NO flags — the matcher the
+/// reference's `PathExpansion.reject_excluded` applies to
+/// `BUILTIN_EXCLUDES + exclude:` on every directory-expanded path. An exact
+/// port of MRI `dir.c`'s `fnmatch_helper` + `bracket` at `flags = 0` —
+/// every row below is oracle-measured:
+///
+/// - `*` and `?` span `/` (no `FNM_PATHNAME`) and consecutive `*`s collapse,
+///   so `a/**/b` is `a/` + `*` + `/b` — it does NOT match `a/b` (the
+///   `glob::Pattern` drift this replaces on the analyze path).
+/// - The leading-period rule fires once, at entry: a `.` at path position 0
+///   matches only a literal `.` (seen through ONE `\` unescape) — `*gen.rb`
+///   and `[.]x` fail on `.`-led paths, `\\.x` and `.x` match, and
+///   `lib/*.rb` still matches `lib/.x.rb` (no `FNM_PATHNAME`, so the rule
+///   does not fire after a `/`).
+/// - `\` escapes the next character to a literal; a trailing `\` matches
+///   nothing itself (`"a\\"` matches `"a"` — `UNESCAPE` reads past it into
+///   the pattern terminator).
+/// - `[...]` is a character class: `!` or `^` right after `[` negates, the
+///   FIRST `]` always closes (so `[]…]` is the empty class — it matches
+///   nothing — while `[!]…]` matches every character), `\` escapes a
+///   member, `a-z` is a range (`[a-]` keeps the `-` literal, `[a-` is
+///   unterminated), and a reversed range still matches its two endpoints
+///   (`[z-a]` = {z, a}: `bracket` `memcmp`s `t1`/`t2` before the codepoint
+///   range test). An unterminated `[` fails the match wherever reached.
+#[cfg(test)]
+pub(crate) fn fnmatch(pattern: &str, path: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let s: Vec<char> = path.chars().collect();
-    go(&p, &s)
+    fnmatch_chars(&p, &s)
+}
+
+/// The `fnmatch` matcher body over pre-decoded `char` slices — the hot
+/// callers (`expand_check_paths_excluding`, `root_has_ruby_file`, the LSP
+/// buffer gate) convert each pattern once and each path once instead of per
+/// (pattern, path) pair.
+pub(crate) fn fnmatch_chars(p: &[char], s: &[char]) -> bool {
+    // dir.c's entry guard: `period && *s == '.' && *UNESCAPE(p) != '.'` —
+    // evaluated once, while `s` is still the string's head.
+    if s.first() == Some(&'.') && unescaped(p, 0) != Some('.') {
+        return false;
+    }
+    // `ptmp`/`stmp` are dir.c's single backtrack point — the position just
+    // past the most recent `*` run and the string index it matched zero
+    // characters against; `failed` retries with `*` consuming one more char.
+    let mut ptmp: Option<usize> = None;
+    let mut stmp = 0usize;
+    let mut pi = 0usize;
+    let mut si = 0usize;
+    loop {
+        let mut failed = false;
+        match p.get(pi) {
+            Some('*') => {
+                while p.get(pi) == Some(&'*') {
+                    pi += 1;
+                }
+                // `ISEND(UNESCAPE(p))` — a `*` run at pattern end (incl. `*\`)
+                // matches the rest of the string.
+                if unescaped(p, pi).is_none() {
+                    return true;
+                }
+                // `ISEND(s)` — `*` cannot keep a non-empty rest over "".
+                if si == s.len() {
+                    return false;
+                }
+                ptmp = Some(pi);
+                stmp = si;
+            }
+            Some('?') => {
+                if si == s.len() {
+                    return false; // dir.c RETURNs here — no backtrack
+                }
+                pi += 1;
+                si += 1;
+            }
+            Some('[') => {
+                if si == s.len() {
+                    return false;
+                }
+                match bracket(p, pi + 1, s[si]) {
+                    Some(next) => {
+                        pi = next;
+                        si += 1;
+                    }
+                    None => failed = true,
+                }
+            }
+            _ => {
+                // The ordinary arm: `p = UNESCAPE(p)` skips ONE `\`, so `\x`
+                // compares `x` literally and a trailing `\` folds into the
+                // pattern-end check below.
+                let lit = if p.get(pi) == Some(&'\\') { pi + 1 } else { pi };
+                let lit_end = p.get(lit).is_none_or(|c| *c == '\0'); // ISEND(p)
+                if si == s.len() {
+                    // `ISEND(s)` → match iff the (unescaped) pattern is spent.
+                    return lit_end;
+                }
+                if lit_end {
+                    failed = true; // `ISEND(p)` → failed
+                } else if s[si] == p[lit] {
+                    pi = lit + 1;
+                    si += 1;
+                } else {
+                    failed = true;
+                }
+            }
+        }
+        if !failed {
+            continue;
+        }
+        // failed: retry with the last `*` consuming one more character.
+        match ptmp {
+            Some(t) => {
+                pi = t;
+                stmp += 1;
+                if stmp > s.len() {
+                    return false;
+                }
+                si = stmp;
+            }
+            None => return false,
+        }
+    }
+}
+
+/// `UNESCAPE(p)` at index `i`: the character after ONE skipped `\`, or the
+/// pattern character itself — `None` at pattern end, where dir.c reads the
+/// NUL terminator (so a literal `'\0'` in the pattern ends it here too).
+fn unescaped(p: &[char], i: usize) -> Option<char> {
+    match p.get(i) {
+        Some('\\') => p.get(i + 1).copied().filter(|c| *c != '\0'),
+        other => other.copied().filter(|c| *c != '\0'),
+    }
+}
+
+/// `dir.c bracket()`: evaluate the `[` class whose members start at `p[from]`
+/// against `c`. Returns the index just past the closing `]` on a (negated)
+/// match, `None` when the class is unterminated or the character fails —
+/// dir.c's NULL, which the `[` arm turns into `failed`.
+fn bracket(p: &[char], mut i: usize, c: char) -> Option<usize> {
+    let negated = matches!(p.get(i), Some('!') | Some('^'));
+    if negated {
+        i += 1;
+    }
+    let mut ok = false;
+    loop {
+        match p.get(i) {
+            Some(']') => {
+                i += 1;
+                break;
+            }
+            None => return None, // `*p` ran out before `]` → NULL
+            _ => {}
+        }
+        // One member, `\`-escaped if written so — `!*t1` makes a NUL member
+        // unterminated, and a member at pattern end is unterminated too
+        // (`p >= pend` after the member is consumed).
+        let mut j = i;
+        if p.get(j) == Some(&'\\') {
+            j += 1;
+        }
+        let &lo = p.get(j).filter(|c| **c != '\0')?;
+        j += 1;
+        if j >= p.len() {
+            return None;
+        }
+        // `c1-c2` is a range only when `-` is followed by a member — `p[0] ==
+        // '-' && p[1] != ']'`, where pattern end reads as NUL (≠ `]`).
+        if p.get(j) == Some(&'-') && p.get(j + 1) != Some(&']') {
+            let mut k = j + 1;
+            if p.get(k) == Some(&'\\') {
+                k += 1;
+            }
+            let &hi = p.get(k).filter(|c| **c != '\0')?;
+            j = k + 1;
+            // Endpoints first (`memcmp` on `t1`/`t2`), then `c1 <= c <= c2`
+            // — a reversed range (z-a) therefore still matches its two ends.
+            if !ok && (c == lo || c == hi || (lo <= c && c <= hi)) {
+                ok = true;
+            }
+        } else if !ok && c == lo {
+            ok = true;
+        }
+        i = j;
+    }
+    // `ok == negated → NULL`: the empty non-negated class fails the match
+    // outright; a negated class with no member hit matches (any char).
+    (ok != negated).then_some(i)
 }
 
 /// `Configuration::BUILTIN_EXCLUDES`, always appended upstream.
@@ -618,10 +777,15 @@ fn root_has_ruby_file(root: &str, excludes: &[String]) -> bool {
         }
         let mut files = Vec::new();
         crate::collect_rb_files(path, &mut files);
+        let patterns: Vec<Vec<char>> = BUILTIN_EXCLUDES
+            .iter()
+            .copied()
+            .chain(excludes.iter().map(String::as_str))
+            .map(|p| p.chars().collect())
+            .collect();
         files.iter().any(|f| {
-            let f = f.as_str();
-            !BUILTIN_EXCLUDES.iter().any(|p| fnmatch_may(p, f))
-                && !excludes.iter().any(|p| fnmatch_may(p, f))
+            let f: Vec<char> = f.chars().collect();
+            !patterns.iter().any(|p| fnmatch_chars(p, &f))
         })
     } else {
         // An explicit file: `File.file?(path) && path.end_with?(".rb")`,
@@ -709,23 +873,65 @@ mod tests {
         }
     }
 
+    /// `fnmatch` is an EXACT `File.fnmatch?`-no-flags port — every row below
+    /// was measured against the reference Ruby's matcher (2026-07).
     #[test]
-    fn fnmatch_over_approximates_ruby() {
-        assert!(fnmatch_may("**/vendor/bundle/**", "x/vendor/bundle/a.rb"));
-        assert!(!fnmatch_may("**/vendor/bundle/**", "vendor/bundle/a.rb"));
-        assert!(fnmatch_may("app.rb", "app.rb"));
-        assert!(fnmatch_may("lib/*", "lib/a/b.rb"));
-        assert!(!fnmatch_may("lib/*.rb", "app/a.rb"));
-        assert!(fnmatch_may("[a]pp.rb", "zzz"));
-        // Leading-period rule, position-0 only (oracle-measured truth table).
-        assert!(!fnmatch_may("*gen.rb", "./app/gen.rb"));
-        assert!(!fnmatch_may("*gen.rb", ".gen.rb"));
-        assert!(!fnmatch_may("?gen.rb", ".gen.rb"));
-        assert!(!fnmatch_may("[g]en.rb", ".gen.rb"));
-        assert!(fnmatch_may("*gen.rb", "lib/.gen.rb"));
-        assert!(fnmatch_may("lib/*.rb", "lib/.x.rb"));
-        assert!(fnmatch_may(".*gen.rb", "./app/gen.rb"));
-        assert!(fnmatch_may("./app/*.rb", "./app/gen.rb"));
+    fn fnmatch_matches_ruby_no_flags() {
+        assert!(fnmatch("**/vendor/bundle/**", "x/vendor/bundle/a.rb"));
+        assert!(!fnmatch("**/vendor/bundle/**", "vendor/bundle/a.rb"));
+        assert!(fnmatch("app.rb", "app.rb"));
+        assert!(fnmatch("lib/*", "lib/a/b.rb"));
+        assert!(!fnmatch("lib/*.rb", "app/a.rb"));
+        // Consecutive `*`s collapse — `a/**/b` needs a real `/` between.
+        assert!(!fnmatch("a/**/b", "a/b"));
+        assert!(fnmatch("a/**/b", "a/x/b"));
+        assert!(fnmatch("a/**/b", "a/x/y/b"));
+        assert!(!fnmatch("**/x", "x"));
+        assert!(fnmatch("**/x", "a/x"));
+        assert!(!fnmatch("a/**/", "a/"));
+        // Character classes: `!`/`^` negate, first `]` closes, `\` escapes,
+        // ranges take endpoint equality before the `c1 <= c <= c2` test (so
+        // `[z-a]` still matches z and a), an unterminated class fails.
+        assert!(fnmatch("[a]pp.rb", "app.rb"));
+        assert!(!fnmatch("[a]pp.rb", "zzz"));
+        assert!(fnmatch("[a-c]", "b"));
+        assert!(!fnmatch("[a-c]", "d"));
+        assert!(fnmatch("[z-a]", "z"));
+        assert!(fnmatch("[z-a]", "a"));
+        assert!(!fnmatch("[z-a]", "m"));
+        assert!(fnmatch("[a-]", "-"));
+        assert!(!fnmatch("[a-", "a"));
+        assert!(!fnmatch("[]x]", "a"));
+        assert!(!fnmatch("[]x]", "x"));
+        assert!(fnmatch("[!]", "a"));
+        assert!(fnmatch("[!]x]", "ax]"));
+        assert!(fnmatch("[!a]", "b"));
+        assert!(!fnmatch("[!a]", "a"));
+        assert!(fnmatch("[^a]", "b"));
+        assert!(fnmatch("[\\]]", "]"));
+        assert!(!fnmatch("[\\]]", "x"));
+        assert!(fnmatch("[[]", "["));
+        assert!(!fnmatch("x*[", "xyz"));
+        // `\` escapes to a literal; a trailing `\` folds into pattern end.
+        assert!(fnmatch("a\\", "a"));
+        assert!(!fnmatch("a\\", "a\\"));
+        assert!(fnmatch("\\*", "*"));
+        assert!(!fnmatch("\\*", "x"));
+        assert!(fnmatch("*\\", "xa"));
+        assert!(!fnmatch("\\", "x"));
+        // Leading-period rule, position-0 only: a `.` at the path head needs
+        // a literal `.` at the pattern head (seen through ONE `\`) — `*`/`?`
+        // and even the `[.]` class all fail there.
+        assert!(!fnmatch("*gen.rb", "./app/gen.rb"));
+        assert!(!fnmatch("*gen.rb", ".gen.rb"));
+        assert!(!fnmatch("?gen.rb", ".gen.rb"));
+        assert!(!fnmatch("[g]en.rb", ".gen.rb"));
+        assert!(!fnmatch("[.]", "."));
+        assert!(fnmatch("\\.gen.rb", ".gen.rb"));
+        assert!(fnmatch("*gen.rb", "lib/.gen.rb"));
+        assert!(fnmatch("lib/*.rb", "lib/.x.rb"));
+        assert!(fnmatch(".*gen.rb", "./app/gen.rb"));
+        assert!(fnmatch("./app/*.rb", "./app/gen.rb"));
     }
 
     /// Family 9: no Ruby file ⇒ the reference builds no environment and

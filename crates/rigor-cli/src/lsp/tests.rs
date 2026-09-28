@@ -2554,19 +2554,22 @@ fn project_files_follow_bare_check_discovery() {
         .collect();
     assert_eq!(names, vec!["a.rb", "b.rb", "c.rb"], "sorted, recursive, `.rb` only");
 
-    // `exclude:` prunes, exactly as `check`'s per-file gate does.
+    // `exclude:` prunes, exactly as `check`'s expansion-time `reject_excluded`
+    // does.
     let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/nested/**\"\n").unwrap();
     let pruned = project_files(&p.root, &cfg);
     assert_eq!(pruned.len(), 2, "the excluded dir is not harvested: {pruned:?}");
 }
 
 // ---------------------------------------------------------------------
-// Config `exclude:` for the OPEN BUFFER — `check`'s stage-1 file filter.
+// `BUILTIN_EXCLUDES + exclude:` for the OPEN BUFFER — `check`'s
+// expansion-time filter (`reject_excluded` on directory-expanded paths).
 //
-// `check` skips an excluded file before it is even read (`main.rs`
-// `Stage1::Excluded`), so it reports no rows for it; the LSP published
-// markers for it anyway. The gate below is the same filter, applied to the
-// buffer, against the same path SPELLING discovery matches on.
+// `check` never expands an excluded directory hit into the analyzed set
+// (`main.rs` `expand_check_paths_excluding`), so it reports no rows for
+// it; the LSP published markers for it anyway. The gate below is the same
+// filter, applied to the buffer, against the same path SPELLING discovery
+// matches on.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -2710,11 +2713,27 @@ fn exclude_agreement_run(
              discovery disagree about {f}"
         );
     }
-    // Non-vacuity of the loop itself: the `**/*.rb` case must prune everything
-    // and the empty case nothing, so the comparison above is exercised on BOTH
-    // answers somewhere in the matrix.
+    // Non-vacuity of the loop itself, on `File.fnmatch?`'s own terms: the
+    // catch-all `**/*.rb` prunes every spelling EXCEPT a `.`-led one — the
+    // leading-period rule means `*` at the pattern head never matches the
+    // `.` at path position 0 (oracle: `File.fnmatch?("**/*.rb",
+    // "./lib/a.rb")` is `false`), so a `.` `paths:` root's `./x.rb`
+    // spellings legitimately survive. The empty-exclude case still keeps
+    // everything, so the comparison above is exercised on BOTH answers
+    // somewhere in the matrix.
     if patterns.contains("**/*.rb\"") {
-        assert!(kept.is_empty(), "[{yaml:?}] the catch-all pattern prunes the whole set");
+        assert!(
+            kept.iter().all(|f| f.starts_with("./")),
+            "[{yaml:?}] only `./`-led spellings may survive the catch-all: {kept:?}"
+        );
+        if root == Path::new(".") && paths_yaml.contains("\".\"") {
+            assert!(
+                !kept.is_empty(),
+                "[{yaml:?}] `./`-led spellings survive `**/*.rb` upstream too"
+            );
+        } else {
+            assert!(kept.is_empty(), "[{yaml:?}] no `./` spellings ⇒ full prune");
+        }
     }
     if patterns == "exclude: []\n" {
         assert_eq!(kept.len(), all.len(), "[{yaml:?}] no patterns ⇒ nothing pruned");
@@ -2773,12 +2792,14 @@ fn buffer_at(path: &Path) -> BufferPaths {
 }
 
 #[test]
-fn exclude_gate_uses_the_root_relative_spelling_outside_paths() {
+fn exclude_gate_never_drops_a_buffer_only_explicit_check_reports() {
     // A buffer inside the workspace but outside every `paths:` root: bare
     // `check` never discovers it, so the ONLY run that reports on it is an
-    // explicit `rigor check spec/x.rb` from the project root — which matches
-    // `exclude:` against exactly that root-relative spelling. The gate uses it,
-    // so such a buffer is silenced iff that `check` run would report nothing.
+    // explicit `rigor check spec/x.rb` — and that run keeps the `.rb` argument
+    // VERBATIM (`accept_as_ruby_file?` never consults `exclude:`; issue #201
+    // moved the filter inside directory expansion). Nothing `check` could run
+    // is pruned, so the buffer is never excluded — even when a pattern would
+    // match its root-relative spelling.
     //
     // This does NOT touch the S4b/N5 divergence (an out-of-`paths:` buffer is
     // still analysed against the full project index): it only decides whether
@@ -2795,14 +2816,70 @@ fn exclude_gate_uses_the_root_relative_spelling_outside_paths() {
     let buf = buffer_at(&spec);
     let matching: Config = serde_yaml::from_str("exclude:\n  - \"spec/**\"\n").unwrap();
     assert!(
-        ExcludeMatcher::from_config(&PathBuf::from("."), &matching).excludes(&buf, None),
-        "an out-of-`paths:` buffer is excluded exactly when `rigor check \
-         spec/x_spec.rb` from the project root would report nothing for it"
+        !ExcludeMatcher::from_config(&PathBuf::from("."), &matching).excludes(&buf, None),
+        "`rigor check spec/x_spec.rb` analyses the file verbatim — no spelling \
+         `exclude:` can prune — so the buffer keeps its diagnostics"
     );
-    // The control: a pattern that does NOT cover it leaves it analysed, exactly
-    // as today (the N5 divergence is untouched by this slice).
     let other: Config = serde_yaml::from_str("exclude:\n  - \"vendor/**\"\n").unwrap();
     assert!(!ExcludeMatcher::from_config(&PathBuf::from("."), &other).excludes(&buf, None));
+}
+
+#[test]
+fn exclude_gate_never_drops_a_paths_file_entry_matching_exclude() {
+    // Issue #201 (final review): `paths:` may name a `.rb` FILE, and such an
+    // entry is kept VERBATIM by `expand_paths`/`accept_as_ruby_file?` — the
+    // `exclude:` patterns apply only inside directory expansion. A matcher
+    // that pattern-matches the file's own name silences a buffer `check`
+    // analyses — and did so ONLY while the overlay was unbuilt, a
+    // state-dependent divergence. Both gate tiers are pinned.
+    let p = TempProject::new("exclfileroot");
+    let ext = p.write("ext.rb", "class Ext\nend\n");
+    let cfg: Config =
+        serde_yaml::from_str("paths:\n  - lib/ext.rb\nexclude:\n  - \"**/ext.rb\"\n").unwrap();
+    let root = p.root.clone();
+
+    // Ground truth: `check` keeps the file — `project_files` (the verbatim
+    // `expand_check_paths_excluding`) still lists it.
+    assert!(
+        project_files(&root, &cfg).iter().any(|f| f.ends_with("lib/ext.rb")),
+        "check keeps the explicit `paths:` file verbatim"
+    );
+
+    let matcher = ExcludeMatcher::from_config(&root, &cfg);
+    // TIER 2 (overlay off): the spelling fallback must see the verbatim root.
+    assert!(
+        !matcher.excludes(&buffer_at(&ext), None),
+        "overlay off: the `paths:` file entry is exclusion-immune"
+    );
+    // TIER 1 (overlay live): the file IS in the post-`exclude:` set.
+    let empty_core = CoreIndex::new();
+    let held = ProjectFiles {
+        files: project_files(&root, &cfg)
+            .iter()
+            .filter_map(|f| {
+                let ast = Arc::new(lower(&parse(b"")));
+                let harvest = Arc::new(SourceIndex::harvest(&ast, &empty_core));
+                Some((std::fs::canonicalize(f).ok()?, ast, harvest))
+            })
+            .collect(),
+    };
+    assert!(
+        !matcher.excludes(&buffer_at(&ext), Some(&held)),
+        "overlay live: membership already answers not-excluded"
+    );
+
+    // The control: a `paths:` DIRECTORY entry's expansion of the same file IS
+    // prunable — the SAME pattern drops `lib/ext.rb` inside `reject_excluded`
+    // when the file arrives via directory expansion instead of verbatim.
+    // (`exclude:` is matched against the ABSOLUTIZED `paths:` spellings, so a
+    // `**`-led pattern is needed on both sides.)
+    let dir_cfg: Config =
+        serde_yaml::from_str("paths:\n  - lib\nexclude:\n  - \"**/ext.rb\"\n").unwrap();
+    assert!(project_files(&root, &dir_cfg).is_empty(), "the control: dir expansion pruned");
+    assert!(
+        ExcludeMatcher::from_config(&root, &dir_cfg).excludes(&buffer_at(&ext), None),
+        "the control: the same buffer IS excluded through a directory root"
+    );
 }
 
 #[test]
@@ -2831,11 +2908,16 @@ fn exclude_gate_never_drops_a_symlinked_file_check_analyses() {
             .excludes(&buffer_at(&p.root.join("lib/shared.rb")), None),
         "B1: the link's own name survives `exclude:`, so `check` analyses the file"
     );
-    // The control: a pattern covering BOTH the link's name and the target's
-    // leaves no surviving spelling, so the same file IS excluded — proving the
+    // The control: patterns covering BOTH the link's name and the target's
+    // leave no surviving spelling, so the same file IS excluded — proving the
     // gate is live and that tier 3 rescues only a genuinely surviving name.
-    let both: Config =
-        serde_yaml::from_str("paths:\n  - \".\"\nexclude:\n  - \"**/shared.rb\"\n").unwrap();
+    // `./**/shared.rb` covers the `.`-root's `./lib/…` spellings, which the
+    // leading-period rule hides from `**/…`-led patterns (`File.fnmatch?`,
+    // no flags — a `*` at pattern head never matches position-0 `.`).
+    let both: Config = serde_yaml::from_str(
+        "paths:\n  - \".\"\nexclude:\n  - \"**/shared.rb\"\n  - \"./**/shared.rb\"\n",
+    )
+    .unwrap();
     assert!(
         ExcludeMatcher::from_config(&root, &both)
             .excludes(&buffer_at(&p.root.join("lib/shared.rb")), None),
@@ -2876,10 +2958,13 @@ fn exclude_gate_needs_every_root_spelling_excluded() {
             "[{order:?}] B3: one surviving spelling means `check` analyses the file"
         );
     }
-    // The control: a pattern covering BOTH spellings does exclude it.
-    let both: Config =
-        serde_yaml::from_str("paths:\n  - \".\"\n  - lib\nexclude:\n  - \"**/a.rb\"\n")
-            .unwrap();
+    // The control: patterns covering BOTH spellings do exclude it — `./**/`
+    // for the `.`-led spelling (`File.fnmatch?`'s leading-period rule keeps
+    // `**/a.rb` from ever matching `./lib/a.rb`), `**/` for `lib/a.rb`.
+    let both: Config = serde_yaml::from_str(
+        "paths:\n  - \".\"\n  - lib\nexclude:\n  - \"**/a.rb\"\n  - \"./**/a.rb\"\n",
+    )
+    .unwrap();
     assert!(project_files(&root, &both).is_empty());
     assert!(ExcludeMatcher::from_config(&root, &both).excludes(&buf, None));
 }

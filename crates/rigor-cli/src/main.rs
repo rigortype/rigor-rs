@@ -249,24 +249,34 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let folder_ref =
         sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
 
-    // ADR-0040 — the scan roots: explicit path args when given, else the config
-    // `paths:` (default `["lib"]`), matching the reference's
-    // `@argv.empty? ? configuration.paths : @argv`.
+    // ADR-0040 — the scan roots: explicit path args when given (verbatim —
+    // `rigor check .` expands `./x.rb` spellings, which is why a `.`-led
+    // `exclude:` like `**/*.rb` can never match them upstream), else the
+    // config `paths:` in the reference's stored spelling — DECLARED entries
+    // absolutized (`resolve_paths_in`), the `["lib"]` default verbatim.
+    let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
     let roots: &[&str] = if files.is_empty() {
-        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        config_path_strings = effective_config_paths(&cfg);
+        config_paths = config_path_strings.iter().map(String::as_str).collect();
         &config_paths
     } else {
         &files
     };
 
-    // Expand directory roots into their `**/*.rb` files and collect bad-path
-    // errors, matching the reference's `expand_paths`.
-    let (expanded_owned, path_errors) = expand_check_paths(roots);
+    // Expand roots into their `**/*.rb` files and collect bad-path errors,
+    // matching the reference's `expand_paths`: directory-expanded entries
+    // matching `BUILTIN_EXCLUDES + exclude:` are pruned HERE (`reject_excluded`
+    // + `File.fnmatch?` with no flags); explicit `.rb` file roots are kept
+    // verbatim even when they match `exclude:` (issue #201 — the analyzed set
+    // IS the rejected expansion; there is no second per-file gate).
+    let excludes = exclude_patterns(&cfg);
+    let (expanded_owned, path_errors) = expand_check_paths_excluding(roots, &excludes);
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
 
-    // Run the analysis pipeline (config `exclude:`/`disable:` + inline
-    // `# rigor:disable` applied). Shared with `baseline generate`.
+    // Run the analysis pipeline (config `disable:` + inline `# rigor:disable`
+    // applied; `exclude:` already settled by the expansion). Shared with
+    // `baseline generate`.
     // Issue #129 (ADR-0044 § "Environment-parity gate"): the CLI half of the
     // gate — every flag one the port parses exactly as the reference does,
     // the config path the file the reference reads, no baseline in effect
@@ -543,7 +553,7 @@ struct PathError {
 /// DEFAULT is not in the file, so it stays exactly as written
 /// (cwd-relative). `~` is not expanded — the port never resolves it (the
 /// same documented hole as `conformance_gate::signature_entry_ok`).
-fn effective_config_paths(cfg: &Config) -> Vec<String> {
+pub(crate) fn effective_config_paths(cfg: &Config) -> Vec<String> {
     if !cfg.paths_explicitly_declared() {
         return cfg.paths.clone();
     }
@@ -561,50 +571,44 @@ fn effective_config_paths(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-/// Expand raw `check`/`baseline` path arguments into the concrete `.rb` files to
-/// analyze plus any bad-path errors — a faithful port of the reference's
-/// `Runner#expand_paths` (ADR-0040):
-/// - a DIRECTORY → its `**/*.rb` (recursive; hidden dirs and symlinks skipped;
-///   `.gitignore` ignored — the analysis path prunes `exclude:` via the
-///   per-file gate in [`analyze_files`]; the WIDENING expansion prunes
-///   `BUILTIN_EXCLUDES + exclude:` inside
-///   [`expand_check_paths_excluding`]); each directory's files sorted,
-///   concatenated in arg order.
-/// - a FILE ending in `.rb` → kept as-is.
+/// Expand raw `check`/`baseline` path arguments into the concrete `.rb` files
+/// to analyze plus any bad-path errors — a faithful port of the reference's
+/// `Runner#expand_paths` (`PathExpansion#call`, ADR-0040):
+/// - a DIRECTORY → its `**/*.rb` (recursive; hidden dirs and symlinked dirs
+///   skipped; `.gitignore` ignored), each directory's hits sorted and
+///   concatenated in arg order — THEN `reject_excluded`: every directory hit
+///   matching `excludes` is dropped.
+/// - a FILE ending in `.rb` → kept as-is (`accept_as_ruby_file?` never
+///   consults `exclude_patterns` — an explicit `check lib/ext.rb` analyzes
+///   `ext.rb` even when `exclude: [lib/ext.rb]`).
 /// - an existing non-`.rb` file → a `PathError { not_found: false }`.
 /// - a missing path → a `PathError { not_found: true }`.
-fn expand_check_paths(raw: &[&str]) -> (Vec<String>, Vec<PathError>) {
-    expand_check_paths_excluding(raw, &[])
-}
-
-/// `expand_check_paths` with the reference's `reject_excluded` applied to
-/// DIRECTORY-expanded entries only (`PathExpansion.directory_files` drops any
-/// glob hit matching `exclude_patterns`; an explicit `.rb` file root is kept
-/// verbatim — `accept_as_ruby_file?` never consults the list).
 ///
 /// `excludes` is `Configuration#exclude_patterns` (`BUILTIN_EXCLUDES +
-/// exclude:`), matched with `File.fnmatch?` and NO flags — `*` spans `/`, so
-/// `*zz.rb` matches `lib/zz.rb` (this is NOT the `glob::Pattern` semantics
-/// `Config::is_excluded` uses on the analyze path). Callers must only pass
-/// patterns [`conformance_gate::fnmatch_may`] can decide exactly — the
-/// widening path declines entirely when any pattern is undecidable rather
-/// than guess: a wrong guess in EITHER direction can fire (`exclude:`d decl
-/// kept → widened/discovery see a file the reference dropped; legit decl
-/// dropped → widened/extra decls missing), and a discovered decl can CAUSE a
-/// diagnostic, not only suppress one.
-fn expand_check_paths_excluding(
+/// exclude:`) matched with `File.fnmatch?` and NO flags — `*` spans `/`, so
+/// `*zz.rb` matches `lib/zz.rb`, but consecutive `*`s collapse so
+/// `a/**/b` does NOT match `a/b` (unlike the retired `glob::Pattern` per-file
+/// gate — see issue #201). There is no second exclusion stage: this
+/// expansion IS the analyzed set.
+pub(crate) fn expand_check_paths_excluding(
     raw: &[&str],
     excludes: &[String],
 ) -> (Vec<String>, Vec<PathError>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
+    // Decode the patterns once per expansion (not per root) — `reject_excluded`
+    // runs patterns × files; `exclude_fnmatch` decodes each file path once.
+    let mut compiled_excludes: Option<Vec<Vec<char>>> = None;
     for &p in raw {
         let path = Path::new(p);
         if path.is_dir() {
             let mut in_dir = Vec::new();
             collect_rb_files(path, &mut in_dir);
             in_dir.sort();
-            in_dir.retain(|f| !exclude_fnmatch(excludes, f));
+            let compiled = compiled_excludes.get_or_insert_with(|| {
+                excludes.iter().map(|p| p.chars().collect()).collect()
+            });
+            in_dir.retain(|f| !exclude_fnmatch(compiled, f));
             files.extend(in_dir);
         } else if path.is_file() && p.ends_with(".rb") {
             files.push(p.to_string());
@@ -618,10 +622,9 @@ fn expand_check_paths_excluding(
 }
 
 /// `Configuration#exclude_patterns` — `BUILTIN_EXCLUDES + exclude:` — the
-/// list `expand_paths`' `reject_excluded` applies to directory expansions
-/// (the analysis-side per-file `exclude:` filter stays the pre-existing
-/// `cfg.is_excluded` glob gate in `analyze_files`).
-fn discovery_exclude_patterns(cfg: &Config) -> Vec<String> {
+/// one list `expand_paths`' `reject_excluded` applies to directory
+/// expansions.
+pub(crate) fn exclude_patterns(cfg: &Config) -> Vec<String> {
     conformance_gate::BUILTIN_EXCLUDES
         .iter()
         .map(|s| (*s).to_string())
@@ -630,15 +633,16 @@ fn discovery_exclude_patterns(cfg: &Config) -> Vec<String> {
 }
 
 /// `File.fnmatch?(pattern, path)`-with-no-flags exclusion for one expanded
-/// path. `fnmatch_may` is exact for patterns without `[` or `\` (the caller
-/// declines widening when any pattern is undecidable, so this only ever sees
-/// decidable input) — and models the leading-period rule: a `*`/`?`/`[` at
-/// pattern position 0 never matches a `.` at path position 0 (`./app/gen.rb`
-/// is NOT excluded by `*gen.rb`).
-fn exclude_fnmatch(patterns: &[String], path: &str) -> bool {
+/// path — the exact matcher [`conformance_gate::fnmatch_chars`] ports from
+/// MRI `dir.c`, including the leading-period rule: a `*`/`?`/`[` at pattern
+/// position 0 never matches a `.` at path position 0 (`./app/gen.rb` is NOT
+/// excluded by `*gen.rb`). Patterns arrive pre-decoded — the caller converts
+/// them once per expansion, not once per file.
+pub(crate) fn exclude_fnmatch(patterns: &[Vec<char>], path: &str) -> bool {
+    let path: Vec<char> = path.chars().collect();
     patterns
         .iter()
-        .any(|p| conformance_gate::fnmatch_may(p, path))
+        .any(|p| conformance_gate::fnmatch_chars(p, &path))
 }
 
 /// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
@@ -955,33 +959,19 @@ fn analyze_files(
         let union_root_refs: Vec<&str> =
             union_roots.iter().map(String::as_str).collect();
         // Both sides of `widened.files.size > expansion.files.size` are the
-        // post-`reject_excluded` expansions: directory entries matching
-        // `BUILTIN_EXCLUDES + exclude:` (fnmatch, no flags) never count and
-        // never become discovery items. The `expansion` side re-expands
-        // `argv_roots` rather than reading `files.len()` because exclusion
-        // needs the dir-vs-file provenance only the roots carry.
-        //
-        // `fnmatch_may` is exact only for patterns without `[` or `\` — when
-        // ANY exclude pattern is undecidable, decline widening entirely (the
-        // same no-widening as the pre-#684 behaviour, so a config the matcher
-        // can't decide falls back instead of guessing: either lean direction
-        // can FIRE, not just suppress — an `exclude:`d decl kept in the
-        // widened set discovers `Foo#bar` upstream would never see, and a
-        // legit decl dropped loses suppression the reference had).
-        // Expansion errors on the discovery side are dropped, exactly as
-        // `project_discovery_expansion` only reads `widened[:files]`.
-        let excludes = discovery_exclude_patterns(cfg);
-        let all_decidable = excludes.iter().all(|p| !p.contains(['[', '\\']));
-        // Both expansions only run when every pattern is decidable;
-        // undecidable ⇒ both stay empty ⇒ `0 > 0` ⇒ no widening.
-        let (widened_files, expanded_files) = if all_decidable {
-            (
-                expand_check_paths_excluding(&union_root_refs, &excludes).0,
-                expand_check_paths_excluding(argv_roots, &excludes).0,
-            )
-        } else {
-            (Vec::new(), Vec::new())
-        };
+        // post-`reject_excluded` expansions — the same exclusion-aware
+        // expansion `files` itself came through, so a directory hit matching
+        // `BUILTIN_EXCLUDES + exclude:` (exact `File.fnmatch?`, no flags)
+        // never counts and never becomes a discovery item. The `expansion`
+        // side re-expands `argv_roots` rather than reading `files.len()`
+        // because exclusion needs the dir-vs-file provenance only the roots
+        // carry. Expansion errors on the discovery side are dropped, exactly
+        // as `project_discovery_expansion` only reads `widened[:files]`.
+        let excludes = exclude_patterns(cfg);
+        let widened_files =
+            expand_check_paths_excluding(&union_root_refs, &excludes).0;
+        let expanded_files =
+            expand_check_paths_excluding(argv_roots, &excludes).0;
         if widened_files.len() > expanded_files.len() {
             for path in widened_files {
                 if analyzed_paths.contains(path.as_str()) {
@@ -1006,15 +996,14 @@ fn analyze_files(
             // predicted branch per file and zero clock reads — the same
             // "invisible by default" contract the stage markers have.
             let t_file = timing.then(std::time::Instant::now);
-            // Config `exclude:` — skip the file entirely before reading it.
-            // Analyzed items only: discovery items arrived already filtered
-            // by the widening expansion's `reject_excluded` (fnmatch, no
-            // flags) — a `glob::Pattern` that over-matches fnmatch here
-            // (e.g. `a/**/b` vs `a/b`) would strip a decl the reference
-            // discovers.
-            if item.analyze && cfg.is_excluded(path) {
-                return Stage1::Excluded;
-            }
+            // No `exclude:` check here — exclusion is settled by
+            // `expand_check_paths_excluding` before this worklist exists:
+            // analyzed items arrive already past `reject_excluded` (directory
+            // entries) or verbatim (explicit `.rb` roots the reference never
+            // filters), and discovery items came through the same filtered
+            // expansion. Re-matching patterns per-file here is how the old
+            // `glob::Pattern` gate dropped `a/**/b`-adjacent and explicit
+            // `exclude:`d roots the reference analyzes (issue #201).
             let source = match std::fs::read_to_string(path) {
                 Ok(s) => s,
                 Err(e) => {
@@ -1661,12 +1650,20 @@ impl<'a> OptParse<'a> {
 /// (which would silently misjudge every out-of-`lib` bucket as cleared);
 /// generate/regenerate ignore it (writing a `lib`-scoped baseline is fine).
 ///
+/// The returned `usize` is the count of bad-path expansion diagnostics —
+/// `expand_paths` errors the reference puts in the run's `diagnostics` list
+/// (`rule: nil`, severity warn-or-error). They never carry a rule, so they
+/// are not in `findings` and never land in a baseline bucket, but the
+/// reference's `generate`/`regenerate` summary counts them
+/// (`diagnostics.size` covers them): `covering 1 diagnostic(s)` for a
+/// missing default `lib/` even when the baseline it writes is empty.
+///
 /// Returns `Err(code)` if the sidecar folder fails to build.
 fn baseline_analysis(
     explicit_config: Option<&str>,
     roots: &[&str],
     verb: &'static str,
-) -> Result<(Config, Findings, bool), ExitCode> {
+) -> Result<(Config, Findings, bool, usize), ExitCode> {
     let cfg = Config::load(explicit_config.map(Path::new));
     let sidecar_folder = build_sidecar_folder(&cfg, None)?;
     let folder_ref =
@@ -1677,15 +1674,24 @@ fn baseline_analysis(
     let scope_undeclared = roots.is_empty() && !cfg.paths_explicitly_declared();
     let roots_given = !roots.is_empty();
 
+    let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
     let roots: &[&str] = if roots.is_empty() {
-        config_paths = cfg.paths.iter().map(String::as_str).collect();
+        // `runner.run(configuration.paths)` — declared `paths:` arrive
+        // absolutized upstream (`resolve_paths_in`), so the exclusion match
+        // and the rendered diagnostic path see the absolute spelling.
+        config_path_strings = effective_config_paths(&cfg);
+        config_paths = config_path_strings.iter().map(String::as_str).collect();
         &config_paths
     } else {
         roots
     };
     let ref_has_files = reference_has_ruby_files(&cfg, if roots_given { roots } else { &[] });
-    let (expanded_owned, _path_errors) = expand_check_paths(roots);
+    // The reference's baseline generation runs `runner.run(paths)`, which
+    // expands through the same `PathExpansion` as `check` —
+    // `reject_excluded` on directory entries, `.rb` file roots verbatim.
+    let (expanded_owned, path_errors) =
+        expand_check_paths_excluding(roots, &exclude_patterns(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _had_io_error) = analyze_files(
         &expanded,
@@ -1698,7 +1704,7 @@ fn baseline_analysis(
         &cfg.bleeding_edge_selector(),
         ref_has_files,
     );
-    Ok((cfg, findings, scope_undeclared))
+    Ok((cfg, findings, scope_undeclared, path_errors.len()))
 }
 
 /// Relativize findings against cwd, as the baseline matcher keys on
@@ -1839,7 +1845,7 @@ fn write_baseline(
     // (empty) surface.
     // generate/regenerate ignore `analysis_set_empty`: an empty resolved set
     // legitimately writes an empty baseline (nothing to record).
-    let (cfg, findings, _analysis_set_empty) =
+    let (cfg, findings, _analysis_set_empty, path_error_count) =
         match baseline_analysis(explicit_config, files, "baseline") {
             Ok(v) => v,
             Err(code) => return code,
@@ -1854,10 +1860,14 @@ fn write_baseline(
         MatchMode::Rule => "rule",
         MatchMode::Message => "message",
     };
+    // The reference's `diagnostics.size` counts every run diagnostic —
+    // `rule: nil` path-expansion errors included — while the baseline FILE
+    // buckets only ruled findings (`entries`), so the summary counts the
+    // union even when the file stays empty (issue #201's `covering 0` row).
     eprintln!(
         "rigor: {verb} {output} ({} bucket(s) covering {} diagnostic(s); match-mode: {mode_str})",
         baseline.size(),
-        entries.len()
+        entries.len() + path_error_count
     );
     if cfg.baseline_path().is_none() {
         // The reference names the config file actually read — the explicit
@@ -1961,7 +1971,7 @@ fn baseline_drift(args: &[String]) -> ExitCode {
     };
     // Positionals-if-given, else config `paths:` (the reference-faithful path).
     let findings = match baseline_analysis(explicit_config, &files, "baseline") {
-        Ok((_cfg, f, scope_undeclared)) => {
+        Ok((_cfg, f, scope_undeclared, _path_errors)) => {
             // Guard the scope-less audit: with no declared analysis scope, every
             // bucket outside the implicit `lib` default would falsely read as
             // "cleared". Refuse rather than mislead.
@@ -2067,7 +2077,7 @@ fn baseline_prune(args: &[String]) -> ExitCode {
     };
     // Positionals-if-given, else config `paths:` (the reference-faithful path).
     let findings = match baseline_analysis(explicit_config, &files, "baseline") {
-        Ok((_cfg, f, scope_undeclared)) => {
+        Ok((_cfg, f, scope_undeclared, _path_errors)) => {
             // Guard the scope-less audit: with no declared analysis scope, every
             // cleared-looking bucket outside the implicit `lib` default would be
             // dropped — emptying a live baseline. Refuse.

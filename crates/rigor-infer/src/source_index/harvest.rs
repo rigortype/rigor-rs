@@ -284,7 +284,7 @@ impl SourceIndex {
     ///
     /// ## The order is normative — never sort `files`
     ///
-    /// Today's order is `expand_check_paths`' (each directory argument expands to
+    /// Today's order is `expand_check_paths_excluding`' (each directory argument expands to
     /// its recursive `**/*.rb` SORTED, arguments concatenated in ARGUMENT order),
     /// and it reaches diagnostics twice: `method_visibilities` is first-write-wins
     /// and `includes` is an ordered append, so `rigor check a.rb b.rb` and

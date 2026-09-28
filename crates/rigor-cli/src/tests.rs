@@ -307,7 +307,7 @@ fn expand_check_paths_dir_recursion_and_errors() {
     std::fs::write(root.join("n.txt"), b"nope\n").unwrap();
 
     let root_s = root.to_string_lossy().into_owned();
-    let (files, errs) = expand_check_paths(&[root_s.as_str()]);
+    let (files, errs) = expand_check_paths_excluding(&[root_s.as_str()], &[]);
     let names: Vec<String> = files
         .iter()
         .map(|f| Path::new(f).file_name().unwrap().to_string_lossy().into_owned())
@@ -321,11 +321,70 @@ fn expand_check_paths_dir_recursion_and_errors() {
     // A missing path and an existing non-.rb file → the two PathError kinds.
     let txt = root.join("n.txt").to_string_lossy().into_owned();
     let missing = root.join("gone.rb").to_string_lossy().into_owned();
-    let (f2, e2) = expand_check_paths(&[missing.as_str(), txt.as_str()]);
+    let (f2, e2) = expand_check_paths_excluding(&[missing.as_str(), txt.as_str()], &[]);
     assert!(f2.is_empty());
     assert_eq!(e2.len(), 2);
     assert!(e2[0].not_found, "missing path is not_found");
     assert!(!e2[1].not_found, "existing non-.rb is not_found=false");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue #201 — the analyzed expansion IS `reject_excluded` output:
+/// directory hits matching `BUILTIN_EXCLUDES + exclude:` are dropped with
+/// `File.fnmatch?`-no-flags semantics (`**/node_modules/**` prunes
+/// `lib/node_modules/x.rb`, and `a/**/b` does NOT match `a/b` — the
+/// `glob::Pattern` drift the retired stage-1 gate had), while an explicit
+/// `.rb` root is kept VERBATIM even when it matches an exclude pattern
+/// (`accept_as_ruby_file?` never consults the list).
+#[test]
+fn expand_check_paths_excluding_dir_filtered_file_verbatim() {
+    let root = std::env::temp_dir().join(format!("rigor_expand_excl_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib/node_modules")).unwrap();
+    std::fs::create_dir_all(root.join("a/x")).unwrap();
+    std::fs::write(root.join("lib/ok.rb"), b"class Ok\nend\n").unwrap();
+    std::fs::write(root.join("lib/ext.rb"), b"class Ext\nend\n").unwrap();
+    std::fs::write(root.join("lib/node_modules/x.rb"), b"class X\nend\n").unwrap();
+    std::fs::write(root.join("a/b.rb"), b"class DirectB\nend\n").unwrap();
+    std::fs::write(root.join("a/x/b.rb"), b"class DeepB\nend\n").unwrap();
+
+    let lib = root.join("lib").to_string_lossy().into_owned();
+    let a = root.join("a").to_string_lossy().into_owned();
+    let ext = root.join("lib/ext.rb").to_string_lossy().into_owned();
+    let xrb = root.join("lib/node_modules/x.rb").to_string_lossy().into_owned();
+    // `Configuration#exclude_patterns`: BUILTIN_EXCLUDES + the user list —
+    // `exclude: ["<root>/lib/ext.rb", "<root>/a/**/b"]`.
+    let excludes = vec![
+        "**/vendor/bundle/**".to_string(),
+        "**/.bundle/**".to_string(),
+        "**/node_modules/**".to_string(),
+        ext.clone(),
+        format!("{a}/**/b.rb"),
+    ];
+
+    // Directory roots: builtin + user patterns prune the expanded hits.
+    let (files, errs) = expand_check_paths_excluding(&[lib.as_str()], &excludes);
+    assert!(errs.is_empty(), "a valid dir yields no path errors");
+    assert_eq!(
+        files,
+        vec![root.join("lib/ok.rb").to_string_lossy().into_owned()],
+        "node_modules (builtin) and ext.rb (user) pruned; got {files:?}"
+    );
+    // `a/**/b` collapsed to `a/*/b`: `a/x/b.rb` excluded, `a/b.rb` kept —
+    // where `glob::Pattern` would have dropped both.
+    let (files_a, _) = expand_check_paths_excluding(&[a.as_str()], &excludes);
+    assert_eq!(
+        files_a,
+        vec![root.join("a/b.rb").to_string_lossy().into_owned()],
+        "fnmatch-no-flags: a/**/b.rb must not match a/b.rb; got {files_a:?}"
+    );
+
+    // The very same paths as explicit `.rb` roots are kept verbatim.
+    let (files2, errs2) =
+        expand_check_paths_excluding(&[ext.as_str(), xrb.as_str()], &excludes);
+    assert!(errs2.is_empty(), "existing .rb files yield no path errors");
+    assert_eq!(files2, vec![ext.clone(), xrb.clone()]);
 
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -851,16 +910,15 @@ fn analyze_files_repeated_paths_dedup_in_union() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// An `exclude:` pattern `fnmatch_may` cannot decide (`[`/`\`) declines
-/// widening ENTIRELY — the pre-#684 no-widening behaviour — rather than
-/// lean: an `exclude:`d decl kept in the widened set (or dropped from
-/// the expansion count) FIRES, not just suppresses. Here
-/// `exclude: ["lib/[f]oo.rb"]` makes `check a.rb` see no `lib/` decls at
-/// all (`Foo.new.bar.upcase` silent — the `"s".nope` control proves the
-/// file was still analysed); guessing would either wrongly keep foo.rb
-/// (port fires where ref is silent) or wrongly empty the expansion.
+/// Issue #201 — a `[`/`\\` `exclude:` pattern is decided EXACTLY now, not
+/// declined: `fnmatch` is the full `dir.c` port, so the widened expansion
+/// answers `File.fnmatch?("lib/[f]oo.rb", "<abs>/lib/foo.rb")` itself. The
+/// declared `paths: [lib]` expands to an ABSOLUTE root, so the relative
+/// pattern cannot match the widened hit — `foo.rb` stays, widening runs,
+/// and `Foo.new.bar.upcase` fires exactly as the reference's does
+/// (probe-measured; `"s".nope` is the still-analysed control).
 #[test]
-fn analyze_files_undecidable_exclude_declines_widening() {
+fn analyze_files_class_pattern_decided_exactly() {
     let root = std::env::temp_dir().join(format!("rigor_widen_und_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
@@ -890,8 +948,8 @@ fn analyze_files_undecidable_exclude_declines_widening() {
     let messages: Vec<&str> =
         findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
     assert!(
-        !messages.iter().any(|m| m.contains("`upcase'")),
-        "undecidable `exclude:` must decline widening; got {messages:?}"
+        messages.iter().any(|m| m.contains("`upcase'")),
+        "exact `fnmatch` decides the class pattern — widening must run; got {messages:?}"
     );
     assert!(
         messages.iter().any(|m| m.contains("`nope'")),
@@ -901,14 +959,12 @@ fn analyze_files_undecidable_exclude_declines_widening() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Same decline on the dup-argv shape (`check app app`): with
-/// `exclude: ["[q]zz.rb"]` (matches nothing upstream, but undecidable for
-/// `fnmatch_may`) the widened set must not be computed — before the fix
-/// the "drop undecidable" lean emptied the expansion count (2 vs 0 →
-/// widen → `upcase` ×2 where the reference counts 2 vs 2 and stays
-/// silent).
+/// The same `[` pattern on the dup-argv shape (`check app app`): the exact
+/// `fnmatch` decides `[q]zz.rb` matches nothing in the widened expansion,
+/// so the counts stay 2 vs 2 — no widening, no `upcase` — the reference's
+/// answer, reached by matching rather than by declining.
 #[test]
-fn analyze_files_undecidable_exclude_declines_on_dup_argv() {
+fn analyze_files_class_pattern_no_match_on_dup_argv() {
     let root = std::env::temp_dir().join(format!("rigor_widen_und2_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("cfg/lib")).unwrap();
@@ -944,7 +1000,7 @@ fn analyze_files_undecidable_exclude_declines_on_dup_argv() {
         findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
     assert!(
         !messages.iter().any(|m| m.contains("`upcase'")),
-        "undecidable `exclude:` must decline widening; got {messages:?}"
+        "[q]zz.rb matches nothing — widened count stays equal; got {messages:?}"
     );
     assert_eq!(
         messages.iter().filter(|m| m.contains("`nope'")).count(),
@@ -956,12 +1012,12 @@ fn analyze_files_undecidable_exclude_declines_on_dup_argv() {
 }
 
 /// The leading-period half of the fnmatch fix is exercised at the
-/// matcher level (`conformance_gate::fnmatch_over_approximates_ruby`);
+/// matcher level (`conformance_gate::fnmatch_matches_ruby_no_flags`);
 /// the e2e `check ./app ./app` row is probe-verified because a
 /// `./`-spelled root needs a controlled cwd.
 #[test]
 fn exclude_fnmatch_leading_period_rule() {
-    let excludes = vec!["*gen.rb".to_string()];
+    let excludes: Vec<Vec<char>> = vec!["*gen.rb".chars().collect()];
     // `File.fnmatch?("*gen.rb", "./app/gen.rb")` is false — `./app/gen.rb`
     // must NOT be excluded from the widened/expansion counts.
     assert!(!exclude_fnmatch(&excludes, "./app/gen.rb"));
