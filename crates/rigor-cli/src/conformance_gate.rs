@@ -564,6 +564,7 @@ pub(crate) fn process_env_ok(
 ///   unterminated), and a reversed range still matches its two endpoints
 ///   (`[z-a]` = {z, a}: `bracket` `memcmp`s `t1`/`t2` before the codepoint
 ///   range test). An unterminated `[` fails the match wherever reached.
+#[cfg(test)]
 pub(crate) fn fnmatch(pattern: &str, path: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let s: Vec<char> = path.chars().collect();

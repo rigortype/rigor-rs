@@ -596,17 +596,19 @@ pub(crate) fn expand_check_paths_excluding(
 ) -> (Vec<String>, Vec<PathError>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
+    // Decode the patterns once per expansion (not per root) — `reject_excluded`
+    // runs patterns × files; `exclude_fnmatch` decodes each file path once.
+    let mut compiled_excludes: Option<Vec<Vec<char>>> = None;
     for &p in raw {
         let path = Path::new(p);
         if path.is_dir() {
             let mut in_dir = Vec::new();
             collect_rb_files(path, &mut in_dir);
             in_dir.sort();
-            // Decode the patterns once per root and each path once per file —
-            // `reject_excluded` runs patterns × files.
-            let excludes: Vec<Vec<char>> =
-                excludes.iter().map(|p| p.chars().collect()).collect();
-            in_dir.retain(|f| !exclude_fnmatch(&excludes, f));
+            let compiled = compiled_excludes.get_or_insert_with(|| {
+                excludes.iter().map(|p| p.chars().collect()).collect()
+            });
+            in_dir.retain(|f| !exclude_fnmatch(compiled, f));
             files.extend(in_dir);
         } else if path.is_file() && p.ends_with(".rb") {
             files.push(p.to_string());

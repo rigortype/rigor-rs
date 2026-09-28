@@ -798,9 +798,11 @@ impl Config {
 /// `glob::Pattern` `a/**/b` matches `a/b`; `File.fnmatch?` does not).
 #[must_use]
 pub fn matches_exclude(patterns: &[String], path: &str) -> bool {
-    patterns
-        .iter()
-        .any(|pat| crate::conformance_gate::fnmatch(pat, path))
+    let path: Vec<char> = path.chars().collect();
+    patterns.iter().any(|pat| {
+        let pat: Vec<char> = pat.chars().collect();
+        crate::conformance_gate::fnmatch_chars(&pat, &path)
+    })
 }
 
 #[cfg(test)]
