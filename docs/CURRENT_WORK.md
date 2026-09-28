@@ -12,13 +12,11 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-27): pin `e59b7b89`, 0 FP / 9,337, gaps 827.** Retractions no gate sees:
-**#134–#137** (a mechanism each). FPs: #139, #146. #138/#164/#167 abandoned
-(see ledger). #142–#145/#152 closed (0). CLI/config:
-#155–#159, #162–#163, #168–#171; #160 blocked upstream. Also #130, #132.
-
-- Measurement-tool lesson: audit at NODE granularity — per-file
-  histograms net over-claims vs under-claims.
+▶ **NEXT (2026-09-28): pin `e59b7b89`, 0 FP / 9,337, gaps 827.** In flight:
+#163 (PR #282), #164 (PR #283); #139/#168 claimed. Retractions no gate sees:
+**#134–#137**. FPs: #146. #138/#167 abandoned (see ledger). CLI/config:
+#155–#159, #162, #168–#171; #160 blocked upstream. Also #130, #132, #194, #201.
+Audit at NODE granularity — per-file histograms net over-claims vs under-claims.
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
   (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
   [plan](notes/20260718-compat-next-stage-plan.md)).
@@ -34,10 +32,10 @@ State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
 unregistered extras / 0 registered divergences**, coverage 651/708; standing
 sweep **0 FP / 9,337 files / 827 gaps** (#141 closed 3,002), 8 corpora, baselines in
 `harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). `--sweep` is a
-3-MINUTE gate again (upstream #874); read per-corpus MATCHED counts, not only FPs. Neither sweep tool sees project-`sig/`. Grading tools REFUSE a
-binary older than the rigor-cli path-dep closure (PR #65, scoped by #100) —
-corpus tools release, fixture harness debug. Clippy: workspace `-D warnings`,
-FRESH `CARGO_TARGET_DIR`.
+3-MINUTE gate again (upstream #874); read per-corpus MATCHED counts. Grading
+tools REFUSE a binary older than the rigor-cli path-dep closure (PR #65, scoped
+by #100) — corpus tools release, fixture harness debug. Clippy: workspace
+`-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
@@ -91,6 +89,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-28 #199 CLOSED** (PR #281): list config keys read with `Array().map(&:to_s)` semantics — a scalar no longer drops the file to `Config::default()`; `signature_paths: ~` keeps reference nil→default. 0 FP; satisfies #157's scalar-`signature_paths` item. [note](notes/20260928-issue-199-scalar-list-keys.md)
 - **2026-09-27/28 splits** #204/#234/#258/#260: lib.rs infer 14,084→144, rules 4,497→95; ast.rs 3,756→80; source_index.rs 4,650→668. [note](notes/20260928-ast-index-split-outcome.md)
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review bar met the deepest infer file — 6–8 rounds each, review discovered the reference's decision table one branch per round. Branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`, CI green); blockers listed in each closing comment. New merge bar: issue-scope resolution, findings get filed. [note](notes/20260927-abandoned-infer-pr-stream.md).
 - **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once — nominal self slot, `arm_of`/`join` auto-splat, reopen-aware union answering (`Node::Alias` + ancestor walk), `paths:` widen = `expand(paths|argv)>files` + excludes + undecidable-decline. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
@@ -113,7 +112,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 - **2026-08-26 LSP honours `rootUri` / `workspaceFolders`** (PR #110) — the server took the process CWD as the project root, so an editor spawning it elsewhere got the wrong config, `sig/` and discovery. It now **ENTERS** the client's root (`workspaceFolders` → `rootUri` → `rootPath` → cwd) rather than threading one: the root IS a cwd in all five consumers, so parity with `cd <root> && rigor check` holds by construction. **The probe is why**: threading would have missed `sig/` AND regressed `exclude:` (its spellings are deliberately RELATIVE), vacuously passing the existing matrix. Multi-root takes the first folder and discloses. [note](notes/20260826-s111-lsp-rooturi.md).
 
-- **2026-08-25/26 two arcs CLOSED, folded** — the EFFECT-SYSTEM slices 0–3 (PRs #91/#100/#105/#107/#108/#111: summaries graded per METHOD as a sound subset; a typer-free Prism collector; upstream's TRANSITIVE exhaustive bit — the direct bit is 986 OVER on mastodon; **35 MATCH / 11 UNDER / 0 OVER**, and `05_posture`/`07_mutators` are GENERATED from the vendored tables after a live OVER hand fixtures could not see — [s3](notes/20260826-effects-s3-impl.md) / [#106](notes/20260826-s106-posture-over-fix.md)); and the frozen-index arc (PRs #95/#97-#99/#101/#103/#109/#113: harvest/merge split, ancestor closure 164.9→82.5ms, LSP held harvests with OverlayGuard ON, #113's Pass-4b fold capture making the decline SYNTACTIC. **Standing**: file order is NORMATIVE in `merge`; eviction stays BLOCKED; harvest cache NO-GO — [s113](notes/20260826-s113-fold-capture-impl.md)).
+- **2026-08-25/26 two arcs CLOSED, folded** — EFFECT-SYSTEM slices 0–3 (PRs #91/#100/#105/#107/#108/#111: per-METHOD summary grading, typer-free Prism collector, **35 MATCH / 11 UNDER / 0 OVER**; `05_posture`/`07_mutators` GENERATED after a live OVER — [s3](notes/20260826-effects-s3-impl.md) / [#106](notes/20260826-s106-posture-over-fix.md)); frozen-index arc (PRs #95/#97–#99/#101/#103/#109/#113: harvest/merge split, ancestor closure 164.9→82.5ms, Pass-4b syntactic decline; **standing**: file order NORMATIVE in `merge`, eviction BLOCKED, harvest cache NO-GO — [s113](notes/20260826-s113-fold-capture-impl.md)).
 - **2026-08-23/25 re-pin `v0.3.2 → v0.3.4` + master survey (HOLD)** — 151 commits: **0 FP / 9204, gaps 841→820**, harness 97 fixtures; rbs and `data/` unchanged, exception tables empty; the raw bump opened **50 FPs**, all upstream RETRACTIONS (#319, #318) from OUR batch-3 reports, invisible to the snapshot diff ([note](notes/20260823-repin-v034.md)). The 64-commit survey moved 0 diagnostics but found the **vendored plugin RBS had drifted since 2026-06-26 = 10 FPs** (a THIRD pin-tracking surface; fixture 98 + ritual step 3 now cover it) and that every `documentation_url` 404s (upstream #438) ([survey](notes/20260825-upstream-survey-v034-master.md)).
 - **2026-08-09 unresolved-const-receiver carrier REJECTED at 0 rows** (PR #89, closed). [note](notes/20260809-unresolved-const-receiver-carrier.md)
 - **2026-08-09 era (3 slices, folded)** — re-pin `v0.3.1 → v0.3.2` (+rbs 4.1.1): 0 FP / 9204, gaps 1125→841 (upstream retracting possible-nil FPs, #297); BOTH exception tables emptied; **trap: bundler/rubygems sigs depend on the rbs gem's `sig/shims/` — 2 FPs the sweep CANNOT SEE**, closed by `overlay/rbs_shims/` ([note](notes/20260809-repin-v032.md)); join-wipe retention (`retain_joined_facts` + the `else`-carrier unwrap; 1 FP closed, 15 probe shapes ref-matched — [note](notes/20260809-join-wipe-retention.md)); chain-guard meet (`chains` carries `ClassFact`, `narrow_nominal_to_class` shared by both arms; 2 FPs closed — [note](notes/20260809-chain-guard-meet.md)).
