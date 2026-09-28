@@ -315,8 +315,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
     match format {
         OutputFormat::Text => print_text(&findings),
         OutputFormat::Json => print_json(&findings),
-        OutputFormat::Github => print_github(&findings),
-        OutputFormat::Sarif => print_sarif(&findings),
+        OutputFormat::Github => print_rendered(&findings, diagnostic_formats::render_github),
+        OutputFormat::Sarif => print_rendered(&findings, diagnostic_formats::render_sarif),
         OutputFormat::Gitlab => print_rendered(&findings, diagnostic_formats::render_gitlab),
         OutputFormat::Checkstyle => print_rendered(&findings, diagnostic_formats::render_checkstyle),
         OutputFormat::Junit => print_rendered(&findings, diagnostic_formats::render_junit),
@@ -2199,14 +2199,11 @@ fn relative_path(path: &str, cwd: Option<&Path>) -> String {
 // Output formatters
 // ---------------------------------------------------------------------------
 
-/// Human format: `path:line:col: <severity>: <message>` (1-based line/col).
-/// Severity is rendered from the diagnostic's actual severity field — not
-/// hardcoded — so warning/info diagnostics render correctly.
+/// `--format text`: the reference's `write_text_result` — `Diagnostic#to_s`
+/// rows plus the `No diagnostics` / `N error(s) in M file(s)` summary, all on
+/// stdout (see [`diagnostic_formats::render_text`]).
 fn print_text(findings: &[(usize, String, String, Diagnostic)]) {
-    for (_order, path, source, diag) in findings {
-        let (line, col) = line_col(source, diag.start_offset);
-        println!("{path}:{line}:{col}: {}: {}", diag.severity.as_str(), diag.message);
-    }
+    print!("{}", diagnostic_formats::render_text(&to_rendered(findings)));
 }
 
 /// JSON format: a flat array of objects matching the reference's field
@@ -2269,121 +2266,12 @@ fn json_document(findings: &[(usize, String, String, Diagnostic)]) -> String {
     buf
 }
 
-/// GitHub Actions workflow-command format: one annotation line per diagnostic,
-/// `::{level} file={path},line={line},col={col}::{message}`. Levels map
-/// Error→error, Warning→warning, Info→notice. The message body is escaped per
-/// GitHub's annotation rules (`%`/`\r`/`\n`); property values additionally
-/// escape `,`/`:`. Emits nothing when there are no diagnostics. ADDITIVE — does
-/// not touch text/json.
-fn print_github(findings: &[(usize, String, String, Diagnostic)]) {
-    for (_order, path, source, diag) in findings {
-        let (line, col) = line_col(source, diag.start_offset);
-        let level = match diag.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-            Severity::Info => "notice",
-        };
-        println!(
-            "::{level} file={},line={line},col={col}::{}",
-            gh_escape_prop(path),
-            gh_escape_data(&diag.message),
-        );
-    }
-}
-
-/// Escape an annotation message body (the part after `::`): `%`→`%25`, then
-/// `\r`→`%0D`, `\n`→`%0A` so a multi-line message stays on one annotation line.
-fn gh_escape_data(s: &str) -> String {
-    s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A")
-}
-
-/// Escape an annotation property value (`file`/`line`/`col`): the data escapes
-/// plus `,`→`%2C` and `:`→`%3A` so a value containing them can't break the
-/// `key=value,key=value` structure.
-fn gh_escape_prop(s: &str) -> String {
-    gh_escape_data(s).replace(',', "%2C").replace(':', "%3A")
-}
-
-/// SARIF 2.1.0 format: a single SARIF log object with one `result` per
-/// diagnostic and a deduped `rules` list (first-appearance order). Severity maps
-/// Error→"error", Warning→"warning", Info→"note". Always emits the full object,
-/// even with zero results. Built as a `serde_json::Value` and pretty-printed.
-/// ADDITIVE — does not touch text/json.
-fn print_sarif(findings: &[(usize, String, String, Diagnostic)]) {
-    println!("{}", serde_json::to_string_pretty(&sarif_document(findings)).unwrap());
-}
-
-/// The SARIF log as a `serde_json::Value`. Split out of [`print_sarif`] so a
-/// test can assert on the REAL tree instead of re-implementing the builder (a
-/// duplicated test-side builder cannot catch a change here at all).
-fn sarif_document(findings: &[(usize, String, String, Diagnostic)]) -> serde_json::Value {
-    use serde_json::{json, Value};
-
-    let mut rules: Vec<Value> = Vec::new();
-    let mut seen_rules: Vec<&str> = Vec::new();
-    let mut results: Vec<Value> = Vec::new();
-
-    for (_order, path, source, diag) in findings {
-        // A ruleless diagnostic declares no rule and carries no `ruleId` — the
-        // reference's `filter_map(&:qualified_rule)` for the driver's rule list
-        // and `entry["ruleId"] = rule_id if rule_id` for the result.
-        let rule = diag.qualified_rule();
-        if let Some(rule) = rule {
-            if !seen_rules.contains(&rule) {
-                seen_rules.push(rule);
-                rules.push(json!({ "id": rule }));
-            }
-        }
-
-        let (line, col) = line_col(source, diag.start_offset);
-        let level = match diag.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-            Severity::Info => "note",
-        };
-
-        // `ruleId` keeps its leading position for rule-carrying rows (the key
-        // order rigor-rs has always emitted) and is absent — not `""` — for a
-        // ruleless one.
-        let mut entry = serde_json::Map::new();
-        if let Some(rule) = rule {
-            entry.insert("ruleId".into(), json!(rule));
-        }
-        entry.insert("level".into(), json!(level));
-        entry.insert("message".into(), json!({ "text": diag.message }));
-        entry.insert(
-            "locations".into(),
-            json!([{
-                "physicalLocation": {
-                    "artifactLocation": { "uri": path },
-                    "region": { "startLine": line, "startColumn": col }
-                }
-            }]),
-        );
-        results.push(Value::Object(entry));
-    }
-
-    json!({
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": {
-                "driver": {
-                    "name": "rigor-rs",
-                    "informationUri": "https://github.com/rigortype/rigor",
-                    "rules": rules
-                }
-            },
-            "results": results
-        }]
-    })
-}
-
 /// Flatten findings into `Rendered` rows (resolve each byte offset to a 1-based
 /// line/column) for the CI formatters, then print the rendered document. Mirrors
 /// the reference's `write_result` for the `DiagnosticFormats` cases: an empty
-/// render (teamcity with no diagnostics) prints nothing; otherwise the document
-/// is printed with a trailing newline. ADDITIVE — does not touch text/json.
+/// render (github / teamcity with no diagnostics) prints nothing; otherwise the
+/// document is printed with a trailing newline (`@out.puts(output) unless
+/// output.empty?`).
 fn print_rendered(
     findings: &[(usize, String, String, Diagnostic)],
     render: fn(&[Rendered]) -> String,
@@ -2429,7 +2317,7 @@ fn emit_ci_detected_output(findings: &[(usize, String, String, Diagnostic)]) {
             // Render in the platform's native stdout format on top of the text.
             let rows = to_rendered(findings);
             let output = match platform.format {
-                Some("github") => render_github_string(&rows),
+                Some("github") => diagnostic_formats::render_github(&rows),
                 Some("teamcity") => diagnostic_formats::render_teamcity(&rows),
                 _ => String::new(),
             };
@@ -2462,28 +2350,6 @@ fn ci_detected_hint(platform: &ci_detector::Platform) -> String {
             platform.name,
         ),
     }
-}
-
-/// Build the GitHub Actions annotation block as a string (the same lines
-/// `print_github` prints), so CI auto-detection can emit it on top of text.
-fn render_github_string(rows: &[Rendered]) -> String {
-    rows.iter()
-        .map(|r| {
-            let level = match r.severity {
-                Severity::Error => "error",
-                Severity::Warning => "warning",
-                Severity::Info => "notice",
-            };
-            format!(
-                "::{level} file={},line={},col={}::{}",
-                gh_escape_prop(r.path),
-                r.line,
-                r.column,
-                gh_escape_data(r.message),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -2637,9 +2503,8 @@ fn json_string(s: &str) -> String {
 }
 
 /// Output format for `rigor check` (ADR-0014; text default, json nice-to-have).
-/// `Github`/`Sarif`/`Gitlab`/`Checkstyle`/`Junit`/`Teamcity` are ADDITIVE
-/// CI-oriented formats (reference ADR-51) — they do not affect the text/json
-/// output the differential harness depends on.
+/// `Github`/`Sarif`/`Gitlab`/`Checkstyle`/`Junit`/`Teamcity` are the
+/// CI-oriented formats (reference ADR-51), rendered in `diagnostic_formats`.
 #[derive(Clone, Copy)]
 enum OutputFormat {
     Text,

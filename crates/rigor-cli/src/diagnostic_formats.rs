@@ -5,6 +5,9 @@
 //! `--format json` (path / line / column / severity / qualified rule / message)
 //! and add no new information — only a platform-native rendering of it.
 //!
+//!   text       — `Diagnostic#to_s` rows plus the check command's summary
+//!   github     — GitHub Actions workflow commands (`::error file=…::`)
+//!   sarif      — SARIF 2.1.0
 //!   gitlab     — GitLab Code Quality report JSON (the CodeClimate subset)
 //!                that drives the merge-request Code Quality widget
 //!   checkstyle — Checkstyle XML, the broad lint-interchange format that
@@ -12,8 +15,9 @@
 //!   junit      — JUnit XML, the test-report format many CI systems render
 //!   teamcity   — TeamCity inspection service messages (`##teamcity[…]`)
 //!
-//! ADDITIVE / NOT harness-gated: these never touch the text/json output the
-//! differential harness (`harness/run.rb`) depends on. Severity maps once per
+//! None of these is the JSON the differential harness (`harness/run.rb`)
+//! reads; `tests/output_formats.rs` pins their bytes against measured oracle
+//! output instead (issue #163). Severity maps once per
 //! format from Error / Warning / Info; the qualified rule (here the
 //! `rule_id`, which already carries the `builtin` family bare) is the stable
 //! identifier surfaced where the format has a slot for it.
@@ -39,6 +43,208 @@ pub struct Rendered<'a> {
     pub severity: Severity,
     pub rule_id: Option<&'a str>,
     pub message: &'a str,
+}
+
+/// `--format text` — the reference's `write_text_result`, as the FULL stdout
+/// (every line newline-terminated). One `Diagnostic#to_s` row per diagnostic
+/// (`path:line:col: severity: message [qualified_rule]`, the bracket omitted
+/// for a ruleless row), then:
+///
+/// * no error-severity row (`Result#success?`) and no rows at all →
+///   `No diagnostics`; rows that are all warnings/info → nothing more;
+/// * otherwise a blank line and `N error(s) in M file(s)`, where N counts the
+///   error rows only and M the distinct paths carrying one — warnings are
+///   neither counted nor pluralised.
+pub fn render_text(rows: &[Rendered]) -> String {
+    let mut out = String::new();
+    for r in rows {
+        out.push_str(&format!(
+            "{}:{}:{}: {}: {}",
+            r.path,
+            r.line,
+            r.column,
+            r.severity.as_str(),
+            r.message
+        ));
+        if let Some(rule) = r.rule_id {
+            out.push_str(&format!(" [{rule}]"));
+        }
+        out.push('\n');
+    }
+    let errors: Vec<&Rendered> = rows.iter().filter(|r| r.severity == Severity::Error).collect();
+    if errors.is_empty() {
+        if rows.is_empty() {
+            out.push_str("No diagnostics\n");
+        }
+        return out;
+    }
+    let mut error_files: Vec<&str> = Vec::new();
+    for r in &errors {
+        if !error_files.contains(&r.path) {
+            error_files.push(r.path);
+        }
+    }
+    out.push_str(&format!("\n{} error(s) in {} file(s)\n", errors.len(), error_files.len()));
+    out
+}
+
+/// GitHub Actions workflow commands — one
+/// `::<level> file=…,line=…,col=…,title=<rule>::<message>` line per
+/// diagnostic, joined by `\n` (no trailing newline; the caller's `puts` adds
+/// it, and an empty render prints nothing). Levels map Error→error,
+/// Warning→warning, Info→notice. `title=` is omitted for a ruleless row
+/// (`props << "title=…" if rule_id`).
+pub fn render_github(rows: &[Rendered]) -> String {
+    rows.iter()
+        .map(|r| {
+            let level = match r.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "notice",
+            };
+            let mut props = format!("file={},line={},col={}", gh_escape_prop(r.path), r.line, r.column);
+            if let Some(rule) = r.rule_id {
+                props.push_str(&format!(",title={}", gh_escape_prop(rule)));
+            }
+            format!("::{level} {props}::{}", gh_escape_data(r.message))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// GitHub's workflow-command data escaping: `%` first, then CR / LF, so a
+/// multi-line message stays on one annotation line.
+pub fn gh_escape_data(s: &str) -> String {
+    s.replace('%', "%25").replace('\r', "%0D").replace('\n', "%0A")
+}
+
+/// Property values additionally escape `,` (property separator) and `:`
+/// (command terminator).
+pub fn gh_escape_prop(s: &str) -> String {
+    gh_escape_data(s).replace(',', "%2C").replace(':', "%3A")
+}
+
+/// The tool version the SARIF driver reports. The reference writes its own
+/// `Rigor::VERSION`; the port reports its own release version, the same one
+/// `rigor --version` prints, so this one field differs from the oracle's bytes
+/// by design.
+pub const SARIF_TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// SARIF 2.1.0 — one log with one run. Serde-derived structs (not
+/// `serde_json::Value`, whose map sorts keys) so the key order is the
+/// reference's hash insertion order byte for byte: `version`, `$schema`,
+/// `runs`; `tool{driver{name, informationUri, version, rules}}` before
+/// `results`; per result `level`, `message`, `locations`, then `ruleId` LAST
+/// and only when the row has a rule. `rules` is the distinct rule ids in
+/// first-appearance order. Always a full document, even with zero results.
+pub fn render_sarif(rows: &[Rendered]) -> String {
+    #[derive(Serialize)]
+    struct Log<'a> {
+        version: &'static str,
+        #[serde(rename = "$schema")]
+        schema: &'static str,
+        runs: [Run<'a>; 1],
+    }
+    #[derive(Serialize)]
+    struct Run<'a> {
+        tool: Tool<'a>,
+        results: Vec<SarifResult<'a>>,
+    }
+    #[derive(Serialize)]
+    struct Tool<'a> {
+        driver: Driver<'a>,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Driver<'a> {
+        name: &'static str,
+        information_uri: &'static str,
+        version: &'static str,
+        rules: Vec<Rule<'a>>,
+    }
+    #[derive(Serialize)]
+    struct Rule<'a> {
+        id: &'a str,
+    }
+    #[derive(Serialize)]
+    struct Message<'a> {
+        text: &'a str,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Region {
+        start_line: usize,
+        start_column: usize,
+    }
+    #[derive(Serialize)]
+    struct ArtifactLocation {
+        uri: String,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct PhysicalLocation {
+        artifact_location: ArtifactLocation,
+        region: Region,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Location {
+        physical_location: PhysicalLocation,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SarifResult<'a> {
+        level: &'static str,
+        message: Message<'a>,
+        locations: [Location; 1],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rule_id: Option<&'a str>,
+    }
+
+    let mut rules: Vec<Rule> = Vec::new();
+    for r in rows {
+        if let Some(id) = r.rule_id {
+            if !rules.iter().any(|rule| rule.id == id) {
+                rules.push(Rule { id });
+            }
+        }
+    }
+    let results = rows
+        .iter()
+        .map(|r| SarifResult {
+            level: match r.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Info => "note",
+            },
+            message: Message { text: r.message },
+            locations: [Location {
+                physical_location: PhysicalLocation {
+                    // SARIF URIs use forward slashes on every platform
+                    // (`path.to_s.tr("\\", "/")`).
+                    artifact_location: ArtifactLocation { uri: r.path.replace('\\', "/") },
+                    region: Region { start_line: r.line, start_column: r.column },
+                },
+            }],
+            rule_id: r.rule_id,
+        })
+        .collect();
+    let log = Log {
+        version: "2.1.0",
+        schema: "https://json.schemastore.org/sarif-2.1.0.json",
+        runs: [Run {
+            tool: Tool {
+                driver: Driver {
+                    name: "Rigor",
+                    information_uri: "https://github.com/rigortype/rigor",
+                    version: SARIF_TOOL_VERSION,
+                    rules,
+                },
+            },
+            results,
+        }],
+    };
+    serde_json::to_string_pretty(&log).unwrap()
 }
 
 /// GitLab Code Quality report — the CodeClimate-subset JSON array GitLab reads
