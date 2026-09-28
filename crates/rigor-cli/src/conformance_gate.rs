@@ -236,6 +236,16 @@ fn strings(node: &Node) -> Option<Vec<&str>> {
     }
 }
 
+/// The strings of a key the reference reads as `Array(x).map(&:to_s)`:
+/// a sequence, or (issue #199) a lone string scalar — a one-element list on
+/// both engines ([`crate::config`]'s shared `ruby_array` reader).
+fn array_strings(node: &Node) -> Option<Vec<&str>> {
+    match node {
+        Node::Scalar(s) => is_string(s).then(|| vec![s.text.as_str()]),
+        n => strings(n),
+    }
+}
+
 /// The top-level keys the reference's `Configuration` owns
 /// (`KNOWN_KEYS`: its `DEFAULTS`, `includes`, the reserved `rigor_rs`).
 const REFERENCE_KNOWN_KEYS: &[&str] = &[
@@ -262,13 +272,13 @@ pub(crate) fn config_text_ok(text: &str) -> bool {
 fn key_ok(key: &str, node: &Node) -> bool {
     match key {
         // `Array(x).map(&:to_s)`; paths are then `File.expand_path`'d.
-        "signature_paths" | "paths" => strings(node).is_some(),
+        "signature_paths" | "paths" => array_strings(node).is_some(),
         // A bare `key:` is `nil` upstream, `Array(nil) == []`; the port reads
         // an empty list too.
-        "exclude" | "disable" => *node == Node::Null || strings(node).is_some(),
+        "exclude" | "disable" => *node == Node::Null || array_strings(node).is_some(),
         // `coerce_plugin_entry`: a String is a GEM name the loader requires;
         // the port normalises a bare id too, the reference fails to load it.
-        "plugins" => *node == Node::Null || strings(node).is_some_and(|ids| {
+        "plugins" => *node == Node::Null || array_strings(node).is_some_and(|ids| {
             ids.iter().all(|id| {
                 id.starts_with("rigor-") && rigor_index::plugins::bundled_plugin(id).is_some()
             })
@@ -654,6 +664,9 @@ mod tests {
             "signature_paths:\n  - sig\ntarget_ruby: \"3.4\"\nbaseline: .rigor-baseline.yml\nbleeding_edge: true\nfail_on: warning\n",
             "signature_paths:\r\n  - sig\r\npaths:\r\n  - lib\r\n",
             "signature_paths:\n  - sig\nplugins:\n  - rigor-activesupport-core-ext\ntarget_ruby: 4.0\n",
+            // Issue #199: a scalar is `Array()`-wrapped on both engines.
+            "signature_paths: sig\n",
+            "signature_paths: sig\npaths: lib\nexclude: vendor/x.rb\ndisable: call\nplugins: rigor-activesupport-core-ext\n",
         ] {
             assert!(config_text_ok(ok), "{ok:?}");
         }
@@ -683,7 +696,8 @@ mod tests {
             "signature_paths:\n  - 1_0\n",
             "signature_paths:\n  - nope\nsignature_paths:\n  - sig\n",
             "signature_paths:\n  - sig\nplugins:\n  - activesupport-core-ext\n",
-            "signature_paths: sig\n",
+            "signature_paths: off\n",
+            "signature_paths: sig\nplugins: activesupport-core-ext\n",
             "signature_paths:\n  - sig\nlibraries:\n  - json\n",
             "signature_paths:\n  - sig\nincludes:\n  - other.yml\n",
             "signature_paths:\n  - sig\nrbs_collection:\n  auto_detect: false\n",
