@@ -567,9 +567,17 @@ pub(crate) fn process_env_ok(
 pub(crate) fn fnmatch(pattern: &str, path: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let s: Vec<char> = path.chars().collect();
+    fnmatch_chars(&p, &s)
+}
+
+/// The `fnmatch` matcher body over pre-decoded `char` slices — the hot
+/// callers (`expand_check_paths_excluding`, `root_has_ruby_file`, the LSP
+/// buffer gate) convert each pattern once and each path once instead of per
+/// (pattern, path) pair.
+pub(crate) fn fnmatch_chars(p: &[char], s: &[char]) -> bool {
     // dir.c's entry guard: `period && *s == '.' && *UNESCAPE(p) != '.'` —
     // evaluated once, while `s` is still the string's head.
-    if s.first() == Some(&'.') && unescaped(&p, 0) != Some('.') {
+    if s.first() == Some(&'.') && unescaped(p, 0) != Some('.') {
         return false;
     }
     // `ptmp`/`stmp` are dir.c's single backtrack point — the position just
@@ -588,7 +596,7 @@ pub(crate) fn fnmatch(pattern: &str, path: &str) -> bool {
                 }
                 // `ISEND(UNESCAPE(p))` — a `*` run at pattern end (incl. `*\`)
                 // matches the rest of the string.
-                if unescaped(&p, pi).is_none() {
+                if unescaped(p, pi).is_none() {
                     return true;
                 }
                 // `ISEND(s)` — `*` cannot keep a non-empty rest over "".
@@ -609,7 +617,7 @@ pub(crate) fn fnmatch(pattern: &str, path: &str) -> bool {
                 if si == s.len() {
                     return false;
                 }
-                match bracket(&p, pi + 1, s[si]) {
+                match bracket(p, pi + 1, s[si]) {
                     Some(next) => {
                         pi = next;
                         si += 1;
@@ -769,10 +777,15 @@ fn root_has_ruby_file(root: &str, excludes: &[String]) -> bool {
         }
         let mut files = Vec::new();
         crate::collect_rb_files(path, &mut files);
+        let patterns: Vec<Vec<char>> = BUILTIN_EXCLUDES
+            .iter()
+            .copied()
+            .chain(excludes.iter().map(String::as_str))
+            .map(|p| p.chars().collect())
+            .collect();
         files.iter().any(|f| {
-            let f = f.as_str();
-            !BUILTIN_EXCLUDES.iter().any(|p| fnmatch(p, f))
-                && !excludes.iter().any(|p| fnmatch(p, f))
+            let f: Vec<char> = f.chars().collect();
+            !patterns.iter().any(|p| fnmatch_chars(p, &f))
         })
     } else {
         // An explicit file: `File.file?(path) && path.end_with?(".rb")`,

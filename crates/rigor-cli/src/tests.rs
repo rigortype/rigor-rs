@@ -1017,7 +1017,7 @@ fn analyze_files_class_pattern_no_match_on_dup_argv() {
 /// `./`-spelled root needs a controlled cwd.
 #[test]
 fn exclude_fnmatch_leading_period_rule() {
-    let excludes = vec!["*gen.rb".to_string()];
+    let excludes: Vec<Vec<char>> = vec!["*gen.rb".chars().collect()];
     // `File.fnmatch?("*gen.rb", "./app/gen.rb")` is false — `./app/gen.rb`
     // must NOT be excluded from the widened/expansion counts.
     assert!(!exclude_fnmatch(&excludes, "./app/gen.rb"));

@@ -188,10 +188,9 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     // the `exclude:` match inside `resolve_paths` sees the same spelling
     // `check` does.
     let mut raw_strings = crate::effective_config_paths(&cfg);
-    for p in &positional {
-        let p = (*p).to_string();
-        if !raw_strings.contains(&p) {
-            raw_strings.push(p);
+    for &p in &positional {
+        if !raw_strings.iter().any(|e| e.as_str() == p) {
+            raw_strings.push(p.to_string());
         }
     }
     let raw: Vec<&str> = raw_strings.iter().map(String::as_str).collect();

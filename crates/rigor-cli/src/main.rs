@@ -602,7 +602,11 @@ pub(crate) fn expand_check_paths_excluding(
             let mut in_dir = Vec::new();
             collect_rb_files(path, &mut in_dir);
             in_dir.sort();
-            in_dir.retain(|f| !exclude_fnmatch(excludes, f));
+            // Decode the patterns once per root and each path once per file —
+            // `reject_excluded` runs patterns × files.
+            let excludes: Vec<Vec<char>> =
+                excludes.iter().map(|p| p.chars().collect()).collect();
+            in_dir.retain(|f| !exclude_fnmatch(&excludes, f));
             files.extend(in_dir);
         } else if path.is_file() && p.ends_with(".rb") {
             files.push(p.to_string());
@@ -627,14 +631,16 @@ pub(crate) fn exclude_patterns(cfg: &Config) -> Vec<String> {
 }
 
 /// `File.fnmatch?(pattern, path)`-with-no-flags exclusion for one expanded
-/// path — the exact matcher [`conformance_gate::fnmatch`] ports from MRI
-/// `dir.c`, including the leading-period rule: a `*`/`?`/`[` at pattern
+/// path — the exact matcher [`conformance_gate::fnmatch_chars`] ports from
+/// MRI `dir.c`, including the leading-period rule: a `*`/`?`/`[` at pattern
 /// position 0 never matches a `.` at path position 0 (`./app/gen.rb` is NOT
-/// excluded by `*gen.rb`).
-pub(crate) fn exclude_fnmatch(patterns: &[String], path: &str) -> bool {
+/// excluded by `*gen.rb`). Patterns arrive pre-decoded — the caller converts
+/// them once per expansion, not once per file.
+pub(crate) fn exclude_fnmatch(patterns: &[Vec<char>], path: &str) -> bool {
+    let path: Vec<char> = path.chars().collect();
     patterns
         .iter()
-        .any(|p| conformance_gate::fnmatch(p, path))
+        .any(|p| conformance_gate::fnmatch_chars(p, &path))
 }
 
 /// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
