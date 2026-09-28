@@ -35,13 +35,16 @@ use serde::Deserialize;
 #[serde(default)]
 pub struct Config {
     /// Rule tokens to disable globally (e.g. `undefined-method`, `call`, `all`).
+    #[serde(deserialize_with = "de_ruby_array")]
     pub disable: Vec<String>,
     /// Path glob patterns whose matching files are skipped entirely.
+    #[serde(deserialize_with = "de_ruby_array")]
     pub exclude: Vec<String>,
     /// ADR-0040 — the default scan roots for a bare `rigor check` (no path
     /// args): `paths:` in `.rigor.yml`, defaulting to `["lib"]` (the reference's
     /// `Configuration` default). Each is expanded to its `**/*.rb` like an
     /// explicit directory arg. Ignored when the CLI is given explicit path args.
+    #[serde(deserialize_with = "de_ruby_array")]
     pub paths: Vec<String>,
     /// Config-gated plugins to activate (ADR-25), as listed under `.rigor.yml`'s
     /// `plugins:`. Each entry is a plugin id — either the gem name
@@ -50,6 +53,7 @@ pub struct Config {
     /// normalises and resolves them, ignoring any that aren't bundled. The
     /// reference discovers plugins ONLY from this list (no Gemfile auto-detect),
     /// so the default (no-config) corpus run is unaffected.
+    #[serde(deserialize_with = "de_ruby_array")]
     pub plugins: Vec<String>,
     /// ADR-22 baseline path. `baseline: <path>` activates a baseline for
     /// `check`; `baseline: false` is the explicit-disable form. Absent / `null`
@@ -63,6 +67,7 @@ pub struct Config {
     /// `*.rbs` are ingested into the type environment on top of core + plugin
     /// RBS, so a project's hand-written types join the known-class surface the
     /// dispatch rules witness against. A named dir that doesn't exist is inert.
+    #[serde(deserialize_with = "de_signature_paths")]
     pub signature_paths: Vec<String>,
     /// ADR-0034: `rbs collection` awareness. Mirrors the reference's
     /// `rbs_collection:` config block (`auto_detect` default `true`, optional
@@ -117,6 +122,11 @@ pub struct Config {
     /// [`Config::load`]; never (de)serialized.
     #[serde(skip)]
     present_keys: std::collections::BTreeSet<String>,
+    /// `signature_paths:` was written with an explicit null — the reference's
+    /// `nil` ("not configured"), so it is NOT an explicit declaration even
+    /// though the key is in [`Self::present_keys`]. Set by [`Config::read`].
+    #[serde(skip)]
+    signature_paths_null: bool,
     /// `target_ruby:` as written (untyped: YAML reads `3.4` as a float). Read
     /// only by [`Config::target_ruby_supported`].
     #[serde(default)]
@@ -216,6 +226,7 @@ impl Default for Config {
             bundler: BundlerConfig::default(),
             rigor_rs: RigorRsConfig::default(),
             present_keys: std::collections::BTreeSet::new(),
+            signature_paths_null: false,
             target_ruby: serde_yaml::Value::Null,
             base_dir: None,
             parity_text_ok: false,
@@ -235,10 +246,68 @@ fn default_paths() -> Vec<String> {
     vec!["lib".to_string()]
 }
 
+/// Ruby's `Array(value).map(&:to_s)` over a YAML value — how the reference's
+/// `Configuration#initialize` reads EVERY list-valued key (`paths`, `exclude`,
+/// `plugins`, `disable`, `signature_paths`, …): `nil` is `[]`, a scalar is a
+/// one-element list, a sequence is itself, and each element goes through
+/// `to_s` (`1` → `"1"`, `true` → `"true"`, `nil` → `""`).
+///
+/// A mapping value, a tagged value, or a sequence element that is itself a
+/// collection stays a deserialization error — the document then takes the
+/// loader's existing malformed-config fallback, unchanged by issue #199.
+fn ruby_array(value: &serde_yaml::Value) -> Result<Vec<String>, String> {
+    use serde_yaml::Value;
+    fn to_s(v: &Value) -> Option<String> {
+        match v {
+            Value::Null => Some(String::new()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::String(s) => Some(s.clone()),
+            Value::Sequence(_) | Value::Mapping(_) | Value::Tagged(_) => None,
+        }
+    }
+    match value {
+        Value::Null => Ok(Vec::new()),
+        Value::Sequence(items) => items
+            .iter()
+            .map(|v| to_s(v).ok_or_else(|| format!("unsupported list element {v:?}")))
+            .collect(),
+        scalar => to_s(scalar)
+            .map(|s| vec![s])
+            .ok_or_else(|| format!("expected a scalar or a sequence, got {scalar:?}")),
+    }
+}
+
+/// The shared serde adapter for every list-valued key: [`ruby_array`].
+fn de_ruby_array<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(d)?;
+    ruby_array(&value).map_err(serde::de::Error::custom)
+}
+
+/// `signature_paths:` is the one list key whose explicit `null` is NOT
+/// `Array(nil)`: the reference keeps it `nil` (`sig_paths.nil? ? nil : …`),
+/// i.e. "not configured, use the default discovery" — the same as an absent
+/// key. So null yields the default here, and [`Config::explicit_signature_paths`]
+/// treats it as undeclared.
+fn de_signature_paths<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(default_signature_paths());
+    }
+    ruby_array(&value).map_err(serde::de::Error::custom)
+}
+
 /// The top-level mapping keys present in a `.rigor.yml` document. Used to record
-/// which keys were explicitly configured (vs defaulted). A non-mapping / broken
-/// document yields an empty set — treated as "nothing explicit", which is the
-/// FP-safe direction for the audit.
+/// which keys were explicitly configured (vs defaulted) — whatever the value's
+/// shape: a scalar (`paths: other`) or null is as declared as a list. A
+/// non-mapping / broken document yields an empty set — treated as "nothing
+/// explicit", which is the FP-safe direction for the audit.
 fn top_level_keys(text: &str) -> std::collections::BTreeSet<String> {
     match serde_yaml::from_str::<serde_yaml::Value>(text) {
         Ok(serde_yaml::Value::Mapping(map)) => map
@@ -246,6 +315,18 @@ fn top_level_keys(text: &str) -> std::collections::BTreeSet<String> {
             .filter_map(|k| k.as_str().map(str::to_string))
             .collect(),
         _ => std::collections::BTreeSet::new(),
+    }
+}
+
+/// Whether the document writes `signature_paths:` with an explicit null value
+/// (`signature_paths:` / `signature_paths: ~`) — the reference's `nil`, which
+/// is "not configured" rather than an empty list.
+fn signature_paths_is_null(text: &str) -> bool {
+    match serde_yaml::from_str::<serde_yaml::Value>(text) {
+        Ok(serde_yaml::Value::Mapping(map)) => {
+            map.get("signature_paths").is_some_and(serde_yaml::Value::is_null)
+        }
+        _ => false,
     }
 }
 
@@ -294,6 +375,7 @@ impl Config {
             Ok(text) => match serde_yaml::from_str::<Config>(&text) {
                 Ok(mut cfg) => {
                     cfg.present_keys = top_level_keys(&text);
+                    cfg.signature_paths_null = signature_paths_is_null(&text);
                     cfg.base_dir = config_base_dir(path);
                     cfg.parity_text_ok = crate::conformance_gate::config_text_ok(&text);
                     ConfigRead::Parsed(Box::new(cfg))
@@ -346,6 +428,7 @@ impl Config {
         match serde_yaml::from_str::<Config>(text) {
             Ok(mut cfg) => {
                 cfg.present_keys = top_level_keys(text);
+                cfg.signature_paths_null = signature_paths_is_null(text);
                 cfg
             }
             Err(e) => {
@@ -542,8 +625,7 @@ impl Config {
     /// `Configuration#signature_paths` is `nil` when unset.
     #[must_use]
     pub fn explicit_signature_paths(&self) -> Option<&[String]> {
-        self.present_keys
-            .contains("signature_paths")
+        (self.present_keys.contains("signature_paths") && !self.signature_paths_null)
             .then_some(self.signature_paths.as_slice())
     }
 
@@ -752,6 +834,88 @@ mod tests {
         assert_eq!(Config::default().paths, vec!["lib"]);
         let cfg: Config = serde_yaml::from_str("paths:\n  - app\n  - lib\n").unwrap();
         assert_eq!(cfg.paths, vec!["app", "lib"]);
+    }
+
+    /// Issue #199 — `ruby_array` is Ruby's `Array(x).map(&:to_s)`.
+    #[test]
+    fn ruby_array_semantics() {
+        let v = |s: &str| serde_yaml::from_str::<serde_yaml::Value>(s).unwrap();
+        assert_eq!(ruby_array(&v("other")).unwrap(), vec!["other"], "scalar wraps");
+        assert_eq!(ruby_array(&v("[a, b]")).unwrap(), vec!["a", "b"], "list is itself");
+        assert_eq!(ruby_array(&v("~")).unwrap(), Vec::<String>::new(), "Array(nil) == []");
+        assert_eq!(ruby_array(&v("1")).unwrap(), vec!["1"], "Integer#to_s");
+        assert_eq!(ruby_array(&v("true")).unwrap(), vec!["true"], "true.to_s");
+        assert_eq!(ruby_array(&v("1.5")).unwrap(), vec!["1.5"], "Float#to_s");
+        assert_eq!(ruby_array(&v("[1, false, ~, x]")).unwrap(), vec!["1", "false", "", "x"]);
+        // Collections stay malformed (the loader's existing fallback).
+        assert!(ruby_array(&v("{a: 1}")).is_err());
+        assert!(ruby_array(&v("[[a]]")).is_err());
+        assert!(ruby_array(&v("[{a: 1}]")).is_err());
+    }
+
+    /// Issue #199 — every list key accepts a scalar through the ONE shared
+    /// adapter, and a scalar key never discards the rest of the document.
+    #[test]
+    fn scalar_list_keys_parse_and_keep_other_keys() {
+        let yaml = "paths: other\nexclude: vendor/x.rb\ndisable: call.undefined-method\n\
+                    plugins: rigor-activesupport-core-ext\nsignature_paths: types\nbaseline: b.yml\n";
+        let cfg = Config::parse_or_warn(yaml, "test");
+        assert_eq!(cfg.paths, vec!["other"]);
+        assert_eq!(cfg.exclude, vec!["vendor/x.rb"]);
+        assert_eq!(cfg.disable, vec!["call.undefined-method"]);
+        assert_eq!(cfg.plugins, vec!["rigor-activesupport-core-ext"]);
+        assert_eq!(cfg.signature_paths, vec!["types"]);
+        assert_eq!(cfg.baseline_path().as_deref(), Some("b.yml"));
+        // Mixed: one scalar key alongside a list key.
+        let cfg = Config::parse_or_warn("paths: other\ndisable: [call.undefined-method]\n", "t");
+        assert_eq!(cfg.paths, vec!["other"]);
+        assert_eq!(cfg.disable, vec!["call.undefined-method"]);
+        // Non-string scalars go through `to_s`.
+        let cfg = Config::parse_or_warn("paths: 1\ndisable: true\n", "t");
+        assert_eq!(cfg.paths, vec!["1"]);
+        assert_eq!(cfg.disable, vec!["true"]);
+    }
+
+    /// Issue #199 — explicit null: `Array(nil) == []` for every list key
+    /// except `signature_paths`, which the reference keeps `nil` (default
+    /// discovery, not an explicit declaration).
+    #[test]
+    fn null_list_keys_follow_the_reference() {
+        let yaml = "paths: ~\nexclude:\ndisable: ~\nplugins: ~\nsignature_paths: ~\n";
+        let cfg = Config::parse_or_warn(yaml, "test");
+        assert!(cfg.paths.is_empty());
+        assert!(cfg.exclude.is_empty());
+        assert!(cfg.disable.is_empty());
+        assert!(cfg.plugins.is_empty());
+        assert_eq!(cfg.signature_paths, vec!["sig"], "null => default discovery");
+        assert!(cfg.explicit_signature_paths().is_none(), "null is not a declaration");
+        // `paths: ~` is still DECLARED (the key is in the file).
+        assert!(cfg.paths_explicitly_declared());
+    }
+
+    /// Issue #199 — a scalar-valued key is recorded as declared exactly as a
+    /// list would be (drives the upstream #684 discovery widening and the
+    /// config audit's explicit-`signature_paths` check).
+    #[test]
+    fn scalar_keys_are_declared() {
+        let cfg = Config::parse_or_warn("paths: other\nsignature_paths: sig\n", "test");
+        assert!(cfg.paths_explicitly_declared());
+        assert!(cfg.declares_key("paths"));
+        assert_eq!(cfg.explicit_signature_paths(), Some(&["sig".to_string()][..]));
+        // The loader path records the same.
+        let dir = std::env::temp_dir()
+            .join(format!("rigor_cfg_scalar_{}_{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".rigor.yml");
+        std::fs::write(&path, "paths: other\n").unwrap();
+        match Config::read(&path) {
+            ConfigRead::Parsed(cfg) => {
+                assert_eq!(cfg.paths, vec!["other"]);
+                assert!(cfg.paths_explicitly_declared());
+            }
+            _ => panic!("a scalar `paths:` must parse, not fall back as malformed"),
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
