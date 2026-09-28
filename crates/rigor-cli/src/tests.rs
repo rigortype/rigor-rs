@@ -15,20 +15,16 @@ fn diag(rule_id: &'static str, severity: Severity, message: &str) -> Diagnostic 
     }
 }
 
-/// Build the single github annotation line for one diagnostic (mirrors what
-/// `print_github` prints), so we can assert the exact string incl. escaping.
+/// One finding flattened exactly as `check` flattens it for the renderers.
+fn rendered<'a>(path: &'a str, source: &str, d: &'a Diagnostic) -> Rendered<'a> {
+    let (line, column) = line_col(source, d.start_offset);
+    Rendered { path, line, column, severity: d.severity, rule_id: d.qualified_rule(), message: &d.message }
+}
+
+/// The single github annotation line for one diagnostic, from the REAL
+/// renderer, so the exact string incl. escaping is asserted.
 fn gh_line(path: &str, source: &str, d: &Diagnostic) -> String {
-    let (line, col) = line_col(source, d.start_offset);
-    let level = match d.severity {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-        Severity::Info => "notice",
-    };
-    format!(
-        "::{level} file={},line={line},col={col}::{}",
-        gh_escape_prop(path),
-        gh_escape_data(&d.message),
-    )
+    diagnostic_formats::render_github(&[rendered(path, source, d)])
 }
 
 #[test]
@@ -36,20 +32,20 @@ fn github_error_line() {
     let d = diag("call.undefined-method", Severity::Error, "undefined method `lenght'");
     assert_eq!(
         gh_line("app.rb", "", &d),
-        "::error file=app.rb,line=1,col=1::undefined method `lenght'"
+        "::error file=app.rb,line=1,col=1,title=call.undefined-method::undefined method `lenght'"
     );
 }
 
 #[test]
 fn github_warning_line() {
     let d = diag("some.rule", Severity::Warning, "watch out");
-    assert_eq!(gh_line("a.rb", "", &d), "::warning file=a.rb,line=1,col=1::watch out");
+    assert_eq!(gh_line("a.rb", "", &d), "::warning file=a.rb,line=1,col=1,title=some.rule::watch out");
 }
 
 #[test]
 fn github_info_is_notice() {
     let d = diag("internal-error", Severity::Info, "fyi");
-    assert_eq!(gh_line("a.rb", "", &d), "::notice file=a.rb,line=1,col=1::fyi");
+    assert_eq!(gh_line("a.rb", "", &d), "::notice file=a.rb,line=1,col=1,title=internal-error::fyi");
 }
 
 #[test]
@@ -59,7 +55,7 @@ fn github_message_escaping() {
     let d = diag("r", Severity::Error, "100% off\nline two\r, a:b");
     assert_eq!(
         gh_line("p.rb", "", &d),
-        "::error file=p.rb,line=1,col=1::100%25 off%0Aline two%0D, a:b"
+        "::error file=p.rb,line=1,col=1,title=r::100%25 off%0Aline two%0D, a:b"
     );
 }
 
@@ -69,7 +65,7 @@ fn github_property_escaping() {
     let d = diag("r", Severity::Error, "msg");
     assert_eq!(
         gh_line("a,b:c.rb", "", &d),
-        "::error file=a%2Cb%3Ac.rb,line=1,col=1::msg"
+        "::error file=a%2Cb%3Ac.rb,line=1,col=1,title=r::msg"
     );
 }
 
@@ -79,7 +75,7 @@ fn github_line_col_from_source() {
     let src = "s = \"x\"\ns.lenght\n";
     let off = src.find("lenght").unwrap();
     let d = Diagnostic { start_offset: off, ..diag("r", Severity::Error, "m") };
-    assert_eq!(gh_line("f.rb", src, &d), "::error file=f.rb,line=2,col=3::m");
+    assert_eq!(gh_line("f.rb", src, &d), "::error file=f.rb,line=2,col=3,title=r::m");
 }
 
 #[test]
@@ -125,11 +121,7 @@ fn line_col_start_of_line_and_eof() {
 
 /// Capture github output for a slice of findings without spawning a process.
 fn github_all(findings: &[(usize, String, String, Diagnostic)]) -> String {
-    findings
-        .iter()
-        .map(|(_o, p, s, d)| gh_line(p, s, d))
-        .collect::<Vec<_>>()
-        .join("\n")
+    diagnostic_formats::render_github(&to_rendered(findings))
 }
 
 #[test]
@@ -137,11 +129,9 @@ fn github_empty_when_no_diagnostics() {
     assert_eq!(github_all(&[]), "");
 }
 
-/// The REAL SARIF builder. This used to be a test-side re-implementation of
-/// `print_sarif`, which by construction could not catch a change to the
-/// emitter it was supposed to pin.
+/// The REAL SARIF renderer's output, re-parsed.
 fn sarif_value(findings: &[(usize, String, String, Diagnostic)]) -> serde_json::Value {
-    sarif_document(findings)
+    serde_json::from_str(&diagnostic_formats::render_sarif(&to_rendered(findings))).unwrap()
 }
 
 fn finding(rule: &'static str, sev: Severity, msg: &str) -> (usize, String, String, Diagnostic) {
@@ -163,11 +153,6 @@ fn sarif_structure_and_levels() {
         finding("call.undefined-method", Severity::Error, "e2"),
     ];
     let v = sarif_value(&findings);
-
-    // Round-trips through serde_json (it already is a Value, but assert the
-    // pretty string re-parses, mirroring the real output path).
-    let pretty = serde_json::to_string_pretty(&v).unwrap();
-    let v: serde_json::Value = serde_json::from_str(&pretty).unwrap();
 
     assert_eq!(v["version"], "2.1.0");
     assert_eq!(v["$schema"], "https://json.schemastore.org/sarif-2.1.0.json");
@@ -192,7 +177,7 @@ fn sarif_structure_and_levels() {
         .map(|r| r["id"].as_str().unwrap())
         .collect();
     assert_eq!(ids, vec!["call.undefined-method", "some.warn", "internal-error"]);
-    assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "rigor-rs");
+    assert_eq!(v["runs"][0]["tool"]["driver"]["name"], "Rigor");
 }
 
 /// A parse error carries NO rule. `--format json` must spell that as JSON
@@ -281,17 +266,21 @@ fn sarif_omits_rule_id_for_a_ruleless_diagnostic() {
     assert_eq!(ids, vec!["call.undefined-method"], "the ruleless row declares no rule");
 }
 
-/// The text format has no rule slot at all, so a ruleless row is already
-/// `path:line:col: error: message` — the exact shape the reference prints
-/// (`Diagnostic#to_s` returns the unsuffixed base when `qualified_rule` is
-/// nil), measured at pin `ffb456b0`.
+/// A ruleless row prints the unsuffixed `Diagnostic#to_s` base (the
+/// reference returns `base` when `qualified_rule` is nil); a ruled row gets
+/// ` [rule]`.
 #[test]
-fn text_row_for_a_ruleless_diagnostic_matches_the_reference_shape() {
-    let (_o, path, source, d) = finding_ruleless("unexpected 'else', ignoring it");
-    let (line, col) = line_col(&source, d.start_offset);
+fn text_row_brackets_the_rule_only_when_there_is_one() {
+    let findings = vec![
+        finding_ruleless("unexpected 'else', ignoring it"),
+        finding("call.undefined-method", Severity::Error, "e1"),
+    ];
     assert_eq!(
-        format!("{path}:{line}:{col}: {}: {}", d.severity.as_str(), d.message),
-        "f.rb:1:1: error: unexpected 'else', ignoring it"
+        diagnostic_formats::render_text(&to_rendered(&findings)),
+        "f.rb:1:1: error: unexpected 'else', ignoring it\n\
+         f.rb:1:1: error: e1 [call.undefined-method]\n\
+         \n\
+         2 error(s) in 1 file(s)\n"
     );
 }
 
