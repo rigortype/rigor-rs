@@ -1112,7 +1112,6 @@ impl<'i> Typer<'i> {
         }
         match interner.get(ty) {
             Type::Intersection(members) => {
-                let members = members.clone();
                 members
                     .iter()
                     .all(|&part| self.coll_could_be_range(interner, part))
