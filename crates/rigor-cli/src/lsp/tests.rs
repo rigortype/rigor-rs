@@ -2792,12 +2792,14 @@ fn buffer_at(path: &Path) -> BufferPaths {
 }
 
 #[test]
-fn exclude_gate_uses_the_root_relative_spelling_outside_paths() {
+fn exclude_gate_never_drops_a_buffer_only_explicit_check_reports() {
     // A buffer inside the workspace but outside every `paths:` root: bare
     // `check` never discovers it, so the ONLY run that reports on it is an
-    // explicit `rigor check spec/x.rb` from the project root — which matches
-    // `exclude:` against exactly that root-relative spelling. The gate uses it,
-    // so such a buffer is silenced iff that `check` run would report nothing.
+    // explicit `rigor check spec/x.rb` — and that run keeps the `.rb` argument
+    // VERBATIM (`accept_as_ruby_file?` never consults `exclude:`; issue #201
+    // moved the filter inside directory expansion). Nothing `check` could run
+    // is pruned, so the buffer is never excluded — even when a pattern would
+    // match its root-relative spelling.
     //
     // This does NOT touch the S4b/N5 divergence (an out-of-`paths:` buffer is
     // still analysed against the full project index): it only decides whether
@@ -2814,14 +2816,70 @@ fn exclude_gate_uses_the_root_relative_spelling_outside_paths() {
     let buf = buffer_at(&spec);
     let matching: Config = serde_yaml::from_str("exclude:\n  - \"spec/**\"\n").unwrap();
     assert!(
-        ExcludeMatcher::from_config(&PathBuf::from("."), &matching).excludes(&buf, None),
-        "an out-of-`paths:` buffer is excluded exactly when `rigor check \
-         spec/x_spec.rb` from the project root would report nothing for it"
+        !ExcludeMatcher::from_config(&PathBuf::from("."), &matching).excludes(&buf, None),
+        "`rigor check spec/x_spec.rb` analyses the file verbatim — no spelling \
+         `exclude:` can prune — so the buffer keeps its diagnostics"
     );
-    // The control: a pattern that does NOT cover it leaves it analysed, exactly
-    // as today (the N5 divergence is untouched by this slice).
     let other: Config = serde_yaml::from_str("exclude:\n  - \"vendor/**\"\n").unwrap();
     assert!(!ExcludeMatcher::from_config(&PathBuf::from("."), &other).excludes(&buf, None));
+}
+
+#[test]
+fn exclude_gate_never_drops_a_paths_file_entry_matching_exclude() {
+    // Issue #201 (final review): `paths:` may name a `.rb` FILE, and such an
+    // entry is kept VERBATIM by `expand_paths`/`accept_as_ruby_file?` — the
+    // `exclude:` patterns apply only inside directory expansion. A matcher
+    // that pattern-matches the file's own name silences a buffer `check`
+    // analyses — and did so ONLY while the overlay was unbuilt, a
+    // state-dependent divergence. Both gate tiers are pinned.
+    let p = TempProject::new("exclfileroot");
+    let ext = p.write("ext.rb", "class Ext\nend\n");
+    let cfg: Config =
+        serde_yaml::from_str("paths:\n  - lib/ext.rb\nexclude:\n  - \"**/ext.rb\"\n").unwrap();
+    let root = p.root.clone();
+
+    // Ground truth: `check` keeps the file — `project_files` (the verbatim
+    // `expand_check_paths_excluding`) still lists it.
+    assert!(
+        project_files(&root, &cfg).iter().any(|f| f.ends_with("lib/ext.rb")),
+        "check keeps the explicit `paths:` file verbatim"
+    );
+
+    let matcher = ExcludeMatcher::from_config(&root, &cfg);
+    // TIER 2 (overlay off): the spelling fallback must see the verbatim root.
+    assert!(
+        !matcher.excludes(&buffer_at(&ext), None),
+        "overlay off: the `paths:` file entry is exclusion-immune"
+    );
+    // TIER 1 (overlay live): the file IS in the post-`exclude:` set.
+    let empty_core = CoreIndex::new();
+    let held = ProjectFiles {
+        files: project_files(&root, &cfg)
+            .iter()
+            .filter_map(|f| {
+                let ast = Arc::new(lower(&parse(b"")));
+                let harvest = Arc::new(SourceIndex::harvest(&ast, &empty_core));
+                Some((std::fs::canonicalize(f).ok()?, ast, harvest))
+            })
+            .collect(),
+    };
+    assert!(
+        !matcher.excludes(&buffer_at(&ext), Some(&held)),
+        "overlay live: membership already answers not-excluded"
+    );
+
+    // The control: a `paths:` DIRECTORY entry's expansion of the same file IS
+    // prunable — the SAME pattern drops `lib/ext.rb` inside `reject_excluded`
+    // when the file arrives via directory expansion instead of verbatim.
+    // (`exclude:` is matched against the ABSOLUTIZED `paths:` spellings, so a
+    // `**`-led pattern is needed on both sides.)
+    let dir_cfg: Config =
+        serde_yaml::from_str("paths:\n  - lib\nexclude:\n  - \"**/ext.rb\"\n").unwrap();
+    assert!(project_files(&root, &dir_cfg).is_empty(), "the control: dir expansion pruned");
+    assert!(
+        ExcludeMatcher::from_config(&root, &dir_cfg).excludes(&buffer_at(&ext), None),
+        "the control: the same buffer IS excluded through a directory root"
+    );
 }
 
 #[test]

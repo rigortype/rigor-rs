@@ -784,13 +784,23 @@ impl ExcludeMatcher {
     /// it never sits on the latency path of a buffer that is getting diagnostics.
     fn survives_discovery(&self, canonical: Option<&Path>) -> bool {
         let Some(canonical) = canonical else { return false };
-        discovery_spellings(&self.root, &self.paths)
-            .iter()
-            .filter(|f| !crate::config::matches_exclude(&self.patterns, f))
-            .any(|f| {
-                std::fs::symlink_metadata(f).is_ok_and(|m| m.file_type().is_symlink())
-                    && std::fs::canonicalize(f).is_ok_and(|c| c == canonical)
-            })
+        // `paths:` `.rb` FILE entries are kept VERBATIM — `accept_as_ruby_file?`
+        // never consults `exclude:` — so a file root that resolves to this
+        // canonical path is discovered regardless of the patterns.
+        let file_root_hit = self.paths.iter().any(|p| {
+            let joined = join_root(&self.root, p);
+            joined.is_file()
+                && p.ends_with(".rb")
+                && std::fs::canonicalize(&joined).is_ok_and(|c| c == canonical)
+        });
+        file_root_hit
+            || discovery_spellings(&self.root, &self.paths)
+                .iter()
+                .filter(|f| !crate::config::matches_exclude(&self.patterns, f))
+                .any(|f| {
+                    std::fs::symlink_metadata(f).is_ok_and(|m| m.file_type().is_symlink())
+                        && std::fs::canonicalize(f).is_ok_and(|c| c == canonical)
+                })
     }
 
     /// Every string `check` could match `exclude:` against for this buffer.
@@ -801,6 +811,13 @@ impl ExcludeMatcher {
     /// only one of them may be excluded. A name under no configured root falls back
     /// to the project-root-relative spelling, which is what an explicit
     /// `rigor check <that file>` from the project root receives.
+    ///
+    /// Spellings a buffer only reaches through a VERBATIM root — a `paths:`
+    /// `.rb` FILE entry, or an explicit `rigor check <file>` for a file under
+    /// no `paths:` root — produce NO excludable spelling at all: `check` keeps
+    /// them without consulting `exclude:` (`accept_as_ruby_file?` /
+    /// `expand_check_paths_excluding`), so matching them against the patterns
+    /// would suppress a buffer `check` analyses.
     ///
     /// Duplicates are harmless (the caller only asks whether they are ALL excluded)
     /// and common — the three names coincide whenever no symlink is involved.
@@ -814,7 +831,6 @@ impl ExcludeMatcher {
 
     /// Append every spelling of one candidate path.
     fn push_spellings(&self, path: &Path, out: &mut Vec<String>) {
-        let before = out.len();
         for p in &self.paths {
             let base = join_root(&self.root, p);
             // A root that does not resolve cannot spell anything. Both the literal
@@ -826,21 +842,24 @@ impl ExcludeMatcher {
             for prefix in bases.into_iter().flatten() {
                 let Ok(rel) = path.strip_prefix(&prefix) else { continue };
                 // `paths:` may name a FILE (`project_files` pushes the joined path
-                // as is); then `rel` is empty and the spelling is the root itself.
-                let spelled =
-                    if rel.as_os_str().is_empty() { base.clone() } else { base.join(rel) };
-                out.push(spelled.to_string_lossy().into_owned());
+                // as is); then `rel` is empty and the root IS the file — kept
+                // VERBATIM (`accept_as_ruby_file?` never consults `exclude:`), so
+                // it contributes no excludable spelling.
+                if rel.as_os_str().is_empty() {
+                    if !(base.is_file() && p.ends_with(".rb")) {
+                        out.push(base.to_string_lossy().into_owned());
+                    }
+                    continue;
+                }
+                out.push(base.join(rel).to_string_lossy().into_owned());
             }
         }
-        if out.len() > before {
-            return; // named by at least one configured root.
-        }
-        // Outside every `paths:` root: the only run that reports on this file is an
-        // explicit `rigor check <that file>` from the project root.
-        let Ok(canonical_root) = std::fs::canonicalize(&self.root) else { return };
-        if let Ok(rel) = path.strip_prefix(&canonical_root) {
-            out.push(join_root(&self.root, &rel.to_string_lossy()).to_string_lossy().into_owned());
-        }
+        // Outside every `paths:` root there is NO excludable spelling: the only
+        // run that reports on the file is an explicit `rigor check <that file>`,
+        // which keeps an `.rb` argument VERBATIM — `reject_excluded` runs inside
+        // directory expansion only (issue #201). Contributing no spelling leaves
+        // the buffer's verdict to its in-roots names; a buffer with none is never
+        // excluded, matching `check <file>` reporting it unconditionally.
     }
 }
 
