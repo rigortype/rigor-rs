@@ -679,9 +679,8 @@ fn unescaped(p: &[char], i: usize) -> Option<char> {
 /// match, `None` when the class is unterminated or the character fails —
 /// dir.c's NULL, which the `[` arm turns into `failed`.
 fn bracket(p: &[char], mut i: usize, c: char) -> Option<usize> {
-    let mut not = false;
-    if matches!(p.get(i), Some('!') | Some('^')) {
-        not = true;
+    let negated = matches!(p.get(i), Some('!') | Some('^'));
+    if negated {
         i += 1;
     }
     let mut ok = false;
@@ -725,9 +724,9 @@ fn bracket(p: &[char], mut i: usize, c: char) -> Option<usize> {
         }
         i = j;
     }
-    // `ok == not → NULL`: the empty non-negated class fails the match
+    // `ok == negated → NULL`: the empty non-negated class fails the match
     // outright; a negated class with no member hit matches (any char).
-    (ok != not).then_some(i)
+    (ok != negated).then_some(i)
 }
 
 /// `Configuration::BUILTIN_EXCLUDES`, always appended upstream.
