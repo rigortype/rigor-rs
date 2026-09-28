@@ -7,12 +7,12 @@
 use std::collections::HashMap;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, Scalar, Type, TypeId};
+use rigor_types::{Interner, Type, TypeId};
 
 use crate::{
     collect_flow_writes, indexed_flow_writes, join_flow_envs, multi_target_binder, qualify_self,
     toplevel_mutations, toplevel_rebinds, widen_flow_writes, DefKind, TypeEnv, Typer,
-    ARRAY_MUTATORS, HASH_MUTATORS, STRING_MUTATORS,
+    ARRAY_MUTATORS, HASH_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -154,8 +154,8 @@ impl<'i> Typer<'i> {
     /// The binding a `local.<mutator>(…)` call leaves behind — the flat-env
     /// port of the reference's `MutationWidening.widen_for_mutator`: a
     /// literal-shape carrier loses its shape but keeps its class (`Tuple` →
-    /// `Nominal[Array]`, `HashShape` → `Nominal[Hash]`, a `Constant` String →
-    /// `Nominal[String]`), a union widens memberwise (`widen_union`), and
+    /// `Nominal[Array]`, `HashShape` → `Nominal[Hash]`), a union widens
+    /// memberwise (`widen_union`), and
     /// every other binding is untouched (`None` — a precise `Nominal` has no
     /// shape to lose and a `Dynamic` gains nothing). The flat env tracks no
     /// element evidence, so the nominal's args stay empty — the message reads
@@ -175,9 +175,6 @@ impl<'i> Typer<'i> {
         match interner.get(ty) {
             Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => mint("Array", interner),
             Type::HashShape(_) if HASH_MUTATORS.contains(&method) => mint("Hash", interner),
-            Type::Constant(Scalar::Str(_)) if STRING_MUTATORS.contains(&method) => {
-                mint("String", interner)
-            }
             Type::Union(members) => {
                 let members = members.clone();
                 let mut out = Vec::with_capacity(members.len());
