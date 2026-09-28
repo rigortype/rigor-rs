@@ -985,17 +985,13 @@ impl<'i> Typer<'i> {
                     }
                     IndexStoreForm::Either => {
                         for m in self.coll_store_value_classes(ast, value, tenv, interner) {
-                            if !added.contains(&m) {
-                                added.push(m);
-                            }
+                            Self::push_unique(&mut added, m);
                         }
                         self.coll_splice_members(ast, value, tenv, interner, &mut added);
                     }
                     IndexStoreForm::Element => {
                         for m in self.coll_store_value_classes(ast, value, tenv, interner) {
-                            if !added.contains(&m) {
-                                added.push(m);
-                            }
+                            Self::push_unique(&mut added, m);
                         }
                     }
                 }
@@ -1003,13 +999,18 @@ impl<'i> Typer<'i> {
         } else {
             for &a in Typer::coll_store_value_args(method, args) {
                 for m in self.coll_store_value_classes(ast, a, tenv, interner) {
-                    if !added.contains(&m) {
-                        added.push(m);
-                    }
+                    Self::push_unique(&mut added, m);
                 }
             }
         }
         added
+    }
+
+    /// Order-preserving membership insert for a small member set.
+    fn push_unique(members: &mut Vec<TypeId>, m: TypeId) {
+        if !members.contains(&m) {
+            members.push(m);
+        }
     }
 
     /// `index_store_form` (`content_join.rb:320`) over the `[]=` call's leading

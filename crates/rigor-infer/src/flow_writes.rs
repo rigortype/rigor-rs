@@ -273,10 +273,13 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
 /// test is STRUCTURAL, never span-based: a heredoc's body lines follow its
 /// opener, so an interpolation write lies inside the enclosing span while
 /// evaluating in the outer scope.
-#[allow(clippy::type_complexity)]
+/// A block/lambda shadow scope: its body's reachable nodes plus the names it
+/// binds (borrowed from the AST, which outlives every census built on it).
+type ShadowScope<'a> = (HashSet<NodeId>, &'a [String]);
+
 fn toplevel_scope_filters(
     ast: &LoweredAst,
-) -> (Vec<rigor_parse::Span>, Vec<(HashSet<NodeId>, &[String])>) {
+) -> (Vec<rigor_parse::Span>, Vec<ShadowScope<'_>>) {
     let scopes: Vec<rigor_parse::Span> = ast
         .iter()
         .filter_map(|(_, n)| match n {
@@ -286,7 +289,7 @@ fn toplevel_scope_filters(
             _ => None,
         })
         .collect();
-    let shadow_scopes: Vec<(HashSet<NodeId>, &[String])> = ast
+    let shadow_scopes: Vec<ShadowScope<'_>> = ast
         .iter()
         .filter_map(|(_, n)| match n {
             Node::Call {
