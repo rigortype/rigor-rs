@@ -20,7 +20,6 @@
 
 use std::path::Path;
 
-use glob::Pattern;
 use rigor_rules::SuppressSet;
 use serde::Deserialize;
 
@@ -784,30 +783,24 @@ impl Config {
         self.rigor_rs.ruby.as_deref()
     }
 
-    /// Whether `path` (as given on the command line) matches any `exclude:`
-    /// pattern. Invalid glob patterns are skipped (they match nothing) so a typo
-    /// in config can never crash the run.
-    #[must_use]
-    pub fn is_excluded(&self, path: &str) -> bool {
-        matches_exclude(&self.exclude, path)
-    }
 }
 
-/// Whether `path` matches any of the `exclude:` `patterns`. Invalid globs are
-/// skipped (they match nothing) so a config typo can never crash a run.
+/// Whether `path` matches any of the `exclude:` `patterns`, matched with the
+/// reference's `File.fnmatch?` and NO flags (`reject_excluded`) — every `*`
+/// spans `/`, consecutive `*`s collapse (so `a/**/b` never matches `a/b`),
+/// `[…]` is a character class, `\` escapes, and the leading-period rule
+/// applies at path position 0.
 ///
-/// Split out of [`Config::is_excluded`] so the LSP's per-buffer gate can be
-/// matched by the SAME authority `check`'s stage-1 filter uses
-/// (`main.rs`'s `if cfg.is_excluded(path)`), against a pattern list carried on
-/// the LSP's `ProjectContext` rather than a live `Config` borrow. A second
-/// re-implementation of the glob rule is exactly the kind of drift that produced
-/// the divergence this seam closes.
+/// The single matcher authority: `check`'s expansion filter
+/// (`expand_check_paths_excluding`) and the LSP's per-buffer gate both reach
+/// the same `dir.c` port — a second implementation of the glob rule is
+/// exactly the drift the retired `glob::Pattern` stage-1 gate was (a
+/// `glob::Pattern` `a/**/b` matches `a/b`; `File.fnmatch?` does not).
 #[must_use]
 pub fn matches_exclude(patterns: &[String], path: &str) -> bool {
-    patterns.iter().any(|pat| match Pattern::new(pat) {
-        Ok(p) => p.matches(path),
-        Err(_) => false,
-    })
+    patterns
+        .iter()
+        .any(|pat| crate::conformance_gate::fnmatch(pat, path))
 }
 
 #[cfg(test)]
@@ -1010,18 +1003,29 @@ mod tests {
             exclude: vec!["vendor/**".into(), "*.rb".into()],
             ..Default::default()
         };
-        assert!(cfg.is_excluded("vendor/x/y.rb"));
-        assert!(cfg.is_excluded("a.rb"));
+        let m = |path: &str| matches_exclude(&cfg.exclude, path);
+        assert!(m("vendor/x/y.rb"));
+        assert!(m("a.rb"));
         // `*.rb` matches a bare filename; non-matches stay false.
-        assert!(!cfg.is_excluded("vendor")); // no trailing segment
-        assert!(!cfg.is_excluded("src/lib.txt"));
+        assert!(!m("vendor")); // no trailing segment
+        assert!(!m("src/lib.txt"));
+        // `File.fnmatch?` (no flags), not `glob::Pattern`: consecutive `*`s
+        // collapse, so `a/**/b` never matches `a/b` (issue #201).
+        let cfg = Config {
+            exclude: vec!["a/**/b".into()],
+            ..Default::default()
+        };
+        let m = |path: &str| matches_exclude(&cfg.exclude, path);
+        assert!(!m("a/b"));
+        assert!(m("a/x/b"));
     }
 
     #[test]
-    fn invalid_glob_pattern_is_inert() {
-        // A malformed pattern must never panic; it simply matches nothing.
+    fn unterminated_class_is_inert() {
+        // An unterminated `[` must never panic; it simply matches nothing.
         let cfg = Config { disable: vec![], exclude: vec!["[".into()], ..Default::default() };
-        assert!(!cfg.is_excluded("anything.rb"));
+        assert!(!matches_exclude(&cfg.exclude, "anything.rb"));
+        assert!(!matches_exclude(&cfg.exclude, "["));
     }
 
     #[test]

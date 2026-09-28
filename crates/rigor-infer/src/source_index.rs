@@ -334,7 +334,7 @@ pub struct FileDefs {
 /// * **Ordered replay** (`source_classes`, `override_classes`,
 ///   `rbs_constant_names`, `constant_writes`, `fold_defs`) — first-write-wins /
 ///   append semantics that REACH DIAGNOSTICS. The merge replays them in the
-///   caller's file order (`expand_check_paths`: each argument's recursive
+///   caller's file order (`expand_check_paths_excluding`: each argument's recursive
 ///   expansion sorted, arguments concatenated in argument order) and **must
 ///   never sort**: `rigor check a.rb b.rb` and `rigor check b.rb a.rb` are
 ///   legitimately different runs today (issue #92 §3.2/§3.5).

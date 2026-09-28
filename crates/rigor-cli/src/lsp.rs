@@ -625,10 +625,11 @@ impl SeverityStamp {
     }
 }
 
-/// The config `exclude:` gate for the OPEN BUFFER — the LSP's counterpart of
-/// `check`'s STAGE-1 file filter (`main.rs`: `if cfg.is_excluded(path) { return
-/// Stage1::Excluded; }`, the very first thing stage 1 does, before the file is
-/// even read).
+/// The `exclude:` gate for the OPEN BUFFER — the LSP's counterpart of
+/// `check`'s EXPANSION-TIME filter (`main.rs`: `expand_check_paths_excluding`
+/// applies `BUILTIN_EXCLUDES + exclude:` with `File.fnmatch?`-no-flags to
+/// every directory-expanded path, before the file is even read; an explicit
+/// `.rb` root is never filtered).
 ///
 /// Carried on [`ProjectContext`] beside [`ProjectContext::disable`] and
 /// [`ProjectContext::stamp`] for the same reason those live there: every field is
@@ -661,9 +662,10 @@ impl SeverityStamp {
 ///
 /// The spelling half still matters because `exclude:` patterns are matched against
 /// the path string as `check` SPELLS it, not an absolute canonical path: bare
-/// `check` expands each `paths:` root (`expand_check_paths` → `collect_rb_files`,
-/// building `<root>/<rel>` by `Path::join`), so with the production root `.` the
-/// matched string is `lib/sub.rb`, and under `paths: ["."]` it is `./lib/sub.rb`.
+/// `check` expands each `paths:` root (`expand_check_paths_excluding` →
+/// `collect_rb_files`, building `<root>/<rel>` by `Path::join`), so with the
+/// production root `.` the matched string is `lib/sub.rb`, and under
+/// `paths: ["."]` it is `./lib/sub.rb`.
 ///
 /// Carried on [`ProjectContext`] beside [`ProjectContext::disable`] and
 /// [`ProjectContext::stamp`] for the same reason those live there: every field is
@@ -678,8 +680,10 @@ struct ExcludeMatcher {
     /// `paths:` — the discovery roots, needed to reproduce discovery's spelling of
     /// a buffer's path.
     paths: Vec<String>,
-    /// `exclude:` verbatim. Matched by [`crate::config::matches_exclude`], the same
-    /// entry point `Config::is_excluded` (and so `check`) calls — never a second
+    /// `Configuration#exclude_patterns` verbatim — `BUILTIN_EXCLUDES +
+    /// exclude:`, the one list `check`'s `reject_excluded` applies. Matched by
+    /// [`crate::config::matches_exclude`], which reaches the same `dir.c`
+    /// `File.fnmatch?`-no-flags port `check` expands with — never a second
     /// implementation of the glob rule.
     patterns: Vec<String>,
 }
@@ -720,17 +724,17 @@ impl ExcludeMatcher {
     fn from_config(root: &Path, cfg: &Config) -> Self {
         Self {
             root: root.to_path_buf(),
-            paths: cfg.paths.clone(),
-            patterns: cfg.exclude.clone(),
+            paths: crate::effective_config_paths(cfg),
+            patterns: crate::exclude_patterns(cfg),
         }
     }
 
     /// Whether this buffer is `exclude:`d — i.e. whether `check` would report
     /// nothing for it. See the type docs for the two tiers and the invariant.
     fn excludes(&self, buf: &BufferPaths, overlay: Option<&ProjectFiles>) -> bool {
-        if self.patterns.is_empty() {
-            return false; // the overwhelmingly common case: no work at all.
-        }
+        // `patterns` is `BUILTIN_EXCLUDES + exclude:` — never empty (the
+        // builtins are always present), so there is no cheap early exit;
+        // tier 1 is the cheap answer when the overlay exists.
         // TIER 1 — discovery membership. The overlay IS the post-`exclude:` set.
         if let (Some(canonical), Some(overlay)) = (buf.canonical.as_deref(), overlay) {
             if overlay.files.iter().any(|(p, ..)| p == canonical) {
@@ -1121,23 +1125,35 @@ fn build_core_index(root: &Path, cfg: &Config) -> CoreIndex {
     CoreIndex::for_project(&cfg.effective_plugins(root), &cfg.all_signature_dirs(root))
 }
 
-/// The project's analysable `.rb` files, in bare-`check` order (ADR-0040): each
-/// configured `paths:` root expanded recursively (a directory's files sorted,
-/// roots concatenated in config order), minus the config `exclude:` patterns.
+/// The project's analysable `.rb` files, in bare-`check` order (ADR-0040) —
+/// literally the expansion `check` runs: each configured `paths:` root
+/// through [`crate::expand_check_paths_excluding`], so a directory's hits are
+/// `BUILTIN_EXCLUDES + exclude:`-filtered (`File.fnmatch?`, no flags) while a
+/// `paths:` entry that names a `.rb` file is kept verbatim.
 /// `root` is the project root — `.` in production (so the produced path strings
 /// are byte-identical to what `check` matches `exclude:` against); a temp dir in
 /// tests, which is what makes the overlay testable without mutating the process
 /// cwd.
 fn project_files(root: &Path, cfg: &Config) -> Vec<String> {
-    let mut out = discovery_spellings(root, &cfg.paths);
-    out.retain(|p| !cfg.is_excluded(p));
+    let excludes = crate::exclude_patterns(cfg);
+    // `configuration.paths` as `check` sees them — declared entries
+    // absolutized (`resolve_paths_in`), so the `exclude:` match runs on the
+    // same spelling (a `.`-spelled config root would otherwise defeat
+    // `**`-led patterns under `File.fnmatch?`'s leading-period rule).
+    let mut out = Vec::new();
+    for p in crate::effective_config_paths(cfg) {
+        let joined = join_root(root, &p).to_string_lossy().into_owned();
+        // Expansion errors (a non-`.rb` file, a missing entry) produce no file —
+        // the same silent skip `discovery_spellings` gives them.
+        out.extend(crate::expand_check_paths_excluding(&[&joined], &excludes).0);
+    }
     out
 }
 
-/// Bare-`check` discovery BEFORE `exclude:` — every path string stage 1 would be
-/// handed. Split out of [`project_files`] so [`ExcludeMatcher`] can consult the
-/// real walk (rather than a second re-derivation of it) when it needs to know
-/// whether ANOTHER spelling of one file survives the patterns.
+/// Bare-`check` discovery BEFORE `exclude:` — every path string the expansion
+/// would be handed. Split out of [`project_files`] so [`ExcludeMatcher`] can
+/// consult the real walk (rather than a second re-derivation of it) when it
+/// needs to know whether ANOTHER spelling of one file survives the patterns.
 fn discovery_spellings(root: &Path, paths: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for p in paths {
@@ -2816,10 +2832,11 @@ fn send_diagnostics(
 /// markers match `rigor check` on the same content. Panic-isolated (ADR-0016): a
 /// malformed buffer that trips the parser yields no diagnostics, never a crash.
 ///
-/// **The stage-1 head.** `check` never even reads a file the config `exclude:`
-/// patterns cover, so it reports no rows for it; the LSP applies the same gate to
-/// the open buffer ([`ExcludeMatcher`]) and returns an EMPTY set — a publish that
-/// clears, not a silent skip.
+/// **The stage-1 head.** `check` never even reads a directory-expanded file the
+/// `exclude:`/`BUILTIN_EXCLUDES` patterns cover (its `reject_excluded`), so it
+/// reports no rows for it; the LSP applies the same gate to the open buffer
+/// ([`ExcludeMatcher`]) and returns an EMPTY set — a publish that clears, not a
+/// silent skip.
 ///
 /// **The stage-3 tail.** `check`'s stage 3 ends by re-stamping each diagnostic's
 /// severity from the profile + user + bleeding-edge overrides and DROPPING an
@@ -2849,11 +2866,12 @@ fn compute_diagnostics(
     buf: &BufferPaths,
     text: &str,
 ) -> (Vec<Diagnostic>, Option<Duration>, Option<Arc<SourceIndex>>) {
-    // STAGE-1 PARITY, in `check`'s order (`main.rs`): config `exclude:` FIRST —
-    // before the file is even read there, before the buffer is parsed here — then
-    // the ERB-template skip. An excluded buffer yields an EMPTY set rather than no
-    // publish at all, so the caller's publish CLEARS any markers the editor is
-    // already showing for it (the same empty-publish `didClose` uses).
+    // STAGE-1 PARITY, in `check`'s order (`main.rs`): `exclude:` FIRST —
+    // settled by the expansion before `check` even reads a directory's file,
+    // and mirrored here before the buffer is parsed — then the ERB-template
+    // skip. An excluded buffer yields an EMPTY set rather than no publish at
+    // all, so the caller's publish CLEARS any markers the editor is already
+    // showing for it (the same empty-publish `didClose` uses).
     if project.exclude.excludes(buf, project.overlay.as_ref()) {
         return (Vec::new(), None, None);
     }

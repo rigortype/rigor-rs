@@ -2554,19 +2554,22 @@ fn project_files_follow_bare_check_discovery() {
         .collect();
     assert_eq!(names, vec!["a.rb", "b.rb", "c.rb"], "sorted, recursive, `.rb` only");
 
-    // `exclude:` prunes, exactly as `check`'s per-file gate does.
+    // `exclude:` prunes, exactly as `check`'s expansion-time `reject_excluded`
+    // does.
     let cfg: Config = serde_yaml::from_str("exclude:\n  - \"**/nested/**\"\n").unwrap();
     let pruned = project_files(&p.root, &cfg);
     assert_eq!(pruned.len(), 2, "the excluded dir is not harvested: {pruned:?}");
 }
 
 // ---------------------------------------------------------------------
-// Config `exclude:` for the OPEN BUFFER — `check`'s stage-1 file filter.
+// `BUILTIN_EXCLUDES + exclude:` for the OPEN BUFFER — `check`'s
+// expansion-time filter (`reject_excluded` on directory-expanded paths).
 //
-// `check` skips an excluded file before it is even read (`main.rs`
-// `Stage1::Excluded`), so it reports no rows for it; the LSP published
-// markers for it anyway. The gate below is the same filter, applied to the
-// buffer, against the same path SPELLING discovery matches on.
+// `check` never expands an excluded directory hit into the analyzed set
+// (`main.rs` `expand_check_paths_excluding`), so it reports no rows for
+// it; the LSP published markers for it anyway. The gate below is the same
+// filter, applied to the buffer, against the same path SPELLING discovery
+// matches on.
 // ---------------------------------------------------------------------
 
 #[test]
@@ -2710,11 +2713,27 @@ fn exclude_agreement_run(
              discovery disagree about {f}"
         );
     }
-    // Non-vacuity of the loop itself: the `**/*.rb` case must prune everything
-    // and the empty case nothing, so the comparison above is exercised on BOTH
-    // answers somewhere in the matrix.
+    // Non-vacuity of the loop itself, on `File.fnmatch?`'s own terms: the
+    // catch-all `**/*.rb` prunes every spelling EXCEPT a `.`-led one — the
+    // leading-period rule means `*` at the pattern head never matches the
+    // `.` at path position 0 (oracle: `File.fnmatch?("**/*.rb",
+    // "./lib/a.rb")` is `false`), so a `.` `paths:` root's `./x.rb`
+    // spellings legitimately survive. The empty-exclude case still keeps
+    // everything, so the comparison above is exercised on BOTH answers
+    // somewhere in the matrix.
     if patterns.contains("**/*.rb\"") {
-        assert!(kept.is_empty(), "[{yaml:?}] the catch-all pattern prunes the whole set");
+        assert!(
+            kept.iter().all(|f| f.starts_with("./")),
+            "[{yaml:?}] only `./`-led spellings may survive the catch-all: {kept:?}"
+        );
+        if root == Path::new(".") && paths_yaml.contains("\".\"") {
+            assert!(
+                !kept.is_empty(),
+                "[{yaml:?}] `./`-led spellings survive `**/*.rb` upstream too"
+            );
+        } else {
+            assert!(kept.is_empty(), "[{yaml:?}] no `./` spellings ⇒ full prune");
+        }
     }
     if patterns == "exclude: []\n" {
         assert_eq!(kept.len(), all.len(), "[{yaml:?}] no patterns ⇒ nothing pruned");
@@ -2831,11 +2850,16 @@ fn exclude_gate_never_drops_a_symlinked_file_check_analyses() {
             .excludes(&buffer_at(&p.root.join("lib/shared.rb")), None),
         "B1: the link's own name survives `exclude:`, so `check` analyses the file"
     );
-    // The control: a pattern covering BOTH the link's name and the target's
-    // leaves no surviving spelling, so the same file IS excluded — proving the
+    // The control: patterns covering BOTH the link's name and the target's
+    // leave no surviving spelling, so the same file IS excluded — proving the
     // gate is live and that tier 3 rescues only a genuinely surviving name.
-    let both: Config =
-        serde_yaml::from_str("paths:\n  - \".\"\nexclude:\n  - \"**/shared.rb\"\n").unwrap();
+    // `./**/shared.rb` covers the `.`-root's `./lib/…` spellings, which the
+    // leading-period rule hides from `**/…`-led patterns (`File.fnmatch?`,
+    // no flags — a `*` at pattern head never matches position-0 `.`).
+    let both: Config = serde_yaml::from_str(
+        "paths:\n  - \".\"\nexclude:\n  - \"**/shared.rb\"\n  - \"./**/shared.rb\"\n",
+    )
+    .unwrap();
     assert!(
         ExcludeMatcher::from_config(&root, &both)
             .excludes(&buffer_at(&p.root.join("lib/shared.rb")), None),
@@ -2876,10 +2900,13 @@ fn exclude_gate_needs_every_root_spelling_excluded() {
             "[{order:?}] B3: one surviving spelling means `check` analyses the file"
         );
     }
-    // The control: a pattern covering BOTH spellings does exclude it.
-    let both: Config =
-        serde_yaml::from_str("paths:\n  - \".\"\n  - lib\nexclude:\n  - \"**/a.rb\"\n")
-            .unwrap();
+    // The control: patterns covering BOTH spellings do exclude it — `./**/`
+    // for the `.`-led spelling (`File.fnmatch?`'s leading-period rule keeps
+    // `**/a.rb` from ever matching `./lib/a.rb`), `**/` for `lib/a.rb`.
+    let both: Config = serde_yaml::from_str(
+        "paths:\n  - \".\"\n  - lib\nexclude:\n  - \"**/a.rb\"\n  - \"./**/a.rb\"\n",
+    )
+    .unwrap();
     assert!(project_files(&root, &both).is_empty());
     assert!(ExcludeMatcher::from_config(&root, &both).excludes(&buf, None));
 }
