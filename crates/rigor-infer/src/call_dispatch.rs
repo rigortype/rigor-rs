@@ -246,7 +246,8 @@ impl<'i> Typer<'i> {
                 // literal across `<<`, `+=`, branch and block writes, so a lookup
                 // that reads a local declines to the RBS answer (#149 review:
                 // `buf = ""; buf << "x"; buf[0].upcase` fired `for nil`).
-                let stale_risk = folding::is_str_lookup(&scalar, method)
+                // `Float#<=>` joins them: its `nil` arm has the same problem.
+                let stale_risk = folding::is_nilable_fold(&scalar, method)
                     && std::iter::once(receiver)
                         .chain(args.iter().copied())
                         .any(|id| ast.reads_local_within(ast.get(id).span()));
@@ -254,6 +255,11 @@ impl<'i> Typer<'i> {
                     (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
                 {
                     return interner.intern(Type::Constant(folded));
+                }
+                // Issue #164: for these `Integer?` lookups an unfolded literal
+                // call must not reach tier 3's bare `Integer` (see the predicate).
+                if folding::declines_unfolded(&scalar, method) {
+                    return interner.untyped();
                 }
                 // ADR-0008 sidecar fallback: the Rust core declined, but if this
                 // is a `sidecar_foldable` pure call and a real-Ruby folder is
