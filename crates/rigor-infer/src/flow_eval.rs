@@ -11,7 +11,8 @@ use rigor_types::{Interner, Type, TypeId};
 
 use crate::{
     collect_flow_writes, indexed_flow_writes, join_flow_envs, multi_target_binder, qualify_self,
-    toplevel_rebinds, widen_flow_writes, DefKind, TypeEnv, Typer,
+    toplevel_mutations, toplevel_rebinds, widen_flow_writes, DefKind, TypeEnv, Typer,
+    ARRAY_MUTATORS, HASH_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -66,28 +67,32 @@ impl<'i> Typer<'i> {
             _ => return env,
         };
         let rebinds = toplevel_rebinds(ast);
+        let mutations = toplevel_mutations(ast);
         for stmt in body {
-            self.bind_check_statement(ast, stmt, &mut env, &rebinds, interner);
+            self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, interner);
         }
         env
     }
 
     /// One statement of [`Self::build_toplevel_check_env`]: a direct write binds
-    /// as [`Self::bind_statement`] does, after widening the rebinds nested in
-    /// its value (`x = xs.each { |e| w = e }`); any other statement widens every
-    /// rebind inside it.
+    /// as [`Self::bind_statement`] does, after widening the rebinds and
+    /// receiver mutations nested in its value (`x = xs.each { |e| w = e }`,
+    /// `y = (a << 1)`); any other statement widens every rebind inside it and
+    /// applies the contained `local.<mutator>` calls.
     fn bind_check_statement(
         &self,
         ast: &LoweredAst,
         id: NodeId,
         env: &mut TypeEnv,
         rebinds: &[(rigor_parse::Span, String)],
+        mutations: &[(rigor_parse::Span, String, String)],
         interner: &mut Interner,
     ) {
         match ast.get(id) {
             Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
                 let vspan = ast.get(*value).span();
                 widen_flow_writes(rebinds, vspan, env, interner);
+                self.widen_mutated_locals(mutations, vspan, env, interner);
                 self.bind_statement(ast, id, env, interner);
             }
             // Only a real statement sequence is straight-line code. A recovery
@@ -96,11 +101,105 @@ impl<'i> Typer<'i> {
             // (`defined?`, `END`, `BEGIN`) has no writes in `rebinds` and so
             // changes nothing (rigor-rs#153).
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
-                for s in body.clone() {
-                    self.bind_check_statement(ast, s, env, rebinds, interner);
+                for &s in body {
+                    self.bind_check_statement(ast, s, env, rebinds, mutations, interner);
                 }
             }
-            other => widen_flow_writes(rebinds, other.span(), env, interner),
+            other => {
+                let span = other.span();
+                widen_flow_writes(rebinds, span, env, interner);
+                self.widen_mutated_locals(mutations, span, env, interner);
+            }
+        }
+    }
+
+    /// Apply the `local.<mutator>(…)` entries inside `span` to `env` — the
+    /// flat-env port of the reference's `MutationWidening` (`widen_after_call`
+    /// runs on every statement). A mutation whose own call span IS `span` is
+    /// the statement itself: it ran unconditionally, so the binding becomes
+    /// the widened nominal outright and `a.frobnicate` keeps firing. A
+    /// mutation nested deeper ran conditionally (inside an `if`, a block, a
+    /// `&&`, a `rescue` arm), where the flat env cannot reproduce `Scope#join`
+    /// — it widens to `Dynamic` instead, handing the convergence question to
+    /// the collection-shape pass: two edges that mint the same carrier join
+    /// back to it and still fire through `check_collection_call`'s Dynamic
+    /// gate, while divergent edges decline there and stay silent — exactly
+    /// the reference's union-then-decline (rigor-rs#139).
+    fn widen_mutated_locals(
+        &self,
+        mutations: &[(rigor_parse::Span, String, String)],
+        span: rigor_parse::Span,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        for (wspan, name, method) in mutations {
+            if !(span.0 <= wspan.0 && wspan.1 <= span.1) {
+                continue;
+            }
+            let Some(&pre) = env.get(name.as_str()) else {
+                continue;
+            };
+            let ty = if *wspan == span {
+                let Some(widened) = self.widen_mutated_binding(pre, method, interner) else {
+                    continue;
+                };
+                widened
+            } else {
+                interner.untyped()
+            };
+            env.insert(name.clone(), ty);
+        }
+    }
+
+    /// The binding a `local.<mutator>(…)` call leaves behind — the flat-env
+    /// port of the reference's `MutationWidening.widen_for_mutator`: a
+    /// literal-shape carrier loses its shape but keeps its class (`Tuple` →
+    /// `Nominal[Array]`, `HashShape` → `Nominal[Hash]`), a union widens
+    /// memberwise (`widen_union`), and
+    /// every other binding is untouched (`None` — a precise `Nominal` has no
+    /// shape to lose and a `Dynamic` gains nothing). The flat env tracks no
+    /// element evidence, so the nominal's args stay empty — the message reads
+    /// `for Array` where the reference says `for Array[Dynamic[top] | …]`; a
+    /// message drift only, since the harness keys on `(rule, line, col)`.
+    fn widen_mutated_binding(
+        &self,
+        ty: TypeId,
+        method: &str,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let mint = |name: &str, interner: &mut Interner| {
+            self.index
+                .class_id(name)
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
+        };
+        match interner.get(ty) {
+            Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => mint("Array", interner),
+            Type::HashShape(_) if HASH_MUTATORS.contains(&method) => mint("Hash", interner),
+            Type::Union(members) => {
+                let members = members.clone();
+                let mut out = Vec::with_capacity(members.len());
+                let mut changed = false;
+                for m in members {
+                    match self.widen_mutated_binding(m, method, interner) {
+                        Some(w) => {
+                            changed = true;
+                            out.push(w);
+                        }
+                        None => out.push(m),
+                    }
+                }
+                if !changed {
+                    return None;
+                }
+                out.sort_unstable();
+                out.dedup();
+                Some(if out.len() == 1 {
+                    out[0]
+                } else {
+                    interner.intern(Type::Union(out))
+                })
+            }
+            _ => None,
         }
     }
 

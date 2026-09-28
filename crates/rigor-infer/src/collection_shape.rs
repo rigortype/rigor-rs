@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, Type, TypeId};
+use rigor_types::{ClassId, Interner, Type, TypeId};
 
 use crate::{
     collect_flow_writes, collect_rebind_writes, indexed_flow_writes, multi_target_binder,
@@ -171,8 +171,26 @@ impl<'i> Typer<'i> {
                 let mut t = TypeEnv::new();
                 self.coll_flow_scope(ast, &body, &mut t, ctx, interner, out, true);
             }
-            // Unmodeled statement (`while`/`until`, `begin`/`rescue`, ivar
-            // writes, …): widen every local it writes and do NOT descend.
+            // `BeginRescue` is also the carrier an `if`'s `else` clause lowers
+            // to: its `main_body` runs whenever the edge runs, so the mutations
+            // in it mint carriers exactly like straight-line code — `if c; a <<
+            // 1; else; a << 1; end` converges on both edges and the reference
+            // fires on the call that follows (rigor-rs#139). A real `begin`'s
+            // body runs unconditionally the same way, as does an `ensure`.
+            // Rescue CLAUSES are conditional: their uses still record (on a
+            // scratch env cloned from the clause-entry bindings) and their
+            // writes widen.
+            Node::BeginRescue { main_body, ensure_body, clauses, .. } => {
+                self.coll_flow_scope(ast, main_body, tenv, ctx, interner, out, stmt_position);
+                for cl in clauses {
+                    let mut scratch = tenv.clone();
+                    self.coll_flow_scope(ast, &cl.body, &mut scratch, ctx, interner, out, stmt_position);
+                    widen_flow_writes(ctx.writes, cl.span, tenv, interner);
+                }
+                self.coll_flow_scope(ast, ensure_body, tenv, ctx, interner, out, stmt_position);
+            }
+            // Unmodeled statement (`while`/`until`, ivar writes, …): widen every
+            // local it writes and do NOT descend.
             other => {
                 let span = other.span();
                 widen_flow_writes(ctx.writes, span, tenv, interner);
@@ -195,12 +213,10 @@ impl<'i> Typer<'i> {
         stmt_position: bool,
     ) {
         match ast.get(id) {
-            Node::Call { receiver, method, args, block_body, safe_nav, span, .. } => {
+            Node::Call { receiver, method, args, block_body, safe_nav, span, args_plain_positional, .. } => {
                 let receiver = *receiver;
-                let method = method.clone();
-                let args = args.clone();
-                let block_body = block_body.clone();
                 let safe_nav = *safe_nav;
+                let args_plain = *args_plain_positional;
                 let call_span = *span;
                 // The receiver evaluates first (a nested `a.b` in `a.b.c`) —
                 // EXPRESSION position, so no block/`case` under it establishes
@@ -229,7 +245,7 @@ impl<'i> Typer<'i> {
                 // (`widen_for_mutator`, `mutation_widening.rb:209`).
                 let widened = match local.as_ref().and_then(|name| {
                     let ty = *tenv.get(name)?;
-                    self.coll_widen_for_mutator(interner, ty, &method)
+                    self.coll_widen_for_mutator(interner, ty, method)
                         .map(|c| (name.clone(), c, ty))
                 }) {
                     None => None,
@@ -238,14 +254,9 @@ impl<'i> Typer<'i> {
                     // being swallowed by the already-widened nominal. Read off
                     // the PRE-call carrier, like the widening itself.
                     Some((name, cls, pre_ty)) => {
-                        let mut added: Vec<TypeId> = Vec::new();
-                        for &a in Typer::coll_store_value_args(&method, &args) {
-                            for m in self.coll_store_value_classes(ast, a, tenv, interner) {
-                                if !added.contains(&m) {
-                                    added.push(m);
-                                }
-                            }
-                        }
+                        let added = self.coll_added_members(
+                            ast, cls, method, args, args_plain, tenv, interner,
+                        );
                         // Canonical order: the member set is compared only by the
                         // interned `TypeId` two branch edges end up with, so the
                         // order stores happened in must not separate them.
@@ -297,7 +308,7 @@ impl<'i> Typer<'i> {
                     }
                 };
                 // Arguments are EXPRESSION position.
-                for a in &args {
+                for a in args {
                     self.coll_flow_expr(ast, *a, tenv, ctx, interner, out, false);
                 }
                 if block_body.is_empty() {
@@ -311,7 +322,7 @@ impl<'i> Typer<'i> {
                     // outer one (uses inside the block are recorded there) …
                     let pre = tenv.clone();
                     let mut btenv = tenv.clone();
-                    self.coll_flow_scope(ast, &block_body, &mut btenv, ctx, interner, out, true);
+                    self.coll_flow_scope(ast, block_body, &mut btenv, ctx, interner, out, true);
                     // … then every write the call span contains widens (a block
                     // REBIND of a captured local is visible outside and kills the
                     // carrier — probe m15) …
@@ -324,7 +335,7 @@ impl<'i> Typer<'i> {
                     // inside a block still widens the outer binding (which is why
                     // the gitlab jira-tracker / ddl-lock rows fire in the
                     // reference). We mirror it exactly, off the PRE-call carriers.
-                    for (name, cls) in self.coll_block_mutations(ast, &block_body, &pre, interner) {
+                    for (name, cls) in self.coll_block_mutations(ast, block_body, &pre, interner) {
                         if !rebound_within(ctx.rebinds, call_span, &name) {
                             if let Some(ty) = self.coll_nominal(interner, cls) {
                                 tenv.insert(name, ty);
@@ -939,6 +950,269 @@ impl<'i> Typer<'i> {
             _ => &[],
         }
     }
+
+    /// The erased member classes one store call adds to the carrier — for an
+    /// Array carrier's `[]=`, the port of `array_added_elements`'s
+    /// `index_store_form` dispatch (`content_join.rb:76`, upstream #1141): the
+    /// splice forms (`a[i, n] = v`, `a[range] = v`) store the RHS's ELEMENTS,
+    /// an unclassifiable index (a splat inside the brackets, a `Range |
+    /// Integer` union, an untyped index) contributes BOTH readings, and a
+    /// scalar index stores the value itself. The member set is a superset
+    /// either way, so over-classifying toward `Either` is the safe side.
+    #[allow(clippy::too_many_arguments)]
+    fn coll_added_members(
+        &self,
+        ast: &LoweredAst,
+        cls: &str,
+        method: &str,
+        args: &[NodeId],
+        args_plain: bool,
+        tenv: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<TypeId> {
+        let mut added: Vec<TypeId> = Vec::new();
+        if cls == "Array" && method == "[]=" {
+            if let Some(&value) = args.last() {
+                match self.coll_index_store_form(
+                    ast,
+                    &args[..args.len() - 1],
+                    args_plain,
+                    tenv,
+                    interner,
+                ) {
+                    IndexStoreForm::Splice => {
+                        self.coll_splice_members(ast, value, tenv, interner, &mut added);
+                    }
+                    IndexStoreForm::Either => {
+                        for m in self.coll_store_value_classes(ast, value, tenv, interner) {
+                            Self::push_unique(&mut added, m);
+                        }
+                        self.coll_splice_members(ast, value, tenv, interner, &mut added);
+                    }
+                    IndexStoreForm::Element => {
+                        for m in self.coll_store_value_classes(ast, value, tenv, interner) {
+                            Self::push_unique(&mut added, m);
+                        }
+                    }
+                }
+            }
+        } else {
+            for &a in Typer::coll_store_value_args(method, args) {
+                for m in self.coll_store_value_classes(ast, a, tenv, interner) {
+                    Self::push_unique(&mut added, m);
+                }
+            }
+        }
+        added
+    }
+
+    /// Order-preserving membership insert for a small member set.
+    fn push_unique(members: &mut Vec<TypeId>, m: TypeId) {
+        if !members.contains(&m) {
+            members.push(m);
+        }
+    }
+
+    /// `index_store_form` (`content_join.rb:320`) over the `[]=` call's leading
+    /// (index) arguments, with the reference's `arg_types` nil-membership
+    /// played by `args_plain_positional`: a plain positional arg always types
+    /// (to `Dynamic` at worst — "an ordinary argument counts as a provable
+    /// index however untyped it is"), while a splat or keyword inside the
+    /// brackets is the arg the reference cannot count — `a[i, *xs] = v` may
+    /// expand to any arity, so an un-plain call reads `Either` (the superset
+    /// member set: the element AND the splice's elements). One definite index
+    /// reduces to the Range question the definite/could-be pair asks.
+    fn coll_index_store_form(
+        &self,
+        ast: &LoweredAst,
+        index_args: &[NodeId],
+        args_plain: bool,
+        tenv: &TypeEnv,
+        interner: &mut Interner,
+    ) -> IndexStoreForm {
+        if !args_plain || index_args.is_empty() {
+            return IndexStoreForm::Either;
+        }
+        if index_args.len() >= 2 {
+            return IndexStoreForm::Splice;
+        }
+        let ty = self.stmt_value_type(ast, index_args[0], tenv, interner);
+        let members = Self::coll_type_members(interner, ty);
+        if members.iter().all(|&m| self.coll_definite_range(interner, m)) {
+            return IndexStoreForm::Splice;
+        }
+        if members.iter().all(|&m| !self.coll_could_be_range(interner, m)) {
+            return IndexStoreForm::Element;
+        }
+        IndexStoreForm::Either
+    }
+
+    /// `union_members` for this pass: the union's arms, or the type itself.
+    fn coll_type_members(interner: &Interner, ty: TypeId) -> Vec<TypeId> {
+        match interner.get(ty) {
+            Type::Union(members) => members.to_vec(),
+            _ => vec![ty],
+        }
+    }
+
+    /// `range_index?` (`content_join.rb:442`): the index carrier is a Range —
+    /// `Nominal[Range]` (what a `(0..1)` literal types to here) or a
+    /// refinement / difference over one. Port `Type::IntegerRange` is a
+    /// scalar-number refinement, not a Range object, and declines exactly as
+    /// the reference's own `IntegerRange` does.
+    fn coll_range_index(&self, interner: &Interner, ty: TypeId) -> bool {
+        match interner.get(ty) {
+            Type::Nominal { class, .. } => self.index.class_name_for_id(*class) == Some("Range"),
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                let base = *base;
+                self.coll_range_index(interner, base)
+            }
+            _ => false,
+        }
+    }
+
+    /// `definite_range?` (`content_join.rb:351`): the index position PROVABLY
+    /// holds a Range — a Range carrier, or a core class whose complete
+    /// ancestor chain includes `Range`. A gradual member is excluded before
+    /// asking (it accepts in BOTH directions, and an untyped index may hold a
+    /// scalar just as well), and an unresolvable chain answers `maybe`, which
+    /// declines here — the `Either` reading belongs to
+    /// [`Self::coll_could_be_range`].
+    fn coll_definite_range(&self, interner: &Interner, ty: TypeId) -> bool {
+        if self.coll_range_index(interner, ty) {
+            return true;
+        }
+        match interner.get(ty) {
+            Type::Dynamic(_) | Type::Top => false,
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                let base = *base;
+                self.coll_definite_range(interner, base)
+            }
+            Type::Nominal { class, .. } | Type::DataInstance { class, .. } => self
+                .index
+                .class_name_for_id(*class)
+                .and_then(|n| self.index.ancestor_names(n))
+                .is_some_and(|ns| ns.contains(&"Range")),
+            _ => false,
+        }
+    }
+
+    /// `could_be_range?` (`content_join.rb:374`): the index position MAY hold
+    /// a Range at runtime — a definite Range carrier, a gradual member, a
+    /// carrier the chains cannot resolve (unresolvable ⇒ `maybe` ⇒ `either`,
+    /// the reference's own rule), or a nominal whose complete chain lacks
+    /// `Object` (a module — `class MyRange < Range; include Comparable` still
+    /// splices). A member provably disjoint from Range — every `Constant`
+    /// scalar (the port's `Scalar` holds no Range), `Tuple`, `HashShape`, an
+    /// `IntegerRange`, a `Singleton`, a nominal whose chain reaches `Object`
+    /// without passing through `Range` — is an element store.
+    fn coll_could_be_range(&self, interner: &Interner, ty: TypeId) -> bool {
+        if self.coll_range_index(interner, ty) {
+            return true;
+        }
+        match interner.get(ty) {
+            Type::Intersection(members) => {
+                members
+                    .iter()
+                    .all(|&part| self.coll_could_be_range(interner, part))
+            }
+            Type::Dynamic(_) | Type::Top => true,
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                let base = *base;
+                self.coll_could_be_range(interner, base)
+            }
+            Type::Nominal { class, .. } | Type::DataInstance { class, .. } => {
+                match self
+                    .index
+                    .class_name_for_id(*class)
+                    .and_then(|n| self.index.ancestor_names(n))
+                {
+                    // The chain cannot be resolved ⇒ `maybe` ⇒ either.
+                    None => true,
+                    Some(chain) => chain.contains(&"Range") || !chain.contains(&"Object"),
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `splice_stored_elements` (`content_join.rb:411`) erased to member
+    /// classes: a `Tuple` RHS contributes its own elements, a `Nominal[Array]`
+    /// its type args (a bare `Array`'s untyped elements — and a definite
+    /// Array-subclass RHS's — name nothing in an erased class set, so both
+    /// contribute no member), and any other member contributes its own erased
+    /// class. The reference also keeps a `Dynamic[top]` arm beside each
+    /// non-Array member for a possible `to_ary` coercion; a gradual arm names
+    /// nothing in an erased set, so it drops out here exactly as the seed's
+    /// own `Dynamic[top]` does.
+    fn coll_splice_members(
+        &self,
+        ast: &LoweredAst,
+        value: NodeId,
+        tenv: &TypeEnv,
+        interner: &mut Interner,
+        out: &mut Vec<TypeId>,
+    ) {
+        let ty = self.stmt_value_type(ast, value, tenv, interner);
+        for m in Self::coll_type_members(interner, ty) {
+            let mut base = m;
+            while let Type::Refined { base: b, .. } | Type::Difference { base: b, .. } =
+                interner.get(base)
+            {
+                base = *b;
+            }
+            match interner.get(base) {
+                Type::Tuple(elems) => {
+                    let elems = elems.clone();
+                    for e in elems {
+                        self.coll_erased_store_member(interner, e, out);
+                    }
+                }
+                // `Array#[]=` splices an Array RHS directly — `to_ary` is never
+                // consulted for one — so its own type args join exactly; a bare
+                // `Array` left them unknown (the reference's `[untyped]` arm),
+                // which names nothing in an erased member set.
+                Type::Nominal { class, args }
+                    if self.index.class_name_for_id(*class) == Some("Array") =>
+                {
+                    let args = args.clone();
+                    for a in args {
+                        self.coll_erased_store_member(interner, a, out);
+                    }
+                }
+                // A definite Array SUBCLASS splices the same way, its elements
+                // unknown to this seam (`accepts` ⇒ `[untyped]`) — no member.
+                // An unresolvable chain is `maybe`, not `yes`, and falls to the
+                // member arm like the reference's own.
+                Type::Nominal { class, .. } | Type::DataInstance { class, .. }
+                    if self.is_array_subclass(*class) => {}
+                _ => self.coll_erased_store_member(interner, m, out),
+            }
+        }
+    }
+
+    /// `class` names a definite Array subclass (`accepts` => `yes` in the
+    /// reference's terms): resolvable, not `Array` itself, and `Array` appears
+    /// among its ancestors. An unresolvable chain is `maybe`, not `yes`.
+    fn is_array_subclass(&self, class: ClassId) -> bool {
+        self.index.class_name_for_id(class).is_some_and(|n| {
+            n != "Array"
+                && self
+                    .index
+                    .ancestor_names(n)
+                    .is_some_and(|ns| ns.contains(&"Array"))
+        })
+    }
+}
+
+/// Which store `a[…] = v` performs on an Array carrier (`index_store_form`,
+/// `content_join.rb:320`): `a[i] = v` puts `v` in as one element, the splice
+/// forms (`a[i, n] = v`, `a[range] = v`) put `v`'s ELEMENTS in, and `Either`
+/// is the unclassifiable middle that contributes both readings.
+enum IndexStoreForm {
+    Splice,
+    Either,
+    Element,
 }
 
 /// The per-program write tables the collection-shape walker threads (bundled to

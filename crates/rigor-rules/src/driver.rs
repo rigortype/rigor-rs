@@ -175,8 +175,16 @@ pub fn analyze_with_source_and_folder(
                 )
             })
             .or_else(|| {
+                // The collection gate reads `env` (the widened check env), not
+                // `gate_env`: a local a receiver MUTATION widened to `Dynamic`
+                // in the check env (`a << 1` inside an `if`) must still reach
+                // the snapshot — the snap itself is the witness that the coll
+                // pass saw the carrier converge, exactly the reference's
+                // union-then-rejoin on both edges (rigor-rs#139). `gate_env`'s
+                // unwidened bindings stay for the narrowing rule, whose snaps
+                // replace a Dynamic carrier rather than witness a concrete one.
                 check_collection_call(
-                    call_id, ast, recv, &method, message_span, safe_nav, gate_env, &typer,
+                    call_id, ast, recv, &method, message_span, safe_nav, env, &typer,
                     interner, index, &coll_snaps,
                 )
             })

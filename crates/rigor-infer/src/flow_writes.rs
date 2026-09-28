@@ -226,41 +226,7 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
 /// enclosing block's body roots, so the enclosing `locals` list shadows a
 /// write there (a heredoc's body escapes its opener's span — see below).
 pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    let scopes: Vec<rigor_parse::Span> = ast
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
-                Some(n.span())
-            }
-            _ => None,
-        })
-        .collect();
-    // `(body descendant ids, names the scope binds)` for every literal block /
-    // lambda. The membership test must be STRUCTURAL, never span-based: a
-    // heredoc's body lines follow its opener, so a `#{w = 2}` inside a heredoc
-    // that sits in the call's arguments (or a sibling statement) lies inside
-    // the block's SPAN while evaluating in the outer scope — and the same
-    // escaping `#{…}` span makes a genuinely block-scoped interpolation write
-    // reachable only through the arg's child links, not through any body
-    // root's span (rigor-rs#166 review). Only scopes that bind at least one
-    // name can shadow a write, so empty `locals` lists are skipped.
-    let shadow_scopes: Vec<(HashSet<NodeId>, &[String])> = ast
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Node::Call {
-                block_body,
-                block_locals,
-                ..
-            } if !block_locals.is_empty() => Some((
-                descendants_of(ast, block_body),
-                block_locals.as_slice(),
-            )),
-            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
-                Some((descendants_of(ast, body), locals.as_slice()))
-            }
-            _ => None,
-        })
-        .collect();
+    let (scopes, shadow_scopes) = toplevel_scope_filters(ast);
     let mut out: Vec<(NodeId, rigor_parse::Span, String)> = Vec::new();
     for (id, n) in ast.iter() {
         match n {
@@ -297,6 +263,92 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
         out.into_iter().map(|(_, s, n)| (s, n)).collect();
     drop_inert_writes(ast, &mut out);
     out
+}
+
+/// The two scope filters [`toplevel_rebinds`] and [`toplevel_mutations`]
+/// share: the `def` / `class` / `module` spans (each an independent local
+/// scope) and the block/lambda SHADOW scopes as `(body descendant ids, names
+/// the scope binds)` — a write or mutation of a name a block binds is
+/// block-scoped, not a top-level-local one (rigor-rs#166). The membership
+/// test is STRUCTURAL, never span-based: a heredoc's body lines follow its
+/// opener, so an interpolation write lies inside the enclosing span while
+/// evaluating in the outer scope.
+/// A block/lambda shadow scope: its body's reachable nodes plus the names it
+/// binds (borrowed from the AST, which outlives every census built on it).
+type ShadowScope<'a> = (HashSet<NodeId>, &'a [String]);
+
+fn toplevel_scope_filters(
+    ast: &LoweredAst,
+) -> (Vec<rigor_parse::Span>, Vec<ShadowScope<'_>>) {
+    let scopes: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                Some(n.span())
+            }
+            _ => None,
+        })
+        .collect();
+    let shadow_scopes: Vec<ShadowScope<'_>> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call {
+                block_body,
+                block_locals,
+                ..
+            } if !block_locals.is_empty() => {
+                Some((descendants_of(ast, block_body), block_locals.as_slice()))
+            }
+            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
+                Some((descendants_of(ast, body), locals.as_slice()))
+            }
+            _ => None,
+        })
+        .collect();
+    (scopes, shadow_scopes)
+}
+
+/// Every in-place mutation of a TOP-LEVEL local — a `local.<mutator>(…)` call
+/// with a bare `LocalVariableRead` receiver — as `(call span, name, method)`,
+/// subject to the same def/class/module and block-binding filters as
+/// [`toplevel_rebinds`]. [`crate::flow_eval::Typer::build_toplevel_check_env`]
+/// widens these statements: a mutator call rewrites the literal carrier the
+/// binding tracked (a `Tuple`'s arity, a `HashShape`'s pair set, a `Constant`
+/// String's value) exactly as the reference's `MutationWidening` does
+/// (`mutation_widening.rb`). Without it `a = []; a[0, 2] = [1, 2]` kept `a` at
+/// `Tuple[]`, so `a.last` folded to `nil` and `x.succ` fired `for nil` where
+/// both references are silent (rigor-rs#139). The caller decides whether a
+/// contained mutation rewrote its receiver unconditionally (the statement IS
+/// the call — mint the nominal) or conditionally (inside a branch, block or
+/// value position — it widens to `Dynamic`, handing the convergence question
+/// to the collection-shape pass).
+pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String, String)> {
+    let (scopes, shadow_scopes) = toplevel_scope_filters(ast);
+    let mut out: Vec<(NodeId, rigor_parse::Span, String, String)> = Vec::new();
+    for (id, n) in ast.iter() {
+        if let Node::Call {
+            receiver: Some(r),
+            method,
+            span,
+            ..
+        } = n
+        {
+            if !MUTATOR_METHODS.contains(&method.as_str()) {
+                continue;
+            }
+            if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                out.push((id, *span, name.clone(), method.clone()));
+            }
+        }
+    }
+    out.retain(|(id, w, name, _)| {
+        !ast.in_inert_carrier(*w)
+            && !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
+            && !shadow_scopes.iter().any(|(descendants, bound)| {
+                descendants.contains(id) && bound.iter().any(|b| b == name)
+            })
+    });
+    out.into_iter().map(|(_, s, n, m)| (s, n, m)).collect()
 }
 
 /// Every node reachable from `roots` through child links, roots included —
