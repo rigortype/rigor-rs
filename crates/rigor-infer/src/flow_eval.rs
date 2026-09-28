@@ -101,7 +101,7 @@ impl<'i> Typer<'i> {
             // (`defined?`, `END`, `BEGIN`) has no writes in `rebinds` and so
             // changes nothing (rigor-rs#153).
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
-                for s in body.clone() {
+                for &s in body {
                     self.bind_check_statement(ast, s, env, rebinds, mutations, interner);
                 }
             }

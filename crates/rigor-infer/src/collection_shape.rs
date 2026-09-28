@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, Type, TypeId};
+use rigor_types::{ClassId, Interner, Type, TypeId};
 
 use crate::{
     collect_flow_writes, collect_rebind_writes, indexed_flow_writes, multi_target_binder,
@@ -181,15 +181,13 @@ impl<'i> Typer<'i> {
             // scratch env cloned from the clause-entry bindings) and their
             // writes widen.
             Node::BeginRescue { main_body, ensure_body, clauses, .. } => {
-                let (main_body, ensure_body, clauses) =
-                    (main_body.clone(), ensure_body.clone(), clauses.clone());
-                self.coll_flow_scope(ast, &main_body, tenv, ctx, interner, out, stmt_position);
-                for cl in &clauses {
+                self.coll_flow_scope(ast, main_body, tenv, ctx, interner, out, stmt_position);
+                for cl in clauses {
                     let mut scratch = tenv.clone();
                     self.coll_flow_scope(ast, &cl.body, &mut scratch, ctx, interner, out, stmt_position);
                     widen_flow_writes(ctx.writes, cl.span, tenv, interner);
                 }
-                self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
+                self.coll_flow_scope(ast, ensure_body, tenv, ctx, interner, out, stmt_position);
             }
             // Unmodeled statement (`while`/`until`, ivar writes, …): widen every
             // local it writes and do NOT descend.
@@ -217,9 +215,6 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::Call { receiver, method, args, block_body, safe_nav, span, args_plain_positional, .. } => {
                 let receiver = *receiver;
-                let method = method.clone();
-                let args = args.clone();
-                let block_body = block_body.clone();
                 let safe_nav = *safe_nav;
                 let args_plain = *args_plain_positional;
                 let call_span = *span;
@@ -250,7 +245,7 @@ impl<'i> Typer<'i> {
                 // (`widen_for_mutator`, `mutation_widening.rb:209`).
                 let widened = match local.as_ref().and_then(|name| {
                     let ty = *tenv.get(name)?;
-                    self.coll_widen_for_mutator(interner, ty, &method)
+                    self.coll_widen_for_mutator(interner, ty, method)
                         .map(|c| (name.clone(), c, ty))
                 }) {
                     None => None,
@@ -260,7 +255,7 @@ impl<'i> Typer<'i> {
                     // the PRE-call carrier, like the widening itself.
                     Some((name, cls, pre_ty)) => {
                         let added = self.coll_added_members(
-                            ast, cls, &method, &args, args_plain, tenv, interner,
+                            ast, cls, method, args, args_plain, tenv, interner,
                         );
                         // Canonical order: the member set is compared only by the
                         // interned `TypeId` two branch edges end up with, so the
@@ -313,7 +308,7 @@ impl<'i> Typer<'i> {
                     }
                 };
                 // Arguments are EXPRESSION position.
-                for a in &args {
+                for a in args {
                     self.coll_flow_expr(ast, *a, tenv, ctx, interner, out, false);
                 }
                 if block_body.is_empty() {
@@ -327,7 +322,7 @@ impl<'i> Typer<'i> {
                     // outer one (uses inside the block are recorded there) …
                     let pre = tenv.clone();
                     let mut btenv = tenv.clone();
-                    self.coll_flow_scope(ast, &block_body, &mut btenv, ctx, interner, out, true);
+                    self.coll_flow_scope(ast, block_body, &mut btenv, ctx, interner, out, true);
                     // … then every write the call span contains widens (a block
                     // REBIND of a captured local is visible outside and kills the
                     // carrier — probe m15) …
@@ -340,7 +335,7 @@ impl<'i> Typer<'i> {
                     // inside a block still widens the outer binding (which is why
                     // the gitlab jira-tracker / ddl-lock rows fire in the
                     // reference). We mirror it exactly, off the PRE-call carriers.
-                    for (name, cls) in self.coll_block_mutations(ast, &block_body, &pre, interner) {
+                    for (name, cls) in self.coll_block_mutations(ast, block_body, &pre, interner) {
                         if !rebound_within(ctx.rebinds, call_span, &name) {
                             if let Some(ty) = self.coll_nominal(interner, cls) {
                                 tenv.insert(name, ty);
@@ -1054,7 +1049,7 @@ impl<'i> Typer<'i> {
     /// `union_members` for this pass: the union's arms, or the type itself.
     fn coll_type_members(interner: &Interner, ty: TypeId) -> Vec<TypeId> {
         match interner.get(ty) {
-            Type::Union(members) => members.clone(),
+            Type::Union(members) => members.to_vec(),
             _ => vec![ty],
         }
     }
@@ -1161,11 +1156,10 @@ impl<'i> Typer<'i> {
         let ty = self.stmt_value_type(ast, value, tenv, interner);
         for m in Self::coll_type_members(interner, ty) {
             let mut base = m;
-            loop {
-                base = match interner.get(base) {
-                    Type::Refined { base: b, .. } | Type::Difference { base: b, .. } => *b,
-                    _ => break,
-                };
+            while let Type::Refined { base: b, .. } | Type::Difference { base: b, .. } =
+                interner.get(base)
+            {
+                base = *b;
             }
             match interner.get(base) {
                 Type::Tuple(elems) => {
@@ -1191,16 +1185,23 @@ impl<'i> Typer<'i> {
                 // An unresolvable chain is `maybe`, not `yes`, and falls to the
                 // member arm like the reference's own.
                 Type::Nominal { class, .. } | Type::DataInstance { class, .. }
-                    if self.index.class_name_for_id(*class).is_some_and(|n| {
-                        n != "Array"
-                            && self
-                                .index
-                                .ancestor_names(n)
-                                .is_some_and(|ns| ns.contains(&"Array"))
-                    }) => {}
+                    if self.is_array_subclass(*class) => {}
                 _ => self.coll_erased_store_member(interner, m, out),
             }
         }
+    }
+
+    /// `class` names a definite Array subclass (`accepts` => `yes` in the
+    /// reference's terms): resolvable, not `Array` itself, and `Array` appears
+    /// among its ancestors. An unresolvable chain is `maybe`, not `yes`.
+    fn is_array_subclass(&self, class: ClassId) -> bool {
+        self.index.class_name_for_id(class).is_some_and(|n| {
+            n != "Array"
+                && self
+                    .index
+                    .ancestor_names(n)
+                    .is_some_and(|ns| ns.contains(&"Array"))
+        })
     }
 }
 

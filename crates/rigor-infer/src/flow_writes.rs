@@ -276,7 +276,7 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
 #[allow(clippy::type_complexity)]
 fn toplevel_scope_filters(
     ast: &LoweredAst,
-) -> (Vec<rigor_parse::Span>, Vec<(HashSet<NodeId>, Vec<String>)>) {
+) -> (Vec<rigor_parse::Span>, Vec<(HashSet<NodeId>, &[String])>) {
     let scopes: Vec<rigor_parse::Span> = ast
         .iter()
         .filter_map(|(_, n)| match n {
@@ -286,7 +286,7 @@ fn toplevel_scope_filters(
             _ => None,
         })
         .collect();
-    let shadow_scopes: Vec<(HashSet<NodeId>, Vec<String>)> = ast
+    let shadow_scopes: Vec<(HashSet<NodeId>, &[String])> = ast
         .iter()
         .filter_map(|(_, n)| match n {
             Node::Call {
@@ -294,10 +294,10 @@ fn toplevel_scope_filters(
                 block_locals,
                 ..
             } if !block_locals.is_empty() => {
-                Some((descendants_of(ast, block_body), block_locals.clone()))
+                Some((descendants_of(ast, block_body), block_locals.as_slice()))
             }
             Node::Lambda { body, locals, .. } if !locals.is_empty() => {
-                Some((descendants_of(ast, body), locals.clone()))
+                Some((descendants_of(ast, body), locals.as_slice()))
             }
             _ => None,
         })
