@@ -658,7 +658,11 @@ impl SeverityStamp {
 ///    tripped (`overlay: None`), the project is empty, the buffer is new/unsaved, or
 ///    it lives outside `paths:`. Then every candidate spelling of the buffer is
 ///    enumerated ([`Self::check_spellings`]) and the buffer is excluded only if they
-///    are ALL excluded — the invariant again, this time computed.
+///    are ALL excluded — the invariant again, this time computed — and it knows
+///    two names `check` never matches `exclude:` against: a `paths:` entry that
+///    names the `.rb` file itself and the explicit `rigor check <file>` spelling
+///    of a file under no `paths:` root (verbatim `accept_as_ruby_file?` roots —
+///    `reject_excluded` runs inside directory expansion only).
 ///
 /// The spelling half still matters because `exclude:` patterns are matched against
 /// the path string as `check` SPELLS it, not an absolute canonical path: bare
