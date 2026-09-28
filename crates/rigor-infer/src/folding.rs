@@ -457,7 +457,7 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
     };
     match (method, args) {
         ("[]" | "slice" | "byteslice", [Scalar::Int(i)]) => {
-            let i = if *i < 0 { i + len } else { *i };
+            let i = if *i < 0 { *i + len } else { *i };
             Some(if (0..len).contains(&i) {
                 Scalar::Str(a[i as usize..=i as usize].to_owned())
             } else {
@@ -474,7 +474,7 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
         // is `nil`. Only an Integer index — Ruby truncates a Float and raises
         // on anything else.
         ("getbyte", [Scalar::Int(i)]) => {
-            let i = if *i < 0 { i + len } else { *i };
+            let i = if *i < 0 { *i + len } else { *i };
             Some(if (0..len).contains(&i) {
                 Scalar::Int(i64::from(a.as_bytes()[i as usize]))
             } else {
@@ -496,7 +496,7 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
             let start = match rest {
                 [] => len,
                 [Scalar::Int(p)] => {
-                    let p = if *p < 0 { p + len } else { *p };
+                    let p = if *p < 0 { *p + len } else { *p };
                     if p < 0 {
                         return Some(Scalar::Nil);
                     }
@@ -512,7 +512,7 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
             Some(a[..end].rfind(sub.as_str()).map_or(Scalar::Nil, |p| Scalar::Int(p as i64)))
         }
         ("index" | "byteindex", [Scalar::Str(sub), Scalar::Int(offset)]) if sub.is_ascii() => {
-            let offset = if *offset < 0 { offset + len } else { *offset };
+            let offset = if *offset < 0 { *offset + len } else { *offset };
             if !(0..=len).contains(&offset) {
                 return Some(Scalar::Nil);
             }
