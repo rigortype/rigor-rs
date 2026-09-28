@@ -29,6 +29,7 @@
 
 use rigor_rules::Severity;
 use serde::Serialize;
+use std::fmt::Write as _;
 
 /// One diagnostic flattened for the CI formatters: the resolved location plus
 /// the fields a format renders. `rule_id` is the qualified rule (rigor-rs keeps
@@ -58,16 +59,10 @@ pub struct Rendered<'a> {
 pub fn render_text(rows: &[Rendered]) -> String {
     let mut out = String::new();
     for r in rows {
-        out.push_str(&format!(
-            "{}:{}:{}: {}: {}",
-            r.path,
-            r.line,
-            r.column,
-            r.severity.as_str(),
-            r.message
-        ));
+        write!(out, "{}:{}:{}: {}: {}", r.path, r.line, r.column, r.severity.as_str(), r.message)
+            .unwrap();
         if let Some(rule) = r.rule_id {
-            out.push_str(&format!(" [{rule}]"));
+            write!(out, " [{rule}]").unwrap();
         }
         out.push('\n');
     }
@@ -84,7 +79,7 @@ pub fn render_text(rows: &[Rendered]) -> String {
             error_files.push(r.path);
         }
     }
-    out.push_str(&format!("\n{} error(s) in {} file(s)\n", errors.len(), error_files.len()));
+    writeln!(out, "\n{} error(s) in {} file(s)", errors.len(), error_files.len()).unwrap();
     out
 }
 
@@ -104,7 +99,7 @@ pub fn render_github(rows: &[Rendered]) -> String {
             };
             let mut props = format!("file={},line={},col={}", gh_escape_prop(r.path), r.line, r.column);
             if let Some(rule) = r.rule_id {
-                props.push_str(&format!(",title={}", gh_escape_prop(rule)));
+                write!(props, ",title={}", gh_escape_prop(rule)).unwrap();
             }
             format!("::{level} {props}::{}", gh_escape_data(r.message))
         })
@@ -244,7 +239,7 @@ pub fn render_sarif(rows: &[Rendered]) -> String {
             results,
         }],
     };
-    serde_json::to_string_pretty(&log).unwrap()
+    serde_json::to_string_pretty(&log).expect("serializing a plain-data SARIF struct cannot fail")
 }
 
 /// GitLab Code Quality report — the CodeClimate-subset JSON array GitLab reads
@@ -291,7 +286,8 @@ pub fn render_gitlab(rows: &[Rendered]) -> String {
             },
         })
         .collect();
-    serde_json::to_string_pretty(&entries).unwrap()
+    serde_json::to_string_pretty(&entries)
+        .expect("serializing a plain-data codequality struct cannot fail")
 }
 
 fn gitlab_severity(severity: Severity) -> &'static str {

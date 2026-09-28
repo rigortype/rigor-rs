@@ -212,12 +212,12 @@ const SARIF: &str = r#"{
 
 #[test]
 fn text_matches_the_reference() {
-    assert_eq!(check_format("text"), (TEXT.to_string(), String::new(), 1));
+    assert_eq!(check_format("text"), (TEXT.to_owned(), String::new(), 1));
 }
 
 #[test]
 fn github_matches_the_reference() {
-    assert_eq!(check_format("github"), (GITHUB.to_string(), String::new(), 1));
+    assert_eq!(check_format("github"), (GITHUB.to_owned(), String::new(), 1));
 }
 
 #[test]
