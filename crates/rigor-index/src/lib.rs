@@ -374,6 +374,84 @@ impl CoreIndex {
         self.data.singleton_method_tuple_return(class, method)
     }
 
+    /// Issue #168: the `(return class, nilable)` of `class_name#method` for a
+    /// receiver the source index typed — the [`Self::method_return`] answer
+    /// with the qualified-preferred routing a project signature's `use`-mapped
+    /// / `::`-anchored member names need. See
+    /// [`rbs::CoreData::receiver_method_return`].
+    pub fn receiver_method_return(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        self.data.receiver_method_return(class, method)
+    }
+
+    /// Issue #168: the tuple twin of [`Self::receiver_method_return`], with
+    /// element names resolved through the definer's member contexts (an
+    /// unresolvable element degrades to `Unknown`, not a whole-tuple decline).
+    /// See [`rbs::CoreData::receiver_method_tuple_return`].
+    pub fn receiver_method_tuple_return(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<Vec<RbsReturnShape>> {
+        self.data.receiver_method_tuple_return(class, method)
+    }
+
+    /// Issue #168: the singleton twin of [`Self::receiver_method_return`]
+    /// (`def self.m` on a project-signature class). See
+    /// [`rbs::CoreData::receiver_singleton_method_return`].
+    pub fn receiver_singleton_method_return(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<&'static str> {
+        self.data.receiver_singleton_method_return(class, method)
+    }
+
+    /// Issue #168: the singleton-tuple twin of
+    /// [`Self::receiver_method_tuple_return`]. See
+    /// [`rbs::CoreData::receiver_singleton_tuple_return`].
+    pub fn receiver_singleton_tuple_return(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<Vec<RbsReturnShape>> {
+        self.data.receiver_singleton_tuple_return(class, method)
+    }
+
+    /// Issue #168: whether `name` is a type the missing-referenced-type pass
+    /// SYNTHESIZED — `Dynamic[top]` in the reference, so every diagnostic and
+    /// return lookup must decline it. See [`rbs::CoreData::is_synthesized_stub`].
+    pub fn is_synthesized_stub(&self, name: &str) -> bool {
+        self.data.is_synthesized_stub(name)
+    }
+
+    /// Issue #168: whether `qname`'s instance definition could be built by the
+    /// reference's `build_instance` (complete ancestor chain, no module where
+    /// a superclass belongs, every module self-type declared). See
+    /// [`rbs::CoreData::project_sig_chain_ok`].
+    pub fn project_sig_chain_ok(&self, qname: &str) -> bool {
+        self.data.project_sig_chain_ok(qname)
+    }
+
+    /// Issue #168: the class names project `sig/` introduced (qualified and
+    /// short) — the set the source registry pre-registers so an RBS return
+    /// naming one can mint its `Nominal`. See
+    /// [`rbs::CoreData::project_sig_declared_names`].
+    pub fn project_sig_declared_names(&self) -> Vec<&'static str> {
+        self.data.project_sig_declared_names()
+    }
+
+    /// Issue #168: the SYNTHESIZED (module/class) stub names — registered for
+    /// `Nominal` identity only; a stub receiver is `Dynamic[top]` in the
+    /// reference so it never joins the declaration-only witness set. See
+    /// [`rbs::CoreData::synthesized_stub_names`].
+    pub fn synthesized_stub_names(&self) -> Vec<&'static str> {
+        self.data.synthesized_stub_names()
+    }
+
     /// Every class name reachable as an element of a tuple return in the loaded
     /// RBS — the closed set the source registry pre-registers ids for, so a
     /// `Nominal` can be minted for an RBS-only element class that the analyzed

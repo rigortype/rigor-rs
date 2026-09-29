@@ -152,6 +152,40 @@ impl<'i> Typer<'i> {
         if let Type::Singleton(class) = interner.get(recv_ty) {
             let class = *class;
             if let Some(class_name) = self.source.class_name_for_id(class) {
+                // Issue #168: a PROJECT-sig class object's `def self.m` return —
+                // `Foo::Impl.make` behind `use Foo::*`. The member names a
+                // project signature stores (`::`-anchored / `use`-mapped)
+                // resolve only through the qualified path, so this rides
+                // `receiver_singleton_*` — which falls back to the identical
+                // short-key answer for bundled names — gated the same way the
+                // instance arm is: project-sig provenance requires the
+                // reference's `build_singleton` to succeed
+                // (`project_sig_chain_ok`); a SYNTHESIZED stub receiver is
+                // `Dynamic[top]` upstream, never a mintable carrier.
+                if self.index.is_synthesized_stub(class_name) {
+                    return interner.untyped();
+                }
+                if self.index.is_qualified_project_sig_class(class_name)
+                    && self.index.project_sig_chain_ok(class_name)
+                {
+                    if let Some(shapes) =
+                        self.index.receiver_singleton_tuple_return(class_name, method)
+                    {
+                        return self.intern_rbs_tuple(&shapes, interner);
+                    }
+                    if let Some(ret) =
+                        self.index.receiver_singleton_method_return(class_name, method)
+                    {
+                        if let Some(class_id) = self
+                            .index
+                            .class_id(ret)
+                            .or_else(|| self.source.class_id(ret))
+                        {
+                            return interner
+                                .intern(Type::Nominal { class: class_id, args: vec![] });
+                        }
+                    }
+                }
                 // A TUPLE return (`Process.wait2 : [Integer, Process::Status]`)
                 // types to a `Type::Tuple` of its element classes — the shape the
                 // flat `singleton_method_return` slot collapses to `None`. Same
@@ -354,6 +388,58 @@ impl<'i> Typer<'i> {
         // core name — falls through to Dynamic (silent; zero-FP).
         if let Some(src_name) = self.source.class_name_for_id_of(interner, recv_ty) {
             let src_name = src_name.to_string();
+            // Issue #168: a SYNTHESIZED missing-type stub receiver is
+            // `Dynamic[top]` in the reference (`try_synthesized_stub_type`) —
+            // never a carrier a source method table may answer for either
+            // (the stub exists exactly because nothing declared the name).
+            if self.index.is_synthesized_stub(&src_name) {
+                return interner.untyped();
+            }
+            // Issue #168 (tier-4b RBS half): a receiver typed by a PROJECT-sig
+            // class gets its method returns from the loaded RBS — `x.make`
+            // where `use Foo::*` mapped the receiver's signature. The member
+            // names a project signature stores (`::`-anchored / `use`-mapped /
+            // root-only) resolve only through the qualified path, which
+            // `receiver_method_*` prefers for exactly these names; a bundled
+            // qualified-only name (`Process::Status`, reached through a tuple
+            // element mint) takes the same ADR-0042 Slice-5 routing it already
+            // had via `method_return_nilable`. Two gates keep it
+            // zero-false-positive:
+            //   * `project_sig_chain_ok` — the reference's `build_instance`
+            //     collapses the whole definition to `Dynamic[top]` when the
+            //     chain is incomplete / a module sits where a superclass
+            //     belongs / a module self-type never declared (project-sig
+            //     names only; bundled names keep prefix semantics);
+            //   * nilable — a `C?` return is `C | nil` upstream, a carrier no
+            //     negative rule fires on (the `ENV['X']` arm's discipline).
+            let qualified_receiver = self.index.is_qualified_project_sig_class(&src_name)
+                || (self.index.knows_qualified_class(&src_name)
+                    && !self.index.knows_class(&src_name));
+            if qualified_receiver
+                && (!self.index.is_qualified_project_sig_class(&src_name)
+                    || self.index.project_sig_chain_ok(&src_name))
+            {
+                if let Some(shapes) =
+                    self.index.receiver_method_tuple_return(&src_name, method)
+                {
+                    return self.intern_rbs_tuple(&shapes, interner);
+                }
+                if let Some((ret, nilable)) =
+                    self.index.receiver_method_return(&src_name, method)
+                {
+                    if nilable {
+                        return interner.untyped();
+                    }
+                    if let Some(class_id) = self
+                        .index
+                        .class_id(ret)
+                        .or_else(|| self.source.class_id(ret))
+                    {
+                        return interner
+                            .intern(Type::Nominal { class: class_id, args: vec![] });
+                    }
+                }
+            }
             if let Some(ret_core) = self.source.method_return(&src_name, method) {
                 if let Some(class_id) = self.index.class_id(ret_core) {
                     return interner.intern(Type::Nominal { class: class_id, args: vec![] });
