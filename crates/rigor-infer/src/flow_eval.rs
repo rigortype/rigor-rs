@@ -147,6 +147,10 @@ impl<'i> Typer<'i> {
     /// mints the widened nominal (the flat env's own answer for a
     /// same-statement mutator call); anything else widens `Dynamic`, the
     /// flat env's conservative decline for a conditional position.
+    // too_many_arguments: the replay context (ast, flow, env, interner) is
+    // threaded through each recursive step; bundling into a struct would
+    // obscure the recursion.
+    #[allow(clippy::too_many_arguments)]
     fn entry_descend(
         &self,
         ast: &LoweredAst,
@@ -242,6 +246,9 @@ impl<'i> Typer<'i> {
     /// is entered. A `Barrier` child is a scope boundary — it gets the flat
     /// env, which for a block body is the `ScopedEnv::at` answer from before
     /// this pass.
+    // too_many_arguments: same replay context as `entry_descend`; a bundle
+    // struct would obscure the recursion.
+    #[allow(clippy::too_many_arguments)]
     fn entry_children(
         &self,
         ast: &LoweredAst,
