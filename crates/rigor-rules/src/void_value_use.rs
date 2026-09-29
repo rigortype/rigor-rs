@@ -39,20 +39,18 @@ pub fn void_value_use_diagnostics(
     let env = ScopedEnv::build(&typer, ast, interner);
     let mut out = Vec::new();
     for (_id, node) in ast.iter() {
-        let span = node.span();
-        let scoped = env.at(span);
         match node {
             Node::LocalVariableWrite { value, .. }
             | Node::InstanceVariableWrite { value, .. }
             | Node::ConstantWrite { value, .. } => {
-                check_void_value_use(ast, *value, scoped, &typer, interner, index, &mut out);
+                check_void_value_use(ast, *value, &env, &typer, interner, index, &mut out);
             }
             Node::Call { receiver, args, .. } => {
                 if let Some(recv) = receiver {
-                    check_void_value_use(ast, *recv, scoped, &typer, interner, index, &mut out);
+                    check_void_value_use(ast, *recv, &env, &typer, interner, index, &mut out);
                 }
                 for &arg in args {
-                    check_void_value_use(ast, arg, scoped, &typer, interner, index, &mut out);
+                    check_void_value_use(ast, arg, &env, &typer, interner, index, &mut out);
                 }
             }
             _ => {}
@@ -71,7 +69,7 @@ pub fn void_value_use_diagnostics(
 fn check_void_value_use(
     ast: &LoweredAst,
     value_id: NodeId,
-    env: &rigor_infer::TypeEnv,
+    scoped: &ScopedEnv,
     typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
@@ -81,7 +79,9 @@ fn check_void_value_use(
         return;
     };
     let (recv, method, span) = (*recv, method.clone(), *span);
-    let recv_ty = typer.type_of(ast, recv, env, interner);
+    // The value types from the scope it was entered from (rigor-rs#136).
+    let env = scoped.at(ast, typer, ast.get(value_id).span(), interner);
+    let recv_ty = typer.type_of(ast, recv, &env, interner);
     // Resolve the receiver to (class name, dispatch kind).
     let (class_name, is_singleton) = if let Type::Singleton(class) = interner.get(recv_ty) {
         match typer.source().class_name_for_id(*class) {

@@ -7,7 +7,7 @@ use rigor_parse::{LoweredAst, NodeId};
 use rigor_types::{Interner, Type};
 
 use crate::{
-    catalog, concrete_class_name, render_receiver, Diagnostic, Severity,
+    catalog, concrete_class_name, render_receiver, Diagnostic, ScopedEnv, Severity,
     CALL_ARGUMENT_TYPE_MISMATCH, CALL_WRONG_ARITY,
 };
 
@@ -302,7 +302,7 @@ fn single_overload_mismatch(
     ov: &OverloadSignature,
     args: &[NodeId],
     ast: &LoweredAst,
-    env: &rigor_infer::TypeEnv,
+    scoped: &ScopedEnv,
     typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
@@ -328,7 +328,11 @@ fn single_overload_mismatch(
             continue; // arity mismatch is the wrong-arity rule's concern.
         };
         let param_name = names.get(i).copied().flatten();
-        let arg_ty = typer.type_of(ast, arg, env, interner);
+        // `argument_scope(arg)`: each argument types from the scope it was
+        // ENTERED from (rigor-rs#136) — a later arg's env still sees the
+        // earlier args' effects, the first arg's does not.
+        let arg_env = scoped.at(ast, typer, ast.get(arg).span(), interner);
+        let arg_ty = typer.type_of(ast, arg, &arg_env, interner);
 
         if arg_is_pure_nil(interner, index, source, arg_ty) {
             if index.param_admits_nil(param) {
@@ -371,7 +375,7 @@ fn multi_overload_mismatch(
     method: &str,
     args: &[NodeId],
     ast: &LoweredAst,
-    env: &rigor_infer::TypeEnv,
+    scoped: &ScopedEnv,
     typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
@@ -398,7 +402,9 @@ fn multi_overload_mismatch(
             continue;
         };
 
-        let arg_ty = typer.type_of(ast, arg, env, interner);
+        // `argument_scope(arg)`: the scope the argument was entered from.
+        let arg_env = scoped.at(ast, typer, ast.get(arg).span(), interner);
+        let arg_ty = typer.type_of(ast, arg, &arg_env, interner);
 
         if arg_is_pure_nil(interner, index, source, arg_ty) {
             if params.iter().any(|p| index.param_admits_nil(p)) {
@@ -442,7 +448,11 @@ fn multi_overload_mismatch(
 ///   concern — this never double-fires with undefined-method);
 /// - unlike undefined-method / wrong-arity, this does NOT skip when the project
 ///   also `def`s the method: the RBS sig is the authoritative parameter contract
-///   (reference `check_rules.rb:1955`).
+///   (reference `check_rules.rb:1955`);
+/// - each argument types from the scope it was entered from (reference
+///   `argument_scope`, rigor-rs#136): `f(b.unshift("s"), b.first)` types the
+///   second arg against the scope the first left, while the first arg still
+///   sees the call's entry scope.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_argument_type_mismatch(
     ast: &LoweredAst,
@@ -450,7 +460,8 @@ pub(crate) fn check_argument_type_mismatch(
     method: &str,
     args: &[rigor_parse::NodeId],
     args_all_plain: bool,
-    env: &rigor_infer::TypeEnv,
+    message_span: (usize, usize),
+    scoped: &ScopedEnv,
     typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
@@ -466,7 +477,8 @@ pub(crate) fn check_argument_type_mismatch(
     }
 
     let source = typer.source();
-    let recv_ty = typer.type_of(ast, receiver, env, interner);
+    let call_env = scoped.at(ast, typer, message_span, interner);
+    let recv_ty = typer.type_of(ast, receiver, &call_env, interner);
 
     // Resolve `(class_name, overloads)` for INSTANCE or SINGLETON (class-method)
     // dispatch. The overloads are cloned so no `index` borrow lingers across the
@@ -490,9 +502,11 @@ pub(crate) fn check_argument_type_mismatch(
     }
 
     let mismatch = if overloads.len() == 1 {
-        single_overload_mismatch(&overloads[0], args, ast, env, typer, interner, index, source)
+        single_overload_mismatch(&overloads[0], args, ast, scoped, typer, interner, index, source)
     } else {
-        multi_overload_mismatch(&overloads, method, args, ast, env, typer, interner, index, source)
+        multi_overload_mismatch(
+            &overloads, method, args, ast, scoped, typer, interner, index, source,
+        )
     }?;
 
     let (start, end) = ast.get(mismatch.arg).span();

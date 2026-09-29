@@ -63,6 +63,7 @@ use rigor_parse::{LoweredAst, NodeId};
 use rigor_types::{Interner, TypeId};
 
 pub use class_narrowing::ClassNarrowing;
+pub use flow_eval::CheckFlow;
 pub use flow_writes::collect_flow_writes;
 pub use folding::RubyFolder;
 pub use source_index::{
