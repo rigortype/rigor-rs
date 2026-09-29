@@ -126,9 +126,9 @@ pub fn sidecar_foldable(receiver_class: &str, method: &str) -> bool {
 /// would otherwise build the string, and a 3e9 width took 70 s and 10 GB.
 pub fn sidecar_blows_up(method: &str, args: &[Scalar]) -> bool {
     matches!(method, "center" | "ljust" | "rjust")
-        && matches!(args.first(), Some(Scalar::Int(w))
-            if *w > crate::kernel_fold::STRING_FOLD_BYTE_LIMIT as i64
-        // A Bignum width exceeds the byte limit by construction.
+        && (matches!(args.first(), Some(Scalar::Int(w))
+            if *w > crate::kernel_fold::STRING_FOLD_BYTE_LIMIT as i64)
+            // A Bignum width exceeds the byte limit by construction.
             || matches!(args.first(), Some(Scalar::BigInt(_))))
 }
 
@@ -754,6 +754,7 @@ mod tests {
         assert!(!sidecar_blows_up("center", &[Scalar::Int(4096)]));
         assert!(sidecar_blows_up("center", &[Scalar::Int(4097)]));
         assert!(sidecar_blows_up("ljust", &[Scalar::Int(3_000_000_000), Scalar::Str("-".into())]));
+        assert!(sidecar_blows_up("center", &[Scalar::BigInt("99999999999999999999".into())]));
         assert!(!sidecar_blows_up("tr", &[Scalar::Int(9999)]));
     }
 
