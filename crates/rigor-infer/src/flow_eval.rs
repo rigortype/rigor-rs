@@ -523,10 +523,11 @@ impl<'i> Typer<'i> {
                 // was just bound to — so the reference widens each receiver AFTER
                 // `MultiTargetBinder` applies (`eval_multi_write`, rigor-rs#134).
                 // Widening by the TARGET span mints the unconditional carrier
-                // (`wspan == span`), as a straight-line `h[k] = v` gets.
+                // (`path_unconditional` reaches it through `target_exprs`),
+                // as a straight-line `h[k] = v` gets.
                 if let Node::MultiWrite { targets, .. } = ast.get(id) {
                     for (_, tspan) in targets.index_writes() {
-                        self.widen_mutated_locals(mutations, tspan, env, interner);
+                        self.widen_mutated_locals(ast, mutations, id, tspan, env, interner);
                     }
                 }
             }
