@@ -12,9 +12,10 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-28): pin `e59b7b89`, 0 FP / 9,337, gaps 827.** In flight:
-#168 claimed. Retractions: **#134–#137**. FPs: #146. CLI/config:
-#155–#159, #162, #168–#171; #160 blocked upstream. Also #130, #132, #194.
+▶ **NEXT (2026-09-29): pin `e59b7b89`, 0 FP / 9,337, gaps 827.** Nothing
+claimed; WIP branches hold interrupted work: #168 `ebcc596`,
+#194 `3baa519`. Retractions: **#134–#137**. FPs: #146. CLI/config:
+#155–#159, #162, #168–#171; #160 blocked upstream. Also #130, #132.
 Audit at NODE granularity — per-file histograms net over-claims vs under-claims.
 - **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
   (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
@@ -97,9 +98,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review met the deepest infer file. Branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`); merge bar is now issue-scope resolution. [note](notes/20260927-abandoned-infer-pr-stream.md).
 - **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once — nominal self slot, `arm_of`/`join` auto-splat, reopen-aware union answering (`Node::Alias` + ancestor walk), `paths:` widen = `expand(paths|argv)>files` + excludes + undecidable-decline. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
 - **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver — `declaration_prefix` re-anchors rooted/self::, multi-segment names = ONE rung, per-file `Object` slice keeps `unresolved-toplevel`. **3,002 gaps (→827), 0 FP**; fx 118; → #185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
-- **2026-09-26 #166 CLOSED** (PR #174): block/lambda params shadow toplevel locals — bound set = Prism `locals`; membership STRUCTURAL not span (heredoc `#{w=…}` = review FP). 0 FP; fx 116b. [note](notes/20260926-issue-166-block-param-shadow.md).
+- **2026-09-26 #166 CLOSED** (PR #174): block/lambda params shadow toplevel locals — bound set = Prism `locals`; membership structural not span. 0 FP; fx 116b. [note](notes/20260926-issue-166-block-param-shadow.md).
 - **2026-09-26 #165 CLOSED** (PR #175): `wrong-arity` declines on splat/kwarg/`...`; `&b`→#176. 0 FP; fx 116. [note](notes/20260926-issue-165-splat-arity.md).
-- **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 4 review rounds found 39 FP families no gate saw; **0 FP / 9,337, = master**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
+- **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 4 review rounds found 39 FP families; **0 FP / 9,337**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
 - **2026-09-25 #151 CLOSED + #153 rows 1–3** (PR #154): `Statements` carriers gain a kind (`Inert` = `defined?`/`END`/`BEGIN`/`super`/`yield`, writes dropped; `Recovered` widens); `for` index is a rebind. **0 FP / 9,337, = master**; fixture 114 exact. Review: 0 new keys. [note](notes/20260925-issues-151-153-binder-writes.md).
 - **2026-09-25 #121 CLOSED** (PR #149): String `[]`/`slice`/`byteslice`/`index` fold on literals; a class-guarded param drops the nilable slot (10 FPs). Review BLOCKed a stale-top-local nil fold (now declines) and found `i32`→`0` literal lowering and `nil&.m`, both fixed. **0 FP / 9,337, gaps = master**; fixture 113. [note](notes/20260925-string-lookup-fold-guarded-arg.md).
 - **2026-09-25 #133 CLOSED by a decline** (PR #148): the flat top-level binder never saw a nested rebind; rules now widen such locals, Dynamic-only gates keep the old env. **0 FP / 9,337, = master**; fixture 112 7→0 FPs. Folded-message drift + lost rows → #152. [note](notes/20260925-issue-133-jump-path-rebind.md).
