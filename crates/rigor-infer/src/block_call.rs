@@ -576,7 +576,11 @@ impl<'i> Typer<'i> {
     ///   write and tail read).
     ///
     /// Nodes inside the span are scanned whole — a write inside a nested
-    /// `def`/`lambda`/`defined?` over-declines, which is the safe side.
+    /// `def`/`lambda` over-declines, which is the safe side. The one
+    /// exemption is `Statements{Inert}` contents (`yield`/`super`/`defined?`/
+    /// `BEGIN`/`END` operands): the reference's evaluator never enters them,
+    /// so their writes genuinely cannot move the tail (measured: `yield (x =
+    /// 9); x` folds to the entry element on both engines).
     fn fold_body_has_unmodelled_write(
         &self,
         ast: &LoweredAst,
@@ -591,9 +595,25 @@ impl<'i> Typer<'i> {
             .last()
             .map(|&t| ast.get(t).span().1)
             .unwrap_or(usize::MAX);
+        // `Statements{Inert}` carriers (`yield`/`super`/`defined?`/`BEGIN`/`END`
+        // operands): the reference's statement evaluator never enters them, so
+        // a write or mutation inside cannot change what the tail reads —
+        // `yield (x = 9); x` folds to the entry element there. Exempt their
+        // contents rather than decline: declining is safe but costs parity.
+        let inert: Vec<rigor_parse::Span> = ast
+            .iter()
+            .filter(|(_, n)| {
+                matches!(n, Node::Statements { kind: StatementsKind::Inert, .. })
+                    && block_span.0 <= n.span().0
+                    && n.span().1 <= block_span.1
+            })
+            .map(|(_, n)| n.span())
+            .collect();
         for (id, node) in ast.iter() {
             let span = node.span();
-            if !(block_span.0 <= span.0 && span.1 <= block_span.1) {
+            if !(block_span.0 <= span.0 && span.1 <= block_span.1)
+                || inert.iter().any(|i| i.0 <= span.0 && span.1 <= i.1)
+            {
                 continue;
             }
             match node {

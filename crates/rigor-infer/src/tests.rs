@@ -1580,6 +1580,24 @@ fn per_element_map_fold_declines_unmodelled_writes() {
     };
     assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(9)));
     assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(9)));
+    // Contents of `yield`/`super`/`defined?` operands never bind in the
+    // reference's evaluator (no `YieldNode`/`SuperNode`/`DefinedNode`
+    // handler), so writes inside them are EXEMPT — the fold proceeds and
+    // matches the reference's entry-element answer `[1, 2]` exactly.
+    for src in [
+        b"def f; [1, 2].map { |x| yield (x = 9); x }; end\n".as_slice(),
+        b"[1, 2].map { |x| defined?(x = 9); x }\n".as_slice(),
+        b"[1, 2].map { |x| yield x; x }\n".as_slice(),
+    ] {
+        let ast = lower_src(src);
+        let call = find_call(&ast, "map");
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        assert!(
+            matches!(i.get(ty), Type::Tuple(_)),
+            "inert contents are exempt: {}",
+            String::from_utf8_lossy(src)
+        );
+    }
 }
 
 #[test]
