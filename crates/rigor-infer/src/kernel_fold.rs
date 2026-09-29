@@ -42,6 +42,8 @@ pub const STRING_FOLD_BYTE_LIMIT: usize = 4096;
 pub fn ruby_string_of(s: &Scalar) -> String {
     match s {
         Scalar::Int(n) => n.to_string(),
+        // `String(bignum)` / `bignum.to_s` is its decimal spelling verbatim.
+        Scalar::BigInt(d) => d.clone(),
         Scalar::Str(v) => v.clone(),
         Scalar::Sym(v) => v.clone(),
         Scalar::Bool(b) => b.to_string(),

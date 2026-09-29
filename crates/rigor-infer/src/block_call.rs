@@ -45,6 +45,17 @@ enum SplatArm {
     Unknown,
 }
 
+/// The positions a `find`-family per-element fold may stop at — the port of
+/// the reference's `first_match_candidates` / `NO_MATCH` pair
+/// (`expression_typer.rb:5271`).
+enum FoldMatch {
+    /// Every position folded falsey (all `Constant`) — the call answers `nil`.
+    NoMatch,
+    /// The undecided positions before the first truthy `Constant`, plus that
+    /// position itself (the search ends there whatever it answers).
+    At(Vec<usize>),
+}
+
 /// A block-level jump the [`Typer::block_level_jumps`] scan collected: its
 /// span, its control-flow kind, and the lowered VALUE expressions of a valued
 /// `break e` / `next e` (empty for the argument-less forms).
@@ -78,6 +89,7 @@ impl<'i> Typer<'i> {
         method: &str,
         block_body: &[NodeId],
         block_span: Option<rigor_parse::Span>,
+        block_locals: &[String],
         block_params: &[(String, BlockParamKind)],
         explicit_arg_list: bool,
         safe_nav: bool,
@@ -126,6 +138,7 @@ impl<'i> Typer<'i> {
                     method,
                     block_body,
                     block_span,
+                    block_locals,
                     block_params,
                     explicit_arg_list,
                     non_nil,
@@ -141,6 +154,7 @@ impl<'i> Typer<'i> {
             method,
             block_body,
             block_span,
+            block_locals,
             block_params,
             explicit_arg_list,
             recv_ty,
@@ -159,12 +173,31 @@ impl<'i> Typer<'i> {
         method: &str,
         block_body: &[NodeId],
         block_span: Option<rigor_parse::Span>,
+        block_locals: &[String],
         block_params: &[(String, BlockParamKind)],
         explicit_arg_list: bool,
         recv_ty: TypeId,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
+        // rigor-rs#194 — the reference's `try_per_element_block_fold`
+        // (`expression_typer.rb:4506`) answers BEFORE the dispatcher's RBS
+        // projection for `PER_ELEMENT_TUPLE_METHODS` on a finite Tuple
+        // receiver.
+        if let Some(folded) = self.per_element_block_fold(
+            ast,
+            method,
+            block_body,
+            block_span,
+            block_locals,
+            block_params,
+            explicit_arg_list,
+            recv_ty,
+            env,
+            interner,
+        ) {
+            return folded;
+        }
         // The receiver must resolve to a concrete class the index models; a
         // Dynamic / unknown receiver ⇒ silent (never guess the block return).
         let Some(class_name) = self.index.class_name_of(interner, recv_ty) else {
@@ -201,6 +234,452 @@ impl<'i> Typer<'i> {
             return ty;
         }
         result.unwrap_or_else(|| interner.untyped())
+    }
+
+    /// rigor-rs#194 — the reference's `try_per_element_block_fold`
+    /// (`expression_typer.rb:4506`, `PER_ELEMENT_TUPLE_METHODS`). A finite
+    /// `Tuple` receiver folds its literal block ONCE PER POSITION: the first
+    /// positional parameter binds that position's own element type, the body
+    /// tail is re-typed under it, and the per-position results assemble per
+    /// the method — `tuple_of` for `map`/`collect`, a kept-subset `Tuple` for
+    /// the filter family, a first-match `union`/`nil` for `find`/`detect`,
+    /// index constants for `find_index`/`index`, and a flattened `Tuple` for
+    /// `flat_map`/`filter_map` — strictly tighter than the RBS block-overload
+    /// `Array`, and with `undecided_fold_floor`'s honest answers
+    /// (`Array[union]` / `elem | nil` / `Integer | nil`) where the fold can
+    /// prove positions but not decide them.
+    ///
+    /// `None` declines to the untouched dispatch chain (the RBS `Array`
+    /// projection — strictly wider, never an FP). The reference's own gates
+    /// port exactly: the method-name set, `call_node.arguments.nil?` (the
+    /// port's `explicit_arg_list`), a literal `BlockNode` (`block_span` — a
+    /// `&:sym` / `&proc` pass declines, where the reference additionally
+    /// folds the SymbolNode shorthand), a non-empty body, and a Tuple with
+    /// at least one element. The reference's `Constant<Range>` element source
+    /// is not ported — a range receiver declines too.
+    ///
+    /// Three further gates are the port's FP-safe subset of machinery the
+    /// reference threads and this walk does not:
+    ///
+    /// - a block-level `break`/`next`/`return`/`redo`/`retry` — the reference
+    ///   joins `next` arms and re-routes `break` through its evaluator, while
+    ///   a tail-only read would answer the jump node itself;
+    /// - a write or in-place shape mutation that touches a CAPTURED outer
+    ///   local — the reference's `captured` bindings thread values across
+    ///   positions (`seen += 1`), which a flat per-position overlay would pin
+    ///   wrongly;
+    /// - a destructured first parameter `|(a, b)|` — the names flatten to one
+    ///   `DestructuredSelfArg` group, and a nested `|(a, (b, c))|` binds
+    ///   element-wise only through the reference's real destructure, which a
+    ///   flat positional bind would pin wrongly.
+    #[allow(clippy::too_many_arguments)]
+    fn per_element_block_fold(
+        &self,
+        ast: &LoweredAst,
+        method: &str,
+        block_body: &[NodeId],
+        block_span: Option<rigor_parse::Span>,
+        block_locals: &[String],
+        block_params: &[(String, BlockParamKind)],
+        explicit_arg_list: bool,
+        recv_ty: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        // `PER_ELEMENT_TUPLE_METHODS` (expression_typer.rb:4483).
+        const METHODS: &[&str] = &[
+            "map", "collect", "filter_map", "flat_map", "select", "filter", "reject", "find",
+            "detect", "find_index", "index",
+        ];
+        if !METHODS.contains(&method) {
+            return None;
+        }
+        if explicit_arg_list {
+            return None;
+        }
+        let block_span = block_span?;
+        let &tail = block_body.last()?;
+        let Type::Tuple(elements) = interner.get(recv_ty).clone() else {
+            return None;
+        };
+        if elements.is_empty()
+            || !self.block_level_jumps(ast, block_span).is_empty()
+            || self.fold_body_has_unmodelled_write(ast, block_body, block_span, block_locals, env)
+            // Only a bare single-positional block (`|x|`, `|x = 1|`, `it`,
+            // `_1`, `|;local|` declarations bind nothing) folds. A second
+            // positional, a destructure, `*rest`, keywords or `&blk` invoke
+            // CRuby's yield-time spread (`BlockAutoSplat`-per-element,
+            // nil-padding, destructure grouping) — the reference's
+            // `BlockParameterBinder` — which a flat `expected[0]` bind would
+            // pin wrongly; declining keeps the wider answer (never an FP).
+            || block_params.iter().any(|(_, k)| {
+                !matches!(
+                    k,
+                    BlockParamKind::SelfArg | BlockParamKind::SelfOpt | BlockParamKind::Local
+                )
+            })
+        {
+            return None;
+        }
+        let per_position: Vec<TypeId> = elements
+            .iter()
+            .map(|&element| {
+                let benv =
+                    self.fold_position_env(ast, block_body, block_params, element, env, interner);
+                self.stmt_value_type(ast, tail, &benv, interner)
+            })
+            .collect();
+        self.assemble_fold_result(method, &per_position, &elements, interner)
+    }
+
+    /// `assemble_per_element_result` (`expression_typer.rb:5178`) over the
+    /// port's carriers, with `undecided_fold_floor` (`:4549`) folded in —
+    /// `None` declines to the dispatcher exactly as the reference does.
+    fn assemble_fold_result(
+        &self,
+        method: &str,
+        per_position: &[TypeId],
+        elements: &[TypeId],
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let constant = |t: TypeId| matches!(interner.get(t), Type::Constant(_));
+        let truthy = |t: TypeId| {
+            matches!(interner.get(t), Type::Constant(s)
+                if !matches!(s, Scalar::Nil | Scalar::Bool(false)))
+        };
+        let all_constant = per_position.iter().all(|&t| constant(t));
+        match method {
+            "map" | "collect" => Some(interner.intern(Type::Tuple(per_position.to_vec()))),
+            // `assemble_filter_result` — every position decisive: keep the
+            // receiver ELEMENTS whose predicate reads truthy (`select` /
+            // `filter`) or falsey (`reject`); an empty keep is the sound
+            // `[]`. Undecided positions take the `filter_family_floor` —
+            // `Array[union(elements)]` for a Tuple receiver (pins kept).
+            "select" | "filter" | "reject" => {
+                if !all_constant {
+                    return self.filter_family_floor(elements, interner);
+                }
+                let keep_on_truthy = method != "reject";
+                let kept: Vec<TypeId> = elements
+                    .iter()
+                    .zip(per_position.iter().copied())
+                    .filter(|(_, r)| truthy(*r) == keep_on_truthy)
+                    .map(|(&e, _)| e)
+                    .collect();
+                Some(interner.intern(Type::Tuple(kept)))
+            }
+            // `assemble_filter_map_result` — every position decisive; nil /
+            // false results drop, the rest keep THEIR OWN types.
+            "filter_map" => all_constant.then(|| {
+                let kept: Vec<TypeId> = per_position
+                    .iter()
+                    .copied()
+                    .filter(|&r| {
+                        !matches!(
+                            interner.get(r),
+                            Type::Constant(Scalar::Nil | Scalar::Bool(false))
+                        )
+                    })
+                    .collect();
+                interner.intern(Type::Tuple(kept))
+            }),
+            // `assemble_flat_map_result` — Tuple positions contribute their
+            // elements, Constant positions contribute themselves (a `Constant`
+            // never holds an array literal), anything else declines.
+            "flat_map" => {
+                let mut flattened: Vec<TypeId> = Vec::new();
+                for &r in per_position {
+                    match interner.get(r) {
+                        Type::Tuple(inner) => flattened.extend(inner.iter().copied()),
+                        Type::Constant(_) => flattened.push(r),
+                        _ => return None,
+                    }
+                }
+                Some(interner.intern(Type::Tuple(flattened)))
+            }
+            // `assemble_find_result` / `assemble_find_index_result` — the
+            // positions the search may stop at: the first decisive truthy one
+            // plus every undecided one before it (never `nil` once a truthy
+            // position exists). All-falsey-and-decisive ⇒ `nil`; undecided
+            // with no truthy ⇒ the `undecided_fold_floor`.
+            "find" | "detect" | "find_index" | "index" => {
+                let candidates = match self.first_match_candidates(per_position, interner) {
+                    Some(c) => c,
+                    // `undecided_fold_floor`: `find`/`detect` hand back an
+                    // element or `nil`; `find_index`/`index` a position or
+                    // `nil` — the floor keeps the pins (the element answer is
+                    // never computed, so they stay true).
+                    None => {
+                        let nil = interner.intern(Type::Constant(Scalar::Nil));
+                        let base = if matches!(method, "find" | "detect") {
+                            elements
+                                .iter()
+                                .copied()
+                                .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                                .expect("non-empty tuple")
+                        } else {
+                            match self.index.class_id("Integer") {
+                                Some(class) => interner
+                                    .intern(Type::Nominal { class, args: vec![] }),
+                                None => return None,
+                            }
+                        };
+                        return Some(rigor_types::Algebra::join(interner, base, nil));
+                    }
+                };
+                match candidates {
+                    FoldMatch::NoMatch => {
+                        Some(interner.intern(Type::Constant(Scalar::Nil)))
+                    }
+                    FoldMatch::At(indices) => {
+                        let is_find = matches!(method, "find" | "detect");
+                        let mapped: Vec<TypeId> = indices
+                            .into_iter()
+                            .map(|ix| {
+                                if is_find {
+                                    elements[ix]
+                                } else {
+                                    interner.intern(Type::Constant(Scalar::Int(ix as i64)))
+                                }
+                            })
+                            .collect();
+                        Some(
+                            mapped
+                                .into_iter()
+                                .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+                                .expect("non-empty candidates"),
+                        )
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `filter_family_floor` (`expression_typer.rb:4565`) for a Tuple
+    /// receiver: `Array[union(*elements)]` — which positions survive is
+    /// undecided, what they are is not. A `Constant<Range>` receiver's
+    /// widening arm is unported (ranges never reach the fold). `None` — the
+    /// decline — when `Array` is not a known class.
+    fn filter_family_floor(
+        &self,
+        elements: &[TypeId],
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let class = self.index.class_id("Array")?;
+        let joined = elements
+            .iter()
+            .copied()
+            .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
+            .expect("non-empty tuple");
+        Some(interner.intern(Type::Nominal { class, args: vec![joined] }))
+    }
+
+    /// `first_match_candidates` (`expression_typer.rb:5271`): the positions a
+    /// `find`-family search may stop at — every undecided (non-`Constant`)
+    /// position before the first truthy `Constant`, plus that truthy
+    /// position; `NoMatch` when every position folds falsey (all
+    /// `Constant`); `None` when an undecided position exists with NO truthy
+    /// one after it (the floor answers instead of the assembler).
+    fn first_match_candidates(
+        &self,
+        per_position: &[TypeId],
+        interner: &Interner,
+    ) -> Option<FoldMatch> {
+        let truthy = |t: TypeId| {
+            matches!(interner.get(t), Type::Constant(s)
+                if !matches!(s, Scalar::Nil | Scalar::Bool(false)))
+        };
+        let is_constant = |t: TypeId| matches!(interner.get(t), Type::Constant(_));
+        let Some(first_truthy) = per_position.iter().position(|&t| truthy(t)) else {
+            return per_position
+                .iter()
+                .all(|&t| is_constant(t))
+                .then_some(FoldMatch::NoMatch);
+        };
+        let mut indices: Vec<usize> = (0..first_truthy)
+            .filter(|&ix| !is_constant(per_position[ix]))
+            .collect();
+        indices.push(first_truthy);
+        Some(FoldMatch::At(indices))
+    }
+
+    /// One fold position's entry env: the caller's `env` with every block
+    /// parameter hidden (a `|x|` redeclares the name — the reference's
+    /// `BlockParameterBinder` opens a fresh scope), the FIRST positional
+    /// bound to this position's element type (the reference's
+    /// `expected_param_types[0]` — `|x|`, `|x = 1|`, `it`, `_1`; a
+    /// destructured `|(a, b)|`, later positionals and `*rest`/`k:`/`&blk`
+    /// stay unbound — `Dynamic[top]` on read, strictly wider than the
+    /// reference's binding and never an FP), then the same top-level
+    /// `LocalVariableWrite` overlay [`Self::block_entry_env`] applies so a
+    /// block-local `y = x; y + 1` reads `y` at this position's element.
+    fn fold_position_env(
+        &self,
+        ast: &LoweredAst,
+        block_body: &[NodeId],
+        block_params: &[(String, BlockParamKind)],
+        element: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeEnv {
+        let mut benv = env.clone();
+        let mut bound_first = false;
+        for (name, kind) in block_params {
+            benv.remove(name);
+            if !bound_first
+                && !name.is_empty()
+                && matches!(kind, BlockParamKind::SelfArg | BlockParamKind::SelfOpt)
+            {
+                benv.insert(name.clone(), element);
+                bound_first = true;
+            }
+        }
+        let tail_offset = block_body
+            .last()
+            .map(|&t| ast.get(t).span().1)
+            .unwrap_or(usize::MAX);
+        for &id in block_body {
+            let Node::LocalVariableWrite { name, value, span, .. } = ast.get(id) else {
+                continue;
+            };
+            if span.1 <= tail_offset {
+                let vty = self.type_of(ast, *value, &benv, interner);
+                benv.insert(name.clone(), vty);
+            }
+        }
+        benv
+    }
+
+    /// Whether the fold body contains a write or in-place mutation the flat
+    /// per-position overlay cannot replay — the reference's threaded body
+    /// evaluation answers such a tail with the POST-write state (or the
+    /// tail-only `Dynamic[top]` floor); answering with the entry binding mints
+    /// a wrong constant — a false-positive vector, not a safe decline
+    /// (`[1, 2].map { |x| x += 1; x }` must not answer `[1, 2]`).
+    ///
+    /// The overlay replays exactly one write form: a `LocalVariableWrite`
+    /// that is a direct member of `block_body` before the tail (a block-local
+    /// `y = x; y + 1` reads `y` per position). Everything else declines:
+    ///
+    /// - op-writes (`x += 1`, `y ||= z`) — read-modify-write, unmodeled;
+    /// - multiwrites, `for`/`while`/`until` loops, `rescue => e` binds;
+    /// - ivar/cvar/gvar/constant writes and [`Node::UnmodeledWrite`] markers
+    ///   (operator writes the lowering cannot reproduce, `in`/`=>` pattern
+    ///   binds);
+    /// - a plain write that is NESTED (`if c; x = 9; end` — conditional
+    ///   rebinding) or targets a captured outer local (`block_locals` is the
+    ///   block's own name set — Prism `BlockNode#locals` — so a write outside
+    ///   it is a capture the flat overlay threads wrongly);
+    /// - a shape-mutator or setter call on a read binding (`x << 3`,
+    ///   `x.attr = v`, `k[i] = v` — the element's own state changes between
+    ///   write and tail read).
+    ///
+    /// Nodes inside the span are scanned whole — a write inside a nested
+    /// `def`/`lambda` over-declines, which is the safe side. The one
+    /// exemption is `Statements{Inert}` contents (`yield`/`super`/`defined?`/
+    /// `BEGIN`/`END` operands): the reference's evaluator never enters them,
+    /// so their writes genuinely cannot move the tail (measured: `yield (x =
+    /// 9); x` folds to the entry element on both engines).
+    fn fold_body_has_unmodelled_write(
+        &self,
+        ast: &LoweredAst,
+        block_body: &[NodeId],
+        block_span: rigor_parse::Span,
+        block_locals: &[String],
+        env: &TypeEnv,
+    ) -> bool {
+        let locals: HashSet<&str> = block_locals.iter().map(String::as_str).collect();
+        let captured = |name: &str| !locals.contains(name) && env.contains_key(name);
+        let tail_end = block_body
+            .last()
+            .map(|&t| ast.get(t).span().1)
+            .unwrap_or(usize::MAX);
+        // `Statements{Inert}` carriers (`yield`/`super`/`defined?`/`BEGIN`/`END`
+        // operands): the reference's statement evaluator never enters them, so
+        // a write or mutation inside cannot change what the tail reads —
+        // `yield (x = 9); x` folds to the entry element there. Exempt their
+        // contents rather than decline: declining is safe but costs parity.
+        let inert: Vec<rigor_parse::Span> = ast
+            .iter()
+            .filter(|(_, n)| {
+                matches!(n, Node::Statements { kind: StatementsKind::Inert, .. })
+                    && block_span.0 <= n.span().0
+                    && n.span().1 <= block_span.1
+            })
+            .map(|(_, n)| n.span())
+            .collect();
+        for (id, node) in ast.iter() {
+            let span = node.span();
+            if !(block_span.0 <= span.0 && span.1 <= block_span.1)
+                || inert.iter().any(|i| i.0 <= span.0 && span.1 <= i.1)
+            {
+                continue;
+            }
+            match node {
+                Node::LocalVariableWrite { name, .. }
+                    if captured(name)
+                        || !(block_body.contains(&id) && span.1 <= tail_end) =>
+                {
+                    return true;
+                }
+                Node::LocalVariableOpWrite { .. }
+                | Node::MultiWrite { .. }
+                | Node::Loop { .. }
+                | Node::VariableWrite { .. }
+                | Node::InstanceVariableWrite { .. }
+                | Node::ConstantWrite { .. }
+                | Node::UnmodeledWrite { .. } => return true,
+                Node::BeginRescue { clauses, .. }
+                    if clauses.iter().any(|c| c.bound_name.is_some()) =>
+                {
+                    return true;
+                }
+                Node::Call { receiver: Some(r), method, .. }
+                    if (crate::is_shape_mutator(method) || Self::is_setter_call(method))
+                        && Self::receiver_reads_binding(ast, *r) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Whether a mutator/setter call receiver reads a local, ivar/cvar/gvar,
+    /// or constant binding anywhere inside it. `x << 3` mutates `x`'s object;
+    /// `x.attr = v` and `x[i] = v` (`[]=`) the same; `x[i] << 3` mutates a
+    /// sub-object a later `x` read still reaches; `(x; y) << 3` mutates
+    /// whatever `y` binds. The flat overlay replays none of these, so any
+    /// binding read inside the receiver expression declines the fold. A pure
+    /// literal receiver (`[].push(x)`) or a computed one (`x.dup << 3` —
+    /// over-declined, but safe) carries none.
+    fn receiver_reads_binding(ast: &LoweredAst, receiver: NodeId) -> bool {
+        let rspan = ast.get(receiver).span();
+        ast.iter().any(|(_, n)| {
+            let s = n.span();
+            rspan.0 <= s.0
+                && s.1 <= rspan.1
+                && matches!(
+                    n,
+                    Node::LocalVariableRead { .. }
+                        | Node::VariableRead { .. }
+                        | Node::ConstantRead { .. }
+                )
+        })
+    }
+
+    /// An attribute-writer call (`x.attr = v`) by method-name shape — `foo=`
+    /// but never a comparison or match operator (`==`, `!=`, `<=`, `>=`,
+    /// `=~`, `!~`, `<=>`, `===`). `[]=` qualifies too: `k[i] = v` mutates the
+    /// binding the same way a `push` does.
+    fn is_setter_call(method: &str) -> bool {
+        method.ends_with('=')
+            && !matches!(
+                method,
+                "==" | "!=" | "<=" | ">=" | "=~" | "!~" | "<=>" | "===" | "="
+            )
     }
 
     /// The rigor-rs#140 block-timing answer for `receiver.method { … }`, or

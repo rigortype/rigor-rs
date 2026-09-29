@@ -164,11 +164,19 @@ impl<'src> Builder<'src> {
 
         if let Some(int) = node.as_integer_node() {
             // Prism's `TryInto<i32>` covers only `i32`; the digit view widens
-            // that to all of `i64`. A Bignum lowers to `None` — never to a
-            // wrong value (`3_000_000_000` once lowered to `0` and folded).
+            // that to all of `i64`. A Bignum lowers `value` to `None` — never
+            // to a wrong value (`3_000_000_000` once lowered to `0` and
+            // folded) — while `digits` keeps the exact decimal spelling so
+            // the typer can pin it as `Scalar::BigInt` (rigor-rs#194).
             let value = integer_value(&int.value());
+            let digits = if value.is_none() {
+                Some(integer_decimal(&int.value()))
+            } else {
+                None
+            };
             return self.push(Node::IntegerLit {
                 value,
+                digits,
                 span: span_of(&int.location()),
             });
         }
@@ -642,7 +650,13 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(in_node) = node.as_in_node() {
-            // An `in` pattern branch: lower the pattern and the body.
+            // An `in` pattern branch: lower the pattern and the body. The
+            // pattern's bindings write locals the lowering cannot name — mark
+            // the clause so the per-element block fold declines rather than
+            // answer a tail with the pre-bind value (rigor-rs#194).
+            self.push(Node::UnmodeledWrite {
+                span: span_of(&in_node.location()),
+            });
             let mut body = vec![self.lower_node(&in_node.pattern())];
             if let Some(s) = in_node.statements() {
                 body.extend(self.lower_body(&s.body()));
@@ -1188,6 +1202,29 @@ impl<'src> Builder<'src> {
             return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
         }
 
+        // Assignment shapes with no owned variant — operator/and/or writes to
+        // ivars, cvars, globals, constants, `x.f` / `a[i]` targets, `K::V`
+        // path writes, and `expr => pat` / `expr in pat` bindings. The node is
+        // additionally marked with a sibling [`Node::UnmodeledWrite`] (visible
+        // to span-scanning consumers — the per-element block-fold gate must
+        // decline rather than answer a tail with the pre-write binding,
+        // rigor-rs#194) while the node itself keeps the plain `Recovered`
+        // carrier every other consumer already handles.
+        if is_unmodeled_write(node) {
+            self.push(Node::UnmodeledWrite { span });
+            let recovered = collect_recoverable_children(node);
+            if recovered.is_empty() {
+                return self.push(Node::Other { span, jump: None });
+            }
+            let body: Vec<NodeId> =
+                recovered.iter().map(|c| self.lower_node(c)).collect();
+            return self.push(Node::Statements {
+                body,
+                span,
+                kind: StatementsKind::Recovered,
+            });
+        }
+
         // Anything outside the handled subset: RECOVER any meaningful descendant
         // nodes (local reads / op-writes / calls) so structural walks see them.
         //
@@ -1242,6 +1279,41 @@ fn constant_list_names(list: &ruby_prism::ConstantList<'_>) -> Vec<String> {
     list.iter().map(|c| constant_string(c.as_slice())).collect()
 }
 
+/// Whether a Prism node is an assignment the lowering cannot reproduce —
+/// every operator/and/or write on a non-local target (`@x += 1`, `K += 1`,
+/// `a[i] ||= v`, `x.f &&= v`), a `K::V` constant-path write, and the
+/// pattern-binding nodes (`expr => pat`, `expr in pat`). Local writes,
+/// multiwrites, `for` indexes, and the plain `K = v`/`@x = v`/`$g = v`/`@@x =
+/// v` forms have owned variants already; multiwrite TARGETS never reach
+/// `lower_node` standalone (a `MultiWriteNode` wraps them).
+fn is_unmodeled_write(node: &PrismNode<'_>) -> bool {
+    node.as_call_and_write_node().is_some()
+        || node.as_call_operator_write_node().is_some()
+        || node.as_call_or_write_node().is_some()
+        || node.as_class_variable_and_write_node().is_some()
+        || node.as_class_variable_operator_write_node().is_some()
+        || node.as_class_variable_or_write_node().is_some()
+        || node.as_constant_and_write_node().is_some()
+        || node.as_constant_operator_write_node().is_some()
+        || node.as_constant_or_write_node().is_some()
+        || node.as_constant_path_and_write_node().is_some()
+        || node.as_constant_path_operator_write_node().is_some()
+        || node.as_constant_path_or_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_global_variable_and_write_node().is_some()
+        || node.as_global_variable_operator_write_node().is_some()
+        || node.as_global_variable_or_write_node().is_some()
+        || node.as_index_and_write_node().is_some()
+        || node.as_index_operator_write_node().is_some()
+        || node.as_index_or_write_node().is_some()
+        || node.as_instance_variable_and_write_node().is_some()
+        || node.as_instance_variable_operator_write_node().is_some()
+        || node.as_instance_variable_or_write_node().is_some()
+        || node.as_match_write_node().is_some()
+        || node.as_match_predicate_node().is_some()
+        || node.as_match_required_node().is_some()
+}
+
 /// A prism integer's value when it fits `i64`, from its little-endian `u32`
 /// digits; `None` for a Bignum.
 fn integer_value(int: &ruby_prism::Integer<'_>) -> Option<i64> {
@@ -1251,4 +1323,43 @@ fn integer_value(int: &ruby_prism::Integer<'_>) -> Option<i64> {
         mag = mag.checked_mul(1 << 32)?.checked_add(i128::from(d))?;
     }
     i64::try_from(if negative { -mag } else { mag }).ok()
+}
+
+/// A Bignum's signed decimal spelling — the string `Integer#inspect` prints —
+/// from the little-endian `u32` digit view. Base-2^32 to base-10 by repeated
+/// chunk division (10^9 fits `u32` products in `u64`); no precision is ever
+/// lost, so an arbitrarily long literal renders exactly.
+fn integer_decimal(int: &ruby_prism::Integer<'_>) -> String {
+    const CHUNK: u64 = 1_000_000_000; // largest power of ten below 2^32
+    let (negative, digits) = int.to_u32_digits();
+    let mut digits = digits.to_vec();
+    let mut chunks: Vec<u64> = Vec::new();
+    while !digits.is_empty() {
+        let mut rem: u64 = 0;
+        for d in digits.iter_mut().rev() {
+            let cur = (rem << 32) | u64::from(*d);
+            *d = (cur / CHUNK) as u32;
+            rem = cur % CHUNK;
+        }
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+        chunks.push(rem);
+    }
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    match chunks.last() {
+        // A Bignum is never zero (0 lowers to `value: Some(0)`), so a `None`
+        // arm only fires on an empty digit list — spell it `0` anyway.
+        None => out.push('0'),
+        Some(&top) => {
+            out.push_str(&top.to_string());
+            for &chunk in chunks.iter().rev().skip(1) {
+                out.push_str(&format!("{chunk:09}"));
+            }
+        }
+    }
+    out
 }

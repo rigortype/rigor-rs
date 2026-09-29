@@ -678,6 +678,7 @@ pub fn method_arity(class: &str, method: &str) -> Option<(usize, Option<usize>)>
 fn scalar_class(scalar: &Scalar) -> &'static str {
     match scalar {
         Scalar::Int(_) => "Integer",
+        Scalar::BigInt(_) => "Integer",
         Scalar::Str(_) => "String",
         Scalar::Sym(_) => "Symbol",
         Scalar::Bool(true) => "TrueClass",

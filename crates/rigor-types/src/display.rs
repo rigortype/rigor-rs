@@ -219,8 +219,9 @@ fn scalar_erase(s: &Scalar) -> String {
         Scalar::Bool(false) => "false".to_string(),
         Scalar::Nil => "nil".to_string(),
         Scalar::Int(n) => n.to_string(),
-        Scalar::Str(v) => format!("{v:?}"),
-        Scalar::Sym(v) => format!(":{v}"),
+        Scalar::BigInt(digits) => digits.clone(),
+        Scalar::Str(v) => ruby_inspect_dq(v),
+        Scalar::Sym(v) => symbol_inspect(v),
         Scalar::Float(_) => "Float".to_string(),
     }
 }
@@ -340,17 +341,155 @@ fn uniq_join(items: Vec<String>) -> String {
 }
 
 /// A `Constant` scalar as Ruby's `inspect` renders it (reference
-/// `Constant#describe`): strings quoted, symbols colon-prefixed, floats always
-/// with a decimal (`3.0`, not `3`), everything else by its natural spelling.
-fn scalar_inspect(s: &Scalar) -> String {
+/// `Constant#describe`): strings quoted, symbols colon-prefixed (`:foo`,
+/// `:"a b"` — [`symbol_inspect`]), floats always with a decimal (`3.0`, not
+/// `3`), a Bignum by its exact decimal spelling, everything else by its
+/// natural spelling. Public so message renderers outside this module (e.g.
+/// `rigor-rules`) spell a literal identically.
+pub fn scalar_inspect(s: &Scalar) -> String {
     match s {
-        Scalar::Str(v) => format!("{v:?}"),
-        Scalar::Sym(v) => format!(":{v}"),
+        Scalar::Str(v) => ruby_inspect_dq(v),
+        Scalar::Sym(v) => symbol_inspect(v),
         Scalar::Int(n) => n.to_string(),
+        Scalar::BigInt(digits) => digits.clone(),
         Scalar::Float(f) => named_float(*f),
         Scalar::Bool(b) => b.to_string(),
         Scalar::Nil => "nil".to_string(),
     }
+}
+
+/// Ruby `Symbol#inspect` (`rb_sym_inspect`): `:name` when the name is a valid
+/// bare symbol spelling (`rb_str_symname_p` — an identifier/method name, a
+/// `@`/`@@`/`$` variable name, or a spelled operator), else `:"escaped"` with
+/// the double-quoted `inspect` escaping (rigor-rs#194 — `:"a b"`, not `:a b`).
+fn symbol_inspect(name: &str) -> String {
+    if bare_symname(name) {
+        format!(":{name}")
+    } else {
+        format!(":{}", ruby_inspect_dq(name))
+    }
+}
+
+/// The operator spellings Ruby's `rb_enc_symname_type` recognises as bare
+/// symbol names — unary/binary operators plus `+@`, `-@`, `[]`, `[]=` and
+/// backtick. Verified against `Symbol#inspect` on the pinned toolchain.
+const OPERATOR_SYMNAMES: &[&str] = &[
+    "+", "-", "*", "**", "/", "%", "==", "===", "=~", "!~", "!=", "<", "<=", "<=>", ">", ">=",
+    "<<", ">>", "&", "|", "^", "~", "+@", "-@", "[]", "[]=", "`", "!",
+];
+
+/// One character that may appear inside a Ruby identifier (`is_identchar`).
+/// Byte-level like the C check: on the pinned toolchain a non-ASCII byte
+/// never counts, which is why `:"café"` inspects quoted.
+fn identchar(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// `is_global_name_punct`'s byte set (parse.y `SPECIAL_PUNCT`): the
+/// single-character specials a `$` tail may be (`$$`, `$~`, `$'`, `$0`, `$,`
+/// …). `0` is here rather than in the digit loop, so `:"$00"` quotes.
+const GLOBAL_NAME_PUNCT: &[char] = &[
+    '~', '*', '$', '?', '!', '@', '/', '\\', ';', ',', '.', '=', ':', '<', '>', '"', '&', '`',
+    '\'', '+', '0',
+];
+
+/// `is_special_global_name` (symbol.c): the tail after `$` — one punct byte
+/// (`$$`), `-` plus one identchar (`$-a`, `$-9`; `:"$-!"` and `:"$-ab"`
+/// quote), or an all-digit tail (`$12`, `$5`). Checked before the identifier
+/// path, mirroring the C order.
+fn special_global_tail(tail: &str) -> bool {
+    let mut chars = tail.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if GLOBAL_NAME_PUNCT.contains(&first) {
+        return chars.next().is_none();
+    }
+    if first == '-' {
+        return chars.next().is_some_and(identchar) && chars.next().is_none();
+    }
+    first.is_ascii_digit() && chars.all(|c| c.is_ascii_digit())
+}
+
+/// The identifier half of `rb_enc_symname_type`: a `_`/ASCII-alpha first char
+/// then identchars — plus, for locals and constants only, one trailing
+/// `?`/`!`/`=` sigil (`foo?`, `Foo=`). `$`/`@`/`@@` names reject all three
+/// (`:"$foo?"`, `:"@x="` quote).
+fn ident_tail(name: &str, allow_sigil: bool) -> bool {
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic()) {
+        return false;
+    }
+    if chars.all(identchar) {
+        return true;
+    }
+    if !allow_sigil {
+        return false;
+    }
+    let Some(last) = name.chars().last() else {
+        return false;
+    };
+    matches!(last, '?' | '!' | '=') && name[..name.len() - last.len_utf8()]
+        .chars()
+        .all(identchar)
+}
+
+/// The `rb_str_symname_p` half of [`symbol_inspect`]: whether `name` inspects
+/// as `:name` without quotes.
+fn bare_symname(name: &str) -> bool {
+    if OPERATOR_SYMNAMES.contains(&name) {
+        return true;
+    }
+    match name.chars().next() {
+        // `$` — a `is_special_global_name` tail (`$$`, `$-a`, `$12`) or a
+        // plain global identifier (`$foo`, `$_x`); sigils are never allowed.
+        Some('$') => special_global_tail(&name[1..]) || ident_tail(&name[1..], false),
+        // `@`/`@@` — an identifier tail, no sigils (`:"@x?"` quotes).
+        Some('@') => ident_tail(name.strip_prefix("@@").unwrap_or(&name[1..]), false),
+        // A local or constant name — one trailing `?`/`!`/`=` allowed.
+        Some(_) => ident_tail(name, true),
+        None => false,
+    }
+}
+
+/// Ruby's double-quoted `inspect` escaping for a symbol name or string body —
+/// the `rb_str_inspect` ASCII forms (`\"`, `\\`, `\n`, `\t`, `\r`, `\0`, `\a`,
+/// `\b`, `\f`, `\v`, `\e`, `\xNN` for other control bytes and DEL) plus the
+/// interpolation-guard `\#` before `{`/`@`/`$`. A byte-exact match of Ruby's
+/// full Unicode escaping is out of scope (same documented bound as
+/// `rigor-parse`'s `ruby_inspect_string`): non-ASCII printable characters are
+/// emitted raw.
+fn ruby_inspect_dq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\x0b' => out.push_str("\\v"),
+            '\x1b' => out.push_str("\\e"),
+            '#' => {
+                if matches!(chars.peek(), Some('{') | Some('@') | Some('$')) {
+                    out.push('\\');
+                }
+                out.push('#');
+            }
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                out.push_str(&format!("\\x{:02X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Ruby `Float#inspect` always shows a decimal point (`3.0.inspect == "3.0"`),
@@ -359,18 +498,62 @@ fn named_float(f: f64) -> String {
     ruby_float_to_s(f)
 }
 
-/// Ruby `Float#to_s` / `Float#inspect` spelling of a finite float: a decimal
-/// point is always present (`3.0.to_s == "3.0"`, `3.14.to_s == "3.14"`), and
-/// non-integral values use Rust's shortest round-trip (which matches Ruby's
-/// `flo_to_s` dtoa for the overwhelming majority of values). Exposed for the
-/// Kernel `String()` / `sprintf` folds (`kernel_fold`), which must reproduce
-/// Ruby's `to_s` byte-for-byte. Non-finite inputs (`NaN`/`±Infinity`) fall to
-/// Rust's spelling; callers that fold must guard those out separately.
+/// Ruby `Float#to_s` / `Float#inspect` spelling: a decimal point is always
+/// present (`3.0.to_s == "3.0"`, `3.14.to_s == "3.14"`); non-finite inputs
+/// spell `NaN` / `±Infinity` as Ruby does. The scientific switch is CRuby's
+/// `flo_to_s` rule over the shortest round-trip digits (`d.ddd` with decimal
+/// exponent `E`): exponential when `E <= -5` (`1e-5` → `"1.0e-05"`) or when
+/// `E >= 16` (`1e16` → `"1.0e+16"`), plus the integral corner at `E == 15` —
+/// `1e15` and `1234567890123456.0` print `"...e+15"` while a value with real
+/// fraction digits at the same magnitude stays decimal
+/// (`1234567890123456.8`, `999999999999999.9`). The exponent comes from
+/// `{:e}`'s shortest-round-trip digits, NOT `log10().floor()` — the latter
+/// rounds `999999999999999.9` up to `1e15` and picks scientific wrongly.
+/// Exposed for the Kernel `String()` / `sprintf` folds (`kernel_fold`), which
+/// must reproduce Ruby's `to_s` byte-for-byte.
 pub fn ruby_float_to_s(f: f64) -> String {
-    if f.is_finite() && f == f.trunc() {
-        format!("{f:.1}")
+    if f.is_nan() {
+        return "NaN".to_string();
+    }
+    if f.is_infinite() {
+        return if f.is_sign_positive() {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
+    if f == 0.0 {
+        // Preserves `-0.0` (Ruby: `(-0.0).to_s == "-0.0"`).
+        return format!("{f:.1}");
+    }
+    // `{:e}` is Rust's shortest-round-trip scientific ("1e20", "3.14e0",
+    // "-9.999999999999999e14") — the same digits Ruby's dtoa emits, sign
+    // included (`-1e20` must render `-1.0e+20`, not `1.0e+20`).
+    let sci = format!("{f:e}");
+    let Some((_, exp_str)) = sci.split_once('e') else {
+        return f.to_string();
+    };
+    let exp10: i32 = exp_str.parse().unwrap_or(0);
+    let use_exp = exp10 <= -5 || exp10 >= 16 || (exp10 == 15 && f == f.trunc());
+    if !use_exp {
+        if f == f.trunc() {
+            format!("{f:.1}")
+        } else {
+            f.to_string()
+        }
     } else {
-        f.to_string()
+        // Re-dress the shortest-round-trip mantissa as Ruby's: a decimal
+        // point in the mantissa and a signed at-least-two-digit exponent.
+        let Some((mant, _)) = sci.split_once('e') else {
+            return sci;
+        };
+        let sign = if exp10 < 0 { "-" } else { "+" };
+        let mantissa = if mant.contains('.') {
+            mant.to_string()
+        } else {
+            format!("{mant}.0")
+        };
+        format!("{mantissa}e{sign}{:02}", exp10.abs())
     }
 }
 
@@ -379,7 +562,7 @@ pub fn ruby_float_to_s(f: f64) -> String {
 fn named_key(k: &ShapeKey) -> String {
     match k {
         ShapeKey::Sym(s) => s.clone(),
-        ShapeKey::Str(s) => format!("{s:?}"),
+        ShapeKey::Str(s) => ruby_inspect_dq(s),
         ShapeKey::Int(v) => v.to_string(),
         ShapeKey::Float(bits) => named_float(f64::from_bits(*bits)),
         ShapeKey::Bool(b) => b.to_string(),
@@ -575,8 +758,9 @@ fn is_nil(i: &Interner, id: TypeId) -> bool {
 fn scalar(s: &Scalar) -> String {
     match s {
         Scalar::Int(v) => v.to_string(),
-        Scalar::Str(v) => format!("{v:?}"),
-        Scalar::Sym(v) => format!(":{v}"),
+        Scalar::BigInt(digits) => digits.clone(),
+        Scalar::Str(v) => ruby_inspect_dq(v),
+        Scalar::Sym(v) => symbol_inspect(v),
         Scalar::Bool(v) => v.to_string(),
         Scalar::Nil => "nil".to_string(),
         Scalar::Float(v) => v.to_string(),
@@ -585,8 +769,8 @@ fn scalar(s: &Scalar) -> String {
 
 fn shape_key(k: &ShapeKey) -> String {
     match k {
-        ShapeKey::Sym(s) => format!(":{s}"),
-        ShapeKey::Str(s) => format!("{s:?}"),
+        ShapeKey::Sym(s) => symbol_inspect(s),
+        ShapeKey::Str(s) => ruby_inspect_dq(s),
         ShapeKey::Int(v) => v.to_string(),
         ShapeKey::Float(bits) => named_float(f64::from_bits(*bits)),
         ShapeKey::Bool(b) => b.to_string(),
@@ -640,6 +824,115 @@ mod named_tests {
         assert_eq!(describe_named(&i, f, &resolver), "3.0");
         let nil = i.nil();
         assert_eq!(describe_named(&i, nil, &resolver), "nil");
+    }
+
+    #[test]
+    fn quoted_symbols_and_bignum_constants() {
+        let mut i = Interner::new();
+        // rigor-rs#194 — `Symbol#inspect` quotes a name that cannot spell bare
+        // (`:"a b"`), escapes like a double-quoted string, and keeps every
+        // bare-able form unquoted (`:foo`, `:foo?`, `:[]`, `:$x`, `:@iv`).
+        let quoted = i.intern(Type::Constant(Scalar::Sym("a b".to_string())));
+        assert_eq!(describe_named(&i, quoted, &resolver), ":\"a b\"");
+        let tup = i.intern(Type::Tuple(vec![quoted]));
+        assert_eq!(describe_named(&i, tup, &resolver), "[:\"a b\"]");
+        for (name, want) in [
+            ("foo?", ":foo?"),
+            ("Foo", ":Foo"),
+            ("[]=", ":[]="),
+            ("$x", ":$x"),
+            ("@iv", ":@iv"),
+            ("a=b", ":\"a=b\""),
+            ("a\"b", ":\"a\\\"b\""),
+        ] {
+            let sym = i.intern(Type::Constant(Scalar::Sym(name.to_string())));
+            assert_eq!(describe_named(&i, sym, &resolver), want, ":{name}");
+        }
+        // A Bignum renders its exact decimal spelling — `Integer#inspect`.
+        let big = i.intern(Type::Constant(Scalar::BigInt("99999999999999999999".to_string())));
+        assert_eq!(describe_named(&i, big, &resolver), "99999999999999999999");
+        let tup = i.intern(Type::Tuple(vec![big]));
+        assert_eq!(describe_named(&i, tup, &resolver), "[99999999999999999999]");
+        // …and erases to the same literal RBS spelling, like `Int`.
+        assert_eq!(erase_to_rbs_named(&i, big, &resolver), "99999999999999999999");
+    }
+
+    #[test]
+    fn bare_symname_follows_the_cruby_grammar() {
+        // rigor-rs#194 FINAL review — `rb_str_symname_p` only leaves a `$` name
+        // bare when its tail is a `is_special_global_name` form (one punct
+        // byte, `-` + one identchar, or all digits) or a plain global
+        // identifier; every other `$` tail quotes (`:"$a=b"`, `:"$foo?"`,
+        // `:"$-"`). Every row below is measured against `Symbol#inspect` on
+        // the pinned toolchain.
+        let mut i = Interner::new();
+        for (name, want) in [
+            // Locals/constants keep one trailing sigil.
+            ("foo?", ":foo?"),
+            ("foo!", ":foo!"),
+            ("foo=", ":foo="),
+            ("Foo?", ":Foo?"),
+            ("_x", ":_x"),
+            ("a=b", ":\"a=b\""),
+            ("a==", ":\"a==\""),
+            ("a?b", ":\"a?b\""),
+            ("a!=", ":\"a!=\""),
+            ("9lives", ":\"9lives\""),
+            ("", ":\"\""),
+            // Special-global forms stay bare.
+            ("$x", ":$x"),
+            ("$foo", ":$foo"),
+            ("$_", ":$_"),
+            ("$K", ":$K"),
+            ("$a9", ":$a9"),
+            ("$0", ":$0"),
+            ("$5", ":$5"),
+            ("$12", ":$12"),
+            ("$$", ":$$"),
+            ("$~", ":$~"),
+            ("$&", ":$&"),
+            ("$+", ":$+"),
+            ("$!", ":$!"),
+            ("$?", ":$?"),
+            ("$,", ":$,"),
+            ("$/", ":$/"),
+            ("$;", ":$;"),
+            ("$'", ":$'"),
+            ("$`", ":$`"),
+            ("$:", ":$:"),
+            ("$.", ":$."),
+            ("$<", ":$<"),
+            ("$=", ":$="),
+            ("$*", ":$*"),
+            ("$@", ":$@"),
+            ("$\"", ":$\""),
+            ("$-a", ":$-a"),
+            ("$-9", ":$-9"),
+            // …everything else after `$` quotes.
+            ("$9x", ":\"$9x\""),
+            ("$0x", ":\"$0x\""),
+            ("$00", ":\"$00\""),
+            ("$-", ":\"$-\""),
+            ("$-ab", ":\"$-ab\""),
+            ("$-!", ":\"$-!\""),
+            ("$a=b", ":\"$a=b\""),
+            ("$foo?", ":\"$foo?\""),
+            ("$a!", ":\"$a!\""),
+            ("$@x", ":\"$@x\""),
+            ("$", ":\"$\""),
+            // `@`/`@@` names take an identifier tail, never a sigil.
+            ("@iv", ":@iv"),
+            ("@@cv", ":@@cv"),
+            ("@_x", ":@_x"),
+            ("@x?", ":\"@x?\""),
+            ("@@x=", ":\"@@x=\""),
+            ("@", ":\"@\""),
+            ("@@", ":\"@@\""),
+            ("@9x", ":\"@9x\""),
+        ] {
+            let sym = i.intern(Type::Constant(Scalar::Sym(name.to_string())));
+            assert_eq!(describe_named(&i, sym, &resolver), want, ":{name}");
+        }
     }
 
     #[test]

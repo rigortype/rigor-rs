@@ -287,6 +287,11 @@ fn scalar_to_json(s: &Scalar) -> serde_json::Value {
     use serde_json::json;
     match s {
         Scalar::Int(i) => json!({ "t": "int", "v": i }),
+        // A Bignum crosses as the integer's decimal spelling — the sidecar's
+        // `Integer(h["v"])` decode accepts a string payload, and a folded
+        // result that overflows `i64` comes back undecodable and declines
+        // (`json_to_scalar`'s `as_i64`), which is the safe side.
+        Scalar::BigInt(d) => json!({ "t": "int", "v": d }),
         Scalar::Float(f) => json!({ "t": "float", "v": f }),
         Scalar::Str(s) => json!({ "t": "str", "v": s }),
         Scalar::Sym(s) => json!({ "t": "sym", "v": s }),

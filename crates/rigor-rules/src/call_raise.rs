@@ -255,6 +255,7 @@ pub(crate) fn concrete_class_name(
 fn constant_class_name(scalar: &Scalar) -> &'static str {
     match scalar {
         Scalar::Int(_) => "Integer",
+        Scalar::BigInt(_) => "Integer",
         Scalar::Str(_) => "String",
         Scalar::Sym(_) => "Symbol",
         Scalar::Bool(true) => "TrueClass",

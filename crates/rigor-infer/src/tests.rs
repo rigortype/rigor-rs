@@ -1368,6 +1368,262 @@ fn block_call_on_unmodeled_or_dynamic_is_silent_dynamic() {
     assert_eq!(ty, i.untyped(), "block call on Dynamic receiver must be Dynamic[top]");
 }
 
+// --- rigor-rs#194: per-element `map`/`collect` fold over a Tuple ---------
+//
+// The port of `try_per_element_block_fold` (`expression_typer.rb:4506`), the
+// `map`/`collect` head of `PER_ELEMENT_TUPLE_METHODS`: a Tuple receiver folds
+// its literal block once per position into `Tuple[U_1..U_n]` — strictly
+// tighter than the RBS `Array`. Rows outside the ported subset decline to
+// the prior `Array` answer (never an FP).
+
+#[test]
+fn per_element_map_fold_assembles_a_tuple() {
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    // `[1, 2].map { |x| x + 1 }` — per-position `x + 1` folds to `2` / `3`.
+    let ast = lower_src(b"[1, 2].map { |x| x + 1 }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("map over a literal tuple must fold to a Tuple, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(elems.len(), 2);
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(2)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(3)));
+
+    // `collect` folds identically; a block-local write reads per position.
+    let ast = lower_src(b"[1, 2].collect { |x| y = x + 1; y }\n");
+    let call = find_call(&ast, "collect");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("collect must fold identically, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(2)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(3)));
+
+    // The implicit `it` parameter binds the element too.
+    let ast = lower_src(b"[1, 2].map { it * 10 }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("`it` must bind the element, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(10)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(20)));
+}
+
+#[test]
+fn per_element_fold_filter_and_find_families() {
+    // The rest of `PER_ELEMENT_TUPLE_METHODS`: `select`/`reject` keep the
+    // receiver's own elements at decisive-Constant positions; `filter_map`
+    // keeps non-nil/false RESULTS; `flat_map` flattens Tuple positions;
+    // `find`/`find_index` answer the first truthy position's element/index.
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut folded = |src: &[u8], method: &str| -> String {
+        let ast = lower_src(src);
+        let call = find_call(&ast, method);
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        rigor_types::describe(&i, ty)
+    };
+    assert_eq!(
+        folded(b"[1, 2].select { |x| x > 1 }\n", "select"),
+        "Tuple[Constant[2]]"
+    );
+    assert_eq!(
+        folded(b"[1, 2].reject { |x| x > 1 }\n", "reject"),
+        "Tuple[Constant[1]]"
+    );
+    assert_eq!(
+        folded(b"[1, 2].filter_map { |x| x.to_s if x > 1 }\n", "filter_map"),
+        "Tuple[Constant[\"2\"]]"
+    );
+    assert_eq!(
+        folded(b"[1, 2].flat_map { |x| [x, x] }\n", "flat_map"),
+        "Tuple[Constant[1], Constant[1], Constant[2], Constant[2]]"
+    );
+    assert_eq!(folded(b"[1, 2].find { |x| x > 1 }\n", "find"), "Constant[2]");
+    assert_eq!(folded(b"[1, 2].find { |x| x > 9 }\n", "find"), "nil");
+    assert_eq!(
+        folded(b"[1, 2].find_index { |x| x > 1 }\n", "find_index"),
+        "Constant[1]"
+    );
+    // An undecided position takes `undecided_fold_floor`: `select` widens to
+    // `Array[union]`; `find` answers `union(elements, nil)`.
+    let undecided = folded(b"[1, 2].select { |x| unknown_call }\n", "select");
+    assert!(
+        !undecided.starts_with("Tuple"),
+        "undecided select must not fold: {undecided}"
+    );
+    assert_eq!(
+        folded(b"[1, 2].find { |x| unknown_call }\n", "find"),
+        "Constant[1] | Constant[2] | nil"
+    );
+}
+
+#[test]
+fn per_element_map_fold_declines_unported_shapes() {
+    let idx = CoreIndex::new();
+    if !idx.class_has_method("Array", "map") {
+        return; // stub index: every row declines anyway — vacuous.
+    }
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut not_folded = |src: &[u8]| -> bool {
+        let ast = lower_src(src);
+        let method = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::Call { receiver: Some(_), method, .. } => Some(method.clone()),
+                _ => None,
+            })
+            .expect("a receiver call");
+        let call = find_call(&ast, &method);
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        !matches!(i.get(ty), Type::Tuple(_))
+    };
+    // An argument declines (`call_node.arguments.nil?` — even though `map`
+    // takes none, the gate is syntactic exactly like the reference).
+    assert!(not_folded(b"[1, 2].map(1) { |x| x }\n"));
+    // A block-level `next` declines — the reference joins `next` arms through
+    // its evaluator; a tail-only read cannot.
+    assert!(not_folded(b"[1, 2].map { |x| next x }\n"));
+    // A `&:sym` pass is not a literal `BlockNode` (`block_span` is None).
+    assert!(not_folded(b"[1, 2].map(&:to_s)\n"));
+    // A destructured first parameter declines — `|(a, (b, c))|` needs the
+    // reference's real destructure, which a flat positional bind would pin
+    // wrongly.
+    assert!(not_folded(b"[[1, 2], [3, 4]].map { |(a, b)| a + b }\n"));
+    // A non-Tuple receiver (a plain `Array` nominal) declines.
+    assert!(not_folded(b"Array.new.map { |x| x }\n"));
+}
+
+#[test]
+fn per_element_map_fold_declines_captured_rebinds() {
+    // A write to a CAPTURED local is the reference's cross-position
+    // threading (`per_element_captured_bindings`), which the flat
+    // per-position overlay would pin wrongly — decline to `Array`.
+    let idx = CoreIndex::new();
+    if !idx.class_has_method("Array", "map") {
+        return;
+    }
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let ast = lower_src(b"seen = 0\n[1, 2].map { |x| seen += 1; x }\n");
+    let env = typer.build_toplevel_env(&ast, &mut i);
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &env, &mut i);
+    assert_eq!(idx.class_name_of(&i, ty), Some("Array"));
+    // A write to a BLOCK-LOCAL name shadows, never captures — still folds.
+    let ast = lower_src(b"[1, 2].map { |x| y = x; y + 1 }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    assert!(matches!(i.get(ty), Type::Tuple(_)), "block-local writes still fold");
+}
+
+#[test]
+fn per_element_map_fold_declines_unmodelled_writes() {
+    // rigor-rs#194 FINAL review — the flat per-position overlay replays only
+    // a direct-member `LocalVariableWrite` before the tail. Any other write
+    // or in-place mutation visible in the block span must decline the whole
+    // fold: answering the tail with the ENTRY binding mints a wrong constant
+    // (`[1, 2].map { |x| x += 1; x }.first.even?` reads `false` where the
+    // reference's `[2, 3]` gives `true`) — a false-positive vector.
+    let idx = CoreIndex::new();
+    if !idx.class_has_method("Array", "map") {
+        return; // stub index: every row declines anyway — vacuous.
+    }
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut not_folded = |src: &[u8]| -> bool {
+        let ast = lower_src(src);
+        let call = find_call(&ast, "map");
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        !matches!(i.get(ty), Type::Tuple(_))
+    };
+    // An op-write on the block parameter — read-modify-write is unmodeled.
+    assert!(not_folded(b"[1, 2].map { |x| x += 1; x }\n"));
+    // …on a block-local (`y += 1` changes what the tail reads).
+    assert!(not_folded(b"[1, 2].map { |x| y = x; y += 1; y }\n"));
+    // A shape mutator on the parameter mutates the ELEMENT between write and
+    // tail read — the reference answers the post-mutation tuple.
+    assert!(not_folded(b"[[1], [2]].map { |x| x << 3; x }\n"));
+    // A setter / index-write on a read binding (`x[0] = 9` lowers as `[]=`).
+    assert!(not_folded(b"[[1], [2]].map { |x| x[0] = 9; x }\n"));
+    // A mutation of a sub-object reachable through the binding (`x[0] << 9`).
+    assert!(not_folded(b"[[1], [2]].map { |x| x[0] << 9; x }\n"));
+    // Writes on non-local targets the lowering cannot reproduce: operator
+    // writes (`x.f += 1`), `K::V` path writes, multiwrites, `for` index
+    // binds, `rescue => e`, and `in`/`=>` pattern binds.
+    assert!(not_folded(b"[1, 2].map { |x| K = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| @v = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| $g = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| @v += x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| x.f += 1; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| K::V = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| a, b = x, x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| for q in []; end; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| begin; rescue => e; end; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| case x; in Integer => q; end; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| x => q; x }\n"));
+    // A write nested inside a conditional is not a direct member of
+    // `block_body` — the overlay never replays it, so the fold declines.
+    assert!(not_folded(b"[1, 2].map { |x| x = 9 if x > 1; x }\n"));
+    // A plain rebind of the parameter IS replayed — still folds to `[9, 9]`.
+    let ast = lower_src(b"[1, 2].map { |x| x = 9; x }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("plain rebind still folds, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(9)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(9)));
+    // Contents of `yield`/`super`/`defined?` operands never bind in the
+    // reference's evaluator (no `YieldNode`/`SuperNode`/`DefinedNode`
+    // handler), so writes inside them are EXEMPT — the fold proceeds and
+    // matches the reference's entry-element answer `[1, 2]` exactly.
+    for src in [
+        b"def f; [1, 2].map { |x| yield (x = 9); x }; end\n".as_slice(),
+        b"[1, 2].map { |x| defined?(x = 9); x }\n".as_slice(),
+        b"[1, 2].map { |x| yield x; x }\n".as_slice(),
+    ] {
+        let ast = lower_src(src);
+        let call = find_call(&ast, "map");
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        assert!(
+            matches!(i.get(ty), Type::Tuple(_)),
+            "inert contents are exempt: {}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+#[test]
+fn bignum_literal_pins_its_exact_value() {
+    // rigor-rs#194 — a Bignum types `Constant(BigInt)` carrying its decimal
+    // spelling (the reference's `Constant[99999999999999999999]`), not a
+    // widened `Integer` nominal.
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let ast = lower_src(b"[99999999999999999999, 42]\n");
+    let ty = ast
+        .iter()
+        .find_map(|(id, n)| matches!(n, Node::ArrayLit { .. }).then_some(id))
+        .map(|id| typer.type_of(&ast, id, &TypeEnv::new(), &mut i))
+        .expect("an array literal");
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("array literal types Tuple, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(
+        i.get(elems[0]),
+        &Type::Constant(Scalar::BigInt("99999999999999999999".to_string()))
+    );
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(42)));
+}
+
 // --- rigor-rs#140: exactly-once block timing (upstream rigor#1105) ------
 //
 // `Kernel#tap` / `#then` / `#yield_self` invoke a literal block exactly
@@ -1855,3 +2111,4 @@ fn core_singleton_name_is_string() {
     let interned = i.intern(ty.clone());
     assert_eq!(idx.class_name_of(&i, interned), Some("String"), "Time.name must be String, got {ty:?}");
 }
+
