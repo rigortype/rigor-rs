@@ -179,6 +179,30 @@ fn missing_referenced_types_are_stubbed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Review finding: a nearer lexical scope binding `scope::head` as a
+/// class/module ALIAS (or interface/type alias) wins in RBS
+/// (`resolve_head_namespace` checks `aliased_name?`/`has_type_name?`), and
+/// the reference then follows the alias target — unmodelled here. The port
+/// must DECLINE, not skip to a same-named outer/root class: with `Ns::Alias
+/// = Other` and a root `Alias::Bar`, `-> Alias::Bar` written inside `Ns`
+/// means `Other::Bar` to the reference, so binding the root `Alias::Bar`
+/// would type calls by the wrong class (an FP vector).
+#[test]
+fn lexical_alias_head_declines_rather_than_bind_wrong_namesake() {
+    let dir = proj_dir(
+        "alias_head",
+        &[(
+            "alias.rbs",
+            "module Ns\n  class Alias = Other\n  class User\n    def m: () -> Alias::Bar\n    def bare: () -> Alias\n  end\nend\nmodule Other\n  class Bar\n    def real: () -> Integer\n  end\nend\nmodule Alias\n  class Bar\n    def wrong: () -> String\n  end\nend\n",
+        )],
+    );
+    let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+    // Declines — never `Some("Alias::Bar")` (the wrong root namesake).
+    assert_eq!(idx.receiver_method_return("Ns::User", "m"), None);
+    assert_eq!(idx.receiver_method_return("Ns::User", "bare"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The tuple twin resolves element names through the same project path
 /// (`[Integer, Impl]` inside `module Foo` ⇒ `Foo::Impl`), and
 /// `project_sig_chain_ok` reports an unbuildable superclass chain the way

@@ -2158,24 +2158,61 @@ impl CoreData {
     //   (∈ {`Random::Base`, `Digest::Base`}) shapes must never resolve by
     //   guess. Declining loses coverage; guessing manufactures FPs.
 
-    /// Resolve a WRITTEN type reference against the qualified registry with
-    /// RBS's name-resolution rule: an absolute reference (`"::Digest::Instance"`)
-    /// looks up its exact key; a relative one tries each lexical context scope
-    /// innermost-outward (`"{scope}::{written}"`), then the root
-    /// (`"{written}"`). First existing candidate wins — deterministic, because
-    /// the written path is full-fidelity. `None` when nothing matches
-    /// (conservative decline).
+    /// `TypeNameResolver#resolve_namespace0` for a WRITTEN
+    /// (namespace-preserving) type reference against `ctx` (innermost scope
+    /// LAST): an absolute `"::X::Y"` looks up its exact key; a relative name
+    /// binds its HEAD segment at the first lexical scope — innermost-outward,
+    /// then root — holding `scope::head`, then requires each tail segment
+    /// under the bound namespace. `None` when nothing binds
+    /// (`resolve_namespace0`'s `nil` — the name stays written-relative and
+    /// `absolute!` later reads it as `::`-rooted, so the root `written`
+    /// lookup is the correct fallback there) — a conservative decline.
+    ///
+    /// When the binding scope holds `scope::head` (or `cur::seg`) as a KNOWN
+    /// non-class/module name — a class/module alias (`aliased_name?` binds,
+    /// and the reference then normalizes through the alias target the port
+    /// does not record), interface or type alias (`has_type_name?` binds
+    /// them too) — the reference resolves through it and this walk cannot
+    /// follow. Returning an outer/root namesake instead would mint a type
+    /// the reference never produced — a false positive — so those decline
+    /// as well (issue #168 review).
     fn resolve_written_ref(&self, written: &str, ctx: &[&'static str]) -> Option<&'static str> {
         if let Some(abs) = written.strip_prefix("::") {
             return self.qualified.get_key_value(abs).map(|(&k, _)| k);
         }
-        for scope in ctx.iter().rev() {
-            let cand = format!("{scope}::{written}");
+        let mut segs = written.split("::");
+        let head = segs.next()?;
+        let root_fallback = || self.qualified.get_key_value(written).map(|(&k, _)| k);
+        let head_hit = ctx
+            .iter()
+            .rev()
+            .map(|scope| format!("{scope}::{head}"))
+            .chain(std::iter::once(head.to_string()))
+            .find_map(|cand| {
+                if let Some((&k, _)) = self.qualified.get_key_value(cand.as_str()) {
+                    Some(Ok(k))
+                } else if self.type_names.contains(cand.as_str()) {
+                    Some(Err(()))
+                } else {
+                    None
+                }
+            });
+        let mut cur = match head_hit {
+            Some(Ok(k)) => k,
+            Some(Err(())) => return None,
+            None => return root_fallback(),
+        };
+        for seg in segs {
+            let cand = format!("{cur}::{seg}");
             if let Some((&k, _)) = self.qualified.get_key_value(cand.as_str()) {
-                return Some(k);
+                cur = k;
+            } else if self.type_names.contains(cand.as_str()) {
+                return None;
+            } else {
+                return root_fallback();
             }
         }
-        self.qualified.get_key_value(written).map(|(&k, _)| k)
+        Some(cur)
     }
 
     /// Resolve a type reference whose stored spelling the flat slots carried:
@@ -2220,7 +2257,7 @@ impl CoreData {
     /// * A name a PROJECT signature stores is full-fidelity — `member_name`
     ///   under a `FileSigCtx` keeps the written namespace (`Ns::Impl`,
     ///   `Impl`, `::X`), so it resolves by RBS's own deterministic rule —
-    ///   [`Self::resolve_project_type_ref`]: head segment innermost-outward,
+    ///   [`Self::resolve_written_ref`]: head segment innermost-outward,
     ///   FIRST hit binds (`Ns::Impl` shadows a root `Impl` written inside
     ///   `module Ns`), a bound head that fails its tail falls back to the
     ///   written path at root (the reference keeps the relative name, which
@@ -2235,7 +2272,7 @@ impl CoreData {
         let mut agreed: Option<&'static str> = None;
         for ctx in &entry.member_ctxs {
             let r = if project {
-                self.resolve_project_type_ref(name, ctx)?
+                self.resolve_written_ref(name, ctx)?
             } else {
                 self.resolve_leaf_unique(name, ctx)?
             };
@@ -2245,54 +2282,6 @@ impl CoreData {
             }
         }
         agreed
-    }
-
-    /// `TypeNameResolver#resolve` for a full-fidelity (namespace-preserving)
-    /// member name a project signature stored — the deterministic rule a
-    /// `resolve_leaf_unique` "unique candidate" check approximates WRONGLY:
-    /// RBS binds the HEAD segment by walking the lexical context
-    /// innermost-outward (first `has_type_name?` wins — a nearer `Ns::Impl`
-    /// shadows a root `Impl`), then requires each tail segment under it. On
-    /// any failure the reference keeps the name written-relative, and
-    /// `DefinitionBuilder`'s `absolute!` reads that as the ROOT spelling —
-    /// so the root `name` lookup is the correct fallback in both failure
-    /// modes (head unresolved, or head bound but tail missing beneath it).
-    /// Class-alias hops in the head/tail walk (`aliases.fetch`) are not
-    /// modelled — the port records class aliases only in `known_type_names`
-    /// — so those decline to the root spelling: a coverage gap, never an FP.
-    fn resolve_project_type_ref(&self, name: &str, ctx: &[&'static str]) -> Option<&'static str> {
-        if let Some(abs) = name.strip_prefix("::") {
-            return self.qualified.get_key_value(abs).map(|(&k, _)| k);
-        }
-        let (head, tail) = match name.split_once("::") {
-            Some((h, t)) => (h, Some(t)),
-            None => (name, None),
-        };
-        // `resolve_head_namespace`: each context scope innermost-outward, then
-        // the root head — first hit binds. A head that resolves nowhere leaves
-        // the name written-relative, which downstream `absolute!` reads as
-        // `::name` — so the root `name` lookup is the fallback there too (and
-        // is what lets `Foo::Bar` resolve even when `Foo` itself is a
-        // synthesized-namespace gap).
-        let resolved_head = ctx
-            .iter()
-            .rev()
-            .find_map(|scope| {
-                self.qualified
-                    .get_key_value(format!("{scope}::{head}").as_str())
-                    .map(|(&k, _)| k)
-            })
-            .or_else(|| self.qualified.get_key_value(head).map(|(&k, _)| k));
-        let resolved_root = || self.qualified.get_key_value(name).map(|(&k, _)| k);
-        match (resolved_head, tail) {
-            (Some(h), None) => Some(h),
-            (Some(h), Some(tail)) => self
-                .qualified
-                .get_key_value(format!("{h}::{tail}").as_str())
-                .map(|(&k, _)| k)
-                .or_else(resolved_root),
-            (None, _) => resolved_root(),
-        }
     }
 
     /// Whether every `Class` name inside a tuple-return shape list resolves —
