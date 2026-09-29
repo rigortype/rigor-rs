@@ -12,28 +12,26 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-29): pin `e59b7b89`, 0 FP / 9,337, gaps 818.** Resume
-WIP #194 `3baa519`. Retractions: **#134–#137**. FPs: #146. CLI/config:
-#155–#159, #162, #169–#171, #130, #132; #160 blocked upstream.
-Audit at NODE granularity; per-file histograms net over-claims.
+▶ **NEXT (2026-09-29): pin `e59b7b89`, 0 FP / 9,337, gaps 818.**
+Retractions: **#134–#137** (134–136 WIP). FPs: #146. CLI/config:
+#155–#159, #162, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 core migration + compat
   next-stage plan (Phases 0–3, [plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
   `--protection`/`--mutation` + `type-scan` deferred ([scoping
   call](notes/20260719-coverage-command-scoping.md)).
-- **Pin is master `e59b7b89`** (+ vendored rbs 4.2.0; re-pinned 2026-09-25). Both
+- **Pin is master `e59b7b89`** (rbs 4.2.0 vendored). Both
   standing exception tables EMPTY; a new entry is a real finding, not maintenance
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap). Version-guard folds mirror
-  host dependence (`HOST_RUBY_VERSION` 4.0.5/`ruby`, `RIGOR_RUBY_*`).
+  host dependence (`HOST_RUBY_VERSION`, `RIGOR_RUBY_*`).
 
 State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
-unregistered extras / 0 registered divergences**, coverage 651/708; standing
-sweep **0 FP / 9,337 files / 827 gaps** (#141 closed 3,002), 8 corpora, baselines in
-`harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). `--sweep` is ~3
-min (upstream #874); read per-corpus MATCHED counts. Grading tools REFUSE a
-binary older than the rigor-cli path-dep closure — corpus tools release,
-fixture harness debug. Clippy: workspace
-`-D warnings`, FRESH `CARGO_TARGET_DIR`.
+unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
+9,337 files / 818 gaps** (#141 closed 3,002), 8 corpora, baselines in
+`harness/CORPUS.md`; effects gate 0 OVER. `--sweep` ~3 min; read per-corpus
+MATCHED counts. Grading tools REFUSE a stale rigor-cli build — corpus tools
+release, fixture harness debug. Clippy: workspace `-D warnings`, FRESH
+`CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
@@ -87,6 +85,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-29 #194 CLOSED** (PR #291): symbol/BigInt/float witness spelling; literal-tuple block fold + write gate. 0 FP / 818; → #292–#294. [note](notes/20260929-issue-194-witness-rendering.md)
 - **2026-09-29 #168 CLOSED** (PR #289): project-`sig/` `use` + `resolve-type-names` + missing-name stubs; alias-aware head-first resolver. 0 FP / 818; → #286–#290. [note](notes/20260929-issue-168-rbs-use.md)
 - **2026-09-28 #201 CLOSED** (PR #285): `exclude:` + `BUILTIN_EXCLUDES` moved inside directory expansion (explicit `.rb` roots verbatim); exact `dir.c` `fnmatch` flags-0 port; LSP gate exclusion-immunity for verbatim roots. 0 FP / sweep. [note](notes/20260928-issue-201-excludes.md)
 - **2026-09-28 #139 CLOSED** (PR #284): `[]=` splice writes + top-level mutation widening (unconditional → `Nominal`, conditional → `Dynamic`, coll pass joins); `BeginRescue` flow arm; coll rule reads the widened env. 0 FP / sweep. [note](notes/20260928-issue-139-splice-write.md)
