@@ -2,7 +2,8 @@
 //! `StatementsKind` / `JumpKind` / `RescueClause` payloads.
 
 use super::{
-    BlockParamKind, HashKey, MethodBody, MultiTargets, NodeId, ParamShape, Span, Visibility,
+    BlockParamKind, HashKey, IndexWrites, MethodBody, MultiTargets, NodeId, ParamShape, Span,
+    Visibility,
 };
 
 /// One `rescue` clause of a `begin`/`def` rescue chain, in chain order — the
@@ -30,6 +31,12 @@ pub struct RescueClause {
     /// `String → C` drift. Populated only from a real `BeginNode` rescue chain
     /// (empty for the reused carriers).
     pub bound_name: Option<String>,
+    /// The `[]=` stores an index-target reference performs — `rescue => h[:e]`
+    /// stores the rescued exception through `[]=` on `h`
+    /// (`statement_evaluator.rb` `bind_rescue_reference`, rigor-rs#134). Each
+    /// `(receiver local, target span)` widens `h` as `h[:e] = e` does. Empty
+    /// for a non-index reference.
+    pub index_writes: IndexWrites,
     pub span: Span,
 }
 
@@ -467,10 +474,17 @@ pub enum Node {
     /// reference binds the index to the element type on every iteration
     /// (`statement_evaluator.rb` `bind_for_index`), so the flow write collectors
     /// treat each name as a rebind (rigor-rs#151).
+    ///
+    /// `index_writes` is the `[]=` half of a `for` index: an index-target index
+    /// (`for h[:k] in xs`, `for w, h[:k] in pairs`, `for *h[:k] in xs`) stores
+    /// the element through `[]=` on `h` each iteration, so each `(receiver
+    /// local, target span)` widens `h` exactly as `h[k] = v` does
+    /// (`IndexWriteWidening`, rigor-rs#134).
     Loop {
         predicate: Option<NodeId>,
         body: Vec<NodeId>,
         index: Vec<(String, Span)>,
+        index_writes: IndexWrites,
         span: Span,
     },
     /// `begin`/`rescue`/`else`/`ensure`. The protected body, each rescue body,

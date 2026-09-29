@@ -200,6 +200,14 @@ impl<'i> Typer<'i> {
                     penv.remove(&name);
                     tenv.insert(name, ty);
                 }
+                // An `h[k]` index target stores through `[]=` on the
+                // post-binding scope — a MUTATION of `h`, not a rebind: widen
+                // `tenv` (the stored slot's type is unmodelled) but keep any
+                // `nenv`/`penv` fact, exactly as a bare `h[k] = v` call does
+                // (rigor-rs#134).
+                for (_, tspan) in targets.index_writes() {
+                    widen_flow_writes(writes, tspan, tenv, interner);
+                }
             }
             Node::LocalVariableOpWrite { name, .. } => {
                 // `x += …` / `x ||= …` reads-then-writes ⇒ the nil possibility is
