@@ -12,10 +12,10 @@ note or ADR *first*. No status essays — hard byte budget.
 ## Now / Next
 
 ▶ **NEXT: pin `e59b7b89`, 0 FP / 9,337 / 818 gaps.**
-Retractions: **#135/#137**. FPs: #146. CLI/config:
+FPs: #146. CLI/config:
 #155–#159, #162, #169–#171, #130, #132; #160 blocked.
-- **CLOSED arcs** (do not re-open): ADR-0042 migration + compat plan
-  ([Phases 0–3](notes/20260718-compat-next-stage-plan.md)).
+- **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
+  ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
   `--protection`/`--mutation` + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
@@ -37,16 +37,14 @@ release, fixture harness debug. Clippy: `-D warnings`, FRESH
 - **Possible-nil / Tier B/C is CLOSED, not deferred** — the closing slice deletes
   the nameable-concrete-arm FP-safety mechanism; `fp_audit` would score it
   0 FP: the parity gate points the wrong way
-  ([tier-bc](notes/20260717-tier-bc-track-closed.md)). **Its SCOPE, measured per row
-  at `v0.3.8` with the oracle's `type-of`: the 85 `Dynamic`-arm rows, NOT the 93
-  concrete-arm ones** (gated on nested-scope typing, then a 36-source tail).
+  ([tier-bc](notes/20260717-tier-bc-track-closed.md)). **Its SCOPE: the 85
+  `Dynamic`-arm rows at `v0.3.8`, NOT the 93 concrete-arm ones**.
 - **Reference-FP undefined-method clusters, CLOSED** — `pre_eval:` cross-file
   monkey-patch (closing INVERTS the ADR-0033 provenance gate), receiver-typed-`nil`,
   rdoc generated-parser `Hash` ([141](notes/20260807-gap-adjudication-141.md)).
   Re-adjudicated whole at `v0.3.8` ([799](notes/20260909-gap-adjudication-799.md)):
-  rdoc is **93 rows** naming classes the port's RBS does not declare; plus
-  `Class.new(X) do…end` bodies read at TOP-LEVEL scope, nested `def` never
-  indexed, gvar/OpenStruct. **395 of 799 sit behind decisions; biggest
+  rdoc is **93 rows** naming undeclared classes; plus `Class.new` bodies,
+  nested `def`, gvar/OpenStruct. **395 of 799 sit behind decisions; biggest
   mechanism = nested-scope receiver typing, 71 rows.**
 - **Five consecutive FP-safe flow slices closed 0 survey gaps** — never build a
   coverage slice without a valid-mode `fp_audit --gaps` prediction
@@ -55,10 +53,10 @@ release, fixture harness debug. Clippy: `-D warnings`, FRESH
   the 2026-08-07 census re-opened it by asking which MECHANISM each gap is, not which
   rule, and four slices closed **47 rows** on shapes the port already had signatures
   for. Pick from mechanism buckets; re-run `gap_census.py --sweep` after each.
-- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (2026-08-26 s4). Four stricter typer-free rules measured; best still 5 OVER on gitlab-foss/lib. Upstream's edge set = the call nodes its typer visited, not characterisable (blind spots depend on condition folding, sometimes THROUGH A CALL). Inversion: more edges ⇒ more TAINT (sound) AND more LABELS (unsound); `absorb` moves both in one pass. **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER; proposals must MATCH the oracle. [probe](notes/20260826-effects-s4-probe.md).
+- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (s4). Four stricter typer-free rules measured; best still 5 OVER on gitlab-foss/lib; upstream's edge set isn't characterisable and inversion adds LABELS (unsound). **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen arc closed** — byte surface 0, `--write` sound; rest coverage-only.
 - **Plugin work:** pure-RBS bundle track closed ([note](notes/20260710-pure-rbs-bundle-track-closed.md));
-  sidecar complete, perf slices retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
+  sidecar + perf retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
 
 ## Build & gates
 
@@ -79,6 +77,8 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-29 #137 CLOSED** (PR #305): closure-bound locals shadow outer to `Dynamic[top]` in unentered blocks (entry-scope + shadow). 0 FP / 818; → #315–#317. [note](notes/20260929-issue-137-closure-shadow.md)
+- **2026-09-29 #135 CLOSED** (PR #297): `Node::IndexWrite` for `h[k] op=/||=/&&=` routes into mutator widening; resolves #298. 0 FP; → #312–#314. [note](notes/20260929-issue-135-index-write.md)
 - **2026-09-29 #136 CLOSED** (PR #296): per-site operand env replay (`OperandWalk` port) — later operands type from the scope earlier ones left. 0 FP; → #306–#311. [note](notes/20260929-issue-136-operand-scope.md)
 - **2026-09-29 #134 CLOSED** (PR #295): index-target stores (multi-assign/`for`/`rescue`) widen receivers via `MultiTarget::Index`. 0 FP; → #298–#304. [note](notes/20260929-issue-134-index-widening.md)
 - **2026-09-29 #194 CLOSED** (PR #291): symbol/BigInt/float witness spelling; literal-tuple block fold + write gate. 0 FP / 818; → #292–#294. [note](notes/20260929-issue-194-witness-rendering.md)
