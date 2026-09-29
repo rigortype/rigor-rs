@@ -12,17 +12,15 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT (2026-09-29): pin `e59b7b89`, 0 FP / 9,337, gaps 827.** Nothing
-claimed; WIP branches hold interrupted work: #168 `ebcc596`,
-#194 `3baa519`. Retractions: **#134–#137**. FPs: #146. CLI/config:
-#155–#159, #162, #168–#171; #160 blocked upstream. Also #130, #132.
-Audit at NODE granularity — per-file histograms net over-claims vs under-claims.
-- **CLOSED arcs** (in the ledger; do not re-open): ADR-0042 core migration
-  (PRs #31/#32) and the compat next-stage plan (Phases 0–3 done, exhausted —
-  [plan](notes/20260718-compat-next-stage-plan.md)).
-- **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage`
-  precision done; `--protection`/`--mutation` + `type-scan` deferred
-  ([scoping call](notes/20260719-coverage-command-scoping.md)).
+▶ **NEXT (2026-09-29): pin `e59b7b89`, 0 FP / 9,337, gaps 818.** Resume
+WIP #194 `3baa519`. Retractions: **#134–#137**. FPs: #146. CLI/config:
+#155–#159, #162, #169–#171, #130, #132; #160 blocked upstream.
+Audit at NODE granularity; per-file histograms net over-claims.
+- **CLOSED arcs** (do not re-open): ADR-0042 core migration + compat
+  next-stage plan (Phases 0–3, [plan](notes/20260718-compat-next-stage-plan.md)).
+- **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
+  `--protection`/`--mutation` + `type-scan` deferred ([scoping
+  call](notes/20260719-coverage-command-scoping.md)).
 - **Pin is master `e59b7b89`** (+ vendored rbs 4.2.0; re-pinned 2026-09-25). Both
   standing exception tables EMPTY; a new entry is a real finding, not maintenance
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap). Version-guard folds mirror
@@ -31,10 +29,10 @@ Audit at NODE granularity — per-file histograms net over-claims vs under-claim
 State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
 unregistered extras / 0 registered divergences**, coverage 651/708; standing
 sweep **0 FP / 9,337 files / 827 gaps** (#141 closed 3,002), 8 corpora, baselines in
-`harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). `--sweep` is a
-3-MINUTE gate again (upstream #874); read per-corpus MATCHED counts. Grading
-tools REFUSE a binary older than the rigor-cli path-dep closure (PR #65, scoped
-by #100) — corpus tools release, fixture harness debug. Clippy: workspace
+`harness/CORPUS.md`; effects gate 0 OVER (report and snapshot). `--sweep` is ~3
+min (upstream #874); read per-corpus MATCHED counts. Grading tools REFUSE a
+binary older than the rigor-cli path-dep closure — corpus tools release,
+fixture harness debug. Clippy: workspace
 `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
@@ -63,8 +61,8 @@ by #100) — corpus tools release, fixture harness debug. Clippy: workspace
   for. Pick from mechanism buckets; re-run `gap_census.py --sweep` after each — the
   gap set's SHAPE moves even when its total barely does.
 - **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (2026-08-26 s4). Four stricter typer-free rules measured; best still 5 OVER on gitlab-foss/lib. Upstream's edge set = the call nodes its typer visited, not characterisable (blind spots depend on condition folding, sometimes THROUGH A CALL). Inversion: more edges ⇒ more TAINT (sound) AND more LABELS (unsound); `absorb` moves both in one pass. **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER; proposals must MATCH the oracle. [probe](notes/20260826-effects-s4-probe.md).
-- **sig-gen arc is closed** — byte-mismatch surface 0, `--write` sound;
-  remaining items are thin coverage-only (sound-superset, AGENTS.md).
+- **sig-gen arc closed** — byte surface 0, `--write` sound; remaining items
+  coverage-only (sound-superset, AGENTS.md).
 - **Plugin work:** the pure-RBS bundle track is closed
   ([note](notes/20260710-pure-rbs-bundle-track-closed.md)); the code engine is a
   separate ADR-backed track. **Sidecar**: complete; perf slices retired
@@ -89,6 +87,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-29 #168 CLOSED** (PR #289): project-`sig/` `use` + `resolve-type-names` + missing-name stubs; alias-aware head-first resolver. 0 FP / 818; → #286–#290. [note](notes/20260929-issue-168-rbs-use.md)
 - **2026-09-28 #201 CLOSED** (PR #285): `exclude:` + `BUILTIN_EXCLUDES` moved inside directory expansion (explicit `.rb` roots verbatim); exact `dir.c` `fnmatch` flags-0 port; LSP gate exclusion-immunity for verbatim roots. 0 FP / sweep. [note](notes/20260928-issue-201-excludes.md)
 - **2026-09-28 #139 CLOSED** (PR #284): `[]=` splice writes + top-level mutation widening (unconditional → `Nominal`, conditional → `Dynamic`, coll pass joins); `BeginRescue` flow arm; coll rule reads the widened env. 0 FP / sweep. [note](notes/20260928-issue-139-splice-write.md)
 - **2026-09-28 #163 CLOSED** (PR #282): `text`/`github`/`sarif` byte-matched (`[rule]` suffix, `N error(s)` summary, `title=`, serde key-order); SARIF `driver.version` deliberately the port's own. 0 FP; `output_formats.rs` pin. [note](notes/20260928-issue-163-output-formats.md)
