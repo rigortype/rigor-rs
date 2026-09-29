@@ -218,7 +218,7 @@ impl<'i> Typer<'i> {
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
-            Node::Call { .. } => {
+            Node::Call { .. } | Node::IndexWrite { .. } => {
                 self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
             }
             Node::Definition { body, .. }
@@ -320,6 +320,37 @@ impl<'i> Typer<'i> {
                 nenv.clear();
                 self.nil_flow_expr(ast, left, tenv, nenv, penv, writes, interner, out);
                 self.nil_flow_expr(ast, right, tenv, nenv, penv, writes, interner, out);
+            }
+            // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index
+            // write. The receiver read is recorded exactly as a `[]=`
+            // `Call` receiver's: evaluating `h[k]` on a nil `h` raises just
+            // the same. The store can only REPLACE `h`'s contents, never
+            // leave `h` nil — but narrowing it away is this pass's decline,
+            // matching the `Call` arm's keep-the-fact treatment of
+            // `h[k] = v`. Operands are EXPRESSION position: evaluating them
+            // preserves the uses the old recovered `Statements` carrier
+            // descended (rigor-rs#135).
+            Node::IndexWrite {
+                receiver,
+                indices,
+                value,
+                ..
+            } => {
+                let (receiver, indices, value) = (*receiver, indices.clone(), *value);
+                if let Some(r) = receiver {
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
+                }
+                if let Some(r) = receiver {
+                    if let Node::LocalVariableRead { name, .. } = ast.get(r) {
+                        if let Some(&arm) = nenv.get(name) {
+                            out.insert(id, arm);
+                        }
+                    }
+                }
+                for i in &indices {
+                    self.nil_flow_expr(ast, *i, tenv, nenv, penv, writes, interner, out);
+                }
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
             }
             _ => {}
         }

@@ -108,6 +108,49 @@ fn coll_m03_hash_index_assign_fires() {
     );
 }
 
+/// `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index write stores
+/// through `[]=` on the receiver, so the reference's `IndexWriteWidening`
+/// (`index_write_widening.rb`, upstream #560) routes it into the same `[]=`
+/// widening `h[k] = v` takes: the literal shape is gone, the carrier widens
+/// to the nominal, and a later use still dispatches. Before `Node::IndexWrite`
+/// existed these rows read the STALE shape (`h[:a].upcase` fired `for 1`
+/// where the oracle is silent — rigor-rs#135).
+#[test]
+fn coll_index_compound_write_widens_receiver() {
+    for (src, cls) in [
+        (&b"def f\n  h = {}\n  h[:a] ||= 1\n  h.frobnicate_zzz\nend\n"[..], "Hash"),
+        (&b"def f\n  h = {}\n  h[:a] &&= 1\n  h.frobnicate_zzz\nend\n"[..], "Hash"),
+        (&b"def f\n  h = {}\n  h[:a] += 1\n  h.frobnicate_zzz\nend\n"[..], "Hash"),
+        (&b"def f\n  a = []\n  a[0] += 1\n  a.frobnicate_zzz\nend\n"[..], "Array"),
+        (&b"def f\n  a = []\n  a[0] ||= 1\n  a.frobnicate_zzz\nend\n"[..], "Array"),
+    ] {
+        assert_eq!(
+            snap(src, "frobnicate_zzz"),
+            Some(cls),
+            "expected {cls} for {:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// The widening keeps the `[]=` `Call` arm's envelope: a param (an untyped
+/// seed) mints no carrier, and a branch-contained compound write leaves
+/// divergent edges — both decline (the zero-FP side).
+#[test]
+fn coll_index_compound_write_silent_rows() {
+    for src in [
+        &b"def f(h)\n  h[:a] ||= 1\n  h.frobnicate_zzz\nend\n"[..],
+        &b"def f(c)\n  h = {}\n  h[:a] ||= 1 if c\n  h.frobnicate_zzz\nend\n"[..],
+    ] {
+        assert_eq!(
+            snap(src, "frobnicate_zzz"),
+            None,
+            "expected silence for {:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
 /// m06: no alias tracking — `b = a; b << 1` widens only `b`; `a` keeps its
 /// `Tuple[]`, which dispatches as Array all the same
 /// (`receiver_descriptor:209`). BOTH uses fire.

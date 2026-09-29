@@ -633,6 +633,16 @@ fn node_children(node: &Node) -> Vec<NodeId> {
             out.push(*value);
             out.extend(target_exprs.iter().copied());
         }
+        Node::IndexWrite {
+            receiver,
+            indices,
+            value,
+            ..
+        } => {
+            out.extend(receiver.iter().copied());
+            out.extend(indices.iter().copied());
+            out.push(*value);
+        }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             out.extend(parts.iter().copied())
         }

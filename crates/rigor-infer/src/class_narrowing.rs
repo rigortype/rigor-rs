@@ -452,7 +452,7 @@ impl<'i> Typer<'i> {
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
-            Node::Call { .. } => {
+            Node::Call { .. } | Node::IndexWrite { .. } => {
                 self.class_flow_expr(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             // A `return E` evaluates its values in the current facts (`return
@@ -965,6 +965,37 @@ impl<'i> Typer<'i> {
             // post-clear apply here too.
             Node::Statements { .. } | Node::BeginRescue { .. } => {
                 self.class_flow_stmt(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
+            }
+            // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index
+            // write. Its operands evaluate in EXPRESSION position and record
+            // uses under the facts in force — the stage 3b-1
+            // `cache[v] ||= v.use` shape (row d1), which the old recovered
+            // `Statements` carrier descended and the owned variant must not
+            // lose. The `[]=` store kills a narrowed fact on the receiver
+            // exactly as the `[]=` `Call` arm does — `kill_cenv_narrowed` by
+            // span: mutation, never a rebind.
+            Node::IndexWrite {
+                receiver,
+                indices,
+                value,
+                span,
+            } => {
+                let (receiver, indices, value, wspan) =
+                    (*receiver, indices.clone(), *value, *span);
+                if let Some(r) = receiver {
+                    self.class_flow_expr(
+                        ast, r, tenv, cenv, coarse, writes, interner, out, false,
+                    );
+                }
+                for i in &indices {
+                    self.class_flow_expr(
+                        ast, *i, tenv, cenv, coarse, writes, interner, out, false,
+                    );
+                }
+                self.class_flow_expr(
+                    ast, value, tenv, cenv, coarse, writes, interner, out, false,
+                );
+                kill_cenv_narrowed(writes, wspan, cenv);
             }
             // Stage 3a-3: a bare read of a chain ROOT anywhere OTHER than
             // beneath a live address read invalidates every chain rooted at it.

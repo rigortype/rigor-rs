@@ -1331,6 +1331,16 @@ fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
             out.push(*value);
             out.extend_from_slice(target_exprs);
         }
+        Node::IndexWrite {
+            receiver,
+            indices,
+            value,
+            ..
+        } => {
+            out.extend(receiver.iter().copied());
+            out.extend_from_slice(indices);
+            out.push(*value);
+        }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             out.extend_from_slice(parts);
         }

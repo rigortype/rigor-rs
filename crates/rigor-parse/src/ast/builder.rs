@@ -136,6 +136,42 @@ impl<'src> Builder<'src> {
             });
         }
 
+        // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — Prism's three compound
+        // index-write nodes. A plain `h[k] = v` stays a `[]=` `Node::Call`;
+        // the compound forms read the slot AND store through `[]=`, so they
+        // need a dedicated shape the reference's `IndexWriteWidening`
+        // (`index_write_widening.rb`) consumes — receiver, index args, value.
+        // They are NOT `Node::Call`s: the reference's `eval_index_write` /
+        // `eval_index_or_write` widen the receiver binding and type the node
+        // without dispatching `call.*` rules on the synthesized `[]` / `[]=`
+        // (`c[0] ||= 1` is silent for a `class C; end` receiver — probed at
+        // `e59b7b89`); a `Call` here would fire `call.undefined-method` /
+        // `call.wrong-arity` the reference never emits.
+        let index_write = node
+            .as_index_or_write_node()
+            .map(|w| (w.receiver(), w.arguments(), w.value()))
+            .or_else(|| {
+                node.as_index_and_write_node()
+                    .map(|w| (w.receiver(), w.arguments(), w.value()))
+            })
+            .or_else(|| {
+                node.as_index_operator_write_node()
+                    .map(|w| (w.receiver(), w.arguments(), w.value()))
+            });
+        if let Some((receiver, arguments, value)) = index_write {
+            let receiver = receiver.as_ref().map(|r| self.lower_node(r));
+            let indices = arguments
+                .map(|a| self.lower_body(&a.arguments()))
+                .unwrap_or_default();
+            let value = self.lower_node(&value);
+            return self.push(Node::IndexWrite {
+                receiver,
+                indices,
+                value,
+                span,
+            });
+        }
+
         if let Some(read) = node.as_local_variable_read_node() {
             let name = constant_string(read.name().as_slice());
             return self.push(Node::LocalVariableRead {
@@ -1294,7 +1330,7 @@ fn constant_list_names(list: &ruby_prism::ConstantList<'_>) -> Vec<String> {
 
 /// Whether a Prism node is an assignment the lowering cannot reproduce —
 /// every operator/and/or write on a non-local target (`@x += 1`, `K += 1`,
-/// `a[i] ||= v`, `x.f &&= v`), a `K::V` constant-path write, and the
+/// `x.f &&= v`), a `K::V` constant-path write, and the
 /// pattern-binding nodes (`expr => pat`, `expr in pat`). Local writes,
 /// multiwrites, `for` indexes, and the plain `K = v`/`@x = v`/`$g = v`/`@@x =
 /// v` forms have owned variants already; multiwrite TARGETS never reach
@@ -1316,9 +1352,6 @@ fn is_unmodeled_write(node: &PrismNode<'_>) -> bool {
         || node.as_global_variable_and_write_node().is_some()
         || node.as_global_variable_operator_write_node().is_some()
         || node.as_global_variable_or_write_node().is_some()
-        || node.as_index_and_write_node().is_some()
-        || node.as_index_operator_write_node().is_some()
-        || node.as_index_or_write_node().is_some()
         || node.as_instance_variable_and_write_node().is_some()
         || node.as_instance_variable_operator_write_node().is_some()
         || node.as_instance_variable_or_write_node().is_some()

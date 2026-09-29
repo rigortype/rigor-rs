@@ -563,6 +563,9 @@ impl<'i> Typer<'i> {
     /// `y = x; y + 1` reads `y` per position). Everything else declines:
     ///
     /// - op-writes (`x += 1`, `y ||= z`) — read-modify-write, unmodeled;
+    /// - compound index writes (`x[i] += 1`, `x[i] ||= v` — [`Node::IndexWrite`]):
+    ///   a store through `[]=` on a binding the overlay replays as a value, so
+    ///   the tail would answer with the pre-write slot (rigor-rs#135);
     /// - multiwrites, `for`/`while`/`until` loops, `rescue => e` binds;
     /// - ivar/cvar/gvar/constant writes and [`Node::UnmodeledWrite`] markers
     ///   (operator writes the lowering cannot reproduce, `in`/`=>` pattern
@@ -626,6 +629,7 @@ impl<'i> Typer<'i> {
                 Node::LocalVariableOpWrite { .. }
                 | Node::MultiWrite { .. }
                 | Node::Loop { .. }
+                | Node::IndexWrite { .. }
                 | Node::VariableWrite { .. }
                 | Node::InstanceVariableWrite { .. }
                 | Node::ConstantWrite { .. }

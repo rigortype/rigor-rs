@@ -104,6 +104,31 @@ pub enum Node {
     },
     /// A read of a previously-written local (`s`).
     LocalVariableRead { name: String, span: Span },
+    /// A compound index write — `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v`
+    /// (Prism's `IndexOrWriteNode` / `IndexAndWriteNode` /
+    /// `IndexOperatorWriteNode`; `h[k] = v` stays a `[]=` [`Node::Call`]).
+    /// Each stores through `[]=` on its receiver, so the flow passes treat a
+    /// bare-local receiver as an in-place mutation of that binding — the
+    /// reference's `IndexWriteWidening` (`index_write_widening.rb`, upstream
+    /// #560) routes all three into `widen_for_mutator` / `widen_receiver_aliases`
+    /// with method `[]=`, widening the carrier exactly as `h[k] = v` does.
+    ///
+    /// This is deliberately NOT a [`Node::Call`]: the reference's
+    /// `eval_index_write` / `eval_index_or_write` type the node and widen the
+    /// binding without running the `call.*` dispatch on the synthesized `[]=`
+    /// / `[]` (`c[0] ||= 1` is silent for a `class C; end` receiver — probed
+    /// at `e59b7b89`). Lowering it as a `Call` would attach
+    /// `call.undefined-method` / `call.wrong-arity` firings the reference
+    /// does not emit.
+    ///
+    /// `receiver` is `None` in the no-receiver edge (Prism marks it optional);
+    /// `indices` are the lowered index arguments, `value` the stored value.
+    IndexWrite {
+        receiver: Option<NodeId>,
+        indices: Vec<NodeId>,
+        value: NodeId,
+        span: Span,
+    },
     /// A string literal (`"Hello"`); `value` is the unescaped contents.
     StringLit { value: String, span: Span },
     /// An interpolated string or heredoc (`"a#{x}b"`, `<<~SQL ... #{t} ... SQL`).
@@ -789,6 +814,7 @@ impl Node {
             | Node::LocalVariableOpWrite { span, .. }
             | Node::MultiWrite { span, .. }
             | Node::LocalVariableRead { span, .. }
+            | Node::IndexWrite { span, .. }
             | Node::StringLit { span, .. }
             | Node::InterpolatedString { span, .. }
             | Node::InterpolatedSymbol { span, .. }

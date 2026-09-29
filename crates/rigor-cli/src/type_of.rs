@@ -292,6 +292,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::LocalVariableOpWrite { .. } => "LocalVariableOpWrite",
         Node::MultiWrite { .. } => "MultiWrite",
         Node::LocalVariableRead { .. } => "LocalVariableRead",
+        Node::IndexWrite { .. } => "IndexWrite",
         Node::StringLit { .. } => "StringLit",
         Node::InterpolatedString { .. } => "InterpolatedString",
         Node::InterpolatedSymbol { .. } => "InterpolatedSymbol",
