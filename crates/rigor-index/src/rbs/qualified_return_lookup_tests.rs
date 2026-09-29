@@ -106,13 +106,16 @@ fn ambiguous_superclass_leaf_declines() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Member-level twin of the ambiguity decline: a flat return LEAF whose
-/// namespace the tables discarded resolves only when the lexical walk has
-/// exactly ONE candidate. `-> Class` written inside `module Digest` sees
-/// BOTH `Digest::Class` and top-level `Class` ⇒ DECLINE; `-> Base` sees
-/// only `Digest::Base` ⇒ resolves.
+/// Member-level return names in a PROJECT file resolve by RBS lexical
+/// order (issue #168 — project signatures store the full written spelling,
+/// so the uniqueness decline a discarded-namespace bundled leaf needed no
+/// longer applies). `-> Class` written inside `module Digest` means
+/// `Digest::Class`, shadowing the root `Class` — confirmed against the
+/// reference (`Digest::MakerZzz.new.makec.spni` fires
+/// `undefined method 'spni' for Digest::Class` there); `-> Base` likewise
+/// resolves `Digest::Base`.
 #[test]
-fn ambiguous_member_return_leaf_declines() {
+fn project_member_return_resolves_lexically() {
     let dir = std::env::temp_dir().join("rigor_qual_return_amb_member_test");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -125,8 +128,14 @@ fn ambiguous_member_return_leaf_declines() {
     if !idx.knows_qualified_class("Digest::Base") {
         return; // stub fallback.
     }
-    assert_eq!(idx.method_return("Digest::MakerZzz", "makec"), None);
-    assert_eq!(idx.method_return("Digest::MakerZzz", "makeb"), Some("Digest::Base"));
+    assert_eq!(
+        idx.method_return("Digest::MakerZzz", "makec"),
+        Some("Digest::Class")
+    );
+    assert_eq!(
+        idx.method_return("Digest::MakerZzz", "makeb"),
+        Some("Digest::Base")
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

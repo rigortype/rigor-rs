@@ -15,12 +15,12 @@
 //! Falls back to a hardcoded stub only in the degenerate case (embedded set
 //! empty / override dir absent or unparsable), so the crate never panics.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 use ruby_rbs::node::{
     parse, AliasKind, AttributeKind, ClassNode, InterfaceNode, MethodDefinitionKind,
-    MethodDefinitionVisibility, ModuleNode, Node, TypeAliasNode,
+    MethodDefinitionVisibility, ModuleNode, Node, SignatureNode, TypeAliasNode,
 };
 
 // The build-time-embedded RBS signature set: `EMBEDDED_RBS: &[(&str, &str)]`,
@@ -592,6 +592,20 @@ struct ClassEntry {
     /// leaves, block-return leaves) resolve against ALL of these and must
     /// agree — any disagreement declines (FP-safe under-emit, never a guess).
     member_ctxs: Vec<Vec<&'static str>>,
+    /// Issue #168: every name-bearing type this entry's members REFERENCE —
+    /// the port's `unresolved_referenced_types` input (`collect_member_references`
+    /// / `collect_type_references` in the reference loader): instance-side method
+    /// signatures (all overloads, `initialize` and `def self.x` excluded —
+    /// `validate_type_params` never reaches them), non-singleton attribute
+    /// types, include/extend/prepend type ARGUMENTS, superclass type
+    /// arguments, and module self-type arguments — with each name stored the
+    /// way `resolve_type_names` left it (`use`-mapped / `::`-anchored /
+    /// root-only). Header NAMES (the superclass itself, a mixin's module
+    /// name, a module self-type's name) are deliberately NOT here: the
+    /// reference fails the whole definition build on those rather than
+    /// stubbing them, which `project_sig_chain_ok` mirrors instead. Read
+    /// only by [`synthesize_missing_referenced_types`].
+    referenced_type_names: Vec<&'static str>,
     /// `true` when this name was declared as a `module` (not a `class`) in RBS —
     /// the analogue of the reference's `Environment#rbs_module?`. Read ONLY by
     /// `call.raise-non-exception`'s instance path (a value typed as a module
@@ -717,6 +731,19 @@ pub struct CoreData {
     /// constant-receiver arm, which types the CALL's return, never the constant
     /// itself. So this adds no new witnessing surface for the constant.
     object_constants: HashMap<&'static str, &'static str>,
+    /// Issue #168: the qualified name of EVERY type the loaded env declares —
+    /// classes, modules, interfaces, type aliases and class/module aliases —
+    /// the `RBS::TypeNameResolver#all_names` analogue. The member-level
+    /// resolver consults `qualified` (classes only) because a return can only
+    /// ever mint a class nominal; the missing-type scan and the
+    /// `resolve-type-names: false` root check must answer about ANY declared
+    /// type, so this wider set rides along.
+    type_names: HashSet<&'static str>,
+    /// Issue #168: qualified names the missing-referenced-type stub pass
+    /// SYNTHESIZED — the reference's `synthesized_type_names`. A receiver
+    /// typed by one is `Dynamic[top]` there (never a method-bearing class),
+    /// so the undefined-method gates must never witness through them either.
+    synthesized_type_names: HashSet<&'static str>,
     /// Issue #129: the `rigor:v1:conforms-to` scan tables (see
     /// [`conformance`]). Read only by [`Self::conformance_findings`].
     conformance: conformance::ConformanceData,
@@ -843,6 +870,12 @@ impl CoreData {
             .filter(|k| !pre_sig_qualified.contains(k))
             .collect();
 
+        // Issue #168: stub the project-declared references the reference's
+        // `stub_missing_referenced_types` fixes up — BEFORE `finish`, so the
+        // synthesized names join the same maps a written decl would (and the
+        // project-sig snapshots above already exclude them).
+        synthesize_missing_referenced_types(&mut builder, &qualified_project_sig_classes);
+
         let (
             mut classes,
             toplevel_classes,
@@ -851,6 +884,8 @@ impl CoreData {
             mut qualified,
             short_to_qualified,
             object_constants,
+            type_names,
+            synthesized_type_names,
         ) = builder.finish();
         // 4) Neutralise the classes whose definition the REFERENCE cannot build
         //    (see `UNBUILDABLE_DEFINITIONS`). Applied LAST, after project `sig/`
@@ -870,6 +905,8 @@ impl CoreData {
                 qualified,
                 short_to_qualified,
                 object_constants,
+                type_names,
+                synthesized_type_names,
                 conformance,
             };
         }
@@ -2121,33 +2158,75 @@ impl CoreData {
     //   (∈ {`Random::Base`, `Digest::Base`}) shapes must never resolve by
     //   guess. Declining loses coverage; guessing manufactures FPs.
 
-    /// Resolve a WRITTEN type reference against the qualified registry with
-    /// RBS's name-resolution rule: an absolute reference (`"::Digest::Instance"`)
-    /// looks up its exact key; a relative one tries each lexical context scope
-    /// innermost-outward (`"{scope}::{written}"`), then the root
-    /// (`"{written}"`). First existing candidate wins — deterministic, because
-    /// the written path is full-fidelity. `None` when nothing matches
-    /// (conservative decline).
+    /// `TypeNameResolver#resolve_namespace0` for a WRITTEN
+    /// (namespace-preserving) type reference against `ctx` (innermost scope
+    /// LAST): an absolute `"::X::Y"` looks up its exact key; a relative name
+    /// binds its HEAD segment at the first lexical scope — innermost-outward,
+    /// then root — holding `scope::head`, then requires each tail segment
+    /// under the bound namespace. `None` when nothing binds
+    /// (`resolve_namespace0`'s `nil` — the name stays written-relative and
+    /// `absolute!` later reads it as `::`-rooted, so the root `written`
+    /// lookup is the correct fallback there) — a conservative decline.
+    ///
+    /// When the binding scope holds `scope::head` (or `cur::seg`) as a KNOWN
+    /// non-class/module name — a class/module alias (`aliased_name?` binds,
+    /// and the reference then normalizes through the alias target the port
+    /// does not record), interface or type alias (`has_type_name?` binds
+    /// them too) — the reference resolves through it and this walk cannot
+    /// follow. Returning an outer/root namesake instead would mint a type
+    /// the reference never produced — a false positive — so those decline
+    /// as well (issue #168 review).
     fn resolve_written_ref(&self, written: &str, ctx: &[&'static str]) -> Option<&'static str> {
         if let Some(abs) = written.strip_prefix("::") {
             return self.qualified.get_key_value(abs).map(|(&k, _)| k);
         }
-        for scope in ctx.iter().rev() {
-            let cand = format!("{scope}::{written}");
+        let mut segs = written.split("::");
+        let head = segs.next()?;
+        let root_fallback = || self.qualified.get_key_value(written).map(|(&k, _)| k);
+        let head_hit = ctx
+            .iter()
+            .rev()
+            .map(|scope| format!("{scope}::{head}"))
+            .chain(std::iter::once(head.to_string()))
+            .find_map(|cand| {
+                if let Some((&k, _)) = self.qualified.get_key_value(cand.as_str()) {
+                    Some(Ok(k))
+                } else if self.type_names.contains(cand.as_str()) {
+                    Some(Err(()))
+                } else {
+                    None
+                }
+            });
+        let mut cur = match head_hit {
+            Some(Ok(k)) => k,
+            Some(Err(())) => return None,
+            None => return root_fallback(),
+        };
+        for seg in segs {
+            let cand = format!("{cur}::{seg}");
             if let Some((&k, _)) = self.qualified.get_key_value(cand.as_str()) {
-                return Some(k);
+                cur = k;
+            } else if self.type_names.contains(cand.as_str()) {
+                return None;
+            } else {
+                return root_fallback();
             }
         }
-        self.qualified.get_key_value(written).map(|(&k, _)| k)
+        Some(cur)
     }
 
-    /// Resolve a LEAF-ONLY type reference (namespace + absolute bit lost at
-    /// ingestion) in ONE lexical context: every scope on the innermost-outward
-    /// walk (plus the root) that holds the name is a candidate, and the
-    /// resolution succeeds ONLY when exactly one distinct candidate exists.
-    /// Two or more ⇒ the discarded qualifier could have picked either ⇒
-    /// DECLINE (`None`) — never guess.
+    /// Resolve a type reference whose stored spelling the flat slots carried:
+    /// a leading `"::"` (absolute / `use`-mapped / `resolve-type-names:
+    /// false` root-only — issue #168) looks up its exact key; a leaf/written
+    /// path resolves in ONE lexical context, every scope on the
+    /// innermost-outward walk (plus the root) that holds the name a
+    /// candidate, and the resolution succeeds ONLY when exactly one distinct
+    /// candidate exists. Two or more ⇒ the discarded qualifier could have
+    /// picked either ⇒ DECLINE (`None`) — never guess.
     fn resolve_leaf_unique(&self, leaf: &str, ctx: &[&'static str]) -> Option<&'static str> {
+        if let Some(abs) = leaf.strip_prefix("::") {
+            return self.qualified.get_key_value(abs).map(|(&k, _)| k);
+        }
         let mut found: Option<&'static str> = None;
         for scope in ctx.iter().rev() {
             let cand = format!("{scope}::{leaf}");
@@ -2168,15 +2247,35 @@ impl CoreData {
     }
 
     /// Resolve a member-level type reference (a flat return-class name) of the
-    /// entry `definer`: [`Self::resolve_leaf_unique`] in EVERY member context
-    /// the entry was ingested under, adopting only a unanimous answer. A
-    /// definer with no recorded context (pre-Slice-5 stub data) or any
-    /// disagreement declines.
+    /// entry `definer`, in EVERY member context the entry was ingested under,
+    /// adopting only a unanimous answer. A definer with no recorded context
+    /// (pre-Slice-5 stub data) or any disagreement declines.
+    ///
+    /// The per-context resolver is chosen by the STORED name's fidelity
+    /// (issue #168):
+    ///
+    /// * A name a PROJECT signature stores is full-fidelity — `member_name`
+    ///   under a `FileSigCtx` keeps the written namespace (`Ns::Impl`,
+    ///   `Impl`, `::X`), so it resolves by RBS's own deterministic rule —
+    ///   [`Self::resolve_written_ref`]: head segment innermost-outward,
+    ///   FIRST hit binds (`Ns::Impl` shadows a root `Impl` written inside
+    ///   `module Ns`), a bound head that fails its tail falls back to the
+    ///   written path at root (the reference keeps the relative name, which
+    ///   `validate_type_name`'s `absolute!` then reads as `::`-rooted).
+    /// * A bundled entry's flat LEAF (`Instance`, namespace discarded by
+    ///   `type_name_str` at ingest) keeps [`Self::resolve_leaf_unique`]'s
+    ///   uniqueness requirement: there first-hit could mint a class the
+    ///   discarded qualifier would not have resolved to.
     fn resolve_member_type_ref(&self, definer: &str, name: &str) -> Option<&'static str> {
         let entry = self.qualified.get(definer)?;
+        let project = self.qualified_project_sig_classes.contains(definer);
         let mut agreed: Option<&'static str> = None;
         for ctx in &entry.member_ctxs {
-            let r = self.resolve_leaf_unique(name, ctx)?;
+            let r = if project {
+                self.resolve_written_ref(name, ctx)?
+            } else {
+                self.resolve_leaf_unique(name, ctx)?
+            };
             match agreed {
                 Some(prev) if prev != r => return None,
                 _ => agreed = Some(r),
@@ -2302,6 +2401,15 @@ impl CoreData {
             None => self.qualified_default_superclass(key, entry),
         };
         if let Some(s) = sup {
+            // The reference's `build_instance` raises when a superclass
+            // resolves to a MODULE (`class D < Mod` is not a class) — the
+            // whole definition collapses to `Dynamic[Top]` there. Issue #168
+            // made this reachable: a synthesized `module` namespace stub can
+            // sit where a project `< X` points.
+            if self.qualified.get(s).is_some_and(|e| e.is_module) {
+                *ok = false;
+                return;
+            }
             self.collect_qualified(s, order, seen, ok);
         }
     }
@@ -2332,6 +2440,13 @@ impl CoreData {
                 },
                 None => self.qualified_default_superclass(key, entry),
             };
+            // `build_singleton` fails the same way on a module superclass —
+            // see `collect_qualified`.
+            if let Some(s) = cur {
+                if self.qualified.get(s).is_some_and(|e| e.is_module) {
+                    break;
+                }
+            }
         }
         chain
     }
@@ -2532,6 +2647,302 @@ impl CoreData {
             }
         }
         false
+    }
+
+    // -- Issue #168: project-signature receiver dispatch --------------------
+
+    /// Whether `name` is a type the missing-referenced-type pass SYNTHESIZED
+    /// (module/class stubs only — the reference's `synthesized_type_names`,
+    /// `names_synthesized_in` over `class_decls`). A receiver typed by one is
+    /// `Dynamic[top]` in the reference (`try_synthesized_stub_type`), so every
+    /// diagnostic gate must decline it — a synthesized class is empty, but
+    /// "empty" is never "proven-absent".
+    pub fn is_synthesized_stub(&self, name: &str) -> bool {
+        self.synthesized_type_names.contains(name)
+    }
+
+    /// The module self-type half of [`Self::project_sig_chain_ok`]: whether
+    /// the WRITTEN name resolves to a definition the reference's
+    /// `build_instance`/`build_interface` accepts. Resolution follows
+    /// `TypeNameResolver` — the (already `use`-applied) spelling's head binds
+    /// innermost→outer→root, then each tail segment under the bound
+    /// namespace, every segment binding on `has_type_name? ||
+    /// aliased_name?` — i.e. `type_names`, which holds both sets. The bound
+    /// name is buildable iff it is a class/module (`qualified` ⇒
+    /// `define_instance`) or an interface (a `_` leaf ⇒ `define_interface`);
+    /// a type alias or missing name fails the reference's build identically.
+    ///
+    /// The two reference paths the port cannot reproduce stay declines —
+    /// failing the gate only ever loses coverage, it can never admit a name
+    /// the reference rejected:
+    ///
+    /// * a bound CLASS/MODULE-ALIAS segment (capitalized leaf in
+    ///   `type_names` but not `qualified`) normalizes through an `old_name`
+    ///   target the index never records — the reference may land on a
+    ///   buildable decl, but the port cannot know; and
+    /// * a bound non-namespace segment mid-path (an interface or type
+    ///   alias) dead-ends the tail, so the whole written name stays
+    ///   unresolved — the reference keeps it relative and `absolute!` reads
+    ///   it `::`-rooted, so the ROOT spelling is retried, never the
+    ///   intermediate binding.
+    fn self_type_buildable(&self, w: &str, ctx: &[&'static str]) -> bool {
+        fn leaf_of(n: &str) -> &str {
+            n.rsplit("::").next().unwrap_or(n)
+        }
+        // The reference's `define_instance`/`define_interface` split: a
+        // class/module name is buildable iff `class_decls` holds it
+        // (`qualified`); a `_`-leaf bound in `type_names` is an interface
+        // decl (nothing else may carry `_`); any other bound leaf — a
+        // lowercase type alias or a capitalized class/module alias — is not
+        // a buildable definition for a self-type.
+        let buildable = |k: &str| {
+            self.qualified.contains_key(k) || (leaf_of(k).starts_with('_') && self.type_names.contains(k))
+        };
+        let alias_hop = |k: &str| {
+            !self.qualified.contains_key(k)
+                && leaf_of(k).chars().next().is_some_and(|c| c.is_uppercase())
+        };
+        // An unresolvable relative spelling survives written-relative and
+        // `absolute!` roots it — the `::w` retry.
+        let root = |w: &str| self.type_names.get(w).is_some_and(|&k| buildable(k));
+
+        if let Some(abs) = w.strip_prefix("::") {
+            // Absolute names resolve context-free; a failure leaves the
+            // name untouched and `absolute!` is a no-op — no retry.
+            let mut segs = abs.split("::").peekable();
+            let mut cur: Option<&'static str> = None;
+            while let Some(seg) = segs.next() {
+                let cand = match cur {
+                    Some(c) => format!("{c}::{seg}"),
+                    None => seg.to_string(),
+                };
+                match self.type_names.get(cand.as_str()) {
+                    Some(&k) if self.qualified.contains_key(k) => cur = Some(k),
+                    Some(&k) if alias_hop(k) => return false,
+                    Some(&k) => return segs.peek().is_none() && buildable(k),
+                    None => return false,
+                }
+            }
+            return cur.is_some_and(|k| self.qualified.contains_key(k));
+        }
+
+        let mut segs = w.split("::").peekable();
+        let Some(head) = segs.next() else { return false };
+        let mut bound: Option<&'static str> = None;
+        for cand in ctx
+            .iter()
+            .rev()
+            .map(|s| format!("{s}::{head}"))
+            .chain(std::iter::once(head.to_string()))
+        {
+            if let Some(&k) = self.type_names.get(cand.as_str()) {
+                bound = Some(k);
+                break;
+            }
+        }
+        let Some(mut cur) = bound else { return root(w) };
+        if alias_hop(cur) {
+            return false;
+        }
+        if !self.qualified.contains_key(cur) {
+            return if segs.peek().is_none() {
+                buildable(cur)
+            } else {
+                root(w)
+            };
+        }
+        while let Some(seg) = segs.next() {
+            let cand = format!("{cur}::{seg}");
+            match self.type_names.get(cand.as_str()) {
+                Some(&k) if self.qualified.contains_key(k) => cur = k,
+                Some(&k) if alias_hop(k) => return false,
+                Some(&k) => {
+                    return if segs.peek().is_none() {
+                        buildable(k)
+                    } else {
+                        root(w)
+                    };
+                }
+                None => return root(w),
+            }
+        }
+        buildable(cur)
+    }
+
+    /// Whether a class/module name the SOURCE INDEX minted could have its
+    /// instance definition built by the reference's `build_instance` — the
+    /// chain-completeness gate the RBS return arm rides before trusting a
+    /// signature's method table:
+    ///
+    /// * the qualified ancestor chain must be COMPLETE (an unresolvable
+    ///   superclass/include/prepend — or a module where a superclass belongs —
+    ///   fails the build wholesale in the reference: the definition is `nil`,
+    ///   `Dynamic[top]` everywhere); and
+    /// * every module self-type on the chain must resolve to a DECLARED name
+    ///   (a `module M : Missing` the stub pass deliberately did NOT
+    ///   synthesize — `unresolved_referenced_types` never checks self-type
+    ///   NAMES — still fails `build_instance`).
+    ///
+    /// `initialize`/singleton-side names are deliberately NOT part of the
+    /// gate (the reference builds those lazily / skips them the same way).
+    pub fn project_sig_chain_ok(&self, qname: &str) -> bool {
+        let (chain, complete) = self.qualified_ancestors(qname);
+        if !complete {
+            return false;
+        }
+        for anc in chain {
+            let Some(entry) = self.qualified.get(anc) else {
+                return false;
+            };
+            for (w, ctx) in &entry.self_types_written {
+                if !self.self_type_buildable(w, ctx) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether `class_name` takes the QUALIFIED return path — the issue-#168
+    /// member names a project signature stores (`::`-anchored or
+    /// context-relative) only resolve through the member-context resolver.
+    /// Project-sig names always do; a qualified-only name (absent from
+    /// `classes`) does (the ADR-0042 Slice-5 routing); every other name keeps
+    /// the legacy short path — byte-identical bundled behaviour.
+    fn prefers_qualified_return(&self, class_name: &str) -> bool {
+        self.qualified_project_sig_classes.contains(class_name)
+            || (!self.classes.contains_key(class_name) && self.qualified.contains_key(class_name))
+    }
+
+    /// The `(return class, nilable)` of `class_name#method` for a receiver the
+    /// source index typed — [`Self::method_return_nilable`] with the
+    /// qualified-preferred routing of [`Self::prefers_qualified_return`]. The
+    /// issue-#168 `Foo::Impl` return — a `use`-mapped member name stored
+    /// `"::Foo::Impl"` — resolves only through the member contexts this path
+    /// reaches.
+    pub fn receiver_method_return(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        if self.prefers_qualified_return(class_name) {
+            self.qualified_method_return_core(class_name, method)
+        } else {
+            self.method_return_nilable(class_name, method)
+        }
+    }
+
+    /// The TUPLE twin of [`Self::receiver_method_return`], with project-side
+    /// shapes RESOLVED element-by-element through the definer's member
+    /// contexts — a `use`-mapped or context-relative element name mints the
+    /// class resolution arrives at, and an element resolution cannot pin (a
+    /// stub, an interface) degrades to `Unknown` rather than sinking the whole
+    /// tuple, exactly as the reference's translator yields `Dynamic[top]` for
+    /// that slot.
+    pub fn receiver_method_tuple_return(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<Vec<RbsReturnShape>> {
+        if !self.prefers_qualified_return(class_name) {
+            return self
+                .method_tuple_return(class_name, method)
+                .map(<[RbsReturnShape]>::to_vec);
+        }
+        let chain = self.qualified_ancestors_prefix(class_name);
+        for anc in chain {
+            let Some(entry) = self.qualified.get(anc) else {
+                continue;
+            };
+            if entry.methods.contains_key(method) {
+                let shapes = entry.tuple_returns.get(method)?;
+                return Some(self.resolve_return_shapes(anc, shapes));
+            }
+        }
+        None
+    }
+
+    /// Resolve each `Class` element of a stored tuple shape list through
+    /// `definer`'s member contexts; an element that does not resolve becomes
+    /// `Unknown` (the reference's `Dynamic[top]` degrade for that slot).
+    fn resolve_return_shapes(&self, definer: &str, shapes: &[RbsReturnShape]) -> Vec<RbsReturnShape> {
+        shapes
+            .iter()
+            .map(|s| match s {
+                RbsReturnShape::Class(name) => self
+                    .resolve_member_type_ref(definer, name)
+                    .map(RbsReturnShape::Class)
+                    .unwrap_or(RbsReturnShape::Unknown),
+                RbsReturnShape::Tuple(inner) => {
+                    RbsReturnShape::Tuple(self.resolve_return_shapes(definer, inner))
+                }
+                RbsReturnShape::Unknown => RbsReturnShape::Unknown,
+            })
+            .collect()
+    }
+
+    /// The singleton (class-method) twin of [`Self::receiver_method_return`]:
+    /// `def self.m` on a project-signature class resolves through the same
+    /// qualified-preferred path.
+    pub fn receiver_singleton_method_return(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<&'static str> {
+        if self.prefers_qualified_return(class_name) {
+            self.qualified_singleton_method_return(class_name, method, 0)
+        } else {
+            self.singleton_method_return(class_name, method)
+        }
+    }
+
+    /// The singleton-tuple twin of [`Self::receiver_method_tuple_return`].
+    pub fn receiver_singleton_tuple_return(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<Vec<RbsReturnShape>> {
+        if !self.prefers_qualified_return(class_name) {
+            return self
+                .singleton_method_tuple_return(class_name, method)
+                .map(<[RbsReturnShape]>::to_vec);
+        }
+        let chain = self.qualified_singleton_chain_prefix(class_name);
+        for anc in chain {
+            let Some(entry) = self.qualified.get(anc) else {
+                continue;
+            };
+            if entry.singleton_methods.contains_key(method) {
+                let shapes = entry.singleton_tuple_returns.get(method)?;
+                return Some(self.resolve_return_shapes(anc, shapes));
+            }
+        }
+        None
+    }
+
+    /// Issue #168: the qualified (and short) class names project `sig/`
+    /// introduced — the set the source registry pre-registers so an RBS
+    /// return naming one can mint its `Nominal`. Project-sig provenance is
+    /// what the dispatch gates (`is_qualified_project_sig_class`) key on, so
+    /// synthesized stubs are deliberately NOT here.
+    pub fn project_sig_declared_names(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = self
+            .project_sig_classes
+            .iter()
+            .chain(&self.qualified_project_sig_classes)
+            .copied()
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Issue #168: the SYNTHESIZED (module/class) stub names — registered for
+    /// `Nominal` identity but never flagged declaration-only: a stub receiver
+    /// is `Dynamic[top]` in the reference (`try_synthesized_stub_type`), so
+    /// the undefined-method gates must stay silent on it.
+    pub fn synthesized_stub_names(&self) -> Vec<&'static str> {
+        self.synthesized_type_names.iter().copied().collect()
     }
 
     /// Resolve a method's arity envelope over the ancestor chain (first defining
@@ -3137,6 +3548,9 @@ impl CoreData {
                     // (the qualified return-lookup path needs the real embedded
                     // RBS); empty keeps that path inert under the fallback.
                     superclass_written: None,
+                    // The stub records no member-level type references (the
+                    // missing-type stub pass needs the real embedded RBS).
+                    referenced_type_names: Vec::new(),
                     includes_written: Vec::new(),
                     // The stub models no `prepend` directives.
                     prepends: Vec::new(),
@@ -3388,6 +3802,10 @@ impl CoreData {
             short_to_qualified: HashMap::new(),
             // The stub carries no RBS object-constant declarations.
             object_constants: HashMap::new(),
+            // The stub models no wider known-type set and synthesizes no
+            // missing-type stubs.
+            type_names: HashSet::new(),
+            synthesized_type_names: HashSet::new(),
             conformance: conformance::ConformanceData::default(),
         }
     }
@@ -3435,6 +3853,8 @@ type BuiltData = (
     HashMap<&'static str, ClassEntry>,
     HashMap<&'static str, Vec<&'static str>>,
     HashMap<&'static str, &'static str>,
+    HashSet<&'static str>,
+    HashSet<&'static str>,
 );
 
 /// Accumulates parsed RBS declarations into per-class entries before flattening.
@@ -3483,6 +3903,22 @@ struct Builder {
     short_to_qualified: HashMap<&'static str, Vec<&'static str>>,
     /// Collection-shape stage 2b: see [`CoreData::object_constants`].
     object_constants: HashMap<&'static str, &'static str>,
+    /// Issue #168: the qualified name of EVERY declaration the env provides —
+    /// classes, modules, interfaces, type aliases and class/module aliases —
+    /// the `UseMap::Table.known_types` / `TypeNameResolver#all_names`
+    /// analogue. Bundled and plugin files populate it through the normal
+    /// ingest; project files contribute through the `ingest_project_dirs`
+    /// pre-pass because `use Foo::*` expands against the WHOLE loaded set
+    /// (the reference builds the table once over every source before
+    /// resolving any of them). Synthesized missing-type stubs (the
+    /// `stub_missing_referenced_types` pass) join the same set.
+    known_type_names: HashSet<&'static str>,
+    /// Issue #168: qualified names the missing-referenced-type stub pass
+    /// SYNTHESIZED (a subset of `known_type_names` once the pass runs). The
+    /// reference keeps exactly this set (`synthesized_type_names`) and treats
+    /// a receiver typed by one as `Dynamic[top]` — the dispatch gates need it
+    /// to keep a stub from ever witnessing a diagnostic.
+    synthesized_type_names: HashSet<&'static str>,
 }
 
 impl Builder {
@@ -3491,20 +3927,39 @@ impl Builder {
         let Ok(sig) = parse(code) else {
             return;
         };
+        self.ingest_sig(code, &sig, None);
+    }
+
+    /// Fold one ALREADY-PARSED signature's top-level declarations in. `ctx` is
+    /// the per-file resolution context a PROJECT signature ingests under
+    /// (issue #168 — `use` imports and `# resolve-type-names: false`); `None`
+    /// is the bundled/plugin path, byte-identical to the previous behaviour.
+    fn ingest_sig(&mut self, code: &str, sig: &SignatureNode<'_>, ctx: Option<&FileSigCtx>) {
         self.conformance.walk(code, sig.directives(), sig.declarations());
         for decl in sig.declarations().iter() {
             // `false` = top-level (file-level) declaration: only these may enter
             // the `toplevel_classes` set. `code` is threaded so the ATM substrate
             // can slice verbatim written forms for `RetainedParamType::Other`.
             match decl {
-                Node::Class(c) => self.ingest_class(&c, false, &[], code),
-                Node::Module(m) => self.ingest_module(&m, false, &[], code),
+                Node::Class(c) => self.ingest_class(&c, false, &[], code, ctx),
+                Node::Module(m) => self.ingest_module(&m, false, &[], code, ctx),
                 // Collection-shape stage 2b: a TOP-LEVEL `ENV: …` object
                 // constant. The nested dispatch (`collect_members`) deliberately
                 // does NOT mirror this — see `CoreData::object_constants`.
-                Node::Constant(c) => self.ingest_object_constant(&c),
-                Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code),
-                Node::Interface(i) => self.ingest_interface(&i),
+                Node::Constant(c) => self.ingest_object_constant(&c, ctx),
+                Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code, &[], ctx),
+                Node::Interface(i) => self.ingest_interface(&i, &[]),
+                Node::ClassAlias(ca) => {
+                    // Not modelled as a dispatch surface — but its NEW name is a
+                    // known type for `use` maps and the missing-type scan, just
+                    // as `class_alias_decls` feeds `known_types` in the reference.
+                    self.known_type_names
+                        .insert(qualified_name(&[], &ca.new_name()));
+                }
+                Node::ModuleAlias(ma) => {
+                    self.known_type_names
+                        .insert(qualified_name(&[], &ma.new_name()));
+                }
                 _ => {}
             }
         }
@@ -3519,7 +3974,7 @@ impl Builder {
     /// A literal / optional / union / interface type (`CROSS_COMPILING: true?`)
     /// is skipped, so the map only ever carries a name the class tables can
     /// resolve. First write wins.
-    fn ingest_object_constant(&mut self, c: &ruby_rbs::node::ConstantNode) {
+    fn ingest_object_constant(&mut self, c: &ruby_rbs::node::ConstantNode, ctx: Option<&FileSigCtx>) {
         let Some(name) = type_name_str(&c.name()) else {
             return;
         };
@@ -3532,30 +3987,41 @@ impl Builder {
         let Node::ClassInstanceType(ci) = c.type_() else {
             return;
         };
-        let Some(class) = type_name_str(&ci.name()) else {
+        let Some(class) = member_name(ctx, &ci.name()) else {
             return;
         };
+        // The value feeds `method_return`-family lookups, which key on registry
+        // names with no `::` root marker.
+        let class = class.strip_prefix("::").unwrap_or(class);
         self.object_constants.entry(name).or_insert(class);
     }
 
     /// Fold one `type X = ...` alias into the global map (ATM substrate). First
     /// write wins on reopen. The RHS is retained one level deep (aliases inside
     /// are kept as `Alias(..)` leaves, not expanded — Slice 2 owns expansion).
-    fn ingest_type_alias(&mut self, ta: &TypeAliasNode, code: &str) {
+    fn ingest_type_alias(
+        &mut self,
+        ta: &TypeAliasNode,
+        code: &str,
+        enclosing: &[&'static str],
+        ctx: Option<&FileSigCtx>,
+    ) {
         let Some(name) = type_name_str(&ta.name()) else {
             return;
         };
-        let rhs = retained_param_type(&ta.type_(), code, &[]);
+        self.known_type_names.insert(qualified_name(enclosing, &ta.name()));
+        let rhs = retained_param_type(&ta.type_(), code, &[], ctx);
         self.type_alias_defs.entry(name).or_insert(rhs);
     }
 
     /// Fold one `interface _X ... end` into the global map (ATM substrate),
     /// recording its declared instance-method names in declaration order. First
     /// write wins on reopen.
-    fn ingest_interface(&mut self, i: &InterfaceNode) {
+    fn ingest_interface(&mut self, i: &InterfaceNode, enclosing: &[&'static str]) {
         let Some(name) = type_name_str(&i.name()) else {
             return;
         };
+        self.known_type_names.insert(qualified_name(enclosing, &i.name()));
         let mut names: Vec<&'static str> = Vec::new();
         for member in i.members().iter() {
             if let Node::MethodDefinition(md) = member {
@@ -3568,7 +4034,14 @@ impl Builder {
         self.interface_method_names.entry(name).or_insert(names);
     }
 
-    fn ingest_class(&mut self, c: &ClassNode, nested: bool, enclosing: &[&'static str], code: &str) {
+    fn ingest_class(
+        &mut self,
+        c: &ClassNode,
+        nested: bool,
+        enclosing: &[&'static str],
+        code: &str,
+        ctx: Option<&FileSigCtx>,
+    ) {
         let tn = c.name();
         let Some(name) = type_name_str(&tn) else {
             return;
@@ -3592,11 +4065,22 @@ impl Builder {
         // ADR-0042 Slice 5: the superclass reference as WRITTEN, resolved (at
         // lookup time) in the OUTER lexical context — the enclosing chain
         // WITHOUT this class (the reference resolves a super clause in
-        // `outer_context`).
+        // `outer_context`). Issue #168: a project file stores the name as the
+        // reference's `resolve_type_names` left it — `use`-mapped /
+        // `::`-anchored via `written_ref_ctx`.
         let superclass_written = c
             .super_class()
-            .and_then(|s| written_ref(&s.name()))
+            .and_then(|s| written_ref_ctx(ctx, &s.name()))
             .map(|w| (w, enclosing.to_vec()));
+        // Issue #168: the superclass's type ARGUMENTS are member-level
+        // references (`class D < Goo[Missing]`); the super NAME itself fails
+        // the definition build instead of reaching the stub pass.
+        let mut super_arg_names = Vec::new();
+        if let Some(sc) = c.super_class() {
+            for arg in sc.args().iter() {
+                collect_type_node_names(&arg, ctx, &mut super_arg_names);
+            }
+        }
         let mut entry = ClassEntry {
             superclass,
             superclass_written,
@@ -3605,19 +4089,28 @@ impl Builder {
         // ADR-0042 Slice 1: this decl's own qualified key, and the enclosing
         // context a NESTED decl within its members will qualify against.
         let qual = qualified_name(enclosing, &tn);
+        self.known_type_names.insert(qual);
         let child_enclosing: Vec<&'static str> =
             enclosing.iter().copied().chain(std::iter::once(qual)).collect();
         // ADR-0042 Slice 5: members below are ingested under the INNER lexical
         // context (this class included) — record it for member-level type-ref
         // resolution on the qualified path.
         entry.member_ctxs.push(child_enclosing.clone());
-        self.collect_members(c.members().iter(), &mut entry, &child_enclosing, code);
+        Self::record_ref_names(&mut entry, super_arg_names);
+        self.collect_members(c.members().iter(), &mut entry, &child_enclosing, code, ctx);
         self.merge_qualified(qual, entry.clone());
         self.short_to_qualified_push(name, qual);
         self.merge(name, entry, authoritative);
     }
 
-    fn ingest_module(&mut self, m: &ModuleNode, nested: bool, enclosing: &[&'static str], code: &str) {
+    fn ingest_module(
+        &mut self,
+        m: &ModuleNode,
+        nested: bool,
+        enclosing: &[&'static str],
+        code: &str,
+        ctx: Option<&FileSigCtx>,
+    ) {
         let tn = m.name();
         let Some(name) = type_name_str(&tn) else {
             return;
@@ -3632,23 +4125,31 @@ impl Builder {
         };
         // ADR-0042: a module's self-type clause (`module PPMethods :
         // _PPMethodsRequired`) resolves in the OUTER lexical context, exactly
-        // like a class's `< X` super clause.
+        // like a class's `< X` super clause. Issue #168: `use`-mapped /
+        // `::`-anchored forms under a project ctx; the self-type's ARGS are
+        // member-level references for the stub pass.
+        let mut self_arg_names = Vec::new();
         for st in m.self_types().iter() {
             if let Node::ModuleSelf(ms) = st {
-                if let Some(w) = written_ref(&ms.name()) {
+                if let Some(w) = written_ref_ctx(ctx, &ms.name()) {
                     let pair = (w, enclosing.to_vec());
                     if !entry.self_types_written.contains(&pair) {
                         entry.self_types_written.push(pair);
                     }
                 }
+                for arg in ms.args().iter() {
+                    collect_type_node_names(&arg, ctx, &mut self_arg_names);
+                }
             }
         }
         let qual = qualified_name(enclosing, &tn);
+        self.known_type_names.insert(qual);
         let child_enclosing: Vec<&'static str> =
             enclosing.iter().copied().chain(std::iter::once(qual)).collect();
         // ADR-0042 Slice 5: see `ingest_class` — the inner member context.
         entry.member_ctxs.push(child_enclosing.clone());
-        self.collect_members(m.members().iter(), &mut entry, &child_enclosing, code);
+        Self::record_ref_names(&mut entry, self_arg_names);
+        self.collect_members(m.members().iter(), &mut entry, &child_enclosing, code, ctx);
         self.merge_qualified(qual, entry.clone());
         self.short_to_qualified_push(name, qual);
         self.merge(name, entry, authoritative);
@@ -3676,6 +4177,16 @@ impl Builder {
         }
     }
 
+    /// Issue #168: record the collected member-level type references on
+    /// `entry`, deduplicated — see [`ClassEntry::referenced_type_names`].
+    fn record_ref_names(entry: &mut ClassEntry, names: impl IntoIterator<Item = &'static str>) {
+        for n in names {
+            if !entry.referenced_type_names.contains(&n) {
+                entry.referenced_type_names.push(n);
+            }
+        }
+    }
+
     /// ADR-0042 Slice 1: record `qual` under `short`'s qualified-key list,
     /// deduplicated (a reopen ingests the same qualified key more than once).
     fn short_to_qualified_push(&mut self, short: &'static str, qual: &'static str) {
@@ -3696,6 +4207,7 @@ impl Builder {
         entry: &mut ClassEntry,
         enclosing: &[&'static str],
         code: &str,
+        ctx: Option<&FileSigCtx>,
     ) {
         // A bare `private` / `public` member is a SECTION modifier: it applies to
         // every subsequent `def` in this body that does not carry its own
@@ -3707,16 +4219,16 @@ impl Builder {
                 Node::MethodDefinition(md) => {
                     let mname = intern(md.name().as_str());
                     let (ret, arity, nilable, ret_instance, ret_self, ret_void) =
-                        method_signature(&md);
-                    let block_ret = block_overload_return(&md);
+                        method_signature(&md, ctx);
+                    let block_ret = block_overload_return(&md, ctx);
                     // Collection-shape stage 2a/2c: the return the BLOCK-FREE
                     // overloads alone agree on, recorded only when a block
                     // overload also exists (otherwise it can add nothing the
                     // flat slot does not already carry).
-                    let block_free_ret = block_free_overload_return(&md);
+                    let block_free_ret = block_free_overload_return(&md, ctx);
                     // The structured TUPLE return the flat `ret` slot above
                     // collapses to `None` (Slice 2 of the MultiWrite substrate).
-                    let tuple_ret = tuple_return(&md);
+                    let tuple_ret = tuple_return(&md, ctx);
                     // An explicit per-`def` visibility overrides the section
                     // modifier in force; `Unspecified` inherits it.
                     let is_private = match md.visibility() {
@@ -3725,6 +4237,22 @@ impl Builder {
                         MethodDefinitionVisibility::Unspecified => section_private,
                     };
                     let kind = md.kind();
+                    // Issue #168 (`collect_member_references`): an instance-side
+                    // method's signature types feed the missing-referenced-type
+                    // stub pass — `initialize` and `def self.x` are excluded
+                    // (`validate_type_params` never reaches them), `def self?.x`
+                    // contributes because its instance side exists.
+                    if !matches!(kind, MethodDefinitionKind::Singleton) && mname != "initialize" {
+                        let mut names = Vec::new();
+                        for ov in md.overloads().iter() {
+                            if let Node::MethodDefinitionOverload(ovn) = ov {
+                                if let Node::MethodType(mt) = ovn.method_type() {
+                                    collect_method_type_names(&mt, ctx, &mut names);
+                                }
+                            }
+                        }
+                        Self::record_ref_names(entry, names);
+                    }
                     // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
                     // (BOTH a class method AND an instance method); a plain
                     // `def x` ⇒ Instance. Record into the matching map(s).
@@ -3774,12 +4302,12 @@ impl Builder {
                         if md.overloading() {
                             entry
                                 .overloading_method_overloads
-                                .push((mname, method_overloads(&md, code)));
+                                .push((mname, method_overloads(&md, code, ctx)));
                         } else {
                             entry
                                 .method_overloads
                                 .entry(mname)
-                                .or_insert_with(|| method_overloads(&md, code));
+                                .or_insert_with(|| method_overloads(&md, code, ctx));
                         }
                     }
                     if matches!(
@@ -3804,12 +4332,12 @@ impl Builder {
                         if md.overloading() {
                             entry
                                 .overloading_singleton_overloads
-                                .push((mname, method_overloads(&md, code)));
+                                .push((mname, method_overloads(&md, code, ctx)));
                         } else {
                             entry
                                 .singleton_method_overloads
                                 .entry(mname)
-                                .or_insert_with(|| method_overloads(&md, code));
+                                .or_insert_with(|| method_overloads(&md, code, ctx));
                         }
                     }
                 }
@@ -3819,18 +4347,44 @@ impl Builder {
                 // `x=`, an accessor both; `kind()` splits instance from
                 // singleton (`attr_reader self.x`).
                 Node::AttrReader(a) => {
+                    // Issue #168: a non-singleton attribute's TYPE is a
+                    // member-level reference (`kind == :singleton` stands it
+                    // down, exactly like `def self.x`).
+                    if a.kind() != AttributeKind::Singleton {
+                        let mut names = Vec::new();
+                        collect_type_node_names(&a.type_(), ctx, &mut names);
+                        Self::record_ref_names(entry, names);
+                    }
                     let name = intern(a.name().as_str());
                     Self::record_attr(entry, a.kind(), name, true, false);
                 }
                 Node::AttrWriter(a) => {
+                    if a.kind() != AttributeKind::Singleton {
+                        let mut names = Vec::new();
+                        collect_type_node_names(&a.type_(), ctx, &mut names);
+                        Self::record_ref_names(entry, names);
+                    }
                     let name = intern(a.name().as_str());
                     Self::record_attr(entry, a.kind(), name, false, true);
                 }
                 Node::AttrAccessor(a) => {
+                    if a.kind() != AttributeKind::Singleton {
+                        let mut names = Vec::new();
+                        collect_type_node_names(&a.type_(), ctx, &mut names);
+                        Self::record_ref_names(entry, names);
+                    }
                     let name = intern(a.name().as_str());
                     Self::record_attr(entry, a.kind(), name, true, true);
                 }
                 Node::Include(inc) => {
+                    // Issue #168: the type ARGUMENTS are member references;
+                    // the mixin's own name fails the definition build instead
+                    // of being stubbed (see `referenced_type_names`).
+                    let mut names = Vec::new();
+                    for arg in inc.args().iter() {
+                        collect_type_node_names(&arg, ctx, &mut names);
+                    }
+                    Self::record_ref_names(entry, names);
                     if let Some(modname) = type_name_str(&inc.name()) {
                         if !entry.includes.contains(&modname) {
                             entry.includes.push(modname);
@@ -3839,8 +4393,9 @@ impl Builder {
                     // ADR-0042 Slice 5: the include reference as WRITTEN plus
                     // its INNER lexical context (`enclosing` here already
                     // includes the declaring class — it is the
-                    // `child_enclosing` the ingest passed down).
-                    if let Some(w) = written_ref(&inc.name()) {
+                    // `child_enclosing` the ingest passed down). Issue #168:
+                    // `use`-mapped / `::`-anchored under a project ctx.
+                    if let Some(w) = written_ref_ctx(ctx, &inc.name()) {
                         let pair = (w, enclosing.to_vec());
                         if !entry.includes_written.contains(&pair) {
                             entry.includes_written.push(pair);
@@ -3852,12 +4407,17 @@ impl Builder {
                     // method EXISTENCE that is the same contribution as an
                     // `include`; the walks keep the ordering distinction so a
                     // first-definer-wins return lookup stays faithful.
+                    let mut names = Vec::new();
+                    for arg in pre.args().iter() {
+                        collect_type_node_names(&arg, ctx, &mut names);
+                    }
+                    Self::record_ref_names(entry, names);
                     if let Some(modname) = type_name_str(&pre.name()) {
                         if !entry.prepends.contains(&modname) {
                             entry.prepends.push(modname);
                         }
                     }
-                    if let Some(w) = written_ref(&pre.name()) {
+                    if let Some(w) = written_ref_ctx(ctx, &pre.name()) {
                         let pair = (w, enclosing.to_vec());
                         if !entry.prepends_written.contains(&pair) {
                             entry.prepends_written.push(pair);
@@ -3870,6 +4430,11 @@ impl Builder {
                     // Random::Formatter` ⇒ `SecureRandom.hex`). Record the
                     // module name; the singleton lookup resolves it conservatively
                     // (an unknown extended module ⇒ surface incomplete ⇒ silent).
+                    let mut names = Vec::new();
+                    for arg in ext.args().iter() {
+                        collect_type_node_names(&arg, ctx, &mut names);
+                    }
+                    Self::record_ref_names(entry, names);
                     if let Some(modname) = type_name_str(&ext.name()) {
                         if !entry.extends.contains(&modname) {
                             entry.extends.push(modname);
@@ -3905,14 +4470,14 @@ impl Builder {
                 // ⇒ all typo detection silently disabled). Registering nested
                 // types by simple name keeps chains complete. (Simple-name
                 // collisions only ever ADD methods, never witness false absence.)
-                Node::Class(inner) => self.ingest_class(&inner, true, enclosing, code),
-                Node::Module(inner) => self.ingest_module(&inner, true, enclosing, code),
+                Node::Class(inner) => self.ingest_class(&inner, true, enclosing, code, ctx),
+                Node::Module(inner) => self.ingest_module(&inner, true, enclosing, code, ctx),
                 // A NESTED `type X = ...` / `interface _X ... end` folds into the
                 // SAME global maps as a top-level one (ATM substrate), keyed by
                 // simple name — consistent with how nested classes/modules are
                 // registered by simple name above.
-                Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code),
-                Node::Interface(i) => self.ingest_interface(&i),
+                Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code, enclosing, ctx),
+                Node::Interface(i) => self.ingest_interface(&i, enclosing),
                 _ => {}
             }
         }
@@ -4027,6 +4592,11 @@ impl Builder {
         // Attribute members are pure existence, so a reopen simply unions them.
         slot.attr_methods.extend(entry.attr_methods);
         slot.singleton_attr_methods.extend(entry.singleton_attr_methods);
+        for name in entry.referenced_type_names {
+            if !slot.referenced_type_names.contains(&name) {
+                slot.referenced_type_names.push(name);
+            }
+        }
         for pre in entry.prepends {
             if !slot.prepends.contains(&pre) {
                 slot.prepends.push(pre);
@@ -4084,6 +4654,13 @@ impl Builder {
         for ctx in entry.member_ctxs {
             if !slot.member_ctxs.contains(&ctx) {
                 slot.member_ctxs.push(ctx);
+            }
+        }
+        // Issue #168: member-level type references union across reopens,
+        // deduped — the missing-referenced-type scan reads them.
+        for name in entry.referenced_type_names {
+            if !slot.referenced_type_names.contains(&name) {
+                slot.referenced_type_names.push(name);
             }
         }
         slot.is_module |= entry.is_module;
@@ -4210,7 +4787,30 @@ impl Builder {
             self.qualified,
             self.short_to_qualified,
             self.object_constants,
+            self.known_type_names,
+            self.synthesized_type_names,
         )
+    }
+
+    /// RBS `TypeNameResolver#resolve`-style lookup of a stored member name in
+    /// ONE lexical context over the full known-type set (classes, modules,
+    /// interfaces, aliases — `all_names`): innermost scope outward, then the
+    /// root spelling. `Some(_)` ⇒ the name is DECLARED (no stub needed); the
+    /// returned key is the resolved qualified name. Unlike the class-only
+    /// [`CoreData::resolve_written_ref`], interfaces/aliases count as hits —
+    /// `all_names` does not discriminate, and the missing-type scan must not
+    /// stub a declared interface.
+    fn resolve_type_name_rbs(&self, name: &str, ctx: &[&'static str]) -> Option<&'static str> {
+        if let Some(abs) = name.strip_prefix("::") {
+            return self.known_type_names.get(abs).copied();
+        }
+        for scope in ctx.iter().rev() {
+            let cand = format!("{scope}::{name}");
+            if let Some(&k) = self.known_type_names.get(cand.as_str()) {
+                return Some(k);
+            }
+        }
+        self.known_type_names.get(name).copied()
     }
 }
 
@@ -4270,6 +4870,23 @@ fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_d
             }
         }
     }
+    // Issue #168 — the project load runs in the reference's order:
+    //
+    //   1. PARSE every file and collect every declared name FIRST. RBS loads
+    //      all project declarations into the env (and the `UseMap::Table`
+    //      children snapshot) before resolving any of them, so `use Foo::*`
+    //      sees a decl in ANY project file, not just files ingested so far.
+    //   2. RESOLVE + ingest each file under its own per-file context
+    //      (`use` map, `resolve-type-names: false`) — source-local, exactly
+    //      like `Environment#resolve_type_names` iterating sources.
+    //
+    // Pass 1: read + parse, collecting the qualified name of every decl.
+    let mut parsed_files: Vec<(
+        String,
+        conformance::Phase,
+        &'static str,
+        SignatureNode<'static>,
+    )> = Vec::new();
     for (abs, phase) in files {
         let Ok(code) = std::fs::read_to_string(&abs) else {
             // A directory named `*.rbs` or a dangling link is skipped upstream
@@ -4285,6 +4902,35 @@ fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_d
         if code.contains('\0') || code.contains("resolve-type-names") {
             builder.conformance.block();
         }
+        // Interned so the parsed `SignatureNode<'static>` can travel alongside
+        // the text into the deferred pass-2 ingest.
+        let code: &'static str = intern(&code);
+        match parse(code) {
+            Ok(sig) => {
+                // Every declaration name contributes to `known_type_names`
+                // — the set `use Foo::*` expands against (and the missing-type
+                // scan's declared set). `ingest_sig` re-records them on the
+                // real ingest path; the pre-pass exists because the wildcard
+                // children table is computed BEFORE the first file folds in.
+                collect_project_decl_names(sig.declarations(), builder);
+                parsed_files.push((abs, phase, code, sig));
+            }
+            Err(_) => {
+                // A file the parser rejects is never dropped silently — the
+                // same rule the ingest loop below applies, raised early here
+                // because this file never reaches it.
+                builder.conformance.block();
+            }
+        }
+    }
+
+    // `UseMap::Table#compute_children` — `Foo` → the leaf→child map of every
+    // known type DIRECTLY under `Foo` — over the whole known set (bundled +
+    // project), computed once before any file resolves.
+    let children = use_map_children(builder);
+
+    // Pass 2: ingest each file under its per-file resolution context.
+    for (abs, phase, code, sig) in parsed_files {
         let key = intern(&abs);
         let origin = match phase {
             conformance::Phase::Collection => conformance::Origin::Collection(key),
@@ -4292,12 +4938,391 @@ fn ingest_project_dirs(builder: &mut Builder, sig_dirs: &[PathBuf], collection_d
         };
         builder.conformance.set_origin(Some(origin));
         let walked = builder.conformance.walks();
-        ingest_rbs_source(builder, &abs, &code);
+        let ctx = file_sig_ctx(&sig, code, &children);
+        if ctx.bad_wildcard {
+            // `use X::*` with no children under `X`: the reference's
+            // `children.fetch` raises `KeyError` and the run dies with an
+            // internal-analyzer-error row — a crash shape the port cannot
+            // reproduce (its message embeds a Ruby object address) and must
+            // not approximate with its own findings.
+            builder.conformance.block();
+        }
+        builder.ingest_sig(code, &sig, Some(&ctx));
         // Not walked = the port's parser rejected it: never drop it silently.
         if builder.conformance.walks() == walked {
             builder.conformance.block();
         }
         builder.conformance.set_origin(None);
+    }
+}
+
+/// Record the qualified name of every declaration in `decls` (nested members
+/// included) into `builder.known_type_names` — the project-name pre-pass the
+/// `use Foo::*` expansion table needs before any file resolves.
+fn collect_project_decl_names<'a>(
+    decls: ruby_rbs::node::NodeList<'a>,
+    builder: &mut Builder,
+) {
+    collect_decl_names_inner(decls.iter(), &[], builder);
+}
+
+fn collect_decl_names_inner<'a>(
+    decls: impl Iterator<Item = Node<'a>>,
+    enclosing: &[&'static str],
+    builder: &mut Builder,
+) {
+    for decl in decls {
+        match decl {
+            Node::Class(c) => {
+                let qual = qualified_name(enclosing, &c.name());
+                builder.known_type_names.insert(qual);
+                let mut inner = enclosing.to_vec();
+                inner.push(qual);
+                collect_decl_names_inner(c.members().iter(), &inner, builder);
+            }
+            Node::Module(m) => {
+                let qual = qualified_name(enclosing, &m.name());
+                builder.known_type_names.insert(qual);
+                let mut inner = enclosing.to_vec();
+                inner.push(qual);
+                collect_decl_names_inner(m.members().iter(), &inner, builder);
+            }
+            Node::Interface(i) => {
+                builder
+                    .known_type_names
+                    .insert(qualified_name(enclosing, &i.name()));
+            }
+            Node::TypeAlias(ta) => {
+                builder
+                    .known_type_names
+                    .insert(qualified_name(enclosing, &ta.name()));
+            }
+            Node::ClassAlias(ca) => {
+                builder
+                    .known_type_names
+                    .insert(qualified_name(enclosing, &ca.new_name()));
+            }
+            Node::ModuleAlias(ma) => {
+                builder
+                    .known_type_names
+                    .insert(qualified_name(enclosing, &ma.new_name()));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `UseMap::Table#compute_children` over the builder's known-type set —
+/// `namespace` → the qualified names directly beneath it (`"Foo"` →
+/// `["Foo::Bar", "Foo::Impl"]`, one `::` level deep only), which a
+/// `use Foo::*` clause expands through.
+fn use_map_children(builder: &Builder) -> HashMap<&'static str, Vec<&'static str>> {
+    let mut children: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+    for &name in &builder.known_type_names {
+        if let Some(pos) = name.rfind("::") {
+            children.entry(&name[..pos]).or_default().push(name);
+        }
+    }
+    for list in children.values_mut() {
+        list.sort_unstable();
+    }
+    children
+}
+
+/// Issue #168 (`collect_type_references` over `MethodType#each_type`): every
+/// name-bearing type reachable inside `node`, stored the way
+/// `resolve_type_names` left it (`use`-mapped / `::`-anchored / root-only via
+/// [`member_name`]). Only `ClassInstance` / `Interface` / `Alias` names are
+/// candidates (the three kinds `VarianceCalculator#type` raises for); every
+/// other node is traversed for the types nested inside it.
+fn collect_method_type_names(
+    mt: &ruby_rbs::node::MethodTypeNode,
+    ctx: Option<&FileSigCtx>,
+    out: &mut Vec<&'static str>,
+) {
+    collect_type_node_names(&mt.type_(), ctx, out);
+    if let Some(b) = mt.block() {
+        collect_type_node_names(&b.type_(), ctx, out);
+        if let Some(st) = b.self_type() {
+            collect_type_node_names(&st, ctx, out);
+        }
+    }
+}
+
+fn collect_type_node_names(node: &Node, ctx: Option<&FileSigCtx>, out: &mut Vec<&'static str>) {
+    match node {
+        Node::ClassInstanceType(ci) => {
+            if let Some(n) = member_name(ctx, &ci.name()) {
+                out.push(n);
+            }
+            for a in ci.args().iter() {
+                collect_type_node_names(&a, ctx, out);
+            }
+        }
+        Node::InterfaceType(i) => {
+            if let Some(n) = member_name(ctx, &i.name()) {
+                out.push(n);
+            }
+            for a in i.args().iter() {
+                collect_type_node_names(&a, ctx, out);
+            }
+        }
+        Node::AliasType(a) => {
+            if let Some(n) = member_name(ctx, &a.name()) {
+                out.push(n);
+            }
+            for arg in a.args().iter() {
+                collect_type_node_names(&arg, ctx, out);
+            }
+        }
+        Node::UnionType(u) => {
+            for t in u.types().iter() {
+                collect_type_node_names(&t, ctx, out);
+            }
+        }
+        Node::IntersectionType(u) => {
+            for t in u.types().iter() {
+                collect_type_node_names(&t, ctx, out);
+            }
+        }
+        Node::OptionalType(o) => collect_type_node_names(&o.type_(), ctx, out),
+        Node::TupleType(t) => {
+            for e in t.types().iter() {
+                collect_type_node_names(&e, ctx, out);
+            }
+        }
+        Node::RecordType(r) => {
+            for (_k, f) in r.all_fields().iter() {
+                match f {
+                    Node::RecordFieldType(rf) => collect_type_node_names(&rf.type_(), ctx, out),
+                    other => collect_type_node_names(&other, ctx, out),
+                }
+            }
+        }
+        Node::ProcType(p) => {
+            collect_type_node_names(&p.type_(), ctx, out);
+            if let Some(b) = p.block() {
+                collect_type_node_names(&b.type_(), ctx, out);
+                if let Some(st) = b.self_type() {
+                    collect_type_node_names(&st, ctx, out);
+                }
+            }
+            if let Some(st) = p.self_type() {
+                collect_type_node_names(&st, ctx, out);
+            }
+        }
+        Node::FunctionType(ft) => collect_function_type_names(ft, ctx, out),
+        Node::MethodType(mt) => collect_method_type_names(mt, ctx, out),
+        Node::BlockType(b) => {
+            collect_type_node_names(&b.type_(), ctx, out);
+            if let Some(st) = b.self_type() {
+                collect_type_node_names(&st, ctx, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_function_type_names(
+    ft: &ruby_rbs::node::FunctionTypeNode,
+    ctx: Option<&FileSigCtx>,
+    out: &mut Vec<&'static str>,
+) {
+    for p in ft
+        .required_positionals()
+        .iter()
+        .chain(ft.optional_positionals().iter())
+        .chain(ft.trailing_positionals().iter())
+    {
+        match p {
+            Node::FunctionParam(fp) => collect_type_node_names(&fp.type_(), ctx, out),
+            other => collect_type_node_names(&other, ctx, out),
+        }
+    }
+    for p in [
+        ft.rest_positionals(),
+        ft.rest_keywords(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match p {
+            Node::FunctionParam(fp) => collect_type_node_names(&fp.type_(), ctx, out),
+            other => collect_type_node_names(&other, ctx, out),
+        }
+    }
+    for (_k, v) in ft
+        .required_keywords()
+        .iter()
+        .chain(ft.optional_keywords().iter())
+    {
+        match v {
+            Node::FunctionParam(fp) => collect_type_node_names(&fp.type_(), ctx, out),
+            other => collect_type_node_names(&other, ctx, out),
+        }
+    }
+    collect_type_node_names(&ft.return_type(), ctx, out);
+}
+
+/// Issue #168 (`synthesize_missing_namespaces` in the reference): a project
+/// decl `class Foo::Bar` whose enclosing `Foo` was never declared makes
+/// `DefinitionBuilder#build_instance` raise `NoTypeFoundError` there — the
+/// reference synthesizes an empty `module Foo` so the classes still build.
+/// Every proper `::` prefix of every qualified class/module key must itself
+/// be a qualified (class/module) decl; a missing one gets an empty module
+/// stub. Runs BEFORE the referenced-type stub pass, as the reference orders
+/// them — the stubs it lands are then "already declared" there.
+fn synthesize_missing_namespaces(builder: &mut Builder) {
+    let mut missing: Vec<&str> = Vec::new();
+    for name in builder.qualified.keys() {
+        let mut idx = name.len();
+        while let Some(pos) = name[..idx].rfind("::") {
+            let prefix = &name[..pos];
+            if !builder.qualified.contains_key(prefix) && !missing.contains(&prefix) {
+                missing.push(prefix);
+            }
+            idx = pos;
+        }
+    }
+    // Shallowest-first, matching the reference's depth sort — a nested stub's
+    // own prefix is synthesized by the time it lands.
+    missing.sort_by_key(|n| n.matches("::").count());
+    for prefix in missing {
+        let key = intern(prefix);
+        let entry = ClassEntry {
+            is_module: true,
+            ..Default::default()
+        };
+        builder.merge_qualified(key, entry);
+        builder.known_type_names.insert(key);
+        builder.synthesized_type_names.insert(key);
+    }
+}
+
+/// Issue #168 (`stub_missing_referenced_types` in the reference): find the
+/// type names PROJECT declarations reference but no declaration provides, and
+/// synthesize the same empty declarations the reference appends — namespaces
+/// as `module`, `_x` as `interface`, lowercase as `type x = untyped`,
+/// everything else as `class` — iterating to a fixpoint because a fresh stub
+/// can itself resolve a name the previous pass could not. `project_qualified`
+/// is the class/module-keyed provenance set — the scan is bounded to
+/// project-declared entries exactly like `project_entry?` bounds the
+/// reference's walk.
+fn synthesize_missing_referenced_types(
+    builder: &mut Builder,
+    project_qualified: &HashSet<&'static str>,
+) {
+    // The reference's `synthesize_missing_namespaces` runs FIRST: enclosing
+    // namespaces of declared qualified names get `module` stubs before any
+    // member-level reference is considered.
+    synthesize_missing_namespaces(builder);
+
+    let mut previous: Option<BTreeSet<String>> = None;
+    for _ in 0..5 {
+        // `unresolved_referenced_types`: the references no declaration
+        // provides, per project-declared qualified entry.
+        let mut missing: BTreeSet<String> = BTreeSet::new();
+        for &q in project_qualified {
+            let Some(entry) = builder.qualified.get(q) else {
+                continue;
+            };
+            for &name in &entry.referenced_type_names {
+                // `declared_reference?` — `env.type_name?(normalize(name))`.
+                // Resolves in EVERY recorded member context (a name declared
+                // under any of the entry's decl scopes is declared — `any`
+                // keeps the stub set a strict subset of the reference's, so
+                // the pass never over-synthesizes); failing that, the
+                // reference falls back to the name `absolute!`'d at the root.
+                let resolved = entry
+                    .member_ctxs
+                    .iter()
+                    .any(|ctx| builder.resolve_type_name_rbs(name, ctx).is_some());
+                if resolved {
+                    continue;
+                }
+                let cand = name.strip_prefix("::").unwrap_or(name);
+                if !builder.known_type_names.contains(cand) {
+                    missing.insert(cand.to_string());
+                }
+            }
+        }
+        if missing.is_empty() || previous.as_ref() == Some(&missing) {
+            break;
+        }
+        // `append_stub_declarations`: enclosing `::` prefixes of a missing
+        // name are stubbed with it, minus anything already declared.
+        let mut names = missing.clone();
+        for m in &missing {
+            let mut idx = m.len();
+            while let Some(pos) = m[..idx].rfind("::") {
+                names.insert(m[..pos].to_string());
+                idx = pos;
+            }
+        }
+        names.retain(|n| !builder.known_type_names.contains(n.as_str()));
+        if names.is_empty() {
+            break;
+        }
+        let mut synthesized = false;
+        for name in &names {
+            synthesized |= synthesize_stub(builder, name, &names);
+        }
+        if !synthesized {
+            break;
+        }
+        previous = Some(missing);
+    }
+}
+
+/// `stub_declaration_for`: the declaration kind a stubbed name's leaf syntax
+/// requires — `module` for a name another stub nests under, `interface` for a
+/// `_`-leaf, `type x = untyped` for a lowercase leaf, `class` otherwise.
+/// `names` is the whole stub set (for the namespace check). Returns whether a
+/// stub landed.
+///
+/// Only the `module` / `class` arms join `synthesized_type_names` — exactly
+/// the reference's `names_synthesized_in` (class/module `class_decls` only):
+/// the `interface` and `type` stubs read as `untyped` through every consumer
+/// anyway (`RbsTypeTranslator` maps an interface to `Dynamic[Top]`).
+fn synthesize_stub(builder: &mut Builder, name: &str, names: &BTreeSet<String>) -> bool {
+    let is_namespace = names
+        .iter()
+        .any(|other| other != name && other.starts_with(&format!("{name}::")));
+    let leaf = name.rsplit("::").next().unwrap_or(name);
+    if is_namespace {
+        let key = intern(name);
+        let entry = ClassEntry {
+            is_module: true,
+            ..Default::default()
+        };
+        builder.merge_qualified(key, entry);
+        builder.known_type_names.insert(key);
+        builder.synthesized_type_names.insert(key);
+        true
+    } else if leaf.starts_with('_') {
+        // The `interface` stub — a methodless interface the
+        // `qualified_self_type_provides` walk must know exists-but-is-empty
+        // (it answers "provides nothing" rather than "unknown ⇒ assume
+        // provided"). Not a class decl ⇒ stays out of `synthesized_type_names`.
+        builder.interface_method_names.entry(intern(leaf)).or_default();
+        builder.known_type_names.insert(intern(name));
+        true
+    } else if leaf.chars().next().is_some_and(|c| c.is_lowercase()) {
+        // `type x = untyped` — the acceptance walk treats `Other` as
+        // admit-everything, matching the `Dynamic[Top]` an invented alias
+        // reads as in the reference.
+        builder
+            .type_alias_defs
+            .entry(intern(leaf))
+            .or_insert_with(|| RetainedParamType::Other("untyped".to_string()));
+        builder.known_type_names.insert(intern(name));
+        true
+    } else {
+        let key = intern(name);
+        builder.merge_qualified(key, ClassEntry::default());
+        builder.known_type_names.insert(key);
+        builder.synthesized_type_names.insert(key);
+        true
     }
 }
 
@@ -4539,6 +5564,7 @@ fn qualified_name(enclosing: &[&'static str], tn: &ruby_rbs::node::TypeNameNode)
 /// conservative here only loses recall in `possible-nil-receiver`, never an FP).
 fn method_signature(
     md: &ruby_rbs::node::MethodDefinitionNode,
+    ctx: Option<&FileSigCtx>,
 ) -> (Option<&'static str>, ArityEnvelope, bool, bool, bool, bool) {
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = Some(0);
@@ -4608,7 +5634,7 @@ fn method_signature(
         // overloads agree on class, nil bit AND instance-ness; any
         // disagreement ⇒ leave None (never guess).
         let (this_ret, this_nilable, this_instance, this_self, this_void) = match ft.return_type() {
-            Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), false, false, false, false),
+            Node::ClassInstanceType(ci) => (member_name(ctx, &ci.name()), false, false, false, false),
             // `-> instance` (M2-GO slice 4): the receiver-class instance.
             Node::InstanceType(_) => (None, false, true, false, false),
             // `-> self` — the RECEIVER itself (`String#force_encoding`,
@@ -4626,7 +5652,7 @@ fn method_signature(
             // Recurse into the inner type; a nested optional/union/generic
             // inside the optional is not a single concrete class ⇒ None.
             Node::OptionalType(opt) => match opt.type_() {
-                Node::ClassInstanceType(ci) => (type_name_str(&ci.name()), true, false, false, false),
+                Node::ClassInstanceType(ci) => (member_name(ctx, &ci.name()), true, false, false, false),
                 Node::InstanceType(_) => (None, true, true, false, false),
                 _ => (None, false, false, false, false),
             },
@@ -4684,7 +5710,10 @@ fn method_signature(
 /// An `Optional` tuple (`-> [String, String]?`) is deliberately NOT unwrapped:
 /// the reference translates it to a `Tuple | nil` union, which this descriptor
 /// cannot carry, and inventing the non-nil half would be unsound.
-fn tuple_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<Vec<RbsReturnShape>> {
+fn tuple_return(
+    md: &ruby_rbs::node::MethodDefinitionNode,
+    ctx: Option<&FileSigCtx>,
+) -> Option<Vec<RbsReturnShape>> {
     let mut agreed: Option<Vec<RbsReturnShape>> = None;
     let mut seen = false;
     for overload in md.overloads().iter() {
@@ -4698,7 +5727,7 @@ fn tuple_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<Vec<RbsRetu
             continue;
         };
         let this = match ft.return_type() {
-            Node::TupleType(t) => Some(t.types().iter().map(|e| return_shape(&e)).collect()),
+            Node::TupleType(t) => Some(t.types().iter().map(|e| return_shape(&e, ctx)).collect()),
             _ => None,
         };
         if !seen {
@@ -4717,16 +5746,31 @@ fn tuple_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<Vec<RbsRetu
 /// models. Everything else degrades to [`RbsReturnShape::Unknown`]
 /// (`Dynamic[top]`), exactly as the reference's translator falls back to
 /// `Type::Combinator.untyped` for a shape with no handler.
-fn return_shape(node: &Node) -> RbsReturnShape {
+fn return_shape(node: &Node, ctx: Option<&FileSigCtx>) -> RbsReturnShape {
     match node {
-        Node::ClassInstanceType(ci) => match written_type_name(&ci.name()) {
+        Node::ClassInstanceType(ci) => match member_name_shape(ctx, &ci.name()) {
             Some(name) => RbsReturnShape::Class(name),
             None => RbsReturnShape::Unknown,
         },
         Node::TupleType(t) => {
-            RbsReturnShape::Tuple(t.types().iter().map(|e| return_shape(&e)).collect())
+            RbsReturnShape::Tuple(t.types().iter().map(|e| return_shape(&e, ctx)).collect())
         }
         _ => RbsReturnShape::Unknown,
+    }
+}
+
+/// The element class name a tuple return RECORDS: the bundled path keeps
+/// [`written_type_name`]'s resolved-looking spelling (no `::` marker — the
+/// shapes mint verbatim), while a project ctx records the
+/// post-`resolve_type_names` name (`::`-anchored) for the lookup-time member
+/// resolver to pin.
+fn member_name_shape(
+    ctx: Option<&FileSigCtx>,
+    tn: &ruby_rbs::node::TypeNameNode,
+) -> Option<&'static str> {
+    match ctx {
+        None => written_type_name(tn),
+        Some(c) => project_member_name(c, tn),
     }
 }
 
@@ -4778,6 +5822,209 @@ fn written_ref(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
     Some(intern(&s))
 }
 
+/// Issue #168: the per-FILE resolution context a PROJECT signature is ingested
+/// under — the port's analogue of `RBS::Environment#resolve_signature` running
+/// per source file (`Environment#resolve_type_names` resolves each source's
+/// declarations independently). Two knobs:
+///
+/// * `use_map` — the file's `use` clauses as `UseMap::build_map` produces
+///   them: `use Foo::Impl` ⇒ `"Impl" -> "Foo::Impl"`, `use Foo::Impl as B` ⇒
+///   `"B" -> "Foo::Impl"`, `use Foo::*` ⇒ every known type `Foo::X`
+///   contributes `"X" -> "Foo::X"` (the expansion table is the env-wide
+///   known-type set, exactly as `UseMap::Table`). Targets are stored WITHOUT
+///   the leading `::`; hits re-anchor them (`UseMap` targets are absolute by
+///   construction).
+/// * `root_only` — the `# resolve-type-names: false` magic comment: the
+///   file's type names pass through unresolved and the reference's
+///   `DefinitionBuilder` `absolute!`s them — i.e. they become ROOT-relative
+///   as written. The `use` map is skipped in that file too: the directive
+///   disables `resolve_signature` wholesale.
+///
+/// Both are per-file by construction — one file's directives never reach a
+/// sibling's resolution.
+#[derive(Default)]
+struct FileSigCtx {
+    /// `# resolve-type-names: false` was the file's leading comment.
+    root_only: bool,
+    /// bare-name → qualified target (no `::` marker), per `UseMap::build_map`.
+    use_map: HashMap<&'static str, &'static str>,
+    /// A `use X::*` wildcard whose namespace has no `children` entry — the
+    /// reference's `children.fetch` raises `KeyError` there and the whole run
+    /// dies with an internal-analyzer-error row (its message embeds a Ruby
+    /// object address, so even the row's text is not reproducible). The ingest
+    /// flags it so `ingest_project_dirs` can stand the conformance scan down.
+    bad_wildcard: bool,
+}
+
+/// The reference recognises `# resolve-type-names:` only as the file's LEADING
+/// content — `RBS::Parser.magic_comment` anchors `\A` at `buf.content` offset 0
+/// with `#\s*resolve-type-names\s*:\s+(true|false)$` — so a blank first line, a
+/// different leading comment, or any later line carrying the text does NOT
+/// disable resolution there. Mirror that shape exactly.
+fn resolve_type_names_disabled(code: &str) -> bool {
+    let line = code.lines().next().unwrap_or("");
+    let Some(rest) = line.strip_prefix('#') else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix("resolve-type-names") else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix(':') else {
+        return false;
+    };
+    // `\s+` after the colon is required; the value must be the whole line tail.
+    if !rest.starts_with([' ', '\t']) {
+        return false;
+    }
+    rest.trim_start() == "false"
+}
+
+/// Build a file's [`FileSigCtx`]: the magic comment, plus `UseMap::build_map`
+/// over the signature's `use` directives. `children` is the env-wide
+/// namespace-children table (`UseMap::Table#compute_children` — `Foo` → every
+/// known type directly under `Foo`), which the ingest's project pre-pass
+/// fills before any file resolves so a wildcard sees declarations from EVERY
+/// project file, not just those already ingested.
+fn file_sig_ctx(
+    sig: &SignatureNode<'_>,
+    code: &str,
+    children: &HashMap<&'static str, Vec<&'static str>>,
+) -> FileSigCtx {
+    let mut ctx = FileSigCtx {
+        root_only: resolve_type_names_disabled(code),
+        ..Default::default()
+    };
+    for directive in sig.directives().iter() {
+        let Node::Use(use_) = directive else {
+            continue;
+        };
+        for clause in use_.clauses().iter() {
+            match clause {
+                Node::UseSingleClause(sc) => {
+                    // `use Foo::Impl [as B]` — the map key is the NEW name
+                    // when `as` is present, else the type's own leaf
+                    // (`@map[clause.type_name.name]` in `build_map`). The
+                    // target `absolute!`s; the map stores it without `::`.
+                    let Some(target) = written_ref(&sc.type_name()) else {
+                        continue;
+                    };
+                    let target = intern(target.strip_prefix("::").unwrap_or(target));
+                    let key = match sc.new_name() {
+                        Some(new_name) => intern(new_name.as_str()),
+                        None => match type_name_str(&sc.type_name()) {
+                            Some(leaf) => leaf,
+                            None => continue,
+                        },
+                    };
+                    ctx.use_map.insert(key, target);
+                }
+                Node::UseWildcardClause(wc) => {
+                    // `use Foo::*` — `table.children.fetch(ns.absolute!).each
+                    // { @map[child.name] = child }`: every known type directly
+                    // under `Foo` maps its leaf to the full path. `fetch`
+                    // RAISES when the namespace has no children entry — `use
+                    // Nowhere::*`, and `use EmptyMod::*` alike — and the
+                    // reference's whole run dies there. The port maps nothing
+                    // and flags it (`bad_wildcard`), which is the unverifiable
+                    // signal `ingest_project_dirs` stands the scan down on.
+                    if let Some(ns) = namespace_path_str(&wc.namespace()) {
+                        match children.get(ns) {
+                            Some(list) => {
+                                for &child in list {
+                                    if let Some(leaf) = child.rsplit("::").next() {
+                                        ctx.use_map.insert(intern(leaf), child);
+                                    }
+                                }
+                            }
+                            None => ctx.bad_wildcard = true,
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    ctx
+}
+
+/// A `NamespaceNode` (the `Foo` of `use Foo::*`) as a qualified string, root
+/// marker dropped (`ns.absolute!` in the reference produces the same
+/// `Foo`/`::Foo`-canonical key the `children` table is built on).
+fn namespace_path_str(ns: &ruby_rbs::node::NamespaceNode) -> Option<&'static str> {
+    let mut parts: Vec<String> = Vec::new();
+    for seg in ns.path().iter() {
+        if let Node::Symbol(sym) = seg {
+            parts.push(sym.as_str().to_string());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(intern(&parts.join("::")))
+    }
+}
+
+/// The type name a PROJECT signature's member records, resolved the way the
+/// reference's `resolve_type_names` leaves it before the build — see
+/// [`FileSigCtx`]. `None` (`ctx` absent ⇒ bundled/plugin path) falls back to
+/// [`type_name_str`]'s flat leaf, byte-identical to the previous behaviour.
+fn member_name(ctx: Option<&FileSigCtx>, tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
+    match ctx {
+        None => type_name_str(tn),
+        Some(c) => project_member_name(c, tn),
+    }
+}
+
+/// [`written_ref`] under a project ctx — the `_written` header references
+/// (superclass / include / prepend / module self-type) record the
+/// post-`resolve_type_names` name so the qualified resolver sees the same
+/// spelling the reference's `DefinitionBuilder` consumed.
+fn written_ref_ctx(
+    ctx: Option<&FileSigCtx>,
+    tn: &ruby_rbs::node::TypeNameNode,
+) -> Option<&'static str> {
+    match ctx {
+        None => written_ref(tn),
+        Some(c) => project_member_name(c, tn),
+    }
+}
+
+/// `resolve_type_names` for one member reference — `UseMap::resolve?` +
+/// `absolute_type_name`:
+///
+/// * `::Foo::Bar` passes through untouched (an absolute name never looks up
+///   the `use` map — `resolve?` returns early);
+/// * `root_only` (`resolve-type-names: false`) ⇒ the name `absolute!`s to the
+///   root spelling: `"::" + written`;
+/// * else the `use` map: a BARE `Baz` looks up `Baz`; a `Foo::Bar` looks up
+///   its HEAD `Foo` only (`resolve?` maps `hd`, keeping the tail). A hit
+///   re-anchors `"::" + target [:: + tail]`; a miss keeps the written path —
+///   the `resolver.resolve || type_name` fallback, which the builder then
+///   resolves lexically / `absolute!`s at lookup time.
+fn project_member_name(
+    ctx: &FileSigCtx,
+    tn: &ruby_rbs::node::TypeNameNode,
+) -> Option<&'static str> {
+    let written = written_ref(tn)?;
+    if written.starts_with("::") {
+        return Some(written);
+    }
+    if ctx.root_only {
+        return Some(intern(&format!("::{written}")));
+    }
+    let (head, rest) = match written.split_once("::") {
+        Some((h, r)) => (h, Some(r)),
+        None => (written, None),
+    };
+    match ctx.use_map.get(head) {
+        Some(&target) => match rest {
+            Some(tail) => Some(intern(&format!("::{target}::{tail}"))),
+            None => Some(intern(&format!("::{target}"))),
+        },
+        None => Some(written),
+    }
+}
+
 /// Retain the per-overload positional-parameter shapes of a method definition —
 /// the ATM substrate (Slice 1). Unlike [`method_signature`], which collapses all
 /// overloads into a single `(min, max)` arity envelope, this keeps every overload
@@ -4789,6 +6036,7 @@ fn written_ref(tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
 fn method_overloads(
     md: &ruby_rbs::node::MethodDefinitionNode,
     code: &str,
+    ctx: Option<&FileSigCtx>,
 ) -> Vec<OverloadSignature> {
     let mut out: Vec<OverloadSignature> = Vec::new();
     for overload in md.overloads().iter() {
@@ -4810,16 +6058,16 @@ fn method_overloads(
         // (the reference renders exactly it: `expected int | _ToInt`), so a
         // bounded variable resolves to its bound. An UNbounded variable stays
         // opaque — genuinely unconstrained, genuinely admits everything.
-        let bounds = method_type_param_bounds(&mt, code);
+        let bounds = method_type_param_bounds(&mt, code, ctx);
         let required_positionals = ft
             .required_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, &bounds))
+            .map(|p| param_node_type(&p, code, &bounds, ctx))
             .collect();
         let optional_positionals = ft
             .optional_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, &bounds))
+            .map(|p| param_node_type(&p, code, &bounds, ctx))
             .collect();
         let required_positional_names = ft
             .required_positionals()
@@ -4876,6 +6124,7 @@ type TypeParamBounds = [(&'static str, RetainedParamType)];
 fn method_type_param_bounds(
     mt: &ruby_rbs::node::MethodTypeNode,
     code: &str,
+    ctx: Option<&FileSigCtx>,
 ) -> Vec<(&'static str, RetainedParamType)> {
     mt.type_params()
         .iter()
@@ -4892,16 +6141,21 @@ fn method_type_param_bounds(
             // The bound is resolved with NO bounds in scope: a bound that
             // itself mentions a sibling variable is not a shape rbs core uses,
             // and resolving it would need fixpoint ordering for no gain.
-            Some((intern(name), retained_param_type(&bound, code, &[])))
+            Some((intern(name), retained_param_type(&bound, code, &[], ctx)))
         })
         .collect()
 }
 
 /// Resolve a positional-parameter node (`RBS::Types::Function::Param`, whose
 /// `.type_()` is the parameter's type) into a one-level [`RetainedParamType`].
-fn param_node_type(param: &Node, code: &str, bounds: &TypeParamBounds) -> RetainedParamType {
+fn param_node_type(
+    param: &Node,
+    code: &str,
+    bounds: &TypeParamBounds,
+    ctx: Option<&FileSigCtx>,
+) -> RetainedParamType {
     match param {
-        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, bounds),
+        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, bounds, ctx),
         // Defensive: a positional that isn't a FunctionParam node (shouldn't
         // occur) is retained verbatim as an `Other` leaf.
         other => RetainedParamType::Other(node_written_form(other, code)),
@@ -4928,7 +6182,12 @@ fn param_node_name(param: &Node) -> Option<&'static str> {
 /// `bounds` carries the enclosing method type's bounded type parameters: a
 /// variable listed there resolves to its upper bound instead of collapsing to an
 /// (admit-everything) `Other` leaf.
-fn retained_param_type(node: &Node, code: &str, bounds: &TypeParamBounds) -> RetainedParamType {
+fn retained_param_type(
+    node: &Node,
+    code: &str,
+    bounds: &TypeParamBounds,
+    ctx: Option<&FileSigCtx>,
+) -> RetainedParamType {
     match node {
         Node::VariableType(v) => {
             let name = v.name();
@@ -4937,28 +6196,39 @@ fn retained_param_type(node: &Node, code: &str, bounds: &TypeParamBounds) -> Ret
                 None => RetainedParamType::Other(node_written_form(node, code)),
             }
         }
-        Node::ClassInstanceType(ci) => match type_name_str(&ci.name()) {
+        Node::ClassInstanceType(ci) => match retained_name(ctx, &ci.name()) {
             Some(name) => RetainedParamType::ClassInstance(name),
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
-        Node::AliasType(a) => match type_name_str(&a.name()) {
+        Node::AliasType(a) => match retained_name(ctx, &a.name()) {
             Some(name) => RetainedParamType::Alias(name),
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
-        Node::InterfaceType(i) => match type_name_str(&i.name()) {
+        Node::InterfaceType(i) => match retained_name(ctx, &i.name()) {
             Some(name) => RetainedParamType::Interface(name),
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::UnionType(u) => RetainedParamType::Union(
-            u.types().iter().map(|t| retained_param_type(&t, code, bounds)).collect(),
+            u.types()
+                .iter()
+                .map(|t| retained_param_type(&t, code, bounds, ctx))
+                .collect(),
         ),
         Node::OptionalType(o) => RetainedParamType::Optional(Box::new(retained_param_type(
             &o.type_(),
             code,
             bounds,
+            ctx,
         ))),
         other => RetainedParamType::Other(node_written_form(other, code)),
     }
+}
+
+/// A retained-parameter leaf name under a project ctx: the post-
+/// `resolve_type_names` spelling WITHOUT the `::` marker (the ATM consumers
+/// compare registry spellings, which carry no root marker).
+fn retained_name(ctx: Option<&FileSigCtx>, tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
+    member_name(ctx, tn).map(|n| n.strip_prefix("::").unwrap_or(n))
 }
 
 /// The verbatim written form of a type node, sliced from the RBS source `code`
@@ -4993,7 +6263,10 @@ fn node_written_form(node: &Node, code: &str) -> String {
 /// can't pin to a single concrete class. When MULTIPLE block overloads exist
 /// we require them to AGREE on the return (any disagreement ⇒ `None`), matching
 /// the conservative discipline of [`method_signature`].
-fn block_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<&'static str> {
+fn block_overload_return(
+    md: &ruby_rbs::node::MethodDefinitionNode,
+    ctx: Option<&FileSigCtx>,
+) -> Option<&'static str> {
     let mut found: Option<Option<&'static str>> = None;
     for overload in md.overloads().iter() {
         let Node::MethodDefinitionOverload(ov) = overload else {
@@ -5010,7 +6283,7 @@ fn block_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<&'
             continue;
         };
         let this_ret = match ft.return_type() {
-            Node::ClassInstanceType(ci) => type_name_str(&ci.name()),
+            Node::ClassInstanceType(ci) => member_name(ctx, &ci.name()),
             // A `self` block return (each/tap) ⇒ the receiver's own type.
             Node::SelfType(_) => Some(SELF_RETURN),
             _ => None,
@@ -5048,7 +6321,10 @@ fn block_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<&'
 /// return, or a disagreement between two block-free overloads — yields `None`,
 /// i.e. the existing Dynamic decline (zero-FP, the same conservative discipline
 /// as [`method_signature`] and [`block_overload_return`]).
-fn block_free_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<&'static str> {
+fn block_free_overload_return(
+    md: &ruby_rbs::node::MethodDefinitionNode,
+    ctx: Option<&FileSigCtx>,
+) -> Option<&'static str> {
     let mut has_block_overload = false;
     let mut agreed: Option<&'static str> = None;
     let mut seen_block_free = false;
@@ -5069,7 +6345,7 @@ fn block_free_overload_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Opti
             return None;
         };
         let this_ret = match ft.return_type() {
-            Node::ClassInstanceType(ci) => type_name_str(&ci.name()),
+            Node::ClassInstanceType(ci) => member_name(ctx, &ci.name()),
             _ => None,
         };
         let this_ret = this_ret?;
@@ -5134,6 +6410,12 @@ mod qualified_return_lookup_tests;
 
 #[cfg(test)]
 mod qualified_project_sig_tests;
+
+/// Issue #168: project `sig/` `use` directives, the `resolve-type-names`
+/// magic comment, and missing-referenced-type stubs — the acceptance rows a
+/// hand-built project probes.
+#[cfg(test)]
+mod use_directive_tests;
 
 #[cfg(test)]
 mod collection_shape_stage2_tests;

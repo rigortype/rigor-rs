@@ -508,6 +508,25 @@ impl SourceIndex {
             }
         }
 
+        // Pass 2c (issue #168): register an id for every class a PROJECT `sig/`
+        // introduced — the names a `use`-mapped / `::`-anchored RBS return mints
+        // (`Foo::Impl` behind `use Foo::*`), so the call dispatch can type the
+        // chain off a signature-only class the analyzed source never declares.
+        // Project-sig provenance already drives the witness gate
+        // (`is_qualified_project_sig_class`), so these are deliberately NOT
+        // added to `declaration_only_classes` (which would doubly-admit them).
+        for name in core.project_sig_declared_names() {
+            idx.register(name);
+        }
+        // And the SYNTHESIZED missing-referenced-type stubs — registered for
+        // `Nominal` identity only. A stub receiver reads as `Dynamic[top]` in
+        // the reference (`try_synthesized_stub_type`), so they must never join
+        // `declaration_only_classes` or any witness set — identity, nothing
+        // more.
+        for name in core.synthesized_stub_names() {
+            idx.register(name);
+        }
+
         // === M3: AST-consuming passes ======================================
 
         let asts: Vec<&LoweredAst> = files.iter().map(|(_, ast)| *ast).collect();
