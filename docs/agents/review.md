@@ -22,9 +22,14 @@ veto on them:
   fix` round costs more than a filed issue and a small follow-up PR.
 
 Cap review rounds at two per PR. After that, everything outstanding is filed
-and the PR lands or is abandoned; it does not loop. The full-parity review
-that produced the 2026-09-27 abandoned stream is recorded as an anti-pattern
-in `docs/notes/20260927-abandoned-infer-pr-stream.md`.
+and the PR lands or is abandoned; it does not loop. The cap binds the primary
+(style) pass too: each round must list ALL findings, and a fix-confirmation
+re-review checks only whether listed items landed — new non-blocking findings
+are filed, not bounced. A finding that removes a clone/allocation must name a
+compilable alternative — borrow constraints through `&mut` calls have made
+three such findings non-actionable. The full-parity review that produced the
+2026-09-27 abandoned stream is recorded as an anti-pattern in
+`docs/notes/20260927-abandoned-infer-pr-stream.md`.
 
 ## Who reviews
 
@@ -34,6 +39,12 @@ in `docs/notes/20260927-abandoned-infer-pr-stream.md`.
   independent review when available — it catches different things (on PR #154
   it approved while Opus found six message regressions), but its verdict is
   advisory, not blocking.
+- **Substitute reviewers**: when OpenCode providers or Grok are quota-blocked,
+  Codex (`gpt-5.6-sol`) may run either pass with the same prompt and contract —
+  record the substitution in the PR body. Always attach the diff INLINE in the
+  prompt and forbid tool calls: a tool-driven reviewer once burned its whole
+  budget reading and produced no verdict (GLM-5.2, 2026-09-28). Probe failures
+  cheaply — try each provider once, then move on; do not retry a hang.
 
 Review once per PR, on the final head after CI is green, not on every push. A
 `Needs fix` sends the PR back to the implementer only for landing-blocking

@@ -143,6 +143,18 @@ What the gates cannot see, so probe it by hand:
 - An implementer works in an isolated worktree, from a spec that names the
   likely mis-implementations and requires the full *Gates* list. It may
   resolve a spec-vs-oracle conflict toward the oracle; the review confirms it.
+- Implementers commit WIP early and often — provider capacity deaths have
+  twice destroyed whole uncommitted sessions; a pushed draft is the resumable
+  record. The spec should require a first commit + draft PR before deep
+  implementation, and investigation findings belong in a commit body or a
+  worktree note, not only in the agent's context.
+- Implementer pre-push hygiene, alongside `gate.sh`: `git diff` (and
+  `git status`) after every edit batch — silent no-op edits have been
+  reported as success; `git diff | rg -n 'eprintln!|dbg!|println!'` —
+  committed debug output once survived to review; never `cargo fmt --all`
+  (it reformats ~120 untouched files); rebase onto `origin/master` when it
+  moved — a #139×#164 interaction FP was invisible locally until CI ran the
+  rebased tree.
 - Reviewers from other agents are Grok 4.6 and Opus 5.5, both at `high`,
   run together (`docs/agents/review.md`).
 - A new worktree starts with an empty `reference/rigor`. Populate it with
