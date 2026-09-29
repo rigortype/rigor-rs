@@ -6,7 +6,8 @@ use crate::ruby_prism::{self, Node as PrismNode};
 use super::{
     all_param_names, block_param_names, body_has_explicit_return, collect_defined_operand_children,
     collect_recoverable_children, constant_node_name, constant_path_string, constant_string,
-    direct_method_names, discover_visibilities_and_includes, for_index_names, lower_multi_targets,
+    direct_method_names, discover_visibilities_and_includes, for_index_writes, lower_multi_targets,
+    rescue_reference_index_writes,
     param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
     span_of, strict_constant_path_string, JumpKind, Node, NodeId, ParamShape, RescueClause,
     StatementsKind,
@@ -681,6 +682,7 @@ impl<'src> Builder<'src> {
                 predicate,
                 body,
                 index: Vec::new(),
+                index_writes: Vec::new(),
                 span: span_of(&while_node.location()),
             });
         }
@@ -695,6 +697,7 @@ impl<'src> Builder<'src> {
                 predicate,
                 body,
                 index: Vec::new(),
+                index_writes: Vec::new(),
                 span: span_of(&until_node.location()),
             });
         }
@@ -703,17 +706,20 @@ impl<'src> Builder<'src> {
             // `for x in coll; …; end`. Lower the collection (a call can live
             // there) and the body. The index target is a write target, not an
             // arena node: only the LOCAL names it binds are recorded, so the flow
-            // write collectors see the rebind (rigor-rs#151).
+            // write collectors see the rebind (rigor-rs#151) — and the `[]=`
+            // stores an index-target index performs (`for h[:k] in xs`,
+            // rigor-rs#134) widen the receiver's locals through `index_writes`.
             let predicate = Some(self.lower_node(&for_node.collection()));
             let body = for_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
-            let index = for_index_names(&for_node.index());
+            let (index, index_writes) = for_index_writes(&for_node.index());
             return self.push(Node::Loop {
                 predicate,
                 body,
                 index,
+                index_writes,
                 span: span_of(&for_node.location()),
             });
         }
@@ -754,10 +760,17 @@ impl<'src> Builder<'src> {
                     .reference()
                     .and_then(|reference| reference.as_local_variable_target_node())
                     .map(|target| constant_string(target.name().as_slice()));
+                // `rescue => h[:e]` stores the exception through `[]=` on `h`
+                // (rigor-rs#134); a non-index reference contributes nothing.
+                let index_writes = r
+                    .reference()
+                    .map(|reference| rescue_reference_index_writes(&reference))
+                    .unwrap_or_default();
                 clauses.push(RescueClause {
                     exceptions,
                     body: clause_body,
                     bound_name,
+                    index_writes,
                     span: span_of(&r.location()),
                 });
                 rescue = r.subsequent();

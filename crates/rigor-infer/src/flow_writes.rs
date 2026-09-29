@@ -105,6 +105,17 @@ pub(crate) fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span,
     out
 }
 
+/// The `(name, span)` entries an `h[k]` index target contributes to a write
+/// table — `h[k], z = …` stores through `[]=` on `h` (a mutation, NOT a rebind:
+/// the receiver keeps its binding and widens its carrier, exactly as `h[k] = v`
+/// does — `IndexWriteWidening` / `MutationWidening.widen_receiver_aliases`,
+/// rigor-rs#134). Each entry is keyed by the TARGET's own span: it sits inside
+/// the owning `MultiWrite` / `for` / `rescue` construct, so span-containment
+/// widening in the enclosing flow constructs sees it.
+fn index_target_writes(entries: Vec<(String, rigor_parse::Span)>) -> Vec<(rigor_parse::Span, String)> {
+    entries.into_iter().map(|(name, span)| (span, name)).collect()
+}
+
 /// A `for` index's bound names as rebind entries, each keyed by its own target
 /// span — which lies inside the loop's span, so the loop widens them at its exit
 /// exactly as it widens a body write (rigor-rs#151). The reference binds the
@@ -179,18 +190,28 @@ pub(crate) const MUTATOR_METHODS: &[&str] = &[
 ///   inside it would. `ast.iter()` already descends nested block/case bodies, so a
 ///   mutation deep inside an `each`/`case` is found and its span is contained by
 ///   the enclosing construct; a straight-line mutation is its own containing span
-///   and widens through the catch-all/`If` arms.
+///   and widens through the catch-all/`If` arms;
+/// - **index-target stores** — `h[k]` as a multi-assign target (`h[:a], z = 1, 2`),
+///   `for` index (`for h[:k] in xs`) or `rescue` reference (`rescue => h[:e]`):
+///   each stores through `[]=` on `h` (`IndexWriteWidening`, rigor-rs#134). Keyed
+///   by the TARGET's span, so it widens inside whichever construct owns it.
 pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     let mut out: Vec<(rigor_parse::Span, String)> = ast
         .iter()
         .flat_map(|(_, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
             | Node::LocalVariableOpWrite { name, span, .. } => vec![(*span, name.clone())],
-            Node::MultiWrite { targets, span, .. } => targets
-                .bound_names()
-                .into_iter()
-                .map(|(name, _)| (*span, name))
-                .collect(),
+            Node::MultiWrite { targets, span, .. } => {
+                let mut entries: Vec<(rigor_parse::Span, String)> = targets
+                    .bound_names()
+                    .into_iter()
+                    .map(|(name, _)| (*span, name))
+                    .collect();
+                // An `h[k]` target stores through `[]=` on `h` — a receiver
+                // MUTATION at the target's span, not a rebind (rigor-rs#134).
+                entries.extend(index_target_writes(targets.index_writes()));
+                entries
+            }
             Node::Call { receiver: Some(r), method, span, .. }
                 if MUTATOR_METHODS.contains(&method.as_str()) =>
             {
@@ -199,7 +220,20 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
                     _ => Vec::new(),
                 }
             }
-            Node::Loop { index, .. } => for_index_rebinds(index),
+            Node::Loop { index, index_writes, .. } => {
+                let mut entries = for_index_rebinds(index);
+                // `for h[:k] in xs` stores each element through `[]=` on `h`.
+                entries.extend(index_target_writes(index_writes.clone()));
+                entries
+            }
+            // `rescue => h[:e]` stores the exception through `[]=` on `h`
+            // (rigor-rs#134); `bound_name` stays out here — a method-level
+            // `rescue => e` keeps folding on the reference too (see
+            // `indexed_flow_writes`).
+            Node::BeginRescue { clauses, .. } => clauses
+                .iter()
+                .flat_map(|c| index_target_writes(c.index_writes.clone()))
+                .collect(),
             _ => Vec::new(),
         })
         .collect();
@@ -309,8 +343,10 @@ fn toplevel_scope_filters(
 }
 
 /// Every in-place mutation of a TOP-LEVEL local — a `local.<mutator>(…)` call
-/// with a bare `LocalVariableRead` receiver — as `(call span, name, method)`,
-/// subject to the same def/class/module and block-binding filters as
+/// with a bare `LocalVariableRead` receiver, plus the `[]=` store an `h[k]`
+/// index target performs in a `MultiWrite`, `for` index or `rescue` reference
+/// (rigor-rs#134) — as `(call span, name, method)`, subject to the same
+/// def/class/module and block-binding filters as
 /// [`toplevel_rebinds`]. [`crate::flow_eval::Typer::build_toplevel_check_env`]
 /// widens these statements: a mutator call rewrites the literal carrier the
 /// binding tracked (a `Tuple`'s arity, a `HashShape`'s pair set, a `Constant`
@@ -326,19 +362,45 @@ pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, St
     let (scopes, shadow_scopes) = toplevel_scope_filters(ast);
     let mut out: Vec<(NodeId, rigor_parse::Span, String, String)> = Vec::new();
     for (id, n) in ast.iter() {
-        if let Node::Call {
-            receiver: Some(r),
-            method,
-            span,
-            ..
-        } = n
-        {
-            if !MUTATOR_METHODS.contains(&method.as_str()) {
-                continue;
+        match n {
+            Node::Call {
+                receiver: Some(r),
+                method,
+                span,
+                ..
+            } => {
+                if !MUTATOR_METHODS.contains(&method.as_str()) {
+                    continue;
+                }
+                if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                    out.push((id, *span, name.clone(), method.clone()));
+                }
             }
-            if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
-                out.push((id, *span, name.clone(), method.clone()));
+            // An `h[k]` index target is a `[]=` call whose call node Prism
+            // does not make: `h[k], z = …`, `for h[k] in xs`,
+            // `rescue => h[k]` all store through `[]=` on `h`
+            // (`IndexWriteWidening`, rigor-rs#134). Keyed by the TARGET span —
+            // inside the owning construct, so a contained store widens
+            // conditionally and `bind_check_statement`'s `MultiWrite` arm can
+            // still mint the unconditional carrier by widening that span.
+            Node::MultiWrite { targets, .. } => {
+                for (name, tspan) in targets.index_writes() {
+                    out.push((id, tspan, name, "[]=".to_string()));
+                }
             }
+            Node::Loop { index_writes, .. } => {
+                for (name, tspan) in index_writes {
+                    out.push((id, *tspan, name.clone(), "[]=".to_string()));
+                }
+            }
+            Node::BeginRescue { clauses, .. } => {
+                for c in clauses {
+                    for (name, tspan) in &c.index_writes {
+                        out.push((id, *tspan, name.clone(), "[]=".to_string()));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     out.retain(|(id, w, name, _)| {

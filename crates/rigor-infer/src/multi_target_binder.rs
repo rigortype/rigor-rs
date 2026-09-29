@@ -176,7 +176,10 @@ fn is_nil_literal(interner: &Interner, member: TypeId) -> bool {
 }
 
 /// Reference `bind_target`: a local target binds, a nested multi-target
-/// recurses with the slot type as its new RHS, anything else is skipped.
+/// recurses with the slot type as its new RHS, anything else is skipped. An
+/// index target (`h[k], x = rhs`) binds no name — its `[]=` store is the
+/// `Result#index_targets` half the flow passes read via
+/// [`MultiTargets::index_writes`] instead.
 fn bind_target(
     target: &MultiTarget,
     ty: TypeId,
@@ -186,7 +189,7 @@ fn bind_target(
     match target {
         MultiTarget::Local { name, .. } => out.push((name.clone(), ty)),
         MultiTarget::Nested(inner) => visit(inner, ty, interner, out),
-        MultiTarget::Ignored { .. } => {}
+        MultiTarget::Index { .. } | MultiTarget::Ignored { .. } => {}
     }
 }
 
@@ -310,6 +313,20 @@ mod tests {
         let out = bind(&t, rhs, &mut i);
         assert_eq!(names(&out), ["b"]);
         assert_eq!(out[0].1, b, "b takes slot 1, not slot 0");
+    }
+
+    #[test]
+    fn index_target_binds_no_name_but_keeps_its_slot() {
+        let mut i = Interner::new();
+        let (a, b) = (i.int(1), i.int(2));
+        let rhs = i.intern(Type::Tuple(vec![a, b]));
+        // `h[:k], b = [1, 2]` — the `[]=` store on `h` binds no name (the
+        // flow passes widen it via `index_writes`), but slot 0 stays ITS
+        // slot: `b` takes element 1.
+        let t = targets("h[:k], b = [1, 2]\n");
+        let out = bind(&t, rhs, &mut i);
+        assert_eq!(names(&out), ["b"]);
+        assert_eq!(out[0].1, b);
     }
 
     #[test]

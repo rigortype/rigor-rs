@@ -94,6 +94,17 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(rebinds, vspan, env, interner);
                 self.widen_mutated_locals(mutations, vspan, env, interner);
                 self.bind_statement(ast, id, env, interner);
+                // An `h[k]` index target stores through `[]=` on the POST-binding
+                // scope — `swap, swap[:a] = swap, 1` stores into the object `swap`
+                // was just bound to — so the reference widens each receiver AFTER
+                // `MultiTargetBinder` applies (`eval_multi_write`, rigor-rs#134).
+                // Widening by the TARGET span mints the unconditional carrier
+                // (`wspan == span`), as a straight-line `h[k] = v` gets.
+                if let Node::MultiWrite { targets, .. } = ast.get(id) {
+                    for (_, tspan) in targets.index_writes() {
+                        self.widen_mutated_locals(mutations, tspan, env, interner);
+                    }
+                }
             }
             // Only a real statement sequence is straight-line code. A recovery
             // carrier (a `rescue` modifier, `super(…)`, …) runs its writes
@@ -334,6 +345,14 @@ impl<'i> Typer<'i> {
                 let rhs = self.type_of(ast, value, env, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     env.insert(name, ty);
+                }
+                // An `h[k]` index target stores through `[]=` on the
+                // POST-binding scope (`h, h[:a] = h, 1` stores into the rebound
+                // `h`), so each receiver's locals widen after the bindings —
+                // exactly as `h[k] = v` widens them (`eval_multi_write` →
+                // `IndexWriteWidening.widen`, rigor-rs#134).
+                for (_, tspan) in targets.index_writes() {
+                    widen_flow_writes(writes, tspan, env, interner);
                 }
             }
             Node::LocalVariableOpWrite { name, .. } => {

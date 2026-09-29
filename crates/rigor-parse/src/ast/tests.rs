@@ -236,6 +236,96 @@ fn for_index_names_are_carried_on_the_loop() {
     assert_eq!(loops, expect);
 }
 
+/// rigor-rs#134: an `h[k]` multi-assign target stores through `[]=` on `h` —
+/// it binds no local, keeps its position in the tuple decomposition, and
+/// reports its receiver locals for widening.
+#[test]
+fn multi_write_index_targets_report_their_receiver_writes() {
+    // `h` must be a LOCAL for the receiver read — `h = {}` first, else Prism
+    // parses the bare `h` as a method call and it names no local.
+    let t = multi_targets(b"h = {}\nh[:a], z = 1, 2\n");
+    let names: Vec<String> = t.bound_names().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["z"], "the index target binds no local");
+    assert!(matches!(t.lefts[0], MultiTarget::Index { .. }));
+    let writes: Vec<String> = t.index_writes().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(writes, ["h"]);
+}
+
+#[test]
+fn nested_and_splatted_index_targets_keep_their_writes() {
+    let t = multi_targets(b"h = {}\ns = []\n(h[:a], q), *s[0] = xs\n");
+    let names: Vec<String> = t.bound_names().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["q"]);
+    let writes: Vec<String> = t.index_writes().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(writes, ["h", "s"], "nested and splatted receivers, in source order");
+}
+
+#[test]
+fn index_target_receivers_walk_branching_expressions() {
+    // `(c ? a : b)[:k]` mutates whichever local the ternary selects — the
+    // local half of the reference's `ReceiverAlias.mutated_reads`.
+    let t = multi_targets(b"a = {}\nb = {}\n(c ? a : b)[:k], z = 1, 2\n");
+    let writes: Vec<String> = t.index_writes().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(writes, ["a", "b"]);
+    // An ivar receiver names no local — a strict decline, still `Index`.
+    let t = multi_targets(b"@h[:k], z = 1, 2\n");
+    assert!(t.index_writes().is_empty());
+    assert!(matches!(t.lefts[0], MultiTarget::Index { .. }));
+}
+
+/// rigor-rs#134: a `for` index target's `[]=` store rides the loop's
+/// `index_writes` — the whole index (`for h[:a] in xs`), a multi-target slot
+/// (`for w, p[:k] in ys`) and a bare splat index (`for *s[0] in zs`).
+#[test]
+fn for_index_targets_report_their_receiver_writes() {
+    let src = b"h = {}\np = {}\ns = []\nfor h[:a] in xs; end\nfor w, p[:k] in ys; end\nfor *s[0] in zs; end\nfor q in qs; end\n";
+    let ast = lower(&crate::parse(src));
+    let loops: Vec<(Vec<String>, Vec<String>)> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Loop { index, index_writes, span, .. } => {
+                assert!(index_writes.iter().all(|(_, s)| span.0 <= s.0 && s.1 <= span.1));
+                Some((
+                    index.iter().map(|(n, _)| n.clone()).collect(),
+                    index_writes.iter().map(|(n, _)| n.clone()).collect(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        loops,
+        vec![
+            (vec![], vec!["h".into()]),
+            (vec!["w".into()], vec!["p".into()]),
+            (vec![], vec!["s".into()]),
+            (vec!["q".into()], vec![]),
+        ]
+    );
+}
+
+/// rigor-rs#134: `rescue => h[:e]` stores the exception through `[]=` on `h`;
+/// a local `rescue => e` binds a name and reports no index write.
+#[test]
+fn rescue_index_reference_reports_its_receiver_writes() {
+    let src = b"h = {}\nbegin; foo; rescue => h[:e]; end\nbegin; foo; rescue => e; end\n";
+    let ast = lower(&crate::parse(src));
+    let seen: Vec<(Option<String>, Vec<String>)> = ast
+        .iter()
+        .flat_map(|(_, n)| match n {
+            Node::BeginRescue { clauses, .. } => clauses.clone(),
+            _ => Vec::new(),
+        })
+        .map(|c| {
+            (
+                c.bound_name.clone(),
+                c.index_writes.iter().map(|(n, _)| n.clone()).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(seen, vec![(None, vec!["h".into()]), (Some("e".into()), vec![])]);
+}
+
 /// rigor-rs#153: the carrier kinds. A real statement list is a sequence;
 /// `defined?`, `END`, `BEGIN`, `super` and `yield` are inert; any other
 /// recovery (a `rescue` modifier) is `Recovered`. Every write stays in the

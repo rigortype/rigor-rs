@@ -41,7 +41,7 @@ use crate::ruby_prism;
 pub use block_params::BlockParamKind;
 pub(crate) use block_params::*;
 pub use hash_keys::{HashKey, HashKeyTag};
-pub use multi_target::{MultiTarget, MultiTargets};
+pub use multi_target::{IndexWrites, MultiTarget, MultiTargets};
 pub(crate) use multi_target::*;
 pub use definitions::{MethodBody, ParamShape, Visibility};
 pub(crate) use definitions::*;

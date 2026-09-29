@@ -380,6 +380,13 @@ impl<'i> Typer<'i> {
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     tenv.insert(name, ty);
                 }
+                // An `h[k]` index target stores through `[]=` on the
+                // post-binding scope — widen each receiver's carrier after the
+                // bindings, as `h[k] = v` does (`eval_multi_write` →
+                // `IndexWriteWidening`, rigor-rs#134).
+                for (_, tspan) in targets.index_writes() {
+                    widen_flow_writes(ctx.writes, tspan, tenv, interner);
+                }
             }
             // Op-writes (`output += [1]`) are unmodeled — the reference folds
             // `Tuple + Tuple` and keeps the literal shape (probe m16); mirroring

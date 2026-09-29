@@ -990,7 +990,8 @@ fn proc_like_block(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> 
 fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
     fn any_ignored(t: &rigor_parse::MultiTarget) -> bool {
         match t {
-            rigor_parse::MultiTarget::Ignored { .. } => true,
+            rigor_parse::MultiTarget::Ignored { .. }
+            | rigor_parse::MultiTarget::Index { .. } => true,
             rigor_parse::MultiTarget::Local { .. } => false,
             rigor_parse::MultiTarget::Nested(inner) => has_non_local_target(inner),
         }
