@@ -682,6 +682,17 @@ pub enum Node {
     /// recorded DECLINE (probes `p16_next_with_value` / `p16b_break_with_value`
     /// — the reference narrows through them), not an oversight.
     Other { span: Span, jump: Option<JumpKind> },
+    /// An assignment the lowering cannot reproduce: the operator/and/or-write
+    /// and target forms for ivars, cvars, globals, constants, constant paths,
+    /// `x.f`/`a[i]` targets, and the pattern-binding nodes (`in`, `=>`,
+    /// `expr in pat`). Their value children stay lowered for reachability, but
+    /// the write itself is only a marker: it types `Dynamic[top]` like
+    /// [`Node::Other`], and lets the per-element block fold (rigor-rs#194)
+    /// decline a body whose side effects its flat env overlay cannot replay —
+    /// `K += x`, `@i += x`, `rescue => e`, `in [a, b]` all rebind names a tail
+    /// may read, and answering with the pre-write binding mints a wrong
+    /// constant (a false-positive vector, not a safe decline).
+    UnmodeledWrite { span: Span },
     /// `alias new_name old_name` (Prism `AliasMethodNode`). Both operands are
     /// lowered so an interpolated name's calls stay reachable to the rule
     /// walk; the def-attribution walk reads the literal symbol names through
@@ -795,6 +806,7 @@ impl Node {
             | Node::SelfExpr { span }
             | Node::Return { span, .. }
             | Node::Other { span, .. }
+            | Node::UnmodeledWrite { span }
             | Node::Alias { span, .. } => *span,
         }
     }

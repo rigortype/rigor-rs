@@ -650,7 +650,13 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(in_node) = node.as_in_node() {
-            // An `in` pattern branch: lower the pattern and the body.
+            // An `in` pattern branch: lower the pattern and the body. The
+            // pattern's bindings write locals the lowering cannot name — mark
+            // the clause so the per-element block fold declines rather than
+            // answer a tail with the pre-bind value (rigor-rs#194).
+            self.push(Node::UnmodeledWrite {
+                span: span_of(&in_node.location()),
+            });
             let mut body = vec![self.lower_node(&in_node.pattern())];
             if let Some(s) = in_node.statements() {
                 body.extend(self.lower_body(&s.body()));
@@ -1196,6 +1202,29 @@ impl<'src> Builder<'src> {
             return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
         }
 
+        // Assignment shapes with no owned variant — operator/and/or writes to
+        // ivars, cvars, globals, constants, `x.f` / `a[i]` targets, `K::V`
+        // path writes, and `expr => pat` / `expr in pat` bindings. The node is
+        // additionally marked with a sibling [`Node::UnmodeledWrite`] (visible
+        // to span-scanning consumers — the per-element block-fold gate must
+        // decline rather than answer a tail with the pre-write binding,
+        // rigor-rs#194) while the node itself keeps the plain `Recovered`
+        // carrier every other consumer already handles.
+        if is_unmodeled_write(node) {
+            self.push(Node::UnmodeledWrite { span });
+            let recovered = collect_recoverable_children(node);
+            if recovered.is_empty() {
+                return self.push(Node::Other { span, jump: None });
+            }
+            let body: Vec<NodeId> =
+                recovered.iter().map(|c| self.lower_node(c)).collect();
+            return self.push(Node::Statements {
+                body,
+                span,
+                kind: StatementsKind::Recovered,
+            });
+        }
+
         // Anything outside the handled subset: RECOVER any meaningful descendant
         // nodes (local reads / op-writes / calls) so structural walks see them.
         //
@@ -1248,6 +1277,41 @@ impl<'src> Builder<'src> {
 /// captured outer local), decoded to owned `String`s.
 fn constant_list_names(list: &ruby_prism::ConstantList<'_>) -> Vec<String> {
     list.iter().map(|c| constant_string(c.as_slice())).collect()
+}
+
+/// Whether a Prism node is an assignment the lowering cannot reproduce —
+/// every operator/and/or write on a non-local target (`@x += 1`, `K += 1`,
+/// `a[i] ||= v`, `x.f &&= v`), a `K::V` constant-path write, and the
+/// pattern-binding nodes (`expr => pat`, `expr in pat`). Local writes,
+/// multiwrites, `for` indexes, and the plain `K = v`/`@x = v`/`$g = v`/`@@x =
+/// v` forms have owned variants already; multiwrite TARGETS never reach
+/// `lower_node` standalone (a `MultiWriteNode` wraps them).
+fn is_unmodeled_write(node: &PrismNode<'_>) -> bool {
+    node.as_call_and_write_node().is_some()
+        || node.as_call_operator_write_node().is_some()
+        || node.as_call_or_write_node().is_some()
+        || node.as_class_variable_and_write_node().is_some()
+        || node.as_class_variable_operator_write_node().is_some()
+        || node.as_class_variable_or_write_node().is_some()
+        || node.as_constant_and_write_node().is_some()
+        || node.as_constant_operator_write_node().is_some()
+        || node.as_constant_or_write_node().is_some()
+        || node.as_constant_path_and_write_node().is_some()
+        || node.as_constant_path_operator_write_node().is_some()
+        || node.as_constant_path_or_write_node().is_some()
+        || node.as_constant_path_write_node().is_some()
+        || node.as_global_variable_and_write_node().is_some()
+        || node.as_global_variable_operator_write_node().is_some()
+        || node.as_global_variable_or_write_node().is_some()
+        || node.as_index_and_write_node().is_some()
+        || node.as_index_operator_write_node().is_some()
+        || node.as_index_or_write_node().is_some()
+        || node.as_instance_variable_and_write_node().is_some()
+        || node.as_instance_variable_operator_write_node().is_some()
+        || node.as_instance_variable_or_write_node().is_some()
+        || node.as_match_write_node().is_some()
+        || node.as_match_predicate_node().is_some()
+        || node.as_match_required_node().is_some()
 }
 
 /// A prism integer's value when it fits `i64`, from its little-endian `u32`

@@ -304,7 +304,7 @@ impl<'i> Typer<'i> {
         };
         if elements.is_empty()
             || !self.block_level_jumps(ast, block_span).is_empty()
-            || self.fold_body_touches_captured(ast, block_span, block_locals, env)
+            || self.fold_body_has_unmodelled_write(ast, block_body, block_span, block_locals, env)
             // Only a bare single-positional block (`|x|`, `|x = 1|`, `it`,
             // `_1`, `|;local|` declarations bind nothing) folds. A second
             // positional, a destructure, `*rest`, keywords or `&blk` invoke
@@ -551,50 +551,73 @@ impl<'i> Typer<'i> {
         benv
     }
 
-    /// Whether the fold body writes — or mutates in place — a local the OUTER
-    /// env binds: the reference's captured-bindings threading, which the flat
-    /// per-position overlay cannot reproduce (`seen += 1` reads a different
-    /// value at every position). `block_locals` is the block's own name set
-    /// (Prism `BlockNode#locals`: params, `;`-declared locals, and
-    /// block-scoped writes — never a captured outer local), so a write to one
-    /// shadows rather than captures and stays foldable. Nodes inside the span
-    /// are scanned whole — a write inside a nested `def`/`lambda`/`defined?`
-    /// over-declines, which is the safe side.
-    fn fold_body_touches_captured(
+    /// Whether the fold body contains a write or in-place mutation the flat
+    /// per-position overlay cannot replay — the reference's threaded body
+    /// evaluation answers such a tail with the POST-write state (or the
+    /// tail-only `Dynamic[top]` floor); answering with the entry binding mints
+    /// a wrong constant — a false-positive vector, not a safe decline
+    /// (`[1, 2].map { |x| x += 1; x }` must not answer `[1, 2]`).
+    ///
+    /// The overlay replays exactly one write form: a `LocalVariableWrite`
+    /// that is a direct member of `block_body` before the tail (a block-local
+    /// `y = x; y + 1` reads `y` per position). Everything else declines:
+    ///
+    /// - op-writes (`x += 1`, `y ||= z`) — read-modify-write, unmodeled;
+    /// - multiwrites, `for`/`while`/`until` loops, `rescue => e` binds;
+    /// - ivar/cvar/gvar/constant writes and [`Node::UnmodeledWrite`] markers
+    ///   (operator writes the lowering cannot reproduce, `in`/`=>` pattern
+    ///   binds);
+    /// - a plain write that is NESTED (`if c; x = 9; end` — conditional
+    ///   rebinding) or targets a captured outer local (`block_locals` is the
+    ///   block's own name set — Prism `BlockNode#locals` — so a write outside
+    ///   it is a capture the flat overlay threads wrongly);
+    /// - a shape-mutator or setter call on a read binding (`x << 3`,
+    ///   `x.attr = v`, `k[i] = v` — the element's own state changes between
+    ///   write and tail read).
+    ///
+    /// Nodes inside the span are scanned whole — a write inside a nested
+    /// `def`/`lambda`/`defined?` over-declines, which is the safe side.
+    fn fold_body_has_unmodelled_write(
         &self,
         ast: &LoweredAst,
+        block_body: &[NodeId],
         block_span: rigor_parse::Span,
         block_locals: &[String],
         env: &TypeEnv,
     ) -> bool {
         let locals: HashSet<&str> = block_locals.iter().map(String::as_str).collect();
         let captured = |name: &str| !locals.contains(name) && env.contains_key(name);
-        for (_, node) in ast.iter() {
+        let tail_end = block_body
+            .last()
+            .map(|&t| ast.get(t).span().1)
+            .unwrap_or(usize::MAX);
+        for (id, node) in ast.iter() {
             let span = node.span();
             if !(block_span.0 <= span.0 && span.1 <= block_span.1) {
                 continue;
             }
             match node {
                 Node::LocalVariableWrite { name, .. }
-                | Node::LocalVariableOpWrite { name, .. }
-                    if captured(name) =>
+                    if captured(name)
+                        || !(block_body.contains(&id) && span.1 <= tail_end) =>
                 {
                     return true;
                 }
-                Node::MultiWrite { targets, .. }
-                    if targets.bound_names().iter().any(|(n, _)| captured(n)) =>
-                {
-                    return true;
-                }
-                Node::Loop { index, .. }
-                    if index.iter().any(|(n, _)| captured(n)) =>
+                Node::LocalVariableOpWrite { .. }
+                | Node::MultiWrite { .. }
+                | Node::Loop { .. }
+                | Node::VariableWrite { .. }
+                | Node::InstanceVariableWrite { .. }
+                | Node::ConstantWrite { .. }
+                | Node::UnmodeledWrite { .. } => return true,
+                Node::BeginRescue { clauses, .. }
+                    if clauses.iter().any(|c| c.bound_name.is_some()) =>
                 {
                     return true;
                 }
                 Node::Call { receiver: Some(r), method, .. }
-                    if crate::is_shape_mutator(method)
-                        && matches!(ast.get(*r), Node::LocalVariableRead { name, .. }
-                            if captured(name)) =>
+                    if (crate::is_shape_mutator(method) || Self::is_setter_call(method))
+                        && Self::receiver_reads_binding(ast, *r) =>
                 {
                     return true;
                 }
@@ -602,6 +625,41 @@ impl<'i> Typer<'i> {
             }
         }
         false
+    }
+
+    /// Whether a mutator/setter call receiver reads a local, ivar/cvar/gvar,
+    /// or constant binding anywhere inside it. `x << 3` mutates `x`'s object;
+    /// `x.attr = v` and `x[i] = v` (`[]=`) the same; `x[i] << 3` mutates a
+    /// sub-object a later `x` read still reaches; `(x; y) << 3` mutates
+    /// whatever `y` binds. The flat overlay replays none of these, so any
+    /// binding read inside the receiver expression declines the fold. A pure
+    /// literal receiver (`[].push(x)`) or a computed one (`x.dup << 3` —
+    /// over-declined, but safe) carries none.
+    fn receiver_reads_binding(ast: &LoweredAst, receiver: NodeId) -> bool {
+        let rspan = ast.get(receiver).span();
+        ast.iter().any(|(_, n)| {
+            let s = n.span();
+            rspan.0 <= s.0
+                && s.1 <= rspan.1
+                && matches!(
+                    n,
+                    Node::LocalVariableRead { .. }
+                        | Node::VariableRead { .. }
+                        | Node::ConstantRead { .. }
+                )
+        })
+    }
+
+    /// An attribute-writer call (`x.attr = v`) by method-name shape — `foo=`
+    /// but never a comparison or match operator (`==`, `!=`, `<=`, `>=`,
+    /// `=~`, `!~`, `<=>`, `===`). `[]=` qualifies too: `k[i] = v` mutates the
+    /// binding the same way a `push` does.
+    fn is_setter_call(method: &str) -> bool {
+        method.ends_with('=')
+            && !matches!(
+                method,
+                "==" | "!=" | "<=" | ">=" | "=~" | "!~" | "<=>" | "===" | "="
+            )
     }
 
     /// The rigor-rs#140 block-timing answer for `receiver.method { … }`, or

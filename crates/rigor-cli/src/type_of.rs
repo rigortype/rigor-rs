@@ -323,6 +323,7 @@ pub(crate) fn node_kind(node: &Node) -> &'static str {
         Node::SelfExpr { .. } => "SelfExpr",
         Node::Return { .. } => "Return",
         Node::Other { .. } => "Other",
+        Node::UnmodeledWrite { .. } => "UnmodeledWrite",
         Node::Alias { .. } => "Alias",
     }
 }

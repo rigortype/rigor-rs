@@ -378,58 +378,78 @@ const OPERATOR_SYMNAMES: &[&str] = &[
     "<<", ">>", "&", "|", "^", "~", "+@", "-@", "[]", "[]=", "`", "!",
 ];
 
-/// One character that may appear inside a Ruby identifier (`is_identchar`):
-/// ASCII alphanumerics and `_`, plus non-ASCII alphanumeric characters.
+/// One character that may appear inside a Ruby identifier (`is_identchar`).
+/// Byte-level like the C check: on the pinned toolchain a non-ASCII byte
+/// never counts, which is why `:"café"` inspects quoted.
 fn identchar(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || (!c.is_ascii() && c.is_alphanumeric())
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// `is_global_name_punct`'s byte set (parse.y `SPECIAL_PUNCT`): the
+/// single-character specials a `$` tail may be (`$$`, `$~`, `$'`, `$0`, `$,`
+/// …). `0` is here rather than in the digit loop, so `:"$00"` quotes.
+const GLOBAL_NAME_PUNCT: &[char] = &[
+    '~', '*', '$', '?', '!', '@', '/', '\\', ';', ',', '.', '=', ':', '<', '>', '"', '&', '`',
+    '\'', '+', '0',
+];
+
+/// `is_special_global_name` (symbol.c): the tail after `$` — one punct byte
+/// (`$$`), `-` plus one identchar (`$-a`, `$-9`; `:"$-!"` and `:"$-ab"`
+/// quote), or an all-digit tail (`$12`, `$5`). Checked before the identifier
+/// path, mirroring the C order.
+fn special_global_tail(tail: &str) -> bool {
+    let mut chars = tail.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if GLOBAL_NAME_PUNCT.contains(&first) {
+        return chars.next().is_none();
+    }
+    if first == '-' {
+        return chars.next().is_some_and(identchar) && chars.next().is_none();
+    }
+    first.is_ascii_digit() && chars.all(|c| c.is_ascii_digit())
+}
+
+/// The identifier half of `rb_enc_symname_type`: a `_`/ASCII-alpha first char
+/// then identchars — plus, for locals and constants only, one trailing
+/// `?`/`!`/`=` sigil (`foo?`, `Foo=`). `$`/`@`/`@@` names reject all three
+/// (`:"$foo?"`, `:"@x="` quote).
+fn ident_tail(name: &str, allow_sigil: bool) -> bool {
+    let mut chars = name.chars();
+    if !chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic()) {
+        return false;
+    }
+    if chars.all(identchar) {
+        return true;
+    }
+    if !allow_sigil {
+        return false;
+    }
+    let Some(last) = name.chars().last() else {
+        return false;
+    };
+    matches!(last, '?' | '!' | '=') && name[..name.len() - last.len_utf8()]
+        .chars()
+        .all(identchar)
 }
 
 /// The `rb_str_symname_p` half of [`symbol_inspect`]: whether `name` inspects
-/// as `:name` without quotes. Identifier and constant names allow one trailing
-/// `?`/`!`/`=` (`foo?`, `Foo=`); `@`/`@@` names allow none (`@x?` quotes);
-/// `$` globals accept any printable non-space tail (`$$`, `$-a`, `$"`).
+/// as `:name` without quotes.
 fn bare_symname(name: &str) -> bool {
-    let Some(first) = name.chars().next() else {
-        return false;
-    };
     if OPERATOR_SYMNAMES.contains(&name) {
         return true;
     }
-    if first == '$' {
-        let rest = &name[1..];
-        return !rest.is_empty()
-            && rest.chars().all(|c| c.is_ascii_graphic() || !c.is_ascii());
+    match name.chars().next() {
+        // `$` — a `is_special_global_name` tail (`$$`, `$-a`, `$12`) or a
+        // plain global identifier (`$foo`, `$_x`); sigils are never allowed.
+        Some('$') => special_global_tail(&name[1..]) || ident_tail(&name[1..], false),
+        // `@`/`@@` — an identifier tail, no sigils (`:"@x?"` quotes).
+        Some('@') => ident_tail(name.strip_prefix("@@").unwrap_or(&name[1..]), false),
+        // A local or constant name — one trailing `?`/`!`/`=` allowed.
+        Some(_) => ident_tail(name, true),
+        None => false,
     }
-    let ident = match first {
-        '@' => {
-            let mut rest = name[1..].chars();
-            let cvar = rest.next() == Some('@');
-            let after = if cvar { &name[2..] } else { &name[1..] };
-            return !after.is_empty()
-                && after.chars().next().is_some_and(|c| {
-                    c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && c.is_alphanumeric())
-                })
-                && after.chars().all(identchar);
-        }
-        _ if first.is_ascii_alphabetic()
-            || first == '_'
-            || (!first.is_ascii() && first.is_alphanumeric()) =>
-        {
-            name
-        }
-        _ => return false,
-    };
-    if ident.chars().all(identchar) {
-        return true;
-    }
-    // Method-name suffixes: `foo?`, `foo!`, `foo=` — one trailing sigil on an
-    // otherwise-all-identifier name (`a==`, `a=b` still quote).
-    let Some(last) = ident.chars().last() else { return false };
-    if !matches!(last, '?' | '!' | '=') {
-        return false;
-    }
-    let stem = &ident[..ident.len() - last.len_utf8()];
-    !stem.is_empty() && stem.chars().all(identchar)
 }
 
 /// Ruby's double-quoted `inspect` escaping for a symbol name or string body —
@@ -835,6 +855,84 @@ mod named_tests {
         assert_eq!(describe_named(&i, tup, &resolver), "[99999999999999999999]");
         // …and erases to the same literal RBS spelling, like `Int`.
         assert_eq!(erase_to_rbs_named(&i, big, &resolver), "99999999999999999999");
+    }
+
+    #[test]
+    fn bare_symname_follows_the_cruby_grammar() {
+        // rigor-rs#194 FINAL review — `rb_str_symname_p` only leaves a `$` name
+        // bare when its tail is a `is_special_global_name` form (one punct
+        // byte, `-` + one identchar, or all digits) or a plain global
+        // identifier; every other `$` tail quotes (`:"$a=b"`, `:"$foo?"`,
+        // `:"$-"`). Every row below is measured against `Symbol#inspect` on
+        // the pinned toolchain.
+        let mut i = Interner::new();
+        for (name, want) in [
+            // Locals/constants keep one trailing sigil.
+            ("foo?", ":foo?"),
+            ("foo!", ":foo!"),
+            ("foo=", ":foo="),
+            ("Foo?", ":Foo?"),
+            ("_x", ":_x"),
+            ("a=b", ":\"a=b\""),
+            ("a==", ":\"a==\""),
+            ("a?b", ":\"a?b\""),
+            ("a!=", ":\"a!=\""),
+            ("9lives", ":\"9lives\""),
+            ("", ":\"\""),
+            // Special-global forms stay bare.
+            ("$x", ":$x"),
+            ("$foo", ":$foo"),
+            ("$_", ":$_"),
+            ("$K", ":$K"),
+            ("$a9", ":$a9"),
+            ("$0", ":$0"),
+            ("$5", ":$5"),
+            ("$12", ":$12"),
+            ("$$", ":$$"),
+            ("$~", ":$~"),
+            ("$&", ":$&"),
+            ("$+", ":$+"),
+            ("$!", ":$!"),
+            ("$?", ":$?"),
+            ("$,", ":$,"),
+            ("$/", ":$/"),
+            ("$;", ":$;"),
+            ("$'", ":$'"),
+            ("$`", ":$`"),
+            ("$:", ":$:"),
+            ("$.", ":$."),
+            ("$<", ":$<"),
+            ("$=", ":$="),
+            ("$*", ":$*"),
+            ("$@", ":$@"),
+            ("$\"", ":$\""),
+            ("$-a", ":$-a"),
+            ("$-9", ":$-9"),
+            // …everything else after `$` quotes.
+            ("$9x", ":\"$9x\""),
+            ("$0x", ":\"$0x\""),
+            ("$00", ":\"$00\""),
+            ("$-", ":\"$-\""),
+            ("$-ab", ":\"$-ab\""),
+            ("$-!", ":\"$-!\""),
+            ("$a=b", ":\"$a=b\""),
+            ("$foo?", ":\"$foo?\""),
+            ("$a!", ":\"$a!\""),
+            ("$@x", ":\"$@x\""),
+            ("$", ":\"$\""),
+            // `@`/`@@` names take an identifier tail, never a sigil.
+            ("@iv", ":@iv"),
+            ("@@cv", ":@@cv"),
+            ("@_x", ":@_x"),
+            ("@x?", ":\"@x?\""),
+            ("@@x=", ":\"@@x=\""),
+            ("@", ":\"@\""),
+            ("@@", ":\"@@\""),
+            ("@9x", ":\"@9x\""),
+        ] {
+            let sym = i.intern(Type::Constant(Scalar::Sym(name.to_string())));
+            assert_eq!(describe_named(&i, sym, &resolver), want, ":{name}");
+        }
     }
 
     #[test]

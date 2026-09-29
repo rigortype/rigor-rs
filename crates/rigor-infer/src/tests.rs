@@ -1524,6 +1524,65 @@ fn per_element_map_fold_declines_captured_rebinds() {
 }
 
 #[test]
+fn per_element_map_fold_declines_unmodelled_writes() {
+    // rigor-rs#194 FINAL review — the flat per-position overlay replays only
+    // a direct-member `LocalVariableWrite` before the tail. Any other write
+    // or in-place mutation visible in the block span must decline the whole
+    // fold: answering the tail with the ENTRY binding mints a wrong constant
+    // (`[1, 2].map { |x| x += 1; x }.first.even?` reads `false` where the
+    // reference's `[2, 3]` gives `true`) — a false-positive vector.
+    let idx = CoreIndex::new();
+    if !idx.class_has_method("Array", "map") {
+        return; // stub index: every row declines anyway — vacuous.
+    }
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut not_folded = |src: &[u8]| -> bool {
+        let ast = lower_src(src);
+        let call = find_call(&ast, "map");
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        !matches!(i.get(ty), Type::Tuple(_))
+    };
+    // An op-write on the block parameter — read-modify-write is unmodeled.
+    assert!(not_folded(b"[1, 2].map { |x| x += 1; x }\n"));
+    // …on a block-local (`y += 1` changes what the tail reads).
+    assert!(not_folded(b"[1, 2].map { |x| y = x; y += 1; y }\n"));
+    // A shape mutator on the parameter mutates the ELEMENT between write and
+    // tail read — the reference answers the post-mutation tuple.
+    assert!(not_folded(b"[[1], [2]].map { |x| x << 3; x }\n"));
+    // A setter / index-write on a read binding (`x[0] = 9` lowers as `[]=`).
+    assert!(not_folded(b"[[1], [2]].map { |x| x[0] = 9; x }\n"));
+    // A mutation of a sub-object reachable through the binding (`x[0] << 9`).
+    assert!(not_folded(b"[[1], [2]].map { |x| x[0] << 9; x }\n"));
+    // Writes on non-local targets the lowering cannot reproduce: operator
+    // writes (`x.f += 1`), `K::V` path writes, multiwrites, `for` index
+    // binds, `rescue => e`, and `in`/`=>` pattern binds.
+    assert!(not_folded(b"[1, 2].map { |x| K = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| @v = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| $g = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| @v += x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| x.f += 1; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| K::V = x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| a, b = x, x; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| for q in []; end; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| begin; rescue => e; end; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| case x; in Integer => q; end; x }\n"));
+    assert!(not_folded(b"[1, 2].map { |x| x => q; x }\n"));
+    // A write nested inside a conditional is not a direct member of
+    // `block_body` — the overlay never replays it, so the fold declines.
+    assert!(not_folded(b"[1, 2].map { |x| x = 9 if x > 1; x }\n"));
+    // A plain rebind of the parameter IS replayed — still folds to `[9, 9]`.
+    let ast = lower_src(b"[1, 2].map { |x| x = 9; x }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("plain rebind still folds, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(9)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(9)));
+}
+
+#[test]
 fn bignum_literal_pins_its_exact_value() {
     // rigor-rs#194 — a Bignum types `Constant(BigInt)` carrying its decimal
     // spelling (the reference's `Constant[99999999999999999999]`), not a
@@ -2034,3 +2093,4 @@ fn core_singleton_name_is_string() {
     let interned = i.intern(ty.clone());
     assert_eq!(idx.class_name_of(&i, interned), Some("String"), "Time.name must be String, got {ty:?}");
 }
+
