@@ -2210,21 +2210,89 @@ impl CoreData {
     }
 
     /// Resolve a member-level type reference (a flat return-class name) of the
-    /// entry `definer`: [`Self::resolve_leaf_unique`] in EVERY member context
-    /// the entry was ingested under, adopting only a unanimous answer. A
-    /// definer with no recorded context (pre-Slice-5 stub data) or any
-    /// disagreement declines.
+    /// entry `definer`, in EVERY member context the entry was ingested under,
+    /// adopting only a unanimous answer. A definer with no recorded context
+    /// (pre-Slice-5 stub data) or any disagreement declines.
+    ///
+    /// The per-context resolver is chosen by the STORED name's fidelity
+    /// (issue #168):
+    ///
+    /// * A name a PROJECT signature stores is full-fidelity — `member_name`
+    ///   under a `FileSigCtx` keeps the written namespace (`Ns::Impl`,
+    ///   `Impl`, `::X`), so it resolves by RBS's own deterministic rule —
+    ///   [`Self::resolve_project_type_ref`]: head segment innermost-outward,
+    ///   FIRST hit binds (`Ns::Impl` shadows a root `Impl` written inside
+    ///   `module Ns`), a bound head that fails its tail falls back to the
+    ///   written path at root (the reference keeps the relative name, which
+    ///   `validate_type_name`'s `absolute!` then reads as `::`-rooted).
+    /// * A bundled entry's flat LEAF (`Instance`, namespace discarded by
+    ///   `type_name_str` at ingest) keeps [`Self::resolve_leaf_unique`]'s
+    ///   uniqueness requirement: there first-hit could mint a class the
+    ///   discarded qualifier would not have resolved to.
     fn resolve_member_type_ref(&self, definer: &str, name: &str) -> Option<&'static str> {
         let entry = self.qualified.get(definer)?;
+        let project = self.qualified_project_sig_classes.contains(definer);
         let mut agreed: Option<&'static str> = None;
         for ctx in &entry.member_ctxs {
-            let r = self.resolve_leaf_unique(name, ctx)?;
+            let r = if project {
+                self.resolve_project_type_ref(name, ctx)?
+            } else {
+                self.resolve_leaf_unique(name, ctx)?
+            };
             match agreed {
                 Some(prev) if prev != r => return None,
                 _ => agreed = Some(r),
             }
         }
         agreed
+    }
+
+    /// `TypeNameResolver#resolve` for a full-fidelity (namespace-preserving)
+    /// member name a project signature stored — the deterministic rule a
+    /// `resolve_leaf_unique` "unique candidate" check approximates WRONGLY:
+    /// RBS binds the HEAD segment by walking the lexical context
+    /// innermost-outward (first `has_type_name?` wins — a nearer `Ns::Impl`
+    /// shadows a root `Impl`), then requires each tail segment under it. On
+    /// any failure the reference keeps the name written-relative, and
+    /// `DefinitionBuilder`'s `absolute!` reads that as the ROOT spelling —
+    /// so the root `name` lookup is the correct fallback in both failure
+    /// modes (head unresolved, or head bound but tail missing beneath it).
+    /// Class-alias hops in the head/tail walk (`aliases.fetch`) are not
+    /// modelled — the port records class aliases only in `known_type_names`
+    /// — so those decline to the root spelling: a coverage gap, never an FP.
+    fn resolve_project_type_ref(&self, name: &str, ctx: &[&'static str]) -> Option<&'static str> {
+        if let Some(abs) = name.strip_prefix("::") {
+            return self.qualified.get_key_value(abs).map(|(&k, _)| k);
+        }
+        let (head, tail) = match name.split_once("::") {
+            Some((h, t)) => (h, Some(t)),
+            None => (name, None),
+        };
+        // `resolve_head_namespace`: each context scope innermost-outward, then
+        // the root head — first hit binds. A head that resolves nowhere leaves
+        // the name written-relative, which downstream `absolute!` reads as
+        // `::name` — so the root `name` lookup is the fallback there too (and
+        // is what lets `Foo::Bar` resolve even when `Foo` itself is a
+        // synthesized-namespace gap).
+        let resolved_head = ctx
+            .iter()
+            .rev()
+            .find_map(|scope| {
+                self.qualified
+                    .get_key_value(format!("{scope}::{head}").as_str())
+                    .map(|(&k, _)| k)
+            })
+            .or_else(|| self.qualified.get_key_value(head).map(|(&k, _)| k));
+        let resolved_root = || self.qualified.get_key_value(name).map(|(&k, _)| k);
+        match (resolved_head, tail) {
+            (Some(h), None) => Some(h),
+            (Some(h), Some(tail)) => self
+                .qualified
+                .get_key_value(format!("{h}::{tail}").as_str())
+                .map(|(&k, _)| k)
+                .or_else(resolved_root),
+            (None, _) => resolved_root(),
+        }
     }
 
     /// Whether every `Class` name inside a tuple-return shape list resolves —
@@ -6265,6 +6333,12 @@ mod qualified_return_lookup_tests;
 
 #[cfg(test)]
 mod qualified_project_sig_tests;
+
+/// Issue #168: project `sig/` `use` directives, the `resolve-type-names`
+/// magic comment, and missing-referenced-type stubs — the acceptance rows a
+/// hand-built project probes.
+#[cfg(test)]
+mod use_directive_tests;
 
 #[cfg(test)]
 mod collection_shape_stage2_tests;
