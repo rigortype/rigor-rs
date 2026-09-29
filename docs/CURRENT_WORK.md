@@ -1,9 +1,8 @@
 # rigor-rs — Current Work
 
 The session-to-session baton: **what is in flight, what to pull next, and a
-one-line ledger of what landed**. The complete per-subsystem port map is
-[PORT_BACKLOG.md](PORT_BACKLOG.md); measured outcomes and narratives live in
-`docs/notes/` + `docs/adr/`; history is `git log`.
+one-line ledger of what landed**. Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md);
+outcomes: `docs/notes/` + `docs/adr/`; history: `git log`.
 
 **Contract (gated by `harness/docs_check.py`):** a landed/closed arc gets ONE
 ledger line here — verdict + numbers + link — and its detail goes to a dated
@@ -13,13 +12,13 @@ note or ADR *first*. No status essays; this file has a hard byte budget.
 ## Now / Next
 
 ▶ **NEXT (2026-09-29): pin `e59b7b89`, 0 FP / 9,337, gaps 818.**
-Retractions: **#134–#137** (134–136 WIP). FPs: #146. CLI/config:
+Retractions: **#135–#137** (all WIP). FPs: #146. CLI/config:
 #155–#159, #162, #169–#171, #130, #132; #160 blocked.
-- **CLOSED arcs** (do not re-open): ADR-0042 core migration + compat
-  next-stage plan (Phases 0–3, [plan](notes/20260718-compat-next-stage-plan.md)).
+- **CLOSED arcs** (do not re-open): ADR-0042 migration + compat plan
+  ([Phases 0–3](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
-  `--protection`/`--mutation` + `type-scan` deferred ([scoping
-  call](notes/20260719-coverage-command-scoping.md)).
+  `--protection`/`--mutation` + `type-scan` deferred
+  ([scoping call](notes/20260719-coverage-command-scoping.md)).
 - **Pin is master `e59b7b89`** (rbs 4.2.0 vendored). Both
   standing exception tables EMPTY; a new entry is a real finding, not maintenance
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap). Version-guard folds mirror
@@ -30,7 +29,7 @@ unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
 9,337 files / 818 gaps** (#141 closed 3,002), 8 corpora, baselines in
 `harness/CORPUS.md`; effects gate 0 OVER. `--sweep` ~3 min; read per-corpus
 MATCHED counts. Grading tools REFUSE a stale rigor-cli build — corpus tools
-release, fixture harness debug. Clippy: workspace `-D warnings`, FRESH
+release, fixture harness debug. Clippy: `-D warnings`, FRESH
 `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
@@ -59,12 +58,9 @@ release, fixture harness debug. Clippy: workspace `-D warnings`, FRESH
   for. Pick from mechanism buckets; re-run `gap_census.py --sweep` after each — the
   gap set's SHAPE moves even when its total barely does.
 - **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (2026-08-26 s4). Four stricter typer-free rules measured; best still 5 OVER on gitlab-foss/lib. Upstream's edge set = the call nodes its typer visited, not characterisable (blind spots depend on condition folding, sometimes THROUGH A CALL). Inversion: more edges ⇒ more TAINT (sound) AND more LABELS (unsound); `absorb` moves both in one pass. **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER; proposals must MATCH the oracle. [probe](notes/20260826-effects-s4-probe.md).
-- **sig-gen arc closed** — byte surface 0, `--write` sound; remaining items
-  coverage-only (sound-superset, AGENTS.md).
-- **Plugin work:** the pure-RBS bundle track is closed
-  ([note](notes/20260710-pure-rbs-bundle-track-closed.md)); the code engine is a
-  separate ADR-backed track. **Sidecar**: complete; perf slices retired
-  ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
+- **sig-gen arc closed** — byte surface 0, `--write` sound; rest coverage-only.
+- **Plugin work:** pure-RBS bundle track closed ([note](notes/20260710-pure-rbs-bundle-track-closed.md));
+  sidecar complete, perf slices retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
 
 ## Build & gates
 
@@ -85,6 +81,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-29 #134 CLOSED** (PR #295): index-target stores (multi-assign/`for`/`rescue`) widen receivers via `MultiTarget::Index`. 0 FP; → #298–#304. [note](notes/20260929-issue-134-index-widening.md)
 - **2026-09-29 #194 CLOSED** (PR #291): symbol/BigInt/float witness spelling; literal-tuple block fold + write gate. 0 FP / 818; → #292–#294. [note](notes/20260929-issue-194-witness-rendering.md)
 - **2026-09-29 #168 CLOSED** (PR #289): project-`sig/` `use` + `resolve-type-names` + missing-name stubs; alias-aware head-first resolver. 0 FP / 818; → #286–#290. [note](notes/20260929-issue-168-rbs-use.md)
 - **2026-09-28 #201 CLOSED** (PR #285): `exclude:` + `BUILTIN_EXCLUDES` moved inside directory expansion (explicit `.rb` roots verbatim); exact `dir.c` `fnmatch` flags-0 port; LSP gate exclusion-immunity for verbatim roots. 0 FP / sweep. [note](notes/20260928-issue-201-excludes.md)
