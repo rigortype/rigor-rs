@@ -5038,8 +5038,8 @@ fn collect_type_node_names(node: &Node, ctx: Option<&FileSigCtx>, out: &mut Vec<
                 collect_type_node_names(&st, ctx, out);
             }
         }
-        Node::FunctionType(ft) => collect_function_type_names(&ft, ctx, out),
-        Node::MethodType(mt) => collect_method_type_names(&mt, ctx, out),
+        Node::FunctionType(ft) => collect_function_type_names(ft, ctx, out),
+        Node::MethodType(mt) => collect_method_type_names(mt, ctx, out),
         Node::BlockType(b) => {
             collect_type_node_names(&b.type_(), ctx, out);
             if let Some(st) = b.self_type() {
@@ -5116,8 +5116,10 @@ fn synthesize_missing_namespaces(builder: &mut Builder) {
     missing.sort_by_key(|n| n.matches("::").count());
     for prefix in missing {
         let key = intern(prefix);
-        let mut entry = ClassEntry::default();
-        entry.is_module = true;
+        let entry = ClassEntry {
+            is_module: true,
+            ..Default::default()
+        };
         builder.merge_qualified(key, entry);
         builder.known_type_names.insert(key);
         builder.synthesized_type_names.insert(key);
@@ -5216,8 +5218,10 @@ fn synthesize_stub(builder: &mut Builder, name: &str, names: &BTreeSet<String>) 
     let leaf = name.rsplit("::").next().unwrap_or(name);
     if is_namespace {
         let key = intern(name);
-        let mut entry = ClassEntry::default();
-        entry.is_module = true;
+        let entry = ClassEntry {
+            is_module: true,
+            ..Default::default()
+        };
         builder.merge_qualified(key, entry);
         builder.known_type_names.insert(key);
         builder.synthesized_type_names.insert(key);
