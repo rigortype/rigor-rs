@@ -3358,3 +3358,90 @@ fn atm_silent_correct_arguments() {
     assert!(atm_diags(b"[1, 2, 3].fetch(0)\n").is_empty());
     assert!(atm_diags(b"\"abc\".center(5)\n").is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// rigor-rs#136 — later call arguments type from the call's ENTRY scope (the
+// port of the reference's `OperandWalk` per-node scope index, upstream
+// rigor#1310). Every row below is oracle-measured on the pinned reference
+// (fresh cwd, `--no-cache`).
+// ---------------------------------------------------------------------------
+
+/// Headline row: the second argument is typed from the scope it was entered
+/// from — which already holds the first argument's `unshift` mutation — so
+/// `b` is the widened carrier there and `b.first.upcase` declines. Silent
+/// on both engines at the e59b7b89 pin.
+#[test]
+fn arg_entry_scope_headline_row_is_silent() {
+    let src = b"b = [1, 2, 3]\nputs(b.unshift(\"s\"), b.first.upcase)\n";
+    let diags = run(src);
+    assert!(
+        diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+        "expected silent (reference is silent at e59b7b89), got {diags:?}"
+    );
+}
+
+/// Swapped control: `b.first` evaluates BEFORE the `unshift` mutation, so it
+/// types from the pre-mutation binding and `upcase` on `1` fires — on both
+/// engines, at `2:14`.
+#[test]
+fn arg_entry_scope_swapped_control_fires() {
+    let src = b"b = [1, 2, 3]\nputs(b.first.upcase, b.unshift(\"s\"))\n";
+    let diags = run(src);
+    let d = diags
+        .iter()
+        .find(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .unwrap_or_else(|| panic!("expected undefined-method, got {diags:?}"));
+    assert_eq!(d.message, "undefined method `upcase' for 1");
+    assert_eq!(&src[d.start_offset..d.end_offset], b"upcase");
+}
+
+/// The same entry-scope replay, nested: the mutator call's own argument is
+/// still typed from the scope that ran before it.
+#[test]
+fn arg_entry_scope_nested_call_arg_fires() {
+    let src = b"b = [1, 2, 3]\nb.unshift(b.first.upcase)\n";
+    let diags = run(src);
+    let d = diags
+        .iter()
+        .find(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .unwrap_or_else(|| panic!("expected undefined-method, got {diags:?}"));
+    assert_eq!(&src[d.start_offset..d.end_offset], b"upcase");
+}
+
+/// A straight rebind no longer leaks backwards across statements: the flat
+/// env used to type `s.upcase` as `5` — a live false positive the oracle is
+/// silent on (the statement-sequence analogue of the argument rule).
+#[test]
+fn entry_scope_rebind_does_not_reach_back() {
+    let diags = run(b"s = \"x\"\ns.upcase\ns = 5\n");
+    assert!(diags.is_empty(), "expected silent, got {diags:?}");
+}
+
+/// And in the other direction the write still reaches the later operand:
+/// `n.even?` typed from the scope the FIRST arg was entered from fires
+/// `for "x"` on both engines.
+#[test]
+fn arg_entry_scope_earlier_arg_keeps_entry_scope() {
+    let src = b"n = \"x\"\nputs(n.even?, n = 5)\n";
+    let diags = run(src);
+    let d = diags
+        .iter()
+        .find(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .unwrap_or_else(|| panic!("expected undefined-method, got {diags:?}"));
+    assert_eq!(d.message, "undefined method `even?' for \"x\"");
+}
+
+/// An `if` replays only the TAKEN branch's statements: the else body still
+/// reads the pre-branch `b`, so `b.first.upcase` fires (the sibling branch's
+/// `unshift` never reached the site's scope).
+#[test]
+fn arg_entry_scope_if_else_branch_is_exclusive() {
+    let src =
+        b"b = [1, 2, 3]\nc = true\nif c\n  b.unshift(\"s\")\nelse\n  b.first.upcase\nend\n";
+    let diags = run(src);
+    let d = diags
+        .iter()
+        .find(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .unwrap_or_else(|| panic!("expected undefined-method, got {diags:?}"));
+    assert_eq!(&src[d.start_offset..d.end_offset], b"upcase");
+}

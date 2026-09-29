@@ -83,8 +83,17 @@ pub(crate) fn span_within(inner: rigor_parse::Span, outer: rigor_parse::Span) ->
 /// carrier, so for them a widened local would OPEN the gate the stale concrete
 /// type closed. They read the unwidened env through [`Self::gate_at`], exactly
 /// as before.
+/// inside any method body.
+///
+/// At file scope [`Self::at`] replays the recorded rebinds/mutations in
+/// evaluation order up to the site (`Typer::check_env_at`, rigor-rs#136 — the
+/// port of the reference's per-node scope index): an operand typed earlier
+/// than a same-statement `local.<mutator>` call or rebind still reads the
+/// binding it saw, while a later operand sees the effect. Sites inside a
+/// literal block / lambda / class / module body keep the flat env — a
+/// closure may run at any later point.
 pub(crate) struct ScopedEnv {
-    top: rigor_infer::TypeEnv,
+    flow: rigor_infer::CheckFlow,
     gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
     method_bodies: Vec<rigor_parse::Span>,
@@ -93,21 +102,28 @@ pub(crate) struct ScopedEnv {
 impl ScopedEnv {
     pub(crate) fn build(typer: &Typer, ast: &LoweredAst, interner: &mut Interner) -> Self {
         ScopedEnv {
-            top: typer.build_toplevel_check_env(ast, interner),
+            flow: typer.build_toplevel_check_flow(ast, interner),
             gate_top: typer.build_toplevel_env(ast, interner),
             empty: rigor_infer::TypeEnv::new(),
             method_bodies: rigor_infer::method_body_spans(ast),
         }
     }
 
-    /// The env a use site at `span` may read: the top-level env at file scope (or
-    /// inside a block, which DOES capture the enclosing locals), an empty env
-    /// inside any method body.
-    pub(crate) fn at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
+    /// The env a use site at `span` may read: the entered-scope env at file
+    /// scope (or inside a block, which keeps the flat env since it DOES
+    /// capture the enclosing locals), an empty env inside any method body.
+    /// Pass the span of the node being typed — its evaluation-entry point.
+    pub(crate) fn at<'a>(
+        &'a self,
+        ast: &LoweredAst,
+        typer: &Typer,
+        span: rigor_parse::Span,
+        interner: &mut Interner,
+    ) -> std::borrow::Cow<'a, rigor_infer::TypeEnv> {
         if self.in_method_body(span) {
-            &self.empty
+            std::borrow::Cow::Borrowed(&self.empty)
         } else {
-            &self.top
+            typer.check_env_at(ast, &self.flow, span, interner)
         }
     }
 

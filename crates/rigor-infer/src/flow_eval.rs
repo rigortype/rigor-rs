@@ -4,6 +4,7 @@
 //! [`Typer::always_truthy_snapshots`] (ADR-0022), which
 //! `flow.always-truthy-condition` reads.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
@@ -61,17 +62,440 @@ impl<'i> Typer<'i> {
     /// [`Node::Call::block_locals`], rigor-rs#166) shadows the top-level name
     /// and widens nothing either.
     pub fn build_toplevel_check_env(&self, ast: &LoweredAst, interner: &mut Interner) -> TypeEnv {
+        self.build_toplevel_check_flow(ast, interner).env
+    }
+
+    /// [`Self::build_toplevel_check_env`] plus the boundary/effect data
+    /// [`Self::check_env_at`] needs to give a use site the env it was ENTERED
+    /// from: the env snapshot before each top-level statement, and the
+    /// span-keyed rebind/mutation lists an ordered replay inside the
+    /// statement applies (rigor-rs#136, the port of upstream rigor#1310's
+    /// per-node scope index).
+    pub fn build_toplevel_check_flow(&self, ast: &LoweredAst, interner: &mut Interner) -> CheckFlow {
         let mut env = TypeEnv::new();
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
-            _ => return env,
+            _ => {
+                return CheckFlow {
+                    env,
+                    boundaries: Vec::new(),
+                    rebinds: Vec::new(),
+                    mutations: Vec::new(),
+                }
+            }
         };
         let rebinds = toplevel_rebinds(ast);
         let mutations = toplevel_mutations(ast);
+        // Boundaries only matter while a recorded effect could postdate a use
+        // site; a file with none gets the flat env for every site.
+        let record = !(rebinds.is_empty() && mutations.is_empty());
+        let mut boundaries = Vec::new();
         for stmt in body {
+            if record {
+                boundaries.push((stmt, env.clone()));
+            }
             self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, interner);
         }
-        env
+        CheckFlow {
+            env,
+            boundaries,
+            rebinds,
+            mutations,
+        }
+    }
+
+    /// The env a use site at `site` was entered from: the pre-statement
+    /// boundary env, replayed in evaluation order through the effects that
+    /// run before the site. An operand earlier than a same-statement
+    /// mutation or rebind therefore still types from the binding it saw —
+    /// the reference's `argument_scope` / per-node scope index
+    /// (`OperandWalk`, rigor-rs#136) — while a LATER operand still sees the
+    /// effect, exactly as the flat env already produced.
+    ///
+    /// Sites inside a barrier scope (literal block body, lambda, `def`,
+    /// `class`, `module` body) get the flat env: a closure may run at any
+    /// later point, which is the answer `ScopedEnv::at` gave before this
+    /// pass. So does a site with no recorded effect at or after its
+    /// statement — the replayed env is then byte-identical to the flat one.
+    pub fn check_env_at<'f>(
+        &self,
+        ast: &LoweredAst,
+        flow: &'f CheckFlow,
+        site: rigor_parse::Span,
+        interner: &mut Interner,
+    ) -> Cow<'f, TypeEnv> {
+        let Some(&(stmt, ref pre)) = flow.boundaries.iter().find(|(id, _)| {
+            let s = ast.get(*id).span();
+            s.0 <= site.0 && site.1 <= s.1
+        }) else {
+            return Cow::Borrowed(&flow.env);
+        };
+        let stmt_span = ast.get(stmt).span();
+        let later = flow.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
+            || flow.mutations.iter().any(|(w, _, _)| w.0 >= stmt_span.0);
+        if !later {
+            return Cow::Borrowed(&flow.env);
+        }
+        let mut env = pre.clone();
+        self.entry_descend(ast, stmt, site, true, &mut env, flow, interner);
+        Cow::Owned(env)
+    }
+
+    /// Replay `id`'s contained effects into `env` in evaluation order until
+    /// the node holding `site` is reached. `uncond` says `id`'s own position
+    /// evaluates unconditionally — a mutation on an all-unconditional path
+    /// mints the widened nominal (the flat env's own answer for a
+    /// same-statement mutator call); anything else widens `Dynamic`, the
+    /// flat env's conservative decline for a conditional position.
+    // too_many_arguments: the replay context (ast, flow, env, interner) is
+    // threaded through each recursive step; bundling into a struct would
+    // obscure the recursion.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_descend(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        site: rigor_parse::Span,
+        uncond: bool,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        interner: &mut Interner,
+    ) {
+        match ast.get(id) {
+            // `if` evaluates its predicate first, then ONE branch — the
+            // sibling branch's writes never reach the site (upstream probe:
+            // `if c; b.unshift("s"); else; b.first.upcase; end` still fires
+            // on the pre-branch `b`). Sites inside the taken branch replay
+            // its earlier statements conditionally.
+            Node::If {
+                predicate,
+                then_body,
+                else_body,
+                ..
+            } => {
+                let (predicate, then_body, else_body) =
+                    (*predicate, then_body.clone(), else_body.clone());
+                let pspan = ast.get(predicate).span();
+                if pspan.0 <= site.0 && site.1 <= pspan.1 {
+                    self.entry_descend(ast, predicate, site, uncond, env, flow, interner);
+                    return;
+                }
+                self.apply_subtree_effects(ast, predicate, uncond, env, flow, interner);
+                let branch: &[NodeId] = if then_body
+                    .iter()
+                    .any(|&s| within_span(site, ast.get(s).span()))
+                {
+                    &then_body
+                } else if else_body
+                    .iter()
+                    .any(|&s| within_span(site, ast.get(s).span()))
+                {
+                    &else_body
+                } else {
+                    return; // the site is the `if`'s own span, no child holds it
+                };
+                for &s in branch {
+                    let sspan = ast.get(s).span();
+                    if sspan.0 <= site.0 && site.0 < sspan.1 {
+                        self.entry_descend(ast, s, site, false, env, flow, interner);
+                        return;
+                    }
+                    if sspan.1 <= site.0 {
+                        self.apply_subtree_effects(ast, s, false, env, flow, interner);
+                    }
+                }
+            }
+            // A `begin`'s main body runs in order unconditionally; a rescue
+            // clause, the else arm and `ensure` are conditional or later, so
+            // a site inside one takes every contained effect conservatively
+            // — the flat env's own decline.
+            Node::BeginRescue { main_body, .. } => {
+                let main_body = main_body.clone();
+                if main_body
+                    .iter()
+                    .any(|&s| within_span(site, ast.get(s).span()))
+                {
+                    self.entry_children(ast, id, site, uncond, env, flow, interner);
+                } else {
+                    self.apply_subtree_effects(ast, id, false, env, flow, interner);
+                }
+            }
+            // Conditional container: nothing inside orders against the site
+            // (recovery carrier, loop, case/when), so apply every contained
+            // effect conservatively — byte-identical to the flat env.
+            Node::Statements { kind, .. } if !matches!(kind, StatementsKind::Sequence) => {
+                self.apply_subtree_effects(ast, id, false, env, flow, interner);
+            }
+            Node::Loop { .. } | Node::Case { .. } | Node::When { .. } => {
+                self.apply_subtree_effects(ast, id, false, env, flow, interner);
+            }
+            // A closure body or class/module body captures the whole env —
+            // today's `ScopedEnv::at` answer, kept verbatim.
+            Node::Lambda { .. }
+            | Node::Definition { .. }
+            | Node::ClassDef { .. }
+            | Node::ModuleDef { .. } => {
+                *env = flow.env.clone();
+            }
+            _ => self.entry_children(ast, id, site, uncond, env, flow, interner),
+        }
+    }
+
+    /// Ordered-children descent ([`Self::flow_children`]): apply each child's
+    /// contained effects in evaluation order until the child holding `site`
+    /// is entered. A `Barrier` child is a scope boundary — it gets the flat
+    /// env, which for a block body is the `ScopedEnv::at` answer from before
+    /// this pass.
+    // too_many_arguments: same replay context as `entry_descend`; a bundle
+    // struct would obscure the recursion.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_children(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        site: rigor_parse::Span,
+        uncond: bool,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        interner: &mut Interner,
+    ) {
+        for (child, edge) in self.flow_children(ast.get(id)) {
+            let cspan = ast.get(child).span();
+            if cspan.0 <= site.0 && site.0 < cspan.1 {
+                if edge == FlowEdge::Barrier {
+                    *env = flow.env.clone();
+                } else {
+                    self.entry_descend(
+                        ast,
+                        child,
+                        site,
+                        uncond && edge == FlowEdge::Uncond,
+                        env,
+                        flow,
+                        interner,
+                    );
+                }
+                return;
+            }
+            if cspan.1 <= site.0 && edge != FlowEdge::Barrier {
+                self.apply_subtree_effects(
+                    ast,
+                    child,
+                    uncond && edge == FlowEdge::Uncond,
+                    env,
+                    flow,
+                    interner,
+                );
+            }
+        }
+    }
+
+    /// Apply every recorded effect inside `id`'s span to `env`: a rebind
+    /// always widens `Dynamic` (the flat env's own envelope); a mutation
+    /// mints the unconditional nominal only when it sits on an
+    /// all-`Uncond` descent from `id` — a conditional position widens
+    /// `Dynamic`, byte-identical to the flat env.
+    fn apply_subtree_effects(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        uncond: bool,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        interner: &mut Interner,
+    ) {
+        let span = ast.get(id).span();
+        for (wspan, name) in &flow.rebinds {
+            if wspan.0 >= span.0 && wspan.1 <= span.1 {
+                let u = interner.untyped();
+                env.insert(name.clone(), u);
+            }
+        }
+        for (wspan, name, method) in &flow.mutations {
+            if wspan.0 >= span.0 && wspan.1 <= span.1 {
+                if uncond && self.path_unconditional(ast, id, *wspan) {
+                    let Some(&pre) = env.get(name.as_str()) else {
+                        continue;
+                    };
+                    if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
+                        env.insert(name.clone(), widened);
+                    }
+                } else {
+                    let u = interner.untyped();
+                    env.insert(name.clone(), u);
+                }
+            }
+        }
+    }
+
+    /// Whether `wspan`'s position inside `id` sits on an all-`Uncond` descent
+    /// — `f(b.unshift("s"), …)` evaluates it before the call's dispatch (yes)
+    /// while `x && b.unshift("s")` may never reach it (no).
+    fn path_unconditional(&self, ast: &LoweredAst, id: NodeId, wspan: rigor_parse::Span) -> bool {
+        let node = ast.get(id);
+        if node.span() == wspan {
+            return true;
+        }
+        for (child, edge) in self.flow_children(node) {
+            let cspan = ast.get(child).span();
+            if cspan.0 <= wspan.0 && wspan.1 <= cspan.1 {
+                return edge == FlowEdge::Uncond && self.path_unconditional(ast, child, wspan);
+            }
+        }
+        // `wspan` sits inside `id` but inside no linked child — it rides
+        // `id`'s own position.
+        true
+    }
+
+    /// `node`'s children in evaluation order, each flagged by the certainty
+    /// its position evaluates ([`FlowEdge`]). The order feeds both
+    /// [`Self::entry_children`] (positional replay to a site) and
+    /// [`Self::path_unconditional`] (is an effect's position unconditional).
+    // exhaustive: every variant with value children lists them in eval order.
+    #[allow(clippy::too_many_lines)]
+    fn flow_children(&self, node: &Node) -> Vec<(NodeId, FlowEdge)> {
+        match node {
+            Node::Statements {
+                body,
+                kind: StatementsKind::Sequence,
+                ..
+            } => body.iter().map(|&c| (c, FlowEdge::Uncond)).collect(),
+            Node::Statements { body, .. } => {
+                body.iter().map(|&c| (c, FlowEdge::Cond)).collect()
+            }
+            Node::Call {
+                receiver,
+                args,
+                block_body,
+                block_span,
+                ..
+            } => {
+                let mut v: Vec<(NodeId, FlowEdge)> =
+                    receiver.iter().map(|&c| (c, FlowEdge::Uncond)).collect();
+                v.extend(args.iter().map(|&c| (c, FlowEdge::Uncond)));
+                // A literal block body is a scope barrier (it may run at any
+                // later point, so it keeps the flat env); a `&expr`
+                // block-pass is an operand evaluated before dispatch — its
+                // `block_span` is `None` by construction.
+                let edge = if block_span.is_some() {
+                    FlowEdge::Barrier
+                } else {
+                    FlowEdge::Cond
+                };
+                v.extend(block_body.iter().map(|&c| (c, edge)));
+                v
+            }
+            Node::If {
+                predicate,
+                then_body,
+                else_body,
+                ..
+            } => {
+                let mut v = vec![(*predicate, FlowEdge::Uncond)];
+                v.extend(then_body.iter().map(|&c| (c, FlowEdge::Cond)));
+                v.extend(else_body.iter().map(|&c| (c, FlowEdge::Cond)));
+                v
+            }
+            Node::Logical { left, right, .. } => {
+                vec![(*left, FlowEdge::Uncond), (*right, FlowEdge::Cond)]
+            }
+            Node::Case {
+                predicate,
+                branches,
+                else_body,
+                ..
+            } => {
+                let mut v: Vec<(NodeId, FlowEdge)> =
+                    predicate.iter().map(|&c| (c, FlowEdge::Uncond)).collect();
+                v.extend(branches.iter().map(|&c| (c, FlowEdge::Cond)));
+                v.extend(else_body.iter().map(|&c| (c, FlowEdge::Cond)));
+                v
+            }
+            Node::When {
+                conditions, body, ..
+            } => conditions
+                .iter()
+                .chain(body.iter())
+                .map(|&c| (c, FlowEdge::Cond))
+                .collect(),
+            Node::Loop {
+                predicate, body, ..
+            } => predicate
+                .iter()
+                .chain(body.iter())
+                .map(|&c| (c, FlowEdge::Cond))
+                .collect(),
+            Node::BeginRescue {
+                body,
+                main_body,
+                ensure_body,
+                clauses,
+                ..
+            } => {
+                // `main_body` is `Cond`, not `Uncond`: a `rescue` exit can
+                // leave a mutation inside it unrun, and the joined
+                // post-statement scope still sees the pre-mutation binding
+                // (upstream probe: `begin; b.unshift("s"); rescue; nil; end;
+                // b.frobnicate` is silent on the reference). Sites inside it
+                // still replay in order — the flag only widens to `Dynamic`.
+                let mut v: Vec<(NodeId, FlowEdge)> =
+                    main_body.iter().map(|&c| (c, FlowEdge::Cond)).collect();
+                let mut covered: std::collections::HashSet<NodeId> =
+                    main_body.iter().copied().collect();
+                covered.extend(ensure_body.iter().copied());
+                for clause in clauses {
+                    covered.extend(clause.body.iter().copied());
+                    v.extend(clause.body.iter().map(|&c| (c, FlowEdge::Cond)));
+                }
+                v.extend(
+                    body.iter()
+                        .filter(|c| !covered.contains(c))
+                        .map(|&c| (c, FlowEdge::Cond)),
+                );
+                v.extend(ensure_body.iter().map(|&c| (c, FlowEdge::Cond)));
+                v
+            }
+            Node::LocalVariableWrite { value, .. }
+            | Node::LocalVariableOpWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. } => vec![(*value, FlowEdge::Uncond)],
+            Node::MultiWrite {
+                value,
+                target_exprs,
+                ..
+            } => {
+                let mut v = vec![(*value, FlowEdge::Uncond)];
+                v.extend(target_exprs.iter().map(|&c| (c, FlowEdge::Uncond)));
+                v
+            }
+            Node::ArrayLit { elements, .. }
+            | Node::HashLit { elements, .. }
+            | Node::InterpolatedString {
+                parts: elements, ..
+            }
+            | Node::InterpolatedSymbol {
+                parts: elements, ..
+            }
+            | Node::Return {
+                values: elements, ..
+            } => elements.iter().map(|&c| (c, FlowEdge::Uncond)).collect(),
+            Node::Alias {
+                new_name, old_name, ..
+            } => vec![
+                (*new_name, FlowEdge::Uncond),
+                (*old_name, FlowEdge::Uncond),
+            ],
+            // A class/module header may hold a superclass or `<<` operand;
+            // read it under the same barrier as the body.
+            Node::Lambda { body, .. }
+            | Node::Definition { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => {
+                body.iter().map(|&c| (c, FlowEdge::Barrier)).collect()
+            }
+            _ => vec![],
+        }
     }
 
     /// One statement of [`Self::build_toplevel_check_env`]: a direct write binds
@@ -92,17 +516,18 @@ impl<'i> Typer<'i> {
             Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
                 let vspan = ast.get(*value).span();
                 widen_flow_writes(rebinds, vspan, env, interner);
-                self.widen_mutated_locals(mutations, vspan, env, interner);
+                self.widen_mutated_locals(ast, mutations, *value, vspan, env, interner);
                 self.bind_statement(ast, id, env, interner);
                 // An `h[k]` index target stores through `[]=` on the POST-binding
                 // scope — `swap, swap[:a] = swap, 1` stores into the object `swap`
                 // was just bound to — so the reference widens each receiver AFTER
                 // `MultiTargetBinder` applies (`eval_multi_write`, rigor-rs#134).
                 // Widening by the TARGET span mints the unconditional carrier
-                // (`wspan == span`), as a straight-line `h[k] = v` gets.
+                // (`path_unconditional` reaches it through `target_exprs`),
+                // as a straight-line `h[k] = v` gets.
                 if let Node::MultiWrite { targets, .. } = ast.get(id) {
                     for (_, tspan) in targets.index_writes() {
-                        self.widen_mutated_locals(mutations, tspan, env, interner);
+                        self.widen_mutated_locals(ast, mutations, id, tspan, env, interner);
                     }
                 }
             }
@@ -119,26 +544,32 @@ impl<'i> Typer<'i> {
             other => {
                 let span = other.span();
                 widen_flow_writes(rebinds, span, env, interner);
-                self.widen_mutated_locals(mutations, span, env, interner);
+                self.widen_mutated_locals(ast, mutations, id, span, env, interner);
             }
         }
     }
 
     /// Apply the `local.<mutator>(…)` entries inside `span` to `env` — the
     /// flat-env port of the reference's `MutationWidening` (`widen_after_call`
-    /// runs on every statement). A mutation whose own call span IS `span` is
-    /// the statement itself: it ran unconditionally, so the binding becomes
-    /// the widened nominal outright and `a.frobnicate` keeps firing. A
-    /// mutation nested deeper ran conditionally (inside an `if`, a block, a
-    /// `&&`, a `rescue` arm), where the flat env cannot reproduce `Scope#join`
-    /// — it widens to `Dynamic` instead, handing the convergence question to
-    /// the collection-shape pass: two edges that mint the same carrier join
-    /// back to it and still fire through `check_collection_call`'s Dynamic
-    /// gate, while divergent edges decline there and stay silent — exactly
-    /// the reference's union-then-decline (rigor-rs#139).
+    /// runs on every statement). A mutation on an all-`Uncond` descent from
+    /// `root` ([`Self::path_unconditional`]) — the statement's own call, a
+    /// write's unconditional operand, a positional argument — definitely
+    /// ran, so the binding becomes the widened nominal outright and a later
+    /// `a.frobnicate` keeps firing (the reference's sequential rebind,
+    /// rigor-rs#136). A mutation in a conditional position (inside an `if`
+    /// branch, a `&&` operand, a `rescue` arm — including `begin`'s main
+    /// body, whose `rescue` exit can leave it unrun) widens to `Dynamic`
+    /// instead, where the flat env cannot reproduce `Scope#join`, handing
+    /// the convergence question to the collection-shape pass: two edges that
+    /// mint the same carrier join back to it and still fire through
+    /// `check_collection_call`'s Dynamic gate, while divergent edges decline
+    /// there and stay silent — exactly the reference's union-then-decline
+    /// (rigor-rs#139).
     fn widen_mutated_locals(
         &self,
+        ast: &LoweredAst,
         mutations: &[(rigor_parse::Span, String, String)],
+        root: NodeId,
         span: rigor_parse::Span,
         env: &mut TypeEnv,
         interner: &mut Interner,
@@ -150,7 +581,7 @@ impl<'i> Typer<'i> {
             let Some(&pre) = env.get(name.as_str()) else {
                 continue;
             };
-            let ty = if *wspan == span {
+            let ty = if self.path_unconditional(ast, root, *wspan) {
                 let Some(widened) = self.widen_mutated_binding(pre, method, interner) else {
                     continue;
                 };
@@ -478,4 +909,46 @@ impl<'i> Typer<'i> {
             _ => {}
         }
     }
+}
+
+/// Half-open span containment.
+fn within_span(site: rigor_parse::Span, outer: rigor_parse::Span) -> bool {
+    outer.0 <= site.0 && site.1 <= outer.1
+}
+
+/// One edge of [`Typer::flow_children`]: how certain the child's own position
+/// is to evaluate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlowEdge {
+    /// Always evaluates in position (a receiver, a positional argument, a
+    /// sequence statement, an `if`/`case` predicate, a write's value).
+    Uncond,
+    /// May not evaluate (a `&&`/`||` right operand, a branch body, a loop
+    /// body, a rescue/else/ensure clause, a `case`/`when` arm, a `&expr`
+    /// block-pass operand the port cannot prove ran).
+    Cond,
+    /// A scope that captures the whole env rather than evaluating inline —
+    /// a literal block body, a lambda, a `def`/`class`/`module` body.
+    Barrier,
+}
+
+/// The flat check env plus the data [`Typer::check_env_at`] needs to
+/// reconstruct the scope a use site was ENTERED from — the port of the
+/// reference's per-node scope index (`OperandWalk`, upstream rigor#1310 /
+/// rigor-rs#136). `boundaries` records the env before each top-level
+/// statement; `rebinds`/`mutations` are the span-keyed effects the ordered
+/// replay applies inside it.
+pub struct CheckFlow {
+    /// The end-of-file flat env — [`Typer::build_toplevel_check_env`]'s
+    /// whole answer, and the fallback for sites inside a barrier scope or
+    /// outside every recorded statement.
+    pub env: TypeEnv,
+    /// `(top-level statement, env before it)` in program order. Empty unless
+    /// the file has any recorded effect at all.
+    boundaries: Vec<(NodeId, TypeEnv)>,
+    /// [`toplevel_rebinds`]: every top-level local write `(span, name)`.
+    rebinds: Vec<(rigor_parse::Span, String)>,
+    /// [`toplevel_mutations`]: every `local.<mutator>` call
+    /// `(call span, name, method)`.
+    mutations: Vec<(rigor_parse::Span, String, String)>,
 }

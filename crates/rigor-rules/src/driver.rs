@@ -151,9 +151,13 @@ pub fn analyze_with_source_and_folder(
         // The reference emits exactly one of these per call; we mirror that by
         // returning the first that fires.
         // Ruby method bodies are independent local scopes, so a use site inside a
-        // `def` never reads the file's top-level locals (`ScopedEnv::at`).
+        // `def` never reads the file's top-level locals (`ScopedEnv::at`);
+        // at file scope the env replays to the call's entry scope — the
+        // reference's `OperandWalk` index (rigor-rs#136).
+        let scoped = &env;
         let gate_env = env.gate_at(message_span);
-        let env = env.at(message_span);
+        let site_env = env.at(ast, &typer, message_span, interner);
+        let env = site_env.as_ref();
         // `nil&.m` never dispatches: the reference's `safe_navigation_receiver`
         // turns a receiver that is exactly nil into `bot` for undefined-method.
         // A `T | nil` union still flows through unchanged, as it does there.
@@ -219,7 +223,8 @@ pub fn analyze_with_source_and_folder(
             &method,
             &args,
             args_all_plain,
-            env,
+            message_span,
+            scoped,
             &typer,
             interner,
             index,

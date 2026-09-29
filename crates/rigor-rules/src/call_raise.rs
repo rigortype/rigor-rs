@@ -75,7 +75,10 @@ pub(crate) fn raise_non_exception_diagnostics(
         if raise_redefined_in_scope(ast, source, call_id, &method) {
             continue;
         }
-        let operand_ty = typer.type_of(ast, arg, env.at(message_span), interner);
+        // The operand types from the scope it was entered from
+        // (`argument_scope`, rigor-rs#136).
+        let arg_env = env.at(ast, typer, ast.get(arg).span(), interner);
+        let operand_ty = typer.type_of(ast, arg, &arg_env, interner);
         if raise_operand_verdict(interner, index, source, operand_ty) != RaiseVerdict::Illegal {
             continue;
         }
