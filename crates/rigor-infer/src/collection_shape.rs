@@ -386,7 +386,7 @@ impl<'i> Typer<'i> {
                         // A `local.<mutator>` on a name the block BINDS mutates
                         // the parameter/local — the outer carrier is untouched
                         // (rigor-rs#137).
-                        if bound.iter().any(|b| b == &name) {
+                        if bound.contains(&name) {
                             continue;
                         }
                         if !rebound_within(ctx.rebinds, call_span, &name) {

@@ -134,7 +134,7 @@ fn drop_shadowed_writes(
     let shadow_scopes = closure_shadow_scopes(ast);
     writes.retain(|(id, _, name)| {
         !shadow_scopes.iter().any(|(descendants, bound)| {
-            descendants.contains(id) && bound.iter().any(|b| b == name)
+            descendants.contains(id) && bound.contains(name)
         })
     });
 }
@@ -328,7 +328,7 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
     out.retain(|(id, w, name)| {
         !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
             && !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.iter().any(|b| b == name)
+                descendants.contains(id) && bound.contains(name)
             })
     });
     let mut out: Vec<(rigor_parse::Span, String)> =
@@ -430,7 +430,7 @@ pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, St
         !ast.in_inert_carrier(*w)
             && !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
             && !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.iter().any(|b| b == name)
+                descendants.contains(id) && bound.contains(name)
             })
     });
     out.into_iter().map(|(_, s, n, m)| (s, n, m)).collect()

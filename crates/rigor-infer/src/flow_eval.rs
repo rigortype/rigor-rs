@@ -889,7 +889,7 @@ impl<'i> Typer<'i> {
     fn bind_statement(&self, ast: &LoweredAst, id: NodeId, env: &mut TypeEnv, interner: &mut Interner) {
         match ast.get(id) {
             Node::LocalVariableWrite { name, value, .. } => {
-                if ast.closure_bound_names(id).iter().any(|b| b == name) {
+                if ast.closure_bound_names(id).contains(name) {
                     return;
                 }
                 let (name, value) = (name.clone(), *value);
@@ -901,7 +901,7 @@ impl<'i> Typer<'i> {
                 let bound = ast.closure_bound_names(id);
                 let rhs = self.type_of(ast, value, env, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
-                    if bound.iter().any(|b| *b == name) {
+                    if bound.contains(&name) {
                         continue;
                     }
                     env.insert(name, ty);

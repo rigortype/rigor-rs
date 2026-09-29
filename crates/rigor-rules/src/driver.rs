@@ -165,13 +165,13 @@ pub fn analyze_with_source_and_folder(
         // turns a receiver that is exactly nil into `bot` for undefined-method.
         // A `T | nil` union still flows through unchanged, as it does there.
         let nil_skip = safe_nav && {
-            let recv_ty = typer.type_of(ast, recv, &env, interner);
+            let recv_ty = typer.type_of(ast, recv, env, interner);
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
         let diag = (!nil_skip)
             .then(|| {
                 check_call(
-                    ast, recv, &method, message_span, safe_nav, &env, &typer, interner, index,
+                    ast, recv, &method, message_span, safe_nav, env, &typer, interner, index,
                 )
             })
             .flatten()
@@ -191,14 +191,14 @@ pub fn analyze_with_source_and_folder(
                 // unwidened bindings stay for the narrowing rule, whose snaps
                 // replace a Dynamic carrier rather than witness a concrete one.
                 check_collection_call(
-                    call_id, ast, recv, &method, message_span, safe_nav, &env, &typer,
+                    call_id, ast, recv, &method, message_span, safe_nav, env, &typer,
                     interner, index, &coll_snaps,
                 )
             })
             .or_else(|| {
                 check_wrong_arity(
                     ast, recv, &method, &args, args_plain_positional, has_block, message_span,
-                    &env, &typer, interner, index,
+                    env, &typer, interner, index,
                 )
             })
             .or_else(|| {
@@ -206,7 +206,7 @@ pub fn analyze_with_source_and_folder(
             })
             .or_else(|| {
                 check_always_raises(
-                    ast, recv, &method, &args, has_block, message_span, &env, &typer, interner,
+                    ast, recv, &method, &args, has_block, message_span, env, &typer, interner,
                     index,
                 )
             });
