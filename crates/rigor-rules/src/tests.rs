@@ -517,6 +517,55 @@ fn disjoint_guard_suppression_does_not_over_reach() {
     }
 }
 
+/// `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index write stores
+/// through `[]=` on its receiver, so the reference's `IndexWriteWidening`
+/// (`index_write_widening.rb`, upstream #560) widens the binding exactly as
+/// `h[k] = v` does: the literal shape is gone and a later ELEMENT read is
+/// silent. These rows fired `call.undefined-method` for the STALE element
+/// type (`for 1`) before `Node::IndexWrite` existed (rigor-rs#135). All
+/// measured silent on the reference at `e59b7b89`.
+#[test]
+fn index_compound_writes_widen_the_receiver_binding() {
+    for src in [
+        // Straight-line, all three compound forms, Array and Hash seeds.
+        &b"h = {a: 1}\nh[:a] += 1\nh[:a].upcase\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= 2\nh[:a].upcase\n"[..],
+        &b"h = {a: 1}\nh[:a] &&= 2\nh[:a].upcase\n"[..],
+        &b"a = [1]\na[0] += 1\na.first.upcase\n"[..],
+        &b"a = [1]\na[0] ||= 2\na.first.upcase\n"[..],
+        // Conditional / loop-contained writes widen to Dynamic — the read is
+        // still silent (the reference's `Scope#join` equivalent declines).
+        &b"h = {a: 1}\nif rand > 0\n  h[:a] += 1\nend\nh[:a].upcase\n"[..],
+        &b"h = {a: 1}\nh[:a] += 1 if rand > 0\nh[:a].upcase\n"[..],
+        // Value position: `x = h[:a] ||= 1` mutates `h` too.
+        &b"h = {a: 1}\nx = (h[:a] ||= 1)\nh[:a].upcase\n"[..],
+        // A second compound store on the already-widened carrier stays silent.
+        &b"h = {a: 1}\nh[:a] += 1\nh[:a] += 2\nh[:a].upcase\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.is_empty(),
+            "expected silence for {:?}, got {diags:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// The widening's controls: the read WITHOUT the write keeps firing on the
+/// pinned literal (the stale shape is real there), and the carrier itself
+/// still witnesses a method Hash lacks — `for Hash`, the widened nominal.
+#[test]
+fn index_compound_write_widening_keeps_its_controls() {
+    let diags = run(b"h = {a: 1}\nh[:a].upcase\n");
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+
+    let diags = run(b"h = {a: 1}\nh[:a] += 1\nh.frobnicate_zzz\n");
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `frobnicate_zzz' for Hash");
+}
+
 /// The suppression is per-CALL-NODE, keyed on the guarded local being the
 /// receiver — not a span blanket over the branch. A call on a DIFFERENT
 /// local, and a call nested in the suppressed call's own arguments, both

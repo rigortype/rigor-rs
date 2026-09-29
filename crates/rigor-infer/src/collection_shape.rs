@@ -146,6 +146,7 @@ impl<'i> Typer<'i> {
             Node::LocalVariableWrite { .. }
             | Node::MultiWrite { .. }
             | Node::LocalVariableOpWrite { .. }
+            | Node::IndexWrite { .. }
             | Node::Call { .. } => {
                 self.coll_flow_expr(ast, id, tenv, ctx, interner, out, stmt_position);
             }
@@ -257,54 +258,8 @@ impl<'i> Typer<'i> {
                         let added = self.coll_added_members(
                             ast, cls, method, args, args_plain, tenv, interner,
                         );
-                        // Canonical order: the member set is compared only by the
-                        // interned `TypeId` two branch edges end up with, so the
-                        // order stores happened in must not separate them.
-                        let grown = |base: &[TypeId]| {
-                            let mut members = base.to_vec();
-                            for &m in &added {
-                                if !members.contains(&m) {
-                                    members.push(m);
-                                }
-                            }
-                            members.sort_unstable();
-                            members
-                        };
-                        match interner.get(pre_ty) {
-                            // `widen_union` (mutation_widening.rb:316) widens
-                            // EACH arm and `Combinator.union` re-joins, deduping
-                            // only structurally identical arms — the edges
-                            // converge iff every arm grows to the same set.
-                            // Collapsing to one merged carrier fired where the
-                            // oracle kept the union (probe r2).
-                            Type::Union(arms) => {
-                                let arms = arms.clone();
-                                let mut minted = Vec::with_capacity(arms.len());
-                                for arm in arms {
-                                    let members =
-                                        grown(&Typer::coll_value_members(interner, arm));
-                                    if let Some(t) =
-                                        self.coll_nominal_with(interner, cls, &members)
-                                    {
-                                        minted.push(t);
-                                    }
-                                }
-                                minted.sort_unstable();
-                                minted.dedup();
-                                match minted.as_slice() {
-                                    [] => None,
-                                    [only] => Some((name, *only)),
-                                    _ => Some((name, interner.intern(Type::Union(minted)))),
-                                }
-                            }
-                            _ => self
-                                .coll_nominal_with(
-                                    interner,
-                                    cls,
-                                    &grown(&Typer::coll_value_members(interner, pre_ty)),
-                                )
-                                .map(|ty| (name, ty)),
-                        }
+                        self.coll_grown_carrier(interner, cls, pre_ty, &added)
+                            .map(|ty| (name, ty))
                     }
                 };
                 // Arguments are EXPRESSION position.
@@ -351,6 +306,73 @@ impl<'i> Typer<'i> {
                 // REBOUND the same local (`output << (output = x)`).
                 if let Some((name, ty)) = widened {
                     if !rebound_within(ctx.rebinds, call_span, &name) {
+                        tenv.insert(name, ty);
+                    }
+                }
+            }
+            // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index
+            // write stores through `[]=` on its receiver, so a bare-local
+            // receiver's carrier widens exactly as a plain `h[k] = v` call
+            // widens it (`IndexWriteWidening`, `index_write_widening.rb`,
+            // upstream #560). Mirror the `Call` arm's pieces that apply:
+            // children evaluate in EXPRESSION position, the PRE-write carrier
+            // decides the widening, and the member growth reads the compound
+            // store's `[indices…, value]` as `[]=` args — the true stored
+            // value is `h[k] op v`, which erased member classes over-count
+            // either way (the union's safe direction). No `call.*` dispatch
+            // attaches: the reference's `eval_index_or_write` /
+            // `eval_index_operator_write` widen and type the node without the
+            // synthesized `[]`/`[]=` reaching the call rules (a `class C; end`
+            // receiver is silent — probed at `e59b7b89`).
+            Node::IndexWrite {
+                receiver,
+                indices,
+                value,
+                span,
+            } => {
+                let (receiver, indices, value, wspan) =
+                    (*receiver, indices.clone(), *value, *span);
+                if let Some(r) = receiver {
+                    self.coll_flow_expr(ast, r, tenv, ctx, interner, out, false);
+                }
+                let local = receiver.and_then(|r| match ast.get(r) {
+                    Node::LocalVariableRead { name, .. } => Some(name.clone()),
+                    _ => None,
+                });
+                // Record the use BEFORE the write's own effects, as the `Call`
+                // arm does (`output[k] += 1` reads the seed).
+                if let Some(name) = &local {
+                    if let Some(cls) = tenv.get(name).and_then(|&ty| self.coll_carrier(interner, ty))
+                    {
+                        out.insert(id, cls);
+                    }
+                }
+                let widened = match local.as_ref().and_then(|name| {
+                    let ty = *tenv.get(name)?;
+                    self.coll_widen_for_mutator(interner, ty, "[]=")
+                        .map(|c| (name.clone(), c, ty))
+                }) {
+                    None => None,
+                    Some((name, cls, pre_ty)) => {
+                        let mut store_args = indices.clone();
+                        store_args.push(value);
+                        let added = self.coll_added_members(
+                            ast, cls, "[]=", &store_args, false, tenv, interner,
+                        );
+                        self.coll_grown_carrier(interner, cls, pre_ty, &added)
+                            .map(|ty| (name, ty))
+                    }
+                };
+                for i in &indices {
+                    self.coll_flow_expr(ast, *i, tenv, ctx, interner, out, false);
+                }
+                self.coll_flow_expr(ast, value, tenv, ctx, interner, out, false);
+                // Every write the statement span contains widens (the index
+                // write's own entry plus anything nested in the operands); the
+                // modeled `[]=` effect is re-applied below.
+                widen_flow_writes(ctx.writes, wspan, tenv, interner);
+                if let Some((name, ty)) = widened {
+                    if !rebound_within(ctx.rebinds, wspan, &name) {
                         tenv.insert(name, ty);
                     }
                 }
@@ -702,6 +724,63 @@ impl<'i> Typer<'i> {
             _ => vec![interner.intern(Type::Union(members.to_vec()))],
         };
         Some(interner.intern(Type::Nominal { class, args }))
+    }
+
+    /// The carrier the mutator's `added` member evidence grows `pre_ty` into —
+    /// `Inference::MutationRejoin` (`1ad7351e`, #580, `v0.3.9`): a later store
+    /// grows the carrier's value side instead of being swallowed by the
+    /// already-widened nominal. Shared by the `Call` and `IndexWrite` arms of
+    /// [`Typer::coll_flow_expr`], both of which read the PRE-write carrier.
+    ///
+    /// Canonical order: the member set is compared only by the interned
+    /// `TypeId` two branch edges end up with, so the order stores happened in
+    /// must not separate them.
+    fn coll_grown_carrier(
+        &self,
+        interner: &mut Interner,
+        cls: &'static str,
+        pre_ty: TypeId,
+        added: &[TypeId],
+    ) -> Option<TypeId> {
+        let grown = |base: &[TypeId]| {
+            let mut members = base.to_vec();
+            for &m in added {
+                if !members.contains(&m) {
+                    members.push(m);
+                }
+            }
+            members.sort_unstable();
+            members
+        };
+        match interner.get(pre_ty) {
+            // `widen_union` (mutation_widening.rb:316) widens EACH arm and
+            // `Combinator.union` re-joins, deduping only structurally identical
+            // arms — the edges converge iff every arm grows to the same set.
+            // Collapsing to one merged carrier fired where the oracle kept the
+            // union (probe r2).
+            Type::Union(arms) => {
+                let arms = arms.clone();
+                let mut minted = Vec::with_capacity(arms.len());
+                for arm in arms {
+                    let members = grown(&Typer::coll_value_members(interner, arm));
+                    if let Some(t) = self.coll_nominal_with(interner, cls, &members) {
+                        minted.push(t);
+                    }
+                }
+                minted.sort_unstable();
+                minted.dedup();
+                match minted.as_slice() {
+                    [] => None,
+                    [only] => Some(*only),
+                    _ => Some(interner.intern(Type::Union(minted))),
+                }
+            }
+            _ => self.coll_nominal_with(
+                interner,
+                cls,
+                &grown(&Typer::coll_value_members(interner, pre_ty)),
+            ),
+        }
     }
 
     /// The store-value classes a carrier has accumulated so far, in canonical

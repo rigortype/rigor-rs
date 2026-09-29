@@ -198,6 +198,39 @@ fn lowers_operator_and_or_writes_to_op_write_variant() {
 }
 
 #[test]
+fn lowers_index_compound_writes_to_index_write_variant() {
+    // `h[:a] ||= 1`, `h[:a] &&= 1`, `h[:a] += 1` all lower to `IndexWrite`
+    // with the receiver, the index arguments and the stored value as
+    // children — the `[]=` store the reference's `IndexWriteWidening` widens
+    // on (`index_write_widening.rb`, upstream #560). NOT a `Call`, so the
+    // synthesized `[]`/`[]=` never reach the `call.*` rules.
+    for src in [
+        &b"h[:a] ||= 1\n"[..],
+        &b"h[:a] &&= 1\n"[..],
+        &b"h[:a] += 1\n"[..],
+        &b"h[:a, :b] -= 1\n"[..],
+    ] {
+        let ast = lower(&crate::parse(src));
+        let found = ast.iter().any(|(_, n)| {
+            matches!(n, Node::IndexWrite { receiver: Some(_), indices, .. } if !indices.is_empty())
+        });
+        assert!(found, "expected IndexWrite in {src:?}");
+    }
+    // The operands are fully lowered children — a call in the value stays
+    // reachable exactly as it did under the recovered carrier.
+    let ast = lower(&crate::parse(b"h[:a] ||= foo\n"));
+    assert!(ast.iter().any(|(_, n)| {
+        matches!(n, Node::Call { method, .. } if method == "foo")
+    }));
+    // A plain `h[:a] = 1` stays a `[]=` `Call`.
+    let ast = lower(&crate::parse(b"h[:a] = 1\n"));
+    assert!(ast.iter().any(|(_, n)| {
+        matches!(n, Node::Call { method, .. } if method == "[]=")
+    }));
+    assert!(!ast.iter().any(|(_, n)| matches!(n, Node::IndexWrite { .. })));
+}
+
+#[test]
 fn reads_local_within_finds_reads_inside_a_span_only() {
     let src = b"s = 1\n\"abc\"[s]\n\"abc\"[0]\n";
     let ast = lower(&crate::parse(src));

@@ -220,6 +220,17 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
                     _ => Vec::new(),
                 }
             }
+            // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index
+            // write stores through `[]=` on its receiver, so a bare-local
+            // receiver is a content mutation of the binding, keyed by the
+            // whole-statement span exactly like the `[]=` `Call` arm. The
+            // reference routes all three into `widen_for_mutator` /
+            // `widen_receiver_aliases` with method `[]=` (`index_write_
+            // widening.rb`, upstream #560).
+            Node::IndexWrite { receiver: Some(r), span, .. } => match ast.get(*r) {
+                Node::LocalVariableRead { name, .. } => vec![(*span, name.clone())],
+                _ => Vec::new(),
+            },
             Node::Loop { index, index_writes, .. } => {
                 let mut entries = for_index_rebinds(index);
                 // `for h[:k] in xs` stores each element through `[]=` on `h`.
@@ -402,6 +413,20 @@ pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, St
             }
             _ => {}
         }
+        // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — the reference's
+        // `IndexWriteWidening` (`index_write_widening.rb`, upstream #560)
+        // routes all three into `widen_for_mutator` with method `[]=`,
+        // widening the bare-local receiver's carrier exactly as `h[k] = v`.
+        if let Node::IndexWrite {
+            receiver: Some(r),
+            span,
+            ..
+        } = n
+        {
+            if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                out.push((id, *span, name.clone(), "[]=".to_string()));
+            }
+        }
     }
     out.retain(|(id, w, name, _)| {
         !ast.in_inert_carrier(*w)
@@ -450,6 +475,16 @@ fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
         Node::MultiWrite { value, target_exprs, .. } => {
             out.push(*value);
             out.extend_from_slice(target_exprs);
+        }
+        Node::IndexWrite {
+            receiver,
+            indices,
+            value,
+            ..
+        } => {
+            out.extend(receiver.iter().copied());
+            out.extend_from_slice(indices);
+            out.push(*value);
         }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             out.extend_from_slice(parts);

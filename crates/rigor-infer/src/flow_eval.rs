@@ -906,6 +906,25 @@ impl<'i> Typer<'i> {
                     self.bind_statement(ast, s, env, interner);
                 }
             }
+            // `h[k] op= v` — a compound index write binds no LOCAL name, but a
+            // write nested in its operands (`h[:a] ||= (y = 5)`) binds as it
+            // did under the old recovered carrier this replaces.
+            Node::IndexWrite {
+                receiver,
+                indices,
+                value,
+                ..
+            } => {
+                let children: Vec<NodeId> = receiver
+                    .iter()
+                    .chain(indices.iter())
+                    .chain(std::iter::once(value))
+                    .copied()
+                    .collect();
+                for c in children {
+                    self.bind_statement(ast, c, env, interner);
+                }
+            }
             _ => {}
         }
     }
