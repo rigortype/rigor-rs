@@ -38,6 +38,11 @@ use rigor_types::Scalar;
 pub fn fold(receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar> {
     match receiver {
         Scalar::Int(a) => fold_int(*a, method, args),
+        // A Bignum: every fold declines. The decimal spelling carries no `i64`
+        // to compute on, and the sidecar path (ADR-0008) still reaches the few
+        // `Integer` methods it models via `scalar_class` — never a guessed
+        // value (rigor-rs#194).
+        Scalar::BigInt(_) => None,
         Scalar::Float(a) => fold_float(*a, method, args),
         Scalar::Bool(a) => fold_bool(*a, method, args),
         Scalar::Nil => fold_nil(method, args),
@@ -82,7 +87,7 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
 #[must_use]
 pub fn scalar_class(s: &Scalar) -> &'static str {
     match s {
-        Scalar::Int(_) => "Integer",
+        Scalar::Int(_) | Scalar::BigInt(_) => "Integer",
         Scalar::Float(_) => "Float",
         Scalar::Str(_) => "String",
         Scalar::Sym(_) => "Symbol",
@@ -122,7 +127,9 @@ pub fn sidecar_foldable(receiver_class: &str, method: &str) -> bool {
 pub fn sidecar_blows_up(method: &str, args: &[Scalar]) -> bool {
     matches!(method, "center" | "ljust" | "rjust")
         && matches!(args.first(), Some(Scalar::Int(w))
-            if *w > crate::kernel_fold::STRING_FOLD_BYTE_LIMIT as i64)
+            if *w > crate::kernel_fold::STRING_FOLD_BYTE_LIMIT as i64
+        // A Bignum width exceeds the byte limit by construction.
+            || matches!(args.first(), Some(Scalar::BigInt(_))))
 }
 
 /// Executes a purity-gated fold the Rust core declined, by running the real Ruby

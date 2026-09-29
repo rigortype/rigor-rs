@@ -1368,6 +1368,185 @@ fn block_call_on_unmodeled_or_dynamic_is_silent_dynamic() {
     assert_eq!(ty, i.untyped(), "block call on Dynamic receiver must be Dynamic[top]");
 }
 
+// --- rigor-rs#194: per-element `map`/`collect` fold over a Tuple ---------
+//
+// The port of `try_per_element_block_fold` (`expression_typer.rb:4506`), the
+// `map`/`collect` head of `PER_ELEMENT_TUPLE_METHODS`: a Tuple receiver folds
+// its literal block once per position into `Tuple[U_1..U_n]` — strictly
+// tighter than the RBS `Array`. Rows outside the ported subset decline to
+// the prior `Array` answer (never an FP).
+
+#[test]
+fn per_element_map_fold_assembles_a_tuple() {
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    // `[1, 2].map { |x| x + 1 }` — per-position `x + 1` folds to `2` / `3`.
+    let ast = lower_src(b"[1, 2].map { |x| x + 1 }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("map over a literal tuple must fold to a Tuple, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(elems.len(), 2);
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(2)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(3)));
+
+    // `collect` folds identically; a block-local write reads per position.
+    let ast = lower_src(b"[1, 2].collect { |x| y = x + 1; y }\n");
+    let call = find_call(&ast, "collect");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("collect must fold identically, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(2)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(3)));
+
+    // The implicit `it` parameter binds the element too.
+    let ast = lower_src(b"[1, 2].map { it * 10 }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("`it` must bind the element, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(10)));
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(20)));
+}
+
+#[test]
+fn per_element_fold_filter_and_find_families() {
+    // The rest of `PER_ELEMENT_TUPLE_METHODS`: `select`/`reject` keep the
+    // receiver's own elements at decisive-Constant positions; `filter_map`
+    // keeps non-nil/false RESULTS; `flat_map` flattens Tuple positions;
+    // `find`/`find_index` answer the first truthy position's element/index.
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut folded = |src: &[u8], method: &str| -> String {
+        let ast = lower_src(src);
+        let call = find_call(&ast, method);
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        rigor_types::describe(&i, ty)
+    };
+    assert_eq!(
+        folded(b"[1, 2].select { |x| x > 1 }\n", "select"),
+        "Tuple[Constant[2]]"
+    );
+    assert_eq!(
+        folded(b"[1, 2].reject { |x| x > 1 }\n", "reject"),
+        "Tuple[Constant[1]]"
+    );
+    assert_eq!(
+        folded(b"[1, 2].filter_map { |x| x.to_s if x > 1 }\n", "filter_map"),
+        "Tuple[Constant[\"2\"]]"
+    );
+    assert_eq!(
+        folded(b"[1, 2].flat_map { |x| [x, x] }\n", "flat_map"),
+        "Tuple[Constant[1], Constant[1], Constant[2], Constant[2]]"
+    );
+    assert_eq!(folded(b"[1, 2].find { |x| x > 1 }\n", "find"), "Constant[2]");
+    assert_eq!(folded(b"[1, 2].find { |x| x > 9 }\n", "find"), "nil");
+    assert_eq!(
+        folded(b"[1, 2].find_index { |x| x > 1 }\n", "find_index"),
+        "Constant[1]"
+    );
+    // An undecided position takes `undecided_fold_floor`: `select` widens to
+    // `Array[union]`; `find` answers `union(elements, nil)`.
+    let undecided = folded(b"[1, 2].select { |x| unknown_call }\n", "select");
+    assert!(
+        !undecided.starts_with("Tuple"),
+        "undecided select must not fold: {undecided}"
+    );
+    assert_eq!(
+        folded(b"[1, 2].find { |x| unknown_call }\n", "find"),
+        "Constant[1] | Constant[2] | nil"
+    );
+}
+
+#[test]
+fn per_element_map_fold_declines_unported_shapes() {
+    let idx = CoreIndex::new();
+    if !idx.class_has_method("Array", "map") {
+        return; // stub index: every row declines anyway — vacuous.
+    }
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut not_folded = |src: &[u8]| -> bool {
+        let ast = lower_src(src);
+        let method = ast
+            .iter()
+            .find_map(|(_, n)| match n {
+                Node::Call { receiver: Some(_), method, .. } => Some(method.clone()),
+                _ => None,
+            })
+            .expect("a receiver call");
+        let call = find_call(&ast, &method);
+        let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+        !matches!(i.get(ty), Type::Tuple(_))
+    };
+    // An argument declines (`call_node.arguments.nil?` — even though `map`
+    // takes none, the gate is syntactic exactly like the reference).
+    assert!(not_folded(b"[1, 2].map(1) { |x| x }\n"));
+    // A block-level `next` declines — the reference joins `next` arms through
+    // its evaluator; a tail-only read cannot.
+    assert!(not_folded(b"[1, 2].map { |x| next x }\n"));
+    // A `&:sym` pass is not a literal `BlockNode` (`block_span` is None).
+    assert!(not_folded(b"[1, 2].map(&:to_s)\n"));
+    // A destructured first parameter declines — `|(a, (b, c))|` needs the
+    // reference's real destructure, which a flat positional bind would pin
+    // wrongly.
+    assert!(not_folded(b"[[1, 2], [3, 4]].map { |(a, b)| a + b }\n"));
+    // A non-Tuple receiver (a plain `Array` nominal) declines.
+    assert!(not_folded(b"Array.new.map { |x| x }\n"));
+}
+
+#[test]
+fn per_element_map_fold_declines_captured_rebinds() {
+    // A write to a CAPTURED local is the reference's cross-position
+    // threading (`per_element_captured_bindings`), which the flat
+    // per-position overlay would pin wrongly — decline to `Array`.
+    let idx = CoreIndex::new();
+    if !idx.class_has_method("Array", "map") {
+        return;
+    }
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let ast = lower_src(b"seen = 0\n[1, 2].map { |x| seen += 1; x }\n");
+    let env = typer.build_toplevel_env(&ast, &mut i);
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &env, &mut i);
+    assert_eq!(idx.class_name_of(&i, ty), Some("Array"));
+    // A write to a BLOCK-LOCAL name shadows, never captures — still folds.
+    let ast = lower_src(b"[1, 2].map { |x| y = x; y + 1 }\n");
+    let call = find_call(&ast, "map");
+    let ty = typer.type_of(&ast, call, &TypeEnv::new(), &mut i);
+    assert!(matches!(i.get(ty), Type::Tuple(_)), "block-local writes still fold");
+}
+
+#[test]
+fn bignum_literal_pins_its_exact_value() {
+    // rigor-rs#194 — a Bignum types `Constant(BigInt)` carrying its decimal
+    // spelling (the reference's `Constant[99999999999999999999]`), not a
+    // widened `Integer` nominal.
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let ast = lower_src(b"[99999999999999999999, 42]\n");
+    let ty = ast
+        .iter()
+        .find_map(|(id, n)| matches!(n, Node::ArrayLit { .. }).then_some(id))
+        .map(|id| typer.type_of(&ast, id, &TypeEnv::new(), &mut i))
+        .expect("an array literal");
+    let Type::Tuple(elems) = i.get(ty).clone() else {
+        panic!("array literal types Tuple, got {}", rigor_types::describe(&i, ty));
+    };
+    assert_eq!(
+        i.get(elems[0]),
+        &Type::Constant(Scalar::BigInt("99999999999999999999".to_string()))
+    );
+    assert_eq!(i.get(elems[1]), &Type::Constant(Scalar::Int(42)));
+}
+
 // --- rigor-rs#140: exactly-once block timing (upstream rigor#1105) ------
 //
 // `Kernel#tap` / `#then` / `#yield_self` invoke a literal block exactly

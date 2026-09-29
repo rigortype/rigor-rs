@@ -113,8 +113,18 @@ pub enum Node {
     /// stay reachable for the walk, exactly like `InterpolatedString`.
     InterpolatedSymbol { parts: Vec<NodeId>, span: Span },
     /// An integer literal (`42`). `value` is `None` for a literal outside
-    /// `i64` (a Bignum): no consumer may pin it, since every scalar is `i64`.
-    IntegerLit { value: Option<i64>, span: Span },
+    /// `i64` (a Bignum); `digits` then carries its signed decimal spelling so
+    /// the typer can still pin the VALUE (`Scalar::BigInt`) exactly as the
+    /// reference's arbitrary-precision `Constant[…]` does (rigor-rs#194) —
+    /// the same witnesses the literal `Constant` gives, without any `i64`
+    /// consumer being able to read a wrong value out of `value`.
+    IntegerLit {
+        value: Option<i64>,
+        /// Signed decimal digits — `Some` iff `value` is `None` (a Bignum);
+        /// never a lossy or truncated rendering.
+        digits: Option<String>,
+        span: Span,
+    },
     /// A float literal (`3.14`); `value` is the parsed `f64`.
     FloatLit { value: f64, span: Span },
     /// A symbol literal (`:foo`); `value` is the symbol name (no leading colon).

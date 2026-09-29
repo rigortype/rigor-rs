@@ -219,8 +219,9 @@ fn scalar_erase(s: &Scalar) -> String {
         Scalar::Bool(false) => "false".to_string(),
         Scalar::Nil => "nil".to_string(),
         Scalar::Int(n) => n.to_string(),
-        Scalar::Str(v) => format!("{v:?}"),
-        Scalar::Sym(v) => format!(":{v}"),
+        Scalar::BigInt(digits) => digits.clone(),
+        Scalar::Str(v) => ruby_inspect_dq(v),
+        Scalar::Sym(v) => symbol_inspect(v),
         Scalar::Float(_) => "Float".to_string(),
     }
 }
@@ -340,17 +341,135 @@ fn uniq_join(items: Vec<String>) -> String {
 }
 
 /// A `Constant` scalar as Ruby's `inspect` renders it (reference
-/// `Constant#describe`): strings quoted, symbols colon-prefixed, floats always
-/// with a decimal (`3.0`, not `3`), everything else by its natural spelling.
-fn scalar_inspect(s: &Scalar) -> String {
+/// `Constant#describe`): strings quoted, symbols colon-prefixed (`:foo`,
+/// `:"a b"` — [`symbol_inspect`]), floats always with a decimal (`3.0`, not
+/// `3`), a Bignum by its exact decimal spelling, everything else by its
+/// natural spelling. Public so message renderers outside this module (e.g.
+/// `rigor-rules`) spell a literal identically.
+pub fn scalar_inspect(s: &Scalar) -> String {
     match s {
-        Scalar::Str(v) => format!("{v:?}"),
-        Scalar::Sym(v) => format!(":{v}"),
+        Scalar::Str(v) => ruby_inspect_dq(v),
+        Scalar::Sym(v) => symbol_inspect(v),
         Scalar::Int(n) => n.to_string(),
+        Scalar::BigInt(digits) => digits.clone(),
         Scalar::Float(f) => named_float(*f),
         Scalar::Bool(b) => b.to_string(),
         Scalar::Nil => "nil".to_string(),
     }
+}
+
+/// Ruby `Symbol#inspect` (`rb_sym_inspect`): `:name` when the name is a valid
+/// bare symbol spelling (`rb_str_symname_p` — an identifier/method name, a
+/// `@`/`@@`/`$` variable name, or a spelled operator), else `:"escaped"` with
+/// the double-quoted `inspect` escaping (rigor-rs#194 — `:"a b"`, not `:a b`).
+fn symbol_inspect(name: &str) -> String {
+    if bare_symname(name) {
+        format!(":{name}")
+    } else {
+        format!(":{}", ruby_inspect_dq(name))
+    }
+}
+
+/// The operator spellings Ruby's `rb_enc_symname_type` recognises as bare
+/// symbol names — unary/binary operators plus `+@`, `-@`, `[]`, `[]=` and
+/// backtick. Verified against `Symbol#inspect` on the pinned toolchain.
+const OPERATOR_SYMNAMES: &[&str] = &[
+    "+", "-", "*", "**", "/", "%", "==", "===", "=~", "!~", "!=", "<", "<=", "<=>", ">", ">=",
+    "<<", ">>", "&", "|", "^", "~", "+@", "-@", "[]", "[]=", "`", "!",
+];
+
+/// One character that may appear inside a Ruby identifier (`is_identchar`):
+/// ASCII alphanumerics and `_`, plus non-ASCII alphanumeric characters.
+fn identchar(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || (!c.is_ascii() && c.is_alphanumeric())
+}
+
+/// The `rb_str_symname_p` half of [`symbol_inspect`]: whether `name` inspects
+/// as `:name` without quotes. Identifier and constant names allow one trailing
+/// `?`/`!`/`=` (`foo?`, `Foo=`); `@`/`@@` names allow none (`@x?` quotes);
+/// `$` globals accept any printable non-space tail (`$$`, `$-a`, `$"`).
+fn bare_symname(name: &str) -> bool {
+    let Some(first) = name.chars().next() else {
+        return false;
+    };
+    if OPERATOR_SYMNAMES.contains(&name) {
+        return true;
+    }
+    if first == '$' {
+        let rest = &name[1..];
+        return !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_graphic() || !c.is_ascii());
+    }
+    let ident = match first {
+        '@' => {
+            let mut rest = name[1..].chars();
+            let cvar = rest.next() == Some('@');
+            let after = if cvar { &name[2..] } else { &name[1..] };
+            return !after.is_empty()
+                && after.chars().next().is_some_and(|c| {
+                    c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && c.is_alphanumeric())
+                })
+                && after.chars().all(identchar);
+        }
+        _ if first.is_ascii_alphabetic()
+            || first == '_'
+            || (!first.is_ascii() && first.is_alphanumeric()) =>
+        {
+            name
+        }
+        _ => return false,
+    };
+    if ident.chars().all(identchar) {
+        return true;
+    }
+    // Method-name suffixes: `foo?`, `foo!`, `foo=` — one trailing sigil on an
+    // otherwise-all-identifier name (`a==`, `a=b` still quote).
+    let Some(last) = ident.chars().last() else { return false };
+    if !matches!(last, '?' | '!' | '=') {
+        return false;
+    }
+    let stem = &ident[..ident.len() - last.len_utf8()];
+    !stem.is_empty() && stem.chars().all(identchar)
+}
+
+/// Ruby's double-quoted `inspect` escaping for a symbol name or string body —
+/// the `rb_str_inspect` ASCII forms (`\"`, `\\`, `\n`, `\t`, `\r`, `\0`, `\a`,
+/// `\b`, `\f`, `\v`, `\e`, `\xNN` for other control bytes and DEL) plus the
+/// interpolation-guard `\#` before `{`/`@`/`$`. A byte-exact match of Ruby's
+/// full Unicode escaping is out of scope (same documented bound as
+/// `rigor-parse`'s `ruby_inspect_string`): non-ASCII printable characters are
+/// emitted raw.
+fn ruby_inspect_dq(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '\x07' => out.push_str("\\a"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\x0b' => out.push_str("\\v"),
+            '\x1b' => out.push_str("\\e"),
+            '#' => {
+                if matches!(chars.peek(), Some('{') | Some('@') | Some('$')) {
+                    out.push('\\');
+                }
+                out.push('#');
+            }
+            c if (c as u32) < 0x20 || c == '\x7f' => {
+                out.push_str(&format!("\\x{:02X}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Ruby `Float#inspect` always shows a decimal point (`3.0.inspect == "3.0"`),
@@ -379,7 +498,7 @@ pub fn ruby_float_to_s(f: f64) -> String {
 fn named_key(k: &ShapeKey) -> String {
     match k {
         ShapeKey::Sym(s) => s.clone(),
-        ShapeKey::Str(s) => format!("{s:?}"),
+        ShapeKey::Str(s) => ruby_inspect_dq(s),
         ShapeKey::Int(v) => v.to_string(),
         ShapeKey::Float(bits) => named_float(f64::from_bits(*bits)),
         ShapeKey::Bool(b) => b.to_string(),
@@ -575,8 +694,9 @@ fn is_nil(i: &Interner, id: TypeId) -> bool {
 fn scalar(s: &Scalar) -> String {
     match s {
         Scalar::Int(v) => v.to_string(),
-        Scalar::Str(v) => format!("{v:?}"),
-        Scalar::Sym(v) => format!(":{v}"),
+        Scalar::BigInt(digits) => digits.clone(),
+        Scalar::Str(v) => ruby_inspect_dq(v),
+        Scalar::Sym(v) => symbol_inspect(v),
         Scalar::Bool(v) => v.to_string(),
         Scalar::Nil => "nil".to_string(),
         Scalar::Float(v) => v.to_string(),
@@ -585,8 +705,8 @@ fn scalar(s: &Scalar) -> String {
 
 fn shape_key(k: &ShapeKey) -> String {
     match k {
-        ShapeKey::Sym(s) => format!(":{s}"),
-        ShapeKey::Str(s) => format!("{s:?}"),
+        ShapeKey::Sym(s) => symbol_inspect(s),
+        ShapeKey::Str(s) => ruby_inspect_dq(s),
         ShapeKey::Int(v) => v.to_string(),
         ShapeKey::Float(bits) => named_float(f64::from_bits(*bits)),
         ShapeKey::Bool(b) => b.to_string(),
@@ -640,6 +760,37 @@ mod named_tests {
         assert_eq!(describe_named(&i, f, &resolver), "3.0");
         let nil = i.nil();
         assert_eq!(describe_named(&i, nil, &resolver), "nil");
+    }
+
+    #[test]
+    fn quoted_symbols_and_bignum_constants() {
+        let mut i = Interner::new();
+        // rigor-rs#194 — `Symbol#inspect` quotes a name that cannot spell bare
+        // (`:"a b"`), escapes like a double-quoted string, and keeps every
+        // bare-able form unquoted (`:foo`, `:foo?`, `:[]`, `:$x`, `:@iv`).
+        let quoted = i.intern(Type::Constant(Scalar::Sym("a b".to_string())));
+        assert_eq!(describe_named(&i, quoted, &resolver), ":\"a b\"");
+        let tup = i.intern(Type::Tuple(vec![quoted]));
+        assert_eq!(describe_named(&i, tup, &resolver), "[:\"a b\"]");
+        for (name, want) in [
+            ("foo?", ":foo?"),
+            ("Foo", ":Foo"),
+            ("[]=", ":[]="),
+            ("$x", ":$x"),
+            ("@iv", ":@iv"),
+            ("a=b", ":\"a=b\""),
+            ("a\"b", ":\"a\\\"b\""),
+        ] {
+            let sym = i.intern(Type::Constant(Scalar::Sym(name.to_string())));
+            assert_eq!(describe_named(&i, sym, &resolver), want, ":{name}");
+        }
+        // A Bignum renders its exact decimal spelling — `Integer#inspect`.
+        let big = i.intern(Type::Constant(Scalar::BigInt("99999999999999999999".to_string())));
+        assert_eq!(describe_named(&i, big, &resolver), "99999999999999999999");
+        let tup = i.intern(Type::Tuple(vec![big]));
+        assert_eq!(describe_named(&i, tup, &resolver), "[99999999999999999999]");
+        // …and erases to the same literal RBS spelling, like `Int`.
+        assert_eq!(erase_to_rbs_named(&i, big, &resolver), "99999999999999999999");
     }
 
     #[test]

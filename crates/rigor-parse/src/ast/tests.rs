@@ -271,21 +271,33 @@ fn statements_carriers_record_their_kind() {
 }
 
 #[test]
-fn integer_literals_lower_across_i64_and_decline_bignums() {
-    // Beyond `i32` used to lower to `0`; beyond `i64` must not pin at all.
+fn integer_literals_lower_across_i64_and_preserve_bignum_digits() {
+    // Beyond `i32` used to lower to `0`; beyond `i64` `value` stays `None`
+    // (never a wrong pin) while `digits` keeps the exact decimal spelling for
+    // `Scalar::BigInt` (rigor-rs#194) — including a negative Bignum's sign.
     let src = b"[1, -2, 3_000_000_000, 0x7fff_ffff_ffff_ffff, \
-                -9223372036854775808, 9223372036854775808, 100000000000000000000]\n";
+                -9223372036854775808, 9223372036854775808, 100000000000000000000, \
+                -9223372036854775809]\n";
     let ast = lower(&crate::parse(src));
-    let values: Vec<Option<i64>> = ast
+    let lits: Vec<(Option<i64>, Option<String>)> = ast
         .iter()
         .filter_map(|(_, n)| match n {
-            Node::IntegerLit { value, .. } => Some(*value),
+            Node::IntegerLit { value, digits, .. } => Some((*value, digits.clone())),
             _ => None,
         })
         .collect();
     assert_eq!(
-        values,
-        [Some(1), Some(-2), Some(3_000_000_000), Some(i64::MAX), Some(i64::MIN), None, None]
+        lits,
+        [
+            (Some(1), None),
+            (Some(-2), None),
+            (Some(3_000_000_000), None),
+            (Some(i64::MAX), None),
+            (Some(i64::MIN), None),
+            (None, Some("9223372036854775808".to_string())),
+            (None, Some("100000000000000000000".to_string())),
+            (None, Some("-9223372036854775809".to_string())),
+        ]
     );
 }
 

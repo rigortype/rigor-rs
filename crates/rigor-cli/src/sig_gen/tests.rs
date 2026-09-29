@@ -715,11 +715,19 @@ fn emits_sound_project_class_instance_return() {
 }
 
 #[test]
-fn skips_bare_generic_nominal_return() {
-    // `[1, 2].map { }` loses the value-pin to a bare `Array` in rigor-rs; the
-    // reference would elaborate to `Array[untyped]`, so rigor-rs skips it
-    // (FP-safe) rather than emit an under-elaborated `-> Array`.
+fn folds_literal_tuple_map_and_still_skips_bare_generic_nominal() {
+    // rigor-rs#194: `[1, 2, 3].map { |x| x }` keeps the per-position fold —
+    // `Tuple[1, 2, 3]` erases to the record spelling the reference emits.
     let src = "class Foo\n  def mapped\n    [1, 2, 3].map { |x| x }\n  end\nend\n";
+    let cs = candidates_tagged("folded", src, false);
+    let mapped = cs.iter().find(|c| c.method_name == "mapped").expect("mapped emitted");
+    assert_eq!(mapped.rbs, "def mapped: () -> [1, 2, 3]");
+
+    // A non-tuple receiver keeps the pre-fold answer: `Array.new.map { }` is
+    // the bare `Array` the reference would elaborate to `Array[untyped]`, so
+    // rigor-rs skips it (FP-safe) rather than emit an under-elaborated
+    // `-> Array`.
+    let src = "class Foo\n  def mapped\n    Array.new.map { |x| x }\n  end\nend\n";
     assert!(candidates_tagged("bare", src, false).is_empty());
 }
 

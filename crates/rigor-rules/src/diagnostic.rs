@@ -2,7 +2,7 @@
 //! and receiver rendering for messages.
 
 use rigor_index::CoreIndex;
-use rigor_types::{Interner, Scalar};
+use rigor_types::Interner;
 
 // ---------------------------------------------------------------------------
 // Severity enum
@@ -121,16 +121,3 @@ pub(crate) fn render_receiver(
     rigor_types::describe_named(interner, ty, &resolve)
 }
 
-/// Render a scalar literal as it appears in the reference's message: strings
-/// quoted (`"Hello"`), symbols colon-prefixed (`:foo`), everything else by its
-/// natural literal spelling.
-fn render_scalar(scalar: &Scalar) -> String {
-    match scalar {
-        Scalar::Str(s) => format!("{s:?}"),
-        Scalar::Sym(s) => format!(":{s}"),
-        Scalar::Int(n) => n.to_string(),
-        Scalar::Float(f) => f.to_string(),
-        Scalar::Bool(b) => b.to_string(),
-        Scalar::Nil => "nil".to_string(),
-    }
-}

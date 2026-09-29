@@ -164,11 +164,19 @@ impl<'src> Builder<'src> {
 
         if let Some(int) = node.as_integer_node() {
             // Prism's `TryInto<i32>` covers only `i32`; the digit view widens
-            // that to all of `i64`. A Bignum lowers to `None` — never to a
-            // wrong value (`3_000_000_000` once lowered to `0` and folded).
+            // that to all of `i64`. A Bignum lowers `value` to `None` — never
+            // to a wrong value (`3_000_000_000` once lowered to `0` and
+            // folded) — while `digits` keeps the exact decimal spelling so
+            // the typer can pin it as `Scalar::BigInt` (rigor-rs#194).
             let value = integer_value(&int.value());
+            let digits = if value.is_none() {
+                Some(integer_decimal(&int.value()))
+            } else {
+                None
+            };
             return self.push(Node::IntegerLit {
                 value,
+                digits,
                 span: span_of(&int.location()),
             });
         }
@@ -1251,4 +1259,43 @@ fn integer_value(int: &ruby_prism::Integer<'_>) -> Option<i64> {
         mag = mag.checked_mul(1 << 32)?.checked_add(i128::from(d))?;
     }
     i64::try_from(if negative { -mag } else { mag }).ok()
+}
+
+/// A Bignum's signed decimal spelling — the string `Integer#inspect` prints —
+/// from the little-endian `u32` digit view. Base-2^32 to base-10 by repeated
+/// chunk division (10^9 fits `u32` products in `u64`); no precision is ever
+/// lost, so an arbitrarily long literal renders exactly.
+fn integer_decimal(int: &ruby_prism::Integer<'_>) -> String {
+    const CHUNK: u64 = 1_000_000_000; // largest power of ten below 2^32
+    let (negative, digits) = int.to_u32_digits();
+    let mut digits = digits.to_vec();
+    let mut chunks: Vec<u64> = Vec::new();
+    while !digits.is_empty() {
+        let mut rem: u64 = 0;
+        for d in digits.iter_mut().rev() {
+            let cur = (rem << 32) | u64::from(*d);
+            *d = (cur / CHUNK) as u32;
+            rem = cur % CHUNK;
+        }
+        while digits.last() == Some(&0) {
+            digits.pop();
+        }
+        chunks.push(rem);
+    }
+    let mut out = String::new();
+    if negative {
+        out.push('-');
+    }
+    match chunks.last() {
+        // A Bignum is never zero (0 lowers to `value: Some(0)`), so a `None`
+        // arm only fires on an empty digit list — spell it `0` anyway.
+        None => out.push('0'),
+        Some(&top) => {
+            out.push_str(&top.to_string());
+            for &chunk in chunks.iter().rev().skip(1) {
+                out.push_str(&format!("{chunk:09}"));
+            }
+        }
+    }
+    out
 }

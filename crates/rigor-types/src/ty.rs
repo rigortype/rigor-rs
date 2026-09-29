@@ -40,6 +40,13 @@ pub struct HktUri(pub String);
 #[derive(Clone, Debug)]
 pub enum Scalar {
     Int(i64),
+    /// An Integer literal that does not fit `i64` (a Ruby Bignum), carried as
+    /// its signed decimal spelling. Ruby Integers are arbitrary precision and
+    /// the reference pins the literal VALUE (`Constant[99999999999999999999]`);
+    /// the spelling round-trips the value for witness rendering and equality
+    /// without an arbitrary-precision dependency. Arithmetic folds decline it,
+    /// matching the pre-pin `Integer` nominal's safety (rigor-rs#194).
+    BigInt(String),
     Str(String),
     Sym(String),
     Bool(bool),
@@ -57,6 +64,7 @@ impl Scalar {
             Scalar::Float(_) => 3,
             Scalar::Str(_) => 4,
             Scalar::Sym(_) => 5,
+            Scalar::BigInt(_) => 6,
         }
     }
 }
@@ -65,6 +73,7 @@ impl PartialEq for Scalar {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Scalar::Int(a), Scalar::Int(b)) => a == b,
+            (Scalar::BigInt(a), Scalar::BigInt(b)) => a == b,
             (Scalar::Str(a), Scalar::Str(b)) => a == b,
             (Scalar::Sym(a), Scalar::Sym(b)) => a == b,
             (Scalar::Bool(a), Scalar::Bool(b)) => a == b,
@@ -84,6 +93,7 @@ impl std::hash::Hash for Scalar {
         self.tag().hash(state);
         match self {
             Scalar::Int(v) => v.hash(state),
+            Scalar::BigInt(v) => v.hash(state),
             Scalar::Str(v) => v.hash(state),
             Scalar::Sym(v) => v.hash(state),
             Scalar::Bool(v) => v.hash(state),
@@ -103,6 +113,7 @@ impl Ord for Scalar {
     fn cmp(&self, other: &Self) -> Ordering {
         match (self, other) {
             (Scalar::Int(a), Scalar::Int(b)) => a.cmp(b),
+            (Scalar::BigInt(a), Scalar::BigInt(b)) => a.cmp(b),
             (Scalar::Str(a), Scalar::Str(b)) => a.cmp(b),
             (Scalar::Sym(a), Scalar::Sym(b)) => a.cmp(b),
             (Scalar::Bool(a), Scalar::Bool(b)) => a.cmp(b),

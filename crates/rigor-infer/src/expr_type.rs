@@ -37,6 +37,10 @@ fn scalar_to_shape_key(s: &Scalar) -> ShapeKey {
         Scalar::Sym(v) => ShapeKey::Sym(v.clone()),
         Scalar::Str(v) => ShapeKey::Str(v.clone()),
         Scalar::Int(v) => ShapeKey::Int(*v),
+        // A Bignum key is a real Ruby key but `ShapeKey::Int` holds `i64`;
+        // `Other` keeps the shape honest — lookups keyed on it decline rather
+        // than pin a wrong identity (rigor-rs#194).
+        Scalar::BigInt(_) => ShapeKey::Other,
         Scalar::Float(f) => ShapeKey::Float(f.to_bits()),
         Scalar::Bool(b) => ShapeKey::Bool(*b),
         Scalar::Nil => ShapeKey::Nil,
@@ -145,7 +149,14 @@ impl<'i> Typer<'i> {
             Node::IntegerLit { value: Some(value), .. } => {
                 interner.intern(Type::Constant(Scalar::Int(*value)))
             }
-            // A Bignum: the reference pins it, but no `i64` scalar can.
+            // A Bignum pins its exact decimal spelling (`Scalar::BigInt`) —
+            // the reference's `Constant[99999999999999999999]` — so witnesses
+            // render the literal (rigor-rs#194). Arithmetic folds decline it
+            // (no i64), the zero-FP-safe side. A `digits: None` bigint keeps
+            // the pre-pin nominal answer.
+            Node::IntegerLit { digits: Some(digits), .. } => {
+                interner.intern(Type::Constant(Scalar::BigInt(digits.clone())))
+            }
             Node::IntegerLit { value: None, .. } => self.nominal_or_untyped("Integer", interner),
             Node::FloatLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Float(*value)))
@@ -175,16 +186,27 @@ impl<'i> Typer<'i> {
                 args,
                 block_body,
                 block_span,
+                block_locals,
                 block_params,
                 explicit_arg_list,
                 safe_nav,
                 ..
             } => {
-                let (r, method, block_body, block_span, block_params, explicit_arg_list, safe_nav) = (
+                let (
+                    r,
+                    method,
+                    block_body,
+                    block_span,
+                    block_locals,
+                    block_params,
+                    explicit_arg_list,
+                    safe_nav,
+                ) = (
                     *r,
                     method.clone(),
                     block_body.clone(),
                     *block_span,
+                    block_locals.clone(),
                     block_params.clone(),
                     *explicit_arg_list,
                     *safe_nav,
@@ -213,6 +235,7 @@ impl<'i> Typer<'i> {
                         &method,
                         &block_body,
                         block_span,
+                        &block_locals,
                         &block_params,
                         explicit_arg_list,
                         safe_nav,
