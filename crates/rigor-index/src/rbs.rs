@@ -2661,24 +2661,112 @@ impl CoreData {
         self.synthesized_type_names.contains(name)
     }
 
-    /// RBS `TypeNameResolver#resolve`-style lookup over the FULL known-type
-    /// set (`type_names` — classes, modules, interfaces, aliases), in ONE
-    /// lexical context: innermost scope outward, then the root spelling. The
-    /// member-level resolvers stay `qualified`-only because a mintable
-    /// receiver is always a class; this wider walk exists for questions about
-    /// ANY declared type — the module self-type check in
-    /// [`Self::project_sig_chain_ok`].
-    fn resolve_type_name_in_ctx(&self, name: &str, ctx: &[&'static str]) -> Option<&'static str> {
-        if let Some(abs) = name.strip_prefix("::") {
-            return self.type_names.get(abs).copied();
+    /// The module self-type half of [`Self::project_sig_chain_ok`]: whether
+    /// the WRITTEN name resolves to a definition the reference's
+    /// `build_instance`/`build_interface` accepts. Resolution follows
+    /// `TypeNameResolver` — the (already `use`-applied) spelling's head binds
+    /// innermost→outer→root, then each tail segment under the bound
+    /// namespace, every segment binding on `has_type_name? ||
+    /// aliased_name?` — i.e. `type_names`, which holds both sets. The bound
+    /// name is buildable iff it is a class/module (`qualified` ⇒
+    /// `define_instance`) or an interface (a `_` leaf ⇒ `define_interface`);
+    /// a type alias or missing name fails the reference's build identically.
+    ///
+    /// The two reference paths the port cannot reproduce stay declines —
+    /// failing the gate only ever loses coverage, it can never admit a name
+    /// the reference rejected:
+    ///
+    /// * a bound CLASS/MODULE-ALIAS segment (capitalized leaf in
+    ///   `type_names` but not `qualified`) normalizes through an `old_name`
+    ///   target the index never records — the reference may land on a
+    ///   buildable decl, but the port cannot know; and
+    /// * a bound non-namespace segment mid-path (an interface or type
+    ///   alias) dead-ends the tail, so the whole written name stays
+    ///   unresolved — the reference keeps it relative and `absolute!` reads
+    ///   it `::`-rooted, so the ROOT spelling is retried, never the
+    ///   intermediate binding.
+    fn self_type_buildable(&self, w: &str, ctx: &[&'static str]) -> bool {
+        fn leaf_of(n: &str) -> &str {
+            n.rsplit("::").next().unwrap_or(n)
         }
-        for scope in ctx.iter().rev() {
-            let cand = format!("{scope}::{name}");
+        // The reference's `define_instance`/`define_interface` split: a
+        // class/module name is buildable iff `class_decls` holds it
+        // (`qualified`); a `_`-leaf bound in `type_names` is an interface
+        // decl (nothing else may carry `_`); any other bound leaf — a
+        // lowercase type alias or a capitalized class/module alias — is not
+        // a buildable definition for a self-type.
+        let buildable = |k: &str| {
+            self.qualified.contains_key(k) || (leaf_of(k).starts_with('_') && self.type_names.contains(k))
+        };
+        let alias_hop = |k: &str| {
+            !self.qualified.contains_key(k)
+                && leaf_of(k).chars().next().is_some_and(|c| c.is_uppercase())
+        };
+        // An unresolvable relative spelling survives written-relative and
+        // `absolute!` roots it — the `::w` retry.
+        let root = |w: &str| self.type_names.get(w).is_some_and(|&k| buildable(k));
+
+        if let Some(abs) = w.strip_prefix("::") {
+            // Absolute names resolve context-free; a failure leaves the
+            // name untouched and `absolute!` is a no-op — no retry.
+            let mut segs = abs.split("::").peekable();
+            let mut cur: Option<&'static str> = None;
+            while let Some(seg) = segs.next() {
+                let cand = match cur {
+                    Some(c) => format!("{c}::{seg}"),
+                    None => seg.to_string(),
+                };
+                match self.type_names.get(cand.as_str()) {
+                    Some(&k) if self.qualified.contains_key(k) => cur = Some(k),
+                    Some(&k) if alias_hop(k) => return false,
+                    Some(&k) => return segs.peek().is_none() && buildable(k),
+                    None => return false,
+                }
+            }
+            return cur.is_some_and(|k| self.qualified.contains_key(k));
+        }
+
+        let mut segs = w.split("::").peekable();
+        let Some(head) = segs.next() else { return false };
+        let mut bound: Option<&'static str> = None;
+        for cand in ctx
+            .iter()
+            .rev()
+            .map(|s| format!("{s}::{head}"))
+            .chain(std::iter::once(head.to_string()))
+        {
             if let Some(&k) = self.type_names.get(cand.as_str()) {
-                return Some(k);
+                bound = Some(k);
+                break;
             }
         }
-        self.type_names.get(name).copied()
+        let Some(mut cur) = bound else { return root(w) };
+        if alias_hop(cur) {
+            return false;
+        }
+        if !self.qualified.contains_key(cur) {
+            return if segs.peek().is_none() {
+                buildable(cur)
+            } else {
+                root(w)
+            };
+        }
+        while let Some(seg) = segs.next() {
+            let cand = format!("{cur}::{seg}");
+            match self.type_names.get(cand.as_str()) {
+                Some(&k) if self.qualified.contains_key(k) => cur = k,
+                Some(&k) if alias_hop(k) => return false,
+                Some(&k) => {
+                    return if segs.peek().is_none() {
+                        buildable(k)
+                    } else {
+                        root(w)
+                    };
+                }
+                None => return root(w),
+            }
+        }
+        buildable(cur)
     }
 
     /// Whether a class/module name the SOURCE INDEX minted could have its
@@ -2707,11 +2795,7 @@ impl CoreData {
                 return false;
             };
             for (w, ctx) in &entry.self_types_written {
-                // A module self-type is a TYPE, not a class — interface/alias
-                // names count as declared (the `all_names` walk).
-                if self.resolve_written_ref(w, ctx).is_none()
-                    && self.resolve_type_name_in_ctx(w, ctx).is_none()
-                {
+                if !self.self_type_buildable(w, ctx) {
                     return false;
                 }
             }

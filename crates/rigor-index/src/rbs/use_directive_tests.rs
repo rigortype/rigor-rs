@@ -234,3 +234,32 @@ fn tuple_elements_and_unbuildable_chain() {
     assert!(!idx.project_sig_chain_ok("Sub"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A module self-type's written name must resolve through the reference's
+/// head-first walk, not a second whole-name lookup: `Ns::Alias` is a class
+/// alias, so `Alias::Bar` under `module Ns` binds the alias head and
+/// normalizes through an `old_name` target the port never records — the
+/// chain declines even though a root `Alias::Bar` namesake exists (the
+/// reference keeps the unresolvable name relative and `absolute!` roots
+/// it, but the bound-alias outcome is unmodelled, and a type-alias leaf
+/// self-type fails `build_instance` the same way). Controls: a declared
+/// interface self-type builds; a missing one does not.
+#[test]
+fn self_type_alias_head_declines_rather_than_bind_namesake() {
+    let dir = proj_dir(
+        "self_type_alias",
+        &[(
+            "m.rbs",
+            "module Ns\n  class Alias = Other\n  module M : Alias::Bar\n    def f: () -> Integer\n  end\nend\nmodule Alias\n  class Bar\n  end\nend\ninterface _I\nend\nmodule Via : _I\nend\nmodule Gone : _Missing\nend\n",
+        )],
+    );
+    let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+    // Bound-alias head ⇒ unmodelled ⇒ decline, never `Alias::Bar` at root.
+    assert!(!idx.project_sig_chain_ok("Ns::M"));
+    // `module Via : _I` — a declared interface self-type builds.
+    assert!(idx.project_sig_chain_ok("Via"));
+    // `_Missing` is only referenced as a self-type NAME, which the stub
+    // pass deliberately does not synthesize — `build_interface` fails.
+    assert!(!idx.project_sig_chain_ok("Gone"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
