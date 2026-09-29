@@ -87,20 +87,26 @@ pub(crate) fn is_shape_mutator(method: &str) -> bool {
 /// apart: a mutation KEEPS the nominal while a rebind kills it, and the merged
 /// table cannot tell them apart.
 pub(crate) fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    let mut out: Vec<(rigor_parse::Span, String)> = ast
+    let mut out: Vec<(NodeId, rigor_parse::Span, String)> = ast
         .iter()
-        .flat_map(|(_, n)| match n {
+        .flat_map(|(id, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. } => vec![(*span, name.clone())],
+            | Node::LocalVariableOpWrite { name, span, .. } => vec![(id, *span, name.clone())],
             Node::MultiWrite { targets, span, .. } => targets
                 .bound_names()
                 .into_iter()
-                .map(|(name, _)| (*span, name))
+                .map(|(name, _)| (id, *span, name))
                 .collect(),
-            Node::Loop { index, .. } => for_index_rebinds(index),
+            Node::Loop { index, .. } => for_index_rebinds(index)
+                .into_iter()
+                .map(|(s, n)| (id, s, n))
+                .collect(),
             _ => Vec::new(),
         })
         .collect();
+    drop_shadowed_writes(ast, &mut out);
+    let mut out: Vec<(rigor_parse::Span, String)> =
+        out.into_iter().map(|(_, s, n)| (s, n)).collect();
     drop_inert_writes(ast, &mut out);
     out
 }
@@ -114,6 +120,23 @@ pub(crate) fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span,
 /// widening in the enclosing flow constructs sees it.
 fn index_target_writes(entries: Vec<(String, rigor_parse::Span)>) -> Vec<(rigor_parse::Span, String)> {
     entries.into_iter().map(|(name, span)| (span, name)).collect()
+}
+
+/// Drop every `(id, _, name)` write that sits inside a closure's shadow scope
+/// and names a local the closure BINDS — it rebinds the closure's own
+/// parameter/local, never the outer binding of the same name (rigor-rs#166 for
+/// literal blocks; rigor-rs#137 extends the scope set with `block_params` and
+/// the crossed-closure recovered children, [`closure_shadow_scopes`]).
+fn drop_shadowed_writes(
+    ast: &LoweredAst,
+    writes: &mut Vec<(NodeId, rigor_parse::Span, String)>,
+) {
+    let shadow_scopes = closure_shadow_scopes(ast);
+    writes.retain(|(id, _, name)| {
+        !shadow_scopes.iter().any(|(descendants, bound)| {
+            descendants.contains(id) && bound.contains(name)
+        })
+    });
 }
 
 /// A `for` index's bound names as rebind entries, each keyed by its own target
@@ -196,27 +219,31 @@ pub(crate) const MUTATOR_METHODS: &[&str] = &[
 ///   each stores through `[]=` on `h` (`IndexWriteWidening`, rigor-rs#134). Keyed
 ///   by the TARGET's span, so it widens inside whichever construct owns it.
 pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    let mut out: Vec<(rigor_parse::Span, String)> = ast
+    let mut out: Vec<(NodeId, rigor_parse::Span, String)> = ast
         .iter()
-        .flat_map(|(_, n)| match n {
+        .flat_map(|(id, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. } => vec![(*span, name.clone())],
+            | Node::LocalVariableOpWrite { name, span, .. } => vec![(id, *span, name.clone())],
             Node::MultiWrite { targets, span, .. } => {
-                let mut entries: Vec<(rigor_parse::Span, String)> = targets
+                let mut entries: Vec<(NodeId, rigor_parse::Span, String)> = targets
                     .bound_names()
                     .into_iter()
-                    .map(|(name, _)| (*span, name))
+                    .map(|(name, _)| (id, *span, name))
                     .collect();
                 // An `h[k]` target stores through `[]=` on `h` — a receiver
                 // MUTATION at the target's span, not a rebind (rigor-rs#134).
-                entries.extend(index_target_writes(targets.index_writes()));
+                entries.extend(
+                    index_target_writes(targets.index_writes())
+                        .into_iter()
+                        .map(|(s, n)| (id, s, n)),
+                );
                 entries
             }
             Node::Call { receiver: Some(r), method, span, .. }
                 if MUTATOR_METHODS.contains(&method.as_str()) =>
             {
                 match ast.get(*r) {
-                    Node::LocalVariableRead { name, .. } => vec![(*span, name.clone())],
+                    Node::LocalVariableRead { name, .. } => vec![(id, *span, name.clone())],
                     _ => Vec::new(),
                 }
             }
@@ -232,9 +259,16 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
                 _ => Vec::new(),
             },
             Node::Loop { index, index_writes, .. } => {
-                let mut entries = for_index_rebinds(index);
+                let mut entries: Vec<(NodeId, rigor_parse::Span, String)> = for_index_rebinds(index)
+                    .into_iter()
+                    .map(|(s, n)| (id, s, n))
+                    .collect();
                 // `for h[:k] in xs` stores each element through `[]=` on `h`.
-                entries.extend(index_target_writes(index_writes.clone()));
+                entries.extend(
+                    index_target_writes(index_writes.clone())
+                        .into_iter()
+                        .map(|(s, n)| (id, s, n)),
+                );
                 entries
             }
             // `rescue => h[:e]` stores the exception through `[]=` on `h`
@@ -244,10 +278,14 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             Node::BeginRescue { clauses, .. } => clauses
                 .iter()
                 .flat_map(|c| index_target_writes(c.index_writes.clone()))
+                .map(|(s, n)| (id, s, n))
                 .collect(),
             _ => Vec::new(),
         })
         .collect();
+    drop_shadowed_writes(ast, &mut out);
+    let mut out: Vec<(rigor_parse::Span, String)> =
+        out.into_iter().map(|(_, s, n)| (s, n)).collect();
     drop_inert_writes(ast, &mut out);
     out
 }
@@ -301,7 +339,7 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
     out.retain(|(id, w, name)| {
         !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
             && !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.iter().any(|b| b == name)
+                descendants.contains(id) && bound.contains(name)
             })
     });
     let mut out: Vec<(rigor_parse::Span, String)> =
@@ -319,12 +357,13 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
 /// opener, so an interpolation write lies inside the enclosing span while
 /// evaluating in the outer scope.
 /// A block/lambda shadow scope: its body's reachable nodes plus the names it
-/// binds (borrowed from the AST, which outlives every census built on it).
-type ShadowScope<'a> = (HashSet<NodeId>, &'a [String]);
+/// binds (owned — [`closure_shadow_scopes`] unions the Prism `locals` with the
+/// lowered `block_params` and the recovered-child bindings table).
+type ShadowScope = (HashSet<NodeId>, Vec<String>);
 
 fn toplevel_scope_filters(
     ast: &LoweredAst,
-) -> (Vec<rigor_parse::Span>, Vec<ShadowScope<'_>>) {
+) -> (Vec<rigor_parse::Span>, Vec<ShadowScope>) {
     let scopes: Vec<rigor_parse::Span> = ast
         .iter()
         .filter_map(|(_, n)| match n {
@@ -334,23 +373,7 @@ fn toplevel_scope_filters(
             _ => None,
         })
         .collect();
-    let shadow_scopes: Vec<ShadowScope<'_>> = ast
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Node::Call {
-                block_body,
-                block_locals,
-                ..
-            } if !block_locals.is_empty() => {
-                Some((descendants_of(ast, block_body), block_locals.as_slice()))
-            }
-            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
-                Some((descendants_of(ast, body), locals.as_slice()))
-            }
-            _ => None,
-        })
-        .collect();
-    (scopes, shadow_scopes)
+    (scopes, closure_shadow_scopes(ast))
 }
 
 /// Every in-place mutation of a TOP-LEVEL local — a `local.<mutator>(…)` call
@@ -432,10 +455,71 @@ pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, St
         !ast.in_inert_carrier(*w)
             && !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
             && !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.iter().any(|b| b == name)
+                descendants.contains(id) && bound.contains(name)
             })
     });
     out.into_iter().map(|(_, s, n, m)| (s, n, m)).collect()
+}
+
+/// Every literal block/lambda SHADOW scope — `(structural body descendants,
+/// bound names)` — as an OWNED table for use-site lookups outside the
+/// rebind/mutation filters (rigor-rs#137, upstream rigor#1245). A local a
+/// closure binds reads `Dynamic[top]` at any use site inside its body: the
+/// closure is a lexical boundary, its `locals` the bound set, so the
+/// inherited outer binding of the same name does not reach inside.
+///
+/// The name set is `block_locals` ∪ `block_params`: Prism's `locals` already
+/// covers every parameter form, `;` locals, and body-introduced names; the
+/// parameter list adds only the implicit `it`, which Prism keeps out of
+/// `locals` but which still binds (and can only ever shadow an env binding,
+/// so the union is the safe set). Membership is STRUCTURAL — the same
+/// [`descendants_of`] walk `toplevel_rebinds` relies on — never span-based:
+/// a heredoc body escapes its opener's span while evaluating in its scope.
+pub fn closure_shadow_scopes(ast: &LoweredAst) -> Vec<(HashSet<NodeId>, Vec<String>)> {
+    let mut scopes: Vec<(HashSet<NodeId>, Vec<String>)> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Call {
+                block_body,
+                block_locals,
+                block_params,
+                ..
+            } => {
+                let mut bound = block_locals.clone();
+                for (name, _) in block_params {
+                    if !bound.contains(name) {
+                        bound.push(name.clone());
+                    }
+                }
+                (!bound.is_empty()).then(|| (descendants_of(ast, block_body), bound))
+            }
+            Node::Lambda { body, locals, .. } if !locals.is_empty() => {
+                Some((descendants_of(ast, body), locals.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    // A block/lambda CROSSED by a wrapper's recovery (`super { |o| o + 1 }` —
+    // no `Node::Call` carries its `locals`) records the same shadow set on the
+    // recovered child id, whose subtree IS the closure body.
+    for &(id, ref bound) in ast.closure_bindings() {
+        scopes.push((descendants_of(ast, &[NodeId(id)]), bound.clone()));
+    }
+    scopes
+}
+
+/// The local names a literal block binds — `block_locals` ∪ `block_params`
+/// ([`closure_shadow_scopes`]'s name set), for the flow passes that seed a
+/// block body's env from the outer bindings: a bound name must not carry its
+/// outer binding into the block (rigor-rs#137).
+pub(crate) fn block_bound_names<'a>(
+    block_locals: &'a [String],
+    block_params: &'a [(String, rigor_parse::BlockParamKind)],
+) -> impl Iterator<Item = &'a str> {
+    block_locals
+        .iter()
+        .map(String::as_str)
+        .chain(block_params.iter().map(|(n, _)| n.as_str()))
 }
 
 /// Every node reachable from `roots` through child links, roots included —

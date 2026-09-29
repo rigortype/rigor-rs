@@ -393,6 +393,40 @@ fn statements_carriers_record_their_kind() {
     assert_eq!(writes.iter().map(|w| w.1).collect::<Vec<_>>(), [false, true]);
 }
 
+/// rigor-rs#137 (upstream rigor#1245): the recovery walk records a crossed
+/// `BlockNode`/`LambdaNode`'s `locals` on each recovered child, so the shadow
+/// pass can drop them from the enclosing scope even when no `Node::Call` /
+/// `Node::Lambda` carries the closure.
+#[test]
+fn recovered_child_under_crossed_block_records_bound_names() {
+    // `super { |o| o.f }` — the `super` wrapper is inert; the block inside is
+    // CROSSED to reach the `o.f` call, which is lowered with `o` in its bound
+    // set. A `super(…)` ARGUMENT recovered outside the block keeps `bound`
+    // empty (it reads the enclosing scope).
+    let inert_children = |ast: &LoweredAst| -> Vec<NodeId> {
+        ast.iter()
+            .flat_map(|(_, n)| match n {
+                Node::Statements {
+                    body,
+                    kind: StatementsKind::Inert,
+                    ..
+                } => body.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
+    };
+    let ast = lower(&crate::parse(b"def m\n  super { |o| o.f }\n  super(o.g)\nend\n"));
+    let children = inert_children(&ast);
+    assert_eq!(children.len(), 2);
+    assert_eq!(ast.closure_bound_names(children[0]), &["o".to_string()]);
+    assert!(ast.closure_bound_names(children[1]).is_empty());
+    // A lambda crossed the same way (`super ->(x) { x.f }`) records too.
+    let ast = lower(&crate::parse(b"def m\n  super ->(x) { x.f }\nend\n"));
+    let children = inert_children(&ast);
+    assert_eq!(children.len(), 1);
+    assert_eq!(ast.closure_bound_names(children[0]), &["x".to_string()]);
+}
+
 #[test]
 fn integer_literals_lower_across_i64_and_preserve_bignum_digits() {
     // Beyond `i32` used to lower to `0`; beyond `i64` `value` stays `None`

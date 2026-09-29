@@ -371,8 +371,54 @@ impl<'i> Typer<'i> {
     }
 
     /// Apply one statement's effect on `(tenv, cenv)` and record narrowed uses.
+    ///
+    /// A statement lowered under a CROSSED block/lambda (a recovered child
+    /// carrying [`LoweredAst::closure_bound_names`] — `super { |o| … }`) is
+    /// processed on scratch envs with the closure's bound names dropped and
+    /// their facts killed: inside the closure those names read the parameter
+    /// (`Dynamic[top]`), never the shadowed outer binding/fact, and the
+    /// closure's effects do not reach the enclosing scope (rigor-rs#137).
     #[allow(clippy::too_many_arguments)]
     fn class_flow_stmt(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        cenv: &mut Facts,
+        coarse: &HashSet<String>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut ClassNarrowing,
+        stmt_position: bool,
+    ) {
+        let bound = ast.closure_bound_names(id);
+        if !bound.is_empty() {
+            let mut t = tenv.clone();
+            let mut c = cenv.clone();
+            for name in bound {
+                t.remove(name.as_str());
+                c.kill_local(name.as_str());
+            }
+            return self.class_flow_stmt_inner(
+                ast,
+                id,
+                &mut t,
+                &mut c,
+                coarse,
+                writes,
+                interner,
+                out,
+                stmt_position,
+            );
+        }
+        self.class_flow_stmt_inner(
+            ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position,
+        )
+    }
+
+    /// The per-node half of [`Typer::class_flow_stmt`].
+    #[allow(clippy::too_many_arguments)]
+    fn class_flow_stmt_inner(
         &self,
         ast: &LoweredAst,
         id: NodeId,

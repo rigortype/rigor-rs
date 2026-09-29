@@ -3,6 +3,20 @@
 
 use crate::ruby_prism::{self, Node as PrismNode};
 
+/// One recovered child of an unhandled wrapper: the outermost recoverable
+/// Prism node plus `bound`, the union of `locals` of every `BlockNode` /
+/// `LambdaNode` the walk CROSSED to reach it (rigor-rs#137, upstream
+/// rigor#1245). A block buried under a wrapper the evaluator never enters —
+/// `super { |o| o + 1 }` is the upstream row — has no `Node::Call` /
+/// `Node::Lambda` to carry its bound names, so they are recorded here and the
+/// shadow pass applies them at the recovered child's use sites. A `super`
+/// ARGUMENT recovered outside the block keeps `bound` empty and reads the
+/// enclosing scope, exactly as it should.
+pub(crate) struct Recovered<'pr> {
+    pub(crate) node: PrismNode<'pr>,
+    pub(crate) bound: Vec<String>,
+}
+
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
 /// node — a local read / write / operator-write / call — WITHOUT descending past
 /// one (so [`Builder::lower_node`] recurses into it once, normally). Used by the
@@ -15,7 +29,7 @@ use crate::ruby_prism::{self, Node as PrismNode};
 /// owned `Definition`) would confuse the dead-assignment nested-unit barrier.
 ///
 /// [`Builder::lower_node`]: crate::ast::Builder::lower_node
-pub(crate) fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+pub(crate) fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<Recovered<'pr>> {
     collect_recoverable(node, false)
 }
 
@@ -31,15 +45,27 @@ pub(crate) fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<Pr
 /// measured at the `v0.3.4` pin, and the reason this is a call-suppressing
 /// recovery rather than the leaf it started as. Calls are recursed THROUGH
 /// rather than recorded, so a read in `defined?(foo(y))` still counts.
-pub(crate) fn collect_defined_operand_children<'pr>(node: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+pub(crate) fn collect_defined_operand_children<'pr>(node: &PrismNode<'pr>) -> Vec<Recovered<'pr>> {
     collect_recoverable(node, true)
 }
 
-fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<PrismNode<'pr>> {
+fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<Recovered<'pr>> {
     use ruby_prism::Visit;
     struct Collector<'a, 'pr> {
-        out: &'a mut Vec<PrismNode<'pr>>,
+        out: &'a mut Vec<Recovered<'pr>>,
         suppress_calls: bool,
+        /// `locals` of the `BlockNode` / `LambdaNode` chain the walk is
+        /// currently inside — a recovered child's closure-shadow set
+        /// (rigor-rs#137).
+        bound: Vec<String>,
+    }
+    impl<'pr> Collector<'_, 'pr> {
+        fn push(&mut self, node: PrismNode<'pr>) {
+            self.out.push(Recovered {
+                node,
+                bound: self.bound.clone(),
+            });
+        }
     }
     // Override each recoverable node type to RECORD it and stop (do not recurse —
     // `lower_node` will recurse into it once, normally). Every OTHER node type
@@ -48,35 +74,60 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
     // each recoverable node is collected exactly once (no double-lowering, which
     // for a call would otherwise mint a duplicate diagnostic).
     impl<'pr> Visit<'pr> for Collector<'_, 'pr> {
+        // A `BlockNode` / `LambdaNode` buried under the wrapper is CROSSED, not
+        // recorded: the calls inside stay reachable, but the closure's `locals`
+        // shadow the enclosing scope for everything under it (rigor-rs#137 —
+        // `super { |o| o + 1 }` reads `o` as the parameter, not an outer
+        // local). The names accumulate on `self.bound` until the block exits.
+        fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+            let mark = self.bound.len();
+            self.bound.extend(
+                node.locals()
+                    .iter()
+                    .map(|name| String::from_utf8_lossy(name.as_slice()).into_owned()),
+            );
+            ruby_prism::visit_block_node(self, node);
+            self.bound.truncate(mark);
+        }
+        fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+            let mark = self.bound.len();
+            self.bound.extend(
+                node.locals()
+                    .iter()
+                    .map(|name| String::from_utf8_lossy(name.as_slice()).into_owned()),
+            );
+            ruby_prism::visit_lambda_node(self, node);
+            self.bound.truncate(mark);
+        }
         fn visit_local_variable_read_node(
             &mut self,
             node: &ruby_prism::LocalVariableReadNode<'pr>,
         ) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_local_variable_write_node(
             &mut self,
             node: &ruby_prism::LocalVariableWriteNode<'pr>,
         ) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_local_variable_operator_write_node(
             &mut self,
             node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>,
         ) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_local_variable_and_write_node(
             &mut self,
             node: &ruby_prism::LocalVariableAndWriteNode<'pr>,
         ) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_local_variable_or_write_node(
             &mut self,
             node: &ruby_prism::LocalVariableOrWriteNode<'pr>,
         ) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if self.suppress_calls {
@@ -86,20 +137,20 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
                 ruby_prism::visit_call_node(self, node);
                 return;
             }
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         // A `defined?` buried under an unhandled wrapper (`super(defined?(x))`)
         // is recovered WHOLE, so its own lowering applies the call suppression
         // instead of this walk recovering the operand's calls as live code.
         fn visit_defined_node(&mut self, node: &ruby_prism::DefinedNode<'pr>) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         // A multi-write buried under an unhandled wrapper is recovered WHOLE
         // (its own lowering re-lowers the RHS), so its target names still reach
         // `collect_flow_writes`. Without this the wrapper's default recursion
         // would recover only the RHS's reads/calls and drop the LHS names again.
         fn visit_multi_write_node(&mut self, node: &ruby_prism::MultiWriteNode<'pr>) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         // A jump buried under an unhandled wrapper (`raise "x" rescue break
         // "s"` — a RescueModifierNode has no owned variant) is recovered WHOLE
@@ -110,20 +161,24 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
         // Recovered here only means the node exists in the arena; the
         // `Recovered` carrier still keeps its order and reachability unknown.
         fn visit_break_node(&mut self, node: &ruby_prism::BreakNode<'pr>) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_next_node(&mut self, node: &ruby_prism::NextNode<'pr>) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_redo_node(&mut self, node: &ruby_prism::RedoNode<'pr>) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
         fn visit_retry_node(&mut self, node: &ruby_prism::RetryNode<'pr>) {
-            self.out.push(node.as_node());
+            self.push(node.as_node());
         }
     }
     let mut out = Vec::new();
-    let mut c = Collector { out: &mut out, suppress_calls };
+    let mut c = Collector {
+        out: &mut out,
+        suppress_calls,
+        bound: Vec::new(),
+    };
     // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
     // the unhandled root. The default `visit` dispatches the root to its own
     // (non-overridden) per-type method, which recurses into children — exactly

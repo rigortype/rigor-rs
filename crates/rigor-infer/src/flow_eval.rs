@@ -881,17 +881,29 @@ impl<'i> Typer<'i> {
 
     /// Bind a single statement into `env` if it is a local write; recurse
     /// through a `Statements` wrapper. Other statements have no binding effect.
+    ///
+    /// A write recovered under a CROSSED block/lambda binds the closure's own
+    /// local, not the enclosing one it shadows — `super { |o| o = 1 }` must not
+    /// rebind the outer `o` (rigor-rs#137). [`LoweredAst::closure_bound_names`]
+    /// carries exactly that bound set on the recovered child.
     fn bind_statement(&self, ast: &LoweredAst, id: NodeId, env: &mut TypeEnv, interner: &mut Interner) {
         match ast.get(id) {
             Node::LocalVariableWrite { name, value, .. } => {
+                if ast.closure_bound_names(id).contains(name) {
+                    return;
+                }
                 let (name, value) = (name.clone(), *value);
                 let ty = self.type_of(ast, value, env, interner);
                 env.insert(name, ty);
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
+                let bound = ast.closure_bound_names(id);
                 let rhs = self.type_of(ast, value, env, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    if bound.contains(&name) {
+                        continue;
+                    }
                     env.insert(name, ty);
                 }
             }

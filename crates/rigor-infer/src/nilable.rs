@@ -10,8 +10,8 @@ use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, Type};
 
 use crate::{
-    collect_flow_writes, indexed_flow_writes, multi_target_binder, widen_flow_writes,
-    widen_penv_writes, TypeEnv, Typer,
+    block_bound_names, collect_flow_writes, indexed_flow_writes, multi_target_binder,
+    widen_flow_writes, widen_penv_writes, TypeEnv, Typer,
 };
 
 /// The reference's `Array.new(n)` tuple-lift cap (`ARRAY_NEW_TUPLE_LIMIT`,
@@ -107,8 +107,44 @@ impl<'i> Typer<'i> {
     }
 
     /// Apply one statement's effect on `(tenv, nenv, penv)` and record any nil uses.
+    ///
+    /// A statement lowered under a CROSSED block/lambda (a recovered child
+    /// carrying [`LoweredAst::closure_bound_names`] — `super { |o| … }`) is
+    /// processed on scratch envs with the closure's bound names dropped: those
+    /// names read the parameter, never the shadowed outer binding, and the
+    /// closure's effects do not reach the enclosing scope (rigor-rs#137).
     #[allow(clippy::too_many_arguments)]
     fn nil_flow_stmt(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        nenv: &mut HashMap<String, &'static str>,
+        penv: &mut HashSet<String>,
+        writes: &[(rigor_parse::Span, String)],
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+    ) {
+        let bound = ast.closure_bound_names(id);
+        if !bound.is_empty() {
+            let mut t = tenv.clone();
+            let mut n = nenv.clone();
+            let mut p = penv.clone();
+            for name in bound {
+                t.remove(name.as_str());
+                n.remove(name.as_str());
+                p.remove(name.as_str());
+            }
+            return self.nil_flow_stmt_inner(
+                ast, id, &mut t, &mut n, &mut p, writes, interner, out,
+            );
+        }
+        self.nil_flow_stmt_inner(ast, id, tenv, nenv, penv, writes, interner, out)
+    }
+
+    /// The per-node half of [`Typer::nil_flow_stmt`].
+    #[allow(clippy::too_many_arguments)]
+    fn nil_flow_stmt_inner(
         &self,
         ast: &LoweredAst,
         id: NodeId,
@@ -261,13 +297,15 @@ impl<'i> Typer<'i> {
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         match ast.get(id) {
-            Node::Call { receiver, method, args, block_body, safe_nav, span, .. } => {
+            Node::Call { receiver, method, args, block_body, block_locals, block_params, safe_nav, span, .. } => {
                 let receiver = *receiver;
                 let method = method.clone();
                 let args = args.clone();
                 let block_body = block_body.clone();
                 let safe_nav = *safe_nav;
                 let call_span = *span;
+                let bound: Vec<String> =
+                    block_bound_names(block_locals, block_params).map(str::to_string).collect();
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
                 if let Some(r) = receiver {
                     self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
@@ -298,13 +336,21 @@ impl<'i> Typer<'i> {
                 }
                 if !block_body.is_empty() {
                     // Same-block locality: descend with a FRESH `nenv`, inheriting
-                    // (cloning) `(tenv, penv)`. Afterwards CLEAR ALL outer `nenv`
-                    // (a block capture may invisibly reassign an outer local), and
-                    // widen `tenv`/`penv` for locals the block visibly writes (a
-                    // capture-write must not leave a stale type/provenance behind).
+                    // (cloning) `(tenv, penv)` MINUS the names the block binds —
+                    // a bound name reads its own parameter/local, never the
+                    // shadowed outer local (rigor-rs#137; the port has no
+                    // block-entry typing, so the name is simply unbound inside).
+                    // Afterwards CLEAR ALL outer `nenv` (a block capture may
+                    // invisibly reassign an outer local), and widen `tenv`/`penv`
+                    // for locals the block visibly writes (a capture-write must
+                    // not leave a stale type/provenance behind).
                     let mut btenv = tenv.clone();
                     let mut bnenv: HashMap<String, &'static str> = HashMap::new();
                     let mut bpenv = penv.clone();
+                    for name in &bound {
+                        btenv.remove(name);
+                        bpenv.remove(name.as_str());
+                    }
                     self.nil_flow_scope(
                         ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, interner, out,
                     );

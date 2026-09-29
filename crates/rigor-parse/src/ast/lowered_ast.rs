@@ -89,6 +89,13 @@ pub struct LoweredAst {
     /// a literal. Sorted for a binary-search read via
     /// [`LoweredAst::paren_unwrapped`].
     paren_unwrapped: Vec<u32>,
+    /// `(arena id, bound names)` for recovered children a wrapper's recovery
+    /// walk reached by CROSSING a `BlockNode`/`LambdaNode` — `super { |o| … }`
+    /// lowers its `o` reads into a `Statements` carrier with no `Node::Call` to
+    /// carry `block_locals`, so the closure's bound names are recorded here
+    /// instead (rigor-rs#137, upstream rigor#1245). The names still shadow the
+    /// enclosing scope for every node under the recovered child.
+    closure_bindings: Vec<(u32, Vec<String>)>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -141,6 +148,26 @@ impl LoweredAst {
         self.paren_unwrapped
             .binary_search(&id.0)
             .is_ok()
+    }
+
+    /// Every `(arena id, bound names)` of a recovered child lowered under a
+    /// crossed `BlockNode`/`LambdaNode` — see the `closure_bindings` field.
+    /// Consumers needing "is `id` the root of a shadowed subtree" test these;
+    /// the names apply to `id` and every node reachable below it.
+    pub fn closure_bindings(&self) -> &[(u32, Vec<String>)] {
+        &self.closure_bindings
+    }
+
+    /// The bound names recorded for recovered child `id` — empty unless `id`
+    /// was lowered under a crossed block/lambda. A flow pass descending `id`
+    /// must first drop these names from its env: the local they name inside is
+    /// the closure's own, never the shadowed outer binding.
+    pub fn closure_bound_names(&self, id: NodeId) -> &[String] {
+        self.closure_bindings
+            .binary_search_by_key(&id.0, |(k, _)| *k)
+            .ok()
+            .map(|i| self.closure_bindings[i].1.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Resolve a handle to its owned node.
@@ -201,6 +228,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         source,
         line_starts,
         paren_unwrapped: Vec::new(),
+        closure_bindings: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -222,6 +250,12 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         .collect();
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
+    let mut closure_bindings: Vec<(u32, Vec<String>)> = builder
+        .closure_bindings
+        .into_iter()
+        .map(|(id, bound)| (id.0, bound))
+        .collect();
+    closure_bindings.sort_unstable_by_key(|(id, _)| *id);
     LoweredAst {
         nodes: builder.nodes,
         root,
@@ -230,5 +264,6 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         local_read_starts,
         inert_spans,
         paren_unwrapped,
+        closure_bindings,
     }
 }

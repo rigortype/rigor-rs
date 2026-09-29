@@ -3,7 +3,7 @@
 
 use crate::ruby_prism::{self, Node as PrismNode};
 
-use super::{collect_recoverable_children, constant_string, span_of, Span};
+use super::{collect_recoverable_children, constant_string, span_of, Recovered, Span};
 
 /// The `[]=` stores an index target performs: `(receiver local, target span)`
 /// pairs — the name-keyed half of the reference's `Result#index_targets`.
@@ -173,7 +173,7 @@ pub(crate) fn lower_multi_targets<'pr>(
     rest: Option<&PrismNode<'pr>>,
     rights: &ruby_prism::NodeList<'pr>,
     span: Span,
-    recovered: &mut Vec<PrismNode<'pr>>,
+    recovered: &mut Vec<Recovered<'pr>>,
 ) -> MultiTargets {
     MultiTargets {
         lefts: lefts.iter().map(|t| lower_multi_target(&t, recovered)).collect(),
@@ -193,7 +193,7 @@ pub(crate) fn lower_multi_targets<'pr>(
 /// (`multi_target_binder.rb:29-46`).
 fn lower_multi_target<'pr>(
     node: &PrismNode<'pr>,
-    recovered: &mut Vec<PrismNode<'pr>>,
+    recovered: &mut Vec<Recovered<'pr>>,
 ) -> MultiTarget {
     if let Some(t) = node.as_local_variable_target_node() {
         return MultiTarget::Local {

@@ -9,8 +9,8 @@ use super::{
     direct_method_names, discover_visibilities_and_includes, for_index_writes, lower_multi_targets,
     rescue_reference_index_writes,
     param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
-    span_of, strict_constant_path_string, JumpKind, Node, NodeId, ParamShape, RescueClause,
-    StatementsKind,
+    span_of, strict_constant_path_string, JumpKind, Node, NodeId, ParamShape, Recovered,
+    RescueClause, StatementsKind,
 };
 
 /// Mutable accumulator for the owned arena during the lowering walk.
@@ -25,6 +25,13 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`LoweredAst::paren_unwrapped`]: crate::ast::LoweredAst::paren_unwrapped
     pub(crate) paren_unwrapped: Vec<u32>,
+    /// `(arena id, bound names)` for recovered children the recovery walk
+    /// reached by CROSSING a `BlockNode`/`LambdaNode` — the closure's `locals`
+    /// still shadow the enclosing scope inside the recovered subtree
+    /// (rigor-rs#137, upstream rigor#1245). See [`LoweredAst::closure_bindings`].
+    ///
+    /// [`LoweredAst::closure_bindings`]: crate::ast::LoweredAst::closure_bindings
+    pub(crate) closure_bindings: Vec<(NodeId, Vec<String>)>,
 }
 
 impl<'src> Builder<'src> {
@@ -125,8 +132,7 @@ impl<'src> Builder<'src> {
             // structural walks keep seeing those reads/calls — the old
             // recovered-children carrier did, and `flow.dead-assignment`
             // depends on it (netrc `item[3], item[5] = info`).
-            let target_exprs: Vec<NodeId> =
-                recovered.iter().map(|c| self.lower_node(c)).collect();
+            let target_exprs: Vec<NodeId> = self.lower_recovered(recovered);
             let value = self.lower_node(&mw.value());
             return self.push(Node::MultiWrite {
                 targets,
@@ -1217,7 +1223,7 @@ impl<'src> Builder<'src> {
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
-            let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
+            let body: Vec<NodeId> = self.lower_recovered(recovered);
             return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
         }
 
@@ -1247,7 +1253,7 @@ impl<'src> Builder<'src> {
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
-            let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
+            let body: Vec<NodeId> = self.lower_recovered(recovered);
             return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
         }
 
@@ -1265,8 +1271,7 @@ impl<'src> Builder<'src> {
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
-            let body: Vec<NodeId> =
-                recovered.iter().map(|c| self.lower_node(c)).collect();
+            let body: Vec<NodeId> = self.lower_recovered(recovered);
             return self.push(Node::Statements {
                 body,
                 span,
@@ -1291,7 +1296,7 @@ impl<'src> Builder<'src> {
         if recovered.is_empty() {
             return self.push(Node::Other { span, jump: None });
         }
-        let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
+        let body: Vec<NodeId> = self.lower_recovered(recovered);
         self.push(Node::Statements { body, span, kind: StatementsKind::Recovered })
     }
 
@@ -1299,6 +1304,25 @@ impl<'src> Builder<'src> {
     /// source order — the order inference relies on to populate the env.
     fn lower_body(&mut self, body: &ruby_prism::NodeList<'_>) -> Vec<NodeId> {
         body.iter().map(|n| self.lower_node(&n)).collect()
+    }
+
+    /// Lower one recovered-children batch (the [`Recovered`] list a wrapper's
+    /// recovery produced), recording each child's crossed-block `bound` names
+    /// into [`Self::closure_bindings`] — the closure-shadow side table
+    /// `LoweredAst::closure_bindings` publishes (rigor-rs#137).
+    ///
+    /// [`Recovered`]: crate::ast::Recovered
+    fn lower_recovered(&mut self, recovered: Vec<Recovered<'_>>) -> Vec<NodeId> {
+        recovered
+            .into_iter()
+            .map(|Recovered { node, bound }| {
+                let id = self.lower_node(&node);
+                if !bound.is_empty() {
+                    self.closure_bindings.push((id, bound));
+                }
+                id
+            })
+            .collect()
     }
 
     /// Lower an *optional* body node (a `def`/`class`/`module`/block body, which
