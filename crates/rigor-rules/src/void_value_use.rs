@@ -44,13 +44,16 @@ pub fn void_value_use_diagnostics(
             | Node::InstanceVariableWrite { value, .. }
             | Node::ConstantWrite { value, .. } => {
                 check_void_value_use(ast, *value, &env, &typer, interner, index, &mut out);
+
             }
             Node::Call { receiver, args, .. } => {
                 if let Some(recv) = receiver {
                     check_void_value_use(ast, *recv, &env, &typer, interner, index, &mut out);
+
                 }
                 for &arg in args {
                     check_void_value_use(ast, arg, &env, &typer, interner, index, &mut out);
+
                 }
             }
             _ => {}
@@ -80,7 +83,7 @@ fn check_void_value_use(
     };
     let (recv, method, span) = (*recv, method.clone(), *span);
     // The value types from the scope it was entered from (rigor-rs#136).
-    let env = scoped.at(ast, typer, ast.get(value_id).span(), interner);
+    let env = scoped.at(ast, typer, ast.get(value_id).span(), value_id, interner);
     let recv_ty = typer.type_of(ast, recv, &env, interner);
     // Resolve the receiver to (class name, dispatch kind).
     let (class_name, is_singleton) = if let Type::Singleton(class) = interner.get(recv_ty) {

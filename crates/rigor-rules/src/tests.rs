@@ -1252,6 +1252,43 @@ fn dead_assignment_block_pass_read_is_silent() {
     );
 }
 
+/// rigor-rs#137 (upstream rigor#1245): a block/lambda in VALUE position is a
+/// lexical boundary — a name the closure BINDS reads `Dynamic[top]` inside,
+/// never the outer local it shadows; captured names still read the outer
+/// binding; and the shadowed write inside never leaks out.
+#[test]
+fn block_param_shadows_outer_local_in_value_position() {
+    // The issue row: `o` inside `map { |o| … }` is the parameter, not the
+    // outer `{ x: 1 }` — reference-silent, and so are we.
+    assert!(
+        run(b"def show(x) = x\no = { x: 1 }\nshow([1, 2].map { |o| o + 1 })\n").is_empty(),
+        "bound `o` must not read the outer hash shape"
+    );
+    // The same-name write inside the block is the closure's own — the outer
+    // `o` keeps its binding and still fires afterwards.
+    let diags =
+        run(b"def show(x) = x\no = { x: 1 }\nshow([1].each { |o| o = 2 })\no.frobnicate\n");
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    // A CAPTURED name is not shadowed: `o` inside reads the outer binding and
+    // still fires.
+    let diags =
+        run(b"def show(x) = x\no = { x: 1 }\nshow([1, 2].map { |x| o + 1 })\n");
+    assert_eq!(diags.len(), 1, "captured `o` must still witness, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    // Lambdas, `;` block-locals, `do…end` and implicit `it` are the same
+    // boundary.
+    assert!(run(b"def show(x) = x\no = { x: 1 }\nshow(->(o) { o + 1 })\n").is_empty());
+    assert!(run(b"def show(x) = x\no = { x: 1 }\nshow([1].map { |y; o| o + 1 })\n").is_empty());
+    assert!(run(b"def show(x) = x\no = { x: 1 }\nshow([1].map do |o| o + 1 end)\n").is_empty());
+    // A bound name under a CROSSED closure (no `Node::Call` carries its
+    // `locals`) is shadowed too — `super { |o| … }`.
+    assert!(
+        run(b"def m\n  o = nil\n  super { |o| o.frobnicate }\nend\n").is_empty(),
+        "crossed-block `o` is the parameter, not the outer nil"
+    );
+}
+
 #[test]
 fn dead_assignment_nested_def_isolation() {
     // An OUTER write read only by an INNER def is a closure capture? No — a

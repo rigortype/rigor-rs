@@ -76,8 +76,9 @@ pub(crate) fn raise_non_exception_diagnostics(
             continue;
         }
         // The operand types from the scope it was entered from
-        // (`argument_scope`, rigor-rs#136).
-        let arg_env = env.at(ast, typer, ast.get(arg).span(), interner);
+        // (`argument_scope`, rigor-rs#136), shadowed for any name an
+        // enclosing literal block/lambda binds (rigor-rs#137).
+        let arg_env = env.at(ast, typer, ast.get(arg).span(), arg, interner);
         let operand_ty = typer.type_of(ast, arg, &arg_env, interner);
         if raise_operand_verdict(interner, index, source, operand_ty) != RaiseVerdict::Illegal {
             continue;

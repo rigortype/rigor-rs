@@ -10,8 +10,9 @@ use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{ClassId, Interner, Type, TypeId};
 
 use crate::{
-    collect_flow_writes, collect_rebind_writes, indexed_flow_writes, multi_target_binder,
-    rebound_within, span_hull, widen_flow_writes, TypeEnv, Typer, ARRAY_MUTATORS, HASH_MUTATORS,
+    block_bound_names, collect_flow_writes, collect_rebind_writes, indexed_flow_writes,
+    multi_target_binder, rebound_within, span_hull, widen_flow_writes, TypeEnv, Typer,
+    ARRAY_MUTATORS, HASH_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -106,8 +107,45 @@ impl<'i> Typer<'i> {
     }
 
     /// Apply one statement's effect on `tenv` and record collection-typed uses.
+    ///
+    /// A statement that was lowered under a CROSSED block/lambda (a recovered
+    /// child carrying [`LoweredAst::closure_bound_names`] — `super { |o| … }`)
+    /// is processed on a scratch env with the closure's bound names dropped:
+    /// those names read the parameter, never the shadowed outer binding, and
+    /// the closure's effects do not reach the enclosing scope (rigor-rs#137).
     #[allow(clippy::too_many_arguments)]
     fn coll_flow_stmt(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, &'static str>,
+        stmt_position: bool,
+    ) {
+        let bound = ast.closure_bound_names(id);
+        if !bound.is_empty() {
+            let mut shadowed = tenv.clone();
+            for name in bound {
+                shadowed.remove(name.as_str());
+            }
+            return self.coll_flow_stmt_inner(
+                ast,
+                id,
+                &mut shadowed,
+                ctx,
+                interner,
+                out,
+                stmt_position,
+            );
+        }
+        self.coll_flow_stmt_inner(ast, id, tenv, ctx, interner, out, stmt_position)
+    }
+
+    /// The per-node half of [`Typer::coll_flow_stmt`].
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_stmt_inner(
         &self,
         ast: &LoweredAst,
         id: NodeId,
@@ -213,11 +251,13 @@ impl<'i> Typer<'i> {
         stmt_position: bool,
     ) {
         match ast.get(id) {
-            Node::Call { receiver, method, args, block_body, safe_nav, span, args_plain_positional, .. } => {
+            Node::Call { receiver, method, args, block_body, block_locals, block_params, safe_nav, span, args_plain_positional, .. } => {
                 let receiver = *receiver;
                 let safe_nav = *safe_nav;
                 let args_plain = *args_plain_positional;
                 let call_span = *span;
+                let bound: Vec<String> =
+                    block_bound_names(block_locals, block_params).map(str::to_string).collect();
                 // The receiver evaluates first (a nested `a.b` in `a.b.c`) —
                 // EXPRESSION position, so no block/`case` under it establishes
                 // anything.
@@ -319,9 +359,16 @@ impl<'i> Typer<'i> {
                     widen_flow_writes(ctx.writes, call_span, tenv, interner);
                 } else if stmt_position {
                     // The block body evaluates in a CHILD env seeded from the
-                    // outer one (uses inside the block are recorded there) …
+                    // outer one (uses inside the block are recorded there) —
+                    // minus the names the block BINDS, which read their own
+                    // parameter/local, never the shadowed outer local
+                    // (rigor-rs#137; the port has no block-entry typing, so the
+                    // name is simply unbound inside — a decline).
                     let pre = tenv.clone();
                     let mut btenv = tenv.clone();
+                    for name in &bound {
+                        btenv.remove(name);
+                    }
                     self.coll_flow_scope(ast, block_body, &mut btenv, ctx, interner, out, true);
                     // … then every write the call span contains widens (a block
                     // REBIND of a captured local is visible outside and kills the
@@ -336,6 +383,12 @@ impl<'i> Typer<'i> {
                     // the gitlab jira-tracker / ddl-lock rows fire in the
                     // reference). We mirror it exactly, off the PRE-call carriers.
                     for (name, cls) in self.coll_block_mutations(ast, block_body, &pre, interner) {
+                        // A `local.<mutator>` on a name the block BINDS mutates
+                        // the parameter/local — the outer carrier is untouched
+                        // (rigor-rs#137).
+                        if bound.iter().any(|b| b == &name) {
+                            continue;
+                        }
                         if !rebound_within(ctx.rebinds, call_span, &name) {
                             if let Some(ty) = self.coll_nominal(interner, cls) {
                                 tenv.insert(name, ty);

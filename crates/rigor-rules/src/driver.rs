@@ -153,22 +153,25 @@ pub fn analyze_with_source_and_folder(
         // Ruby method bodies are independent local scopes, so a use site inside a
         // `def` never reads the file's top-level locals (`ScopedEnv::at`);
         // at file scope the env replays to the call's entry scope — the
-        // reference's `OperandWalk` index (rigor-rs#136).
+        // reference's `OperandWalk` index (rigor-rs#136) — and a local a
+        // literal block/lambda binds reads `Dynamic[top]` inside its body
+        // (rigor-rs#137 — the closure shadow boundary, on top of the
+        // resolved env).
         let scoped = &env;
         let gate_env = env.gate_at(message_span);
-        let site_env = env.at(ast, &typer, message_span, interner);
+        let site_env = env.at(ast, &typer, message_span, call_id, interner);
         let env = site_env.as_ref();
         // `nil&.m` never dispatches: the reference's `safe_navigation_receiver`
         // turns a receiver that is exactly nil into `bot` for undefined-method.
         // A `T | nil` union still flows through unchanged, as it does there.
         let nil_skip = safe_nav && {
-            let recv_ty = typer.type_of(ast, recv, env, interner);
+            let recv_ty = typer.type_of(ast, recv, &env, interner);
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
         let diag = (!nil_skip)
             .then(|| {
                 check_call(
-                    ast, recv, &method, message_span, safe_nav, env, &typer, interner, index,
+                    ast, recv, &method, message_span, safe_nav, &env, &typer, interner, index,
                 )
             })
             .flatten()
@@ -188,14 +191,14 @@ pub fn analyze_with_source_and_folder(
                 // unwidened bindings stay for the narrowing rule, whose snaps
                 // replace a Dynamic carrier rather than witness a concrete one.
                 check_collection_call(
-                    call_id, ast, recv, &method, message_span, safe_nav, env, &typer,
+                    call_id, ast, recv, &method, message_span, safe_nav, &env, &typer,
                     interner, index, &coll_snaps,
                 )
             })
             .or_else(|| {
                 check_wrong_arity(
                     ast, recv, &method, &args, args_plain_positional, has_block, message_span,
-                    env, &typer, interner, index,
+                    &env, &typer, interner, index,
                 )
             })
             .or_else(|| {
@@ -203,7 +206,7 @@ pub fn analyze_with_source_and_folder(
             })
             .or_else(|| {
                 check_always_raises(
-                    ast, recv, &method, &args, has_block, message_span, env, &typer, interner,
+                    ast, recv, &method, &args, has_block, message_span, &env, &typer, interner,
                     index,
                 )
             });

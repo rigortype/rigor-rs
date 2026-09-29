@@ -92,11 +92,29 @@ pub(crate) fn span_within(inner: rigor_parse::Span, outer: rigor_parse::Span) ->
 /// binding it saw, while a later operand sees the effect. Sites inside a
 /// literal block / lambda / class / module body keep the flat env — a
 /// closure may run at any later point.
+///
+/// rigor-rs#137 (upstream rigor#1245) then shadows whichever env the site
+/// resolved: a block or lambda is a LEXICAL boundary — a local the literal
+/// closure BINDS (every parameter form, a `;` block-local, a name first
+/// assigned in the body) reads `Dynamic[top]` at any use site inside the
+/// body, never the outer local of the same name it shadows
+/// (`show([1, 2].map { |o| o + 1 })` must not type `o` as the outer
+/// `{x: 1}`). The reference computes this from the scope index — an
+/// unentered closure's fallback scope shadows every `locals` name to
+/// `untyped`, and an entered block binds the real parameter types.
+/// `Dynamic[top]` is the port's uniform FP-safe floor for both: the
+/// value-position rows land exactly on the reference (silent), and in-place
+/// rows decline where the reference would fire on the parameter's element
+/// type. Membership is STRUCTURAL (`closure_shadow_scopes`, the #166 heredoc
+/// lesson), not span containment.
 pub(crate) struct ScopedEnv {
     flow: rigor_infer::CheckFlow,
     gate_top: rigor_infer::TypeEnv,
     empty: rigor_infer::TypeEnv,
     method_bodies: Vec<rigor_parse::Span>,
+    /// `(body descendant ids, bound names)` per literal block/lambda.
+    closures: Vec<(std::collections::HashSet<rigor_parse::NodeId>, Vec<String>)>,
+    untyped: rigor_types::TypeId,
 }
 
 impl ScopedEnv {
@@ -106,29 +124,61 @@ impl ScopedEnv {
             gate_top: typer.build_toplevel_env(ast, interner),
             empty: rigor_infer::TypeEnv::new(),
             method_bodies: rigor_infer::method_body_spans(ast),
+            closures: rigor_infer::closure_shadow_scopes(ast),
+            untyped: interner.untyped(),
         }
     }
 
-    /// The env a use site at `span` may read: the entered-scope env at file
-    /// scope (or inside a block, which keeps the flat env since it DOES
-    /// capture the enclosing locals), an empty env inside any method body.
-    /// Pass the span of the node being typed — its evaluation-entry point.
+    /// The env a use site at `site` (node `id`) may read: the entered-scope
+    /// env at file scope — `Typer::check_env_at` replays this statement's
+    /// recorded rebinds/mutations in evaluation order up to the site
+    /// (rigor-rs#136), and a site inside a barrier scope (a block/lambda or
+    /// `def`/`class`/`module` body) keeps the flat env — an empty env inside
+    /// any method body. On top of whichever env the site resolves, a site
+    /// inside a literal block/lambda body reads every name the enclosing
+    /// closures bind as `Dynamic[top]` (the `Self::closures` shadow set,
+    /// rigor-rs#137). `Cow` so an unshadowed site borrows the resolved env
+    /// without a clone.
     pub(crate) fn at<'a>(
         &'a self,
         ast: &LoweredAst,
         typer: &Typer,
-        span: rigor_parse::Span,
+        site: rigor_parse::Span,
+        id: rigor_parse::NodeId,
         interner: &mut Interner,
     ) -> std::borrow::Cow<'a, rigor_infer::TypeEnv> {
-        if self.in_method_body(span) {
-            std::borrow::Cow::Borrowed(&self.empty)
-        } else {
-            typer.check_env_at(ast, &self.flow, span, interner)
+        use std::borrow::Cow;
+        if self.in_method_body(site) {
+            return Cow::Borrowed(&self.empty);
+        }
+        let env = typer.check_env_at(ast, &self.flow, site, interner);
+        let mut shadowed: Option<rigor_infer::TypeEnv> = None;
+        for (descendants, bound) in &self.closures {
+            if !descendants.contains(&id) {
+                continue;
+            }
+            for name in bound {
+                if env.contains_key(name.as_str()) {
+                    shadowed
+                        .get_or_insert_with(|| env.as_ref().clone())
+                        .insert(name.clone(), self.untyped);
+                }
+            }
+        }
+        match shadowed {
+            Some(env) => Cow::Owned(env),
+            None => env,
         }
     }
 
     /// [`Self::at`] for the `Dynamic`-only gates of the class-narrowing and
-    /// collection-shape rules: the unwidened top-level env.
+    /// collection-shape rules: the unwidened top-level env. Deliberately NOT
+    /// closure-shadowed: the snapshot passes that mint those candidates record
+    /// their facts against the outer bindings (the class-narrowing descent
+    /// keeps them — shadowing there would narrow an untyped param past a
+    /// guard the reference's concrete element type renders disjoint), so the
+    /// gate must read the same env the facts were computed on. Declines are
+    /// the safe side of a shadowed name either way.
     pub(crate) fn gate_at(&self, span: rigor_parse::Span) -> &rigor_infer::TypeEnv {
         if self.in_method_body(span) {
             &self.empty

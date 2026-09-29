@@ -64,7 +64,7 @@ use rigor_types::{Interner, TypeId};
 
 pub use class_narrowing::ClassNarrowing;
 pub use flow_eval::CheckFlow;
-pub use flow_writes::collect_flow_writes;
+pub use flow_writes::{closure_shadow_scopes, collect_flow_writes};
 pub use folding::RubyFolder;
 pub use source_index::{
     lexical_scopes, method_body_spans, ConstLit, DefKind, Harvest, ParamBoundReturn, SourceIndex,

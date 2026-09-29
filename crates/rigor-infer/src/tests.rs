@@ -599,6 +599,98 @@ fn nil_snapshot_block_param_shadow_does_not_leak() {
     );
 }
 
+/// rigor-rs#137 (upstream rigor#1245): the closure shadow set — every literal
+/// block/lambda contributes its body's descendants + bound names (Prism
+/// `locals` ∪ `block_params`, so `it` and `;` block-locals count), and a
+/// closure a recovery walk CROSSED (`->(o) { … } rescue nil`) records the
+/// same set on its recovered children.
+#[test]
+fn closure_shadow_scopes_cover_params_locals_it_and_crossed_children() {
+    let ast = lower_src(
+        b"[1].map { |o| o }\n[1].map { it }\n[1].map { |a; bl| bl }\n->(x) { x } rescue nil\n",
+    );
+    let scopes = closure_shadow_scopes(&ast);
+    // `o` (a param), `it` (implicit param — Prism keeps it out of `locals`),
+    // `a` + `bl` (param + `;` block-local), and `x` via the crossed lambda's
+    // recovered child are all bound sets.
+    let all: Vec<String> = scopes.iter().flat_map(|(_, b)| b.clone()).collect();
+    for name in ["o", "it", "a", "bl", "x"] {
+        assert!(all.iter().any(|n| n == name), "missing bound name {name}");
+    }
+    // Every use site inside the first block's body is a shadow descendant:
+    // the `o` read is, the enclosing `map` call is not.
+    let read_in_block = ast
+        .iter()
+        .find_map(|(id, n)| {
+            matches!(n, Node::LocalVariableRead { name, .. } if name == "o").then_some(id)
+        })
+        .unwrap();
+    let map_call = ast
+        .iter()
+        .find_map(|(id, n)| {
+            matches!(n, Node::Call { method, .. } if method == "map").then_some(id)
+        })
+        .unwrap();
+    let o_scope = scopes.iter().find(|(_, b)| b == &vec!["o".to_string()]).unwrap();
+    assert!(o_scope.0.contains(&read_in_block));
+    assert!(!o_scope.0.contains(&map_call));
+}
+
+/// rigor-rs#137: a write/mutation of a closure-bound name must not widen or
+/// rebind the outer local it shadows — `collect_flow_writes` /
+/// `collect_rebind_writes` / `toplevel_rebinds` / `toplevel_mutations` all
+/// drop it; a captured name's write still counts.
+#[test]
+fn closure_bound_writes_are_not_outer_writes() {
+    let ast = lower_src(
+        b"o = { x: 1 }\n[1].each { |o| o = 2; o << 3 }\n\
+          k = 1\n[1].each { |y| k = 2 }\n\
+          x = 1\n->(x) { x = 2 } rescue nil\n",
+    );
+    let names = |v: &[(rigor_parse::Span, String)]| -> Vec<String> {
+        v.iter().map(|(_, n)| n.clone()).collect()
+    };
+    // `o`/`x` writes inside the closures are shadowed; the captured `k`
+    // write is a real top-level rebind.
+    assert_eq!(names(&collect_rebind_writes(&ast)), ["o", "k", "k", "x"]);
+    assert_eq!(names(&toplevel_rebinds(&ast)), ["o", "k", "k", "x"]);
+    // Same for the mutation half: `o << 3` inside the block is off
+    // `collect_flow_writes`/`toplevel_mutations`; the captured `k << 3` stays.
+    let ast = lower_src(b"o = []\n[1].each { |o| o << 3 }\nk = []\n[1].each { |y| k << 3 }\n");
+    assert_eq!(names(&collect_flow_writes(&ast)), ["o", "k", "k"]);
+    assert_eq!(
+        toplevel_mutations(&ast)
+            .iter()
+            .map(|(_, n, _)| n.as_str())
+            .collect::<Vec<_>>(),
+        ["k"]
+    );
+    // The flat envs keep the shadowed binding, widen the captured one.
+    let ast = lower_src(b"o = \"s\"\n[1].each { |o| o = 2 }\nk = \"s\"\n[1].each { |y| k = 2 }\n");
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_check_env(&ast, &mut i);
+    let untyped = i.untyped();
+    assert_eq!(env.get("o"), Some(&i.intern(Type::Constant(Scalar::Str("s".into())))));
+    assert_eq!(env.get("k"), Some(&untyped));
+}
+
+/// rigor-rs#137: a write recovered under a CROSSED lambda binds the closure's
+/// local, not the outer one — the flat env keeps the outer binding.
+#[test]
+fn crossed_closure_write_does_not_rebind_flat_env() {
+    let ast = lower_src(b"o = \"s\"\n->(o) { o = 2 } rescue nil\n");
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_env(&ast, &mut i);
+    assert_eq!(
+        env.get("o"),
+        Some(&i.intern(Type::Constant(Scalar::Str("s".into()))))
+    );
+}
+
 #[test]
 fn local_read_resolves_from_env() {
     let ast = lower_src(b"s = \"Hello\"\ns.length\n");

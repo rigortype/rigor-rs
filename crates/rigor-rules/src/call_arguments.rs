@@ -331,7 +331,7 @@ fn single_overload_mismatch(
         // `argument_scope(arg)`: each argument types from the scope it was
         // ENTERED from (rigor-rs#136) — a later arg's env still sees the
         // earlier args' effects, the first arg's does not.
-        let arg_env = scoped.at(ast, typer, ast.get(arg).span(), interner);
+        let arg_env = scoped.at(ast, typer, ast.get(arg).span(), arg, interner);
         let arg_ty = typer.type_of(ast, arg, &arg_env, interner);
 
         if arg_is_pure_nil(interner, index, source, arg_ty) {
@@ -403,7 +403,7 @@ fn multi_overload_mismatch(
         };
 
         // `argument_scope(arg)`: the scope the argument was entered from.
-        let arg_env = scoped.at(ast, typer, ast.get(arg).span(), interner);
+        let arg_env = scoped.at(ast, typer, ast.get(arg).span(), arg, interner);
         let arg_ty = typer.type_of(ast, arg, &arg_env, interner);
 
         if arg_is_pure_nil(interner, index, source, arg_ty) {
@@ -477,7 +477,7 @@ pub(crate) fn check_argument_type_mismatch(
     }
 
     let source = typer.source();
-    let call_env = scoped.at(ast, typer, message_span, interner);
+    let call_env = scoped.at(ast, typer, message_span, receiver, interner);
     let recv_ty = typer.type_of(ast, receiver, &call_env, interner);
 
     // Resolve `(class_name, overloads)` for INSTANCE or SINGLETON (class-method)
