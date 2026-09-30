@@ -335,6 +335,33 @@ impl<'i> Typer<'i> {
             return folded;
         }
 
+        // Issue #146: a call whose argument reaches more than one distinct
+        // precise value (`v = 1; v = 2 if c`) is folded MEMBER-WISE on the
+        // reference when the receiver is a value-pinned `Constant` —
+        // `"abc"[v]` answers the `"b" | "c"` union and `1.fdiv(v)` the
+        // `1.0 | 0.5` union, both carriers `call.undefined-method` never
+        // witnesses on — never the flat `method_return` class tier 3 would
+        // mint (the row's FP). Withhold the nominal only on that exact
+        // shape: a single reaching literal still folds or pins (`"abc"[1]`
+        // fires `for "b"`, and `v = 1` keeps its `String`), the untyped /
+        // guarded declines keep their own gates, and non-Constant receivers
+        // never entered the member fold to begin with.
+        if matches!(interner.get(recv_ty), Type::Constant(_)) {
+            let untyped = interner.untyped();
+            let multi_arg = args.iter().any(|&a| {
+                let arg_ty = self.type_of(ast, a, env, interner);
+                // A `Union` carrier covers the inlined join (`c ? 1 : 2`)
+                // and any env that already merged the writes; the bare
+                // `untyped` carrier covers the def-body reads `arg_reach`
+                // exists for.
+                (arg_ty == untyped || matches!(interner.get(arg_ty), Type::Union(_)))
+                    && self.arg_reach(ast, a).multi
+            });
+            if multi_arg {
+                return interner.untyped();
+            }
+        }
+
         // Tier 3 (-ish): resolve receiver class -> method return class.
         if let Some(class_name) = self.index.class_name_of(interner, recv_ty) {
             // The instance twin of the singleton tuple arm above

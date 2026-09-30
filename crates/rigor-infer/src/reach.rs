@@ -138,7 +138,12 @@ impl<'i> Typer<'i> {
         let Some(root) = untyped_expr_root(ast, id, 8) else { return Reach::OPAQUE };
         let reach = self.root_reach(ast, &root, ast.get(id).span(), seen);
         if matches!(ast.get(id), Node::Call { .. }) {
-            Reach { untyped: reach.untyped, precise: reach.precise, opaque: reach.precise }
+            Reach {
+                untyped: reach.untyped,
+                precise: reach.precise,
+                opaque: reach.precise,
+                multi: reach.multi,
+            }
         } else {
             reach
         }
@@ -293,18 +298,63 @@ impl<'i> Typer<'i> {
                 _ => {}
             }
         }
+        // Issue #146: a read inside a literal block / `->` no scope-recording
+        // evaluation enters (`unrecorded_closure` — the reference's
+        // `propagate` / `closure_scope` fill) resolves its locals against the
+        // ENCLOSING scope as of the closure's position: the closure's own
+        // writes never reach it, its bound names read `Dynamic[top]`, and a
+        // captured local sees only what the enclosing scope binds there.
+        let operand = unrecorded_closure(ast, use_span);
+        if let Some((_, boundary)) = operand {
+            // A name bound by ANY closure inside the typed-only boundary — a
+            // parameter, `;`-local or body-introduced local — is floored to
+            // `Dynamic[top]` by `closure_scope`, whatever its outer writes
+            // say: `{ a: [1].each { |n| Float(n) } }` stays silent even when
+            // an unrelated block elsewhere wrote the same name (cross-block
+            // bleed is how this was reached).
+            let floored = ast.iter().any(|(_, n)| {
+                let (extent, locals) = match n {
+                    Node::Lambda { span, locals, .. } => (*span, locals),
+                    Node::Call { block_span: Some(b), block_locals, .. } => (*b, block_locals),
+                    _ => return false,
+                };
+                contains(boundary, extent)
+                    && contains(extent, use_span)
+                    && locals.iter().any(|l| l == root)
+            });
+            if floored {
+                return Reach::UNTYPED;
+            }
+        }
         let (region, skip_defs, flow_body, params): (_, _, &[NodeId], &[String]) = match def {
             Some((d, id)) => match ast.get(id) {
                 Node::Definition { body, param_names, .. } => (d, false, body, param_names),
                 _ => return Reach::UNKNOWN,
             },
-            None => match binder {
-                Some((_, true)) => match ast.get(ast.root()) {
+            None => {
+                // The whole file is the region when the read's innermost
+                // binder is proc-like — or when the read sits inside a
+                // closure the recorder never enters: `propagate` /
+                // `closure_scope` resolves every block-local name against the
+                // ENCLOSING scope there, whatever the block's yield contract
+                // is (`{ a: xs.each { |n| Float(n) } }` is reference-silent
+                // where the same `each` at statement level fires `for 1.0`).
+                // A bare top-level read has no binder at all and resolves the
+                // same way — the propagate'd scope binds every top-level
+                // write the flow-approximate way a `def` region binds its
+                // own, with the same `Dynamic[top]` for an unwritten local.
+                let program_region = match binder {
+                    Some((_, true)) | None => true,
+                    Some((_, false)) => operand.is_some(),
+                };
+                if !program_region {
+                    return Reach::OPAQUE;
+                }
+                match ast.get(ast.root()) {
                     Node::Program { body, span } => (*span, true, body, &[]),
                     _ => return Reach::UNKNOWN,
-                },
-                _ => return Reach::OPAQUE,
-            },
+                }
+            }
         };
         let in_region = |s: rigor_parse::Span| {
             contains(region, s)
@@ -315,7 +365,15 @@ impl<'i> Typer<'i> {
         // they (or a loop) can carry a later write back round to the read.
         blocks_around.retain(|&b| contains(region, b));
         loop_spans.retain(|&l| contains(region, l));
-        let loopy = !blocks_around.is_empty() || !loop_spans.is_empty();
+        // A never-entered closure's body inherits a STATIC snapshot of the
+        // enclosing scope — the deferred-run model does not apply to it, so
+        // only a real loop can carry a write positioned after the closure
+        // back round to the read.
+        let loopy = if operand.is_some() {
+            !loop_spans.is_empty()
+        } else {
+            !blocks_around.is_empty() || !loop_spans.is_empty()
+        };
         // A guard is a narrowing, not a binding, so the `->` skip does not apply
         // to it — only the region does.
         let guards_here = |s: rigor_parse::Span| contains(region, s);
@@ -331,7 +389,9 @@ impl<'i> Typer<'i> {
             }
             match n {
                 Node::LocalVariableWrite { name, value, span, .. }
-                    if name == root && in_region(*span) =>
+                    if name == root
+                        && in_region(*span)
+                        && !closure_bound_elsewhere(ast, *span, root, use_span) =>
                 {
                     writes.push((*span, LocalWrite::Plain(*value)));
                 }
@@ -343,12 +403,15 @@ impl<'i> Typer<'i> {
                     return Reach::UNKNOWN;
                 }
                 Node::LocalVariableOpWrite { name, value, span }
-                    if name == root && in_region(*span) =>
+                    if name == root
+                        && in_region(*span)
+                        && !closure_bound_elsewhere(ast, *span, root, use_span) =>
                 {
                     writes.push((*span, LocalWrite::Op(*value)));
                 }
                 Node::MultiWrite { targets, value, span, .. }
                     if in_region(*span)
+                        && !closure_bound_elsewhere(ast, *span, root, use_span)
                         && targets.bound_names().iter().any(|(n, _)| n == root) =>
                 {
                     writes.push((*span, LocalWrite::Multi(*value)));
@@ -391,13 +454,21 @@ impl<'i> Typer<'i> {
             }
             _ => false,
         };
-        let kill = latest_definite_assignment(ast, flow_body, use_span, &is_target);
+        // At an unrecorded-closure read the scope index's fill sees the
+        // closure's own POSITION, not the read's: the definite-assignment cut
+        // runs to the closure-bearing statement and no further into its body.
+        let kill_span = operand.map(|(b, _)| ast.get(b).span()).unwrap_or(use_span);
+        let kill = latest_definite_assignment(ast, flow_body, kill_span, &is_target);
         let mut reach = match kill {
             Some(_) => Reach::NONE,
             None => {
-                let outer_write = writes
-                    .iter()
-                    .any(|(w, _)| !blocks_around.iter().any(|&b| contains(b, *w)));
+                // Inside a never-entered closure a write has to sit BEFORE
+                // the closure (or loop back round it) to reach the read — a
+                // write outside the block but positioned after it cannot.
+                let outer_write = writes.iter().any(|(w, _)| {
+                    !blocks_around.iter().any(|&b| contains(b, *w))
+                        && (operand.is_none() || loopy || w.1 <= kill_span.0)
+                });
                 if params.iter().any(|p| p == root) || !outer_write {
                     Reach::UNTYPED
                 } else {
@@ -416,7 +487,7 @@ impl<'i> Typer<'i> {
                 LocalWrite::Plain(v) => self.expr_reach(ast, v, seen),
                 LocalWrite::Op(v) => {
                     let r = self.expr_reach(ast, v, seen);
-                    Reach { untyped: r.untyped, precise: true, opaque: true }
+                    Reach { untyped: r.untyped, precise: true, opaque: true, multi: r.multi }
                 }
                 LocalWrite::Multi(v) => match ast.get(v) {
                     Node::ArrayLit { elements, .. } => {
@@ -703,6 +774,19 @@ impl<'i> Typer<'i> {
 /// only when the argument is BARE untyped (`!precise`) or a member might be
 /// one of those (`opaque` — also any precise value this analysis cannot see
 /// into, the conservative side).
+///
+/// `multi` answers a different question — whether TWO OR MORE distinct precise
+/// values may reach, the shape an unconditional-then-conditional rebind leaves
+/// (`v = 1; v = 2 if c` — issue #146). It is not one of `imprecise_arg?`'s
+/// flags: a `1 | 2` argument is PRECISE, so the strict overload passes run,
+/// but the reference's per-member fold over a `Constant` receiver answers the
+/// UNION of the folds (`"abc"[v]` -> `"b" | "c"`, `1.fdiv(v)` -> `1.0 | 0.5`)
+/// — a carrier no negative rule fires on — never the flat `method_return`
+/// class tier 3 would mint. [`Typer::type_call`] reads `multi` to withhold
+/// that nominal; the Kernel folds do not consult it (the reference joins
+/// THEIR overloads to the conversion class regardless — `Float(v)` fires
+/// `for Float`, `rand(v)` `for Integer`, `String(v)` `for String`, all
+/// oracle-measured).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Reach {
     /// A `Dynamic[Top]` value may reach.
@@ -712,25 +796,36 @@ pub(crate) struct Reach {
     /// A precise value that is not known to be a `rand`-pinning literal may
     /// reach (a Range, the literal `0`, or anything not a literal).
     opaque: bool,
+    /// More than one distinct precise value may reach — a member-wise folded
+    /// receiver call answers a union, not one value (issue #146).
+    pub(crate) multi: bool,
 }
 
 impl Reach {
     /// Nothing reaches (a join's identity, and a revisited recursion node).
-    const NONE: Reach = Reach { untyped: false, precise: false, opaque: false };
+    const NONE: Reach =
+        Reach { untyped: false, precise: false, opaque: false, multi: false };
     /// Only the untyped carrier reaches.
-    const UNTYPED: Reach = Reach { untyped: true, precise: false, opaque: false };
+    const UNTYPED: Reach =
+        Reach { untyped: true, precise: false, opaque: false, multi: false };
     /// A precise literal `rand` would pin on.
-    const LITERAL: Reach = Reach { untyped: false, precise: true, opaque: false };
+    const LITERAL: Reach =
+        Reach { untyped: false, precise: true, opaque: false, multi: false };
     /// A precise value of unknown shape.
-    const OPAQUE: Reach = Reach { untyped: false, precise: true, opaque: true };
+    const OPAQUE: Reach =
+        Reach { untyped: false, precise: true, opaque: true, multi: false };
     /// Anything at all — the decline side of every gate.
-    const UNKNOWN: Reach = Reach { untyped: true, precise: true, opaque: true };
+    const UNKNOWN: Reach =
+        Reach { untyped: true, precise: true, opaque: true, multi: true };
 
     fn join(self, other: Reach) -> Reach {
         Reach {
             untyped: self.untyped || other.untyped,
             precise: self.precise || other.precise,
             opaque: self.opaque || other.opaque,
+            // Two precise sources meeting is exactly what makes the carrier a
+            // union of distinct values rather than one pinned value.
+            multi: self.multi || other.multi || (self.precise && other.precise),
         }
     }
 
@@ -962,6 +1057,156 @@ fn untyped_expr_root(ast: &LoweredAst, id: NodeId, depth: u32) -> Option<Untyped
         }
         Node::Call { receiver: Some(r), .. } => untyped_expr_root(ast, *r, depth - 1),
         _ => None,
+    }
+}
+
+/// The span of the innermost literal block or `->` body enclosing `use_span`
+/// when no scope-recording evaluation reaches that closure — issue #146's
+/// "operand position".
+///
+/// The reference's scope index (`scope_indexer.rb`) records a type
+/// environment per node the statement evaluator ENTERS. A closure sitting in
+/// a position the evaluator only TYPES — an element of an array/hash/range
+/// literal or interpolation, a call's argument or receiver, a `Constant`'s
+/// right-hand side, a multi-assignment or index-write value, a
+/// `return`/`next`/`break` value, a `rescue` modifier — is never entered:
+/// `propagate` fills the unrecorded body with the PARENT scope, and
+/// `closure_scope` floors every name the closure itself binds (parameters,
+/// `;`-locals and body-introduced locals) to `Dynamic[top]`. An in-body write
+/// therefore never reaches a read in that body — `{ a: lambda { |q| q = 1;
+/// Float(q) } }` is reference-silent where the same `lambda` at statement
+/// level fires `for 1.0` — and a closure-bound name never reads the precise
+/// value the entry scope might suggest.
+///
+/// `Some((bearing, boundary))` — the innermost unrecorded closure's node and
+/// the span of the OUTERMOST ancestor whose edge toward it is typed-only —
+/// when the read sits inside such a closure; `None` when the read is inside
+/// no closure at all, or when the closure sits on an evaluate-through edge
+/// all the way up (a statement, a `def`/branch/loop/`begin`/`case` section,
+/// a local/ivar/gvar/`op=` RHS, a `&&`/`||` operand, an evaluated call's own
+/// literal block, a `->` body). Every closure inside `boundary` is unentered
+/// — nested operand positions (`f(g { … })`, `h = [xs.map { … }]`) mark
+/// every ancestor they pass through.
+fn unrecorded_closure(
+    ast: &LoweredAst,
+    use_span: rigor_parse::Span,
+) -> Option<(NodeId, rigor_parse::Span)> {
+    let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
+    let mut inner: Option<(rigor_parse::Span, NodeId)> = None;
+    for (id, n) in ast.iter() {
+        // The CLOSURE's extent is the literal block node (`{ |q| … }`,
+        // parameters included) for a call, the whole `->` node for a lambda —
+        // the reference floors params and `;`-locals the same way it does
+        // body-introduced locals.
+        let extent = match n {
+            Node::Lambda { span, .. } => *span,
+            Node::Call { block_span: Some(b), .. } => *b,
+            _ => continue,
+        };
+        if contains(extent, use_span)
+            && inner.is_none_or(|(c, _)| extent.1 - extent.0 < c.1 - c.0)
+        {
+            inner = Some((extent, id));
+        }
+    }
+    let (_, bearing) = inner?;
+    let bearing_span = ast.get(bearing).span();
+    // The closure is scope-recorded iff EVERY ancestor edge preserves
+    // evaluation; a single typed-only ancestor leaves the whole subtree
+    // unentered (`x = [y = 1, lambda { … }]` threads the write through the
+    // operand walker but still records no scope inside the `lambda`). Keep
+    // the OUTERMOST such ancestor: it is the boundary inside which every
+    // closure is unentered.
+    let mut boundary: Option<rigor_parse::Span> = None;
+    for (id, n) in ast.iter() {
+        let span = n.span();
+        if id == bearing || !contains(span, bearing_span) || edge_evaluates(ast, id, bearing_span)
+        {
+            continue;
+        }
+        if boundary.is_none_or(|b| span.1 - span.0 > b.1 - b.0) {
+            boundary = Some(span);
+        }
+    }
+    boundary.map(|b| (bearing, b))
+}
+
+/// Whether `name` is bound by a literal block / `->` that contains `span`
+/// but NOT `use_span` — a parameter, `;`-local or body-introduced local
+/// (Prism's `BlockNode#locals`, which a captured outer local never joins).
+/// A write to it rebinds THAT closure's scope only, so it cannot reach a
+/// read outside the block: `xs.each { |x| x = 1 }` leaves a top-level `x`
+/// untouched, and `x` inside one `lambda`'s body is a different variable
+/// from `x` inside a sibling's. The write-collectors of [`Typer::local_reach`]
+/// skip such writes, the cross-closure bleed that otherwise minted a precise
+/// value for a name the reference reads as `Dynamic[top]`.
+fn closure_bound_elsewhere(
+    ast: &LoweredAst,
+    span: rigor_parse::Span,
+    name: &str,
+    use_span: rigor_parse::Span,
+) -> bool {
+    let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
+    ast.iter().any(|(_, n)| {
+        let (extent, locals) = match n {
+            Node::Lambda { span: s, locals, .. } => (*s, locals),
+            Node::Call { block_span: Some(b), block_locals, .. } => (*b, block_locals),
+            _ => return false,
+        };
+        contains(extent, span) && !contains(extent, use_span) && locals.iter().any(|l| l == name)
+    })
+}
+
+/// Whether `child_span`'s subtree is reached by a scope-recording evaluation
+/// when `parent` itself is ([`unrecorded_closure`]): the edge classes the
+/// reference's statement evaluator threads scopes through — anything else
+/// types, defers or discards its operand.
+fn edge_evaluates(ast: &LoweredAst, parent: NodeId, child_span: rigor_parse::Span) -> bool {
+    let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
+    match ast.get(parent) {
+        // An evaluated call enters its LITERAL block
+        // (`evaluate_block_if_present`); its receiver, arguments and `&expr`
+        // block-pass are operands (`thread_operand`).
+        Node::Call { block_span, .. } => block_span.is_some_and(|b| contains(b, child_span)),
+        // `eval_lambda` sub-evals the `->` body — but not its parameter
+        // defaults, which ride the same span boundary; a `def`/class/module
+        // evaluates its body (and only its body — never a parameter default).
+        Node::Lambda { body, .. }
+        | Node::Definition { body, .. }
+        | Node::ClassDef { body, .. }
+        | Node::ModuleDef { body, .. } => {
+            body.iter().any(|&b| contains(ast.get(b).span(), child_span))
+        }
+        // Only a real statement sequence evaluates its children: the
+        // `Recovered` carrier (`rescue` modifier, splat, `super`/`yield`),
+        // the `Inert` one (`defined?`, `BEGIN`/`END`, `super`/`yield`
+        // arguments) and the `Jump` one (`next e` / `break e` values —
+        // `jump_scope` evaluates them but deliberately records no per-node
+        // scope) do not.
+        Node::Statements { kind, .. } => matches!(kind, StatementsKind::Sequence),
+        // Every child edge of these preserves evaluation: a statement's own
+        // sections, a predicate, and the value side of the writes that
+        // sub-eval their RHS (`x =`, `x op=`, `@x =`, `$x =` — all measured
+        // firing `for 1.0` where the ConstantRHS / multi-write / index-write
+        // spellings are silent).
+        Node::Program { .. }
+        | Node::If { .. }
+        | Node::Case { .. }
+        | Node::When { .. }
+        | Node::Loop { .. }
+        | Node::BeginRescue { .. }
+        | Node::Logical { .. }
+        | Node::LocalVariableWrite { .. }
+        | Node::LocalVariableOpWrite { .. }
+        | Node::VariableWrite { .. }
+        | Node::InstanceVariableWrite { .. } => true,
+        // Everything else types, defers or discards the operand instead of
+        // recording a scope: `ConstantWrite` (`X = lambda { … }` is silent —
+        // `eval_constant_write` uses `type_of`), `MultiWrite` and `IndexWrite`
+        // (measured silent), `ArrayLit`/`HashLit`/`Range`/`Interpolated*`
+        // (value containers — `eval_value_container` types them), `Return`,
+        // `Other`, `Alias`, `UnmodeledWrite` and the read/literal leaves.
+        _ => false,
     }
 }
 
