@@ -382,6 +382,7 @@ impl<'i> Typer<'i> {
                 indices,
                 value,
                 span,
+                ..
             } => {
                 let (receiver, indices, value, wspan) =
                     (*receiver, indices.clone(), *value, *span);

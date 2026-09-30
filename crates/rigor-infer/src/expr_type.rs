@@ -3,7 +3,7 @@
 //! and hash-shape projection folds, implicit-self calls, and the shape-key and
 //! literal-set helpers they share.
 
-use rigor_parse::{LoweredAst, Node, NodeId};
+use rigor_parse::{IndexCompound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 use crate::{kernel_fold, ConstLit, TypeEnv, Typer};
@@ -432,6 +432,26 @@ impl<'i> Typer<'i> {
                     None => else_ty,
                 }
             }
+            // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` evaluate to the value
+            // they STORE — `index_write_stored_type` (statement_evaluator.rb:828):
+            // `||=` → `narrow_truthy(h[k]) | v`, `&&=` → `narrow_falsey(h[k]) |
+            // v`. `op=` would be the dispatched `h[k] op v`; this slice declines
+            // it (`Dynamic[top]` — the stored-type path only ever produces a
+            // witnessable constant from `||=`/`&&=` anyway). Only an
+            // `operand`-flagged write keeps a value — a joined-position write
+            // lowered for its `[]=` widening alone types `Dynamic[top]`.
+            Node::IndexWrite {
+                receiver: Some(r),
+                indices,
+                value,
+                compound,
+                operand: true,
+                ..
+            } => {
+                let (r, indices, value, compound) =
+                    (*r, indices.clone(), *value, compound.clone());
+                self.index_write_value_type(ast, r, &indices, value, &compound, env, interner)
+            }
             // Any other carrier (`@ivar`, constant, `self`, index, range,
             // logical, variable read) is not precisely typed in this slice ->
             // Dynamic[top] (never guess; keeps the call rule silent). Implicit-
@@ -440,6 +460,183 @@ impl<'i> Typer<'i> {
             // container-element typing.
             _ => interner.untyped(),
         }
+    }
+
+    /// The value a compound index write stores (`index_write_stored_type`,
+    /// `statement_evaluator.rb:828`): `union(narrow_truthy(current), rhs)` for
+    /// `||=`, `union(narrow_falsey(current), rhs)` for `&&=` — `current`
+    /// being the `receiver[k]` read, which itself consults the recorded
+    /// indexed narrowing through `type_call`'s `[]` interception
+    /// (`index_read_type` does the same). The `op=` form declines —
+    /// dispatching `h[k] op v` here is the reference's `MethodDispatcher`
+    /// tier this slice does not carry.
+    #[allow(clippy::too_many_arguments)]
+    fn index_write_value_type(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        indices: &[NodeId],
+        value: NodeId,
+        compound: &IndexCompound,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let current = self.type_call(ast, receiver, "[]", indices, env, interner);
+        let rhs = self.type_of(ast, value, env, interner);
+        match compound {
+            IndexCompound::Or => {
+                let truthy = self.narrow_truthy(current, interner);
+                rigor_types::Algebra::join(interner, truthy, rhs)
+            }
+            IndexCompound::And => {
+                let falsey = self.narrow_falsey(current, interner);
+                rigor_types::Algebra::join(interner, falsey, rhs)
+            }
+            IndexCompound::Op(_) => interner.untyped(),
+        }
+    }
+
+    /// `index_write_stored_type` for a recorded `h[k] ||= v`
+    /// (`statement_evaluator.rb:828`): `union(narrow_truthy(current), rhs)`
+    /// where `current` is the `index_read_type` — the `[]` dispatch, which
+    /// consults the recorded narrowing ahead of the receiver binding
+    /// (statement_evaluator.rb:871). `None` declines the record: a receiver
+    /// holding `Dynamic`/`Top` (`fully_tracked_receiver_type?`, upstream
+    /// issue #544) could carry a caller-supplied slot value `||=` keeps, so
+    /// the recorded default would invent a fact.
+    pub(crate) fn slot_stored_type(
+        &self,
+        ast: &LoweredAst,
+        w: &crate::flow_writes::SlotWrite,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let pre = env.get(w.name.as_str())?;
+        if !self.fully_tracked_type(*pre, interner) {
+            return None;
+        }
+        let current = self.type_call(ast, w.receiver, "[]", &[w.key_node], env, interner);
+        let rhs = self.type_of(ast, w.value, env, interner);
+        let truthy = self.narrow_truthy(current, interner);
+        Some(rigor_types::Algebra::join(interner, truthy, rhs))
+    }
+
+    /// `IndexedNarrowing.fully_tracked_receiver_type?`
+    /// (indexed_narrowing.rb:92): a `Dynamic`/`Top` constituent means the
+    /// collection can hold a caller-supplied slot value `||=` keeps.
+    fn fully_tracked_type(&self, ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Dynamic(_) | Type::Top => false,
+            Type::Union(members) => members
+                .iter()
+                .all(|&m| self.fully_tracked_type(m, interner)),
+            _ => true,
+        }
+    }
+
+    /// `IndexedNarrowing.string_slot_floor` (indexed_narrowing.rb:184): a
+    /// String mutator `widen_for_mutator` declines on an all-String slot
+    /// still leaves the same object in it — the record is kept, floored to
+    /// `String`.
+    pub(crate) fn string_slot_floor(
+        &self,
+        recorded: TypeId,
+        method: &str,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        if !crate::STRING_MUTATORS.contains(&method) {
+            return None;
+        }
+        let members: Vec<TypeId> = match interner.get(recorded) {
+            Type::Union(m) => m.clone(),
+            _ => vec![recorded],
+        };
+        if members
+            .iter()
+            .all(|&m| self.index.class_name_of(interner, m) == Some("String"))
+        {
+            Some(self.nominal_or_untyped("String", interner))
+        } else {
+            None
+        }
+    }
+
+    /// `Narrowing.narrow_truthy` (`narrowing.rb:73`): the truthy fragment —
+    /// `nil`/`false` constants and `NilClass`/`FalseClass` nominals collapse
+    /// to `Bot`; a union maps memberwise; every other carrier passes
+    /// through unchanged.
+    pub(crate) fn narrow_truthy(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+        match interner.get(ty) {
+            Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => {
+                interner.intern(Type::Bottom)
+            }
+            Type::Union(members) => {
+                let members = members.clone();
+                self.union_members(
+                    members
+                        .iter()
+                        .map(|&m| self.narrow_truthy(m, interner))
+                        .collect(),
+                    interner,
+                )
+            }
+            Type::Nominal { class, .. }
+                if matches!(
+                    self.index.class_name_for_id(*class),
+                    Some("NilClass" | "FalseClass")
+                ) =>
+            {
+                interner.intern(Type::Bottom)
+            }
+            _ => ty,
+        }
+    }
+
+    /// `Narrowing.narrow_falsey` (`narrowing.rb:88`): the falsey fragment —
+    /// `nil`/`false` constants and `NilClass`/`FalseClass` nominals pass
+    /// through; `Singleton`/`Tuple`/`HashShape` and every other constant or
+    /// nominal collapses to `Bot`; `Dynamic`/`Top`/`Bot` stay.
+    pub(crate) fn narrow_falsey(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+        match interner.get(ty) {
+            Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => ty,
+            Type::Constant(_) => interner.intern(Type::Bottom),
+            Type::Nominal { class, .. } => {
+                if matches!(
+                    self.index.class_name_for_id(*class),
+                    Some("NilClass" | "FalseClass")
+                ) {
+                    ty
+                } else {
+                    interner.intern(Type::Bottom)
+                }
+            }
+            Type::Union(members) => {
+                let members = members.clone();
+                self.union_members(
+                    members
+                        .iter()
+                        .map(|&m| self.narrow_falsey(m, interner))
+                        .collect(),
+                    interner,
+                )
+            }
+            Type::Singleton(_) | Type::Tuple(_) | Type::HashShape(_) => {
+                interner.intern(Type::Bottom)
+            }
+            _ => ty,
+        }
+    }
+
+    /// `Type::Combinator.union` over a member list — `Bot` folds away
+    /// through `Algebra::join`.
+    fn union_members(&self, members: Vec<TypeId>, interner: &mut Interner) -> TypeId {
+        let mut it = members.into_iter();
+        let Some(first) = it.next() else {
+            return interner.intern(Type::Bottom);
+        };
+        it.fold(first, |acc, m| {
+            rigor_types::Algebra::join(interner, acc, m)
+        })
     }
 
     /// The value a branch body evaluates to (reference `statements_or_nil`): its
@@ -498,6 +695,26 @@ impl<'i> Typer<'i> {
             | Node::ConstantWrite { value, .. } => {
                 let value = *value;
                 self.type_of(ast, value, env, interner)
+            }
+            // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` evaluate to the value
+            // they STORE — `index_write_stored_type` (statement_evaluator.rb:828):
+            // `||=` → `narrow_truthy(h[k]) | v`, `&&=` → `narrow_falsey(h[k]) |
+            // v`, `op=` → the dispatched `h[k] op v` (declined here — `op=`
+            // never reaches a witnessable constant in this slice). Only an
+            // `operand`-flagged write keeps a value: a joined-position write
+            // lowered for its `[]=` widening alone has no meaningful
+            // expression type either (`Dynamic[top]`, the `_` arm's answer).
+            Node::IndexWrite {
+                receiver: Some(r),
+                indices,
+                value,
+                compound,
+                operand: true,
+                ..
+            } => {
+                let (r, indices, value, compound) =
+                    (*r, indices.clone(), *value, compound.clone());
+                self.index_write_value_type(ast, r, &indices, value, &compound, env, interner)
             }
             _ => self.type_of(ast, id, env, interner),
         }

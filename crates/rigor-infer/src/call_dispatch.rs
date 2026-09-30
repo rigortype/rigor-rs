@@ -101,6 +101,25 @@ impl<'i> Typer<'i> {
 
         let recv_ty = self.type_of(ast, receiver, env, interner);
 
+        // Indexed stored-slot narrowing (rigor-rs#325): a `h[k]` read with a
+        // stable `(local, literal key)` address answers the record an
+        // `operand`-flagged `h[k] ||= v` left (`eval_index_or_write` →
+        // `Scope#with_indexed_narrowing`), ahead of the `[]` dispatch — the
+        // reference's `indexed_narrowing_for` "sits ahead of
+        // MethodDispatcher.dispatch so the standard `Hash#[]` answer does
+        // not override the narrowing" (expression_typer.rb:1394).
+        if method == "[]" && args.len() == 1 {
+            if let Node::LocalVariableRead { name, .. } = ast.get(receiver) {
+                if let Some(key) = crate::stable_index_key(ast.get(args[0])) {
+                    if let Some(&recorded) =
+                        env.get(&crate::indexed_narrowing_key(name, &key))
+                    {
+                        return recorded;
+                    }
+                }
+            }
+        }
+
         // C3a Part B: `Module#name` / `Class#name` / `#to_s` on a CLASS OBJECT
         // (`Singleton` receiver) returns the class name as a `String`. This is a
         // real (core-RBS) `Singleton` — from the `ConstantRead` arm's zero-FP gate

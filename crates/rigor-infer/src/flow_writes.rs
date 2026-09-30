@@ -6,8 +6,8 @@
 
 use std::collections::HashSet;
 
-use rigor_parse::{LoweredAst, Node, NodeId};
-use rigor_types::Interner;
+use rigor_parse::{IndexCompound, LoweredAst, Node, NodeId};
+use rigor_types::{Interner, ShapeKey};
 
 use crate::{SourceIndex, TypeEnv};
 
@@ -400,7 +400,7 @@ fn toplevel_scope_filters(
 /// Every in-place mutation of a TOP-LEVEL local — a `local.<mutator>(…)` call
 /// with a bare `LocalVariableRead` receiver, plus the `[]=` store an `h[k]`
 /// index target performs in a `MultiWrite`, `for` index or `rescue` reference
-/// (rigor-rs#134) — as `(call span, name, method)`, subject to the same
+/// (rigor-rs#134) — as `(call span, name, method, drop_key)`, subject to the same
 /// def/class/module and block-binding filters as
 /// [`toplevel_rebinds`]. [`crate::flow_eval::Typer::build_toplevel_check_env`]
 /// widens these statements: a mutator call rewrites the literal carrier the
@@ -413,22 +413,42 @@ fn toplevel_scope_filters(
 /// the call — mint the nominal) or conditionally (inside a branch, block or
 /// value position — it widens to `Dynamic`, handing the convergence question
 /// to the collection-shape pass).
-pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String, String)> {
+/// The tuple is `(call span, receiver name, method, drop_key)`:
+/// `drop_key` is the literal index of a `local[key] = v` `[]=` — the one
+/// call that invalidates a single `(local, key)` indexed narrowing
+/// (`IndexedNarrowing.invalidate_indexed_write`, rigor-rs#325). `None`
+/// everywhere else — a compound index write or index-target `[]=` does NOT
+/// invalidate the record (the reference only drops inside
+/// `invalidate_after_call`, which sees real `[]=` `CallNode`s), and a
+/// non-`[]=` mutator drops every record rooted at the receiver.
+pub(crate) fn toplevel_mutations(
+    ast: &LoweredAst,
+) -> Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)> {
     let (scopes, shadow_scopes) = toplevel_scope_filters(ast);
-    let mut out: Vec<(NodeId, rigor_parse::Span, String, String)> = Vec::new();
+    let mut out: Vec<(NodeId, rigor_parse::Span, String, String, Option<ShapeKey>)> = Vec::new();
     for (id, n) in ast.iter() {
         match n {
             Node::Call {
                 receiver: Some(r),
                 method,
+                args,
                 span,
                 ..
             } => {
-                if !MUTATOR_METHODS.contains(&method.as_str()) {
+                // `IndexedNarrowing.mutator?` reads the whole SHAPE_MUTATORS
+                // table — the HashLookupMutation names (`default=` …)
+                // included: they never change a binding here, but they DO
+                // drop indexed narrowings rooted at the receiver.
+                if !is_shape_mutator(method) {
                     continue;
                 }
                 if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
-                    out.push((id, *span, name.clone(), method.clone()));
+                    let drop_key = if method == "[]=" {
+                        args.first().and_then(|&a| stable_index_key(ast.get(a)))
+                    } else {
+                        None
+                    };
+                    out.push((id, *span, name.clone(), method.clone(), drop_key));
                 }
             }
             // An `h[k]` index target is a `[]=` call whose call node Prism
@@ -440,18 +460,18 @@ pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, St
             // still mint the unconditional carrier by widening that span.
             Node::MultiWrite { targets, .. } => {
                 for (name, tspan) in targets.index_writes() {
-                    out.push((id, tspan, name, "[]=".to_string()));
+                    out.push((id, tspan, name, "[]=".to_string(), None));
                 }
             }
             Node::Loop { index_writes, .. } => {
                 for (name, tspan) in index_writes {
-                    out.push((id, *tspan, name.clone(), "[]=".to_string()));
+                    out.push((id, *tspan, name.clone(), "[]=".to_string(), None));
                 }
             }
             Node::BeginRescue { clauses, .. } => {
                 for c in clauses {
                     for (name, tspan) in &c.index_writes {
-                        out.push((id, *tspan, name.clone(), "[]=".to_string()));
+                        out.push((id, *tspan, name.clone(), "[]=".to_string(), None));
                     }
                 }
             }
@@ -461,6 +481,9 @@ pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, St
         // `IndexWriteWidening` (`index_write_widening.rb`, upstream #560)
         // routes all three into `widen_for_mutator` with method `[]=`,
         // widening the bare-local receiver's carrier exactly as `h[k] = v`.
+        // `drop_key` stays `None`: `eval_index_write` /
+        // `eval_index_or_write` do not run `invalidate_after_call`, so an
+        // earlier `h[k]` record survives the compound write.
         if let Node::IndexWrite {
             receiver: Some(r),
             span,
@@ -468,18 +491,20 @@ pub(crate) fn toplevel_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, St
         } = n
         {
             if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
-                out.push((id, *span, name.clone(), "[]=".to_string()));
+                out.push((id, *span, name.clone(), "[]=".to_string(), None));
             }
         }
     }
-    out.retain(|(id, w, name, _)| {
+    out.retain(|(id, w, name, ..)| {
         !ast.in_inert_carrier(*w)
             && !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
             && !shadow_scopes.iter().any(|(descendants, bound)| {
                 descendants.contains(id) && bound.contains(name)
             })
     });
-    out.into_iter().map(|(_, s, n, m)| (s, n, m)).collect()
+    out.into_iter()
+        .map(|(_, s, n, m, k)| (s, n, m, k))
+        .collect()
 }
 
 /// Every literal block/lambda SHADOW scope — `(structural body descendants,
@@ -794,4 +819,222 @@ pub(crate) fn join_flow_envs(a: &TypeEnv, b: &TypeEnv, interner: &mut Interner) 
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Indexed stored-slot narrowing (rigor-rs#325) — the port of the reference's
+// `IndexedNarrowing` side table (`indexed_narrowing.rb` +
+// `Scope#with_indexed_narrowing`). A `h[k] ||= v` that evaluated inline
+// records `h[k] -> narrow_truthy(h[k]) | v`; a later `h[k]` reads it.
+// The record lives in the flat `TypeEnv` under a synthetic key that can
+// never collide with a local name, so env joins intersect it away for
+// free and rebind/mutator invalidation is an env edit.
+// ---------------------------------------------------------------------------
+
+/// The env key an `(h, k)` indexed narrowing is recorded under —
+/// `h\u{1f}Sym("a")` shaped. `\u{1f}` can never appear in a Ruby local
+/// name, so a record can never collide with a real binding, and
+/// `join_flow_envs` treats it like any disagreement: two branches whose
+/// records differ widen the key to `Dynamic` — which is exactly the
+/// "no narrowing survives the join" answer (`eval_index_or_write`'s
+/// record is post-scope state that joins away when the other side lacks
+/// it, rigor-rs#325).
+pub fn indexed_narrowing_key(name: &str, key: &ShapeKey) -> String {
+    format!("{name}\u{1f}{key:?}")
+}
+
+/// Drop every indexed narrowing rooted at `name` — the reference's
+/// `Scope#without_indexed_narrowings_for`: a rebind of `name` or a
+/// shape-mutator call on it invalidates all of its slot records.
+pub fn drop_indexed_narrowings(env: &mut TypeEnv, name: &str) {
+    let prefix = format!("{name}\u{1f}");
+    env.retain(|k, _| !k.starts_with(prefix.as_str()));
+}
+
+/// `IndexedNarrowing.stable_key` (`indexed_narrowing.rb:63`): the literal
+/// `ShapeKey` an index argument names — Symbol / String / Integer literals
+/// only (`STABLE_KEY_NODES`); a variable, splat or interpolated key
+/// declines.
+pub(crate) fn stable_index_key(node: &Node) -> Option<ShapeKey> {
+    match node {
+        Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
+        Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
+        Node::IntegerLit {
+            value: Some(v), ..
+        } => Some(ShapeKey::Int(*v)),
+        _ => None,
+    }
+}
+
+/// `IndexedNarrowing.element_address` (`indexed_narrowing.rb:198`): the
+/// `(receiver_local, literal_key)` address of a single-key element read
+/// `h[k]` — or of a compound index write `h[k] ||= v`, whose stored value
+/// IS that element — bare (parentheses are already unwrapped at lower
+/// time). `None` for any other receiver shape, a missing `[]` argument, a
+/// `h[k] { }` read with a block, or a multi-index form.
+pub(crate) fn element_slot(ast: &LoweredAst, id: NodeId) -> Option<(String, ShapeKey)> {
+    let (receiver, key_node) = match ast.get(id) {
+        Node::Call {
+            receiver: Some(r),
+            method,
+            args,
+            block_body,
+            ..
+        } if method == "[]" && args.len() == 1 && block_body.is_empty() => (*r, args[0]),
+        Node::IndexWrite {
+            receiver: Some(r),
+            indices,
+            ..
+        } if indices.len() == 1 => (*r, indices[0]),
+        _ => return None,
+    };
+    let Node::LocalVariableRead { name, .. } = ast.get(receiver) else {
+        return None;
+    };
+    stable_index_key(ast.get(key_node)).map(|key| (name.clone(), key))
+}
+
+/// A `h[k] ||= v` write that evaluated inline (`operand`): records
+/// `h[k] -> narrow_truthy(h[k]) | v` under [`indexed_narrowing_key`].
+#[derive(Clone, Debug)]
+pub(crate) struct SlotWrite {
+    /// The `IndexWrite` node's id — the scope filters key on it.
+    pub id: NodeId,
+    /// The write's whole span — the same key `mutations` applies it under.
+    pub span: rigor_parse::Span,
+    /// The receiver local (`h`).
+    pub name: String,
+    /// The literal index (`:a`).
+    pub key: ShapeKey,
+    /// The receiver node — `slot_stored_type` reads `receiver[k]` through it
+    /// for the `current` half (`index_read_type`).
+    pub receiver: NodeId,
+    /// The single index node.
+    pub key_node: NodeId,
+    /// The rvalue node.
+    pub value: NodeId,
+}
+
+/// A `h[k].<mutator>` or `h[k][j] = v` call — the reference's
+/// `widen_mutated_slot`: the mutator widens the RECORDED slot's value
+/// (`MutationWidening.widen_for_mutator` + the `string_slot_floor`
+/// fallback), never the receiver binding.
+#[derive(Clone, Debug)]
+pub(crate) struct SlotMutation {
+    /// The call node's id — the scope filters key on it.
+    pub id: NodeId,
+    /// The call's whole span.
+    pub span: rigor_parse::Span,
+    /// The slot's receiver local (`h`).
+    pub name: String,
+    /// The slot's literal key.
+    pub key: ShapeKey,
+    /// The mutator method (`<<`, `[]=`, `strip!`, …).
+    pub method: String,
+}
+
+/// The indexed-narrowing facts one file contributes (rigor-rs#325).
+#[derive(Default)]
+pub(crate) struct IndexedFlow {
+    /// The `h[k] ||= v` records — `eval_index_or_write`'s
+    /// `with_indexed_narrowing` half.
+    pub slot_writes: Vec<SlotWrite>,
+    /// The span of every `operand`-flagged `IndexWrite` — including the
+    /// `slot_writes` — the lenient carrier mint applies to (an evaluated
+    /// `h[k] op= v` mints `h`'s nominal rather than `Dynamic` exactly as
+    /// `eval_index_write` widens the receiver).
+    pub operand_spans: HashSet<rigor_parse::Span>,
+    /// Element-mutator calls on a recorded slot.
+    pub slot_mutations: Vec<SlotMutation>,
+}
+
+/// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s
+/// filters: closure-shadowed receivers drop out structurally, and an
+/// `Inert`-carrier write drops unless it is a scan-visible content
+/// mutation inside an iterated body's scanned operand (rigor-rs#312) —
+/// every indexed write is content-shaped, so `scan_visible` holds for all
+/// of them. `def`/`class`/`module` scope filtering happens at the consumers
+/// (`flow_eval_scope`'s `use_scopes` retain), the same place the write
+/// tables get theirs.
+pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
+    let shadow_scopes = closure_shadow_scopes(ast);
+    let shadowed = |id: NodeId, name: &str| {
+        shadow_scopes
+            .iter()
+            .any(|(descendants, bound)| descendants.contains(&id) && bound.contains(&name.to_string()))
+    };
+    // The same inert-carrier gate `collect_flow_writes` applies to
+    // scan-visible content mutations.
+    let write_dropped = |span: rigor_parse::Span| {
+        ast.in_inert_carrier(span) && !ast.in_scanned_inert_carrier(span)
+    };
+    let mut flow = IndexedFlow::default();
+    for (id, n) in ast.iter() {
+        match n {
+            Node::IndexWrite {
+                receiver: Some(r),
+                indices,
+                value,
+                compound,
+                operand,
+                span,
+            } => {
+                if !*operand {
+                    continue;
+                }
+                if !write_dropped(*span) {
+                    flow.operand_spans.insert(*span);
+                }
+                // `single_index_argument` + `stable_address`: only a
+                // single-literal-key `||=` on a bare local records.
+                if !matches!(compound, IndexCompound::Or)
+                    || indices.len() != 1
+                    || write_dropped(*span)
+                {
+                    continue;
+                }
+                let Node::LocalVariableRead { name, .. } = ast.get(*r) else {
+                    continue;
+                };
+                if shadowed(id, name) {
+                    continue;
+                }
+                if let Some(key) = stable_index_key(ast.get(indices[0])) {
+                    flow.slot_writes.push(SlotWrite {
+                        id,
+                        span: *span,
+                        name: name.clone(),
+                        key,
+                        receiver: *r,
+                        key_node: indices[0],
+                        value: *value,
+                    });
+                }
+            }
+            Node::Call {
+                receiver: Some(r),
+                method,
+                span,
+                ..
+            } if method == "[]=" || is_shape_mutator(method) => {
+                if write_dropped(*span) {
+                    continue;
+                }
+                if let Some((name, key)) = element_slot(ast, *r) {
+                    if shadowed(id, &name) {
+                        continue;
+                    }
+                    flow.slot_mutations.push(SlotMutation {
+                        id,
+                        span: *span,
+                        name,
+                        key,
+                        method: method.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    flow
 }

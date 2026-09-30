@@ -127,6 +127,23 @@ pub enum Node {
         receiver: Option<NodeId>,
         indices: Vec<NodeId>,
         value: NodeId,
+        /// Which compound form this is — `index_write_stored_type` differs:
+        /// `h[k] ||= v` stores `truthy(h[k]) | v`, `h[k] &&= v` stores
+        /// `falsey(h[k]) | v`, `h[k] op= v` stores the dispatched result.
+        compound: IndexCompound,
+        /// `true` when the write lowered in a position that EVALUATES inline
+        /// — straight-line code or a scope-transparent recovery position (a
+        /// splat argument, a `return` operand, a container element). Its
+        /// `[]=` receiver widening then mints the nominal carrier wherever
+        /// the flow's strict `path_unconditional` would decline to `Dynamic`,
+        /// and `compound == Or` additionally records the stored value as the
+        /// `h[k]` indexed narrowing the reference keeps
+        /// (`eval_index_or_write` → `Scope#with_indexed_narrowing`,
+        /// rigor-rs#325). `false` under a joined position — an `if`/`case`
+        /// arm, a `&&`/`||` right operand, a `rescue` scope — where the
+        /// reference's scope join intersects that narrowing away and only
+        /// the receiver widening survives.
+        operand: bool,
         span: Span,
     },
     /// A string literal (`"Hello"`); `value` is the unescaped contents.
@@ -799,6 +816,22 @@ pub enum StatementsKind {
     /// an argument position, not a sequence — so the kind reads like
     /// `Recovered` to every binder.
     Jump(JumpKind),
+}
+
+/// The compound form of a [`Node::IndexWrite`] — the reference's three
+/// `Prism::Index*WriteNode` classes (`statement_evaluator.rb`'s
+/// `eval_index_or_write` / `eval_index_write` split).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum IndexCompound {
+    /// `h[k] ||= v` — stores `narrow_truthy(h[k]) | v` and records it as the
+    /// `(h, k)` indexed narrowing (`eval_index_or_write`).
+    Or,
+    /// `h[k] &&= v` — stores `narrow_falsey(h[k]) | v`; widens only
+    /// (`eval_index_write` — no narrowing record).
+    And,
+    /// `h[k] op= v` — stores the dispatched `h[k] op v` result; widens only.
+    /// Carries the operator name for the stored-type dispatch.
+    Op(String),
 }
 
 /// Which control-flow jump an argument-less [`Node::Other`] or a

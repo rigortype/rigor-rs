@@ -661,7 +661,7 @@ fn closure_bound_writes_are_not_outer_writes() {
     assert_eq!(
         toplevel_mutations(&ast)
             .iter()
-            .map(|(_, n, _)| n.as_str())
+            .map(|(_, n, ..)| n.as_str())
             .collect::<Vec<_>>(),
         ["k"]
     );

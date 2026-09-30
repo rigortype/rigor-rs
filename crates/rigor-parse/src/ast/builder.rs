@@ -9,8 +9,8 @@ use super::{
     direct_method_names, discover_visibilities_and_includes, for_index_writes, lower_multi_targets,
     rescue_reference_index_writes,
     param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
-    span_of, strict_constant_path_string, JumpKind, Node, NodeId, ParamShape, Recovered,
-    RescueClause, ScopeMarks, Span, StatementsKind,
+    span_of, strict_constant_path_string, IndexCompound, JumpKind, Node, NodeId, ParamShape,
+    Recovered, RescueClause, ScopeMarks, Span, StatementsKind,
 };
 
 /// Mutable accumulator for the owned arena during the lowering walk.
@@ -202,25 +202,48 @@ impl<'src> Builder<'src> {
         // `call.wrong-arity` the reference never emits.
         let index_write = node
             .as_index_or_write_node()
-            .map(|w| (w.receiver(), w.arguments(), w.value()))
+            .map(|w| (IndexCompound::Or, w.receiver(), w.arguments(), w.value()))
             .or_else(|| {
                 node.as_index_and_write_node()
-                    .map(|w| (w.receiver(), w.arguments(), w.value()))
+                    .map(|w| (IndexCompound::And, w.receiver(), w.arguments(), w.value()))
             })
             .or_else(|| {
-                node.as_index_operator_write_node()
-                    .map(|w| (w.receiver(), w.arguments(), w.value()))
+                node.as_index_operator_write_node().map(|w| {
+                    (
+                        IndexCompound::Op(
+                            constant_string(w.binary_operator().as_slice()),
+                        ),
+                        w.receiver(),
+                        w.arguments(),
+                        w.value(),
+                    )
+                })
             });
-        if let Some((receiver, arguments, value)) = index_write {
+        if let Some((compound, receiver, arguments, value)) = index_write {
             let receiver = receiver.as_ref().map(|r| self.lower_node(r));
             let indices = arguments
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
             let value = self.lower_node(&value);
+            // `operand`: the write lowered where it EVALUATES inline —
+            // straight-line code or a scope-transparent recovery position
+            // (the collector only `push`es it there now — see
+            // `index_write_transparent` in `recovery.rs`). A joined position
+            // leaves the flag off: the reference's scope join erases the
+            // `h[k] -> stored` narrowing an `||=` would otherwise record
+            // (rigor-rs#325), so the flow machinery treats the write as a
+            // plain conditional `[]=` mutation.
+            let operand = self.recovery_joined == 0
+                && self.recovery_blocked == 0
+                && self.recovery_iterative == 0
+                && self.recovery_next_sink == 0
+                && self.recovery_suppressed == 0;
             return self.push(Node::IndexWrite {
                 receiver,
                 indices,
                 value,
+                compound,
+                operand,
                 span,
             });
         }
