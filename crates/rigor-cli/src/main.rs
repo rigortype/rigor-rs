@@ -214,11 +214,18 @@ fn cmd_check(args: &[String]) -> ExitCode {
     }
     let ruby_cli = ruby_cli.or(no_ruby_flag.then_some(ruby_mode::RubyMode::Off));
 
-    // Load `.rigor.yml` (explicit `--config` path, else cwd auto-discovery).
-    // Config ONLY suppresses/scopes diagnostics; it never changes analysis.
-    // Degrades to default (= inert) on any error, so the differential harness —
-    // which runs from a directory with no `.rigor.yml` — is unaffected.
-    let cfg = Config::load(explicit_config.map(Path::new));
+    // Load `.rigor.yml` (explicit `--config` path, else `.rigor.yml` →
+    // `.rigor.dist.yml` cwd discovery). Config ONLY suppresses/scopes
+    // diagnostics; it never changes analysis. A config the reference's
+    // `Configuration.load` dies on (bad YAML, a non-mapping document, an
+    // `includes:` miss or cycle) is fatal here too — `rigor: <msg>` +
+    // exit 64 (the `rescue ConfigurationError` surface). An absent file
+    // uses the defaults, so the differential harness — which runs from a
+    // directory with no `.rigor.yml` — is unaffected.
+    let cfg = match Config::load(explicit_config.map(Path::new)) {
+        Ok(c) => c,
+        Err(f) => return f.report(),
+    };
 
     // Config audit (reference `warn_unresolved_config`): surface configured
     // values that silently resolve to nothing — a typo'd `signature_paths:` dir
@@ -543,32 +550,17 @@ struct PathError {
 }
 
 /// The config `paths:` in the spelling the reference's `Configuration`
-/// actually stores (`resolve_path_key!`): a DECLARED entry is
-/// `File.expand_path(entry, config_dir)` — an ABSOLUTE string, with `.`/`..`
-/// folded lexically (a cwd `.rigor.yml` expands against the cwd itself).
-/// The absolute spelling is load-bearing upstream, not cosmetic: `exclude:` is
-/// `File.fnmatch?`'d against the expanded file list, so a project-relative
-/// pattern like `lib/ext.rb` NEVER matches a declared `paths:` file there —
-/// a relative spelling would over-exclude and manufacture FPs. The `["lib"]`
-/// DEFAULT is not in the file, so it stays exactly as written
-/// (cwd-relative). `~` is not expanded — the port never resolves it (the
-/// same documented hole as `conformance_gate::signature_entry_ok`).
+/// actually stores (`resolve_path_key!`): a DECLARED entry was
+/// `File.expand_path(entry, config_dir)`'d at load time (issue #158) — an
+/// ABSOLUTE string with `.`/`..` folded lexically (a cwd `.rigor.yml`
+/// expands against the cwd itself). The absolute spelling is load-bearing
+/// upstream, not cosmetic: `exclude:` is `File.fnmatch?`'d against the
+/// expanded file list, so a project-relative pattern like `lib/ext.rb`
+/// NEVER matches a declared `paths:` file there — a relative spelling would
+/// over-exclude and manufacture FPs. The `["lib"]` DEFAULT is not in the
+/// file, so it stays exactly as written (cwd-relative).
 pub(crate) fn effective_config_paths(cfg: &Config) -> Vec<String> {
-    if !cfg.paths_explicitly_declared() {
-        return cfg.paths.clone();
-    }
-    let base = cfg
-        .config_base_dir()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    cfg.paths
-        .iter()
-        .map(|p| {
-            conformance_gate::expand_path(&base.join(p))
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect()
+    cfg.paths.clone()
 }
 
 /// Expand raw `check`/`baseline` path arguments into the concrete `.rb` files
@@ -685,11 +677,14 @@ pub(crate) fn collect_rb_files(dir: &Path, out: &mut Vec<String>) {
     }
 }
 
-/// Prepend bad-path diagnostics to `findings` (ADR-0040): severity is `warning`
-/// (` (skipped)`) when SOME files were found, else `error` — the reference's
-/// "a bad path among valid ones warns; a bad path leaving nothing to do errors,
-/// so a lone typo is not silently masked". Emitted with a synthetic `rule_id`
-/// (rigor-rs's `Diagnostic.rule_id` is non-optional; the reference uses `null`).
+/// Splice bad-path diagnostics into `findings` (ADR-0040): severity is
+/// `warning` (` (skipped)`) when SOME files were found, else `error` — the
+/// reference's "a bad path among valid ones warns; a bad path leaving nothing
+/// to do errors, so a lone typo is not silently masked". Emitted with a
+/// synthetic `rule_id` (rigor-rs's `Diagnostic.rule_id` is non-optional; the
+/// reference uses `null`). They are `expansion.errors` upstream — the LAST of
+/// the run-level rows — so they land after any leading `pre-eval.*` rows
+/// `analyze_files` emitted but still ahead of every per-file finding.
 fn prepend_path_errors(
     findings: &mut Vec<(usize, String, String, Diagnostic)>,
     errors: &[PathError],
@@ -700,7 +695,7 @@ fn prepend_path_errors(
     }
     let severity = if any_files { Severity::Warning } else { Severity::Error };
     let suffix = if any_files { " (skipped)" } else { "" };
-    let mut injected: Vec<(usize, String, String, Diagnostic)> = errors
+    let injected: Vec<(usize, String, String, Diagnostic)> = errors
         .iter()
         .map(|e| {
             let (rule, base): (&'static str, &str) = if e.not_found {
@@ -721,8 +716,13 @@ fn prepend_path_errors(
             (0usize, e.path.clone(), String::new(), diag)
         })
         .collect();
-    injected.append(findings);
-    *findings = injected;
+    let n_run = findings
+        .iter()
+        .take_while(|(_, _, _, d)| d.rule_id.starts_with("pre-eval."))
+        .count();
+    let tail = findings.split_off(n_run);
+    findings.extend(injected);
+    findings.extend(tail);
 }
 
 /// `files`: the expanded `.rb` file list to ANALYZE (one work item per entry,
@@ -1331,6 +1331,70 @@ fn analyze_files(
     // Restore input order (stage-1 panics and stage-3 findings interleave by order).
     findings.sort_by_key(|(order, _, _, _)| *order);
 
+    // ADR-17 slice 1 — `pre-eval.file-not-found`: a run-level `:error` row for
+    // each `pre_eval:` entry that is not a FILE on disk (the reference's
+    // `File.file?` — a directory earns the row too). Run-level, not per-file:
+    // upstream these lead `pre_file_diagnostics` — AHEAD of the
+    // `expansion.errors` rows `prepend_path_errors` splices in (which is why
+    // that fn skips leading `pre-eval.*` entries) — and the `disable:` filter
+    // never reaches them (oracle: `disable: [pre-eval.file-not-found]` leaves
+    // the row standing), while `severity_overrides:` / `severity_profile:`
+    // DO re-stamp them (`SeverityStamp.apply` covers the whole stream). The
+    // `path:` is the literal ".rigor.yml" upstream even under `--config` or a
+    // `.rigor.dist.yml` discovery — the aggregator hard-codes it. Glob-meta
+    // entries (`*`, `?`, `[`) are `Dir.glob`'d into concrete files upstream
+    // (`expand_pre_eval_entries`) and never earn this row, matched or not.
+    if !cfg.pre_eval.is_empty() {
+        // `expand_pre_eval_entries` ends in `.uniq` — a duplicated literal
+        // entry earns ONE row upstream, not one per mention.
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        let mut run_rows: Vec<(usize, String, String, Diagnostic)> = Vec::new();
+        for entry in &cfg.pre_eval {
+            if !seen.insert(entry.as_str())
+                || entry.contains(['*', '?', '['])
+                || std::path::Path::new(entry).is_file()
+            {
+                continue;
+            }
+            let sev = match severity::resolve(
+                "pre-eval.file-not-found",
+                severity::ResolvedSeverity::Error,
+                profile,
+                &user_overrides,
+                &bleeding_overrides,
+            ) {
+                severity::ResolvedSeverity::Off => continue,
+                severity::ResolvedSeverity::Error => Severity::Error,
+                severity::ResolvedSeverity::Warning => Severity::Warning,
+                severity::ResolvedSeverity::Info => Severity::Info,
+            };
+            run_rows.push((
+                0usize,
+                ".rigor.yml".to_string(),
+                String::new(),
+                Diagnostic {
+                    rule_id: "pre-eval.file-not-found",
+                    start_offset: 0,
+                    end_offset: 0,
+                    // `{path.inspect}` upstream — `{:?}` renders the same
+                    // double-quoted string for a path.
+                    message: format!(
+                        "pre_eval entry not found: {entry:?}. \
+                         Pre-evaluation requires the file to exist on disk; \
+                         remove the entry or create the file before \
+                         re-running analysis."
+                    ),
+                    severity: sev,
+                    source_family: "builtin",
+                    receiver_type: None,
+                    method_name: None,
+                },
+            ));
+        }
+        run_rows.append(&mut findings);
+        findings = run_rows;
+    }
+
     // Issue #129 — the `rigor:v1:conforms-to` rows. Run-level, not per-file:
     // the reference appends them AFTER the per-file stream, positioned at the
     // annotation in the project `.rbs`, re-stamped by the severity profile but
@@ -1664,7 +1728,7 @@ fn baseline_analysis(
     roots: &[&str],
     verb: &'static str,
 ) -> Result<(Config, Findings, bool, usize), ExitCode> {
-    let cfg = Config::load(explicit_config.map(Path::new));
+    let cfg = Config::load(explicit_config.map(Path::new)).map_err(|f| f.report())?;
     let sidecar_folder = build_sidecar_folder(&cfg, None)?;
     let folder_ref =
         sidecar_folder.as_ref().map(|f| f as &(dyn rigor_infer::RubyFolder + Sync));
@@ -1871,8 +1935,12 @@ fn write_baseline(
     );
     if cfg.baseline_path().is_none() {
         // The reference names the config file actually read — the explicit
-        // `--config` path when given, else the auto-discovered `.rigor.yml`.
-        let config_label = explicit_config.unwrap_or(".rigor.yml");
+        // `--config` path when given, else `Configuration.discover`'s winner
+        // (`.rigor.yml` before `.rigor.dist.yml`), else the bare name.
+        let config_label = explicit_config.map(str::to_string).or_else(|| {
+            Config::discover().map(|p| p.display().to_string())
+        });
+        let config_label = config_label.as_deref().unwrap_or(".rigor.yml");
         eprintln!(
             "rigor: note — `{config_label}` does not declare `baseline:`; \
              add `baseline: {output}` to activate the suppression."

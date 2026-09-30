@@ -76,7 +76,7 @@ struct ServerContext {
 /// The stdio read/dispatch/respond loop. Reads one JSON-RPC message per line;
 /// responds to requests (those with an `id`), silently accepts notifications.
 fn run_stdio() -> Result<(), String> {
-    let cfg = Config::load(None);
+    let cfg = Config::load(None).map_err(|f| format!("rigor: {}", f.message))?;
     let ctx = ServerContext {
         index: CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new("."))),
         disable: cfg.disable_matcher(),

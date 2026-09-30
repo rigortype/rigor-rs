@@ -126,7 +126,10 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
         }
     }
 
-    let cfg = crate::Config::load(explicit_config.map(std::path::Path::new));
+    let cfg = match crate::Config::load(explicit_config.map(std::path::Path::new)) {
+        Ok(c) => c,
+        Err(f) => return f.report(),
+    };
     let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
     let roots: &[&str] = if paths.is_empty() {

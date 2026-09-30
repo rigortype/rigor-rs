@@ -192,7 +192,10 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
 
     // Paths: positional args, or config `paths:` when none are supplied
     // (reference `@argv.empty? ? configuration.paths : @argv`).
-    let cfg = crate::Config::load(explicit_config.map(Path::new));
+    let cfg = match crate::Config::load(explicit_config.map(Path::new)) {
+        Ok(c) => c,
+        Err(f) => return f.report(),
+    };
     let config_paths: Vec<&str>;
     let raw: &[&str] = if positional.is_empty() {
         config_paths = cfg.paths.iter().map(String::as_str).collect();
@@ -1407,7 +1410,10 @@ fn candidates_json_string(candidates: &[Candidate]) -> String {
 /// (see `docs/notes/20260711-siggen-params-observed-substrate-blocked.md`); this
 /// seam is always the `untyped` param policy.
 pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> String {
-    let cfg = crate::Config::load(explicit_config);
+    let cfg = crate::Config::load(explicit_config).unwrap_or_else(|f| {
+        eprintln!("rigor: {}", f.message);
+        crate::Config::default()
+    });
     let config_paths: Vec<&str>;
     let raw: &[&str] = if raw_paths.is_empty() {
         config_paths = cfg.paths.iter().map(String::as_str).collect();

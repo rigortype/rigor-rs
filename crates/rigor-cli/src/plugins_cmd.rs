@@ -64,7 +64,10 @@ pub fn cmd_plugins(args: &[String]) -> ExitCode {
         }
     }
 
-    let cfg = Config::load(explicit_config.as_deref().map(std::path::Path::new));
+    let cfg = match Config::load(explicit_config.as_deref().map(std::path::Path::new)) {
+        Ok(c) => c,
+        Err(f) => return f.report(),
+    };
     let bundled = rigor_index::plugins::bundled_plugins();
 
     // Label the config truthfully: an explicit `--config` path, an
@@ -73,10 +76,10 @@ pub fn cmd_plugins(args: &[String]) -> ExitCode {
     // (`Config::load` degrades "absent" and "present" to the same value).
     let config_label = match &explicit_config {
         Some(path) => path.clone(),
-        None if std::path::Path::new(".rigor.yml").is_file() => {
-            ".rigor.yml (auto-discovered)".to_string()
-        }
-        None => "none (using defaults)".to_string(),
+        None => match Config::discover() {
+            Some(p) => format!("{} (auto-discovered)", p.display()),
+            None => "none (using defaults)".to_string(),
+        },
     };
 
     println!("Bundled plugin report");

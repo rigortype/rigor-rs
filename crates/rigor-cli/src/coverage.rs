@@ -250,7 +250,10 @@ pub fn cmd_coverage(args: &[String]) -> ExitCode {
 
     // Config drives the fallback `paths:` and the RBS signature environment.
     let config_path = options.config.as_deref().map(Path::new);
-    let cfg = Config::load(config_path);
+    let cfg = match Config::load(config_path) {
+        Ok(c) => c,
+        Err(f) => return f.report(),
+    };
 
     // Resolve paths: explicit args, else config `paths:` (reference
     // `@argv.empty? ? configuration.paths : @argv`).
@@ -406,7 +409,7 @@ pub fn mcp_coverage_json(
     path_args: &[String],
     config: Option<&Path>,
 ) -> Result<String, String> {
-    let cfg = Config::load(config);
+    let cfg = Config::load(config).map_err(|f| format!("rigor: {}", f.message))?;
     let args_for_paths: Vec<String> = if path_args.is_empty() {
         cfg.paths.clone()
     } else {
