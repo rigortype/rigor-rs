@@ -168,20 +168,30 @@ impl MultiTargets {
 /// reads / writes / calls) to `recovered`, so the caller can lower them into
 /// the arena and keep them visible to the structural walks — the old
 /// recovered-children carrier did exactly this.
+/// `joined` is the enclosing scope-join mark ([`Recovered::joined`]): a
+/// multi-write recovered inside a scope-joining construct keeps the mark for
+/// the recoverable children embedded in its targets (rigor-rs#312).
 pub(crate) fn lower_multi_targets<'pr>(
     lefts: &ruby_prism::NodeList<'pr>,
     rest: Option<&PrismNode<'pr>>,
     rights: &ruby_prism::NodeList<'pr>,
     span: Span,
     recovered: &mut Vec<Recovered<'pr>>,
+    joined: bool,
 ) -> MultiTargets {
     MultiTargets {
-        lefts: lefts.iter().map(|t| lower_multi_target(&t, recovered)).collect(),
+        lefts: lefts
+            .iter()
+            .map(|t| lower_multi_target(&t, recovered, joined))
+            .collect(),
         // `rest` is recorded whenever Prism reports one — an anonymous `*` and
         // an implicit rest (`a, = xs`) become `Ignored`, because the reference's
         // `rest_present:` keys on PRESENCE, not on bindability.
-        rest: rest.map(|t| Box::new(lower_multi_target(t, recovered))),
-        rights: rights.iter().map(|t| lower_multi_target(&t, recovered)).collect(),
+        rest: rest.map(|t| Box::new(lower_multi_target(t, recovered, joined))),
+        rights: rights
+            .iter()
+            .map(|t| lower_multi_target(&t, recovered, joined))
+            .collect(),
         span,
     }
 }
@@ -194,6 +204,7 @@ pub(crate) fn lower_multi_targets<'pr>(
 fn lower_multi_target<'pr>(
     node: &PrismNode<'pr>,
     recovered: &mut Vec<Recovered<'pr>>,
+    joined: bool,
 ) -> MultiTarget {
     if let Some(t) = node.as_local_variable_target_node() {
         return MultiTarget::Local {
@@ -208,6 +219,7 @@ fn lower_multi_target<'pr>(
             &t.rights(),
             span_of(&t.location()),
             recovered,
+            joined,
         ));
     }
     if let Some(s) = node.as_splat_node() {
@@ -215,7 +227,7 @@ fn lower_multi_target<'pr>(
         // expression) keeps `Ignored`; an index-target rest (`*h[k]`) keeps
         // its `[]=` store, matching the reference's `bind_rest_target`.
         return match s.expression() {
-            Some(e) => match lower_multi_target(&e, recovered) {
+            Some(e) => match lower_multi_target(&e, recovered, joined) {
                 // A splat's expression is never a nested multi-target in valid
                 // Ruby; guard anyway so the binder's rest slot only ever sees
                 // the shapes the reference's `bind_rest_target` handles.
@@ -230,7 +242,7 @@ fn lower_multi_target<'pr>(
         // keep the receiver's mutated local reads so the owner can widen them
         // (rigor-rs#134). The embedded expressions still lower into `recovered`
         // exactly as before.
-        recovered.extend(collect_recoverable_children(node));
+        recovered.extend(collect_recoverable_children(node, joined));
         return MultiTarget::Index {
             receivers: mutated_local_reads(&t.receiver(), 0),
             span: span_of(&t.location()),
@@ -238,7 +250,7 @@ fn lower_multi_target<'pr>(
     }
     // A non-local target can still EMBED expressions that READ locals or CALL
     // methods (`item[3] = …` reads `item`; `obj.foo, bar = …` calls `obj`).
-    recovered.extend(collect_recoverable_children(node));
+    recovered.extend(collect_recoverable_children(node, joined));
     MultiTarget::Ignored { span: span_of(&node.location()) }
 }
 
@@ -349,6 +361,8 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
             &t.rights(),
             span_of(&t.location()),
             &mut ignored,
+            // `ignored` is dropped — the joined mark on its entries is moot.
+            false,
         );
         return (targets.bound_names(), targets.index_writes());
     }

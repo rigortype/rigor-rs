@@ -32,6 +32,16 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`LoweredAst::closure_bindings`]: crate::ast::LoweredAst::closure_bindings
     pub(crate) closure_bindings: Vec<(NodeId, Vec<String>)>,
+    /// Depth of JOINED recovered children being lowered — the mark
+    /// [`Recovered::joined`] carried into `lower_recovered`. A nested
+    /// recovery run under one (a `Recovered` carrier's own collect, a
+    /// `defined?` operand, a multi-write target's embedded exprs) inherits
+    /// the mark, so a compound index write buried there still lowers to a
+    /// widening `Node::IndexWrite` rather than being descended through
+    /// (rigor-rs#312).
+    ///
+    /// [`Recovered::joined`]: super::Recovered::joined
+    pub(crate) recovery_joined: u32,
 }
 
 impl<'src> Builder<'src> {
@@ -127,6 +137,7 @@ impl<'src> Builder<'src> {
                 &mw.rights(),
                 span_of(&mw.location()),
                 &mut recovered,
+                self.recovery_joined > 0,
             );
             // Lower the expressions embedded in non-local targets so the
             // structural walks keep seeing those reads/calls — the old
@@ -1219,7 +1230,8 @@ impl<'src> Builder<'src> {
             // `DefinedNode` itself: the collector records a `DefinedNode` whole
             // (so a nested one is re-entered here), and handing it its own root
             // would record it forever.
-            let recovered = collect_defined_operand_children(&defined.value());
+            let recovered =
+                collect_defined_operand_children(&defined.value(), self.recovery_joined > 0);
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
@@ -1249,7 +1261,7 @@ impl<'src> Builder<'src> {
             || node.as_forwarding_super_node().is_some()
             || node.as_yield_node().is_some()
         {
-            let recovered = collect_recoverable_children(node);
+            let recovered = collect_recoverable_children(node, self.recovery_joined > 0);
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
@@ -1267,7 +1279,7 @@ impl<'src> Builder<'src> {
         // carrier every other consumer already handles.
         if is_unmodeled_write(node) {
             self.push(Node::UnmodeledWrite { span });
-            let recovered = collect_recoverable_children(node);
+            let recovered = collect_recoverable_children(node, self.recovery_joined > 0);
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
@@ -1292,7 +1304,7 @@ impl<'src> Builder<'src> {
         // each into the arena, linked under a `Statements` carrier (Dynamic-typed;
         // purely a reachability handle). This also keeps a CALL inside such a
         // wrapper reachable for the existing call rules — a strict improvement.
-        let recovered = collect_recoverable_children(node);
+        let recovered = collect_recoverable_children(node, self.recovery_joined > 0);
         if recovered.is_empty() {
             return self.push(Node::Other { span, jump: None });
         }
@@ -1315,8 +1327,10 @@ impl<'src> Builder<'src> {
     fn lower_recovered(&mut self, recovered: Vec<Recovered<'_>>) -> Vec<NodeId> {
         recovered
             .into_iter()
-            .map(|Recovered { node, bound }| {
+            .map(|Recovered { node, bound, joined }| {
+                self.recovery_joined += u32::from(joined);
                 let id = self.lower_node(&node);
+                self.recovery_joined -= u32::from(joined);
                 if !bound.is_empty() {
                     self.closure_bindings.push((id, bound));
                 }

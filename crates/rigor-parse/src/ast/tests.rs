@@ -359,7 +359,106 @@ fn rescue_index_reference_reports_its_receiver_writes() {
     assert_eq!(seen, vec![(None, vec!["h".into()]), (Some("e".into()), vec![])]);
 }
 
-/// rigor-rs#153: the carrier kinds. A real statement list is a sequence;
+/// rigor-rs#312: a compound index write (`h[k] op= v`) under an unhandled
+/// wrapper is recovered WHOLE — lowered to `Node::IndexWrite`, receiver /
+/// indices / value all in the arena — only when it sits in a scope-JOINED
+/// position (a `rescue` arm, an `&&`/`||` right operand, an `if`/`case`
+/// branch, a `begin … rescue`, a crossed closure body). There the reference
+/// keeps the `[]=` widening but the join intersects away its `h[k] -> stored`
+/// slot narrowing (`Scope#join`), so `Node::IndexWrite`'s receiver widening
+/// is the same observable state. In an operand-transparent position
+/// (a splat argument, a `super`/pattern/return operand, an `if`/`case`
+/// predicate, `&&`'s left operand, a bare `begin`) the reference keeps the
+/// narrowing — the walk must instead DESCEND so no `IndexWrite` materialises
+/// and `h` stays un-widened: `puts(*[h[:a] ||= 1]); h[:a].upcase` still
+/// reads the slot's `1`, matching the oracle.
+#[test]
+fn compound_index_write_recovers_whole_only_in_joined_positions() {
+    let index_writes = |src: &[u8]| -> Vec<String> {
+        let ast = lower(&crate::parse(src));
+        ast.iter()
+            .filter_map(|(_, n)| match n {
+                Node::IndexWrite {
+                    receiver: Some(r), ..
+                } => match ast.get(*r) {
+                    Node::LocalVariableRead { name, .. } => Some(name.clone()),
+                    _ => Some("<nonlocal>".to_string()),
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    // Joined positions: the write lowers whole, so its `[]=` mutation can
+    // widen `h` exactly where the oracle's scope join erased the narrowing.
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (h[:a] ||= 1)\n"),
+        ["h"],
+        "rescue-modifier arm"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = (h[:a] ||= 1) rescue nil\n"),
+        ["h"],
+        "rescue-modifier expression"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (h[:a] &&= 1)\n"),
+        ["h"],
+        "IndexAndWriteNode"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (h[:a] += 1)\n"),
+        ["h"],
+        "IndexOperatorWriteNode"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (begin; h[:a] ||= 1; rescue; nil; end)\n"),
+        ["h"],
+        "begin … rescue clause"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (c && (h[:a] ||= 1))\n"),
+        ["h"],
+        "&& right operand"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue -> { h[:a] ||= 1 }\n"),
+        ["h"],
+        "crossed lambda body"
+    );
+    // Nested propagation: the `puts` call is the joined carrier's child and
+    // ITS recovery must still see the splat as joined.
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue puts(*[h[:a] ||= 1])\n"),
+        ["h"],
+        "nested carrier inherits the join"
+    );
+    // Transparent positions: descend — no `IndexWrite`, no widening.
+    for src in [
+        &b"h = {}\nputs(*[h[:a] ||= 1])\n"[..],                       // splat argument
+        &b"h = {}\nx = *[h[:a] ||= 1]\n"[..],                        // splat value
+        &b"h = {}\n@i ||= (h[:a] ||= 1)\n"[..],                      // non-local target operand
+        &b"h = {}\ndefined?(h[:a] ||= 1)\n"[..],                     // never evaluated
+        &b"h = {}\nputs(*[if h[:a] ||= 1 then 1 else 2 end])\n"[..], // if predicate
+        &b"h = {}\nputs(*[(h[:a] ||= 1) && c])\n"[..],               // && left operand
+        &b"h = {}\nputs(*[case h[:a] ||= 1 when 1 then 2 end])\n"[..], // case subject
+        &b"h = {}\nputs(*[h[:a] ||= 1 => Integer])\n"[..],           // => pattern subject
+        &b"h = {}\nputs(*[begin h[:a] ||= 1 end])\n"[..],            // bare begin (no join)
+        // a crossed `def` opens a fresh scope — the write inside mutates an
+        // INNER local and must not widen the same-named outer one.
+        &b"h = {}\nx = foo rescue (def n\n  h[:a] ||= 1\nend)\n"[..],
+    ] {
+        assert_eq!(index_writes(src), Vec::<String>::new(), "{src:?}");
+    }
+    // The transparent descent still keeps the operand READS reachable —
+    // `h` is recovered as a local read in every one of those cases.
+    let reads = |src: &[u8]| -> usize {
+        lower(&crate::parse(src))
+            .iter()
+            .filter(|(_, n)| matches!(n, Node::LocalVariableRead { name, .. } if name == "h"))
+            .count()
+    };
+    assert!(reads(b"h = {}\nputs(*[h[:a] ||= 1])\n") >= 1);
+}
 /// `defined?`, `END`, `BEGIN`, `super` and `yield` are inert; any other
 /// recovery (a `rescue` modifier) is `Recovered`. Every write stays in the
 /// arena for the structural walks.

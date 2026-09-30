@@ -15,6 +15,18 @@ use crate::ruby_prism::{self, Node as PrismNode};
 pub(crate) struct Recovered<'pr> {
     pub(crate) node: PrismNode<'pr>,
     pub(crate) bound: Vec<String>,
+    /// Whether the walk reached this node inside a scope-JOINING
+    /// construct — a `rescue` modifier's arm, an `&&`/`||` right
+    /// operand, an `if`/`case`/`in` arm, a loop body, a
+    /// `begin … rescue`, a crossed block/lambda body. The reference
+    /// merges each such position's post-scope with a sibling scope
+    /// (`eval_rescue_modifier`, `eval_and_or`, `eval_if`, `eval_loop`,
+    /// `eval_begin`), and the join intersects away per-slot facts like
+    /// the `h[k] -> stored` narrowing `eval_index_or_write` records —
+    /// while the write's `[]=` receiver widening still applies. Nested
+    /// recovery during this node's lowering inherits the mark
+    /// (rigor-rs#312).
+    pub(crate) joined: bool,
 }
 
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
@@ -29,8 +41,15 @@ pub(crate) struct Recovered<'pr> {
 /// owned `Definition`) would confuse the dead-assignment nested-unit barrier.
 ///
 /// [`Builder::lower_node`]: crate::ast::Builder::lower_node
-pub(crate) fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<Recovered<'pr>> {
-    collect_recoverable(node, false)
+/// `joined` is the enclosing scope-join mark: `true` when `node` was already
+/// recovered inside a scope-joining construct, so a lowered carrier's nested
+/// recovery does not resurrect a slot narrowing the join had already erased
+/// (rigor-rs#312 — see [`Recovered::joined`]).
+pub(crate) fn collect_recoverable_children<'pr>(
+    node: &PrismNode<'pr>,
+    joined: bool,
+) -> Vec<Recovered<'pr>> {
+    collect_recoverable(node, false, joined)
 }
 
 /// `collect_recoverable_children` with CALLS suppressed — the recovery a
@@ -45,11 +64,18 @@ pub(crate) fn collect_recoverable_children<'pr>(node: &PrismNode<'pr>) -> Vec<Re
 /// measured at the `v0.3.4` pin, and the reason this is a call-suppressing
 /// recovery rather than the leaf it started as. Calls are recursed THROUGH
 /// rather than recorded, so a read in `defined?(foo(y))` still counts.
-pub(crate) fn collect_defined_operand_children<'pr>(node: &PrismNode<'pr>) -> Vec<Recovered<'pr>> {
-    collect_recoverable(node, true)
+pub(crate) fn collect_defined_operand_children<'pr>(
+    node: &PrismNode<'pr>,
+    joined: bool,
+) -> Vec<Recovered<'pr>> {
+    collect_recoverable(node, true, joined)
 }
 
-fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<Recovered<'pr>> {
+fn collect_recoverable<'pr>(
+    node: &PrismNode<'pr>,
+    suppress_calls: bool,
+    joined: bool,
+) -> Vec<Recovered<'pr>> {
     use ruby_prism::Visit;
     struct Collector<'a, 'pr> {
         out: &'a mut Vec<Recovered<'pr>>,
@@ -58,13 +84,36 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
         /// currently inside — a recovered child's closure-shadow set
         /// (rigor-rs#137).
         bound: Vec<String>,
+        /// Depth of scope-JOINING constructs the walk is inside — see
+        /// [`Recovered::joined`]. Seeded by the caller's mark so nested
+        /// recovery under a joined carrier stays joined.
+        joined: u32,
     }
     impl<'pr> Collector<'_, 'pr> {
         fn push(&mut self, node: PrismNode<'pr>) {
             self.out.push(Recovered {
                 node,
                 bound: self.bound.clone(),
+                joined: self.joined > 0,
             });
+        }
+
+        /// Visit `f` with the walk marked inside a scope-joining
+        /// construct: every recoverable node `f` reaches records
+        /// [`Recovered::joined`].
+        fn under_join(&mut self, f: impl FnOnce(&mut Self)) {
+            self.joined += 1;
+            f(self);
+            self.joined -= 1;
+        }
+
+        /// Visit `f` with the join mark cleared: `f` opens a fresh local
+        /// scope, where a compound index write mutates an INNER local and
+        /// the enclosing scope's join semantics no longer apply.
+        fn fresh_scope(&mut self, f: impl FnOnce(&mut Self)) {
+            let saved = std::mem::replace(&mut self.joined, 0);
+            f(self);
+            self.joined = saved;
         }
     }
     // Override each recoverable node type to RECORD it and stop (do not recurse —
@@ -79,6 +128,10 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
         // shadow the enclosing scope for everything under it (rigor-rs#137 —
         // `super { |o| o + 1 }` reads `o` as the parameter, not an outer
         // local). The names accumulate on `self.bound` until the block exits.
+        // The body is also a JOINED position for an outer local's compound
+        // index write: the reference threads the body's result scope into
+        // `block_writebacks`, which widens a mutated receiver without keeping
+        // its slot narrowing (rigor-rs#312).
         fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
             let mark = self.bound.len();
             self.bound.extend(
@@ -86,7 +139,9 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
                     .iter()
                     .map(|name| String::from_utf8_lossy(name.as_slice()).into_owned()),
             );
+            self.joined += 1;
             ruby_prism::visit_block_node(self, node);
+            self.joined -= 1;
             self.bound.truncate(mark);
         }
         fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
@@ -96,7 +151,9 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
                     .iter()
                     .map(|name| String::from_utf8_lossy(name.as_slice()).into_owned()),
             );
+            self.joined += 1;
             ruby_prism::visit_lambda_node(self, node);
+            self.joined -= 1;
             self.bound.truncate(mark);
         }
         fn visit_local_variable_read_node(
@@ -128,6 +185,190 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
             node: &ruby_prism::LocalVariableOrWriteNode<'pr>,
         ) {
             self.push(node.as_node());
+        }
+        // A compound index write (`h[k] ||= v` / `h[k] &&= v` / `h[k] op= v`)
+        // is observably different under the port's shape-recording
+        // `StatementsKind::Recovered` carrier: recording it whole materialises
+        // a `Node::IndexWrite`, and its `[]=` mutation widens the receiver —
+        // the slot then reads the widened binding. Where the reference keeps
+        // the write's `h[k] -> stored` narrowing (every operand-transparent
+        // position — `Scope` join would discard it, but a straight-line
+        // operand never passes through one) it still answers the slot's
+        // constant: `puts(*[h[:a] ||= 1])` fires `call.undefined-method` for
+        // `1` on the oracle. Recording there is unsound, so the walk DESCENDS
+        // instead — the write contributes its operand reads, no widening —
+        // which keeps the stored slot exactly as the kept narrowing leaves
+        // it. Only under a scope-joining construct, where the narrowing dies
+        // at the join while the `[]=` widening survives, is the write
+        // recovered whole (rigor-rs#312).
+        fn visit_index_or_write_node(
+            &mut self,
+            node: &ruby_prism::IndexOrWriteNode<'pr>,
+        ) {
+            if self.joined > 0 {
+                self.push(node.as_node());
+            } else {
+                ruby_prism::visit_index_or_write_node(self, node);
+            }
+        }
+        fn visit_index_and_write_node(
+            &mut self,
+            node: &ruby_prism::IndexAndWriteNode<'pr>,
+        ) {
+            if self.joined > 0 {
+                self.push(node.as_node());
+            } else {
+                ruby_prism::visit_index_and_write_node(self, node);
+            }
+        }
+        fn visit_index_operator_write_node(
+            &mut self,
+            node: &ruby_prism::IndexOperatorWriteNode<'pr>,
+        ) {
+            if self.joined > 0 {
+                self.push(node.as_node());
+            } else {
+                ruby_prism::visit_index_operator_write_node(self, node);
+            }
+        }
+        // Scope-joining constructs crossed under a wrapper — the positions
+        // where the reference threads the joined child's scope through a
+        // join, so a compound index write's slot narrowing is intersected
+        // away while its receiver widening survives. The granularity follows
+        // `statement_evaluator.rb`: `rescue` joins its expression arm with
+        // the rescue arm (`eval_rescue_modifier`); `&&`/`||` join only the
+        // right operand (`eval_and_or` keeps the left's facts — the left's
+        // post-scope feeds the right); an `if`/`unless`/`while`/`until`
+        // predicate and a `case` subject evaluate straight-line (both branch
+        // scopes inherit the predicate's narrowing, so it survives their
+        // join — measured: `x = (if h[:a] ||= 1 …)` and
+        // `x = case (h[:a] ||= 1) …` still fire `for 1`); a `for`
+        // collection evaluates once (the join is over iterations of the
+        // index/body); a `begin`'s body joins only when a rescue clause is
+        // present (`eval_begin`'s `live_rescues.empty?` fast path returns
+        // the primary scope unchanged — measured: `x = begin h[:a] ||= 1
+        // end` fires, `x = begin h[:a] ||= 1 rescue nil end` is silent); a
+        // crossed block/lambda body writes mutated outer locals back through
+        // the `block_writebacks` sink, which drops each slot's narrowing.
+        fn visit_rescue_modifier_node(
+            &mut self,
+            node: &ruby_prism::RescueModifierNode<'pr>,
+        ) {
+            self.under_join(|c| ruby_prism::visit_rescue_modifier_node(c, node));
+        }
+        fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
+            self.visit(&node.left());
+            self.under_join(|c| c.visit(&node.right()));
+        }
+        fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
+            self.visit(&node.left());
+            self.under_join(|c| c.visit(&node.right()));
+        }
+        fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+            self.visit(&node.predicate());
+            self.under_join(|c| {
+                if let Some(statements) = node.statements() {
+                    c.visit(&statements.as_node());
+                }
+                if let Some(subsequent) = node.subsequent() {
+                    c.visit(&subsequent);
+                }
+            });
+        }
+        fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+            self.visit(&node.predicate());
+            self.under_join(|c| {
+                if let Some(statements) = node.statements() {
+                    c.visit(&statements.as_node());
+                }
+                if let Some(else_clause) = node.else_clause() {
+                    c.visit(&else_clause.as_node());
+                }
+            });
+        }
+        fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
+            self.visit(&node.predicate());
+            self.under_join(|c| {
+                if let Some(statements) = node.statements() {
+                    c.visit(&statements.as_node());
+                }
+            });
+        }
+        fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
+            self.visit(&node.predicate());
+            self.under_join(|c| {
+                if let Some(statements) = node.statements() {
+                    c.visit(&statements.as_node());
+                }
+            });
+        }
+        fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
+            self.visit(&node.collection());
+            self.under_join(|c| {
+                c.visit(&node.index());
+                if let Some(statements) = node.statements() {
+                    c.visit(&statements.as_node());
+                }
+            });
+        }
+        fn visit_case_node(&mut self, node: &ruby_prism::CaseNode<'pr>) {
+            if let Some(predicate) = node.predicate() {
+                self.visit(&predicate);
+            }
+            self.under_join(|c| {
+                for condition in node.conditions().iter() {
+                    c.visit(&condition);
+                }
+                if let Some(else_clause) = node.else_clause() {
+                    c.visit(&else_clause.as_node());
+                }
+            });
+        }
+        fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
+            if let Some(predicate) = node.predicate() {
+                self.visit(&predicate);
+            }
+            self.under_join(|c| {
+                for condition in node.conditions().iter() {
+                    c.visit(&condition);
+                }
+                if let Some(else_clause) = node.else_clause() {
+                    c.visit(&else_clause.as_node());
+                }
+            });
+        }
+        fn visit_when_node(&mut self, node: &ruby_prism::WhenNode<'pr>) {
+            self.under_join(|c| ruby_prism::visit_when_node(c, node));
+        }
+        fn visit_in_node(&mut self, node: &ruby_prism::InNode<'pr>) {
+            self.under_join(|c| ruby_prism::visit_in_node(c, node));
+        }
+        fn visit_begin_node(&mut self, node: &ruby_prism::BeginNode<'pr>) {
+            if node.rescue_clause().is_some() {
+                self.under_join(|c| ruby_prism::visit_begin_node(c, node));
+            } else {
+                ruby_prism::visit_begin_node(self, node);
+            }
+        }
+        // `def` / `class` / `module` / `class <<` open a fresh local scope: a
+        // compound index write crossed inside mutates an INNER local, so the
+        // enclosing scope's join mark resets — descending keeps the write's
+        // operand reads reachable without inventing a `Node::IndexWrite` that
+        // would widen a same-named outer local.
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            self.fresh_scope(|c| ruby_prism::visit_def_node(c, node));
+        }
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            self.fresh_scope(|c| ruby_prism::visit_class_node(c, node));
+        }
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.fresh_scope(|c| ruby_prism::visit_module_node(c, node));
+        }
+        fn visit_singleton_class_node(
+            &mut self,
+            node: &ruby_prism::SingletonClassNode<'pr>,
+        ) {
+            self.fresh_scope(|c| ruby_prism::visit_singleton_class_node(c, node));
         }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if self.suppress_calls {
@@ -178,6 +419,7 @@ fn collect_recoverable<'pr>(node: &PrismNode<'pr>, suppress_calls: bool) -> Vec<
         out: &mut out,
         suppress_calls,
         bound: Vec::new(),
+        joined: u32::from(joined),
     };
     // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
     // the unhandled root. The default `visit` dispatches the root to its own
