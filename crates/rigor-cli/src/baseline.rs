@@ -695,6 +695,25 @@ impl RowAcc {
         }
     }
 
+    /// The decoded field value, or `None` when the YAML scalar is null —
+    /// `key:` empty, `~`, `null`/`Null`/`NULL` (plain only; quoted `'~'` is
+    /// the string). Matches `row["k"] or raise` / `if row["message"]`
+    /// upstream, where a YAML nil is absent.
+    fn decoded_nonnull(&self, f: Field) -> Option<String> {
+        let fv = self.field_ref(f)?;
+        let decoded = self.decode(f)?;
+        // Only a PLAIN scalar can be YAML nil; quoted and block scalars are
+        // Strings (`'~'` is the 1-char string, `|` content is literal).
+        if matches!(fv.kind, ScalarKind::Plain)
+            && (decoded.is_empty()
+                || decoded == "~"
+                || decoded.eq_ignore_ascii_case("null"))
+        {
+            return None;
+        }
+        Some(decoded)
+    }
+
     /// Apply a `key: value` fragment — the text after `- ` (a row head, where
     /// a missing colon means the row isn't a mapping at all) or a member line
     /// (where it is malformed YAML the reference's Psych parse would have
@@ -800,10 +819,10 @@ impl RowAcc {
 
     fn into_bucket(self, label: &str) -> Result<Bucket, LoadError> {
         let idx = self.idx;
-        let file = self.decode(Field::File).ok_or_else(|| {
+        let file = self.decoded_nonnull(Field::File).ok_or_else(|| {
             LoadError(format!("{label}: ignored[{idx}] missing `file:`"))
         })?;
-        let rule = self.decode(Field::Rule).ok_or_else(|| {
+        let rule = self.decoded_nonnull(Field::Rule).ok_or_else(|| {
             LoadError(format!("{label}: ignored[{idx}] missing `rule:`"))
         })?;
         // `count.is_a?(Integer) && count.positive?` upstream: a quoted or
@@ -823,7 +842,7 @@ impl RowAcc {
             )));
         }
         let count = count_decoded.parse::<usize>().expect("positive i64 fits usize");
-        Ok(match self.decode(Field::Message) {
+        Ok(match self.decoded_nonnull(Field::Message) {
             Some(m) => {
                 // The reference compiles the row's Regexp at load and raises
                 // LoadError on a bad pattern — dropping the whole baseline —
@@ -1828,5 +1847,24 @@ mod tests {
         assert_eq!(e.0, "t: expected a Hash at top level, got Array");
         let e = Baseline::parse("---\njust a scalar\n", "t").unwrap_err();
         assert_eq!(e.0, "t: expected a Hash at top level, got String");
+    }
+
+    #[test]
+    fn yaml_null_scalars_read_as_absent_not_literal_strings() {
+        // `message: ~`/`message:` is nil upstream → a rule-ID row. Only PLAIN
+        // scalars nil out — `'~'` is the string "~", `|` content is literal.
+        let text = "---\nversion: 1\nignored:\n\
+                    - file: a.rb\n  rule: r\n  message: ~\n  count: 1\n\
+                    - file: b.rb\n  rule: r\n  message: '~'\n  count: 1\n";
+        let b = Baseline::parse(text, "t").unwrap();
+        assert!(b.buckets()[0].message.is_none());
+        assert_eq!(b.buckets()[1].message.as_deref(), Some("~"));
+        // And a null `file`/`rule` is a `missing` error upstream.
+        let e = Baseline::parse(
+            "---\nversion: 1\nignored:\n- file: ~\n  rule: r\n  count: 1\n",
+            "t",
+        )
+        .unwrap_err();
+        assert_eq!(e.0, "t: ignored[0] missing `file:`");
     }
 }
