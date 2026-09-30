@@ -207,8 +207,10 @@ impl Baseline {
 
             // A document that is a bare sequence (`- x` at column 0 outside
             // `ignored:`) loads as an Array upstream, a bare scalar as a
-            // String — both fail `raw.is_a?(Hash)` there.
-            if !in_ignored && (trimmed == "-" || trimmed.starts_with("- ")) {
+            // String — both fail `raw.is_a?(Hash)` there. An INDENTED `- x`
+            // belongs to some other key's nested sequence and is ignored like
+            // its key.
+            if !in_ignored && indent == 0 && (trimmed == "-" || trimmed.starts_with("- ")) {
                 return Err(LoadError(format!("{label}: expected a Hash at top level, got Array")));
             }
 
@@ -235,23 +237,29 @@ impl Baseline {
                         !matches!(kind, ScalarKind::Plain) || value.starts_with('!'),
                     ));
                 } else if let Some(rest) = trimmed.strip_prefix("ignored:") {
-                    in_ignored = true;
-                    // `ignored: []` — an explicit empty array on one line;
-                    // `ignored:` with `null`/`Null`/`NULL`/`~` (or only a
-                    // ` #…` comment — nil) is the reference's `|| []`. A
-                    // quoted or `!tag`d value is a String upstream — like any
-                    // other non-nil inline it fails `rows.is_a?(Array)`.
+                    // `ignored:` bare or comment-only leaves the key's value
+                    // unset — the block sequence below IS the value, so
+                    // `in_ignored` stays open. Any PRESENT inline scalar —
+                    // even a nil one (`~`/`null`/`Null`/`NULL`) — already
+                    // consumed the value, and a following `- …` row is a
+                    // Psych::SyntaxError upstream; closing `in_ignored` lands
+                    // that row on the `expected a Hash …, got Array` error.
+                    // `ignored: []` is an explicit empty array; a quoted or
+                    // `!tag`d value is a String upstream — like any other
+                    // non-nil inline it fails `rows.is_a?(Array)`.
                     let value = rest.trim_start();
                     let (inline, kind) = scalar_head(value);
                     let is_plain =
                         matches!(kind, ScalarKind::Plain) && !value.starts_with('!');
-                    let is_nil = is_plain
-                        && (inline.is_empty()
+                    let is_nil = if is_plain {
+                        inline.is_empty()
                             || inline == "~"
-                            || inline.eq_ignore_ascii_case("null"));
-                    if is_plain && inline == "[]" {
-                        in_ignored = false;
-                    } else if !is_nil {
+                            || inline.eq_ignore_ascii_case("null")
+                    } else {
+                        inline.is_empty() // a bare `!tag` is tagged nil
+                    };
+                    in_ignored = is_plain && inline.is_empty();
+                    if !(is_nil || (is_plain && inline == "[]")) {
                         return Err(LoadError(format!("{label}: `ignored:` must be an Array")));
                     }
                 }
@@ -1909,5 +1917,36 @@ mod tests {
         // A comment mid-value ends a plain scalar there.
         let e = Baseline::parse("---\nversion: 2 # nope\nignored: []\n", "t").unwrap_err();
         assert_eq!(e.0, "t: unsupported `version: 2` (expected 1)");
+    }
+
+    #[test]
+    fn present_inline_scalar_closes_ignored_so_rows_are_rejected() {
+        // Round-2 review blocker: a PRESENT inline scalar (`~`, `null`,
+        // `[]`, quoted) already consumed `ignored:`'s value — a following
+        // block sequence is a Psych::SyntaxError upstream. The port degrades
+        // gracefully (LoadError → baseline dropped, everything surfaces) but
+        // must NEVER parse the rows. A bare `ignored:` or comment-only line
+        // leaves the value unset, and the block sequence below IS the value.
+        for present in ["~", "null", "Null", "NULL", "~ # c", "[]", "'[]'", "!foo"] {
+            let text = format!(
+                "---\nversion: 1\nignored: {present}\n- file: a.rb\n  rule: r\n  count: 5\n"
+            );
+            // `!foo` is tagged nil upstream; `'[]'`/`5`-shaped strings are not
+            // Arrays — error text differs but the outcome must be a LoadError
+            // (never silently accepted rows).
+            assert!(Baseline::parse(&text, "t").is_err(), "ignored: {present} + rows");
+        }
+        // The controls still work: bare `ignored:` and comment-only accept rows.
+        for absent in ["", " # comment"] {
+            let text = format!(
+                "---\nversion: 1\nignored:{absent}\n- file: a.rb\n  rule: r\n  count: 5\n"
+            );
+            assert_eq!(Baseline::parse(&text, "t").unwrap().size(), 1, "ignored:{absent}");
+        }
+        // And a present nil scalar ALONE (no rows) is the reference's `|| []`.
+        for nil in ["~", "null", "Null", "NULL", "~ # c"] {
+            let text = format!("---\nversion: 1\nignored: {nil}\n");
+            assert!(Baseline::parse(&text, "t").unwrap().is_empty(), "ignored: {nil}");
+        }
     }
 }
