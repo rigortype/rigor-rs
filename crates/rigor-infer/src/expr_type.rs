@@ -524,6 +524,7 @@ impl<'i> Typer<'i> {
     /// `IndexedNarrowing.fully_tracked_receiver_type?`
     /// (indexed_narrowing.rb:92): a `Dynamic`/`Top` constituent means the
     /// collection can hold a caller-supplied slot value `||=` keeps.
+    #[allow(clippy::only_used_in_recursion)]
     fn fully_tracked_type(&self, ty: TypeId, interner: &Interner) -> bool {
         match interner.get(ty) {
             Type::Dynamic(_) | Type::Top => false,

@@ -807,6 +807,8 @@ impl<'i> Typer<'i> {
     /// applies it unconditionally at an evaluated operand position — and
     /// records its stored slot (`eval_index_or_write` →
     /// `Scope#with_indexed_narrowing`) through [`Self::apply_mutation_effects`].
+    // too_many_arguments: shared replay context — a bundle struct would obscure.
+    #[allow(clippy::too_many_arguments)]
     fn widen_mutated_locals(
         &self,
         ast: &LoweredAst,
