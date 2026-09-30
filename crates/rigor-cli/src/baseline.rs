@@ -927,7 +927,7 @@ fn scalar_head(value: &str) -> (&str, ScalarKind) {
     let mut v = value;
     // One `!`-tag token then the scalar (`!!str '<<'`, `! 'x'`).
     if v.starts_with('!') {
-        match v[1..].find(|c: char| c == ' ' || c == '\t') {
+        match v[1..].find([' ', '\t']) {
             Some(i) => v = v[1 + i..].trim_start(),
             None => v = "", // a bare tag with no scalar → nil
         }
@@ -1078,7 +1078,7 @@ fn scalar_style(s: &str) -> YamlStyle {
     }
     if let Some(first) = s.chars().next() {
         // Ruby `[:word:]` ≈ `[a-zA-Z0-9_]` plus Unicode alphanumerics.
-        if !(first.is_alphanumeric() || first == '_') && !s.contains('"') {
+        if !(first.is_alphanumeric() || first == '_' || s.contains('"')) {
             return YamlStyle::Double;
         }
     }
