@@ -230,6 +230,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         paren_unwrapped: Vec::new(),
         closure_bindings: Vec::new(),
         recovery_joined: 0,
+        recovery_blocked: 0,
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);

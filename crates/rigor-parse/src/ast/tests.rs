@@ -432,6 +432,31 @@ fn compound_index_write_recovers_whole_only_in_joined_positions() {
         ["h"],
         "nested carrier inherits the join"
     );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (if c then h[:a] ||= 1 else nil end)\n"),
+        ["h"],
+        "if branch join"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (case v; when 1 then h[:a] ||= 1; else nil; end)\n"),
+        ["h"],
+        "case arm join (two live arms)"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (begin; nil; rescue; h[:a] ||= 1; end)\n"),
+        ["h"],
+        "live rescue clause"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (begin; nil; rescue; nil; else h[:a] ||= 1; end)\n"),
+        ["h"],
+        "begin else folds into the primary join"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue (while c; h[:a] ||= 1; end)\n"),
+        ["h"],
+        "loop body"
+    );
     // Transparent positions: descend — no `IndexWrite`, no widening.
     for src in [
         &b"h = {}\nputs(*[h[:a] ||= 1])\n"[..],                       // splat argument
@@ -446,6 +471,48 @@ fn compound_index_write_recovers_whole_only_in_joined_positions() {
         // a crossed `def` opens a fresh scope — the write inside mutates an
         // INNER local and must not widen the same-named outer one.
         &b"h = {}\nx = foo rescue (def n\n  h[:a] ||= 1\nend)\n"[..],
+        // `ensure` threads straight-line onto the joined exit scope — its
+        // effects never pass the join, so the narrowing lives.
+        &b"h = {}\nputs(*[begin; nil; rescue; nil; ensure; h[:a] ||= 1; end])\n"[..],
+        // `when` conditions and `in` patterns/guards are shape-narrowed,
+        // never scope-evaluated — the write inside contributes nothing.
+        &b"h = {}\nputs(*[case v when h[:a] ||= 1 then nil end])\n"[..],
+        &b"h = {}\nputs(*[case v when 1, h[:a] ||= 1 then nil end])\n"[..],
+        &b"h = {}\nx = foo rescue (case v; in x if h[:a] ||= 1 then nil; end)\n"[..],
+        // `super`/`yield`/`BEGIN`/`END` operands never evaluate — the
+        // write's scope effects die entirely.
+        &b"h = {}\nx = foo rescue super(h[:a] ||= 1)\n"[..],
+        &b"h = {}\nx = foo rescue yield(h[:a] ||= 1)\n"[..],
+        &b"h = {}\nx = foo rescue (END { h[:a] ||= 1 })\n"[..],
+        // A multi-write target's embedded exprs are typed without scope
+        // effects — never joined.
+        &b"h = {}\nx = foo rescue (a, b[h[:a] ||= 1] = xs)\n"[..],
+        // A terminating `&&`/`||` right operand's scope is DISCARDED — no
+        // join member ever sees the write.
+        &b"h = {}\nputs(*[c && (h[:a] ||= 1; raise \"e\")])\n"[..],
+        &b"h = {}\nputs(*[c || (h[:a] ||= 1; raise \"e\")])\n"[..],
+        &b"h = {}\nx = foo rescue (c && (h[:a] ||= 1; raise \"e\"))\n"[..],
+        // A terminated then-arm with no else drops its scope (`eval_if`
+        // returns the falsey edge).
+        &b"h = {}\nx = foo rescue (if c then h[:a] ||= 1; raise \"e\" end)\n"[..],
+        // A terminated `case` arm drops its scope; a sole survivor returns
+        // unjoined.
+        &b"h = {}\nx = foo rescue (case v; when 1 then h[:a] ||= 1; raise \"e\"; else nil; end)\n"[..],
+        &b"h = {}\nputs(*[case v; when 1 then raise \"e\"; else h[:a] ||= 1; end])\n"[..],
+        // An exiting rescue-modifier arm keeps the expression scope
+        // unjoined — the write's narrowing survives.
+        &b"h = {}\nx = foo rescue (h[:a] ||= 1; raise \"e\")\n"[..],
+        &b"h = {}\nx = ((h[:a] ||= 1) rescue raise(\"e\"))\n"[..],
+        // `begin…rescue` with every arm terminating keeps the primary scope
+        // unjoined (`live_rescues.empty?`), and a dead arm among live ones
+        // contributes nothing.
+        &b"h = {}\nputs(*[begin; h[:a] ||= 1; rescue; raise \"e\"; end])\n"[..],
+        &b"h = {}\nputs(*[begin; nil; rescue TypeError; h[:a] ||= 1; raise \"e\"; rescue; nil; end])\n"[..],
+        // Constant-folded predicates evaluate only the live branch
+        // (`branch_certainty` / `live_branch_for_if`).
+        &b"h = {}\nputs(*[if true then h[:a] ||= 1 else 2 end])\n"[..],
+        &b"h = {}\nputs(*[if false then 2 else h[:a] ||= 1 end])\n"[..],
+        &b"h = {}\nputs(*[true ? (h[:a] ||= 1) : 2])\n"[..],
     ] {
         assert_eq!(index_writes(src), Vec::<String>::new(), "{src:?}");
     }
