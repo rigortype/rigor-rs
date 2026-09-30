@@ -2182,12 +2182,14 @@ fn apply_baseline(
         eprintln!("rigor: {silenced} diagnostic(s) silenced by baseline {path}");
     }
 
-    // Keep only the surfaced indices, preserving order.
-    let keep: std::collections::HashSet<usize> = surfaced_idx.into_iter().collect();
-    findings
+    // Keep only the surfaced indices IN THE FILTER'S ORDER — the reference
+    // regroups output by (file, rule) bin under a non-empty baseline
+    // (`Baseline#filter` returns the regrouped diagnostics themselves).
+    let mut slots: Vec<Option<(usize, String, String, Diagnostic)>> =
+        findings.into_iter().map(Some).collect();
+    surfaced_idx
         .into_iter()
-        .enumerate()
-        .filter_map(|(i, f)| if keep.contains(&i) { Some(f) } else { None })
+        .map(|i| slots[i].take().expect("baseline filter returns each index at most once"))
         .collect()
 }
 
