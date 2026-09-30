@@ -486,7 +486,7 @@ impl<'i> Typer<'i> {
                 // post-binding scope (rigor-rs#134): it kills a `Narrowed` /
                 // chain fact like a `h.mut!(…)` call (`kill_cenv_narrowed`),
                 // not a rebind's full `kill_local`.
-                for (_, tspan) in targets.index_writes() {
+                for (_, tspan, _) in targets.index_writes() {
                     widen_flow_writes(writes, tspan, tenv, interner);
                     kill_cenv_narrowed(writes, tspan, cenv);
                 }
@@ -951,7 +951,7 @@ impl<'i> Typer<'i> {
                 // An `h[k]` index target MUTATES `h` through `[]=` on the
                 // post-binding scope (rigor-rs#134): kill only the
                 // `Narrowed` / chain facts a mutation drops.
-                for (_, tspan) in targets.index_writes() {
+                for (_, tspan, _) in targets.index_writes() {
                     widen_flow_writes(writes, tspan, tenv, interner);
                     kill_cenv_narrowed(writes, tspan, cenv);
                 }

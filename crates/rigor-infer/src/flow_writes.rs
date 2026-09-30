@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use rigor_parse::{IndexCompound, LoweredAst, Node, NodeId};
+use rigor_parse::{IndexCompound, IndexTargetKey, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, ShapeKey};
 
 use crate::{SourceIndex, TypeEnv};
@@ -117,9 +117,26 @@ pub(crate) fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span,
 /// does — `IndexWriteWidening` / `MutationWidening.widen_receiver_aliases`,
 /// rigor-rs#134). Each entry is keyed by the TARGET's own span: it sits inside
 /// the owning `MultiWrite` / `for` / `rescue` construct, so span-containment
-/// widening in the enclosing flow constructs sees it.
-fn index_target_writes(entries: Vec<(String, rigor_parse::Span)>) -> Vec<(rigor_parse::Span, String)> {
-    entries.into_iter().map(|(name, span)| (span, name)).collect()
+/// widening in the enclosing flow constructs sees it. The stored `drop key`
+/// is the narrowing-invalidation half — [`toplevel_mutations`] consumes it;
+/// this rebind/mutation widening table does not.
+fn index_target_writes(entries: rigor_parse::IndexWrites) -> Vec<(rigor_parse::Span, String)> {
+    entries
+        .into_iter()
+        .map(|(name, span, _)| (span, name))
+        .collect()
+}
+
+/// The [`ShapeKey`] half of a [`rigor_parse::IndexTargetKey`] — the literal
+/// index a `h[k]` index-target `[]=` store addresses, for
+/// [`crate::flow_eval::Typer::drop_indexed_mutation`] to drop exactly that
+/// slot's record (rigor-rs#342).
+fn index_target_drop_key(key: Option<IndexTargetKey>) -> Option<ShapeKey> {
+    key.map(|k| match k {
+        IndexTargetKey::Sym(s) => ShapeKey::Sym(s),
+        IndexTargetKey::Str(s) => ShapeKey::Str(s),
+        IndexTargetKey::Int(i) => ShapeKey::Int(i),
+    })
 }
 
 /// Drop every `(id, _, name)` write that sits inside a closure's shadow scope
@@ -414,13 +431,16 @@ fn toplevel_scope_filters(
 /// value position — it widens to `Dynamic`, handing the convergence question
 /// to the collection-shape pass).
 /// The tuple is `(call span, receiver name, method, drop_key)`:
-/// `drop_key` is the literal index of a `local[key] = v` `[]=` — the one
-/// call that invalidates a single `(local, key)` indexed narrowing
-/// (`IndexedNarrowing.invalidate_indexed_write`, rigor-rs#325). `None`
-/// everywhere else — a compound index write or index-target `[]=` does NOT
-/// invalidate the record (the reference only drops inside
-/// `invalidate_after_call`, which sees real `[]=` `CallNode`s), and a
-/// non-`[]=` mutator drops every record rooted at the receiver.
+/// `drop_key` is the literal index a `[]=` store addresses — a real
+/// `local[key] = v` call OR an `h[k]` index target (`h[k], z = …`,
+/// `for h[k] in xs`, `rescue => h[k]`), both of which the reference routes
+/// through `IndexedNarrowing.invalidate_indexed_write` to drop the one
+/// `(local, key)` record (a `[]=` `CallNode` via `invalidate_after_call`,
+/// rigor-rs#325; an `IndexTargetNode` via `widen_index_target`,
+/// rigor-rs#342). `None` everywhere else — a compound index write does NOT
+/// invalidate the record (`eval_index_write` / `eval_index_or_write` never
+/// run `invalidate_after_call`), and a non-`[]=` mutator drops every record
+/// rooted at the receiver.
 pub(crate) fn toplevel_mutations(
     ast: &LoweredAst,
 ) -> Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)> {
@@ -458,20 +478,43 @@ pub(crate) fn toplevel_mutations(
             // inside the owning construct, so a contained store widens
             // conditionally and `bind_check_statement`'s `MultiWrite` arm can
             // still mint the unconditional carrier by widening that span.
+            // The literal `k` rides `drop_key`: `widen_index_target` runs
+            // `invalidate_indexed_write` on the target exactly as a `[]=`
+            // `CallNode` (rigor-rs#342) — without it the `h[k] ||= v` slot
+            // record survived the overwrite and a later `h[k]` read the
+            // stale narrowing where the oracle reads the stored value.
             Node::MultiWrite { targets, .. } => {
-                for (name, tspan) in targets.index_writes() {
-                    out.push((id, tspan, name, "[]=".to_string(), None));
+                for (name, tspan, key) in targets.index_writes() {
+                    out.push((
+                        id,
+                        tspan,
+                        name,
+                        "[]=".to_string(),
+                        index_target_drop_key(key),
+                    ));
                 }
             }
             Node::Loop { index_writes, .. } => {
-                for (name, tspan) in index_writes {
-                    out.push((id, *tspan, name.clone(), "[]=".to_string(), None));
+                for (name, tspan, key) in index_writes {
+                    out.push((
+                        id,
+                        *tspan,
+                        name.clone(),
+                        "[]=".to_string(),
+                        index_target_drop_key(key.clone()),
+                    ));
                 }
             }
             Node::BeginRescue { clauses, .. } => {
                 for c in clauses {
-                    for (name, tspan) in &c.index_writes {
-                        out.push((id, *tspan, name.clone(), "[]=".to_string(), None));
+                    for (name, tspan, key) in &c.index_writes {
+                        out.push((
+                            id,
+                            *tspan,
+                            name.clone(),
+                            "[]=".to_string(),
+                            index_target_drop_key(key.clone()),
+                        ));
                     }
                 }
             }

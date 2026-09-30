@@ -1535,7 +1535,7 @@ fn is_unmodeled_write(node: &PrismNode<'_>) -> bool {
 
 /// A prism integer's value when it fits `i64`, from its little-endian `u32`
 /// digits; `None` for a Bignum.
-fn integer_value(int: &ruby_prism::Integer<'_>) -> Option<i64> {
+pub(crate) fn integer_value(int: &ruby_prism::Integer<'_>) -> Option<i64> {
     let (negative, digits) = int.to_u32_digits();
     let mut mag: i128 = 0;
     for &d in digits.iter().rev() {

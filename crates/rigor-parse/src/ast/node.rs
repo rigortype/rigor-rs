@@ -34,7 +34,9 @@ pub struct RescueClause {
     /// The `[]=` stores an index-target reference performs — `rescue => h[:e]`
     /// stores the rescued exception through `[]=` on `h`
     /// (`statement_evaluator.rb` `bind_rescue_reference`, rigor-rs#134). Each
-    /// `(receiver local, target span)` widens `h` as `h[:e] = e` does. Empty
+    /// `(receiver local, target span, drop key)` widens `h` as `h[:e] = e`
+    /// does; the drop key is the slot a literal-keyed store invalidates
+    /// (`IndexedNarrowing.invalidate_indexed_write`, rigor-rs#342). Empty
     /// for a non-index reference.
     pub index_writes: IndexWrites,
     pub span: Span,
@@ -520,8 +522,10 @@ pub enum Node {
     /// `index_writes` is the `[]=` half of a `for` index: an index-target index
     /// (`for h[:k] in xs`, `for w, h[:k] in pairs`, `for *h[:k] in xs`) stores
     /// the element through `[]=` on `h` each iteration, so each `(receiver
-    /// local, target span)` widens `h` exactly as `h[k] = v` does
-    /// (`IndexWriteWidening`, rigor-rs#134).
+    /// local, target span, drop key)` widens `h` exactly as `h[k] = v` does
+    /// (`IndexWriteWidening`, rigor-rs#134); the drop key is the slot a
+    /// literal-keyed store invalidates (`IndexedNarrowing.
+    /// invalidate_indexed_write`, rigor-rs#342).
     Loop {
         predicate: Option<NodeId>,
         body: Vec<NodeId>,
