@@ -1065,8 +1065,10 @@ impl<'i> Typer<'i> {
             Type::Union(arms) => {
                 let arms = arms.clone();
                 let mut minted = Vec::with_capacity(arms.len());
+                let mut member_evidence = false;
                 for arm in arms {
                     let members = grown(&Typer::coll_value_members(interner, arm));
+                    member_evidence |= !members.is_empty();
                     if let Some(t) = self.coll_nominal_with(interner, cls, &members) {
                         minted.push(t);
                     }
@@ -1075,7 +1077,17 @@ impl<'i> Typer<'i> {
                 minted.dedup();
                 match minted.as_slice() {
                     [] => None,
-                    [only] => Some(*only),
+                    // Collapse only on MEMBER evidence: arms that all grow to
+                    // an EMPTY member set mint the same bare nominal where the
+                    // reference keeps structurally distinct carriers —
+                    // `widen_tuple([])` is `Array[untyped]`, never the raw
+                    // `Nominal[Array]`, and a `HashShape`'s pinned pairs never
+                    // equal the other edge's added key (the gitlab
+                    // `attributes[:error] = error if error` → `compact!` row
+                    // fires `for Hash` here where the oracle stays silent).
+                    // Keeping the union is the reference's own outcome.
+                    [only] if member_evidence => Some(*only),
+                    [_] => Some(pre_ty),
                     _ => Some(interner.intern(Type::Union(minted))),
                 }
             }
