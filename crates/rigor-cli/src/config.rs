@@ -1275,7 +1275,7 @@ impl<'de> serde::de::Visitor<'de> for DupOkVisitor {
                 "Tried to load unspecified class: {tag}"
             )));
         }
-        Ok(variant.newtype_variant::<DupOk>()?)
+        variant.newtype_variant::<DupOk>()
     }
 }
 
