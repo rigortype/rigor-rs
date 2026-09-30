@@ -255,7 +255,7 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             // `widen_receiver_aliases` with method `[]=` (`index_write_
             // widening.rb`, upstream #560).
             Node::IndexWrite { receiver: Some(r), span, .. } => match ast.get(*r) {
-                Node::LocalVariableRead { name, .. } => vec![(*span, name.clone())],
+                Node::LocalVariableRead { name, .. } => vec![(id, *span, name.clone())],
                 _ => Vec::new(),
             },
             Node::Loop { index, index_writes, .. } => {
