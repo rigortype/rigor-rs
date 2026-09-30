@@ -129,10 +129,13 @@ fn nilable_dispatch_declines_under_a_guarded_parameter() {
         ),
         "Class<0>"
     );
-    // A `case` guard still refuses (recorded, not chased).
+    // A `case` guard's narrowed `Nominal[Integer]` is not a foldable
+    // `Constant` either — the reference's `String | nil` join stands —
+    // and issue #332's `pins_one_constant` gate now sees that (this row's
+    // `Class<0>` used to be a recorded FP).
     assert_eq!(
         ty_of_last_recv_call(b"def f(u)\n  case u\n  when Integer then \"abc\"[u]\n  end\nend\n"),
-        "Class<0>"
+        "Dynamic[top]"
     );
 }
 

@@ -4,7 +4,9 @@
 //! declines — with the definite-assignment and untyped-root helpers behind it.
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
+use rigor_types::Scalar;
 
+use crate::folding;
 use crate::Typer;
 
 impl<'i> Typer<'i> {
@@ -48,9 +50,11 @@ impl<'i> Typer<'i> {
     /// such folds per file. Measured on a synthetic worst case (9000 lines, 4500
     /// `Float`/`Integer`/`Array` calls on bare parameters): 1.48s vs 0.89s user
     /// for the same file with literal arguments, where the `type_of` gate keeps
-    /// the helper from running at all. Real files carry a handful of these, and
-    /// the whole analysis is skipped unless the argument already types
-    /// `Dynamic[top]`. Revisit if a sweep file regresses.
+    /// the helper from running at all. Real files carry a handful of these.
+    /// #332 widened the trigger a little — `arg_reach` also runs on
+    /// nominal-typed arguments of `Constant`-receiver calls and non-bare joins,
+    /// though literal arguments still short-circuit in [`Typer::expr_reach`]
+    /// before any scan. Revisit if a sweep file regresses.
     pub(crate) fn arg_reach(&self, ast: &LoweredAst, arg: NodeId) -> Reach {
         self.expr_reach(ast, arg, &mut Vec::new())
     }
@@ -94,27 +98,129 @@ impl<'i> Typer<'i> {
                 reach
             }
             Node::StringLit { .. }
-            | Node::InterpolatedString { .. }
             | Node::FloatLit { .. }
             | Node::SymbolLit { .. }
-            | Node::InterpolatedSymbol { .. }
             | Node::NilLit { .. }
             | Node::TrueLit { .. }
-            | Node::FalseLit { .. }
+            | Node::FalseLit { .. } => Reach::LITERAL,
+            // Precise literals the reference does NOT carry as `Type::Constant`
+            // — an interpolated string / symbol is its literal-string carrier,
+            // an Array / Hash literal a `Tuple` / `HashShape` — so a
+            // `Constant`-receiver call with one cannot value-fold either
+            // (`"abc"[[1]]` keeps the `String | nil` join, rigor-rs#332).
+            Node::InterpolatedString { .. }
+            | Node::InterpolatedSymbol { .. }
             | Node::ArrayLit { .. }
-            | Node::HashLit { .. } => Reach::LITERAL,
-            // `rand`'s `(?0) -> Float` overload accepts the literal `0`, and a
-            // Range is what its two Range overloads take: either member keeps a
-            // second overload in `rand`'s join (see [`Reach`]).
+            | Node::HashLit { .. } => Reach::PINLESS,
+            // `rand`'s `(?0) -> Float` overload accepts the literal `0`: it
+            // stays `opaque` for `declines_rand`, but `0` is still a
+            // `Type::Constant` on the reference — `"abc"[0]` folds to `"a"`
+            // — so it is `pinned` too.
             Node::IntegerLit { value, .. } => {
                 if *value == Some(0) {
-                    Reach::OPAQUE
+                    Reach::PINNED_OPAQUE
                 } else {
                     Reach::LITERAL
                 }
             }
-            Node::Range { .. } => Reach::OPAQUE,
-            _ => self.chain_reach(ast, id, seen),
+            // A range literal pins to `Constant[Range]` on the reference only
+            // when every endpoint is static — a literal or an expression it
+            // types `Type::Constant` (`static_range_endpoint`). A non-static
+            // endpoint leaves `Nominal[Range]` — still precise, still `opaque`
+            // for `rand`, but no `Constant`-receiver call folds through it:
+            // `"abc"[v..]` keeps `String | nil` (#332).
+            Node::Range { left, right, .. } => Reach {
+                untyped: false,
+                precise: true,
+                opaque: true,
+                multi: false,
+                pinned: [left, right].iter().all(|e| match e {
+                    Some(e) => self.expr_reach(ast, *e, seen).pins_one_constant(),
+                    None => true,
+                }),
+            },
+            _ => {
+                // The reference pins `Type::Constant` whenever every reaching
+                // value folds to ONE scalar — a literal, a call whose operands
+                // pin (`"x".to_i` -> `Constant[0]`, `1 + 1` -> `Constant[2]`
+                // — the `ConstantFolding` whitelist `folding::fold`
+                // implements), or a chain through a pinned local (`w = v + 1`
+                // with `v = 1`, and `v = 1; v = 1 if c`, whose `1 | 1` the
+                // member fold still collapses to `Constant[1]`). That is
+                // [`Typer::expr_scalar`]; a hit here is exactly `pinned`
+                // (rigor-rs#332).
+                if let Some(scalar) = self.expr_scalar(ast, id, seen) {
+                    return pinned_scalar_reach(&scalar);
+                }
+                let mut reach = self.chain_reach(ast, id, seen);
+                // The operands of a call COMPOSE into its result rather than
+                // alternate like branch arms: an untyped or multi-valued
+                // argument makes the reference's type for the call carry that
+                // carrier (`1 + v` is `2 | 3` when `v` is `1 | 2`, #332), while
+                // a precise receiver plus a precise argument still make ONE
+                // value — so the arg folds in by `compose`, not `join`.
+                let mut cur = id;
+                while let Node::Call { receiver, args, .. } = ast.get(cur) {
+                    for &a in args {
+                        reach = reach.compose(self.expr_reach(ast, a, seen));
+                    }
+                    match receiver {
+                        Some(r) => cur = *r,
+                        None => break,
+                    }
+                }
+                reach
+            }
+        }
+    }
+
+    /// The single `Scalar` every value reaching `id` folds to — the foldable
+    /// view of [`Reach::pinned`] (rigor-rs#332). `Some` only when the
+    /// expression is a literal scalar, a call whose operand pins let
+    /// [`folding::fold`] answer a scalar (`"x".upcase`, `1 + v` with `v = 1`),
+    /// or a local whose reaching values all pin to the SAME scalar —
+    /// `v = 1; v = 1 if c` still collapses to `Constant[1]` on the reference,
+    /// which is why the gate is `pin.is_some()`, not `!multi`. `None` is the
+    /// decline side: an unpinned operand, a `fold` miss (`to_i` is not in the
+    /// whitelist), an untyped or imprecise reach.
+    ///
+    /// Shares `seen` with the reach walk — a local's read is keyed exactly as
+    /// [`Typer::root_reach`] keys a `Local` root, so a self-referential write
+    /// (`while c; v = "abc"[v]; end`) terminates on the decline side.
+    fn expr_scalar(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Option<Scalar> {
+        if let Some(scalar) = literal_scalar(ast, id) {
+            return Some(scalar);
+        }
+        match ast.get(id) {
+            Node::LocalVariableRead { name, span } => {
+                let key = format!("{name}@{}", span.0);
+                if seen.contains(&key) || seen.len() >= 4 {
+                    return None;
+                }
+                seen.push(key);
+                let (reach, pin) = self.local_reach(ast, name, *span, seen, false);
+                seen.pop();
+                // `pin` is only worth anything beside a precise reach — every
+                // contributor having folded to the same scalar is meaningless
+                // when `Dynamic[top]` can also reach.
+                if reach.precise && !reach.untyped {
+                    pin
+                } else {
+                    None
+                }
+            }
+            Node::Call { receiver: Some(recv), method, args, .. } => {
+                let recv_scalar = self.expr_scalar(ast, *recv, seen)?;
+                let arg_scalars = args
+                    .iter()
+                    .map(|&a| self.expr_scalar(ast, a, seen))
+                    .collect::<Option<Vec<_>>>()?;
+                if folding::sidecar_blows_up(method, &arg_scalars) {
+                    return None;
+                }
+                folding::fold(&recv_scalar, method, &arg_scalars)
+            }
+            _ => None,
         }
     }
 
@@ -143,6 +249,11 @@ impl<'i> Typer<'i> {
                 precise: reach.precise,
                 opaque: reach.precise,
                 multi: reach.multi,
+                // A call over even a pinned literal is only `pinned` on the
+                // reference when the call itself folds to a `Constant`
+                // (`"x".to_i` -> `Constant[0]`), which this analysis cannot
+                // see — the conservative `false` (rigor-rs#332).
+                pinned: false,
             }
         } else {
             reach
@@ -173,7 +284,7 @@ impl<'i> Typer<'i> {
         }
         seen.push(key);
         let reach = match root {
-            UntypedRoot::Local(name) => self.local_reach(ast, name, use_span, seen, false),
+            UntypedRoot::Local(name) => self.local_reach(ast, name, use_span, seen, false).0,
             UntypedRoot::Ivar(name) => self.ivar_reach(ast, name, use_span, seen),
             UntypedRoot::Cvar(name) => self.cvar_reach(ast, name, use_span, seen),
             UntypedRoot::Gvar(name) => self.gvar_reach(ast, name, seen),
@@ -236,6 +347,15 @@ impl<'i> Typer<'i> {
     /// stepped over, so the caller can ask what reaches the root BEFORE the
     /// guard narrows it ([`Typer::arg_is_guarded_parameter`]); every other guard
     /// shape (`C === root`, a `case`) still refuses.
+    ///
+    /// The pair's second half is the PIN: `Some(s)` when every value that can
+    /// reach the read folds to the same scalar `s` — a single write's literal
+    /// or foldable chain, or several writes whose scalars agree (`v = 1; v =
+    /// 1 if c` — the reference's member fold still collapses `1 | 1` to
+    /// `Constant[1]`, rigor-rs#332). It stays `None` on an untyped, opaque,
+    /// disagreeing or unscalarable (`op=`, multi-write) contributor — every
+    /// early return carries `None` — and is only meaningful to callers beside
+    /// the returned [`Reach`] (see [`Typer::expr_scalar`]).
     pub(crate) fn local_reach(
         &self,
         ast: &LoweredAst,
@@ -243,7 +363,7 @@ impl<'i> Typer<'i> {
         use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
         skip_class_guards: bool,
-    ) -> Reach {
+    ) -> (Reach, Option<Scalar>) {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
         // One pass for the scope shapes: every `def` span, every `->` span, the
         // innermost `def` around the use site, the narrowest binder (a `def`, a
@@ -323,13 +443,13 @@ impl<'i> Typer<'i> {
                     && locals.iter().any(|l| l == root)
             });
             if floored {
-                return Reach::UNTYPED;
+                return (Reach::UNTYPED, None);
             }
         }
         let (region, skip_defs, flow_body, params): (_, _, &[NodeId], &[String]) = match def {
             Some((d, id)) => match ast.get(id) {
                 Node::Definition { body, param_names, .. } => (d, false, body, param_names),
-                _ => return Reach::UNKNOWN,
+                _ => return (Reach::UNKNOWN, None),
             },
             None => {
                 // The whole file is the region when the read's innermost
@@ -348,11 +468,11 @@ impl<'i> Typer<'i> {
                     Some((_, false)) => operand.is_some(),
                 };
                 if !program_region {
-                    return Reach::OPAQUE;
+                    return (Reach::OPAQUE, None);
                 }
                 match ast.get(ast.root()) {
                     Node::Program { body, span } => (*span, true, body, &[]),
-                    _ => return Reach::UNKNOWN,
+                    _ => return (Reach::UNKNOWN, None),
                 }
             }
         };
@@ -400,7 +520,7 @@ impl<'i> Typer<'i> {
                 Node::Loop { index, .. }
                     if index.iter().any(|(n, s)| n == root && in_region(*s)) =>
                 {
-                    return Reach::UNKNOWN;
+                    return (Reach::UNKNOWN, None);
                 }
                 Node::LocalVariableOpWrite { name, value, span }
                     if name == root
@@ -420,7 +540,7 @@ impl<'i> Typer<'i> {
                     if in_region(*span)
                         && clauses.iter().any(|c| c.bound_name.as_deref() == Some(root)) =>
                 {
-                    return Reach::OPAQUE;
+                    return (Reach::OPAQUE, None);
                 }
                 Node::Call { receiver, method, args, span, .. }
                     if skip_class_guards
@@ -437,12 +557,12 @@ impl<'i> Typer<'i> {
                         && (receiver.is_some_and(reads_root)
                             || args.iter().copied().any(&reads_root)) =>
                 {
-                    return Reach::OPAQUE;
+                    return (Reach::OPAQUE, None);
                 }
                 Node::Case { predicate, span, .. }
                     if guards_here(*span) && predicate.is_some_and(reads_root) =>
                 {
-                    return Reach::OPAQUE;
+                    return (Reach::OPAQUE, None);
                 }
                 _ => {}
             }
@@ -459,6 +579,10 @@ impl<'i> Typer<'i> {
         // runs to the closure-bearing statement and no further into its body.
         let kill_span = operand.map(|(b, _)| ast.get(b).span()).unwrap_or(use_span);
         let kill = latest_definite_assignment(ast, flow_body, kill_span, &is_target);
+        // The pin runs beside the reach join: `None` until a value
+        // contributes, `Some(Some(s))` while every contributor folds to the
+        // same scalar, `Some(None)` once one does not (`pin_join`).
+        let mut pin: Option<Option<Scalar>> = None;
         let mut reach = match kill {
             Some(_) => Reach::NONE,
             None => {
@@ -470,8 +594,10 @@ impl<'i> Typer<'i> {
                         && (operand.is_none() || loopy || w.1 <= kill_span.0)
                 });
                 if params.iter().any(|p| p == root) || !outer_write {
+                    pin = pin_join(pin, None);
                     Reach::UNTYPED
                 } else {
+                    pin = pin_join(pin, Some(Scalar::Nil));
                     Reach::LITERAL // an unassigned local reads `nil`
                 }
             }
@@ -484,24 +610,37 @@ impl<'i> Typer<'i> {
                 continue; // at or after the read, and nothing loops back
             }
             reach = reach.join(match *write {
-                LocalWrite::Plain(v) => self.expr_reach(ast, v, seen),
-                LocalWrite::Op(v) => {
-                    let r = self.expr_reach(ast, v, seen);
-                    Reach { untyped: r.untyped, precise: true, opaque: true, multi: r.multi }
+                LocalWrite::Plain(v) => {
+                    pin = pin_join(pin, self.expr_scalar(ast, v, seen));
+                    self.expr_reach(ast, v, seen)
                 }
-                LocalWrite::Multi(v) => match ast.get(v) {
-                    Node::ArrayLit { elements, .. } => {
-                        let mut r = Reach::LITERAL;
-                        for &e in elements {
-                            r = r.join(self.expr_reach(ast, e, seen));
-                        }
-                        r
+                LocalWrite::Op(v) => {
+                    pin = pin_join(pin, None);
+                    let r = self.expr_reach(ast, v, seen);
+                    Reach {
+                        untyped: r.untyped,
+                        precise: true,
+                        opaque: true,
+                        multi: r.multi,
+                        pinned: false,
                     }
-                    _ => Reach::UNKNOWN,
-                },
+                }
+                LocalWrite::Multi(v) => {
+                    pin = pin_join(pin, None);
+                    match ast.get(v) {
+                        Node::ArrayLit { elements, .. } => {
+                            let mut r = Reach::LITERAL;
+                            for &e in elements {
+                                r = r.join(self.expr_reach(ast, e, seen));
+                            }
+                            r
+                        }
+                        _ => Reach::UNKNOWN,
+                    }
+                }
             });
         }
-        reach
+        (reach, pin.flatten())
     }
 
     /// The INSTANCE-VARIABLE arm — the port of the reference's class-ivar
@@ -787,6 +926,16 @@ impl<'i> Typer<'i> {
 /// THEIR overloads to the conversion class regardless — `Float(v)` fires
 /// `for Float`, `rand(v)` `for Integer`, `String(v)` `for String`, all
 /// oracle-measured).
+///
+/// `pinned` is the #332 half of that story: whether every precise value that
+/// may reach is one the reference holds as `Type::Constant` — a scalar
+/// literal, or a range literal whose endpoints are all static — so a
+/// `Constant`-receiver call over it folds to ONE value. Without it the call
+/// cannot fold and the overload join stands (`"abc"[i]` with `i = rand.to_i`
+/// is `String | nil`, silent; the port's bare `String` was the FP). A single
+/// non-literal write — `i = rand.to_i`, `i = x.to_i` on a nominal `x` — is
+/// precise-but-unpinned; a `Union[Constant…]` is `pinned` but `multi`, and
+/// member-folds to a union either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Reach {
     /// A `Dynamic[Top]` value may reach.
@@ -799,24 +948,38 @@ pub(crate) struct Reach {
     /// More than one distinct precise value may reach — a member-wise folded
     /// receiver call answers a union, not one value (issue #146).
     pub(crate) multi: bool,
+    /// Every precise value that may reach is one the reference would hold as
+    /// `Type::Constant` (issue #332).
+    pinned: bool,
 }
 
 impl Reach {
     /// Nothing reaches (a join's identity, and a revisited recursion node).
+    /// `pinned` is `true` as the `&&` identity — a join still reports the
+    /// other side's pinning.
     const NONE: Reach =
-        Reach { untyped: false, precise: false, opaque: false, multi: false };
+        Reach { untyped: false, precise: false, opaque: false, multi: false, pinned: true };
     /// Only the untyped carrier reaches.
     const UNTYPED: Reach =
-        Reach { untyped: true, precise: false, opaque: false, multi: false };
+        Reach { untyped: true, precise: false, opaque: false, multi: false, pinned: false };
     /// A precise literal `rand` would pin on.
     const LITERAL: Reach =
-        Reach { untyped: false, precise: true, opaque: false, multi: false };
+        Reach { untyped: false, precise: true, opaque: false, multi: false, pinned: true };
+    /// A precise literal the reference does NOT carry as `Type::Constant` —
+    /// an interpolated string/symbol, a Tuple literal, a HashShape.
+    const PINLESS: Reach =
+        Reach { untyped: false, precise: true, opaque: false, multi: false, pinned: false };
+    /// A precise value that is `opaque` for `rand` but still a
+    /// `Type::Constant` on the reference — the literal `0` and a
+    /// fully-static range literal.
+    const PINNED_OPAQUE: Reach =
+        Reach { untyped: false, precise: true, opaque: true, multi: false, pinned: true };
     /// A precise value of unknown shape.
     const OPAQUE: Reach =
-        Reach { untyped: false, precise: true, opaque: true, multi: false };
+        Reach { untyped: false, precise: true, opaque: true, multi: false, pinned: false };
     /// Anything at all — the decline side of every gate.
     const UNKNOWN: Reach =
-        Reach { untyped: true, precise: true, opaque: true, multi: true };
+        Reach { untyped: true, precise: true, opaque: true, multi: true, pinned: false };
 
     fn join(self, other: Reach) -> Reach {
         Reach {
@@ -826,7 +989,36 @@ impl Reach {
             // Two precise sources meeting is exactly what makes the carrier a
             // union of distinct values rather than one pinned value.
             multi: self.multi || other.multi || (self.precise && other.precise),
+            // ALTERNATIVES pin together only if every alternative pins; the
+            // union a multi one produces still declines via `multi`.
+            pinned: self.pinned && other.pinned,
         }
+    }
+
+    /// Two operands COMPOSED into one result — a call and its argument, a
+    /// range and its endpoint. Unlike [`Reach::join`], a precise value on
+    /// each side does NOT create a `multi`: the operands make ONE value, not
+    /// two alternatives. The untyped and multi carriers still propagate —
+    /// `1 + v` is `2 | 3` when `v` is `1 | 2` — and the composite is pinned
+    /// only if both sides are (a call result itself never is; the flag is
+    /// for the endpoint-composition case [`Typer::expr_reach`]'s Range arm
+    /// checks member-wise).
+    fn compose(self, other: Reach) -> Reach {
+        Reach {
+            untyped: self.untyped || other.untyped,
+            precise: self.precise || other.precise,
+            opaque: self.opaque || other.opaque,
+            multi: self.multi || other.multi,
+            pinned: self.pinned && other.pinned,
+        }
+    }
+
+    /// Whether the reference would hold exactly ONE `Type::Constant` here —
+    /// every precise value is a foldable literal and there is only one of
+    /// them — the only argument shape whose `Constant`-receiver call folds to
+    /// a single reportable value (rigor-rs#332).
+    pub(crate) fn pins_one_constant(self) -> bool {
+        self.precise && self.pinned && !self.untyped && !self.multi
     }
 
     /// Whether `rand(arg)` declines: see the type's doc.
@@ -1129,6 +1321,47 @@ fn unrecorded_closure(
         }
     }
     boundary.map(|b| (bearing, b))
+}
+
+/// Meet one more contributor into a running pin ([`Typer::local_reach`] /
+/// [`Typer::expr_scalar`]): `Some(Some(s))` while every contributor folds to
+/// the same scalar `s`, `Some(None)` once one fails to or two disagree,
+/// `None` before the first contributor.
+fn pin_join(acc: Option<Option<Scalar>>, value: Option<Scalar>) -> Option<Option<Scalar>> {
+    match (acc, value) {
+        (None, value) => Some(value),
+        (Some(Some(a)), Some(b)) if a == b => Some(Some(a)),
+        (Some(_), _) => Some(None),
+    }
+}
+
+/// The `Scalar` a literal node carries — the input `folding::fold` wants —
+/// or `None` for a non-literal. Used by [`Typer::expr_scalar`] to pin an
+/// all-literal chain (`"x".to_i`) to the `Constant` the reference's own fold
+/// would give it (rigor-rs#332).
+fn literal_scalar(ast: &LoweredAst, id: NodeId) -> Option<Scalar> {
+    match ast.get(id) {
+        Node::IntegerLit { value: Some(v), .. } => Some(Scalar::Int(*v)),
+        Node::IntegerLit { digits: Some(d), .. } => Some(Scalar::BigInt(d.clone())),
+        Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
+        Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
+        Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+        Node::TrueLit { .. } => Some(Scalar::Bool(true)),
+        Node::FalseLit { .. } => Some(Scalar::Bool(false)),
+        Node::NilLit { .. } => Some(Scalar::Nil),
+        _ => None,
+    }
+}
+
+/// The [`Reach`] of a folded literal call — `precise` + `pinned`, with the
+/// `rand` opacity of the scalar it landed on (`0` keeps `(?0) -> Float`
+/// alive).
+fn pinned_scalar_reach(scalar: &Scalar) -> Reach {
+    if matches!(scalar, Scalar::Int(0)) {
+        Reach::PINNED_OPAQUE
+    } else {
+        Reach::LITERAL
+    }
 }
 
 /// Whether `name` is bound by a literal block / `->` that contains `span`
