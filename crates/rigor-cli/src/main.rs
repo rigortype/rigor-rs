@@ -2192,17 +2192,54 @@ fn apply_baseline(
 }
 
 /// Normalize a path to project-root-relative (against cwd), matching the
-/// reference's `Pathname#relative_path_from(Dir.pwd)`. A path outside the root
-/// (or when cwd is unknown) is returned unchanged, as the reference falls back
-/// to the original on `ArgumentError`.
+/// reference's `Pathname#relative_path_from(Dir.pwd)` — including a path
+/// OUTSIDE the root, which relativizes through `..` segments (`check
+/// /abs/sibling/o.rb` from `/proj` records `../sibling/o.rb`). Both sides are
+/// `cleanpath`ed first, so `./` and `a/../` spellings fold. The reference's
+/// `ArgumentError` fallbacks — mixed absolute/relative, or a `..` left over in
+/// the base — return the original spelling unchanged, as does an unknown cwd.
 fn relative_path(path: &str, cwd: Option<&Path>) -> String {
     let Some(cwd) = cwd else { return path.to_string() };
-    let p = Path::new(path);
-    let abs = if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) };
-    match abs.strip_prefix(cwd) {
-        Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => path.to_string(),
+    let (dest_abs, dest) = cleanpath_components(path);
+    let (base_abs, base) = cleanpath_components(&cwd.to_string_lossy());
+    if dest_abs != base_abs {
+        return path.to_string();
     }
+    let common = dest.iter().zip(&base).take_while(|(d, b)| d == b).count();
+    let base_rest = &base[common..];
+    if base_rest.iter().any(|c| c == "..") {
+        return path.to_string();
+    }
+    let mut parts: Vec<&str> = vec![".."; base_rest.len()];
+    parts.extend(dest[common..].iter().map(String::as_str));
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
+}
+
+/// `Pathname#cleanpath` on components: drop `.` and empty segments, fold `..`
+/// into the previous component. A `..` that reaches the root of an ABSOLUTE
+/// path is dropped (`/a/../../b` → `/b`); a relative path keeps its leading
+/// `..`s (`a/../../b` → `../b`). Returns `(absolute?, components)`.
+fn cleanpath_components(path: &str) -> (bool, Vec<String>) {
+    let abs = path.starts_with('/');
+    let mut out: Vec<String> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => match out.last() {
+                Some(last) if last != ".." => {
+                    out.pop();
+                }
+                None if abs => {}
+                _ => out.push("..".to_string()),
+            },
+            s => out.push(s.to_string()),
+        }
+    }
+    (abs, out)
 }
 
 // ---------------------------------------------------------------------------
