@@ -346,17 +346,20 @@ impl<'i> Typer<'i> {
         // fires `for "b"`, and `v = 1` keeps its `String`), the untyped /
         // guarded declines keep their own gates, and non-Constant receivers
         // never entered the member fold to begin with.
+        //
+        // Issue #332: the multi-valuedness is the ARGUMENT's, not its type's.
+        // The old conjunct (`arg_ty == untyped || Union`) only asked about the
+        // carrier rigor-rs types the argument with, and missed the nominal
+        // ones: `"abc"[1 + v]` types `Integer` while `v` is `1 | 2`, and
+        // `"abc"[v..]` types `Nominal[Range]` — the reference still member-
+        // folds `1 + v` to `2 | 3` (then `"abc"[2 | 3]` to `"c" | nil`) or
+        // leaves `String | nil` for a range it cannot pin. `arg_reach` now
+        // composes the operands of an arg expression, so `.multi` carries the
+        // union through the nominal shell; nominal-typed single values keep
+        // their own decline below (`rbs_dispatch_declines_on_untyped_arg`'s
+        // `pins_one_constant`).
         if matches!(interner.get(recv_ty), Type::Constant(_)) {
-            let untyped = interner.untyped();
-            let multi_arg = args.iter().any(|&a| {
-                let arg_ty = self.type_of(ast, a, env, interner);
-                // A `Union` carrier covers the inlined join (`c ? 1 : 2`)
-                // and any env that already merged the writes; the bare
-                // `untyped` carrier covers the def-body reads `arg_reach`
-                // exists for.
-                (arg_ty == untyped || matches!(interner.get(arg_ty), Type::Union(_)))
-                    && self.arg_reach(ast, a).multi
-            });
+            let multi_arg = args.iter().any(|&a| self.arg_reach(ast, a).multi);
             if multi_arg {
                 return interner.untyped();
             }
@@ -532,39 +535,42 @@ impl<'i> Typer<'i> {
     ///
     /// ## The gate
     ///
-    /// Withhold only when an argument is REFERENCE-IMPRECISE — untyped, or
-    /// since #1021 (`5496acd6`) a union with an untyped member
-    /// ([`Typer::arg_reach`], the same analysis the Kernel folds use:
-    /// `s = 1 if s.nil?; "abc"[s]` and `"abc".index(s)` are reference-silent
-    /// now, rows r01/r11). An imprecise argument is what makes the reference
-    /// unable to value-fold the call, which is what leaves the union standing:
-    /// with a LITERAL argument the reference folds `"abc"[0]` to `"a"` and
-    /// fires, and rigor-rs's bare `String` matches that row — so gating on
-    /// imprecision keeps every such row (`"abc"[0]`, `"abc"[1..]`,
-    /// `"abc".byteslice(1)`, `"abc".index("b")`, `"abc".slice(1)`, all measured
-    /// BOTH before and after). A union's precise members can narrow the
-    /// reference's candidate set back to one agreeing return, which this
-    /// declines on anyway — a coverage loss, never a false positive.
+    /// Withhold when some argument is one the reference cannot value-fold to
+    /// a single reportable value ([`Typer::arg_reach`], the same analysis the
+    /// Kernel folds use):
+    ///
+    /// - a REFERENCE-IMPRECISE argument — untyped, or since #1021 (`5496acd6`)
+    ///   a union with an untyped member — skips the strict and alias passes,
+    ///   so the gradual join keeps `Dynamic[union]` standing (`s = 1 if
+    ///   s.nil?; "abc"[s]` and `"abc".index(s)` are reference-silent, rows
+    ///   r01/r11);
+    /// - on a NILABLE join, an argument that is not one pinned `Constant`
+    ///   (`pins_one_constant`): a multi-valued local member-folds to a union
+    ///   (#146), and a precise-but-never-`Constant` one — a nominal like
+    ///   `i = rand.to_i` or `1 + v`, a range with a non-static endpoint
+    ///   (`"abc"[v..]`), a guarded parameter (#121), an interpolated /
+    ///   Tuple / Hash literal — leaves the `C?` overload's nil arm in place,
+    ///   so the reference answers `C | nil` and is silent (rigor-rs#332:
+    ///   the old gate asked `arg_ty == untyped`, which saw none of these).
+    ///
+    /// With a LITERAL argument the reference folds `"abc"[0]` to `"a"` and
+    /// fires, and rigor-rs's bare `String` matches that row — so the foldable
+    /// shapes keep their diagnostic (`"abc"[0]`, `"abc"[1..]`, `v = "x"` then
+    /// `"abc"[v]`, `v = 0` — `0` is `Constant[0]` upstream despite its `rand`
+    /// opacity — all measured).
+    ///
+    /// A disagreeing NON-nilable join keeps the flat slot for an unpinned
+    /// precise argument on purpose: the argument's own nominal can narrow
+    /// the overload set back to one agreeing return — `[1, 2].product(u)`
+    /// with `u` guarded `Integer` fires on the reference — so only the
+    /// imprecise arm declines there.
     ///
     /// The index test runs FIRST and the arena walk only if it says the answer
     /// is at risk: `arg_reach` is two arena scans per root visited (see its own
-    /// COST note), and tier 3 is the hot dispatch path.
-    ///
-    /// A class-GUARDED parameter is refused by that allow-list (the reference
-    /// types it precisely), but for a NILABLE return it declines anyway through
-    /// [`Typer::arg_is_guarded_parameter`] (issue #121): a guarded parameter is
-    /// never a value the reference can fold, so its join keeps the nil arm —
-    /// `return unless u.is_a?(Integer); "abc"[u].typo` is reference-silent.
-    ///
-    /// Known withholdings, recorded not chased: an argument the reference types
-    /// but rigor-rs cannot see as such stays firing (a `case`/`when` or
-    /// `C === u` guard, a chain over a guarded root, a guard after a
-    /// conditional rebind — see fixture 106's trailer), because the allow-list
-    /// is deliberately syntactic; and
-    /// an overload written as an untyped function (`(?) -> untyped`) is not
-    /// retained in `method_overloads` at all, so it cannot contribute a
-    /// disagreement (18 occurrences in the vendored RBS, none of them a
-    /// multi-overload method whose flat slot answers).
+    /// COST note), and tier 3 is the hot dispatch path. An argument the
+    /// reference would pin but this analysis cannot see as such — a chain over
+    /// a pinned local (`v = s.length`), a `Constant`-valued range endpoint —
+    /// declines into a coverage loss, never a false positive.
     fn rbs_dispatch_declines_on_untyped_arg(
         &self,
         class_name: &str,
@@ -578,40 +584,47 @@ impl<'i> Typer<'i> {
             return false;
         }
         let nilable = matches!(self.index.method_return_nilable(class_name, method), Some((_, true)));
-        let untyped = interner.untyped();
         args.iter().any(|&a| {
-            self.type_of(ast, a, env, interner) == untyped
-                && (self.arg_reach(ast, a).untyped
-                    || (nilable && self.arg_is_guarded_parameter(ast, a)))
+            let arg_ty = self.type_of(ast, a, env, interner);
+            // A port-pinned arg — `K = 5; "abc"[K]`, an inline literal — is
+            // what the fold itself sees; leave it alone.
+            if matches!(interner.get(arg_ty), Type::Constant(_)) {
+                return false;
+            }
+            let reach = self.arg_reach(ast, a);
+            // An imprecise argument (bare `Dynamic[top]` or a union carrying
+            // it) skips the strict/alias passes on ANY non-bare join — the
+            // gradual answer is the union and no negative rule fires on it.
+            if reach.untyped {
+                return true;
+            }
+            // A precise argument that is not one pinned `Constant` keeps the
+            // nil arm of a `C?` overload — `C | nil` is silent — but can
+            // still narrow a disagreeing NON-nilable join back to one
+            // agreeing return (`[1, 2].product(u)` with `u` guarded
+            // `Integer` fires on the reference), so only the nilable join
+            // declines.
+            nilable && !self.arg_pins_one_constant(ast, a)
         })
     }
 
-    /// Issue #121 — the NILABLE half of tier 3's decline, for the argument the
-    /// untyped allow-list deliberately refuses: a bare local that a class guard
-    /// narrows (`return unless u.is_a?(Integer); "abc"[u]`).
-    ///
-    /// The reference types that argument as the guard's `Nominal` (or leaves it
-    /// `Dynamic` where the guard does not dominate the read) — never a value it
-    /// can constant-fold — so the call cannot fold and the carrier stays the RBS
-    /// join. When every overload returns `C?` that join is `C | nil`, on which
-    /// no negative rule fires (`"abc"[u].frobnicate` and `"abc"[u].upcase` are
-    /// both reference-silent). The flat slot's bare `C` is what fired here.
-    ///
-    /// The test is "only the untyped carrier reaches the root once the class
-    /// guards are stepped over": a parameter the region never rebinds. Any
-    /// precise write reaching the read (`u = 1; return unless u.is_a?(Integer)`)
-    /// could leave the reference a `Constant` to fold, and the rows a25/a31 of
-    /// the Kernel-fold arc ride exactly that — so it does not qualify, and
-    /// neither does a chain over the root (`u <=> 1` can answer a union of
-    /// literals the reference does fold). Only the nilable case asks: a guarded
-    /// argument can narrow the erasure family (`Array#product`) back to one
-    /// overload, and the reference then fires.
-    fn arg_is_guarded_parameter(&self, ast: &LoweredAst, arg: NodeId) -> bool {
-        let Node::LocalVariableRead { name, span, .. } = ast.get(arg) else {
-            return false;
-        };
-        let reach = self.local_reach(ast, name, *span, &mut vec![format!("{name}@{}", span.0)], true);
-        reach.untyped && !reach.precise
+    /// Whether `arg` resolves to exactly one `Type::Constant` on the
+    /// reference ([`Reach::pins_one_constant`]) — looking through an
+    /// `is_a?`/`kind_of?`/`instance_of?` guard the way issue #121's
+    /// `arg_is_guarded_parameter` did: a class guard only NARROWS the value,
+    /// so `u = 1; return unless u.is_a?(Integer)` still leaves `u` a pinned
+    /// `Constant[1]` that `"abc"[u]` folds through (it fires `for "b"`).
+    fn arg_pins_one_constant(&self, ast: &LoweredAst, arg: NodeId) -> bool {
+        if self.arg_reach(ast, arg).pins_one_constant() {
+            return true;
+        }
+        match ast.get(arg) {
+            Node::LocalVariableRead { name, span, .. } => self
+                .local_reach(ast, name, *span, &mut vec![format!("{name}@{}", span.0)], true)
+                .0
+                .pins_one_constant(),
+            _ => false,
+        }
     }
 
     /// The index half of [`Typer::rbs_dispatch_declines_on_untyped_arg`]:
