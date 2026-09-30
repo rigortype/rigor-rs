@@ -12,7 +12,7 @@ note or ADR *first*. No status essays — hard byte budget.
 ## Now / Next
 
 ▶ **NEXT: pin `e59b7b89`, 0 FP / 9,337 / 818 gaps.**
-CLI/config: #155–#159, #169–#171, #130, #132; #160 blocked.
+CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
@@ -24,8 +24,8 @@ CLI/config: #155–#159, #169–#171, #130, #132; #160 blocked.
 
 State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
 unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
-9,337 files / 818 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min. Grading
-tools REFUSE a stale rigor-cli build. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
+9,337 files / 818 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
+Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
@@ -71,6 +71,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 - **2026-09-30 #309 CLOSED** (PR #333): rescue-carrier post-scopes join in coll snapshots + literal-arm member evidence (union collapse FP fix). 0 FP; → #337–#339. [note](notes/20260930-issue-309-rescue-snapshot.md)
 - **2026-09-30 #325 CLOSED** (PR #336): `IndexedFlow` stored-slot narrowing (`h[k] ||= v` records reach `h[k]` reads). 0 FP; → #342–#344. [note](notes/20260930-issue-325-slot-narrowing.md)
+- **2026-09-30 #158 CLOSED** (PR #335): config parity — Psych dup/`<<`-merge/multi-doc/UTF-8 + `~`/`..`/dist, exit-64 surface. 0 FP; → #345–#349. [note](notes/20260930-issue-158-config.md)
 - **2026-09-30 #332 CLOSED** (PR #334): pin-value threading (`local_reach` → `(Reach, Option<Scalar>)`); nominal multi-arg + `when`-pattern FPs. 0 FP / 818; → #340/#341. [note](notes/20260930-issue-332-multi-arg.md)
 - **2026-09-30 #312 CLOSED** (PR #324): recovery collector models `joined`/`blocked`/loop-writeback marks — compound index writes widen exactly where the reference joins. 0 FP; → #325. [note](notes/20260930-issue-312-recovery.md)
 - **2026-09-30 #146 CLOSED** (PR #318): `Reach::multi` + tier-3 decline for multi-valued args; unentered closures floor to untyped. 0 FP / 818; → #330–#332. [note](notes/20260930-issue-146-untyped-args.md)
@@ -109,12 +110,12 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 - **2026-08-26 LSP honours `rootUri` / `workspaceFolders`** (PR #110) — enters the client's root rather than threading one (the root IS a cwd in all consumers; threading missed `sig/` + regressed `exclude:`). [note](notes/20260826-s111-lsp-rooturi.md).
 
-- **2026-08-25/26 two arcs CLOSED, folded** — effects slices 0–3 (35 MATCH / 11 UNDER / 0 OVER — [s3](notes/20260826-effects-s3-impl.md) / [#106](notes/20260826-s106-posture-over-fix.md)); frozen-index arc (**standing**: file order NORMATIVE in `merge`, eviction BLOCKED, harvest cache NO-GO — [s113](notes/20260826-s113-fold-capture-impl.md)).
+- **2026-08-25/26 two arcs CLOSED, folded** — effects slices 0–3 (35 MATCH / 11 UNDER / 0 OVER — [s3](notes/20260826-effects-s3-impl.md)); frozen-index arc (file order NORMATIVE, eviction BLOCKED, harvest NO-GO — [s113](notes/20260826-s113-fold-capture-impl.md)).
 - **2026-08-23/25 re-pin `v0.3.2 → v0.3.4` + master survey (HOLD)** — 151 commits: **0 FP / 9204, gaps 841→820**, harness 97 fixtures; rbs and `data/` unchanged, exception tables empty; the raw bump opened **50 FPs**, all upstream RETRACTIONS (#319, #318) from OUR batch-3 reports, invisible to the snapshot diff ([note](notes/20260823-repin-v034.md)). The 64-commit survey moved 0 diagnostics but found the **vendored plugin RBS had drifted since 2026-06-26 = 10 FPs** (a THIRD pin-tracking surface; fixture 98 + ritual step 3 now cover it) and that every `documentation_url` 404s (upstream #438) ([survey](notes/20260825-upstream-survey-v034-master.md)).
 - **2026-08-09 unresolved-const-receiver carrier REJECTED at 0 rows** (PR #89, closed). [note](notes/20260809-unresolved-const-receiver-carrier.md)
 - **2026-08-09 era (3 slices, folded)** — re-pin `v0.3.1 → v0.3.2` (+rbs 4.1.1): 0 FP / 9204, gaps 1125→841 (upstream retracting possible-nil FPs, #297); BOTH exception tables emptied; **trap: bundler/rubygems sigs depend on the rbs gem's `sig/shims/` — 2 FPs the sweep CANNOT SEE**, closed by `overlay/rbs_shims/` ([note](notes/20260809-repin-v032.md)); join-wipe retention (`retain_joined_facts` + the `else`-carrier unwrap; 1 FP closed, 15 probe shapes ref-matched — [note](notes/20260809-join-wipe-retention.md)); chain-guard meet (`chains` carries `ClassFact`, `narrow_nominal_to_class` shared by both arms; 2 FPs closed — [note](notes/20260809-chain-guard-meet.md)).
 - **2026-08-08 era, folded (0 FP / 9204 throughout)** — the narrowing/shape trio (PRs #70/#75/#78/#80–#82: sequential-guard meet, qualified-name WITNESSING 1136→1127, the collection-shape ARC — **26 rows closed**; [meet](notes/20260808-sequential-guard-meet.md) / [witnessing](notes/20260808-qualified-witnessing-mini-spec.md) / [shape](notes/20260807-collection-shape-slice-spec.md)); the `Object` bucket ADJUDICATED, 30 rows behind decisions, 18 of them reference FPs fixed upstream at `v0.3.4` (PR #85, [adjudication](notes/20260808-object-bucket-adjudication.md)); constant-value harvesting per-file gate + partial containers (PRs #83/#84: 1127→1125; chain constants DECLINED — [mini-spec](notes/20260808-partial-constant-harvest-mini-spec.md)).
-- **2026-08-07/08 the class-narrowing ARC, CLOSED at a measured stop** (PRs #63, #68, #71-#74, #76, #77, #79) — ported `narrow_class_other` end-to-end (snapshot pass, statement-form descent, compound predicates, `next`/`break`, chain guards): **19 gap closures + eleven master FP shapes**, 0 FP / 9204 at every step. Three probe-forced lessons: the FP-safety argument was WRONG THREE TIMES (position AXIS; carrier ALLOW-list; disjoint→`Bot`); census windows measure PROXIMITY not mechanism; **verify the CONSUMPTION gate can witness the class before crediting rows**. [spec](notes/20260807-class-narrowing-slice-spec.md) / [stage3](notes/20260807-narrowing-stage3-spec.md).
+- **2026-08-07/08 the class-narrowing ARC, CLOSED at a measured stop** (PRs #63, #68, #71-#74, #76, #77, #79) — `narrow_class_other` end-to-end: **19 gap closures + 11 master FP shapes**, 0 FP / 9204 throughout. Lessons: FP-safety argument WRONG 3× (position axis; carrier allow-list; disjoint→`Bot`); verify the consumption gate can witness the class before crediting rows. [spec](notes/20260807-class-narrowing-slice-spec.md) / [stage3](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-01/08 instruments + adjudication, folded** — the 0-FP gate could pass VACUOUSLY (PR #65: corpus tools measured `target/release` while `cargo build` writes debug, and `run_rs` swallowed failures into `[]` — [note](notes/20260807-fp-audit-port-side-blind-spots.md)); the coverage-gap CENSUS buckets gaps by MECHANISM, not rule, and half sit behind decisions already made ([note](notes/20260807-gap-census.md)); `arity_eligible?` was never ported = a `call.wrong-arity` FP (fixture 80); LSP config reload keeps LAST GOOD ([lsp](notes/20260801-lsp-config-reload.md)).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup routing** (PR #64, MERGED) — the 8-member return family routes namespaced receivers via the qualified registry (refs AS WRITTEN + lexical ctx; ambiguity DECLINES); **14 closures (→1179), 0 FP / 9204**; fixture 82 pins the Tier-3 instance boundary (gaps 3→4 on merge). [spec+outcome](notes/20260807-adr0042-s5-return-lookup-spec.md).
 - **2026-08-07 upstream survey + feedback batch 2, folded** — the `v0.3.1`→`80aaf9bc` 2×2 self-diff moved 2 diagnostics on 9204 (superseded by the `v0.3.2` re-pin) and RETIRED GEM_HOME rbs selection, which had silently dropped 1650 files ([note](notes/20260807-upstream-survey-v031-to-master.md)); batch 2 filed 3 reference-side defects with paste-ready repros — the `c7f28da1` master FP, the `Dynamic|nil` possible-nil FP class, and the fail-soft definition build blinding 12 classes ([note](notes/20260807-upstream-feedback-batch2.md)).
