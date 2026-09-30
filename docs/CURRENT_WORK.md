@@ -12,8 +12,7 @@ note or ADR *first*. No status essays — hard byte budget.
 ## Now / Next
 
 ▶ **NEXT: pin `e59b7b89`, 0 FP / 9,337 / 818 gaps.**
-FPs: #146. CLI/config:
-#155–#159, #169–#171, #130, #132; #160 blocked.
+CLI/config: #155–#159, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
@@ -25,8 +24,7 @@ FPs: #146. CLI/config:
 
 State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
 unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
-9,337 files / 818 gaps** (#141 closed 3,002), 8 corpora, baselines in
-`harness/CORPUS.md`; effects gate 0 OVER. `--sweep` ~3 min. Grading
+9,337 files / 818 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min. Grading
 tools REFUSE a stale rigor-cli build. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
@@ -35,14 +33,12 @@ tools REFUSE a stale rigor-cli build. Clippy: `-D warnings`, FRESH `CARGO_TARGET
   the nameable-concrete-arm FP-safety mechanism; `fp_audit` would score it
   0 FP: the parity gate points the wrong way
   ([tier-bc](notes/20260717-tier-bc-track-closed.md)). **Its SCOPE: the 85
-  `Dynamic`-arm rows at `v0.3.8`, NOT the 93 concrete-arm ones**.
+  `Dynamic`-arm rows, NOT the 93 concrete-arm ones**.
 - **Reference-FP undefined-method clusters, CLOSED** — `pre_eval:` cross-file
   monkey-patch (closing INVERTS the ADR-0033 provenance gate), receiver-typed-`nil`,
   rdoc generated-parser `Hash` ([141](notes/20260807-gap-adjudication-141.md)).
-  Re-adjudicated whole at `v0.3.8` ([799](notes/20260909-gap-adjudication-799.md)):
-  rdoc is **93 rows** naming undeclared classes; plus `Class.new` bodies,
-  nested `def`, gvar/OpenStruct. **395 of 799 sit behind decisions; biggest
-  mechanism = nested-scope receiver typing, 71 rows.**
+  Re-adjudicated at `v0.3.8` ([799](notes/20260909-gap-adjudication-799.md)):
+  **395 of 799 behind decisions; biggest = nested-scope receiver typing, 71 rows.**
 - **Five consecutive FP-safe flow slices closed 0 survey gaps** — never build a
   coverage slice without a valid-mode `fp_audit --gaps` prediction
   ([flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
@@ -73,6 +69,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-30 #146 CLOSED** (PR #318): `Reach::multi` + tier-3 decline for multi-valued args; unentered closures floor to untyped. 0 FP / 818; → #330–#332. [note](notes/20260930-issue-146-untyped-args.md)
 - **2026-09-30 #162 CLOSED** (PR #323): baseline parity — (file,rule) regroup, Psych scalar reader/writer, `../` keys. 0 FP; → #326–#329. [note](notes/20260930-issue-162-baseline.md)
 - **2026-09-30 #306 CLOSED** (PR #320): `Loop`/`rescue` index targets decline + `Range` bounds link Uncond in `flow_children` — kills the unlinked-span FP fallback. 0 FP / 818; → #321/#322. [note](notes/20260930-issue-306-effect-spans.md)
 - **2026-09-29 #137 CLOSED** (PR #305): closure-bound locals shadow outer to `Dynamic[top]` in unentered blocks (entry-scope + shadow). 0 FP / 818; → #315–#317. [note](notes/20260929-issue-137-closure-shadow.md)
