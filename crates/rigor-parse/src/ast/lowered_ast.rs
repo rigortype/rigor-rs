@@ -79,27 +79,10 @@ pub struct LoweredAst {
     /// Sorted start offsets of every `LocalVariableRead`, so
     /// [`LoweredAst::reads_local_within`] is a binary search, not an arena scan.
     local_read_starts: Vec<usize>,
-    /// The spans of every [`StatementsKind::Inert`] carrier, for
-    /// [`LoweredAst::in_inert_carrier`].
-    inert_spans: Vec<Span>,
-    /// The spans of every inert carrier whose operand an iterated body's
-    /// content-writeback text scan covers — a subset of `inert_spans`
-    /// (rigor-rs#312; [`LoweredAst::in_scanned_inert_carrier`]).
-    scanned_inert_spans: Vec<Span>,
-    /// The spans of recovered children the walk reached inside a position
-    /// whose post-scope the reference DISCARDS or never evaluates —
-    /// [`Recovered::blocked`]: a `when`/`in` condition or guard flattened by
-    /// a wrapper (a rescue modifier's `case` has no `Node::Case`/`Node::When`
-    /// in the arena), an unconditionally-exiting arm, a `super`/`yield`
-    /// operand under a wrapper, the dead side of a fold. A local write in
-    /// one binds nothing — the lowering path's sibling of `inert_spans`
-    /// (rigor-rs#357; [`LoweredAst::in_blocked_carrier`]).
-    blocked_spans: Vec<Span>,
-    /// The `blocked_spans` subset an iterated body's content-writeback TEXT
-    /// scan still covers ([`Recovered::iterative`]): a local rebind there
-    /// still binds nothing, but a `[]=`/mutator content mark lands
-    /// (rigor-rs#312; [`LoweredAst::in_iterative_blocked_carrier`]).
-    blocked_iterative_spans: Vec<Span>,
+    /// The never-evaluated/discarded extent tables — bundled behind one
+    /// allocation so they do not inflate `LoweredAst` (its size feeds
+    /// `enum Lowered`'s variant budget in rigor-cli). See [`CarrierSpans`].
+    carrier_spans: Box<CarrierSpans>,
     /// Nodes a single-statement `(e)` parens was UNWRAPPED to. The reference
     /// reads the receiver's SYNTAX node — `(nil)` is a `ParenthesesNode`, not
     /// a `NilNode` — so a consumer that discriminates literal syntax (the
@@ -114,6 +97,35 @@ pub struct LoweredAst {
     /// instead (rigor-rs#137, upstream rigor#1245). The names still shadow the
     /// enclosing scope for every node under the recovered child.
     closure_bindings: Vec<(u32, Vec<String>)>,
+}
+
+/// The span side tables for positions whose post-scope the reference never
+/// lands — `StatementsKind::Inert` carriers and `Recovered::blocked`
+/// extents. Bundled and boxed so the four lists cost `LoweredAst` one
+/// pointer.
+#[derive(Clone, Default)]
+struct CarrierSpans {
+    /// The spans of every [`StatementsKind::Inert`] carrier, for
+    /// [`LoweredAst::in_inert_carrier`].
+    inert: Vec<Span>,
+    /// The spans of every inert carrier whose operand an iterated body's
+    /// content-writeback text scan covers — a subset of `inert`
+    /// (rigor-rs#312; [`LoweredAst::in_scanned_inert_carrier`]).
+    scanned_inert: Vec<Span>,
+    /// The spans of recovered children the walk reached inside a position
+    /// whose post-scope the reference DISCARDS or never evaluates —
+    /// [`Recovered::blocked`]: a `when`/`in` condition or guard flattened by
+    /// a wrapper (a rescue modifier's `case` has no `Node::Case`/`Node::When`
+    /// in the arena), an unconditionally-exiting arm, a `super`/`yield`
+    /// operand under a wrapper, the dead side of a fold. A local write in
+    /// one binds nothing — the lowering path's sibling of `inert`
+    /// (rigor-rs#357; [`LoweredAst::in_blocked_carrier`]).
+    blocked: Vec<Span>,
+    /// The `blocked` subset an iterated body's content-writeback TEXT scan
+    /// still covers ([`Recovered::iterative`]): a local rebind there still
+    /// binds nothing, but a `[]=`/mutator content mark lands (rigor-rs#312;
+    /// [`LoweredAst::in_iterative_blocked_carrier`]).
+    iterative_blocked: Vec<Span>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -155,7 +167,10 @@ impl LoweredAst {
     /// `defined?` operand, an `END { }` / `BEGIN { }` body). A local write there
     /// does not exist for flow: the reference never evaluates it in sequence.
     pub fn in_inert_carrier(&self, span: Span) -> bool {
-        self.inert_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
+        self.carrier_spans
+            .inert
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
 
     /// Whether `span` lies inside an inert carrier that an iterated body's
@@ -166,7 +181,8 @@ impl LoweredAst {
     /// widening lands. `defined?` is never scanned — `NodeWalker` prunes
     /// the operand entirely.
     pub fn in_scanned_inert_carrier(&self, span: Span) -> bool {
-        self.scanned_inert_spans
+        self.carrier_spans
+            .scanned_inert
             .iter()
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
@@ -184,7 +200,8 @@ impl LoweredAst {
     ///
     /// [`Recovered::blocked`]: crate::ast::Recovered::blocked
     pub fn in_blocked_carrier(&self, span: Span) -> bool {
-        self.blocked_spans
+        self.carrier_spans
+            .blocked
             .iter()
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
@@ -194,7 +211,8 @@ impl LoweredAst {
     /// rigor-rs#312): the local rebind still binds nothing, but a
     /// `local[k] op= v`/`local.mutator` content mark lands on the reference.
     pub fn in_iterative_blocked_carrier(&self, span: Span) -> bool {
-        self.blocked_iterative_spans
+        self.carrier_spans
+            .iterative_blocked
             .iter()
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
@@ -317,9 +335,12 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
             _ => None,
         })
         .collect();
-    let scanned_inert_spans = builder.scanned_inert_spans;
-    let blocked_spans = builder.blocked_spans;
-    let blocked_iterative_spans = builder.blocked_iterative_spans;
+    let carrier_spans = Box::new(CarrierSpans {
+        inert: inert_spans,
+        scanned_inert: builder.scanned_inert_spans,
+        blocked: builder.blocked_spans,
+        iterative_blocked: builder.blocked_iterative_spans,
+    });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
     let mut closure_bindings: Vec<(u32, Vec<String>)> = builder
@@ -334,10 +355,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         file_key,
         const_mutations,
         local_read_starts,
-        inert_spans,
-        scanned_inert_spans,
-        blocked_spans,
-        blocked_iterative_spans,
+        carrier_spans,
         paren_unwrapped,
         closure_bindings,
     }
