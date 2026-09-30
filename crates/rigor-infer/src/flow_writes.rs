@@ -219,23 +219,30 @@ pub(crate) const MUTATOR_METHODS: &[&str] = &[
 ///   each stores through `[]=` on `h` (`IndexWriteWidening`, rigor-rs#134). Keyed
 ///   by the TARGET's span, so it widens inside whichever construct owns it.
 pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    let mut out: Vec<(NodeId, rigor_parse::Span, String)> = ast
+    // The bool is `scan_visible`: the mark names a CONTENT mutation the
+    // reference's writeback text scan (`content_mutation_target` — a
+    // mutator `CallNode`, a compound index write, or an `IndexTargetNode`)
+    // sees even inside a never-evaluated operand of an iterated body
+    // (rigor-rs#312). Rebinds are never scan-visible.
+    let mut out: Vec<(NodeId, rigor_parse::Span, String, bool)> = ast
         .iter()
         .flat_map(|(id, n)| match n {
             Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. } => vec![(id, *span, name.clone())],
+            | Node::LocalVariableOpWrite { name, span, .. } => {
+                vec![(id, *span, name.clone(), false)]
+            }
             Node::MultiWrite { targets, span, .. } => {
-                let mut entries: Vec<(NodeId, rigor_parse::Span, String)> = targets
+                let mut entries: Vec<(NodeId, rigor_parse::Span, String, bool)> = targets
                     .bound_names()
                     .into_iter()
-                    .map(|(name, _)| (id, *span, name))
+                    .map(|(name, _)| (id, *span, name, false))
                     .collect();
                 // An `h[k]` target stores through `[]=` on `h` — a receiver
                 // MUTATION at the target's span, not a rebind (rigor-rs#134).
                 entries.extend(
                     index_target_writes(targets.index_writes())
                         .into_iter()
-                        .map(|(s, n)| (id, s, n)),
+                        .map(|(s, n)| (id, s, n, true)),
                 );
                 entries
             }
@@ -243,7 +250,9 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
                 if MUTATOR_METHODS.contains(&method.as_str()) =>
             {
                 match ast.get(*r) {
-                    Node::LocalVariableRead { name, .. } => vec![(id, *span, name.clone())],
+                    Node::LocalVariableRead { name, .. } => {
+                        vec![(id, *span, name.clone(), true)]
+                    }
                     _ => Vec::new(),
                 }
             }
@@ -255,19 +264,22 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             // `widen_receiver_aliases` with method `[]=` (`index_write_
             // widening.rb`, upstream #560).
             Node::IndexWrite { receiver: Some(r), span, .. } => match ast.get(*r) {
-                Node::LocalVariableRead { name, .. } => vec![(id, *span, name.clone())],
+                Node::LocalVariableRead { name, .. } => {
+                    vec![(id, *span, name.clone(), true)]
+                }
                 _ => Vec::new(),
             },
             Node::Loop { index, index_writes, .. } => {
-                let mut entries: Vec<(NodeId, rigor_parse::Span, String)> = for_index_rebinds(index)
-                    .into_iter()
-                    .map(|(s, n)| (id, s, n))
-                    .collect();
+                let mut entries: Vec<(NodeId, rigor_parse::Span, String, bool)> =
+                    for_index_rebinds(index)
+                        .into_iter()
+                        .map(|(s, n)| (id, s, n, false))
+                        .collect();
                 // `for h[:k] in xs` stores each element through `[]=` on `h`.
                 entries.extend(
                     index_target_writes(index_writes.clone())
                         .into_iter()
-                        .map(|(s, n)| (id, s, n)),
+                        .map(|(s, n)| (id, s, n, true)),
                 );
                 entries
             }
@@ -278,16 +290,25 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             Node::BeginRescue { clauses, .. } => clauses
                 .iter()
                 .flat_map(|c| index_target_writes(c.index_writes.clone()))
-                .map(|(s, n)| (id, s, n))
+                .map(|(s, n)| (id, s, n, true))
                 .collect(),
             _ => Vec::new(),
         })
         .collect();
-    drop_shadowed_writes(ast, &mut out);
-    let mut out: Vec<(rigor_parse::Span, String)> =
-        out.into_iter().map(|(_, s, n)| (s, n)).collect();
-    drop_inert_writes(ast, &mut out);
-    out
+    let shadow_scopes = closure_shadow_scopes(ast);
+    out.retain(|(id, _, name, _)| {
+        !shadow_scopes.iter().any(|(descendants, bound)| {
+            descendants.contains(id) && bound.contains(name)
+        })
+    });
+    // The inert filter: a write inside a never-evaluated operand binds
+    // nothing, so its mark always drops — EXCEPT a scan-visible content
+    // mutation inside an ITERATED body's scanned operand, which the
+    // reference's writeback applies anyway (rigor-rs#312).
+    out.retain(|(_, w, _, scan)| {
+        !ast.in_inert_carrier(*w) || (*scan && ast.in_scanned_inert_carrier(*w))
+    });
+    out.into_iter().map(|(_, s, n, _)| (s, n)).collect()
 }
 
 /// Every rebind of a TOP-LEVEL local, span-keyed for [`widen_flow_writes`]: a

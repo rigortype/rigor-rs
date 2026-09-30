@@ -82,6 +82,10 @@ pub struct LoweredAst {
     /// The spans of every [`StatementsKind::Inert`] carrier, for
     /// [`LoweredAst::in_inert_carrier`].
     inert_spans: Vec<Span>,
+    /// The spans of every inert carrier whose operand an iterated body's
+    /// content-writeback text scan covers — a subset of `inert_spans`
+    /// (rigor-rs#312; [`LoweredAst::in_scanned_inert_carrier`]).
+    scanned_inert_spans: Vec<Span>,
     /// Nodes a single-statement `(e)` parens was UNWRAPPED to. The reference
     /// reads the receiver's SYNTAX node — `(nil)` is a `ParenthesesNode`, not
     /// a `NilNode` — so a consumer that discriminates literal syntax (the
@@ -138,6 +142,19 @@ impl LoweredAst {
     /// does not exist for flow: the reference never evaluates it in sequence.
     pub fn in_inert_carrier(&self, span: Span) -> bool {
         self.inert_spans.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
+    /// Whether `span` lies inside an inert carrier that an iterated body's
+    /// content-writeback TEXT SCAN covers (rigor-rs#312): `while w;
+    /// super(h[:a] ||= 1); end` — the operand never evaluates (a local
+    /// write there still binds nothing), but `loop_content_writeback`'s
+    /// `NodeWalker` read finds the content mutation, so its `[]=`/mutator
+    /// widening lands. `defined?` is never scanned — `NodeWalker` prunes
+    /// the operand entirely.
+    pub fn in_scanned_inert_carrier(&self, span: Span) -> bool {
+        self.scanned_inert_spans
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
 
     /// Whether `id` is a node a `(e)` single-statement parens unwrapped to —
@@ -229,6 +246,12 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         line_starts,
         paren_unwrapped: Vec::new(),
         closure_bindings: Vec::new(),
+        recovery_joined: 0,
+        recovery_blocked: 0,
+        recovery_iterative: 0,
+        recovery_next_sink: 0,
+        recovery_suppressed: 0,
+        scanned_inert_spans: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -248,6 +271,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
             _ => None,
         })
         .collect();
+    let scanned_inert_spans = builder.scanned_inert_spans;
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
     let mut closure_bindings: Vec<(u32, Vec<String>)> = builder
@@ -263,6 +287,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         const_mutations,
         local_read_starts,
         inert_spans,
+        scanned_inert_spans,
         paren_unwrapped,
         closure_bindings,
     }
