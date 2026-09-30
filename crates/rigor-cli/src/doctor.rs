@@ -51,14 +51,18 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
 
     let mut healthy = true;
 
+    // --- Config discovery ---------------------------------------------------
+    // The config load is FATAL upstream (`Configuration.load` raising inside
+    // `CLI::DoctorCommand` hits the dispatcher's `rescue ConfigurationError`
+    // → `rigor: <msg>` + exit 64) before ANY report output, so resolve first
+    // and die the same way — no report, no header.
+    let (config_label, config_status, cfg) = match resolve_config(explicit_config.as_deref()) {
+        Ok(t) => t,
+        Err(f) => return f.report(),
+    };
+
     println!("rigor doctor — rigor-rs v{} (standalone, sound-subset port)", env!("CARGO_PKG_VERSION"));
     println!();
-
-    // --- Config discovery ---------------------------------------------------
-    // Distinguish "no config" (normal) from "found but malformed" (warn). We
-    // probe the raw file ourselves so we can tell the two apart — `Config::load`
-    // degrades both to default.
-    let (config_label, config_status, cfg) = resolve_config(explicit_config.as_deref());
     println!("[{config_status}] config: {config_label}");
 
     // --- RBS source (audit-R1) ----------------------------------------------
@@ -164,23 +168,27 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
     }
 }
 
-/// Resolve the config for the report: returns `(label, status, loaded_config)`.
-/// `status` is `PASS` (found+parsed or absent), `WARN` (present but the load
-/// fails — what a `rigor` command would die on). The loaded `Config` is what
-/// [`Config::read`] parses; discovery follows the reference's
+/// Resolve the config for the report: `(label, status, loaded_config)` —
+/// `status` is `PASS` (found+parsed or absent), `WARN` (an explicit `--config`
+/// naming a missing file). A load the reference dies on propagates as
+/// [`Err(LoadFailure)`](crate::config::LoadFailure) — `cmd_doctor` reports it
+/// upstream-style and exits before the report prints. The loaded `Config` is
+/// what [`Config::read`] parses; discovery follows the reference's
 /// `.rigor.yml` → `.rigor.dist.yml` order.
-fn resolve_config(explicit: Option<&str>) -> (String, &'static str, Config) {
+fn resolve_config(
+    explicit: Option<&str>,
+) -> Result<(String, &'static str, Config), crate::config::LoadFailure> {
     let path = explicit
         .map(std::path::PathBuf::from)
         .or_else(Config::discover);
     let Some(path) = path else {
-        return (
+        return Ok((
             "no .rigor.yml/.rigor.dist.yml in cwd (using defaults)".to_string(),
             "PASS",
             Config::default(),
-        );
+        ));
     };
-    match Config::read(&path) {
+    Ok(match Config::read(&path) {
         crate::config::ConfigRead::Parsed(cfg) => {
             (format!("{} (found, parsed OK)", path.display()), "PASS", *cfg)
         }
@@ -196,16 +204,8 @@ fn resolve_config(explicit: Option<&str>) -> (String, &'static str, Config) {
                 )
             }
         }
-        crate::config::ConfigRead::Fatal(f) => (
-            format!(
-                "{} (found but MALFORMED — {} — ignored, analysing with defaults)",
-                path.display(),
-                f.message
-            ),
-            "WARN",
-            Config::default(),
-        ),
-    }
+        crate::config::ConfigRead::Fatal(f) => return Err(f),
+    })
 }
 
 #[cfg(test)]
@@ -214,7 +214,8 @@ mod tests {
 
     #[test]
     fn missing_config_is_pass_with_defaults() {
-        let (_label, status, cfg) = resolve_config(Some("/nonexistent/.rigor.yml"));
+        let (_label, status, cfg) =
+            resolve_config(Some("/nonexistent/.rigor.yml")).expect("absent is not fatal");
         // An explicit missing path warns; auto-discovery would PASS.
         assert_eq!(status, "WARN");
         assert!(cfg.plugins.is_empty());
@@ -224,7 +225,8 @@ mod tests {
     fn auto_discovery_absent_is_pass() {
         // Resolve against a path guaranteed absent under cwd; the auto-discovery
         // (explicit=None) branch treats absence as PASS.
-        let (label, status, _cfg) = resolve_config(None);
+        let (label, status, _cfg) =
+            resolve_config(None).unwrap_or_else(|f| (f.message, "WARN", Config::default()));
         // Either there is no .rigor.yml (PASS, "no .rigor.yml") or one parses.
         assert!(status == "PASS" || status == "WARN");
         assert!(!label.is_empty());

@@ -1024,7 +1024,7 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
         message: format!("cannot read config {}: {e}", absolute.display()),
         code: 1,
     })?;
-    let value = serde_yaml::from_str::<serde_yaml::Value>(&text).map_err(|e| {
+    let value = parse_yaml(&text).map_err(|e| {
         // Re-render as upstream's `#{absolute}:#{e.line}:#{e.column}: not
         // valid YAML: #{e.problem} #{e.context}` (exit 64). serde_yaml's
         // Display is `{problem} at line {pl} column {pc}, {context} at line
@@ -1045,6 +1045,117 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
             message: format!("config file must be a YAML mapping: {}", absolute.display()),
             code: 64,
         }),
+    }
+}
+
+/// Parse `text` as ONE YAML document the way Psych's `YAML.safe_load_file`
+/// does: the FIRST document only (a `---` follower is never even scanned —
+/// oracle: `paths: [src]\n---\nother: 1` loads doc 1 and runs), and a
+/// repeated mapping key folds last-wins at EVERY level (oracle:
+/// `disable: [call]` then `disable: []` parses to `[]`). serde_yaml's
+/// `from_str` refuses both shapes ("more than one document",
+/// "duplicate entry with key"), so the first `Deserializer` document goes
+/// through [`DupOk`]'s pairwise collector instead; merge keys (`<<`) are
+/// applied afterward exactly as `Value`'s own parse does.
+fn parse_yaml(text: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
+    let Some(doc) = serde_yaml::Deserializer::from_str(text).next() else {
+        return Ok(serde_yaml::Value::Null);
+    };
+    let mut value = DupOk::deserialize(doc)?.0;
+    value.apply_merge()?;
+    Ok(value)
+}
+
+/// A `serde_yaml::Value` deserialized with Psych's duplicate-key semantics —
+/// last-wins at every level, instead of serde_yaml `Value`'s
+/// `duplicate entry with key` rejection. The visitor collects each mapping's
+/// `(key, value)` pairs itself, so nothing between the parser and the map can
+/// reject a repeat.
+struct DupOk(serde_yaml::Value);
+
+impl<'de> Deserialize<'de> for DupOk {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        d.deserialize_any(DupOkVisitor)
+    }
+}
+
+struct DupOkVisitor;
+
+impl<'de> serde::de::Visitor<'de> for DupOkVisitor {
+    type Value = DupOk;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any YAML value")
+    }
+
+    fn visit_bool<E>(self, v: bool) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::Bool(v)))
+    }
+    fn visit_i64<E>(self, v: i64) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::Number(serde_yaml::Number::from(v))))
+    }
+    fn visit_i128<E>(self, v: i128) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::Number(serde_yaml::Number::from(
+            i64::try_from(v).unwrap_or(i64::MAX),
+        ))))
+    }
+    fn visit_u64<E>(self, v: u64) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::Number(serde_yaml::Number::from(v))))
+    }
+    fn visit_u128<E>(self, v: u128) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::Number(serde_yaml::Number::from(
+            u64::try_from(v).unwrap_or(u64::MAX),
+        ))))
+    }
+    fn visit_f64<E>(self, v: f64) -> Result<DupOk, E> {
+        let n = serde_yaml::Number::from(v);
+        Ok(DupOk(serde_yaml::Value::Number(n)))
+    }
+    fn visit_str<E>(self, v: &str) -> Result<DupOk, E>
+    where
+        E: serde::de::Error,
+    {
+        Ok(DupOk(serde_yaml::Value::String(v.to_string())))
+    }
+    fn visit_char<E>(self, v: char) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::String(v.to_string())))
+    }
+    fn visit_none<E>(self) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::Null))
+    }
+    fn visit_unit<E>(self) -> Result<DupOk, E> {
+        Ok(DupOk(serde_yaml::Value::Null))
+    }
+    fn visit_some<D>(self, d: D) -> Result<DupOk, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        DupOk::deserialize(d)
+    }
+    fn visit_seq<A>(self, mut seq: A) -> Result<DupOk, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut items = Vec::new();
+        while let Some(DupOk(v)) = seq.next_element::<DupOk>()? {
+            items.push(v);
+        }
+        Ok(DupOk(serde_yaml::Value::Sequence(items)))
+    }
+    fn visit_map<A>(self, mut map: A) -> Result<DupOk, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut m = serde_yaml::Mapping::new();
+        while let Some((DupOk(k), DupOk(v))) = map.next_entry::<DupOk, DupOk>()? {
+            // Psych last-wins: `Hash#[]=` overwrites, and serde_yaml's
+            // `Mapping::insert` replaces the existing entry the same way.
+            m.insert(k, v);
+        }
+        Ok(DupOk(serde_yaml::Value::Mapping(m)))
     }
 }
 
@@ -1079,20 +1190,35 @@ fn psych_render(detail: &str) -> (usize, usize, String) {
         marks.push((start, end, line, column));
         search = end;
     }
-    let Some(&(last_start, _, line, column)) = marks.last() else {
+    let Some(&(_, _, line, column)) = marks.last() else {
         return (0, 0, detail.to_string());
     };
-    // The problem is everything before the FIRST marker; the context is what
-    // lies between the first marker's end and the last marker's start, minus
-    // serde's `, ` separator. (libyaml emits at most problem+context here.)
-    let problem = &detail[..marks[0].0];
-    let between = &detail[marks[0].1..last_start];
-    let context = between.strip_prefix(", ").unwrap_or(between);
-    let rendered = if context.is_empty() {
-        problem.to_string()
-    } else {
-        format!("{problem} {context}")
-    };
+    // The header position is the LAST marker's (the context anchor when one
+    // carries a position — Psych's `e.line`/`e.column` — else the problem's).
+    // The detail is `problem` + ` ` + `context`: every marker dropped and each
+    // text piece between them stripped of serde's `, ` separator. Covers all
+    // three emitted shapes: `{p} at line L C` (no context), `{p} at line L C,
+    // {ctx}` (context without a position), and `{p} at line L C, {ctx} at
+    // line L2 C2` (positioned context); N>2 markers degrade the same way.
+    let mut pieces: Vec<&str> = Vec::new();
+    let mut cursor = 0usize;
+    for &(start, end, _, _) in &marks {
+        pieces.push(&detail[cursor..start]);
+        cursor = end;
+    }
+    pieces.push(&detail[cursor..]);
+    let problem = pieces[0];
+    let mut rendered = problem.to_string();
+    for piece in &pieces[1..] {
+        let piece = piece.strip_prefix(", ").unwrap_or(piece);
+        if piece.is_empty() {
+            continue;
+        }
+        if !rendered.is_empty() {
+            rendered.push(' ');
+        }
+        rendered.push_str(piece);
+    }
     (line, column, rendered)
 }
 
@@ -2077,6 +2203,93 @@ mod severity_config_tests {
     #[test]
     fn discovery_order_is_local_then_dist() {
         assert_eq!(DISCOVERY_ORDER, [".rigor.yml", ".rigor.dist.yml"]);
+    }
+
+    /// Issue #158 review fix — the `not valid YAML` renderer must handle
+    /// serde_yaml's THREE position shapes, not only the two-marker one:
+    /// `{p} at line L C` (`a: b: c` → `1:5`), `{p} at line L C, {ctx}`
+    /// (`paths: [src,` → `2:1`), and `{p} at line L C, {ctx} at line L2 C2`
+    /// (`paths: [src` → context's `1:8`). Single-marker strings used to
+    /// slice-invert and panic (begin > end). Positions/wording are
+    /// oracle-verified.
+    #[test]
+    fn yaml_error_renders_like_psych() {
+        let dir = cfg_dir("psych");
+        for (yaml, want) in [
+            (
+                "a: b: c\n",
+                "1:5: not valid YAML: mapping values are not allowed in this context",
+            ),
+            (
+                "paths:\n\t- src\n",
+                "2:1: not valid YAML: found character that cannot start any token \
+                 while scanning for the next token",
+            ),
+            (
+                "paths: [src,\n",
+                "2:1: not valid YAML: did not find expected node content \
+                 while parsing a flow node",
+            ),
+            (
+                "paths: [:foo]\n",
+                "1:9: not valid YAML: did not find expected node content \
+                 while parsing a flow node",
+            ),
+            (
+                "paths: [src\n",
+                "1:8: not valid YAML: did not find expected ',' or ']' \
+                 while parsing a flow sequence",
+            ),
+        ] {
+            std::fs::write(dir.join("b.yml"), yaml).unwrap();
+            match Config::read(&dir.join("b.yml")) {
+                ConfigRead::Fatal(f) => {
+                    assert_eq!(f.code, 64, "{yaml:?}");
+                    assert!(
+                        f.message.ends_with(want),
+                        "{yaml:?} → {:?} (want …{want:?})",
+                        f.message
+                    );
+                }
+                _ => panic!("{yaml:?} must be a fatal parse error"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Psych's `safe_load_file` folds a repeated mapping key LAST-WINS at
+    /// every level — serde_yaml's `Value` rejects it (`duplicate entry with
+    /// key`), so the load goes through the pairwise [`DupOk`] collector.
+    #[test]
+    fn duplicate_keys_last_wins_like_psych() {
+        let dir = cfg_dir("dup");
+        std::fs::write(
+            dir.join("d.yml"),
+            "disable: [call.undefined-method]\ndisable: []\nplugins_io:\n  allowed_paths: [a]\n  allowed_paths: [b]\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join("d.yml"));
+        assert!(cfg.disable.is_empty(), "last `disable:` wins");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `safe_load_file` reads the FIRST document only — a `---` follower is
+    /// never scanned (serde_yaml's `from_str` errors "more than one
+    /// document").
+    #[test]
+    fn multi_document_reads_doc_one_like_psych() {
+        let dir = cfg_dir("multidoc");
+        std::fs::write(
+            dir.join("m.yml"),
+            "paths: [src]\n---\ndisable: [call.undefined-method]\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join("m.yml"));
+        // Doc 1's `paths:` is in force (resolved); doc 2's `disable:` never
+        // read.
+        assert_eq!(cfg.paths, vec![dir.join("src").display().to_string()]);
+        assert!(cfg.disable.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A non-mapping document and a broken YAML file are the reference's

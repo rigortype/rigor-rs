@@ -92,7 +92,15 @@ pub fn severity_overrides_for(
 pub fn cmd_show_bleedingedge(_args: &[String]) -> ExitCode {
     let cfg = match Config::load(None) {
         Ok(c) => c,
-        Err(f) => return f.report(),
+        // Upstream this command rescues ANY StandardError from
+        // `Configuration.load` itself and reports it as
+        // `show-bleedingedge: could not load configuration: <msg>` + exit 64
+        // (`run` → `EXIT_USAGE`) — not the dispatcher's `rigor:` surface, and
+        // always 64 even for the uncaught-`Errno` cases.
+        Err(f) => {
+            eprintln!("show-bleedingedge: could not load configuration: {}", f.message);
+            return ExitCode::from(64);
+        }
     };
     let selector = cfg.bleeding_edge_selector();
     println!("Bleeding-edge overlay (ADR-50 § WD2)");
