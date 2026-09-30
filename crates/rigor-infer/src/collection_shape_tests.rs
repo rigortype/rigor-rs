@@ -375,3 +375,154 @@ fn coll_def_body_scope_isolation_silent() {
         None,
     );
 }
+
+/// rigor-rs#309: a mutation inside a `begin`/`rescue` protected body is on an
+/// ALTERNATIVE exit path — the reference's `eval_begin` evaluates every rescue
+/// arm from the ENTRY scope and joins the live ones
+/// (`live_rescue_results` / `reduce_scopes_with_nil_injection`), so the
+/// post-`begin` binding is a union `receiver_descriptor` declines:
+/// `begin; b.unshift("s"); rescue; nil; end; b.frobnicate` is silent on the
+/// oracle.
+#[test]
+fn coll_rescue_protected_body_mutation_silent() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    nil\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+    // … and the Hash index-store shape of the same carrier.
+    assert_eq!(
+        snap(
+            b"def f\n  h = {a: 1}\n  begin\n    h[:a] = 2\n  rescue\n    nil\n  end\n  h.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// A `begin` with NO `rescue` — and an `ensure`-only one — keeps its body
+/// unconditional: the clause-less `BeginRescue` carrier is the same shape the
+/// `else`/`when`/`in`/parens carriers reuse (rigor-rs#139 convergence), so
+/// the mutation mints the carrier exactly like straight-line code.
+#[test]
+fn coll_begin_without_rescue_mutation_fires() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    nil\n  rescue\n    nil\n  ensure\n    b.unshift(\"s\")\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+}
+
+/// A rescue arm that never falls through (`branch_terminates?` — `return`,
+/// `raise`, an all-diverging `if`/`case`) contributes NO scope: the primary
+/// body alone is the exit, so its mutation still mints the carrier.
+#[test]
+fn coll_rescue_dead_arm_keeps_primary_fires() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    return\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    assert_eq!(
+        snap(
+            b"def f(c)\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    if c\n      return\n    else\n      return\n    end\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+}
+
+/// A `retry` arm contributes the RE-RUN primary scope
+/// (`eval_retried_begin` → `eval_begin_paths`): the protected body's own
+/// mutation lands again, so the carrier survives. An arm-side mutation
+/// crosses the retry edge the other way — it enters the re-run's entry and
+/// joins the unmutated primary as a union — silent.
+#[test]
+fn coll_rescue_retry_replays_primary() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    retry\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    nil\n  rescue\n    b.unshift(\"s\")\n    retry\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// A mutation AFTER the rescued `begin` widens the joined union memberwise
+/// (`widen_union`, mutation_widening.rb:316): the literal arm grows to the
+/// same nominal the mutated arm holds, the union collapses, and the use
+/// fires — `begin; b.unshift(5); rescue; nil; end; b.push(6)` fires on the
+/// reference.
+#[test]
+fn coll_rescue_mutation_then_later_mutation_fires() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(5)\n  rescue\n    nil\n  end\n  b.push(6)\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    // … while a member the arms do NOT converge on keeps the union — silent.
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(5)\n  rescue\n    nil\n  end\n  b.push(\"x\")\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// `rescue => e` rebinds `e` to the exception inside the arm
+/// (`bind_rescue_reference` → `rescue_exception_type`): an `e` that was a
+/// collection before the `begin` must not read the entry carrier inside the
+/// arm, nor carry it through the join.
+#[test]
+fn coll_rescue_bound_name_drops_entry_carrier() {
+    assert_eq!(
+        snap(
+            b"def f\n  e = []\n  begin\n    nil\n  rescue => e\n    e.frobnicate_zzz\n  end\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+    assert_eq!(
+        snap(
+            b"def f\n  e = []\n  begin\n    nil\n  rescue => e\n    nil\n  end\n  e.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// `rescue => h[:k]` stores through `[]=` on `h` in the ARM's entry scope —
+/// the store widens the arm's `h`, and the join keeps the divergence silent.
+#[test]
+fn coll_rescue_index_reference_silent() {
+    assert_eq!(
+        snap(
+            b"def f\n  h = {a: 1}\n  begin\n    nil\n  rescue => h[:k]\n    nil\n  end\n  h.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
