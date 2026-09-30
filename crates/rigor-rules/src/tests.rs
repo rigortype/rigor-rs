@@ -3531,3 +3531,111 @@ fn arg_entry_scope_if_else_branch_is_exclusive() {
         .unwrap_or_else(|| panic!("expected undefined-method, got {diags:?}"));
     assert_eq!(&src[d.start_offset..d.end_offset], b"upcase");
 }
+
+// ---------------------------------------------------------------------------
+// rigor-rs#306 — effect spans NOT linked in `flow_children` (a `for` index
+// target, a `rescue =>` target, `Range` bounds) rode `path_unconditional`'s
+// "inside `id` but inside no linked child" fallback, which answered TRUE and
+// minted the unconditional mutator nominal where nothing was proven. Every
+// row below is oracle-measured on the pinned reference (fresh cwd,
+// `--no-cache`).
+// ---------------------------------------------------------------------------
+
+/// Headline row 1: the `[]=` store a `for h[:k]` index performs is per-
+/// iteration and the loop may not run — the reference joins the
+/// zero-iteration scope into `eval_for`'s continuation, so `h` keeps its
+/// join, never the widened nominal the fallback minted.
+#[test]
+fn for_index_target_store_is_conditional() {
+    let src = b"h = {}\nfor h[:k] in [[\"x\"]]; end\nh.frobnicate\n";
+    let diags = run(src);
+    assert!(
+        diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+        "expected silent (reference is silent at e59b7b89), got {diags:?}"
+    );
+}
+
+/// The store stays conditional in the other `for` index shapes too — a
+/// multi-target slot and a bare splat index (`for *h[:k] in xs`).
+#[test]
+fn for_index_target_multi_and_splat_are_conditional() {
+    for src in [
+        &b"h = {}\nfor w, h[:k] in [[1, 2]]; end\nh.frobnicate\n"[..],
+        &b"h = {}\nfor *h[:k] in [[1]]; end\nh.frobnicate\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected silent (reference is silent at e59b7b89), got {diags:?}"
+        );
+    }
+}
+
+/// Headline row 2: `rescue => h[:k]` stores the exception through `[]=` only
+/// when the clause fires (`bind_rescue_reference` binds inside the clause's
+/// edge), so `h` widens Dynamic — never the unconditional nominal.
+#[test]
+fn rescue_reference_store_is_conditional() {
+    for src in [
+        &b"h = {}\nbegin\n  raise StandardError\nrescue => h[:k]\nend\nh.frobnicate\n"[..],
+        &b"h = {}\nbegin\n  raise StandardError\nrescue StandardError, RuntimeError => h[:k]\nend\nh.frobnicate\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected silent (reference is silent at e59b7b89), got {diags:?}"
+        );
+    }
+}
+
+/// Headline row 3: a range evaluates its bounds unconditionally in order
+/// (the reference's `OPERAND_CONTAINERS` lists `RangeNode`), so the LEFT
+/// bound's `unshift` widens `b` before `b.first` types inside the RIGHT
+/// bound — silent on both engines.
+#[test]
+fn range_left_bound_effect_reaches_right_bound() {
+    let src = b"b = [1, 2, 3]\nx = (b.unshift(\"s\"))..b.first.upcase\n";
+    let diags = run(src);
+    assert!(
+        diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+        "expected silent (reference is silent at e59b7b89), got {diags:?}"
+    );
+}
+
+/// Ordering control: the RIGHT bound's effect never reaches back — `b.first`
+/// in the left bound still types the pre-mutation `Tuple`, so `upcase` on
+/// `1` fires on both engines, and the post-statement `b` is the widened
+/// carrier the unconditional bound mutation left (`frobnicate` fires too).
+#[test]
+fn range_right_bound_effect_does_not_reach_back() {
+    let src = b"b = [1, 2, 3]\nx = b.first.upcase..(b.unshift(\"s\"))\n";
+    let diags = run(src);
+    let d = diags
+        .iter()
+        .find(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .unwrap_or_else(|| panic!("expected undefined-method, got {diags:?}"));
+    assert_eq!(&src[d.start_offset..d.end_offset], b"upcase");
+
+    let src = b"b = [1, 2, 3]\nx = b.first.upcase..(b.unshift(\"s\"))\nb.frobnicate\n";
+    let diags = run(src);
+    let names: Vec<&str> = diags
+        .iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .map(|d| &src[d.start_offset..d.end_offset])
+        .map(|s| std::str::from_utf8(s).unwrap())
+        .collect();
+    assert_eq!(names, ["upcase", "frobnicate"], "got {diags:?}");
+}
+
+/// Sibling exclusion preserved: a mutation inside a `for` BODY still widens
+/// `Dynamic` (the loop may not run), so `b.frobnicate` stays silent — the
+/// `Cond` edge, not the unconditional mint.
+#[test]
+fn loop_body_mutation_stays_conditional() {
+    let src = b"b = [1, 2, 3]\nfor x in [1]; b.unshift(\"s\"); end\nb.frobnicate\n";
+    let diags = run(src);
+    assert!(
+        diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+        "expected silent (reference is silent at e59b7b89), got {diags:?}"
+    );
+}

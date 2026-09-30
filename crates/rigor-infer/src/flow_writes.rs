@@ -523,10 +523,12 @@ pub(crate) fn block_bound_names<'a>(
 }
 
 /// Every node reachable from `roots` through child links, roots included —
-/// the structural "inside a block body" test for [`toplevel_rebinds`]. Orphan
-/// arena nodes (a `Range` bound — lowered for reachability but never linked
-/// under its node) are not reached; a write in one declines rather than risks
-/// a false positive. A `def` parameter default is likewise unreachable here,
+/// the structural "inside a block body" test for [`toplevel_rebinds`]. This
+/// walk's own child table ([`node_child_ids`]) still leaves a `Range` bound
+/// unlinked — `flow_children` links it for the eval-order replay
+/// (rigor-rs#306), but for shadow-scope membership the safe side is keeping
+/// the write a rebind, so a write in one declines rather than risks a false
+/// positive. A `def` parameter default is likewise unreachable here,
 /// but the `def`-scope span filter already drops it before this test runs.
 fn descendants_of(ast: &LoweredAst, roots: &[NodeId]) -> HashSet<NodeId> {
     let mut seen = HashSet::new();

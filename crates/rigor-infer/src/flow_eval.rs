@@ -343,7 +343,37 @@ impl<'i> Typer<'i> {
             }
         }
         // `wspan` sits inside `id` but inside no linked child — it rides
-        // `id`'s own position.
+        // `id`'s own position, UNLESS the position is one the node keeps off
+        // its child list and evaluates conditionally (rigor-rs#306):
+        // - a `for` index target: `for h[:k] in xs` stores each element
+        //   through `[]=` on `h` per iteration (`bind_for_index`), and the
+        //   loop may never run — the post-loop scope joins the zero-iteration
+        //   binding (`eval_for`'s `join_with_nil_injection`), so the store is
+        //   conditional;
+        // - a `rescue` clause's header: the exception list and the `=>`
+        //   target run only when the clause fires
+        //   (`bind_rescue_reference` binds inside the clause's edge). The
+        //   clause's own span covers both, and its body statements already
+        //   declined through their `Cond` edges above.
+        match node {
+            Node::Loop { index_writes, .. } => {
+                if index_writes
+                    .iter()
+                    .any(|(_, s)| s.0 <= wspan.0 && wspan.1 <= s.1)
+                {
+                    return false;
+                }
+            }
+            Node::BeginRescue { clauses, .. } => {
+                if clauses
+                    .iter()
+                    .any(|c| c.span.0 <= wspan.0 && wspan.1 <= c.span.1)
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
         true
     }
 
@@ -486,6 +516,16 @@ impl<'i> Typer<'i> {
                 (*new_name, FlowEdge::Uncond),
                 (*old_name, FlowEdge::Uncond),
             ],
+            // A range evaluates each bound unconditionally in source order —
+            // the reference's `OPERAND_CONTAINERS` includes `RangeNode`
+            // (`eval_value_container` threads each child into the next), so
+            // `(b.unshift("s"))..b.first` widens `b` before `first` types and
+            // `b.first..(b.unshift("s"))` does not (rigor-rs#306).
+            Node::Range { left, right, .. } => left
+                .iter()
+                .chain(right.iter())
+                .map(|&c| (c, FlowEdge::Uncond))
+                .collect(),
             // A class/module header may hold a superclass or `<<` operand;
             // read it under the same barrier as the body.
             Node::Lambda { body, .. }

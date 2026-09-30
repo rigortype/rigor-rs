@@ -594,11 +594,22 @@ pub enum Node {
         dup_keys: Vec<HashKey>,
         span: Span,
     },
-    /// A range (`a..b` / `a...b`). Both bounds (when present) lowered. Typed
-    /// `Dynamic[top]`. Note: an index read `a[i]` is a Prism `CallNode` named
-    /// `[]`, so it lowers as a [`Node::Call`] (receiver + index args) and needs
-    /// no dedicated variant.
-    Range { span: Span },
+    /// A range (`a..b` / `a...b`). Both bounds (when present) lowered and
+    /// LINKED — `left` is the `a` bound, `right` the `b` bound, either `None`
+    /// for an endless/beginless range. Typed `Dynamic[top]`. Note: an index
+    /// read `a[i]` is a Prism `CallNode` named `[]`, so it lowers as a
+    /// [`Node::Call`] (receiver + index args) and needs no dedicated variant.
+    ///
+    /// The bounds are kept on the node (not just in the arena) because the
+    /// range evaluates each unconditionally in source order — the reference
+    /// lists `RangeNode` among its `OPERAND_CONTAINERS` — so the flow replay
+    /// (`Typer::flow_children`, rigor-rs#306) threads a mutation in `left`
+    /// into `right`'s entry scope exactly as the operand walk does.
+    Range {
+        left: Option<NodeId>,
+        right: Option<NodeId>,
+        span: Span,
+    },
     /// An instance/class/global variable read (`@x`, `@@x`, `$x`). Typed
     /// `Dynamic[top]` — no ivar/cvar/gvar type tracking in this slice.
     ///
@@ -837,7 +848,7 @@ impl Node {
             | Node::Logical { span, .. }
             | Node::ArrayLit { span, .. }
             | Node::HashLit { span, .. }
-            | Node::Range { span }
+            | Node::Range { span, .. }
             | Node::VariableRead { span, .. }
             | Node::VariableWrite { span, .. }
             | Node::InstanceVariableWrite { span, .. }
