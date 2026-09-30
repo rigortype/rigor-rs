@@ -558,7 +558,7 @@ fn coll_union_literal_arms_stay_distinct() {
         // `HashShape` edge all the way to `compact!`.
         b"def f(c)\n  h = {a: 1}\n  h[:e] = c if c\n  h.compact!\n  h.frobnicate_zzz\nend\n",
     ] {
-        assert_eq!(snap(src, "frobnicate_zzz"), None, "{:?}", src);
+        assert_eq!(snap(src, "frobnicate_zzz"), None, "{src:?}");
     }
 }
 
