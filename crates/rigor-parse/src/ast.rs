@@ -49,7 +49,7 @@ pub(crate) use recovery::*;
 pub use constants::ConstMutation;
 pub(crate) use constants::*;
 pub use lowered_ast::{lower, lower_with_key, FileKey, LoweredAst};
-pub use node::{IndexCompound, JumpKind, Node, RescueClause, StatementsKind};
+pub use node::{Compound, JumpKind, Node, RescueClause, StatementsKind};
 pub(crate) use builder::*;
 
 /// A dense handle into [`LoweredAst::nodes`]. Cheap to copy; stable for the

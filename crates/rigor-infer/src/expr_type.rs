@@ -3,7 +3,7 @@
 //! and hash-shape projection folds, implicit-self calls, and the shape-key and
 //! literal-set helpers they share.
 
-use rigor_parse::{IndexCompound, LoweredAst, Node, NodeId};
+use rigor_parse::{Compound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 use crate::{kernel_fold, ConstLit, TypeEnv, Typer};
@@ -452,6 +452,36 @@ impl<'i> Typer<'i> {
                     (*r, indices.clone(), *value, compound.clone());
                 self.index_write_value_type(ast, r, &indices, value, &compound, env, interner)
             }
+            // `recv.attr ||= v` / `recv.attr &&= v` / `recv.attr op= v` —
+            // `call_or_write_type_for` / `call_and_write_type_for` /
+            // `call_operator_write_type_for` (`expression_typer.rb`): `||=` /
+            // `&&=` union the narrowed `recv.attr` READ with the RHS; `op=` is
+            // the dispatched `recv.attr op v`, declined here (rigor-rs#343).
+            // A receiver-less write (`attr ||= v` on `self`) declines too —
+            // this slice has no `self` typing.
+            Node::AttrWrite {
+                receiver: Some(r),
+                read_name,
+                compound,
+                value,
+                ..
+            } => {
+                let (r, read_name, compound, value) =
+                    (*r, read_name.clone(), compound.clone(), *value);
+                let current = self.type_call(ast, r, &read_name, &[], env, interner);
+                let rhs = self.type_of(ast, value, env, interner);
+                match compound {
+                    Compound::Or => {
+                        let truthy = self.narrow_truthy(current, interner);
+                        rigor_types::Algebra::join(interner, truthy, rhs)
+                    }
+                    Compound::And => {
+                        let falsey = self.narrow_falsey(current, interner);
+                        rigor_types::Algebra::join(interner, falsey, rhs)
+                    }
+                    Compound::Op(_) => interner.untyped(),
+                }
+            }
             // Any other carrier (`@ivar`, constant, `self`, index, range,
             // logical, variable read) is not precisely typed in this slice ->
             // Dynamic[top] (never guess; keeps the call rule silent). Implicit-
@@ -477,22 +507,22 @@ impl<'i> Typer<'i> {
         receiver: NodeId,
         indices: &[NodeId],
         value: NodeId,
-        compound: &IndexCompound,
+        compound: &Compound,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
         let current = self.type_call(ast, receiver, "[]", indices, env, interner);
         let rhs = self.type_of(ast, value, env, interner);
         match compound {
-            IndexCompound::Or => {
+            Compound::Or => {
                 let truthy = self.narrow_truthy(current, interner);
                 rigor_types::Algebra::join(interner, truthy, rhs)
             }
-            IndexCompound::And => {
+            Compound::And => {
                 let falsey = self.narrow_falsey(current, interner);
                 rigor_types::Algebra::join(interner, falsey, rhs)
             }
-            IndexCompound::Op(_) => interner.untyped(),
+            Compound::Op(_) => interner.untyped(),
         }
     }
 

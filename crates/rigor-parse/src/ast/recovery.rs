@@ -55,6 +55,26 @@ pub(crate) struct Recovered<'pr> {
     /// a call — and no writeback rescues it, inside an iterated body
     /// or out.
     pub(crate) suppressed: bool,
+    /// Whether the walk reached this node inside a pure `type_of`
+    /// operand — a call receiver or argument, a splat's contents, a
+    /// literal-container element, an interpolation part, a `return`
+    /// operand, an `in` pattern, a `rescue`-modifier operand. The
+    /// reference TYPES such a position rather than `evaluate`-ing it,
+    /// so an `evaluate`-only scope effect never lands from one —
+    /// specifically a compound ATTRIBUTE write's
+    /// `widen_attribute_write` (`eval_attribute_compound_write`;
+    /// `OperandEffects` does not list the `Call*WriteNode`s as
+    /// outliving, unlike the `Index*WriteNode` pair — rigor-rs#343).
+    /// Index writes themselves still record their `(h, k)` narrowing
+    /// from `type_of`, so this mark does not feed their `operand` flag.
+    pub(crate) typed: bool,
+    /// Whether the walk reached this node inside a DEFERRED body — a
+    /// crossed literal block or lambda. A compound attribute write's
+    /// widening is scoped to the closure's own run:
+    /// `evaluate_invocation`'s `OperandEffects.any?` writeback check
+    /// excludes `Call*WriteNode`s, so `x.each { h.default ||= 0 }` keeps
+    /// `h`'s indexed narrowings (rigor-rs#343).
+    pub(crate) closure: bool,
 }
 
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
@@ -101,6 +121,10 @@ pub(crate) struct ScopeMarks {
     /// Inside a fresh local scope (`def`/`class`/`module`/`class <<`) —
     /// [`Recovered::suppressed`].
     pub(crate) suppressed: bool,
+    /// Inside a pure `type_of` operand — [`Recovered::typed`].
+    pub(crate) typed: bool,
+    /// Inside a deferred block/lambda body — [`Recovered::closure`].
+    pub(crate) closure: bool,
 }
 
 /// `collect_recoverable_children` with CALLS suppressed — the recovery a
@@ -162,6 +186,12 @@ fn collect_recoverable<'pr>(
         /// Depth of fresh local scopes the walk is inside — see
         /// [`Recovered::suppressed`].
         suppressed: u32,
+        /// Depth of pure `type_of` operand positions the walk is inside
+        /// — see [`Recovered::typed`].
+        typed: u32,
+        /// Depth of deferred block/lambda bodies the walk is inside —
+        /// see [`Recovered::closure`].
+        closure: u32,
     }
     impl<'pr> Collector<'_, 'pr> {
         fn push(&mut self, node: PrismNode<'pr>) {
@@ -172,7 +202,12 @@ fn collect_recoverable<'pr>(
                 blocked: self.blocked > 0,
                 iterative: self.iterative > 0,
                 next_sink: self.next_sink > 0,
-                suppressed: self.suppressed > 0,
+                // A `suppress_calls` run (`defined?`) never evaluates —
+                // a recovered write there is suppressed like a fresh
+                // local scope's, so its mutations do not land.
+                suppressed: self.suppressed > 0 || self.suppress_calls,
+                typed: self.typed > 0,
+                closure: self.closure > 0,
             });
         }
 
@@ -211,6 +246,16 @@ fn collect_recoverable<'pr>(
             self.suppressed += 1;
             f(self);
             self.suppressed -= 1;
+        }
+
+        /// Visit `f` inside a pure `type_of` operand — see
+        /// [`Recovered::typed`]. Unlike `blocked_subtree` this does NOT
+        /// clear `joined`: a typed operand's own nested joins still
+        /// describe it (they simply never run an `evaluate`).
+        fn typed_subtree(&mut self, f: impl FnOnce(&mut Self)) {
+            self.typed += 1;
+            f(self);
+            self.typed -= 1;
         }
 
         /// Whether a compound index write reached HERE is recovered whole
@@ -347,8 +392,12 @@ fn collect_recoverable<'pr>(
             if let Some(in_node) = arm.as_in_node() {
                 // Prism 1.9 folds `in P if G` into the pattern as an `IfNode`
                 // wrapper, so the guard is visited with the pattern — both
-                // blocked (shape-narrowed, never scope-evaluated).
-                self.blocked_subtree(|c| c.visit(&in_node.pattern()));
+                // blocked (shape-narrowed, never scope-evaluated) and TYPED
+                // (`in_arm_position` — `case h; in {a: x} if (h.default ||= 0)`
+                // keeps the narrowing on the oracle, rigor-rs#343).
+                self.typed_subtree(|c| {
+                    c.blocked_subtree(|c2| c2.visit(&in_node.pattern()))
+                });
                 if let Some(statements) = in_node.statements() {
                     visit_body(self, statements.as_node());
                 }
@@ -392,7 +441,12 @@ fn collect_recoverable<'pr>(
             if iterated {
                 self.iterative += 1;
             }
+            // Deferred scope: a compound attribute write's widening is
+            // scoped to the closure run, never written back
+            // (`OperandEffects` excludes `Call*WriteNode`s, rigor-rs#343).
+            self.closure += 1;
             ruby_prism::visit_block_node(self, node);
+            self.closure -= 1;
             if iterated {
                 self.iterative -= 1;
             }
@@ -409,7 +463,9 @@ fn collect_recoverable<'pr>(
             if iterated {
                 self.iterative += 1;
             }
+            self.closure += 1;
             ruby_prism::visit_lambda_node(self, node);
+            self.closure -= 1;
             if iterated {
                 self.iterative -= 1;
             }
@@ -491,6 +547,78 @@ fn collect_recoverable<'pr>(
                 ruby_prism::visit_index_operator_write_node(self, node);
             }
         }
+        // `recv.attr ||= v` / `recv.attr &&= v` / `recv.attr op= v` — the
+        // compound ATTRIBUTE writes (`eval_attribute_compound_write` —
+        // `widen_attribute_write` keyed on `write_name`, rigor-rs#343).
+        // Always `push`ed whole as `Node::AttrWrite`: the flow machinery
+        // needs the writer, and the recovered `typed`/`closure`/`suppressed`
+        // marks — not the recovery itself — decide whether its widening
+        // lands. (Under `suppress_calls` the push records `suppressed`, so
+        // `defined?(h.default ||= 0)` keeps its reads while skipping the
+        // mutation.)
+        fn visit_call_or_write_node(&mut self, node: &ruby_prism::CallOrWriteNode<'pr>) {
+            self.push(node.as_node());
+        }
+        fn visit_call_and_write_node(&mut self, node: &ruby_prism::CallAndWriteNode<'pr>) {
+            self.push(node.as_node());
+        }
+        fn visit_call_operator_write_node(
+            &mut self,
+            node: &ruby_prism::CallOperatorWriteNode<'pr>,
+        ) {
+            self.push(node.as_node());
+        }
+        // ---- pure `type_of` operand positions (rigor-rs#343) -----------
+        // The reference TYPES each of these rather than `evaluate`-ing
+        // them — `OperandWalk.thread_operand`/`operand_scope` for splat
+        // contents, `eval_value_container` for literal elements,
+        // `eval_interpolation` for `#{…}` parts, `jump_value_type` for
+        // `return` operands — so an `evaluate`-only effect (a compound
+        // attribute write's `widen_attribute_write`) inside them never
+        // lands. The walk marks the whole subtree `typed`; the
+        // `Recovered` mark feeds `Node::AttrWrite.evaluated`.
+        fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_splat_node(c, node));
+        }
+        fn visit_assoc_splat_node(&mut self, node: &ruby_prism::AssocSplatNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_assoc_splat_node(c, node));
+        }
+        fn visit_array_node(&mut self, node: &ruby_prism::ArrayNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_array_node(c, node));
+        }
+        fn visit_hash_node(&mut self, node: &ruby_prism::HashNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_hash_node(c, node));
+        }
+        fn visit_keyword_hash_node(&mut self, node: &ruby_prism::KeywordHashNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_keyword_hash_node(c, node));
+        }
+        fn visit_assoc_node(&mut self, node: &ruby_prism::AssocNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_assoc_node(c, node));
+        }
+        fn visit_interpolated_string_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedStringNode<'pr>,
+        ) {
+            self.typed_subtree(|c| ruby_prism::visit_interpolated_string_node(c, node));
+        }
+        fn visit_interpolated_symbol_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedSymbolNode<'pr>,
+        ) {
+            self.typed_subtree(|c| ruby_prism::visit_interpolated_symbol_node(c, node));
+        }
+        fn visit_interpolated_x_string_node(
+            &mut self,
+            node: &ruby_prism::InterpolatedXStringNode<'pr>,
+        ) {
+            self.typed_subtree(|c| ruby_prism::visit_interpolated_x_string_node(c, node));
+        }
+        fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_range_node(c, node));
+        }
+        fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+            self.typed_subtree(|c| ruby_prism::visit_return_node(c, node));
+        }
         // Scope-joining constructs crossed under a wrapper, granular to match
         // `statement_evaluator.rb`. `eval_rescue_modifier` joins the
         // expression scope with the arm's — but when the arm unconditionally
@@ -506,13 +634,20 @@ fn collect_recoverable<'pr>(
             &mut self,
             node: &ruby_prism::RescueModifierNode<'pr>,
         ) {
+            // Both operands are TYPED — `eval_rescue_modifier` joins
+            // `type_rescue_modifier`'s pure type-of evaluation; the join
+            // marks below describe the post-scope shape, but no
+            // `evaluate`-only effect (a compound attribute write's
+            // widening) lands inside either side (rigor-rs#343).
             let arm = node.rescue_expression();
-            if rescue_arm_exits(&arm) && !self.arm_lands(&arm) {
-                self.visit(&node.expression());
-                self.blocked_subtree(|c| c.visit(&node.rescue_expression()));
-            } else {
-                self.under_join(|c| ruby_prism::visit_rescue_modifier_node(c, node));
-            }
+            self.typed_subtree(|c| {
+                if rescue_arm_exits(&arm) && !c.arm_lands(&arm) {
+                    c.visit(&node.expression());
+                    c.blocked_subtree(|c2| c2.visit(&node.rescue_expression()));
+                } else {
+                    c.under_join(|c2| ruby_prism::visit_rescue_modifier_node(c2, node));
+                }
+            });
         }
         // `and_or_with_edges`: the LEFT operand's scope feeds the right and
         // the final join — a left-side narrowing survives, so the left
@@ -875,6 +1010,8 @@ fn collect_recoverable<'pr>(
         iterative: u32::from(marks.iterative),
         next_sink: u32::from(marks.next_sink),
         suppressed: u32::from(marks.suppressed),
+        typed: u32::from(marks.typed),
+        closure: u32::from(marks.closure),
     };
     // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
     // the unhandled root. The default `visit` dispatches the root to its own

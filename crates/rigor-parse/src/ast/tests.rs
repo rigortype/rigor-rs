@@ -629,6 +629,166 @@ fn compound_index_write_recovers_whole_only_in_joined_positions() {
     assert!(reads(b"h = {}\nputs(*[h[:a] ||= 1])\n") >= 1);
 }
 
+/// rigor-rs#343: a compound ATTRIBUTE write (`h.attr ||= v` / `&&=` /
+/// `op=`) lowers to `Node::AttrWrite` — receiver, `read_name` (the
+/// getter), `write_name` (the `attr=` setter `widen_attribute_write`
+/// widens on), compound form, `safe_nav`, `evaluated` — never to a
+/// `Node::Call` (a synthesized `attr`/`attr=` dispatch would mint
+/// `call.*` diagnostics the oracle never emits).
+#[test]
+fn compound_attr_write_lowers_owned() {
+    let writes = |src: &[u8]| -> Vec<(String, String, String, bool, bool)> {
+        let ast = lower(&crate::parse(src));
+        ast.iter()
+            .filter_map(|(_, n)| match n {
+                Node::AttrWrite {
+                    receiver: Some(r),
+                    read_name,
+                    write_name,
+                    safe_nav,
+                    evaluated,
+                    ..
+                } => Some((
+                    match ast.get(*r) {
+                        Node::LocalVariableRead { name, .. } => name.clone(),
+                        _ => "<nonlocal>".to_string(),
+                    },
+                    read_name.clone(),
+                    write_name.clone(),
+                    *safe_nav,
+                    *evaluated,
+                )),
+                _ => None,
+            })
+            .collect()
+    };
+    // `||=`, `&&=`, `op=` all own-lower, keeping getter vs writer apart.
+    for (src, read, write) in [
+        (&b"h = {}
+h.default ||= 0\n"[..], "default", "default="),
+        (&b"h = {}
+h.default &&= 0\n"[..], "default", "default="),
+        (&b"h = {}
+h.default += 0\n"[..], "default", "default="),
+        (&b"h = {}
+h.name ||= \"s\"\n"[..], "name", "name="),
+    ] {
+        assert_eq!(
+            writes(src),
+            [("h".to_string(), read.to_string(), write.to_string(), false, true)],
+            "{src:?}"
+        );
+    }
+    // `&.` threads the safe-navigation flag.
+    assert_eq!(
+        writes(b"h = {}\nh&.default ||= 0\n"),
+        [("h".to_string(), "default".to_string(), "default=".to_string(), true, true)],
+        "safe-nav write"
+    );
+    // Positions the reference EVALUATES (measured silent — the writer's
+    // `widen_attribute_write` lands): straight-line and every
+    // `sub_eval`'d position — write RHS, `&&`/`||` operands, `if`/`case`
+    // arms (operand-position or not), predicates, loop bodies, rescue
+    // arms, `ensure`, `when` conditions, parenthesised statements.
+    for src in [
+        &b"h = {}
+x = h.default ||= 0\n"[..],
+        &b"h = {}
+x = (h && (h.default ||= 0))\n"[..],
+        &b"h = {}
+x = (h.default ||= 0) && 1\n"[..],
+        &b"h = {}
+x = (h.default ||= 0) || 1\n"[..],
+        &b"h = {}
+if h; h.default ||= 0; end\n"[..],
+        &b"h = {}
+x = (if h; h.default ||= 0; end)\n"[..],
+        &b"h = {}
+unless h.nil?; h.default ||= 0; end\n"[..],
+        &b"h = {}
+case 1; when 1; h.default ||= 0; end\n"[..],
+        &b"h = {}
+case h; when h.default ||= 0; end\n"[..],
+        &b"h = {}
+if h.default ||= 0; end\n"[..],
+        &b"h = {}
+while h.default ||= 0; end\n"[..],
+        &b"h = {}
+while h[:b]; h.default ||= 0; end\n"[..],
+        &b"h = {}
+for i in [1]; h.default ||= 0; end\n"[..],
+        &b"h = {}
+begin; h.default ||= 0; rescue; end\n"[..],
+        &b"h = {}
+begin; nil; rescue; h.default ||= 0; end\n"[..],
+        &b"h = {}
+begin; nil; ensure; h.default ||= 0; end\n"[..],
+        &b"h = {}
+x = (h.default ||= 0; 1)\n"[..],
+        &b"h = {}
+x = (h.default ||= 0; 1) if h\n"[..],
+    ] {
+        assert_eq!(
+            writes(src),
+            [("h".to_string(), "default".to_string(), "default=".to_string(), false, true)],
+            "{src:?}"
+        );
+    }
+    // Pure `type_of` operand positions and deferred/suppressed scopes —
+    // `eval_attribute_compound_write` never runs there, so the write's
+    // scope effect cannot land: `evaluated` is `false` (the oracle keeps
+    // the `h[k]` narrowing in every one of these).
+    for src in [
+        &b"h = {}
+puts(h.default ||= 0)\n"[..],              // call argument
+        &b"h = {}
+x = (h.default ||= 0).class\n"[..],        // call receiver
+        &b"h = {}
+puts(*[h.default ||= 0])\n"[..],           // splat
+        &b"h = {}
+x = [h.default ||= 0]\n"[..],              // array element
+        &b"h = {}
+x = {b: h.default ||= 0}\n"[..],           // hash value
+        &b"h = {}
+x = \"#{h.default ||= 0}\"\n"[..],         // interpolation
+        &b"h = {}
+x = (h.default ||= 0)..9\n"[..],           // range bound
+        &b"h = {}
+def m; return h.default ||= 0; end\n"[..], // return operand
+        &b"h = {}
+x = (h.default ||= 0) rescue nil\n"[..],   // rescue modifier
+        &b"h = {}
+case h; in {a: x} if (h.default ||= 0); end\n"[..], // in-pattern guard
+        &b"h = {}
+x = h.default ||= 0, h[:a]\n"[..],        // multi-assign RHS is a `type_of` operand
+        &b"h = {}
+x = defined?(h.default ||= 0)\n"[..],      // never evaluated
+        &b"h = {}
+[1].each { h.default ||= 0 }\n"[..],       // deferred block body
+        &b"h = {}
+l = -> { h.default ||= 0 }\n"[..],         // lambda body
+        &b"h = {}
+[1].map { |i| h.default ||= 0 }\n"[..],    // block-local body
+    ] {
+        let ws = writes(src);
+        assert!(
+            ws.iter().all(|(.., ev)| !ev),
+            "expected evaluated=false in {src:?}, got {ws:?}"
+        );
+        assert!(!ws.is_empty(), "expected AttrWrite in {src:?}");
+    }
+    // A write nested inside another's `type_of` operand is typed, never
+    // evaluated — the outer `default=` still is.
+    assert_eq!(
+        writes(b"h = {}\nh.default ||= (h.x ||= 1)\n"),
+        [
+            ("h".to_string(), "x".to_string(), "x=".to_string(), false, false),
+            ("h".to_string(), "default".to_string(), "default=".to_string(), false, true),
+        ],
+        "nested in the write's own RHS"
+    );
+}
+
 /// rigor-rs#312 round 2: an ITERATED body — `while`/`until`/`for`, an
 /// invoked block/lambda — gives the reference a content-writeback text scan
 /// (`loop_content_writeback`, `content_writeback_block_captures`) that lands

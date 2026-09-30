@@ -643,6 +643,14 @@ fn node_children(node: &Node) -> Vec<NodeId> {
             out.extend(indices.iter().copied());
             out.push(*value);
         }
+        // `recv.attr op= v` — receiver + value are the node's children
+        // (rigor-rs#343).
+        Node::AttrWrite {
+            receiver, value, ..
+        } => {
+            out.extend(receiver.iter().copied());
+            out.push(*value);
+        }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             out.extend(parts.iter().copied())
         }

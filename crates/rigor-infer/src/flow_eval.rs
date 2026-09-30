@@ -694,6 +694,18 @@ impl<'i> Typer<'i> {
                 .chain(std::iter::once(*value))
                 .map(|c| (c, FlowEdge::Uncond))
                 .collect(),
+            // `recv.attr op= v` — `eval_attribute_compound_write` reads the
+            // receiver unconditionally; the RHS is conditional under
+            // `||=`/`&&=` (runs only when `recv.attr`'s truthiness requires)
+            // and unconditional under `op=`. `Cond` is the safe join for all
+            // three (rigor-rs#343).
+            Node::AttrWrite {
+                receiver, value, ..
+            } => receiver
+                .iter()
+                .map(|&c| (c, FlowEdge::Uncond))
+                .chain(std::iter::once((*value, FlowEdge::Cond)))
+                .collect(),
             Node::ArrayLit { elements, .. }
             | Node::HashLit { elements, .. }
             | Node::InterpolatedString {
@@ -1384,6 +1396,21 @@ impl<'i> Typer<'i> {
                 let children: Vec<NodeId> = receiver
                     .iter()
                     .chain(indices.iter())
+                    .chain(std::iter::once(value))
+                    .copied()
+                    .collect();
+                for c in children {
+                    self.bind_statement(ast, c, env, interner);
+                }
+            }
+            // `recv.attr op= v` — a compound ATTRIBUTE write binds no local
+            // itself; nested writes in its operands (`h.default ||= (x = 1)`)
+            // bind as they did under the recovered carrier (rigor-rs#343).
+            Node::AttrWrite {
+                receiver, value, ..
+            } => {
+                let children: Vec<NodeId> = receiver
+                    .iter()
                     .chain(std::iter::once(value))
                     .copied()
                     .collect();
