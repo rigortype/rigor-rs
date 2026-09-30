@@ -28,28 +28,46 @@ const DEFAULT_PATH: &str = ".rigor.dist.yml";
 /// success, 1 if the destination exists and `--force` was not given, 64 on a
 /// usage error.
 pub fn cmd_init(args: &[String]) -> ExitCode {
+    // Reference `run_init`'s table, `opts.on` order.
+    const SWITCHES: &[crate::optparse::Switch] = &[
+        crate::optparse::Switch::new(
+            "force",
+            &[("force", false)],
+            crate::optparse::ArgStyle::Flag,
+            crate::optparse::ValueKind::Raw,
+            "--force",
+            "",
+            &["Overwrite an existing configuration file"],
+        ),
+        crate::optparse::Switch::new(
+            "path",
+            &[("path", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--path",
+            "=PATH",
+            &["Configuration file path"],
+        ),
+    ];
+    const PARSER: crate::optparse::OptParser =
+        crate::optparse::OptParser::new("Usage: rigor init [options]", SWITCHES);
+
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
     let mut force = false;
     let mut path = DEFAULT_PATH.to_string();
-
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--force" => force = true,
-            "--path" => match it.next() {
-                Some(p) => path = p.clone(),
-                None => {
-                    eprintln!("rigor init: --path expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            // Accept `--path=PATH` (the reference's optparse spelling) too.
-            other if other.starts_with("--path=") => {
-                path = other["--path=".len()..].to_string();
-            }
-            other => {
-                eprintln!("rigor init: unexpected argument `{other}`");
-                return ExitCode::from(64);
-            }
+    for item in items {
+        let crate::optparse::Item::Opt { key, value, .. } = item else {
+            // `parser.parse!` leaves positionals in `@argv`, which `run_init`
+            // never reads — they are ignored, not an error.
+            continue;
+        };
+        match key {
+            "force" => force = true,
+            "path" => path = value.unwrap().as_str().to_string(),
+            _ => unreachable!("the switch table is closed"),
         }
     }
 

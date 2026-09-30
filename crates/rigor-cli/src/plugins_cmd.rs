@@ -30,38 +30,85 @@ use crate::config::Config;
 /// config-gated activation state. Always exits 0 (read-only inspection,
 /// matching the reference's non-`--strict` advisory exit).
 pub fn cmd_plugins(args: &[String]) -> ExitCode {
-    let mut explicit_config: Option<String> = None;
+    // Reference `PluginsCommand#define_options`, `opts.on` order. Leftover
+    // argv is never read upstream — a `list` (or any) positional parses and is
+    // ignored, which also keeps the port's `rigor plugins list` habit working.
+    const SWITCHES: &[crate::optparse::Switch] = &[
+        crate::optparse::Switch::new(
+            "config",
+            &[("config", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--config",
+            "=PATH",
+            &["Path to the Rigor configuration file"],
+        ),
+        crate::optparse::Switch::new(
+            "format",
+            &[("format", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--format",
+            "=FORMAT",
+            &["Output format: text (default) or json"],
+        ),
+        crate::optparse::Switch::new(
+            "strict",
+            &[("strict", false)],
+            crate::optparse::ArgStyle::Flag,
+            crate::optparse::ValueKind::Raw,
+            "--strict",
+            "",
+            &["Exit 1 if any plugin failed to load (CI gate)"],
+        ),
+        crate::optparse::Switch::new(
+            "capabilities",
+            &[("capabilities", false)],
+            crate::optparse::ArgStyle::Flag,
+            crate::optparse::ValueKind::Raw,
+            "--capabilities",
+            "",
+            &["Emit the per-plugin extension-protocol catalogue (ADR-37)"],
+        ),
+    ];
+    const PARSER: crate::optparse::OptParser =
+        crate::optparse::OptParser::new("Usage: rigor plugins [options]", SWITCHES);
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            // The reference's grammar is the bare `rigor plugins`; accept a
-            // leading `list` subcommand too since it reads naturally and some
-            // users reach for it (it is a no-op selector — there is only one
-            // view in the standalone build).
-            "list" => {}
-            "--config" => match it.next() {
-                Some(p) => explicit_config = Some(p.clone()),
-                None => {
-                    eprintln!("rigor plugins: --config expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--config=") => {
-                explicit_config = Some(other["--config=".len()..].to_string());
-            }
-            "-h" | "--help" | "help" => {
-                println!("Usage: rigor plugins [list] [--config PATH]");
-                println!();
-                println!("List the bundled plugins rigor-rs ships and which `.rigor.yml`'s");
-                println!("`plugins:` list enables. Read-only; always exits 0.");
-                return ExitCode::SUCCESS;
-            }
-            other => {
-                eprintln!("rigor plugins: unexpected argument `{other}`");
-                return ExitCode::from(64);
-            }
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut explicit_config: Option<String> = None;
+    let mut format = "text".to_string();
+    let mut capabilities = false;
+    for item in items {
+        let crate::optparse::Item::Opt { key, value, .. } = item else {
+            continue;
+        };
+        match key {
+            "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+            "format" => format = value.unwrap().as_str().to_string(),
+            // `--strict` only moves the exit code when a plugin FAILED TO
+            // LOAD; the port's bundled-plugin model has no load failures, so
+            // the flag is inert here (the upstream `any_load_errors` set is
+            // always empty on this surface).
+            "strict" => {}
+            "capabilities" => capabilities = true,
+            _ => unreachable!("the switch table is closed"),
         }
+    }
+    // `validate!` — inside `parse_options`, before `Configuration.load`.
+    if !matches!(format.as_str(), "text" | "json") {
+        eprintln!("invalid argument: unsupported format: {format}");
+        return ExitCode::from(64);
+    }
+    if format == "json" {
+        eprintln!("rigor: plugins --format=json is not supported by rigor-rs");
+        return ExitCode::from(64);
+    }
+    if capabilities {
+        eprintln!("rigor: plugins --capabilities is not supported by rigor-rs");
+        return ExitCode::from(64);
     }
 
     let cfg = match Config::load(explicit_config.as_deref().map(std::path::Path::new)) {

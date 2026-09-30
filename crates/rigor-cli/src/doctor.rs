@@ -27,26 +27,60 @@ use crate::ruby_mode;
 /// `rigor doctor [--config PATH]` — report the environment/setup diagnostic.
 /// Exit 0 when healthy, 1 if a check fails (a malformed explicit config).
 pub fn cmd_doctor(args: &[String]) -> ExitCode {
-    let mut explicit_config: Option<String> = None;
+    // Reference `DoctorCommand#parse_options`: `--config` then `--format`
+    // (both raw strings; `validate!` raises `InvalidArgument` on a bad format
+    // INSIDE parse_options — before `Configuration.load` — surfacing as
+    // `invalid argument: unsupported format: X`, exit 64). Leftover argv is
+    // never read upstream.
+    const SWITCHES: &[crate::optparse::Switch] = &[
+        crate::optparse::Switch::new(
+            "config",
+            &[("config", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--config",
+            "=PATH",
+            &["Path to the Rigor configuration file"],
+        ),
+        crate::optparse::Switch::new(
+            "format",
+            &[("format", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--format",
+            "=FORMAT",
+            &["Output format: text (default) or json"],
+        ),
+    ];
+    const PARSER: crate::optparse::OptParser =
+        crate::optparse::OptParser::new("Usage: rigor doctor [options]", SWITCHES);
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--config" => match it.next() {
-                Some(p) => explicit_config = Some(p.clone()),
-                None => {
-                    eprintln!("rigor doctor: --config expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--config=") => {
-                explicit_config = Some(other["--config=".len()..].to_string());
-            }
-            other => {
-                eprintln!("rigor doctor: unexpected argument `{other}`");
-                return ExitCode::from(64);
-            }
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut explicit_config: Option<String> = None;
+    let mut format = "text".to_string();
+    for item in items {
+        let crate::optparse::Item::Opt { key, value, .. } = item else {
+            continue;
+        };
+        match key {
+            "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+            "format" => format = value.unwrap().as_str().to_string(),
+            _ => unreachable!("the switch table is closed"),
         }
+    }
+    // `validate!` — before config load, matching `parse_options`'s position.
+    if !matches!(format.as_str(), "text" | "json") {
+        eprintln!("invalid argument: unsupported format: {format}");
+        return ExitCode::from(64);
+    }
+    // `json` is valid upstream but the port has no JSON report — the
+    // classified-unsupported surface (issue #155).
+    if format == "json" {
+        eprintln!("rigor: doctor --format=json is not supported by rigor-rs");
+        return ExitCode::from(64);
     }
 
     let mut healthy = true;

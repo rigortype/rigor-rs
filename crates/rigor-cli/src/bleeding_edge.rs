@@ -89,8 +89,49 @@ pub fn severity_overrides_for(
 
 /// `rigor show-bleedingedge` — print the overlay + what the cwd's config
 /// adopts, byte-matching the reference command's text output.
-pub fn cmd_show_bleedingedge(_args: &[String]) -> ExitCode {
-    let cfg = match Config::load(None) {
+pub fn cmd_show_bleedingedge(args: &[String]) -> ExitCode {
+    // Reference `ShowBleedingedgeCommand#parse_options`: `--format` is a
+    // `%w[text json]` list, `--config` a raw path.
+    const SWITCHES: &[crate::optparse::Switch] = &[
+        crate::optparse::Switch::new(
+            "format",
+            &[("format", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Choice(&["text", "json"]),
+            "--format",
+            "=FORMAT",
+            &["Output format (text | json). Default: text."],
+        ),
+        crate::optparse::Switch::new(
+            "config",
+            &[("config", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--config",
+            "=PATH",
+            &["Path to a .rigor.yml (default: auto-discovery)."],
+        ),
+    ];
+    const PARSER: crate::optparse::OptParser =
+        crate::optparse::OptParser::new("Usage: rigor show-bleedingedge [options]", SWITCHES);
+
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut format = "text".to_string();
+    let mut explicit_config: Option<String> = None;
+    for item in items {
+        let crate::optparse::Item::Opt { key, value, .. } = item else {
+            continue;
+        };
+        match key {
+            "format" => format = value.unwrap().as_str().to_string(),
+            "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+            _ => unreachable!("the switch table is closed"),
+        }
+    }
+    let cfg = match Config::load(explicit_config.as_deref().map(std::path::Path::new)) {
         Ok(c) => c,
         // Upstream this command rescues ANY StandardError from
         // `Configuration.load` itself and reports it as
@@ -102,6 +143,13 @@ pub fn cmd_show_bleedingedge(_args: &[String]) -> ExitCode {
             return ExitCode::from(64);
         }
     };
+    // `render_json` is upstream-only — the port has no JSON overlay report.
+    // Reached only after a successful config load (upstream's `case` on format
+    // sits after `load_configuration`).
+    if format == "json" {
+        eprintln!("rigor: show-bleedingedge --format=json is not supported by rigor-rs");
+        return ExitCode::from(64);
+    }
     let selector = cfg.bleeding_edge_selector();
     println!("Bleeding-edge overlay (ADR-50 § WD2)");
     println!();

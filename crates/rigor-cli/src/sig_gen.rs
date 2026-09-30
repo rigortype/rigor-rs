@@ -148,62 +148,109 @@ struct Candidate {
 /// `rigor sig-gen [--print] [--format text|json] [--include-private] [--config PATH] [paths]`.
 /// Exit 0 on success, 64 on a usage error, 2 for a not-yet-ported mode.
 pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
-    let mut format = "text";
-    let mut include_private = false;
-    let mut write = false;
-    let mut diff = false;
-    let mut overwrite = false;
-    let mut explicit_config: Option<&str> = None;
-    let mut positional: Vec<&str> = Vec::new();
+    // Reference `SigGenCommand#build_option_parser`, `opts.on` order.
+    // `--format`/`--params` are RAW (the reference validates them post-parse
+    // in `validation_error`, printing `sig-gen: <msg>` + exit 64); the mode
+    // flags are last-wins (`options[:mode] = …`).
+    use crate::optparse::{ArgStyle, Item, OptParser, Switch, ValueKind};
+    const SWITCHES: &[Switch] = &[
+        Switch::new("print", &[("print", false)], ArgStyle::Flag, ValueKind::Raw, "--print", "", &["Write RBS skeletons to stdout (default)"]),
+        Switch::new("diff", &[("diff", false)], ArgStyle::Flag, ValueKind::Raw, "--diff", "", &["Write a unified diff against existing RBS"]),
+        Switch::new("write", &[("write", false)], ArgStyle::Flag, ValueKind::Raw, "--write", "", &["Write generated RBS to sig/<path>.rbs files"]),
+        Switch::new("overwrite", &[("overwrite", false)], ArgStyle::Flag, ValueKind::Raw, "--overwrite", "", &["Allow tighter-return updates to replace user-authored RBS"]),
+        Switch::new("include-private", &[("include-private", false)], ArgStyle::Flag, ValueKind::Raw, "--include-private", "", &["Emit private / protected instance methods (default: public only)"]),
+        Switch::new("effect-envelopes", &[("effect-envelopes", false)], ArgStyle::Flag, ValueKind::Raw, "--effect-envelopes", "", &["Also emit %a{rigor:v1:effect ...} for effectful methods (requires the effects: opt-in)"]),
+        Switch::new("no-cache", &[("no-cache", false)], ArgStyle::Flag, ValueKind::Raw, "--no-cache", "", &["Do not read or write the analysis cache (effect collection only)"]),
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        Switch::new("params", &[("params", false)], ArgStyle::Required, ValueKind::Raw, "--params", "=POLICY", &["Parameter policy: untyped (default), observed, observed-strict"]),
+        Switch::new("observe", &[("observe", false)], ArgStyle::Required, ValueKind::Raw, "--observe", "=PATH", &["Directory / file to scan for call-site observations (repeatable)"]),
+        Switch::new("new-files", &[("new-files", false)], ArgStyle::Flag, ValueKind::Raw, "--new-files", "", &["Emit only new-file classifications"]),
+        Switch::new("new-methods", &[("new-methods", false)], ArgStyle::Flag, ValueKind::Raw, "--new-methods", "", &["Emit only new-method classifications"]),
+        Switch::new("tighter-returns", &[("tighter-returns", false)], ArgStyle::Flag, ValueKind::Raw, "--tighter-returns", "", &["Emit only tighter-return classifications"]),
+        Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    ];
+    const PARSER: OptParser =
+        OptParser::new("Usage: rigor sig-gen [options] [paths]", SWITCHES);
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--print" => {} // the default mode
-            "--write" => write = true,
-            "--diff" => diff = true,
-            "--overwrite" => overwrite = true,
-            "--include-private" => include_private = true,
-            "--format" => match it.next().map(String::as_str) {
-                Some(f @ ("text" | "json")) => format = f,
-                other => {
-                    eprintln!("sig-gen: --format expects `text` or `json`, got {other:?}");
-                    return ExitCode::from(64);
-                }
-            },
-            "--config" => match it.next() {
-                Some(p) => explicit_config = Some(p),
-                None => {
-                    eprintln!("sig-gen: --config expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--params") || other.starts_with("--observe") => {
-                eprintln!("sig-gen: `{other}` is not yet implemented in this slice (params stay untyped)");
-                return ExitCode::from(2);
-            }
-            other if other.starts_with("--") => {
-                eprintln!("sig-gen: unknown option `{other}`");
-                return ExitCode::from(64);
-            }
-            other => positional.push(other),
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut format = String::from("text");
+    let mut params = String::from("untyped");
+    let mut include_private = false;
+    let mut mode = "print";
+    let mut overwrite = false;
+    let mut explicit_config: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    // The first flag naming machinery this slice does not port (in argv order,
+    // so the diagnostic names the first offender).
+    let mut deferred: Option<String> = None;
+    let defer = |flag: &str, deferred: &mut Option<String>| {
+        if deferred.is_none() {
+            *deferred = Some(flag.to_string());
         }
+    };
+    for item in items {
+        match item {
+            Item::Positional(p) => positional.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "print" => mode = "print",
+                "diff" => mode = "diff",
+                "write" => mode = "write",
+                "overwrite" => overwrite = true,
+                "include-private" => include_private = true,
+                // No persistent analysis cache exists in the port.
+                "no-cache" => {}
+                "format" => format = value.unwrap().as_str().to_string(),
+                "params" => params = value.unwrap().as_str().to_string(),
+                "observe" => defer("--observe", &mut deferred),
+                "effect-envelopes" => defer("--effect-envelopes", &mut deferred),
+                "new-files" => defer("--new-files", &mut deferred),
+                "new-methods" => defer("--new-methods", &mut deferred),
+                "tighter-returns" => defer("--tighter-returns", &mut deferred),
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                _ => unreachable!("the switch table is closed"),
+            },
+        }
+    }
+
+    // `validation_error` — inside `parse_options`, before `Configuration.load`,
+    // each failure a `sig-gen: <msg>` line + exit 64.
+    if !matches!(format.as_str(), "text" | "json") {
+        eprintln!("sig-gen: unsupported --format={format}");
+        return ExitCode::from(64);
+    }
+    if !matches!(params.as_str(), "untyped" | "observed" | "observed-strict") {
+        eprintln!("sig-gen: unsupported --params={params}");
+        return ExitCode::from(64);
+    }
+    if params == "observed-strict" {
+        eprintln!("sig-gen: --params=observed-strict is reserved until the capability-role catalog ships");
+        return ExitCode::from(64);
+    }
+    if params == "observed" {
+        defer("--params=observed", &mut deferred);
+    }
+    if let Some(flag) = deferred {
+        eprintln!("sig-gen: `{flag}` is not yet implemented in this slice");
+        return ExitCode::from(2);
     }
 
     // Paths: positional args, or config `paths:` when none are supplied
     // (reference `@argv.empty? ? configuration.paths : @argv`).
-    let cfg = match crate::Config::load(explicit_config.map(Path::new)) {
+    let cfg = match crate::Config::load(explicit_config.as_deref().map(Path::new)) {
         Ok(c) => c,
         Err(f) => return f.report(),
     };
-    let config_paths: Vec<&str>;
-    let raw: &[&str] = if positional.is_empty() {
-        config_paths = cfg.paths.iter().map(String::as_str).collect();
-        &config_paths
+    let config_paths: Vec<String>;
+    let raw: Vec<&str> = if positional.is_empty() {
+        config_paths = cfg.paths.clone();
+        config_paths.iter().map(String::as_str).collect()
     } else {
-        &positional
+        positional.iter().map(String::as_str).collect()
     };
-    let files = resolve_paths(raw);
+    let files = resolve_paths(&raw);
 
     // The sig-gen-local, FQN-keyed declaration env, built ONCE from the project's
     // own `.rbs` under the configured signature dirs (ADR-14 slice 10). Drives
@@ -214,8 +261,8 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
 
-    if write {
-        return cmd_write(&files, include_private, format, overwrite, &cfg, &sig_env);
+    if mode == "write" {
+        return cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env);
     }
 
     // `--overwrite` only affects the write path (it governs replacing an existing
@@ -227,7 +274,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
 
     // `--format json` renders the candidate table regardless of print/diff mode
     // (reference `Renderer#render`); text picks the diff or print layout.
-    match (format, diff) {
+    match (format.as_str(), mode == "diff") {
         ("json", _) => render_json(&candidates),
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),

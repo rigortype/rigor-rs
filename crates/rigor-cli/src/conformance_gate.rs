@@ -470,34 +470,42 @@ pub(crate) fn config_path_ok(path: &str) -> bool {
 /// `lib/rigor/cli/check_command.rb` + `options.rb` at the pin: `--format` and
 /// `--config` take a REQUIRED argument (the separate-word form is accepted),
 /// `--bleeding-edge=[LIST]` takes an OPTIONAL one only in the `=` form.
-pub(crate) fn check_args_ok(args: &[String]) -> bool {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if !a.starts_with('-') {
+/// Whether the parsed `check` items prove the run the port models — the
+/// OptionParser-classified argv (issue #155). Positionals are paths either
+/// way; each `Opt` must be a flag whose semantics the port reproduces
+/// exactly. `--fail-on`, `--baseline-strict`, `--workers`, the cache/stat/CI
+/// toggles and the `--bleeding-edge` forms move the exit code or nothing at
+/// all — never the diagnostic set — so they stay. Everything that changes
+/// what is analyzed or which diagnostics print (`--explain`'s :info rows,
+/// `--coverage`, editor mode, the incremental modes, `--no-tolerated-effects`,
+/// an explicit `--baseline`, the rigor-rs-only `--ruby` axis) stands the
+/// gate down.
+pub(crate) fn check_args_ok(items: &[crate::optparse::Item]) -> bool {
+    use crate::optparse::{Item, Value};
+    for item in items {
+        let Item::Opt { key, value, .. } = item else {
             continue;
-        }
-        match a.as_str() {
-            "--format" => {
-                if !it.next().is_some_and(|v| {
-                    matches!(
-                        v.as_str(),
-                        "text" | "json" | "github" | "sarif" | "gitlab" | "checkstyle" | "junit" | "teamcity"
-                    )
-                }) {
+        };
+        match *key {
+            "format" => {
+                let ok = matches!(value, Some(Value::Str(s)) if matches!(
+                    s.as_str(),
+                    "text" | "json" | "github" | "sarif" | "gitlab" | "checkstyle" | "junit" | "teamcity"
+                ));
+                if !ok {
                     return false;
                 }
             }
-            "--config" => {
-                if !it.next().is_some_and(|v| config_path_ok(v)) {
+            "config" => {
+                let ok = matches!(value, Some(Value::Str(s)) if config_path_ok(s));
+                if !ok {
                     return false;
                 }
             }
-            "--no-baseline" | "--bleeding-edge" | "--no-bleeding-edge" => {}
-            // `--bleeding-edge=` (empty) adopts NOTHING there, everything here.
-            other => match other.strip_prefix("--bleeding-edge=") {
-                Some(list) if list.split(',').any(|id| !id.trim().is_empty()) => {}
-                _ => return false,
-            },
+            "no-baseline" | "baseline-strict" | "bleeding-edge" | "no-bleeding-edge"
+            | "no-cache" | "clear-cache" | "stats" | "no-ci-detect" | "fail-on"
+            | "workers" => {}
+            _ => return false,
         }
     }
     true
@@ -564,7 +572,6 @@ pub(crate) fn process_env_ok(
 ///   unterminated), and a reversed range still matches its two endpoints
 ///   (`[z-a]` = {z, a}: `bracket` `memcmp`s `t1`/`t2` before the codepoint
 ///   range test). An unterminated `[` fails the match wherever reached.
-#[cfg(test)]
 pub(crate) fn fnmatch(pattern: &str, path: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let s: Vec<char> = path.chars().collect();
@@ -983,30 +990,53 @@ mod tests {
         assert!(!config_text_ok("signature_paths:\r  - sig\n"));
     }
 
-    /// Round 4, family E: only exact spellings the port parses as the
-    /// reference does.
+    /// Round 4, family E / issue #155: the gate reads the OptionParser-
+    /// classified items — spellings the parser already rejected (unknown
+    /// flags, `-file.rb`, `--`) never reach it.
     #[test]
     fn check_args_allow_list() {
-        let ok = |a: &[&str]| check_args_ok(&a.iter().map(|s| (*s).to_string()).collect::<Vec<_>>());
-        assert!(ok(&["app.rb", "--format", "json"]));
-        assert!(ok(&["--bleeding-edge", "app.rb", "--no-baseline", "--bleeding-edge=a,b"]));
+        use crate::optparse::{Item, Value};
+        let opt = |key: &'static str, v: Option<Value>| Item::Opt {
+            key,
+            negated: false,
+            value: v,
+        };
+        let s = |v: &str| Some(Value::Str(v.to_string()));
+        let pos = |v: &str| Item::Positional(v.to_string());
+        assert!(check_args_ok(&[pos("app.rb"), opt("format", s("json"))]));
+        // Output/exit-code-only and provably-identical flags keep the gate up.
+        assert!(check_args_ok(&[
+            opt("bleeding-edge", None),
+            pos("app.rb"),
+            opt("no-baseline", None),
+            opt("bleeding-edge", s("a,b")),
+            opt("bleeding-edge", s("")),
+            opt("workers", Some(Value::Int(2))),
+            opt("stats", None),
+            opt("no-ci-detect", None),
+            opt("fail-on", s("warning")),
+            opt("no-cache", None),
+            opt("clear-cache", None),
+            opt("baseline-strict", None),
+            opt("config", s("x.yml")),
+        ]));
         for bad in [
-            &["--config=x.yml", "app.rb"][..],
-            &["--baseline=bl.yml", "app.rb"],
-            &["--bogus", "app.rb"],
-            &["-q", "app.rb"],
-            &["-app.rb"],
-            &["app.rb", "--workers"],
-            &["--no", "app.rb"],
-            &["--basel=bl.yml", "app.rb"],
-            &["--verify-incremental", "app.rb"],
-            &["--", "app.rb"],
-            &["--bleeding-edge=", "app.rb"],
-            &["--ruby", "off", "app.rb"],
-            &["--format", "yaml"],
-            &["--config", "~/x.yml"],
+            vec![opt("baseline", s("bl.yml")), pos("app.rb")],
+            vec![opt("bogus", None), pos("app.rb")],
+            vec![opt("verify-incremental", None), pos("app.rb")],
+            vec![opt("incremental", None), pos("app.rb")],
+            vec![opt("ruby", s("off")), pos("app.rb")],
+            vec![opt("no-ruby", None), pos("app.rb")],
+            vec![opt("format", s("yaml"))],
+            vec![opt("config", s("~/x.yml"))],
+            vec![opt("explain", None), pos("app.rb")],
+            vec![opt("coverage", None)],
+            vec![opt("cache-stats", None)],
+            vec![opt("tmp-file", s("t.rb")), opt("instead-of", s("a.rb"))],
+            vec![opt("no-tolerated-effects", None)],
+            vec![opt("treat-all-as-inline-rbs", None)],
         ] {
-            assert!(!ok(bad), "{bad:?}");
+            assert!(!check_args_ok(&bad), "{bad:?}");
         }
     }
 

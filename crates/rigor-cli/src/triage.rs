@@ -48,8 +48,81 @@ use std::process::ExitCode;
 use rigor_rules::{Diagnostic, Severity};
 use serde_json::json;
 
+use crate::optparse::{ArgStyle, Item, OptParser, Switch, ValueKind};
+
 const BAR_WIDTH: usize = 24;
 const SELECTOR_ROWS: usize = 15;
+
+/// `parse_options`' table, `opts.on` order (issue #155). `--format` is RAW —
+/// `validate!` checks membership post-parse and raises
+/// `invalid argument: unsupported format: X` (before `Configuration.load`);
+/// `--top` is `Integer`.
+const TRIAGE_SWITCHES: &[Switch] = &[
+    Switch::new(
+        "config",
+        &[("config", false)],
+        ArgStyle::Required,
+        ValueKind::Raw,
+        "--config",
+        "=PATH",
+        &["Path to the Rigor configuration file"],
+    ),
+    Switch::new(
+        "format",
+        &[("format", false)],
+        ArgStyle::Required,
+        ValueKind::Raw,
+        "--format",
+        "=FORMAT",
+        &["Output format: text (default) or json"],
+    ),
+    Switch::new(
+        "top",
+        &[("top", false)],
+        ArgStyle::Required,
+        ValueKind::Int,
+        "--top",
+        "=N",
+        &["Hotspot-file count (default 10)"],
+    ),
+    Switch::new(
+        "include-info",
+        &[("include-info", false)],
+        ArgStyle::Flag,
+        ValueKind::Raw,
+        "--include-info",
+        "",
+        &["Route info diagnostics into distribution / selectors / hotspots (excluded by default — mostly plugin recognition trace)"],
+    ),
+    Switch::new(
+        "hints-only",
+        &[("hints-only", false)],
+        ArgStyle::Flag,
+        ValueKind::Raw,
+        "--hints-only",
+        "",
+        &["Print only the heuristic-hints section"],
+    ),
+    Switch::new(
+        "no-hints",
+        &[("no-hints", false)],
+        ArgStyle::Flag,
+        ValueKind::Raw,
+        "--no-hints",
+        "",
+        &["Print distribution + selectors + hotspots only"],
+    ),
+    Switch::new(
+        "selectors-only",
+        &[("selectors-only", false)],
+        ArgStyle::Flag,
+        ValueKind::Raw,
+        "--selectors-only",
+        "",
+        &["Print only the class/method selectors section"],
+    ),
+];
+const TRIAGE_PARSER: OptParser = OptParser::new("Usage: rigor triage [options] [paths]", TRIAGE_SWITCHES);
 
 /// A diagnostic paired with the path it was reported in (`path` rides the
 /// findings tuple, not the `Diagnostic`). The aggregation works over these.
@@ -66,70 +139,51 @@ enum Section {
 /// `rigor triage [--format text|json] [--top N] [--include-info] [--no-hints |
 /// --selectors-only | --hints-only] [--config PATH] [paths...]`.
 pub fn cmd_triage(args: &[String]) -> ExitCode {
-    let mut format = "text";
+    let items = match TRIAGE_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut format = String::from("text");
     let mut top = 10usize;
     let mut include_info = false;
     // Default sections: hints deferred, so the default equals `--no-hints`.
     let mut sections =
         vec![Section::Distribution, Section::Selectors, Section::Hotspots, Section::Hints];
-    let mut explicit_config: Option<&str> = None;
-    let mut paths: Vec<&str> = Vec::new();
+    let mut explicit_config: Option<String> = None;
+    let mut paths: Vec<String> = Vec::new();
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--format" => match it.next().map(String::as_str) {
-                Some(f @ ("text" | "json")) => format = f,
-                other => {
-                    eprintln!("rigor triage: --format expects `text` or `json`, got {other:?}");
-                    return ExitCode::from(64);
+    for item in items {
+        match item {
+            Item::Positional(p) => paths.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "format" => format = value.unwrap().as_str().to_string(),
+                // `Integer()` already validated; a negative N would raise
+                // upstream (`Array#first(-1)` is an ArgumentError crash) —
+                // clamp to 0 rather than emulate an exception dump.
+                "top" => top = value.unwrap().as_int().max(0) as usize,
+                "include-info" => include_info = true,
+                "hints-only" => sections = vec![Section::Hints],
+                "no-hints" => {
+                    sections = vec![Section::Distribution, Section::Selectors, Section::Hotspots];
                 }
+                "selectors-only" => sections = vec![Section::Selectors],
+                _ => unreachable!("the switch table is closed"),
             },
-            other if other.starts_with("--format=") => match &other["--format=".len()..] {
-                f @ ("text" | "json") => format = f,
-                v => {
-                    eprintln!("rigor triage: unsupported format: {v}");
-                    return ExitCode::from(64);
-                }
-            },
-            "--top" => match it.next().and_then(|v| v.parse::<usize>().ok()) {
-                Some(n) => top = n,
-                None => {
-                    eprintln!("rigor triage: --top expects an integer");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--top=") => match other["--top=".len()..].parse::<usize>() {
-                Ok(n) => top = n,
-                Err(_) => {
-                    eprintln!("rigor triage: --top expects an integer");
-                    return ExitCode::from(64);
-                }
-            },
-            "--include-info" => include_info = true,
-            "--no-hints" => {
-                sections = vec![Section::Distribution, Section::Selectors, Section::Hotspots];
-            }
-            "--selectors-only" => sections = vec![Section::Selectors],
-            "--hints-only" => sections = vec![Section::Hints],
-            "--config" => match it.next() {
-                Some(p) => explicit_config = Some(p),
-                None => {
-                    eprintln!("rigor triage: --config expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--config=") => {
-                explicit_config = Some(&other["--config=".len()..]);
-            }
-            other => paths.push(other),
         }
     }
 
-    let cfg = match crate::Config::load(explicit_config.map(std::path::Path::new)) {
+    // `validate!` — post-parse, BEFORE `Configuration.load`.
+    if !matches!(format.as_str(), "text" | "json") {
+        eprintln!("invalid argument: unsupported format: {format}");
+        return ExitCode::from(64);
+    }
+
+    let cfg = match crate::Config::load(explicit_config.as_deref().map(std::path::Path::new)) {
         Ok(c) => c,
         Err(f) => return f.report(),
     };
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
     let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
     let roots: &[&str] = if paths.is_empty() {
@@ -140,7 +194,7 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
         config_paths = config_path_strings.iter().map(String::as_str).collect();
         &config_paths
     } else {
-        &paths
+        &path_refs
     };
     // Same exclusion-aware expansion `check` runs (upstream triage goes
     // through `runner.run` → `expand_paths` → `reject_excluded` too).
@@ -151,12 +205,12 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
         &expanded,
         // `None` on the `paths:` fallback — same no-widening rule as
         // `check` (`paths == configuration.paths` upstream).
-        if paths.is_empty() { None } else { Some(paths.as_slice()) },
+        if paths.is_empty() { None } else { Some(path_refs.as_slice()) },
         &cfg,
         "triage",
         None,
         &cfg.bleeding_edge_selector(),
-        crate::reference_has_ruby_files(&cfg, &paths),
+        crate::reference_has_ruby_files(&cfg, &path_refs),
     );
 
     // (path, diagnostic) pairs — `path` rides the findings tuple, not the diag.
@@ -164,7 +218,7 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
         findings.iter().map(|(_o, path, _src, d)| (path.as_str(), d)).collect();
 
     let report = analyze(&diags, top, sections.contains(&Section::Hints), include_info);
-    match format {
+    match format.as_str() {
         "json" => println!("{}", report_json(&report)),
         _ => print!("{}", render_text(&report, &sections)),
     }

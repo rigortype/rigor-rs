@@ -31,6 +31,8 @@ use rigor_infer::{SourceIndex, Typer};
 use rigor_parse::{lower, parse, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, TypeId};
 
+use crate::optparse::Item;
+
 /// A located, typed result, ready to render (mirrors the reference's `Result`).
 struct Probe {
     file: String,
@@ -46,28 +48,126 @@ struct Probe {
 /// usage error (bad args or an out-of-range position), mirroring the reference's
 /// exit codes.
 pub fn cmd_type_of(args: &[String]) -> ExitCode {
-    let mut format = "text";
-    let mut positional: Vec<&str> = Vec::new();
+    // Reference `TypeOfCommand#parse_options`: `--format` is a RAW string
+    // (a bad value raises `InvalidArgument` inside `render` — after the run),
+    // then `--trace`, then `Options.add_config` + `Options.add_editor_mode`.
+    const SWITCHES: &[crate::optparse::Switch] = &[
+        crate::optparse::Switch::new(
+            "format",
+            &[("format", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--format",
+            "=FORMAT",
+            &["Output format: text or json"],
+        ),
+        crate::optparse::Switch::new(
+            "trace",
+            &[("trace", false)],
+            crate::optparse::ArgStyle::Flag,
+            crate::optparse::ValueKind::Raw,
+            "--trace",
+            "",
+            &["Record fail-soft fallbacks via FallbackTracer"],
+        ),
+        crate::optparse::Switch::new(
+            "config",
+            &[("config", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--config",
+            "=PATH",
+            &["Path to the Rigor configuration file"],
+        ),
+        crate::optparse::Switch::new(
+            "tmp-file",
+            &[("tmp-file", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--tmp-file",
+            "=PATH",
+            &["Editor mode: read source bytes from PATH instead of --instead-of (paired)"],
+        ),
+        crate::optparse::Switch::new(
+            "instead-of",
+            &[("instead-of", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--instead-of",
+            "=PATH",
+            &["Editor mode: the logical project path the buffer represents (paired with --tmp-file)"],
+        ),
+    ];
+    const PARSER: crate::optparse::OptParser = crate::optparse::OptParser::new(
+        "Usage: rigor type-of [options] FILE:LINE[:COL] [FILE:LINE[:COL] ...]",
+        SWITCHES,
+    );
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--format" => match it.next().map(String::as_str) {
-                Some(f @ ("text" | "json")) => format = f,
-                other => {
-                    eprintln!("rigor type-of: --format expects `text` or `json`, got {other:?}");
-                    return ExitCode::from(64);
-                }
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut format = String::from("text");
+    let mut trace = false;
+    let mut explicit_config: Option<String> = None;
+    let mut tmp_file: Option<String> = None;
+    let mut instead_of: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            Item::Positional(p) => positional.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "format" => format = value.unwrap().as_str().to_string(),
+                "trace" => trace = true,
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "tmp-file" => tmp_file = Some(value.unwrap().as_str().to_string()),
+                "instead-of" => instead_of = Some(value.unwrap().as_str().to_string()),
+                _ => unreachable!("the switch table is closed"),
             },
-            other => positional.push(other),
         }
     }
 
-    let target = match parse_position(&positional) {
+    // `Options.resolve_buffer_binding` — the first post-parse check upstream.
+    match (tmp_file.is_some(), instead_of.is_some()) {
+        (true, false) | (false, true) => {
+            eprintln!("--tmp-file and --instead-of must appear together");
+            return ExitCode::from(64);
+        }
+        (true, true) => {
+            let tmp = tmp_file.as_deref().unwrap_or_default();
+            if !Path::new(tmp).is_file() {
+                eprintln!("--tmp-file {tmp:?}: no such file or not readable");
+                return ExitCode::from(64);
+            }
+            eprintln!("rigor: --tmp-file/--instead-of is not supported by rigor-rs");
+            return ExitCode::from(64);
+        }
+        (false, false) => {}
+    }
+
+    let positional_refs: Vec<&str> = positional.iter().map(String::as_str).collect();
+    let target = match parse_position(&positional_refs) {
         Some(t) => t,
         None => return ExitCode::from(64),
     };
     let (file, line, column) = target;
+
+    // `--trace` renders upstream's FallbackTracer event stream — machinery the
+    // port does not carry. Rejected only once the invocation is otherwise
+    // well-formed (upstream reaches the flag's effect at render time).
+    if trace {
+        eprintln!("rigor: --trace is not supported by rigor-rs");
+        return ExitCode::from(64);
+    }
+
+    // `Configuration.load(options[:config])` opens `execute` upstream — a bad
+    // config beats a missing file. The port's single-file probe does not read
+    // the config, but it surfaces the same load errors.
+    if let Err(f) =
+        crate::config::Config::load(explicit_config.as_deref().map(Path::new))
+    {
+        return f.report();
+    }
 
     // The file must exist on disk (no editor-mode buffer binding in this port).
     if !Path::new(file).is_file() {
@@ -123,9 +223,16 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
         erased: crate::type_display::erase(&interner, &index, &source_index, ty),
     };
 
-    match format {
+    // `Renderable#render`'s dispatch — an unknown format is an
+    // `OptionParser::InvalidArgument` HERE (after the probe ran), surfacing as
+    // `invalid argument: unsupported format: X`, exit 64.
+    match format.as_str() {
+        "text" => render_text(&probe),
         "json" => render_json(&probe),
-        _ => render_text(&probe),
+        other => {
+            eprintln!("invalid argument: unsupported format: {other}");
+            return ExitCode::from(64);
+        }
     }
     ExitCode::SUCCESS
 }

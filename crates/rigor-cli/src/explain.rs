@@ -14,6 +14,8 @@
 
 use std::process::ExitCode;
 
+use crate::optparse::Item;
+
 /// One catalogue entry — the metadata `rigor explain` renders for a rule.
 /// Field set mirrors the reference's `RuleCatalog::Entry`.
 struct Entry {
@@ -773,32 +775,41 @@ pub(crate) fn explain_json(query: Option<&str>) -> Result<serde_json::Value, Str
 /// `rigor explain [--format text|json] [<rule>]` — print rule metadata.
 /// Exit 0 on success, 64 on an unknown rule or a usage error.
 pub fn cmd_explain(args: &[String]) -> ExitCode {
-    let mut format = "text";
-    let mut token: Option<&str> = None;
+    // Reference `ExplainCommand#parse_options`: one `%w[text json]` switch
+    // (`--format=j` completes to `json`; a non-member is `invalid argument:`).
+    const SWITCHES: &[crate::optparse::Switch] = &[crate::optparse::Switch::new(
+        "format",
+        &[("format", false)],
+        crate::optparse::ArgStyle::Required,
+        crate::optparse::ValueKind::Choice(&["text", "json"]),
+        "--format",
+        "=FORMAT",
+        &["Output format (text | json). Default: text."],
+    )];
+    const PARSER: crate::optparse::OptParser =
+        crate::optparse::OptParser::new("Usage: rigor explain [options] [<rule>]", SWITCHES);
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--format" => match it.next().map(String::as_str) {
-                Some(f @ ("text" | "json")) => format = f,
-                other => {
-                    eprintln!("rigor explain: --format expects `text` or `json`, got {other:?}");
-                    return ExitCode::from(64);
-                }
-            },
-            other => {
-                if token.is_some() {
-                    eprintln!("rigor explain: unexpected argument `{other}`");
-                    return ExitCode::from(64);
-                }
-                token = Some(other);
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut format = String::from("text");
+    let mut positional: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            Item::Positional(p) => positional.push(p),
+            Item::Opt { key: "format", value, .. } => {
+                format = value.unwrap().as_str().to_string();
             }
+            _ => unreachable!("the switch table is closed"),
         }
     }
+    // `@argv.shift` — the first positional; any extras are never read upstream.
+    let token = positional.first().map(String::as_str);
 
     match token {
         None => {
-            render_index(format);
+            render_index(&format);
             ExitCode::SUCCESS
         }
         Some(tok) => {
@@ -808,7 +819,7 @@ pub fn cmd_explain(args: &[String]) -> ExitCode {
                 eprintln!("Run `rigor explain` with no arguments to list every rule.");
                 return ExitCode::from(64);
             }
-            render_entries(&entries, format);
+            render_entries(&entries, &format);
             ExitCode::SUCCESS
         }
     }

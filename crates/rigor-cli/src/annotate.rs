@@ -44,43 +44,84 @@ const USAGE: &str = "Usage: rigor annotate [options] FILE";
 
 /// `rigor annotate [--format text|json] [--[no-]color] [--[no-]bat] FILE`.
 pub fn cmd_annotate(args: &[String]) -> ExitCode {
-    let mut format = "text";
-    let mut file: Option<&str> = None;
+    // Reference `AnnotateCommand#parse_options`, `opts.on` order: config,
+    // `--format` as a `%w[text json]` list (prefix completion + a non-member
+    // is `invalid argument:`), then the two flag pairs. Port: colour/bat are
+    // accepted no-ops — the standalone build renders plain output either way.
+    const SWITCHES: &[crate::optparse::Switch] = &[
+        crate::optparse::Switch::new(
+            "config",
+            &[("config", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Raw,
+            "--config",
+            "=PATH",
+            &["Path to the Rigor configuration file"],
+        ),
+        crate::optparse::Switch::new(
+            "format",
+            &[("format", false)],
+            crate::optparse::ArgStyle::Required,
+            crate::optparse::ValueKind::Choice(&["text", "json"]),
+            "--format",
+            "=FORMAT",
+            &["Output format: text (default) or json (a { line => type } map)"],
+        ),
+        crate::optparse::Switch::new(
+            "color",
+            &[("color", false), ("no-color", true)],
+            crate::optparse::ArgStyle::Flag,
+            crate::optparse::ValueKind::Raw,
+            "--[no-]color",
+            "",
+            &["Force or disable ANSI colour (default: auto-detect a tty; honours NO_COLOR)"],
+        ),
+        crate::optparse::Switch::new(
+            "bat",
+            &[("bat", false), ("no-bat", true)],
+            crate::optparse::ArgStyle::Flag,
+            crate::optparse::ValueKind::Raw,
+            "--[no-]bat",
+            "",
+            &["Force or disable highlighting through bat (default: when colour is on and bat is found)"],
+        ),
+    ];
+    const PARSER: crate::optparse::OptParser =
+        crate::optparse::OptParser::new(USAGE, SWITCHES);
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--format" => match it.next().map(String::as_str) {
-                Some(f @ ("text" | "json")) => format = f,
-                other => {
-                    eprintln!("rigor annotate: --format expects `text` or `json`, got {other:?}");
-                    return ExitCode::from(64);
-                }
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut format = String::from("text");
+    let mut explicit_config: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            crate::optparse::Item::Positional(p) => positional.push(p),
+            crate::optparse::Item::Opt { key, value, .. } => match key {
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "format" => format = value.unwrap().as_str().to_string(),
+                "color" | "bat" => {}
+                _ => unreachable!("the switch table is closed"),
             },
-            other if other.starts_with("--format=") => match &other["--format=".len()..] {
-                f @ ("text" | "json") => format = f,
-                v => {
-                    eprintln!("rigor annotate: unsupported format: {v}");
-                    return ExitCode::from(64);
-                }
-            },
-            // Colour flags accepted for CLI compatibility; output is plain.
-            "--color" | "--no-color" | "--bat" | "--no-bat" => {}
-            other if other.starts_with('-') => {
-                eprintln!("rigor annotate: unknown option {other:?}");
-                return ExitCode::from(64);
-            }
-            other => file = Some(other),
         }
     }
 
-    let Some(file) = file else {
+    // `@argv.shift` — the FIRST positional is the file; extras are never read.
+    let Some(file) = positional.first().map(String::as_str) else {
         eprintln!("{USAGE}");
         return ExitCode::from(64);
     };
     if !Path::new(file).is_file() {
         eprintln!("annotate: file not found: {file}");
         return ExitCode::from(1);
+    }
+    // `execute` opens with `Configuration.load(options[:config])` upstream —
+    // after the file check, before the read. The port's plain pipeline does
+    // not consume the config, but it surfaces the same load errors.
+    if let Err(f) = crate::Config::load(explicit_config.as_deref().map(Path::new)) {
+        return f.report();
     }
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
@@ -100,8 +141,9 @@ pub fn cmd_annotate(args: &[String]) -> ExitCode {
     let line_types =
         collect_line_types(&ast, &typer, &source_index, &index, &env, &mut interner, &source);
 
-    match format {
+    match format.as_str() {
         "json" => emit_json(&line_types),
+        // `Choice` guarantees "text" | "json" here.
         _ => print!("{}", annotate_text(&source, &line_types)),
     }
     ExitCode::SUCCESS
