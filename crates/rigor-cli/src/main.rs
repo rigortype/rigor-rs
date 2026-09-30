@@ -2386,7 +2386,7 @@ fn dump_text(rows: &[&Bucket]) {
             groups.push((b.rule.as_str(), vec![b]));
         }
     }
-    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
     let mut occurrences = 0usize;
     for (rule, group) in &groups {
         let total: usize = group.iter().map(|b| b.count).sum();

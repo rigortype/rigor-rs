@@ -380,11 +380,11 @@ impl OptParser {
         let mut nonopts: Vec<String> = Vec::new();
 
         while let Some(tok) = rest.pop_front() {
-            if tok.starts_with("--") {
+            if let Some(stripped) = tok.strip_prefix("--") {
                 // Long option: /\A--([^=]*)(?:=(.*))?/m
-                let (name_raw, eq) = match tok[2..].find('=') {
-                    Some(p) => (&tok[2..2 + p], Some(tok[2 + p + 1..].to_string())),
-                    None => (&tok[2..], None),
+                let (name_raw, eq) = match stripped.find('=') {
+                    Some(p) => (&stripped[..p], Some(stripped[p + 1..].to_string())),
+                    None => (stripped, None),
                 };
                 // `opt.tr!('_', '-')` — underscores in the NAME become dashes.
                 let name = name_raw.replace('_', "-");
@@ -694,7 +694,7 @@ impl OptParser {
             }
         }
 
-        for s in nonopts.into_iter().chain(rest.into_iter()) {
+        for s in nonopts.into_iter().chain(rest) {
             items.push(Item::Positional(s));
         }
         Parsed::Items(items)
@@ -1156,11 +1156,11 @@ fn jaro(s1: &[u32], s2: &[u32]) -> f64 {
     let mut flags1 = 0u128;
     let mut flags2 = 0u128;
     let range = if l2 > 3 { l2 / 2 - 1 } else { 0 };
-    for i in 0..l1 {
+    for (i, &c1) in s1.iter().enumerate() {
         let last = i + range;
-        let mut j = if i >= range { i - range } else { 0 };
+        let mut j = i.saturating_sub(range);
         while j <= last && j < l2 {
-            if flags2 & (1 << j) == 0 && s1[i] == s2[j] {
+            if flags2 & (1 << j) == 0 && c1 == s2[j] {
                 flags2 |= 1 << j;
                 flags1 |= 1 << i;
                 m += 1.0;
@@ -1171,7 +1171,7 @@ fn jaro(s1: &[u32], s2: &[u32]) -> f64 {
     }
     let mut t = 0.0f64;
     let mut k = 0usize;
-    for i in 0..l1 {
+    for (i, &c1) in s1.iter().enumerate() {
         if flags1 & (1 << i) == 0 {
             continue;
         }
@@ -1187,7 +1187,7 @@ fn jaro(s1: &[u32], s2: &[u32]) -> f64 {
         // `k = break(j + 1)` — the loop always breaks before l2 when a
         // flags1 bit is set (each has a flagged partner).
         k = if j < l2 { j + 1 } else { l2 };
-        if index < l2 && s1[i] != s2[index] {
+        if index < l2 && c1 != s2[index] {
             t += 1.0;
         }
     }
@@ -1233,11 +1233,11 @@ fn dym_levenshtein(a: &str, b: &str) -> usize {
     }
     let mut d: Vec<usize> = (0..=m).collect();
     let mut x = 0usize;
-    for i1 in 0..n {
+    for (i1, &c1) in s1.iter().enumerate() {
         let mut i = i1 + 1;
         let mut j = 0usize;
         while j < m {
-            let cost = usize::from(s1[i1] != s2[j]);
+            let cost = usize::from(c1 != s2[j]);
             let a_ = d[j + 1] + 1;
             let b_ = i + 1;
             let c_ = d[j] + cost;

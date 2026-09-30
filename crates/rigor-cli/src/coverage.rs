@@ -359,10 +359,7 @@ fn parse_options(args: &[String]) -> Result<(Options, Vec<String>), ExitCode> {
     ];
     const PARSER: OptParser = OptParser::new(USAGE, SWITCHES);
 
-    let items = match PARSER.parse(args).items_or_exit() {
-        Ok(items) => items,
-        Err(code) => return Err(code),
-    };
+    let items = PARSER.parse(args).items_or_exit()?;
     let mut options = Options {
         format: "text".to_string(),
         threshold: None,
