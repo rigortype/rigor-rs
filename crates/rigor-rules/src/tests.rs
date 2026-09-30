@@ -3860,3 +3860,76 @@ fn issue_309_union_converging_arms_still_fire_end_to_end() {
         "expected the rescue-grown carrier to fire, got {diags:?}"
     );
 }
+
+/// rigor-rs#341 — a local write inside a `when` clause's CONDITIONS or an
+/// `in` clause's pattern/guard never binds: the reference shape-reads
+/// those extents (`Narrowing.case_when_scopes`,
+/// `apply_in_pattern_bindings`) and sub-evals only the clause body
+/// (`StatementEvaluator#eval_when_or_in` walks `node.statements` alone),
+/// so `case v; when (q = 1; Integer) then Float(q).w; end` is silent on
+/// the oracle while `local_reach`'s lexical span scan collected the
+/// write and minted `Float` — the `edge_evaluates` `when`-exclusion's
+/// (rigor-rs#334) sibling hole. Every row below is oracle-measured
+/// SILENT for `call.undefined-method` at e59b7b89.
+#[test]
+fn issue_341_case_clause_writes_stay_silent_end_to_end() {
+    for src in [
+        // The issue row — a multi-statement condition.
+        b"def f(v)\n  case v\n  when (q = 1; Integer) then\n    Float(q).w\n  end\nend\n" as &[u8],
+        // The bare-write condition.
+        b"def f(v)\n  case v\n  when q = 1 then\n    Float(q).w\n  end\nend\n",
+        // `&&` / `||` condition shapes.
+        b"def f(v)\n  case v\n  when Integer && (q = 1) then\n    Float(q).w\n  end\nend\n",
+        b"def f(v)\n  case v\n  when (q = 1) || Integer then\n    Float(q).w\n  end\nend\n",
+        // One condition of several.
+        b"def f(v)\n  case v\n  when Integer, (q = 1; String) then\n    Float(q).w\n  end\nend\n",
+        // With an `else`: the write reaches neither body.
+        b"def f(v)\n  case v\n  when (q = 1; Integer) then\n    Float(q).w\n  else\n    Float(q).w\n  end\nend\n",
+        // Nor the post-`case` read.
+        b"def f(v)\n  case v\n  when (q = 1; Integer) then\n    1\n  end\n  Float(q).w\nend\n",
+        // A nested `case`'s own `when` conditions are just as inert.
+        b"def f(v)\n  case v\n  when (case 1\n        when (q = 1; Integer) then 0\n        else 1\n        end; Integer) then\n    Float(q).w\n  end\nend\n",
+        // `in` patterns and `if`/`unless` guards ride the same
+        // never-evaluated extent (Prism folds the guard into the
+        // pattern's `IfNode`).
+        b"def f(v)\n  case v\n  in ^(q = 1) then\n    Float(q).w\n  end\nend\n",
+        b"def f(v)\n  case v\n  in Integer if (q = 1; true) then\n    Float(q).w\n  end\nend\n",
+        b"def f(v)\n  case v\n  in Integer unless (q = 1; false) then\n    Float(q).w\n  end\nend\n",
+        // The read can sit inside the shape-only extent too — `q`'s
+        // write must not pin it there either.
+        b"def f(v)\n  case v\n  when (q = 1; q.is_a?(Integer)) then\n    1\n  end\nend\n",
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected silent (reference is silent at e59b7b89), got {diags:?} for {:?}",
+            String::from_utf8_lossy(src),
+        );
+    }
+}
+
+/// The exclusion is the clause's CONDITION/PATTERN extent, not the
+/// `case`: a write before it, inside a branch body, or joining after it
+/// still binds and still witnesses.
+#[test]
+fn issue_341_real_writes_still_witness_end_to_end() {
+    for src in [
+        // A pre-`case` write.
+        b"def f(v)\n  q = 1\n  case v\n  when Integer then\n    Float(q).w\n  end\nend\n" as &[u8],
+        // A `when`-BODY write reaches the body's own read…
+        b"def f(v)\n  case v\n  when Integer then\n    q = 1\n    Float(q).w\n  end\nend\n",
+        // …and the post-`case` read.
+        b"def f(v)\n  case v\n  when Integer then\n    q = 1\n  end\n  Float(q).w\nend\n",
+        // A real body write still lands beside an excluded condition
+        // write for the post-`case` read.
+        b"def f(v)\n  case v\n  when (q = 1; Integer) then\n    q = 2\n  end\n  Float(q).w\nend\n",
+    ] {
+        let diags = run(src);
+        assert_eq!(
+            diags.iter().filter(|d| d.rule_id == CALL_UNDEFINED_METHOD).count(),
+            1,
+            "expected one undefined-method, got {diags:?} for {:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}

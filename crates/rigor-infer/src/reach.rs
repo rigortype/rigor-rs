@@ -476,10 +476,22 @@ impl<'i> Typer<'i> {
                 }
             }
         };
+        // A `when` clause's conditions and an `in` clause's pattern are
+        // never scope-evaluated: `eval_when_or_in` sub-evals
+        // `node.statements` alone while `Narrowing.case_when_scopes` /
+        // `apply_in_pattern_bindings` shape-read the rest, so a write
+        // there binds nothing on the reference — `case v when (q = 1;
+        // Integer) then Float(q).w` is silent (rigor-rs#341).
+        let case_clauses = unevaluated_case_clause_spans(ast);
+        let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
         let in_region = |s: rigor_parse::Span| {
-            contains(region, s)
-                && !lambda_spans.iter().any(|&l| contains(l, s))
-                && !(skip_defs && def_spans.iter().any(|&d| contains(d, s)))
+            if !contains(region, s) || in_case_clause(s) {
+                return false;
+            }
+            if lambda_spans.iter().any(|&l| contains(l, s)) {
+                return false;
+            }
+            !(skip_defs && def_spans.iter().any(|&d| contains(d, s)))
         };
         // Only the blocks INSIDE the region can hold a block parameter, and only
         // they (or a loop) can carry a later write back round to the read.
@@ -495,8 +507,11 @@ impl<'i> Typer<'i> {
             !blocks_around.is_empty() || !loop_spans.is_empty()
         };
         // A guard is a narrowing, not a binding, so the `->` skip does not apply
-        // to it — only the region does.
-        let guards_here = |s: rigor_parse::Span| contains(region, s);
+        // to it — only the region does. A guard inside a `when` condition or an
+        // `in` pattern/guard is excluded for the same reason a write is:
+        // `case_when_scopes` narrows the SUBJECT local only, so `q.is_a?(C)`
+        // there types no `q` (rigor-rs#341).
+        let guards_here = |s: rigor_parse::Span| contains(region, s) && !in_case_clause(s);
         let reads_root = |i: NodeId| {
             matches!(ast.get(i), Node::LocalVariableRead { name, .. } if name == root)
         };
@@ -692,6 +707,9 @@ impl<'i> Typer<'i> {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
         let scope = self.class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
+        let case_clauses = unevaluated_case_clause_spans(ast);
+        let in_case_clause =
+            |s: rigor_parse::Span| case_clauses.iter().any(|&c| c.0 <= s.0 && s.1 <= c.1);
         let mut writes: Vec<(rigor_parse::Span, NodeId)> = Vec::new();
         let mut def: Option<(rigor_parse::Span, NodeId)> = None;
         let mut loopy = false;
@@ -705,10 +723,16 @@ impl<'i> Typer<'i> {
                 Node::InstanceVariableWrite { name, value, span, .. }
                     if name == root && scope.contains(*span) =>
                 {
-                    // A `def`-body write is what the class-ivar table collects;
-                    // a class-body (or top-level) write binds only inside that
-                    // same body.
-                    if scope.def_of(*span).is_some() || !use_in_def {
+                    // A `def`-body write is what the class-ivar table collects —
+                    // a TEXT scan, so it sees a write inside a `when` condition
+                    // too (`case v when (@x = 1; Integer) then …` inside a `def`
+                    // fires on the reference) — while a class-body/top-level
+                    // write binds only inside that same body, which a
+                    // never-evaluated condition extent does not reach
+                    // (rigor-rs#341).
+                    if scope.def_of(*span).is_some()
+                        || (!use_in_def && !in_case_clause(*span))
+                    {
                         writes.push((*span, *value));
                     }
                 }
@@ -1060,6 +1084,13 @@ fn latest_definite_assignment(
 ) -> Option<rigor_parse::Span> {
     let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
     let holds = |b: &[NodeId]| b.iter().any(|&s| contains(ast.get(s).span(), use_span));
+    // A `when` clause's conditions / an `in` clause's pattern are never
+    // scope-evaluated ([`unevaluated_case_clause_spans`]), so for a read
+    // inside one the statement path ends at the `case` — descending into
+    // the clause's own `Statements` would mint a definite assignment out
+    // of a write that never binds (rigor-rs#341).
+    let case_clauses = unevaluated_case_clause_spans(ast);
+    let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
     let mut kill = None;
     let mut body: &[NodeId] = body;
     for _ in 0..64 {
@@ -1067,7 +1098,7 @@ fn latest_definite_assignment(
             break;
         };
         for &s in &body[..pos] {
-            if definitely_assigns(ast, s, is_target) {
+            if definitely_assigns(ast, s, is_target, &case_clauses) {
                 kill = Some(ast.get(s).span());
             }
         }
@@ -1085,7 +1116,11 @@ fn latest_definite_assignment(
                 let mut best: Option<(rigor_parse::Span, &[NodeId])> = None;
                 for (id, n) in ast.iter() {
                     let sp = n.span();
-                    if id == stmt || !contains(outer, sp) || !contains(sp, use_span) {
+                    if id == stmt
+                        || !contains(outer, sp)
+                        || !contains(sp, use_span)
+                        || in_case_clause(sp)
+                    {
                         continue;
                     }
                     if matches!(n, Node::Lambda { .. }) {
@@ -1149,21 +1184,37 @@ fn ends_in_return(ast: &LoweredAst, id: NodeId) -> bool {
 
 /// Whether statement `id` assigns on every path that falls through it — see
 /// [`latest_definite_assignment`].
-fn definitely_assigns(ast: &LoweredAst, id: NodeId, is_target: &dyn Fn(&Node) -> bool) -> bool {
+fn definitely_assigns(
+    ast: &LoweredAst,
+    id: NodeId,
+    is_target: &dyn Fn(&Node) -> bool,
+    case_clauses: &[rigor_parse::Span],
+) -> bool {
     let node = ast.get(id);
+    let span = node.span();
+    // A statement inside a `when` condition / `in` pattern is never
+    // scope-evaluated — it assigns nothing on the reference
+    // ([`unevaluated_case_clause_spans`], rigor-rs#341).
+    if case_clauses
+        .iter()
+        .any(|&c| c.0 <= span.0 && span.1 <= c.1)
+    {
+        return false;
+    }
     if is_target(node) {
         return true;
     }
     let arm = |b: &[NodeId]| {
-        b.iter().any(|&s| definitely_assigns(ast, s, is_target))
+        b.iter().any(|&s| definitely_assigns(ast, s, is_target, case_clauses))
             || b.last().is_some_and(|&l| ends_in_return(ast, l))
     };
     match node {
         Node::If { predicate, then_body, else_body, .. } => {
-            definitely_assigns(ast, *predicate, is_target) || (arm(then_body) && arm(else_body))
+            definitely_assigns(ast, *predicate, is_target, case_clauses)
+                || (arm(then_body) && arm(else_body))
         }
         Node::Case { predicate, branches, else_body, .. } => {
-            predicate.is_some_and(|p| definitely_assigns(ast, p, is_target))
+            predicate.is_some_and(|p| definitely_assigns(ast, p, is_target, case_clauses))
                 || (!else_body.is_empty()
                     && arm(else_body)
                     && branches.iter().all(|&w| match ast.get(w) {
@@ -1175,12 +1226,12 @@ fn definitely_assigns(ast: &LoweredAst, id: NodeId, is_target: &dyn Fn(&Node) ->
         // recovery carrier may be skipped, and one under `defined?` / `END`
         // never runs in sequence (rigor-rs#153).
         Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
-            body.iter().any(|&s| definitely_assigns(ast, s, is_target))
+            body.iter().any(|&s| definitely_assigns(ast, s, is_target, case_clauses))
         }
         // A clause-less `begin` — which is also the carrier an `if`'s `else`
         // clause lowers to — runs its body to the end.
         Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
-            body.iter().any(|&s| definitely_assigns(ast, s, is_target))
+            body.iter().any(|&s| definitely_assigns(ast, s, is_target, case_clauses))
         }
         _ => false,
     }
@@ -1362,6 +1413,49 @@ fn pinned_scalar_reach(scalar: &Scalar) -> Reach {
     } else {
         Reach::LITERAL
     }
+}
+
+/// The spans a scope-recording evaluation never enters inside a `case`:
+/// every `when` clause's CONDITIONS, and every `in` clause's PATTERN —
+/// the first body entry of the `BeginRescue` carrier an `in` lowers to,
+/// which a sibling [`Node::UnmodeledWrite`] at the clause's own span
+/// marks (Prism folds `in P if G`/`unless G` into the pattern as an
+/// `IfNode`, so a guard rides the same extent).
+///
+/// `StatementEvaluator::eval_case_when_branches` sub-evals only a
+/// clause's `node.statements`; the conditions/pattern are shape-read by
+/// `Narrowing.case_when_scopes` / `apply_in_pattern_bindings` and
+/// back-filled by `propagate` — never entered. A write inside one binds
+/// nothing on the reference, so `case v when (q = 1; Integer) then
+/// Float(q).w` is silent while the span scan that collected the write
+/// minted `Float` (rigor-rs#341 — the [`edge_evaluates`] `when`-pattern
+/// exclusion's sibling hole). A `case` SUBJECT's own span is not one:
+/// the predicate IS sub-evaled.
+fn unevaluated_case_clause_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+    let mut unmodeled: Vec<rigor_parse::Span> = Vec::new();
+    let mut branches: Vec<NodeId> = Vec::new();
+    for (_, n) in ast.iter() {
+        match n {
+            Node::Case { branches: bs, .. } => branches.extend(bs.iter().copied()),
+            Node::UnmodeledWrite { span } => unmodeled.push(*span),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for &b in &branches {
+        match ast.get(b) {
+            Node::When { conditions, .. } => {
+                out.extend(conditions.iter().map(|&c| ast.get(c).span()));
+            }
+            Node::BeginRescue { body, span, .. } if unmodeled.contains(span) => {
+                if let Some(&p) = body.first() {
+                    out.push(ast.get(p).span());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Whether `name` is bound by a literal block / `->` that contains `span`
