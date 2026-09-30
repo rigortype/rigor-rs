@@ -20,17 +20,15 @@ FPs: #146. CLI/config:
   `--protection`/`--mutation` + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
 - **Pin is master `e59b7b89`** (rbs 4.2.0 vendored). Both
-  standing exception tables EMPTY; a new entry is a real finding, not maintenance
+  standing exception tables EMPTY; new entries are real findings
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap). Version-guard folds mirror
   host dependence (`HOST_RUBY_VERSION`, `RIGOR_RUBY_*`).
 
 State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
 unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
 9,337 files / 818 gaps** (#141 closed 3,002), 8 corpora, baselines in
-`harness/CORPUS.md`; effects gate 0 OVER. `--sweep` ~3 min; read per-corpus
-MATCHED counts. Grading tools REFUSE a stale rigor-cli build — corpus tools
-release, fixture harness debug. Clippy: `-D warnings`, FRESH
-`CARGO_TARGET_DIR`.
+`harness/CORPUS.md`; effects gate 0 OVER. `--sweep` ~3 min. Grading
+tools REFUSE a stale rigor-cli build. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 
@@ -49,10 +47,9 @@ release, fixture harness debug. Clippy: `-D warnings`, FRESH
 - **Five consecutive FP-safe flow slices closed 0 survey gaps** — never build a
   coverage slice without a valid-mode `fp_audit --gaps` prediction
   ([flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
-- **The receiver-typing lever is NOT exhausted** (the 2026-07 conclusion is RETIRED):
-  the 2026-08-07 census re-opened it by asking which MECHANISM each gap is, not which
-  rule, and four slices closed **47 rows** on shapes the port already had signatures
-  for. Pick from mechanism buckets; re-run `gap_census.py --sweep` after each.
+- **The receiver-typing lever is NOT exhausted** (2026-07 conclusion RETIRED): the
+  08-07 census buckets gaps by MECHANISM; four slices closed **47 rows**. Re-run
+  `gap_census.py --sweep` after each.
 - **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (s4). Four stricter typer-free rules measured; best still 5 OVER on gitlab-foss/lib; upstream's edge set isn't characterisable and inversion adds LABELS (unsound). **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen arc closed** — byte surface 0, `--write` sound; rest coverage-only.
 - **Plugin work:** pure-RBS bundle track closed ([note](notes/20260710-pure-rbs-bundle-track-closed.md));
@@ -77,6 +74,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-30 #306 CLOSED** (PR #320): `Loop`/`rescue` index targets decline + `Range` bounds link Uncond in `flow_children` — kills the unlinked-span FP fallback. 0 FP / 818; → #321/#322. [note](notes/20260930-issue-306-effect-spans.md)
 - **2026-09-29 #137 CLOSED** (PR #305): closure-bound locals shadow outer to `Dynamic[top]` in unentered blocks (entry-scope + shadow). 0 FP / 818; → #315–#317. [note](notes/20260929-issue-137-closure-shadow.md)
 - **2026-09-29 #135 CLOSED** (PR #297): `Node::IndexWrite` for `h[k] op=/||=/&&=` routes into mutator widening; resolves #298. 0 FP; → #312–#314. [note](notes/20260929-issue-135-index-write.md)
 - **2026-09-29 #136 CLOSED** (PR #296): per-site operand env replay (`OperandWalk` port) — later operands type from the scope earlier ones left. 0 FP; → #306–#311. [note](notes/20260929-issue-136-operand-scope.md)
