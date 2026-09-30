@@ -13,7 +13,7 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ▶ **NEXT: pin `e59b7b89`, 0 FP / 9,337 / 818 gaps.**
 FPs: #146. CLI/config:
-#155–#159, #162, #169–#171, #130, #132; #160 blocked.
+#155–#159, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
@@ -21,8 +21,7 @@ FPs: #146. CLI/config:
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
 - **Pin is master `e59b7b89`** (rbs 4.2.0 vendored). Both
   standing exception tables EMPTY; new entries are real findings
-  (`UPSTREAM.md` hazards + overlay/`sig/shims` trap). Version-guard folds mirror
-  host dependence (`HOST_RUBY_VERSION`, `RIGOR_RUBY_*`).
+  (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
 
 State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
 unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
@@ -50,8 +49,8 @@ tools REFUSE a stale rigor-cli build. Clippy: `-D warnings`, FRESH `CARGO_TARGET
 - **The receiver-typing lever is NOT exhausted** (2026-07 conclusion RETIRED): the
   08-07 census buckets gaps by MECHANISM; four slices closed **47 rows**. Re-run
   `gap_census.py --sweep` after each.
-- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (s4). Four stricter typer-free rules measured; best still 5 OVER on gitlab-foss/lib; upstream's edge set isn't characterisable and inversion adds LABELS (unsound). **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER. [probe](notes/20260826-effects-s4-probe.md).
-- **sig-gen arc closed** — byte surface 0, `--write` sound; rest coverage-only.
+- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (s4). Four typer-free rules measured; best still 5 OVER; upstream's edge set isn't characterisable. **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER. [probe](notes/20260826-effects-s4-probe.md).
+- **sig-gen closed** — byte surface 0, `--write` sound.
 - **Plugin work:** pure-RBS bundle track closed ([note](notes/20260710-pure-rbs-bundle-track-closed.md));
   sidecar + perf retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
 
@@ -74,6 +73,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-09-30 #162 CLOSED** (PR #323): baseline parity — (file,rule) regroup, Psych scalar reader/writer, `../` keys. 0 FP; → #326–#329. [note](notes/20260930-issue-162-baseline.md)
 - **2026-09-30 #306 CLOSED** (PR #320): `Loop`/`rescue` index targets decline + `Range` bounds link Uncond in `flow_children` — kills the unlinked-span FP fallback. 0 FP / 818; → #321/#322. [note](notes/20260930-issue-306-effect-spans.md)
 - **2026-09-29 #137 CLOSED** (PR #305): closure-bound locals shadow outer to `Dynamic[top]` in unentered blocks (entry-scope + shadow). 0 FP / 818; → #315–#317. [note](notes/20260929-issue-137-closure-shadow.md)
 - **2026-09-29 #135 CLOSED** (PR #297): `Node::IndexWrite` for `h[k] op=/||=/&&=` routes into mutator widening; resolves #298. 0 FP; → #312–#314. [note](notes/20260929-issue-135-index-write.md)
