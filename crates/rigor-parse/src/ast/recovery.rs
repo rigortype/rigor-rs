@@ -35,6 +35,26 @@ pub(crate) struct Recovered<'pr> {
     /// never reach an enclosing local, joined or not; nested recovery
     /// during this node's lowering inherits the block.
     pub(crate) blocked: bool,
+    /// Whether the walk reached this node inside a body the
+    /// reference's content-writeback text scan covers — a
+    /// `while`/`until` body or a block/lambda body
+    /// (`loop_content_writeback`, `content_writeback_block_captures`).
+    /// Every compound index write in that text joins its `[]=`
+    /// receiver widening into the continuation, whatever position or
+    /// jump wraps it; nested recovery inherits the mark.
+    pub(crate) iterative: bool,
+    /// Whether the walk reached this node inside a body whose `next`
+    /// jumps re-merge through a sink (`loop_iteration` /
+    /// `evaluate_invocation`). Distinguishes a `for` body — which has
+    /// no content writeback, so a `break`/`raise` arm is dropped —
+    /// whose `next` arms still land.
+    pub(crate) next_sink: bool,
+    /// Whether the walk reached this node inside a fresh local scope
+    /// (`def`/`class`/`module`/`class <<`): a compound index write
+    /// there mutates an INNER local — or none, the receiver parses as
+    /// a call — and no writeback rescues it, inside an iterated body
+    /// or out.
+    pub(crate) suppressed: bool,
 }
 
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
@@ -49,16 +69,38 @@ pub(crate) struct Recovered<'pr> {
 /// owned `Definition`) would confuse the dead-assignment nested-unit barrier.
 ///
 /// [`Builder::lower_node`]: crate::ast::Builder::lower_node
-/// `joined` is the enclosing scope-join mark: `true` when `node` was already
-/// recovered inside a scope-joining construct, so a lowered carrier's nested
-/// recovery does not resurrect a slot narrowing the join had already erased
-/// (rigor-rs#312 — see [`Recovered::joined`]).
+/// `marks` is the enclosing scope-landing state: `joined` is `true` when
+/// `node` was already recovered inside a scope-joining construct, so a
+/// lowered carrier's nested recovery does not resurrect a slot narrowing
+/// the join had already erased; `iterative` when inside a body whose text
+/// the reference's content-writeback scan covers; `next_sink` when inside
+/// a body whose `next`s re-merge; `suppressed` when inside a fresh local
+/// scope (rigor-rs#312 — see [`Recovered`]).
 pub(crate) fn collect_recoverable_children<'pr>(
     node: &PrismNode<'pr>,
-    joined: bool,
-    blocked: bool,
+    marks: ScopeMarks,
 ) -> Vec<Recovered<'pr>> {
-    collect_recoverable(node, false, joined, blocked)
+    collect_recoverable(node, false, marks)
+}
+
+/// The scope-landing marks a recovery collect carries — each is `true`
+/// when the enclosing position has the property (see [`Collector`]).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ScopeMarks {
+    /// Inside a scope-JOINING construct — [`Recovered::joined`].
+    pub(crate) joined: bool,
+    /// Inside a scope-DISCARDING or never-evaluated position —
+    /// [`Recovered::blocked`]. Rescued by `iterative`.
+    pub(crate) blocked: bool,
+    /// Inside a body the content-writeback text scan covers (a
+    /// `while`/`until` body, a block/lambda body) —
+    /// [`Recovered::iterative`].
+    pub(crate) iterative: bool,
+    /// Inside a `for` body — [`Recovered::next_sink`].
+    pub(crate) next_sink: bool,
+    /// Inside a fresh local scope (`def`/`class`/`module`/`class <<`) —
+    /// [`Recovered::suppressed`].
+    pub(crate) suppressed: bool,
 }
 
 /// `collect_recoverable_children` with CALLS suppressed — the recovery a
@@ -77,15 +119,24 @@ pub(crate) fn collect_defined_operand_children<'pr>(
     node: &PrismNode<'pr>,
     joined: bool,
 ) -> Vec<Recovered<'pr>> {
-    // A `defined?` operand is never evaluated — the block is unconditional.
-    collect_recoverable(node, true, joined, true)
+    // A `defined?` operand is never evaluated — the block is unconditional —
+    // and `NodeWalker` prunes it too, so no writeback scan covers it even
+    // inside an iterated body: `iterative`/`next_sink` stay unset.
+    collect_recoverable(
+        node,
+        true,
+        ScopeMarks {
+            joined,
+            blocked: true,
+            ..ScopeMarks::default()
+        },
+    )
 }
 
 fn collect_recoverable<'pr>(
     node: &PrismNode<'pr>,
     suppress_calls: bool,
-    joined: bool,
-    blocked: bool,
+    marks: ScopeMarks,
 ) -> Vec<Recovered<'pr>> {
     use ruby_prism::Visit;
     struct Collector<'a, 'pr> {
@@ -102,6 +153,15 @@ fn collect_recoverable<'pr>(
         /// Depth of scope-DISCARDING positions the walk is inside — see
         /// [`Recovered::blocked`]. Seeded the same way.
         blocked: u32,
+        /// Depth of iterated bodies the walk is inside — see
+        /// [`Recovered::iterative`].
+        iterative: u32,
+        /// Depth of `next`-sink bodies the walk is inside — see
+        /// [`Recovered::next_sink`].
+        next_sink: u32,
+        /// Depth of fresh local scopes the walk is inside — see
+        /// [`Recovered::suppressed`].
+        suppressed: u32,
     }
     impl<'pr> Collector<'_, 'pr> {
         fn push(&mut self, node: PrismNode<'pr>) {
@@ -110,6 +170,9 @@ fn collect_recoverable<'pr>(
                 bound: self.bound.clone(),
                 joined: self.joined > 0,
                 blocked: self.blocked > 0,
+                iterative: self.iterative > 0,
+                next_sink: self.next_sink > 0,
+                suppressed: self.suppressed > 0,
             });
         }
 
@@ -134,12 +197,45 @@ fn collect_recoverable<'pr>(
             self.joined = saved;
         }
 
+        /// Visit `f` inside a body whose text the reference's
+        /// content-writeback scan covers — see [`Recovered::iterative`].
+        fn under_iterative(&mut self, f: impl FnOnce(&mut Self)) {
+            self.iterative += 1;
+            f(self);
+            self.iterative -= 1;
+        }
+
+        /// Visit `f` inside a fresh local scope — see
+        /// [`Recovered::suppressed`].
+        fn suppressed_subtree(&mut self, f: impl FnOnce(&mut Self)) {
+            self.suppressed += 1;
+            f(self);
+            self.suppressed -= 1;
+        }
+
         /// Whether a compound index write reached HERE is recovered whole
-        /// (lowers to `Node::IndexWrite` and widens its receiver): only
-        /// when its scope reaches a join that drops the slot narrowing
-        /// (`joined`) without being discarded first (`blocked`).
+        /// (lowers to `Node::IndexWrite` and widens its receiver). Under
+        /// `iterative` the writeback scan lands it regardless of the
+        /// position or jump that wraps it; otherwise only when its scope
+        /// reaches a join that drops the slot narrowing (`joined`)
+        /// without being discarded first (`blocked`). A fresh local
+        /// scope (`suppressed`) wins over both: the write mutates an
+        /// inner local, never the enclosing one.
         fn index_write_joined(&self) -> bool {
-            self.joined > 0 && self.blocked == 0
+            self.suppressed == 0
+                && (self.iterative > 0 || (self.joined > 0 && self.blocked == 0))
+        }
+
+        /// Whether a syntactically-exiting arm still lands its scope
+        /// downstream: inside a `next`-sink body (a `for` body's
+        /// `loop_iteration` join — unlike `while`/`until`/block/lambda
+        /// bodies it has no content writeback, so only `next` arms
+        /// survive) an arm holding a `next` that targets the construct
+        /// merges back. Under `iterative` this is moot —
+        /// `index_write_joined` ignores `blocked` there — so only
+        /// `next_sink` is consulted.
+        fn arm_lands(&self, node: &PrismNode<'_>) -> bool {
+            self.next_sink > 0 && has_targeted_next(node)
         }
 
         /// One rescue arm's non-chain children — exceptions, `rescue => x`
@@ -159,21 +255,32 @@ fn collect_recoverable<'pr>(
 
         /// The `when`/`in` arm list of a `case`/`case in`, per
         /// `join_case_branch_scopes`: a terminated arm contributes no scope
-        /// (blocked); a sole live arm returns unjoined (inherits the outer
-        /// mark); two-or-more live arms join (statements under the mark,
+        /// (blocked — unless its scope still lands downstream, `arm_lands`);
+        /// a sole live arm returns unjoined (inherits the outer mark);
+        /// two-or-more live arms join (statements under the mark,
         /// conditions/pattern/guard inheriting — they shape-narrow only).
-        /// An absent `else` still counts the no-match arm as live; the
-        /// all-dead fallback joins every arm anyway.
+        /// `no_match_path` is `true` only for `case`/`when`: an absent
+        /// `else` is a real fall-through arm there, while `case`/`in`
+        /// without `else` raises `NoMatchingPatternError` on no match —
+        /// `pattern_case_matches_every_path?` joins only the actual arms.
+        /// The all-dead fallback joins every arm either way.
         fn visit_case_arms(
             &mut self,
             arms: &[PrismNode<'pr>],
             else_node: Option<&PrismNode<'pr>>,
+            no_match_path: bool,
         ) {
-            let else_dead = else_node.is_some_and(|e| case_arm_exits(e));
-            let live = arms.iter().filter(|a| !case_arm_exits(a)).count()
-                + usize::from(else_node.is_none() || !else_dead);
+            let else_dead = match else_node {
+                Some(e) => case_arm_exits(e) && !self.arm_lands(e),
+                None => !no_match_path,
+            };
+            let arm_dead = |c: &Self, a: &PrismNode<'pr>| {
+                case_arm_exits(a) && !c.arm_lands(a)
+            };
+            let live = arms.iter().filter(|a| !arm_dead(self, a)).count()
+                + usize::from(!else_dead);
             for arm in arms {
-                if case_arm_exits(arm) {
+                if arm_dead(self, arm) {
                     if live == 0 {
                         self.under_join(|c| c.visit(arm));
                     } else {
@@ -247,10 +354,14 @@ fn collect_recoverable<'pr>(
         // shadow the enclosing scope for everything under it (rigor-rs#137 —
         // `super { |o| o + 1 }` reads `o` as the parameter, not an outer
         // local). The names accumulate on `self.bound` until the block exits.
-        // The body is also a JOINED position for an outer local's compound
-        // index write: the reference threads the body's result scope into
-        // `block_writebacks`, which widens a mutated receiver without keeping
-        // its slot narrowing (rigor-rs#312).
+        // The body is also an ITERATED position for an outer local's compound
+        // index write: `evaluate_invocation` / `content_writeback_block_captures`
+        // join the scope at every `next` and the text-scanned mutations into
+        // the continuation, whatever position or jump wraps the write —
+        // `b.each { x = foo rescue (h[:a] ||= 1; break) }` is silent on the
+        // oracle. The exception is a body that never runs: under a blocked
+        // position outside any iterated body (`super { h[:a] ||= 1 }` — the
+        // oracle fires) no writeback applies (rigor-rs#312).
         fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
             let mark = self.bound.len();
             self.bound.extend(
@@ -258,9 +369,14 @@ fn collect_recoverable<'pr>(
                     .iter()
                     .map(|name| String::from_utf8_lossy(name.as_slice()).into_owned()),
             );
-            self.joined += 1;
+            let iterated = self.iterative > 0 || self.blocked == 0;
+            if iterated {
+                self.iterative += 1;
+            }
             ruby_prism::visit_block_node(self, node);
-            self.joined -= 1;
+            if iterated {
+                self.iterative -= 1;
+            }
             self.bound.truncate(mark);
         }
         fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
@@ -270,9 +386,14 @@ fn collect_recoverable<'pr>(
                     .iter()
                     .map(|name| String::from_utf8_lossy(name.as_slice()).into_owned()),
             );
-            self.joined += 1;
+            let iterated = self.iterative > 0 || self.blocked == 0;
+            if iterated {
+                self.iterative += 1;
+            }
             ruby_prism::visit_lambda_node(self, node);
-            self.joined -= 1;
+            if iterated {
+                self.iterative -= 1;
+            }
             self.bound.truncate(mark);
         }
         fn visit_local_variable_read_node(
@@ -353,14 +474,20 @@ fn collect_recoverable<'pr>(
         // Scope-joining constructs crossed under a wrapper, granular to match
         // `statement_evaluator.rb`. `eval_rescue_modifier` joins the
         // expression scope with the arm's — but when the arm unconditionally
-        // exits (`branch_unconditionally_exits?` →
-        // `[type, after_expression]`) the arm's scope is DISCARDED and the
-        // expression's survives unjoined.
+        // exits (`branch_unconditionally_exits?` → `[type, after_expression]`)
+        // the arm's scope is DISCARDED and the expression's survives
+        // unjoined. That test is the STRICT syntactic one (rescue_arm_exits —
+        // not the Bot-inclusive `branch_terminates?` the other sites use): an
+        // `if`/`unless` there never exits because the else slot arrives as an
+        // `ElseNode`, which the reference's dispatch does not unwrap. A
+        // discarded arm still lands when a `next` inside it targets a
+        // `next`-sink body (`for`), or under `iterative` via the writeback.
         fn visit_rescue_modifier_node(
             &mut self,
             node: &ruby_prism::RescueModifierNode<'pr>,
         ) {
-            if unconditional_exit(&node.rescue_expression()) {
+            let arm = node.rescue_expression();
+            if rescue_arm_exits(&arm) && !self.arm_lands(&arm) {
                 self.visit(&node.expression());
                 self.blocked_subtree(|c| c.visit(&node.rescue_expression()));
             } else {
@@ -374,7 +501,7 @@ fn collect_recoverable<'pr>(
         // scope discarded).
         fn visit_and_node(&mut self, node: &ruby_prism::AndNode<'pr>) {
             self.visit(&node.left());
-            if unconditional_exit(&node.right()) {
+            if unconditional_exit(&node.right()) && !self.arm_lands(&node.right()) {
                 self.blocked_subtree(|c| c.visit(&node.right()));
             } else {
                 self.under_join(|c| c.visit(&node.right()));
@@ -382,7 +509,7 @@ fn collect_recoverable<'pr>(
         }
         fn visit_or_node(&mut self, node: &ruby_prism::OrNode<'pr>) {
             self.visit(&node.left());
-            if unconditional_exit(&node.right()) {
+            if unconditional_exit(&node.right()) && !self.arm_lands(&node.right()) {
                 self.blocked_subtree(|c| c.visit(&node.right()));
             } else {
                 self.under_join(|c| c.visit(&node.right()));
@@ -420,11 +547,11 @@ fn collect_recoverable<'pr>(
                 None => {
                     let then_dropped = statements
                         .as_ref()
-                        .is_some_and(|s| unconditional_exit(s))
+                        .is_some_and(|s| unconditional_exit(s) && !self.arm_lands(s))
                         && subsequent.is_none();
                     let else_dropped = subsequent
                         .as_ref()
-                        .is_some_and(|s| unconditional_exit(s))
+                        .is_some_and(|s| unconditional_exit(s) && !self.arm_lands(s))
                         && statements.is_some();
                     if then_dropped {
                         if let Some(s) = &statements {
@@ -476,11 +603,11 @@ fn collect_recoverable<'pr>(
                 None => {
                     let body_dropped = statements
                         .as_ref()
-                        .is_some_and(|s| unconditional_exit(s))
+                        .is_some_and(|s| unconditional_exit(s) && !self.arm_lands(s))
                         && else_clause.is_none();
                     let else_dropped = else_clause
                         .as_ref()
-                        .is_some_and(|s| unconditional_exit(s))
+                        .is_some_and(|s| unconditional_exit(s) && !self.arm_lands(s))
                         && statements.is_some();
                     if body_dropped {
                         if let Some(s) = &statements {
@@ -508,10 +635,13 @@ fn collect_recoverable<'pr>(
         }
         // `eval_loop`: the predicate's narrowing lands in `post_pred`, which
         // both join members derive from — it survives (predicate inherits).
-        // The body's scope joins the predicate's — its narrowings die.
+        // The body is ITERATED: `loop_iteration` merges the scope at every
+        // targeting `next`, `join_break_scopes` recovers `break`-path locals,
+        // and `loop_content_writeback` text-scans the body so every compound
+        // index write's `[]=` widening lands regardless of position or jump.
         fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
             self.visit(&node.predicate());
-            self.under_join(|c| {
+            self.under_iterative(|c| {
                 if let Some(statements) = node.statements() {
                     c.visit(&statements.as_node());
                 }
@@ -519,20 +649,27 @@ fn collect_recoverable<'pr>(
         }
         fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
             self.visit(&node.predicate());
-            self.under_join(|c| {
+            self.under_iterative(|c| {
                 if let Some(statements) = node.statements() {
                     c.visit(&statements.as_node());
                 }
             });
         }
+        // `eval_for` has NO `loop_content_writeback` — a `break`/`raise` arm
+        // is dropped like any unjoined scope — but its single
+        // `loop_iteration` still joins the scope at every targeting `next`
+        // (`next_sink`), and the fall-through/body scope joins the
+        // continuation (`joined`).
         fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
             self.visit(&node.collection());
+            self.next_sink += 1;
             self.under_join(|c| {
                 c.visit(&node.index());
                 if let Some(statements) = node.statements() {
                     c.visit(&statements.as_node());
                 }
             });
+            self.next_sink -= 1;
         }
         // `eval_case`: the subject evaluates once, straight-line. Each arm's
         // statements feed `join_case_branch_scopes` — an arm that terminates
@@ -546,7 +683,8 @@ fn collect_recoverable<'pr>(
             }
             let arms: Vec<PrismNode<'pr>> = node.conditions().iter().collect();
             let else_node = node.else_clause().map(|e| e.as_node());
-            self.visit_case_arms(&arms, else_node.as_ref());
+            // `case`/`when`: an absent `else` is a real no-match arm.
+            self.visit_case_arms(&arms, else_node.as_ref(), true);
         }
         fn visit_case_match_node(&mut self, node: &ruby_prism::CaseMatchNode<'pr>) {
             if let Some(predicate) = node.predicate() {
@@ -554,7 +692,10 @@ fn collect_recoverable<'pr>(
             }
             let arms: Vec<PrismNode<'pr>> = node.conditions().iter().collect();
             let else_node = node.else_clause().map(|e| e.as_node());
-            self.visit_case_arms(&arms, else_node.as_ref());
+            // `case`/`in` without `else` has no no-match arm: no match raises
+            // `NoMatchingPatternError`, and `pattern_case_matches_every_path?`
+            // joins only the actual `in` results.
+            self.visit_case_arms(&arms, else_node.as_ref(), false);
         }
         // `eval_begin`: body + rescue arms + else are alternative exit paths
         // joined by `reduce_scopes_with_nil_injection` — but a rescue arm
@@ -568,26 +709,30 @@ fn collect_recoverable<'pr>(
                 ruby_prism::visit_begin_node(self, node);
                 return;
             }
-            let arm_dead = |r: &ruby_prism::RescueNode<'pr>| {
+            let arm_dead = |c: &Self, r: &ruby_prism::RescueNode<'pr>| {
                 r.statements()
-                    .is_some_and(|s| unconditional_exit(&s.as_node()))
+                    .is_some_and(|s| unconditional_exit(&s.as_node()) && !c.arm_lands(&s.as_node()))
             };
             let mut live = 0usize;
             let mut cur = node.rescue_clause();
             while let Some(r) = cur {
-                live += usize::from(!arm_dead(&r));
+                live += usize::from(!arm_dead(self, &r));
                 cur = r.subsequent();
             }
-            if live == 0 {
-                ruby_prism::visit_begin_node(self, node);
-                return;
-            }
+            // `live_rescues.empty?` — the exit scope is the primary scope
+            // alone, unjoined; dead arms are dropped outright (a `retry`
+            // arm is not dead — `unconditional_exit` excludes it — since
+            // `retry_edge_for` lands its scope back in the primary frame).
             if let Some(statements) = node.statements() {
-                self.under_join(|c| c.visit(&statements.as_node()));
+                if live == 0 {
+                    self.visit(&statements.as_node());
+                } else {
+                    self.under_join(|c| c.visit(&statements.as_node()));
+                }
             }
             let mut cur = node.rescue_clause();
             while let Some(r) = cur {
-                if arm_dead(&r) {
+                if arm_dead(self, &r) {
                     self.blocked_subtree(|c| c.visit_rescue_arm_parts(&r));
                 } else {
                     self.under_join(|c| c.visit_rescue_arm_parts(&r));
@@ -595,7 +740,11 @@ fn collect_recoverable<'pr>(
                 cur = r.subsequent();
             }
             if let Some(else_clause) = node.else_clause() {
-                self.under_join(|c| c.visit(&else_clause.as_node()));
+                if live == 0 {
+                    self.visit(&else_clause.as_node());
+                } else {
+                    self.under_join(|c| c.visit(&else_clause.as_node()));
+                }
             }
             if let Some(ensure_clause) = node.ensure_clause() {
                 self.visit(&ensure_clause.as_node());
@@ -630,24 +779,27 @@ fn collect_recoverable<'pr>(
             self.blocked_subtree(|c| ruby_prism::visit_post_execution_node(c, node));
         }
         // `def` / `class` / `module` / `class <<` open a fresh local scope:
-        // a compound index write crossed inside mutates an INNER local, so
-        // the enclosing scope's marks block — descending keeps the write's
-        // operand reads reachable without inventing a `Node::IndexWrite`
-        // that would widen a same-named outer local.
+        // a compound index write crossed inside mutates an INNER local —
+        // the receiver doesn't even parse as a local read there — so the
+        // writeback scan's `LocalVariableReadNode` test declines it too:
+        // suppressed PERMANENTLY, inside an iterated body or out.
+        // Descending keeps the write's operand reads reachable without
+        // inventing a `Node::IndexWrite` that would widen a same-named
+        // outer local.
         fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
-            self.blocked_subtree(|c| ruby_prism::visit_def_node(c, node));
+            self.suppressed_subtree(|c| ruby_prism::visit_def_node(c, node));
         }
         fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-            self.blocked_subtree(|c| ruby_prism::visit_class_node(c, node));
+            self.suppressed_subtree(|c| ruby_prism::visit_class_node(c, node));
         }
         fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-            self.blocked_subtree(|c| ruby_prism::visit_module_node(c, node));
+            self.suppressed_subtree(|c| ruby_prism::visit_module_node(c, node));
         }
         fn visit_singleton_class_node(
             &mut self,
             node: &ruby_prism::SingletonClassNode<'pr>,
         ) {
-            self.blocked_subtree(|c| ruby_prism::visit_singleton_class_node(c, node));
+            self.suppressed_subtree(|c| ruby_prism::visit_singleton_class_node(c, node));
         }
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if self.suppress_calls {
@@ -698,8 +850,11 @@ fn collect_recoverable<'pr>(
         out: &mut out,
         suppress_calls,
         bound: Vec::new(),
-        joined: u32::from(joined),
-        blocked: u32::from(blocked),
+        joined: u32::from(marks.joined),
+        blocked: u32::from(marks.blocked),
+        iterative: u32::from(marks.iterative),
+        next_sink: u32::from(marks.next_sink),
+        suppressed: u32::from(marks.suppressed),
     };
     // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
     // the unhandled root. The default `visit` dispatches the root to its own
@@ -709,22 +864,26 @@ fn collect_recoverable<'pr>(
     out
 }
 
-/// Prism-level analog of the reference's `branch_unconditionally_exits?`
-/// (statement_evaluator.rb): SYNTACTIC exits only — a `return`/`next`/
-/// `break`, a receiverless `raise`/`throw`/`exit`/`abort`/`fail` call, a
-/// statement list whose final node exits, parentheses whose body exits, or
-/// an `if`/`unless` whose arms BOTH exit. The reference's other verdict
-/// half — `branch_terminates?`'s `Type::Bot` test — needs inferred types
-/// the collect walk does not have, so a branch ending in an always-raising
-/// RESOLVED call reads as live here (the descending/gap side, never an FP
-/// source). `redo`/`retry` fold in for free: their eval type is `Bot`, so
-/// the reference reaches the same verdict through that half.
+/// Prism-level approximation of the reference's `branch_terminates?` for
+/// the sites that apply it (`eval_if`/`eval_unless` arm drops,
+/// `and_or_with_edges`'s right operand, `join_case_branch_scopes`,
+/// `live_rescue_results`): the SYNTACTIC `branch_unconditionally_exits?`
+/// set — a `return`/`next`/`break`, a receiverless `raise`/`throw`/`exit`/
+/// `abort`/`fail` call, a statement list whose final node exits,
+/// parentheses whose body exits — plus the `Type::Bot` half where it is
+/// syntactically visible: an `if`/`unless`/`else` whose every arm
+/// terminates types `Bot`. A `Bot`-only ending the walk cannot see (a
+/// resolved always-raising call) reads as live here — the descending/gap
+/// side, never an FP source.
+///
+/// `redo`/`retry` are NOT counted, though `branch_terminates?` types them
+/// `Bot`: their scope lands anyway — `retry` re-enters through
+/// `retry_edge_for`, and `redo` is only legal inside an iterated body
+/// whose writeback re-merges it.
 fn unconditional_exit(node: &PrismNode<'_>) -> bool {
     if node.as_return_node().is_some()
         || node.as_next_node().is_some()
         || node.as_break_node().is_some()
-        || node.as_redo_node().is_some()
-        || node.as_retry_node().is_some()
     {
         return true;
     }
@@ -835,4 +994,111 @@ fn case_arm_exits(arm: &PrismNode<'_>) -> bool {
         None
     };
     statements.is_some_and(|s| unconditional_exit(&s))
+}
+
+
+/// The strict, syntactic-only mirror of `branch_unconditionally_exits?` —
+/// the verdict `eval_rescue_modifier` alone applies to its rescue arm.
+/// Recognises `return`/`next`/`break`, a receiverless `raise`/`throw`/
+/// `exit`/`abort`/`fail` call, a statement list or parenthesised group
+/// whose final expression exits, and an `if`/`unless` whose then-branch
+/// AND else-slot exit — where the else slot is handed over RAW
+/// (`node.subsequent` / `node.else_clause`): an explicit `else` arrives as
+/// an `ElseNode`, which the dispatch does not unwrap, so an `if`/`unless`
+/// NEVER exits at this site even when both arms do. `retry`/`redo` and
+/// `Bot`-typed endings are absent — those terminate only via
+/// `branch_terminates?`, which the rescue modifier does not consult.
+fn rescue_arm_exits(node: &PrismNode<'_>) -> bool {
+    if node.as_return_node().is_some()
+        || node.as_next_node().is_some()
+        || node.as_break_node().is_some()
+    {
+        return true;
+    }
+    if let Some(call) = node.as_call_node() {
+        return call.receiver().is_none()
+            && matches!(
+                call.name().as_slice(),
+                b"raise" | b"throw" | b"exit" | b"abort" | b"fail"
+            );
+    }
+    if let Some(stmts) = node.as_statements_node() {
+        return stmts
+            .body()
+            .iter()
+            .last()
+            .is_some_and(|last| rescue_arm_exits(&last));
+    }
+    if let Some(paren) = node.as_parentheses_node() {
+        return paren.body().is_some_and(|b| rescue_arm_exits(&b));
+    }
+    if let Some(if_node) = node.as_if_node() {
+        return if_node
+            .statements()
+            .is_some_and(|s| rescue_arm_exits(&s.as_node()))
+            && if_node
+                .subsequent()
+                .is_some_and(|s| rescue_arm_exits(&s));
+    }
+    if let Some(unless_node) = node.as_unless_node() {
+        return unless_node
+            .statements()
+            .is_some_and(|s| rescue_arm_exits(&s.as_node()))
+            && unless_node
+                .else_clause()
+                .is_some_and(|e| rescue_arm_exits(&e.as_node()));
+    }
+    false
+}
+
+/// `JumpTargets.boundary?` — a nested block, lambda, `def`, loop or class
+/// body retargets the `next`/`break` jumps below it.
+fn is_jump_boundary(node: &PrismNode<'_>) -> bool {
+    node.as_block_node().is_some()
+        || node.as_lambda_node().is_some()
+        || node.as_def_node().is_some()
+        || node.as_while_node().is_some()
+        || node.as_until_node().is_some()
+        || node.as_for_node().is_some()
+        || node.as_class_node().is_some()
+        || node.as_module_node().is_some()
+        || node.as_singleton_class_node().is_some()
+}
+
+/// `JumpTargets.any?(node, Prism::NextNode)` — whether `node` holds a
+/// `next` targeting the construct whose body it lives in, i.e. one
+/// reachable without crossing a [`is_jump_boundary`] construct.
+fn has_targeted_next(node: &PrismNode<'_>) -> bool {
+    use ruby_prism::Visit;
+    struct NextScan {
+        found: bool,
+    }
+    impl<'pr> Visit<'pr> for NextScan {
+        fn visit_next_node(&mut self, _node: &ruby_prism::NextNode<'pr>) {
+            self.found = true;
+        }
+        // Boundaries retarget the `next`s below them — do not descend.
+        fn visit_block_node(&mut self, _node: &ruby_prism::BlockNode<'pr>) {}
+        fn visit_lambda_node(&mut self, _node: &ruby_prism::LambdaNode<'pr>) {}
+        fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+        fn visit_while_node(&mut self, _node: &ruby_prism::WhileNode<'pr>) {}
+        fn visit_until_node(&mut self, _node: &ruby_prism::UntilNode<'pr>) {}
+        fn visit_for_node(&mut self, _node: &ruby_prism::ForNode<'pr>) {}
+        fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+        fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+        fn visit_singleton_class_node(
+            &mut self,
+            _node: &ruby_prism::SingletonClassNode<'pr>,
+        ) {
+        }
+    }
+    if node.as_next_node().is_some() {
+        return true;
+    }
+    if is_jump_boundary(node) {
+        return false;
+    }
+    let mut scan = NextScan { found: false };
+    scan.visit(node);
+    scan.found
 }

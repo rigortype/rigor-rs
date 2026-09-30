@@ -10,7 +10,7 @@ use super::{
     rescue_reference_index_writes,
     param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
     span_of, strict_constant_path_string, JumpKind, Node, NodeId, ParamShape, Recovered,
-    RescueClause, StatementsKind,
+    RescueClause, ScopeMarks, Span, StatementsKind,
 };
 
 /// Mutable accumulator for the owned arena during the lowering walk.
@@ -49,6 +49,35 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`Recovered::blocked`]: super::Recovered::blocked
     pub(crate) recovery_blocked: u32,
+    /// Depth of ITERATED-body recovered children being lowered — the mark
+    /// [`Recovered::iterative`] carried into `lower_recovered`, and set by
+    /// `lower_node` itself while a `while`/`until` body or a block/lambda
+    /// body lowers: the reference's content-writeback text scan
+    /// (`loop_content_writeback`, `content_writeback_block_captures`)
+    /// lands every compound index write in that text whatever wraps it
+    /// (rigor-rs#312).
+    ///
+    /// [`Recovered::iterative`]: super::Recovered::iterative
+    pub(crate) recovery_iterative: u32,
+    /// Depth of `next`-sink bodies being lowered — [`Recovered::next_sink`]:
+    /// a `for` body, whose `next` arms re-merge through `loop_iteration`
+    /// even though it has no content writeback.
+    ///
+    /// [`Recovered::next_sink`]: super::Recovered::next_sink
+    pub(crate) recovery_next_sink: u32,
+    /// Depth of fresh-local-scope recovered children —
+    /// [`Recovered::suppressed`].
+    ///
+    /// [`Recovered::suppressed`]: super::Recovered::suppressed
+    pub(crate) recovery_suppressed: u32,
+    /// Spans of `Statements{Inert}` carriers (`super`/`yield`/`BEGIN`/`END`
+    /// operands) emitted while inside an iterated body — the operand is
+    /// still never evaluated, but a content-writeback text scan covers it
+    /// (rigor-rs#312; see [`LoweredAst::in_scanned_inert_carrier`]).
+    ///
+    /// [`LoweredAst::in_scanned_inert_carrier`]:
+    ///     crate::ast::LoweredAst::in_scanned_inert_carrier
+    pub(crate) scanned_inert_spans: Vec<Span>,
 }
 
 impl<'src> Builder<'src> {
@@ -144,6 +173,7 @@ impl<'src> Builder<'src> {
                 &mw.rights(),
                 span_of(&mw.location()),
                 &mut recovered,
+                self.recovery_iterative > 0,
             );
             // Lower the expressions embedded in non-local targets so the
             // structural walks keep seeing those reads/calls — the old
@@ -340,7 +370,14 @@ impl<'src> Builder<'src> {
                 None => Vec::new(),
                 Some(b) => {
                     if let Some(bn) = b.as_block_node() {
-                        self.lower_optional_body(bn.body().as_ref())
+                        // An iterated body — `evaluate_invocation` /
+                        // `content_writeback_block_captures` land every
+                        // wrapped index write's `[]=` widening
+                        // (rigor-rs#312).
+                        self.recovery_iterative += 1;
+                        let body = self.lower_optional_body(bn.body().as_ref());
+                        self.recovery_iterative -= 1;
+                        body
                     } else if let Some(ba) = b.as_block_argument_node() {
                         ba.expression()
                             .map(|e| vec![self.lower_node(&e)])
@@ -733,10 +770,16 @@ impl<'src> Builder<'src> {
 
         if let Some(while_node) = node.as_while_node() {
             let predicate = Some(self.lower_node(&while_node.predicate()));
+            // The body is ITERATED — see `recovery_iterative`: the
+            // reference's `loop_content_writeback` text-scans it, so a
+            // wrapped compound index write inside widens its receiver
+            // whatever position or jump it sits under (rigor-rs#312).
+            self.recovery_iterative += 1;
             let body = while_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.recovery_iterative -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -748,10 +791,12 @@ impl<'src> Builder<'src> {
 
         if let Some(until_node) = node.as_until_node() {
             let predicate = Some(self.lower_node(&until_node.predicate()));
+            self.recovery_iterative += 1;
             let body = until_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.recovery_iterative -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -769,10 +814,19 @@ impl<'src> Builder<'src> {
             // stores an index-target index performs (`for h[:k] in xs`,
             // rigor-rs#134) widen the receiver's locals through `index_writes`.
             let predicate = Some(self.lower_node(&for_node.collection()));
+            // A `for` body joins its fall-through scope into the
+            // continuation (`joined`) and re-merges targeting `next` arms
+            // through `loop_iteration`'s sink (`next_sink`), but has NO
+            // content writeback — `break`/`raise` arms drop
+            // (rigor-rs#312).
+            self.recovery_joined += 1;
+            self.recovery_next_sink += 1;
             let body = for_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.recovery_joined -= 1;
+            self.recovery_next_sink -= 1;
             let (index, index_writes) = for_index_writes(&for_node.index());
             return self.push(Node::Loop {
                 predicate,
@@ -1121,8 +1175,12 @@ impl<'src> Builder<'src> {
             // `-> { … }` / `->(x) { … }`. Lower the body so calls/reads inside stay
             // visible to the rule walk (closing the `Node::Other` soundness gap),
             // AND mark the lambda boundary so `flow.return-in-ensure` recognises it
-            // as a return barrier.
+            // as a return barrier. The body is iterated for recovery purposes:
+            // a compound index write inside widens its receiver on the oracle
+            // even when the lambda is never called (rigor-rs#312).
+            self.recovery_iterative += 1;
             let body = self.lower_optional_body(lambda.body().as_ref());
+            self.recovery_iterative -= 1;
             return self.push(Node::Lambda {
                 body,
                 locals: constant_list_names(&lambda.locals()),
@@ -1237,7 +1295,7 @@ impl<'src> Builder<'src> {
             // (so a nested one is re-entered here), and handing it its own root
             // would record it forever.
             let recovered =
-                collect_defined_operand_children(&defined.value(), self.recovery_joined > 0);
+                collect_defined_operand_children(&defined.value(), self.recovery_marks().joined);
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
@@ -1267,12 +1325,29 @@ impl<'src> Builder<'src> {
             || node.as_forwarding_super_node().is_some()
             || node.as_yield_node().is_some()
         {
-            let recovered =
-                collect_recoverable_children(node, self.recovery_joined > 0, true);
+            let recovered = collect_recoverable_children(
+                node,
+                ScopeMarks {
+                    blocked: true,
+                    ..self.recovery_marks()
+                },
+            );
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
             let body: Vec<NodeId> = self.lower_recovered(recovered);
+            // Inside an iterated body the operand is still never
+            // evaluated — a write in it binds nothing — but the reference's
+            // content-writeback text scan (`loop_content_writeback`,
+            // `content_writeback_block_captures`) reads it, so a content
+            // mutation there lands its `[]=`/mutator widening:
+            // `while w; super(h[:a] ||= 1); end` widens `h` on the oracle
+            // (rigor-rs#312). The carrier stays `Inert` — binds and uses
+            // keep the no-eval rule — and the span is recorded as SCANNED
+            // so `flow_writes` keeps the mutation marks (only) inside it.
+            if self.recovery_iterative > 0 {
+                self.scanned_inert_spans.push(span);
+            }
             return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
         }
 
@@ -1286,11 +1361,7 @@ impl<'src> Builder<'src> {
         // carrier every other consumer already handles.
         if is_unmodeled_write(node) {
             self.push(Node::UnmodeledWrite { span });
-            let recovered = collect_recoverable_children(
-                node,
-                self.recovery_joined > 0,
-                self.recovery_blocked > 0,
-            );
+            let recovered = collect_recoverable_children(node, self.recovery_marks());
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
             }
@@ -1315,11 +1386,7 @@ impl<'src> Builder<'src> {
         // each into the arena, linked under a `Statements` carrier (Dynamic-typed;
         // purely a reachability handle). This also keeps a CALL inside such a
         // wrapper reachable for the existing call rules — a strict improvement.
-        let recovered = collect_recoverable_children(
-            node,
-            self.recovery_joined > 0,
-            self.recovery_blocked > 0,
-        );
+        let recovered = collect_recoverable_children(node, self.recovery_marks());
         if recovered.is_empty() {
             return self.push(Node::Other { span, jump: None });
         }
@@ -1331,6 +1398,18 @@ impl<'src> Builder<'src> {
     /// source order — the order inference relies on to populate the env.
     fn lower_body(&mut self, body: &ruby_prism::NodeList<'_>) -> Vec<NodeId> {
         body.iter().map(|n| self.lower_node(&n)).collect()
+    }
+
+    /// The enclosing scope-landing marks for a fresh recovery collect —
+    /// the ambient `recovery_*` flags as a [`ScopeMarks`].
+    fn recovery_marks(&self) -> ScopeMarks {
+        ScopeMarks {
+            joined: self.recovery_joined > 0,
+            blocked: self.recovery_blocked > 0,
+            iterative: self.recovery_iterative > 0,
+            next_sink: self.recovery_next_sink > 0,
+            suppressed: self.recovery_suppressed > 0,
+        }
     }
 
     /// Lower one recovered-children batch (the [`Recovered`] list a wrapper's
@@ -1347,12 +1426,21 @@ impl<'src> Builder<'src> {
                      bound,
                      joined,
                      blocked,
+                     iterative,
+                     next_sink,
+                     suppressed,
                  }| {
                 self.recovery_joined += u32::from(joined);
                 self.recovery_blocked += u32::from(blocked);
+                self.recovery_iterative += u32::from(iterative);
+                self.recovery_next_sink += u32::from(next_sink);
+                self.recovery_suppressed += u32::from(suppressed);
                 let id = self.lower_node(&node);
                 self.recovery_joined -= u32::from(joined);
                 self.recovery_blocked -= u32::from(blocked);
+                self.recovery_iterative -= u32::from(iterative);
+                self.recovery_next_sink -= u32::from(next_sink);
+                self.recovery_suppressed -= u32::from(suppressed);
                 if !bound.is_empty() {
                     self.closure_bindings.push((id, bound));
                 }

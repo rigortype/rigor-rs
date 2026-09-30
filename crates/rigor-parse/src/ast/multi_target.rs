@@ -3,7 +3,7 @@
 
 use crate::ruby_prism::{self, Node as PrismNode};
 
-use super::{collect_recoverable_children, constant_string, span_of, Recovered, Span};
+use super::{collect_recoverable_children, constant_string, span_of, Recovered, ScopeMarks, Span};
 
 /// The `[]=` stores an index target performs: `(receiver local, target span)`
 /// pairs — the name-keyed half of the reference's `Result#index_targets`.
@@ -179,19 +179,20 @@ pub(crate) fn lower_multi_targets<'pr>(
     rights: &ruby_prism::NodeList<'pr>,
     span: Span,
     recovered: &mut Vec<Recovered<'pr>>,
+    iterative: bool,
 ) -> MultiTargets {
     MultiTargets {
         lefts: lefts
             .iter()
-            .map(|t| lower_multi_target(&t, recovered))
+            .map(|t| lower_multi_target(&t, recovered, iterative))
             .collect(),
         // `rest` is recorded whenever Prism reports one — an anonymous `*` and
         // an implicit rest (`a, = xs`) become `Ignored`, because the reference's
         // `rest_present:` keys on PRESENCE, not on bindability.
-        rest: rest.map(|t| Box::new(lower_multi_target(t, recovered))),
+        rest: rest.map(|t| Box::new(lower_multi_target(t, recovered, iterative))),
         rights: rights
             .iter()
-            .map(|t| lower_multi_target(&t, recovered))
+            .map(|t| lower_multi_target(&t, recovered, iterative))
             .collect(),
         span,
     }
@@ -205,6 +206,7 @@ pub(crate) fn lower_multi_targets<'pr>(
 fn lower_multi_target<'pr>(
     node: &PrismNode<'pr>,
     recovered: &mut Vec<Recovered<'pr>>,
+    iterative: bool,
 ) -> MultiTarget {
     if let Some(t) = node.as_local_variable_target_node() {
         return MultiTarget::Local {
@@ -219,6 +221,7 @@ fn lower_multi_target<'pr>(
             &t.rights(),
             span_of(&t.location()),
             recovered,
+            iterative,
         ));
     }
     if let Some(s) = node.as_splat_node() {
@@ -226,7 +229,7 @@ fn lower_multi_target<'pr>(
         // expression) keeps `Ignored`; an index-target rest (`*h[k]`) keeps
         // its `[]=` store, matching the reference's `bind_rest_target`.
         return match s.expression() {
-            Some(e) => match lower_multi_target(&e, recovered) {
+            Some(e) => match lower_multi_target(&e, recovered, iterative) {
                 // A splat's expression is never a nested multi-target in valid
                 // Ruby; guard anyway so the binder's rest slot only ever sees
                 // the shapes the reference's `bind_rest_target` handles.
@@ -241,8 +244,18 @@ fn lower_multi_target<'pr>(
         // keep the receiver's mutated local reads so the owner can widen them
         // (rigor-rs#134). The embedded expressions still lower into
         // `recovered` exactly as before — blocked, since the binder applies
-        // none of their scope effects.
-        recovered.extend(collect_recoverable_children(node, false, true));
+        // none of their scope effects. Inside an iterated body the
+        // content-writeback text scan still sees a compound index write
+        // (`while w; a, b[h[:a] ||= 1] = xs; end` widens `h` on the oracle
+        // — rigor-rs#312), so the seed keeps `iterative`.
+        recovered.extend(collect_recoverable_children(
+            node,
+            ScopeMarks {
+                blocked: true,
+                iterative,
+                ..ScopeMarks::default()
+            },
+        ));
         return MultiTarget::Index {
             receivers: mutated_local_reads(&t.receiver(), 0),
             span: span_of(&t.location()),
@@ -250,7 +263,14 @@ fn lower_multi_target<'pr>(
     }
     // A non-local target can still EMBED expressions that READ locals or CALL
     // methods (`item[3] = …` reads `item`; `obj.foo, bar = …` calls `obj`).
-    recovered.extend(collect_recoverable_children(node, false, true));
+    recovered.extend(collect_recoverable_children(
+        node,
+        ScopeMarks {
+            blocked: true,
+            iterative,
+            ..ScopeMarks::default()
+        },
+    ));
     MultiTarget::Ignored { span: span_of(&node.location()) }
 }
 
@@ -361,7 +381,10 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
             &t.rights(),
             span_of(&t.location()),
             // `ignored` is dropped — this caller needs the target tree only.
+            // The for-INDEX (the target tree) is not inside the body, so no
+            // content writeback reaches it — `iterative: false`.
             &mut ignored,
+            false,
         );
         return (targets.bound_names(), targets.index_writes());
     }

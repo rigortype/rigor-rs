@@ -526,6 +526,111 @@ fn compound_index_write_recovers_whole_only_in_joined_positions() {
     };
     assert!(reads(b"h = {}\nputs(*[h[:a] ||= 1])\n") >= 1);
 }
+
+/// rigor-rs#312 round 2: an ITERATED body — `while`/`until`/`for`, an
+/// invoked block/lambda — gives the reference a content-writeback text scan
+/// (`loop_content_writeback`, `content_writeback_block_captures`) that lands
+/// every compound index write in that text whatever wraps it, so the write
+/// lowers whole even inside positions a plain statement would discard.
+#[test]
+fn iterated_bodies_recover_compound_writes_through_jumps_and_wrappers() {
+    let index_writes = |src: &[u8]| -> Vec<String> {
+        let ast = lower(&crate::parse(src));
+        ast.iter()
+            .filter_map(|(_, n)| match n {
+                Node::IndexWrite {
+                    receiver: Some(r), ..
+                } => match ast.get(*r) {
+                    Node::LocalVariableRead { name, .. } => Some(name.clone()),
+                    _ => Some("<nonlocal>".to_string()),
+                },
+                _ => None,
+            })
+            .collect()
+    };
+    // The writeback scan is a TEXT scan of the body: every wrapped write in
+    // it lands its `[]=` widening — under a splat, a terminated `if` arm, a
+    // `next`/`break`/`redo`/`raise` arm, a `retry` rescue clause, `super`'s
+    // never-evaluated operand, `BEGIN`/`END`, and a `when` condition.
+    for src in [
+        &b"h = {}\nputs(*[while c; h[:a] ||= 1 end])\n"[..],           // while body
+        &b"h = {}\nputs(*[while c; h[:a] ||= 1; raise \"e\" end])\n"[..], // raise in body
+        &b"h = {}\nputs(*[while c; h[:a] ||= 1; break end])\n"[..],    // break arm
+        &b"h = {}\nputs(*[while c; h[:a] ||= 1; next end])\n"[..],     // next arm
+        &b"h = {}\nputs(*[while c; if x then h[:a] ||= 1; raise \"e\" end end])\n"[..],
+        &b"h = {}\nputs(*[while c; super(h[:a] ||= 1) end])\n"[..],    // text-seen super operand
+        &b"h = {}\nputs(*[while c; BEGIN { h[:a] ||= 1 } end])\n"[..], // text-seen BEGIN
+        &b"h = {}\nputs(*[while c; case v when h[:a] ||= 1 then nil end end])\n"[..],
+        &b"h = {}\nputs(*[until c; h[:a] ||= 1 end])\n"[..],           // until body
+        &b"h = {}\nputs(*[b.each { h[:a] ||= 1; break }])\n"[..],      // iterated block body
+        &b"h = {}\nputs(*[b.each { |x| h[:a] ||= 1; next }])\n"[..],   // block next
+        &b"h = {}\nputs(*[-> { h[:a] ||= 1 }.call])\n"[..],            // invoked lambda
+        &b"h = {}\nputs(*[begin; nil; rescue; h[:a] ||= 1; retry; end])\n"[..],
+        // A `next`-targeting arm inside a `for` body — `loop_iteration`
+        // joins the sink scope even though the arm "exits" locally.
+        &b"h = {}\nputs(*[for i in xs; x = foo rescue (h[:a] ||= 1; next) end])\n"[..],
+        &b"h = {}\nputs(*[for i in xs; c && (h[:a] ||= 1; next) end])\n"[..],
+        &b"h = {}\nputs(*[for i in xs; if c then h[:a] ||= 1; next end end])\n"[..],
+        &b"h = {}\nputs(*[for i in xs; if c then h[:a] ||= 1; next else nil end end])\n"[..],
+    ] {
+        assert_eq!(index_writes(src), ["h"], "{src:?}");
+    }
+    // …but the scan prunes `defined?` operands (`NodeWalker`), and a `for`
+    // body has NO writeback — only its fall-through join and `next` sink
+    // land a write; `break`/`raise` arms drop.
+    for src in [
+        &b"h = {}\nputs(*[while c; defined?(h[:a] ||= 1) end])\n"[..],
+        // A rescue arm that EXITS (no `retry` anywhere) is filtered from
+        // the join (`live_rescue_results`) — its write drops with it.
+        &b"h = {}\nputs(*[begin; nil; rescue; h[:a] ||= 1; raise \"e\"; end])\n"[..],
+        &b"h = {}\nx = foo rescue (begin; nil; rescue; h[:a] ||= 1; raise \"e\"; end)\n"[..],
+        // `for` joins only `next` arms and the fall-through; a `break`/
+        // `raise` arm's content mutation is not a rebound local, so
+        // `join_break_scopes` skips it.
+        &b"h = {}\nputs(*[for i in xs; if c then h[:a] ||= 1; break end end])\n"[..],
+        &b"h = {}\nputs(*[for i in xs; if c then h[:a] ||= 1; raise \"e\" end end])\n"[..],
+        &b"h = {}\nputs(*[for i in xs; x = foo rescue (h[:a] ||= 1; break) end])\n"[..],
+        &b"h = {}\nputs(*[for i in xs; c && (h[:a] ||= 1; break) end])\n"[..],
+    ] {
+        assert_eq!(index_writes(src), Vec::<String>::new(), "{src:?}");
+    }
+    // `for`'s fall-through join and `next` sink DO land the write — the
+    // body scope joins the continuation, so even a write right before a
+    // `break`/`raise` has already applied (f3/f7 probes).
+    assert_eq!(
+        index_writes(b"h = {}\nputs(*[for i in xs; h[:a] ||= 1 end])\n"),
+        ["h"],
+        "for body fall-through"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nputs(*[for i in xs; h[:a] ||= 1; next end])\n"),
+        ["h"],
+        "for next sink"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nputs(*[for i in xs; h[:a] ||= 1; break end])\n"),
+        ["h"],
+        "for break — write applied before the jump records"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nputs(*[for i in xs; h[:a] ||= 1; raise \"e\" end])\n"),
+        ["h"],
+        "for raise — same"
+    );
+    // A lambda defined but never called is still text-seen by the scan —
+    // the oracle widens there too (`l = -> { puts(*[h[:a] ||= 1]) }`):
+    // recovery is position-static, so the write lowers whole.
+    assert_eq!(
+        index_writes(b"h = {}\nx = foo rescue -> { h[:a] ||= 1 }\n"),
+        ["h"],
+        "crossed lambda body"
+    );
+    assert_eq!(
+        index_writes(b"h = {}\nputs(*[l = -> { h[:a] ||= 1 }])\n"),
+        ["h"],
+        "defined lambda body"
+    );
+}
 /// `defined?`, `END`, `BEGIN`, `super` and `yield` are inert; any other
 /// recovery (a `rescue` modifier) is `Recovered`. Every write stays in the
 /// arena for the structural walks.
