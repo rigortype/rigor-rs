@@ -63,6 +63,48 @@ fn generic_dispatch_declines_under_an_untyped_argument() {
     assert_eq!(ty_of_last_recv_call(b"def f\n  \"abc\"[0]\nend\n"), "Constant[\"a\"]");
 }
 
+/// Issue #146 — a `Constant` receiver's call folds MEMBER-WISE when an
+/// argument reaches more than one distinct precise value (`v = 1; v = 2 if
+/// c`): the reference answers the union of the per-member folds — `"abc"[v]`
+/// -> `"b" | "c"`, `1.fdiv(v)` -> `1.0 | 0.5` — a carrier no negative rule
+/// fires on, never the flat `method_return` class. Tier 3 withholds the
+/// nominal on that `multi` reach; a single reaching value keeps it, and a
+/// literal argument still pins its folded `Constant`. The Kernel folds are
+/// deliberately untouched — the reference joins THEIR overloads to the
+/// conversion class on the same input (`Float(v)` fires `for Float`).
+#[test]
+fn constant_receiver_declines_under_a_multi_value_argument() {
+    // The issue's row 2, verbatim.
+    assert_eq!(
+        ty_of_last_recv_call(b"def g(c)\n  v = 1\n  v = 2 if c\n  \"abc\"[v]\nend\n"),
+        "Dynamic[top]"
+    );
+    // The same shape on another value-pinned receiver, and at top level
+    // (where the propagate'd scope joins the same writes).
+    assert_eq!(
+        ty_of_last_recv_call(b"def g(c)\n  v = 1\n  v = 2 if c\n  1.fdiv(v)\nend\n"),
+        "Dynamic[top]"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(b"v = 1\nv = 2 if $c\n\"abc\"[v]\n"),
+        "Dynamic[top]"
+    );
+    // CONTROLS.
+    assert_eq!(
+        ty_of_last_recv_call(b"def g\n  v = 1\n  \"abc\"[v]\nend\n"),
+        "Class<0>"
+    );
+    assert_eq!(ty_of_last_recv_call(b"\"abc\"[1]\n"), "Constant[\"b\"]");
+    // And the Kernel folds keep their answers on the same `1 | 2` local —
+    // the reference joins their overloads to the conversion class
+    // (`Float(v)` -> `Float`, so `.to_s` -> `String`); the `multi` flag is
+    // only for a `Constant` receiver's member-wise fold.
+    assert_eq!(
+        ty_of_last_recv_call(b"def g(c)\n  v = 1\n  v = 2 if c\n  Float(v).to_s\nend\n"),
+        "Class<0>"
+    );
+}
+
 /// Issue #121 — a class-GUARDED parameter is refused by the untyped
 /// allow-list, but a NILABLE return still gives up the flat slot for it: the
 /// reference cannot fold a guarded parameter, so its join keeps the nil arm.

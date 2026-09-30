@@ -3639,3 +3639,66 @@ fn loop_body_mutation_stays_conditional() {
         "expected silent (reference is silent at e59b7b89), got {diags:?}"
     );
 }
+
+/// Issue #146 — a `lambda`/`proc`/ordinary-block body sitting in a TYPED
+/// (operand) position is never scope-entered on the reference:
+/// `propagate`/`closure_scope` fills it with the parent scope and floors the
+/// closure's own locals to `Dynamic[top]`, so `Float(q)` declines. The same
+/// body at statement level IS entered and fires.
+#[test]
+fn issue_146_closure_in_operand_position_is_silent() {
+    // The issue's row 1, verbatim.
+    assert!(run(b"NL3 = { a: lambda { |q| q = 1; Float(q).w_nl3 } }\n").is_empty());
+    // The same mechanism around it — array / call-argument operands and the
+    // `->` spelling — plus an ordinary block's parameter and a
+    // body-introduced local, which `closure_scope` floors the same way.
+    assert!(run(b"x = [lambda { |q| q = 1; Float(q).wA }]\n").is_empty());
+    assert!(run(b"puts(lambda { |q| q = 1; Float(q).wB })\n").is_empty());
+    assert!(run(b"h = { a: ->(q) { q = 1; Float(q).wC } }\n").is_empty());
+    assert!(run(b"h = { a: [1].each { |n| Float(n).wD } }\n").is_empty());
+    assert!(run(b"h = { a: [1].each { |n| n = 2; Float(n).wE } }\n").is_empty());
+    // A same-named write inside a DIFFERENT block must not leak in:
+    // `n = 2` here is `each`'s block-local, invisible to the sibling body.
+    assert!(run(
+        b"h = { a: [1].each { |n| n = 2; Float(n).wF } }\nb = { c: [1].each { |n| Float(n).wG } }\n"
+    )
+    .is_empty());
+    // CONTROLS — the entered spellings keep firing (the reference answers
+    // `for 1.0`; the port's `for Float` carrier is the recorded gap, not an
+    // FP), and a captured OUTER local keeps its enclosing binding inside an
+    // operand closure (`x` is not a block local there).
+    let diags = run(b"lambda { |q| q = 1; Float(q).wK }\n");
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    let diags = run(b"[1].each { |n| Float(n).wH }\n");
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    let diags = run(b"x = 0\nh = { a: lambda { x = 1; Float(x).wX } }\n");
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+}
+
+/// Issue #146 — a `Constant`-receiver call whose argument reaches more than
+/// one distinct precise value is folded member-wise on the reference
+/// (`"abc"[v]` -> `"b" | "c"`), a union no negative rule fires on — never
+/// the flat `method_return` class tier 3 minted.
+#[test]
+fn issue_146_multi_value_argument_stays_silent() {
+    // The issue's row 2, verbatim.
+    assert!(run(b"def g(c)\n  v = 1\n  v = 2 if c\n  \"abc\"[v].w_lit\nend\n").is_empty());
+    // The same shape at top level, on another value-pinned receiver, and
+    // with the join inlined into the argument.
+    assert!(run(b"v = 1\nv = 2 if $c\n\"abc\"[v].wA\n").is_empty());
+    assert!(run(b"def g(c)\n  v = 1\n  v = 2 if c\n  1.fdiv(v).wB\nend\n").is_empty());
+    assert!(run(b"def g(c)\n  \"abc\"[c ? 1 : 2].wC\nend\n").is_empty());
+    // CONTROLS — a literal argument still folds (`for "b"`), and a single
+    // reaching value keeps its nominal pin (the reference's `for "b"` there
+    // is the recorded precision gap, not an FP).
+    let diags = run(b"\"abc\"[1].wK\n");
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `wK' for \"b\"");
+    let diags = run(b"def g\n  v = 1\n  \"abc\"[v].wL\nend\n");
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+}
