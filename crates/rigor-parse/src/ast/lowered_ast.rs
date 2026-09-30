@@ -86,6 +86,20 @@ pub struct LoweredAst {
     /// content-writeback text scan covers — a subset of `inert_spans`
     /// (rigor-rs#312; [`LoweredAst::in_scanned_inert_carrier`]).
     scanned_inert_spans: Vec<Span>,
+    /// The spans of recovered children the walk reached inside a position
+    /// whose post-scope the reference DISCARDS or never evaluates —
+    /// [`Recovered::blocked`]: a `when`/`in` condition or guard flattened by
+    /// a wrapper (a rescue modifier's `case` has no `Node::Case`/`Node::When`
+    /// in the arena), an unconditionally-exiting arm, a `super`/`yield`
+    /// operand under a wrapper, the dead side of a fold. A local write in
+    /// one binds nothing — the lowering path's sibling of `inert_spans`
+    /// (rigor-rs#357; [`LoweredAst::in_blocked_carrier`]).
+    blocked_spans: Vec<Span>,
+    /// The `blocked_spans` subset an iterated body's content-writeback TEXT
+    /// scan still covers ([`Recovered::iterative`]): a local rebind there
+    /// still binds nothing, but a `[]=`/mutator content mark lands
+    /// (rigor-rs#312; [`LoweredAst::in_iterative_blocked_carrier`]).
+    blocked_iterative_spans: Vec<Span>,
     /// Nodes a single-statement `(e)` parens was UNWRAPPED to. The reference
     /// reads the receiver's SYNTAX node — `(nil)` is a `ParenthesesNode`, not
     /// a `NilNode` — so a consumer that discriminates literal syntax (the
@@ -153,6 +167,34 @@ impl LoweredAst {
     /// the operand entirely.
     pub fn in_scanned_inert_carrier(&self, span: Span) -> bool {
         self.scanned_inert_spans
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
+    /// Whether `span` lies inside a recovered position whose post-scope the
+    /// reference DISCARDS — [`Recovered::blocked`]: a `when`/`in` condition
+    /// or guard, an unconditionally-exiting arm, a `super`/`yield`/`BEGIN`/
+    /// `END` operand under a wrapper, the dead side of a fold. A local write
+    /// there binds nothing: `x = (case v when (q = 1; Integer) then 1 end)
+    /// rescue nil` never feeds `q` a value. This is the wrapper-flattened
+    /// sibling of `unevaluated_case_clause_spans` (rigor-rs#341): the rescue
+    /// modifier lowers the `case` to a `Statements{Recovered}` carrier with
+    /// no `Node::When` left to span, so the blocked MARK the walk already
+    /// computes is recorded instead (rigor-rs#357).
+    ///
+    /// [`Recovered::blocked`]: crate::ast::Recovered::blocked
+    pub fn in_blocked_carrier(&self, span: Span) -> bool {
+        self.blocked_spans
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
+    /// Whether `span` lies inside a blocked position an iterated body's
+    /// content-writeback TEXT SCAN still covers (`blocked` + `iterative` —
+    /// rigor-rs#312): the local rebind still binds nothing, but a
+    /// `local[k] op= v`/`local.mutator` content mark lands on the reference.
+    pub fn in_iterative_blocked_carrier(&self, span: Span) -> bool {
+        self.blocked_iterative_spans
             .iter()
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
@@ -254,6 +296,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         typed_depth: 0,
         closure_depth: 0,
         scanned_inert_spans: Vec::new(),
+        blocked_spans: Vec::new(),
+        blocked_iterative_spans: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -274,6 +318,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         })
         .collect();
     let scanned_inert_spans = builder.scanned_inert_spans;
+    let blocked_spans = builder.blocked_spans;
+    let blocked_iterative_spans = builder.blocked_iterative_spans;
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
     let mut closure_bindings: Vec<(u32, Vec<String>)> = builder
@@ -290,6 +336,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         local_read_starts,
         inert_spans,
         scanned_inert_spans,
+        blocked_spans,
+        blocked_iterative_spans,
         paren_unwrapped,
         closure_bindings,
     }

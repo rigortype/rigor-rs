@@ -346,7 +346,11 @@ fn collect_recoverable<'pr>(
             for arm in arms {
                 if arm_dead(self, arm) {
                     if live == 0 {
-                        self.under_join(|c| c.visit(arm));
+                        // Every arm's statements still join into the
+                        // post-scope, but the conditions/pattern/guard stay
+                        // blocked — `eval_when_or_in` never scope-evals them
+                        // even when the arm's scope is joined (rigor-rs#357).
+                        self.visit_case_arm_parts(arm, true);
                     } else {
                         self.blocked_subtree(|c| c.visit(arm));
                     }

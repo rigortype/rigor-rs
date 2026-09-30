@@ -99,6 +99,25 @@ pub(crate) struct Builder<'src> {
     /// [`LoweredAst::in_scanned_inert_carrier`]:
     ///     crate::ast::LoweredAst::in_scanned_inert_carrier
     pub(crate) scanned_inert_spans: Vec<Span>,
+    /// The spans of recovered children the walk reached inside a position
+    /// whose post-scope the reference DISCARDS or never evaluates
+    /// ([`Recovered::blocked`]: a `when`/`in` condition or guard, an
+    /// unconditionally-exiting arm, a `super`/`yield`/`BEGIN`/`END` operand
+    /// under a wrapper, the dead side of a constant or short-circuit fold).
+    /// A local write in one binds nothing — the lowering path's sibling of
+    /// `inert_spans` — so reach/flow scans must not collect it
+    /// (rigor-rs#357).
+    ///
+    /// [`Recovered::blocked`]: crate::ast::Recovered::blocked
+    pub(crate) blocked_spans: Vec<Span>,
+    /// The `blocked_spans` subset inside an iterated body the writeback TEXT
+    /// scan still covers ([`Recovered::iterative`]): a local rebind there
+    /// still binds nothing, but a `[]=`/mutator content mark lands on the
+    /// reference — `while w; super(h[:a] ||= 1); end` under a wrapper
+    /// (rigor-rs#312).
+    ///
+    /// [`Recovered::iterative`]: crate::ast::Recovered::iterative
+    pub(crate) blocked_iterative_spans: Vec<Span>,
 }
 
 impl<'src> Builder<'src> {
@@ -1621,6 +1640,13 @@ impl<'src> Builder<'src> {
                      typed,
                      closure,
                  }| {
+                let child_span = span_of(&node.location());
+                if blocked {
+                    self.blocked_spans.push(child_span);
+                    if iterative {
+                        self.blocked_iterative_spans.push(child_span);
+                    }
+                }
                 self.recovery_joined += u32::from(joined);
                 self.recovery_blocked += u32::from(blocked);
                 self.recovery_iterative += u32::from(iterative);

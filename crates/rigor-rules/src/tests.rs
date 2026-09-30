@@ -3933,3 +3933,79 @@ fn issue_341_real_writes_still_witness_end_to_end() {
         );
     }
 }
+
+/// rigor-rs#357 — the same never-evaluated `when`-condition / `in`-pattern
+/// write under a rescue MODIFIER: `x = (case v when (q = 1; Integer) then
+/// 1 end) rescue nil` flattens the `case` into a `Statements{Recovered}`
+/// carrier, so no `Node::Case`/`Node::When` survives for
+/// `unevaluated_case_clause_spans` to exclude — the leak path
+/// `rigor-rs#341`'s span filter cannot see. The `Recovered::blocked` mark
+/// the recovery walk already stamps on those children is recorded on the
+/// AST instead, and reach/flow collectors skip writes inside it. Every row
+/// below is oracle-measured SILENT for `call.undefined-method` at
+/// e59b7b89.
+#[test]
+fn issue_357_modifier_rescue_blocked_writes_stay_silent_end_to_end() {
+    for src in [
+        // The issue row, top level and inside a `def`.
+        b"x = (case v\nwhen (q = 1; Integer) then 1\nend) rescue nil\nFloat(q).w\n" as &[u8],
+        b"def f(v)\n  x = (case v\n  when (q = 1; Integer) then 1\n  end) rescue nil\n  Float(q).w\nend\n",
+        // The no-parens spelling reaches the same carrier.
+        b"x = case v\nwhen (q = 1; Integer) then 1\nend rescue nil\nFloat(q).w\n",
+        // Nested rescue modifiers.
+        b"x = ((case v\nwhen (q = 1; Integer) then 1\nend) rescue nil) rescue nil\nFloat(q).w\n",
+        // The `case` wrapped in a `begin` under the modifier.
+        b"x = begin\ncase v\nwhen (q = 1; Integer) then 1\nend\nend rescue nil\nFloat(q).w\n",
+        // An `in` pattern guard under the modifier.
+        b"x = (case v\nin Integer if (q = 1) then 1\nend) rescue nil\nFloat(q).w\n",
+        // Every arm terminated — the all-dead join still never evaluates
+        // the conditions.
+        b"x = (case v\nwhen (q = 1; Integer) then raise\nelse raise\nend) rescue nil\nFloat(q).w\n",
+        // Other blocked positions the same carrier replays: a `super`
+        // operand and the dead right of a short-circuit.
+        b"x = (super(q = 1)) rescue nil\nFloat(q).w\n",
+        b"x = (c && (q = 1; raise)) rescue nil\nFloat(q).w\n",
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected silent (reference is silent at e59b7b89), got {diags:?} for {:?}",
+            String::from_utf8_lossy(src),
+        );
+    }
+}
+
+/// The blocked exclusion is positional, not a rescue-modifier blanket: an
+/// ordinary write under the modifier still binds, a `when`-BODY write still
+/// lands, an `if`-arm write still lands, and a blocked write must not
+/// overwrite an EARLIER binding either — `q = "s"` survives the discarded
+/// `q = 1`, so `q.upcase.w` fires `for "S"` on the oracle. A blocked
+/// content-mutation mark outside an iterated body never lands either, so
+/// `h` keeps `[]` and `h.first` folds `nil` (`super(h.push(1))` —
+/// rigor-rs#312's scan reaches only iterated bodies).
+#[test]
+fn issue_357_evaluated_writes_still_witness_end_to_end() {
+    for src in [
+        b"x = (q = 1) rescue nil\nFloat(q).w\n" as &[u8],
+        b"x = (q = 1; q = \"s\") rescue nil\nFloat(q).w\n",
+        // `when`-arm bodies still join into the post-scope.
+        b"x = (case v\nwhen Integer then (q = 1)\nend) rescue nil\nFloat(q).w\n",
+        b"x = (case v\nwhen Integer then (q = 1)\nelse (q = \"s\")\nend) rescue nil\nFloat(q).w\n",
+        // An `if` arm under the modifier is an evaluated position.
+        b"x = if c then (q = 1; 2) end rescue 1\nFloat(q).w\n",
+        // A `begin` block under the modifier.
+        b"x = (begin\nq = 1\nend) rescue nil\nFloat(q).w\n",
+        // The prior binding survives the discarded write.
+        b"q = \"s\"\nx = (case v\nwhen (q = 1; Integer) then 1\nend) rescue nil\nq.upcase.w\n",
+        // The blocked mutation mark does not widen `h`.
+        b"h = []\nx = (super(h.push(1))) rescue nil\nh.first.w\n",
+    ] {
+        let diags = run(src);
+        assert_eq!(
+            diags.iter().filter(|d| d.rule_id == CALL_UNDEFINED_METHOD).count(),
+            1,
+            "expected one undefined-method, got {diags:?} for {:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
