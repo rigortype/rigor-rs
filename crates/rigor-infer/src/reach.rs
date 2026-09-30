@@ -485,10 +485,13 @@ impl<'i> Typer<'i> {
         let case_clauses = unevaluated_case_clause_spans(ast);
         let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
         let in_region = |s: rigor_parse::Span| {
-            contains(region, s)
-                && !in_case_clause(s)
-                && !lambda_spans.iter().any(|&l| contains(l, s))
-                && !(skip_defs && def_spans.iter().any(|&d| contains(d, s)))
+            if !contains(region, s) || in_case_clause(s) {
+                return false;
+            }
+            if lambda_spans.iter().any(|&l| contains(l, s)) {
+                return false;
+            }
+            !(skip_defs && def_spans.iter().any(|&d| contains(d, s)))
         };
         // Only the blocks INSIDE the region can hold a block parameter, and only
         // they (or a loop) can carry a later write back round to the read.
