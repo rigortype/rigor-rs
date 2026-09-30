@@ -225,20 +225,33 @@ impl Baseline {
                 }
                 in_ignored = false;
                 if let Some(rest) = trimmed.strip_prefix("version:") {
-                    let raw = rest.trim();
+                    // `version: 1 # schema` — the ` #…` is a comment, and a
+                    // `!tag`d or quoted scalar loads as a non-Integer upstream
+                    // (String), so it must fail the `== 1` check there too.
+                    let value = rest.trim_start();
+                    let (head, kind) = scalar_head(value);
                     version = Some((
-                        unyaml_scalar(raw),
-                        raw.starts_with('"') || raw.starts_with('\''),
+                        unyaml_scalar(head),
+                        !matches!(kind, ScalarKind::Plain) || value.starts_with('!'),
                     ));
                 } else if let Some(rest) = trimmed.strip_prefix("ignored:") {
                     in_ignored = true;
                     // `ignored: []` — an explicit empty array on one line;
-                    // `ignored:` with `null`/`~` is the reference's `|| []`.
-                    // Anything else inline fails `rows.is_a?(Array)` upstream.
-                    let inline = rest.trim();
-                    if inline == "[]" {
+                    // `ignored:` with `null`/`Null`/`NULL`/`~` (or only a
+                    // ` #…` comment — nil) is the reference's `|| []`. A
+                    // quoted or `!tag`d value is a String upstream — like any
+                    // other non-nil inline it fails `rows.is_a?(Array)`.
+                    let value = rest.trim_start();
+                    let (inline, kind) = scalar_head(value);
+                    let is_plain =
+                        matches!(kind, ScalarKind::Plain) && !value.starts_with('!');
+                    let is_nil = is_plain
+                        && (inline.is_empty()
+                            || inline == "~"
+                            || inline.eq_ignore_ascii_case("null"));
+                    if is_plain && inline == "[]" {
                         in_ignored = false;
-                    } else if !inline.is_empty() && inline != "~" && inline != "null" {
+                    } else if !is_nil {
                         return Err(LoadError(format!("{label}: `ignored:` must be an Array")));
                     }
                 }
@@ -944,6 +957,10 @@ fn block_value(lines: &[String], folded: bool, chomp: Chomp) -> String {
 /// decodes as `'<<'`) and a trailing ` #` comment.
 fn scalar_head(value: &str) -> (&str, ScalarKind) {
     let mut v = value;
+    // A `#` in value position is a comment — the scalar is empty.
+    if v.starts_with('#') {
+        return ("", ScalarKind::Plain);
+    }
     // One `!`-tag token then the scalar (`!!str '<<'`, `! 'x'`).
     if v.starts_with('!') {
         match v[1..].find([' ', '\t']) {
@@ -1866,5 +1883,31 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.0, "t: ignored[0] missing `file:`");
+    }
+
+    #[test]
+    fn top_level_keys_accept_trailing_hash_comments_and_null_forms() {
+        // Review-found blocker: `version: 1 # schema` must strip ` #…` —
+        // upstream Psych reads the scalar, not the raw line tail. Same for
+        // `ignored:` inline values, and `null`/`Null`/`NULL`/`~` all read nil.
+        let b = Baseline::parse(
+            "---\nversion: 1 # schema version\nignored: # commented\n\
+             - file: a.rb\n  rule: r\n  count: 2\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 1);
+
+        for nil_form in ["[] # c", "Null", "NULL", "~ # trailing"] {
+            let text = format!("---\nversion: 1\nignored: {nil_form}\n");
+            let b = Baseline::parse(&text, "t").unwrap();
+            assert!(b.is_empty(), "{nil_form:?}");
+        }
+        // A quoted `[]` is a String upstream — not an Array.
+        let e = Baseline::parse("---\nversion: 1\nignored: '[]'\n", "t").unwrap_err();
+        assert_eq!(e.0, "t: `ignored:` must be an Array");
+        // A comment mid-value ends a plain scalar there.
+        let e = Baseline::parse("---\nversion: 2 # nope\nignored: []\n", "t").unwrap_err();
+        assert_eq!(e.0, "t: unsupported `version: 2` (expected 1)");
     }
 }
