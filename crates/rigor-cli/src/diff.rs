@@ -31,7 +31,43 @@ use std::process::ExitCode;
 use rigor_rules::{catalog, Diagnostic};
 use serde_json::{json, Value};
 
+use crate::optparse::{ArgStyle, Item, OptParser, Switch, ValueKind};
+
 const USAGE: &str = "Usage: rigor diff [options] <baseline.json> [paths...]";
+
+/// `parse_options`' table, `opts.on` order (issue #155): `--format` is a
+/// `%w[text json]` list — prefix completion (`--format=j` → json) and a
+/// non-member is `invalid argument:`. `--current`/`--config` are raw paths.
+const DIFF_SWITCHES: &[Switch] = &[
+    Switch::new(
+        "format",
+        &[("format", false)],
+        ArgStyle::Required,
+        ValueKind::Choice(&["text", "json"]),
+        "--format",
+        "=FORMAT",
+        &["Output format (text | json). Default: text."],
+    ),
+    Switch::new(
+        "current",
+        &[("current", false)],
+        ArgStyle::Required,
+        ValueKind::Raw,
+        "--current",
+        "=PATH",
+        &["Compare to the saved current JSON instead of running `rigor check`."],
+    ),
+    Switch::new(
+        "config",
+        &[("config", false)],
+        ArgStyle::Required,
+        ValueKind::Raw,
+        "--config",
+        "=PATH",
+        &["Path to .rigor.yml. Forwarded to the implicit `rigor check` run."],
+    ),
+];
+const DIFF_PARSER: OptParser = OptParser::new(USAGE, DIFF_SWITCHES);
 
 /// The identity fields (reference `KEY_FIELDS`). Two diagnostics are "the same"
 /// iff these six field values match.
@@ -41,79 +77,54 @@ const KEY_FIELDS: [&str; 6] =
 /// `rigor diff [--format text|json] [--current PATH] [--config PATH]
 /// <baseline.json> [paths...]`.
 pub fn cmd_diff(args: &[String]) -> ExitCode {
-    let mut format = Format::Text;
-    let mut current_path: Option<&str> = None;
-    let mut explicit_config: Option<&str> = None;
-    let mut positionals: Vec<&str> = Vec::new();
-
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--format" => match it.next().map(String::as_str) {
-                Some("text") => format = Format::Text,
-                Some("json") => format = Format::Json,
-                other => {
-                    eprintln!("rigor diff: --format expects `text` or `json`, got {other:?}");
-                    return ExitCode::from(64);
-                }
+    let items = match DIFF_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    // `Choice` delivers the canonical entry — only `"text"` / `"json"` reach
+    // the fold.
+    let mut format = String::from("text");
+    let mut current_path: Option<String> = None;
+    let mut explicit_config: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            Item::Positional(p) => positionals.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "format" => format = value.unwrap().as_str().to_string(),
+                "current" => current_path = Some(value.unwrap().as_str().to_string()),
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                _ => unreachable!("the switch table is closed"),
             },
-            "--current" => match it.next() {
-                Some(p) => current_path = Some(p),
-                None => {
-                    eprintln!("rigor diff: --current expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            "--config" => match it.next() {
-                Some(p) => explicit_config = Some(p),
-                None => {
-                    eprintln!("rigor diff: --config expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--format=") => {
-                match &other["--format=".len()..] {
-                    "text" => format = Format::Text,
-                    "json" => format = Format::Json,
-                    v => {
-                        eprintln!("rigor diff: --format expects `text` or `json`, got {v:?}");
-                        return ExitCode::from(64);
-                    }
-                }
-            }
-            other if other.starts_with("--current=") => {
-                current_path = Some(&other["--current=".len()..]);
-            }
-            other if other.starts_with("--config=") => {
-                explicit_config = Some(&other["--config=".len()..]);
-            }
-            other => positionals.push(other),
         }
     }
 
+    // `@argv.shift` — the first positional is the baseline path; the rest are
+    // the check roots.
     let Some((baseline_path, paths)) = positionals.split_first() else {
         eprintln!("{USAGE}");
         return ExitCode::from(64);
     };
+    let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
 
     let Some(baseline) = load_diagnostics(baseline_path) else {
         return ExitCode::from(64);
     };
     let current = match current_path {
-        Some(p) => match load_diagnostics(p) {
+        Some(p) => match load_diagnostics(&p) {
             Some(c) => c,
             None => return ExitCode::from(64),
         },
-        None => match run_current(explicit_config, paths) {
+        None => match run_current(explicit_config.as_deref(), &path_refs) {
             Ok(c) => c,
             Err(code) => return code,
         },
     };
 
     let diff = compute_diff(&baseline, &current);
-    match format {
-        Format::Text => write_diff_text(&diff, baseline_path, baseline.len(), current.len()),
-        Format::Json => write_diff_json(&diff, baseline_path, baseline.len(), current.len()),
+    match format.as_str() {
+        "json" => write_diff_json(&diff, baseline_path, baseline.len(), current.len()),
+        _ => write_diff_text(&diff, baseline_path, baseline.len(), current.len()),
     }
 
     if diff.new.is_empty() {
@@ -121,12 +132,6 @@ pub fn cmd_diff(args: &[String]) -> ExitCode {
     } else {
         ExitCode::from(1)
     }
-}
-
-#[derive(Clone, Copy)]
-enum Format {
-    Text,
-    Json,
 }
 
 /// The delta: diagnostics gained (`new`) and resolved (`fixed`), each a full JSON

@@ -19,9 +19,9 @@
 //!   severity-by-profile, fires-when / does-not-fire,
 //!   suppression, docs URL). Canonical id, legacy alias,
 //!   and family token (`call`/`flow`/…) all resolve.
-//! - unknown id → a stderr error listing the documented rules + exit 64 (matching
-//!   `explain`'s unknown-rule behaviour; the reference's `docs` lists docs + exits
-//!   1, but reusing `explain`'s contract keeps the two rule-doc paths consistent).
+//! - unknown id → `name_error` like the reference: "Unknown doc: <name>" plus the
+//!   documented-rule list on stderr, exit 1 (the reference prints its manual /
+//!   handbook list; this build prints the rule catalogue it actually serves).
 //!
 //! **Deferred** (no bundled prose corpus in the standalone build): the reference's
 //! manual / handbook / install pages, the `llms.txt` index, and the
@@ -38,43 +38,61 @@ use std::process::ExitCode;
 const MANUAL_HOME: &str = "https://rigor.typedduck.fail/manual/";
 
 /// `rigor docs [<rule-id>]` — list documented rules, or print one rule's doc.
-/// Exit 0 on success, 64 on an unknown rule or usage error.
+///
+/// Mirrors the reference's manual dispatch (`DocsCommand#run`): the positional
+/// slot is always a doc *name*, so an unrecognised first argument — including a
+/// dashed one like `--bogus` — resolves as a name and hits `name_error`
+/// ("Unknown doc: …" + the doc list, exit 1), never a usage error. Only the
+/// grammar words `-h`/`--help`/`help`, `--list`, `--path` and `--print` are
+/// special. Exit 0 on success, 1 on an unknown doc name, 64 on a usage error.
 pub fn cmd_docs(args: &[String]) -> ExitCode {
-    let mut token: Option<&str> = None;
-
-    for arg in args {
-        match arg.as_str() {
-            "-h" | "--help" | "help" => {
-                print_usage();
-                return ExitCode::SUCCESS;
-            }
-            other if other.starts_with('-') => {
-                eprintln!("rigor docs: unsupported flag `{other}`");
-                eprintln!("(the standalone build documents rules only — see usage with --help)");
-                return ExitCode::from(64);
-            }
-            other => {
-                if token.is_some() {
-                    eprintln!("rigor docs: unexpected argument `{other}`");
-                    return ExitCode::from(64);
-                }
-                token = Some(other);
-            }
-        }
-    }
-
-    match token {
+    match args.first().map(String::as_str) {
         None => {
             render_index();
             ExitCode::SUCCESS
+        }
+        Some("-h" | "--help" | "help") => {
+            print_usage();
+            ExitCode::SUCCESS
+        }
+        // The reference's `--list` prints the bundled-docs table; this build's
+        // doc corpus is the rule catalogue, so the index is the analogue.
+        Some("--list") => {
+            render_index();
+            ExitCode::SUCCESS
+        }
+        // `--path` prints a bundled file's path — the standalone build ships no
+        // prose files, so the flag is named explicitly rather than silently
+        // resolving to a rule.
+        Some("--path") => {
+            eprintln!("rigor docs: --path is not supported by rigor-rs");
+            eprintln!("(the standalone build documents rules only — see usage with --help)");
+            ExitCode::from(64)
+        }
+        Some("--print") => print_named(args.get(1).map(String::as_str)),
+        Some(name) => print_named(Some(name)),
+    }
+}
+
+/// `run_print(name)`: nil is a usage error (64); an unresolvable name is
+/// `name_error` — "Unknown doc: …" + the available list on stderr, exit 1.
+fn print_named(name: Option<&str>) -> ExitCode {
+    match name {
+        None => {
+            eprintln!("a doc name is required");
+            print_usage_stderr();
+            ExitCode::from(64)
         }
         Some(tok) => {
             if crate::explain::render_rule_doc(tok) {
                 ExitCode::SUCCESS
             } else {
                 eprintln!("Unknown doc: {tok}");
-                eprintln!("rigor docs documents rules — run `rigor docs` to list them.");
-                ExitCode::from(64)
+                eprintln!("Available docs (try `rigor docs --list`):");
+                for (id, _) in crate::explain::catalogue_index() {
+                    eprintln!("  {id}");
+                }
+                ExitCode::from(1)
             }
         }
     }
@@ -100,16 +118,24 @@ fn render_index() {
 }
 
 fn print_usage() {
-    println!("Usage: rigor docs [<rule-id>]");
+    println!("Usage: rigor docs [<rule-id>] [--list] [--print <rule-id>]");
     println!();
     println!("  rigor docs                Print the documented-rule index");
     println!("  rigor docs <rule-id>      Print that rule's documentation");
+    println!("  rigor docs --list         List the documented rules");
+    println!("  rigor docs --print <id>   Print that rule's documentation");
     println!();
     println!("`<rule-id>` accepts a canonical id (`flow.dead-assignment`), a legacy");
     println!("alias (`dead-assignment`), or a family token (`flow`, `call`, …).");
     println!();
     println!("Note: the standalone build documents rules only. The full manual /");
     println!("handbook prose the reference bundles is web-only — see {MANUAL_HOME}.");
+}
+
+/// `usage_error` writes to stderr in the reference.
+fn print_usage_stderr() {
+    eprintln!("Usage: rigor docs [<rule-id>] [--list] [--print <rule-id>]");
+    eprintln!("(the standalone build documents rules only — see `rigor docs --help`)");
 }
 
 #[cfg(test)]
@@ -144,9 +170,30 @@ mod tests {
     }
 
     #[test]
-    fn cmd_unknown_exits_64() {
-        let code = cmd_docs(&["bogus".to_string()]);
-        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(64)));
+    fn cmd_unknown_exits_1_like_name_error() {
+        // `name_error` in the reference returns 1 — even for a dashed token,
+        // which the grammar resolves as a doc name, never a flag.
+        for argv in ["bogus", "--bogus"] {
+            let code = cmd_docs(&[argv.to_string()]);
+            assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::from(1)));
+        }
+    }
+
+    #[test]
+    fn cmd_grammar_words() {
+        // --list renders the index; extra positionals after a name are ignored
+        // (the reference reads only argv.first).
+        assert_eq!(
+            format!("{:?}", cmd_docs(&["--list".to_string()])),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+        assert_eq!(
+            format!(
+                "{:?}",
+                cmd_docs(&["flow.dead-assignment".to_string(), "extra".to_string()])
+            ),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
     }
 
     #[test]

@@ -235,6 +235,12 @@ struct Options {
     threshold: Option<f64>,
     config: Option<String>,
     workers: Option<usize>,
+    // The deferred mutation-machinery track (ADR-63/70): collected so the
+    // misuse checks + the deferred dispatch mirror `run`'s order.
+    protection: bool,
+    mutation: bool,
+    with_tests: bool,
+    include_dynamic: bool,
 }
 
 /// `rigor coverage [options] PATH...`.
@@ -248,12 +254,49 @@ pub fn cmd_coverage(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
+    // The reference's misuse checks run inside `run`, right after
+    // `parse_options` and BEFORE any deferred-mode dispatch or config load.
+    if options.mutation && !options.protection {
+        eprintln!("coverage: --mutation requires --protection");
+        eprintln!("{USAGE}");
+        return ExitCode::from(64);
+    }
+    if options.with_tests && !options.mutation {
+        eprintln!("coverage: --with-tests requires --mutation (and --protection)");
+        eprintln!("{USAGE}");
+        return ExitCode::from(64);
+    }
+    if options.include_dynamic && !options.with_tests {
+        eprintln!(
+            "coverage: --include-dynamic requires --with-tests (a Dynamic site's only protection is a test)"
+        );
+        eprintln!("{USAGE}");
+        return ExitCode::from(64);
+    }
+    // `--mutation` reaches `run_mutation_protection` upstream — the deferred
+    // track (ADR-63 Tier 2 / ADR-70), still unported.
+    if options.mutation {
+        eprintln!(
+            "coverage: --mutation (type-protection / mutation coverage) is not yet implemented in this port"
+        );
+        return ExitCode::from(2);
+    }
+
     // Config drives the fallback `paths:` and the RBS signature environment.
     let config_path = options.config.as_deref().map(Path::new);
     let cfg = match Config::load(config_path) {
         Ok(c) => c,
         Err(f) => return f.report(),
     };
+
+    // `--protection` (ADR-63 Tier 1) dispatches after config load upstream —
+    // `run_protection`. Deferred track → exit 2.
+    if options.protection {
+        eprintln!(
+            "coverage: --protection (type-protection coverage) is not yet implemented in this port"
+        );
+        return ExitCode::from(2);
+    }
 
     // Resolve paths: explicit args, else config `paths:` (reference
     // `@argv.empty? ? configuration.paths : @argv`).
@@ -292,88 +335,71 @@ pub fn cmd_coverage(args: &[String]) -> ExitCode {
 }
 
 /// Parse the option flags, returning `(options, positional_args)` or an exit
-/// code. `--protection` / `--mutation` / `--with-tests` and their sub-flags are
-/// the deferred mutation-machinery track (ADR-63/70): parsed and rejected with
-/// exit 2 (the stub convention).
+/// code. Reference `define_options` + `define_mutation_options`, `opts.on`
+/// order. `--protection` / `--mutation` / `--with-tests` / `--include-dynamic`
+/// name the deferred mutation-machinery track (ADR-63/70): collected for the
+/// misuse checks + the deferred dispatch in [`cmd_coverage`]. The value
+/// switches (`--test-command`, `--limit`, `--seed`) and `--no-cache` parse and
+/// convert like upstream but are inert outside the deferred modes.
 fn parse_options(args: &[String]) -> Result<(Options, Vec<String>), ExitCode> {
-    let mut format = "text".to_string();
-    let mut threshold: Option<f64> = None;
-    let mut config: Option<String> = None;
-    let mut workers: Option<usize> = None;
-    let mut positional: Vec<String> = Vec::new();
+    use crate::optparse::{ArgStyle, OptParser, Switch, ValueKind};
+    const SWITCHES: &[Switch] = &[
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+        Switch::new("protection", &[("protection", false)], ArgStyle::Flag, ValueKind::Raw, "--protection", "", &["Report type-protection coverage (ADR-63 Tier 1) instead of type precision"]),
+        Switch::new("mutation", &[("mutation", false)], ArgStyle::Flag, ValueKind::Raw, "--mutation", "", &["With --protection: measure actual mutation effectiveness (ADR-63 Tier 2). Scopes to git-changed files when no paths are given; explicit paths override."]),
+        Switch::new("with-tests", &[("with-tests", false)], ArgStyle::Flag, ValueKind::Raw, "--with-tests", "", &["With --mutation: also measure dynamic (test-suite) protection (ADR-70). Runs --test-command against each type-survivor; reports the fused map."]),
+        Switch::new("test-command", &[("test-command", false)], ArgStyle::Required, ValueKind::Raw, "--test-command", "=CMD", &["The test runner hook for --with-tests (default: bundle exec rake)"]),
+        Switch::new("include-dynamic", &[("include-dynamic", false)], ArgStyle::Flag, ValueKind::Raw, "--include-dynamic", "", &["With --with-tests: also mutate Dynamic-receiver (untyped) sites, where a test is the only protection (ADR-69 Seam 2). Completes the map, runs more."]),
+        Switch::new("limit", &[("limit", false)], ArgStyle::Required, ValueKind::Int, "--limit", "=N", &["Sample at most N mutations/file under --mutation (caps cost; ratios become estimates)"]),
+        Switch::new("seed", &[("seed", false)], ArgStyle::Required, ValueKind::Int, "--seed", "=N", &["RNG seed for --limit sampling (default 1)"]),
+        Switch::new("no-cache", &[("no-cache", false)], ArgStyle::Flag, ValueKind::Raw, "--no-cache", "", &["With --mutation: measure every file from scratch, neither reading nor writing the per-file mutation-result cache"]),
+        Switch::new("workers", &[("workers", false)], ArgStyle::Required, ValueKind::Int, "--workers", "=N", &["With --protection (with or without --mutation, but not --with-tests, which must stay sequential): fork N workers over the scanned files (default: config parallel.workers / RIGOR_RACTOR_WORKERS / 0)"]),
+        Switch::new("threshold", &[("threshold", false)], ArgStyle::Required, ValueKind::Float, "--threshold", "=RATIO", &["Exit 1 when the precision (or, with --protection, protection/effectiveness) ratio is below RATIO (0.0–1.0)"]),
+    ];
+    const PARSER: OptParser = OptParser::new(USAGE, SWITCHES);
 
-    // Split `--flag=value` on the first `=`; otherwise consume the next arg.
-    let mut it = args.iter().peekable();
-    while let Some(arg) = it.next() {
-        let (flag, inline) = match arg.split_once('=') {
-            Some((f, v)) => (f, Some(v.to_string())),
-            None => (arg.as_str(), None),
-        };
-        // A helper to fetch the flag's value from `--flag=v` or the next token.
-        macro_rules! value_for {
-            ($name:expr) => {
-                match inline {
-                    Some(v) => v,
-                    None => match it.next() {
-                        Some(v) => v.clone(),
-                        None => {
-                            eprintln!("coverage: {} requires an argument", $name);
-                            return Err(ExitCode::from(64));
-                        }
-                    },
-                }
-            };
-        }
-        match flag {
-            "--format" => format = value_for!("--format"),
-            "--config" => config = Some(value_for!("--config")),
-            "--threshold" => {
-                let v = value_for!("--threshold");
-                match v.parse::<f64>() {
-                    Ok(r) => threshold = Some(r),
-                    Err(_) => {
-                        eprintln!("coverage: invalid argument for --threshold: {v}");
-                        return Err(ExitCode::from(64));
-                    }
-                }
-            }
-            "--workers" => {
-                let v = value_for!("--workers");
-                match v.parse::<i64>() {
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return Err(code),
+    };
+    let mut options = Options {
+        format: "text".to_string(),
+        threshold: None,
+        config: None,
+        workers: None,
+        protection: false,
+        mutation: false,
+        with_tests: false,
+        include_dynamic: false,
+    };
+    let mut positional: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            crate::optparse::Item::Positional(p) => positional.push(p),
+            crate::optparse::Item::Opt { key, value, .. } => match key {
+                "format" => options.format = value.unwrap().as_str().to_string(),
+                "config" => options.config = Some(value.unwrap().as_str().to_string()),
+                "protection" => options.protection = true,
+                "mutation" => options.mutation = true,
+                "with-tests" => options.with_tests = true,
+                "include-dynamic" => options.include_dynamic = true,
+                // Inert outside the deferred modes — parsed + converted
+                // (Integer for limit/seed) exactly like upstream.
+                "test-command" | "limit" | "seed" | "no-cache" => {}
+                "workers" => {
                     // Absent/0/negative → default pool (None). N>0 → pool size.
-                    Ok(n) => workers = if n > 0 { Some(n as usize) } else { None },
-                    Err(_) => {
-                        eprintln!("coverage: invalid argument for --workers: {v}");
-                        return Err(ExitCode::from(64));
-                    }
+                    let n = value.as_ref().map_or(0, |v| v.as_int());
+                    options.workers = if n > 0 { Some(n as usize) } else { None };
                 }
-            }
-            // The deferred mutation-machinery track (ADR-63/70).
-            "--protection" | "--mutation" | "--with-tests" | "--test-command"
-            | "--include-dynamic" | "--limit" | "--seed" => {
-                eprintln!(
-                    "coverage: {flag} (type-protection / mutation coverage) is not yet implemented in this port"
-                );
-                return Err(ExitCode::from(2));
-            }
-            other if other.starts_with('-') => {
-                eprintln!("coverage: unknown option: {other}");
-                eprintln!("{USAGE}");
-                return Err(ExitCode::from(64));
-            }
-            _ => positional.push(arg.clone()),
+                "threshold" => {
+                    options.threshold = value.map(|v| v.as_float());
+                }
+                _ => unreachable!("the switch table is closed"),
+            },
         }
     }
-
-    Ok((
-        Options {
-            format,
-            threshold,
-            config,
-            workers,
-        },
-        positional,
-    ))
+    Ok((options, positional))
 }
 
 /// Exit code (reference `determine_exit`): 1 when any file failed to parse; else

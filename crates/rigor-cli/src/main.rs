@@ -35,6 +35,8 @@ mod diagnostic_formats;
 use diagnostic_formats::Rendered;
 mod baseline;
 use baseline::{Baseline, Bucket, DriftStatus, MatchMode, DEFAULT_BASELINE_PATH};
+mod optparse;
+use optparse::{Item, Value};
 mod docs;
 mod doctor;
 mod effects;
@@ -56,17 +58,57 @@ const COMMANDS: &[&str] = &[
     "check", "annotate", "type-of", "trace", "type-scan", "explain", "diff",
     "sig-gen", "baseline", "triage", "coverage", "plugins", "plugin", "lsp",
     "mcp", "skill", "docs", "init", "doctor", "version", "show-bleedingedge",
-    "effects",
+    "effects", "unused", "describe", "playground", "upgrade",
 ];
+
+/// The reference's `CLI#help` heredoc (`lib/rigor/cli.rb`), verbatim — the
+/// text `rigor`, `rigor help`, `rigor -h` and `rigor --help` print to stdout
+/// and the tail of the `Unknown command:` stderr surface.
+const TOP_HELP: &str = "\
+Usage: rigor <command> [options]
+
+Commands:
+  check      Analyze Ruby source files
+  init       Create a starter .rigor.yml
+  annotate   Print FILE with each line's last-expression type
+  type-of    Print inferred types at FILE:LINE[:COL] positions
+  trace      Replay how the engine typed FILE as a terminal animation
+  type-scan  Report Scope#type_of coverage across PATHs
+  effects    Report each method's effect labels, and the committed effect snapshot
+             (opt-in; effects update/check/diff/explain)
+  explain    Print the description of one or all CheckRules
+  diff       Compare current diagnostics to a saved baseline JSON
+  baseline   Manage the baseline file (baseline generate/regenerate/dump/drift/prune)
+  sig-gen    Emit RBS skeletons inferred from .rb sources
+  lsp        Run the Rigor Language Server (LSP) over stdio
+  mcp        Run the Rigor MCP server over stdio
+  triage     Summarise diagnostics: distribution, hotspots, hints
+  coverage   Report type-precision coverage (precise vs Dynamic ratio)
+  unused     Report unreferenced classes, modules and constants as removal candidates
+  plugins    Report activation status of every configured plugin
+  plugin     Browse bundled plugin source as worked examples (list/path/print/root)
+  playground Start the browser playground (requires rigor-playground gem)
+  describe   Recommend the next skill for this project (alias for `skill describe`)
+  skill      Recommend the next skill + list/print bundled Agent Skills (skill describe, skill <name>)
+  docs       Print the bundled docs offline (docs <name>, docs --list)
+  show-bleedingedge  Show the bleeding-edge overlay + what your config adopts
+  doctor     Classify setup problems vs clean run with routed next actions
+  upgrade    Migration command skeleton (queued)
+  version    Print the Rigor version
+  help       Print this help
+";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        // `version` / `--version` / `-v` / `-V` — print `rigor <version>` and
-        // exit 0 (§13). Mirrors the reference's `rigor #{Rigor::VERSION}` output
-        // (`lib/rigor/cli.rb`, which accepts `version`/`-v`/`--version`). The
-        // version is the crate version baked in at compile time, so it tracks
-        // the workspace `version` automatically. `-V` is the conventional Rust
+        // `CLI#run`: no command, `help`, `-h`, `--help` → the command list on
+        // STDOUT, exit 0.
+        None | Some("help" | "-h" | "--help") => {
+            print!("{TOP_HELP}");
+            ExitCode::SUCCESS
+        }
+        // `version` / `-v` / `--version` — print `rigor <version>` and exit 0
+        // (`rigor #{Rigor::VERSION}` upstream). `-V` is the conventional Rust
         // short flag; accepted alongside the reference's `-v`.
         Some("version" | "--version" | "-v" | "-V") => {
             println!("rigor {}", env!("CARGO_PKG_VERSION"));
@@ -91,18 +133,43 @@ fn main() -> ExitCode {
         // ADR-0043 slice 2 — the effect-summary REPORT. Observational: it
         // shares no state with `check` and consults no inference.
         Some("effects") => effects::cmd_effects(&args[1..]),
+        // Commands upstream owns an OptionParser table for but the port does
+        // not implement: parse argv against the reference's table first — an
+        // unknown flag is `invalid option:` + 64 and `--help` prints the
+        // reference surface — before the deferred stub reports itself.
+        Some("trace") => cmd_deferred("trace", &TRACE_PARSER, &args[1..]),
+        Some("type-scan") => cmd_deferred("type-scan", &TYPE_SCAN_PARSER, &args[1..]),
+        Some("unused") => cmd_unused(&args[1..]),
+        // `run_upgrade`: ignores argv entirely — prints the queued notice and
+        // exits 0 upstream.
+        Some("upgrade") => {
+            println!("rigor upgrade: No migration target available yet (ADR-50 WD7, queued).");
+            println!("Current version: {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        // `run_playground`: the separate `rigor-playground` gem can never load
+        // for a standalone binary — the reference's LoadError surface.
+        Some("playground") => {
+            eprintln!("rigor playground requires the rigor-playground gem.");
+            eprintln!("Install it with: gem install rigor-playground");
+            ExitCode::from(64)
+        }
+        // Manual-dispatch commands (no OptionParser upstream): reproduce the
+        // reference's grammar-level errors — an unrecognised argv.first is a
+        // subcommand / doc-name error, never a deferred stub and never a path.
+        Some("plugin") => cmd_plugin_deferred(&args[1..]),
+        Some("skill") => cmd_skill_deferred(&args[1..]),
+        Some("describe") => cmd_describe_deferred(&args[1..]),
         Some(cmd) if COMMANDS.contains(&cmd) => {
             eprintln!("rigor-rs: `{cmd}` is recognized but not yet implemented in this phase");
             ExitCode::from(2)
         }
+        // `CLI#dispatch`'s unknown-command path: the message and the full help
+        // text on STDERR, exit 64 (`EXIT_USAGE`).
         Some(other) => {
-            eprintln!("rigor-rs: unknown command `{other}`");
-            ExitCode::from(2)
-        }
-        None => {
-            eprintln!("rigor-rs (pre-alpha). usage: rigor <command>");
-            eprintln!("commands: {}", COMMANDS.join(", "));
-            ExitCode::from(2)
+            eprintln!("Unknown command: {other}");
+            eprint!("{TOP_HELP}");
+            ExitCode::from(64)
         }
     }
 }
@@ -111,10 +178,296 @@ fn main() -> ExitCode {
 /// (a directory expands to its `**/*.rb`, ADR-0040) and print
 /// its diagnostics. Exit 1 if any ERROR-severity diagnostic is found (a
 /// warning-only run exits 0, ADR-0040), 64 on a usage error (ADR-0030 exit codes).
+/// The `check` switch table — `parse_check_options`' `opts.on` calls in
+/// declaration order (reference `cli/check_command.rb`), which feeds
+/// abbreviation resolution, `Did you mean?` and `--help`. `--ruby`/`--no-ruby`
+/// are rigor-rs-only (ADR-0036): registered last and `hidden` so upstream
+/// help/completion/candidate output stays byte-identical while they keep
+/// parsing (`--ruby=MODE` and `--ruby MODE`).
+const CHECK_SWITCHES: &[optparse::Switch] = &[
+    optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text, json, sarif, github, gitlab, checkstyle, junit, teamcity"]),
+    optparse::Switch::new("explain", &[("explain", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--explain", "", &["Surface fail-soft fallback events as :info diagnostics"]),
+    optparse::Switch::new("cache-stats", &[("cache-stats", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--cache-stats", "", &["Print on-disk cache inventory at end of run"]),
+    optparse::Switch::new("coverage", &[("coverage", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--coverage", "", &["Add a type-precision coverage block (an extra precision pass over the analyzed files)"]),
+    optparse::Switch::new("clear-cache", &[("clear-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--clear-cache", "", &["Remove the .rigor/cache directory before running"]),
+    optparse::Switch::new("no-cache", &[("no-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-cache", "", &["Disable the persistent cache for this run"]),
+    optparse::Switch::new("stats", &[("stats", false), ("no-stats", true)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--[no-]stats", "", &["Print run summary (files, classes, memory, wall time) to stderr (default: on)"]),
+    optparse::Switch::new("workers", &[("workers", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--workers", "=N", &["Dispatch per-file analysis across N Ractor workers (default: 0; sequential)"]),
+    optparse::Switch::new("tmp-file", &[("tmp-file", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--tmp-file", "=PATH", &["Editor mode: read source bytes from PATH instead of --instead-of (paired)"]),
+    optparse::Switch::new("instead-of", &[("instead-of", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--instead-of", "=PATH", &["Editor mode: the logical project path the buffer represents (paired with --tmp-file)"]),
+    optparse::Switch::new("baseline", &[("baseline", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--baseline", "=PATH", &["load baseline from PATH (overrides .rigor.yml `baseline:`)"]),
+    optparse::Switch::new("no-baseline", &[("no-baseline", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-baseline", "", &["ignore any configured baseline for this run"]),
+    optparse::Switch::new("baseline-strict", &[("baseline-strict", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--baseline-strict", "", &["fail the run on any baseline drift (CI gate)"]),
+    optparse::Switch::new("fail-on", &[("fail-on", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--fail-on", "=SEVERITY", &["exit non-zero on a diagnostic at or above SEVERITY: error (default), warning, or info"]),
+    optparse::Switch::new("treat-all-as-inline-rbs", &[("treat-all-as-inline-rbs", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--treat-all-as-inline-rbs", "", &["force-load rigor-rbs-inline with require_magic_comment: false"]),
+    optparse::Switch::new("verify-incremental", &[("verify-incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--verify-incremental", "", &["assert incremental analysis matches a full run, then exit"]),
+    optparse::Switch::new("incremental", &[("incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--incremental", "", &["re-analyze only files changed since the last run (cross-process cache)"]),
+    optparse::Switch::new("no-ci-detect", &[("no-ci-detect", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-ci-detect", "", &["do not auto-emit CI-native output when a CI environment is detected"]),
+    optparse::Switch::new("bleeding-edge", &[("bleeding-edge", false)], optparse::ArgStyle::Optional, optparse::ValueKind::Raw, "--bleeding-edge", "=[LIST]", &["adopt the bleeding-edge overlay for this run (all features, or a comma-separated feature-id list)"]),
+    optparse::Switch::new("no-bleeding-edge", &[("no-bleeding-edge", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-bleeding-edge", "", &["ignore any configured bleeding_edge: selection for this run"]),
+    optparse::Switch::new("no-tolerated-effects", &[("no-tolerated-effects", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-tolerated-effects", "", &["check effect envelopes as if effects.tolerated: were empty"]),
+    // rigor-rs-only (ADR-0036): not in the reference table, so hidden from
+    // `--help` / completion / `Did you mean?` — still parseable.
+    optparse::Switch::hidden("ruby", &[("ruby", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw),
+    optparse::Switch::hidden("no-ruby", &[("no-ruby", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw),
+];
+
+const CHECK_PARSER: optparse::OptParser =
+    optparse::OptParser::new("Usage: rigor check [options] [paths]", CHECK_SWITCHES);
+
+/// The `rigor: <flag> is not supported by rigor-rs` surface for reference-only
+/// flags the port cannot reproduce — `ParseError`-shaped (stderr, exit 64) but
+/// the message names the port gap, not a parser failure.
+fn check_unsupported(flag: &str) -> ExitCode {
+    eprintln!("rigor: {flag} is not supported by rigor-rs");
+    ExitCode::from(64)
+}
+
+// ---------------------------------------------------------------------------
+// Deferred commands (ADR-0015): real commands upstream, unimplemented here.
+// Their OptionParser tables still run — parse errors surface identically
+// (`invalid option:` + 64, abbreviations, `--`, POSIXLY_CORRECT) and `--help`
+// prints the reference's table — before the stub's exit-2 message.
+// ---------------------------------------------------------------------------
+
+const TRACE_PARSER: optparse::OptParser = optparse::OptParser::new(
+    "Usage: rigor trace [options] FILE",
+    &[
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (animation) or json (raw event stream)"]),
+        optparse::Switch::new("delay", &[("delay", false)], optparse::ArgStyle::Required, optparse::ValueKind::Float, "--delay", "=SECONDS", &["Autoplay with SECONDS between frames (default: step on key press)"]),
+        optparse::Switch::new("line", &[("line", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--line", "=N", &["Only replay events whose source range starts on line N"]),
+        optparse::Switch::new("verbose", &[("verbose", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--verbose", "", &["Include every expression enter/result frame"]),
+        optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    ],
+);
+
+const TYPE_SCAN_PARSER: optparse::OptParser = optparse::OptParser::new(
+    "Usage: rigor type-scan [options] PATH...",
+    &[
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+        optparse::Switch::new("limit", &[("limit", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--limit", "=N", &["Max example events to print (text only)"]),
+        optparse::Switch::new("show-recognized", &[("show-recognized", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--show-recognized", "", &["Include classes with 0 unrecognized in the table"]),
+        optparse::Switch::new("threshold", &[("threshold", false)], optparse::ArgStyle::Required, optparse::ValueKind::Float, "--threshold", "=RATIO", &["Exit non-zero when unrecognized/visits > RATIO"]),
+    ],
+);
+
+const UNUSED_PARSER: optparse::OptParser = optparse::OptParser::new(
+    "Usage: rigor unused [options] [paths]",
+    &[
+        optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (default) or json"]),
+        optparse::Switch::new("entry-point", &[("entry-point", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--entry-point", "=GLOB", &["Treat declarations in files matching GLOB as roots (repeatable)"]),
+        optparse::Switch::new("limit", &[("limit", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--limit", "=N", &["Print at most N candidates (default: all)"]),
+        optparse::Switch::new("incremental", &[("incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--incremental", "", &["(unsupported)"]),
+    ],
+);
+
+/// Parse `args` against the deferred command's reference table, then report
+/// the command as unimplemented. Parse exits (--help, invalid option) are
+/// honoured first.
+fn cmd_deferred(name: &str, parser: &optparse::OptParser, args: &[String]) -> ExitCode {
+    match parser.parse(args).items_or_exit() {
+        Ok(_) => {
+            eprintln!("rigor-rs: `{name}` is recognized but not yet implemented in this phase");
+            ExitCode::from(2)
+        }
+        Err(code) => code,
+    }
+}
+
+/// `rigor unused` — deferred, with the reference's one semantic refusal kept:
+/// `--incremental` is a usage error upstream even though the command's run
+/// body is unported.
+fn cmd_unused(args: &[String]) -> ExitCode {
+    let items = match UNUSED_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    if items
+        .iter()
+        .any(|i| matches!(i, Item::Opt { key: "incremental", .. }))
+    {
+        // `usage_error` in UnusedCommand — verbatim message, exit 64.
+        eprintln!(
+            "rigor unused does not support --incremental: reachability is only sound over a \
+             whole-project run, so an incremental pass would report constants as unused merely \
+             because the files that reference them were served from cache. Re-run without \
+             --incremental."
+        );
+        return ExitCode::from(64);
+    }
+    eprintln!("rigor-rs: `unused` is recognized but not yet implemented in this phase");
+    ExitCode::from(2)
+}
+
+/// `PluginCommand::USAGE` — verbatim; `--help`/`help` print it on stdout.
+const PLUGIN_USAGE: &str = r#"Usage: rigor plugin <subcommand> [args]
+
+Browse the plugins bundled in the rigortype toolchain (worked
+examples for authoring your own). For the activation status of
+the plugins in your .rigor.yml, use `rigor plugins` (plural).
+
+Subcommands:
+  list                  List bundled + example plugins (default)
+  path  <name>          Print the absolute directory path of <name>
+  print <name>          Print <name>'s main lib source, with a header
+  root                  Print the gem root + key subdirectories
+
+Examples:
+  rigor plugin list
+  rigor plugin path  rigor-activerecord
+  rigor plugin print rigor-activesupport-core-ext
+  rigor plugin root
+"#;
+
+/// `SkillCommand::USAGE` — verbatim; `--help`/`help` print it on stdout.
+const SKILL_USAGE: &str = r#"Usage: rigor skill [<name>] [--full <name>] [--path <name>] [--list] [--describe]
+
+With no argument, lists the bundled skills.
+
+  rigor skill                List bundled skills
+  rigor skill <name>         Print the SKILL.md body for <name> (with a header)
+  rigor skill --full <name>  Print the SKILL.md body AND its references/ inline
+                             (the complete, version-current procedure in one call)
+  rigor skill --path <name>  Print the absolute path of the SKILL.md file for <name>
+  rigor skill --list         List bundled skills (name + absolute path)
+  rigor skill --describe     Report project state + recommend the next skill to run
+                             (presence-only probe — never runs `rigor check`)
+  rigor skill describe --deep
+                             Same, but run `rigor check` first and route the
+                             recommendation on its result (slow; writes the cache)
+
+Examples:
+  rigor skill
+  rigor skill rigor-project-init
+  rigor skill --full rigor-baseline-reduce
+  rigor skill --path rigor-baseline-reduce
+  rigor skill --describe        (also: rigor describe)
+  rigor skill describe --deep   (also: rigor describe --deep)
+"#;
+
+/// `rigor plugin` — deferred. `PluginCommand#run` is manual dispatch: argv[0]
+/// is always a subcommand (default `list`), so an unrecognised one is
+/// "Unknown subcommand: X" + USAGE on stderr, exit 64 — not an option error.
+/// The implemented upstream subcommands stay deferred (no bundled plugin tree).
+fn cmd_plugin_deferred(args: &[String]) -> ExitCode {
+    let sub = args.first().map(String::as_str).unwrap_or("list");
+    match sub {
+        "list" | "path" | "print" | "root" => {
+            eprintln!("rigor-rs: `plugin` is recognized but not yet implemented in this phase");
+            ExitCode::from(2)
+        }
+        "-h" | "--help" | "help" => {
+            print!("{PLUGIN_USAGE}");
+            ExitCode::SUCCESS
+        }
+        other => {
+            eprintln!("Unknown subcommand: {other}");
+            eprint!("{PLUGIN_USAGE}");
+            ExitCode::from(64)
+        }
+    }
+}
+
+/// `rigor skill` — deferred. `SkillCommand#run` is manual dispatch like
+/// `docs`: argv[0] is a skill *name* unless it is one of the grammar words, so
+/// an unrecognised token is `name_error` ("Unknown skill: X" + list, exit 1).
+/// `describe`/`--describe` routes to `run_describe`, which refuses any trailing
+/// token as `unknown option for \`describe\`: X` (usage_error, exit 64).
+fn cmd_skill_deferred(args: &[String]) -> ExitCode {
+    match args.first().map(String::as_str) {
+        None | Some("--list" | "--full" | "--path" | "--print") => {
+            eprintln!("rigor-rs: `skill` is recognized but not yet implemented in this phase");
+            ExitCode::from(2)
+        }
+        Some("-h" | "--help" | "help") => {
+            print!("{SKILL_USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("describe" | "--describe") => cmd_describe_args(&args[1..]),
+        Some(name) if BUNDLED_SKILL_NAMES.contains(&name) => {
+            // `run_print` on a real skill — the SKILL.md bodies are the
+            // deferred content, not the name resolution.
+            eprintln!("rigor-rs: `skill` is recognized but not yet implemented in this phase");
+            ExitCode::from(2)
+        }
+        Some(name) => {
+            // `name_error` — "Unknown skill: X" + the bundled-skill list.
+            // The skills corpus itself is deferred (SKILL.md bodies aren't
+            // shipped), but the name list is stable upstream data, so the
+            // error surface stays byte-identical.
+            eprintln!("Unknown skill: {name}");
+            eprintln!("Available skills (try `rigor skill --list`):");
+            for s in BUNDLED_SKILL_NAMES {
+                eprintln!("  {s}");
+            }
+            ExitCode::from(1)
+        }
+    }
+}
+
+/// `SkillCommand#discover_skills` over the reference's bundled `skills/` tree —
+/// the names `name_error` prints, in directory order. The SKILL.md bodies are
+/// not shipped in the standalone build; this list exists only so the unknown-
+/// skill error surface matches the reference byte-for-byte.
+const BUNDLED_SKILL_NAMES: &[&str] = &[
+    "rigor-ask",
+    "rigor-baseline-reduce",
+    "rigor-ci-setup",
+    "rigor-doctor",
+    "rigor-editor-setup",
+    "rigor-mcp-setup",
+    "rigor-monkeypatch-resolve",
+    "rigor-next-steps",
+    "rigor-plugin-author",
+    "rigor-plugin-review",
+    "rigor-plugin-tune",
+    "rigor-project-init",
+    "rigor-protection-uplift",
+    "rigor-rbs-setup",
+    "rigor-type-oracle",
+    "rigor-unused-adjudicate",
+    "rigor-upgrade",
+];
+
+/// `rigor describe` — `run_describe` upstream wraps `skill describe`: argv
+/// becomes `["describe", *argv]`.
+fn cmd_describe_deferred(args: &[String]) -> ExitCode {
+    cmd_describe_args(args)
+}
+
+/// `SkillCommand#run_describe` argument handling: `--deep` tokens are deleted,
+/// then any remaining argv is a usage error; an empty remainder is the
+/// (unported) describe run itself.
+fn cmd_describe_args(args: &[String]) -> ExitCode {
+    let rest: Vec<&String> = args.iter().filter(|a| a.as_str() != "--deep").collect();
+    if let Some(unknown) = rest.first() {
+        eprintln!("unknown option for `describe`: {unknown}");
+        eprint!("{SKILL_USAGE}");
+        return ExitCode::from(64);
+    }
+    eprintln!("rigor-rs: `describe` is recognized but not yet implemented in this phase");
+    ExitCode::from(2)
+}
+
+/// `rigor check [--format text|json] <path...>` — analyze each file or directory
+/// (a directory expands to its `**/*.rb`, ADR-0040) and print
+/// its diagnostics. Exit 1 if any ERROR-severity diagnostic is found (a
+/// warning-only run exits 0, ADR-0040), 64 on a usage error (ADR-0030 exit codes).
 fn cmd_check(args: &[String]) -> ExitCode {
-    let mut format = OutputFormat::Text;
-    let mut files: Vec<&str> = Vec::new();
-    let mut explicit_config: Option<&str> = None;
+    let items = match CHECK_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+
+    // `--format` stays a raw string until output time — the reference stores
+    // it verbatim and only raises `invalid argument: unsupported format: X`
+    // inside `write_result`, AFTER the analysis ran.
+    let mut format = String::from("text");
+    let mut files: Vec<String> = Vec::new();
+    let mut explicit_config: Option<String> = None;
     // ADR-22 baseline resolution (mirrors the reference's precedence in
     // `apply_baseline_filter`): `--no-baseline` (Off) > `--baseline PATH`
     // (Path) > `.rigor.yml`'s `baseline:` (Unset → config).
@@ -124,86 +477,125 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // default `require`) after config load.
     let mut ruby_cli: Option<ruby_mode::RubyMode> = None;
     let mut no_ruby_flag = false;
-    // ADR-22 slice 5 — the `--baseline-strict` CI gate. When set, ANY baseline
-    // drift (over, cleared, or reducible) fails the run; a no-op with a stderr
-    // note when no baseline is active (WD2 — the flag never loads a baseline the
-    // config did not name).
+    // ADR-22 slice 5 — the `--baseline-strict` CI gate.
     let mut baseline_strict = false;
     // ADR-50 WD2 — the `--bleeding-edge[=LIST]` / `--no-bleeding-edge` CLI
-    // mirror of the `bleeding_edge:` config key. `None` means "no flag — use
-    // the configured selection". `=LIST` (not ` LIST`) so a bare
-    // `--bleeding-edge` never swallows a following positional path.
+    // mirror of the `bleeding_edge:` config key.
     let mut bleeding_edge_cli: Option<config::BleedingEdgeSelector> = None;
+    // Issue #812 — `--fail-on=SEVERITY` (`:error` default). Stored raw;
+    // `valid_fail_on_option?` validates it post-parse, before config load.
+    let mut fail_on: Option<String> = None;
+    // ADR-51 WD7 — `--no-ci-detect` (the reference default is on).
+    let mut ci_detect = true;
+    // Editor mode (reference-only): collected for the upstream pairing check,
+    // then rejected — the port has no buffer-binding path.
+    let mut tmp_file: Option<String> = None;
+    let mut instead_of: Option<String> = None;
+    // The first unsupported flag in argv order, reported after the semantic
+    // validations the reference runs post-parse.
+    let mut unsupported: Option<&'static str> = None;
 
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--format" => match it.next().map(String::as_str) {
-                Some("text") => format = OutputFormat::Text,
-                Some("json") => format = OutputFormat::Json,
-                Some("github") => format = OutputFormat::Github,
-                Some("sarif") => format = OutputFormat::Sarif,
-                Some("gitlab") => format = OutputFormat::Gitlab,
-                Some("checkstyle") => format = OutputFormat::Checkstyle,
-                Some("junit") => format = OutputFormat::Junit,
-                Some("teamcity") => format = OutputFormat::Teamcity,
-                other => {
-                    eprintln!(
-                        "rigor check: --format expects `text`, `json`, `github`, `sarif`, \
-                         `gitlab`, `checkstyle`, `junit`, or `teamcity`, got {other:?}"
-                    );
-                    return ExitCode::from(64);
+    for item in &items {
+        match item {
+            Item::Positional(p) => files.push(p.clone()),
+            Item::Opt { key, value, .. } => match *key {
+                "config" => explicit_config = Some(value.as_ref().unwrap().as_str().to_string()),
+                "format" => format = value.as_ref().unwrap().as_str().to_string(),
+                // Accepted no-ops — the semantics trivially hold for a port
+                // with no persistent cache and no run-stats output.
+                "no-cache" | "clear-cache" | "stats" => {}
+                // Sequential-only: the worker pool is a performance axis with
+                // identical output, so the (Integer-validated) value is a no-op.
+                "workers" => {}
+                "tmp-file" => tmp_file = Some(value.as_ref().unwrap().as_str().to_string()),
+                "instead-of" => {
+                    instead_of = Some(value.as_ref().unwrap().as_str().to_string())
                 }
-            },
-            "--config" => match it.next() {
-                Some(path) => explicit_config = Some(path),
-                None => {
-                    eprintln!("rigor check: --config expects a path");
-                    return ExitCode::from(64);
+                "baseline" => {
+                    baseline_arg = BaselineArg::Path(value.as_ref().unwrap().as_str().to_string())
                 }
-            },
-            "--baseline" => match it.next() {
-                Some(path) => baseline_arg = BaselineArg::Path(path.clone()),
-                None => {
-                    eprintln!("rigor check: --baseline expects a path");
-                    return ExitCode::from(64);
+                "no-baseline" => baseline_arg = BaselineArg::Off,
+                "baseline-strict" => baseline_strict = true,
+                "fail-on" => {
+                    fail_on = Some(value.as_ref().unwrap().as_str().to_lowercase())
                 }
-            },
-            "--no-baseline" => baseline_arg = BaselineArg::Off,
-            "--baseline-strict" => baseline_strict = true,
-            "--ruby" => match it.next() {
-                Some(v) => ruby_cli = Some(ruby_mode::parse_value(v)),
-                None => {
-                    eprintln!("rigor check: --ruby expects require|auto|off|<path>");
-                    return ExitCode::from(64);
+                // Reference-only features the port cannot reproduce — rejected
+                // below, after the validations the reference runs first.
+                "explain" | "cache-stats" | "coverage" | "treat-all-as-inline-rbs"
+                | "verify-incremental" | "incremental" | "no-tolerated-effects" => {
+                    if unsupported.is_none() {
+                        unsupported = Some(*key);
+                    }
                 }
+                "no-ci-detect" => ci_detect = false,
+                "bleeding-edge" => {
+                    bleeding_edge_cli = Some(match value {
+                        // A bare `--bleeding-edge` (optional argument absent)
+                        // adopts the whole overlay — the reference's
+                        // `value.nil? || <list>` fold.
+                        None => config::BleedingEdgeSelector::All { except: Vec::new() },
+                        Some(Value::Str(list)) => config::BleedingEdgeSelector::List(
+                            // `--bleeding-edge=` (empty) is `[]` upstream —
+                            // "adopt only these ids" with none listed — NOT
+                            // the bare-flag `true`. `List([])` activates
+                            // nothing, matching.
+                            list.split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .collect(),
+                        ),
+                        _ => unreachable!("Raw-valued switch"),
+                    });
+                }
+                "no-bleeding-edge" => {
+                    bleeding_edge_cli = Some(config::BleedingEdgeSelector::None);
+                }
+                "ruby" => {
+                    ruby_cli = Some(ruby_mode::parse_value(value.as_ref().unwrap().as_str()))
+                }
+                "no-ruby" => no_ruby_flag = true,
+                _ => unreachable!("the switch table is closed"),
             },
-            "--no-ruby" => no_ruby_flag = true,
-            "--bleeding-edge" => {
-                bleeding_edge_cli =
-                    Some(config::BleedingEdgeSelector::All { except: Vec::new() });
-            }
-            "--no-bleeding-edge" => {
-                bleeding_edge_cli = Some(config::BleedingEdgeSelector::None);
-            }
-            other if other.starts_with("--bleeding-edge=") => {
-                let ids: Vec<String> = other["--bleeding-edge=".len()..]
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                bleeding_edge_cli = Some(if ids.is_empty() {
-                    config::BleedingEdgeSelector::All { except: Vec::new() }
-                } else {
-                    config::BleedingEdgeSelector::List(ids)
-                });
-            }
-            other if other.starts_with("--ruby=") => {
-                ruby_cli = Some(ruby_mode::parse_value(&other["--ruby=".len()..]));
-            }
-            other => files.push(other),
         }
+    }
+
+    // `--fail-on` is validated post-parse — BEFORE the buffer-binding check and
+    // config load, exactly where `valid_fail_on_option?` sits in `run`.
+    let fail_on = match fail_on.as_deref() {
+        None => Severity::Error,
+        Some("error") => Severity::Error,
+        Some("warning") => Severity::Warning,
+        Some("info") => Severity::Info,
+        Some(v) => {
+            eprintln!(
+                "rigor: invalid --fail-on value: {v} (expected error, warning, or info)"
+            );
+            return ExitCode::from(64);
+        }
+    };
+
+    // `Options.resolve_buffer_binding`: the pair must appear together; an
+    // existing-but-unsupported pair is the port gap the reference never
+    // reaches.
+    match (tmp_file.is_some(), instead_of.is_some()) {
+        (true, false) | (false, true) => {
+            eprintln!("--tmp-file and --instead-of must appear together");
+            return ExitCode::from(64);
+        }
+        (true, true) => {
+            let tmp = tmp_file.as_deref().unwrap_or_default();
+            if !Path::new(tmp).is_file() {
+                eprintln!("--tmp-file {tmp:?}: no such file or not readable");
+                return ExitCode::from(64);
+            }
+            return check_unsupported("--tmp-file/--instead-of");
+        }
+        (false, false) => {}
+    }
+
+    if let Some(flag) = unsupported {
+        return check_unsupported(&format!("--{flag}"));
     }
 
     // ADR-0036 same-layer mutual exclusion: `--ruby` and `--no-ruby` together is
@@ -222,7 +614,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // exit 64 (the `rescue ConfigurationError` surface). An absent file
     // uses the defaults, so the differential harness — which runs from a
     // directory with no `.rigor.yml` — is unaffected.
-    let cfg = match Config::load(explicit_config.map(Path::new)) {
+    let cfg = match Config::load(explicit_config.as_deref().map(Path::new)) {
         Ok(c) => c,
         Err(f) => return f.report(),
     };
@@ -261,6 +653,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `exclude:` like `**/*.rb` can never match them upstream), else the
     // config `paths:` in the reference's stored spelling — DECLARED entries
     // absolutized (`resolve_paths_in`), the `["lib"]` default verbatim.
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
     let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
     let roots: &[&str] = if files.is_empty() {
@@ -268,7 +661,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         config_paths = config_path_strings.iter().map(String::as_str).collect();
         &config_paths
     } else {
-        &files
+        &file_refs
     };
 
     // Expand roots into their `**/*.rb` files and collect bad-path errors,
@@ -289,9 +682,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // the config path the file the reference reads, no baseline in effect
     // (the reference regroups its output by (file, rule) bin under one, and
     // matches paths the port renders differently).
-    let ref_has_files = reference_has_ruby_files(&cfg, &files)
-        && conformance_gate::check_args_ok(args)
-        && conformance_gate::config_path_ok(explicit_config.unwrap_or(".rigor.yml"))
+    let ref_has_files = reference_has_ruby_files(&cfg, &file_refs)
+        && conformance_gate::check_args_ok(&items)
+        && conformance_gate::config_path_ok(explicit_config.as_deref().unwrap_or(".rigor.yml"))
         && resolve_baseline_path(&baseline_arg, &cfg).is_none()
         && conformance_gate::process_env_ok(
             std::env::var_os("POSIXLY_CORRECT").as_deref(),
@@ -301,7 +694,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
         &expanded,
         // `None` on the `paths:` fallback ⇒ `paths == configuration.paths`
         // ⇒ the reference never widens discovery for a bare `check`.
-        if files.is_empty() { None } else { Some(files.as_slice()) },
+        if files.is_empty() { None } else { Some(file_refs.as_slice()) },
         &cfg,
         "check",
         folder_ref,
@@ -329,15 +722,23 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // the reference: warn-and-skip when SOME files were analyzed, else error.
     prepend_path_errors(&mut findings, &path_errors, !expanded_owned.is_empty());
 
-    match format {
-        OutputFormat::Text => print_text(&findings),
-        OutputFormat::Json => print_json(&findings),
-        OutputFormat::Github => print_rendered(&findings, diagnostic_formats::render_github),
-        OutputFormat::Sarif => print_rendered(&findings, diagnostic_formats::render_sarif),
-        OutputFormat::Gitlab => print_rendered(&findings, diagnostic_formats::render_gitlab),
-        OutputFormat::Checkstyle => print_rendered(&findings, diagnostic_formats::render_checkstyle),
-        OutputFormat::Junit => print_rendered(&findings, diagnostic_formats::render_junit),
-        OutputFormat::Teamcity => print_rendered(&findings, diagnostic_formats::render_teamcity),
+    // `write_result`'s `case format` — an unknown value raises
+    // `OptionParser::InvalidArgument` HERE (after the run, instead of any
+    // output), which `dispatch`'s `rescue ParseError` renders as
+    // `invalid argument: unsupported format: X` on stderr, exit 64.
+    match format.as_str() {
+        "text" => print_text(&findings),
+        "json" => print_json(&findings),
+        "github" => print_rendered(&findings, diagnostic_formats::render_github),
+        "sarif" => print_rendered(&findings, diagnostic_formats::render_sarif),
+        "gitlab" => print_rendered(&findings, diagnostic_formats::render_gitlab),
+        "checkstyle" => print_rendered(&findings, diagnostic_formats::render_checkstyle),
+        "junit" => print_rendered(&findings, diagnostic_formats::render_junit),
+        "teamcity" => print_rendered(&findings, diagnostic_formats::render_teamcity),
+        _ => {
+            eprintln!("invalid argument: unsupported format: {format}");
+            return ExitCode::from(64);
+        }
     }
 
     // CI auto-detection (ADR-51 WD7): only augments the default human (`text`)
@@ -346,9 +747,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // the platform's annotations are emitted on top of the text output; for
     // GitLab (native but artifact-based) and the reviewdog-routed CIs a one-line
     // hint goes to stderr, but only when there are diagnostics so a clean run
-    // stays quiet. `RIGOR_CI_DETECT=0`/`false`/`no`/`off` disables it (and so the
-    // differential harness, which runs without those CI vars, is never affected).
-    if matches!(format, OutputFormat::Text) {
+    // stays quiet. `RIGOR_CI_DETECT=0`/`false`/`no`/`off` or `--no-ci-detect`
+    // disables it (and so the differential harness, which runs without those
+    // CI vars, is never affected).
+    if ci_detect && format == "text" {
         emit_ci_detected_output(&findings);
     }
 
@@ -358,6 +760,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let normal_fail =
         had_io_error || findings.iter().any(|(_, _, _, d)| finding_fails_run(d));
 
+    // Issue #812 — `--fail-on=SEVERITY` (the reference's `fail_on_violation?`):
+    // a diagnostic at or above the threshold — over the SAME baseline-filtered
+    // list the output used — fails the run. `:error` is a no-op over
+    // `normal_fail`'s severity half.
+    let fail_on_hit = findings
+        .iter()
+        .any(|(_, _, _, d)| severity_rank(d.severity) >= severity_rank(fail_on));
+
     // ADR-22 slice 5 — the `--baseline-strict` gate runs LAST (after all normal
     // stdout diagnostics + stderr stats/silenced lines) so its report is the
     // final thing emitted, and OR's onto the exit code. It must run and print
@@ -366,10 +776,20 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let strict_violation =
         baseline_strict && baseline_strict_violation(&raw_findings, &cfg, &baseline_arg);
 
-    if normal_fail || strict_violation {
+    if normal_fail || strict_violation || fail_on_hit {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+/// Issue #812 — the `FAIL_ON_RANK` order: `info` (0) < `warning` (1) <
+/// `error` (2).
+fn severity_rank(s: Severity) -> u8 {
+    match s {
+        Severity::Info => 0,
+        Severity::Warning => 1,
+        Severity::Error => 2,
     }
 }
 
@@ -1574,10 +1994,25 @@ fn char_column_delta(source: &str, offset: usize) -> usize {
 /// `regenerate`/`drift`/`prune` from the reference are NOT yet implemented in
 /// this phase (they depend on `configuration.paths`, which rigor-rs's CLI does
 /// not yet model); a clear message + exit 2 is reported for them.
+/// `BaselineCommand#help`'s heredoc, verbatim — stdout for
+/// `rigor baseline`/`--help`, stderr tail for the unknown-subcommand error.
+const BASELINE_HELP: &str = "\
+Usage: rigor baseline <subcommand> [options]
+
+Subcommands:
+  generate    Write a fresh baseline file from a `rigor check` run.
+  regenerate  Rewrite the baseline unconditionally (post-fix refresh).
+  dump        Print the contents of an existing baseline.
+  drift       Compare baseline vs current diagnostics (reduction / regression hints).
+  prune       Drop cleared buckets (`actual == 0`) from the baseline.
+
+Run `rigor baseline <subcommand> --help` for subcommand options.
+";
+
 fn cmd_baseline(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         None | Some("help") | Some("-h") | Some("--help") => {
-            print_baseline_help();
+            print!("{BASELINE_HELP}");
             ExitCode::SUCCESS
         }
         Some("generate") => baseline_generate(&args[1..]),
@@ -1586,116 +2021,60 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
         Some("drift") => baseline_drift(&args[1..]),
         Some("prune") => baseline_prune(&args[1..]),
         Some(other) => {
-            eprintln!("rigor baseline: unknown subcommand `{other}`");
-            print_baseline_help();
+            // `run`'s else: `subcommand.inspect` — the Ruby double-quoted
+            // spelling Rust's `{:?}` reproduces for ordinary words.
+            eprintln!("Unknown baseline subcommand: {other:?}");
+            eprint!("{BASELINE_HELP}");
             ExitCode::from(64)
         }
     }
 }
 
-fn print_baseline_help() {
-    eprintln!(
-        "Usage: rigor baseline <subcommand> [options]\n\n\
-         Subcommands:\n\
-         \x20 generate    Write a fresh baseline from a check run over the given files.\n\
-         \x20 regenerate  Rewrite the baseline unconditionally (post-fix refresh).\n\
-         \x20 dump        Print the contents of an existing baseline.\n\
-         \x20 drift       Compare baseline vs current diagnostics (reduction / regression hints).\n\
-         \x20 prune       Drop cleared buckets (actual == 0) from the baseline.\n\n\
-         generate/regenerate options:\n\
-         \x20 --match-mode rule|message   Row form: rule (default) or message\n\
-         \x20 --output PATH               Write baseline to PATH (default: {DEFAULT_BASELINE_PATH})\n\
-         \x20 --force                     Overwrite an existing baseline file (generate only)\n\
-         \x20 --config PATH               Path to .rigor.yml\n\n\
-         drift options:\n\
-         \x20 --baseline PATH             Path to the baseline file (default: {DEFAULT_BASELINE_PATH})\n\
-         \x20 --only STATUS               Show only within|over|cleared|reducible buckets\n\
-         \x20 --config PATH               Path to .rigor.yml\n\n\
-         prune options:\n\
-         \x20 --baseline PATH             Path to the baseline file (default: {DEFAULT_BASELINE_PATH})\n\
-         \x20 --dry-run                   Show what would be dropped without writing\n\
-         \x20 --config PATH               Path to .rigor.yml"
-    );
-}
-
 /// A run's findings: `(input-order, path, source, diagnostic)` tuples.
 type Findings = Vec<(usize, String, String, Diagnostic)>;
 
-/// A minimal `OptionParser`-compatible flag parser for the baseline
-/// subcommands, reproducing the reference Ruby's `optparse` error surface so
-/// stderr + exit codes match byte-for-byte:
-/// - `--flag value` and `--flag=value` both accepted for value flags.
-/// - missing value → `missing argument: <flag>` (exit 64).
-/// - unknown `--flag` → `invalid option: <flag>` (exit 64).
-/// - a value-flag validator rejecting a value → `invalid argument: <token>`
-///   where `<token>` is the ORIGINAL argv token (`--only bogus` vs
-///   `--only=bogus`), matching optparse (exit 64).
-/// - positional (non-`--`) args are collected and returned; the baseline
-///   subcommands ignore them (optparse `parse!` leaves them in argv unused).
-struct OptParse<'a> {
-    args: &'a [String],
-    idx: usize,
-}
+/// The baseline subcommand switch tables — `parse_generate_options` /
+/// `parse_dump_options` / `parse_drift_options` / `parse_prune_options` in
+/// `cli/baseline_command.rb`, declaration order. `regenerate` shares
+/// generate's table minus `--force`.
+const BASELINE_GENERATE_SWITCHES: &[optparse::Switch] = &[
+    optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    optparse::Switch::new("output", &[("output", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--output", "=PATH", &["Write baseline to PATH (default: .rigor-baseline.yml)"]),
+    optparse::Switch::new("match-mode", &[("match-mode", false)], optparse::ArgStyle::Required, optparse::ValueKind::Choice(&["rule", "message"]), "--match-mode", "=MODE", &["Row form: rule (default) or message"]),
+    optparse::Switch::new("force", &[("force", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--force", "", &["Overwrite an existing baseline file"]),
+];
+const BASELINE_REGENERATE_SWITCHES: &[optparse::Switch] = &[
+    optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    optparse::Switch::new("output", &[("output", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--output", "=PATH", &["Write baseline to PATH (default: .rigor-baseline.yml)"]),
+    optparse::Switch::new("match-mode", &[("match-mode", false)], optparse::ArgStyle::Required, optparse::ValueKind::Choice(&["rule", "message"]), "--match-mode", "=MODE", &["Row form: rule (default) or message"]),
+];
+const BASELINE_DUMP_SWITCHES: &[optparse::Switch] = &[
+    optparse::Switch::new("baseline", &[("baseline", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--baseline", "=PATH", &["Path to the baseline file (default: .rigor-baseline.yml)"]),
+    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Choice(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
+    optparse::Switch::new("rule", &[("rule", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--rule", "=RULE", &["Filter rows by exact rule id"]),
+    optparse::Switch::new("file", &[("file", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--file", "=GLOB", &["Filter rows by File.fnmatch? glob"]),
+];
+const BASELINE_DRIFT_SWITCHES: &[optparse::Switch] = &[
+    optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    optparse::Switch::new("baseline", &[("baseline", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--baseline", "=PATH", &["Path to the baseline file (default: .rigor-baseline.yml)"]),
+    optparse::Switch::new("only", &[("only", false)], optparse::ArgStyle::Required, optparse::ValueKind::Choice(&["within", "over", "cleared", "reducible"]), "--only", "=STATUS", &["Show only buckets with the given status (within|over|cleared|reducible)"]),
+];
+const BASELINE_PRUNE_SWITCHES: &[optparse::Switch] = &[
+    optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    optparse::Switch::new("baseline", &[("baseline", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--baseline", "=PATH", &["Path to the baseline file (default: .rigor-baseline.yml)"]),
+    optparse::Switch::new("dry-run", &[("dry-run", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--dry-run", "", &["Show what would be dropped without writing the file"]),
+];
 
-/// One parsed flag occurrence.
-enum OptEvent<'a> {
-    /// A value flag: canonical name (`--only`), its value, and the original
-    /// token for error rendering.
-    Value { name: &'a str, value: String, token: String },
-    /// A boolean flag (e.g. `--dry-run`).
-    Bool { name: String },
-    /// A positional argument (the raw token).
-    Positional { token: &'a str },
-}
-
-impl<'a> OptParse<'a> {
-    fn new(args: &'a [String]) -> Self {
-        OptParse { args, idx: 0 }
-    }
-
-    /// Advance to the next token, classifying it. `value_flags` names the flags
-    /// that consume a value. Returns `Err(msg)` for missing-argument on a
-    /// value flag whose value is absent.
-    fn next(&mut self, value_flags: &[&'a str]) -> Option<Result<OptEvent<'a>, String>> {
-        if self.idx >= self.args.len() {
-            return None;
-        }
-        let raw = &self.args[self.idx];
-        self.idx += 1;
-        if let Some(rest) = raw.strip_prefix("--") {
-            let _ = rest;
-            // Split `--flag=value`.
-            let (name, inline) = match raw.split_once('=') {
-                Some((n, v)) => (n, Some(v.to_string())),
-                None => (raw.as_str(), None),
-            };
-            if let Some(canon) = value_flags.iter().find(|f| **f == name).copied() {
-                match inline {
-                    Some(v) => {
-                        Some(Ok(OptEvent::Value { name: canon, value: v, token: raw.clone() }))
-                    }
-                    None => {
-                        // Consume the following token as the value.
-                        if self.idx < self.args.len() {
-                            let v = self.args[self.idx].clone();
-                            let token = format!("{name} {v}");
-                            self.idx += 1;
-                            Some(Ok(OptEvent::Value { name: canon, value: v, token }))
-                        } else {
-                            Some(Err(format!("missing argument: {name}")))
-                        }
-                    }
-                }
-            } else {
-                // A `--flag` that is not a value flag: caller decides whether
-                // it is a known boolean or an unknown option.
-                Some(Ok(OptEvent::Bool { name: name.to_string() }))
-            }
-        } else {
-            Some(Ok(OptEvent::Positional { token: raw.as_str() }))
-        }
-    }
-}
+const BASELINE_GENERATE_PARSER: optparse::OptParser =
+    optparse::OptParser::new("Usage: rigor baseline generate [options]", BASELINE_GENERATE_SWITCHES);
+const BASELINE_REGENERATE_PARSER: optparse::OptParser =
+    optparse::OptParser::new("Usage: rigor baseline regenerate [options]", BASELINE_REGENERATE_SWITCHES);
+const BASELINE_DUMP_PARSER: optparse::OptParser =
+    optparse::OptParser::new("Usage: rigor baseline dump [options]", BASELINE_DUMP_SWITCHES);
+const BASELINE_DRIFT_PARSER: optparse::OptParser =
+    optparse::OptParser::new("Usage: rigor baseline drift [options]", BASELINE_DRIFT_SWITCHES);
+const BASELINE_PRUNE_PARSER: optparse::OptParser =
+    optparse::OptParser::new("Usage: rigor baseline prune [options]", BASELINE_PRUNE_SWITCHES);
 
 /// Shared analysis path for generate/regenerate/drift/prune: load config,
 /// build the sidecar folder, resolve roots, analyze, and return the findings
@@ -1800,43 +2179,37 @@ fn load_baseline_strict(path: &str) -> Result<Baseline, ExitCode> {
 
 /// `rigor baseline generate` — run `check` over the files and write a baseline.
 fn baseline_generate(args: &[String]) -> ExitCode {
-    let mut files: Vec<&str> = Vec::new();
+    let items = match BASELINE_GENERATE_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut files: Vec<String> = Vec::new();
     let mut output = DEFAULT_BASELINE_PATH.to_string();
     let mut mode = MatchMode::Rule;
     let mut force = false;
     let mut explicit_config: Option<String> = None;
-
-    let mut p = OptParse::new(args);
-    while let Some(ev) = p.next(&["--output", "--match-mode", "--config"]) {
-        match ev {
-            Err(msg) => {
-                eprintln!("{msg}");
-                return ExitCode::from(64);
-            }
-            Ok(OptEvent::Value { name: "--output", value, .. }) => output = value,
-            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
-            Ok(OptEvent::Value { name: "--match-mode", value, token }) => {
-                mode = match value.as_str() {
-                    "rule" => MatchMode::Rule,
-                    "message" => MatchMode::Message,
-                    _ => {
-                        eprintln!("invalid argument: {token}");
-                        return ExitCode::from(64);
-                    }
-                };
-            }
-            Ok(OptEvent::Value { .. }) => unreachable!(),
-            Ok(OptEvent::Bool { name }) if name == "--force" => force = true,
-            Ok(OptEvent::Bool { name }) => {
-                eprintln!("invalid option: {name}");
-                return ExitCode::from(64);
-            }
+    for item in items {
+        match item {
             // A rigor-rs generate-parity extension: positional roots override
             // config `paths:`. The reference accepts no positionals here.
-            Ok(OptEvent::Positional { token }) => files.push(token),
+            Item::Positional(p) => files.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "output" => output = value.unwrap().as_str().to_string(),
+                // `Choice` already canonicalized/validated the value.
+                "match-mode" => {
+                    mode = if value.unwrap().as_str() == "message" {
+                        MatchMode::Message
+                    } else {
+                        MatchMode::Rule
+                    }
+                }
+                "force" => force = true,
+                _ => unreachable!("the switch table is closed"),
+            },
         }
     }
-    let explicit_config = explicit_config.as_deref();
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
     if Path::new(&output).exists() && !force {
         eprintln!(
@@ -1846,50 +2219,43 @@ fn baseline_generate(args: &[String]) -> ExitCode {
         return ExitCode::from(64);
     }
 
-    write_baseline(explicit_config, &files, &output, mode, "wrote baseline to")
+    write_baseline(explicit_config.as_deref(), &file_refs, &output, mode, "wrote baseline to")
 }
 
 /// `rigor baseline regenerate` — `generate --force` with a different success
-/// verb: unconditional overwrite (no existence check, no `--force` flag). Roots
+/// verb: unconditional overwrite (no existence check, no `--force` flag — its
+/// table lacks `force`, so `--force` is `invalid option: --force`). Roots
 /// follow the same rigor-rs generate-parity extension (positionals-if-given
 /// else config `paths:`); the reference always analyzes config `paths:`.
 fn baseline_regenerate(args: &[String]) -> ExitCode {
-    let mut files: Vec<&str> = Vec::new();
+    let items = match BASELINE_REGENERATE_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut files: Vec<String> = Vec::new();
     let mut output = DEFAULT_BASELINE_PATH.to_string();
     let mut mode = MatchMode::Rule;
     let mut explicit_config: Option<String> = None;
-
-    let mut p = OptParse::new(args);
-    // No `--force` here: regenerate always overwrites, and passing `--force`
-    // must fail as `invalid option: --force` (reference optparse parity).
-    while let Some(ev) = p.next(&["--output", "--match-mode", "--config"]) {
-        match ev {
-            Err(msg) => {
-                eprintln!("{msg}");
-                return ExitCode::from(64);
-            }
-            Ok(OptEvent::Value { name: "--output", value, .. }) => output = value,
-            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
-            Ok(OptEvent::Value { name: "--match-mode", value, token }) => {
-                mode = match value.as_str() {
-                    "rule" => MatchMode::Rule,
-                    "message" => MatchMode::Message,
-                    _ => {
-                        eprintln!("invalid argument: {token}");
-                        return ExitCode::from(64);
+    for item in items {
+        match item {
+            Item::Positional(p) => files.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "output" => output = value.unwrap().as_str().to_string(),
+                "match-mode" => {
+                    mode = if value.unwrap().as_str() == "message" {
+                        MatchMode::Message
+                    } else {
+                        MatchMode::Rule
                     }
-                };
-            }
-            Ok(OptEvent::Value { .. }) => unreachable!(),
-            Ok(OptEvent::Bool { name }) => {
-                eprintln!("invalid option: {name}");
-                return ExitCode::from(64);
-            }
-            Ok(OptEvent::Positional { token }) => files.push(token),
+                }
+                _ => unreachable!("the switch table is closed"),
+            },
         }
     }
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
-    write_baseline(explicit_config.as_deref(), &files, &output, mode, "regenerated baseline")
+    write_baseline(explicit_config.as_deref(), &file_refs, &output, mode, "regenerated baseline")
 }
 
 /// Shared generate/regenerate writer: analyze, build the baseline, write it, and
@@ -1949,96 +2315,168 @@ fn write_baseline(
     ExitCode::SUCCESS
 }
 
-/// `rigor baseline dump` — print an existing baseline's rows.
+/// `rigor baseline dump` — print an existing baseline's rows, honouring
+/// `--format` (`text`|`json`), `--rule` (exact) and `--file` (`File.fnmatch?`
+/// glob — `conformance_gate::fnmatch`, the no-flags port) filters.
 fn baseline_dump(args: &[String]) -> ExitCode {
+    let items = match BASELINE_DUMP_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
     let mut path = DEFAULT_BASELINE_PATH.to_string();
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "--baseline" => match it.next() {
-                Some(p) => path = p.clone(),
-                None => {
-                    eprintln!("rigor baseline dump: --baseline expects a path");
-                    return ExitCode::from(64);
-                }
+    let mut format = String::from("text");
+    let mut rule: Option<String> = None;
+    let mut file_glob: Option<String> = None;
+    for item in items {
+        match item {
+            Item::Positional(_) => {} // upstream leaves them in argv, unused
+            Item::Opt { key, value, .. } => match key {
+                "baseline" => path = value.unwrap().as_str().to_string(),
+                "format" => format = value.unwrap().as_str().to_string(),
+                "rule" => rule = Some(value.unwrap().as_str().to_string()),
+                "file" => file_glob = Some(value.unwrap().as_str().to_string()),
+                _ => unreachable!("the switch table is closed"),
             },
-            other => {
-                eprintln!("rigor baseline dump: unexpected argument `{other}`");
-                return ExitCode::from(64);
+        }
+    }
+    let baseline = match load_baseline_strict(&path) {
+        Ok(b) => b,
+        Err(code) => return code,
+    };
+    // `filter_dump_rows`: exact rule match, `File.fnmatch?`-no-flags file glob.
+    let rows: Vec<&Bucket> = baseline
+        .buckets()
+        .iter()
+        .filter(|b| {
+            if let Some(r) = &rule {
+                if &b.rule != r {
+                    return false;
+                }
+            }
+            if let Some(g) = &file_glob {
+                if !conformance_gate::fnmatch(g, &b.file) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+    if format == "json" {
+        println!("{}", dump_json(&rows));
+    } else {
+        dump_text(&rows);
+    }
+    ExitCode::SUCCESS
+}
+
+/// `dump_text`: empty → `(no baseline rows matching the supplied filters)`;
+/// else group by rule (first-seen order, most buckets first — `group_by` +
+/// `sort_by -group.size`, stable), buckets by `[-count, file]`, a blank line
+/// between groups, then the `Total:` line over the FILTERED rows.
+fn dump_text(rows: &[&Bucket]) {
+    if rows.is_empty() {
+        println!("(no baseline rows matching the supplied filters)");
+        return;
+    }
+    let mut groups: Vec<(&str, Vec<&Bucket>)> = Vec::new();
+    for b in rows {
+        if let Some(g) = groups.iter_mut().find(|(r, _)| *r == b.rule) {
+            g.1.push(b);
+        } else {
+            groups.push((b.rule.as_str(), vec![b]));
+        }
+    }
+    groups.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    let mut occurrences = 0usize;
+    for (rule, group) in &groups {
+        let total: usize = group.iter().map(|b| b.count).sum();
+        occurrences += total;
+        println!("{rule}  ({} bucket(s), {total} occurrence(s))", group.len());
+        let mut sorted = group.clone();
+        sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.file.cmp(&b.file)));
+        for bucket in sorted {
+            match &bucket.message {
+                Some(m) => println!("  {}: {}  ~/{m}/", bucket.file, bucket.count),
+                None => println!("  {}: {}", bucket.file, bucket.count),
             }
         }
+        println!();
     }
-    if !Path::new(&path).exists() {
-        eprintln!("rigor: baseline file not found: {path}");
-        return ExitCode::from(64);
+    println!("Total: {} bucket(s), {occurrences} occurrence(s)", rows.len());
+}
+
+/// `dump_to_json` + `JSON.pretty_generate` — the `{"version":…,"ignored":[…]}`
+/// document at two-space indent. `message` rides `message_regex.source` — the
+/// stored bucket `message` IS that source (it round-trips byte-for-byte).
+fn dump_json(rows: &[&Bucket]) -> String {
+    let mut out = String::from("{\n  \"version\": ");
+    out.push_str(&baseline::CURRENT_VERSION.to_string());
+    out.push_str(",\n  \"ignored\": ");
+    if rows.is_empty() {
+        out.push_str("[]\n}");
+        return out;
     }
-    let baseline = match Baseline::load(Path::new(&path)) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("rigor: baseline load failed: {e}");
-            return ExitCode::from(64);
+    out.push_str("[\n");
+    for (i, b) in rows.iter().enumerate() {
+        out.push_str("    {\n");
+        out.push_str(&format!("      \"file\": {},\n", json_string(&b.file)));
+        out.push_str(&format!("      \"rule\": {},\n", json_string(&b.rule)));
+        out.push_str(&format!("      \"count\": {}", b.count));
+        if let Some(m) = &b.message {
+            out.push_str(&format!(",\n      \"message\": {}", json_string(m)));
         }
-    };
-    let mut total = 0usize;
-    for b in baseline.buckets() {
-        total += b.count;
-        match &b.message {
-            Some(m) => println!("{}  [{}]  count={}  ~/{m}/", b.file, b.rule, b.count),
-            None => println!("{}  [{}]  count={}", b.file, b.rule, b.count),
+        out.push_str("\n    }");
+        if i + 1 < rows.len() {
+            out.push(',');
         }
+        out.push('\n');
     }
-    println!("Total: {} bucket(s), {total} occurrence(s)", baseline.size());
-    ExitCode::SUCCESS
+    out.push_str("  ]\n}");
+    out
 }
 
 /// `rigor baseline drift` — audit current diagnostics against the baseline and
 /// report per-bucket drift. Informational: exit 0 whether or not drift is
 /// found; exit 64 only for usage / missing / malformed baseline.
 fn baseline_drift(args: &[String]) -> ExitCode {
+    let items = match BASELINE_DRIFT_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
     let mut path = DEFAULT_BASELINE_PATH.to_string();
     let mut only: Option<DriftStatus> = None;
     let mut explicit_config: Option<String> = None;
-    let mut files: Vec<&str> = Vec::new();
-
-    let mut p = OptParse::new(args);
-    while let Some(ev) = p.next(&["--baseline", "--only", "--config"]) {
-        match ev {
-            Err(msg) => {
-                eprintln!("{msg}");
-                return ExitCode::from(64);
-            }
-            Ok(OptEvent::Value { name: "--baseline", value, .. }) => path = value,
-            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
-            Ok(OptEvent::Value { name: "--only", value, token }) => {
-                only = Some(match value.as_str() {
-                    "within" => DriftStatus::Within,
-                    "over" => DriftStatus::Over,
-                    "cleared" => DriftStatus::Cleared,
-                    "reducible" => DriftStatus::Reducible,
-                    _ => {
-                        eprintln!("invalid argument: {token}");
-                        return ExitCode::from(64);
-                    }
-                });
-            }
-            Ok(OptEvent::Value { .. }) => unreachable!(),
-            Ok(OptEvent::Bool { name }) => {
-                eprintln!("invalid option: {name}");
-                return ExitCode::from(64);
-            }
+    let mut files: Vec<String> = Vec::new();
+    for item in items {
+        match item {
             // A rigor-rs generate-parity extension: positional roots override
             // config `paths:`. The reference accepts no positionals here.
-            Ok(OptEvent::Positional { token }) => files.push(token),
+            Item::Positional(p) => files.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "baseline" => path = value.unwrap().as_str().to_string(),
+                "only" => {
+                    only = Some(match value.unwrap().as_str() {
+                        "within" => DriftStatus::Within,
+                        "over" => DriftStatus::Over,
+                        "cleared" => DriftStatus::Cleared,
+                        "reducible" => DriftStatus::Reducible,
+                        _ => unreachable!("Choice canonicalizes"),
+                    });
+                }
+                _ => unreachable!("the switch table is closed"),
+            },
         }
     }
     let explicit_config = explicit_config.as_deref();
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
     let baseline = match load_baseline_strict(&path) {
         Ok(b) => b,
         Err(code) => return code,
     };
     // Positionals-if-given, else config `paths:` (the reference-faithful path).
-    let findings = match baseline_analysis(explicit_config, &files, "baseline") {
+    let findings = match baseline_analysis(explicit_config, &file_refs, "baseline") {
         Ok((_cfg, f, scope_undeclared, _path_errors)) => {
             // Guard the scope-less audit: with no declared analysis scope, every
             // bucket outside the implicit `lib` default would falsely read as
@@ -2112,39 +2550,36 @@ fn drift_section_header(status: DriftStatus, n: usize) -> String {
 /// `rigor baseline prune` — drop cleared buckets (`actual == 0`) from the
 /// baseline. Same missing/malformed handling as drift (exit 64).
 fn baseline_prune(args: &[String]) -> ExitCode {
+    let items = match BASELINE_PRUNE_PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
     let mut path = DEFAULT_BASELINE_PATH.to_string();
     let mut dry_run = false;
     let mut explicit_config: Option<String> = None;
-    let mut files: Vec<&str> = Vec::new();
-
-    let mut p = OptParse::new(args);
-    while let Some(ev) = p.next(&["--baseline", "--config"]) {
-        match ev {
-            Err(msg) => {
-                eprintln!("{msg}");
-                return ExitCode::from(64);
-            }
-            Ok(OptEvent::Value { name: "--baseline", value, .. }) => path = value,
-            Ok(OptEvent::Value { name: "--config", value, .. }) => explicit_config = Some(value),
-            Ok(OptEvent::Value { .. }) => unreachable!(),
-            Ok(OptEvent::Bool { name }) if name == "--dry-run" => dry_run = true,
-            Ok(OptEvent::Bool { name }) => {
-                eprintln!("invalid option: {name}");
-                return ExitCode::from(64);
-            }
+    let mut files: Vec<String> = Vec::new();
+    for item in items {
+        match item {
             // A rigor-rs generate-parity extension: positional roots override
             // config `paths:`. The reference accepts no positionals here.
-            Ok(OptEvent::Positional { token }) => files.push(token),
+            Item::Positional(p) => files.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "baseline" => path = value.unwrap().as_str().to_string(),
+                "dry-run" => dry_run = true,
+                _ => unreachable!("the switch table is closed"),
+            },
         }
     }
     let explicit_config = explicit_config.as_deref();
+    let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
     let baseline = match load_baseline_strict(&path) {
         Ok(b) => b,
         Err(code) => return code,
     };
     // Positionals-if-given, else config `paths:` (the reference-faithful path).
-    let findings = match baseline_analysis(explicit_config, &files, "baseline") {
+    let findings = match baseline_analysis(explicit_config, &file_refs, "baseline") {
         Ok((_cfg, f, scope_undeclared, _path_errors)) => {
             // Guard the scope-less audit: with no declared analysis scope, every
             // cleared-looking bucket outside the implicit `lib` default would be
@@ -2617,21 +3052,6 @@ fn json_string(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-/// Output format for `rigor check` (ADR-0014; text default, json nice-to-have).
-/// `Github`/`Sarif`/`Gitlab`/`Checkstyle`/`Junit`/`Teamcity` are the
-/// CI-oriented formats (reference ADR-51), rendered in `diagnostic_formats`.
-#[derive(Clone, Copy)]
-enum OutputFormat {
-    Text,
-    Json,
-    Github,
-    Sarif,
-    Gitlab,
-    Checkstyle,
-    Junit,
-    Teamcity,
 }
 
 // ---------------------------------------------------------------------------

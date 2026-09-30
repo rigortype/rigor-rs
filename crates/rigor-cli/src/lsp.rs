@@ -57,37 +57,49 @@ use crate::ruby_mode;
 use crate::severity;
 use crate::sidecar;
 
-/// `rigor lsp [--transport=stdio] [--log=PATH]`. Only `stdio` transport is
-/// supported in v1 (ADR-0029); `--log` is accepted and reserved (server logs go
-/// to stderr until wired). Returns exit 0 on a clean shutdown, 64 on a usage
-/// error (unknown transport), 1 on a protocol/IO error.
+/// `rigor lsp [--transport=stdio] [--log=PATH] [--config=PATH]`. Only `stdio`
+/// transport is supported in v1 (ADR-0029); `--log` is accepted and reserved
+/// (server logs go to stderr until wired). Returns exit 0 on a clean shutdown,
+/// 64 on a usage error (unknown transport), 1 on a protocol/IO error.
 pub fn cmd_lsp(args: &[String]) -> ExitCode {
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            // `--transport=stdio` or `--transport stdio`.
-            "--transport=stdio" => {}
-            "--transport" => match it.next().map(String::as_str) {
-                Some("stdio") => {}
-                other => {
-                    eprintln!("rigor lsp: only --transport=stdio is supported, got {other:?}");
-                    return ExitCode::from(64);
-                }
-            },
-            a if a.starts_with("--transport=") => {
-                eprintln!("rigor lsp: only --transport=stdio is supported, got {a:?}");
+    const USAGE: &str = "Usage: rigor lsp [options]";
+    // Reference `LspCommand#parse_options` — its `rescue ParseError` prints the
+    // message AND the usage line, unlike the dispatcher's bare rescue.
+    use crate::optparse::{ArgStyle, OptParser, Switch, ValueKind};
+    const SWITCHES: &[Switch] = &[
+        Switch::new("transport", &[("transport", false)], ArgStyle::Required, ValueKind::Raw, "--transport", "=NAME", &["Transport (default: stdio; only stdio supported in v1)"]),
+        Switch::new("log", &[("log", false)], ArgStyle::Required, ValueKind::Raw, "--log", "=PATH", &["Write LSP wire log + server debug to PATH (default: stderr)"]),
+        Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+    ];
+    const PARSER: OptParser = OptParser::new(USAGE, SWITCHES);
+
+    let items = match PARSER.parse(args).items_or_exit_usage(USAGE) {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut transport = String::from("stdio");
+    for item in items {
+        let crate::optparse::Item::Opt { key, value, .. } = item else {
+            continue;
+        };
+        match key {
+            "transport" => transport = value.unwrap().as_str().to_string(),
+            // `--log` is accepted + reserved (ADR-0029). `--config` parses like
+            // upstream but the port's root-relative config discovery cannot
+            // honour it — rejected rather than silently ignored.
+            "log" => {}
+            "config" => {
+                eprintln!("rigor: lsp --config is not supported by rigor-rs");
                 return ExitCode::from(64);
             }
-            // `--log=PATH` / `--log PATH` — accepted + reserved (ADR-0029).
-            a if a.starts_with("--log=") => {}
-            "--log" => {
-                let _ = it.next();
-            }
-            other => {
-                eprintln!("rigor lsp: unexpected argument {other:?}");
-                return ExitCode::from(64);
-            }
+            _ => unreachable!("the switch table is closed"),
         }
+    }
+    if transport != "stdio" {
+        eprintln!(
+            "rigor lsp: unsupported transport: {transport:?} (only `stdio` is supported in v1)"
+        );
+        return ExitCode::from(64);
     }
 
     match run_stdio() {

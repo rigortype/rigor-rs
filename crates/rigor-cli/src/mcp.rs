@@ -44,20 +44,44 @@ use crate::config::Config;
 /// compatible response — the client then decides whether to proceed).
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// `rigor mcp` — run the stdio MCP server. Accepts (and ignores, reserved) a
-/// `--transport=stdio` flag for symmetry with `lsp`. Returns exit 0 on a clean
-/// EOF shutdown, 1 on an IO error, 64 on a usage error.
+/// `rigor mcp` — run the stdio MCP server. Only `stdio` transport is
+/// supported (ADR-0029); `--config` sets the session-level default config path.
+/// Returns exit 0 on a clean EOF shutdown, 1 on an IO error, 64 on a usage
+/// error.
 pub fn cmd_mcp(args: &[String]) -> ExitCode {
-    for arg in args {
-        match arg.as_str() {
-            "--transport=stdio" | "--transport" | "stdio" => {}
-            other => {
-                eprintln!("rigor mcp: unexpected argument {other:?} (only stdio transport)");
-                return ExitCode::from(64);
-            }
+    const USAGE: &str = "Usage: rigor mcp [options]";
+    // Reference `McpCommand#parse_options` — like `lsp`, its `rescue
+    // ParseError` appends the USAGE line.
+    use crate::optparse::{ArgStyle, OptParser, Switch, ValueKind};
+    const SWITCHES: &[Switch] = &[
+        Switch::new("transport", &[("transport", false)], ArgStyle::Required, ValueKind::Raw, "--transport", "=NAME", &["Transport (default: stdio; only stdio is supported in v1)"]),
+        Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Session-level default config path (individual tool calls may override)"]),
+    ];
+    const PARSER: OptParser = OptParser::new(USAGE, SWITCHES);
+
+    let items = match PARSER.parse(args).items_or_exit_usage(USAGE) {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut transport = String::from("stdio");
+    let mut explicit_config: Option<String> = None;
+    for item in items {
+        let crate::optparse::Item::Opt { key, value, .. } = item else {
+            continue;
+        };
+        match key {
+            "transport" => transport = value.unwrap().as_str().to_string(),
+            "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+            _ => unreachable!("the switch table is closed"),
         }
     }
-    match run_stdio() {
+    if transport != "stdio" {
+        eprintln!(
+            "rigor mcp: unsupported transport: {transport:?} (only `stdio` is supported in v1)"
+        );
+        return ExitCode::from(64);
+    }
+    match run_stdio(explicit_config.as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("rigor mcp: {e}");
@@ -75,8 +99,11 @@ struct ServerContext {
 
 /// The stdio read/dispatch/respond loop. Reads one JSON-RPC message per line;
 /// responds to requests (those with an `id`), silently accepts notifications.
-fn run_stdio() -> Result<(), String> {
-    let cfg = Config::load(None).map_err(|f| format!("rigor: {}", f.message))?;
+fn run_stdio(config_path: Option<&str>) -> Result<(), String> {
+    // `MCP::Server.new(config_path:)` — the session default, upstream's
+    // `--config` (auto-discovery when absent).
+    let cfg = Config::load(config_path.map(std::path::Path::new))
+        .map_err(|f| format!("rigor: {}", f.message))?;
     let ctx = ServerContext {
         index: CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new("."))),
         disable: cfg.disable_matcher(),

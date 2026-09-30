@@ -116,79 +116,108 @@ fn annotation_hint(line: &str) -> bool {
 
 /// `rigor effects` — the report. Exit 0 always; 64 on a usage error.
 pub fn cmd_effects(args: &[String]) -> ExitCode {
-    let mut format = "text";
-    let mut full = false;
-    let mut explicit_config: Option<&str> = None;
-    let mut positional: Vec<&str> = Vec::new();
-
-    let mut it = args.iter();
-    while let Some(arg) = it.next() {
-        match arg.as_str() {
-            "help" | "--help" | "-h" => {
-                println!("{}", help());
-                return ExitCode::SUCCESS;
-            }
-            // The snapshot family. Named explicitly so the message says which
-            // slice owns them — and deliberately NOT phrased as an unknown
-            // command, which `harness/effects_diff.py` reads as
-            // "the port has no `effects` subcommand at all".
-            verb @ ("update" | "check" | "diff" | "explain") => {
-                eprintln!(
-                    "rigor-rs: `effects {verb}` (the committed effect snapshot) is not yet \
-                     implemented — ADR-0043 slice 5"
-                );
-                return ExitCode::from(2);
-            }
-            "--full" => full = true,
-            // Accepted and deliberately inert, exactly as upstream accepts it on
-            // the report: an observation is undischarged, and only a JUDGMENT
-            // reads `effects.tolerated:`.
-            "--no-tolerated-effects" => {}
-            "--format" => match it.next().map(String::as_str) {
-                Some(f @ ("text" | "json")) => format = f,
-                other => {
-                    eprintln!("effects: --format expects `text` or `json`, got {other:?}");
-                    eprintln!("{USAGE}");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--format=") => {
-                match other.trim_start_matches("--format=") {
-                    f @ ("text" | "json") => format = f,
-                    other => {
-                        eprintln!("effects: unsupported format: {other}");
-                        eprintln!("{USAGE}");
-                        return ExitCode::from(64);
-                    }
-                }
-            }
-            "--config" => match it.next() {
-                Some(path) => explicit_config = Some(path),
-                None => {
-                    eprintln!("effects: --config expects a path");
-                    return ExitCode::from(64);
-                }
-            },
-            other if other.starts_with("--") => {
-                eprintln!("effects: unknown option `{other}`");
-                eprintln!("{USAGE}");
-                return ExitCode::from(64);
-            }
-            other => positional.push(other),
+    // The reference's `run` dispatches on `@argv.first` BEFORE any option
+    // parsing — a verb in a later position is just a report path.
+    match args.first().map(String::as_str) {
+        Some("help" | "--help" | "-h") => {
+            println!("{}", help());
+            return ExitCode::SUCCESS;
         }
+        // The snapshot family (upstream `EffectsSnapshotCommand::VERBS`).
+        // Named explicitly so the message says which slice owns them — and
+        // deliberately NOT phrased as an unknown command, which
+        // `harness/effects_diff.py` reads as "the port has no `effects`
+        // subcommand at all".
+        Some(verb @ ("update" | "check" | "diff" | "explain")) => {
+            eprintln!(
+                "rigor-rs: `effects {verb}` (the committed effect snapshot) is not yet \
+                 implemented — ADR-0043 slice 5"
+            );
+            return ExitCode::from(2);
+        }
+        _ => {}
+    }
+
+    // Reference `EffectsCommand#parse_options`, `opts.on` order. `--format` is
+    // a RAW string — a non-member is the post-parse `usage_error` (`unsupported
+    // format: X` + USAGE on stderr, 64); `--label` is repeatable and
+    // comma-split; `--limit` is `accept Integer`.
+    use crate::optparse::{ArgStyle, Item, OptParser, Switch, ValueKind};
+    const SWITCHES: &[Switch] = &[
+        Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (default) or json"]),
+        Switch::new("full", &[("full", false)], ArgStyle::Flag, ValueKind::Raw, "--full", "", &["List every method, including the ones with nothing to say"]),
+        Switch::new("label", &[("label", false)], ArgStyle::Required, ValueKind::Raw, "--label", "=LABEL", &["Only methods carrying LABEL (or a label under it), in either lane"]),
+        Switch::new("pure", &[("pure", false)], ArgStyle::Flag, ValueKind::Raw, "--pure", "", &["Only methods proven to do nothing beyond mutate.local — the %a{pure} set"]),
+        Switch::new("limit", &[("limit", false)], ArgStyle::Required, ValueKind::Int, "--limit", "=N", &["Print at most N methods"]),
+        Switch::new("why", &[("why", false)], ArgStyle::Flag, ValueKind::Raw, "--why", "", &["Expand each method's unresolved reasons and declared-lane sources"]),
+        Switch::new("list-labels", &[("list-labels", false)], ArgStyle::Flag, ValueKind::Raw, "--list-labels", "", &["Print the effect vocabulary this project can name, and exit"]),
+        Switch::new("no-tolerated-effects", &[("no-tolerated-effects", false)], ArgStyle::Flag, ValueKind::Raw, "--no-tolerated-effects", "", &["Judge as if effects.tolerated: were empty (inert on the report)"]),
+    ];
+    const PARSER: OptParser = OptParser::new(USAGE, SWITCHES);
+
+    let items = match PARSER.parse(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut format = String::from("text");
+    let mut full = false;
+    let mut explicit_config: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+    // The first unsupported report flag, in argv order.
+    let mut unsupported: Option<String> = None;
+    let note = |flag: &str, unsupported: &mut Option<String>| {
+        if unsupported.is_none() {
+            *unsupported = Some(flag.to_string());
+        }
+    };
+    for item in items {
+        match item {
+            Item::Positional(p) => positional.push(p),
+            Item::Opt { key, value, .. } => match key {
+                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "format" => format = value.unwrap().as_str().to_string(),
+                "full" => full = true,
+                // Accepted and deliberately inert, exactly as upstream accepts
+                // it on the report: an observation is undischarged, and only a
+                // JUDGMENT reads `effects.tolerated:`.
+                "no-tolerated-effects" => {}
+                // Report filters/expansions the slice-2 surface cannot
+                // compute faithfully (lane-aware label matching, the `why`
+                // expansion, the vocabulary list) — classified unsupported.
+                "label" | "pure" | "limit" | "why" | "list-labels" => {
+                    note(&format!("--{key}"), &mut unsupported);
+                }
+                _ => unreachable!("the switch table is closed"),
+            },
+        }
+    }
+
+    // `run`'s first check post-parse: `usage_error` prints the message AND
+    // the usage line.
+    if !matches!(format.as_str(), "text" | "json") {
+        eprintln!("unsupported format: {format}");
+        eprintln!("{USAGE}");
+        return ExitCode::from(64);
     }
 
     // The file `config_declares_effect_lane` probes is the one
     // `Configuration.load` would read — `--config`, else discovery's winner
     // (`.rigor.yml` before `.rigor.dist.yml`), else the bare name.
-    let config_path = explicit_config.map_or_else(
+    let config_path = explicit_config.as_deref().map_or_else(
         || crate::Config::discover().unwrap_or_else(|| PathBuf::from(".rigor.yml")),
         PathBuf::from,
     );
-    let cfg = match crate::Config::load(explicit_config.map(Path::new)) {
+    let cfg = match crate::Config::load(explicit_config.as_deref().map(Path::new)) {
         Ok(c) => c,
         Err(f) => return f.report(),
     };
+    // Upstream reaches `list_labels` and the report filters only after the
+    // config load — so a port gap surfaces here, on a well-formed invocation.
+    if let Some(flag) = unsupported {
+        eprintln!("rigor: effects {flag} is not supported by rigor-rs");
+        return ExitCode::from(64);
+    }
     // The analysed set is the configured `paths:` PLUS the positional scope —
     // upstream's `runner.run((configuration.paths + scope).uniq)` (#439: an
     // effect summary is transitive over whatever was analysed, so analysing
@@ -197,7 +226,7 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     // the `exclude:` match inside `resolve_paths` sees the same spelling
     // `check` does.
     let mut raw_strings = crate::effective_config_paths(&cfg);
-    for &p in &positional {
+    for p in &positional {
         if !raw_strings.iter().any(|e| e.as_str() == p) {
             raw_strings.push(p.to_string());
         }
@@ -226,19 +255,28 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// The reference's `help` heredoc, verbatim — what `rigor effects` / `help` /
+/// `--help` / `-h` in FIRST position prints.
 fn help() -> String {
     format!(
         "{USAGE}\n\n\
-         With no subcommand, prints one line per method: its proven effect labels and whether\n\
-         that list is exhaustive.\n\n\
-         Options:\n    \
-         --full                     List every method, including exhaustive ones with no\n                               \
-         effects beyond mutate.local\n    \
-         --format=FORMAT            Output format: text (default) or json\n    \
-         --config=PATH              Read PATH instead of ./.rigor.yml\n    \
-         --no-tolerated-effects     Accepted and inert on the report\n\n\
-         The committed effect snapshot (`effects update` / `check` / `diff` / `explain`) is\n\
-         ADR-0043 slice 5 and not implemented yet."
+         With no subcommand, prints one line per method: its proven effect labels and whether that\n\
+         list is exhaustive. A PATH selects which methods are printed, never which are analysed.\n\n\
+         Options:\n  \
+           --config=PATH        Path to the Rigor configuration file\n  \
+           --format=FORMAT      Output format: text (default) or json\n  \
+           --full               List every method, including the ones with nothing to say\n  \
+           --label=LABEL        Only methods carrying LABEL (or a label under it), in either lane\n  \
+           --pure               Only methods proven to do nothing beyond mutate.local\n  \
+           --limit=N            Print at most N methods\n  \
+           --why                Expand each method's unresolved reasons and declared-lane sources\n  \
+           --list-labels        Print the effect vocabulary this project can name, and exit\n\n\
+         Subcommands (the committed effect snapshot, ADR-103 WD7):\n  \
+           update      Write the snapshot to effects.snapshot.path. Commit it; review its diff.\n  \
+           check       Recompute and compare; exits 1 on drift, 0 when fresh.\n  \
+           diff        The same comparison, never gating.\n  \
+           explain     The shortest edge path behind a reach change (--symbol KEY for one unit).\n\n\
+         Run `rigor effects <subcommand> --help` for subcommand options."
     )
 }
 
