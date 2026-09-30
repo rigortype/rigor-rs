@@ -375,3 +375,203 @@ fn coll_def_body_scope_isolation_silent() {
         None,
     );
 }
+
+/// rigor-rs#309: a mutation inside a `begin`/`rescue` protected body is on an
+/// ALTERNATIVE exit path — the reference's `eval_begin` evaluates every rescue
+/// arm from the ENTRY scope and joins the live ones
+/// (`live_rescue_results` / `reduce_scopes_with_nil_injection`), so the
+/// post-`begin` binding is a union `receiver_descriptor` declines:
+/// `begin; b.unshift("s"); rescue; nil; end; b.frobnicate` is silent on the
+/// oracle.
+#[test]
+fn coll_rescue_protected_body_mutation_silent() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    nil\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+    // … and the Hash index-store shape of the same carrier.
+    assert_eq!(
+        snap(
+            b"def f\n  h = {a: 1}\n  begin\n    h[:a] = 2\n  rescue\n    nil\n  end\n  h.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// A `begin` with NO `rescue` — and an `ensure`-only one — keeps its body
+/// unconditional: the clause-less `BeginRescue` carrier is the same shape the
+/// `else`/`when`/`in`/parens carriers reuse (rigor-rs#139 convergence), so
+/// the mutation mints the carrier exactly like straight-line code.
+#[test]
+fn coll_begin_without_rescue_mutation_fires() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    nil\n  rescue\n    nil\n  ensure\n    b.unshift(\"s\")\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+}
+
+/// A rescue arm that never falls through (`branch_terminates?` — `return`,
+/// `raise`, an all-diverging `if`/`case`) contributes NO scope: the primary
+/// body alone is the exit, so its mutation still mints the carrier.
+#[test]
+fn coll_rescue_dead_arm_keeps_primary_fires() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    return\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    assert_eq!(
+        snap(
+            b"def f(c)\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    if c\n      return\n    else\n      return\n    end\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+}
+
+/// A `retry` arm contributes the RE-RUN primary scope
+/// (`eval_retried_begin` → `eval_begin_paths`): the protected body's own
+/// mutation lands again, so the carrier survives. An arm-side mutation
+/// crosses the retry edge the other way — it enters the re-run's entry and
+/// joins the unmutated primary as a union — silent.
+#[test]
+fn coll_rescue_retry_replays_primary() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(\"s\")\n  rescue\n    retry\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    nil\n  rescue\n    b.unshift(\"s\")\n    retry\n  end\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// A mutation AFTER the rescued `begin` widens the joined union memberwise
+/// (`widen_union`, mutation_widening.rb:316): the literal arm grows to the
+/// same nominal the mutated arm holds, the union collapses, and the use
+/// fires — `begin; b.unshift(5); rescue; nil; end; b.push(6)` fires on the
+/// reference.
+#[test]
+fn coll_rescue_mutation_then_later_mutation_fires() {
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(5)\n  rescue\n    nil\n  end\n  b.push(6)\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+    // … while a member the arms do NOT converge on keeps the union — silent.
+    assert_eq!(
+        snap(
+            b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(5)\n  rescue\n    nil\n  end\n  b.push(\"x\")\n  b.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// `rescue => e` rebinds `e` to the exception inside the arm
+/// (`bind_rescue_reference` → `rescue_exception_type`): an `e` that was a
+/// collection before the `begin` must not read the entry carrier inside the
+/// arm, nor carry it through the join.
+#[test]
+fn coll_rescue_bound_name_drops_entry_carrier() {
+    assert_eq!(
+        snap(
+            b"def f\n  e = []\n  begin\n    nil\n  rescue => e\n    e.frobnicate_zzz\n  end\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+    assert_eq!(
+        snap(
+            b"def f\n  e = []\n  begin\n    nil\n  rescue => e\n    nil\n  end\n  e.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// `rescue => h[:k]` stores through `[]=` on `h` in the ARM's entry scope —
+/// the store widens the arm's `h`, and the join keeps the divergence silent.
+#[test]
+fn coll_rescue_index_reference_silent() {
+    assert_eq!(
+        snap(
+            b"def f\n  h = {a: 1}\n  begin\n    nil\n  rescue => h[:k]\n    nil\n  end\n  h.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        None,
+    );
+}
+
+/// Union-member growth dedups on the arm's WHOLE widened content, so literal
+/// seeds keep the arms distinct (`widen_union` memberwise + `Combinator.union`
+/// structural dedup): `c ? [1] : [2]` under `a.push(3)` is `Array[1 | …] |
+/// Array[2 | …]` in the reference — a union `receiver_descriptor` declines.
+/// Member sets that read only the erased classes mint one `Array[Integer]`
+/// and fired `frobnicate` where the oracle is silent (adversarial review of
+/// rigor-rs#309).
+#[test]
+fn coll_union_literal_arms_stay_distinct() {
+    for src in [
+        // The ternary join the reviewer bisected to: two literal Tuple arms.
+        b"def f(c)\n  a = c ? [1] : [2]\n  a.push(3)\n  a.frobnicate_zzz\nend\n" as &[u8],
+        // The same union through the rescue join — a rebind on the
+        // protected path unions with the entry literal.
+        b"def f\n  b = [1]\n  begin\n    b = [2]\n  rescue\n    nil\n  end\n  b.push(3)\n  b.frobnicate_zzz\nend\n",
+        // … and through a plain `if` modifier rebind.
+        b"def f(c)\n  a = [1]\n  a = [2] if c\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+        // Empty against non-empty, longer literals, string members: every
+        // pair of DISTINCT literal seeds keeps two arms.
+        b"def f(c)\n  a = c ? [1] : []\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+        b"def f(c)\n  a = c ? [1, 2] : [3, 4]\n  a << 5\n  a.frobnicate_zzz\nend\n",
+        b"def f(c)\n  a = c ? [\"s\"] : [\"t\"]\n  a << \"u\"\n  a.frobnicate_zzz\nend\n",
+        // The Hash twin — distinct HashShape arms under `[]=`.
+        b"def f(c)\n  h = c ? {a: \"s\"} : {b: 1}\n  h[:k] = 9\n  h.frobnicate_zzz\nend\n",
+        // A grown edge must not collapse onto the untouched edge either:
+        // the content-adder's `gradual_floor` (an `untyped` member in the
+        // reference's bound) is what separated the gitlab
+        // `attributes[:error] = error if error` edge from the bare
+        // `HashShape` edge all the way to `compact!`.
+        b"def f(c)\n  h = {a: 1}\n  h[:e] = c if c\n  h.compact!\n  h.frobnicate_zzz\nend\n",
+    ] {
+        assert_eq!(snap(src, "frobnicate_zzz"), None, "{src:?}");
+    }
+}
+
+/// The other direction still converges: literal seeds whose grown member
+/// sets AGREE mint the same arm, the union dedups, and the use fires —
+/// `Combinator.union`'s structural dedup is symmetric.
+#[test]
+fn coll_union_literal_arms_converge_fires() {
+    assert_eq!(
+        snap(
+            b"def f(c)\n  a = c ? [1] : [1]\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+}

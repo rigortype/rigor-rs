@@ -984,6 +984,16 @@ impl<'i> Typer<'i> {
     /// element evidence, so the nominal's args stay empty — the message reads
     /// `for Array` where the reference says `for Array[Dynamic[top] | …]`; a
     /// message drift only, since the harness keys on `(rule, line, col)`.
+    ///
+    /// The union arm's per-member mint is the exception: `widen_union` grows
+    /// each arm memberwise and `Combinator.union` dedups on STRUCTURAL
+    /// equality, so a literal arm keeps its own element evidence —
+    /// `widen_tuple` writes `Array[1 | …]`, not bare `Array`. Two DISTINCT
+    /// literal arms (`c ? [1] : [2]` then `a.push(3)`) must therefore mint
+    /// two distinct carriers or the union collapses to `Nominal[Array]` and
+    /// `a.frobnicate` fires where the oracle stays silent (adversarial review
+    /// of rigor-rs#309). Member evidence comes from the same
+    /// [`Typer::coll_value_members`] the collection-shape pass uses.
     fn widen_mutated_binding(
         &self,
         ty: TypeId,
@@ -1003,7 +1013,19 @@ impl<'i> Typer<'i> {
                 let mut out = Vec::with_capacity(members.len());
                 let mut changed = false;
                 for m in members {
-                    match self.widen_mutated_binding(m, method, interner) {
+                    let shape_cls = match interner.get(m) {
+                        Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => Some("Array"),
+                        Type::HashShape(_) if HASH_MUTATORS.contains(&method) => Some("Hash"),
+                        _ => None,
+                    };
+                    let widened = match shape_cls {
+                        Some(cls) => {
+                            let members = self.coll_value_members(interner, m);
+                            self.coll_nominal_with(interner, cls, &members)
+                        }
+                        None => self.widen_mutated_binding(m, method, interner),
+                    };
+                    match widened {
                         Some(w) => {
                             changed = true;
                             out.push(w);

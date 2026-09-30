@@ -6,8 +6,8 @@
 
 use std::collections::HashMap;
 
-use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{ClassId, Interner, Type, TypeId};
+use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
+use rigor_types::{ClassId, Interner, ShapeKey, Type, TypeId};
 
 use crate::{
     block_bound_names, collect_flow_writes, collect_rebind_writes, indexed_flow_writes,
@@ -211,22 +211,125 @@ impl<'i> Typer<'i> {
                 self.coll_flow_scope(ast, &body, &mut t, ctx, interner, out, true);
             }
             // `BeginRescue` is also the carrier an `if`'s `else` clause lowers
-            // to: its `main_body` runs whenever the edge runs, so the mutations
-            // in it mint carriers exactly like straight-line code — `if c; a <<
-            // 1; else; a << 1; end` converges on both edges and the reference
-            // fires on the call that follows (rigor-rs#139). A real `begin`'s
-            // body runs unconditionally the same way, as does an `ensure`.
-            // Rescue CLAUSES are conditional: their uses still record (on a
-            // scratch env cloned from the clause-entry bindings) and their
-            // writes widen.
-            Node::BeginRescue { main_body, ensure_body, clauses, .. } => {
-                self.coll_flow_scope(ast, main_body, tenv, ctx, interner, out, stmt_position);
-                for cl in clauses {
-                    let mut scratch = tenv.clone();
-                    self.coll_flow_scope(ast, &cl.body, &mut scratch, ctx, interner, out, stmt_position);
-                    widen_flow_writes(ctx.writes, cl.span, tenv, interner);
+            // to — and every reused carrier (else/when/in/parens), like a real
+            // `begin` with NO `rescue`, has an EMPTY `clauses` list: the body
+            // runs whenever the construct runs, so mutations in it mint
+            // carriers exactly like straight-line code (`if c; a << 1; else;
+            // a << 1; end` converges on both edges and the reference fires on
+            // the call that follows — rigor-rs#139; `begin; a << 1; end` and
+            // `begin … ensure` fire the same way).
+            //
+            // A real `begin`/`rescue` is different (rigor-rs#309): the
+            // reference's `eval_begin` evaluates the protected body AND each
+            // rescue arm as alternative exit paths — every arm seeded from
+            // the ENTRY scope, not the post-body scope — and joins them with
+            // nil-injection (`reduce_scopes_with_nil_injection`), keeping only
+            // the arms that fall through (`live_rescue_results`). A mutation
+            // in the protected body therefore unions against the arm's
+            // unmutated binding instead of landing unconditionally, and
+            // `receiver_descriptor`'s missing `Type::Union` arm silences the
+            // call that follows.
+            Node::BeginRescue { body, main_body, ensure_body, clauses, .. } => {
+                let (body, main_body, ensure_body, clauses) =
+                    (body.clone(), main_body.clone(), ensure_body.clone(), clauses.clone());
+                if clauses.is_empty() {
+                    self.coll_flow_scope(ast, &main_body, tenv, ctx, interner, out, stmt_position);
+                    self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
+                    return;
                 }
-                self.coll_flow_scope(ast, ensure_body, tenv, ctx, interner, out, stmt_position);
+                // The primary path: the protected body, then the `else` clause,
+                // which runs only when the body completes but on the body's own
+                // post-scope (`eval_begin_primary_under`). `body` is flat —
+                // main + per-clause exceptions and bodies + else + ensure — so
+                // the else statements are the ids nothing else claims.
+                let mut covered: std::collections::HashSet<NodeId> =
+                    main_body.iter().copied().collect();
+                covered.extend(ensure_body.iter().copied());
+                for cl in &clauses {
+                    covered.extend(cl.exceptions.iter().copied());
+                    covered.extend(cl.body.iter().copied());
+                }
+                let else_body: Vec<NodeId> =
+                    body.iter().copied().filter(|s| !covered.contains(s)).collect();
+                let mut exit = tenv.clone();
+                self.coll_flow_scope(ast, &main_body, &mut exit, ctx, interner, out, stmt_position);
+                self.coll_flow_scope(ast, &else_body, &mut exit, ctx, interner, out, stmt_position);
+                for cl in &clauses {
+                    // Exception designators evaluate in the entry bindings and
+                    // the scope they return is discarded (`bind_rescue_reference`
+                    // keeps only the type) — a throwaway env, uses still record.
+                    let mut thrown = tenv.clone();
+                    for &exc in &cl.exceptions {
+                        self.coll_flow_expr(ast, exc, &mut thrown, ctx, interner, out, false);
+                    }
+                    let mut arm = tenv.clone();
+                    // `rescue => e` binds the exception instance in the arm —
+                    // the reference's `rescue_exception_type` (`bind_rescue_
+                    // reference`): `StandardError` for a bare `rescue`, the
+                    // union of the named classes otherwise, `Dynamic[top]`
+                    // whenever a designator does not resolve. The binding
+                    // replaces any collection carrier the same local held on
+                    // entry (so the arm can't witness `e` as the entry's
+                    // Array/Hash); the `for StandardError` use the reference
+                    // fires is outside this pass's Array/Hash envelope, a
+                    // coverage residual not a witness.
+                    if let Some(name) = &cl.bound_name {
+                        arm.insert(
+                            name.clone(),
+                            self.coll_rescue_exception_ty(ast, cl, interner),
+                        );
+                    }
+                    // `rescue => h[:k]` stores the exception through `[]=` on
+                    // `h` (`widen_index_target`), widening its carrier in the
+                    // arm's entry scope exactly as `h[:k] = e` would.
+                    for (name, _) in &cl.index_writes {
+                        let cls = arm
+                            .get(name.as_str())
+                            .and_then(|&ty| self.coll_widen_for_mutator(interner, ty, "[]="));
+                        if let Some(cls) = cls {
+                            if let Some(ty) = self.coll_nominal(interner, cls) {
+                                arm.insert(name.clone(), ty);
+                            }
+                        }
+                    }
+                    self.coll_flow_scope(ast, &cl.body, &mut arm, ctx, interner, out, stmt_position);
+                    // Arms that never fall through (`live_rescue_results` —
+                    // `branch_terminates?`) contribute no scope to the exit
+                    // join; with no live arm the primary scope IS the exit
+                    // scope, so `begin; a << 1; rescue; return; end` keeps
+                    // firing.
+                    if Self::coll_arm_retries(ast, &cl.body) {
+                        // `eval_retried_begin` answers a `retry` arm with the
+                        // SECOND pass's protected-body scope (`eval_begin_
+                        // paths`) — `main_body` re-evaluated on an entry that
+                        // absorbed the arm's retry-edge writes (`widen_entry_
+                        // for_retry`). The arm's own post-scope is the closest
+                        // holder of those writes, so the contribution is
+                        // `main_body` replayed over it: `rescue; retry` keeps
+                        // the body's own mutation (`…; rescue; retry; end;
+                        // b.frobnicate` fires), while `rescue; b.unshift("s");
+                        // retry` carries the ARM's widening back in and joins
+                        // against the unmutated primary — silent, exactly as
+                        // the reference.
+                        let mut rerun = arm;
+                        self.coll_flow_scope(
+                            ast,
+                            &main_body,
+                            &mut rerun,
+                            ctx,
+                            interner,
+                            out,
+                            stmt_position,
+                        );
+                        exit = self.coll_join_envs(&exit, &rerun, interner);
+                    } else if !Self::coll_arm_terminates(ast, &cl.body) {
+                        exit = self.coll_join_envs(&exit, &arm, interner);
+                    }
+                }
+                *tenv = exit;
+                // `ensure` runs on the joined exit scope and its effects apply
+                // unconditionally (eval_begin's `sub_eval(ensure, exit_scope)`).
+                self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
             }
             // Unmodeled statement (`while`/`until`, ivar writes, …): widen every
             // local it writes and do NOT descend.
@@ -569,6 +672,150 @@ impl<'i> Typer<'i> {
         *tenv = self.coll_join_envs(&acc, &e, interner);
     }
 
+    /// Whether a rescue arm's post-scope joins the post-`begin` flow at all —
+    /// the syntactic half of the reference's `branch_terminates?`
+    /// (`statement_evaluator.rb:5061`, on `branch_unconditionally_exits?`
+    /// :5027): `false` (the arm stays LIVE) for an empty body, and otherwise
+    /// decided by the LAST statement — `return`, `next` or `break` (bare or
+    /// valued), a receiverless `raise`/`throw`/`exit`/`abort`/`fail`
+    /// (`EXIT_CALL_NAMES`), a statement sequence's tail, or an `if`/`elsif`/
+    /// `else` chain whose EVERY terminal exits (an all-diverging `if` types
+    /// `bot` upstream, which the reference's second half catches — the chain's
+    /// own `else` arm is an `ElseNode` the syntactic walk declines).
+    ///
+    /// What stays deliberately live: a `case`/`when`, a `retry`/`redo` (the
+    /// retry's `bot` type needs `eval_retried_begin`'s widened re-entry, which
+    /// this pass does not model), a nested `begin`/`rescue`, and the `Bot`-type
+    /// half in general (an arm ending in a helper that always raises). Every
+    /// miss lands the same way: the arm is joined where the reference dropped
+    /// it — one MORE joined scope can only widen a carrier away, never mint
+    /// one, so the wrong answer is always silence.
+    ///
+    /// An associated function rather than a method: it reads nothing but the
+    /// arena, and clippy 1.88 flags a `self` only the recursion uses
+    /// (`only_used_in_recursion`).
+    fn coll_arm_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
+        let Some(&tail) = body.last() else {
+            return false;
+        };
+        match ast.get(tail) {
+            Node::Return { .. } => true,
+            Node::Other { jump: Some(kind), .. }
+            | Node::Statements { kind: StatementsKind::Jump(kind), .. } => {
+                matches!(kind, JumpKind::Next | JumpKind::Break)
+            }
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+                Self::coll_arm_terminates(ast, body)
+            }
+            // A `ParenthesesNode` tail recurses into the wrapped body in the
+            // reference — and a clause-less `BeginRescue` is exactly where
+            // parens (and `begin … end` without `rescue`, whose bot-typed exit
+            // value catches it upstream) lower.
+            Node::BeginRescue { main_body, clauses, .. } => {
+                clauses.is_empty() && Self::coll_arm_terminates(ast, main_body)
+            }
+            Node::If { then_body, else_body, .. } => {
+                !else_body.is_empty()
+                    && Self::coll_arm_terminates(ast, then_body)
+                    && Self::coll_arm_terminates(ast, else_body)
+            }
+            // `eval_case` unions every branch's exit type with the else's, so
+            // the arm dies on `Bot` exactly when every path diverges. A
+            // `case/when` without `else` still types the miss path
+            // `Constant[nil]` (`eval_case_else`); a `case/in` without `else`
+            // drops it (`unmatched_pattern_result`, issue #1122) — the union
+            // is `bot` the moment every pattern arm exits. `in` arms lower to
+            // clause-less `BeginRescue` carriers, `when` arms to `Node::When`;
+            // that split is how the two shapes tell apart here.
+            Node::Case { branches, else_body, .. } => {
+                let when_style =
+                    branches.iter().any(|&b| matches!(ast.get(b), Node::When { .. }));
+                let else_exits = if when_style {
+                    !else_body.is_empty() && Self::coll_arm_terminates(ast, else_body)
+                } else {
+                    else_body.is_empty() || Self::coll_arm_terminates(ast, else_body)
+                };
+                else_exits
+                    && !branches.is_empty()
+                    && branches.iter().all(|&b| match ast.get(b) {
+                        Node::When { body, .. } => Self::coll_arm_terminates(ast, body),
+                        Node::BeginRescue { main_body, clauses, .. } => {
+                            clauses.is_empty() && Self::coll_arm_terminates(ast, main_body)
+                        }
+                        _ => false,
+                    })
+            }
+            Node::Call { receiver: None, method, .. } => {
+                matches!(method.as_str(), "raise" | "throw" | "exit" | "abort" | "fail")
+            }
+            _ => false,
+        }
+    }
+
+    /// The type a `rescue => e` binds `e` to inside the arm — the reference's
+    /// `rescue_exception_type` (`bind_rescue_reference`): `StandardError` for a
+    /// bare `rescue`, the union of the named exception classes' INSTANCE types
+    /// otherwise, and `Dynamic[top]` for any designator that does not resolve
+    /// to a class (a dynamic receiver, a missing name) — upstream that member
+    /// poisons the union, so here it poisons the binding outright.
+    fn coll_rescue_exception_ty(
+        &self,
+        ast: &LoweredAst,
+        cl: &rigor_parse::RescueClause,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let nominal = |name: &str, interner: &mut Interner| {
+            self.index
+                .class_id(name)
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
+        };
+        if cl.exceptions.is_empty() {
+            return nominal("StandardError", interner).unwrap_or_else(|| interner.untyped());
+        }
+        let mut members = Vec::with_capacity(cl.exceptions.len());
+        for &exc in &cl.exceptions {
+            let ty = match ast.get(exc) {
+                Node::ConstantRead { name, .. } if !name.is_empty() => {
+                    nominal(name, interner)
+                }
+                _ => None,
+            };
+            match ty {
+                Some(ty) => members.push(ty),
+                None => return interner.untyped(),
+            }
+        }
+        members.sort_unstable();
+        members.dedup();
+        if members.len() == 1 {
+            members[0]
+        } else {
+            interner.intern(Type::Union(members))
+        }
+    }
+
+    /// Whether the rescue arm's tail RETRIES the `begin`. The reference's
+    /// `eval_rescue_clause` answers `RetryNode` with `eval_retried_begin`,
+    /// whose clause result is the SECOND pass's protected-body scope — so the
+    /// arm joins approximately the primary scope, not the entry scope the
+    /// caller cloned for it. The caller skips the join rather than cloning
+    /// `exit` into it (joining a scope with itself is a no-op anyway).
+    /// Sequence tails recurse; anything deeper (`if c; retry; end`) declines —
+    /// the arm then joins as live, the silent side.
+    fn coll_arm_retries(ast: &LoweredAst, body: &[NodeId]) -> bool {
+        let Some(&tail) = body.last() else {
+            return false;
+        };
+        match ast.get(tail) {
+            Node::Other { jump: Some(JumpKind::Retry), .. }
+            | Node::Statements { kind: StatementsKind::Jump(JumpKind::Retry), .. } => true,
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+                Self::coll_arm_retries(ast, body)
+            }
+            _ => false,
+        }
+    }
+
     /// The collection class a receiver carrier projects to, or `None`. Mirrors
     /// the reference's `receiver_descriptor` (`rbs_dispatch.rb:209-212`): a
     /// `Tuple` dispatches as `Array` and a `HashShape` as `Hash`, and a kept
@@ -629,14 +876,20 @@ impl<'i> Typer<'i> {
             // mutation_widening.rb:316; `MutationRejoin` grows an
             // already-widened carrier — upstream's `joinable_receiver?` had to
             // stop skipping an already-nominal receiver for exactly this
-            // reason). The union is not a Dynamic carrier, so minting here does
-            // not breach this pass's "never mint from Dynamic" envelope: every
-            // member was minted from a literal seed already.
+            // reason). Members need only be CARRIERS, not already-nominal: the
+            // rescue-carrier join (rigor-rs#309) leaves `Nominal[Array] |
+            // Tuple` on the merged binding, and a later `a.push` widens the
+            // literal arm to the same nominal — the convergence probe
+            // `begin; a << 1; rescue; end; a << 2; a.frobnicate` fires in the
+            // reference for exactly that reason. A member that is no carrier
+            // (`Nominal[Integer]`, `Dynamic`) still declines the whole call —
+            // upstream would keep that member and stay a union, which
+            // `receiver_descriptor` declines the same way.
             Type::Union(members) => {
                 let members = members.clone();
                 let mut carrier: Option<&'static str> = None;
                 for m in members {
-                    let c = self.coll_nominal_carrier(interner, m)?;
+                    let c = self.coll_carrier(interner, m)?;
                     match carrier {
                         None => carrier = Some(c),
                         Some(prev) if prev == c => {}
@@ -765,7 +1018,7 @@ impl<'i> Typer<'i> {
     /// and the reason a faithful port of the content-join model is its own arc.
     ///
     /// [`join_flow_envs`]: crate::join_flow_envs
-    fn coll_nominal_with(
+    pub(crate) fn coll_nominal_with(
         &self,
         interner: &mut Interner,
         class_name: &str,
@@ -806,17 +1059,25 @@ impl<'i> Typer<'i> {
             members.sort_unstable();
             members
         };
-        match interner.get(pre_ty) {
+        let union_arms = match interner.get(pre_ty) {
+            Type::Union(arms) => Some(arms.clone()),
+            _ => None,
+        };
+        match union_arms {
             // `widen_union` (mutation_widening.rb:316) widens EACH arm and
             // `Combinator.union` re-joins, deduping only structurally identical
             // arms — the edges converge iff every arm grows to the same set.
             // Collapsing to one merged carrier fired where the oracle kept the
-            // union (probe r2).
-            Type::Union(arms) => {
-                let arms = arms.clone();
+            // union (probe r2), and the member sets must carry the seed's
+            // literal content or distinct literal arms collapse the same way:
+            // `c ? [1] : [2]` then `a.push(3)` mints `Array[1 | …]` against
+            // `Array[2 | …]` in the reference, two arms `Combinator.union`
+            // keeps — erased class members alone mint one `Array[Integer]`
+            // and fired `frobnicate` where the oracle stays silent.
+            Some(arms) => {
                 let mut minted = Vec::with_capacity(arms.len());
                 for arm in arms {
-                    let members = grown(&Typer::coll_value_members(interner, arm));
+                    let members = grown(&self.coll_value_members(interner, arm));
                     if let Some(t) = self.coll_nominal_with(interner, cls, &members) {
                         minted.push(t);
                     }
@@ -829,47 +1090,103 @@ impl<'i> Typer<'i> {
                     _ => Some(interner.intern(Type::Union(minted))),
                 }
             }
-            _ => self.coll_nominal_with(
-                interner,
-                cls,
-                &grown(&Typer::coll_value_members(interner, pre_ty)),
-            ),
+            None => {
+                let members = grown(&self.coll_value_members(interner, pre_ty));
+                self.coll_nominal_with(interner, cls, &members)
+            }
         }
     }
 
-    /// The store-value classes a carrier has accumulated so far, in canonical
-    /// order (the `args` of [`Typer::coll_nominal_with`], unwrapped).
+    /// The member evidence a carrier's widened form holds, in canonical order
+    /// — the `args` of a [`Typer::coll_nominal_with`] nominal, unwrapped, and
+    /// for a literal seed the content `widen_tuple`/`widen_hash_shape` write
+    /// into the bound (`mutation_widening.rb:535,555`).
     ///
-    /// A free function rather than a method: it reads nothing but the interner,
-    /// and clippy 1.88 — the version CI pins — flags a `self` that only the
-    /// recursive call uses (`only_used_in_recursion`).
-    fn coll_value_members(interner: &Interner, ty: TypeId) -> Vec<TypeId> {
-        let args = match interner.get(ty) {
-            Type::Nominal { args, .. } => args,
+    /// The literal content is load-bearing, not cosmetic: `widen_union`
+    /// widens each arm memberwise and `Combinator.union` dedups on structural
+    /// equality, so `c ? [1] : [2]` under `a.push(3)` must grow to
+    /// `Array[1 | …] | Array[2 | …]` — two arms the union keeps — not one
+    /// merged `Array[Integer]` a use site then witnesses. `Tuple` elements
+    /// enter AS the pin the slot holds (`values: :keep` — only a slot-
+    /// rewriting mutator erases it, a documented residual); a `HashShape`
+    /// contributes each key's erased class exactly as `key_union_for`
+    /// (`content_join.rb:510`) spells it — `true`/`false`/`nil` keys keep the
+    /// constant carrier, `Other` names nothing — plus each pinned value.
+    /// A `Nominal` contributes every arg's members (the `Hash[K, V]` two-arg
+    /// form flattens to the same bag — a documented over-merge, residual
+    /// direction only).
+    pub(crate) fn coll_value_members(&self, interner: &mut Interner, ty: TypeId) -> Vec<TypeId> {
+        let mut out: Vec<TypeId> = Vec::new();
+        match interner.get(ty) {
+            Type::Nominal { args, .. } => {
+                for &a in args.clone().iter() {
+                    match interner.get(a) {
+                        Type::Union(ms) => {
+                            for &m in ms.clone().iter() {
+                                Self::push_unique(&mut out, m);
+                            }
+                        }
+                        _ => Self::push_unique(&mut out, a),
+                    }
+                }
+            }
+            Type::Tuple(elems) => {
+                for &e in elems.clone().iter() {
+                    Self::push_unique(&mut out, e);
+                }
+            }
+            Type::HashShape(members) => {
+                for m in members.clone().iter() {
+                    // `key_union_for` (`content_join.rb:510`): `true`/`false`/
+                    // `nil` keys keep the constant carrier, every other
+                    // literal key erases to its class nominal, and a
+                    // non-literal `Other` key names nothing.
+                    match &m.key {
+                        ShapeKey::Bool(true) => {
+                            let t = interner.true_();
+                            Self::push_unique(&mut out, t);
+                        }
+                        ShapeKey::Bool(false) => {
+                            let t = interner.false_();
+                            Self::push_unique(&mut out, t);
+                        }
+                        ShapeKey::Nil => {
+                            let t = interner.nil();
+                            Self::push_unique(&mut out, t);
+                        }
+                        _ => {}
+                    }
+                    let key_class = match &m.key {
+                        ShapeKey::Sym(_) => Some("Symbol"),
+                        ShapeKey::Str(_) => Some("String"),
+                        ShapeKey::Int(_) => Some("Integer"),
+                        ShapeKey::Float(_) => Some("Float"),
+                        ShapeKey::Bool(_) | ShapeKey::Nil | ShapeKey::Other => None,
+                    };
+                    if let Some(class) = key_class.and_then(|n| self.index.class_id(n)) {
+                        Self::push_store_member(
+                            interner,
+                            &mut out,
+                            Type::Nominal { class, args: vec![] },
+                        );
+                    }
+                    Self::push_unique(&mut out, m.value);
+                }
+            }
             // Defensive: the store path handles a `Nominal[C] | Nominal[C]`
             // union arm-by-arm before reaching here (`widen_union`), so this
             // arm only merges member sets if a union arrives some other way.
             Type::Union(members) => {
-                let mut out: Vec<TypeId> = Vec::new();
-                for &m in members {
-                    for v in Typer::coll_value_members(interner, m) {
-                        if !out.contains(&v) {
-                            out.push(v);
-                        }
+                for &m in members.clone().iter() {
+                    for v in self.coll_value_members(interner, m) {
+                        Self::push_unique(&mut out, v);
                     }
                 }
-                out.sort_unstable();
-                return out;
             }
-            _ => return Vec::new(),
-        };
-        match args.first() {
-            None => Vec::new(),
-            Some(&a) => match interner.get(a) {
-                Type::Union(ms) => ms.clone(),
-                _ => vec![a],
-            },
+            _ => {}
         }
+        out.sort_unstable();
+        out
     }
 
     /// The erased classes one stored value contributes to the carrier's value
@@ -1059,11 +1376,13 @@ impl<'i> Typer<'i> {
     /// for, or `None` when it is neither.
     fn coll_union_class(&self, interner: &Interner, ty: TypeId) -> Option<&'static str> {
         match interner.get(ty) {
-            Type::Nominal { .. } => self.coll_nominal_carrier(interner, ty),
+            Type::Nominal { .. } | Type::Tuple(_) | Type::HashShape(_) => {
+                self.coll_carrier(interner, ty)
+            }
             Type::Union(members) => {
                 let mut cls: Option<&'static str> = None;
                 for &m in members {
-                    let c = self.coll_nominal_carrier(interner, m)?;
+                    let c = self.coll_union_class(interner, m)?;
                     match cls {
                         None => cls = Some(c),
                         Some(prev) if prev == c => {}
@@ -1142,6 +1461,21 @@ impl<'i> Typer<'i> {
                     Self::push_unique(&mut added, m);
                 }
             }
+        }
+        // `join_added_elements`/`join_added_pairs` close with `gradual_floor`:
+        // a content-adder's join leaves the bound OPEN (`untyped` enters both
+        // sides — the reference renders the floor as the `Dynamic[top]` member
+        // of `Hash[Dynamic[top] | Symbol, Dynamic[top] | Integer]`). The floor
+        // is load-bearing on the union path: a grown edge and an untouched
+        // `HashShape`/`Tuple` edge can only stay distinct while their member
+        // sets differ. `Dynamic[top]` itself cannot be the marker — it is
+        // already the member an untyped SEED value contributes (`{p: @x}`),
+        // so the gitlab `attributes[:error] = error if error` → `compact!`
+        // row would erase the distinction the floor exists to keep. `top` is
+        // the member no store evidence can ever mint, which is exactly the
+        // separation the reference's per-side `untyped` gives it.
+        if !Typer::coll_store_value_args(method, args).is_empty() {
+            Self::push_unique(&mut added, interner.top());
         }
         added
     }
