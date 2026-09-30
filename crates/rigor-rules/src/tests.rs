@@ -537,8 +537,6 @@ fn index_compound_writes_widen_the_receiver_binding() {
         // still silent (the reference's `Scope#join` equivalent declines).
         &b"h = {a: 1}\nif rand > 0\n  h[:a] += 1\nend\nh[:a].upcase\n"[..],
         &b"h = {a: 1}\nh[:a] += 1 if rand > 0\nh[:a].upcase\n"[..],
-        // Value position: `x = h[:a] ||= 1` mutates `h` too.
-        &b"h = {a: 1}\nx = (h[:a] ||= 1)\nh[:a].upcase\n"[..],
         // A second compound store on the already-widened carrier stays silent.
         &b"h = {a: 1}\nh[:a] += 1\nh[:a] += 2\nh[:a].upcase\n"[..],
     ] {
@@ -549,6 +547,89 @@ fn index_compound_writes_widen_the_receiver_binding() {
             String::from_utf8_lossy(src)
         );
     }
+
+    // `h[k] ||= v` in an operand-transparent position ALSO records the
+    // stored slot's type (`eval_index_or_write` →
+    // `Scope#with_indexed_narrowing`, rigor-rs#325): `h[:a] ||= 1` stores
+    // `narrow_truthy(1) | 1` = `1`, and the narrowing intercepts the later
+    // `h[:a]` read ahead of the widened carrier — so the reference FIRES
+    // `for 1` here (probed at `e59b7b89`), unlike the `||= 2` row above
+    // where the stored `1 | 2` union keeps `upcase` silent.
+    let diags = run(b"h = {a: 1}\nx = (h[:a] ||= 1)\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for 1`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1");
+}
+
+/// rigor-rs#325: `h[k] ||= v` in an operand-transparent recovery position —
+/// a splat argument, a container element, anywhere the write evaluates
+/// inline without its scope reaching a join — still records the stored
+/// slot: `eval_index_or_write` runs `Scope#with_indexed_narrowing` keyed on
+/// `(h, k)`, so a later `h[k]` read sees `narrow_truthy(h[k]) | v` instead
+/// of the receiver's literal element type. `&&=` / `op=` never record (the
+/// reference's `eval_index_write` widens only), and a multi-index `||=`
+/// splices a region, not a slot. Every row probed at `e59b7b89`.
+#[test]
+fn index_or_write_records_the_stored_slot_through_transparent_positions() {
+    for src in [
+        // The primary reproducer: the stored `"s"` answers `h[:a]`, not the
+        // literal's `1` — silent both engines.
+        &b"h = {a: 1}\nputs(*[h[:a] ||= \"s\"])\nh[:a].upcase\n"[..],
+        // `narrow_truthy(1) | 2` = `1 | 2` — a union keeps `upcase` silent.
+        &b"h = {a: 1}\nputs(*[h[:a] ||= 2])\nh[:a].upcase\n"[..],
+        &b"h = {a: 1}\nputs(*[h[:a] ||= nil])\nh[:a].upcase\n"[..],
+        // `&&=` records no narrowing — the `[]=` widening alone silences.
+        &b"h = {a: 1}\nputs(*[h[:a] &&= \"s\"])\nh[:a].upcase\n"[..],
+        &b"h = {a: 1}\nputs(*[h[:a] &&= 2])\nh[:a].upcase\n"[..],
+        // Array slot through a splat; a container-element position.
+        &b"a = [1]\nputs(*[a[0] ||= \"s\"])\na[0].upcase\n"[..],
+        &b"h = {a: 1}\nputs({k: h[:a] ||= \"s\"})\nh[:a].upcase\n"[..],
+        // A later direct `h[k] = v` invalidates the recorded slot — the
+        // read falls back to the widened carrier, still silent.
+        &b"h = {a: 1}\nputs(*[h[:a] ||= \"s\"])\nh[:a] = 2\nh[:a].upcase\n"[..],
+        // A multi-index `||=` splices a region (`single_index_argument`
+        // declines the record); a joined-position `||=` keeps the `[]=`
+        // widening only — both silent.
+        &b"h = {a: 1}\nputs(*[h[0, 1] ||= \"s\"])\nh[:a].upcase\n"[..],
+        &b"h = {a: 1}\nx = 1 rescue (h[:a] ||= \"s\")\nh[:a].upcase\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.is_empty(),
+            "expected silence for {:?}, got {diags:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// The narrowing's controls (rigor-rs#325): a `||=` storing a truthy
+/// constant keeps firing on the STORED type (`narrow_truthy(1) | 1` = `1`),
+/// and rebinding the receiver drops every slot fact rooted at it — `h[:a]`
+/// on the fresh `{b: 3}` reads `nil`.
+#[test]
+fn index_or_write_narrowing_keeps_its_controls() {
+    let diags = run(b"h = {a: 1}\nputs(*[h[:a] ||= 1])\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for 1`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1");
+
+    let diags =
+        run(b"h = {a: 1}\nputs(*[h[:a] ||= \"s\"])\nh = {b: 3}\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for nil`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for nil");
 }
 
 /// The widening's controls: the read WITHOUT the write keeps firing on the

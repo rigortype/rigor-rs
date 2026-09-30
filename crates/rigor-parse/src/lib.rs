@@ -11,9 +11,9 @@ pub use ruby_prism;
 pub mod ast;
 
 pub use ast::{
-    lower, lower_with_key, BlockParamKind, ConstMutation, FileKey, HashKey, HashKeyTag, JumpKind,
-    IndexWrites, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node, NodeId, ParamShape,
-    RescueClause,
+    lower, lower_with_key, BlockParamKind, ConstMutation, FileKey, HashKey, HashKeyTag,
+    IndexCompound, IndexWrites, JumpKind, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node,
+    NodeId, ParamShape, RescueClause,
     Span, StatementsKind, Visibility,
 };
 

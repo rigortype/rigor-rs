@@ -226,6 +226,25 @@ fn collect_recoverable<'pr>(
                 && (self.iterative > 0 || (self.joined > 0 && self.blocked == 0))
         }
 
+        /// Whether a compound index write reached HERE evaluates inline —
+        /// a position carrying NO recovery mark at all: straight-line code
+        /// or a scope-transparent operand (a splat argument, a `return`
+        /// operand, a container element, an `ensure` body, a bare
+        /// `begin`). The reference's `eval_index_or_write` /
+        /// `eval_index_write` run it there and keep the effects: the
+        /// `[]=` receiver widening AND — for `||=` — the `(h, k)` indexed
+        /// narrowing (`eval_index_or_write` → `Scope#with_indexed_narrowing`,
+        /// rigor-rs#325). The write is `push`ed whole so the flow machinery
+        /// can apply both; the `operand` flag it gets marks this case off
+        /// from a `index_write_joined()` push.
+        fn index_write_transparent(&self) -> bool {
+            self.joined == 0
+                && self.blocked == 0
+                && self.iterative == 0
+                && self.next_sink == 0
+                && self.suppressed == 0
+        }
+
         /// Whether a syntactically-exiting arm still lands its scope
         /// downstream: inside a `next`-sink body (a `for` body's
         /// `loop_iteration` join — unlike `while`/`until`/block/lambda
@@ -427,25 +446,26 @@ fn collect_recoverable<'pr>(
             self.push(node.as_node());
         }
         // A compound index write (`h[k] ||= v` / `h[k] &&= v` / `h[k] op= v`)
-        // is observably different under the port's shape-recording
-        // `StatementsKind::Recovered` carrier: recording it whole materialises
-        // a `Node::IndexWrite`, and its `[]=` mutation widens the receiver —
-        // the slot then reads the widened binding. Where the reference keeps
-        // the write's `h[k] -> stored` narrowing (`eval_index_or_write` →
-        // `Scope#with_indexed_narrowing` — every position whose post-scope
-        // reaches the read without passing a join) it still answers the
-        // slot's constant: `puts(*[h[:a] ||= 1])` fires
-        // `call.undefined-method` for `1` on the oracle. Recording there is
-        // unsound, so the walk DESCENDS instead — the write contributes its
-        // operand reads, no widening — which keeps the stored slot exactly
-        // as the kept narrowing leaves it. Only where the post-scope passes
-        // a join that intersects the narrowing away (`index_write_joined`)
-        // is the write recovered whole (rigor-rs#312).
+        // is recovered whole (`push` → `Node::IndexWrite`) wherever the
+        // reference evaluator RUNS it — which is everywhere EXCEPT a
+        // position whose scope effects are discarded outright (`blocked`: a
+        // never-evaluated operand, a terminated arm, a shape-narrowed
+        // `when`/`in` condition or guard, a multi-write target expression)
+        // or one that binds a fresh local scope (`suppressed`). A joined
+        // position (`index_write_joined`) lowers it so the `[]=` widening
+        // can land through the join — which also intersects the `h[k] ->
+        // stored` narrowing away. An evaluated operand-transparent
+        // position (`index_write_transparent` — a splat argument, a
+        // `return` operand, a container element: rigor-rs#325) lowers it
+        // too, flagged `operand`, so the flow machinery can mint the
+        // receiver's nominal carrier instead of `Dynamic` AND apply the
+        // `h[k] -> stored` narrowing the reference records via
+        // `Scope#with_indexed_narrowing`.
         fn visit_index_or_write_node(
             &mut self,
             node: &ruby_prism::IndexOrWriteNode<'pr>,
         ) {
-            if self.index_write_joined() {
+            if self.index_write_joined() || self.index_write_transparent() {
                 self.push(node.as_node());
             } else {
                 ruby_prism::visit_index_or_write_node(self, node);
@@ -455,7 +475,7 @@ fn collect_recoverable<'pr>(
             &mut self,
             node: &ruby_prism::IndexAndWriteNode<'pr>,
         ) {
-            if self.index_write_joined() {
+            if self.index_write_joined() || self.index_write_transparent() {
                 self.push(node.as_node());
             } else {
                 ruby_prism::visit_index_and_write_node(self, node);
@@ -465,7 +485,7 @@ fn collect_recoverable<'pr>(
             &mut self,
             node: &ruby_prism::IndexOperatorWriteNode<'pr>,
         ) {
-            if self.index_write_joined() {
+            if self.index_write_joined() || self.index_write_transparent() {
                 self.push(node.as_node());
             } else {
                 ruby_prism::visit_index_operator_write_node(self, node);

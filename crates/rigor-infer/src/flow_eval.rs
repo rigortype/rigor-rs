@@ -8,12 +8,16 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, Type, TypeId};
+use rigor_types::{Interner, ShapeKey, Type, TypeId};
 
 use crate::{
     collect_flow_writes, indexed_flow_writes, join_flow_envs, multi_target_binder, qualify_self,
     toplevel_mutations, toplevel_rebinds, widen_flow_writes, DefKind, TypeEnv, Typer,
     ARRAY_MUTATORS, HASH_MUTATORS,
+};
+use crate::flow_writes::{
+    collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, IndexedFlow,
+    MUTATOR_METHODS,
 };
 
 impl<'i> Typer<'i> {
@@ -81,11 +85,13 @@ impl<'i> Typer<'i> {
                     boundaries: Vec::new(),
                     rebinds: Vec::new(),
                     mutations: Vec::new(),
+                    indexed: IndexedFlow::default(),
                 }
             }
         };
         let rebinds = toplevel_rebinds(ast);
         let mutations = toplevel_mutations(ast);
+        let indexed = collect_indexed_flow(ast);
         // Boundaries only matter while a recorded effect could postdate a use
         // site; a file with none gets the flat env for every site.
         let record = !(rebinds.is_empty() && mutations.is_empty());
@@ -94,13 +100,14 @@ impl<'i> Typer<'i> {
             if record {
                 boundaries.push((stmt, env.clone()));
             }
-            self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, interner);
+            self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, &indexed, interner);
         }
         CheckFlow {
             env,
             boundaries,
             rebinds,
             mutations,
+            indexed,
         }
     }
 
@@ -132,7 +139,7 @@ impl<'i> Typer<'i> {
         };
         let stmt_span = ast.get(stmt).span();
         let later = flow.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
-            || flow.mutations.iter().any(|(w, _, _)| w.0 >= stmt_span.0);
+            || flow.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0);
         if !later {
             return Cow::Borrowed(&flow.env);
         }
@@ -309,21 +316,135 @@ impl<'i> Typer<'i> {
             if wspan.0 >= span.0 && wspan.1 <= span.1 {
                 let u = interner.untyped();
                 env.insert(name.clone(), u);
+                drop_indexed_narrowings(env, name);
             }
         }
-        for (wspan, name, method) in &flow.mutations {
+        for (wspan, name, method, drop_key) in &flow.mutations {
             if wspan.0 >= span.0 && wspan.1 <= span.1 {
-                if uncond && self.path_unconditional(ast, id, *wspan) {
-                    let Some(&pre) = env.get(name.as_str()) else {
-                        continue;
-                    };
+                self.apply_mutation_effects(
+                    ast,
+                    &flow.indexed,
+                    id,
+                    uncond,
+                    *wspan,
+                    name,
+                    method,
+                    drop_key.as_ref(),
+                    env,
+                    interner,
+                );
+            }
+        }
+        for m in &flow.indexed.slot_mutations {
+            if m.span.0 >= span.0 && m.span.1 <= span.1 {
+                self.apply_slot_mutation(ast, id, m, env, interner);
+            }
+        }
+    }
+
+    /// One mutation's env effects — the receiver's binding AND the indexed
+    /// narrowings (`rigor-rs#325`). Three stages, in the reference's order:
+    ///
+    /// 1. `IndexedNarrowing.invalidate_after_call`: a stable-key `local[k]
+    ///    = v` `[]=` drops that one slot's record (`drop_key`), every other
+    ///    shape mutator drops every record rooted at the receiver
+    ///    (`invalidate_mutator`), and a compound `h[k] op= v` / index-target
+    ///    store — `method == "[]="` with `drop_key == None` — drops none
+    ///    (those nodes never run `invalidate_after_call`).
+    /// 2. `index_write_stored_type` on the env the write was ENTERED with —
+    ///    an `operand`-flagged `h[k] ||= v` — computed BEFORE the `[]=`
+    ///    widening lands, exactly as `eval_index_or_write` does.
+    /// 3. The binding itself: an unconditional mutation mints the widened
+    ///    nominal (`widen_mutated_binding`), a conditional one widens to
+    ///    `Dynamic`; an `operand` write additionally passes
+    ///    `path_operand_evaluated`, so a `puts(*[h[k] ||= v])` mints `h`'s
+    ///    nominal carrier instead of `Dynamic` (`IndexWriteWidening` widens
+    ///    it unconditionally there).
+    // too_many_arguments: shared replay context — a bundle struct would obscure.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_mutation_effects(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        root: NodeId,
+        uncond: bool,
+        wspan: rigor_parse::Span,
+        name: &str,
+        method: &str,
+        drop_key: Option<&ShapeKey>,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        self.drop_indexed_mutation(name, method, drop_key, env);
+        let evaluated = uncond
+            && (self.path_unconditional(ast, root, wspan)
+                || (indexed.operand_spans.contains(&wspan)
+                    && self.path_operand_evaluated(ast, root, wspan)));
+        // The `h[k] ||= v` record computes on the PRE-widening env
+        // (`eval_index_or_write`: `index_write_stored_type(node, scope)`
+        // before `IndexWriteWidening.widen`, then `with_indexed_narrowing`).
+        let stored = if evaluated {
+            indexed
+                .slot_writes
+                .iter()
+                .find(|w| w.span == wspan)
+                .and_then(|w| {
+                    self.slot_stored_type(ast, w, env, interner)
+                        .map(|ty| (indexed_narrowing_key(&w.name, &w.key), ty))
+                })
+        } else {
+            None
+        };
+        if MUTATOR_METHODS.contains(&method) {
+            if let Some(&pre) = env.get(name) {
+                if evaluated {
                     if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
-                        env.insert(name.clone(), widened);
+                        env.insert(name.to_string(), widened);
                     }
                 } else {
-                    let u = interner.untyped();
-                    env.insert(name.clone(), u);
+                    env.insert(name.to_string(), interner.untyped());
                 }
+            }
+        }
+        if let Some((key, ty)) = stored {
+            env.insert(key, ty);
+        }
+    }
+
+    /// `IndexedNarrowing.widen_mutated_slot` (`indexed_narrowing.rb:166`): a
+    /// mutator call whose receiver IS a recorded slot's element — `h[k] <<
+    /// x`, `h[k][j] = v`, `(h[k] ||= []) << x` — widens the recorded value
+    /// as the mutator widens it, or drops the record when the widening
+    /// declines. A call that may not have evaluated drops the record
+    /// instead — the reference's join diverges the narrowing away.
+    fn apply_slot_mutation(
+        &self,
+        ast: &LoweredAst,
+        root: NodeId,
+        m: &crate::flow_writes::SlotMutation,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        let lookup = indexed_narrowing_key(&m.name, &m.key);
+        let Some(&recorded) = env.get(&lookup) else {
+            return;
+        };
+        // Element mutators live in ordinary expression positions (argument
+        // lists, splats), so the lenient operand path — not the strict
+        // carrier mint — decides whether the call ran.
+        if !self.path_operand_evaluated(ast, root, m.span) {
+            env.remove(&lookup);
+            return;
+        }
+        let widened = self
+            .widen_mutated_binding(recorded, &m.method, interner)
+            .or_else(|| self.string_slot_floor(recorded, &m.method, interner));
+        match widened {
+            Some(ty) => {
+                env.insert(lookup, ty);
+            }
+            None => {
+                env.remove(&lookup);
             }
         }
     }
@@ -368,6 +489,62 @@ impl<'i> Typer<'i> {
                 if clauses
                     .iter()
                     .any(|c| c.span.0 <= wspan.0 && wspan.1 <= c.span.1)
+                {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// The lenient sibling of [`Self::path_unconditional`] for a recovery-
+    /// flagged `operand` `IndexWrite` (rigor-rs#325): the recovery collect
+    /// already decided the write evaluates inline — its `Cond` edges ride a
+    /// `StatementsKind::Recovered`/`Jump` carrier that flattened an arbitrary
+    /// expression shape (a splat argument, a `return` operand, a `p(...)`
+    /// argument list), not a real branch. An edge out of such a carrier
+    /// counts as `Uncond` here; every other `Cond` — `if` arms, `&&`/`||`
+    /// operands, `begin` bodies, loop bodies — still declines, so a
+    /// `narrows`-flagged write records only where its stored slot can
+    /// actually reach a read.
+    fn path_operand_evaluated(&self, ast: &LoweredAst, id: NodeId, span: rigor_parse::Span) -> bool {
+        let node = ast.get(id);
+        if node.span() == span {
+            return true;
+        }
+        // A `Recovered` / `Jump` carrier flattens evaluated operands behind
+        // `Cond` edges — treated as `Uncond` here, never the other kinds
+        // (`Inert` carriers hold no flagged writes at all).
+        let lenient = matches!(
+            node,
+            Node::Statements {
+                kind: StatementsKind::Recovered | StatementsKind::Jump(_),
+                ..
+            }
+        );
+        for (child, edge) in self.flow_children(node) {
+            let cspan = ast.get(child).span();
+            if cspan.0 <= span.0 && span.1 <= cspan.1 {
+                return (edge == FlowEdge::Uncond || lenient)
+                    && self.path_operand_evaluated(ast, child, span);
+            }
+        }
+        // Same off-child-position rule `path_unconditional` applies: a `for`
+        // index target or rescue header position never evaluates inline.
+        match node {
+            Node::Loop { index_writes, .. } => {
+                if index_writes
+                    .iter()
+                    .any(|(_, s)| s.0 <= span.0 && span.1 <= s.1)
+                {
+                    return false;
+                }
+            }
+            Node::BeginRescue { clauses, .. } => {
+                if clauses
+                    .iter()
+                    .any(|c| c.span.0 <= span.0 && span.1 <= c.span.1)
                 {
                     return false;
                 }
@@ -499,6 +676,20 @@ impl<'i> Typer<'i> {
                 v.extend(target_exprs.iter().map(|&c| (c, FlowEdge::Uncond)));
                 v
             }
+            // A compound index write evaluates receiver, index arguments and
+            // value in order (`eval_index_or_write` / `eval_index_write`
+            // sub_eval each); its `[]=` widening is applied by the mutation
+            // pass, not these edges.
+            Node::IndexWrite {
+                receiver: Some(r),
+                indices,
+                value,
+                ..
+            } => std::iter::once(*r)
+                .chain(indices.iter().copied())
+                .chain(std::iter::once(*value))
+                .map(|c| (c, FlowEdge::Uncond))
+                .collect(),
             Node::ArrayLit { elements, .. }
             | Node::HashLit { elements, .. }
             | Node::InterpolatedString {
@@ -543,20 +734,23 @@ impl<'i> Typer<'i> {
     /// receiver mutations nested in its value (`x = xs.each { |e| w = e }`,
     /// `y = (a << 1)`); any other statement widens every rebind inside it and
     /// applies the contained `local.<mutator>` calls.
+    #[allow(clippy::too_many_arguments)]
     fn bind_check_statement(
         &self,
         ast: &LoweredAst,
         id: NodeId,
         env: &mut TypeEnv,
         rebinds: &[(rigor_parse::Span, String)],
-        mutations: &[(rigor_parse::Span, String, String)],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        indexed: &IndexedFlow,
         interner: &mut Interner,
     ) {
         match ast.get(id) {
             Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
                 let vspan = ast.get(*value).span();
                 widen_flow_writes(rebinds, vspan, env, interner);
-                self.widen_mutated_locals(ast, mutations, *value, vspan, env, interner);
+                self.drop_indexed_rebinds(rebinds, vspan, env);
+                self.widen_mutated_locals(ast, mutations, indexed, *value, vspan, env, interner);
                 self.bind_statement(ast, id, env, interner);
                 // An `h[k]` index target stores through `[]=` on the POST-binding
                 // scope — `swap, swap[:a] = swap, 1` stores into the object `swap`
@@ -567,7 +761,7 @@ impl<'i> Typer<'i> {
                 // as a straight-line `h[k] = v` gets.
                 if let Node::MultiWrite { targets, .. } = ast.get(id) {
                     for (_, tspan) in targets.index_writes() {
-                        self.widen_mutated_locals(ast, mutations, id, tspan, env, interner);
+                        self.widen_mutated_locals(ast, mutations, indexed, id, tspan, env, interner);
                     }
                 }
             }
@@ -578,13 +772,14 @@ impl<'i> Typer<'i> {
             // changes nothing (rigor-rs#153).
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for &s in body {
-                    self.bind_check_statement(ast, s, env, rebinds, mutations, interner);
+                    self.bind_check_statement(ast, s, env, rebinds, mutations, indexed, interner);
                 }
             }
             other => {
                 let span = other.span();
                 widen_flow_writes(rebinds, span, env, interner);
-                self.widen_mutated_locals(ast, mutations, id, span, env, interner);
+                self.drop_indexed_rebinds(rebinds, span, env);
+                self.widen_mutated_locals(ast, mutations, indexed, id, span, env, interner);
             }
         }
     }
@@ -605,31 +800,177 @@ impl<'i> Typer<'i> {
     /// `check_collection_call`'s Dynamic gate, while divergent edges decline
     /// there and stay silent — exactly the reference's union-then-decline
     /// (rigor-rs#139).
+    ///
+    /// `indexed` threads the rigor-rs#325 side table: a recovery-flagged
+    /// `operand` `h[k] ||= v` mints the receiver's nominal where strict
+    /// `path_unconditional` declines — the reference's `IndexWriteWidening`
+    /// applies it unconditionally at an evaluated operand position — and
+    /// records its stored slot (`eval_index_or_write` →
+    /// `Scope#with_indexed_narrowing`) through [`Self::apply_mutation_effects`].
+    // too_many_arguments: shared replay context — a bundle struct would obscure.
+    #[allow(clippy::too_many_arguments)]
     fn widen_mutated_locals(
         &self,
         ast: &LoweredAst,
-        mutations: &[(rigor_parse::Span, String, String)],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        indexed: &IndexedFlow,
         root: NodeId,
         span: rigor_parse::Span,
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
-        for (wspan, name, method) in mutations {
+        for (wspan, name, method, drop_key) in mutations {
             if !(span.0 <= wspan.0 && wspan.1 <= span.1) {
                 continue;
             }
-            let Some(&pre) = env.get(name.as_str()) else {
-                continue;
-            };
-            let ty = if self.path_unconditional(ast, root, *wspan) {
-                let Some(widened) = self.widen_mutated_binding(pre, method, interner) else {
-                    continue;
-                };
-                widened
-            } else {
-                interner.untyped()
-            };
-            env.insert(name.clone(), ty);
+            self.apply_mutation_effects(
+                ast,
+                indexed,
+                root,
+                true,
+                *wspan,
+                name,
+                method,
+                drop_key.as_ref(),
+                env,
+                interner,
+            );
+        }
+        for m in &indexed.slot_mutations {
+            if span.0 <= m.span.0 && m.span.1 <= span.1 {
+                self.apply_slot_mutation(ast, root, m, env, interner);
+            }
+        }
+    }
+
+    /// The `h[k] -> stored` pairs every in-span `operand` `||=` writes —
+    /// `eval_index_or_write`'s `with_indexed_narrowing` record — computed on
+    /// `env` AS ENTERED: `index_write_stored_type` reads the slot's `current`
+    /// and the rvalue before `IndexWriteWidening` touches the receiver, so
+    /// this MUST run before the span's rebind/mutation widenings land. A
+    /// `None` `slot_stored_type` declines the record (a `Dynamic`/`Top`
+    /// receiver — `fully_tracked_receiver_type?`, upstream issue #544).
+    #[allow(clippy::too_many_arguments)]
+    fn stored_slot_writes(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        root: NodeId,
+        span: rigor_parse::Span,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<(rigor_parse::Span, String, TypeId)> {
+        indexed
+            .slot_writes
+            .iter()
+            .filter(|w| w.span.0 >= span.0 && w.span.1 <= span.1)
+            .filter(|w| self.path_operand_evaluated(ast, root, w.span))
+            .filter_map(|w| {
+                self.slot_stored_type(ast, w, env, interner)
+                    .map(|ty| (w.span, indexed_narrowing_key(&w.name, &w.key), ty))
+            })
+            .collect()
+    }
+
+    /// The second half of one statement's indexed-narrowing effect for the
+    /// always-truthy env, whose bindings `widen_flow_writes` already moved:
+    /// the `Scope#type_of=` rebind drops, the `invalidate_after_call`
+    /// `[]=`/mutator drops, the `with_indexed_narrowing` inserts, and the
+    /// `widen_mutated_slot` element-mutator widenings — all in SOURCE order
+    /// so `h[:a] ||= 1; h[:a] = 2` leaves the slot dropped while
+    /// `h[:a] ||= []; h[:a] << 1` widens the record it just wrote.
+    #[allow(clippy::too_many_arguments)]
+    fn land_indexed_stored(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        root: NodeId,
+        span: rigor_parse::Span,
+        rebinds: &[(rigor_parse::Span, String)],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        stored: Vec<(rigor_parse::Span, String, TypeId)>,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        self.drop_indexed_rebinds(rebinds, span, env);
+        // Merge the three event lists by span start; kind order on a tie is
+        // drop < insert < slot-widen (a `h[k] = v` after the `||=` still
+        // drops the record the `||=` just wrote).
+        enum Ev {
+            Drop(usize),
+            Insert(usize),
+            SlotMut(usize),
+        }
+        let mut events: Vec<(rigor_parse::Span, Ev)> = Vec::new();
+        for (i, (wspan, ..)) in mutations.iter().enumerate() {
+            if wspan.0 >= span.0 && wspan.1 <= span.1 {
+                events.push((*wspan, Ev::Drop(i)));
+            }
+        }
+        for (i, (wspan, ..)) in stored.iter().enumerate() {
+            events.push((*wspan, Ev::Insert(i)));
+        }
+        for (i, m) in indexed.slot_mutations.iter().enumerate() {
+            if m.span.0 >= span.0 && m.span.1 <= span.1 {
+                events.push((m.span, Ev::SlotMut(i)));
+            }
+        }
+        events.sort_by_key(|(s, ev)| {
+            (
+                s.0,
+                match ev {
+                    Ev::Drop(_) => 0,
+                    Ev::Insert(_) => 1,
+                    Ev::SlotMut(_) => 2,
+                },
+            )
+        });
+        for (_, ev) in events {
+            match ev {
+                Ev::Drop(i) => {
+                    let (_, name, method, drop_key) = &mutations[i];
+                    self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
+                }
+                Ev::Insert(i) => {
+                    env.insert(stored[i].1.clone(), stored[i].2);
+                }
+                Ev::SlotMut(i) => {
+                    self.apply_slot_mutation(ast, root, &indexed.slot_mutations[i], env, interner);
+                }
+            }
+        }
+    }
+
+    /// `Scope#type_of=`'s rebind invalidation: a local rebound anywhere in
+    /// `span` drops every indexed narrowing rooted at it.
+    fn drop_indexed_rebinds(
+        &self,
+        rebinds: &[(rigor_parse::Span, String)],
+        span: rigor_parse::Span,
+        env: &mut TypeEnv,
+    ) {
+        for (wspan, name) in rebinds {
+            if wspan.0 >= span.0 && wspan.1 <= span.1 {
+                drop_indexed_narrowings(env, name);
+            }
+        }
+    }
+
+    /// `IndexedNarrowing.invalidate_after_call` for ONE mutation entry —
+    /// the record-drop half `apply_mutation_effects` also runs.
+    fn drop_indexed_mutation(
+        &self,
+        name: &str,
+        method: &str,
+        drop_key: Option<&ShapeKey>,
+        env: &mut TypeEnv,
+    ) {
+        match drop_key {
+            Some(key) => {
+                env.remove(&indexed_narrowing_key(name, key));
+            }
+            None if method != "[]=" => drop_indexed_narrowings(env, name),
+            _ => {}
         }
     }
 
@@ -726,12 +1067,19 @@ impl<'i> Typer<'i> {
         let mut out = HashMap::new();
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
+        // The indexed-narrowing side table (rigor-rs#325): `rebinds` drops a
+        // rebinding name's records, `mutations` carries the `[]=` / mutator
+        // drops, `indexed` the `h[k] ||= v` records themselves.
+        let mut rebinds = collect_flow_writes(ast);
+        rebinds.extend(indexed_flow_writes(ast, self.source));
+        let mutations = toplevel_mutations(ast);
+        let indexed = collect_indexed_flow(ast);
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
         };
         let mut env = TypeEnv::new();
-        self.flow_eval_scope(ast, &body, &mut env, false, None, DefKind::Instance, &writes, interner, &mut out);
+        self.flow_eval_scope(ast, &body, &mut env, false, None, DefKind::Instance, &writes, &rebinds, &mutations, &indexed, interner, &mut out);
         out
     }
 
@@ -750,11 +1098,14 @@ impl<'i> Typer<'i> {
         self_qual: Option<&str>,
         self_kind: DefKind,
         writes: &[(rigor_parse::Span, String)],
+        rebinds: &[(rigor_parse::Span, String)],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        indexed: &IndexedFlow,
         interner: &mut Interner,
         out: &mut HashMap<NodeId, TypeId>,
     ) {
         for &s in stmts {
-            self.flow_eval_stmt(ast, s, env, in_loop_or_block, self_qual, self_kind, writes, interner, out);
+            self.flow_eval_stmt(ast, s, env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out);
         }
     }
 
@@ -769,6 +1120,9 @@ impl<'i> Typer<'i> {
         self_qual: Option<&str>,
         self_kind: DefKind,
         writes: &[(rigor_parse::Span, String)],
+        rebinds: &[(rigor_parse::Span, String)],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        indexed: &IndexedFlow,
         interner: &mut Interner,
         out: &mut HashMap<NodeId, TypeId>,
     ) {
@@ -778,14 +1132,22 @@ impl<'i> Typer<'i> {
             // are not in `writes`, so it leaves `env` as the reference does.
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 let body = body.clone();
-                self.flow_eval_scope(ast, &body, env, in_loop_or_block, self_qual, self_kind, writes, interner, out);
+                self.flow_eval_scope(ast, &body, env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out);
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
                 // A value expression may itself write OTHER locals (`x = (y = 5)`)
                 // or capture-write via a block — widen those first, then bind.
                 let vspan = ast.get(value).span();
+                // The `h[k] ||= v` records compute on the env the write is
+                // ENTERED with, before the widenings land
+                // (`index_write_stored_type` runs on the entry scope).
+                let stored =
+                    self.stored_slot_writes(ast, indexed, id, vspan, env, interner);
                 widen_flow_writes(writes, vspan, env, interner);
+                self.land_indexed_stored(
+                    ast, indexed, id, vspan, rebinds, mutations, stored, env, interner,
+                );
                 // An if-EXPRESSION assigned to a local (`strategies = if
                 // Gitlab::Database.read_write?; …`) still carries a predicate the
                 // always-truthy rule visits — record its snapshot here (the
@@ -801,6 +1163,7 @@ impl<'i> Typer<'i> {
                     }
                 }
                 let ty = self.type_of(ast, value, env, interner);
+                drop_indexed_narrowings(env, &name);
                 env.insert(name, ty);
             }
             // `a, b = rhs` — destructure the RHS and rebind every target. This
@@ -812,9 +1175,15 @@ impl<'i> Typer<'i> {
                 // Same discipline as the single-target arm: the RHS may itself
                 // write other locals — widen those first, then bind.
                 let vspan = ast.get(value).span();
+                let stored =
+                    self.stored_slot_writes(ast, indexed, id, vspan, env, interner);
                 widen_flow_writes(writes, vspan, env, interner);
+                self.land_indexed_stored(
+                    ast, indexed, id, vspan, rebinds, mutations, stored, env, interner,
+                );
                 let rhs = self.type_of(ast, value, env, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                    drop_indexed_narrowings(env, &name);
                     env.insert(name, ty);
                 }
                 // An `h[k]` index target stores through `[]=` on the
@@ -831,6 +1200,7 @@ impl<'i> Typer<'i> {
                 // tracked constant in this slice — widen.
                 let name = name.clone();
                 let u = interner.untyped();
+                drop_indexed_narrowings(env, &name);
                 env.insert(name, u);
             }
             Node::If { predicate, then_body, else_body, .. } => {
@@ -842,20 +1212,30 @@ impl<'i> Typer<'i> {
                     );
                     out.insert(id, pty);
                 }
+                // A predicate `h[k] ||= v` records its slot on the env the
+                // predicate is ENTERED with; the record lands in BOTH branch
+                // scopes, so it survives the join the same way the
+                // reference's `with_indexed_narrowing` does.
+                let if_span = ast.get(id).span();
+                let stored =
+                    self.stored_slot_writes(ast, indexed, id, if_span, env, interner);
                 // Independently evaluate each branch from the dominating env, then
                 // join: a binding survives only if both branches agree exactly.
                 let mut then_env = env.clone();
                 self.flow_eval_scope(
-                    ast, &then_body, &mut then_env, in_loop_or_block, self_qual, self_kind, writes, interner, out,
+                    ast, &then_body, &mut then_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
                 );
                 let mut else_env = env.clone();
                 self.flow_eval_scope(
-                    ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, interner, out,
+                    ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
                 );
                 *env = join_flow_envs(&then_env, &else_env, interner);
                 // A predicate may contain a write (`if (x = f)`); widen post-join.
                 let pspan = ast.get(predicate).span();
                 widen_flow_writes(writes, pspan, env, interner);
+                self.land_indexed_stored(
+                    ast, indexed, id, if_span, rebinds, mutations, stored, env, interner,
+                );
             }
             Node::Definition { body, singleton_name, .. } => {
                 // Independent scope: fresh local env, inherited suppression flag.
@@ -868,7 +1248,7 @@ impl<'i> Typer<'i> {
                 );
                 let mut fresh = TypeEnv::new();
                 self.flow_eval_scope(
-                    ast, &body, &mut fresh, in_loop_or_block, self_qual, kind, writes, interner, out,
+                    ast, &body, &mut fresh, in_loop_or_block, self_qual, kind, writes, rebinds, mutations, indexed, interner, out,
                 );
             }
             Node::ClassDef { body, name, .. } | Node::ModuleDef { body, name, .. } => {
@@ -879,13 +1259,19 @@ impl<'i> Typer<'i> {
                 let (body, child_qual) = (body.clone(), qualify_self(self_qual, name));
                 let mut fresh = TypeEnv::new();
                 self.flow_eval_scope(
-                    ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Instance, writes, interner, out,
+                    ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Instance, writes, rebinds, mutations, indexed, interner, out,
                 );
             }
             // Loop / case / begin-rescue / logical / call(+block) / any other node:
             // widen every local written in the span, do not descend for snapshots.
             other => {
-                widen_flow_writes(writes, other.span(), env, interner);
+                let span = other.span();
+                let stored =
+                    self.stored_slot_writes(ast, indexed, id, span, env, interner);
+                widen_flow_writes(writes, span, env, interner);
+                self.land_indexed_stored(
+                    ast, indexed, id, span, rebinds, mutations, stored, env, interner,
+                );
             }
         }
     }
@@ -934,6 +1320,7 @@ impl<'i> Typer<'i> {
                 }
                 let (name, value) = (name.clone(), *value);
                 let ty = self.type_of(ast, value, env, interner);
+                drop_indexed_narrowings(env, &name);
                 env.insert(name, ty);
             }
             Node::MultiWrite { targets, value, .. } => {
@@ -944,6 +1331,7 @@ impl<'i> Typer<'i> {
                     if bound.contains(&name) {
                         continue;
                     }
+                    drop_indexed_narrowings(env, &name);
                     env.insert(name, ty);
                 }
             }
@@ -1020,6 +1408,10 @@ pub struct CheckFlow {
     /// [`toplevel_rebinds`]: every top-level local write `(span, name)`.
     rebinds: Vec<(rigor_parse::Span, String)>,
     /// [`toplevel_mutations`]: every `local.<mutator>` call
-    /// `(call span, name, method)`.
-    mutations: Vec<(rigor_parse::Span, String, String)>,
+    /// `(call span, name, method, drop_key)`.
+    mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+    /// [`collect_indexed_flow`]: the indexed-narrowing side table
+    /// (rigor-rs#325) — `operand` `h[k] ||= v` records, their spans, and
+    /// element-mutator calls.
+    indexed: IndexedFlow,
 }
