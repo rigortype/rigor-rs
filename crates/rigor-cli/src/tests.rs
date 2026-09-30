@@ -537,6 +537,57 @@ fn strict_within_bucket_is_not_a_violation() {
     assert!(drifted.is_empty());
 }
 
+// --- `relative_path` — `Pathname#relative_path_from` parity (issue #162) ---
+
+#[test]
+fn relative_path_under_root() {
+    let cwd = Path::new("/proj");
+    assert_eq!(relative_path("/proj/a.rb", Some(cwd)), "a.rb");
+    assert_eq!(relative_path("/proj/sub/deep/x.rb", Some(cwd)), "sub/deep/x.rb");
+}
+
+#[test]
+fn relative_path_outside_root_uses_dotdot() {
+    // The reference keys a file outside the cwd as `../…`, not absolute —
+    // without this a baseline row can never suppress such a file.
+    let cwd = Path::new("/proj");
+    assert_eq!(relative_path("/proj/../outside/o.rb", Some(cwd)), "../outside/o.rb");
+    assert_eq!(relative_path("/other/o.rb", Some(cwd)), "../other/o.rb");
+    assert_eq!(relative_path("/x", Some(cwd)), "../x");
+    assert_eq!(relative_path("/", Some(cwd)), "..");
+    // Same spelling the config `paths: ../outside` expansion produces.
+    let cwd = Path::new("/tmp/wt/proj");
+    assert_eq!(
+        relative_path("/tmp/wt/proj/../outside/o.rb", Some(cwd)),
+        "../outside/o.rb"
+    );
+    assert_eq!(
+        relative_path("/tmp/wt/outside/o.rb", Some(cwd)),
+        "../outside/o.rb"
+    );
+}
+
+#[test]
+fn relative_path_mixed_kinds_returns_original() {
+    // Reference `ArgumentError` fallback: relative vs absolute → verbatim.
+    let cwd = Path::new("/proj");
+    assert_eq!(relative_path("a.rb", Some(cwd)), "a.rb");
+    assert_eq!(relative_path("../o.rb", Some(cwd)), "../o.rb");
+    assert_eq!(relative_path("sub/../o.rb", Some(cwd)), "sub/../o.rb");
+    assert_eq!(relative_path("./a.rb", Some(cwd)), "./a.rb");
+    assert_eq!(relative_path("/proj/a.rb", None), "/proj/a.rb");
+}
+
+#[test]
+fn cleanpath_components_folds_dot_and_dotdot() {
+    // Probed `Pathname#cleanpath`: `..` folds into the previous component,
+    // drops at an absolute root, kept at a relative root.
+    assert_eq!(cleanpath_components("/a/../../b"), (true, vec!["b".to_string()]));
+    assert_eq!(cleanpath_components("a/../../b"), (false, vec!["..".to_string(), "b".to_string()]));
+    assert_eq!(cleanpath_components("x/../.."), (false, vec!["..".to_string()]));
+    assert_eq!(cleanpath_components("/a//b/./c"), (true, vec!["a".to_string(), "b".to_string(), "c".to_string()]));
+}
+
 /// Upstream #684 — an explicit `check a.rb` still scans the configured
 /// `paths:` for DISCOVERY (`expand_paths(paths | argv)`): an accessor
 /// declared by an unlisted `lib/` file suppresses `x.zz` exactly as in a
