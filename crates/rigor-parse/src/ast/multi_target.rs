@@ -3,11 +3,33 @@
 
 use crate::ruby_prism::{self, Node as PrismNode};
 
-use super::{collect_recoverable_children, constant_string, span_of, Recovered, ScopeMarks, Span};
+use super::{
+    collect_recoverable_children, constant_string, integer_value, span_of, Recovered, ScopeMarks,
+    Span,
+};
 
-/// The `[]=` stores an index target performs: `(receiver local, target span)`
-/// pairs — the name-keyed half of the reference's `Result#index_targets`.
-pub type IndexWrites = Vec<(String, Span)>;
+/// `IndexedNarrowing.stable_key` (`indexed_narrowing.rb` `STABLE_KEY_NODES`)
+/// for an index TARGET: the literal index a `h[k]` store addresses — Symbol /
+/// String / Integer literals only; a variable, splat or interpolated key
+/// declines. Mirrors [`rigor_types::ShapeKey`]'s three stable variants
+/// (rigor-parse cannot see that type); `rigor-infer` converts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IndexTargetKey {
+    Sym(String),
+    Str(String),
+    Int(i64),
+}
+
+/// The `[]=` stores an index target performs: `(receiver local, target span,
+/// drop key)` triples — the name-keyed half of the reference's
+/// `Result#index_targets`, plus the key the store invalidates. `drop key` is
+/// `Some` only when the receiver is a bare `LocalVariableReadNode` and the
+/// FIRST index argument is a [`IndexTargetKey`] literal — the reference's
+/// `IndexedNarrowing.invalidate_indexed_write` (`indexed_narrowing.rb:142`),
+/// which `widen_index_target` runs on the `IndexTargetNode` exactly as a
+/// `[]=` `CallNode` (`stable_address` reads `receiver`/`arguments`; a
+/// multi-index `h[:a, :b]` still drops `(h, :a)`).
+pub type IndexWrites = Vec<(String, Span, Option<IndexTargetKey>)>;
 
 /// One target slot of a multiple assignment (`a, (b, c), *rest = rhs`).
 ///
@@ -43,8 +65,16 @@ pub enum MultiTarget {
     Nested(MultiTargets),
     /// An index target (`h[k]`). `receivers` is every local the receiver
     /// expression can evaluate to (empty for an ivar/constant/call receiver);
-    /// `span` is the whole `IndexTargetNode` location.
-    Index { receivers: Vec<String>, span: Span },
+    /// `span` is the whole `IndexTargetNode` location. `key` is the
+    /// `[]=` store's stable drop key — `Some` only for a bare-local receiver
+    /// with a literal first index argument (`IndexedNarrowing.
+    /// invalidate_indexed_write`), so a `receivers` holding it is exactly the
+    /// one name `stable_receiver` resolves.
+    Index {
+        receivers: Vec<String>,
+        span: Span,
+        key: Option<IndexTargetKey>,
+    },
     /// A target with no observable local binding (ivar / constant / call /
     /// const-path target, an implicit rest `a, = …`, an anonymous `*`).
     Ignored { span: Span },
@@ -71,16 +101,23 @@ impl MultiTarget {
         }
     }
 
-    /// Push every `(receiver local, target span)` this target stores through
-    /// `[]=` (recursing into a nested multi-target and a `*rest` slot) — the
-    /// name-keyed half of the reference's `Result#index_targets`
-    /// (`multi_target_binder.rb`), which keys each write by the target node;
-    /// the span plays that role here. A receiver that names no local
-    /// contributes nothing (a strict decline — never a new write).
+    /// Push every `(receiver local, target span, drop key)` this target
+    /// stores through `[]=` (recursing into a nested multi-target and a
+    /// `*rest` slot) — the name-keyed half of the reference's
+    /// `Result#index_targets` (`multi_target_binder.rb`), which keys each
+    /// write by the target node; the span plays that role here. A receiver
+    /// that names no local contributes nothing (a strict decline — never a
+    /// new write). The drop key — `Some` only on a bare-local receiver —
+    /// rides every emitted entry (there is exactly one then), matching the
+    /// `(local, key)` invalidation `widen_index_target` runs.
     pub fn collect_index_writes(&self, out: &mut IndexWrites) {
         match self {
-            MultiTarget::Index { receivers, span } => {
-                out.extend(receivers.iter().map(|r| (r.clone(), *span)));
+            MultiTarget::Index {
+                receivers,
+                span,
+                key,
+            } => {
+                out.extend(receivers.iter().map(|r| (r.clone(), *span, key.clone())));
             }
             MultiTarget::Nested(t) => t.collect_index_writes(out),
             MultiTarget::Local { .. } | MultiTarget::Ignored { .. } => {}
@@ -259,6 +296,7 @@ fn lower_multi_target<'pr>(
         return MultiTarget::Index {
             receivers: mutated_local_reads(&t.receiver(), 0),
             span: span_of(&t.location()),
+            key: index_target_key(&t),
         };
     }
     // A non-local target can still EMBED expressions that READ locals or CALL
@@ -356,6 +394,39 @@ fn mutated_local_reads(node: &PrismNode<'_>, depth: u8) -> Vec<String> {
     Vec::new()
 }
 
+/// The `(local, key)` address an index target's `[]=` store invalidates — the
+/// reference's `IndexedNarrowing.invalidate_indexed_write`, which reads the
+/// `IndexTargetNode`'s `receiver`/`arguments` exactly as a `[]=` `CallNode`'s
+/// (`indexed_narrowing.rb:142`; `widen_index_target` runs it for the
+/// multi-assign slot, the `for` index and the `rescue =>` reference alike).
+/// `stable_receiver` keys on the node KIND, so only a bare
+/// `LocalVariableReadNode` qualifies — a write receiver (`(buf ||= {})[:k]`),
+/// a parenthesised read, or an `it` read declines even though
+/// [`mutated_local_reads`] names a local for it — and only the FIRST index
+/// argument addresses the store (`h[:a, :b] = …` still drops `(h, :a)`).
+fn index_target_key(t: &ruby_prism::IndexTargetNode<'_>) -> Option<IndexTargetKey> {
+    t.receiver().as_local_variable_read_node()?;
+    let first = t.arguments()?.arguments().iter().next()?;
+    stable_key_node(&first)
+}
+
+/// `IndexedNarrowing.stable_key` (`indexed_narrowing.rb:63`): Symbol / String
+/// / Integer literals only (`STABLE_KEY_NODES`). A Bignum declines like the
+/// lowered `IntegerLit { value: None }` the infer-side `stable_index_key`
+/// reads — no slot record can key on it either.
+fn stable_key_node(node: &PrismNode<'_>) -> Option<IndexTargetKey> {
+    if let Some(s) = node.as_symbol_node() {
+        return Some(IndexTargetKey::Sym(constant_string(s.unescaped())));
+    }
+    if let Some(s) = node.as_string_node() {
+        return Some(IndexTargetKey::Str(constant_string(s.unescaped())));
+    }
+    if let Some(i) = node.as_integer_node() {
+        return integer_value(&i.value()).map(IndexTargetKey::Int);
+    }
+    None
+}
+
 /// What a `for` index target writes: `(bound local names, index-target receiver
 /// locals)` — the reference's `bind_for_index` set (`statement_evaluator.rb`).
 /// A `LocalVariableTargetNode` binds a name; a `MultiTargetNode` decomposes as
@@ -389,11 +460,12 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
         return (targets.bound_names(), targets.index_writes());
     }
     if let Some(t) = index.as_index_target_node() {
+        let key = index_target_key(&t);
         return (
             Vec::new(),
             mutated_local_reads(&t.receiver(), 0)
                 .into_iter()
-                .map(|r| (r, span_of(&t.location())))
+                .map(|r| (r, span_of(&t.location()), key.clone()))
                 .collect(),
         );
     }
@@ -401,11 +473,12 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
         // `for *h[:k] in xs` — the store is `*h[:k] = element`; the reference
         // widens the receiver with its undecomposable-rest floor (untyped).
         if let Some(t) = s.expression().and_then(|e| e.as_index_target_node()) {
+            let key = index_target_key(&t);
             return (
                 Vec::new(),
                 mutated_local_reads(&t.receiver(), 0)
                     .into_iter()
-                    .map(|r| (r, span_of(&t.location())))
+                    .map(|r| (r, span_of(&t.location()), key.clone()))
                     .collect(),
             );
         }
@@ -418,14 +491,15 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
 /// `h` (`bind_rescue_reference`, rigor-rs#134). Empty for any other reference
 /// kind (a local binds a name instead; ivar / constant / call references name
 /// no local binding).
-pub(crate) fn rescue_reference_index_writes(
-    reference: &PrismNode<'_>,
-) -> IndexWrites {
+pub(crate) fn rescue_reference_index_writes(reference: &PrismNode<'_>) -> IndexWrites {
     match reference.as_index_target_node() {
-        Some(t) => mutated_local_reads(&t.receiver(), 0)
-            .into_iter()
-            .map(|r| (r, span_of(&t.location())))
-            .collect(),
+        Some(t) => {
+            let key = index_target_key(&t);
+            mutated_local_reads(&t.receiver(), 0)
+                .into_iter()
+                .map(|r| (r, span_of(&t.location()), key.clone()))
+                .collect()
+        }
         None => Vec::new(),
     }
 }

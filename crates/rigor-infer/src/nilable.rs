@@ -241,7 +241,7 @@ impl<'i> Typer<'i> {
                 // `tenv` (the stored slot's type is unmodelled) but keep any
                 // `nenv`/`penv` fact, exactly as a bare `h[k] = v` call does
                 // (rigor-rs#134).
-                for (_, tspan) in targets.index_writes() {
+                for (_, tspan, _) in targets.index_writes() {
                     widen_flow_writes(writes, tspan, tenv, interner);
                 }
             }

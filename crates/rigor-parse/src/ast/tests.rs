@@ -280,7 +280,11 @@ fn multi_write_index_targets_report_their_receiver_writes() {
     let names: Vec<String> = t.bound_names().into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["z"], "the index target binds no local");
     assert!(matches!(t.lefts[0], MultiTarget::Index { .. }));
-    let writes: Vec<String> = t.index_writes().into_iter().map(|(n, _)| n).collect();
+    let writes: Vec<String> = t
+        .index_writes()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
     assert_eq!(writes, ["h"]);
 }
 
@@ -289,7 +293,11 @@ fn nested_and_splatted_index_targets_keep_their_writes() {
     let t = multi_targets(b"h = {}\ns = []\n(h[:a], q), *s[0] = xs\n");
     let names: Vec<String> = t.bound_names().into_iter().map(|(n, _)| n).collect();
     assert_eq!(names, ["q"]);
-    let writes: Vec<String> = t.index_writes().into_iter().map(|(n, _)| n).collect();
+    let writes: Vec<String> = t
+        .index_writes()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
     assert_eq!(writes, ["h", "s"], "nested and splatted receivers, in source order");
 }
 
@@ -298,12 +306,74 @@ fn index_target_receivers_walk_branching_expressions() {
     // `(c ? a : b)[:k]` mutates whichever local the ternary selects — the
     // local half of the reference's `ReceiverAlias.mutated_reads`.
     let t = multi_targets(b"a = {}\nb = {}\n(c ? a : b)[:k], z = 1, 2\n");
-    let writes: Vec<String> = t.index_writes().into_iter().map(|(n, _)| n).collect();
+    let writes: Vec<String> = t
+        .index_writes()
+        .into_iter()
+        .map(|(n, _, _)| n)
+        .collect();
     assert_eq!(writes, ["a", "b"]);
     // An ivar receiver names no local — a strict decline, still `Index`.
     let t = multi_targets(b"@h[:k], z = 1, 2\n");
     assert!(t.index_writes().is_empty());
     assert!(matches!(t.lefts[0], MultiTarget::Index { .. }));
+}
+
+/// rigor-rs#342: an index target's `[]=` store carries the slot key it
+/// invalidates (`IndexedNarrowing.invalidate_indexed_write` — run by
+/// `widen_index_target` for the multi-assign / `for` / `rescue` forms): a
+/// bare-local receiver with a literal FIRST index argument, else `None` —
+/// `stable_receiver` keys on the node kind, so a write / paren / branching
+/// receiver declines even though it names a local.
+#[test]
+fn index_targets_carry_their_drop_key() {
+    let keys = |src: &[u8]| -> Vec<(String, Option<IndexTargetKey>)> {
+        multi_targets(src)
+            .index_writes()
+            .into_iter()
+            .map(|(n, _, k)| (n, k))
+            .collect()
+    };
+    assert_eq!(
+        keys(b"h = {}\nh[:a], z = 1, 2\n"),
+        [("h".to_string(), Some(IndexTargetKey::Sym("a".to_string())))]
+    );
+    assert_eq!(
+        keys(b"h = {}\nh[\"k\"], z = 1, 2\n"),
+        [("h".to_string(), Some(IndexTargetKey::Str("k".to_string())))]
+    );
+    assert_eq!(
+        keys(b"h = {}\nh[3], z = 1, 2\n"),
+        [("h".to_string(), Some(IndexTargetKey::Int(3)))]
+    );
+    // `invalidate_indexed_write` reads `arguments.first` — `h[:a, :b]`
+    // still drops `(h, :a)`.
+    assert_eq!(
+        keys(b"h = {}\nh[:a, :b], z = 1, 2\n"),
+        [("h".to_string(), Some(IndexTargetKey::Sym("a".to_string())))]
+    );
+    // A splatted index target keeps the key too.
+    assert_eq!(
+        keys(b"s = []\nz, *s[0] = 1, 2\n"),
+        [("s".to_string(), Some(IndexTargetKey::Int(0)))]
+    );
+    // A non-literal key and a non-bare receiver both decline — the record
+    // survives on the oracle too.
+    assert_eq!(
+        keys(b"h = {}\nk = :a\nh[k], z = 1, 2\n"),
+        [("h".to_string(), None)]
+    );
+    assert_eq!(
+        keys(b"a = {}\nb = {}\n(c ? a : b)[:k], z = 1, 2\n"),
+        [("a".to_string(), None), ("b".to_string(), None)]
+    );
+    assert_eq!(
+        keys(b"h = {}\n(buf = h)[:a], z = 1, 2\n"),
+        [("buf".to_string(), None)]
+    );
+    assert_eq!(
+        keys(b"h = {}\n(h)[:a], z = 1, 2\n"),
+        [("h".to_string(), None)]
+    );
 }
 
 /// rigor-rs#134: a `for` index target's `[]=` store rides the loop's
@@ -317,10 +387,12 @@ fn for_index_targets_report_their_receiver_writes() {
         .iter()
         .filter_map(|(_, n)| match n {
             Node::Loop { index, index_writes, span, .. } => {
-                assert!(index_writes.iter().all(|(_, s)| span.0 <= s.0 && s.1 <= span.1));
+                assert!(index_writes
+                    .iter()
+                    .all(|(_, s, _)| span.0 <= s.0 && s.1 <= span.1));
                 Some((
                     index.iter().map(|(n, _)| n.clone()).collect(),
-                    index_writes.iter().map(|(n, _)| n.clone()).collect(),
+                    index_writes.iter().map(|(n, _, _)| n.clone()).collect(),
                 ))
             }
             _ => None,
@@ -352,7 +424,7 @@ fn rescue_index_reference_reports_its_receiver_writes() {
         .map(|c| {
             (
                 c.bound_name.clone(),
-                c.index_writes.iter().map(|(n, _)| n.clone()).collect(),
+                c.index_writes.iter().map(|(n, _, _)| n.clone()).collect(),
             )
         })
         .collect();

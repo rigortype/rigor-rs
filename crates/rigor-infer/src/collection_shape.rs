@@ -282,7 +282,7 @@ impl<'i> Typer<'i> {
                     // `rescue => h[:k]` stores the exception through `[]=` on
                     // `h` (`widen_index_target`), widening its carrier in the
                     // arm's entry scope exactly as `h[:k] = e` would.
-                    for (name, _) in &cl.index_writes {
+                    for (name, _, _) in &cl.index_writes {
                         let cls = arm
                             .get(name.as_str())
                             .and_then(|&ty| self.coll_widen_for_mutator(interner, ty, "[]="));
@@ -563,7 +563,7 @@ impl<'i> Typer<'i> {
                 // post-binding scope — widen each receiver's carrier after the
                 // bindings, as `h[k] = v` does (`eval_multi_write` →
                 // `IndexWriteWidening`, rigor-rs#134).
-                for (_, tspan) in targets.index_writes() {
+                for (_, tspan, _) in targets.index_writes() {
                     widen_flow_writes(ctx.writes, tspan, tenv, interner);
                 }
             }

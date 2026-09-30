@@ -346,11 +346,15 @@ impl<'i> Typer<'i> {
     /// narrowings (`rigor-rs#325`). Three stages, in the reference's order:
     ///
     /// 1. `IndexedNarrowing.invalidate_after_call`: a stable-key `local[k]
-    ///    = v` `[]=` drops that one slot's record (`drop_key`), every other
+    ///    = v` `[]=` drops that one slot's record (`drop_key`) — the index
+    ///    targets (`h[k], z = …`, `for h[k] in xs`, `rescue => h[k]`) carry
+    ///    the same key since `widen_index_target` runs
+    ///    `invalidate_indexed_write` on them (rigor-rs#342) — every other
     ///    shape mutator drops every record rooted at the receiver
-    ///    (`invalidate_mutator`), and a compound `h[k] op= v` / index-target
-    ///    store — `method == "[]="` with `drop_key == None` — drops none
-    ///    (those nodes never run `invalidate_after_call`).
+    ///    (`invalidate_mutator`), and a compound `h[k] op= v` or a
+    ///    non-literal / non-local index target — `method == "[]="` with
+    ///    `drop_key == None` — drops none (those never reach
+    ///    `invalidate_indexed_write`).
     /// 2. `index_write_stored_type` on the env the write was ENTERED with —
     ///    an `operand`-flagged `h[k] ||= v` — computed BEFORE the `[]=`
     ///    widening lands, exactly as `eval_index_or_write` does.
@@ -480,7 +484,7 @@ impl<'i> Typer<'i> {
             Node::Loop { index_writes, .. } => {
                 if index_writes
                     .iter()
-                    .any(|(_, s)| s.0 <= wspan.0 && wspan.1 <= s.1)
+                    .any(|(_, s, _)| s.0 <= wspan.0 && wspan.1 <= s.1)
                 {
                     return false;
                 }
@@ -536,7 +540,7 @@ impl<'i> Typer<'i> {
             Node::Loop { index_writes, .. } => {
                 if index_writes
                     .iter()
-                    .any(|(_, s)| s.0 <= span.0 && span.1 <= s.1)
+                    .any(|(_, s, _)| s.0 <= span.0 && span.1 <= s.1)
                 {
                     return false;
                 }
@@ -760,7 +764,7 @@ impl<'i> Typer<'i> {
                 // (`path_unconditional` reaches it through `target_exprs`),
                 // as a straight-line `h[k] = v` gets.
                 if let Node::MultiWrite { targets, .. } = ast.get(id) {
-                    for (_, tspan) in targets.index_writes() {
+                    for (_, tspan, _) in targets.index_writes() {
                         self.widen_mutated_locals(ast, mutations, indexed, id, tspan, env, interner);
                     }
                 }
@@ -1213,7 +1217,7 @@ impl<'i> Typer<'i> {
                 // `h`), so each receiver's locals widen after the bindings —
                 // exactly as `h[k] = v` widens them (`eval_multi_write` →
                 // `IndexWriteWidening.widen`, rigor-rs#134).
-                for (_, tspan) in targets.index_writes() {
+                for (_, tspan, _) in targets.index_writes() {
                     widen_flow_writes(writes, tspan, env, interner);
                 }
             }
