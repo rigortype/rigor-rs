@@ -251,6 +251,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         recovery_iterative: 0,
         recovery_next_sink: 0,
         recovery_suppressed: 0,
+        typed_depth: 0,
+        closure_depth: 0,
         scanned_inert_spans: Vec::new(),
     };
     let root_prism = result.node();

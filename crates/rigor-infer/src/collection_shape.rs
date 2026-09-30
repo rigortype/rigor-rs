@@ -185,6 +185,7 @@ impl<'i> Typer<'i> {
             | Node::MultiWrite { .. }
             | Node::LocalVariableOpWrite { .. }
             | Node::IndexWrite { .. }
+            | Node::AttrWrite { .. }
             | Node::Call { .. } => {
                 self.coll_flow_expr(ast, id, tenv, ctx, interner, out, stmt_position);
             }
@@ -533,6 +534,27 @@ impl<'i> Typer<'i> {
                         tenv.insert(name, ty);
                     }
                 }
+            }
+            // `h.attr op= v` — a compound ATTRIBUTE write (rigor-rs#343).
+            // The WRITER's carrier widening (`widen_attribute_write` →
+            // `widen_receiver_aliases`) replays through the flat check env's
+            // mutation entries, not this pass — the reference's
+            // `widen_for_mutator` on `default=`/`default_proc=` only OPENS a
+            // closed shape, so keeping `h`'s carrier here matches the
+            // reference's collection reading. Receiver and RHS are operand
+            // children; a local write nested inside widens by span.
+            Node::AttrWrite {
+                receiver,
+                value,
+                span,
+                ..
+            } => {
+                let (receiver, value, wspan) = (*receiver, *value, *span);
+                if let Some(r) = receiver {
+                    self.coll_flow_expr(ast, r, tenv, ctx, interner, out, false);
+                }
+                self.coll_flow_expr(ast, value, tenv, ctx, interner, out, false);
+                widen_flow_writes(ctx.writes, wspan, tenv, interner);
             }
             // `&&`/`||` — the RHS may not execute, so its effects are unmodeled:
             // evaluate both sides on a THROWAWAY env (uses are still recorded

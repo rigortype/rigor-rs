@@ -254,7 +254,7 @@ impl<'i> Typer<'i> {
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
-            Node::Call { .. } | Node::IndexWrite { .. } => {
+            Node::Call { .. } | Node::IndexWrite { .. } | Node::AttrWrite { .. } => {
                 self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
             }
             Node::Definition { body, .. }
@@ -395,6 +395,26 @@ impl<'i> Typer<'i> {
                 }
                 for i in &indices {
                     self.nil_flow_expr(ast, *i, tenv, nenv, penv, writes, interner, out);
+                }
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+            }
+            // `h.attr op= v` — a compound ATTRIBUTE write. It is never a
+            // nilable USE site (`eval_attribute_compound_write` types the
+            // node without dispatching a checkable `attr`/`attr=` call —
+            // probed silent at `e59b7b89`, rigor-rs#343). A bare-local
+            // receiver's nilable fact is still CONSUMED: `h.default ||= 0`
+            // raises on `nil` (`for 1`, not `for 1 | nil`, after it on the
+            // oracle) and `h&.default ||= 0` is the write-through-`&.`
+            // the `Call` arm's safe-nav consume already models.
+            Node::AttrWrite {
+                receiver, value, ..
+            } => {
+                let (receiver, value) = (*receiver, *value);
+                if let Some(r) = receiver {
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
+                    if let Node::LocalVariableRead { name, .. } = ast.get(r) {
+                        nenv.remove(name);
+                    }
                 }
                 self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
             }

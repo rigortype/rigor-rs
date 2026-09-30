@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use rigor_parse::{IndexCompound, IndexTargetKey, LoweredAst, Node, NodeId};
+use rigor_parse::{Compound, IndexTargetKey, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, ShapeKey};
 
 use crate::{SourceIndex, TypeEnv};
@@ -537,6 +537,35 @@ pub(crate) fn toplevel_mutations(
                 out.push((id, *span, name.clone(), "[]=".to_string(), None));
             }
         }
+        // `h.attr ||= v` / `h.attr &&= v` / `h.attr op= v` — a compound
+        // ATTRIBUTE write on a bare-local receiver. `eval_attribute_compound_write`
+        // (`statement_evaluator.rb:980`) applies `widen_attribute_write` with
+        // the WRITER name (`attr=`), so `default`/`default_proc`/
+        // `compare_by_identity` — and every other shape mutator — open their
+        // carrier and drop the indexed narrowings rooted at `h`
+        // (`IndexWriteInvalidation.mutator?` accepts
+        // `HashLookupMutation::MUTATORS`, rigor-rs#343). `drop_key` is `None`:
+        // a non-`[]=` mutator drops every record rooted at the receiver.
+        //
+        // Only a write the reference EVALUATES widens — `evaluated` is false
+        // for the operand positions `OperandEffects` never hands to
+        // `evaluate` (call receiver/argument, splat, literal container,
+        // interpolation, `return`, `rescue` modifier, `in` pattern), under a
+        // suppressed carrier, and inside a deferred block/lambda body.
+        if let Node::AttrWrite {
+            receiver: Some(r),
+            write_name,
+            evaluated: true,
+            span,
+            ..
+        } = n
+        {
+            if is_shape_mutator(write_name)
+                && let Node::LocalVariableRead { name, .. } = ast.get(*r)
+            {
+                out.push((id, *span, name.clone(), write_name.clone(), None));
+            }
+        }
     }
     out.retain(|(id, w, name, ..)| {
         !ast.in_inert_carrier(*w)
@@ -659,6 +688,14 @@ fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
         } => {
             out.extend(receiver.iter().copied());
             out.extend_from_slice(indices);
+            out.push(*value);
+        }
+        // `recv.attr op= v` — receiver + value are the node's children
+        // (rigor-rs#343).
+        Node::AttrWrite {
+            receiver, value, ..
+        } => {
+            out.extend(receiver.iter().copied());
             out.push(*value);
         }
         Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
@@ -1030,7 +1067,7 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                 }
                 // `single_index_argument` + `stable_address`: only a
                 // single-literal-key `||=` on a bare local records.
-                if !matches!(compound, IndexCompound::Or)
+                if !matches!(compound, Compound::Or)
                     || indices.len() != 1
                     || write_dropped(*span)
                 {

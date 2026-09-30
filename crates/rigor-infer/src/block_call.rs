@@ -566,6 +566,8 @@ impl<'i> Typer<'i> {
     /// - compound index writes (`x[i] += 1`, `x[i] ||= v` — [`Node::IndexWrite`]):
     ///   a store through `[]=` on a binding the overlay replays as a value, so
     ///   the tail would answer with the pre-write slot (rigor-rs#135);
+    /// - compound attribute writes (`x.attr ||= v` — [`Node::AttrWrite`]):
+    ///   the same decline for a `attr=` store (rigor-rs#343);
     /// - multiwrites, `for`/`while`/`until` loops, `rescue => e` binds;
     /// - ivar/cvar/gvar/constant writes and [`Node::UnmodeledWrite`] markers
     ///   (operator writes the lowering cannot reproduce, `in`/`=>` pattern
@@ -630,6 +632,7 @@ impl<'i> Typer<'i> {
                 | Node::MultiWrite { .. }
                 | Node::Loop { .. }
                 | Node::IndexWrite { .. }
+                | Node::AttrWrite { .. }
                 | Node::VariableWrite { .. }
                 | Node::InstanceVariableWrite { .. }
                 | Node::ConstantWrite { .. }

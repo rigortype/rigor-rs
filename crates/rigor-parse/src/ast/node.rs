@@ -132,7 +132,7 @@ pub enum Node {
         /// Which compound form this is — `index_write_stored_type` differs:
         /// `h[k] ||= v` stores `truthy(h[k]) | v`, `h[k] &&= v` stores
         /// `falsey(h[k]) | v`, `h[k] op= v` stores the dispatched result.
-        compound: IndexCompound,
+        compound: Compound,
         /// `true` when the write lowered in a position that EVALUATES inline
         /// — straight-line code or a scope-transparent recovery position (a
         /// splat argument, a `return` operand, a container element). Its
@@ -146,6 +146,60 @@ pub enum Node {
         /// reference's scope join intersects that narrowing away and only
         /// the receiver widening survives.
         operand: bool,
+        span: Span,
+    },
+    /// A compound attribute write — `recv.attr ||= v` / `recv.attr &&= v` /
+    /// `recv.attr op= v` (Prism's `CallOrWriteNode` / `CallAndWriteNode` /
+    /// `CallOperatorWriteNode`; `recv.attr = v` stays a [`Node::Call`]). The
+    /// reference's `eval_attribute_compound_write`
+    /// (`statement_evaluator.rb:980`) evaluates the node as
+    /// `[scope.type_of(node), widen_attribute_write(receiver, write_name, scope)]`:
+    /// the *writer* name drives `MutationWidening.widen_receiver_aliases` —
+    /// a shape mutator (`default=`, `default_proc=`, `compare_by_identity`)
+    /// on a stable local receiver drops every `receiver[k]` indexed narrowing
+    /// rooted at it (`IndexedNarrowing.mutator?` →
+    /// `without_indexed_narrowings_for`, rigor-rs#343).
+    ///
+    /// This is deliberately NOT a [`Node::Call`]: the reference does not run
+    /// `call.*` dispatch on the synthesized `attr` read or `attr=` write —
+    /// `call_or_write_type_for` types `||=` as `truthy(recv.attr) | v`
+    /// (`expression_typer.rb`) and `h.default ||= 0` is silent for a
+    /// `class C; end` receiver.
+    ///
+    /// `evaluated` is the position flag: `true` when the write lowered where
+    /// the reference *evaluates* it (a statement, a predicate, a write RHS,
+    /// an `if` arm — all probed to drop prior indexed narrowings), `false`
+    /// where it is only typed — a call argument or receiver, a splat
+    /// operand, a container element, an interpolation, a `return` operand, a
+    /// `when` condition, a block/lambda body — where the reference's
+    /// `ExpressionTyper` applies no scope effects and the narrowing
+    /// survives. Mirroring `widen_attribute_write` without the flag would
+    /// drop `h[:a] ||= "s"`'s record inside `puts(h.default ||= 0)` and
+    /// silence `h[:a].upcase` the reference fires on.
+    AttrWrite {
+        /// The written receiver (`h`); `None` in Prism's no-receiver edge.
+        receiver: Option<NodeId>,
+        /// The reader method name (`attr` — `node.read_name`).
+        read_name: String,
+        /// The writer method name (`attr=` — `node.write_name`), the name
+        /// `widen_attribute_write` consults for the mutator set.
+        write_name: String,
+        /// Which compound form this is — `||=` reads `recv.attr` and keeps
+        /// the truthy side, `&&=` keeps the falsey side, `op=` dispatches
+        /// `recv.attr op v`.
+        compound: Compound,
+        /// `recv&.attr ||= v` — the whole write is skipped on a `nil`
+        /// receiver; the read's `nil` unions into the result.
+        safe_nav: bool,
+        /// `true` when the write lowered in a position the reference
+        /// EVALUATES — straight-line code or a scope-transparent position —
+        /// so `widen_attribute_write`'s receiver mutation lands on the
+        /// enclosing scope. `false` under a pure `type_of` position or a
+        /// block/lambda body — where the write's scope effect never reaches
+        /// the enclosing bindings.
+        evaluated: bool,
+        /// The right-hand side (Prism `value`).
+        value: NodeId,
         span: Span,
     },
     /// A string literal (`"Hello"`); `value` is the unescaped contents.
@@ -822,11 +876,12 @@ pub enum StatementsKind {
     Jump(JumpKind),
 }
 
-/// The compound form of a [`Node::IndexWrite`] — the reference's three
-/// `Prism::Index*WriteNode` classes (`statement_evaluator.rb`'s
-/// `eval_index_or_write` / `eval_index_write` split).
+/// The compound form of a [`Node::IndexWrite`] or [`Node::AttrWrite`] — the
+/// reference's `Index*WriteNode` / `Call*WriteNode` splits
+/// (`statement_evaluator.rb`'s `eval_index_or_write` / `eval_index_write` /
+/// `eval_attribute_compound_write`).
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum IndexCompound {
+pub enum Compound {
     /// `h[k] ||= v` — stores `narrow_truthy(h[k]) | v` and records it as the
     /// `(h, k)` indexed narrowing (`eval_index_or_write`).
     Or,
@@ -863,6 +918,7 @@ impl Node {
             | Node::MultiWrite { span, .. }
             | Node::LocalVariableRead { span, .. }
             | Node::IndexWrite { span, .. }
+            | Node::AttrWrite { span, .. }
             | Node::StringLit { span, .. }
             | Node::InterpolatedString { span, .. }
             | Node::InterpolatedSymbol { span, .. }

@@ -11,9 +11,10 @@ use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Type};
 
 use crate::{
-    collect_flow_writes, indexed_flow_writes, multi_target_binder, widen_flow_writes, TypeEnv,
-    Typer,
+    collect_flow_writes, indexed_flow_writes, multi_target_binder,
+    widen_flow_writes, TypeEnv, Typer,
 };
+use crate::flow_writes::is_shape_mutator;
 
 /// One local's class fact inside the narrowing flow pass
 /// ([`Typer::class_narrowing_pass`]). `Narrowed` requires a `Dynamic`/`Top`
@@ -498,7 +499,7 @@ impl<'i> Typer<'i> {
                 let u = interner.untyped();
                 tenv.insert(name, u);
             }
-            Node::Call { .. } | Node::IndexWrite { .. } => {
+            Node::Call { .. } | Node::IndexWrite { .. } | Node::AttrWrite { .. } => {
                 self.class_flow_expr(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
             }
             // A `return E` evaluates its values in the current facts (`return
@@ -1043,6 +1044,41 @@ impl<'i> Typer<'i> {
                     ast, value, tenv, cenv, coarse, writes, interner, out, false,
                 );
                 kill_cenv_narrowed(writes, wspan, cenv);
+            }
+            // `h.attr ||= v` / `h.attr &&= v` / `h.attr op= v` — a compound
+            // ATTRIBUTE write. Receiver and RHS are expression-position
+            // children. The WRITER (`attr=`) — when it names a shape mutator
+            // and the write is `evaluated` — rebinds the receiver through
+            // `widen_attribute_write` (`statement_evaluator.rb`), which drops
+            // a `Narrowed` fact and every chain rooted at `h` exactly like a
+            // mutator `Call` does (`widen_receiver_aliases` → `with_local`,
+            // rigor-rs#343). A non-evaluated occurrence (typed operand,
+            // deferred closure body, suppressed carrier) leaves the facts
+            // alone.
+            Node::AttrWrite {
+                receiver,
+                value,
+                write_name,
+                evaluated,
+                ..
+            } => {
+                let (receiver, value, writer, evaluated) =
+                    (*receiver, *value, write_name.clone(), *evaluated);
+                if let Some(r) = receiver {
+                    self.class_flow_expr(
+                        ast, r, tenv, cenv, coarse, writes, interner, out, false,
+                    );
+                }
+                self.class_flow_expr(
+                    ast, value, tenv, cenv, coarse, writes, interner, out, false,
+                );
+                if evaluated && is_shape_mutator(&writer) {
+                    if let Some(Node::LocalVariableRead { name, .. }) =
+                        receiver.map(|r| ast.get(r))
+                    {
+                        cenv.kill_local(name);
+                    }
+                }
             }
             // Stage 3a-3: a bare read of a chain ROOT anywhere OTHER than
             // beneath a live address read invalidates every chain rooted at it.

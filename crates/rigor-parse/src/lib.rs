@@ -12,7 +12,7 @@ pub mod ast;
 
 pub use ast::{
     lower, lower_with_key, BlockParamKind, ConstMutation, FileKey, HashKey, HashKeyTag,
-    IndexCompound, IndexTargetKey, IndexWrites, JumpKind, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node,
+    Compound, IndexTargetKey, IndexWrites, JumpKind, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node,
     NodeId, ParamShape, RescueClause,
     Span, StatementsKind, Visibility,
 };

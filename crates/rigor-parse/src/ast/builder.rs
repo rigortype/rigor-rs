@@ -9,7 +9,7 @@ use super::{
     direct_method_names, discover_visibilities_and_includes, for_index_writes, lower_multi_targets,
     rescue_reference_index_writes,
     param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
-    span_of, strict_constant_path_string, IndexCompound, JumpKind, Node, NodeId, ParamShape,
+    span_of, strict_constant_path_string, Compound, JumpKind, Node, NodeId, ParamShape,
     Recovered, RescueClause, ScopeMarks, Span, StatementsKind,
 };
 
@@ -70,6 +70,27 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`Recovered::suppressed`]: super::Recovered::suppressed
     pub(crate) recovery_suppressed: u32,
+    /// Depth of pure `type_of` operand positions the lowering sits inside
+    /// — a call receiver or argument, a splat's contents, a literal-
+    /// container element, an interpolation part, a `return` operand, an
+    /// `in` pattern, a `rescue`-modifier operand. The reference TYPES
+    /// these rather than `evaluate`-ing them, and `OperandEffects`
+    /// deliberately does NOT list the `Call*WriteNode`s as outliving
+    /// writes (unlike the `Index*WriteNode` pair), so a compound
+    /// ATTRIBUTE write lowered here runs `type_of` only: its
+    /// `widen_attribute_write` never reaches this scope. `Node::AttrWrite`'s
+    /// `evaluated` flag is `false` at depth > 0 (rigor-rs#343).
+    ///
+    /// [`Recovered::typed`]: super::Recovered::typed
+    pub(crate) typed_depth: u32,
+    /// Depth of DEFERRED bodies the lowering sits inside — a literal
+    /// block or lambda body. A compound attribute write there still
+    /// evaluates, but `widen_attribute_write` lands on the block's own
+    /// scope and `evaluate_invocation`'s `OperandEffects.any?` writeback
+    /// check excludes it, so it never lands here either (rigor-rs#343).
+    ///
+    /// [`Recovered::closure`]: super::Recovered::closure
+    pub(crate) closure_depth: u32,
     /// Spans of `Statements{Inert}` carriers (`super`/`yield`/`BEGIN`/`END`
     /// operands) emitted while inside an iterated body — the operand is
     /// still never evaluated, but a content-writeback text scan covers it
@@ -202,15 +223,15 @@ impl<'src> Builder<'src> {
         // `call.wrong-arity` the reference never emits.
         let index_write = node
             .as_index_or_write_node()
-            .map(|w| (IndexCompound::Or, w.receiver(), w.arguments(), w.value()))
+            .map(|w| (Compound::Or, w.receiver(), w.arguments(), w.value()))
             .or_else(|| {
                 node.as_index_and_write_node()
-                    .map(|w| (IndexCompound::And, w.receiver(), w.arguments(), w.value()))
+                    .map(|w| (Compound::And, w.receiver(), w.arguments(), w.value()))
             })
             .or_else(|| {
                 node.as_index_operator_write_node().map(|w| {
                     (
-                        IndexCompound::Op(
+                        Compound::Op(
                             constant_string(w.binary_operator().as_slice()),
                         ),
                         w.receiver(),
@@ -220,10 +241,16 @@ impl<'src> Builder<'src> {
                 })
             });
         if let Some((compound, receiver, arguments, value)) = index_write {
+            // The receiver and the index arguments are TYPED operands —
+            // `eval_index_or_write` reads `scope.type_of(node.receiver)` and
+            // `index_write_arg_types` types the indices; only the RHS value is
+            // `sub_eval`'d (`statement_evaluator.rb:754-789`, rigor-rs#343).
+            self.typed_depth += 1;
             let receiver = receiver.as_ref().map(|r| self.lower_node(r));
             let indices = arguments
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
+            self.typed_depth -= 1;
             let value = self.lower_node(&value);
             // `operand`: the write lowered where it EVALUATES inline —
             // straight-line code or a scope-transparent recovery position
@@ -244,6 +271,87 @@ impl<'src> Builder<'src> {
                 value,
                 compound,
                 operand,
+                span,
+            });
+        }
+
+        // `recv.attr ||= v` / `recv.attr &&= v` / `recv.attr op= v` — Prism's
+        // compound ATTRIBUTE-write nodes. Like `Node::IndexWrite` above, this
+        // is deliberately NOT a `Node::Call`: the reference dispatches them to
+        // `eval_attribute_compound_write` (`statement_evaluator.rb`), which
+        // types the node via `call_or_write_type_for` and applies
+        // `widen_attribute_write(receiver, node.write_name, s)` — a synthesized
+        // `attr`/`attr=` `call.*` dispatch would mint diagnostics the oracle
+        // never emits (rigor-rs#343).
+        let attr_write = node
+            .as_call_or_write_node()
+            .map(|w| {
+                (
+                    Compound::Or,
+                    w.receiver(),
+                    w.value(),
+                    w.read_name(),
+                    w.write_name(),
+                    w.is_safe_navigation(),
+                )
+            })
+            .or_else(|| {
+                node.as_call_and_write_node().map(|w| {
+                    (
+                        Compound::And,
+                        w.receiver(),
+                        w.value(),
+                        w.read_name(),
+                        w.write_name(),
+                        w.is_safe_navigation(),
+                    )
+                })
+            })
+            .or_else(|| {
+                node.as_call_operator_write_node().map(|w| {
+                    (
+                        Compound::Op(constant_string(w.binary_operator().as_slice())),
+                        w.receiver(),
+                        w.value(),
+                        w.read_name(),
+                        w.write_name(),
+                        w.is_safe_navigation(),
+                    )
+                })
+            });
+        if let Some((compound, receiver, value, read_name, write_name, safe_nav)) = attr_write {
+            // `evaluated`: whether the occurrence sits where
+            // `eval_attribute_compound_write` can run — NOT under a pure
+            // `type_of` operand (`typed_depth`: call receiver/args, splat,
+            // container, interpolation, `return`, `in` pattern, `rescue`
+            // modifier — `OperandEffects` does not list the `Call*WriteNode`s
+            // as outliving), a `defined?`/`super`/`yield` suppression carrier
+            // (`suppressed`), or a literal block/lambda body (`closure_depth`:
+            // `evaluate_invocation`'s `OperandEffects.any?` writeback check
+            // excludes them too — `x.each { h.default ||= 0 }` keeps `h`'s
+            // indexed narrowings). Joined/blocked/iterated/`for` positions
+            // all still EVALUATE (measured: an `if` arm, a `while` predicate
+            // or body, a `when` condition, an `ensure` body all land the
+            // writer's widening).
+            let evaluated = self.typed_depth == 0
+                && self.closure_depth == 0
+                && self.recovery_suppressed == 0;
+            // The receiver and RHS are `type_of` operands of the write —
+            // `call_or_write_type_for` types them; a compound attribute write
+            // nested inside never evaluates (`h.default ||= (h.x ||= 1)`
+            // widens `h` once, through the outer `default=`).
+            self.typed_depth += 1;
+            let receiver = receiver.as_ref().map(|r| self.lower_node(r));
+            let value = self.lower_node(&value);
+            self.typed_depth -= 1;
+            return self.push(Node::AttrWrite {
+                receiver,
+                read_name: constant_string(read_name.as_slice()),
+                write_name: constant_string(write_name.as_slice()),
+                compound,
+                safe_nav,
+                evaluated,
+                value,
                 span,
             });
         }
@@ -329,6 +437,13 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(call) = node.as_call_node() {
+            // The receiver, the positional arguments and the `&expr`
+            // block-pass are OPERAND positions — `OperandWalk.thread_operand`
+            // types each (`operand.type`) unless `OperandEffects.any?` sends
+            // it to `evaluate` — and a compound ATTRIBUTE write inside is not
+            // an outliving effect, so it is only ever typed here
+            // (`typed_depth` → `evaluated: false`, rigor-rs#343).
+            self.typed_depth += 1;
             let receiver = call.receiver().map(|r| self.lower_node(&r));
             let method = constant_string(call.name().as_slice());
             // Lower positional arguments in source order (ADR-0023: argument
@@ -340,6 +455,7 @@ impl<'src> Builder<'src> {
                 .arguments()
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
+            self.typed_depth -= 1;
             // Whether the FIRST positional argument is a non-plain shape
             // (splat / bare keyword-hash / forwarded args) — recorded here
             // because the lowered subtree does not preserve the distinction
@@ -396,15 +512,26 @@ impl<'src> Builder<'src> {
                         // An iterated body — `evaluate_invocation` /
                         // `content_writeback_block_captures` land every
                         // wrapped index write's `[]=` widening
-                        // (rigor-rs#312).
+                        // (rigor-rs#312). It is also a DEFERRED scope for a
+                        // compound ATTRIBUTE write: `OperandEffects.any?`
+                        // does not list `Call*WriteNode`s, so
+                        // `x.each { h.default ||= 0 }` keeps `h`'s indexed
+                        // narrowings (rigor-rs#343).
                         self.recovery_iterative += 1;
+                        self.closure_depth += 1;
                         let body = self.lower_optional_body(bn.body().as_ref());
                         self.recovery_iterative -= 1;
+                        self.closure_depth -= 1;
                         body
                     } else if let Some(ba) = b.as_block_argument_node() {
-                        ba.expression()
+                        // `&expr` is an operand like any other argument.
+                        self.typed_depth += 1;
+                        let pass = ba
+                            .expression()
                             .map(|e| vec![self.lower_node(&e)])
-                            .unwrap_or_default()
+                            .unwrap_or_default();
+                        self.typed_depth -= 1;
+                        pass
                     } else {
                         Vec::new()
                     }
@@ -777,7 +904,12 @@ impl<'src> Builder<'src> {
             self.push(Node::UnmodeledWrite {
                 span: span_of(&in_node.location()),
             });
-            let mut body = vec![self.lower_node(&in_node.pattern())];
+            // The pattern is matched in `in_arm_position` — typed, never
+            // evaluated (rigor-rs#343).
+            self.typed_depth += 1;
+            let pattern = self.lower_node(&in_node.pattern());
+            self.typed_depth -= 1;
+            let mut body = vec![pattern];
             if let Some(s) = in_node.statements() {
                 body.extend(self.lower_body(&s.body()));
             }
@@ -956,7 +1088,12 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(arr) = node.as_array_node() {
+            // Elements are `eval_value_container` operands — TYPED, never
+            // `evaluate`d (`x = [h.default ||= 0]` keeps `h`'s indexed
+            // narrowings on the oracle, rigor-rs#343).
+            self.typed_depth += 1;
             let elements = self.lower_body(&arr.elements());
+            self.typed_depth -= 1;
             return self.push(Node::ArrayLit {
                 elements,
                 span: span_of(&arr.location()),
@@ -971,6 +1108,9 @@ impl<'src> Builder<'src> {
             let dup_keys = self.hash_keys_of(&hash.elements());
             let mut elements = Vec::new();
             let mut all_assoc = true;
+            // Assoc keys/values are `eval_value_container` operands — TYPED
+            // (rigor-rs#343).
+            self.typed_depth += 1;
             for el in hash.elements().iter() {
                 if let Some(assoc) = el.as_assoc_node() {
                     elements.push(self.lower_node(&assoc.key()));
@@ -980,6 +1120,7 @@ impl<'src> Builder<'src> {
                     elements.push(self.lower_node(&el));
                 }
             }
+            self.typed_depth -= 1;
             return self.push(Node::HashLit {
                 elements,
                 all_assoc,
@@ -993,9 +1134,12 @@ impl<'src> Builder<'src> {
             // Dynamic. The ids stay linked on the node: a range evaluates
             // its bounds unconditionally in order (the reference's
             // `OPERAND_CONTAINERS` includes `RangeNode`), which the flow
-            // replay reads (rigor-rs#306).
+            // replay reads (rigor-rs#306). The bounds are TYPED operands —
+            // `eval_value_container` — not `evaluate`d (rigor-rs#343).
+            self.typed_depth += 1;
             let left = range.left().map(|l| self.lower_node(&l));
             let right = range.right().map(|r| self.lower_node(&r));
+            self.typed_depth -= 1;
             return self.push(Node::Range {
                 left,
                 right,
@@ -1012,6 +1156,8 @@ impl<'src> Builder<'src> {
             // — Prism's KeywordHashNode, same `-w` warning as a braced literal).
             let dup_keys = self.hash_keys_of(&khash.elements());
             let mut elements = Vec::new();
+            // Keyword arguments are `type_of` operands too (rigor-rs#343).
+            self.typed_depth += 1;
             for el in khash.elements().iter() {
                 if let Some(assoc) = el.as_assoc_node() {
                     elements.push(self.lower_node(&assoc.key()));
@@ -1020,6 +1166,7 @@ impl<'src> Builder<'src> {
                     elements.push(self.lower_node(&el));
                 }
             }
+            self.typed_depth -= 1;
             // A bare keyword-hash argument is not a precise value carrier — keep
             // `all_assoc: false` so the typer leaves it the bare `Hash` nominal.
             return self.push(Node::HashLit {
@@ -1145,12 +1292,15 @@ impl<'src> Builder<'src> {
         if let Some(interp) = node.as_interpolated_string_node() {
             // Lower every interpolation part (`#{call}`) so its calls are walked,
             // and keep the ids: the node types as a `String` instance, with the
-            // parts as the reachability carrier.
+            // parts as the reachability carrier. Parts are `type_of` operands —
+            // `eval_interpolation` types each part (rigor-rs#343).
+            self.typed_depth += 1;
             let parts: Vec<NodeId> = interp
                 .parts()
                 .iter()
                 .map(|p| self.lower_node(&p))
                 .collect();
+            self.typed_depth -= 1;
             return self.push(Node::InterpolatedString {
                 parts,
                 span: span_of(&interp.location()),
@@ -1167,11 +1317,14 @@ impl<'src> Builder<'src> {
             // is kept as the reachability carrier so a local read inside the
             // interpolation stays visible to structural walks like
             // `flow.dead-assignment`, exactly as `InterpolatedString` does.
+            // Parts are `type_of` operands (rigor-rs#343).
+            self.typed_depth += 1;
             let parts: Vec<NodeId> = interp
                 .parts()
                 .iter()
                 .map(|p| self.lower_node(&p))
                 .collect();
+            self.typed_depth -= 1;
             return self.push(Node::InterpolatedSymbol {
                 parts,
                 span: span_of(&interp.location()),
@@ -1202,10 +1355,14 @@ impl<'src> Builder<'src> {
             // AND mark the lambda boundary so `flow.return-in-ensure` recognises it
             // as a return barrier. The body is iterated for recovery purposes:
             // a compound index write inside widens its receiver on the oracle
-            // even when the lambda is never called (rigor-rs#312).
+            // even when the lambda is never called (rigor-rs#312). A compound
+            // ATTRIBUTE write's scope effect does NOT cross the closure —
+            // `OperandEffects.any?` excludes `Call*WriteNode`s (rigor-rs#343).
             self.recovery_iterative += 1;
+            self.closure_depth += 1;
             let body = self.lower_optional_body(lambda.body().as_ref());
             self.recovery_iterative -= 1;
+            self.closure_depth -= 1;
             return self.push(Node::Lambda {
                 body,
                 locals: constant_list_names(&lambda.locals()),
@@ -1222,10 +1379,15 @@ impl<'src> Builder<'src> {
             // assignment` + the call rules, plus literals now exist too). The
             // node itself stays a STATEMENT: the typer's catch-all types it
             // `Dynamic[top]` exactly like the `Statements` carrier it replaces.
+            // The values are `jump_value_type` operands — TYPED, never
+            // `evaluate`d (`return h.default ||= 0` keeps `h`'s indexed
+            // narrowings on the oracle, rigor-rs#343).
+            self.typed_depth += 1;
             let values = ret
                 .arguments()
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
+            self.typed_depth -= 1;
             return self.push(Node::Return { values, span });
         }
 
@@ -1434,6 +1596,8 @@ impl<'src> Builder<'src> {
             iterative: self.recovery_iterative > 0,
             next_sink: self.recovery_next_sink > 0,
             suppressed: self.recovery_suppressed > 0,
+            typed: self.typed_depth > 0,
+            closure: self.closure_depth > 0,
         }
     }
 
@@ -1454,18 +1618,24 @@ impl<'src> Builder<'src> {
                      iterative,
                      next_sink,
                      suppressed,
+                     typed,
+                     closure,
                  }| {
                 self.recovery_joined += u32::from(joined);
                 self.recovery_blocked += u32::from(blocked);
                 self.recovery_iterative += u32::from(iterative);
                 self.recovery_next_sink += u32::from(next_sink);
                 self.recovery_suppressed += u32::from(suppressed);
+                self.typed_depth += u32::from(typed);
+                self.closure_depth += u32::from(closure);
                 let id = self.lower_node(&node);
                 self.recovery_joined -= u32::from(joined);
                 self.recovery_blocked -= u32::from(blocked);
                 self.recovery_iterative -= u32::from(iterative);
                 self.recovery_next_sink -= u32::from(next_sink);
                 self.recovery_suppressed -= u32::from(suppressed);
+                self.typed_depth -= u32::from(typed);
+                self.closure_depth -= u32::from(closure);
                 if !bound.is_empty() {
                     self.closure_bindings.push((id, bound));
                 }
@@ -1502,17 +1672,15 @@ fn constant_list_names(list: &ruby_prism::ConstantList<'_>) -> Vec<String> {
 }
 
 /// Whether a Prism node is an assignment the lowering cannot reproduce —
-/// every operator/and/or write on a non-local target (`@x += 1`, `K += 1`,
-/// `x.f &&= v`), a `K::V` constant-path write, and the
+/// every operator/and/or write on a non-local target (`@x += 1`, `K += 1`),
+/// a `K::V` constant-path write, and the
 /// pattern-binding nodes (`expr => pat`, `expr in pat`). Local writes,
-/// multiwrites, `for` indexes, and the plain `K = v`/`@x = v`/`$g = v`/`@@x =
+/// multiwrites, `for` indexes, the compound ATTRIBUTE writes (`x.f ||= v` —
+/// `Node::AttrWrite`, rigor-rs#343), and the plain `K = v`/`@x = v`/`$g = v`/`@@x =
 /// v` forms have owned variants already; multiwrite TARGETS never reach
 /// `lower_node` standalone (a `MultiWriteNode` wraps them).
 fn is_unmodeled_write(node: &PrismNode<'_>) -> bool {
-    node.as_call_and_write_node().is_some()
-        || node.as_call_operator_write_node().is_some()
-        || node.as_call_or_write_node().is_some()
-        || node.as_class_variable_and_write_node().is_some()
+    node.as_class_variable_and_write_node().is_some()
         || node.as_class_variable_operator_write_node().is_some()
         || node.as_class_variable_or_write_node().is_some()
         || node.as_constant_and_write_node().is_some()
