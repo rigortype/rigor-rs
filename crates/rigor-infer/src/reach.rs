@@ -1171,10 +1171,19 @@ fn edge_evaluates(ast: &LoweredAst, parent: NodeId, child_span: rigor_parse::Spa
         // `eval_lambda` sub-evals the `->` body — but not its parameter
         // defaults, which ride the same span boundary; a `def`/class/module
         // evaluates its body (and only its body — never a parameter default).
+        // A `when` clause is the same split: `eval_when_or_in` sub-evals only
+        // `node.statements` — the CONDITIONS are never entered (the first gets
+        // an `on_enter` entry-scope record for `flow.unreachable-clause`, and
+        // `Narrowing.case_when_scopes` reads their shape; `propagate` fills
+        // the rest). A lambda/proc in condition position is therefore an
+        // unentered closure whose own locals floor to `Dynamic[top]` — `case v
+        // when lambda { |q| q = 1; Float(q).w }` is reference-silent
+        // (rigor-rs#332).
         Node::Lambda { body, .. }
         | Node::Definition { body, .. }
         | Node::ClassDef { body, .. }
-        | Node::ModuleDef { body, .. } => {
+        | Node::ModuleDef { body, .. }
+        | Node::When { body, .. } => {
             body.iter().any(|&b| contains(ast.get(b).span(), child_span))
         }
         // Only a real statement sequence evaluates its children: the
@@ -1192,7 +1201,6 @@ fn edge_evaluates(ast: &LoweredAst, parent: NodeId, child_span: rigor_parse::Spa
         Node::Program { .. }
         | Node::If { .. }
         | Node::Case { .. }
-        | Node::When { .. }
         | Node::Loop { .. }
         | Node::BeginRescue { .. }
         | Node::Logical { .. }
