@@ -73,6 +73,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-30 #325 CLOSED** (PR #336): `IndexedFlow` stored-slot narrowing (`h[k] ||= v` records reach `h[k]` reads). 0 FP; → #342–#344. [note](notes/20260930-issue-325-slot-narrowing.md)
 - **2026-09-30 #158 CLOSED** (PR #335): config parity — Psych dup/`<<`-merge/multi-doc/UTF-8 + `~`/`..`/dist, exit-64 surface. 0 FP; → #345–#349. [note](notes/20260930-issue-158-config.md)
 - **2026-09-30 #342 CLOSED** (PR #350): index-target `[]=` stores drop the IndexedFlow slot record (`drop_key` on MultiWrite/Loop/BeginRescue). 0 FP; → #352–#354. [note](notes/20260930-issue-342-index-target.md)
+- **2026-09-30 #341 CLOSED** (PR #351): `when`/`in`-guard writes out of reach scans. 0 FP; → #355–#357. [note](notes/20260930-i341-when.md)
 - **2026-09-30 #332 CLOSED** (PR #334): pin-value threading (`local_reach` → `(Reach, Option<Scalar>)`); nominal multi-arg + `when`-pattern FPs. 0 FP / 818; → #340/#341. [note](notes/20260930-issue-332-multi-arg.md)
 - **2026-09-30 #312 CLOSED** (PR #324): recovery collector models `joined`/`blocked`/loop-writeback marks — compound index writes widen exactly where the reference joins. 0 FP; → #325. [note](notes/20260930-issue-312-recovery.md)
 - **2026-09-30 #146 CLOSED** (PR #318): `Reach::multi` + tier-3 decline for multi-valued args; unentered closures floor to untyped. 0 FP / 818; → #330–#332. [note](notes/20260930-issue-146-untyped-args.md)
