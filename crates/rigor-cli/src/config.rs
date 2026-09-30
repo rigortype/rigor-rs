@@ -574,6 +574,19 @@ impl Config {
             Ok(m) => m,
             Err(f) => return ConfigRead::Fatal(f),
         };
+        // `coerce_severity_overrides` raises ConfigurationError at load
+        // (upstream initialize, configuration.rb:1037) — before the
+        // unknown-key pass.
+        if let Err(f) = validate_severity_overrides(&merged) {
+            return ConfigRead::Fatal(f);
+        }
+        // Upstream keeps EVERY parsed key in `data` (objects, not just
+        // strings) and renders `data.keys.map(&:to_s)` for unknown_keys —
+        // `1: one` warns `` `1` `` and loads. serde_yaml would instead die
+        // `invalid type: integer `1`, expected field identifier` inside
+        // `from_value`. Coerce non-String keys to their `to_s` up front so
+        // they take the same unknown-key path.
+        let merged = stringify_top_level_keys(merged);
         let mut cfg: Config = match serde_yaml::from_value(serde_yaml::Value::Mapping(merged.clone()))
         {
             Ok(c) => c,
@@ -1020,10 +1033,36 @@ const PATH_KEYS: [&str; 3] = ["paths", "signature_paths", "pre_eval"];
 /// that is not a mapping — an empty file parses as `nil` which IS a mapping
 /// (`|| {}`) — is `config file must be a YAML mapping: <abs>` (exit 64).
 fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
-    let text = std::fs::read_to_string(absolute).map_err(|e| LoadFailure {
+    let bytes = std::fs::read(absolute).map_err(|e| LoadFailure {
         message: format!("cannot read config {}: {e}", absolute.display()),
         code: 1,
     })?;
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            let bytes = e.as_bytes();
+            // A UTF-16 BOM makes the reference's `File.open(path, 'r:bom|utf-8')`
+            // raise `ASCII incompatible encoding needs binmode` — an uncaught
+            // ArgumentError (exit 1 + backtrace), not the SyntaxError surface.
+            if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+                return Err(LoadFailure {
+                    message: "ASCII incompatible encoding needs binmode".to_string(),
+                    code: 1,
+                });
+            }
+            // libyaml fails the whole read before the parser runs, so the mark
+            // never advances: Psych reports these at 1:1 regardless of where
+            // the bad byte sits (oracle: a `\xff` on line 3 prints `1:1`).
+            return Err(LoadFailure {
+                message: format!(
+                    "{}:1:1: not valid YAML: {}",
+                    absolute.display(),
+                    utf8_error_detail(bytes, e.utf8_error().valid_up_to())
+                ),
+                code: 64,
+            });
+        }
+    };
     let value = parse_yaml(&text).map_err(|e| {
         // Re-render as upstream's `#{absolute}:#{e.line}:#{e.column}: not
         // valid YAML: #{e.problem} #{e.context}` (exit 64). serde_yaml's
@@ -1048,6 +1087,28 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
     }
 }
 
+/// libyaml's UTF-8 reader wording (reader.c `utf8` check): the byte at
+/// `start` either cannot begin a sequence, has a bad continuation byte, or
+/// the file ends mid-sequence.
+fn utf8_error_detail(bytes: &[u8], start: usize) -> &'static str {
+    let need = match bytes[start] {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return "invalid leading UTF-8 octet",
+    };
+    for j in 1..need {
+        match bytes.get(start + j) {
+            None => return "incomplete UTF-8 octet sequence",
+            Some(&c) if !(0x80..=0xBF).contains(&c) => return "invalid trailing UTF-8 octet",
+            _ => {}
+        }
+    }
+    // Lead + continuations all present but still not valid UTF-8 (overlong,
+    // surrogate, or > U+10FFFF) — libyaml blames the lead.
+    "invalid leading UTF-8 octet"
+}
+
 /// Parse `text` as ONE YAML document the way Psych's `YAML.safe_load_file`
 /// does: the FIRST document only (a `---` follower is never even scanned —
 /// oracle: `paths: [src]\n---\nother: 1` loads doc 1 and runs), and a
@@ -1055,15 +1116,15 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
 /// `disable: [call]` then `disable: []` parses to `[]`). serde_yaml's
 /// `from_str` refuses both shapes ("more than one document",
 /// "duplicate entry with key"), so the first `Deserializer` document goes
-/// through [`DupOk`]'s pairwise collector instead; merge keys (`<<`) are
-/// applied afterward exactly as `Value`'s own parse does.
+/// through [`DupOk`]'s pairwise collector instead; `<<` merge keys are
+/// applied Psych-style inside [`DupOkVisitor::visit_map`] — NEVER through
+/// `Value::apply_merge`, which errors on non-mapping merge values where
+/// Psych keeps `<<` as a literal key.
 fn parse_yaml(text: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
     let Some(doc) = serde_yaml::Deserializer::from_str(text).next() else {
         return Ok(serde_yaml::Value::Null);
     };
-    let mut value = DupOk::deserialize(doc)?.0;
-    value.apply_merge()?;
-    Ok(value)
+    Ok(DupOk::deserialize(doc)?.0)
 }
 
 /// A `serde_yaml::Value` deserialized with Psych's duplicate-key semantics —
@@ -1151,12 +1212,144 @@ impl<'de> serde::de::Visitor<'de> for DupOkVisitor {
     {
         let mut m = serde_yaml::Mapping::new();
         while let Some((DupOk(k), DupOk(v))) = map.next_entry::<DupOk, DupOk>()? {
+            if k.as_str() == Some("<<") {
+                // YAML merge key, Psych's `merge_key` semantics — each `<<`
+                // pair is handled in document order and every `<<` is
+                // honoured (a repeated `<<` is NOT last-wins like other dup
+                // keys; oracle: two `<<:` entries both merge). A mapping
+                // value merges its entries; a sequence merges each element
+                // only when EVERY element is a mapping. Anything else keeps
+                // `<<` as a literal key (oracle: `{<<: 5}` loads
+                // `{"<<" => 5}` verbatim — no error path). Merged entries
+                // only fill slots not already taken: an explicit key always
+                // wins, and the earlier of two merges wins.
+                match v {
+                    serde_yaml::Value::Mapping(mm) => {
+                        for (mk, mv) in mm {
+                            if m.get(&mk).is_none() {
+                                m.insert(mk, mv);
+                            }
+                        }
+                    }
+                    serde_yaml::Value::Sequence(seq)
+                        if seq
+                            .iter()
+                            .all(|e| matches!(e, serde_yaml::Value::Mapping(_))) =>
+                    {
+                        for e in seq {
+                            if let serde_yaml::Value::Mapping(mm) = e {
+                                for (mk, mv) in mm {
+                                    if m.get(&mk).is_none() {
+                                        m.insert(mk, mv);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    other => {
+                        m.insert(serde_yaml::Value::String("<<".to_string()), other);
+                    }
+                }
+                continue;
+            }
             // Psych last-wins: `Hash#[]=` overwrites, and serde_yaml's
             // `Mapping::insert` replaces the existing entry the same way.
             m.insert(k, v);
         }
         Ok(DupOk(serde_yaml::Value::Mapping(m)))
     }
+
+    /// serde_yaml surfaces a non-standard tag (`!foo`, `!ruby/object:Foo`)
+    /// through `visit_enum` — the "variant" is the tag text minus the `!`.
+    /// Psych drops an unrecognized tag and loads the bare value; `!ruby/*`
+    /// is `Psych::DisallowedClass` upstream (uncaught — fatal on both sides,
+    /// so here it just keeps dying).
+    fn visit_enum<A>(self, data: A) -> Result<DupOk, A::Error>
+    where
+        A: serde::de::EnumAccess<'de>,
+    {
+        use serde::de::VariantAccess;
+        let (tag, variant) = data.variant::<String>()?;
+        if tag.starts_with("ruby/") {
+            return Err(<A::Error as serde::de::Error>::custom(format!(
+                "Tried to load unspecified class: {tag}"
+            )));
+        }
+        Ok(variant.newtype_variant::<DupOk>()?)
+    }
+}
+
+/// `data.keys.map(&:to_s)` — coerce every non-String TOP-LEVEL key to its
+/// Ruby `to_s` (`` `1` `` → `1`, `["a","b"]` → `["a", "b"]`, `nil` → `""`,
+/// `{"x"=>1}` → `{"x" => 1}`) so it flows into the unknown-key warning like
+/// the reference. A coerced key never shadows a literal String key —
+/// upstream's `data["paths"]`-style fetches only see the String one.
+fn stringify_top_level_keys(map: serde_yaml::Mapping) -> serde_yaml::Mapping {
+    let mut out = serde_yaml::Mapping::new();
+    for (k, v) in map {
+        if matches!(k, serde_yaml::Value::String(_)) {
+            out.insert(k, v);
+        } else {
+            let sk = serde_yaml::Value::String(ruby_to_s(&k));
+            if !out.contains_key(&sk) {
+                out.insert(sk, v);
+            }
+        }
+    }
+    out
+}
+
+/// `Configuration#coerce_severity_overrides` (configuration.rb:1037): the
+/// merged `severity_overrides:` value must be a Hash, every VALUE must be a
+/// String/Symbol (`a YAML boolean` message — bare `off` is already `false`
+/// upstream, though serde_yaml's 1.2 parse keeps it a string), and the
+/// severity must be in `VALID_SEVERITIES`. Errors are ConfigurationError —
+/// `rigor: <msg>` + exit 64 — raised against the FIRST bad entry in document
+/// order. Keys keep their parsed type for `k.inspect` (`severity_overrides[5]`,
+/// `severity_overrides["<<"]`).
+fn validate_severity_overrides(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(v) = merged.get("severity_overrides") else {
+        return Ok(());
+    };
+    let serde_yaml::Value::Mapping(map) = v else {
+        return Err(LoadFailure {
+            message: format!(
+                "severity_overrides must be a Hash, got {}",
+                ruby_inspect(v)
+            ),
+            code: 64,
+        });
+    };
+    for (k, val) in map {
+        let kins = ruby_inspect(k);
+        if let serde_yaml::Value::String(s) = val {
+            if crate::severity::ResolvedSeverity::from_str(s).is_none() {
+                return Err(LoadFailure {
+                    message: format!(
+                        "severity_overrides[{kins}] must be one of [:error, :warning, :info, :off], got {}",
+                        ruby_inspect(val)
+                    ),
+                    code: 64,
+                });
+            }
+            continue;
+        }
+        let hint = if *val == serde_yaml::Value::Bool(false) {
+            " — did you mean the string \"off\"?"
+        } else {
+            ""
+        };
+        return Err(LoadFailure {
+            message: format!(
+                "severity_overrides[{kins}] is {}, a YAML boolean{hint} \
+                 Bare off/on/no/yes/true/false are parsed as booleans; quote the severity \
+                 (e.g. \"off\").",
+                ruby_inspect(val)
+            ),
+            code: 64,
+        });
+    }
+    Ok(())
 }
 
 /// Split a serde_yaml error Display into Psych's `(line, column,
@@ -2289,6 +2482,201 @@ mod severity_config_tests {
         // read.
         assert_eq!(cfg.paths, vec![dir.join("src").display().to_string()]);
         assert!(cfg.disable.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// EVERY `<<` merge key applies — a repeated `<<` is not last-wins like
+    /// other duplicate keys (oracle: both `<<:` entries merge; both
+    /// suppressions land). serde_yaml's `Value::apply_merge` would keep only
+    /// the last `<<` — and silently drop the suppression.
+    #[test]
+    fn duplicate_merge_keys_all_apply_like_psych() {
+        let dir = cfg_dir("dupmerge");
+        std::fs::write(
+            dir.join("m.yml"),
+            "severity_overrides:\n  <<: {call.unresolved-toplevel: \"off\"}\n  <<: {call.undefined-method: \"off\"}\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join("m.yml"));
+        let overrides = cfg.severity_overrides();
+        assert_eq!(
+            overrides,
+            vec![
+                (
+                    "call.unresolved-toplevel".to_string(),
+                    crate::severity::ResolvedSeverity::Off
+                ),
+                (
+                    "call.undefined-method".to_string(),
+                    crate::severity::ResolvedSeverity::Off
+                ),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `<<` whose value can't merge — a scalar, or a sequence containing a
+    /// non-mapping — stays a LITERAL `<<` key (oracle: `mystery: {<<: [a,b]}`
+    /// loads `{"<<" => ["a","b"]}` and warns about `mystery`, not a YAML
+    /// error; `severity_overrides: {<<: 5}` reaches the coercion as
+    /// `severity_overrides["<<"] is 5, a YAML boolean …`).
+    #[test]
+    fn non_mergeable_merge_key_stays_literal() {
+        let dir = cfg_dir("litmerge");
+        std::fs::write(dir.join("a.yml"), "mystery: {<<: [a, b]}\npaths: [src]\n").unwrap();
+        let cfg = parsed(&dir.join("a.yml"));
+        assert!(cfg.present_keys.contains("mystery"));
+        assert_eq!(cfg.paths, vec![dir.join("src").display().to_string()]);
+
+        // `<<` inside severity_overrides stays literal → hits the coercion's
+        // non-String-value branch, oracle wording.
+        std::fs::write(dir.join("b.yml"), "severity_overrides: {<<: 5}\n").unwrap();
+        match Config::read(&dir.join("b.yml")) {
+            ConfigRead::Fatal(f) => {
+                assert_eq!(f.code, 64);
+                assert_eq!(
+                    f.message,
+                    "severity_overrides[\"<<\"] is 5, a YAML boolean \
+                     Bare off/on/no/yes/true/false are parsed as booleans; \
+                     quote the severity (e.g. \"off\")."
+                );
+            }
+            _ => panic!("literal `<<` must reach coerce_severity_overrides"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sequence-of-mappings `<<` merges EACH element (earlier wins on
+    /// overlap — `or_insert` order), interleaved literal keys stay put.
+    #[test]
+    fn merge_sequence_and_interleave_like_psych() {
+        let dir = cfg_dir("seqmerge");
+        std::fs::write(
+            dir.join("s.yml"),
+            "severity_overrides:\n  <<: [{call.unresolved-toplevel: \"off\"}, {call.unresolved-toplevel: \"info\"}]\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join("s.yml"));
+        // Earlier element wins — "off", not the second element's "info".
+        assert_eq!(
+            cfg.severity_overrides(),
+            vec![(
+                "call.unresolved-toplevel".to_string(),
+                crate::severity::ResolvedSeverity::Off
+            )]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Non-String TOP-LEVEL keys ride `data.keys.map(&:to_s)` upstream: `1`
+    /// warns `` `1` ``, `[a,b]` warns `` `["a", "b"]` ``, `~` warns `` `` ``,
+    /// `{x: 1}` warns `` `{"x" => 1}` `` — never `invalid type: … field
+    /// identifier`.
+    #[test]
+    fn non_string_top_level_keys_warn_not_die() {
+        let dir = cfg_dir("nonstrkey");
+        for (yaml, want_key) in [
+            ("1: one\n", "1"),
+            ("? [a, b]\n: v\n", "[\"a\", \"b\"]"),
+            ("~: v\n", ""),
+            ("? {x: 1}\n: v\n", "{\"x\" => 1}"),
+        ] {
+            std::fs::write(dir.join("k.yml"), yaml).unwrap();
+            let cfg = parsed(&dir.join("k.yml"));
+            assert!(
+                cfg.unknown_keys().contains(&want_key),
+                "{yaml:?} → unknown keys {:?} missing {want_key:?}",
+                cfg.unknown_keys()
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unrecognized tag (`!foo`) is DROPPED upstream — the bare value
+    /// loads, the key warns unknown. `!ruby/*` is `Psych::DisallowedClass`
+    /// (uncaught) upstream — still fatal here. `!!str` resolves natively.
+    #[test]
+    fn unknown_tags_drop_like_psych() {
+        let dir = cfg_dir("tags");
+        for yaml in ["x: !foo 1\n", "x: !foo [a, b]\n", "x: !foo {k: 1}\n", "x: !!str 5\n"] {
+            std::fs::write(dir.join("t.yml"), yaml).unwrap();
+            let cfg = parsed(&dir.join("t.yml"));
+            assert!(cfg.unknown_keys().contains(&"x"), "{yaml:?} must load");
+        }
+        std::fs::write(dir.join("r.yml"), "x: !ruby/object:Foo {}\n").unwrap();
+        match Config::read(&dir.join("r.yml")) {
+            ConfigRead::Fatal(f) => assert_eq!(f.code, 64),
+            _ => panic!("!ruby/object must stay fatal"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Invalid UTF-8 is libyaml's reader error, re-rendered upstream as
+    /// `<abs>:1:1: not valid YAML: <detail>` (exit 64) — the mark never
+    /// advances so position is always 1:1. A UTF-16 BOM is a different
+    /// upstream surface (uncaught ArgumentError → exit 1).
+    #[test]
+    fn invalid_utf8_renders_like_psych() {
+        let dir = cfg_dir("utf8");
+        for (bytes, want) in [
+            (&b"a: ok\nb: ok2\nc: \xff bad\n"[..], "invalid leading UTF-8 octet"),
+            (&b"paths: [src]\n\xe2\x82"[..], "incomplete UTF-8 octet sequence"),
+            (&b"x: \xe2\x28y\n"[..], "invalid trailing UTF-8 octet"),
+        ] {
+            std::fs::write(dir.join("u.yml"), bytes).unwrap();
+            match Config::read(&dir.join("u.yml")) {
+                ConfigRead::Fatal(f) => {
+                    assert_eq!(f.code, 64);
+                    assert!(
+                        f.message.ends_with(&format!(":1:1: not valid YAML: {want}")),
+                        "{bytes:?} → {:?}",
+                        f.message
+                    );
+                }
+                _ => panic!("{bytes:?} must be a fatal parse error"),
+            }
+        }
+        // UTF-16 BOM → the `r:bom|utf-8` ArgumentError surface, exit 1.
+        std::fs::write(dir.join("u16.yml"), b"\xff\xfe a\x00:\x00 \x001\x00\n\x00").unwrap();
+        match Config::read(&dir.join("u16.yml")) {
+            ConfigRead::Fatal(f) => assert_eq!(f.code, 1, "{:?}", f.message),
+            _ => panic!("UTF-16 BOM must be fatal"),
+        }
+        // A valid UTF-8 BOM still loads.
+        std::fs::write(dir.join("bom.yml"), b"\xef\xbb\xbfpaths: [src]\n").unwrap();
+        let cfg = parsed(&dir.join("bom.yml"));
+        assert_eq!(cfg.paths, vec![dir.join("src").display().to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `coerce_severity_overrides` upstream: non-Hash → `must be a Hash`;
+    /// non-String value → `a YAML boolean` (hint only for `false`); bad
+    /// severity name → `must be one of`.
+    #[test]
+    fn severity_overrides_validation_matches_reference() {
+        let dir = cfg_dir("sevval");
+        for (yaml, want) in [
+            ("severity_overrides:\n", "severity_overrides must be a Hash, got nil"),
+            ("severity_overrides: [a, b]\n", "severity_overrides must be a Hash, got [\"a\", \"b\"]"),
+            (
+                "severity_overrides:\n  k: v\n",
+                "severity_overrides[\"k\"] must be one of [:error, :warning, :info, :off], got \"v\"",
+            ),
+            (
+                "severity_overrides:\n  call: false\n",
+                "severity_overrides[\"call\"] is false, a YAML boolean — did you mean the string \"off\"? \
+                 Bare off/on/no/yes/true/false are parsed as booleans; quote the severity (e.g. \"off\").",
+            ),
+        ] {
+            std::fs::write(dir.join("v.yml"), yaml).unwrap();
+            match Config::read(&dir.join("v.yml")) {
+                ConfigRead::Fatal(f) => {
+                    assert_eq!(f.code, 64, "{yaml:?}");
+                    assert_eq!(f.message, want, "{yaml:?}");
+                }
+                _ => panic!("{yaml:?} must be fatal"),
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
