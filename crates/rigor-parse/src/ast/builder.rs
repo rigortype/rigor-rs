@@ -895,14 +895,16 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(range) = node.as_range_node() {
-            // Lower both bounds for reachability; the node itself types Dynamic.
-            if let Some(l) = range.left() {
-                self.lower_node(&l);
-            }
-            if let Some(r) = range.right() {
-                self.lower_node(&r);
-            }
+            // Lower both bounds for reachability; the node itself types
+            // Dynamic. The ids stay linked on the node: a range evaluates
+            // its bounds unconditionally in order (the reference's
+            // `OPERAND_CONTAINERS` includes `RangeNode`), which the flow
+            // replay reads (rigor-rs#306).
+            let left = range.left().map(|l| self.lower_node(&l));
+            let right = range.right().map(|r| self.lower_node(&r));
             return self.push(Node::Range {
+                left,
+                right,
                 span: span_of(&range.location()),
             });
         }
