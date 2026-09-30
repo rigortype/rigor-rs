@@ -1025,15 +1025,13 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
         code: 1,
     })?;
     let value = serde_yaml::from_str::<serde_yaml::Value>(&text).map_err(|e| {
-        let (line, column) = e
-            .location()
-            .map(|l| (l.line(), l.column()))
-            .unwrap_or((0, 0));
-        // serde_yaml's Display already ends with " at line L column C" —
-        // strip it so the detail reads like Psych's `problem context`.
-        let detail = e.to_string();
-        let suffix = format!(" at line {line} column {column}");
-        let detail = detail.strip_suffix(&suffix).unwrap_or(&detail);
+        // Re-render as upstream's `#{absolute}:#{e.line}:#{e.column}: not
+        // valid YAML: #{e.problem} #{e.context}` (exit 64). serde_yaml's
+        // Display is `{problem} at line {pl} column {pc}, {context} at line
+        // {cl} column {cc}` (context optional); Psych's `e.line`/`e.column`
+        // name the CONTEXT position — the LAST `at line` — and the detail is
+        // `problem` + ` ` + `context` with no position text at all.
+        let (line, column, detail) = psych_render(&e.to_string());
         LoadFailure {
             message: format!("{}:{line}:{column}: not valid YAML: {detail}", absolute.display()),
             code: 64,
@@ -1048,6 +1046,54 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
             code: 64,
         }),
     }
+}
+
+/// Split a serde_yaml error Display into Psych's `(line, column,
+/// "problem context")` pieces: the header position is the LAST embedded
+/// ` at line L column C` (the context anchor — where the construct started,
+/// e.g. the `[` of an unterminated flow sequence), and the detail is
+/// `problem` + ` ` + `context` — the position fragments removed and serde's
+/// `", "` separator between them replaced by a space. A message with no
+/// position text keeps `(0, 0)` and itself as the detail.
+fn psych_render(detail: &str) -> (usize, usize, String) {
+    // Each ` at line <n> column <m>` marker as (start, end, line, column).
+    let mut marks: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut search = 0usize;
+    while let Some(off) = detail[search..].find(" at line ") {
+        let start = search + off;
+        let tail = &detail[start + " at line ".len()..];
+        let Some((n, r)) = tail.split_once(" column ") else {
+            search = start + " at line ".len();
+            continue;
+        };
+        let Ok(line) = n.trim().parse::<usize>() else {
+            search = start + " at line ".len();
+            continue;
+        };
+        let digits = r.bytes().take_while(|b| b.is_ascii_digit()).count();
+        let Ok(column) = r[..digits].parse::<usize>() else {
+            search = start + " at line ".len();
+            continue;
+        };
+        let end = start + " at line ".len() + n.len() + " column ".len() + digits;
+        marks.push((start, end, line, column));
+        search = end;
+    }
+    let Some(&(last_start, _, line, column)) = marks.last() else {
+        return (0, 0, detail.to_string());
+    };
+    // The problem is everything before the FIRST marker; the context is what
+    // lies between the first marker's end and the last marker's start, minus
+    // serde's `, ` separator. (libyaml emits at most problem+context here.)
+    let problem = &detail[..marks[0].0];
+    let between = &detail[marks[0].1..last_start];
+    let context = between.strip_prefix(", ").unwrap_or(between);
+    let rendered = if context.is_empty() {
+        problem.to_string()
+    } else {
+        format!("{problem} {context}")
+    };
+    (line, column, rendered)
 }
 
 /// `Configuration::load_with_includes` — reads `absolute` plus every file its
