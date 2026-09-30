@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{ClassId, Interner, Type, TypeId};
+use rigor_types::{ClassId, Interner, ShapeKey, Type, TypeId};
 
 use crate::{
     block_bound_names, collect_flow_writes, collect_rebind_writes, indexed_flow_writes,
@@ -267,10 +267,12 @@ impl<'i> Typer<'i> {
                     // the reference's `rescue_exception_type` (`bind_rescue_
                     // reference`): `StandardError` for a bare `rescue`, the
                     // union of the named classes otherwise, `Dynamic[top]`
-                    // whenever a designator does not resolve. Binding the real
-                    // class (not the entry binding, not a bare `Dynamic`) is
-                    // what types `rescue => e; e.frobnicate` `for StandardError`
-                    // exactly as the reference does.
+                    // whenever a designator does not resolve. The binding
+                    // replaces any collection carrier the same local held on
+                    // entry (so the arm can't witness `e` as the entry's
+                    // Array/Hash); the `for StandardError` use the reference
+                    // fires is outside this pass's Array/Hash envelope, a
+                    // coverage residual not a witness.
                     if let Some(name) = &cl.bound_name {
                         arm.insert(
                             name.clone(),
@@ -1015,7 +1017,7 @@ impl<'i> Typer<'i> {
     /// and the reason a faithful port of the content-join model is its own arc.
     ///
     /// [`join_flow_envs`]: crate::join_flow_envs
-    fn coll_nominal_with(
+    pub(crate) fn coll_nominal_with(
         &self,
         interner: &mut Interner,
         class_name: &str,
@@ -1056,19 +1058,25 @@ impl<'i> Typer<'i> {
             members.sort_unstable();
             members
         };
-        match interner.get(pre_ty) {
+        let union_arms = match interner.get(pre_ty) {
+            Type::Union(arms) => Some(arms.clone()),
+            _ => None,
+        };
+        match union_arms {
             // `widen_union` (mutation_widening.rb:316) widens EACH arm and
             // `Combinator.union` re-joins, deduping only structurally identical
             // arms — the edges converge iff every arm grows to the same set.
             // Collapsing to one merged carrier fired where the oracle kept the
-            // union (probe r2).
-            Type::Union(arms) => {
-                let arms = arms.clone();
+            // union (probe r2), and the member sets must carry the seed's
+            // literal content or distinct literal arms collapse the same way:
+            // `c ? [1] : [2]` then `a.push(3)` mints `Array[1 | …]` against
+            // `Array[2 | …]` in the reference, two arms `Combinator.union`
+            // keeps — erased class members alone mint one `Array[Integer]`
+            // and fired `frobnicate` where the oracle stays silent.
+            Some(arms) => {
                 let mut minted = Vec::with_capacity(arms.len());
-                let mut member_evidence = false;
                 for arm in arms {
-                    let members = grown(&Typer::coll_value_members(interner, arm));
-                    member_evidence |= !members.is_empty();
+                    let members = grown(&self.coll_value_members(interner, arm));
                     if let Some(t) = self.coll_nominal_with(interner, cls, &members) {
                         minted.push(t);
                     }
@@ -1077,61 +1085,107 @@ impl<'i> Typer<'i> {
                 minted.dedup();
                 match minted.as_slice() {
                     [] => None,
-                    // Collapse only on MEMBER evidence: arms that all grow to
-                    // an EMPTY member set mint the same bare nominal where the
-                    // reference keeps structurally distinct carriers —
-                    // `widen_tuple([])` is `Array[untyped]`, never the raw
-                    // `Nominal[Array]`, and a `HashShape`'s pinned pairs never
-                    // equal the other edge's added key (the gitlab
-                    // `attributes[:error] = error if error` → `compact!` row
-                    // fires `for Hash` here where the oracle stays silent).
-                    // Keeping the union is the reference's own outcome.
-                    [only] if member_evidence => Some(*only),
-                    [_] => Some(pre_ty),
+                    [only] => Some(*only),
                     _ => Some(interner.intern(Type::Union(minted))),
                 }
             }
-            _ => self.coll_nominal_with(
-                interner,
-                cls,
-                &grown(&Typer::coll_value_members(interner, pre_ty)),
-            ),
+            None => {
+                let members = grown(&self.coll_value_members(interner, pre_ty));
+                self.coll_nominal_with(interner, cls, &members)
+            }
         }
     }
 
-    /// The store-value classes a carrier has accumulated so far, in canonical
-    /// order (the `args` of [`Typer::coll_nominal_with`], unwrapped).
+    /// The member evidence a carrier's widened form holds, in canonical order
+    /// — the `args` of a [`Typer::coll_nominal_with`] nominal, unwrapped, and
+    /// for a literal seed the content `widen_tuple`/`widen_hash_shape` write
+    /// into the bound (`mutation_widening.rb:535,555`).
     ///
-    /// A free function rather than a method: it reads nothing but the interner,
-    /// and clippy 1.88 — the version CI pins — flags a `self` that only the
-    /// recursive call uses (`only_used_in_recursion`).
-    fn coll_value_members(interner: &Interner, ty: TypeId) -> Vec<TypeId> {
-        let args = match interner.get(ty) {
-            Type::Nominal { args, .. } => args,
+    /// The literal content is load-bearing, not cosmetic: `widen_union`
+    /// widens each arm memberwise and `Combinator.union` dedups on structural
+    /// equality, so `c ? [1] : [2]` under `a.push(3)` must grow to
+    /// `Array[1 | …] | Array[2 | …]` — two arms the union keeps — not one
+    /// merged `Array[Integer]` a use site then witnesses. `Tuple` elements
+    /// enter AS the pin the slot holds (`values: :keep` — only a slot-
+    /// rewriting mutator erases it, a documented residual); a `HashShape`
+    /// contributes each key's erased class exactly as `key_union_for`
+    /// (`content_join.rb:510`) spells it — `true`/`false`/`nil` keys keep the
+    /// constant carrier, `Other` names nothing — plus each pinned value.
+    /// A `Nominal` contributes every arg's members (the `Hash[K, V]` two-arg
+    /// form flattens to the same bag — a documented over-merge, residual
+    /// direction only).
+    pub(crate) fn coll_value_members(&self, interner: &mut Interner, ty: TypeId) -> Vec<TypeId> {
+        let mut out: Vec<TypeId> = Vec::new();
+        match interner.get(ty) {
+            Type::Nominal { args, .. } => {
+                for &a in args.clone().iter() {
+                    match interner.get(a) {
+                        Type::Union(ms) => {
+                            for &m in ms.clone().iter() {
+                                Self::push_unique(&mut out, m);
+                            }
+                        }
+                        _ => Self::push_unique(&mut out, a),
+                    }
+                }
+            }
+            Type::Tuple(elems) => {
+                for &e in elems.clone().iter() {
+                    Self::push_unique(&mut out, e);
+                }
+            }
+            Type::HashShape(members) => {
+                for m in members.clone().iter() {
+                    // `key_union_for` (`content_join.rb:510`): `true`/`false`/
+                    // `nil` keys keep the constant carrier, every other
+                    // literal key erases to its class nominal, and a
+                    // non-literal `Other` key names nothing.
+                    match &m.key {
+                        ShapeKey::Bool(true) => {
+                            let t = interner.true_();
+                            Self::push_unique(&mut out, t);
+                        }
+                        ShapeKey::Bool(false) => {
+                            let t = interner.false_();
+                            Self::push_unique(&mut out, t);
+                        }
+                        ShapeKey::Nil => {
+                            let t = interner.nil();
+                            Self::push_unique(&mut out, t);
+                        }
+                        _ => {}
+                    }
+                    let key_class = match &m.key {
+                        ShapeKey::Sym(_) => Some("Symbol"),
+                        ShapeKey::Str(_) => Some("String"),
+                        ShapeKey::Int(_) => Some("Integer"),
+                        ShapeKey::Float(_) => Some("Float"),
+                        ShapeKey::Bool(_) | ShapeKey::Nil | ShapeKey::Other => None,
+                    };
+                    if let Some(class) = key_class.and_then(|n| self.index.class_id(n)) {
+                        Self::push_store_member(
+                            interner,
+                            &mut out,
+                            Type::Nominal { class, args: vec![] },
+                        );
+                    }
+                    Self::push_unique(&mut out, m.value);
+                }
+            }
             // Defensive: the store path handles a `Nominal[C] | Nominal[C]`
             // union arm-by-arm before reaching here (`widen_union`), so this
             // arm only merges member sets if a union arrives some other way.
             Type::Union(members) => {
-                let mut out: Vec<TypeId> = Vec::new();
-                for &m in members {
-                    for v in Typer::coll_value_members(interner, m) {
-                        if !out.contains(&v) {
-                            out.push(v);
-                        }
+                for &m in members.clone().iter() {
+                    for v in self.coll_value_members(interner, m) {
+                        Self::push_unique(&mut out, v);
                     }
                 }
-                out.sort_unstable();
-                return out;
             }
-            _ => return Vec::new(),
-        };
-        match args.first() {
-            None => Vec::new(),
-            Some(&a) => match interner.get(a) {
-                Type::Union(ms) => ms.clone(),
-                _ => vec![a],
-            },
+            _ => {}
         }
+        out.sort_unstable();
+        out
     }
 
     /// The erased classes one stored value contributes to the carrier's value
@@ -1406,6 +1460,21 @@ impl<'i> Typer<'i> {
                     Self::push_unique(&mut added, m);
                 }
             }
+        }
+        // `join_added_elements`/`join_added_pairs` close with `gradual_floor`:
+        // a content-adder's join leaves the bound OPEN (`untyped` enters both
+        // sides — the reference renders the floor as the `Dynamic[top]` member
+        // of `Hash[Dynamic[top] | Symbol, Dynamic[top] | Integer]`). The floor
+        // is load-bearing on the union path: a grown edge and an untouched
+        // `HashShape`/`Tuple` edge can only stay distinct while their member
+        // sets differ. `Dynamic[top]` itself cannot be the marker — it is
+        // already the member an untyped SEED value contributes (`{p: @x}`),
+        // so the gitlab `attributes[:error] = error if error` → `compact!`
+        // row would erase the distinction the floor exists to keep. `top` is
+        // the member no store evidence can ever mint, which is exactly the
+        // separation the reference's per-side `untyped` gives it.
+        if !Typer::coll_store_value_args(method, args).is_empty() {
+            Self::push_unique(&mut added, interner.top());
         }
         added
     }

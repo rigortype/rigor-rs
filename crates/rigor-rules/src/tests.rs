@@ -3702,3 +3702,80 @@ fn issue_146_multi_value_argument_stays_silent() {
     assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
 }
+
+/// rigor-rs#309, adversarial review — a union of DISTINCT literal
+/// collection carriers stays a union after a store mutator. The
+/// reference's `widen_union` widens each arm memberwise (`widen_tuple`
+/// mints `Array[element_type]`; `widen_hash_shape` mints key/value args)
+/// and `Combinator.union` dedups only structurally identical arms, so
+/// `Tuple[1] | Tuple[2]` under `push(3)` is `Array[1 | top] |
+/// Array[2 | top]` — a union receiver no negative rule fires on. The
+/// port's flow-env widening minted a bare `Nominal[Array]` per literal
+/// arm, collapsed the union, and fired `frobnicate` where the oracle is
+/// silent: a new FP family introduced by the first union-normalization
+/// fix.
+#[test]
+fn issue_309_union_literal_arms_stay_distinct_end_to_end() {
+    for src in [
+        // The reviewer's bisected row: two distinct literal Tuple arms.
+        b"def f(c)\n  a = c ? [1] : [2]\n  a.push(3)\n  a.frobnicate_zzz\nend\n" as &[u8],
+        // The same union via the rescue join — a rebind on the protected
+        // path unions with the entry literal.
+        b"def f\n  b = [1]\n  begin\n    b = [2]\n  rescue\n    nil\n  end\n  b.push(3)\n  b.frobnicate_zzz\nend\n",
+        // … and via a plain `if`-modifier rebind.
+        b"def f(c)\n  a = [1]\n  a = [2] if c\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+        // Empty against non-empty, longer literals, string members.
+        b"def f(c)\n  a = c ? [1] : []\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+        b"def f(c)\n  a = c ? [1, 2] : [3, 4]\n  a << 5\n  a.frobnicate_zzz\nend\n",
+        b"def f(c)\n  a = c ? [\"s\"] : [\"t\"]\n  a << \"u\"\n  a.frobnicate_zzz\nend\n",
+        // The Hash twin: distinct HashShape arms under `[]=`.
+        b"def f(c)\n  h = c ? {a: \"s\"} : {b: 1}\n  h[:k] = 9\n  h.frobnicate_zzz\nend\n",
+        // The gitlab changes_access_logger shape — the conditional `[]=`
+        // edge's grown member evidence must survive `compact!` or the
+        // `Hash#stringify_keys!` FP family returns.
+        b"def f(error)\n  h = {a: 1, p: @x}\n  h[:e] = error if error\n  h.compact!\n  h.frobnicate_zzz\nend\n",
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected silent (reference is silent at e59b7b89), got {diags:?} for {:?}",
+            String::from_utf8_lossy(src),
+        );
+    }
+    // The toplevel spellings of the two bisected rows — the flow-env
+    // replay path that minted the collapsed carrier.
+    for src in [
+        b"a = $c ? [1] : [2]\na.push(3)\na.frobnicate_zzz\n" as &[u8],
+        b"h = $c ? {a: \"s\"} : {b: 1}\nh[:k] = 9\nh.frobnicate_zzz\n",
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected silent, got {diags:?} for {:?}",
+            String::from_utf8_lossy(src),
+        );
+    }
+}
+
+/// The dedup is structural, not positional: arms that widen to the SAME
+/// carrier still collapse and fire — identical literal seeds, and the
+/// rescue join that unions a `Tuple`-grown `Nominal[Array]` arm with the
+/// entry `Nominal` arm (`coll_union_literal_arms_converge_fires`'s
+/// end-to-end twin).
+#[test]
+fn issue_309_union_converging_arms_still_fire_end_to_end() {
+    let diags = run(b"def f(c)\n  a = c ? [1] : [1]\n  a.push(3)\n  a.frobnicate_zzz\nend\n");
+    assert_eq!(
+        diags.iter().filter(|d| d.rule_id == CALL_UNDEFINED_METHOD).count(),
+        1,
+        "expected the converged carrier to fire, got {diags:?}"
+    );
+    let diags = run(
+        b"def f\n  b = [1, 2, 3]\n  begin\n    b.unshift(5)\n  rescue\n    nil\n  end\n  b.push(6)\n  b.frobnicate_zzz\nend\n",
+    );
+    assert_eq!(
+        diags.iter().filter(|d| d.rule_id == CALL_UNDEFINED_METHOD).count(),
+        1,
+        "expected the rescue-grown carrier to fire, got {diags:?}"
+    );
+}

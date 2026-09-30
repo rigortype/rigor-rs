@@ -526,3 +526,52 @@ fn coll_rescue_index_reference_silent() {
         None,
     );
 }
+
+/// Union-member growth dedups on the arm's WHOLE widened content, so literal
+/// seeds keep the arms distinct (`widen_union` memberwise + `Combinator.union`
+/// structural dedup): `c ? [1] : [2]` under `a.push(3)` is `Array[1 | …] |
+/// Array[2 | …]` in the reference — a union `receiver_descriptor` declines.
+/// Member sets that read only the erased classes mint one `Array[Integer]`
+/// and fired `frobnicate` where the oracle is silent (adversarial review of
+/// rigor-rs#309).
+#[test]
+fn coll_union_literal_arms_stay_distinct() {
+    for src in [
+        // The ternary join the reviewer bisected to: two literal Tuple arms.
+        b"def f(c)\n  a = c ? [1] : [2]\n  a.push(3)\n  a.frobnicate_zzz\nend\n" as &[u8],
+        // The same union through the rescue join — a rebind on the
+        // protected path unions with the entry literal.
+        b"def f\n  b = [1]\n  begin\n    b = [2]\n  rescue\n    nil\n  end\n  b.push(3)\n  b.frobnicate_zzz\nend\n",
+        // … and through a plain `if` modifier rebind.
+        b"def f(c)\n  a = [1]\n  a = [2] if c\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+        // Empty against non-empty, longer literals, string members: every
+        // pair of DISTINCT literal seeds keeps two arms.
+        b"def f(c)\n  a = c ? [1] : []\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+        b"def f(c)\n  a = c ? [1, 2] : [3, 4]\n  a << 5\n  a.frobnicate_zzz\nend\n",
+        b"def f(c)\n  a = c ? [\"s\"] : [\"t\"]\n  a << \"u\"\n  a.frobnicate_zzz\nend\n",
+        // The Hash twin — distinct HashShape arms under `[]=`.
+        b"def f(c)\n  h = c ? {a: \"s\"} : {b: 1}\n  h[:k] = 9\n  h.frobnicate_zzz\nend\n",
+        // A grown edge must not collapse onto the untouched edge either:
+        // the content-adder's `gradual_floor` (an `untyped` member in the
+        // reference's bound) is what separated the gitlab
+        // `attributes[:error] = error if error` edge from the bare
+        // `HashShape` edge all the way to `compact!`.
+        b"def f(c)\n  h = {a: 1}\n  h[:e] = c if c\n  h.compact!\n  h.frobnicate_zzz\nend\n",
+    ] {
+        assert_eq!(snap(src, "frobnicate_zzz"), None, "{:?}", src);
+    }
+}
+
+/// The other direction still converges: literal seeds whose grown member
+/// sets AGREE mint the same arm, the union dedups, and the use fires —
+/// `Combinator.union`'s structural dedup is symmetric.
+#[test]
+fn coll_union_literal_arms_converge_fires() {
+    assert_eq!(
+        snap(
+            b"def f(c)\n  a = c ? [1] : [1]\n  a.push(3)\n  a.frobnicate_zzz\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+}
