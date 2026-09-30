@@ -1881,7 +1881,7 @@ fn reload_config(ctx: &ServerContext, st: &mut Session) -> Option<(MessageType, 
             std::mem::replace(&mut st.config_broken, false).then(|| {
                 (
                     MessageType::INFO,
-                    "rigor: .rigor.yml reloaded — the earlier error is resolved".to_string(),
+                    "rigor: config reloaded — the earlier error is resolved".to_string(),
                 )
             })
         }
@@ -1894,22 +1894,29 @@ fn reload_config(ctx: &ServerContext, st: &mut Session) -> Option<(MessageType, 
     }
 }
 
-/// Read `<root>/.rigor.yml` into the session's answer for "what is the config".
+/// Read the project's config into the session's answer for "what is the
+/// config", following `Configuration::DISCOVERY_ORDER` (`.rigor.yml`, then
+/// `.rigor.dist.yml` — the first present wins outright).
 /// `Ok` = usable (parsed, or the defaults because there is no file); `Err(reason)`
 /// = the file is THERE but unusable, and the caller must decide what to serve
 /// instead — [`reload_config`] keeps the last good config, startup falls back to
 /// defaults because it has none.
 fn read_project_config(root: &Path) -> Result<Config, String> {
-    match Config::read(&root.join(".rigor.yml")) {
-        crate::config::ConfigRead::Parsed(cfg) => Ok(*cfg),
-        // No file is a valid configuration — the defaults, exactly as a project
-        // that never wrote one gets. Reloading to defaults after a DELETE is
-        // correct for the same reason.
-        crate::config::ConfigRead::Absent(_) => Ok(Config::default()),
-        crate::config::ConfigRead::Unreadable(e) | crate::config::ConfigRead::Malformed(e) => {
-            Err(e)
+    // `Configuration::DISCOVERY_ORDER`: `.rigor.yml` then `.rigor.dist.yml` —
+    // the first present wins outright (includes are the only merge upstream).
+    for name in [".rigor.yml", ".rigor.dist.yml"] {
+        match Config::read(&root.join(name)) {
+            crate::config::ConfigRead::Parsed(cfg) => return Ok(*cfg),
+            // Absent is a valid answer only when NEITHER candidate exists —
+            // try the next before settling on defaults.
+            crate::config::ConfigRead::Absent(_) => continue,
+            crate::config::ConfigRead::Fatal(f) => return Err(f.message),
         }
     }
+    // No file is a valid configuration — the defaults, exactly as a project
+    // that never wrote one gets. Reloading to defaults after a DELETE is
+    // correct for the same reason.
+    Ok(Config::default())
 }
 
 /// The user-facing text for a `.rigor.yml` that will not parse. Names WHICH
@@ -1919,7 +1926,7 @@ fn read_project_config(root: &Path) -> Result<Config, String> {
 /// file never had one and is running on defaults.
 fn config_broken_message(reason: &str) -> String {
     format!(
-        "rigor: .rigor.yml could not be read ({reason}) — keeping the last good \
+        "rigor: the config could not be read ({reason}) — keeping the last good \
          configuration; fix and save the file to reload it"
     )
 }
@@ -1927,7 +1934,7 @@ fn config_broken_message(reason: &str) -> String {
 /// …the startup variant, where there is no last good configuration to keep.
 fn config_broken_at_startup_message(reason: &str) -> String {
     format!(
-        "rigor: .rigor.yml could not be read ({reason}) — analyzing with DEFAULT \
+        "rigor: the config could not be read ({reason}) — analyzing with DEFAULT \
          settings; fix and save the file to reload it"
     )
 }
@@ -2454,6 +2461,7 @@ fn register_watched_files(connection: &Connection) -> Result<(), String> {
                 "watchers": [
                     { "globPattern": "**/*.rb" },
                     { "globPattern": "**/.rigor.yml" },
+                    { "globPattern": "**/.rigor.dist.yml" },
                     { "globPattern": "**/Gemfile.lock" },
                     { "globPattern": "**/sig/**/*.rbs" }
                 ]
@@ -2517,6 +2525,7 @@ fn classify_watched_files(params: &serde_json::Value) -> WatchedChange {
 /// plugin set or the RBS environment, and so needs a full tier-1 rebuild.
 fn watched_file_is_structural(uri: &str) -> bool {
     uri.ends_with(".rigor.yml")
+        || uri.ends_with(".rigor.dist.yml")
         || uri.ends_with("Gemfile.lock")
         || (uri.ends_with(".rbs") && uri.contains("/sig/"))
 }

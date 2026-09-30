@@ -178,8 +178,17 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
         }
     }
 
-    let config_path = explicit_config.map_or_else(|| PathBuf::from(".rigor.yml"), PathBuf::from);
-    let cfg = crate::Config::load(explicit_config.map(Path::new));
+    // The file `config_declares_effect_lane` probes is the one
+    // `Configuration.load` would read — `--config`, else discovery's winner
+    // (`.rigor.yml` before `.rigor.dist.yml`), else the bare name.
+    let config_path = explicit_config.map_or_else(
+        || crate::Config::discover().unwrap_or_else(|| PathBuf::from(".rigor.yml")),
+        PathBuf::from,
+    );
+    let cfg = match crate::Config::load(explicit_config.map(Path::new)) {
+        Ok(c) => c,
+        Err(f) => return f.report(),
+    };
     // The analysed set is the configured `paths:` PLUS the positional scope —
     // upstream's `runner.run((configuration.paths + scope).uniq)` (#439: an
     // effect summary is transitive over whatever was analysed, so analysing

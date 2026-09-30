@@ -104,7 +104,10 @@ pub fn cmd_diff(args: &[String]) -> ExitCode {
             Some(c) => c,
             None => return ExitCode::from(64),
         },
-        None => run_current(explicit_config, paths),
+        None => match run_current(explicit_config, paths) {
+            Ok(c) => c,
+            Err(code) => return code,
+        },
     };
 
     let diff = compute_diff(&baseline, &current);
@@ -167,9 +170,16 @@ fn load_diagnostics(path: &str) -> Option<Vec<Value>> {
 
 /// Run `rigor check` over the paths (or the config `paths:` when none given) and
 /// return the diagnostics as JSON objects field-identical to `check --format
-/// json`, so a rigor-rs-produced baseline matches by identity.
-fn run_current(explicit_config: Option<&str>, paths: &[&str]) -> Vec<Value> {
-    let cfg = crate::Config::load(explicit_config.map(Path::new));
+/// json`, so a rigor-rs-produced baseline matches by identity. A config the
+/// reference dies on propagates the same `rigor:` line + exit status.
+fn run_current(
+    explicit_config: Option<&str>,
+    paths: &[&str],
+) -> Result<Vec<Value>, ExitCode> {
+    let cfg = match crate::Config::load(explicit_config.map(Path::new)) {
+        Ok(c) => c,
+        Err(f) => return Err(f.report()),
+    };
 
     let config_path_strings: Vec<String>;
     let config_paths: Vec<&str>;
@@ -204,10 +214,10 @@ fn run_current(explicit_config: Option<&str>, paths: &[&str]) -> Vec<Value> {
         crate::reference_has_ruby_files(&cfg, paths),
     );
 
-    findings
+    Ok(findings
         .iter()
         .map(|(_order, path, source, diag)| diagnostic_value(path, source, diag))
-        .collect()
+        .collect())
 }
 
 /// Build one diagnostic JSON object with the same fields (and omit-when-none

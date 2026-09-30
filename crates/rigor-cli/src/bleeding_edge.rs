@@ -90,7 +90,10 @@ pub fn severity_overrides_for(
 /// `rigor show-bleedingedge` — print the overlay + what the cwd's config
 /// adopts, byte-matching the reference command's text output.
 pub fn cmd_show_bleedingedge(_args: &[String]) -> ExitCode {
-    let cfg = Config::load(None);
+    let cfg = match Config::load(None) {
+        Ok(c) => c,
+        Err(f) => return f.report(),
+    };
     let selector = cfg.bleeding_edge_selector();
     println!("Bleeding-edge overlay (ADR-50 § WD2)");
     println!();

@@ -165,27 +165,46 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
 }
 
 /// Resolve the config for the report: returns `(label, status, loaded_config)`.
-/// `status` is `PASS` (found+parsed or absent), `WARN` (found but malformed).
-/// The loaded `Config` is what `Config::load` returns (default on any problem).
+/// `status` is `PASS` (found+parsed or absent), `WARN` (present but the load
+/// fails — what a `rigor` command would die on). The loaded `Config` is what
+/// [`Config::read`] parses; discovery follows the reference's
+/// `.rigor.yml` → `.rigor.dist.yml` order.
 fn resolve_config(explicit: Option<&str>) -> (String, &'static str, Config) {
-    let path = explicit.unwrap_or(".rigor.yml");
-    match std::fs::read_to_string(path) {
-        Ok(text) => match serde_yaml::from_str::<Config>(&text) {
-            Ok(cfg) => (format!("{path} (found, parsed OK)"), "PASS", cfg),
-            Err(_) => (
-                format!("{path} (found but MALFORMED — ignored, analysing with defaults)"),
-                "WARN",
-                Config::default(),
-            ),
-        },
-        Err(_) => {
+    let path = explicit
+        .map(std::path::PathBuf::from)
+        .or_else(Config::discover);
+    let Some(path) = path else {
+        return (
+            "no .rigor.yml/.rigor.dist.yml in cwd (using defaults)".to_string(),
+            "PASS",
+            Config::default(),
+        );
+    };
+    match Config::read(&path) {
+        crate::config::ConfigRead::Parsed(cfg) => {
+            (format!("{} (found, parsed OK)", path.display()), "PASS", *cfg)
+        }
+        crate::config::ConfigRead::Absent(_) => {
             if explicit.is_some() {
                 // The user named a path that does not exist — worth a WARN.
-                (format!("{path} (not found)"), "WARN", Config::default())
+                (format!("{} (not found)", path.display()), "WARN", Config::default())
             } else {
-                ("no .rigor.yml in cwd (using defaults)".to_string(), "PASS", Config::default())
+                (
+                    "no .rigor.yml/.rigor.dist.yml in cwd (using defaults)".to_string(),
+                    "PASS",
+                    Config::default(),
+                )
             }
         }
+        crate::config::ConfigRead::Fatal(f) => (
+            format!(
+                "{} (found but MALFORMED — {} — ignored, analysing with defaults)",
+                path.display(),
+                f.message
+            ),
+            "WARN",
+            Config::default(),
+        ),
     }
 }
 

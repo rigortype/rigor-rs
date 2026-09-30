@@ -264,14 +264,9 @@ fn signature_path_warnings(cfg: &Config, project_root: &Path, out: &mut Vec<Conf
 /// Classify one `signature_paths:` entry, returning a warning message when it
 /// resolves to nothing (`:missing` / `:not_directory` / `:empty`), or `None`
 /// when it is a directory holding at least one `.rbs` (`:ok`). The wording and
-/// `path.inspect`-style quoting match the reference's `Entry#message` exactly.
-///
-/// DELIBERATE DIVERGENCE: the message prints the RELATIVE configured string
-/// (`"sigs_typo"`), whereas the reference prints the absolutized path its
-/// `Configuration` stores (`"/abs/project/sigs_typo"`). rigor-rs resolves
-/// signature dirs relative to the cwd and prints paths as given (its house style,
-/// consistent with the diagnostic stream), and the absolute form is
-/// environment-specific. The actionable message text is otherwise identical.
+/// `path.inspect`-style quoting match the reference's `Entry#message` exactly —
+/// including the ABSOLUTE path it prints, since `signature_paths:` entries are
+/// `File.expand_path`'d at load time (issue #158).
 fn classify_signature_path(path: &str, project_root: &Path) -> Option<String> {
     let resolved = project_root.join(path);
     if !resolved.exists() {
@@ -380,14 +375,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let cfg_path = dir.join(".rigor.yml");
         std::fs::write(&cfg_path, "signature_paths:\n  - sigs_typo\n").unwrap();
-        let cfg = Config::load(Some(&cfg_path));
+        let cfg = Config::load(Some(&cfg_path)).unwrap();
         let msgs = messages(&cfg, &dir);
+        // Load-time `File.expand_path` (issue #158): the reference's
+        // `Entry#message` prints the RESOLVED absolute path, so the audit
+        // names `<dir>/sigs_typo`, not the written `sigs_typo`.
+        let abs = dir.join("sigs_typo").display().to_string();
         assert_eq!(
             msgs,
-            vec![
-                "signature_paths: \"sigs_typo\" does not exist (no signatures loaded from it)"
-                    .to_string()
-            ]
+            vec![format!(
+                "signature_paths: {abs:?} does not exist (no signatures loaded from it)"
+            )]
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -408,11 +406,12 @@ mod tests {
         let sig = dir.join("sig");
         std::fs::create_dir_all(&sig).unwrap();
         std::fs::write(dir.join(".rigor.yml"), "signature_paths:\n  - sig\n").unwrap();
-        let cfg = Config::load(Some(&dir.join(".rigor.yml")));
+        let cfg = Config::load(Some(&dir.join(".rigor.yml"))).unwrap();
         let msgs = messages(&cfg, &dir);
+        let abs = sig.display().to_string();
         assert_eq!(
             msgs,
-            vec!["signature_paths: \"sig\" matched 0 signature files".to_string()]
+            vec![format!("signature_paths: {abs:?} matched 0 signature files")]
         );
         // With a `.rbs` present, it goes silent.
         std::fs::write(sig.join("x.rbs"), "class X\nend\n").unwrap();
@@ -429,7 +428,7 @@ mod tests {
             "rbs_collection:\n  lockfile: rbs_collection.lock.yaml\n",
         )
         .unwrap();
-        let cfg = Config::load(Some(&dir.join(".rigor.yml")));
+        let cfg = Config::load(Some(&dir.join(".rigor.yml"))).unwrap();
         let msgs = messages(&cfg, &dir);
         assert_eq!(
             msgs,

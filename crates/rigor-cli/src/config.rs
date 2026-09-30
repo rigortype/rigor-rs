@@ -9,14 +9,28 @@
 //!   matches any pattern is skipped entirely (no diagnostics for it).
 //!
 //! Any other key is ignored gracefully (the reference's full schema is large; an
-//! unknown key must never error). An absent or unparseable `.rigor.yml` yields
+//! unknown key must never error). An absent `.rigor.yml` yields
 //! [`Config::default`] — analyze normally, never crash.
 //!
-//! Discovery (HARNESS SAFETY): an explicit `--config <path>` wins; otherwise we
-//! look for `.rigor.yml` in the CURRENT WORKING DIRECTORY only (not walking up,
-//! not relative to each analyzed file), matching the reference's project-config
-//! behavior. The differential harness runs from a directory with no `.rigor.yml`,
-//! so config is inert there and parity is preserved.
+//! Discovery (HARNESS SAFETY) follows the reference's
+//! `Configuration::DISCOVERY_ORDER`: an explicit `--config <path>` wins;
+//! otherwise `.rigor.yml` then `.rigor.dist.yml` in the CURRENT WORKING
+//! DIRECTORY only (not walking up, not relative to each analyzed file); the
+//! first present wins outright — the two are never implicitly merged (a
+//! committed default is composed only via an explicit `includes:` list).
+//! The differential harness runs from a directory with neither, so config is
+//! inert there and parity is preserved.
+//!
+//! Path values (issue #158): the reference's `load_with_includes` resolves
+//! every entry of `paths:`, `signature_paths:`, `pre_eval:`,
+//! `plugins_io.allowed_paths:` and `includes:` with `File.expand_path`
+//! against the directory of the FILE THAT DECLARES THEM — `~`/`~user`
+//! expanded, `.`/`..` folded lexically (no symlink resolution), one resolver
+//! per file, included files first and the including file's keys merged over
+//! them. `Config::read` ports that whole pipeline: the `paths:` /
+//! `signature_paths:` / `pre_eval:` fields carry the RESOLVED (absolute)
+//! strings the reference's `Configuration` stores, while keys the file never
+//! wrote keep their cwd-relative defaults (`["lib"]`, `["sig"]`).
 
 use std::path::Path;
 
@@ -54,6 +68,15 @@ pub struct Config {
     /// so the default (no-config) corpus run is unaffected.
     #[serde(deserialize_with = "de_ruby_array")]
     pub plugins: Vec<String>,
+    /// ADR-17 — the `pre_eval:` monkey-patch files. Resolved at load like
+    /// `paths:` (issue #158): each entry is `File.expand_path(entry,
+    /// config_dir)` upstream, so a file-loaded config carries the ABSOLUTE
+    /// spellings here. The port models only the slice-1 surface —
+    /// `pre-eval.file-not-found` on an entry that is not a file on disk
+    /// ([`crate::main`]'s run-level rows); the pre-pass scanner's suppression
+    /// effect is not modelled.
+    #[serde(deserialize_with = "de_ruby_array")]
+    pub pre_eval: Vec<String>,
     /// ADR-22 baseline path. `baseline: <path>` activates a baseline for
     /// `check`; `baseline: false` is the explicit-disable form. Absent / `null`
     /// means no baseline. Deserialized as an untyped value so both the string
@@ -70,12 +93,17 @@ pub struct Config {
     pub signature_paths: Vec<String>,
     /// ADR-0034: `rbs collection` awareness. Mirrors the reference's
     /// `rbs_collection:` config block (`auto_detect` default `true`, optional
-    /// `lockfile` override).
+    /// `lockfile` override). Sub-values coerce like the reference's
+    /// `hash.fetch(key)` reads (`auto_detect` is `== true`, `lockfile` is
+    /// `to_s`-or-nil); a non-mapping block is a load error, like the
+    /// reference's `Hash#merge` on it.
+    #[serde(deserialize_with = "de_rbs_collection")]
     pub rbs_collection: RbsCollectionConfig,
     /// ADR-72: `Gemfile.lock`-gated bundled RBS overlays. `bundler.auto_detect`
     /// (default `true`) auto-applies a bundled overlay plugin for each locked gem
     /// that ships no RBS (currently `activesupport` → `activesupport-core-ext`),
     /// so a Rails project "just works" without naming the plugin in `plugins:`.
+    #[serde(deserialize_with = "de_bundler")]
     pub bundler: BundlerConfig,
     /// ADR-50 WD2 — the `bleeding_edge:` selector: `false` (default) adopts
     /// nothing, `true` the whole overlay, a list of feature ids only those, and
@@ -110,7 +138,10 @@ pub struct Config {
     /// ADR-0036: rigor-rs-SPECIFIC config, namespaced so it stays transparent to
     /// the pure-Ruby reference (which ignores unknown keys) — the same `.rigor.yml`
     /// feeds both. Reference-schema keys stay top-level; rigor-rs-only knobs live
-    /// here.
+    /// here. The reference NEVER reads this namespace (`RESERVED_NAMESPACES`),
+    /// so the deserializer tolerates every shape — anything it cannot use is
+    /// simply absent, never a load error.
+    #[serde(deserialize_with = "de_rigor_rs")]
     pub rigor_rs: RigorRsConfig,
     /// The set of top-level keys that were EXPLICITLY present in the parsed file
     /// (empty for `Config::default` and for direct `serde_yaml::from_str`). The
@@ -121,19 +152,21 @@ pub struct Config {
     /// [`Config::load`]; never (de)serialized.
     #[serde(skip)]
     present_keys: std::collections::BTreeSet<String>,
-    /// `signature_paths:` was written with an explicit null — the reference's
-    /// `nil` ("not configured"), so it is NOT an explicit declaration even
-    /// though the key is in [`Self::present_keys`]. Set by [`Config::read`].
+    /// `signature_paths:` merged to an explicit null — the reference's `nil`
+    /// ("not configured"), so it is NOT an explicit declaration even though
+    /// the key is in [`Self::present_keys`]. Set by [`Config::read`] from the
+    /// MERGED document (an `includes:` chain may write it).
     #[serde(skip)]
     signature_paths_null: bool,
     /// `target_ruby:` as written (untyped: YAML reads `3.4` as a float). Read
     /// only by [`Config::target_ruby_supported`].
     #[serde(default)]
     target_ruby: serde_yaml::Value,
-    /// The directory of the config file actually read, when it is not the
-    /// cwd: the reference resolves a relative `signature_paths:` entry against
-    /// it (`Configuration.resolve_paths_in`, `File.expand_path(p, base_dir)`).
-    /// Set by [`Config::read`]; never (de)serialized.
+    /// The ABSOLUTE directory of the top-level config file actually read
+    /// (`File.dirname(File.expand_path(path))` — the reference's `base_dir`).
+    /// Path-bearing keys are resolved at LOAD time, so this is kept only for
+    /// the conformance gates that still take a base ([`Self::config_base_dir`]);
+    /// `None` for a `Config` that did not come from a file.
     #[serde(skip)]
     base_dir: Option<std::path::PathBuf>,
     /// Issue #129: the file's text is a config the reference provably loads
@@ -216,6 +249,7 @@ impl Default for Config {
             exclude: Vec::new(),
             paths: default_paths(),
             plugins: Vec::new(),
+            pre_eval: Vec::new(),
             baseline: serde_yaml::Value::Null,
             bleeding_edge: serde_yaml::Value::Null,
             severity_profile: serde_yaml::Value::Null,
@@ -247,33 +281,76 @@ fn default_paths() -> Vec<String> {
 
 /// Ruby's `Array(value).map(&:to_s)` over a YAML value — how the reference's
 /// `Configuration#initialize` reads EVERY list-valued key (`paths`, `exclude`,
-/// `plugins`, `disable`, `signature_paths`, …): `nil` is `[]`, a scalar is a
-/// one-element list, a sequence is itself, and each element goes through
-/// `to_s` (`1` → `"1"`, `true` → `"true"`, `nil` → `""`).
-///
-/// A mapping value, a tagged value, or a sequence element that is itself a
-/// collection stays a deserialization error — the document then takes the
-/// loader's existing malformed-config fallback, unchanged by issue #199.
+/// `plugins`, `disable`, `signature_paths`, `pre_eval`, …): `nil` is `[]`,
+/// a scalar is a one-element list, a sequence is itself, a mapping's pairs are
+/// its `to_a` elements, and each element goes through `to_s` (`1` → `"1"`,
+/// `true` → `"true"`, `nil` → `""`, `[1, 2]` → `"[1, 2]"`,
+/// `{"a" => 1}` → `'{"a" => 1}'`). Never fails — the reference's `Array()`
+/// accepts every YAML shape, so a key whose value is "wrongly" shaped loads
+/// as the same inert tokens the reference stores.
 fn ruby_array(value: &serde_yaml::Value) -> Result<Vec<String>, String> {
+    Ok(ruby_array_raw(value)
+        .iter()
+        .map(ruby_to_s)
+        .collect::<Vec<String>>())
+}
+
+/// `Array(value)` alone — the VALUE-level list coercion the loader's
+/// `resolve_path_key!` / `includes:` handling uses before stringifying each
+/// element. `nil` → `[]`, a sequence → its items, a mapping → its `to_a`
+/// pair-arrays, any other scalar → a one-element list.
+fn ruby_array_raw(value: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
     use serde_yaml::Value;
-    fn to_s(v: &Value) -> Option<String> {
-        match v {
-            Value::Null => Some(String::new()),
-            Value::Bool(b) => Some(b.to_string()),
-            Value::Number(n) => Some(n.to_string()),
-            Value::String(s) => Some(s.clone()),
-            Value::Sequence(_) | Value::Mapping(_) | Value::Tagged(_) => None,
-        }
-    }
     match value {
-        Value::Null => Ok(Vec::new()),
-        Value::Sequence(items) => items
+        Value::Null => Vec::new(),
+        Value::Sequence(items) => items.clone(),
+        Value::Mapping(map) => map
             .iter()
-            .map(|v| to_s(v).ok_or_else(|| format!("unsupported list element {v:?}")))
+            .map(|(k, v)| Value::Sequence(vec![k.clone(), v.clone()]))
             .collect(),
-        scalar => to_s(scalar)
-            .map(|s| vec![s])
-            .ok_or_else(|| format!("expected a scalar or a sequence, got {scalar:?}")),
+        scalar => vec![scalar.clone()],
+    }
+}
+
+/// Ruby `to_s` for a YAML value: scalars render plainly (`nil` → `""`), and a
+/// collection renders in `inspect` form — `Array#to_s` / `Hash#to_s` inspect
+/// their elements.
+fn ruby_to_s(v: &serde_yaml::Value) -> String {
+    use serde_yaml::Value;
+    match v {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => s.clone(),
+        Value::Sequence(_) | Value::Mapping(_) => ruby_inspect(v),
+        Value::Tagged(t) => ruby_to_s(&t.value),
+    }
+}
+
+/// Ruby `inspect` for a YAML value — how a collection element renders under
+/// `to_s` (`["a", 1].to_s` ⇒ `'["a", 1]'`, `{"a" => 1}.to_s` ⇒
+/// `'{"a" => 1}'`) and how the `include not found` error quotes its entry.
+/// String quoting is Rust's `{:?}` — for the printable-ASCII config values
+/// this surfaces it renders identically to `String#inspect`.
+fn ruby_inspect(v: &serde_yaml::Value) -> String {
+    use serde_yaml::Value;
+    match v {
+        Value::Null => "nil".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => format!("{s:?}"),
+        Value::Sequence(items) => {
+            let inner: Vec<String> = items.iter().map(ruby_inspect).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        Value::Mapping(map) => {
+            let inner: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{} => {}", ruby_inspect(k), ruby_inspect(v)))
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        Value::Tagged(t) => ruby_inspect(&t.value),
     }
 }
 
@@ -302,11 +379,86 @@ where
     ruby_array(&value).map_err(serde::de::Error::custom)
 }
 
+/// `bundler:` — the reference reads it as a Hash (`DEFAULTS.fetch.merge`) and
+/// takes `auto_detect` strictly as `== true`; a non-mapping block crashes
+/// upstream (`Hash#merge`), so it is a load error here.
+fn de_bundler<'de, D>(d: D) -> Result<BundlerConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(d)?;
+    match value {
+        serde_yaml::Value::Mapping(map) => Ok(BundlerConfig {
+            auto_detect: map.get("auto_detect") == Some(&serde_yaml::Value::Bool(true)),
+        }),
+        serde_yaml::Value::Null => Ok(BundlerConfig::default()),
+        other => Err(serde::de::Error::custom(format!(
+            "`bundler:` must be a mapping, got {}",
+            describe_value(&other)
+        ))),
+    }
+}
+
+/// `rbs_collection:` — same `fetch`-then-coerce contract as `bundler:`:
+/// `auto_detect` is `== true`, `lockfile` is `nil`-or-`to_s`.
+fn de_rbs_collection<'de, D>(d: D) -> Result<RbsCollectionConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(d)?;
+    match value {
+        serde_yaml::Value::Mapping(map) => Ok(RbsCollectionConfig {
+            auto_detect: map.get("auto_detect") == Some(&serde_yaml::Value::Bool(true)),
+            lockfile: map
+                .get("lockfile")
+                .filter(|v| !v.is_null())
+                .map(ruby_to_s),
+        }),
+        serde_yaml::Value::Null => Ok(RbsCollectionConfig::default()),
+        other => Err(serde::de::Error::custom(format!(
+            "`rbs_collection:` must be a mapping, got {}",
+            describe_value(&other)
+        ))),
+    }
+}
+
+/// `rigor_rs:` — rigor-rs's reserved namespace. The reference NEVER reads it,
+/// so any shape it cannot use is simply absent rather than a load error.
+fn de_rigor_rs<'de, D>(d: D) -> Result<RigorRsConfig, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(d)?;
+    let serde_yaml::Value::Mapping(map) = value else {
+        return Ok(RigorRsConfig::default());
+    };
+    Ok(RigorRsConfig {
+        ruby: map
+            .get("ruby")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+    })
+}
+
+/// A short name for a YAML value's shape, for load-error text.
+fn describe_value(v: &serde_yaml::Value) -> &'static str {
+    match v {
+        serde_yaml::Value::Null => "null",
+        serde_yaml::Value::Bool(_) => "a boolean",
+        serde_yaml::Value::Number(_) => "a number",
+        serde_yaml::Value::String(_) => "a string",
+        serde_yaml::Value::Sequence(_) => "a sequence",
+        serde_yaml::Value::Mapping(_) => "a mapping",
+        serde_yaml::Value::Tagged(_) => "a tagged value",
+    }
+}
+
 /// The top-level mapping keys present in a `.rigor.yml` document. Used to record
 /// which keys were explicitly configured (vs defaulted) — whatever the value's
 /// shape: a scalar (`paths: other`) or null is as declared as a list. A
 /// non-mapping / broken document yields an empty set — treated as "nothing
 /// explicit", which is the FP-safe direction for the audit.
+#[cfg(test)]
 fn top_level_keys(text: &str) -> std::collections::BTreeSet<String> {
     match serde_yaml::from_str::<serde_yaml::Value>(text) {
         Ok(serde_yaml::Value::Mapping(map)) => map
@@ -320,6 +472,7 @@ fn top_level_keys(text: &str) -> std::collections::BTreeSet<String> {
 /// Whether the document writes `signature_paths:` with an explicit null value
 /// (`signature_paths:` / `signature_paths: ~`) — the reference's `nil`, which
 /// is "not configured" rather than an empty list.
+#[cfg(test)]
 fn signature_paths_is_null(text: &str) -> bool {
     match serde_yaml::from_str::<serde_yaml::Value>(text) {
         Ok(serde_yaml::Value::Mapping(map)) => {
@@ -329,89 +482,153 @@ fn signature_paths_is_null(text: &str) -> bool {
     }
 }
 
-/// The directory a config file's relative `signature_paths:` resolve against
-/// (the reference's `File.dirname(File.expand_path(path))`), or `None` when
-/// that is the cwd itself — the entries then stay exactly as written.
-fn config_base_dir(path: &Path) -> Option<std::path::PathBuf> {
-    path.parent()
-        .filter(|d| !d.as_os_str().is_empty() && *d != Path::new("."))
-        .map(Path::to_path_buf)
+/// `Configuration::DISCOVERY_ORDER` — the cwd candidates `Config::load(None)`
+/// probes in order; the first present wins outright (there is NO implicit
+/// merge: a committed `.rigor.dist.yml` is composed only through an explicit
+/// `includes:` list).
+const DISCOVERY_ORDER: [&str; 2] = [".rigor.yml", ".rigor.dist.yml"];
+
+/// A `.rigor.yml` load failure the reference dies on (`Configuration.load`
+/// raising inside a CLI command): `code` is the exit status — `64`
+/// (`EXIT_USAGE`, the `rescue ConfigurationError` surface — bad YAML, a
+/// non-mapping document, an `includes:` miss or a cycle) or `1` (an
+/// uncaught `Errno`/`ArgumentError` upstream — a file that exists but
+/// cannot be read, an unknown `~user`). `message` is the `rigor:` line body.
+#[derive(Debug)]
+pub struct LoadFailure {
+    pub message: String,
+    pub code: u8,
 }
 
-/// What reading a `.rigor.yml` actually found — the four outcomes
-/// [`Config::load`] deliberately collapses into [`Config::default`].
+impl LoadFailure {
+    /// `rigor: <message>` on stderr — the reference dispatcher's
+    /// `rescue ConfigurationError` line — and the exit status to propagate.
+    pub fn report(&self) -> std::process::ExitCode {
+        eprintln!("rigor: {}", self.message);
+        std::process::ExitCode::from(self.code)
+    }
+}
+
+/// What reading a `.rigor.yml` actually found — the three outcomes a caller
+/// must distinguish.
 ///
-/// The collapse is right for a ONE-SHOT `check`: the run is about to end, so
-/// "absent" and "you typo'd the YAML" both mean "analyze with defaults and warn
-/// on stderr". It is wrong for a LONG-LIVED reader (the LSP), which must tell
-/// **absent** — where the defaults genuinely ARE the configuration — apart from
-/// **broken**, where the defaults are a config the user never wrote and adopting
-/// them would silently drop their `disable:` list mid-edit. Hence this enum: the
-/// distinction lives in one loader both callers share, not in a second parse
-/// path that could drift from `load`'s.
+/// The distinction matters for a LONG-LIVED reader (the LSP): **absent** is
+/// the normal case — the defaults genuinely ARE the configuration — while
+/// **fatal** is a config the user wrote but the reference would die on,
+/// where adopting the defaults would silently drop their `disable:` list
+/// mid-edit; the last good config keeps serving.
 pub enum ConfigRead {
-    /// Read and parsed.
+    /// Read, includes-resolved, and parsed.
     Parsed(Box<Config>),
-    /// Nothing at that path. `.rigor.yml` is optional, so this is the normal
-    /// case. Carries the OS's own words for it so a caller that DID name the
-    /// path explicitly can report them verbatim.
-    Absent(String),
-    /// The path exists but could not be read (permissions, a directory, IO).
-    /// Carries the error text for the caller's warning.
-    Unreadable(String),
-    /// Read, but not valid YAML / not the schema. Carries the parse error text.
-    Malformed(String),
+    /// Nothing at that path (the reference's `File.exist?` gate). `.rigor.yml`
+    /// is optional, so this is the normal case; the payload names the path
+    /// for a caller that wants to report it.
+    Absent(#[allow(dead_code)] String),
+    /// The reference dies loading this config — see [`LoadFailure`].
+    Fatal(LoadFailure),
 }
 
 impl Config {
-    /// Read the config at `path` WITHOUT deciding what to do about a failure —
-    /// the shared loader behind [`Config::load`] (which warns + defaults) and the
-    /// LSP's reload (which keeps the last good config on a parse error). Prints
-    /// nothing itself, so the caller owns the channel and the wording.
+    /// The path `Configuration.load(nil)` would read — the first
+    /// `DISCOVERY_ORDER` candidate that exists — or `None` (defaults). A
+    /// public mirror of `Configuration.discover` for labels and the LSP.
     #[must_use]
-    pub fn read(path: &Path) -> ConfigRead {
-        match std::fs::read_to_string(path) {
-            Ok(text) => match serde_yaml::from_str::<Config>(&text) {
-                Ok(mut cfg) => {
-                    cfg.present_keys = top_level_keys(&text);
-                    cfg.signature_paths_null = signature_paths_is_null(&text);
-                    cfg.base_dir = config_base_dir(path);
-                    cfg.parity_text_ok = crate::conformance_gate::config_text_ok(&text);
-                    ConfigRead::Parsed(Box::new(cfg))
-                }
-                Err(e) => ConfigRead::Malformed(e.to_string()),
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigRead::Absent(e.to_string()),
-            Err(e) => ConfigRead::Unreadable(e.to_string()),
-        }
+    pub fn discover() -> Option<std::path::PathBuf> {
+        DISCOVERY_ORDER
+            .iter()
+            .map(Path::new)
+            .find(|p| p.exists())
+            .map(Path::to_path_buf)
     }
 
-    /// Load the config. With `explicit = Some(path)` read exactly that file;
-    /// otherwise auto-discover `.rigor.yml` in the current working directory.
-    /// Returns [`Config::default`] on ANY problem (missing file, read error,
-    /// malformed YAML), printing a brief `eprintln!` warning only for a file that
-    /// exists but cannot be parsed. Never panics.
+    /// Read the config at `path` WITHOUT deciding what to do about a failure —
+    /// the shared loader behind [`Config::load`] (which reports fatal loads
+    /// like the reference's dispatcher) and the LSP's reload (which keeps the
+    /// last good config). Prints nothing itself, so the caller owns the
+    /// channel and the wording.
+    ///
+    /// Two gates, in the reference's order: `File.exist?(path)` on the RAW
+    /// spelling (a leading `~` is never expanded, `..` resolves through the
+    /// OS — symlinks honoured), then `File.expand_path(path)` for the file
+    /// actually read (`~`/`~user` expanded, `..` folded LEXICALLY — so
+    /// `lnk/../x.yml` reads the lexical parent even when `lnk` points
+    /// elsewhere, and a `~`-led path that only exists literally reads the
+    /// `$HOME` file).
     #[must_use]
-    pub fn load(explicit: Option<&Path>) -> Config {
-        let (path, label): (&Path, String) = match explicit {
-            Some(p) => (p, p.display().to_string()),
-            None => (Path::new(".rigor.yml"), ".rigor.yml".to_string()),
+    pub fn read(path: &Path) -> ConfigRead {
+        if !path.exists() {
+            return ConfigRead::Absent(format!("no such file or directory — {}", path.display()));
+        }
+        let absolute = match expand_tilde_head(&path.to_string_lossy())
+            .map(|s| crate::conformance_gate::expand_path(Path::new(&s)))
+        {
+            Ok(p) => p,
+            Err(f) => return ConfigRead::Fatal(f),
         };
-        match Config::read(path) {
-            ConfigRead::Parsed(cfg) => *cfg,
-            ConfigRead::Malformed(e) => {
-                eprintln!("rigor: ignoring malformed config {label}: {e}");
-                Config::default()
+        let mut includes_seen = false;
+        let merged = match load_with_includes(
+            &absolute,
+            &std::collections::BTreeSet::new(),
+            &mut includes_seen,
+        ) {
+            Ok(m) => m,
+            Err(f) => return ConfigRead::Fatal(f),
+        };
+        let mut cfg: Config = match serde_yaml::from_value(serde_yaml::Value::Mapping(merged.clone()))
+        {
+            Ok(c) => c,
+            // The per-key coercions accept every shape (Ruby's `Array()` /
+            // `fetch`/`==` semantics), so a document that survived YAML
+            // parsing reaches here only through a loader bug.
+            Err(e) => {
+                return ConfigRead::Fatal(LoadFailure {
+                    message: format!("{}: invalid config: {e}", absolute.display()),
+                    code: 64,
+                })
             }
-            // An explicit path the user ASKED for and we could not read is worth a
-            // warning; an absent auto-discovered `.rigor.yml` is the normal case
-            // and stays silent. Both still degrade to default rather than aborting.
-            ConfigRead::Absent(e) | ConfigRead::Unreadable(e) => {
-                if explicit.is_some() {
-                    eprintln!("rigor: cannot read config {label}: {e}");
-                }
-                Config::default()
-            }
+        };
+        cfg.present_keys = merged
+            .keys()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect();
+        if includes_seen {
+            // `includes:` is a load-time directive upstream — `delete`d before
+            // merge so it never reaches `unknown_keys` (it IS a known key, so
+            // recording it only feeds `declares_key`).
+            cfg.present_keys.insert("includes".to_string());
+        }
+        cfg.signature_paths_null = merged
+            .get("signature_paths")
+            .is_some_and(serde_yaml::Value::is_null);
+        cfg.base_dir = absolute.parent().map(Path::to_path_buf);
+        cfg.parity_text_ok = crate::conformance_gate::config_text_ok(
+            &std::fs::read_to_string(&absolute).unwrap_or_default(),
+        );
+        ConfigRead::Parsed(Box::new(cfg))
+    }
+
+    /// Load the config, exactly as `Configuration.load` does: `explicit`
+    /// names the file (`File.exist?` first — a missing or `~`-led path uses
+    /// the DEFAULTS, silently); `None` follows [`Self::discover`]'s
+    /// `.rigor.yml` → `.rigor.dist.yml` order, defaults when neither exists.
+    /// A file the reference dies on surfaces as [`LoadFailure`] instead of
+    /// the defaults — the port's `rigor: <message>` + exit status mirror the
+    /// dispatcher's `rescue ConfigurationError`.
+    pub fn load(explicit: Option<&Path>) -> Result<Config, LoadFailure> {
+        let path = match explicit {
+            Some(p) => p.to_path_buf(),
+            None => match Config::discover() {
+                Some(p) => p,
+                None => return Ok(Config::default()),
+            },
+        };
+        match Config::read(&path) {
+            ConfigRead::Parsed(cfg) => Ok(*cfg),
+            // A race — the file vanished between `exist?` and the read — lands
+            // here; upstream's `File.exist?` gate already answered with the
+            // defaults either way.
+            ConfigRead::Absent(_) => Ok(Config::default()),
+            ConfigRead::Fatal(f) => Err(f),
         }
     }
 
@@ -422,6 +639,8 @@ impl Config {
     /// **Test-only** since [`Config::read`] took the load path over: production
     /// reads a PATH (only there can absent be told from malformed) and owns its
     /// own warning channel — the LSP's is `window/showMessage`, not stderr.
+    /// Inlined `includes:` are a load-pipeline concern [`Config::read`] owns;
+    /// this helper parses a single document exactly as written.
     #[cfg(test)]
     pub(crate) fn parse_or_warn(text: &str, label: &str) -> Config {
         match serde_yaml::from_str::<Config>(text) {
@@ -661,21 +880,17 @@ impl Config {
     }
 
     /// The project's own RBS signature directories from `signature_paths:`
-    /// (ADR-0033). A relative entry resolves against the directory of the
-    /// config file that named it, as the reference's does (issue #129: with
-    /// `--config conf/custom.yml`, `sig` is `conf/sig`); for the discovered
-    /// `.rigor.yml` that directory is the cwd, so the entry stays as written.
-    /// An entry naming a non-existent directory is inert — ingestion skips
-    /// it — so the default `["sig"]` costs nothing when a project ships no
-    /// signatures.
+    /// (ADR-0033), in the spelling the reference stores: a DECLARED entry was
+    /// `File.expand_path`'d against its file's directory at load time (issue
+    /// #158 — `--config conf/custom.yml`'s `sig` is `<cwd>/conf/sig`), while
+    /// the `["sig"]` default was never in a file and stays cwd-relative. An
+    /// entry naming a non-existent directory is inert — ingestion skips
+    /// it — so the default costs nothing when a project ships no signatures.
     #[must_use]
     pub fn signature_dirs(&self) -> Vec<std::path::PathBuf> {
         self.signature_paths
             .iter()
-            .map(|entry| match &self.base_dir {
-                Some(base) => base.join(entry),
-                None => std::path::PathBuf::from(entry),
-            })
+            .map(std::path::PathBuf::from)
             .collect()
     }
 
@@ -785,6 +1000,323 @@ impl Config {
 
 }
 
+// ---------------------------------------------------------------------------
+// `load_with_includes` — the reference's per-file path resolution + merge
+// (issue #158, `Configuration::load_with_includes` / `resolve_paths_in` /
+// `merge_includes` / `deep_merge`, configuration.rb pin e59b7b89).
+// ---------------------------------------------------------------------------
+
+/// `Configuration::PATH_KEYS` — the top-level keys whose values are
+/// file/directory paths resolved against the declaring file's directory.
+/// `exclude:` is deliberately NOT one (its entries are glob patterns, not
+/// paths); `baseline:` is not either — the reference never resolves it, so
+/// `baseline: rel.yml` keeps its cwd-relative spelling.
+const PATH_KEYS: [&str; 3] = ["paths", "signature_paths", "pre_eval"];
+
+/// Read + parse `absolute` (already `File.expand_path`'d) as a YAML document,
+/// or the [`LoadFailure`] the reference dies with: a read error is an uncaught
+/// `Errno` upstream (exit 1); a `Psych::SyntaxError` is re-rendered upstream
+/// as `<abs>:<line>:<col>: not valid YAML: <detail>` (exit 64); a document
+/// that is not a mapping — an empty file parses as `nil` which IS a mapping
+/// (`|| {}`) — is `config file must be a YAML mapping: <abs>` (exit 64).
+fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
+    let text = std::fs::read_to_string(absolute).map_err(|e| LoadFailure {
+        message: format!("cannot read config {}: {e}", absolute.display()),
+        code: 1,
+    })?;
+    let value = serde_yaml::from_str::<serde_yaml::Value>(&text).map_err(|e| {
+        let (line, column) = e
+            .location()
+            .map(|l| (l.line(), l.column()))
+            .unwrap_or((0, 0));
+        // serde_yaml's Display already ends with " at line L column C" —
+        // strip it so the detail reads like Psych's `problem context`.
+        let detail = e.to_string();
+        let suffix = format!(" at line {line} column {column}");
+        let detail = detail.strip_suffix(&suffix).unwrap_or(&detail);
+        LoadFailure {
+            message: format!("{}:{line}:{column}: not valid YAML: {detail}", absolute.display()),
+            code: 64,
+        }
+    })?;
+    match value {
+        // `YAML.safe_load_file(...) || {}` — nil (empty document) reads as {}.
+        serde_yaml::Value::Null => Ok(serde_yaml::Value::Mapping(serde_yaml::Mapping::new())),
+        serde_yaml::Value::Mapping(_) => Ok(value),
+        _ => Err(LoadFailure {
+            message: format!("config file must be a YAML mapping: {}", absolute.display()),
+            code: 64,
+        }),
+    }
+}
+
+/// `Configuration::load_with_includes` — reads `absolute` plus every file its
+/// `includes:` names (recursively, per-file path resolution), and returns the
+/// merged mapping: included files first (in declaration order), the current
+/// file's keys overriding. `visited` is the include CHAIN's absolute paths —
+/// upstream's `visited + [absolute]` makes a FRESH set per level, so a diamond
+/// (two siblings both including the same file) loads that file twice and is
+/// NOT circular; only an ancestor re-entry is.
+/// `includes_seen` records whether ANY file in the chain declared `includes:`
+/// (the merged map has it deleted, so `Config::declares_key("includes")`
+/// needs the record).
+fn load_with_includes(
+    absolute: &Path,
+    visited: &std::collections::BTreeSet<std::path::PathBuf>,
+    includes_seen: &mut bool,
+) -> Result<serde_yaml::Mapping, LoadFailure> {
+    if visited.contains(absolute) {
+        return Err(LoadFailure {
+            message: format!("circular include: {}", absolute.display()),
+            code: 64,
+        });
+    }
+    let serde_yaml::Value::Mapping(mut raw) = read_yaml(absolute)? else {
+        unreachable!("read_yaml yields a mapping");
+    };
+    let base_dir = absolute.parent().unwrap_or_else(|| Path::new("/"));
+    let includes = match raw.remove("includes") {
+        Some(v) => {
+            *includes_seen = true;
+            ruby_array_raw(&v)
+        }
+        None => Vec::new(),
+    };
+    resolve_paths_in(&mut raw, base_dir)?;
+    let mut next_visited = visited.clone();
+    next_visited.insert(absolute.to_path_buf());
+    merge_includes(raw, &includes, base_dir, &next_visited, includes_seen)
+}
+
+/// `Configuration::merge_includes`: each `includes:` entry is
+/// `File.expand_path(inc.to_s, base_dir)` — `base_dir` is the INCLUDING file's
+/// directory — then loaded recursively; a missing one is the load-time
+/// `include not found: <inc> (referenced from <base_dir>)` error (exit 64).
+/// Included files merge left-to-right (a later include wins over an earlier),
+/// then the current file's own keys merge over the lot.
+fn merge_includes(
+    data: serde_yaml::Mapping,
+    includes: &[serde_yaml::Value],
+    base_dir: &Path,
+    visited: &std::collections::BTreeSet<std::path::PathBuf>,
+    includes_seen: &mut bool,
+) -> Result<serde_yaml::Mapping, LoadFailure> {
+    let mut accumulated = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    for inc in includes {
+        let inc_path = expand_config_entry(&ruby_to_s(inc), base_dir)?;
+        if !inc_path.exists() {
+            return Err(LoadFailure {
+                message: format!(
+                    "include not found: {} (referenced from {})",
+                    ruby_inspect(inc),
+                    base_dir.display()
+                ),
+                code: 64,
+            });
+        }
+        let sub = load_with_includes(&inc_path, visited, includes_seen)?;
+        accumulated = deep_merge(
+            &accumulated,
+            &serde_yaml::Value::Mapping(sub),
+        );
+    }
+    let serde_yaml::Value::Mapping(merged) = deep_merge(
+        &accumulated,
+        &serde_yaml::Value::Mapping(data),
+    ) else {
+        unreachable!("deep_merge of two mappings yields a mapping")
+    };
+    Ok(merged)
+}
+
+/// `Configuration::deep_merge` over YAML mappings: a key present in both as a
+/// mapping merges recursively; anything else is right-wins. `dependencies`
+/// merges deeply too but concatenates `source_inference` (`merge_value`'s
+/// carve-out, ADR-10 § "config-conflict diagnostic").
+fn deep_merge(left: &serde_yaml::Value, right: &serde_yaml::Value) -> serde_yaml::Value {
+    use serde_yaml::Value;
+    let (Value::Mapping(l), Value::Mapping(r)) = (left, right) else {
+        return right.clone();
+    };
+    let mut merged = l.clone();
+    for (k, v) in r {
+        let entry = match (merged.get(k), v) {
+            (Some(lv @ Value::Mapping(_)), Value::Mapping(_)) => {
+                if k.as_str() == Some("dependencies") {
+                    merge_dependencies_hash(lv, v)
+                } else {
+                    deep_merge(lv, v)
+                }
+            }
+            _ => v.clone(),
+        };
+        merged.insert(k.clone(), entry);
+    }
+    Value::Mapping(merged)
+}
+
+/// `Configuration::merge_dependencies_hash` — deep-merge, then
+/// `source_inference` is the CONCATENATION `left + right` (kept unless both
+/// sides are empty, so an `includes:` chain sees every contributor's entries).
+fn merge_dependencies_hash(
+    left: &serde_yaml::Value,
+    right: &serde_yaml::Value,
+) -> serde_yaml::Value {
+    let mut out = deep_merge(left, right);
+    let lsi = left.get("source_inference").map(ruby_array_raw);
+    let rsi = right.get("source_inference").map(ruby_array_raw);
+    let mut both_empty = true;
+    let mut joined = Vec::new();
+    for v in [lsi, rsi].into_iter().flatten() {
+        if !v.is_empty() {
+            both_empty = false;
+        }
+        joined.extend(v);
+    }
+    if !both_empty {
+        if let serde_yaml::Value::Mapping(m) = &mut out {
+            m.insert(
+                serde_yaml::Value::String("source_inference".to_string()),
+                serde_yaml::Value::Sequence(joined),
+            );
+        }
+    }
+    out
+}
+
+/// `Configuration::resolve_paths_in`: each PATH_KEYS entry plus the nested
+/// `plugins_io.allowed_paths:` is `Array(v).map { File.expand_path(p.to_s,
+/// base_dir) }` — a present-but-null key stays null (the reference's "not
+/// configured"). `cache.path:` is intentionally left as-is upstream.
+fn resolve_paths_in(
+    out: &mut serde_yaml::Mapping,
+    base_dir: &Path,
+) -> Result<(), LoadFailure> {
+    for key in PATH_KEYS {
+        let Some(v) = out.get(key) else { continue };
+        if v.is_null() {
+            continue;
+        }
+        let mut resolved = Vec::new();
+        for entry in ruby_array_raw(v) {
+            resolved.push(serde_yaml::Value::String(
+                expand_config_entry(&ruby_to_s(&entry), base_dir)?
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
+        out.insert(
+            serde_yaml::Value::String(key.to_string()),
+            serde_yaml::Value::Sequence(resolved),
+        );
+    }
+    // `resolve_plugins_io_paths!` — `plugins_io:` is a Hash upstream; a
+    // non-mapping value is left untouched (the reference's `is_a?(Hash)`
+    // gate), and so is an absent / null `allowed_paths`.
+    if let Some(serde_yaml::Value::Mapping(plugins_io)) = out.get_mut("plugins_io") {
+        if let Some(ap) = plugins_io.get("allowed_paths") {
+            if !ap.is_null() {
+                let mut resolved = Vec::new();
+                for entry in ruby_array_raw(ap) {
+                    resolved.push(serde_yaml::Value::String(
+                        expand_config_entry(&ruby_to_s(&entry), base_dir)?
+                            .to_string_lossy()
+                            .into_owned(),
+                    ));
+                }
+                plugins_io.insert(
+                    serde_yaml::Value::String("allowed_paths".to_string()),
+                    serde_yaml::Value::Sequence(resolved),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ruby `File.expand_path(entry, base_dir)`: `~`/`~user` expand at the head,
+/// then `.`/`..` fold LEXICALLY against `base` (no symlink resolution — the
+/// `lnk/../sig` case lands on the lexical parent, upstream-verified). `base`
+/// is already absolute (the expanded config's directory).
+fn expand_config_entry(entry: &str, base: &Path) -> Result<std::path::PathBuf, LoadFailure> {
+    let expanded = expand_tilde_head(entry)?;
+    let path = Path::new(&expanded);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    Ok(crate::conformance_gate::expand_path(&joined))
+}
+
+/// `File.expand_path`'s `~` handling at the head of `raw` only: `~` / `~/…`
+/// names the current user's home (`ENV["HOME"]`, falling back to the
+/// password database like `Dir.home`); `~user/…` names that user's home —
+/// an unknown user is upstream's `ArgumentError` (uncaught → exit 1). A `~`
+/// with no resolvable home stays literal — the path then names nothing on
+/// disk, the safe direction.
+fn expand_tilde_head(raw: &str) -> Result<String, LoadFailure> {
+    let Some(rest) = raw.strip_prefix('~') else {
+        return Ok(raw.to_string());
+    };
+    let (user, tail) = match rest.split_once('/') {
+        Some((u, t)) => (u.to_string(), format!("/{t}")),
+        None => (rest.to_string(), String::new()),
+    };
+    let home = if user.is_empty() {
+        home_dir()
+    } else {
+        passwd_home(&user)
+    };
+    match home {
+        Some(h) => Ok(format!("{}{tail}", h.trim_end_matches('/'))),
+        None if user.is_empty() => Ok(raw.to_string()),
+        None => Err(LoadFailure {
+            message: format!("user {user} doesn't exist"),
+            code: 1,
+        }),
+    }
+}
+
+/// `Dir.home` — `ENV["HOME"]`, else the current uid's passwd entry.
+fn home_dir() -> Option<String> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(current_user_home)
+}
+
+/// `/etc/passwd` lookup by login name (`getpwnam` equivalent enough for a
+/// `~user` expansion — the reference's own resolution is the OS's).
+fn passwd_home(user: &str) -> Option<String> {
+    passwd_entry(|fields| fields.first() == Some(&user))
+}
+
+/// The current user's home from `/etc/passwd`, keyed by `id -u` (no libc dep
+/// here); `None` when it cannot be told (the `~` then stays literal).
+fn current_user_home() -> Option<String> {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
+    passwd_entry(|fields| fields.get(2) == Some(&uid.as_str()))
+}
+
+/// Scan `/etc/passwd` for the first record `pred` accepts, returning its
+/// home-directory field.
+fn passwd_entry(pred: impl Fn(&[&str]) -> bool) -> Option<String> {
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.len() >= 6 && pred(&fields) {
+            return Some(fields[5].to_string());
+        }
+    }
+    None
+}
+
 /// Whether `path` matches any of the `exclude:` `patterns`, matched with the
 /// reference's `File.fnmatch?` and NO flags (`reject_excluded`) — every `*`
 /// spans `/`, consecutive `*`s collapse (so `a/**/b` never matches `a/b`),
@@ -842,10 +1374,14 @@ mod tests {
         assert_eq!(ruby_array(&v("true")).unwrap(), vec!["true"], "true.to_s");
         assert_eq!(ruby_array(&v("1.5")).unwrap(), vec!["1.5"], "Float#to_s");
         assert_eq!(ruby_array(&v("[1, false, ~, x]")).unwrap(), vec!["1", "false", "", "x"]);
-        // Collections stay malformed (the loader's existing fallback).
-        assert!(ruby_array(&v("{a: 1}")).is_err());
-        assert!(ruby_array(&v("[[a]]")).is_err());
-        assert!(ruby_array(&v("[{a: 1}]")).is_err());
+        // `Array()` accepts even collections: a mapping becomes its `to_a`
+        // pairs and each element renders through `to_s` — `{"a" => 1}` →
+        // `[["a", 1]]` → `'["a", 1]'` (Hash#to_a → Array#to_s). Never an
+        // error: a wrongly-shaped key loads as the same inert tokens the
+        // reference stores.
+        assert_eq!(ruby_array(&v("{a: 1}")).unwrap(), vec![r#"["a", 1]"#]);
+        assert_eq!(ruby_array(&v("[[a]]")).unwrap(), vec![r#"["a"]"#]);
+        assert_eq!(ruby_array(&v("[{a: 1}]")).unwrap(), vec![r#"{"a" => 1}"#]);
     }
 
     /// Issue #199 — every list key accepts a scalar through the ONE shared
@@ -905,7 +1441,8 @@ mod tests {
         std::fs::write(&path, "paths: other\n").unwrap();
         match Config::read(&path) {
             ConfigRead::Parsed(cfg) => {
-                assert_eq!(cfg.paths, vec!["other"]);
+                // Resolved at load against the file's directory (#158).
+                assert_eq!(cfg.paths, vec![dir.join("other").display().to_string()]);
                 assert!(cfg.paths_explicitly_declared());
             }
             _ => panic!("a scalar `paths:` must parse, not fall back as malformed"),
@@ -974,7 +1511,16 @@ mod tests {
         assert!(matches!(Config::read(&path), ConfigRead::Absent(_)), "no file");
 
         std::fs::write(&path, "disable: [unterminated\n").unwrap();
-        assert!(matches!(Config::read(&path), ConfigRead::Malformed(_)), "broken YAML");
+        // Broken YAML is what the reference DIES on (`rescue
+        // ConfigurationError` → `rigor: <file>:<line>:<col>: not valid YAML:
+        // <detail>` + exit 64) — `Fatal`, not the degraded default.
+        assert!(
+            matches!(
+                Config::read(&path),
+                ConfigRead::Fatal(ref f) if f.code == 64 && f.message.contains("not valid YAML")
+            ),
+            "broken YAML is a fatal load upstream"
+        );
 
         std::fs::write(&path, "disable:\n  - call.undefined-method\n").unwrap();
         match Config::read(&path) {
@@ -989,11 +1535,15 @@ mod tests {
         }
 
         // A DIRECTORY at the config path is neither absent nor malformed: it is
-        // there and unreadable, and the LSP treats it like broken (keep the last
-        // good config) rather than like a delete.
+        // there but cannot be read — upstream the `Errno::EISDIR` escapes
+        // `rescue ConfigurationError` and dies (exit 1) — and the LSP treats it
+        // like broken (keep the last good config) rather than like a delete.
         let as_dir = dir.join("dir.yml");
         std::fs::create_dir_all(&as_dir).unwrap();
-        assert!(matches!(Config::read(&as_dir), ConfigRead::Unreadable(_)));
+        assert!(matches!(
+            Config::read(&as_dir),
+            ConfigRead::Fatal(ref f) if f.code == 1
+        ));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1067,10 +1617,12 @@ mod tests {
         assert!(none.signature_dirs().is_empty());
     }
 
-    /// Issue #129 (PR #150 review, family 6): the reference resolves a
-    /// relative `signature_paths:` entry against the directory of the config
-    /// file that named it (`Configuration.resolve_paths_in`); oracle-measured
-    /// with `--config conf/custom.yml` → `conf/sig`.
+    /// Issue #129 (PR #150 review, family 6) + #158: the reference resolves a
+    /// relative `signature_paths:` entry at LOAD time against the directory of
+    /// the config file that named it (`Configuration.resolve_paths_in` —
+    /// `File.expand_path`, so `..` folds lexically and the result is
+    /// absolute); oracle-measured with `--config conf/custom.yml` →
+    /// `conf/sig` — i.e. the absolute `<dir>/conf/sig`.
     #[test]
     fn signature_paths_resolve_against_the_config_dir() {
         let dir = std::env::temp_dir().join(format!("rigor_cfg_base_{}", std::process::id()));
@@ -1084,16 +1636,17 @@ mod tests {
         assert_eq!(
             cfg.signature_dirs(),
             vec![
-                dir.join("conf").join("sig"),
-                dir.join("conf").join("../shared"),
+                dir.join("conf/sig"),
+                dir.join("shared"), // `..` folded lexically at load
                 std::path::PathBuf::from("/abs/sig"),
             ]
         );
-        // The discovered `.rigor.yml` (a bare relative path) keeps the entries
-        // as written: its directory IS the cwd they are read against.
-        assert_eq!(config_base_dir(Path::new(".rigor.yml")), None);
-        assert_eq!(config_base_dir(Path::new("./.rigor.yml")), None);
-        assert_eq!(config_base_dir(Path::new("conf/x.yml")), Some(std::path::PathBuf::from("conf")));
+        // `config_base_dir` is the EXPANDED file's directory (absolute) —
+        // `File.dirname(File.expand_path(path))` upstream.
+        assert_eq!(
+            cfg.config_base_dir(),
+            Some(dir.join("conf").as_path())
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1307,5 +1860,196 @@ mod severity_config_tests {
         // parser (YAML 1.2 Core Schema) does not, so it resolves normally.
         let overrides = cfg("severity_overrides:\n  call: off\n").severity_overrides();
         assert_eq!(overrides, vec![("call".to_string(), ResolvedSeverity::Off)]);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #158 — `Configuration::load_with_includes` parity: per-file
+    // path resolution, include merge order, cycles, `~`, `..` folding.
+    // ------------------------------------------------------------------
+
+    /// A fresh temp dir per test (parallel cargo tests share no cwd here —
+    /// every path is absolute).
+    fn cfg_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rigor_cfg158_{}_{}_{}",
+            std::process::id(),
+            tag,
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn parsed(path: &Path) -> Config {
+        match Config::read(path) {
+            ConfigRead::Parsed(cfg) => *cfg,
+            ConfigRead::Fatal(f) => panic!("fatal load: {} (exit {})", f.message, f.code),
+            ConfigRead::Absent(m) => panic!("config absent: {m}"),
+        }
+    }
+
+    /// `paths:` / `signature_paths:` / `pre_eval:` resolve against the FILE's
+    /// directory at load; `..` folds lexically; `exclude:` and `baseline:`
+    /// are NOT path keys upstream and keep their spelling.
+    #[test]
+    fn path_keys_resolve_against_the_file_dir() {
+        let dir = cfg_dir("keys");
+        std::fs::create_dir_all(dir.join("conf")).unwrap();
+        std::fs::write(
+            dir.join("conf/x.yml"),
+            "paths: [src, ../shared]\n\
+             signature_paths: [sig]\n\
+             pre_eval: [boot/patch.rb]\n\
+             exclude: [vendor/**]\n\
+             baseline: base.yml\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join("conf/x.yml"));
+        assert_eq!(
+            cfg.paths,
+            vec![
+                dir.join("conf/src").display().to_string(),
+                dir.join("shared").display().to_string(), // `..` folded
+            ]
+        );
+        assert_eq!(cfg.signature_paths, vec![dir.join("conf/sig").display().to_string()]);
+        assert_eq!(
+            cfg.pre_eval,
+            vec![dir.join("conf/boot/patch.rb").display().to_string()]
+        );
+        // Not path keys — verbatim.
+        assert_eq!(cfg.exclude, vec!["vendor/**"]);
+        assert_eq!(cfg.baseline_path().as_deref(), Some("base.yml"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `~` expands at the head of a path entry (`File.expand_path`), `~user`
+    /// names that user's home, and an unknown `~user` is the uncaught
+    /// `ArgumentError` upstream — a fatal load (exit 1), not a silent miss.
+    #[test]
+    fn tilde_expands_at_the_head() {
+        let dir = cfg_dir("tilde");
+        let home = home_dir().expect("HOME must resolve for this test");
+        std::fs::write(
+            dir.join(".rigor.yml"),
+            "paths: [~/proj, ~/../proj2, literal/~x]\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join(".rigor.yml"));
+        assert_eq!(cfg.paths[0], format!("{home}/proj"));
+        // `~` expands THEN `..` folds lexically — `~/..` is the home's parent.
+        let home_parent = Path::new(&home)
+            .parent()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        assert_eq!(cfg.paths[1], format!("{home_parent}/proj2"));
+        // `~` NOT at the head stays literal and resolves like any relative path.
+        assert_eq!(cfg.paths[2], dir.join("literal/~x").display().to_string());
+
+        std::fs::write(dir.join("bad.yml"), "paths: [~nonexistent_user_158/x]\n").unwrap();
+        match Config::read(&dir.join("bad.yml")) {
+            ConfigRead::Fatal(f) => {
+                assert_eq!(f.code, 1);
+                assert!(f.message.contains("doesn't exist"), "{}", f.message);
+            }
+            _ => panic!("~nouser must die like the reference"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `includes:` merge order (included first, current overrides), each file
+    /// resolving its own relative paths against ITS directory, a missing
+    /// include as the exit-64 error, and the `visited + [absolute]` chain
+    /// semantics: a diamond is NOT circular, a self-inclusion is.
+    #[test]
+    fn includes_merge_and_resolve_per_file() {
+        let dir = cfg_dir("inc");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(
+            dir.join("sub/base.yml"),
+            "paths: [bsrc]\ndisable: [call.undefined-method]\nsignature_paths: [bsig]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".rigor.yml"),
+            "includes: [sub/base.yml]\npaths: [main]\ndisable: [flow.dead-assignment]\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join(".rigor.yml"));
+        // `paths:` from the current file WINS outright (deep_merge is
+        // right-wins on sequences); `signature_paths:` survives from the
+        // include — resolved against SUB's directory.
+        assert_eq!(cfg.paths, vec![dir.join("main").display().to_string()]);
+        assert_eq!(
+            cfg.signature_paths,
+            vec![dir.join("sub/bsig").display().to_string()]
+        );
+        assert_eq!(cfg.disable, vec!["flow.dead-assignment"]);
+        assert!(cfg.declares_key("includes"));
+
+        // Diamond: a and b both include shared — loaded twice, not circular.
+        std::fs::write(dir.join("shared.yml"), "disable: [call]\n").unwrap();
+        std::fs::write(dir.join("a.yml"), "includes: [shared.yml]\n").unwrap();
+        std::fs::write(dir.join("b.yml"), "includes: [shared.yml]\n").unwrap();
+        std::fs::write(
+            dir.join("diamond.yml"),
+            "includes: [a.yml, b.yml]\n",
+        )
+        .unwrap();
+        let cfg = parsed(&dir.join("diamond.yml"));
+        assert_eq!(cfg.disable, vec!["call"]);
+
+        // Self-inclusion IS circular.
+        std::fs::write(dir.join("cycle.yml"), "includes: [cycle.yml]\n").unwrap();
+        match Config::read(&dir.join("cycle.yml")) {
+            ConfigRead::Fatal(f) => {
+                assert_eq!(f.code, 64);
+                assert!(f.message.contains("circular include"), "{}", f.message);
+            }
+            _ => panic!("a self-include must die upstream"),
+        }
+
+        // Missing include — `include not found: "miss.yml" (referenced from …)`.
+        std::fs::write(dir.join("miss.yml"), "includes: [nope.yml]\n").unwrap();
+        match Config::read(&dir.join("miss.yml")) {
+            ConfigRead::Fatal(f) => {
+                assert_eq!(f.code, 64);
+                assert!(
+                    f.message.contains("include not found")
+                        && f.message.contains("referenced from"),
+                    "{}",
+                    f.message
+                );
+            }
+            _ => panic!("a missing include must die upstream"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `DISCOVERY_ORDER` is `.rigor.yml` before `.rigor.dist.yml` — the first
+    /// existing wins outright (no implicit merge).
+    #[test]
+    fn discovery_order_is_local_then_dist() {
+        assert_eq!(DISCOVERY_ORDER, [".rigor.yml", ".rigor.dist.yml"]);
+    }
+
+    /// A non-mapping document and a broken YAML file are the reference's
+    /// `rescue ConfigurationError` surface — fatal (exit 64), not defaults.
+    #[test]
+    fn fatal_loads_match_the_reference_exit() {
+        let dir = cfg_dir("fatal");
+        std::fs::write(dir.join("seq.yml"), "- just\n- a\n- list\n").unwrap();
+        match Config::read(&dir.join("seq.yml")) {
+            ConfigRead::Fatal(f) => {
+                assert_eq!(f.code, 64);
+                assert!(f.message.contains("must be a YAML mapping"), "{}", f.message);
+            }
+            _ => panic!("a non-mapping document is a ConfigurationError upstream"),
+        }
+        // An empty file is `nil || {}` upstream — parses to defaults.
+        std::fs::write(dir.join("empty.yml"), "").unwrap();
+        let cfg = parsed(&dir.join("empty.yml"));
+        assert_eq!(cfg.paths, vec!["lib"]);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
