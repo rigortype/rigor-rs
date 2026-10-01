@@ -308,6 +308,19 @@ impl SourceIndex {
         None
     }
 
+    /// rigor-rs#368 — whether any project class/module OTHER than the
+    /// toplevel `Object` surface defines instance `method`. A `def` at file
+    /// scope lands on `Object`, and every class descends `Object`, so a
+    /// same-named def ANYWHERE overrides it — the `degrade_if_overridable`
+    /// half of the fold the ancestor index cannot express for `Object`
+    /// itself (no project class records it as a superclass). `true` here
+    /// must drop a folded toplevel literal exactly as the degrade does.
+    pub(crate) fn toplevel_def_overridden(&self, method: &str) -> bool {
+        self.definers
+            .get(&(method.to_string(), DefKind::Instance))
+            .is_some_and(|owners| owners.iter().any(|o| o != "Object"))
+    }
+
     /// Whether the qualified `owner` has its OWN project `def` of `(method, kind)`.
     fn owner_defines(&self, owner: &str, method: &str, kind: DefKind) -> bool {
         self.definers

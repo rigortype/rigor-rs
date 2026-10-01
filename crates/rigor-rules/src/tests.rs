@@ -4294,3 +4294,80 @@ fn issue_357_evaluated_writes_still_witness_end_to_end() {
         );
     }
 }
+
+/// rigor-rs#368 — provably-DEAD positions never let a write bind or widen a
+/// later read (the reference's `live_branch_for_if`/`live_rescues` drops).
+/// Every row is oracle-measured at `e59b7b89`: a folded `if`/`unless` arm's
+/// write reaches nothing, and a `rescue` arm that terminates (`raise`,
+/// `raise if helper`) drops out of the post-`begin` scope and `ensure`.
+#[test]
+fn issue_368_dead_position_writes_stay_silent_end_to_end() {
+    for src in [
+        // A folded `if`/`unless` arm's write never joins the continuation.
+        b"if true\n  1\nelse\n  q = 2\nend\nFloat(q).w\n" as &[u8],
+        b"unless false\n  1\nelse\n  q = 2\nend\nFloat(q).w\n",
+        // A terminating rescue arm drops out of the post-`begin` join…
+        b"begin\n  1\nrescue\n  q = 1\n  raise\nend\nFloat(q).w\n",
+        b"begin\n  1\nrescue\n  q = 1\n  return\nend\nFloat(q).w\n" as &[u8],
+        // …and the arm's own writes never reach `ensure` either on the
+        // oracle (`live_rescues` drops it from every continuation join).
+        b"begin\n  1\nrescue\n  q = 1\n  raise\nensure\n  q.w\nend\n",
+        // `x = raise` / `f(raise)` value positions terminate the arm too.
+        b"def g(a) = a\nbegin\n  1\nrescue\n  q = 1\n  v = raise\nend\nFloat(q).w\n",
+        b"def g(a) = a\nbegin\n  1\nrescue\n  q = 1\n  g(raise)\nend\nFloat(q).w\n",
+        // A folded conditional tail decides the arm: `raise if helper`
+        // exits when `helper` folds truthy.
+        b"def helper = true\nbegin\n  1\nrescue\n  q = 1\n  raise if helper\nend\nFloat(q).w\n",
+        // Nested dead arms stay dead.
+        b"if false\n  if true\n    q = 1\n  end\nend\nFloat(q).w\n",
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected silent for call.undefined-method (oracle silent at e59b7b89), got {diags:?} for {:?}",
+            String::from_utf8_lossy(src),
+        );
+    }
+}
+
+/// The dead-position exclusion is positional, not a blanket: reads inside a
+/// terminating rescue arm still see the arm's own writes (`live_rescues`
+/// drops the arm from the JOIN, not from its own body), the LIVE arm of a
+/// folded conditional still binds, a rescue arm that falls through still
+/// joins the post-`begin` scope, and a folded arm's pre-dead binding still
+/// witnesses at its true value.
+#[test]
+fn issue_368_live_position_writes_still_witness_end_to_end() {
+    for (src, want) in [
+        // A read inside the terminating arm sees the arm's own write.
+        ("begin\n  1\nrescue\n  x = 2\n  x.w\n  raise\nend\n", "for 2"),
+        // The live arm's write binds for the post-`if` read.
+        ("x = 1\nif true\n  x = \"s\"\nend\nx.w\n", "for \"s\""),
+        // `unless`' dead arm drops; the live arm's write binds.
+        ("x = 1\nunless true\n  x = \"s\"\nend\nx.w\n", "for 1"),
+        // A dead-arm write cannot overwrite an earlier binding: `q` keeps
+        // `"ok"`, so `q.w` fires `for "ok"` on the oracle — proof the arm
+        // was dropped, not joined.
+        ("q = \"ok\"\nif false\n  q = 1\nend\nq.w\n", "for \"ok\""),
+        // A rescue arm that falls through still joins post-`begin`.
+        ("begin\n  1\nrescue\n  q = 1\nend\nFloat(q).w\n", "for Float"),
+        // The write INSIDE a live rescue arm still witnesses there.
+        ("begin\n  1\nrescue\n  x = 2\n  x.w\nend\n", "for 2"),
+    ] {
+        let diags = run(src.as_bytes());
+        let hits: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected one undefined-method, got {diags:?} for {src:?}"
+        );
+        assert!(
+            hits[0].message.ends_with(want),
+            "expected message ending {want:?}, got {:?} for {src:?}",
+            hits[0].message
+        );
+    }
+}

@@ -49,6 +49,7 @@ mod block_call;
 mod call_dispatch;
 mod class_narrowing;
 mod collection_shape;
+mod dead;
 mod expr_type;
 mod flow_eval;
 mod flow_writes;
