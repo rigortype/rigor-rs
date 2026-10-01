@@ -351,14 +351,35 @@ Examples:
 /// `rigor plugin` — deferred. `PluginCommand#run` is manual dispatch: argv[0]
 /// is always a subcommand (default `list`), so an unrecognised one is
 /// "Unknown subcommand: X" + USAGE on stderr, exit 64 — not an option error.
-/// The implemented upstream subcommands stay deferred (no bundled plugin tree).
+/// `path`/`print` then shift argv[1] as the plugin *name* — dashed tokens
+/// included: a missing name is `usage_error` (exit 64), an unresolved one is
+/// `name_error` (exit 1). The resolved bodies stay deferred (no bundled
+/// plugin tree).
 fn cmd_plugin_deferred(args: &[String]) -> ExitCode {
     let sub = args.first().map(String::as_str).unwrap_or("list");
     match sub {
-        "list" | "path" | "print" | "root" => {
+        "list" | "root" => {
             eprintln!("rigor-rs: `plugin` is recognized but not yet implemented in this phase");
             ExitCode::from(2)
         }
+        "path" | "print" => match args.get(1).map(String::as_str) {
+            // `usage_error` — the message names the verb, then USAGE.
+            None => {
+                eprintln!("`{sub}` requires a plugin name");
+                eprint!("{PLUGIN_USAGE}");
+                ExitCode::from(64)
+            }
+            Some(name) if plugin_name_known(name) => {
+                eprintln!("rigor-rs: `plugin` is recognized but not yet implemented in this phase");
+                ExitCode::from(2)
+            }
+            // `name_error` — "Unknown plugin: X" + the list pointer.
+            Some(name) => {
+                eprintln!("Unknown plugin: {name}");
+                eprintln!("Run `rigor plugin list` to see the bundled plugins.");
+                ExitCode::from(1)
+            }
+        },
         "-h" | "--help" | "help" => {
             print!("{PLUGIN_USAGE}");
             ExitCode::SUCCESS
@@ -371,14 +392,78 @@ fn cmd_plugin_deferred(args: &[String]) -> ExitCode {
     }
 }
 
+/// `PluginCommand#find` over the reference's bundled `plugins/` + `examples/`
+/// trees: a name resolves on an exact match or with the conventional `rigor-`
+/// prefix dropped from either side. The plugin bodies are deferred; this list
+/// exists only so the unknown-plugin error surface matches the reference.
+fn plugin_name_known(name: &str) -> bool {
+    let stripped = name.strip_prefix("rigor-").unwrap_or(name);
+    BUNDLED_PLUGIN_NAMES
+        .iter()
+        .any(|p| p.strip_prefix("rigor-").unwrap_or(p) == stripped)
+}
+
+/// `discover(PLUGINS_ROOT) + discover(EXAMPLES_ROOT)` at the pinned ref —
+/// production plugins first, then the tutorial examples.
+const BUNDLED_PLUGIN_NAMES: &[&str] = &[
+    "rigor-actioncable",
+    "rigor-actionmailer",
+    "rigor-actionpack",
+    "rigor-active-model-serializers",
+    "rigor-activejob",
+    "rigor-activerecord",
+    "rigor-activestorage",
+    "rigor-activesupport-core-ext",
+    "rigor-devise",
+    "rigor-dry-monads",
+    "rigor-dry-schema",
+    "rigor-dry-struct",
+    "rigor-dry-types",
+    "rigor-dry-validation",
+    "rigor-ethon",
+    "rigor-factorybot",
+    "rigor-ffi",
+    "rigor-ffi-rzmq",
+    "rigor-grape",
+    "rigor-graphql",
+    "rigor-hanami",
+    "rigor-mangrove",
+    "rigor-minitest",
+    "rigor-pundit",
+    "rigor-rails",
+    "rigor-rails-i18n",
+    "rigor-rails-routes",
+    "rigor-railties",
+    "rigor-rbnacl",
+    "rigor-rbs-inline",
+    "rigor-rspec",
+    "rigor-rspec-rails",
+    "rigor-sassc",
+    "rigor-shoulda-matchers",
+    "rigor-sidekiq",
+    "rigor-sinatra",
+    "rigor-sorbet",
+    "rigor-statesman",
+    "rigor-typescript-utility-types",
+    "rigor-deprecations",
+    "rigor-lisp-eval",
+    "rigor-pattern",
+    "rigor-routes",
+    "rigor-units",
+    "rigor-web",
+];
+
 /// `rigor skill` — deferred. `SkillCommand#run` is manual dispatch like
 /// `docs`: argv[0] is a skill *name* unless it is one of the grammar words, so
 /// an unrecognised token is `name_error` ("Unknown skill: X" + list, exit 1).
-/// `describe`/`--describe` routes to `run_describe`, which refuses any trailing
-/// token as `unknown option for \`describe\`: X` (usage_error, exit 64).
+/// `--full`/`--path`/`--print` then shift argv[1] as the name — dashed tokens
+/// included: a missing name is `usage_error` (message differs per flag,
+/// exit 64). `describe`/`--describe` routes to `run_describe`, which refuses
+/// any trailing token as `unknown option for \`describe\`: X` (usage_error,
+/// exit 64).
 fn cmd_skill_deferred(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
-        None | Some("--list" | "--full" | "--path" | "--print") => {
+        None | Some("--list") => {
             eprintln!("rigor-rs: `skill` is recognized but not yet implemented in this phase");
             ExitCode::from(2)
         }
@@ -387,25 +472,46 @@ fn cmd_skill_deferred(args: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("describe" | "--describe") => cmd_describe_args(&args[1..]),
-        Some(name) if BUNDLED_SKILL_NAMES.contains(&name) => {
-            // `run_print` on a real skill — the SKILL.md bodies are the
-            // deferred content, not the name resolution.
-            eprintln!("rigor-rs: `skill` is recognized but not yet implemented in this phase");
-            ExitCode::from(2)
-        }
-        Some(name) => {
-            // `name_error` — "Unknown skill: X" + the bundled-skill list.
-            // The skills corpus itself is deferred (SKILL.md bodies aren't
-            // shipped), but the name list is stable upstream data, so the
-            // error surface stays byte-identical.
-            eprintln!("Unknown skill: {name}");
-            eprintln!("Available skills (try `rigor skill --list`):");
-            for s in BUNDLED_SKILL_NAMES {
-                eprintln!("  {s}");
+        Some(flag @ ("--full" | "--path" | "--print")) => {
+            // `usage_error` — each flag names itself except `--print`, which
+            // shares `run_print`'s positional-slot message.
+            let missing = match flag {
+                "--full" => "`--full` requires a skill name",
+                "--path" => "`--path` requires a skill name",
+                _ => "a skill name is required",
+            };
+            match args.get(1).map(String::as_str) {
+                None => {
+                    eprintln!("{missing}");
+                    eprint!("{SKILL_USAGE}");
+                    ExitCode::from(64)
+                }
+                Some(name) => cmd_skill_named(name),
             }
-            ExitCode::from(1)
         }
+        Some(name) => cmd_skill_named(name),
     }
+}
+
+/// The resolved-name slot shared by `run_print`/`run_path`/`run_full`: a
+/// bundled skill's body is deferred; anything else is `name_error` —
+/// "Unknown skill: X" + the bundled-skill list, exit 1.
+fn cmd_skill_named(name: &str) -> ExitCode {
+    if BUNDLED_SKILL_NAMES.contains(&name) {
+        // `run_print` on a real skill — the SKILL.md bodies are the
+        // deferred content, not the name resolution.
+        eprintln!("rigor-rs: `skill` is recognized but not yet implemented in this phase");
+        return ExitCode::from(2);
+    }
+    // The skills corpus itself is deferred (SKILL.md bodies aren't
+    // shipped), but the name list is stable upstream data, so the
+    // error surface stays byte-identical.
+    eprintln!("Unknown skill: {name}");
+    eprintln!("Available skills (try `rigor skill --list`):");
+    for s in BUNDLED_SKILL_NAMES {
+        eprintln!("  {s}");
+    }
+    ExitCode::from(1)
 }
 
 /// `SkillCommand#discover_skills` over the reference's bundled `skills/` tree —
