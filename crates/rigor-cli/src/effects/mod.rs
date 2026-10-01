@@ -713,7 +713,7 @@ mod tests {
     fn a_plugin_bearing_project_never_claims_exhaustiveness() {
         let root = scratch("plugins");
         let mut cfg = scratch_config(&root);
-        cfg.plugins = vec!["rigor-actionpack".to_string()];
+        cfg.plugins = vec![serde_yaml::Value::String("rigor-actionpack".to_string())];
         assert!(configures_plugins(&cfg));
 
         // The SAME file that is exhaustive above must now be withheld — and the
@@ -850,7 +850,8 @@ mod tests {
         // reproduces: a `plugins:` entry and NOTHING else — no `effects:` block,
         // no `sig/`, no annotation.
         let mut with_plugins = scratch_config(&root);
-        with_plugins.plugins = vec!["rigor-activesupport-core-ext".to_string()];
+        with_plugins.plugins =
+            vec![serde_yaml::Value::String("rigor-activesupport-core-ext".to_string())];
         assert!(
             carries_effect_annotations(&with_plugins, &config_path, &files, &root),
             "a configured plugin's effect rows go to the declared lane, always"

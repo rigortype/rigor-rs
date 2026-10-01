@@ -60,14 +60,18 @@ pub struct Config {
     #[serde(deserialize_with = "de_ruby_array")]
     pub paths: Vec<String>,
     /// Config-gated plugins to activate (ADR-25), as listed under `.rigor.yml`'s
-    /// `plugins:`. Each entry is a plugin id — either the gem name
-    /// (`rigor-activesupport-core-ext`) or the manifest id
-    /// (`activesupport-core-ext`); `rigor_index::CoreIndex::with_plugins`
-    /// normalises and resolves them, ignoring any that aren't bundled. The
-    /// reference discovers plugins ONLY from this list (no Gemfile auto-detect),
-    /// so the default (no-config) corpus run is unaffected.
-    #[serde(deserialize_with = "de_ruby_array")]
-    pub plugins: Vec<String>,
+    /// `plugins:`. Each entry is kept in its raw `Array()`-normalised shape
+    /// ([`ruby_array_raw`] — a scalar is one entry, a mapping's pairs are its
+    /// entries) because the reference walks the list with
+    /// `Plugin::Loader#normalise_entry`, where a bare string is a GEM name
+    /// (`require`d, never a bundled-plugin alias — issue #157) and a
+    /// `{gem:, id:, enabled:, config:}` mapping carries structured options.
+    /// [`Config::plugin_resolution`] performs that walk: a port-bundled gem
+    /// name activates, anything else becomes a `plugin_loader.load-error` row.
+    /// The reference discovers plugins ONLY from this list (no Gemfile
+    /// auto-detect), so the default (no-config) corpus run is unaffected.
+    #[serde(deserialize_with = "de_plugin_entries")]
+    pub plugins: Vec<serde_yaml::Value>,
     /// ADR-17 — the `pre_eval:` monkey-patch files. Resolved at load like
     /// `paths:` (issue #158): each entry is `File.expand_path(entry,
     /// config_dir)` upstream, so a file-loaded config carries the ABSOLUTE
@@ -363,6 +367,19 @@ where
     ruby_array(&value).map_err(serde::de::Error::custom)
 }
 
+/// `plugins:` — `Array(value)` WITHOUT the `.map(&:to_s)` the string-list keys
+/// get: `Plugin::Loader#normalise_entry` reads each entry's real shape (a
+/// String is a gem name; a Hash carries `gem`/`id`/`enabled`/`config`; any
+/// other element type is a `ConfigurationError` at load — issue #157), so the
+/// raw `Value`s must survive deserialization.
+fn de_plugin_entries<'de, D>(d: D) -> Result<Vec<serde_yaml::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(d)?;
+    Ok(ruby_array_raw(&value))
+}
+
 /// `signature_paths:` is the one list key whose explicit `null` is NOT
 /// `Array(nil)`: the reference keeps it `nil` (`sig_paths.nil? ? nil : …`),
 /// i.e. "not configured, use the default discovery" — the same as an absent
@@ -574,10 +591,14 @@ impl Config {
             Ok(m) => m,
             Err(f) => return ConfigRead::Fatal(f),
         };
-        // `coerce_severity_overrides` raises ConfigurationError at load
-        // (upstream initialize, configuration.rb:1037) — before the
-        // unknown-key pass.
-        if let Err(f) = validate_severity_overrides(&merged) {
+        // `Configuration#initialize`'s value coercions, in the reference's own
+        // raise order (configuration.rb:498-561) — a rejected `cache:`/`plugins_io:`
+        // `Hash#merge` or `Integer()`/`to_sym`/`Dependencies.from_h` failure is
+        // an uncaught exception upstream (exit 1), while the `ConfigurationError`
+        // family is the `rigor: <msg>` + exit 64 surface. All fire before the
+        // unknown-key pass, before plugins load, and before any analysis —
+        // the run emits NO diagnostic rows for any of them (issue #157).
+        if let Err(f) = validate_config_values(&merged) {
             return ConfigRead::Fatal(f);
         }
         // Upstream keeps EVERY parsed key in `data` (objects, not just
@@ -678,7 +699,7 @@ impl Config {
     /// the did-you-mean dictionary. `rigor_rs` is the reserved namespace (ADR-99
     /// / ADR-0036) — known by construction, so the reserved-namespace exemption
     /// is inherent.
-    pub const KNOWN_KEYS: [&'static str; 21] = [
+    pub const KNOWN_KEYS: [&'static str; 24] = [
         "target_ruby",
         "paths",
         "exclude",
@@ -689,7 +710,10 @@ impl Config {
         "pre_eval",
         "baseline",
         "fold_platform_specific_paths",
+        "parameter_inference",
+        "effects",
         "cache",
+        "plugins_isolation",
         "plugins_io",
         "severity_profile",
         "severity_overrides",
@@ -918,18 +942,44 @@ impl Config {
         )
     }
 
-    /// Issue #129 / ADR-0044: whether the reference accepts this
-    /// `target_ruby:`. It formats the value (`to_s`, so YAML's float `3.4`
-    /// reads `"3.4"`), rejects a malformed one before the run (exit 64), and
-    /// rejects one its Prism does not parse with a lone `configuration-error`
-    /// row (exit 1): in both cases it emits no other row. The port does not
-    /// reproduce either outcome; it accepts only the absent key and the
-    /// versions every Prism the reference supports parses (3.3, 3.4, 4.0, with
-    /// or without a patch level, and `latest`), and the `conforms-to` scan
-    /// stands down otherwise.
+    /// Issue #129 / #157: whether the reference's Prism accepts this
+    /// `target_ruby:`. Reachable only for a load-validated config (the format
+    /// check is [`coerce_target_ruby`], at load), so `false` means exactly
+    /// "Prism rejects this version" — the lone `configuration-error` row
+    /// [`Self::target_ruby_failure`] carries.
     #[must_use]
     pub fn target_ruby_supported(&self) -> bool {
-        self.target_ruby_value_supported()
+        self.coerced_target_ruby()
+            .is_none_or(|s| prism_accepts_target(&s))
+    }
+
+    /// `Runner#validate_target_ruby`'s failure message — `Some` iff
+    /// `target_ruby:` is present, format-valid, and outside this Prism build's
+    /// supported set (`3.3`/`3.4`/`3.5`/`4.0`/`4.1`/`latest` at the pin). The
+    /// run then emits this single `configuration-error` row and NOTHING else
+    /// (no expansion errors, no plugin rows, no analysis — issue #157).
+    #[must_use]
+    pub fn target_ruby_failure(&self) -> Option<String> {
+        let s = self.coerced_target_ruby()?;
+        if prism_accepts_target(&s) {
+            return None;
+        }
+        Some(format!(
+            "target_ruby {s:?} is not supported by this Rigor build \
+             (Prism accepts 3.3.0 and newer). Set target_ruby to your project's \
+             Ruby version (>= 3.3.0) — read it from Gemfile.lock's `RUBY \
+             VERSION` or .ruby-version. (Prism: invalid version: {s})"
+        ))
+    }
+
+    /// The `target_ruby:` value coerced the reference's way (`to_s` — YAML's
+    /// `3.4` float reads `"3.4"`), or `None` when the key is absent (upstream
+    /// defaults to `"4.0"`).
+    fn coerced_target_ruby(&self) -> Option<String> {
+        if self.target_ruby.is_null() && !self.present_keys.contains("target_ruby") {
+            return None;
+        }
+        Some(ruby_to_s(&self.target_ruby))
     }
 
     /// Issue #129: whether the config text passed the environment-parity
@@ -946,29 +996,173 @@ impl Config {
         self.base_dir.as_deref()
     }
 
-    fn target_ruby_value_supported(&self) -> bool {
-        let text = match &self.target_ruby {
-            serde_yaml::Value::Null => return !self.present_keys.contains("target_ruby"),
-            serde_yaml::Value::String(s) => s.clone(),
-            serde_yaml::Value::Number(n) => match n.as_f64() {
-                Some(f) if n.is_f64() => format!("{f:?}"),
-                _ => n.to_string(),
-            },
-            _ => return false,
-        };
-        if text == "latest" {
-            return true;
+    /// The `plugins:` list normalized to `Plugin::Loader#normalise_entry`
+    /// entries — a bare String is a gem name; a Hash stringifies its keys
+    /// (`k.to_s`) and reads `gem` (or `id` when `gem` is nil-or-false —
+    /// Ruby's `||`), `config` (nil-or-false folds to `{}`), and `enabled`
+    /// (only the literal `false` disables). Non-String/Hash entries were
+    /// rejected at load by `coerce_plugin_entry`; they normalize to `gem:
+    /// None` here so a `Config` built outside [`Self::read`] still walks the
+    /// same ladder.
+    #[must_use]
+    pub fn plugin_entries(&self) -> Vec<PluginEntry> {
+        self.plugins
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| match untag(raw) {
+                serde_yaml::Value::String(g) => PluginEntry {
+                    gem: Some(g.clone()),
+                    id: serde_yaml::Value::Null,
+                    config: serde_yaml::Value::Null,
+                    enabled: true,
+                    index,
+                    raw: raw.clone(),
+                },
+                serde_yaml::Value::Mapping(m) => {
+                    // `raw.to_h { |k, v| [k.to_s, v] }` upstream.
+                    let get = |key: &str| {
+                        m.iter()
+                            .find(|(k, _)| ruby_to_s(k) == key)
+                            .map(|(_, v)| v.clone())
+                    };
+                    let falsy = |v: &serde_yaml::Value| {
+                        matches!(untag(v), serde_yaml::Value::Null | serde_yaml::Value::Bool(false))
+                    };
+                    let gem_v = get("gem").filter(|v| !falsy(v)).or_else(|| get("id"));
+                    let gem = match gem_v.as_ref().map(untag) {
+                        Some(serde_yaml::Value::String(s)) if !s.is_empty() => Some(s.clone()),
+                        _ => None,
+                    };
+                    PluginEntry {
+                        gem,
+                        id: get("id").unwrap_or(serde_yaml::Value::Null),
+                        config: get("config").unwrap_or(serde_yaml::Value::Null),
+                        enabled: !get("enabled")
+                            .is_some_and(|v| falsy(&v)),
+                        index,
+                        raw: raw.clone(),
+                    }
+                }
+                other => PluginEntry {
+                    gem: None,
+                    id: serde_yaml::Value::Null,
+                    config: serde_yaml::Value::Null,
+                    enabled: true,
+                    index,
+                    raw: other.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// `Plugin::Loader.load` for the port's plugin universe
+    /// (issue #157, `loader.rb`): every `plugins:` entry names a GEM —
+    /// `require_gem!` resolves `bundled_plugin_path(gem) || require(gem)`, so
+    /// the engine's own `rigor-*` plugins take their packaged copy and any
+    /// other name is a plain `require` that dies `cannot load such file --
+    /// <gem>` unless the project's bundle provides it. rigor-rs ships ONE
+    /// port-bundled plugin (`rigor-activesupport-core-ext`) and no Ruby load
+    /// path, so for it the require "succeeds" (it activates), the other
+    /// bundled `rigor-*` names follow their probe-verified load outcome
+    /// (nested-`require` failures, the activerecord/rails-routes file-missing
+    /// rows, the rbs-inline stderr warning), and every remaining name is the
+    /// `could not load plugin gem` row.
+    ///
+    /// Post-require checks are mirrored for the plugins the port models:
+    /// `lookup_plugin_class!` (an `id:` that names no registered id), the
+    /// `appeared twice` duplicate-id row, and `manifest.validate_config` (the
+    /// bundled manifests the port knows have closed schemas — `[]` for
+    /// `activesupport-core-ext`, `[require_magic_comment]` for `rbs-inline`).
+    /// The upstream `(loaded from <abs path>)` suffix is not reproduced: it
+    /// embeds the reference checkout's plugin file path, which has no port
+    /// equivalent.
+    #[must_use]
+    pub fn plugin_resolution(&self, project_root: &Path) -> PluginResolution {
+        let mut res = PluginResolution::default();
+        // manifest id → the gem name that first activated it — the
+        // `appeared twice … (first via …, again via …)` payload.
+        let mut seen_ids: std::collections::HashMap<&'static str, String> =
+            std::collections::HashMap::new();
+        for entry in self.plugin_entries() {
+            // `normalise_entry`'s shape guard — unreachable for a `Config`
+            // built by `read` (`coerce_plugin_entries` already exited 64),
+            // kept so a test-built `Config` still walks the loader's ladder.
+            if !matches!(
+                untag(&entry.raw),
+                serde_yaml::Value::String(_) | serde_yaml::Value::Mapping(_)
+            ) {
+                res.load_errors.push(PluginLoadRow::loader(format!(
+                    "plugin entry #{} must be a String or Hash, got {}",
+                    entry.index,
+                    ruby_type_name(untag(&entry.raw))
+                )));
+                continue;
+            }
+            let Some(gem) = entry.gem else {
+                res.load_errors.push(PluginLoadRow::loader(format!(
+                    "plugin entry #{} must declare a non-empty `gem:` (or `id:`), got {}",
+                    entry.index,
+                    ruby_inspect(&entry.raw)
+                )));
+                continue;
+            };
+            // `next unless entry[:enabled]` — before the require, so a
+            // disabled entry neither loads nor errors.
+            if !entry.enabled {
+                continue;
+            }
+            let gem_label = format!("{gem:?}");
+            match resolve_plugin_gem(&gem) {
+                ResolvedGem::Bundled(b) => {
+                    let id = b.id;
+                    // `lookup_plugin_class!` — `if entry[:id]`: a nil OR false
+                    // id skips the check entirely and the entry resolves by
+                    // the gem's single registration; any other non-String is
+                    // `registered_for(<non-string>)` → nil → the row.
+                    let id_ok = match untag(&entry.id) {
+                        serde_yaml::Value::Null | serde_yaml::Value::Bool(false) => true,
+                        serde_yaml::Value::String(s) => s == id,
+                        _ => false,
+                    };
+                    if !id_ok {
+                        res.load_errors.push(PluginLoadRow::loader(format!(
+                            "plugin id {} (gem {gem_label}) did not register itself with Rigor::Plugin.register",
+                            ruby_inspect(&entry.id)
+                        )));
+                        continue;
+                    }
+                    if let Some(first) = seen_ids.get(id) {
+                        res.load_errors.push(PluginLoadRow::loader(format!(
+                            "plugin id {id:?} appeared twice in configuration \
+                             (first via {first:?}, again via {gem_label})"
+                        )));
+                        continue;
+                    }
+                    seen_ids.insert(id, gem.clone());
+                    if let Some(message) =
+                        plugin_config_error(id, &entry.config, b.config_schema)
+                    {
+                        res.load_errors.push(PluginLoadRow::loader(message));
+                        continue;
+                    }
+                    (b.runtime)(&mut res, project_root, &entry.config);
+                    // Only rigor-rs's OWN bundled plugin feeds the type
+                    // environment; a reference-bundled one still "resolved"
+                    // here (id/dup/config checks are uniform) but contributes
+                    // nothing the port carries.
+                    if b.port_bundled {
+                        res.activated.push(id.to_string());
+                    }
+                }
+                ResolvedGem::LoadFailure => {
+                    res.load_errors.push(PluginLoadRow::loader(format!(
+                        "could not load plugin gem {gem_label}: cannot load such file -- {}",
+                        plugin_failed_feature(&gem)
+                    )));
+                }
+            }
         }
-        let mut parts = text.split('.');
-        let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
-            return false;
-        };
-        let patch_ok = match (parts.next(), parts.next()) {
-            (None, None) => true,
-            (Some(p), None) => !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()),
-            _ => false,
-        };
-        patch_ok && matches!((major, minor), ("3", "3") | ("3", "4") | ("4", "0"))
+        res
     }
 
     /// Every RBS signature directory to ingest for a project rooted at
@@ -985,14 +1179,15 @@ impl Config {
     }
 
     /// The effective plugin id set for a project rooted at `project_root`: the
-    /// explicit `plugins:` list, plus (when `bundler.auto_detect`, ADR-72) a
-    /// bundled overlay for each `Gemfile.lock`-locked gem that ships no RBS,
-    /// de-duplicated (an explicit entry is never double-added). With no
-    /// `Gemfile.lock` this equals `plugins:`, so the config-less differential
-    /// harness is unaffected.
+    /// `plugins:` entries that activate a port-bundled plugin
+    /// ([`Self::plugin_resolution`]'s `activated`), plus (when
+    /// `bundler.auto_detect`, ADR-72) a bundled overlay for each
+    /// `Gemfile.lock`-locked gem that ships no RBS, de-duplicated (an explicit
+    /// entry is never double-added). With no `Gemfile.lock` this equals the
+    /// activating `plugins:` entries.
     #[must_use]
     pub fn effective_plugins(&self, project_root: &Path) -> Vec<String> {
-        let mut plugins = self.plugins.clone();
+        let mut plugins = self.plugin_resolution(project_root).activated;
         if self.bundler.auto_detect {
             for overlay in crate::bundler::auto_detected_overlays(project_root) {
                 if !plugins.iter().any(|p| p == &overlay) {
@@ -1011,6 +1206,393 @@ impl Config {
         self.rigor_rs.ruby.as_deref()
     }
 
+}
+
+/// One normalized `plugins:` entry — [`Config::plugin_entries`]' output, the
+/// loader's `{gem:, id:, config:, enabled:}` shape.
+#[derive(Debug)]
+pub struct PluginEntry {
+    /// `gem:` else `id:` when it is a non-empty String; `None` earns the
+    /// `plugin entry #N must declare a non-empty 'gem:' (or 'id:')` row.
+    pub gem: Option<String>,
+    /// The `id:` value as written — `Null` when absent.
+    pub id: serde_yaml::Value,
+    /// The `config:` value as written — `Null` when absent; `nil`/`false`
+    /// fold to `{}` upstream.
+    pub config: serde_yaml::Value,
+    /// `enabled:` — only the literal `false` disables.
+    pub enabled: bool,
+    /// Position within `plugins:` — the `#N` in `plugin entry #N …` rows.
+    pub index: usize,
+    /// The entry as written — `got {entry.inspect}` payload.
+    pub raw: serde_yaml::Value,
+}
+
+impl PluginEntry {
+    /// How a listing (`rigor plugins`, `rigor doctor`) names the entry: the
+    /// gem name, or the raw entry's `inspect` when it declares none.
+    pub fn display_name(&self) -> String {
+        self.gem.clone().unwrap_or_else(|| ruby_inspect(&self.raw))
+    }
+}
+
+/// A run-level row the reference's plugin machinery emits —
+/// `plugin_loader.load-error` (entries that fail to resolve) or a plugin's
+/// own `plugin.<id>.load-error` file-missing row. These bypass
+/// `severity_overrides`/`severity_profile`/`disable:` upstream (oracle:
+/// `plugin_loader: "off"` leaves the row at error), so the severity is fixed
+/// here and callers must not re-stamp it.
+#[derive(Debug)]
+pub struct PluginLoadRow {
+    /// The qualified rule id text output prints (`[plugin_loader.load-error]`).
+    pub rule_id: &'static str,
+    /// The JSON emit strips this `family.` prefix back off `rule_id`, since
+    /// the reference's `Diagnostic#rule` is the short id.
+    pub source_family: &'static str,
+    pub severity: rigor_rules::Severity,
+    pub message: String,
+}
+
+impl PluginLoadRow {
+    fn loader(message: String) -> Self {
+        Self {
+            rule_id: "plugin_loader.load-error",
+            source_family: "plugin_loader",
+            severity: rigor_rules::Severity::Error,
+            message,
+        }
+    }
+}
+
+/// [`Config::plugin_resolution`]'s result: which port-bundled plugin ids
+/// activated (the index's `plugin_bundle` input), the loader's `load_errors`
+/// as ready-made rows (they lead the run-level rows upstream — ahead of
+/// `pre-eval.*`), the plugin-emitted rows (which follow the whole per-file
+/// stream), and any stderr lines the plugins print while loading
+/// (`rigor-rbs-inline`'s missing-library warning).
+#[derive(Debug, Default)]
+pub struct PluginResolution {
+    /// Manifest ids of the port-bundled plugins that activated, in entry
+    /// order.
+    pub activated: Vec<String>,
+    /// `plugin_loader.load-error` rows in `plugins:` entry order.
+    pub load_errors: Vec<PluginLoadRow>,
+    /// Plugin-emitted rows — appended after the per-file stream upstream.
+    pub emitted: Vec<PluginLoadRow>,
+    /// Verbatim stderr lines (the `rigor-rbs-inline` warning).
+    pub stderr: Vec<String>,
+}
+
+/// `require_gem!`'s outcome for one gem name — either it resolves to one of
+/// the engine's bundled `rigor-*` plugins (`bundled_plugin_path` hit), or the
+/// bare `require` fails with `cannot load such file`.
+enum ResolvedGem {
+    Bundled(BundledOutcome),
+    LoadFailure,
+}
+
+/// A `bundled_plugin_path`-resolved plugin: its manifest `id`, the config
+/// schema the port mirrors (`None` — schema not carried — skips
+/// `validate_config` rather than guessing), the load-time side effects
+/// reproduced (`runtime`, fed the raw `config:` value), and whether it feeds
+/// the port's own index (only `rigor-activesupport-core-ext`).
+struct BundledOutcome {
+    id: &'static str,
+    /// `(key, kind)` pairs of `manifest.config_schema` — kind is the
+    /// manifest's `:string` / `:boolean` / `:integer` / `:array` / `:hash` /
+    /// `:any` kind word.
+    config_schema: Option<&'static [(&'static str, &'static str)]>,
+    runtime: fn(&mut PluginResolution, &Path, &serde_yaml::Value),
+    port_bundled: bool,
+}
+
+/// `bundled_plugin_path(gem)` for the pin's `plugins/` tree, then the require
+/// outcome the reference observed for each name (probe-verified over all 39
+/// bundled dirs).
+///
+/// The port-bundled plugin resolves by EXACT gem name
+/// (`rigor-activesupport-core-ext`) — a bare `activesupport-core-ext` is just
+/// another `require` miss, matching `Loader`, which never tries a manifest-id
+/// alias (issue #157).
+///
+/// - `rigor-ethon`/`rigor-ffi-rzmq`/`rigor-rbnacl`/`rigor-sassc`/`rigor-rails`/
+///   `rigor-activestorage` load their packaged main file but die on a
+///   plugin-internal `require` (those features ship under `plugins/…/lib`,
+///   unreachable on the bare load path — a stable failure);
+/// - `rigor-activerecord`/`rigor-rails-routes`/`rigor-rbs-inline` load and
+///   register; the port mirrors their file-probe rows / stderr warning;
+/// - the remaining `rigor-*` names load and register cleanly upstream; rigor-rs
+///   carries none of their runtime, so they go through the uniform id/dup
+///   checks and then resolve to "no activation" — declining coverage rather
+///   than emitting a spurious row.
+fn resolve_plugin_gem(gem: &str) -> ResolvedGem {
+    const NOOP: fn(&mut PluginResolution, &Path, &serde_yaml::Value) = |_, _, _| {};
+    let outcome = match gem {
+        "rigor-activesupport-core-ext" => BundledOutcome {
+            id: "activesupport-core-ext",
+            config_schema: Some(&[]),
+            runtime: NOOP,
+            port_bundled: true,
+        },
+        "rigor-activerecord" => BundledOutcome {
+            id: "activerecord",
+            config_schema: Some(&[
+                ("schema_file", "string"),
+                ("structure_sql_file", "string"),
+                ("model_search_paths", "array"),
+                ("model_base_classes", "array"),
+            ]),
+            runtime: activerecord_runtime,
+            port_bundled: false,
+        },
+        "rigor-rails-routes" => BundledOutcome {
+            id: "rails-routes",
+            config_schema: Some(&[
+                ("routes_file", "string"),
+                ("helper_paths", "array"),
+                ("grape_api_paths", "array"),
+            ]),
+            runtime: rails_routes_runtime,
+            port_bundled: false,
+        },
+        "rigor-rbs-inline" => BundledOutcome {
+            id: "rbs-inline",
+            config_schema: Some(&[("require_magic_comment", "boolean")]),
+            runtime: rbs_inline_runtime,
+            port_bundled: false,
+        },
+        _ => {
+            let Some(id) = gem
+                .strip_prefix("rigor-")
+                .and_then(|id| SILENT_BUNDLED_IDS.iter().find(|i| **i == id))
+            else {
+                return ResolvedGem::LoadFailure;
+            };
+            BundledOutcome {
+                id,
+                config_schema: None,
+                runtime: NOOP,
+                port_bundled: false,
+            }
+        }
+    };
+    ResolvedGem::Bundled(outcome)
+}
+
+/// `bundled_plugin_path`-visible reference plugins that load cleanly upstream
+/// (`require` + register + instantiate) but carry no port runtime —
+/// probe-verified `No diagnostics` each, so the mirrored surface is the
+/// uniform id/dup checks alone.
+const SILENT_BUNDLED_IDS: &[&str] = &[
+    "actioncable",
+    "actionmailer",
+    "actionpack",
+    "active-model-serializers",
+    "activejob",
+    "devise",
+    "dry-monads",
+    "dry-schema",
+    "dry-struct",
+    "dry-types",
+    "dry-validation",
+    "factorybot",
+    "ffi",
+    "grape",
+    "graphql",
+    "hanami",
+    "mangrove",
+    "minitest",
+    "pundit",
+    "rails-i18n",
+    "railties",
+    "rspec",
+    "rspec-rails",
+    "shoulda-matchers",
+    "sidekiq",
+    "sinatra",
+    "sorbet",
+    "statesman",
+    "typescript-utility-types",
+];
+
+/// The feature `require` reports for a bare-load failure — the gem name
+/// itself, or the plugin-internal require the packaged main file dies on.
+fn plugin_failed_feature(gem: &str) -> &str {
+    match gem {
+        "rigor-ethon" | "rigor-ffi-rzmq" | "rigor-rbnacl" | "rigor-sassc" => "rigor-ffi",
+        "rigor-rails" => "rigor-railties",
+        "rigor-activestorage" => "rigor/plugin/activestorage",
+        _ => gem,
+    }
+}
+
+/// `rigor-activerecord`'s init-time schema probe: reads the configured
+/// `schema_file`/`structure_sql_file` (manifest defaults otherwise) and emits
+/// the reduced-mode info row when neither file exists.
+fn activerecord_runtime(
+    res: &mut PluginResolution,
+    root: &Path,
+    config: &serde_yaml::Value,
+) {
+    let cfg_str = |key: &str, default: &str| match config.get(key).map(untag) {
+        Some(serde_yaml::Value::String(s)) => s.clone(),
+        _ => default.to_string(),
+    };
+    let schema = cfg_str("schema_file", "db/schema.rb");
+    let structure = cfg_str("structure_sql_file", "db/structure.sql");
+    if !(root.join(&schema).is_file() || root.join(&structure).is_file()) {
+        res.emitted.push(PluginLoadRow {
+            rule_id: "plugin.activerecord.load-error",
+            source_family: "plugin.activerecord",
+            severity: rigor_rules::Severity::Info,
+            message: format!(
+                "rigor-activerecord: schema file `{schema}` (or `{structure}`) not found; \
+                 typing models from source only — column checks (`where(col:)`, \
+                 column readers) are skipped"
+            ),
+        });
+    }
+}
+
+/// `rigor-rails-routes`'s load probe: the configured `routes_file`
+/// (`config/routes.rb` default) missing on disk is the plugin's own warning
+/// row.
+fn rails_routes_runtime(
+    res: &mut PluginResolution,
+    root: &Path,
+    config: &serde_yaml::Value,
+) {
+    let routes = match config.get("routes_file").map(untag) {
+        Some(serde_yaml::Value::String(s)) => s.clone(),
+        _ => "config/routes.rb".to_string(),
+    };
+    if !root.join(&routes).is_file() {
+        res.emitted.push(PluginLoadRow {
+            rule_id: "plugin.rails-routes.load-error",
+            source_family: "plugin.rails-routes",
+            severity: rigor_rules::Severity::Warning,
+            message: format!(
+                "rigor-rails-routes: routes file `{routes}` not found; route checks skipped"
+            ),
+        });
+    }
+}
+
+/// `rigor-rbs-inline`'s rescued `require "rbs/inline"` warning — the gem is
+/// absent in every environment the port runs in, so the line is
+/// unconditional once the plugin loads. Upstream's `required from <path>`
+/// lines (which embed the install's own paths) are not reproduced.
+fn rbs_inline_runtime(res: &mut PluginResolution, _root: &Path, _config: &serde_yaml::Value) {
+    res.stderr.push(
+        "rigor-rbs-inline: failed to load `rbs/inline` (cannot load such file -- \
+         rbs/inline). The plugin will load but contribute no synthesised RBS. \
+         Install the `rbs-inline` gem to enable inline-RBS comment ingestion."
+            .to_string(),
+    );
+}
+
+/// `manifest.validate_config(config)` — `nil`/`false` fold to `{}` and pass
+/// (the loader's `|| {}`), a non-Hash is `plugin config must be a Hash, got
+/// <Class>`, and per key the schema lookup then the kind check produce
+/// `unknown config key "k" for plugin "id"` / `config key "k" expected
+/// <kind>, got <Class>` errors joined with `; `.
+fn plugin_config_error(
+    id: &'static str,
+    config: &serde_yaml::Value,
+    schema: Option<&'static [(&'static str, &'static str)]>,
+) -> Option<String> {
+    let c = untag(config);
+    if matches!(c, serde_yaml::Value::Null | serde_yaml::Value::Bool(false)) {
+        return None;
+    }
+    let serde_yaml::Value::Mapping(m) = c else {
+        return Some(format!(
+            "plugin {id:?} config invalid: plugin config must be a Hash, got {}",
+            ruby_class_name(c)
+        ));
+    };
+    let Some(schema) = schema else {
+        return None;
+    };
+    let errors: Vec<String> = m
+        .iter()
+        .map(|(k, v)| {
+            let key_s = ruby_to_s(k);
+            match schema.iter().find(|(name, _)| *name == key_s) {
+                None => format!("unknown config key {key_s:?} for plugin {id:?}"),
+                Some((_, kind)) if !config_value_matches(v, kind) => format!(
+                    "config key {key_s:?} expected {kind}, got {}",
+                    ruby_class_name(untag(v))
+                ),
+                Some(_) => String::new(),
+            }
+        })
+        .filter(|e| !e.is_empty())
+        .collect();
+    if errors.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "plugin {id:?} config invalid: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+/// `Manifest#value_matches?` — the shallow config-value kind check.
+fn config_value_matches(v: &serde_yaml::Value, kind: &str) -> bool {
+    match kind {
+        "string" => matches!(untag(v), serde_yaml::Value::String(_)),
+        "boolean" => matches!(untag(v), serde_yaml::Value::Bool(_)),
+        "integer" => matches!(
+            untag(v),
+            serde_yaml::Value::Number(n) if n.is_i64() || n.is_u64()
+        ),
+        "array" => matches!(untag(v), serde_yaml::Value::Sequence(_)),
+        "hash" => matches!(untag(v), serde_yaml::Value::Mapping(_)),
+        "any" => true,
+        _ => false,
+    }
+}
+
+/// `#{value.class}` — the manifest's `got <Class>` wording (distinct from
+/// [`ruby_type_name`], whose `nil`/`true`/`false` name the VALUE for
+/// TypeError messages: `config.class` is always a class name).
+fn ruby_class_name(v: &serde_yaml::Value) -> &'static str {
+    match ruby_type_name(v) {
+        "nil" => "NilClass",
+        "true" => "TrueClass",
+        "false" => "FalseClass",
+        t => t,
+    }
+}
+
+/// Whether this Prism accepts the (load-validated) `target_ruby` string —
+/// the port's mirror of `Prism::VERSIONS` at the pin: `latest`, plus
+/// major.minor[.patch] for 3.3, 3.4, 3.5, 4.0 and 4.1. Any other
+/// format-valid version (`"3.2"`, `"4.2"`, `"03.4"`, `"33.4"`) is upstream's
+/// lone `configuration-error` row.
+fn prism_accepts_target(version: &str) -> bool {
+    if version == "latest" {
+        return true;
+    }
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let mut it = version.split('.');
+    let (Some(major), Some(minor)) = (it.next(), it.next()) else {
+        return false;
+    };
+    if !digits(major) || !digits(minor) {
+        return false;
+    }
+    match it.collect::<Vec<_>>().as_slice() {
+        [] => {}
+        [patch] if digits(patch) => {}
+        _ => return false,
+    }
+    matches!(
+        (major, minor),
+        ("3", "3") | ("3", "4") | ("3", "5") | ("4", "0") | ("4", "1")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1349,6 +1931,672 @@ fn validate_severity_overrides(merged: &serde_yaml::Mapping) -> Result<(), LoadF
             code: 64,
         });
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// `Configuration#initialize` value validation (issue #157). Upstream the
+// constructor coerces every defaulted key in a fixed order; the FIRST bad
+// value wins and the run never reaches analysis. Two failure tiers exist and
+// BOTH are faithfully mirrored here: `ConfigurationError` — the
+// `rescue ConfigurationError` surface, `rigor: <msg>` on stderr and exit 64 —
+// and the UNCAUGHT `TypeError`/`ArgumentError`/`NoMethodError` family (the
+// `Hash#merge` calls on `cache`/`plugins_io`/`parallel`/`bundler`/
+// `rbs_collection`, `Integer()` on `cache.max_bytes`, the `to_sym` calls on
+// `plugins_io.network`/`severity_profile`/`budget_overrun_strategy`, and all
+// of `Dependencies.from_h`), which upstream dies on with a backtrace and
+// exit 1. The port prints the same `rigor: <message>` line and takes the same
+// exit code; the backtrace itself is not reproduced.
+// ---------------------------------------------------------------------------
+
+/// Exit-64 (`rescue ConfigurationError`) load failure.
+fn usage_failure(message: String) -> LoadFailure {
+    LoadFailure { message, code: 64 }
+}
+
+/// Exit-1 load failure — an exception the reference never rescues
+/// (`TypeError`/`ArgumentError`/`NoMethodError`/`FloatDomainError`). The port
+/// reports the exception's message with the same `rigor:` prefix every other
+/// uncaught-shape failure already uses.
+fn crash_failure(message: String) -> LoadFailure {
+    LoadFailure { message, code: 1 }
+}
+
+/// Peel `Tagged` wrappers so every validator sees the payload's real shape —
+/// `YAML.safe_load_file(aliases: false)` upstream tags carry no payload
+/// semantics a config reader consults either.
+fn untag(v: &serde_yaml::Value) -> &serde_yaml::Value {
+    match v {
+        serde_yaml::Value::Tagged(t) => untag(&t.value),
+        other => other,
+    }
+}
+
+/// The name Ruby's `TypeError`/`NoMethodError` messages give a value: `nil`,
+/// `true` and `false` name the VALUE; everything else names its class
+/// (`can't convert nil into Integer`, `no implicit conversion of Array into
+/// Hash`).
+fn ruby_type_name(v: &serde_yaml::Value) -> &'static str {
+    use serde_yaml::Value;
+    match untag(v) {
+        Value::Null => "nil",
+        Value::Bool(true) => "true",
+        Value::Bool(false) => "false",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "Integer",
+        Value::Number(_) => "Float",
+        Value::String(_) => "String",
+        Value::Sequence(_) => "Array",
+        Value::Mapping(_) => "Hash",
+        Value::Tagged(_) => unreachable!("untagged"),
+    }
+}
+
+/// The `NoMethodError` receiver text — `undefined method 'to_sym' for nil` /
+/// `for true` / `for an instance of Integer` (oracle-verified wording).
+fn ruby_receiver_name(v: &serde_yaml::Value) -> String {
+    match untag(v) {
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_) => ruby_type_name(v).to_string(),
+        other => format!("an instance of {}", ruby_type_name(other)),
+    }
+}
+
+/// Ruby `Kernel#Integer(str)` — the strict literal grammar `resolve_workers`
+/// (`CheckRunnerFactory`) and `Integer(value)` apply to String input: ASCII
+/// whitespace padding, an optional sign, `0x`/`0b`/`0o`/`0d` radix prefixes, a
+/// bare leading `0` for octal, and `_` only BETWEEN digits. `None` mirrors the
+/// `ArgumentError` (`invalid value for Integer(): "…"`). `Some` reproduces the
+/// result (saturating — only the sign is ever consulted).
+pub(crate) fn ruby_integer(s: &str) -> Option<i128> {
+    let t = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r'));
+    let (neg, body) = match t.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let (radix, digits): (u32, &str) = match body.strip_prefix('0') {
+        Some(rest) if rest.is_empty() => return Some(0),
+        Some(rest) => match rest.as_bytes()[0] {
+            b'x' | b'X' => (16, &rest[1..]),
+            b'b' | b'B' => (2, &rest[1..]),
+            b'o' | b'O' => (8, &rest[1..]),
+            b'd' | b'D' => (10, &rest[1..]),
+            // `0` leads an octal literal — the 0 itself is a digit
+            // (`Integer("010")` → 8; `Integer("08")` raises).
+            _ => (8, body),
+        },
+        None => (10, body),
+    };
+    let chars: Vec<char> = digits.chars().collect();
+    if chars.first() == Some(&'_') || chars.last() == Some(&'_') {
+        return None;
+    }
+    let mut value: i128 = 0;
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            // `_` is a digit separator only — neighbours must be digits.
+            if chars
+                .get(i + 1)
+                .and_then(|n| n.to_digit(radix))
+                .is_none()
+            {
+                return None;
+            }
+            continue;
+        }
+        let d = c.to_digit(radix)?;
+        value = value.saturating_mul(radix as i128).saturating_add(i128::from(d));
+    }
+    Some(if neg { -value } else { value })
+}
+
+/// The `Integer(value)` result, or WHICH exception Ruby raises —
+/// `coerce_parallel_workers` rescues `TypeError`/`ArgumentError` and re-raises
+/// `ConfigurationError`, but `FloatDomainError` escapes that rescue.
+enum IntegerRejection {
+    /// `TypeError: can't convert <name> into Integer`.
+    NotConvertible(&'static str),
+    /// `ArgumentError: invalid value for Integer(): "<s>"`.
+    BadLiteral,
+    /// `FloatDomainError: NaN` / `Infinity` / `-Infinity` — uncaught upstream.
+    Domain(&'static str),
+}
+
+/// `Kernel#Integer` on a YAML value: Integers pass through, Floats truncate
+/// (and `NaN`/`±Infinity` raise `FloatDomainError`), Strings take the strict
+/// [`ruby_integer`] grammar, everything else is a `TypeError`.
+fn coerce_integer(v: &serde_yaml::Value) -> Result<i128, IntegerRejection> {
+    match untag(v) {
+        serde_yaml::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                return Ok(i128::from(i));
+            }
+            if let Some(u) = n.as_u64() {
+                return Ok(i128::from(u));
+            }
+            let f = n.as_f64().unwrap_or(f64::NAN);
+            if f.is_nan() {
+                return Err(IntegerRejection::Domain("NaN"));
+            }
+            if f == f64::INFINITY {
+                return Err(IntegerRejection::Domain("Infinity"));
+            }
+            if f == f64::NEG_INFINITY {
+                return Err(IntegerRejection::Domain("-Infinity"));
+            }
+            Ok(f.trunc() as i128)
+        }
+        serde_yaml::Value::String(s) => ruby_integer(s).ok_or(IntegerRejection::BadLiteral),
+        other => Err(IntegerRejection::NotConvertible(ruby_type_name(other))),
+    }
+}
+
+/// Every `data.fetch(key, {})` value that reaches `DEFAULTS.fetch(key).merge`
+/// must be a Hash — an absent key merges the `{}` default, but a present nil
+/// (or any non-mapping) dies on `Hash#merge`'s uncaught `TypeError` upstream.
+/// `check`/`baseline`/`doctor`/`plugins` all load through `Configuration.load`,
+/// so the crash mirrors to `rigor: <msg>` + exit 1.
+fn check_hash_merge(merged: &serde_yaml::Mapping, key: &str) -> Result<(), LoadFailure> {
+    match merged.get(key) {
+        None => Ok(()),
+        Some(v) if matches!(untag(v), serde_yaml::Value::Mapping(_)) => Ok(()),
+        Some(v) => Err(crash_failure(format!(
+            "no implicit conversion of {} into Hash",
+            ruby_type_name(v)
+        ))),
+    }
+}
+
+/// `coerce_target_ruby` (configuration.rb:501): `value.to_s` must match
+/// `/\A(?:\d+\.\d+(?:\.\d+)?|latest)\z/` — ANY digits pass here (Prism's own
+/// supported-set check runs later, at analysis time — [`Config::target_ruby_failure`]).
+fn coerce_target_ruby(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(v) = merged.get("target_ruby") else {
+        return Ok(());
+    };
+    let s = ruby_to_s(v);
+    if s == "latest" || target_ruby_format_ok(&s) {
+        return Ok(());
+    }
+    Err(usage_failure(format!(
+        "target_ruby must be a version (e.g. \"3.4\", \"4.0\", \"3.4.0\") or \"latest\", got {}",
+        ruby_inspect(v)
+    )))
+}
+
+/// `/\A\d+\.\d+(\.\d+)?\z/` — the shape gate only; "3.03" or "9.9.9.9"'s extra
+/// segment still fails here while "3.03" itself is a format-VALID (then
+/// Prism-rejected) value.
+fn target_ruby_format_ok(s: &str) -> bool {
+    let mut parts = s.split('.');
+    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    if !digits(major) || !digits(minor) {
+        return false;
+    }
+    match parts.collect::<Vec<_>>().as_slice() {
+        [] => true,
+        [patch] => digits(patch),
+        _ => false,
+    }
+}
+
+/// `coerce_plugin_entry` — each `plugins:` entry must be a String or Hash at
+/// LOAD time (exit 64); the Hash's structured validation is the loader's job
+/// at run time ([`Config::plugin_resolution`]).
+fn coerce_plugin_entries(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(v) = merged.get("plugins") else {
+        return Ok(());
+    };
+    for entry in ruby_array_raw(v) {
+        if !matches!(untag(&entry), serde_yaml::Value::String(_) | serde_yaml::Value::Mapping(_)) {
+            return Err(usage_failure(format!(
+                "plugin configuration entry must be a String or Hash, got {}",
+                ruby_inspect(&entry)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `coerce_bleeding_edge`: `nil`|`false`|`true`|Array|Hash normalize; anything
+/// else is a `ConfigurationError`.
+fn coerce_bleeding_edge_value(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(v) = merged.get("bleeding_edge") else {
+        return Ok(());
+    };
+    match untag(v) {
+        serde_yaml::Value::Null
+        | serde_yaml::Value::Bool(_)
+        | serde_yaml::Value::Sequence(_)
+        | serde_yaml::Value::Mapping(_) => Ok(()),
+        other => Err(usage_failure(format!(
+            "bleeding_edge must be true, false, a list of feature ids, or {{ all: true, except: [...] }}, got {}",
+            ruby_inspect(other)
+        ))),
+    }
+}
+
+/// `coerce_effects` + `coerce_effects_snapshot` + `coerce_effects_policy`:
+/// only a Hash `effects:` value validates (any other shape folds to `{}` — a
+/// present `effects: 5` is silently the empty block upstream). The sub-key
+/// coercions are tier-2 `ConfigurationError`s — `snapshot.gate`, the `reach`
+/// entry grammar, the `tolerated`/`labels`/`attribution`/`envelopes` label and
+/// key shapes.
+fn coerce_effects_value(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(serde_yaml::Value::Mapping(effects)) = merged.get("effects").map(untag) else {
+        return Ok(());
+    };
+    // coerce_effects_snapshot — `snapshot = {} unless snapshot.is_a?(Hash)`.
+    let empty = serde_yaml::Mapping::new();
+    let snapshot = match effects.get("snapshot").map(untag) {
+        Some(serde_yaml::Value::Mapping(s)) => s,
+        _ => &empty,
+    };
+    if let Some(reach) = snapshot.get("reach") {
+        for entry in ruby_array_raw(reach) {
+            let e = ruby_to_s(&entry);
+            // `EntryPoints.glob?` is the GLOB_CHARACTERS match — `* ? [ ] / .`;
+            // `name?` is `/\A[a-z0-9][a-z0-9_-]*\z/`.
+            let glob = e.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b']' | b'/' | b'.'));
+            let name = !e.is_empty()
+                && e.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && e.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+            if !glob && !name {
+                return Err(usage_failure(format!(
+                    "effects.snapshot.reach entry is neither a file glob nor a well-formed \
+                     entry-point preset name: {} (a preset name is /\\A[a-z0-9][a-z0-9_-]*\\z/; \
+                     anything carrying a path or glob character is treated as a file glob instead)",
+                    ruby_inspect(&entry)
+                )));
+            }
+        }
+    }
+    if let Some(gate) = snapshot.get("gate") {
+        // `value.to_s.to_sym` — every shape converts; membership is the check.
+        let g = ruby_to_s(gate);
+        if g != "symmetric" && g != "additions" {
+            return Err(usage_failure(format!(
+                "effects.snapshot.gate must be one of [:symmetric, :additions], got {}",
+                ruby_inspect(gate)
+            )));
+        }
+    }
+    // `effects.tolerated` then the policy trio (labels → attribution → envelopes).
+    if let Some(t) = effects.get("tolerated") {
+        check_effect_labels_where(t, "effects.tolerated")?;
+    }
+    if let Some(l) = effects.get("labels") {
+        check_effect_labels_where(l, "effects.labels")?;
+    }
+    if let Some(serde_yaml::Value::Mapping(attr)) = effects.get("attribution").map(untag) {
+        for (k, labels) in attr {
+            let name = ruby_to_s(k);
+            // `MethodKey.valid?` — `Owner#method`/`Owner.method`: a `#`/`.`
+            // split with non-empty, whitespace-free parts.
+            let idx = name.find(['#', '.']);
+            let valid = idx.is_some_and(|i| {
+                i > 0 && i < name.len() - 1 && [&name[..i], &name[i + 1..]]
+                    .iter()
+                    .all(|p| !p.bytes().any(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c)))
+            });
+            if !valid {
+                return Err(usage_failure(format!(
+                    "effects.attribution key is not a method key (`Owner#method` / `Owner.method`): {}",
+                    ruby_inspect(&serde_yaml::Value::String(name))
+                )));
+            }
+            check_effect_labels_where(labels, &format!("effects.attribution[{}]", ruby_inspect(&serde_yaml::Value::String(name))))?;
+        }
+    }
+    if let Some(envelopes) = effects.get("envelopes") {
+        for (index, entry) in ruby_array_raw(envelopes).iter().enumerate() {
+            let where_ = format!("effects.envelopes[{index}]");
+            let serde_yaml::Value::Mapping(e) = untag(entry) else {
+                return Err(usage_failure(format!(
+                    "{where_} is not a mapping: {}",
+                    ruby_inspect(entry)
+                )));
+            };
+            let selector = |key: &str| -> Result<Option<String>, LoadFailure> {
+                let Some(v) = e.get(key) else { return Ok(None) };
+                if matches!(untag(v), serde_yaml::Value::Null) {
+                    return Ok(None);
+                }
+                let s = ruby_to_s(v);
+                if s.trim().is_empty() {
+                    return Err(usage_failure(format!("{where_}.{key} is empty")));
+                }
+                Ok(Some(s))
+            };
+            let m = selector("match")?;
+            let n = selector("namespace")?;
+            if m.is_none() == n.is_none() {
+                return Err(usage_failure(format!(
+                    "{where_} must name exactly one of `match:` (a path glob) or `namespace:` \
+                     (a constant glob), got {}",
+                    if m.is_none() { "neither" } else { "both" }
+                )));
+            }
+            if !e.contains_key("effect") {
+                return Err(usage_failure(format!(
+                    "{where_} has no `effect:` bound (write `effect: []` for the empty envelope)"
+                )));
+            }
+            if let Some(fx) = e.get("effect") {
+                check_effect_labels_where(fx, &format!("{where_}.effect"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `Effects::Label.valid?` over an `Array(value).map(&:to_s)` list — the
+/// `/\A[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)*\z/` grammar.
+fn check_effect_labels_where(value: &serde_yaml::Value, where_: &str) -> Result<(), LoadFailure> {
+    for label in ruby_array_raw(value) {
+        let l = ruby_to_s(&label);
+        // `/\A[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)*\z/` — a leading letter, then
+        // lowercase/digit segments, `.`-separated (a bare `""` fails).
+        let seg_ok = |s: &str| {
+            s.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+                && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        };
+        if !l.split('.').all(seg_ok) {
+            return Err(usage_failure(format!(
+                "{where_} is not a well-formed effect label: {}",
+                ruby_inspect(&label)
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `cache.fetch("max_bytes")` → `Integer(raw)` when non-nil — the only
+/// nested-cache coercion that can raise (`path`/`validation` are `to_s` /
+/// fail-soft). Uncaught `TypeError`/`ArgumentError`/`FloatDomainError` →
+/// `rigor: <msg>` + exit 1.
+fn coerce_cache_max_bytes(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    // `plugins_io`/`cache` non-Hash shapes already failed in the merge pass.
+    let Some(serde_yaml::Value::Mapping(cache)) = merged.get("cache").map(untag) else {
+        return Ok(());
+    };
+    let Some(v) = cache.get("max_bytes") else {
+        return Ok(());
+    };
+    if matches!(untag(v), serde_yaml::Value::Null) {
+        return Ok(());
+    }
+    match coerce_integer(v) {
+        Ok(_) => Ok(()),
+        Err(IntegerRejection::Domain(d)) => Err(crash_failure(d.to_string())),
+        Err(IntegerRejection::NotConvertible(t)) => {
+            Err(crash_failure(format!("can't convert {t} into Integer")))
+        }
+        Err(IntegerRejection::BadLiteral) => Err(crash_failure(format!(
+            "invalid value for Integer(): {}",
+            ruby_inspect(v)
+        ))),
+    }
+}
+
+/// `coerce_plugins_isolation` — `nil` means unset; `"none"`/`"process"` are
+/// the configurable set; `"ruby_box"` raises its own message (it can only be
+/// selected via `RIGOR_PLUGIN_ISOLATION` before boot); anything else gets the
+/// membership error.
+fn coerce_plugins_isolation(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(v) = merged.get("plugins_isolation") else {
+        return Ok(());
+    };
+    if matches!(untag(v), serde_yaml::Value::Null) {
+        return Ok(());
+    }
+    let s = ruby_to_s(v);
+    if s == "none" || s == "process" {
+        return Ok(());
+    }
+    if s == "ruby_box" {
+        return Err(usage_failure(
+            "plugins_isolation: ruby_box cannot be selected from the configuration file — \
+             `Ruby::Box` must be active before Ruby boots. Run rigor with \
+             RIGOR_PLUGIN_ISOLATION=ruby_box instead (the launcher re-execs itself \
+             with RUBY_BOX=1 set)."
+                .to_string(),
+        ));
+    }
+    Err(usage_failure(format!(
+        "plugins_isolation must be one of [\"none\", \"process\"] (`ruby_box` is environment-only), got {}",
+        ruby_inspect(v)
+    )))
+}
+
+/// `coerce_network_policy` on the merged `plugins_io.network` — `to_sym`
+/// mirrors: a String must be `disabled`/`allowlist`; a non-String dies on
+/// `NoMethodError` upstream (exit 1).
+fn coerce_plugins_io_network(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(serde_yaml::Value::Mapping(pio)) = merged.get("plugins_io").map(untag) else {
+        return Ok(());
+    };
+    let Some(v) = pio.get("network") else {
+        return Ok(());
+    };
+    match untag(v) {
+        serde_yaml::Value::String(s) if s == "disabled" || s == "allowlist" => Ok(()),
+        serde_yaml::Value::String(_) => Err(usage_failure(format!(
+            "plugins_io.network must be one of [:disabled, :allowlist], got {}",
+            ruby_inspect(v)
+        ))),
+        other => Err(crash_failure(format!(
+            "undefined method 'to_sym' for {}",
+            ruby_receiver_name(other)
+        ))),
+    }
+}
+
+/// `coerce_severity_profile` — `to_sym` mirror: a String must be one of
+/// `SeverityProfile::VALID_PROFILES`; a non-String dies on `NoMethodError`
+/// upstream (exit 1).
+fn coerce_severity_profile(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(v) = merged.get("severity_profile") else {
+        return Ok(());
+    };
+    match untag(v) {
+        serde_yaml::Value::String(s) if matches!(s.as_str(), "lenient" | "balanced" | "strict") => {
+            Ok(())
+        }
+        serde_yaml::Value::String(_) => Err(usage_failure(format!(
+            "severity_profile must be one of [:lenient, :balanced, :strict], got {}",
+            ruby_inspect(v)
+        ))),
+        other => Err(crash_failure(format!(
+            "undefined method 'to_sym' for {}",
+            ruby_receiver_name(other)
+        ))),
+    }
+}
+
+/// `Dependencies.from_h` (`configuration/dependencies.rb`) — `nil` is the
+/// empty default; any other non-Hash is the `ArgumentError`
+/// `dependencies: must be a Hash` (exit 1, uncaught upstream). Nested
+/// `source_inference` entries, `budget_per_gem` and `budget_overrun_strategy`
+/// are the same uncaught `ArgumentError` surface.
+fn coerce_dependencies(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    let Some(v) = merged.get("dependencies") else {
+        return Ok(());
+    };
+    let v = untag(v);
+    if matches!(v, serde_yaml::Value::Null) {
+        return Ok(());
+    }
+    let serde_yaml::Value::Mapping(dep) = v else {
+        return Err(crash_failure(format!(
+            "dependencies: must be a Hash, got {}",
+            ruby_inspect(v)
+        )));
+    };
+    if let Some(si) = dep.get("source_inference") {
+        let si = untag(si);
+        if !(matches!(si, serde_yaml::Value::Null | serde_yaml::Value::Bool(false))) {
+            let serde_yaml::Value::Sequence(entries) = si else {
+                return Err(crash_failure(format!(
+                    "dependencies.source_inference: must be a list of entries \
+                     (or false / omitted to disable), got {}",
+                    ruby_inspect(si)
+                )));
+            };
+            for raw in entries {
+                let serde_yaml::Value::Mapping(entry) = untag(raw) else {
+                    return Err(crash_failure(format!(
+                        "dependencies.source_inference[] entry must be a Hash, got {}",
+                        ruby_inspect(raw)
+                    )));
+                };
+                // `gem:` — non-empty String only.
+                match entry.get("gem").map(untag) {
+                    Some(serde_yaml::Value::String(g)) if !g.is_empty() => {}
+                    other => {
+                        return Err(crash_failure(format!(
+                            "dependencies.source_inference[].gem must be a non-empty String, got {}",
+                            other.map_or_else(|| "nil".to_string(), ruby_inspect)
+                        )));
+                    }
+                }
+                // `mode:` — `(value || "when_missing").to_sym`: nil defaults,
+                // a String checks membership, anything else NoMethodErrors.
+                match entry.get("mode").map(untag) {
+                    None | Some(serde_yaml::Value::Null) => {}
+                    Some(serde_yaml::Value::String(m))
+                        if matches!(m.as_str(), "disabled" | "when_missing" | "full") => {}
+                    Some(v @ serde_yaml::Value::String(_)) => {
+                        return Err(crash_failure(format!(
+                            "dependencies.source_inference[].mode must be one of \
+                             [:disabled, :when_missing, :full], got {}",
+                            ruby_inspect(v)
+                        )));
+                    }
+                    Some(other) => {
+                        return Err(crash_failure(format!(
+                            "undefined method 'to_sym' for {}",
+                            ruby_receiver_name(other)
+                        )));
+                    }
+                }
+                // `roots:` — `Array(fetch("roots", ["lib"])).map(&:to_s)`; an
+                // explicitly empty result (including `roots: nil`) raises.
+                if let Some(roots) = entry.get("roots") {
+                    if ruby_array_raw(roots).is_empty() {
+                        return Err(crash_failure(
+                            "dependencies.source_inference[].roots must not be empty when supplied \
+                             (omit the key to fall back to the default [\"lib\"])"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(b) = dep.get("budget_per_gem") {
+        let b = untag(b);
+        match b {
+            serde_yaml::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                let i = n.as_i64().unwrap_or_else(|| n.as_u64().map_or(i64::MAX, |u| u.min(i64::MAX as u64) as i64));
+                if !(1250..=20000).contains(&i) {
+                    return Err(crash_failure(format!(
+                        "dependencies.budget_per_gem must be in the range 1250..20000, got {}",
+                        ruby_inspect(b)
+                    )));
+                }
+            }
+            _ => {
+                return Err(crash_failure(format!(
+                    "dependencies.budget_per_gem must be an Integer, got {}",
+                    ruby_inspect(b)
+                )));
+            }
+        }
+    }
+    if let Some(s) = dep.get("budget_overrun_strategy") {
+        match untag(s) {
+            serde_yaml::Value::String(t)
+                if matches!(t.as_str(), "walker_cap" | "dependency_silence") => {}
+            serde_yaml::Value::String(_) => {
+                return Err(crash_failure(format!(
+                    "dependencies.budget_overrun_strategy must be one of \
+                     [:walker_cap, :dependency_silence], got {}",
+                    ruby_inspect(s)
+                )));
+            }
+            other => {
+                return Err(crash_failure(format!(
+                    "undefined method 'to_sym' for {}",
+                    ruby_receiver_name(other)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `DEFAULTS.fetch("parallel").merge(data.fetch("parallel", {}))` then
+/// `coerce_parallel_workers(parallel.fetch("workers"))` — the merge dies on a
+/// non-Hash `parallel:` (uncaught `TypeError`), and the worker coercion wraps
+/// its `TypeError`/`ArgumentError` in `ConfigurationError` (exit 64) while a
+/// `FloatDomainError` (`NaN`/`Infinity`) escapes upstream entirely (exit 1).
+fn coerce_parallel(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    check_hash_merge(merged, "parallel")?;
+    let Some(serde_yaml::Value::Mapping(p)) = merged.get("parallel").map(untag) else {
+        return Ok(());
+    };
+    let Some(v) = p.get("workers") else {
+        return Ok(());
+    };
+    match coerce_integer(v) {
+        Ok(n) if n >= 0 => Ok(()),
+        Ok(_) => Err(usage_failure(format!(
+            "parallel.workers must be a non-negative Integer, got {} \
+             (parallel.workers must be >= 0, got {})",
+            ruby_inspect(v),
+            ruby_inspect(v)
+        ))),
+        Err(IntegerRejection::Domain(d)) => Err(crash_failure(d.to_string())),
+        Err(IntegerRejection::NotConvertible(t)) => Err(usage_failure(format!(
+            "parallel.workers must be a non-negative Integer, got {} \
+             (can't convert {t} into Integer)",
+            ruby_inspect(v)
+        ))),
+        Err(IntegerRejection::BadLiteral) => Err(usage_failure(format!(
+            "parallel.workers must be a non-negative Integer, got {} \
+             (invalid value for Integer(): {})",
+            ruby_inspect(v),
+            ruby_inspect(v)
+        ))),
+    }
+}
+
+/// The ordered `initialize` pass — the first bad value wins upstream, so the
+/// checks run in `Configuration#initialize`'s own order
+/// (configuration.rb:498-561).
+fn validate_config_values(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    check_hash_merge(merged, "cache")?;
+    check_hash_merge(merged, "plugins_io")?;
+    coerce_target_ruby(merged)?;
+    coerce_plugin_entries(merged)?;
+    coerce_bleeding_edge_value(merged)?;
+    coerce_effects_value(merged)?;
+    coerce_cache_max_bytes(merged)?;
+    coerce_plugins_isolation(merged)?;
+    coerce_plugins_io_network(merged)?;
+    coerce_severity_profile(merged)?;
+    validate_severity_overrides(merged)?;
+    coerce_dependencies(merged)?;
+    coerce_parallel(merged)?;
+    check_hash_merge(merged, "bundler")?;
+    check_hash_merge(merged, "rbs_collection")?;
     Ok(())
 }
 
@@ -2076,8 +3324,13 @@ mod tests {
         // Default (auto_detect on): the overlay is auto-added.
         let cfg = Config::default();
         assert_eq!(cfg.effective_plugins(&dir), vec!["activesupport-core-ext".to_string()]);
-        // An explicit entry is not double-added.
-        let explicit = Config { plugins: vec!["activesupport-core-ext".into()], ..Default::default() };
+        // An explicit entry is not double-added. The entry spells the GEM
+        // name (issue #157 — a bare manifest id is a `require` miss, not an
+        // activation).
+        let explicit = Config {
+            plugins: vec!["rigor-activesupport-core-ext".into()],
+            ..Default::default()
+        };
         assert_eq!(explicit.effective_plugins(&dir), vec!["activesupport-core-ext".to_string()]);
         // auto_detect off → only the explicit list.
         let off = Config { bundler: BundlerConfig { auto_detect: false }, ..Default::default() };

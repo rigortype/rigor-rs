@@ -102,7 +102,10 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
     // --- RBS source (audit-R1) ----------------------------------------------
     // The keystone: surface whether coverage comes from the embedded vendored
     // set (the standalone default), a RIGOR_RBS_CORE_DIR override, or the stub.
-    let index = CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new(".")));
+    let index = CoreIndex::for_project(
+        &cfg.effective_plugins(std::path::Path::new(".")),
+        &cfg.all_signature_dirs(std::path::Path::new(".")),
+    );
     let count = index.class_count();
     match index.rbs_source() {
         RbsSource::Embedded => {
@@ -169,18 +172,26 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
         println!("[PASS] plugins: none bundled");
     } else {
         println!("[PASS] plugins: {} bundled (config-gated)", bundled.len());
+        let activated = cfg.plugin_resolution(std::path::Path::new(".")).activated;
         for p in bundled {
-            let enabled = cfg
-                .plugins
-                .iter()
-                .any(|id| rigor_index::plugins::bundled_plugin(id).is_some_and(|b| b.id == p.id));
+            let enabled = activated.iter().any(|id| id == p.id);
             let state = if enabled { "enabled" } else { "available" };
             println!("  - {} ({state})", p.id);
         }
-        // Flag config plugin ids that resolve to nothing (typo / unbundled).
-        for id in &cfg.plugins {
-            if rigor_index::plugins::bundled_plugin(id).is_none() {
-                println!("  - {id} (unknown — not bundled, ignored)");
+        // Flag config plugin entries whose gem name resolves to no
+        // port-bundled plugin (typo / unbundled / a reference-only `rigor-*`
+        // name — the reference reports them as plugin-load rows; here they
+        // are inert).
+        for entry in cfg.plugin_entries() {
+            let resolves = entry
+                .gem
+                .as_deref()
+                .is_some_and(|g| rigor_index::plugins::bundled_plugin_by_gem(g).is_some());
+            if !resolves {
+                println!(
+                    "  - {} (unknown — not bundled, ignored)",
+                    entry.display_name()
+                );
             }
         }
     }

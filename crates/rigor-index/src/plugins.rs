@@ -57,15 +57,29 @@ pub fn bundled_plugins() -> &'static [&'static BundledPlugin] {
 /// unknown / unbundled id (NEVER an error — the reference likewise can't load a
 /// gem it doesn't have, so an unknown id is simply inert).
 ///
-/// Accepts BOTH spellings the reference recognises: the gem name
-/// (`"rigor-activesupport-core-ext"`) AND the manifest id
-/// (`"activesupport-core-ext"`). The gem name is the `manifest.id` prefixed with
-/// `rigor-`, so we normalise by stripping a leading `rigor-` before matching.
+/// Accepts BOTH spellings: the gem name (`"rigor-activesupport-core-ext"`) AND
+/// the manifest id (`"activesupport-core-ext"`), normalising by stripping a
+/// leading `rigor-`. Internal callers only — the config layer must use
+/// [`bundled_plugin_by_gem`], since the reference's loader resolves entries
+/// strictly as GEM names (issue #157: a bare `activesupport-core-ext` entry is
+/// a `require` miss, not a bundled alias).
 pub fn bundled_plugin(id: &str) -> Option<&'static BundledPlugin> {
     let normalized = normalize_id(id);
     ALL.iter()
         .copied()
         .find(|p| p.id == normalized)
+}
+
+/// The `Plugin::Loader.bundled_plugin_path` counterpart: resolve an entry's
+/// `gem:` name to a bundled payload by its EXACT `rigor-<id>` spelling. No
+/// manifest-id aliasing, no whitespace normalisation — the reference forms
+/// `plugins/<gem>/lib/<gem>.rb` verbatim, so ` rigor-x ` or `rigor- ` (empty
+/// id) never resolve.
+pub fn bundled_plugin_by_gem(gem: &str) -> Option<&'static BundledPlugin> {
+    let Some(id) = gem.strip_prefix("rigor-") else {
+        return None;
+    };
+    ALL.iter().copied().find(|p| p.id == id)
 }
 
 /// Normalise a plugin id to its manifest-id form: trim surrounding whitespace and

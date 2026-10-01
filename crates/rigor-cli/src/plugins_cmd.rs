@@ -159,12 +159,17 @@ pub fn cmd_plugins(args: &[String]) -> ExitCode {
         }
     }
 
-    // Flag config plugin ids that resolve to nothing (typo / unbundled) — the
+    // Flag config plugin entries whose gem name resolves to no port-bundled
+    // plugin (typo / unbundled / reference-only `rigor-*` name) — the
     // reference reports these as load errors; here they are simply inert
     // (rigor-rs can't load a gem it doesn't bundle), matching `doctor`.
-    for id in &cfg.plugins {
-        if rigor_index::plugins::bundled_plugin(id).is_none() {
-            println!("  [--] {id}  (unknown — not bundled, ignored)");
+    for entry in cfg.plugin_entries() {
+        let resolves = entry
+            .gem
+            .as_deref()
+            .is_some_and(|g| rigor_index::plugins::bundled_plugin_by_gem(g).is_some());
+        if !resolves {
+            println!("  [--] {}  (unknown — not bundled, ignored)", entry.display_name());
         }
     }
 
@@ -175,12 +180,15 @@ pub fn cmd_plugins(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Whether the discovered config's `plugins:` list enables `id` (gem-name and
-/// manifest-id spellings both resolve, via the index's normalisation).
+/// Whether the discovered config's `plugins:` list activates `id` — the
+/// reference's loader resolves entries strictly as gem names (issue #157), so
+/// only a `rigor-<id>` entry (or its `{gem:}`/enabled form) enables the
+/// bundled plugin.
 fn plugin_enabled(cfg: &Config, id: &str) -> bool {
-    cfg.plugins
+    cfg.plugin_resolution(std::path::Path::new("."))
+        .activated
         .iter()
-        .any(|p| rigor_index::plugins::bundled_plugin(p).is_some_and(|b| b.id == id))
+        .any(|p| p == id)
 }
 
 /// A one-line description per bundled plugin id. The reference reads this from
@@ -217,17 +225,23 @@ mod tests {
     fn enabled_tracks_config_plugins_list() {
         let mut cfg = Config::default();
         assert!(!plugin_enabled(&cfg, "activesupport-core-ext"));
-        // Both the manifest id and the gem name enable it (index normalises).
-        cfg.plugins = vec!["rigor-activesupport-core-ext".to_string()];
+        // Only the gem-name spelling activates: the reference's loader
+        // resolves `plugins:` entries as gem names, so the bare manifest id
+        // is a `require` miss — a load error, NOT an activation (issue #157).
+        cfg.plugins =
+            vec![serde_yaml::Value::String("rigor-activesupport-core-ext".to_string())];
         assert!(plugin_enabled(&cfg, "activesupport-core-ext"));
-        cfg.plugins = vec!["activesupport-core-ext".to_string()];
-        assert!(plugin_enabled(&cfg, "activesupport-core-ext"));
+        cfg.plugins = vec![serde_yaml::Value::String("activesupport-core-ext".to_string())];
+        assert!(!plugin_enabled(&cfg, "activesupport-core-ext"));
+        // A disabled structured entry does not activate either.
+        cfg.plugins = vec![serde_yaml::from_str("{gem: rigor-activesupport-core-ext, enabled: false}").unwrap()];
+        assert!(!plugin_enabled(&cfg, "activesupport-core-ext"));
     }
 
     #[test]
     fn unknown_config_plugin_does_not_enable_anything() {
         let mut cfg = Config::default();
-        cfg.plugins = vec!["not-a-real-plugin".to_string()];
+        cfg.plugins = vec![serde_yaml::Value::String("not-a-real-plugin".to_string())];
         assert!(!plugin_enabled(&cfg, "activesupport-core-ext"));
     }
 }
