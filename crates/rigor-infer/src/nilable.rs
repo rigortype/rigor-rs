@@ -6,12 +6,12 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, Scalar, Type};
+use rigor_parse::{Compound, LoweredAst, Node, NodeId, StatementsKind};
+use rigor_types::{Interner, Scalar, Type, TypeId};
 
 use crate::{
-    block_bound_names, collect_flow_writes, indexed_flow_writes, multi_target_binder,
-    widen_flow_writes, widen_penv_writes, TypeEnv, Typer,
+    block_bound_names, collect_flow_writes, drop_indexed_narrowings, indexed_flow_writes,
+    is_shape_mutator, multi_target_binder, widen_flow_writes, widen_penv_writes, TypeEnv, Typer,
 };
 
 /// The reference's `Array.new(n)` tuple-lift cap (`ARRAY_NEW_TUPLE_LIMIT`,
@@ -205,6 +205,12 @@ impl<'i> Typer<'i> {
                 let prov = self.array_new_nominal_provenance(ast, value, tenv, interner);
                 let vty = self.type_of(ast, value, tenv, interner);
                 tenv.insert(name.clone(), vty);
+                // A rebind invalidates the local's indexed-narrowing slot
+                // records, exactly as `apply_subtree_effects` drops them for
+                // every rebind in a subtree — without this a `s[k] ||= v`
+                // record outlives `s = "abc"` and answers a later `s[k]` read
+                // for the NEW binding (rigor-rs#352).
+                drop_indexed_narrowings(tenv, &name);
                 // Rebinding always refreshes the provenance (any non-`Array.new`
                 // RHS clears it).
                 if prov {
@@ -234,25 +240,50 @@ impl<'i> Typer<'i> {
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     nenv.remove(&name);
                     penv.remove(&name);
-                    tenv.insert(name, ty);
+                    tenv.insert(name.clone(), ty);
+                    drop_indexed_narrowings(tenv, &name);
                 }
                 // An `h[k]` index target stores through `[]=` on the
                 // post-binding scope — a MUTATION of `h`, not a rebind: widen
                 // `tenv` (the stored slot's type is unmodelled) but keep any
                 // `nenv`/`penv` fact, exactly as a bare `h[k] = v` call does
                 // (rigor-rs#134).
-                for (_, tspan, _) in targets.index_writes() {
+                // rigor-rs#352: the mutation mints the carrier
+                // `widen_for_mutator("[]=")` leaves (`Nominal[String]` for a
+                // value-pinned `s`), not a blunt Dynamic — a later `x = s[k]`
+                // stays a nilable `String | nil` source. The nominal is
+                // computed on the PRE-binding so `widen_flow_writes`' Dynamic
+                // pass (which still covers any writes nested inside the target
+                // expression) cannot shadow it.
+                for (name, tspan, key) in targets.index_writes() {
+                    // The store also invalidates the slot's `||=` record
+                    // (`invalidate_indexed_write`, rigor-rs#342).
+                    if let Some(key) = crate::flow_writes::index_target_drop_key(key) {
+                        tenv.remove(&crate::indexed_narrowing_key(&name, &key));
+                    }
+                    let pre = tenv.get(&name).copied();
+                    let widened = pre
+                        .and_then(|pre| self.widen_mutated_binding(pre, "[]=", interner));
                     widen_flow_writes(writes, tspan, tenv, interner);
+                    // The index-target store is a MUTATION, not a rebind:
+                    // `widen_mutated_binding` declining (`None` — the binding is
+                    // already a `Nominal`/`Dynamic`) keeps the binding it had,
+                    // it does not fall back to `widen_flow_writes`' Dynamic.
+                    if let Some(pre) = pre {
+                        tenv.insert(name, widened.unwrap_or(pre));
+                    }
                 }
             }
             Node::LocalVariableOpWrite { name, .. } => {
                 // `x += …` / `x ||= …` reads-then-writes ⇒ the nil possibility is
-                // narrowed/replaced; drop every fact and widen the type.
+                // narrowed/replaced; drop every fact and widen the type. The
+                // rebind also drops the local's indexed-narrowing records.
                 let name = name.clone();
                 nenv.remove(&name);
                 penv.remove(&name);
                 let u = interner.untyped();
-                tenv.insert(name, u);
+                tenv.insert(name.clone(), u);
+                drop_indexed_narrowings(tenv, &name);
             }
             Node::Call { .. } | Node::IndexWrite { .. } | Node::AttrWrite { .. } => {
                 self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
@@ -267,6 +298,71 @@ impl<'i> Typer<'i> {
                 let mut n: HashMap<String, &'static str> = HashMap::new();
                 let mut p: HashSet<String> = HashSet::new();
                 self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, writes, interner, out);
+            }
+            // `for s[k] in xs` — each index target stores the element through
+            // `[]=` on `s` (`bind_for_index` → `widen_index_target`), and the
+            // post-`for` join keeps the widened carrier beside the
+            // zero-iteration binding: a value-pinned `s` loses its `Constant`
+            // to `Nominal[String]`, so a later `x = s[k]` is still a nilable
+            // `String | nil` source (rigor-rs#352). The store also drops the
+            // slot's `||=` record (`invalidate_indexed_write`). The pass does
+            // not descend the body — every other write inside widens to
+            // Dynamic exactly as the `other` arm does.
+            Node::Loop { index_writes, .. } => {
+                let span = ast.get(id).span();
+                let mut widened: Vec<(String, TypeId)> = Vec::new();
+                for (name, _, key) in index_writes {
+                    if let Some(key) =
+                        crate::flow_writes::index_target_drop_key(key.clone())
+                    {
+                        tenv.remove(&crate::indexed_narrowing_key(name, &key));
+                    }
+                    if let Some(&pre) = tenv.get(name) {
+                        // The store is a MUTATION: a declined widening keeps
+                        // the prior binding rather than falling back to
+                        // `widen_flow_writes`' Dynamic.
+                        widened.push((
+                            name.clone(),
+                            self.widen_mutated_binding(pre, "[]=", interner)
+                                .unwrap_or(pre),
+                        ));
+                    }
+                }
+                widen_flow_writes(writes, span, tenv, interner);
+                widen_penv_writes(writes, span, penv);
+                nenv.clear();
+                for (name, w) in widened {
+                    tenv.insert(name, w);
+                }
+            }
+            // `rescue => s[k]` — the same index-target `[]=` store
+            // (`bind_rescue_reference` → `widen_index_target`), with the same
+            // widened carrier surviving the post-rescue join (rigor-rs#352).
+            Node::BeginRescue { clauses, .. } => {
+                let span = ast.get(id).span();
+                let mut widened: Vec<(String, TypeId)> = Vec::new();
+                for c in clauses {
+                    for (name, _, key) in &c.index_writes {
+                        if let Some(key) =
+                            crate::flow_writes::index_target_drop_key(key.clone())
+                        {
+                            tenv.remove(&crate::indexed_narrowing_key(name, &key));
+                        }
+                        if let Some(&pre) = tenv.get(name) {
+                            widened.push((
+                                name.clone(),
+                                self.widen_mutated_binding(pre, "[]=", interner)
+                                    .unwrap_or(pre),
+                            ));
+                        }
+                    }
+                }
+                widen_flow_writes(writes, span, tenv, interner);
+                widen_penv_writes(writes, span, penv);
+                nenv.clear();
+                for (name, w) in widened {
+                    tenv.insert(name, w);
+                }
             }
             // Any other statement (`if`/`unless`/`while`/`case`/logical/begin/
             // multi-assign/ivar-write/…) is UNMODELED in Slice 1: widen `tenv` and
@@ -329,6 +425,41 @@ impl<'i> Typer<'i> {
                         if safe_nav || is_guard {
                             nenv.remove(name);
                         }
+                        // Issue #352 — the receiver-mutation widening
+                        // (`MutationWidening.widen_for_mutator`): `s[k] = v` /
+                        // `s << x` rewrites `s` in place, and a value-pinned
+                        // `Constant["abc"]` loses its pin to `Nominal[String]`
+                        // — the carrier under which `x = s[0]` is a nilable
+                        // `String | nil` source (the Constant-receiver keystone
+                        // below otherwise declines and `x.upcase` stays
+                        // silent). Only the carriers `widen_mutated_binding`
+                        // widens change here; a `Nominal`/`Dynamic` binding is
+                        // already mutation-safe.
+                        if is_shape_mutator(&method) {
+                            // `IndexedNarrowing.invalidate_after_call` rides
+                            // first: a stable-key `s[k] = v` drops that slot's
+                            // `||=` record, every other shape mutator drops
+                            // every record rooted at `s`.
+                            let drop_key = if method == "[]=" {
+                                args.first()
+                                    .and_then(|&a| crate::stable_index_key(ast.get(a)))
+                            } else {
+                                None
+                            };
+                            self.drop_indexed_mutation(
+                                name,
+                                &method,
+                                drop_key.as_ref(),
+                                tenv,
+                            );
+                            if let Some(&pre) = tenv.get(name) {
+                                if let Some(widened) =
+                                    self.widen_mutated_binding(pre, &method, interner)
+                                {
+                                    tenv.insert(name.clone(), widened);
+                                }
+                            }
+                        }
                     }
                 }
                 for a in &args {
@@ -380,9 +511,12 @@ impl<'i> Typer<'i> {
                 receiver,
                 indices,
                 value,
+                compound,
+                operand,
                 ..
             } => {
-                let (receiver, indices, value) = (*receiver, indices.clone(), *value);
+                let (receiver, indices, value, compound, operand) =
+                    (*receiver, indices.clone(), *value, compound.clone(), *operand);
                 if let Some(r) = receiver {
                     self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
                 }
@@ -390,6 +524,48 @@ impl<'i> Typer<'i> {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
                         if let Some(&arm) = nenv.get(name) {
                             out.insert(id, arm);
+                        }
+                        // rigor-rs#352: the compound index write stores through
+                        // `[]=` — widen `s` the way `eval_index_or_write` does
+                        // (`IndexWriteWidening` → `widen_for_mutator`), so a
+                        // value-pinned String loses its pin to `Nominal[String]`
+                        // and a later `x = s[k]` stays a nilable source. An
+                        // `operand` `||=` additionally records the stored-slot
+                        // narrowing `s[k] -> narrow_truthy(s[k]) | v`, which is
+                        // what `nilable_source_class` then reads for `x = s[k]`
+                        // — `s[0] ||= "x"` narrows the read to `String | "x"`,
+                        // NON-nilable, so `x.upcase` must not fire. The record
+                        // computes on the PRE-widening binding, exactly as
+                        // `eval_index_or_write` does.
+                        let stored = if operand && matches!(compound, Compound::Or) {
+                            let tracked = tenv
+                                .get(name)
+                                .is_some_and(|&pre| self.fully_tracked_type(pre, interner));
+                            if tracked {
+                                indices.first().and_then(|&k| {
+                                    crate::stable_index_key(ast.get(k)).map(|key| {
+                                        let ty = self.index_write_value_type(
+                                            ast, r, &indices, value, &compound, tenv,
+                                            interner,
+                                        );
+                                        (crate::indexed_narrowing_key(name, &key), ty)
+                                    })
+                                })
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(&pre) = tenv.get(name) {
+                            if let Some(widened) =
+                                self.widen_mutated_binding(pre, "[]=", interner)
+                            {
+                                tenv.insert(name.clone(), widened);
+                            }
+                        }
+                        if let Some((key, stored)) = stored {
+                            tenv.insert(key, stored);
                         }
                     }
                 }
@@ -500,6 +676,25 @@ impl<'i> Typer<'i> {
         let recv = *recv;
         let method = method.clone();
         let args = args.clone();
+        // rigor-rs#352: a `s[k]` read answers the `s[k] ||= v` slot record when
+        // one is in scope (`type_call`'s `[]` interception reads the same
+        // `indexed_narrowing_key`), so the record's nilability — not
+        // `String#[]`'s RBS `String?` — decides `x`'s fact: `s[0] ||= "x"`
+        // records `String | "x"` (non-nil), and `x = s[0]` must not mark.
+        if method == "[]" && args.len() == 1 {
+            if let Node::LocalVariableRead { name, .. } = ast.get(recv) {
+                if let Some(key) = crate::stable_index_key(ast.get(args[0])) {
+                    if let Some(&recorded) =
+                        tenv.get(&crate::indexed_narrowing_key(name, &key))
+                    {
+                        return self
+                            .non_nil_fragment(recorded, interner)
+                            .and_then(|frag| self.fragment_class(frag, interner))
+                            .filter(|c| self.index.knows_class(c));
+                    }
+                }
+            }
+        }
         // (c) `Regexp.last_match` — a CORE SINGLETON returning an optional (P2,
         // 2026-07-17). `Regexp.last_match() -> MatchData?`; `Regexp.last_match(n)`
         // / `(name) -> String?`. The receiver is a `ConstantRead "Regexp"` (both
@@ -537,6 +732,15 @@ impl<'i> Typer<'i> {
             }
         }
         let rty = self.type_of(ast, recv, tenv, interner);
+        // Issue #352: a `T | nil` union receiver — `x` bound from an `s[0]`
+        // read — dispatches its call on the non-nil fragment
+        // (`try_non_nil_receiver_retry`), so the nilable-source test reads the
+        // same fragment: `y = x[0]` marks `y` `String | nil` exactly like
+        // `x = u[0]` on a `String.new` receiver does.
+        let rty = match interner.get(rty) {
+            Type::Union(_) => self.non_nil_fragment(rty, interner).unwrap_or(rty),
+            _ => rty,
+        };
         // Folding-parity keystone (shared by both sources): a `Constant` receiver
         // is folded by the reference to a concrete non-nil value ⇒ decline.
         if matches!(interner.get(rty), Type::Constant(_)) {
@@ -565,5 +769,31 @@ impl<'i> Typer<'i> {
             Some((core, true)) if self.index.knows_class(core) => Some(core),
             _ => None,
         }
+    }
+
+    /// The core-class name a nilable-source fragment witnesses — a
+    /// `non_nil_fragment` result is a union whenever the recorded slot held
+    /// more than one non-nil member (`s[k] ||= v` records
+    /// `narrow_truthy(s[k]) | v`, e.g. `String | "x"`), and `class_name_of`
+    /// alone answers `None` for it. The marked arm only needs ONE member's
+    /// class: `check_nil_receiver` fires when the method is absent on
+    /// `NilClass` and present on that arm, and every member is a possible
+    /// receiver — picking the first member with a known class keeps the fire
+    /// for `String | "x" | nil` (`x.upcase` ⇒ `String`) without inventing a
+    /// class a member does not carry (rigor-rs#352).
+    fn fragment_class(&self, frag: TypeId, interner: &Interner) -> Option<&'static str> {
+        if let Some(c) = self.index.class_name_of(interner, frag) {
+            return Some(c);
+        }
+        if let Type::Union(members) = interner.get(frag) {
+            for &m in members {
+                if let Some(c) = self.index.class_name_of(interner, m) {
+                    if self.index.knows_class(c) {
+                        return Some(c);
+                    }
+                }
+            }
+        }
+        None
     }
 }

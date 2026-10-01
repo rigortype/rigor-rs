@@ -91,7 +91,7 @@ fn index_target_writes(entries: rigor_parse::IndexWrites) -> Vec<(rigor_parse::S
 /// index a `h[k]` index-target `[]=` store addresses, for
 /// [`crate::flow_eval::Typer::drop_indexed_mutation`] to drop exactly that
 /// slot's record (rigor-rs#342).
-fn index_target_drop_key(key: Option<IndexTargetKey>) -> Option<ShapeKey> {
+pub(crate) fn index_target_drop_key(key: Option<IndexTargetKey>) -> Option<ShapeKey> {
     key.map(|k| match k {
         IndexTargetKey::Sym(s) => ShapeKey::Sym(s),
         IndexTargetKey::Str(s) => ShapeKey::Str(s),
