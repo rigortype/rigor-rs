@@ -45,8 +45,27 @@ fn contains(outer: Span, inner: Span) -> bool {
 }
 
 /// The implicit-self calls `branch_unconditionally_exits?` counts as exits
-/// (`EXIT_CALL_NAMES`, `statement_evaluator.rb:5025`).
+/// (`EXIT_CALLS`, `statement_evaluator.rb:5025`).
 const EXIT_CALLS: &[&str] = &["raise", "throw", "exit", "abort", "fail"];
+
+/// The `scope.self_type` shape a call site's `self` takes — the input
+/// `self_type_answers?` (`expression_typer.rb:1541`) dispatches on for the
+/// toplevel-`def` bind veto.
+pub(crate) enum CallSelf {
+    /// `self` is an instance of the qualified class — a `def` body that is
+    /// not singleton-side (`self_type_for_method_body` → `Nominal[path]`).
+    Instance(String),
+    /// `self` is the class object — `def self.x`, any `def` under a
+    /// `class <<` frame, a `def <recv>.x` naming the enclosing class, and
+    /// every class/module/`class <<` BODY statement
+    /// (`self_type_for_class_body` → `Singleton[path]`).
+    Singleton(String),
+    /// `self_type` is nil — file top level, a `def`/`class <<` whose
+    /// class-context path is empty, and `def <receiver>.x` forms the
+    /// oracle keeps no modelled `self` for. Nothing vetoes the toplevel
+    /// bind there.
+    Unmodelled,
+}
 
 /// One `rescue` clause of a real `begin`/`rescue`: whether the arm falls
 /// through to the post-`begin` join, and the spans that bound "after the
@@ -225,7 +244,34 @@ impl<'i> Typer<'i> {
     /// → `Narrowing.predicate_certainty`, `narrowing.rb:134`). `Some(true)` =
     /// always truthy, `Some(false)` = always falsey, `None` = live on both
     /// edges (the answer for `Bot` and every unfolded carrier).
+    ///
+    /// Memoized on `(ast, pred)`: the fold re-enters through `expr_scalar` →
+    /// `local_reach` → `definitely_assigns` → `expr_truthiness`, so without
+    /// the memo every `if` on a read's path re-folds every other (the `seen`
+    /// fuel bounds DEPTH, not the per-predicate fanout — exponential on real
+    /// files). Re-entry to a predicate already folding answers `None`, the
+    /// decline side.
     pub(crate) fn expr_truthiness(
+        &self,
+        ast: &LoweredAst,
+        pred: NodeId,
+        seen: &mut Vec<String>,
+    ) -> Option<bool> {
+        let key = (ast as *const LoweredAst as usize, pred.0);
+        if let Some(hit) = self.truthy_memo.borrow().get(&key) {
+            return *hit;
+        }
+        if !self.truthy_in_flight.borrow_mut().insert(key) {
+            return None;
+        }
+        let out = self.expr_truthiness_fold(ast, pred, seen);
+        self.truthy_in_flight.borrow_mut().remove(&key);
+        self.truthy_memo.borrow_mut().insert(key, out);
+        out
+    }
+
+    /// The actual predicate fold behind [`Typer::expr_truthiness`]'s memo.
+    fn expr_truthiness_fold(
         &self,
         ast: &LoweredAst,
         pred: NodeId,
@@ -276,10 +322,16 @@ impl<'i> Typer<'i> {
                 span,
                 ..
             } if args.is_empty() && block_body.is_empty() => {
-                let qual = self.enclosing_prefix(*span).join("::");
+                let (qual, kind) = match self.call_self(ast, *span) {
+                    CallSelf::Singleton(q) => (q, DefKind::Singleton),
+                    CallSelf::Instance(q) => (q, DefKind::Instance),
+                    // An unmodelled `self` resolves only the toplevel def —
+                    // no class table lookup.
+                    CallSelf::Unmodelled => (String::new(), DefKind::Instance),
+                };
                 self.source
-                    .implicit_self_literal(&qual, DefKind::Instance, method)
-                    .or_else(|| self.file_def_literal(ast, method, seen))
+                    .implicit_self_literal(&qual, kind, method)
+                    .or_else(|| self.file_def_literal(ast, method, *span, seen))
             }
             _ => self.expr_scalar(ast, pred, seen),
         };
@@ -291,12 +343,27 @@ impl<'i> Typer<'i> {
     /// `definer`-keyed table misses (a `def` at file scope, or an
     /// empty-source `Typer` in tests). Definitions nested inside a class,
     /// module or another def are not toplevel.
+    ///
+    /// The oracle binds this surface UNCONDITIONALLY —
+    /// `try_local_def_dispatch` → `infer_top_level_user_method` never
+    /// consults `degrade_if_overridable`, so a same-named `def` in some
+    /// unrelated class does NOT drop the fold (`def helper = true; module M;
+    /// def helper = false; end; … if helper` still folds truthy on the
+    /// oracle). The only gate is `self_type_answers?` (`expression_typer.rb:
+    /// 1541`, issue #618): the toplevel `def` is a private `Object` method —
+    /// the LAST link of every MRO — so it binds only where the call's own
+    /// `self` does not answer `name` first. At file top level `self_type` is
+    /// nil and nothing vetoes.
     pub(crate) fn file_def_literal(
         &self,
         ast: &LoweredAst,
         name: &str,
+        site: Span,
         seen: &mut Vec<String>,
     ) -> Option<Scalar> {
+        if self.self_answers(ast, site, name) {
+            return None;
+        }
         let containers: Vec<Span> = ast
             .iter()
             .filter_map(|(_, n)| match n {
@@ -306,18 +373,20 @@ impl<'i> Typer<'i> {
                 _ => None,
             })
             .collect();
-        // `degrade_if_overridable`: a toplevel `def` is an `Object` instance
-        // method, and every project class descends `Object` — a same-named
-        // def anywhere overrides it, so the literal cannot fold.
-        if self.source.toplevel_def_overridden(name) {
-            return None;
-        }
         // The LAST same-named `def` wins a call (Ruby re-definition), so a
         // shadowing second `def` never lets the first one's literal fold.
+        // A receiver-bearing `def Foo.bar` / `def obj.x` files under
+        // `<toplevel>` exactly like a bare `def` (`file_def`'s empty-owner
+        // arm); `def self.x` does not (the reference's `def_singleton?`
+        // skip).
         ast.iter()
             .filter_map(|(_, n)| {
                 let Node::Definition {
-                    name: Some(m),
+                    name: def_name,
+                    receiver_def_name,
+                    singleton_name: None,
+                    is_singleton_class: false,
+                    has_explicit_return,
                     body,
                     span,
                     ..
@@ -325,13 +394,258 @@ impl<'i> Typer<'i> {
                 else {
                     return None;
                 };
-                if m != name || containers.iter().any(|&c| c != *span && contains(c, *span)) {
+                let m = def_name.as_deref().or(receiver_def_name.as_deref());
+                // `has_explicit_return`: the reference unions explicit
+                // returns with the tail, so a `return` anywhere in the body
+                // (a block-nested one included — it exits the method) drops
+                // the fold (`def helper(x); return false if x; true; end`
+                // stays silent on the oracle).
+                if m != Some(name)
+                    || *has_explicit_return
+                    || containers.iter().any(|&c| c != *span && contains(c, *span))
+                {
                     return None;
                 }
                 body.last().copied()
             })
             .last()
             .and_then(|tail| self.expr_scalar(ast, tail, seen))
+    }
+
+    /// `self_type_answers?` (`expression_typer.rb:1541`) — whether the call
+    /// site's own `self` answers `name`, in which case a same-named toplevel
+    /// `def` never binds there. `false` at file top level, where
+    /// `self_type` is nil.
+    fn self_answers(&self, ast: &LoweredAst, site: Span, name: &str) -> bool {
+        match self.call_self(ast, site) {
+            CallSelf::Singleton(qual) => {
+                !qual.is_empty() && self.singleton_answers(&qual, name)
+            }
+            CallSelf::Instance(qual) => {
+                !qual.is_empty() && self.instance_answers(&qual, name)
+            }
+            // `def <receiver>.x` — the oracle does not model `self` there,
+            // so nothing vetoes (`def Foo.m; … if helper` binds the toplevel
+            // `def helper` even when `Foo.self.helper` exists — probed).
+            CallSelf::Unmodelled => false,
+        }
+    }
+
+    /// The `self` a call at `site` dispatches on — the `scope.self_type`
+    /// shape `self_type_answers?` reads. Rebuilt from the containing
+    /// `def` / `class` / `module` / `class <<` nodes exactly as the
+    /// reference builds `@class_context`: `class`/`module` push a plain
+    /// frame and a `def` pushes none; `class << self` re-marks the
+    /// innermost frame singleton, `class << Const` re-marks it when it
+    /// names the innermost frame and REPLACES the whole stack otherwise,
+    /// and `class << <other>` leaves the context unchanged
+    /// (`singleton_context_for`, `statement_evaluator.rb:4856`).
+    pub(crate) fn call_self(&self, ast: &LoweredAst, site: Span) -> CallSelf {
+        let mut chain: Vec<&Node> = Vec::new();
+        for (_, n) in ast.iter() {
+            let span = match n {
+                Node::Definition { span, .. }
+                | Node::ClassDef { span, .. }
+                | Node::ModuleDef { span, .. } => *span,
+                _ => continue,
+            };
+            if contains(span, site) {
+                chain.push(n);
+            }
+        }
+        chain.sort_by_key(|n| {
+            let s = n.span();
+            s.1 - s.0
+        });
+
+        // The class-context frames, outermost-first — each `(frame name,
+        // singleton-marked)`; a frame name keeps its written `A::B` path,
+        // so `path` joins the same way `current_class_path` does.
+        let mut frames: Vec<(String, bool)> = Vec::new();
+        for n in chain.iter().rev() {
+            match n {
+                Node::ClassDef { name, .. } | Node::ModuleDef { name, .. }
+                    if !name.is_empty() =>
+                {
+                    frames.push((name.clone(), false));
+                }
+                Node::Definition {
+                    is_singleton_class: true,
+                    singleton_operand,
+                    ..
+                } => match singleton_operand.map(|op| ast.get(op)) {
+                    // `class << self` re-tags the innermost enclosing frame.
+                    Some(Node::SelfExpr { .. }) => {
+                        if let Some((_, s)) = frames.last_mut() {
+                            *s = true;
+                        }
+                    }
+                    Some(Node::ConstantRead { name, .. }) => {
+                        if frames.last().is_some_and(|(n, _)| n == name) {
+                            if let Some((_, s)) = frames.last_mut() {
+                                *s = true;
+                            }
+                        } else {
+                            frames.clear();
+                            frames.push((name.clone(), true));
+                        }
+                    }
+                    // `class << <other>` — the context is unchanged.
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        let path = frames
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join("::");
+        let inner_singleton = frames.last().is_some_and(|(_, s)| *s);
+
+        let Some(inner) = chain.first() else {
+            // File top level — `self_type` is nil.
+            return CallSelf::Unmodelled;
+        };
+        match inner {
+            // A `def` body — `self_type_for_method_body` + `singleton_def?`:
+            // `def self.x`, ANY def under a `class <<` frame, and a
+            // const-receiver `def C.x` naming the enclosing class
+            // (`def_receiver_targets_lexical_self?`) are singleton-side;
+            // every other `def`'s `self` is the instance. An empty path is
+            // the reference's `nil` — no modelled `self` at all.
+            Node::Definition {
+                is_singleton_class: false,
+                singleton_name,
+                receiver_def_name,
+                def_receiver_path,
+                ..
+            } => {
+                if path.is_empty() {
+                    return CallSelf::Unmodelled;
+                }
+                if singleton_name.is_some() || inner_singleton {
+                    return CallSelf::Singleton(path);
+                }
+                if receiver_def_name.is_some() {
+                    if let Some(rp) = def_receiver_path {
+                        let segs: Vec<&str> = rp.split("::").collect();
+                        if !segs.is_empty()
+                            && segs.len() <= frames.len()
+                            && frames[frames.len() - segs.len()..]
+                                .iter()
+                                .map(|(n, _)| n.as_str())
+                                .eq(segs.iter().copied())
+                        {
+                            return CallSelf::Singleton(path);
+                        }
+                    }
+                }
+                CallSelf::Instance(path)
+            }
+            // A class / module / `class <<` BODY statement — `self` is the
+            // class object itself (`self_type_for_class_body` →
+            // `Singleton[path]`).
+            _ if path.is_empty() => CallSelf::Unmodelled,
+            _ => CallSelf::Singleton(path),
+        }
+    }
+
+    /// The instance side of `self_type_answers?` (`instance_self_answers?`):
+    /// a method the project declares on `qual` or a project ancestor —
+    /// `def`, `attr_*`, `alias`, `define_method` — or a member an
+    /// RBS-declared ancestor carries ahead of `Object` in the MRO.
+    fn instance_answers(&self, qual: &str, name: &str) -> bool {
+        self.source
+            .project_declares_method_through_ancestors(self.file_key(), qual, name)
+            || self.rbs_ancestor_answers(qual, name)
+    }
+
+    /// `rbs_ancestor_answers?` — whether an RBS surface the enclosing class
+    /// inherits (its own when the name reopens a bundled class, else a
+    /// written ancestor's) declares `name`. A declaration owned by `Object`,
+    /// `Kernel` or `BasicObject` sits at-or-after the toplevel `def`'s own
+    /// rung and does NOT veto (`instance_self_answers?`'s `::Object`
+    /// cut-off). The walk uses the WRITTEN ancestor names —
+    /// `override_ancestor_names` drops non-project ancestors, which is
+    /// exactly the surface being asked here.
+    fn rbs_ancestor_answers(&self, qual: &str, name: &str) -> bool {
+        let mut queue: Vec<String> = vec![qual.to_string()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut visited = 0usize;
+        while let Some(current) = queue.pop() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            visited += 1;
+            if visited > crate::source_index::OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return false;
+            }
+            if self.index.knows_toplevel_class(&current)
+                || self.index.knows_qualified_class(&current)
+            {
+                // `declaring_ancestor` resolves the method's OWNER over the
+                // whole RBS chain from `current`, so nothing under it needs
+                // the queue — only a declaration before `Object` vetoes.
+                if self
+                    .index
+                    .declaring_ancestor(&current, name)
+                    .is_some_and(|owner| {
+                        !matches!(owner, "Object" | "Kernel" | "BasicObject")
+                    })
+                {
+                    return true;
+                }
+                continue;
+            }
+            // A project class: keep walking its written ancestors (the
+            // project's own members were the
+            // `project_declares_method_through_ancestors` arm's question).
+            queue.extend(self.source.written_ancestor_names(&current));
+        }
+        false
+    }
+
+    /// `singleton_self_answers?` — a `def self.name` (or `class <<` def) on
+    /// `qual`, on one of its `extend`ed modules' INSTANCE surface
+    /// (ScopeIndexer folds `extend` into the extender's own singleton
+    /// entries), or on a superclass reached through
+    /// `singleton_def_through_ancestors`'s SUPERCLASS-ONLY chain
+    /// (`mixins: false` — an `include`d module's `def self.x` is not
+    /// callable on the includer); plus the RBS arm, which is own-class
+    /// only (`rbs_declared_on_class?` on the `:singleton` definition).
+    fn singleton_answers(&self, qual: &str, name: &str) -> bool {
+        let mut current = qual.to_string();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut visited = 0usize;
+        loop {
+            if !seen.insert(current.clone()) {
+                break;
+            }
+            visited += 1;
+            // Past the walk cap the answer is "answers" — declining the
+            // fold is the uncertainty side, mirroring
+            // `discovered_method_through_ancestors?`.
+            if visited > crate::source_index::OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return true;
+            }
+            if self
+                .source
+                .owner_defines(&current, name, DefKind::Singleton)
+            {
+                return true;
+            }
+            for ext in self.source.extended_names(&current) {
+                if self.source.owner_defines(&ext, name, DefKind::Instance) {
+                    return true;
+                }
+            }
+            let Some(next) = self.source.project_superclass(&current) else {
+                break;
+            };
+            current = next;
+        }
+        self.index.singleton_declared_own(qual, name)
     }
 
     /// The locals a predicate NARROWS on the dead edge, floored to `Bot` for
@@ -388,6 +702,63 @@ impl<'i> Typer<'i> {
             },
             _ => {}
         }
+    }
+
+    /// Whether a `retry` re-entering the `begin` that owns `clause_span`
+    /// sits inside the clause — `retry` retries the NEAREST enclosing
+    /// `begin`, so one under a nested `begin`/`def`/`class`/`module` (or a
+    /// nested `class <<`) belongs to that inner frame and does not count.
+    /// When a clause carries one, the arm re-runs on the next pass: its own
+    /// writes reach earlier reads, exactly the carrier a loop is.
+    pub(crate) fn clause_retries(&self, ast: &LoweredAst, clause_span: Span) -> bool {
+        let nested: Vec<Span> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                // Only a REAL `begin` frame bounds `retry`. The builder also
+                // reuses `BeginRescue` as the carrier for an `if`'s else body,
+                // a `case/in` arm, and multi-statement parens — each an empty
+                // shell (`clauses`/`ensure_body` empty) that a `retry` passes
+                // straight through to the enclosing `begin` (`rescue; if c;
+                // else; retry; end; end` retries the OUTER begin —
+                // `logger/log_device.rb`'s `retry_limit -= 1` shape). A bare
+                // `begin … end` with no rescue/ensure is misread as a shell,
+                // but that only widens the outer clause — losing a diagnostic,
+                // never inventing one.
+                Node::BeginRescue {
+                    span,
+                    clauses,
+                    ensure_body,
+                    ..
+                } if contains(clause_span, *span)
+                    && (!clauses.is_empty() || !ensure_body.is_empty()) =>
+                {
+                    Some(*span)
+                }
+                Node::Definition { span, .. }
+                | Node::ClassDef { span, .. }
+                | Node::ModuleDef { span, .. }
+                    if contains(clause_span, *span) =>
+                {
+                    Some(*span)
+                }
+                _ => None,
+            })
+            .collect();
+        ast.iter().any(|(_, n)| {
+            let span = match n {
+                Node::Statements {
+                    kind: StatementsKind::Jump(JumpKind::Retry),
+                    span,
+                    ..
+                }
+                | Node::Other {
+                    jump: Some(JumpKind::Retry),
+                    span,
+                } => *span,
+                _ => return false,
+            };
+            contains(clause_span, span) && !nested.iter().any(|&s| contains(s, span))
+        })
     }
 
     /// `branch_terminates?` for an arm body — the sequence's LAST statement

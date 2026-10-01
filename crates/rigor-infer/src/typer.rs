@@ -66,6 +66,19 @@ pub struct Typer<'i> {
     /// the result — which is what breaks the `dead_positions` →
     /// `expr_truthiness` → `local_reach` → `dead_positions` cycle.
     pub(crate) dead_in_flight: Cell<bool>,
+    /// Memoized `expr_truthiness` per `(ast, predicate node)` — the fold
+    /// re-enters itself through `expr_scalar` → `local_reach` →
+    /// `definitely_assigns` → `expr_truthiness`, and without the memo every
+    /// `if` on a read's statement path re-folds every other (the `seen` cap
+    /// bounds DEPTH, not the per-predicate fanout: exponential on real
+    /// files). A completed answer is deterministic in `(ast, index)` — the
+    /// `seen` fuel can only shrink it, so caching a fuel-starved `None`
+    /// stays on the decline side.
+    pub(crate) truthy_memo: RefCell<std::collections::HashMap<(usize, u32), Option<bool>>>,
+    /// The predicates whose `expr_truthiness` fold is on the stack. A
+    /// re-entrant fold of the same node answers `None` — the decline half,
+    /// mirroring `dead_in_flight`.
+    pub(crate) truthy_in_flight: RefCell<std::collections::HashSet<(usize, u32)>>,
 }
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a
@@ -76,13 +89,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false) }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()) }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false) }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()) }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -93,7 +106,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false) }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()) }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from

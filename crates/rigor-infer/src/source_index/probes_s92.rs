@@ -708,6 +708,7 @@ fn legacy_collect_override_classes(
                 methods,
                 method_visibilities,
                 includes,
+                &[],
                 false,
             );
             let child_prefix = split_qualified(&qualified);
@@ -726,6 +727,7 @@ fn legacy_collect_override_classes(
                 methods,
                 method_visibilities,
                 includes,
+                &[],
                 true,
             );
             let child_prefix = split_qualified(&qualified);
