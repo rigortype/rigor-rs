@@ -639,9 +639,11 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `rigor: <msg>` + exit 64, and NO analysis rows (issue #157).
     if !workers_cli {
         if let Some(v) = std::env::var_os("RIGOR_RACTOR_WORKERS") {
-            let ok = v
-                .to_str()
-                .is_some_and(|s| config::ruby_integer(s).is_some());
+            // `env_value && !env_value.empty?` upstream — an EMPTY value is
+            // unset, not invalid (falls through to `parallel.workers`).
+            let ok = v.is_empty()
+                || v.to_str()
+                    .is_some_and(|s| config::ruby_integer(s).is_some());
             if !ok {
                 eprintln!(
                     "rigor: invalid RIGOR_RACTOR_WORKERS value: {v:?} (expected an Integer literal)"

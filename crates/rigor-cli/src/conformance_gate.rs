@@ -556,7 +556,11 @@ pub(crate) fn process_env_ok(
         None => true,
         // Ruby `Integer()`'s full literal grammar (sign, `0x`/`0o`/`0b`/`0d`,
         // whitespace padding, `_` separators) — `crate::config::ruby_integer`.
-        Some(v) => v.to_str().is_some_and(|v| crate::config::ruby_integer(v).is_some()),
+        // `env_value && !env_value.empty?`: an EMPTY value is unset, so the
+        // reference ignores it and the scan still runs.
+        Some(v) => v.is_empty()
+            || v.to_str()
+                .is_some_and(|v| crate::config::ruby_integer(v).is_some()),
     }
 }
 
@@ -1096,11 +1100,13 @@ mod tests {
     fn process_environment() {
         use std::ffi::OsStr;
         assert!(process_env_ok(None, None));
-        for good in ["4", "0", " 2", "0x2", "-1", "+3", "0b10", "07", "1_0", " 42 \n"] {
+        for good in ["4", "0", "", " 2", "0x2", "-1", "+3", "0b10", "07", "1_0", " 42 \n"] {
             assert!(process_env_ok(None, Some(OsStr::new(good))), "{good:?}");
         }
         assert!(!process_env_ok(Some(OsStr::new("")), None));
-        for bad in ["abc", "2x", "1.5", "", "-", "1__0", "_1", "1_"] {
+        // `""` is `env_value && !env_value.empty?` → unset; the bare radix
+        // prefixes are `Integer()` raises.
+        for bad in ["abc", "2x", "1.5", "-", "1__0", "_1", "1_", "0x", "0b", "0o", "0d", "-0x"] {
             assert!(!process_env_ok(None, Some(OsStr::new(bad))), "{bad:?}");
         }
     }

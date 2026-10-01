@@ -1037,8 +1037,13 @@ impl Config {
                         gem,
                         id: get("id").unwrap_or(serde_yaml::Value::Null),
                         config: get("config").unwrap_or(serde_yaml::Value::Null),
-                        enabled: !get("enabled")
-                            .is_some_and(|v| falsy(&v)),
+                        // `enabled: string_keyed["enabled"] != false` —
+                        // ONLY the literal `false` disables; `nil`/`~` (or
+                        // any truthy value) leaves the entry enabled.
+                        enabled: !matches!(
+                            get("enabled").as_ref().map(untag),
+                            Some(serde_yaml::Value::Bool(false))
+                        ),
                         index,
                         raw: raw.clone(),
                     }
@@ -2027,6 +2032,11 @@ pub(crate) fn ruby_integer(s: &str) -> Option<i128> {
         },
         None => (10, body),
     };
+    // A bare radix prefix is an `Integer()` raise, not 0: `Integer("0x")`,
+    // `Integer("-0d")` → ArgumentError (the lone `"0"` early-returned above).
+    if digits.is_empty() {
+        return None;
+    }
     let chars: Vec<char> = digits.chars().collect();
     if chars.first() == Some(&'_') || chars.last() == Some(&'_') {
         return None;
@@ -3891,6 +3901,60 @@ mod severity_config_tests {
         std::fs::write(dir.join("bom.yml"), b"\xef\xbb\xbfpaths: [src]\n").unwrap();
         let cfg = parsed(&dir.join("bom.yml"));
         assert_eq!(cfg.paths, vec![dir.join("src").display().to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ruby_integer` is `Kernel#Integer`'s literal grammar — sign,
+    /// whitespace padding, `0x`/`0o`/`0b`/`0d` prefixes, `_` separators. A
+    /// bare radix prefix is a raise, NOT 0 (issue #157 review).
+    #[test]
+    fn ruby_integer_grammar_matches_kernel_integer() {
+        for (s, want) in [
+            ("0", Some(0)),
+            ("-0", Some(0)),
+            ("4", Some(4)),
+            (" 2", Some(2)),
+            ("\t3\n", Some(3)),
+            ("+2", Some(2)),
+            ("-1", Some(-1)),
+            ("0x2", Some(2)),
+            ("0XFF", Some(255)),
+            ("010", Some(8)),
+            ("0d5", Some(5)),
+            ("0o7", Some(7)),
+            ("0b10", Some(2)),
+            ("1_0", Some(10)),
+        ] {
+            assert_eq!(ruby_integer(s), want, "{s:?}");
+        }
+        for bad in [
+            "", "-", "+", "abc", "2x", "1.5", "1__0", "_1", "1_", "0x", "0b", "0o", "0d",
+            "-0x", "+0d", "0x_", "08", "0b2",
+        ] {
+            assert_eq!(ruby_integer(bad), None, "{bad:?}");
+        }
+    }
+
+    /// `normalise_entry` upstream: `enabled: string_keyed["enabled"] != false`
+    /// — ONLY the literal `false` disables; `nil`/`~`, `0`, `""` and `"off"`
+    /// are all truthy (issue #157 review).
+    #[test]
+    fn plugin_enabled_only_false_disables() {
+        let dir = cfg_dir("enabled");
+        for (yaml, want) in [
+            ("plugins:\n  - gem: g\n    enabled: false\n", false),
+            ("plugins:\n  - gem: g\n    enabled: ~\n", true),
+            ("plugins:\n  - gem: g\n    enabled:\n", true),
+            ("plugins:\n  - gem: g\n    enabled: 0\n", true),
+            ("plugins:\n  - gem: g\n    enabled: \"off\"\n", true),
+            ("plugins:\n  - g\n", true),
+        ] {
+            std::fs::write(dir.join("e.yml"), yaml).unwrap();
+            let cfg = parsed(&dir.join("e.yml"));
+            let entries = cfg.plugin_entries();
+            assert_eq!(entries.len(), 1, "{yaml:?}");
+            assert_eq!(entries[0].enabled, want, "{yaml:?}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
