@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, ShapeKey, Type, TypeId};
+use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
     collect_flow_writes, indexed_flow_writes, join_flow_envs, multi_target_binder, qualify_self,
@@ -17,7 +17,7 @@ use crate::{
 };
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, IndexedFlow,
-    MUTATOR_METHODS,
+    MUTATOR_METHODS, STRING_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -974,7 +974,7 @@ impl<'i> Typer<'i> {
 
     /// `IndexedNarrowing.invalidate_after_call` for ONE mutation entry —
     /// the record-drop half `apply_mutation_effects` also runs.
-    fn drop_indexed_mutation(
+    pub(crate) fn drop_indexed_mutation(
         &self,
         name: &str,
         method: &str,
@@ -1010,7 +1010,7 @@ impl<'i> Typer<'i> {
     /// `a.frobnicate` fires where the oracle stays silent (adversarial review
     /// of rigor-rs#309). Member evidence comes from the same
     /// [`Typer::coll_value_members`] the collection-shape pass uses.
-    fn widen_mutated_binding(
+    pub(crate) fn widen_mutated_binding(
         &self,
         ty: TypeId,
         method: &str,
@@ -1024,6 +1024,18 @@ impl<'i> Typer<'i> {
         match interner.get(ty) {
             Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => mint("Array", interner),
             Type::HashShape(_) if HASH_MUTATORS.contains(&method) => mint("Hash", interner),
+            // `StringMutation.widen_constant` (string_mutation.rb): a
+            // String-valued `Constant` under a String mutator loses its value
+            // pin to the bare `String` nominal — `s = "abc"; s[0] = 5` makes
+            // `s` a `String` whose `s[k]` reads answer `String | nil` (the
+            // RBS `String?`), so a chained `s[0].frobnicate` declines instead
+            // of witnessing on the erased bare `String` (rigor-rs#352). Only
+            // the String table applies: the pinned value is what the mutation
+            // falsifies, and no other Constant carrier has a value an
+            // in-place call can change.
+            Type::Constant(Scalar::Str(_)) if STRING_MUTATORS.contains(&method) => {
+                mint("String", interner)
+            }
             Type::Union(members) => {
                 let members = members.clone();
                 let mut out = Vec::with_capacity(members.len());

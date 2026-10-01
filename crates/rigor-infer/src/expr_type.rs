@@ -501,7 +501,7 @@ impl<'i> Typer<'i> {
     /// dispatching `h[k] op v` here is the reference's `MethodDispatcher`
     /// tier this slice does not carry.
     #[allow(clippy::too_many_arguments)]
-    fn index_write_value_type(
+    pub(crate) fn index_write_value_type(
         &self,
         ast: &LoweredAst,
         receiver: NodeId,
@@ -555,7 +555,7 @@ impl<'i> Typer<'i> {
     /// (indexed_narrowing.rb:92): a `Dynamic`/`Top` constituent means the
     /// collection can hold a caller-supplied slot value `||=` keeps.
     #[allow(clippy::only_used_in_recursion)]
-    fn fully_tracked_type(&self, ty: TypeId, interner: &Interner) -> bool {
+    pub(crate) fn fully_tracked_type(&self, ty: TypeId, interner: &Interner) -> bool {
         match interner.get(ty) {
             Type::Dynamic(_) | Type::Top => false,
             Type::Union(members) => members
@@ -656,6 +656,42 @@ impl<'i> Typer<'i> {
             }
             _ => ty,
         }
+    }
+
+    /// `Narrowing.narrow_non_nil` (`narrowing.rb`): the non-nil fragment of a
+    /// `T | nil` union — `Constant[nil]` and `Nominal[NilClass]` members drop,
+    /// every other carrier (falsey `false`, `Dynamic`, tuples, …) passes
+    /// through. Feeds the `try_non_nil_receiver_retry` port in `type_call`
+    /// (rigor-rs#352): a `String | nil` receiver dispatches its call on the
+    /// `String` fragment. `None` when `ty` is not a union that actually holds
+    /// a nil member, or when dropping it leaves `Bot`/`Dynamic` — the
+    /// reference bails the retry on those same shapes
+    /// (`non_nil.is_a?(Bot | Dynamic) || non_nil == receiver`).
+    pub(crate) fn non_nil_fragment(&self, ty: TypeId, interner: &mut Interner) -> Option<TypeId> {
+        let Type::Union(members) = interner.get(ty) else {
+            return None;
+        };
+        let members = members.clone();
+        let non_nil: Vec<TypeId> = members
+            .iter()
+            .copied()
+            .filter(|&m| {
+                !matches!(interner.get(m), Type::Constant(Scalar::Nil))
+                    && !matches!(
+                        interner.get(m),
+                        Type::Nominal { class, .. }
+                            if self.index.class_name_for_id(*class) == Some("NilClass")
+                    )
+            })
+            .collect();
+        if non_nil.is_empty() || non_nil.len() == members.len() {
+            return None;
+        }
+        let fragment = self.union_members(non_nil, interner);
+        if matches!(interner.get(fragment), Type::Dynamic(_) | Type::Bottom) {
+            return None;
+        }
+        Some(fragment)
     }
 
     /// `Type::Combinator.union` over a member list — `Bot` folds away

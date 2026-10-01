@@ -830,6 +830,238 @@ fn nil_receiver_silent_on_non_nilable_return() {
     );
 }
 
+// --- rigor-rs#352: String `[]=`/`||=`/index-target widening + nilable reads ---
+//
+// The reference's `StringMutation.widen_constant` (string_mutation.rb) drops a
+// literal String's value pin to `Nominal[String]` under an in-place mutator —
+// `[]=` included — and `String#[]` is RBS `String?`, so a post-mutation
+// `s[k]` reads `String | nil`: a DIRECT chained call dispatches on the
+// non-nil fragment (`try_non_nil_receiver_retry`), and a local assigned from
+// the read is a `call.possible-nil-receiver` source. Every row below was
+// probed byte-exact against the pinned reference (`e59b7b89`).
+
+/// Post-`[]=` chained reads must not report `undefined-method` — the FP the
+/// issue reports. The read is `String | nil`; `frobnicate_zzz` is absent on
+/// BOTH arms, so nothing fires (the reference stays silent).
+#[test]
+fn string_index_write_then_chained_read_is_silent() {
+    for src in [
+        b"s = \"abc\"; s[0] = 5; s[0].frobnicate_zzz\n".as_slice(),
+        b"s = \"abc\"; s[0] ||= \"x\"; s[0].frobnicate_zzz\n".as_slice(),
+        b"s = \"abc\"; s[0], z = 5, 6; s[0].frobnicate_zzz\n".as_slice(),
+        b"s = \"abc\"; s << \"x\"; s[0].frobnicate_zzz\n".as_slice(),
+        b"s = \"abc\"; s.upcase!; s[0].frobnicate_zzz\n".as_slice(),
+    ] {
+        assert!(
+            run(src).is_empty(),
+            "post-mutation chained read must be silent: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
+/// The non-nil retry still types a DEFINED String method through the
+/// `String | nil` receiver: `s[0].strip` answers `String`, so a bad method on
+/// the RESULT witnesses `for String` exactly like the reference.
+#[test]
+fn string_index_write_strip_chain_witnesses_on_string() {
+    let diags = run(b"s = \"abc\"; s[0] = 5; s[0].strip.frobnicate_zzz\n");
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    let d = &diags[0];
+    assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(d.message, "undefined method `frobnicate_zzz' for String");
+}
+
+/// A local assigned from the post-mutation read is `String | nil`: `upcase`
+/// is absent on NilClass and present on String ⇒ `possible-nil-receiver`
+/// fires, for every store form that widens `s` (`[]=`, compound `+=`/`&&=`,
+/// masgn / `for` / `rescue` index targets, and other String mutators).
+#[test]
+fn string_index_write_assigned_read_fires_possible_nil() {
+    for src in [
+        b"s = \"abc\"; s[0] = 5; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s[0] += \"x\"; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s[0] &&= \"x\"; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s[0], z = 5, 6; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s << \"x\"; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s.upcase!; x = s[0]; x.upcase\n".as_slice(),
+    ] {
+        let diags = nil_diags(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected one possible-nil diag for {:?}, got {diags:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+        assert_eq!(
+            diags[0].message,
+            "possible nil receiver: `upcase' is undefined on NilClass"
+        );
+    }
+}
+
+/// rigor-rs#352 review: a REBIND of the index-target local inside the `for` /
+/// `begin-rescue` construct wins over the `[]=` widening — the post-construct
+/// join types `s` from the pre-construct binding and the rebound value, so
+/// `x = s[0]` is not a nilable `String | nil` source and `x.upcase` stays
+/// silent. Every row probed silent on the reference; the port previously
+/// reinserted the PRE-construct `[]=` widening over the rebind's Dynamic and
+/// fired `call.possible-nil-receiver`.
+#[test]
+fn string_index_target_rebind_inside_construct_wins() {
+    for src in [
+        b"s = \"abc\"; for s[0] in [5]; s = \"q\"; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; z, s = 1, \"q\"; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s = \"q\"; s = \"r\"; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; if true; s = \"q\"; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; for s, s[0] in [[1,2]]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; s = \"q\"; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; ensure; s = \"q\"; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        // A chained call on the indexed read after a body rebind is silent on
+        // both engines (the receiver is not a known-nilable source).
+        b"s = \"abc\"; for s[0] in [5]; s = \"q\"; end; s[0].frobnicate\n".as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; s = \"q\"; end; s[0].frobnicate\n"
+            .as_slice(),
+    ] {
+        assert!(
+            nil_diags(src).is_empty(),
+            "body rebind must win over the []= widening: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
+/// rigor-rs#352 review round 2: a PATTERN binding inside the `for`/`rescue`
+/// span rebinds the index-target local too — `in [s]`, `in Integer => s`,
+/// `v => s`, `v in [s]` all bind `s` on the oracle. `Node::UnmodeledWrite`
+/// now carries those names so the rebind/widen censuses grade them like a
+/// plain write. All probed silent on the reference; the port previously kept
+/// the pre-construct `[]=` widening and fired `possible-nil-receiver`.
+#[test]
+fn string_index_target_pattern_rebind_inside_construct_wins() {
+    for src in [
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in Integer => s; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in s; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in {a: s}; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; v => s; end; x = s[0]; x.upcase\n".as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; v in [s]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; if v in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; case 1; in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        // No construct at all: a straight-line `case`/`in` rebinds `s` after
+        // the `[]=` mutation — the widen census needs the names too.
+        b"s = \"abc\"; s[0] = 5; case 1; in [s]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"v = 1; s = \"abc\"; if v in [s]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = String.new; for s[0] in [5]; case 1; in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+    ] {
+        assert!(
+            nil_diags(src).is_empty(),
+            "pattern rebind must count like a plain rebind: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+    // Controls: a pattern binding a DIFFERENT local does not touch `s`; a
+    // compound index write inside the body still mutates `s` — both fire.
+    for src in [
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in [w]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s[0] += \"x\"; end; x = s[0]; x.upcase\n".as_slice(),
+    ] {
+        assert_eq!(
+            nil_diags(src).len(),
+            1,
+            "unrelated binding / mutation must keep firing: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
+/// Measured declines against the reference (the zero-FP-safe side): a
+/// `s = nil` body arm joins `s` to `String | nil`, which the reference reads
+/// as a nilable `[]` RECEIVER on `s[0]`; `s += "z"` is an op-write rebind the
+/// reference still reads String-ish. The port keeps the conservatively
+/// `Dynamic` binding and declines. Pinned silent so a future join-model fix
+/// updates the pin deliberately.
+#[test]
+fn string_index_target_rebind_declined_gaps() {
+    for src in [
+        b"s = \"abc\"; for s[0] in [5]; s = nil; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s = nil; end; s[0].frobnicate\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s += \"z\"; end; x = s[0]; x.upcase\n".as_slice(),
+    ] {
+        assert!(
+            nil_diags(src).is_empty(),
+            "documented decline vs the reference: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
+/// `s[k] ||= v` records the stored-slot narrowing
+/// `s[k] -> narrow_truthy(s[k]) | v`: a non-nil `v` keeps the slot non-nil,
+/// so `x = s[0]` is NOT a nilable source and `x.upcase` stays silent — but a
+/// `nil` default keeps the slot nilable, and a later `[]=`/masgn store or a
+/// rebind of `s` invalidates the record (each probed against the reference).
+#[test]
+fn string_index_or_write_slot_narrowing() {
+    // `||= "x"` narrows the slot non-nil ⇒ silent.
+    assert!(
+        nil_diags(b"s = \"abc\"; s[0] ||= \"x\"; x = s[0]; x.upcase\n").is_empty(),
+        "recorded non-nil slot must not mint a nilable fact"
+    );
+    // Rebind of `s` drops the slot record ⇒ still silent: the fresh literal
+    // folds `s[0]` to a concrete char (keystone declines a Constant receiver).
+    assert!(
+        nil_diags(b"s = \"abc\"; s[0] ||= \"x\"; s = \"abc\"; x = s[0]; x.upcase\n")
+            .is_empty(),
+        "rebind must drop the slot record"
+    );
+    // Nilable record / invalidated record ⇒ fires.
+    for src in [
+        b"s = \"abc\"; s[0] ||= nil; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s[0] ||= \"x\"; s[0] = 5; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s[0] ||= \"x\"; s[0], z = 5, 6; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; s[0] ||= \"x\"; s << \"y\"; x = s[0]; x.upcase\n".as_slice(),
+    ] {
+        let diags = nil_diags(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected one possible-nil diag for {:?}, got {diags:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
+/// Methods defined on NilClass (`to_s`, `inspect`, `nil?`) never mint a
+/// possible-nil diagnostic — the call is sound on the nil arm.
+#[test]
+fn string_index_read_nilclass_methods_stay_silent() {
+    for src in [
+        b"s = \"abc\"; s[0] = 5; x = s[0]; x.to_s.frobnicate_zzz\n".as_slice(),
+        b"s = \"abc\"; s[0] = 5; x = s[0]; x.inspect.frobnicate_zzz\n".as_slice(),
+        b"s = \"abc\"; s[0] = 5; x = s[0]; x.nil?.frobnicate_zzz\n".as_slice(),
+    ] {
+        assert!(
+            nil_diags(src).is_empty(),
+            "NilClass-defined method must not fire possible-nil: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
 #[test]
 fn flags_wrong_arity_on_string_include() {
     // `String#include?` is arity (1, 1); two args is wrong-arity.

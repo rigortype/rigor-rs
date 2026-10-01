@@ -101,6 +101,27 @@ impl<'i> Typer<'i> {
 
         let recv_ty = self.type_of(ast, receiver, env, interner);
 
+        // Issue #352 — port of the reference's `try_non_nil_receiver_retry`
+        // (expression_typer.rb, upstream #519): a `T | nil` union receiver
+        // whose dispatch exhausts every tier retries the whole cascade on the
+        // non-nil fragment — `s[0]` post-mutation types `String | nil`, so
+        // `s[0].strip` still answers `String` and a chained `.frobnicate`
+        // witnesses on it. The flat env has no memberwise union dispatch, so
+        // this retry IS the union's only dispatch here — which is exactly why
+        // the reference's `nil_class_defines?` guard must ride along: when
+        // NilClass defines `method` (`to_s`, `inspect`, `nil?`, `itself`,
+        // `==`, …) the nil arm is a live answerer (`x.to_s` joins a carrier
+        // `.frobnicate` must not witness on), not the veto that triggers the
+        // retry. Diagnostics read the receiver's own type and are untouched —
+        // this substitution only feeds the call's RESULT type.
+        let recv_ty = match interner.get(recv_ty) {
+            Type::Union(_) => match self.non_nil_fragment(recv_ty, interner) {
+                Some(non_nil) if !self.index.class_has_method("NilClass", method) => non_nil,
+                _ => recv_ty,
+            },
+            _ => recv_ty,
+        };
+
         // Indexed stored-slot narrowing (rigor-rs#325): a `h[k]` read with a
         // stable `(local, literal key)` address answers the record an
         // `operand`-flagged `h[k] ||= v` left (`eval_index_or_write` →
@@ -418,10 +439,31 @@ impl<'i> Typer<'i> {
                     return interner.untyped();
                 }
                 if let Some(class_id) = self.index.class_id(ret_class) {
-                    return interner.intern(Type::Nominal {
+                    let nominal = interner.intern(Type::Nominal {
                         class: class_id,
                         args: vec![],
                     });
+                    // Issue #352 — the nil bit the flat slot erases. A `T?`
+                    // RBS return on a Nominal receiver is `T | nil` in the
+                    // reference (`String#[]` joins `String?` across all four
+                    // overloads): a chained `.frobnicate` declines on the nil
+                    // arm instead of witnessing on bare `String`, while the
+                    // non-nil fragment keeps feeding `non_nil_fragment`'s
+                    // retry above (`s[0].strip -> String`) and the
+                    // `x = s[0]` local's possible-nil channel. A `Constant`
+                    // receiver is folded/pinned upstream, so it keeps the
+                    // bare nominal — `s = "abc"; s[0].frobnicate` still fires
+                    // — and `class_name_of` only reaches here for carriers
+                    // whose reads the reference also runs RBS dispatch on.
+                    if matches!(interner.get(recv_ty), Type::Nominal { .. })
+                        && matches!(
+                            self.index.method_return_nilable(class_name, method),
+                            Some((ret, true)) if ret == ret_class
+                        )
+                    {
+                        return rigor_types::Algebra::join(interner, nominal, interner.nil());
+                    }
+                    return nominal;
                 }
             }
         }

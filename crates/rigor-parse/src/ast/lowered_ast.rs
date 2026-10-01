@@ -173,6 +173,22 @@ impl LoweredAst {
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
 
+    /// Whether `span` lies inside a [`StatementsKind::Inert`] carrier that is
+    /// NOT the carrier AT `span` itself — the `in`-clause
+    /// [`Node::UnmodeledWrite`] marker is a sibling sharing its carrier's span
+    /// exactly, and its pattern bindings are REAL writes on the reference
+    /// (`case v; in [s]; end` binds `s`), so the inert drop must keep them
+    /// while still dropping a marker nested in a WIDER inert carrier
+    /// (`defined?(…)`, `END { }`/`BEGIN { }` body) — rigor-rs#352 review.
+    ///
+    /// [`Node::UnmodeledWrite`]: crate::ast::Node::UnmodeledWrite
+    pub fn in_outer_inert_carrier(&self, span: Span) -> bool {
+        self.carrier_spans
+            .inert
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1 && *s != span)
+    }
+
     /// Whether `span` lies inside an inert carrier that an iterated body's
     /// content-writeback TEXT SCAN covers (rigor-rs#312): `while w;
     /// super(h[:a] ||= 1); end` — the operand never evaluates (a local

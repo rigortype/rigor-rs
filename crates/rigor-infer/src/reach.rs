@@ -1456,7 +1456,7 @@ fn unevaluated_case_clause_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
     for (_, n) in ast.iter() {
         match n {
             Node::Case { branches: bs, .. } => branches.extend(bs.iter().copied()),
-            Node::UnmodeledWrite { span } => unmodeled.push(*span),
+            Node::UnmodeledWrite { span, .. } => unmodeled.push(*span),
             _ => {}
         }
     }
