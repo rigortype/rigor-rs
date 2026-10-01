@@ -902,6 +902,61 @@ fn string_index_write_assigned_read_fires_possible_nil() {
     }
 }
 
+/// rigor-rs#352 review: a REBIND of the index-target local inside the `for` /
+/// `begin-rescue` construct wins over the `[]=` widening — the post-construct
+/// join types `s` from the pre-construct binding and the rebound value, so
+/// `x = s[0]` is not a nilable `String | nil` source and `x.upcase` stays
+/// silent. Every row probed silent on the reference; the port previously
+/// reinserted the PRE-construct `[]=` widening over the rebind's Dynamic and
+/// fired `call.possible-nil-receiver`.
+#[test]
+fn string_index_target_rebind_inside_construct_wins() {
+    for src in [
+        b"s = \"abc\"; for s[0] in [5]; s = \"q\"; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; z, s = 1, \"q\"; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s = \"q\"; s = \"r\"; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; if true; s = \"q\"; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; for s, s[0] in [[1,2]]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; s = \"q\"; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; ensure; s = \"q\"; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        // A chained call on the indexed read after a body rebind is silent on
+        // both engines (the receiver is not a known-nilable source).
+        b"s = \"abc\"; for s[0] in [5]; s = \"q\"; end; s[0].frobnicate\n".as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; s = \"q\"; end; s[0].frobnicate\n"
+            .as_slice(),
+    ] {
+        assert!(
+            nil_diags(src).is_empty(),
+            "body rebind must win over the []= widening: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
+/// Measured declines against the reference (the zero-FP-safe side): a
+/// `s = nil` body arm joins `s` to `String | nil`, which the reference reads
+/// as a nilable `[]` RECEIVER on `s[0]`; `s += "z"` is an op-write rebind the
+/// reference still reads String-ish. The port keeps the conservatively
+/// `Dynamic` binding and declines. Pinned silent so a future join-model fix
+/// updates the pin deliberately.
+#[test]
+fn string_index_target_rebind_declined_gaps() {
+    for src in [
+        b"s = \"abc\"; for s[0] in [5]; s = nil; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s = nil; end; s[0].frobnicate\n".as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s += \"z\"; end; x = s[0]; x.upcase\n".as_slice(),
+    ] {
+        assert!(
+            nil_diags(src).is_empty(),
+            "documented decline vs the reference: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
 /// `s[k] ||= v` records the stored-slot narrowing
 /// `s[k] -> narrow_truthy(s[k]) | v`: a non-nil `v` keeps the slot non-nil,
 /// so `x = s[0]` is NOT a nilable source and `x.upcase` stays silent — but a

@@ -11,7 +11,8 @@ use rigor_types::{Interner, Scalar, Type, TypeId};
 
 use crate::{
     block_bound_names, collect_flow_writes, drop_indexed_narrowings, indexed_flow_writes,
-    is_shape_mutator, multi_target_binder, widen_flow_writes, widen_penv_writes, TypeEnv, Typer,
+    is_shape_mutator, local_rebinds, multi_target_binder, rebound_within, widen_flow_writes,
+    widen_penv_writes, TypeEnv, Typer,
 };
 
 /// The reference's `Array.new(n)` tuple-lift cap (`ARRAY_NEW_TUPLE_LIMIT`,
@@ -77,10 +78,13 @@ impl<'i> Typer<'i> {
         };
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
+        let rebinds = local_rebinds(ast);
         let mut tenv = TypeEnv::new();
         let mut nenv: HashMap<String, &'static str> = HashMap::new();
         let mut penv: HashSet<String> = HashSet::new();
-        self.nil_flow_scope(ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, interner, &mut out);
+        self.nil_flow_scope(
+            ast, &body, &mut tenv, &mut nenv, &mut penv, &writes, &rebinds, interner, &mut out,
+        );
         out
     }
 
@@ -98,11 +102,12 @@ impl<'i> Typer<'i> {
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
+        rebinds: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
         for &s in stmts {
-            self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, interner, out);
+            self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, rebinds, interner, out);
         }
     }
 
@@ -122,6 +127,7 @@ impl<'i> Typer<'i> {
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
+        rebinds: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
@@ -136,10 +142,10 @@ impl<'i> Typer<'i> {
                 p.remove(name.as_str());
             }
             return self.nil_flow_stmt_inner(
-                ast, id, &mut t, &mut n, &mut p, writes, interner, out,
+                ast, id, &mut t, &mut n, &mut p, writes, rebinds, interner, out,
             );
         }
-        self.nil_flow_stmt_inner(ast, id, tenv, nenv, penv, writes, interner, out)
+        self.nil_flow_stmt_inner(ast, id, tenv, nenv, penv, writes, rebinds, interner, out)
     }
 
     /// The per-node half of [`Typer::nil_flow_stmt`].
@@ -152,6 +158,7 @@ impl<'i> Typer<'i> {
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
+        rebinds: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
@@ -162,7 +169,9 @@ impl<'i> Typer<'i> {
                 let (body, kind, span) = (body.clone(), *kind, *span);
                 match kind {
                     StatementsKind::Sequence => {
-                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+                        self.nil_flow_scope(
+                            ast, &body, tenv, nenv, penv, writes, rebinds, interner, out
+                        );
                     }
                     // Its writes may not run, or not in this order: widen them
                     // and drop their facts after the descent. A `Jump` carrier
@@ -170,7 +179,9 @@ impl<'i> Typer<'i> {
                     // it reads exactly like `Recovered` here — the write runs
                     // only when the jump does, which nothing upstream proves.
                     StatementsKind::Recovered | StatementsKind::Jump(_) => {
-                        self.nil_flow_scope(ast, &body, tenv, nenv, penv, writes, interner, out);
+                        self.nil_flow_scope(
+                            ast, &body, tenv, nenv, penv, writes, rebinds, interner, out
+                        );
                         widen_flow_writes(writes, span, tenv, interner);
                         widen_penv_writes(writes, span, penv);
                         for (w, name) in writes {
@@ -188,9 +199,13 @@ impl<'i> Typer<'i> {
                                 | Node::LocalVariableOpWrite { value, .. }
                                 | Node::MultiWrite { value, .. } => {
                                     let value = *value;
-                                    self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                                    self.nil_flow_expr(
+                                        ast, value, tenv, nenv, penv, writes, rebinds, interner, out
+                                    );
                                 }
-                                _ => self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, interner, out),
+                                _ => self.nil_flow_stmt(
+                                    ast, s, tenv, nenv, penv, writes, rebinds, interner, out,
+                                ),
                             }
                         }
                     }
@@ -200,7 +215,7 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 // Record uses in the RHS (and descend any block it carries) BEFORE
                 // rebinding — a use of a currently-nilable local reads the fact.
-                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, rebinds, interner, out);
                 let src = self.nilable_source_class(ast, value, tenv, penv, interner);
                 let prov = self.array_new_nominal_provenance(ast, value, tenv, interner);
                 let vty = self.type_of(ast, value, tenv, interner);
@@ -235,7 +250,7 @@ impl<'i> Typer<'i> {
             // anyway: a destructured slot never carries a manufactured nil.
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
-                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, rebinds, interner, out);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     nenv.remove(&name);
@@ -286,7 +301,7 @@ impl<'i> Typer<'i> {
                 drop_indexed_narrowings(tenv, &name);
             }
             Node::Call { .. } | Node::IndexWrite { .. } | Node::AttrWrite { .. } => {
-                self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, id, tenv, nenv, penv, writes, rebinds, interner, out);
             }
             Node::Definition { body, .. }
             | Node::ClassDef { body, .. }
@@ -297,7 +312,9 @@ impl<'i> Typer<'i> {
                 let mut t = TypeEnv::new();
                 let mut n: HashMap<String, &'static str> = HashMap::new();
                 let mut p: HashSet<String> = HashSet::new();
-                self.nil_flow_scope(ast, &body, &mut t, &mut n, &mut p, writes, interner, out);
+                self.nil_flow_scope(
+                    ast, &body, &mut t, &mut n, &mut p, writes, rebinds, interner, out
+                );
             }
             // `for s[k] in xs` — each index target stores the element through
             // `[]=` on `s` (`bind_for_index` → `widen_index_target`), and the
@@ -332,7 +349,17 @@ impl<'i> Typer<'i> {
                 widen_penv_writes(writes, span, penv);
                 nenv.clear();
                 for (name, w) in widened {
-                    tenv.insert(name, w);
+                    // A rebind of the index-target local INSIDE the loop wins
+                    // over the `[]=` widening: `widen_flow_writes` already
+                    // landed `Dynamic`, and re-inserting the value derived
+                    // from the PRE-loop binding would resurrect a dead
+                    // binding (`for s[0] in xs; s = "q"; end` — the join types
+                    // `s` from the pre-loop binding and the rebound one, so
+                    // the nilable `x = s[k]` source is gone; rigor-rs#352
+                    // review).
+                    if !rebound_within(rebinds, span, &name) {
+                        tenv.insert(name, w);
+                    }
                 }
             }
             // `rescue => s[k]` — the same index-target `[]=` store
@@ -361,7 +388,13 @@ impl<'i> Typer<'i> {
                 widen_penv_writes(writes, span, penv);
                 nenv.clear();
                 for (name, w) in widened {
-                    tenv.insert(name, w);
+                    // Same rebind-in-span guard as `Node::Loop`: a `s = "q"`
+                    // in a clause body or the `ensure` rebinds `s`, so the
+                    // pre-rescue `[]=` widening must not reinsert
+                    // (`rescue => s[0]; s = "q"` — rigor-rs#352 review).
+                    if !rebound_within(rebinds, span, &name) {
+                        tenv.insert(name, w);
+                    }
                 }
             }
             // Any other statement (`if`/`unless`/`while`/`case`/logical/begin/
@@ -389,6 +422,7 @@ impl<'i> Typer<'i> {
         nenv: &mut HashMap<String, &'static str>,
         penv: &mut HashSet<String>,
         writes: &[(rigor_parse::Span, String)],
+        rebinds: &[(rigor_parse::Span, String)],
         interner: &mut Interner,
         out: &mut HashMap<NodeId, &'static str>,
     ) {
@@ -404,7 +438,7 @@ impl<'i> Typer<'i> {
                     block_bound_names(block_locals, block_params).map(str::to_string).collect();
                 // Recurse the receiver first (a nested use like `a.b` in `a.b.c`).
                 if let Some(r) = receiver {
-                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, rebinds, interner, out);
                 }
                 if let Some(r) = receiver {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
@@ -463,7 +497,7 @@ impl<'i> Typer<'i> {
                     }
                 }
                 for a in &args {
-                    self.nil_flow_expr(ast, *a, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, *a, tenv, nenv, penv, writes, rebinds, interner, out);
                 }
                 if !block_body.is_empty() {
                     // Same-block locality: descend with a FRESH `nenv`, inheriting
@@ -483,7 +517,8 @@ impl<'i> Typer<'i> {
                         bpenv.remove(name.as_str());
                     }
                     self.nil_flow_scope(
-                        ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, interner, out,
+                        ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, rebinds,
+                        interner, out,
                     );
                     nenv.clear();
                     widen_flow_writes(writes, call_span, tenv, interner);
@@ -495,8 +530,8 @@ impl<'i> Typer<'i> {
                 // (decline), then recurse for block/call reachability.
                 let (left, right) = (*left, *right);
                 nenv.clear();
-                self.nil_flow_expr(ast, left, tenv, nenv, penv, writes, interner, out);
-                self.nil_flow_expr(ast, right, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, left, tenv, nenv, penv, writes, rebinds, interner, out);
+                self.nil_flow_expr(ast, right, tenv, nenv, penv, writes, rebinds, interner, out);
             }
             // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index
             // write. The receiver read is recorded exactly as a `[]=`
@@ -518,7 +553,7 @@ impl<'i> Typer<'i> {
                 let (receiver, indices, value, compound, operand) =
                     (*receiver, indices.clone(), *value, compound.clone(), *operand);
                 if let Some(r) = receiver {
-                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, rebinds, interner, out);
                 }
                 if let Some(r) = receiver {
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
@@ -570,9 +605,9 @@ impl<'i> Typer<'i> {
                     }
                 }
                 for i in &indices {
-                    self.nil_flow_expr(ast, *i, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, *i, tenv, nenv, penv, writes, rebinds, interner, out);
                 }
-                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, rebinds, interner, out);
             }
             // `h.attr op= v` — a compound ATTRIBUTE write. It is never a
             // nilable USE site (`eval_attribute_compound_write` types the
@@ -587,12 +622,12 @@ impl<'i> Typer<'i> {
             } => {
                 let (receiver, value) = (*receiver, *value);
                 if let Some(r) = receiver {
-                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, interner, out);
+                    self.nil_flow_expr(ast, r, tenv, nenv, penv, writes, rebinds, interner, out);
                     if let Node::LocalVariableRead { name, .. } = ast.get(r) {
                         nenv.remove(name);
                     }
                 }
-                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, interner, out);
+                self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, rebinds, interner, out);
             }
             _ => {}
         }

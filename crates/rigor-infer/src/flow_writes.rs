@@ -324,6 +324,24 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
 /// write there (a heredoc's body escapes its opener's span — see below).
 pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     let (scopes, shadow_scopes) = toplevel_scope_filters(ast);
+    let mut out = collect_rebind_entries(ast);
+    out.retain(|(id, w, name)| {
+        !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
+            && !shadow_scopes.iter().any(|(descendants, bound)| {
+                descendants.contains(id) && bound.contains(name)
+            })
+    });
+    let mut out: Vec<(rigor_parse::Span, String)> =
+        out.into_iter().map(|(_, s, n)| (s, n)).collect();
+    drop_inert_writes(ast, &mut out);
+    drop_blocked_writes(ast, &mut out);
+    out
+}
+
+/// The rebind entries [`toplevel_rebinds`]/[`local_rebinds`] filter —
+/// `(node, span, name)` per local-variable write, masgn bound name, `rescue`
+/// reference binding and `for` index rebind — before any scope filter runs.
+fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String)> {
     let mut out: Vec<(NodeId, rigor_parse::Span, String)> = Vec::new();
     for (id, n) in ast.iter() {
         match n {
@@ -350,11 +368,25 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
             _ => {}
         }
     }
-    out.retain(|(id, w, name)| {
-        !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
-            && !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.contains(name)
-            })
+    out
+}
+
+/// [`toplevel_rebinds`] WITHOUT the `def`/`class`/`module` scope exclusion —
+/// rebinds in EVERY local scope, still minus the block/lambda shadow filter,
+/// inert carriers and blocked-carrier writes. The nilable walker
+/// (`nilable.rs`) descends a `def` body with a fresh env, so a
+/// `for h[k] in xs; h = …; end` INSIDE one still needs its inner rebinds
+/// listed to tell a rebind of the index-target local from the `[]=` mutation
+/// the target performs (rigor-rs#352 review). A write inside a NESTED def may
+/// wrongly count for an enclosing construct's `rebound_within` test — a
+/// one-way decline, never a new fire.
+pub(crate) fn local_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    let (_scopes, shadow_scopes) = toplevel_scope_filters(ast);
+    let mut out = collect_rebind_entries(ast);
+    out.retain(|(id, _w, name)| {
+        !shadow_scopes.iter().any(|(descendants, bound)| {
+            descendants.contains(id) && bound.contains(name)
+        })
     });
     let mut out: Vec<(rigor_parse::Span, String)> =
         out.into_iter().map(|(_, s, n)| (s, n)).collect();
