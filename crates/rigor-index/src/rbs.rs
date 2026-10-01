@@ -237,13 +237,16 @@ pub enum ClassOrdering {
 /// A one-level structural tag for a single RBS parameter type — the ATM
 /// shared-substrate leaf (Slice 1, retention only). Each variant keeps just
 /// enough shape for a later argument-compatibility walk (Slice 2) and message
-/// labels (Slice 3) WITHOUT retaining the full type AST: a `ClassInstanceType`
-/// drops its type arguments (`Array[Integer]` ⇒ `ClassInstance("Array")`), and
-/// only the two genuinely-structural wrappers — `Union` and `Optional` — recurse
-/// into their members (they carry no meaning as an opaque leaf). Everything else
-/// that isn't one of the four named kinds collapses to [`Other`](Self::Other),
-/// whose `String` is the exact WRITTEN form of the type (sliced from the RBS
-/// source) so a diagnostic can quote it verbatim later.
+/// labels (Slice 3) WITHOUT retaining the full type AST: the named kinds keep
+/// their type arguments (`Range[int]` ⇒ `ClassInstance("Range", [Alias("int",
+/// [])])`) so the witness label can reproduce the reference's
+/// `param.type.to_s` generic rendering (`Range[::int]` — issue #304), while the
+/// genuinely-structural wrappers — `Union`, `Optional`, `Tuple` — recurse into
+/// their members. Everything else collapses to [`Other`](Self::Other), whose
+/// `String` is the exact WRITTEN form of the type (sliced from the RBS source)
+/// so a diagnostic can quote it verbatim later. The acceptance walks consult
+/// only the head name (a concrete argument class cannot satisfy or refute on
+/// the args), so retained args are label/data only.
 ///
 /// The interned names ride `&'static str` (the file-wide interning discipline);
 /// the `Other` leaf is an owned `String` because its vocabulary is unbounded.
@@ -253,25 +256,81 @@ pub enum ClassOrdering {
 /// them into a rule yet (the slice is output-inert by contract).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RetainedParamType {
-    /// A concrete class instance, type arguments dropped: `Integer`, `String`,
-    /// `Array[Integer]` ⇒ `ClassInstance("Array")`.
-    ClassInstance(&'static str),
+    /// A concrete class instance: `Integer`, `String`,
+    /// `Array[Integer]` ⇒ `ClassInstance("Array", [ClassInstance("Integer", [])])`.
+    ClassInstance(&'static str, Vec<RetainedParamType>),
     /// A reference to a `type` alias (RBS lowercase alias, e.g. the `string` in
-    /// `(string) -> void`). NOT expanded here — Slice 2 owns bounded expansion
-    /// via [`CoreData::resolve_type_alias`].
-    Alias(&'static str),
-    /// A reference to an `interface` (RBS `_`-prefixed, e.g. `_ToStr`). The
-    /// required method-name set is retained separately in
-    /// [`CoreData::interface_methods`].
-    Interface(&'static str),
+    /// `(string) -> void`; a generic alias keeps its args: `range[int]` ⇒
+    /// `Alias("range", [Alias("int", [])])`). NOT expanded here — Slice 2 owns
+    /// bounded expansion via [`CoreData::resolve_type_alias`].
+    Alias(&'static str, Vec<RetainedParamType>),
+    /// A reference to an `interface` (RBS `_`-prefixed, e.g. `_ToStr`; a generic
+    /// interface keeps its args: `_Each[E]`). The required method-name set is
+    /// retained separately in [`CoreData::interface_methods`].
+    Interface(&'static str, Vec<RetainedParamType>),
+    /// A bare type variable (`E`, `I`). Method-level BOUNDS are not folded at
+    /// retention: the reference substitutes them only in the multi-overload
+    /// channel (`resolve_param_bounds`, `check_rules.rb`), so consumers
+    /// substitute via [`RetainedParamType::substitute_vars`] against
+    /// [`OverloadSignature::type_param_bounds`].
+    Variable(&'static str),
     /// A union `A | B | ...` — each member retained one level deep.
     Union(Vec<RetainedParamType>),
     /// An optional `T?` — the inner type retained one level deep.
     Optional(Box<RetainedParamType>),
+    /// A fixed tuple `[A, B]` — element-wise so a generic argument such as
+    /// `Hash[[K, V], Integer]` renders faithfully; semantically conservative
+    /// like `Other` (the acceptance walks admit it).
+    Tuple(Vec<RetainedParamType>),
     /// Any other type shape (base types `bool`/`nil`/`untyped`/`void`/`self`,
-    /// literals, tuples, records, procs, singletons, type variables, …). The
-    /// `String` is the verbatim written form sliced from the RBS source.
+    /// literals, records, procs, singletons, intersections, …). The `String`
+    /// is the verbatim written form sliced from the RBS source.
     Other(String),
+}
+
+impl RetainedParamType {
+    /// Substitute the method-level bounded type parameters — the reference's
+    /// `resolve_param_bounds` (`check_rules.rb`), which the reference applies
+    /// ONLY when collecting the multi-overload parameter set (the
+    /// single-overload channel walks the raw `param.type`, where a bare
+    /// variable admits `nil` and translates to `untyped` — so it never fires).
+    /// Recurses through every retained wrapper and the named kinds' type
+    /// arguments; an `Other` leaf is opaque and carried verbatim.
+    pub fn substitute_vars(&self, subst: &[(&'static str, RetainedParamType)]) -> RetainedParamType {
+        match self {
+            RetainedParamType::Variable(name) => subst
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, bound)| bound.clone())
+                .unwrap_or_else(|| self.clone()),
+            RetainedParamType::ClassInstance(name, args)
+            | RetainedParamType::Alias(name, args)
+            | RetainedParamType::Interface(name, args) => {
+                let args = args.iter().map(|a| a.substitute_vars(subst)).collect();
+                match self {
+                    RetainedParamType::ClassInstance(..) => {
+                        RetainedParamType::ClassInstance(name, args)
+                    }
+                    RetainedParamType::Alias(..) => RetainedParamType::Alias(name, args),
+                    _ => RetainedParamType::Interface(name, args),
+                }
+            }
+            RetainedParamType::Union(members) | RetainedParamType::Tuple(members) => {
+                let members = members
+                    .iter()
+                    .map(|m| m.substitute_vars(subst))
+                    .collect();
+                match self {
+                    RetainedParamType::Union(_) => RetainedParamType::Union(members),
+                    _ => RetainedParamType::Tuple(members),
+                }
+            }
+            RetainedParamType::Optional(inner) => {
+                RetainedParamType::Optional(Box::new(inner.substitute_vars(subst)))
+            }
+            RetainedParamType::Other(_) => self.clone(),
+        }
+    }
 }
 
 /// A structured RBS **return** descriptor — the richer carrier the flat
@@ -367,6 +426,15 @@ pub struct OverloadSignature {
     /// `OverloadSelector.overload_requires_block?`. A block-less call site never
     /// engages such an overload.
     pub block_required: bool,
+    /// The method type's BOUNDED type parameters — `[I < _ToInt, T] (I index)`
+    /// records `("I", _ToInt)` here and leaves the positional params' `I` as a
+    /// raw [`RetainedParamType::Variable`]. The reference substitutes the bound
+    /// only in the MULTI-overload channel (`resolve_param_bounds`,
+    /// `check_rules.rb`), so consumers apply [`RetainedParamType::substitute_vars`]
+    /// at collection time; the single-overload channel sees the raw variable —
+    /// which admits `nil` and is never a faithful param — exactly as the
+    /// reference declines there.
+    pub type_param_bounds: Vec<(&'static str, RetainedParamType)>,
     /// The overload's RETURN type in its VERBATIM written form, whitespace-
     /// normalised (`Array[[ E, X ]]` ⇒ `"Array[[ E, X ]]"`). Two overloads
     /// answer the *same* return iff these strings are equal.
@@ -695,11 +763,18 @@ pub struct CoreData {
     qualified_project_sig_classes: HashSet<&'static str>,
     /// ATM substrate (Slice 1): `type` alias name → its right-hand-side one-level
     /// [`RetainedParamType`] tag (`type string = String | _ToStr` ⇒
-    /// `"string" → Union([ClassInstance("String"), Interface("_ToStr")])`). The
-    /// RHS is stored RAW (aliases inside it are NOT expanded); bounded expansion
-    /// with a cycle cap is Slice 2's job. Read only via
+    /// `"string" → Union([ClassInstance("String", []), Interface("_ToStr", [])])`).
+    /// The RHS is stored RAW (aliases inside it are NOT expanded); bounded
+    /// expansion with a cycle cap is Slice 2's job. Read only via
     /// [`Self::resolve_type_alias`]; no rule wires it yet.
     type_alias_defs: HashMap<&'static str, RetainedParamType>,
+    /// ATM substrate: `type` alias name → its declared type parameter names
+    /// (`type range[T] = ...` ⇒ `"range" → ["T"]`; a nullary alias maps to an
+    /// empty vec). A use site `range[int]` substitutes positionally — the
+    /// reference `expand_alias2(name, args)` semantics — when the
+    /// translated-describe label expands the alias. Read via
+    /// [`Self::type_alias_params`].
+    type_alias_params: HashMap<&'static str, Vec<&'static str>>,
     /// ATM substrate (Slice 1): `interface` name → its declared method names, in
     /// declaration order (`interface _ToStr; def to_str: ...; end` ⇒
     /// `"_ToStr" → ["to_str"]`). Read only via [`Self::interface_methods`]; no
@@ -880,6 +955,7 @@ impl CoreData {
             mut classes,
             toplevel_classes,
             type_alias_defs,
+            type_alias_params,
             interface_method_names,
             mut qualified,
             short_to_qualified,
@@ -901,6 +977,7 @@ impl CoreData {
                 project_sig_classes,
                 qualified_project_sig_classes,
                 type_alias_defs,
+                type_alias_params,
                 interface_method_names,
                 qualified,
                 short_to_qualified,
@@ -3018,6 +3095,17 @@ impl CoreData {
         self.type_alias_defs.get(name.strip_prefix("::").unwrap_or(name))
     }
 
+    /// The declared type-parameter names of a `type` alias (`type range[T] =
+    /// ...` ⇒ `["T"]`), or `None` if the alias is unknown. A generic alias USE
+    /// (`range[int]`) substitutes these positionally with its own type
+    /// arguments — the reference `expand_alias2(name, args)` semantics — which
+    /// the translated-describe label applies before rendering the expansion.
+    pub fn type_alias_params(&self, name: &str) -> Option<&[&'static str]> {
+        self.type_alias_params
+            .get(name.strip_prefix("::").unwrap_or(name))
+            .map(|v| v.as_slice())
+    }
+
     /// The declared method names of an `interface`, in declaration order, or
     /// `None` if the interface is unknown.
     pub fn interface_methods(&self, name: &str) -> Option<&[&'static str]> {
@@ -3092,20 +3180,21 @@ impl CoreData {
     ///   unresolvable / empty interface admits.
     /// - `Union` ⇒ ANY member admitting admits.
     /// - `Optional` ⇒ `T?` always admits (it explicitly includes nil).
-    /// - `Other` ⇒ every remaining shape (the reference's `else`: bases incl.
-    ///   `nil`/`bool`/`void`/`self`/`top`/`untyped`, type variables, literals,
-    ///   tuples, records, procs, intersections) admits conservatively.
+    /// - `Variable` / `Tuple` / `Other` ⇒ every remaining shape (the
+    ///   reference's `else`: bases incl. `nil`/`bool`/`void`/`self`/`top`/
+    ///   `untyped`, type variables, literals, tuples, records, procs,
+    ///   intersections) admits conservatively.
     pub fn param_admits_nil(&self, t: &RetainedParamType) -> bool {
         self.param_admits_nil_depth(t, 0)
     }
 
     fn param_admits_nil_depth(&self, t: &RetainedParamType, depth: usize) -> bool {
         match t {
-            RetainedParamType::ClassInstance(name) => {
+            RetainedParamType::ClassInstance(name, _) => {
                 let bare = name.strip_prefix("::").unwrap_or(name);
                 NIL_COMPATIBLE_CLASS_NAMES.contains(&bare)
             }
-            RetainedParamType::Alias(name) => {
+            RetainedParamType::Alias(name, _) => {
                 if depth >= Self::ALIAS_EXPANSION_CAP {
                     return true;
                 }
@@ -3116,12 +3205,14 @@ impl CoreData {
                     None => true,
                 }
             }
-            RetainedParamType::Interface(name) => self.interface_admits_nil(name),
+            RetainedParamType::Interface(name, _) => self.interface_admits_nil(name),
             RetainedParamType::Union(members) => {
                 members.iter().any(|m| self.param_admits_nil_depth(m, depth))
             }
-            RetainedParamType::Optional(_) => true,
-            RetainedParamType::Other(_) => true,
+            RetainedParamType::Optional(_)
+            | RetainedParamType::Variable(_)
+            | RetainedParamType::Tuple(_)
+            | RetainedParamType::Other(_) => true,
         }
     }
 
@@ -3157,7 +3248,8 @@ impl CoreData {
     ///   (mirror of [`Self::interface_admits_nil`], asking the arg class); an
     ///   unresolvable / empty interface, or an arg class not RBS-known, accepts.
     /// - `Union` ⇒ ANY member accepting accepts.
-    /// - `Optional` / `Other` ⇒ accept conservatively (the reference `else`).
+    /// - `Optional` / `Variable` / `Tuple` / `Other` ⇒ accept conservatively
+    ///   (the reference `else`).
     pub fn param_accepts_arg_class(&self, t: &RetainedParamType, arg_class: &str) -> bool {
         self.param_accepts_arg_class_depth(t, arg_class, 0)
     }
@@ -3169,7 +3261,7 @@ impl CoreData {
         depth: usize,
     ) -> bool {
         match t {
-            RetainedParamType::ClassInstance(name) => {
+            RetainedParamType::ClassInstance(name, _) => {
                 matches!(
                     self.class_ordering(arg_class, name),
                     ClassOrdering::Equal
@@ -3178,7 +3270,7 @@ impl CoreData {
                         | ClassOrdering::Unknown
                 )
             }
-            RetainedParamType::Alias(name) => {
+            RetainedParamType::Alias(name, _) => {
                 if depth >= Self::ALIAS_EXPANSION_CAP {
                     return true;
                 }
@@ -3189,12 +3281,14 @@ impl CoreData {
                     None => true,
                 }
             }
-            RetainedParamType::Interface(name) => self.interface_accepts_arg(name, arg_class),
+            RetainedParamType::Interface(name, _) => self.interface_accepts_arg(name, arg_class),
             RetainedParamType::Union(members) => members
                 .iter()
                 .any(|m| self.param_accepts_arg_class_depth(m, arg_class, depth)),
-            RetainedParamType::Optional(_) => true,
-            RetainedParamType::Other(_) => true,
+            RetainedParamType::Optional(_)
+            | RetainedParamType::Variable(_)
+            | RetainedParamType::Tuple(_)
+            | RetainedParamType::Other(_) => true,
         }
     }
 
@@ -3794,6 +3888,7 @@ impl CoreData {
             // The stub models no type aliases or interfaces (the ATM substrate
             // needs the real embedded RBS); empty keeps the accessors inert.
             type_alias_defs: HashMap::new(),
+            type_alias_params: HashMap::new(),
             interface_method_names: HashMap::new(),
             // ADR-0042 Slice 1: the stub models no qualified registry either —
             // empty keeps the new accessors conservatively inert (never
@@ -3850,6 +3945,7 @@ type BuiltData = (
     HashSet<&'static str>,
     HashMap<&'static str, RetainedParamType>,
     HashMap<&'static str, Vec<&'static str>>,
+    HashMap<&'static str, Vec<&'static str>>,
     HashMap<&'static str, ClassEntry>,
     HashMap<&'static str, Vec<&'static str>>,
     HashMap<&'static str, &'static str>,
@@ -3883,6 +3979,10 @@ struct Builder {
     /// ATM substrate (Slice 1): global `type` alias defs, folded from every
     /// top-level AND nested `type X = ...` declaration. First write wins.
     type_alias_defs: HashMap<&'static str, RetainedParamType>,
+    /// ATM substrate: global `type` alias declared type-parameter names
+    /// (`type range[T] = ...` ⇒ `"range" → ["T"]`), parallel to
+    /// `type_alias_defs` — the substitution names for a generic alias use site.
+    type_alias_params: HashMap<&'static str, Vec<&'static str>>,
     /// ATM substrate (Slice 1): global `interface` method-name sets, folded from
     /// every top-level AND nested `interface _X ... end` declaration. First
     /// write wins.
@@ -4010,8 +4110,24 @@ impl Builder {
             return;
         };
         self.known_type_names.insert(qualified_name(enclosing, &ta.name()));
-        let rhs = retained_param_type(&ta.type_(), code, &[], ctx);
+        // The alias's declared type params (`type range[T] = Range[T] | _Range[T]`)
+        // are retained so a USE site `range[int]` can substitute positionally —
+        // the reference `expand_alias2(name, args)` semantics — when a label
+        // renders the expansion.
+        let params: Vec<&'static str> = ta
+            .type_params()
+            .iter()
+            .filter_map(|tp| match tp {
+                Node::TypeParam(p) => {
+                    let name = p.name();
+                    (!name.as_str().is_empty()).then(|| intern(name.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        let rhs = retained_param_type(&ta.type_(), code, ctx);
         self.type_alias_defs.entry(name).or_insert(rhs);
+        self.type_alias_params.entry(name).or_insert(params);
     }
 
     /// Fold one `interface _X ... end` into the global map (ATM substrate),
@@ -4783,6 +4899,7 @@ impl Builder {
             self.classes,
             self.toplevel_classes,
             self.type_alias_defs,
+            self.type_alias_params,
             self.interface_method_names,
             self.qualified,
             self.short_to_qualified,
@@ -6051,23 +6168,23 @@ fn method_overloads(
         };
         // A method type may bind its own type parameters, and rbs 4.1 started
         // using BOUNDED ones in core signatures (`def fetch: … | [I < _ToInt,
-        // T] (I index) { (I index) -> T } -> (E | T)`). A bare variable is an
-        // opaque `Other` leaf, which the acceptance walk admits — so the whole
-        // overload would accept any argument and silence the mismatch every
-        // other overload reports. The declared upper bound IS the constraint
-        // (the reference renders exactly it: `expected int | _ToInt`), so a
-        // bounded variable resolves to its bound. An UNbounded variable stays
-        // opaque — genuinely unconstrained, genuinely admits everything.
+        // T] (I index) { (I index) -> T } -> (E | T)`). The bounds ride the
+        // signature in `type_param_bounds` and the params keep their raw
+        // `Variable` leaves: the reference substitutes a bound ONLY when
+        // collecting the multi-overload parameter set (`resolve_param_bounds`),
+        // while the single-overload channel walks the raw `param.type` — where
+        // a bare variable admits `nil` and is never faithfully checkable, so it
+        // declines there.
         let bounds = method_type_param_bounds(&mt, code, ctx);
         let required_positionals = ft
             .required_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, &bounds, ctx))
+            .map(|p| param_node_type(&p, code, ctx))
             .collect();
         let optional_positionals = ft
             .optional_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, &bounds, ctx))
+            .map(|p| param_node_type(&p, code, ctx))
             .collect();
         let required_positional_names = ft
             .required_positionals()
@@ -6090,6 +6207,7 @@ fn method_overloads(
             has_rest_keywords: ft.rest_keywords().is_some(),
             has_trailing_positionals: ft.trailing_positionals().iter().next().is_some(),
             block_required: mt.block().is_some_and(|b| b.required()),
+            type_param_bounds: bounds,
             return_form: normalized_written_form(&ft.return_type(), code, out.len()),
         });
     }
@@ -6115,12 +6233,8 @@ fn normalized_written_form(node: &Node, code: &str, ordinal: usize) -> String {
 /// The upper bounds a method type declares for its own type parameters, as
 /// `(variable name, bound)` pairs — `[I < _ToInt, T]` yields one entry for `I`
 /// and none for `T`. A `Vec` rather than a map: a method type binds a handful of
-/// parameters at most, so a linear scan beats hashing.
-type TypeParamBounds = [(&'static str, RetainedParamType)];
-
-/// Collect the bounded type parameters of one method type (see the call site in
-/// [`method_overloads`]). Unbounded parameters are omitted entirely, so a lookup
-/// miss means "genuinely unconstrained".
+/// parameters at most, so a linear scan beats hashing. Unbounded parameters are
+/// omitted entirely, so a lookup miss means "genuinely unconstrained".
 fn method_type_param_bounds(
     mt: &ruby_rbs::node::MethodTypeNode,
     code: &str,
@@ -6141,21 +6255,16 @@ fn method_type_param_bounds(
             // The bound is resolved with NO bounds in scope: a bound that
             // itself mentions a sibling variable is not a shape rbs core uses,
             // and resolving it would need fixpoint ordering for no gain.
-            Some((intern(name), retained_param_type(&bound, code, &[], ctx)))
+            Some((intern(name), retained_param_type(&bound, code, ctx)))
         })
         .collect()
 }
 
 /// Resolve a positional-parameter node (`RBS::Types::Function::Param`, whose
 /// `.type_()` is the parameter's type) into a one-level [`RetainedParamType`].
-fn param_node_type(
-    param: &Node,
-    code: &str,
-    bounds: &TypeParamBounds,
-    ctx: Option<&FileSigCtx>,
-) -> RetainedParamType {
+fn param_node_type(param: &Node, code: &str, ctx: Option<&FileSigCtx>) -> RetainedParamType {
     match param {
-        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, bounds, ctx),
+        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, ctx),
         // Defensive: a positional that isn't a FunctionParam node (shouldn't
         // occur) is retained verbatim as an `Other` leaf.
         other => RetainedParamType::Other(node_written_form(other, code)),
@@ -6172,54 +6281,74 @@ fn param_node_name(param: &Node) -> Option<&'static str> {
     }
 }
 
-/// Lower one RBS type node to a one-level [`RetainedParamType`] tag (ATM
-/// substrate). The four named kinds — class instance, `type` alias, `interface`,
-/// and the two structural wrappers `Union` / `Optional` — are recognised; every
-/// other shape collapses to [`RetainedParamType::Other`] carrying the verbatim
-/// written form sliced from `code`. Only `Union`/`Optional` recurse (they are
-/// meaningless as opaque leaves); a `ClassInstance` drops its type arguments.
-///
-/// `bounds` carries the enclosing method type's bounded type parameters: a
-/// variable listed there resolves to its upper bound instead of collapsing to an
-/// (admit-everything) `Other` leaf.
+/// Lower one RBS type node to a [`RetainedParamType`] tag (ATM substrate). The
+/// named kinds — class instance, `type` alias, `interface — and the structural
+/// wrappers `Union` / `Optional` / `Tuple` are recognised and recurse into
+/// their type arguments / members; a bare `Variable` keeps its name (method
+/// bounds are applied by consumers, not here); every other shape collapses to
+/// [`RetainedParamType::Other`] carrying the verbatim written form sliced from
+/// `code`.
 fn retained_param_type(
     node: &Node,
     code: &str,
-    bounds: &TypeParamBounds,
     ctx: Option<&FileSigCtx>,
 ) -> RetainedParamType {
     match node {
         Node::VariableType(v) => {
             let name = v.name();
-            match bounds.iter().find(|(n, _)| *n == name.as_str()) {
-                Some((_, bound)) => bound.clone(),
-                None => RetainedParamType::Other(node_written_form(node, code)),
+            if name.as_str().is_empty() {
+                RetainedParamType::Other(node_written_form(node, code))
+            } else {
+                RetainedParamType::Variable(intern(name.as_str()))
             }
         }
         Node::ClassInstanceType(ci) => match retained_name(ctx, &ci.name()) {
-            Some(name) => RetainedParamType::ClassInstance(name),
+            Some(name) => RetainedParamType::ClassInstance(
+                name,
+                ci.args()
+                    .iter()
+                    .map(|a| retained_param_type(&a, code, ctx))
+                    .collect(),
+            ),
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::AliasType(a) => match retained_name(ctx, &a.name()) {
-            Some(name) => RetainedParamType::Alias(name),
+            Some(name) => RetainedParamType::Alias(
+                name,
+                a.args()
+                    .iter()
+                    .map(|a| retained_param_type(&a, code, ctx))
+                    .collect(),
+            ),
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::InterfaceType(i) => match retained_name(ctx, &i.name()) {
-            Some(name) => RetainedParamType::Interface(name),
+            Some(name) => RetainedParamType::Interface(
+                name,
+                i.args()
+                    .iter()
+                    .map(|a| retained_param_type(&a, code, ctx))
+                    .collect(),
+            ),
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::UnionType(u) => RetainedParamType::Union(
             u.types()
                 .iter()
-                .map(|t| retained_param_type(&t, code, bounds, ctx))
+                .map(|t| retained_param_type(&t, code, ctx))
                 .collect(),
         ),
         Node::OptionalType(o) => RetainedParamType::Optional(Box::new(retained_param_type(
             &o.type_(),
             code,
-            bounds,
             ctx,
         ))),
+        Node::TupleType(t) => RetainedParamType::Tuple(
+            t.types()
+                .iter()
+                .map(|e| retained_param_type(&e, code, ctx))
+                .collect(),
+        ),
         other => RetainedParamType::Other(node_written_form(other, code)),
     }
 }

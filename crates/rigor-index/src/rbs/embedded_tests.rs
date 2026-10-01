@@ -167,24 +167,31 @@ fn self_return_on_an_instance_method_resolves_to_the_receiver() {
 
 /// rbs 4.1 also started using BOUNDED method type parameters in core
 /// signatures (`Array#fetch`'s block overload spells its index `[I < _ToInt,
-/// T] (I index)`). A bare variable is an opaque `Other` leaf that admits
-/// every argument, which would silence the mismatch the other overloads
-/// report — so a bounded variable must resolve to its declared bound.
+/// T] (I index)`). The param retains the RAW `Variable` and the bound rides
+/// the signature's `type_param_bounds`: the reference substitutes it only in
+/// the multi-overload channel (`resolve_param_bounds`), where the bare
+/// variable would otherwise admit every argument and silence the mismatch the
+/// other overloads report.
 #[test]
 fn bounded_method_type_param_resolves_to_its_upper_bound() {
     let idx = CoreData::load();
     let overloads = idx.method_overloads("Array", "fetch").expect("Array#fetch");
-    let params: Vec<&RetainedParamType> = overloads
+    let block_ov = overloads
         .iter()
-        .filter_map(|o| o.required_positionals.first())
-        .collect();
+        .find(|o| !o.type_param_bounds.is_empty())
+        .expect("one `fetch` overload binds `[I < _ToInt, T]`");
+    let param = block_ov
+        .required_positionals
+        .first()
+        .expect("block overload has the `I index` param");
     assert!(
-        params.iter().any(|p| matches!(p, RetainedParamType::Interface("_ToInt"))),
-        "the bounded `I < _ToInt` index param must carry its bound: {params:?}"
+        matches!(param, RetainedParamType::Variable("I")),
+        "retention keeps the raw variable; substitution is a consumer step: {param:?}"
     );
-    assert!(
-        !params.iter().any(|p| matches!(p, RetainedParamType::Other(s) if s == "I")),
-        "no overload may keep the bare variable as an admit-everything leaf: {params:?}"
+    assert_eq!(
+        param.substitute_vars(&block_ov.type_param_bounds),
+        RetainedParamType::Interface("_ToInt", vec![]),
+        "the multi-overload channel's bound substitution resolves `I` to `_ToInt`"
     );
 }
 
@@ -298,11 +305,11 @@ fn atm_per_overload_retention_integer_plus() {
     assert_eq!(
         names,
         vec![
-            &RetainedParamType::ClassInstance("BigDecimal"),
-            &RetainedParamType::ClassInstance("Integer"),
-            &RetainedParamType::ClassInstance("Float"),
-            &RetainedParamType::ClassInstance("Rational"),
-            &RetainedParamType::ClassInstance("Complex"),
+            &RetainedParamType::ClassInstance("BigDecimal", vec![]),
+            &RetainedParamType::ClassInstance("Integer", vec![]),
+            &RetainedParamType::ClassInstance("Float", vec![]),
+            &RetainedParamType::ClassInstance("Rational", vec![]),
+            &RetainedParamType::ClassInstance("Complex", vec![]),
         ],
         "the overloading reopen's operand comes first, then the core four"
     );
@@ -328,13 +335,114 @@ fn atm_type_alias_retention_string() {
     assert_eq!(
         rhs,
         &RetainedParamType::Union(vec![
-            RetainedParamType::ClassInstance("String"),
-            RetainedParamType::Interface("_ToStr"),
+            RetainedParamType::ClassInstance("String", vec![]),
+            RetainedParamType::Interface("_ToStr", vec![]),
         ]),
         "type string = String | _ToStr"
     );
     // A leading `::` on the query is tolerated.
     assert!(idx.resolve_type_alias("::string").is_some());
+}
+
+/// Issue #304 substrate: generic class-instance params keep their type
+/// ARGUMENTS so the witness label can render `Range[::int]` (the reference's
+/// `param.type.to_s`) instead of the collapsed `Range`. `Integer#[]` spells
+/// its slicing overload `(Range[int])`, and the args carry a single `Alias`
+/// leaf — acceptance still reads only the head.
+#[test]
+fn atm_generic_param_args_are_retained() {
+    let idx = CoreData::load();
+    let ov = idx
+        .method_overloads("Integer", "[]")
+        .expect("Integer#[] has retained overloads");
+    let range_ov = ov
+        .iter()
+        .find(|o| {
+            matches!(
+                o.required_positionals.first(),
+                Some(RetainedParamType::ClassInstance("Range", _)) if o.required_positionals.len() == 1
+            )
+        })
+        .expect("the `(Range[int]) -> Integer` overload is retained");
+    assert_eq!(
+        range_ov.required_positionals[0],
+        RetainedParamType::ClassInstance("Range", vec![RetainedParamType::Alias("int", vec![])]),
+        "Range[int] keeps its single `int` alias argument"
+    );
+    // Acceptance still consults only the class head — the args are label data,
+    // never new constraints (issue #304 spec).
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Range", vec![RetainedParamType::Alias("int", vec![])]),
+        "Range"
+    ));
+    assert!(!idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Range", vec![RetainedParamType::Alias("int", vec![])]),
+        "String"
+    ));
+    // The canonical generic alias `type range[T] = Range[T] | _Range[T]` keeps
+    // its declared parameter names for positional substitution at render time.
+    assert_eq!(idx.type_alias_params("range"), Some(["T"].as_slice()));
+    assert_eq!(idx.type_alias_params("int"), Some([].as_slice()));
+}
+
+/// Nested / union / optional generic forms retain their structure recursively
+/// (the args inside args), verified through a project `sig/` so the test pins
+/// the exact spellings rather than relying on core's drift.
+#[test]
+fn atm_nested_generic_param_retention() {
+    let base = std::env::temp_dir()
+        .join(format!("rigor-sig-test-generic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("temp sig dir");
+    std::fs::write(
+        base.join("widget.rbs"),
+        "class W\n  def m: (Array[Hash[Symbol, Integer?]] a, Set[String]? s, Array[Integer] | String u, Array b) -> void\nend\n",
+    )
+    .expect("write sig");
+    let idx = CoreData::load_for_project(&[], std::slice::from_ref(&base));
+    let ov = idx.method_overloads("W", "m").expect("W#m retained");
+    assert_eq!(ov.len(), 1);
+    let params = &ov[0].required_positionals;
+    assert_eq!(
+        params[0],
+        RetainedParamType::ClassInstance(
+            "Array",
+            vec![RetainedParamType::ClassInstance(
+                "Hash",
+                vec![
+                    RetainedParamType::ClassInstance("Symbol", vec![]),
+                    RetainedParamType::Optional(Box::new(RetainedParamType::ClassInstance(
+                        "Integer",
+                        vec![]
+                    ))),
+                ]
+            )]
+        ),
+        "Array[Hash[Symbol, Integer?]] retains both levels"
+    );
+    assert_eq!(
+        params[1],
+        RetainedParamType::Optional(Box::new(RetainedParamType::ClassInstance(
+            "Set",
+            vec![RetainedParamType::ClassInstance("String", vec![])]
+        ))),
+        "Set[String]? keeps the generic inside the optional"
+    );
+    assert_eq!(
+        params[2],
+        RetainedParamType::Union(vec![
+            RetainedParamType::ClassInstance(
+                "Array",
+                vec![RetainedParamType::ClassInstance("Integer", vec![])]
+            ),
+            RetainedParamType::ClassInstance("String", vec![]),
+        ]),
+        "the union keeps each member's args"
+    );
+    // A BARE generic head stays arg-less — `Array` is not `Array[...]`.
+    assert_eq!(params[3], RetainedParamType::ClassInstance("Array", vec![]));
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 /// Interface method-name retention against the ACTUAL vendored RBS:
@@ -411,7 +519,10 @@ fn atm_singleton_method_overloads_retained() {
             parse
                 .iter()
                 .any(|o| o.required_positionals.len() == 1
-                    && matches!(o.required_positionals[0], RetainedParamType::ClassInstance("String"))),
+                    && matches!(
+                        &o.required_positionals[0],
+                        RetainedParamType::ClassInstance("String", args) if args.is_empty()
+                    )),
             "CGI.parse takes a single String positional: {parse:?}"
         );
         // A plain `def self.parse` is NOT an instance method.
@@ -449,12 +560,12 @@ fn atm_alias_cycle_guard_and_nested_retention() {
     // No hang at ingestion; the self-cycle is retained as a raw Alias leaf.
     assert_eq!(
         data.resolve_type_alias("loop_t"),
-        Some(&RetainedParamType::Alias("loop_t")),
+        Some(&RetainedParamType::Alias("loop_t", vec![])),
         "self-referential alias retained one level deep, no loop"
     );
     assert_eq!(
         data.resolve_type_alias("a_t"),
-        Some(&RetainedParamType::Alias("b_t")),
+        Some(&RetainedParamType::Alias("b_t", vec![])),
         "mutual alias retained raw (Slice 2 owns expansion)"
     );
     // Interface with a duplicate method decl dedups to one name.
@@ -491,15 +602,15 @@ fn atm_substrate_is_additive_and_populated() {
 #[test]
 fn atm_param_admits_nil_class_instance() {
     let idx = CoreData::load();
-    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Object")));
-    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("BasicObject")));
-    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Kernel")));
-    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("NilClass")));
+    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Object", vec![])));
+    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("BasicObject", vec![])));
+    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("Kernel", vec![])));
+    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("NilClass", vec![])));
     // A leading `::` is tolerated on the name.
-    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("::Object")));
+    assert!(idx.param_admits_nil(&RetainedParamType::ClassInstance("::Object", vec![])));
     // Concrete classes reject nil.
-    assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("String")));
-    assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("Integer")));
+    assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("String", vec![])));
+    assert!(!idx.param_admits_nil(&RetainedParamType::ClassInstance("Integer", vec![])));
 }
 
 /// `Other` forms all admit nil (the reference `else`: `nil`/`untyped`/`self`/
@@ -514,7 +625,7 @@ fn atm_param_admits_nil_other_and_optional() {
         );
     }
     assert!(idx.param_admits_nil(&RetainedParamType::Optional(Box::new(
-        RetainedParamType::ClassInstance("String")
+        RetainedParamType::ClassInstance("String", vec![])
     ))));
 }
 
@@ -524,12 +635,12 @@ fn atm_param_admits_nil_other_and_optional() {
 fn atm_param_admits_nil_union() {
     let idx = CoreData::load();
     assert!(!idx.param_admits_nil(&RetainedParamType::Union(vec![
-        RetainedParamType::ClassInstance("String"),
-        RetainedParamType::ClassInstance("Integer"),
+        RetainedParamType::ClassInstance("String", vec![]),
+        RetainedParamType::ClassInstance("Integer", vec![]),
     ])));
     assert!(idx.param_admits_nil(&RetainedParamType::Union(vec![
-        RetainedParamType::ClassInstance("String"),
-        RetainedParamType::ClassInstance("Object"),
+        RetainedParamType::ClassInstance("String", vec![]),
+        RetainedParamType::ClassInstance("Object", vec![]),
     ])));
 }
 
@@ -542,20 +653,20 @@ fn atm_param_admits_nil_union() {
 fn atm_param_admits_nil_string_int_aliases() {
     let idx = CoreData::load();
     assert!(
-        !idx.param_admits_nil(&RetainedParamType::Alias("string")),
+        !idx.param_admits_nil(&RetainedParamType::Alias("string", vec![])),
         "`string` (String | _ToStr) rejects nil — NilClass lacks to_str"
     );
     assert!(
-        !idx.param_admits_nil(&RetainedParamType::Alias("int")),
+        !idx.param_admits_nil(&RetainedParamType::Alias("int", vec![])),
         "`int` (Integer | _ToInt) rejects nil — NilClass lacks to_int"
     );
     // NilClass HAS to_s, so a `_ToS` interface param admits nil directly.
     assert!(
-        idx.param_admits_nil(&RetainedParamType::Interface("_ToS")),
+        idx.param_admits_nil(&RetainedParamType::Interface("_ToS", vec![])),
         "_ToS admits nil — NilClass#to_s exists"
     );
     // An unknown interface admits conservatively.
-    assert!(idx.param_admits_nil(&RetainedParamType::Interface("_NoSuchIfaceZzz")));
+    assert!(idx.param_admits_nil(&RetainedParamType::Interface("_NoSuchIfaceZzz", vec![])));
 }
 
 /// `ClassInstance` argument acceptance via `class_ordering`: Equal / Subclass
@@ -564,27 +675,27 @@ fn atm_param_admits_nil_string_int_aliases() {
 fn atm_param_accepts_arg_class_instance() {
     let idx = CoreData::load();
     // Equal.
-    assert!(idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String"), "String"));
+    assert!(idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String", vec![]), "String"));
     // Subclass: ArgumentError <: Exception.
     assert!(idx.param_accepts_arg_class(
-        &RetainedParamType::ClassInstance("Exception"),
+        &RetainedParamType::ClassInstance("Exception", vec![]),
         "ArgumentError"
     ));
     // Superclass: arg Numeric is broader than param Integer — a runtime value
     // MIGHT be an Integer, so admit (never a provable reject).
     assert!(idx.param_accepts_arg_class(
-        &RetainedParamType::ClassInstance("Integer"),
+        &RetainedParamType::ClassInstance("Integer", vec![]),
         "Numeric"
     ));
     // Unknown: an unloaded param class cannot be refuted.
     assert!(idx.param_accepts_arg_class(
-        &RetainedParamType::ClassInstance("NoSuchClassZzz"),
+        &RetainedParamType::ClassInstance("NoSuchClassZzz", vec![]),
         "String"
     ));
     // Disjoint: the sole rejection.
-    assert!(!idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String"), "Symbol"));
+    assert!(!idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String", vec![]), "Symbol"));
     assert!(!idx.param_accepts_arg_class(
-        &RetainedParamType::ClassInstance("Integer"),
+        &RetainedParamType::ClassInstance("Integer", vec![]),
         "String"
     ));
 }
@@ -597,17 +708,17 @@ fn atm_param_accepts_arg_class_instance() {
 fn atm_param_accepts_arg_string_int_aliases() {
     let idx = CoreData::load();
     // `string` accepts String (concrete arm, Equal).
-    assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("string"), "String"));
+    assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("string", vec![]), "String"));
     // `int` accepts Integer (concrete arm) AND Float (via _ToInt: Float has
     // Numeric#to_int) — the interface walk declining to reject a coercible.
-    assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("int"), "Integer"));
+    assert!(idx.param_accepts_arg_class(&RetainedParamType::Alias("int", vec![]), "Integer"));
     assert!(
-        idx.param_accepts_arg_class(&RetainedParamType::Alias("int"), "Float"),
+        idx.param_accepts_arg_class(&RetainedParamType::Alias("int", vec![]), "Float"),
         "`int` accepts Float — Float implements to_int via Numeric"
     );
     // `string` rejects Symbol: Disjoint from String AND no to_str.
     assert!(
-        !idx.param_accepts_arg_class(&RetainedParamType::Alias("string"), "Symbol"),
+        !idx.param_accepts_arg_class(&RetainedParamType::Alias("string", vec![]), "Symbol"),
         "`string` rejects Symbol — not a String and no to_str"
     );
 }
@@ -620,22 +731,22 @@ fn atm_param_accepts_arg_union_optional_other() {
     // Union: Symbol accepted by the Symbol arm though rejected by String.
     assert!(idx.param_accepts_arg_class(
         &RetainedParamType::Union(vec![
-            RetainedParamType::ClassInstance("String"),
-            RetainedParamType::ClassInstance("Symbol"),
+            RetainedParamType::ClassInstance("String", vec![]),
+            RetainedParamType::ClassInstance("Symbol", vec![]),
         ]),
         "Symbol"
     ));
     // Union of two disjoint concretes rejects a third disjoint arg.
     assert!(!idx.param_accepts_arg_class(
         &RetainedParamType::Union(vec![
-            RetainedParamType::ClassInstance("String"),
-            RetainedParamType::ClassInstance("Symbol"),
+            RetainedParamType::ClassInstance("String", vec![]),
+            RetainedParamType::ClassInstance("Symbol", vec![]),
         ]),
         "Integer"
     ));
     // Optional / Other admit unconditionally.
     assert!(idx.param_accepts_arg_class(
-        &RetainedParamType::Optional(Box::new(RetainedParamType::ClassInstance("String"))),
+        &RetainedParamType::Optional(Box::new(RetainedParamType::ClassInstance("String", vec![]))),
         "Integer"
     ));
     assert!(idx.param_accepts_arg_class(&RetainedParamType::Other("untyped".to_string()), "Integer"));
@@ -649,17 +760,17 @@ fn atm_interface_accepts_arg_unknown_side() {
     let idx = CoreData::load();
     // Unknown arg class → admit.
     assert!(idx.param_accepts_arg_class(
-        &RetainedParamType::Interface("_ToStr"),
+        &RetainedParamType::Interface("_ToStr", vec![]),
         "NoSuchClassZzz"
     ));
     // Unknown interface → admit.
     assert!(idx.param_accepts_arg_class(
-        &RetainedParamType::Interface("_NoSuchIfaceZzz"),
+        &RetainedParamType::Interface("_NoSuchIfaceZzz", vec![]),
         "Symbol"
     ));
     // Known arg class lacking the required method → reject.
     assert!(
-        !idx.param_accepts_arg_class(&RetainedParamType::Interface("_ToStr"), "Symbol"),
+        !idx.param_accepts_arg_class(&RetainedParamType::Interface("_ToStr", vec![]), "Symbol"),
         "_ToStr rejects Symbol — no to_str"
     );
 }
@@ -684,22 +795,22 @@ fn atm_acceptance_alias_depth_cap_and_chain() {
 
     // Cyclic alias: no hang, admits at the cap (conservative true).
     assert!(
-        data.param_admits_nil(&RetainedParamType::Alias("a_t")),
+        data.param_admits_nil(&RetainedParamType::Alias("a_t", vec![])),
         "cyclic alias terminates and admits at the depth cap"
     );
-    assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("a_t"), "String"));
+    assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("a_t", vec![]), "String"));
 
     // Finite chain resolves to its leaf class.
     assert!(
-        !data.param_admits_nil(&RetainedParamType::Alias("int_t")),
+        !data.param_admits_nil(&RetainedParamType::Alias("int_t", vec![])),
         "`type int_t = Integer` inherits Integer's nil rejection"
     );
     assert!(
-        data.param_admits_nil(&RetainedParamType::Alias("obj_t")),
+        data.param_admits_nil(&RetainedParamType::Alias("obj_t", vec![])),
         "`type obj_t = Object` inherits Object's nil admittance"
     );
-    assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("int_t"), "Integer"));
-    assert!(!data.param_accepts_arg_class(&RetainedParamType::Alias("int_t"), "String"));
+    assert!(data.param_accepts_arg_class(&RetainedParamType::Alias("int_t", vec![]), "Integer"));
+    assert!(!data.param_accepts_arg_class(&RetainedParamType::Alias("int_t", vec![]), "String"));
 
     let _ = std::fs::remove_dir_all(&base);
 }
