@@ -822,7 +822,12 @@ pub enum Node {
     /// `K += x`, `@i += x`, `rescue => e`, `in [a, b]` all rebind names a tail
     /// may read, and answering with the pre-write binding mints a wrong
     /// constant (a false-positive vector, not a safe decline).
-    UnmodeledWrite { span: Span },
+    /// `names` carries the LOCAL names a pattern-binding node binds
+    /// (`LocalVariableTargetNode`s of the pattern — `in [s]`, `in Integer => s`,
+    /// `v => s`, `v in [s]`); empty for every other unmodeled write. The
+    /// rebind/widen censuses (`flow_writes`) need the names to grade a pattern
+    /// rebind like any other local write (rigor-rs#352 review).
+    UnmodeledWrite { span: Span, names: Vec<String> },
     /// `alias new_name old_name` (Prism `AliasMethodNode`). Both operands are
     /// lowered so an interpolated name's calls stay reachable to the rule
     /// walk; the def-attribution walk reads the literal symbol names through
@@ -955,7 +960,7 @@ impl Node {
             | Node::SelfExpr { span }
             | Node::Return { span, .. }
             | Node::Other { span, .. }
-            | Node::UnmodeledWrite { span }
+            | Node::UnmodeledWrite { span, .. }
             | Node::Alias { span, .. } => *span,
         }
     }

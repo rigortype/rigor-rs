@@ -280,6 +280,14 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
                 .flat_map(|c| index_target_writes(c.index_writes.clone()))
                 .map(|(s, n)| (id, s, n, true))
                 .collect(),
+            // A pattern-binding marker's `names` are real local rebinds on
+            // the oracle (`case v; in [s]; end`, `v => s`, `v in [s]`) —
+            // counted so `widen_flow_writes` widens the rebound name like any
+            // other write (rigor-rs#352 review). Not scan-visible.
+            Node::UnmodeledWrite { span, names } => names
+                .iter()
+                .map(|name| (id, *span, name.clone(), false))
+                .collect(),
             _ => Vec::new(),
         })
         .collect();
@@ -296,8 +304,16 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
     // filter is the same shape for `Recovered::blocked` positions (a
     // `when`/`in` condition under a rescue modifier, a dead arm — the
     // reference discards their post-scope, rigor-rs#357).
-    out.retain(|(_, w, _, scan)| {
-        (!ast.in_inert_carrier(*w) || (*scan && ast.in_scanned_inert_carrier(*w)))
+    out.retain(|(id, w, _, scan)| {
+        // A NAMED `UnmodeledWrite` (pattern-binding locals) survives an inert
+        // carrier only when that carrier is the `in` clause the marker itself
+        // stands on — `in_outer_inert_carrier` — never a blocked carrier
+        // (`case … in [s] rescue …` discards the scope, rigor-rs#357).
+        let pattern_bind =
+            matches!(ast.get(*id), Node::UnmodeledWrite { names, .. } if !names.is_empty());
+        (!ast.in_inert_carrier(*w)
+            || (*scan && ast.in_scanned_inert_carrier(*w))
+            || (pattern_bind && !ast.in_outer_inert_carrier(*w)))
             && (!ast.in_blocked_carrier(*w)
                 || (*scan && ast.in_iterative_blocked_carrier(*w)))
     });
@@ -331,11 +347,8 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
                 descendants.contains(id) && bound.contains(name)
             })
     });
-    let mut out: Vec<(rigor_parse::Span, String)> =
-        out.into_iter().map(|(_, s, n)| (s, n)).collect();
-    drop_inert_writes(ast, &mut out);
-    drop_blocked_writes(ast, &mut out);
-    out
+    retain_flowable_rebinds(ast, &mut out);
+    out.into_iter().map(|(_, s, n)| (s, n)).collect()
 }
 
 /// The rebind entries [`toplevel_rebinds`]/[`local_rebinds`] filter —
@@ -365,6 +378,13 @@ fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, S
             Node::Loop { index, .. } => {
                 out.extend(for_index_rebinds(index).into_iter().map(|(s, n)| (id, s, n)));
             }
+            // A pattern-binding marker's `names` rebind locals exactly like a
+            // plain write on the oracle (`case v; in [s]; end` inside a `for
+            // s[0] in …` span makes the post-join `s` NOT the pre-loop String
+            // — rigor-rs#352 review).
+            Node::UnmodeledWrite { span, names } => {
+                out.extend(names.iter().map(|name| (id, *span, name.clone())));
+            }
             _ => {}
         }
     }
@@ -388,11 +408,23 @@ pub(crate) fn local_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)
             descendants.contains(id) && bound.contains(name)
         })
     });
-    let mut out: Vec<(rigor_parse::Span, String)> =
-        out.into_iter().map(|(_, s, n)| (s, n)).collect();
-    drop_inert_writes(ast, &mut out);
-    drop_blocked_writes(ast, &mut out);
-    out
+    retain_flowable_rebinds(ast, &mut out);
+    out.into_iter().map(|(_, s, n)| (s, n)).collect()
+}
+
+/// [`drop_inert_writes`] + [`drop_blocked_writes`] on id-carrying rebind
+/// entries, so a NAMED `UnmodeledWrite` (pattern-binding locals) survives the
+/// `in` clause's own inert carrier — `in_outer_inert_carrier`, the marker is a
+/// sibling sharing the carrier's span — while still dropping inside a wider
+/// inert carrier or any blocked position (`case … in [s] rescue …`,
+/// rigor-rs#357 / #352 review).
+fn retain_flowable_rebinds(ast: &LoweredAst, out: &mut Vec<(NodeId, rigor_parse::Span, String)>) {
+    out.retain(|(id, w, _)| {
+        let pattern_bind =
+            matches!(ast.get(*id), Node::UnmodeledWrite { names, .. } if !names.is_empty());
+        (!ast.in_inert_carrier(*w) || (pattern_bind && !ast.in_outer_inert_carrier(*w)))
+            && !ast.in_blocked_carrier(*w)
+    });
 }
 
 /// The two scope filters [`toplevel_rebinds`] and [`toplevel_mutations`]

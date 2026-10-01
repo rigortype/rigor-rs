@@ -936,6 +936,58 @@ fn string_index_target_rebind_inside_construct_wins() {
     }
 }
 
+/// rigor-rs#352 review round 2: a PATTERN binding inside the `for`/`rescue`
+/// span rebinds the index-target local too — `in [s]`, `in Integer => s`,
+/// `v => s`, `v in [s]` all bind `s` on the oracle. `Node::UnmodeledWrite`
+/// now carries those names so the rebind/widen censuses grade them like a
+/// plain write. All probed silent on the reference; the port previously kept
+/// the pre-construct `[]=` widening and fired `possible-nil-receiver`.
+#[test]
+fn string_index_target_pattern_rebind_inside_construct_wins() {
+    for src in [
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in Integer => s; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in s; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in {a: s}; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; v => s; end; x = s[0]; x.upcase\n".as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; v in [s]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"v = 1; s = \"abc\"; for s[0] in [5]; if v in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; begin; raise; rescue => s[0]; case 1; in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        // No construct at all: a straight-line `case`/`in` rebinds `s` after
+        // the `[]=` mutation — the widen census needs the names too.
+        b"s = \"abc\"; s[0] = 5; case 1; in [s]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"v = 1; s = \"abc\"; if v in [s]; end; x = s[0]; x.upcase\n".as_slice(),
+        b"s = String.new; for s[0] in [5]; case 1; in [s]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+    ] {
+        assert!(
+            nil_diags(src).is_empty(),
+            "pattern rebind must count like a plain rebind: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+    // Controls: a pattern binding a DIFFERENT local does not touch `s`; a
+    // compound index write inside the body still mutates `s` — both fire.
+    for src in [
+        b"v = 1; s = \"abc\"; for s[0] in [5]; case v; in [w]; end; end; x = s[0]; x.upcase\n"
+            .as_slice(),
+        b"s = \"abc\"; for s[0] in [5]; s[0] += \"x\"; end; x = s[0]; x.upcase\n".as_slice(),
+    ] {
+        assert_eq!(
+            nil_diags(src).len(),
+            1,
+            "unrelated binding / mutation must keep firing: {:?}",
+            std::str::from_utf8(src).unwrap()
+        );
+    }
+}
+
 /// Measured declines against the reference (the zero-FP-safe side): a
 /// `s = nil` body arm joins `s` to `String | nil`, which the reference reads
 /// as a nilable `[]` RECEIVER on `s[0]`; `s += "z"` is an op-write rebind the

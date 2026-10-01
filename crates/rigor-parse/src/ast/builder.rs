@@ -956,6 +956,11 @@ impl<'src> Builder<'src> {
             // answer a tail with the pre-bind value (rigor-rs#194).
             self.push(Node::UnmodeledWrite {
                 span: span_of(&in_node.location()),
+                // The pattern binds real locals on the oracle (`in [s]` is a
+                // conditional `s = …`) — name them so the rebind/widen
+                // censuses grade the clause like any other write
+                // (rigor-rs#352 review).
+                names: pattern_bound_locals(&in_node.pattern()),
             });
             // The pattern is matched in `in_arm_position` — typed, never
             // evaluated (rigor-rs#343); it is the dead half of the operand
@@ -1615,7 +1620,23 @@ impl<'src> Builder<'src> {
         // rigor-rs#194) while the node itself keeps the plain `Recovered`
         // carrier every other consumer already handles.
         if is_unmodeled_write(node) {
-            self.push(Node::UnmodeledWrite { span });
+            // A pattern-binding node's locals are real rebinds on the oracle —
+            // `expr => pat`, `expr in pat`, the `MatchWriteNode` target list —
+            // every other unmodeled write (`@i += 1`, `K += 1`, `K::V = …`)
+            // binds no LOCAL (rigor-rs#352 review).
+            let names = if let Some(n) = node.as_match_write_node() {
+                n.targets()
+                    .iter()
+                    .flat_map(|t| pattern_bound_locals(&t))
+                    .collect()
+            } else if let Some(n) = node.as_match_required_node() {
+                pattern_bound_locals(&n.pattern())
+            } else if let Some(n) = node.as_match_predicate_node() {
+                pattern_bound_locals(&n.pattern())
+            } else {
+                Vec::new()
+            };
+            self.push(Node::UnmodeledWrite { span, names });
             let recovered = collect_recoverable_children(node, self.recovery_marks());
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });
@@ -1846,6 +1867,29 @@ fn is_unmodeled_write(node: &PrismNode<'_>) -> bool {
         || node.as_match_write_node().is_some()
         || node.as_match_predicate_node().is_some()
         || node.as_match_required_node().is_some()
+}
+
+/// Every LOCAL a pattern subtree binds — the `LocalVariableTargetNode`s under
+/// it (`in [s]`, `in {a: s}`, `in Integer => s`, `v => s`, `v in [s]`,
+/// `in [a, *b]`). Pinned reads (`^s`) lower as READS, not targets, so only the
+/// bindings land here. `flow_writes` counts each as a rebind exactly like
+/// `s = v`: the oracle binds the name on match (rigor-rs#352 review).
+fn pattern_bound_locals(pattern: &PrismNode<'_>) -> Vec<String> {
+    struct Locals {
+        names: Vec<String>,
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Locals {
+        fn visit_local_variable_target_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableTargetNode<'pr>,
+        ) {
+            self.names.push(constant_string(node.name().as_slice()));
+        }
+    }
+    use ruby_prism::Visit as _;
+    let mut v = Locals { names: Vec::new() };
+    v.visit(pattern);
+    v.names
 }
 
 /// A prism integer's value when it fits `i64`, from its little-endian `u32`
