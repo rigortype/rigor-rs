@@ -165,45 +165,216 @@ fn argument_check_eligible(ov: &OverloadSignature) -> bool {
 /// `ClassInstance` (`String`) is faithful; a union of faithful members is; a
 /// bare `Alias` (`string`) / `Interface` (`_ToStr`) / `Other` is NOT (the
 /// translator would hand the acceptance engine a `Dynamic`, which never refutes,
-/// so `"abc".center("s")` — param `int` — stays silent). `Optional` is treated
-/// as non-faithful (the substrate's `param_accepts_arg_class` always admits it,
-/// so it never fires either way — declining explicitly keeps this honest).
+/// so `"abc".center("s")` — param `int` — stays silent). `Optional(T)` translates
+/// to `union(T, nil)` (`translate_optional`) — never Dynamic — so it is faithful
+/// exactly when its inner type is (an unfaithful inner yields a Dynamic union
+/// member that gradually admits everything, so declining there is outcome-equal).
 fn is_faithful_param(t: &RetainedParamType) -> bool {
     match t {
-        RetainedParamType::ClassInstance(_) => true,
+        RetainedParamType::ClassInstance(..) => true,
         RetainedParamType::Union(members) => members.iter().all(is_faithful_param),
-        RetainedParamType::Alias(_)
-        | RetainedParamType::Interface(_)
-        | RetainedParamType::Optional(_)
+        RetainedParamType::Optional(inner) => is_faithful_param(inner),
+        RetainedParamType::Alias(..)
+        | RetainedParamType::Interface(..)
+        | RetainedParamType::Variable(_)
+        | RetainedParamType::Tuple(_)
         | RetainedParamType::Other(_) => false,
+    }
+}
+
+/// The RBS `to_s` spelling of a retained parameter type in its ABSOLUTE form
+/// (reference `param.type.to_s` — every named leaf is `::`-rooted and carries
+/// its `name[arg, arg]` type arguments; `check_rules.rb`'s
+/// `overload_param_expected_label` then strips ONE leading `::`). `Other`
+/// leaves keep the verbatim written form, which coincides with `to_s` for the
+/// base types and literals that dominate it.
+fn render_tos(t: &RetainedParamType) -> String {
+    match t {
+        RetainedParamType::ClassInstance(name, args)
+        | RetainedParamType::Alias(name, args) => {
+            let name = format!("::{}", name.strip_prefix("::").unwrap_or(name));
+            if args.is_empty() {
+                name
+            } else {
+                format!(
+                    "{name}[{}]",
+                    args.iter().map(render_tos).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
+        // `Interface#to_s` prints the bare `_Name` (interfaces are never
+        // namespaced) with its args in brackets — `_Each[::Integer]`.
+        RetainedParamType::Interface(name, args) => {
+            if args.is_empty() {
+                name.to_string()
+            } else {
+                format!(
+                    "{name}[{}]",
+                    args.iter().map(render_tos).collect::<Vec<_>>().join(", ")
+                )
+            }
+        }
+        RetainedParamType::Variable(name) => name.to_string(),
+        RetainedParamType::Union(members) => members
+            .iter()
+            .map(render_tos)
+            .collect::<Vec<_>>()
+            .join(" | "),
+        RetainedParamType::Optional(inner) => match inner.as_ref() {
+            // RBS `Optional#to_s`: a union or proc inner parenthesises —
+            // `(A | B)?`, `(^() -> T)?`; every other shape is `T?` flat
+            // (`:sym?`, `::Set[::String]?`, `untyped?`).
+            RetainedParamType::Union(_) => format!("({})?", render_tos(inner)),
+            RetainedParamType::Other(s) if s.starts_with('^') => format!("({s})?"),
+            _ => format!("{}?", render_tos(inner)),
+        },
+        // rbs `Tuple#to_s` keeps spaces inside the brackets: `[ A, B ]`.
+        RetainedParamType::Tuple(members) if members.is_empty() => "[]".to_string(),
+        RetainedParamType::Tuple(members) => format!(
+            "[ {} ]",
+            members.iter().map(render_tos).collect::<Vec<_>>().join(", ")
+        ),
+        RetainedParamType::Other(s) => s.clone(),
     }
 }
 
 /// The written-form label of a parameter type (reference
 /// `param.type.to_s.delete_prefix("::")`), used verbatim in the diagnostic
-/// message (presentation only; the harness keys on `(rule, line, column)`).
+/// message. The single leading `::` is stripped AFTER the absolute-form
+/// render, so inner names keep their roots (`::Range[::int]` ⇒ `Range[::int]`).
 fn render_retained_param(t: &RetainedParamType) -> String {
-    fn strip(n: &str) -> String {
-        n.strip_prefix("::").unwrap_or(n).to_string()
-    }
+    let tos = render_tos(t);
+    tos.strip_prefix("::").map(str::to_string).unwrap_or(tos)
+}
+
+/// The `describe(:short)` form of a param's TRANSLATED type — the label the
+/// single-overload non-nil channel emits (reference `expected: param_type`,
+/// rendered by `expected.describe(:short)`): generic args survive
+/// (`Hash[E, Integer]` ⇒ `Hash[Dynamic[top], Integer]`), a `type` alias
+/// expands through `resolve_type_alias` with its declared params substituted,
+/// an interface / unbound variable / `untyped` degrades to `Dynamic[top]`, and
+/// unions render describe-sorted with the `T?` / `bool` collapses.
+fn render_describe(t: &RetainedParamType, index: &CoreIndex, depth: usize) -> String {
     match t {
-        RetainedParamType::ClassInstance(n)
-        | RetainedParamType::Alias(n)
-        | RetainedParamType::Interface(n) => strip(n),
-        RetainedParamType::Union(members) => members
+        RetainedParamType::ClassInstance(name, args) => {
+            let name = name.strip_prefix("::").unwrap_or(name);
+            if args.is_empty() {
+                name.to_string()
+            } else {
+                format!(
+                    "{name}[{}]",
+                    args.iter()
+                        .map(|a| render_describe(a, index, depth))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
+        RetainedParamType::Alias(name, args) => {
+            if depth >= 8 {
+                return "Dynamic[top]".to_string();
+            }
+            match index.resolve_type_alias(name) {
+                Some(rhs) => {
+                    // `expand_alias2(name, args)`: substitute the alias's own
+                    // declared params positionally, then render the expansion.
+                    let expanded = match index.type_alias_params(name) {
+                        Some(params) if !params.is_empty() => {
+                            let subst: Vec<(&'static str, RetainedParamType)> = params
+                                .iter()
+                                .copied()
+                                .zip(args.iter().cloned())
+                                .collect();
+                            rhs.substitute_vars(&subst)
+                        }
+                        _ => rhs.clone(),
+                    };
+                    render_describe(&expanded, index, depth + 1)
+                }
+                // An unexpandable alias degrades to `untyped` (reference
+                // `translate_alias` returns `Dynamic[Top]` when the expander
+                // misses).
+                None => "Dynamic[top]".to_string(),
+            }
+        }
+        // An interface translates to `untyped`, as does a variable with no
+        // binding in `translate_param_type`'s context (`type_vars.fetch`
+        // default) and the `self`/`instance`/`class` bases without a self
+        // type — all read `Dynamic[top]`.
+        RetainedParamType::Interface(..) | RetainedParamType::Variable(_) => {
+            "Dynamic[top]".to_string()
+        }
+        RetainedParamType::Union(members) => union_describe(
+            members
+                .iter()
+                .map(|m| render_describe(m, index, depth))
+                .collect(),
+        ),
+        // `translate_optional` = `union(inner, nil)`.
+        RetainedParamType::Optional(inner) => {
+            union_describe(vec![render_describe(inner, index, depth), "nil".to_string()])
+        }
+        RetainedParamType::Tuple(members) => format!(
+            "[{}]",
+            members
+                .iter()
+                .map(|m| render_describe(m, index, depth))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        RetainedParamType::Other(s) => match s.as_str() {
+            "untyped" | "self" | "instance" | "class" => "Dynamic[top]".to_string(),
+            "void" | "top" => "top".to_string(),
+            "bot" => "bot".to_string(),
+            "bool" => "bool".to_string(),
+            "nil" => "nil".to_string(),
+            // A `^(...) -> T` proc translates to bare `Proc`.
+            _ if s.starts_with('^') => "Proc".to_string(),
+            // Literals / singletons / records describe close to their written
+            // form once the `::` roots are gone (`singleton(::String)` ⇒
+            // `singleton(String)`).
+            _ => s.replace("::", ""),
+        },
+    }
+}
+
+/// Render a union of already-described member strings the way
+/// `Type::Union#describe` does after `Combinator.union` normalisation: `bot`
+/// members drop, `top` absorbs, survivors are describe-sorted and deduped, a
+/// lone-member-plus-`nil` union collapses to `T?`, and the `true | false`
+/// pair leads as `bool`.
+fn union_describe(mut members: Vec<String>) -> String {
+    if members.iter().any(|m| m == "top") {
+        return "top".to_string();
+    }
+    members.retain(|m| m != "bot");
+    members.sort();
+    members.dedup();
+    let bool_pair = members.iter().any(|m| m == "true") && members.iter().any(|m| m == "false");
+    let non_nil: Vec<&String> = members.iter().filter(|m| m.as_str() != "nil").collect();
+    if members.iter().any(|m| m == "nil") && non_nil.len() - usize::from(bool_pair) == 1 {
+        let inner = if bool_pair { "bool" } else { non_nil[0].as_str() };
+        return format!("{inner}?");
+    }
+    if bool_pair {
+        let rest: Vec<&String> = members
             .iter()
-            .map(render_retained_param)
-            .collect::<Vec<_>>()
-            .join(" | "),
-        RetainedParamType::Optional(inner) => format!("{}?", render_retained_param(inner)),
-        RetainedParamType::Other(s) => strip(s),
+            .filter(|m| m.as_str() != "true" && m.as_str() != "false")
+            .collect();
+        let mut out = vec!["bool"];
+        out.extend(rest.iter().map(|m| m.as_str()));
+        return out.join(" | ");
+    }
+    match members.len() {
+        0 => "bot".to_string(),
+        _ => members.join(" | "),
     }
 }
 
 /// The per-overload written-form label for a multi-overload mismatch: each
 /// overload's param at the index rendered, uniq'd in first-seen order, `" | "`
-/// joined (reference `overload_param_expected_label`, `check_rules.rb:2213`).
-fn expected_label_multi(params: &[&RetainedParamType]) -> String {
+/// joined (reference `overload_param_expected_label`, `check_rules.rb:3022`).
+fn expected_label_multi(params: &[RetainedParamType]) -> String {
     let mut seen: Vec<String> = Vec::new();
     for p in params {
         let label = render_retained_param(p);
@@ -212,6 +383,42 @@ fn expected_label_multi(params: &[&RetainedParamType]) -> String {
         }
     }
     seen.join(" | ")
+}
+
+/// The parameter-side missing-class gate (reference `stub_typed_param?` /
+/// `undefined_param_class?`, `check_rules.rb:2836-2857`, issue #661): when the
+/// param's class name carries no definition anywhere — or is one of the
+/// loader's SYNTHESIZED stubs minted to fill a dangling reference — a
+/// rejection is the missing signature restated, not a finding, so the channel
+/// declines. Only the arms a verdict can rest on are walked: union members, an
+/// optional's inner type, an expanded alias — deliberately NOT type ARGUMENTS
+/// (`Array[Missing]` still refutes on `Array` alone). `Other` leaves carry no
+/// class head, so they answer false.
+fn stub_typed_param(index: &CoreIndex, param: &RetainedParamType, depth: usize) -> bool {
+    match param {
+        RetainedParamType::Union(members) => {
+            members.iter().any(|m| stub_typed_param(index, m, depth))
+        }
+        RetainedParamType::Optional(inner) => stub_typed_param(index, inner, depth),
+        RetainedParamType::Alias(name, _) => {
+            if depth >= 8 {
+                return false;
+            }
+            match index.resolve_type_alias(name) {
+                // `resolve_type_alias` borrows `index`; clone the small tag so
+                // the recursive `&index` call does not alias the borrow.
+                Some(rhs) => stub_typed_param(index, &rhs.clone(), depth + 1),
+                None => false,
+            }
+        }
+        RetainedParamType::ClassInstance(name, _) => {
+            index.is_synthesized_stub(name) || !index.knows_class(name)
+        }
+        RetainedParamType::Interface(..)
+        | RetainedParamType::Variable(_)
+        | RetainedParamType::Tuple(_)
+        | RetainedParamType::Other(_) => false,
+    }
 }
 
 /// Whether the argument type is a PURE `nil` (reference `nil_member?` applied to
@@ -276,10 +483,35 @@ fn faithful_param_rejects_arg(
             return false;
         }
         match concrete_class_name(interner, index, source, m) {
-            Some(class_name) => !index.param_accepts_arg_class(param, &class_name),
+            Some(class_name) => !translated_param_accepts(index, param, &class_name),
             None => false,
         }
     })
+}
+
+/// The SINGLE-overload channel's acceptance: the reference hands the param's
+/// TRANSLATED type to `Inference::Acceptance.accepts` (`check_rules.rb:3078`
+/// `translate_param_type` → `argument_genuinely_mismatches?`), which differs
+/// from the substrate's `param_accepts_arg_class` (the multi-overload
+/// `rbs_type_accepts_arg?` port) in exactly one arm — `Optional(T)` translates
+/// to `union(T, nil)`, so a non-nil arg is decided by `T` alone while a
+/// NilClass arg is admitted by the nil member. `Union` members are checked
+/// under the same translation recursively so a `T?` union member sees its
+/// real acceptance rather than the multi-channel's conservative admit.
+fn translated_param_accepts(
+    index: &CoreIndex,
+    param: &RetainedParamType,
+    arg_class: &str,
+) -> bool {
+    match param {
+        RetainedParamType::Optional(inner) => {
+            arg_class == "NilClass" || translated_param_accepts(index, inner, arg_class)
+        }
+        RetainedParamType::Union(members) => members
+            .iter()
+            .any(|m| translated_param_accepts(index, m, arg_class)),
+        _ => index.param_accepts_arg_class(param, arg_class),
+    }
 }
 
 /// One resolved argument-type mismatch: the argument node to anchor on, the
@@ -327,6 +559,11 @@ fn single_overload_mismatch(
         let Some(param) = params.get(i) else {
             continue; // arity mismatch is the wrong-arity rule's concern.
         };
+        // `stub_typed_param?` — a param naming an undefined (or synthesized-
+        // stub) class can never justify a verdict on it; decline the arg.
+        if stub_typed_param(index, param, 0) {
+            continue;
+        }
         let param_name = names.get(i).copied().flatten();
         // `argument_scope(arg)`: each argument types from the scope it was
         // ENTERED from (rigor-rs#136) — a later arg's env still sees the
@@ -356,7 +593,11 @@ fn single_overload_mismatch(
             return Some(AtmMismatch {
                 arg,
                 param_name,
-                expected: render_retained_param(param),
+                // The reference labels this channel with the TRANSLATED param
+                // type's `describe(:short)` (`expected: param_type`), so a
+                // generic param renders `Hash[Dynamic[top], Integer]`, not the
+                // written `Hash[E, Integer]`.
+                expected: render_describe(param, index, 0),
                 actual: arg_ty,
             });
         }
@@ -388,19 +629,29 @@ fn multi_overload_mismatch(
 
     for (i, &arg) in args.iter().enumerate() {
         // The param at index `i` on EVERY overload; `None` if any overload lacks
-        // one (arity divergence — the wrong-arity rule's concern).
-        let params: Option<Vec<&RetainedParamType>> = overloads
+        // one (arity divergence — the wrong-arity rule's concern). Each is
+        // bounds-substituted at collection — the reference's
+        // `resolve_param_bounds` (`check_rules.rb:2805`) applies ONLY here; the
+        // single-overload channel walks the raw param.
+        let params: Option<Vec<RetainedParamType>> = overloads
             .iter()
             .map(|ov| {
                 ov.required_positionals
                     .iter()
                     .chain(ov.optional_positionals.iter())
                     .nth(i)
+                    .map(|p| p.substitute_vars(&ov.type_param_bounds))
             })
             .collect();
         let Some(params) = params else {
             continue;
         };
+        // `checkable_overload_params`: ANY overload's param at this index naming
+        // an undefined / synthesized-stub class unseats the every-overload
+        // premise — decline the whole position.
+        if params.iter().any(|p| stub_typed_param(index, p, 0)) {
+            continue;
+        }
 
         // `argument_scope(arg)`: the scope the argument was entered from.
         let arg_env = scoped.at(ast, typer, ast.get(arg).span(), arg, interner);

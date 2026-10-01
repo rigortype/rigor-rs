@@ -575,6 +575,22 @@ impl CoreIndex {
         self.data.param_accepts_arg_class(t, arg_class)
     }
 
+    /// The right-hand side of a `type` alias, retained one level deep, or
+    /// `None` when unknown — for the translated-describe `expected` label
+    /// (`call.argument-type-mismatch`, single-overload non-nil channel), which
+    /// the reference renders as `param_type.describe(:short)` of the
+    /// alias-EXPANDED translation.
+    pub fn resolve_type_alias(&self, name: &str) -> Option<&RetainedParamType> {
+        self.data.resolve_type_alias(name)
+    }
+
+    /// The declared type-parameter names of a `type` alias (`type range[T] =`
+    /// ⇒ `["T"]`), or `None` when unknown — the substitution names a generic
+    /// alias use site maps its args onto before rendering the expansion.
+    pub fn type_alias_params(&self, name: &str) -> Option<&[&'static str]> {
+        self.data.type_alias_params(name)
+    }
+
     // --- class registry (name <-> ClassId) -----------------------------------
 
     /// Intern a core class name to its stable [`ClassId`], if registered. The

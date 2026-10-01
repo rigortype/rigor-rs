@@ -3675,6 +3675,59 @@ fn atm_nil_channel_int_alias_param_fires() {
     );
 }
 
+/// Issue #304 headline row, pinned byte-for-byte against the oracle: a generic
+/// class-instance param renders its type ARGUMENTS (`Range[::int]`), not the
+/// collapsed head. `Integer#[]` is multi-overload (`(int)`, `(int, int)`,
+/// `(Range[int])`), so the written-form label joins `int | Range[::int]`.
+#[test]
+fn atm_generic_range_param_renders_type_args() {
+    let src = b"5[\"x\"]\n";
+    let d = atm_diags(src);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(&src[d[0].start_offset..d[0].end_offset], b"\"x\"");
+    assert_eq!(d[0].receiver_type.as_deref(), Some("Integer"));
+    assert_eq!(
+        d[0].message,
+        "argument type mismatch at `[]' on Integer: expected int | Range[::int], got \"x\""
+    );
+}
+
+/// The nil channel renders the same written-form label — `Range[::int]`, the
+/// resolved `to_s` minus the outer `::` (`overload_param_expected_label`).
+#[test]
+fn atm_nil_channel_generic_range_param_renders_type_args() {
+    let src = b"5[nil]\n";
+    let d = atm_diags(src);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(
+        d[0].message,
+        "argument type mismatch at `[]' on Integer: expected int | Range[::int], got nil"
+    );
+}
+
+/// The `range[int]` ALIAS param (`Array#[]`'s slicing overload) renders as
+/// written — `range[::int]`, lowercase — while a CLASS param would print
+/// `Range[::int]`. Same issue-#304 machinery, different leaf kind.
+#[test]
+fn atm_generic_alias_param_renders_type_args() {
+    let src = b"a = [1, 2, 3]\na[\"x\"]\n";
+    let d = atm_diags(src);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(
+        d[0].message,
+        "argument type mismatch at `[]' on Array: expected int | range[::int], got \"x\""
+    );
+}
+
+/// A bounded method type parameter (`[I < _ToInt]`) substitutes ONLY in the
+/// multi-overload channel (reference `resolve_param_bounds`); in a
+/// single-overload signature the raw variable stays gradual and declines —
+/// oracle-silent on `Dir#pos=` (`(I pos)` under `[I < _ToInt]`).
+#[test]
+fn atm_bounded_var_single_overload_stays_silent() {
+    assert!(atm_diags(b"d = Dir.new(\".\")\nd.pos = nil\n").is_empty());
+}
+
 #[test]
 fn atm_fires_alongside_wrong_arity_at_one_site() {
     // `"abc".center(nil, "x", "y")` — the reference emits BOTH wrong-arity
