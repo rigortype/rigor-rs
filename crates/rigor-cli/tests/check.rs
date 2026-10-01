@@ -161,3 +161,125 @@ fn compound_attr_write_nil_receiver_still_fires() {
         "expected a nil diagnostic for {src:?}, got {diags:?}"
     );
 }
+
+/// rigor-rs#366: a compound attribute write inside a literal block body is
+/// still EVALUATED — in the block's own scope — so
+/// `x.each { h.default ||= 0; h[:a].m }` runs `widen_attribute_write`
+/// there and drops `h`'s indexed narrowings for the in-body reads that
+/// follow it, while the OUTER scope's records survive and fire
+/// post-block. Before `closure_evaluated` fed the in-block replay the
+/// port kept the narrowing inside the body too, reporting a
+/// `call.undefined-method` the reference never emits.
+///
+/// Every row below ends with a post-block `h[:a].frobnicate`, so a
+/// passing row always reports exactly ONE diagnostic — the post-block
+/// read — and the in-block read stays silent.
+#[test]
+fn block_attr_write_drops_indexed_narrowing_inside_block_only() {
+    let probe = |body: &str| -> Vec<u8> {
+        format!(
+            "h = {{a: 1}}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\n[1].each {{ {body} }}\nh[:a].frobnicate\n",
+        )
+        .into_bytes()
+    };
+    for body in [
+        // The issue row.
+        "h.default ||= 0; h[:a].frobnicate",
+        // Every hash-lookup mutator writer drops the record.
+        "h.default_proc ||= nil; h[:a].frobnicate",
+        "h.default &&= 0; h[:a].frobnicate",
+        "h.default += 1; h[:a].frobnicate",
+        "h&.default ||= 0; h[:a].frobnicate",
+        // A write in an earlier conditional arm still drops: the scope
+        // join removes a record absent on any path.
+        "if x; h.default ||= 0; end; h[:a].frobnicate",
+        "if x; h.default ||= 0; else; 1; end; h[:a].frobnicate",
+        // Evaluation order, not source order — the modifier predicate
+        // runs before the body, the loop predicate before each pass.
+        "h[:a].frobnicate if h.default ||= 0",
+        "h[:a].frobnicate while h.default ||= 0",
+        // A write in a `case` arm drops for that arm's later statements.
+        "case x; when 1; h.default ||= 0; h[:a].frobnicate; else; 2; end",
+        // `ensure` runs on the joined scope — the protected body's drop
+        // reaches it.
+        "begin; h.default ||= 0; ensure; h[:a].frobnicate; end",
+        // An outer-body write reaches a nested block body's read.
+        "h.default ||= 0; [2].each { h[:a].frobnicate }",
+    ] {
+        let src = probe(body);
+        let diags = check(&src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only the post-block read to fire for {src:?}, got {diags:?}"
+        );
+        assert!(
+            diags[0].message.contains("frobnicate"),
+            "expected `frobnicate` on the post-block read for {src:?}, got {diags:?}"
+        );
+    }
+    // The same drop lands inside a lambda body's own scope.
+    let src = b"h = {a: 1}\nh[:a] ||= \"s\"\n-> { h.default ||= 0; h[:a].frobnicate }\nh[:a].frobnicate\n";
+    let diags = check(src);
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected only the post-lambda read to fire for {src:?}, got {diags:?}"
+    );
+}
+
+/// #366 controls — reads whose scope the write does NOT reach keep the
+/// narrowing and still fire: a read evaluated BEFORE the write in the
+/// body, a read in a sibling conditional arm or `rescue` clause (the
+/// write's path never reaches it), a read inside the write's own RHS
+/// operand, and a write whose scope is a NESTED block. Each row therefore
+/// reports TWO diagnostics — in-block and post-block.
+#[test]
+fn block_attr_write_keeps_narrowing_for_reads_it_does_not_reach() {
+    let probe = |body: &str| -> Vec<u8> {
+        format!(
+            "h = {{a: 1}}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\n[1].each {{ {body} }}\nh[:a].frobnicate\n",
+        )
+        .into_bytes()
+    };
+    for body in [
+        // Read before the write — source order.
+        "h[:a].frobnicate; h.default ||= 0",
+        // Sibling conditional arms are alternative paths.
+        "if x; h[:a].frobnicate; else; h.default ||= 0; end",
+        "if x; h.default ||= 0; else; h[:a].frobnicate; end",
+        // The protected body and a `rescue` clause are alternatives.
+        "begin; h[:a].frobnicate; rescue; h.default ||= 0; end",
+        "begin; h.default ||= 0; rescue; h[:a].frobnicate; end",
+        // A `case` arm does not reach the `else` arm.
+        "case x; when 1; h.default ||= 0; else; h[:a].frobnicate; end",
+        // The write's own RHS operand reads the pre-write scope.
+        "h.default ||= (h[:a].frobnicate; 0)",
+        // A nested block's write belongs to the INNER body's scope — the
+        // outer body's later read keeps the record.
+        "[2].each { h.default ||= 0 }; h[:a].frobnicate",
+        // A typed operand with no outliving effect never evaluates —
+        // `puts(h.default ||= 0)` keeps the narrowing (rigor-rs#361).
+        "puts(h.default ||= 0); h[:a].frobnicate",
+        // A non-mutator writer (`foo=`) drops nothing.
+        "h.foo ||= 0; h[:a].frobnicate",
+    ] {
+        let src = probe(body);
+        let diags = check(&src);
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected both reads to fire for {src:?}, got {diags:?}"
+        );
+    }
+    // The operand-effects gate still lands the write inside the block:
+    // `puts(h.default ||= (y = 1))` evaluates, so the later in-body read
+    // is silent — one diagnostic.
+    let src = b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { puts(h.default ||= (y = 1)); h[:a].frobnicate }\nh[:a].frobnicate\n";
+    let diags = check(src);
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected only the post-block read to fire for {src:?}, got {diags:?}"
+    );
+}

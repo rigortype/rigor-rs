@@ -877,6 +877,68 @@ fn operand_effects_gate_keeps_outliving_writes_evaluated() {
     );
 }
 
+/// rigor-rs#366: `closure_evaluated` is `evaluated` minus its
+/// `closure_depth` clause — a compound attribute write inside a literal
+/// block/lambda body still EVALUATES there (its `widen_attribute_write`
+/// lands on the block's own scope, dropping the receiver's indexed
+/// narrowings for later in-body reads) even though the effect never
+/// reaches the enclosing scope. The typed/dead/suppressed gates apply
+/// identically inside the body.
+#[test]
+fn closure_evaluated_marks_writes_the_innermost_body_evaluates() {
+    let flags = |src: &[u8]| -> Vec<(bool, bool)> {
+        lower(&crate::parse(src))
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::AttrWrite {
+                    evaluated,
+                    closure_evaluated,
+                    ..
+                } => Some((*evaluated, *closure_evaluated)),
+                _ => None,
+            })
+            .collect()
+    };
+    // Statement position inside the block body — the body's own scope
+    // evaluates it; the outer scope does not.
+    assert_eq!(
+        flags(b"h = {}\n[1].each { h.default ||= 0 }\n"),
+        [(false, true)]
+    );
+    assert_eq!(
+        flags(b"h = {}\n-> { h.default ||= 0 }\n"),
+        [(false, true)]
+    );
+    // A write in a nested block belongs to the INNER body's scope.
+    assert_eq!(
+        flags(b"h = {}\n[1].each { [2].each { h.default ||= 0 } }\n"),
+        [(false, true)]
+    );
+    // A typed operand without an outliving effect never evaluates — inside
+    // the block just as outside it (`puts(h.default ||= 0)` keeps the
+    // narrowing for a later in-body read).
+    assert_eq!(
+        flags(b"h = {}\n[1].each { puts(h.default ||= 0) }\n"),
+        [(false, false)]
+    );
+    // …but an operand whose subtree carries an outliving effect gates the
+    // write back to evaluated — inside the body's own scope.
+    assert_eq!(
+        flags(b"h = {}\n[1].each { puts(h.default ||= (y = 1)) }\n"),
+        [(false, true)]
+    );
+    // Top-level positions evaluate outright — both flags agree.
+    assert_eq!(flags(b"h = {}\nh.default ||= 0\n"), [(true, true)]);
+    assert_eq!(
+        flags(b"h = {}\nputs(h.default ||= (y = 1))\n"),
+        [(true, true)]
+    );
+    assert_eq!(
+        flags(b"h = {}\nputs(h.default ||= 0)\n"),
+        [(false, false)]
+    );
+}
+
 /// rigor-rs#312 round 2: an ITERATED body — `while`/`until`/`for`, an
 /// invoked block/lambda — gives the reference a content-writeback text scan
 /// (`loop_content_writeback`, `content_writeback_block_captures`) that lands
