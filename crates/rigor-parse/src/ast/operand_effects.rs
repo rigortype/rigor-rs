@@ -85,7 +85,8 @@ pub(crate) fn any(node: &PrismNode<'_>) -> bool {
 /// (`statement_evaluator.rb:2498-2505`) — the node classes `thread_operand`
 /// descends child-by-child.
 fn is_operand_container(node: &PrismNode<'_>) -> bool {
-    match node {
+    matches!(
+        node,
         // `OPERAND_CONTAINERS`.
         PrismNode::ArgumentsNode { .. }
         | PrismNode::KeywordHashNode { .. }
@@ -102,9 +103,8 @@ fn is_operand_container(node: &PrismNode<'_>) -> bool {
         | PrismNode::RangeNode { .. }
         // `OPERAND_SEQUENCES`.
         | PrismNode::StatementsNode { .. }
-        | PrismNode::ParenthesesNode { .. } => true,
-        _ => false,
-    }
+        | PrismNode::ParenthesesNode { .. }
+    )
 }
 
 /// `thread_operand`'s `HANDLERS.key?(node.class)` (`statement_evaluator.rb`
@@ -115,7 +115,8 @@ fn is_operand_container(node: &PrismNode<'_>) -> bool {
 /// `SuperNode`, `YieldNode`, `PreExecutionNode`, `PostExecutionNode`, …
 /// are NOT in it — an effect-bearing one returns `entry` unevaluated.)
 fn is_operand_evaluated(node: &PrismNode<'_>) -> bool {
-    match node {
+    matches!(
+        node,
         PrismNode::StatementsNode { .. }
         | PrismNode::ProgramNode { .. }
         | PrismNode::LocalVariableWriteNode { .. }
@@ -180,9 +181,8 @@ fn is_operand_evaluated(node: &PrismNode<'_>) -> bool {
         | PrismNode::InterpolatedStringNode { .. }
         | PrismNode::InterpolatedSymbolNode { .. }
         | PrismNode::InterpolatedXStringNode { .. }
-        | PrismNode::RangeNode { .. } => true,
-        _ => false,
-    }
+        | PrismNode::RangeNode { .. }
+    )
 }
 
 /// One `effect?` walk — `found` is the `||=` accumulator; `nesting` counts
