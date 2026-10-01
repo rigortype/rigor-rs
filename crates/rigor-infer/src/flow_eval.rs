@@ -86,21 +86,36 @@ impl<'i> Typer<'i> {
                     rebinds: Vec::new(),
                     mutations: Vec::new(),
                     indexed: IndexedFlow::default(),
+                    dead: crate::dead::DeadPositions::default(),
                 }
             }
         };
-        let rebinds = toplevel_rebinds(ast);
-        let mutations = toplevel_mutations(ast);
+        // rigor-rs#368 — provably-dead positions (computed once for the file;
+        // `seen` starts empty — the predicate fold is a fresh walk).
+        let dead = self.dead_positions(ast, &mut Vec::new());
+        let mut rebinds = toplevel_rebinds(ast);
+        let mut mutations = toplevel_mutations(ast);
+        // A write or mutation inside a folded-dead arm never lands — it must
+        // not widen the flat env either (`x = 1; if false; x = "s"; end; x.w`
+        // fires `for 1` on the oracle, not a widened decline). A `rescue`
+        // arm's writes keep widening: they are real writes whose reach the
+        // position rule in `DeadPositions::write_reaches` decides per-use.
+        rebinds.retain(|(s, _)| !dead.covers(*s));
+        mutations.retain(|(s, ..)| !dead.covers(*s));
         let indexed = collect_indexed_flow(ast);
         // Boundaries only matter while a recorded effect could postdate a use
-        // site; a file with none gets the flat env for every site.
-        let record = !(rebinds.is_empty() && mutations.is_empty());
+        // site, a folded-dead arm could hold one, or a `rescue` clause could
+        // (its own bindings + `=> e` reach only through replay — rigor-rs#368);
+        // a file with none of these gets the flat env for every site.
+        let record = !(rebinds.is_empty() && mutations.is_empty())
+            || dead.has_folded()
+            || dead.has_rescue();
         let mut boundaries = Vec::new();
         for stmt in body {
             if record {
                 boundaries.push((stmt, env.clone()));
             }
-            self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, &indexed, interner);
+            self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, &indexed, &dead, interner);
         }
         CheckFlow {
             env,
@@ -108,6 +123,7 @@ impl<'i> Typer<'i> {
             rebinds,
             mutations,
             indexed,
+            dead,
         }
     }
 
@@ -131,21 +147,43 @@ impl<'i> Typer<'i> {
         site: rigor_parse::Span,
         interner: &mut Interner,
     ) -> Cow<'f, TypeEnv> {
-        let Some(&(stmt, ref pre)) = flow.boundaries.iter().find(|(id, _)| {
-            let s = ast.get(*id).span();
-            s.0 <= site.0 && site.1 <= s.1
-        }) else {
-            return Cow::Borrowed(&flow.env);
+        let base: Cow<'f, TypeEnv> = 'env: {
+            let Some(&(stmt, ref pre)) = flow.boundaries.iter().find(|(id, _)| {
+                let s = ast.get(*id).span();
+                s.0 <= site.0 && site.1 <= s.1
+            }) else {
+                break 'env Cow::Borrowed(&flow.env);
+            };
+            let stmt_span = ast.get(stmt).span();
+            // rigor-rs#368 — a site inside a `rescue` clause also needs the
+            // replay even when no write postdates its statement: the clause's
+            // own bindings (`rescue => e`) reach only through it.
+            let later = flow.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
+                || flow.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0)
+                || flow.dead.in_rescue(site);
+            if !later {
+                break 'env Cow::Borrowed(&flow.env);
+            }
+            let mut env = pre.clone();
+            self.entry_descend(ast, stmt, site, true, &mut env, flow, interner);
+            Cow::Owned(env)
         };
-        let stmt_span = ast.get(stmt).span();
-        let later = flow.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
-            || flow.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0);
-        if !later {
-            return Cow::Borrowed(&flow.env);
+        // rigor-rs#368 — a site inside a folded-dead `if`/`unless` arm reads
+        // the arm's ENTRY scope: the reference never evaluates the arm, and
+        // `propagate` fills its nodes with the predicate's edge scope, whose
+        // subject locals narrowed to `Bot` on the dead edge (`q = nil; if q;
+        // q.w; end` is silent on the oracle). This also catches a dead-arm
+        // site the boundary descent cannot reach (buried under a `Loop` /
+        // `Case` — `apply_subtree_effects` is flat there).
+        if let Some(subjects) = flow.dead.subjects_at(site) {
+            let mut env = base.into_owned();
+            let bot = interner.bottom();
+            for name in subjects {
+                env.insert(name.clone(), bot);
+            }
+            return Cow::Owned(env);
         }
-        let mut env = pre.clone();
-        self.entry_descend(ast, stmt, site, true, &mut env, flow, interner);
-        Cow::Owned(env)
+        base
     }
 
     /// Replay `id`'s contained effects into `env` in evaluation order until
@@ -201,6 +239,14 @@ impl<'i> Typer<'i> {
                 } else {
                     return; // the site is the `if`'s own span, no child holds it
                 };
+                // rigor-rs#368 — a folded-dead arm never runs: the site reads
+                // the arm's ENTRY scope (the post-predicate env), so neither
+                // its own earlier writes nor any nested effect replay. The
+                // `check_env_at` post-pass floors the predicate's subject
+                // locals to `Bot` on top of this.
+                if flow.dead.arm_dead(crate::dead::body_hull(ast, branch)) {
+                    return;
+                }
                 for &s in branch {
                     let sspan = ast.get(s).span();
                     if sspan.0 <= site.0 && site.0 < sspan.1 {
@@ -216,16 +262,46 @@ impl<'i> Typer<'i> {
             // clause, the else arm and `ensure` are conditional or later, so
             // a site inside one takes every contained effect conservatively
             // — the flat env's own decline.
-            Node::BeginRescue { main_body, .. } => {
-                let main_body = main_body.clone();
+            Node::BeginRescue {
+                main_body, clauses, ..
+            } => {
+                let (main_body, clauses) = (main_body.clone(), clauses.clone());
                 if main_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
                 {
                     self.entry_children(ast, id, site, uncond, env, flow, interner);
-                } else {
-                    self.apply_subtree_effects(ast, id, false, env, flow, interner);
+                    return;
                 }
+                // rigor-rs#368 — a site inside a `rescue` clause replays the
+                // clause's own statements in order with real bindings: the
+                // reference evaluates each arm from the entry scope
+                // (`collect_rescue_chain_results`), so `x = 2; x.w; raise`
+                // inside fires `w for 2`. Statements after the site, and
+                // sibling arms, do not reach it.
+                for c in &clauses {
+                    if let Some(&s) = c
+                        .body
+                        .iter()
+                        .find(|&&s| within_span(site, ast.get(s).span()))
+                    {
+                        // `rescue => e` binds the exception inside the arm —
+                        // `bind_rescue_reference` on the oracle
+                        // (`statement_evaluator.rb:5100`).
+                        if let Some(name) = c.bound_name.clone() {
+                            let ty = self.rescue_reference_type(ast, c, interner);
+                            env.insert(name, ty);
+                        }
+                        for &pre_s in c.body.iter().take_while(|&x| *x != s) {
+                            self.bind_check_statement(
+                                ast, pre_s, env, &flow.rebinds, &flow.mutations, &flow.indexed, &flow.dead, interner,
+                            );
+                        }
+                        self.entry_descend(ast, s, site, false, env, flow, interner);
+                        return;
+                    }
+                }
+                self.apply_subtree_effects(ast, id, false, env, flow, interner);
             }
             // Conditional container: nothing inside orders against the site
             // (recovery carrier, loop, case/when), so apply every contained
@@ -246,6 +322,32 @@ impl<'i> Typer<'i> {
             }
             _ => self.entry_children(ast, id, site, uncond, env, flow, interner),
         }
+    }
+
+    /// `rescue_exception_type` (`statement_evaluator.rb:5115`): the type a
+    /// `rescue … => e` reference binds — `StandardError` for a bare `rescue`,
+    /// the union of the named classes otherwise; a name the index cannot
+    /// resolve contributes `Dynamic[top]` exactly as the reference's does.
+    fn rescue_reference_type(
+        &self,
+        ast: &LoweredAst,
+        clause: &rigor_parse::RescueClause,
+        interner: &mut Interner,
+    ) -> TypeId {
+        if clause.exceptions.is_empty() {
+            return self.nominal_or_untyped("StandardError", interner);
+        }
+        let mut ty = interner.bottom();
+        for &e in &clause.exceptions {
+            let member = match ast.get(e) {
+                Node::ConstantRead { name, .. } => {
+                    self.nominal_or_untyped(name, interner)
+                }
+                _ => interner.untyped(),
+            };
+            ty = rigor_types::Algebra::join(interner, ty, member);
+        }
+        ty
     }
 
     /// Ordered-children descent ([`Self::flow_children`]): apply each child's
@@ -481,21 +583,19 @@ impl<'i> Typer<'i> {
         //   clause's own span covers both, and its body statements already
         //   declined through their `Cond` edges above.
         match node {
-            Node::Loop { index_writes, .. } => {
+            Node::Loop { index_writes, .. }
                 if index_writes
                     .iter()
-                    .any(|(_, s, _)| s.0 <= wspan.0 && wspan.1 <= s.1)
-                {
-                    return false;
-                }
+                    .any(|(_, s, _)| s.0 <= wspan.0 && wspan.1 <= s.1) =>
+            {
+                return false;
             }
-            Node::BeginRescue { clauses, .. } => {
+            Node::BeginRescue { clauses, .. }
                 if clauses
                     .iter()
-                    .any(|c| c.span.0 <= wspan.0 && wspan.1 <= c.span.1)
-                {
-                    return false;
-                }
+                    .any(|c| c.span.0 <= wspan.0 && wspan.1 <= c.span.1) =>
+            {
+                return false;
             }
             _ => {}
         }
@@ -537,21 +637,19 @@ impl<'i> Typer<'i> {
         // Same off-child-position rule `path_unconditional` applies: a `for`
         // index target or rescue header position never evaluates inline.
         match node {
-            Node::Loop { index_writes, .. } => {
+            Node::Loop { index_writes, .. }
                 if index_writes
                     .iter()
-                    .any(|(_, s, _)| s.0 <= span.0 && span.1 <= s.1)
-                {
-                    return false;
-                }
+                    .any(|(_, s, _)| s.0 <= span.0 && span.1 <= s.1) =>
+            {
+                return false;
             }
-            Node::BeginRescue { clauses, .. } => {
+            Node::BeginRescue { clauses, .. }
                 if clauses
                     .iter()
-                    .any(|c| c.span.0 <= span.0 && span.1 <= c.span.1)
-                {
-                    return false;
-                }
+                    .any(|c| c.span.0 <= span.0 && span.1 <= c.span.1) =>
+            {
+                return false;
             }
             _ => {}
         }
@@ -751,6 +849,7 @@ impl<'i> Typer<'i> {
     /// `y = (a << 1)`); any other statement widens every rebind inside it and
     /// applies the contained `local.<mutator>` calls.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn bind_check_statement(
         &self,
         ast: &LoweredAst,
@@ -759,6 +858,7 @@ impl<'i> Typer<'i> {
         rebinds: &[(rigor_parse::Span, String)],
         mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
         indexed: &IndexedFlow,
+        dead: &crate::dead::DeadPositions,
         interner: &mut Interner,
     ) {
         match ast.get(id) {
@@ -788,8 +888,75 @@ impl<'i> Typer<'i> {
             // changes nothing (rigor-rs#153).
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for &s in body {
-                    self.bind_check_statement(ast, s, env, rebinds, mutations, indexed, interner);
+                    self.bind_check_statement(ast, s, env, rebinds, mutations, indexed, dead, interner);
                 }
+            }
+            // rigor-rs#368 — `live_branch_for_if`: a certainty-folded
+            // `if`/`unless` runs ONE arm unconditionally, so its writes must
+            // BIND their values, not widen (`x = nil; unless x; x = "s"; end;
+            // x.w` fires `for "s"` on the oracle). The folded-dead arm's
+            // writes and mutations never reach the continuation.
+            Node::If {
+                predicate,
+                then_body,
+                else_body,
+                is_unless,
+                ..
+            } => {
+                let span = ast.get(id).span();
+                match self.expr_truthiness(ast, *predicate, &mut Vec::new()) {
+                    Some(truthy) => {
+                        let live = if truthy != *is_unless {
+                            then_body.clone()
+                        } else {
+                            else_body.clone()
+                        };
+                        let live_rebinds: Vec<_> = rebinds
+                            .iter()
+                            .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                            .cloned()
+                            .collect();
+                        let live_mutations: Vec<_> = mutations
+                            .iter()
+                            .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                            .cloned()
+                            .collect();
+                        widen_flow_writes(&live_rebinds, span, env, interner);
+                        self.drop_indexed_rebinds(&live_rebinds, span, env);
+                        self.widen_mutated_locals(
+                            ast, &live_mutations, indexed, id, span, env, interner,
+                        );
+                        for s in live {
+                            self.bind_statement(ast, s, env, interner);
+                        }
+                    }
+                    None => {
+                        widen_flow_writes(rebinds, span, env, interner);
+                        self.drop_indexed_rebinds(rebinds, span, env);
+                        self.widen_mutated_locals(ast, mutations, indexed, id, span, env, interner);
+                    }
+                }
+            }
+            // rigor-rs#368 — `live_rescue_results` (`statement_evaluator.rb:1351`):
+            // a rescue arm `branch_terminates?` drops contributes NO scope to
+            // the post-`begin` join, so its writes do not widen the
+            // continuation either (`begin 1 rescue x = "s" raise end; x.w`
+            // fires `for 1` on the oracle — `x` keeps its pre-begin binding).
+            Node::BeginRescue { clauses, .. } if !clauses.is_empty() => {
+                let span = ast.get(id).span();
+                let live_rebinds: Vec<_> = rebinds
+                    .iter()
+                    .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                    .cloned()
+                    .collect();
+                let live_mutations: Vec<_> = mutations
+                    .iter()
+                    .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                    .cloned()
+                    .collect();
+                widen_flow_writes(&live_rebinds, span, env, interner);
+                self.drop_indexed_rebinds(&live_rebinds, span, env);
+                self.widen_mutated_locals(ast, &live_mutations, indexed, id, span, env, interner);
             }
             other => {
                 let span = other.span();
@@ -1122,8 +1289,14 @@ impl<'i> Typer<'i> {
         // drops, `indexed` the `h[k] ||= v` records themselves.
         let mut rebinds = collect_flow_writes(ast);
         rebinds.extend(indexed_flow_writes(ast, self.source));
-        let mutations = toplevel_mutations(ast);
+        let mut mutations = toplevel_mutations(ast);
         let indexed = collect_indexed_flow(ast);
+        // rigor-rs#368 — a write/mutation inside a folded-dead arm never
+        // lands; it must not widen this env either.
+        let dead = self.dead_positions(ast, &mut Vec::new());
+        writes.retain(|(s, _)| !dead.covers(*s));
+        rebinds.retain(|(s, _)| !dead.covers(*s));
+        mutations.retain(|(s, ..)| !dead.covers(*s));
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
@@ -1253,13 +1426,13 @@ impl<'i> Typer<'i> {
                 drop_indexed_narrowings(env, &name);
                 env.insert(name, u);
             }
-            Node::If { predicate, then_body, else_body, .. } => {
-                let (predicate, then_body, else_body) =
-                    (*predicate, then_body.clone(), else_body.clone());
+            Node::If { predicate, then_body, else_body, is_unless, .. } => {
+                let (predicate, then_body, else_body, is_unless) =
+                    (*predicate, then_body.clone(), else_body.clone(), *is_unless);
+                let pty = self.flow_predicate_type(
+                    ast, predicate, env, self_qual, self_kind, interner,
+                );
                 if !in_loop_or_block {
-                    let pty = self.flow_predicate_type(
-                        ast, predicate, env, self_qual, self_kind, interner,
-                    );
                     out.insert(id, pty);
                 }
                 // A predicate `h[k] ||= v` records its slot on the env the
@@ -1269,17 +1442,52 @@ impl<'i> Typer<'i> {
                 let if_span = ast.get(id).span();
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, if_span, env, interner);
-                // Independently evaluate each branch from the dominating env, then
-                // join: a binding survives only if both branches agree exactly.
-                let mut then_env = env.clone();
-                self.flow_eval_scope(
-                    ast, &then_body, &mut then_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
-                );
-                let mut else_env = env.clone();
-                self.flow_eval_scope(
-                    ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
-                );
-                *env = join_flow_envs(&then_env, &else_env, interner);
+                // rigor-rs#368 — `live_branch_for_if`: a certainty-folded
+                // predicate keeps ONE arm — the dead arm's writes never join
+                // the continuation. It is still walked into a DISCARDED env
+                // so the always-truthy snapshots inside it record the
+                // scope-fill the reference's `propagate` produces.
+                match self.predicate_certainty(pty, interner) {
+                    Some(truthy) => {
+                        let (live, dead_arm) = if truthy != is_unless {
+                            (&then_body, &else_body)
+                        } else {
+                            (&else_body, &then_body)
+                        };
+                        // The reference fills the dead arm's scope from the
+                        // dead EDGE — the predicate's subjects are `Bot`
+                        // there (`q = nil; if q; if q; end` warns on neither
+                        // on the oracle, the inner predicate typing `Bot`).
+                        let mut dead_env = env.clone();
+                        let mut subjects = Vec::new();
+                        self.predicate_locals(ast, predicate, &mut subjects, 4);
+                        let bot = interner.bottom();
+                        for name in subjects {
+                            dead_env.insert(name, bot);
+                        }
+                        self.flow_eval_scope(
+                            ast, dead_arm, &mut dead_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                        );
+                        let mut live_env = env.clone();
+                        self.flow_eval_scope(
+                            ast, live, &mut live_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                        );
+                        *env = live_env;
+                    }
+                    None => {
+                        // Independently evaluate each branch from the dominating env, then
+                        // join: a binding survives only if both branches agree exactly.
+                        let mut then_env = env.clone();
+                        self.flow_eval_scope(
+                            ast, &then_body, &mut then_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                        );
+                        let mut else_env = env.clone();
+                        self.flow_eval_scope(
+                            ast, &else_body, &mut else_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                        );
+                        *env = join_flow_envs(&then_env, &else_env, interner);
+                    }
+                }
                 // A predicate may contain a write (`if (x = f)`); widen post-join.
                 let pspan = ast.get(predicate).span();
                 widen_flow_writes(writes, pspan, env, interner);
@@ -1312,7 +1520,45 @@ impl<'i> Typer<'i> {
                     ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Instance, writes, rebinds, mutations, indexed, interner, out,
                 );
             }
-            // Loop / case / begin-rescue / logical / call(+block) / any other node:
+            // A `begin`/`rescue` DOES get its bodies evaluated on the
+            // reference — `collect_rescue_chain_results` sub-evals each
+            // clause — so their predicate snapshots record (that is what
+            // makes `raise if helper` warn inside an arm). The continuation
+            // join is still the flat decline: every write in the span widens
+            // (rigor-rs#368 only repositions which writes REACH a use —
+            // `local_reach`'s `dead_positions` — not this widening).
+            Node::BeginRescue {
+                main_body,
+                clauses,
+                ensure_body,
+                ..
+            } => {
+                let (main_body, clauses, ensure_body) =
+                    (main_body.clone(), clauses.clone(), ensure_body.clone());
+                if !in_loop_or_block {
+                    let mut scratch = env.clone();
+                    self.flow_eval_scope(
+                        ast, &main_body, &mut scratch, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                    );
+                    for c in &clauses {
+                        let mut cenv = scratch.clone();
+                        self.flow_eval_scope(
+                            ast, &c.body, &mut cenv, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                        );
+                    }
+                    self.flow_eval_scope(
+                        ast, &ensure_body, &mut scratch, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                    );
+                }
+                let span = ast.get(id).span();
+                let stored =
+                    self.stored_slot_writes(ast, indexed, id, span, env, interner);
+                widen_flow_writes(writes, span, env, interner);
+                self.land_indexed_stored(
+                    ast, indexed, id, span, rebinds, mutations, stored, env, interner,
+                );
+            }
+            // Loop / case / logical / call(+block) / any other node:
             // widen every local written in the span, do not descend for snapshots.
             other => {
                 let span = other.span();
@@ -1349,6 +1595,20 @@ impl<'i> Typer<'i> {
                     if let Some(scalar) = self.source.implicit_self_literal(q, self_kind, &method) {
                         return interner.intern(Type::Constant(scalar));
                     }
+                }
+                // rigor-rs#368 — a same-file TOPLEVEL `def helper = true`
+                // folds `helper` the same way (the `definer`-keyed table
+                // never sees it — `walk_fold_defs` harvests class/module
+                // children only). The overridable degrade is applied inside
+                // `file_def_literal`. Only this CALL shape may reach-fold:
+                // locals/comparisons take the env answer — a reach-pin past
+                // a mutator (`upcased.upcase!`) or a block-carried binding
+                // would fold a predicate the oracle does not (fixture 111's
+                // `if upcased == "ab"`).
+                if let Some(scalar) =
+                    self.file_def_literal(ast, &method, &mut Vec::new())
+                {
+                    return interner.intern(Type::Constant(scalar));
                 }
             }
         }
@@ -1489,4 +1749,10 @@ pub struct CheckFlow {
     /// (rigor-rs#325) — `operand` `h[k] ||= v` records, their spans, and
     /// element-mutator calls.
     indexed: IndexedFlow,
+    /// rigor-rs#368 — the file's provably-dead positions (folded
+    /// `if`/`unless` arms and terminating `rescue` arms); `check_env_at`
+    /// floors a dead arm's predicate subjects to `Bot` and `entry_descend`
+    /// skips a dead arm's internal effects — the reference never evaluates
+    /// the arm (`live_branch_for_if` / `live_rescues`).
+    dead: crate::dead::DeadPositions,
 }

@@ -2,6 +2,7 @@
 //! passes are further `impl<'i> Typer<'i>` blocks in sibling modules; the
 //! crate root's docs map them.
 
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use rigor_index::CoreIndex;
@@ -53,6 +54,18 @@ pub struct Typer<'i> {
     /// / `is_toplevel_def` consult `file_defs` through it). `None` for callers
     /// that do not set it ⇒ the union-over-all-files answer.
     pub(crate) file_key: Option<&'i rigor_parse::FileKey>,
+    /// rigor-rs#368: the file's provably-dead positions, memoized by `ast`
+    /// identity — folding a predicate inside `dead_positions` consults
+    /// `local_reach`, which itself calls `dead_positions`, so without the
+    /// cache every reach query recomputes (and the mutual recursion never
+    /// converges). A `RefCell` is sound here: one `Typer` serves a single
+    /// file's analysis on one thread.
+    pub(crate) dead_cache: RefCell<Option<(usize, crate::dead::DeadPositions)>>,
+    /// `true` while the memoized `dead_positions` walk runs. A re-entrant
+    /// call sees it and answers "nothing is dead" — the conservative half of
+    /// the result — which is what breaks the `dead_positions` →
+    /// `expr_truthiness` → `local_reach` → `dead_positions` cycle.
+    pub(crate) dead_in_flight: Cell<bool>,
 }
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a
@@ -63,13 +76,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false) }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false) }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -80,7 +93,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false) }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from

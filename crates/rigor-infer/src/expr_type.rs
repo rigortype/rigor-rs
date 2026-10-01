@@ -796,6 +796,33 @@ impl<'i> Typer<'i> {
     /// aggressive than the reference: a union is always `None`, so rigor-rs never
     /// elides a branch the reference keeps (which could only cost a witness, never
     /// add a false one).
+    /// `Narrowing.predicate_certainty` (`narrowing.rb:134`): whether the
+    /// predicate's TYPE proves the branch — `Some(true)` when the falsey
+    /// fragment is `Bot` (always truthy), `Some(false)` when the truthy one
+    /// is (always falsey), `None` when both edges survive OR the type is
+    /// `Bot` itself ("bot does not count as certainty"). The flow evaluator
+    /// uses this to keep only the live arm (rigor-rs#368).
+    pub(crate) fn predicate_certainty(
+        &self,
+        ty: TypeId,
+        interner: &mut Interner,
+    ) -> Option<bool> {
+        if matches!(interner.get(ty), Type::Bottom) {
+            return None;
+        }
+        let truthy = self.narrow_truthy(ty, interner);
+        let falsey = self.narrow_falsey(ty, interner);
+        let truthy_bot = matches!(interner.get(truthy), Type::Bottom);
+        let falsey_bot = matches!(interner.get(falsey), Type::Bottom);
+        if truthy_bot && !falsey_bot {
+            Some(false)
+        } else if !truthy_bot && falsey_bot {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     fn predicate_polarity(&self, interner: &Interner, ty: TypeId) -> Option<bool> {
         match interner.get(ty) {
             Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => Some(false),
