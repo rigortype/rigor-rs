@@ -1511,9 +1511,7 @@ fn plugin_config_error(
             ruby_class_name(c)
         ));
     };
-    let Some(schema) = schema else {
-        return None;
-    };
+    let schema = schema?;
     let errors: Vec<String> = m
         .iter()
         .map(|(k, v)| {
@@ -2017,7 +2015,7 @@ pub(crate) fn ruby_integer(s: &str) -> Option<i128> {
         return None;
     }
     let (radix, digits): (u32, &str) = match body.strip_prefix('0') {
-        Some(rest) if rest.is_empty() => return Some(0),
+        Some("") => return Some(0),
         Some(rest) => match rest.as_bytes()[0] {
             b'x' | b'X' => (16, &rest[1..]),
             b'b' | b'B' => (2, &rest[1..]),
@@ -2037,13 +2035,7 @@ pub(crate) fn ruby_integer(s: &str) -> Option<i128> {
     for (i, &c) in chars.iter().enumerate() {
         if c == '_' {
             // `_` is a digit separator only — neighbours must be digits.
-            if chars
-                .get(i + 1)
-                .and_then(|n| n.to_digit(radix))
-                .is_none()
-            {
-                return None;
-            }
+            chars.get(i + 1).and_then(|n| n.to_digit(radix))?;
             continue;
         }
         let d = c.to_digit(radix)?;

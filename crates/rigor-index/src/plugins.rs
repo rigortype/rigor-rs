@@ -76,9 +76,7 @@ pub fn bundled_plugin(id: &str) -> Option<&'static BundledPlugin> {
 /// `plugins/<gem>/lib/<gem>.rb` verbatim, so ` rigor-x ` or `rigor- ` (empty
 /// id) never resolve.
 pub fn bundled_plugin_by_gem(gem: &str) -> Option<&'static BundledPlugin> {
-    let Some(id) = gem.strip_prefix("rigor-") else {
-        return None;
-    };
+    let id = gem.strip_prefix("rigor-")?;
     ALL.iter().copied().find(|p| p.id == id)
 }
 
