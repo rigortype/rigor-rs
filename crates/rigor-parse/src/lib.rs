@@ -9,6 +9,10 @@
 pub use ruby_prism;
 
 pub mod ast;
+/// The `SHAPE_MUTATORS` name tables — shared between the lowering-time
+/// `OperandEffects` gate (`ast::operand_effects`, rigor-rs#361) and
+/// `rigor-infer`'s flow analysis.
+pub mod mutators;
 
 pub use ast::{
     lower, lower_with_key, BlockParamKind, ConstMutation, FileKey, HashKey, HashKeyTag,

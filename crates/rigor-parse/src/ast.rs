@@ -32,6 +32,7 @@ mod hash_keys;
 mod multi_target;
 mod definitions;
 mod recovery;
+mod operand_effects;
 mod constants;
 mod lowered_ast;
 mod node;

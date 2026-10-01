@@ -789,6 +789,94 @@ l = -> { h.default ||= 0 }\n"[..],         // lambda body
     );
 }
 
+/// rigor-rs#361: `OperandEffects.any?` gates every typed-operand ELEMENT
+/// (`thread_operand`, `statement_evaluator.rb:2509-2535`) — an operand whose
+/// subtree carries an effect that outlives it is `evaluate`d, not `type_of`'d,
+/// so a compound attribute write inside still lands its
+/// `widen_attribute_write`. The write itself is not an effect (`Call*WriteNode`s
+/// are excluded), but a LOCAL write whose `depth` reaches the operand's own
+/// scope, an ivar/cvar/gvar write, a compound index write (`[]=` widens its
+/// receiver) or a `SHAPE_MUTATORS` call on an outliving receiver gates the
+/// element back in — `puts(h.default ||= (y = 1))` is silent on the oracle
+/// while `puts(h.default ||= 0)` keeps the `h[:k]` narrowing.
+#[test]
+fn operand_effects_gate_keeps_outliving_writes_evaluated() {
+    let evaluated = |src: &[u8]| -> Vec<bool> {
+        lower(&crate::parse(src))
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::AttrWrite { evaluated, .. } => Some(*evaluated),
+                _ => None,
+            })
+            .collect()
+    };
+    // Effect-bearing operand elements — each subtree holds an outliving
+    // effect, so the attr write inside EVALUATES (the oracle drops the
+    // `h[:a]` narrowing in every one of these).
+    for src in [
+        // a local write (`y = 1` at the operand's own depth).
+        &b"h = {}\nputs(h.default ||= (y = 1))\n"[..],
+        // an ivar write always outlives the operand.
+        &b"h = {}\nputs(h.default ||= (@x = 1))\n"[..],
+        // a compound index write's `[]=` widens its receiver.
+        &b"h = {}\ng = {}\nputs(h.default ||= (g[:b] ||= 1))\n"[..],
+        // a `SHAPE_MUTATORS` call on a local receiver (`mutated_reads`).
+        &b"h = {}\na = []\nputs(h.default ||= (a << 1))\n"[..],
+        // …rooted through an element read (`element_read_path`).
+        &b"h = {}\na = [[0]]\nputs(h.default ||= (a[0] << 1))\n"[..],
+        // splat contents, container elements, interpolation parts and
+        // range bounds are gated the same way.
+        &b"h = {}\nputs(*(h.default ||= (y = 1)))\n"[..],
+        &b"h = {}\nx = [h.default ||= (y = 1)]\n"[..],
+        &b"h = {}\nx = \"v#{h.default ||= (y = 1)}\"\n"[..],
+        &b"h = {}\nx = (h.default ||= (y = 1))..9\n"[..],
+        // a statement sequence whose tail binds.
+        &b"h = {}\nputs(*(h.default ||= (z = 1; y = z)))\n"[..],
+        // …and a call RECEIVER element is gated identically.
+        &b"h = {}\nx = (h.default ||= (y = 1)).class\n"[..],
+        // a write to an OUTER local inside a crossed block still
+        // outlives the operand (`depth >= nesting`).
+        &b"h = {}\nt = 0\nputs(h.default ||= [1].each { t = 1 })\n"[..],
+    ] {
+        let ws = evaluated(src);
+        assert_eq!(ws, [true], "expected evaluated=true in {src:?}");
+    }
+    // Effects that do NOT outlive the operand leave the write `type_of`'d:
+    // a local write bound INSIDE a crossed block/lambda (`depth <
+    // nesting`), an opaque `def`/`class`/`module` body, an `it`/parameter
+    // read root, or a position the reference never evaluates at all (a
+    // `return` operand's discarded `jump_value_type` scope, an `in`
+    // pattern).
+    for src in [
+        // `t` is bound inside the block — a block-local write does not
+        // reach the operand's own scope.
+        &b"h = {}\nputs(h.default ||= [1].each { t = 1 })\n"[..],
+        &b"h = {}\nputs(h.default ||= (-> { y = 1 }))\n"[..],
+        // `def` is opaque to the scan: its body's writes are its own.
+        &b"h = {}\nputs(h.default ||= (def zz; y = 1; end))\n"[..],
+        // a mutator on a call RESULT names no binding (`mutated_reads`
+        // yields nothing for `foo()`).
+        &b"h = {}\ndef foo; []; end\nputs(h.default ||= (foo() << 1))\n"[..],
+        // `jump_value_type`'s scope is discarded outright — no gate
+        // rescues a write under a `return` operand.
+        &b"h = {}\ndef m; return (h.default ||= (y = 1)); end\n"[..],
+        // `in` patterns are shape-narrowed only.
+        &b"h = {}\ncase h; in {a: x} if (h.default ||= (y = 1)); end\n"[..],
+    ] {
+        let ws = evaluated(src);
+        assert_eq!(ws, [false], "expected evaluated=false in {src:?}");
+    }
+    // The gate is per-ELEMENT, not per-write: the outer `default=` is
+    // gated in by the `y = 1` under it, but the INNER `x=` sits in the
+    // outer write's own `type_of` operand (dead) and stays unevaluated —
+    // `widen_attribute_write` lands exactly once, on `default=`.
+    assert_eq!(
+        evaluated(b"h = {}\nputs(h.default ||= (h.x ||= (y = 1)))\n"),
+        [false, true],
+        "nested write inside the gated-in operand"
+    );
+}
+
 /// rigor-rs#312 round 2: an ITERATED body — `while`/`until`/`for`, an
 /// invoked block/lambda — gives the reference a content-writeback text scan
 /// (`loop_content_writeback`, `content_writeback_block_captures`) that lands

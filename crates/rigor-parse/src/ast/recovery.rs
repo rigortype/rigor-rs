@@ -55,19 +55,33 @@ pub(crate) struct Recovered<'pr> {
     /// a call — and no writeback rescues it, inside an iterated body
     /// or out.
     pub(crate) suppressed: bool,
-    /// Whether the walk reached this node inside a pure `type_of`
-    /// operand — a call receiver or argument, a splat's contents, a
-    /// literal-container element, an interpolation part, a `return`
-    /// operand, an `in` pattern, a `rescue`-modifier operand. The
-    /// reference TYPES such a position rather than `evaluate`-ing it,
-    /// so an `evaluate`-only scope effect never lands from one —
-    /// specifically a compound ATTRIBUTE write's
-    /// `widen_attribute_write` (`eval_attribute_compound_write`;
-    /// `OperandEffects` does not list the `Call*WriteNode`s as
-    /// outliving, unlike the `Index*WriteNode` pair — rigor-rs#343).
-    /// Index writes themselves still record their `(h, k)` narrowing
-    /// from `type_of`, so this mark does not feed their `operand` flag.
+    /// Whether the walk reached this node inside a typed-operand
+    /// position — a call receiver or argument, a splat's contents, a
+    /// literal-container element, an interpolation part, a range bound,
+    /// a `rescue`-modifier operand. The reference gates each such
+    /// position on `OperandEffects.any?` (`thread_operand`,
+    /// `statement_evaluator.rb:2509-2535`): an element whose subtree
+    /// carries an effect that outlives the operand is still `evaluate`d,
+    /// while one without is `type_of`'d whole — an `evaluate`-only scope
+    /// effect like a compound ATTRIBUTE write's `widen_attribute_write`
+    /// never lands there (`OperandEffects` does not list the
+    /// `Call*WriteNode`s themselves, unlike the `Index*WriteNode` pair —
+    /// rigor-rs#343, #361). The mark therefore re-gates the recovered
+    /// node through `operand_mode` rather than forcing `evaluated:
+    /// false` outright. Index writes themselves still record their
+    /// `(h, k)` narrowing from `type_of`, so this mark does not feed
+    /// their `operand` flag.
     pub(crate) typed: bool,
+    /// Whether the walk reached this node inside a position that is
+    /// typed but NEVER evaluated — the `dead` half of `thread_operand`'s
+    /// gate: an operand element without an outliving effect, and the
+    /// children an evaluator `type_of`s even when its own write runs
+    /// (an `in` pattern's captured bindings, a `return` operand's
+    /// `jump_value_type`, an index write's receiver/indices, a compound
+    /// attribute write's own receiver and value — rigor-rs#361).
+    /// Unlike `typed` this mark is not re-gated: `OperandEffects.any?`
+    /// cannot rescue a position the evaluator never visits.
+    pub(crate) dead: bool,
     /// Whether the walk reached this node inside a DEFERRED body — a
     /// crossed literal block or lambda. A compound attribute write's
     /// widening is scoped to the closure's own run:
@@ -121,8 +135,10 @@ pub(crate) struct ScopeMarks {
     /// Inside a fresh local scope (`def`/`class`/`module`/`class <<`) —
     /// [`Recovered::suppressed`].
     pub(crate) suppressed: bool,
-    /// Inside a pure `type_of` operand — [`Recovered::typed`].
+    /// Inside a typed-operand position — [`Recovered::typed`].
     pub(crate) typed: bool,
+    /// Inside a never-evaluated operand position — [`Recovered::dead`].
+    pub(crate) dead: bool,
     /// Inside a deferred block/lambda body — [`Recovered::closure`].
     pub(crate) closure: bool,
 }
@@ -186,9 +202,12 @@ fn collect_recoverable<'pr>(
         /// Depth of fresh local scopes the walk is inside — see
         /// [`Recovered::suppressed`].
         suppressed: u32,
-        /// Depth of pure `type_of` operand positions the walk is inside
+        /// Depth of typed-operand positions the walk is inside
         /// — see [`Recovered::typed`].
         typed: u32,
+        /// Depth of never-evaluated operand positions the walk is
+        /// inside — see [`Recovered::dead`].
+        dead: u32,
         /// Depth of deferred block/lambda bodies the walk is inside —
         /// see [`Recovered::closure`].
         closure: u32,
@@ -207,6 +226,7 @@ fn collect_recoverable<'pr>(
                 // local scope's, so its mutations do not land.
                 suppressed: self.suppressed > 0 || self.suppress_calls,
                 typed: self.typed > 0,
+                dead: self.dead > 0,
                 closure: self.closure > 0,
             });
         }
@@ -248,14 +268,23 @@ fn collect_recoverable<'pr>(
             self.suppressed -= 1;
         }
 
-        /// Visit `f` inside a pure `type_of` operand — see
+        /// Visit `f` inside a typed-operand position — see
         /// [`Recovered::typed`]. Unlike `blocked_subtree` this does NOT
         /// clear `joined`: a typed operand's own nested joins still
-        /// describe it (they simply never run an `evaluate`).
+        /// describe it (they simply never run an `evaluate` unless
+        /// `OperandEffects.any?` gates the element back in — #361).
         fn typed_subtree(&mut self, f: impl FnOnce(&mut Self)) {
             self.typed += 1;
             f(self);
             self.typed -= 1;
+        }
+
+        /// Visit `f` inside a typed-but-never-evaluated operand position
+        /// — see [`Recovered::dead`].
+        fn dead_subtree(&mut self, f: impl FnOnce(&mut Self)) {
+            self.dead += 1;
+            f(self);
+            self.dead -= 1;
         }
 
         /// Whether a compound index write reached HERE is recovered whole
@@ -396,10 +425,12 @@ fn collect_recoverable<'pr>(
             if let Some(in_node) = arm.as_in_node() {
                 // Prism 1.9 folds `in P if G` into the pattern as an `IfNode`
                 // wrapper, so the guard is visited with the pattern — both
-                // blocked (shape-narrowed, never scope-evaluated) and TYPED
-                // (`in_arm_position` — `case h; in {a: x} if (h.default ||= 0)`
-                // keeps the narrowing on the oracle, rigor-rs#343).
-                self.typed_subtree(|c| {
+                // blocked (shape-narrowed, never scope-evaluated) and DEAD
+                // for operand purposes: `Narrowing.case_when_scopes` types
+                // the pattern only, so no `OperandEffects` gate rescues a
+                // write inside (`case h; in {a: x} if (h.default ||= 0)`
+                // keeps the narrowing on the oracle, rigor-rs#343, #361).
+                self.dead_subtree(|c| {
                     c.blocked_subtree(|c2| c2.visit(&in_node.pattern()))
                 });
                 if let Some(statements) = in_node.statements() {
@@ -572,15 +603,19 @@ fn collect_recoverable<'pr>(
         ) {
             self.push(node.as_node());
         }
-        // ---- pure `type_of` operand positions (rigor-rs#343) -----------
-        // The reference TYPES each of these rather than `evaluate`-ing
-        // them — `OperandWalk.thread_operand`/`operand_scope` for splat
+        // ---- typed operand positions (rigor-rs#343, #361) -----------
+        // The reference TYPES these operand positions — `OperandWalk.
+        // thread_operand`/`operand_scope` for call operands and splat
         // contents, `eval_value_container` for literal elements,
-        // `eval_interpolation` for `#{…}` parts, `jump_value_type` for
-        // `return` operands — so an `evaluate`-only effect (a compound
-        // attribute write's `widen_attribute_write`) inside them never
-        // lands. The walk marks the whole subtree `typed`; the
-        // `Recovered` mark feeds `Node::AttrWrite.evaluated`.
+        // `eval_interpolation` for `#{…}` parts — but gates each ELEMENT
+        // on `OperandEffects.any?`, still `evaluate`-ing an operand whose
+        // subtree carries an outliving effect. The walk marks the subtree
+        // `typed`; `lower_recovered` re-gates each recovered node through
+        // `operand_mode` — so `puts(*(h.default ||= (y = 1)))` lands its
+        // `default=` widening while `puts(*(h.default ||= 0))` keeps the
+        // `(h, k)` narrowing. A position the reference types but can
+        // never evaluate — `jump_value_type`'s `return` operand, an `in`
+        // pattern — is `dead` instead, so the gate cannot rescue it.
         fn visit_splat_node(&mut self, node: &ruby_prism::SplatNode<'pr>) {
             self.typed_subtree(|c| ruby_prism::visit_splat_node(c, node));
         }
@@ -620,8 +655,11 @@ fn collect_recoverable<'pr>(
         fn visit_range_node(&mut self, node: &ruby_prism::RangeNode<'pr>) {
             self.typed_subtree(|c| ruby_prism::visit_range_node(c, node));
         }
+        // `jump_value_type` TYPES a `return` operand for the jump's own
+        // value but the evaluator discards that scope outright — no
+        // `OperandEffects` gate can rescue a write inside (#361).
         fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
-            self.typed_subtree(|c| ruby_prism::visit_return_node(c, node));
+            self.dead_subtree(|c| ruby_prism::visit_return_node(c, node));
         }
         // Scope-joining constructs crossed under a wrapper, granular to match
         // `statement_evaluator.rb`. `eval_rescue_modifier` joins the
@@ -1015,6 +1053,7 @@ fn collect_recoverable<'pr>(
         next_sink: u32::from(marks.next_sink),
         suppressed: u32::from(marks.suppressed),
         typed: u32::from(marks.typed),
+        dead: u32::from(marks.dead),
         closure: u32::from(marks.closure),
     };
     // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
