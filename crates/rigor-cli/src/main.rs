@@ -491,6 +491,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // then rejected — the port has no buffer-binding path.
     let mut tmp_file: Option<String> = None;
     let mut instead_of: Option<String> = None;
+    // Whether `--workers` was given — the env-var fallback's gate.
+    let mut workers_cli = false;
     // The first unsupported flag in argv order, reported after the semantic
     // validations the reference runs post-parse.
     let mut unsupported: Option<&'static str> = None;
@@ -505,8 +507,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 // with no persistent cache and no run-stats output.
                 "no-cache" | "clear-cache" | "stats" => {}
                 // Sequential-only: the worker pool is a performance axis with
-                // identical output, so the (Integer-validated) value is a no-op.
-                "workers" => {}
+                // identical output, so the (Integer-validated) value is a
+                // no-op — but its presence suppresses the
+                // `RIGOR_RACTOR_WORKERS` read (`resolve_workers`: flag wins).
+                "workers" => workers_cli = true,
                 "tmp-file" => tmp_file = Some(value.as_ref().unwrap().as_str().to_string()),
                 "instead-of" => {
                     instead_of = Some(value.as_ref().unwrap().as_str().to_string())
@@ -628,6 +632,27 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `project_root` is the process cwd, the base config discovery resolves against.
     config_audit::emit(&cfg, Path::new("."));
 
+    // `CheckRunnerFactory.resolve_workers`: `--workers` wins outright, so the
+    // env is only read when no flag was given. Upstream a non-`Integer()`
+    // `RIGOR_RACTOR_WORKERS` dies on an uncaught `ArgumentError` (backtrace,
+    // exit 1); the port surfaces the same rejection as a usage error instead —
+    // `rigor: <msg>` + exit 64, and NO analysis rows (issue #157).
+    if !workers_cli {
+        if let Some(v) = std::env::var_os("RIGOR_RACTOR_WORKERS") {
+            // `env_value && !env_value.empty?` upstream — an EMPTY value is
+            // unset, not invalid (falls through to `parallel.workers`).
+            let ok = v.is_empty()
+                || v.to_str()
+                    .is_some_and(|s| config::ruby_integer(s).is_some());
+            if !ok {
+                eprintln!(
+                    "rigor: invalid RIGOR_RACTOR_WORKERS value: {v:?} (expected an Integer literal)"
+                );
+                return ExitCode::from(64);
+            }
+        }
+    }
+
     // ADR-50 WD2 — the effective bleeding-edge selection: CLI flag > config.
     // Threaded into `analyze_files`, where it feeds the severity-resolution
     // pipeline (ADR-8 "Severity profile"): user `severity_overrides:` >
@@ -664,43 +689,88 @@ fn cmd_check(args: &[String]) -> ExitCode {
         &file_refs
     };
 
-    // Expand roots into their `**/*.rb` files and collect bad-path errors,
-    // matching the reference's `expand_paths`: directory-expanded entries
-    // matching `BUILTIN_EXCLUDES + exclude:` are pruned HERE (`reject_excluded`
-    // + `File.fnmatch?` with no flags); explicit `.rb` file roots are kept
-    // verbatim even when they match `exclude:` (issue #201 — the analyzed set
-    // IS the rejected expansion; there is no second per-file gate).
-    let excludes = exclude_patterns(&cfg);
-    let (expanded_owned, path_errors) = expand_check_paths_excluding(roots, &excludes);
-    let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
+    // `Runner#validate_target_ruby` — the FIRST thing `run_analysis` does, so
+    // a format-valid `target_ruby:` this Prism build rejects returns a lone
+    // run-level `configuration-error` row: no path expansion, no plugin
+    // loading, no analysis, no expansion errors (issue #157). The row bypasses
+    // `disable:` and the severity pipeline the same way it does upstream (the
+    // early return renders `Result.diagnostics` verbatim); it still flows
+    // through the baseline filter and `fail_on` below like any result.
+    let (mut findings, had_io_error, expanded_owned, path_errors) = match cfg
+        .target_ruby_failure()
+    {
+        Some(message) => (
+            vec![(
+                0usize,
+                ".rigor.yml".to_string(),
+                String::new(),
+                Diagnostic {
+                    rule_id: "configuration-error",
+                    start_offset: 0,
+                    end_offset: 0,
+                    message,
+                    severity: Severity::Error,
+                    source_family: "builtin",
+                    receiver_type: None,
+                    method_name: None,
+                },
+            )],
+            false,
+            Vec::new(),
+            Vec::new(),
+        ),
+        None => {
+            // Expand roots into their `**/*.rb` files and collect bad-path
+            // errors, matching the reference's `expand_paths`:
+            // directory-expanded entries matching `BUILTIN_EXCLUDES +
+            // exclude:` are pruned HERE (`reject_excluded` + `File.fnmatch?`
+            // with no flags); explicit `.rb` file roots are kept verbatim
+            // even when they match `exclude:` (issue #201 — the analyzed set
+            // IS the rejected expansion; there is no second per-file gate).
+            let excludes = exclude_patterns(&cfg);
+            let (expanded_owned, path_errors) =
+                expand_check_paths_excluding(roots, &excludes);
+            let expanded: Vec<&str> =
+                expanded_owned.iter().map(String::as_str).collect();
 
-    // Run the analysis pipeline (config `disable:` + inline `# rigor:disable`
-    // applied; `exclude:` already settled by the expansion). Shared with
-    // `baseline generate`.
-    // Issue #129 (ADR-0044 § "Environment-parity gate"): the CLI half of the
-    // gate — every flag one the port parses exactly as the reference does,
-    // the config path the file the reference reads, no baseline in effect
-    // (the reference regroups its output by (file, rule) bin under one, and
-    // matches paths the port renders differently).
-    let ref_has_files = reference_has_ruby_files(&cfg, &file_refs)
-        && conformance_gate::check_args_ok(&items)
-        && conformance_gate::config_path_ok(explicit_config.as_deref().unwrap_or(".rigor.yml"))
-        && resolve_baseline_path(&baseline_arg, &cfg).is_none()
-        && conformance_gate::process_env_ok(
-            std::env::var_os("POSIXLY_CORRECT").as_deref(),
-            std::env::var_os("RIGOR_RACTOR_WORKERS").as_deref(),
-        );
-    let (mut findings, had_io_error) = analyze_files(
-        &expanded,
-        // `None` on the `paths:` fallback ⇒ `paths == configuration.paths`
-        // ⇒ the reference never widens discovery for a bare `check`.
-        if files.is_empty() { None } else { Some(file_refs.as_slice()) },
-        &cfg,
-        "check",
-        folder_ref,
-        &bleeding_edge,
-        ref_has_files,
-    );
+            // Run the analysis pipeline (config `disable:` + inline `#
+            // rigor:disable` applied; `exclude:` already settled by the
+            // expansion). Shared with `baseline generate`.
+            // Issue #129 (ADR-0044 § "Environment-parity gate"): the CLI half
+            // of the gate — every flag one the port parses exactly as the
+            // reference does, the config path the file the reference reads,
+            // no baseline in effect (the reference regroups its output by
+            // (file, rule) bin under one, and matches paths the port renders
+            // differently).
+            let ref_has_files = reference_has_ruby_files(&cfg, &file_refs)
+                && conformance_gate::check_args_ok(&items)
+                && conformance_gate::config_path_ok(
+                    explicit_config.as_deref().unwrap_or(".rigor.yml"),
+                )
+                && resolve_baseline_path(&baseline_arg, &cfg).is_none()
+                && conformance_gate::process_env_ok(
+                    std::env::var_os("POSIXLY_CORRECT").as_deref(),
+                    std::env::var_os("RIGOR_RACTOR_WORKERS").as_deref(),
+                );
+            let (findings, had_io_error) = analyze_files(
+                &expanded,
+                // `None` on the `paths:` fallback ⇒ `paths ==
+                // configuration.paths` ⇒ the reference never widens discovery
+                // for a bare `check`.
+                if files.is_empty() {
+                    None
+                } else {
+                    Some(file_refs.as_slice())
+                },
+                &cfg,
+                "check",
+                folder_ref,
+                &bleeding_edge,
+                ref_has_files,
+            );
+            (findings, had_io_error, expanded_owned, path_errors)
+        }
+    };
 
     // ADR-22 slice 5 — snapshot the RAW (pre-baseline-filter) findings for the
     // `--baseline-strict` audit. The reference audits `raw_result.diagnostics`
@@ -1136,9 +1206,15 @@ fn prepend_path_errors(
             (0usize, e.path.clone(), String::new(), diag)
         })
         .collect();
+    // The leading run-level span is `plugin_loader.*` rows then `pre-eval.*`
+    // rows (upstream `pre_file_diagnostics` order — `expansion.errors` come
+    // last); the `plugin.<id>.*` emitted rows are NOT leading (they follow
+    // the per-file stream).
     let n_run = findings
         .iter()
-        .take_while(|(_, _, _, d)| d.rule_id.starts_with("pre-eval."))
+        .take_while(|(_, _, _, d)| {
+            d.rule_id.starts_with("plugin_loader.") || d.rule_id.starts_with("pre-eval.")
+        })
         .count();
     let tail = findings.split_off(n_run);
     findings.extend(injected);
@@ -1202,8 +1278,18 @@ fn analyze_files(
 
     // ADR-72: the effective plugin set = config `plugins:` + `Gemfile.lock`-gated
     // auto-detected overlays (bundler.auto_detect). Empty-Gemfile.lock projects
-    // (incl. the config-less differential harness) get exactly `cfg.plugins`.
+    // (incl. the config-less differential harness) get exactly the activating
+    // `plugins:` entries. Issue #157: the resolution ALSO carries the loader's
+    // run-level rows — `plugin_loader.load-error` for every entry whose
+    // require/id/dup/config check fails (they lead the whole stream upstream,
+    // ahead of `pre-eval.*`) — plus the plugins' own emitted rows (which land
+    // after the per-file stream) and any stderr lines (`rigor-rbs-inline`'s
+    // missing-`rbs/inline` warning).
     let root = std::path::Path::new(".");
+    let plugin_resolution = cfg.plugin_resolution(root);
+    for line in &plugin_resolution.stderr {
+        eprintln!("{line}");
+    }
     let effective_plugins = cfg.effective_plugins(root);
     // The rbs-collection gem dirs ride apart from `signature_paths:` so the
     // `conforms-to` scan can tell them apart (issue #129); every rule reads both.
@@ -1764,11 +1850,39 @@ fn analyze_files(
     // `.rigor.dist.yml` discovery — the aggregator hard-codes it. Glob-meta
     // entries (`*`, `?`, `[`) are `Dir.glob`'d into concrete files upstream
     // (`expand_pre_eval_entries`) and never earn this row, matched or not.
+    // `pre_file_diagnostics` order upstream: `plugin_loader.load-error` rows
+    // FIRST, then the pre-eval stream, then (streams the port does not carry)
+    // and finally `expansion.errors` — which `prepend_path_errors` splices in
+    // after the leading run-level rows. Load-error rows bypass `disable:`,
+    // `severity_profile:` and `severity_overrides:` entirely upstream
+    // (SeverityStamp is not applied to them — oracle: `plugin_loader: "off"`
+    // leaves the row at error), so they carry their authored severity.
+    let mut run_rows: Vec<(usize, String, String, Diagnostic)> = plugin_resolution
+        .load_errors
+        .iter()
+        .map(|row| {
+            (
+                0usize,
+                ".rigor.yml".to_string(),
+                String::new(),
+                Diagnostic {
+                    rule_id: row.rule_id,
+                    start_offset: 0,
+                    end_offset: 0,
+                    message: row.message.clone(),
+                    severity: row.severity,
+                    source_family: row.source_family,
+                    receiver_type: None,
+                    method_name: None,
+                },
+            )
+        })
+        .collect();
+
     if !cfg.pre_eval.is_empty() {
         // `expand_pre_eval_entries` ends in `.uniq` — a duplicated literal
         // entry earns ONE row upstream, not one per mention.
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        let mut run_rows: Vec<(usize, String, String, Diagnostic)> = Vec::new();
         for entry in &cfg.pre_eval {
             if !seen.insert(entry.as_str())
                 || entry.contains(['*', '?', '['])
@@ -1811,8 +1925,29 @@ fn analyze_files(
                 },
             ));
         }
-        run_rows.append(&mut findings);
-        findings = run_rows;
+    }
+    run_rows.append(&mut findings);
+    findings = run_rows;
+
+    // `plugin_run_emission_diagnostics` upstream — the plugins' own
+    // run-scoped rows land AFTER the per-file stream (and before the
+    // `conforms-to` rows): `plugin.<id>.load-error` file-probe disclosures.
+    for row in &plugin_resolution.emitted {
+        findings.push((
+            0usize,
+            ".rigor.yml".to_string(),
+            String::new(),
+            Diagnostic {
+                rule_id: row.rule_id,
+                start_offset: 0,
+                end_offset: 0,
+                message: row.message.clone(),
+                severity: row.severity,
+                source_family: row.source_family,
+                receiver_type: None,
+                method_name: None,
+            },
+        ));
     }
 
     // Issue #129 — the `rigor:v1:conforms-to` rows. Run-level, not per-file:
@@ -1915,7 +2050,19 @@ fn conformance_scan_active(cfg: &Config, root: &Path, ref_has_files: bool) -> bo
     if conformance_gate::bundle_sources_present(root, std::env::var_os("HOME").as_deref()) {
         return false;
     }
-    cfg.plugins.iter().all(|p| rigor_index::plugins::bundled_plugin(p).is_some())
+    // Every enabled `plugins:` entry must activate a port-bundled plugin
+    // cleanly — a load-error/emitted row or an unemulated activation means
+    // the reference's environment diverges from the port's index (issue
+    // #157: entries are gem names now; a bare manifest id is a load error).
+    let resolution = cfg.plugin_resolution(root);
+    resolution.load_errors.is_empty()
+        && resolution.stderr.is_empty()
+        && resolution.activated.len()
+            == cfg
+                .plugin_entries()
+                .iter()
+                .filter(|e| e.enabled)
+                .count()
 }
 
 /// Issue #129 — the scan's findings as `(order, path, source, diagnostic)`
@@ -2792,7 +2939,7 @@ fn json_document(findings: &[(usize, String, String, Diagnostic)]) -> String {
         // different `(rule, line, column)` key for `harness/lib.rb`'s `DiagKey`
         // and would score the row as a gap AND an unregistered extra at once.
         match diag.qualified_rule() {
-            Some(rule) => push_kv_str(&mut buf, "rule", rule, false),
+            Some(rule) => push_kv_str(&mut buf, "rule", json_rule_name(diag, rule), false),
             None => push_kv_raw(&mut buf, "rule", "null"),
         }
         push_kv_str(&mut buf, "source_family", diag.source_family, false);
@@ -2816,6 +2963,21 @@ fn json_document(findings: &[(usize, String, String, Diagnostic)]) -> String {
     }
     buf.push(']');
     buf
+}
+
+/// The reference's `Diagnostic#rule` is the SHORT rule id — for a
+/// non-`builtin` family it is the qualified id minus its `source_family.`
+/// prefix (`plugin_loader.load-error` → `load-error`), while `builtin` rows
+/// carry no prefix and pass through (`configuration-error`,
+/// `pre-eval.file-not-found`).
+fn json_rule_name<'a>(diag: &Diagnostic, qualified: &'a str) -> &'a str {
+    if diag.source_family == "builtin" {
+        return qualified;
+    }
+    qualified
+        .strip_prefix(diag.source_family)
+        .and_then(|s| s.strip_prefix('.'))
+        .unwrap_or(qualified)
 }
 
 /// Flatten findings into `Rendered` rows (resolve each byte offset to a 1-based

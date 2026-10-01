@@ -105,7 +105,10 @@ fn run_stdio(config_path: Option<&str>) -> Result<(), String> {
     let cfg = Config::load(config_path.map(std::path::Path::new))
         .map_err(|f| format!("rigor: {}", f.message))?;
     let ctx = ServerContext {
-        index: CoreIndex::for_project(&cfg.plugins, &cfg.all_signature_dirs(std::path::Path::new("."))),
+        index: CoreIndex::for_project(
+            &cfg.effective_plugins(std::path::Path::new(".")),
+            &cfg.all_signature_dirs(std::path::Path::new(".")),
+        ),
         disable: cfg.disable_matcher(),
     };
 

@@ -45,7 +45,7 @@ Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DI
 - **The receiver-typing lever is NOT exhausted** (2026-07 conclusion RETIRED): the
   08-07 census buckets gaps by MECHANISM; four slices closed **47 rows**. Re-run
   `gap_census.py --sweep` after each.
-- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (s4). Four typer-free rules measured; best still 5 OVER; upstream's edge set isn't characterisable. **REJECTED: matching the reference outranks the ~2,000-method prize** — labels stay UNDER. [probe](notes/20260826-effects-s4-probe.md).
+- **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (s4): four typer-free rules measured, best still 5 OVER; matching the reference outranks the ~2,000-method prize — labels stay UNDER. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen closed** — byte surface 0, `--write` sound.
 - **Plugin work:** pure-RBS bundle track closed ([note](notes/20260710-pure-rbs-bundle-track-closed.md));
   sidecar + perf retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
@@ -94,7 +94,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-28 #164 CLOSED** (PR #283): `getbyte`/`rindex`/`byteindex`/`byterindex`/`Float#<=>` literal folds incl. nil; Dynamic decline via `declines_unfolded`, stale guard widened. 0 FP; fx 119. [note](notes/20260928-issue-164-nilable-fold.md)
 - **2026-09-28 #199 CLOSED** (PR #281): list config keys read with `Array().map(&:to_s)` semantics — a scalar no longer drops the file to `Config::default()`; `signature_paths: ~` keeps reference nil→default. 0 FP; satisfies #157's scalar-`signature_paths` item. [note](notes/20260928-issue-199-scalar-list-keys.md)
 - **2026-09-27/28 splits** #204/#234/#258/#260: lib.rs infer 14,084→144, rules 4,497→95; ast.rs 3,756→80; source_index.rs 4,650→668. [note](notes/20260928-ast-index-split-outcome.md)
-- **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review met the deepest infer file. Branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`); merge bar is now issue-scope resolution. [note](notes/20260927-abandoned-infer-pr-stream.md).
+- **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review met the deepest infer file; branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`). [note](notes/20260927-abandoned-infer-pr-stream.md).
 - **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once — nominal self slot, `arm_of`/`join` auto-splat, reopen-aware union answering (`Node::Alias` + ancestor walk), `paths:` widen = `expand(paths|argv)>files` + excludes + undecidable-decline. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
 - **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver — `declaration_prefix` re-anchors rooted/self::, multi-segment names = ONE rung, per-file `Object` slice keeps `unresolved-toplevel`. **3,002 gaps (→827), 0 FP**; fx 118; → #185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
 - **2026-09-26 #166 CLOSED** (PR #174): block/lambda params shadow toplevel locals — bound set = Prism `locals`; membership structural not span. 0 FP; fx 116b. [note](notes/20260926-issue-166-block-param-shadow.md).

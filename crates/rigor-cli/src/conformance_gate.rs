@@ -276,13 +276,23 @@ fn key_ok(key: &str, node: &Node) -> bool {
         // A bare `key:` is `nil` upstream, `Array(nil) == []`; the port reads
         // an empty list too.
         "exclude" | "disable" => *node == Node::Null || array_strings(node).is_some(),
-        // `coerce_plugin_entry`: a String is a GEM name the loader requires;
-        // the port normalises a bare id too, the reference fails to load it.
-        "plugins" => *node == Node::Null || array_strings(node).is_some_and(|ids| {
-            ids.iter().all(|id| {
-                id.starts_with("rigor-") && rigor_index::plugins::bundled_plugin(id).is_some()
-            })
-        }),
+        // `coerce_plugin_entry` accepts String or Hash entries (issue #157 —
+        // the loader resolves them as GEM names; what a given name does is
+        // `conformance_scan_active`'s plugin-resolution gate, which stands
+        // down on any load-error row or unemulated activation). A scalar
+        // `plugins: x` is `Array(x)` → the one-element list upstream.
+        "plugins" => match node {
+            Node::Null => true,
+            // The subset parser reads a `plugins:` sequence's items as
+            // scalars (a mapping entry fails the parse and stands the scan
+            // down — conservative, still safe).
+            Node::Seq(items) => items.iter().all(is_string),
+            // A non-sequence scalar `Array()`s to itself — a String survives
+            // the load check, anything else fails it identically on both
+            // engines (the run never reaches the scan).
+            Node::Scalar(s) => is_string(s),
+            Node::Map(_) => true,
+        },
         // `coerce_target_ruby`: `to_s` must match the version pattern; a
         // plain `3.3e0` is a String to Psych but a float to serde_yaml.
         "target_ruby" => match node {
@@ -544,7 +554,13 @@ pub(crate) fn process_env_ok(
     }
     match ractor_workers {
         None => true,
-        Some(v) => v.to_str().is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())),
+        // Ruby `Integer()`'s full literal grammar (sign, `0x`/`0o`/`0b`/`0d`,
+        // whitespace padding, `_` separators) — `crate::config::ruby_integer`.
+        // `env_value && !env_value.empty?`: an EMPTY value is unset, so the
+        // reference ignores it and the scan still runs.
+        Some(v) => v.is_empty()
+            || v.to_str()
+                .is_some_and(|v| crate::config::ruby_integer(v).is_some()),
     }
 }
 
@@ -866,9 +882,15 @@ mod tests {
             "signature_paths:\n  - yes\n",
             "signature_paths:\n  - 1_0\n",
             "signature_paths:\n  - nope\nsignature_paths:\n  - sig\n",
-            "signature_paths:\n  - sig\nplugins:\n  - activesupport-core-ext\n",
+            // Issue #157: entries are loader-facing GEM names — a bare
+            // manifest id is a well-formed entry (loads, then a
+            // `plugin_loader.load-error` row the port reproduces); whether
+            // the resolved PLUGIN is port-modelled is
+            // `conformance_scan_active`'s job, not this shape check's.
+            // (A structured `{gem: ...}` entry parses out of the subset and
+            // stands the scan down there.)
             "signature_paths: off\n",
-            "signature_paths: sig\nplugins: activesupport-core-ext\n",
+            "signature_paths: sig\nplugins: {gem: activesupport-core-ext}\n",
             "signature_paths:\n  - sig\nlibraries:\n  - json\n",
             "signature_paths:\n  - sig\nincludes:\n  - other.yml\n",
             "signature_paths:\n  - sig\nrbs_collection:\n  auto_detect: false\n",
@@ -1070,15 +1092,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Round 5: `POSIXLY_CORRECT` (any value) and a non-decimal
-    /// `RIGOR_RACTOR_WORKERS` stand the scan down.
+    /// Round 5: `POSIXLY_CORRECT` (any value) and a `RIGOR_RACTOR_WORKERS`
+    /// that is not an `Integer()` literal stand the scan down. The grammar is
+    /// Ruby's — sign, whitespace padding, radix prefixes and `_` separators
+    /// all parse (issue #157 — `crate::config::ruby_integer`).
     #[test]
     fn process_environment() {
         use std::ffi::OsStr;
         assert!(process_env_ok(None, None));
-        assert!(process_env_ok(None, Some(OsStr::new("4"))));
+        for good in ["4", "0", "", " 2", "0x2", "-1", "+3", "0b10", "07", "1_0", " 42 \n"] {
+            assert!(process_env_ok(None, Some(OsStr::new(good))), "{good:?}");
+        }
         assert!(!process_env_ok(Some(OsStr::new("")), None));
-        for bad in ["abc", "2x", "1.5", "", " 2", "0x2", "-1"] {
+        // `""` is `env_value && !env_value.empty?` → unset; the bare radix
+        // prefixes are `Integer()` raises.
+        for bad in ["abc", "2x", "1.5", "-", "1__0", "_1", "1_", "0x", "0b", "0o", "0d", "-0x"] {
             assert!(!process_env_ok(None, Some(OsStr::new(bad))), "{bad:?}");
         }
     }
