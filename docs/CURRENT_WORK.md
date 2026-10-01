@@ -79,6 +79,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-30 #357 CLOSED** (PR #367): blocked-extent writes stay out of reach/rebinds/binding — modifier `rescue` leak + dead-arm condition fix. 0 FP; → #368. [note](notes/20260930-i357-rescue-mod.md)
 - **2026-09-30 #361 CLOSED** (PR #369): `OperandEffects.any?` ported into the `evaluated` decision (Dead/Gate/Eval operand modes). 0 FP; → #372/#373. [note](notes/20261001-i361.md)
 - **2026-09-30 #157 CLOSED** (PR #371): config value validation — `Integer()` grammar, `enabled:false`-only, `target_ruby` split, plugin load-error rows. → #360. [note](notes/20260930-i157-config-values.md)
+- **2026-10-01 #352 CLOSED** (PR #370): `String#[]` post-`[]=` reads non-firing + `T|nil` retry + rebind-gated index-target widening; `UnmodeledWrite` carries pattern-bound names. 0 FP; → #374. [note](notes/20261001-i352-string-index.md)
 - **2026-09-30 #332 CLOSED** (PR #334): pin-value threading (`local_reach` → `(Reach, Option<Scalar>)`); nominal multi-arg + `when`-pattern FPs. 0 FP / 818; → #340/#341. [note](notes/20260930-issue-332-multi-arg.md)
 - **2026-09-30 #312 CLOSED** (PR #324): recovery collector models `joined`/`blocked`/loop-writeback marks — compound index writes widen exactly where the reference joins. 0 FP; → #325. [note](notes/20260930-issue-312-recovery.md)
 - **2026-09-30 #146 CLOSED** (PR #318): `Reach::multi` + tier-3 decline for multi-valued args; unentered closures floor to untyped. 0 FP / 818; → #330–#332. [note](notes/20260930-issue-146-untyped-args.md)
