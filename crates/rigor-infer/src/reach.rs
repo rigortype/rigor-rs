@@ -481,11 +481,16 @@ impl<'i> Typer<'i> {
         // `node.statements` alone while `Narrowing.case_when_scopes` /
         // `apply_in_pattern_bindings` shape-read the rest, so a write
         // there binds nothing on the reference — `case v when (q = 1;
-        // Integer) then Float(q).w` is silent (rigor-rs#341).
+        // Integer) then Float(q).w` is silent (rigor-rs#341). A wrapper
+        // that FLATTENS the `case` into a `Statements{Recovered}` carrier
+        // (a rescue modifier — `x = (case v when (q = 1; Integer) then 1
+        // end) rescue nil`) leaves no `Node::When` to span, but the same
+        // positions are marked `Recovered::blocked`, so those extents are
+        // excluded identically (rigor-rs#357).
         let case_clauses = unevaluated_case_clause_spans(ast);
         let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
         let in_region = |s: rigor_parse::Span| {
-            if !contains(region, s) || in_case_clause(s) {
+            if !contains(region, s) || in_case_clause(s) || ast.in_blocked_carrier(s) {
                 return false;
             }
             if lambda_spans.iter().any(|&l| contains(l, s)) {
@@ -510,8 +515,11 @@ impl<'i> Typer<'i> {
         // to it — only the region does. A guard inside a `when` condition or an
         // `in` pattern/guard is excluded for the same reason a write is:
         // `case_when_scopes` narrows the SUBJECT local only, so `q.is_a?(C)`
-        // there types no `q` (rigor-rs#341).
-        let guards_here = |s: rigor_parse::Span| contains(region, s) && !in_case_clause(s);
+        // there types no `q` (rigor-rs#341) — and so is a guard recovered
+        // under a blocked wrapper position (rigor-rs#357).
+        let guards_here = |s: rigor_parse::Span| {
+            contains(region, s) && !in_case_clause(s) && !ast.in_blocked_carrier(s)
+        };
         let reads_root = |i: NodeId| {
             matches!(ast.get(i), Node::LocalVariableRead { name, .. } if name == root)
         };
@@ -729,9 +737,12 @@ impl<'i> Typer<'i> {
                     // fires on the reference) — while a class-body/top-level
                     // write binds only inside that same body, which a
                     // never-evaluated condition extent does not reach
-                    // (rigor-rs#341).
+                    // (rigor-rs#341), and neither does an extent recovered
+                    // under a blocked wrapper position (rigor-rs#357).
                     if scope.def_of(*span).is_some()
-                        || (!use_in_def && !in_case_clause(*span))
+                        || (!use_in_def
+                            && !in_case_clause(*span)
+                            && !ast.in_blocked_carrier(*span))
                     {
                         writes.push((*span, *value));
                     }
@@ -805,9 +816,13 @@ impl<'i> Typer<'i> {
         let mut writes: Vec<NodeId> = Vec::new();
         for (_, n) in ast.iter() {
             if let Node::VariableWrite { name, value, span } = n {
+                // Same split as `ivar_reach`: a `def`-body `@@x = …` is a
+                // text-scanned census entry, while a class-body write under a
+                // blocked wrapper position binds nothing (rigor-rs#357).
                 if name == root
                     && scope.contains(*span)
-                    && (scope.def_of(*span).is_some() || !use_in_def)
+                    && (scope.def_of(*span).is_some()
+                        || (!use_in_def && !ast.in_blocked_carrier(*span)))
                 {
                     writes.push(*value);
                 }
@@ -1120,6 +1135,7 @@ fn latest_definite_assignment(
                         || !contains(outer, sp)
                         || !contains(sp, use_span)
                         || in_case_clause(sp)
+                        || ast.in_blocked_carrier(sp)
                     {
                         continue;
                     }
@@ -1194,10 +1210,13 @@ fn definitely_assigns(
     let span = node.span();
     // A statement inside a `when` condition / `in` pattern is never
     // scope-evaluated — it assigns nothing on the reference
-    // ([`unevaluated_case_clause_spans`], rigor-rs#341).
+    // ([`unevaluated_case_clause_spans`], rigor-rs#341), and neither does
+    // one recovered under a blocked wrapper position (a modifier rescue's
+    // flattened `case` — rigor-rs#357).
     if case_clauses
         .iter()
         .any(|&c| c.0 <= span.0 && span.1 <= c.1)
+        || ast.in_blocked_carrier(span)
     {
         return false;
     }

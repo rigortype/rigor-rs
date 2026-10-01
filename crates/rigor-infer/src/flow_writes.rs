@@ -108,6 +108,7 @@ pub(crate) fn collect_rebind_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span,
     let mut out: Vec<(rigor_parse::Span, String)> =
         out.into_iter().map(|(_, s, n)| (s, n)).collect();
     drop_inert_writes(ast, &mut out);
+    drop_blocked_writes(ast, &mut out);
     out
 }
 
@@ -172,6 +173,17 @@ fn for_index_rebinds(index: &[(String, rigor_parse::Span)]) -> Vec<(rigor_parse:
 /// [`StatementsKind::Inert`]: rigor_parse::StatementsKind::Inert
 fn drop_inert_writes(ast: &LoweredAst, writes: &mut Vec<(rigor_parse::Span, String)>) {
     writes.retain(|(span, _)| !ast.in_inert_carrier(*span));
+}
+
+/// Drop every write that sits inside a `Recovered::blocked` position — the
+/// wrapper-flattened never-bound sibling of [`drop_inert_writes`]: a
+/// `when`/`in` condition under a rescue modifier, a dead arm, a `super`/
+/// `yield` operand under a wrapper. The reference discards that position's
+/// post-scope, so the write neither binds nor widens — `x = (case v when
+/// (q = 1; Integer) then 1 end) rescue nil` must not rebind `q`
+/// (rigor-rs#357).
+fn drop_blocked_writes(ast: &LoweredAst, writes: &mut Vec<(rigor_parse::Span, String)>) {
+    writes.retain(|(span, _)| !ast.in_blocked_carrier(*span));
 }
 
 /// In-place mutator methods that invalidate a value-pinned literal carrier
@@ -321,9 +333,14 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
     // The inert filter: a write inside a never-evaluated operand binds
     // nothing, so its mark always drops — EXCEPT a scan-visible content
     // mutation inside an ITERATED body's scanned operand, which the
-    // reference's writeback applies anyway (rigor-rs#312).
+    // reference's writeback applies anyway (rigor-rs#312). The blocked
+    // filter is the same shape for `Recovered::blocked` positions (a
+    // `when`/`in` condition under a rescue modifier, a dead arm — the
+    // reference discards their post-scope, rigor-rs#357).
     out.retain(|(_, w, _, scan)| {
-        !ast.in_inert_carrier(*w) || (*scan && ast.in_scanned_inert_carrier(*w))
+        (!ast.in_inert_carrier(*w) || (*scan && ast.in_scanned_inert_carrier(*w)))
+            && (!ast.in_blocked_carrier(*w)
+                || (*scan && ast.in_iterative_blocked_carrier(*w)))
     });
     out.into_iter().map(|(_, s, n, _)| (s, n)).collect()
 }
@@ -383,6 +400,7 @@ pub(crate) fn toplevel_rebinds(ast: &LoweredAst) -> Vec<(rigor_parse::Span, Stri
     let mut out: Vec<(rigor_parse::Span, String)> =
         out.into_iter().map(|(_, s, n)| (s, n)).collect();
     drop_inert_writes(ast, &mut out);
+    drop_blocked_writes(ast, &mut out);
     out
 }
 
@@ -569,6 +587,14 @@ pub(crate) fn toplevel_mutations(
     }
     out.retain(|(id, w, name, ..)| {
         !ast.in_inert_carrier(*w)
+            // A mutation mark under a `Recovered::blocked` position never
+            // lands — unless an ITERATED body's writeback text scan covers
+            // it (rigor-rs#312) or the mark is a compound ATTRIBUTE write,
+            // whose `widen_attribute_write` the reference lands even in
+            // never-evaluated positions (rigor-rs#343, rigor-rs#357).
+            && (!ast.in_blocked_carrier(*w)
+                || ast.in_iterative_blocked_carrier(*w)
+                || matches!(ast.get(*id), Node::AttrWrite { .. }))
             && !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
             && !shadow_scopes.iter().any(|(descendants, bound)| {
                 descendants.contains(id) && bound.contains(name)

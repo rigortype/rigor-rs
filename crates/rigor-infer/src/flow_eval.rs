@@ -1351,6 +1351,16 @@ impl<'i> Typer<'i> {
     /// rebind the outer `o` (rigor-rs#137). [`LoweredAst::closure_bound_names`]
     /// carries exactly that bound set on the recovered child.
     fn bind_statement(&self, ast: &LoweredAst, id: NodeId, env: &mut TypeEnv, interner: &mut Interner) {
+        // A write lowered inside a position whose post-scope the reference
+        // DISCARDS (`Recovered::blocked` — a `when`/`in` condition under a
+        // rescue modifier, a dead arm, a `super`/`yield` operand under a
+        // wrapper) binds nothing: `x = (case v when (q = 1; Integer) then
+        // 1 end) rescue nil` leaves `q` unbound and preserves an earlier
+        // binding (rigor-rs#357 — the recovered sibling of the `Inert`
+        // carrier arm below).
+        if ast.in_blocked_carrier(ast.get(id).span()) {
+            return;
+        }
         match ast.get(id) {
             Node::LocalVariableWrite { name, value, .. } => {
                 if ast.closure_bound_names(id).contains(name) {
