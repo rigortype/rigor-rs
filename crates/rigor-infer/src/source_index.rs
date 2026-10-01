@@ -200,6 +200,10 @@ struct OverrideClass {
     superclass: Option<String>,
     /// `include` / `prepend` names as WRITTEN, in source order.
     includes: Vec<String>,
+    /// `extend` names as WRITTEN, in source order — the reference folds each
+    /// into the class's OWN singleton surface, so they join the singleton
+    /// ancestor walk (never the instance one).
+    extends: Vec<String>,
     /// The discovered instance-method VISIBILITY table. First-write-wins on
     /// reopen (mirrors the reference accumulator's stable cross-file view).
     method_visibilities: HashMap<String, Visibility>,
@@ -255,6 +259,8 @@ pub(crate) struct HarvestedOverrideClass {
     methods: Vec<String>,
     method_visibilities: Vec<(String, Visibility)>,
     includes: Vec<String>,
+    /// `extend`-ed module names as WRITTEN — see [`OverrideClass::extends`].
+    extends: Vec<String>,
     /// Whether the declaration was a `module` (vs a `class`). Recorded ONLY so
     /// [`SourceIndex::namespace_children`] can render the same class-vs-module
     /// kind [`CoreIndex::namespace_children`] does for the RBS surface; no rule

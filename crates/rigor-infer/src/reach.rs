@@ -426,7 +426,7 @@ impl<'i> Typer<'i> {
             UntypedRoot::Local(name) => self.local_reach(ast, name, use_span, seen, false).0,
             UntypedRoot::Ivar(name) => self.ivar_reach(ast, name, use_span, seen),
             UntypedRoot::Cvar(name) => self.cvar_reach(ast, name, use_span, seen),
-            UntypedRoot::Gvar(name) => self.gvar_reach(ast, name, use_span, seen),
+            UntypedRoot::Gvar(name) => self.gvar_reach(ast, name, seen),
             UntypedRoot::Const(name) => {
                 if self.const_is_reference_untyped(name, use_span) {
                     Reach::UNTYPED
@@ -542,6 +542,22 @@ impl<'i> Typer<'i> {
                     note_binder(*span, true);
                 }
                 Node::Loop { span, .. } if contains(*span, use_span) => loop_spans.push(*span),
+                // `retry` re-enters the `begin`: a rescue arm's own writes can
+                // reach reads earlier in the arm on the next pass — the same
+                // carrier a loop is (rigor-rs#368; `retried = false; begin;
+                // rescue; return if retried; retried = true; retry` does not
+                // pin `retried` on the oracle). The carrier is the WHOLE
+                // `begin` span, not just the arm: the try body re-runs first,
+                // so its writes reach the arm's reads on the retried pass
+                // (`attempts += 1` above `rescue; if attempts < MAX; retry` —
+                // gitlab-foss `migrator.rb`).
+                Node::BeginRescue { clauses, span, .. } => {
+                    for c in clauses {
+                        if contains(c.span, use_span) && self.clause_retries(ast, c.span) {
+                            loop_spans.push(*span);
+                        }
+                    }
+                }
                 Node::Call { receiver, method, block_body, .. } if !block_body.is_empty() => {
                     // A call's own span covers its receiver and arguments too, so
                     // the binder region is the BLOCK BODY's extent.
@@ -1002,23 +1018,15 @@ impl<'i> Typer<'i> {
     /// gvar nothing writes is `Dynamic[Top]` (row g2); `$g = nil` at top level
     /// or `$g = "s"` in a def keeps firing (rows r15/g3), and a gvar with any
     /// untyped write is imprecise (rows n4, g01/g02).
-    fn gvar_reach(
-        &self,
-        ast: &LoweredAst,
-        root: &str,
-        use_span: rigor_parse::Span,
-        seen: &mut Vec<String>,
-    ) -> Reach {
-        // rigor-rs#368 — program-wide writes still respect dead positions.
-        let dead = self.dead_positions(ast, seen);
+    fn gvar_reach(&self, ast: &LoweredAst, root: &str, seen: &mut Vec<String>) -> Reach {
+        // rigor-rs#368 — NOT dead-position filtered: `build_program_global_index`
+        // is a program-wide TEXT census, so `$g = 1` inside a folded-dead arm or
+        // a terminating rescue arm still reaches the read (probed: `if false;
+        // $g = 1; end; Float($g).w` fires `for 1.0` on the oracle).
         let writes: Vec<NodeId> = ast
             .iter()
             .filter_map(|(_, n)| match n {
-                Node::VariableWrite { name, value, span, .. }
-                    if name == root && dead.write_reaches(*span, use_span) =>
-                {
-                    Some(*value)
-                }
+                Node::VariableWrite { name, value, .. } if name == root => Some(*value),
                 _ => None,
             })
             .collect();

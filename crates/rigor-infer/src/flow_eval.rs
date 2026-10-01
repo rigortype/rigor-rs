@@ -334,15 +334,20 @@ impl<'i> Typer<'i> {
         clause: &rigor_parse::RescueClause,
         interner: &mut Interner,
     ) -> TypeId {
+        let named = |name: &str, interner: &mut Interner| {
+            self.index
+                .class_id(name)
+                .or_else(|| self.source.class_id(name))
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
+                .unwrap_or_else(|| interner.untyped())
+        };
         if clause.exceptions.is_empty() {
-            return self.nominal_or_untyped("StandardError", interner);
+            return named("StandardError", interner);
         }
         let mut ty = interner.bottom();
         for &e in &clause.exceptions {
             let member = match ast.get(e) {
-                Node::ConstantRead { name, .. } => {
-                    self.nominal_or_untyped(name, interner)
-                }
+                Node::ConstantRead { name, .. } => named(name, interner),
                 _ => interner.untyped(),
             };
             ty = rigor_types::Algebra::join(interner, ty, member);
@@ -848,7 +853,6 @@ impl<'i> Typer<'i> {
     /// receiver mutations nested in its value (`x = xs.each { |e| w = e }`,
     /// `y = (a << 1)`); any other statement widens every rebind inside it and
     /// applies the contained `local.<mutator>` calls.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn bind_check_statement(
         &self,
@@ -1495,29 +1499,39 @@ impl<'i> Typer<'i> {
                     ast, indexed, id, if_span, rebinds, mutations, stored, env, interner,
                 );
             }
-            Node::Definition { body, singleton_name, .. } => {
-                // Independent scope: fresh local env, inherited suppression flag.
-                // The self KIND flips to singleton inside a `def self.x` (so an
-                // implicit-self call there resolves against the owner's singleton
-                // table); the enclosing class QUALIFIED name is unchanged.
-                let (body, kind) = (
-                    body.clone(),
-                    if singleton_name.is_some() { DefKind::Singleton } else { DefKind::Instance },
-                );
+            Node::Definition { span, body, .. } => {
+                // Independent scope: fresh local env, inherited suppression
+                // flag. The self KIND + owner mirror
+                // `self_type_for_method_body` / `self_type_for_class_body`:
+                // `def self.x`, defs under a `class <<` frame, and
+                // `class <<` / class / module body statements are
+                // singleton-side; a receiver-bearing `def` or an
+                // unnameable context keeps no modelled self (rigor-rs#368).
+                let (qual, kind) = match self.call_self(ast, *span) {
+                    crate::dead::CallSelf::Singleton(q) => (q, DefKind::Singleton),
+                    crate::dead::CallSelf::Instance(q) => (q, DefKind::Instance),
+                    crate::dead::CallSelf::Unmodelled => (String::new(), DefKind::Instance),
+                };
+                let body = body.clone();
                 let mut fresh = TypeEnv::new();
                 self.flow_eval_scope(
-                    ast, &body, &mut fresh, in_loop_or_block, self_qual, kind, writes, rebinds, mutations, indexed, interner, out,
+                    ast, &body, &mut fresh, in_loop_or_block,
+                    if qual.is_empty() { None } else { Some(qual.as_str()) },
+                    kind, writes, rebinds, mutations, indexed, interner, out,
                 );
             }
             Node::ClassDef { body, name, .. } | Node::ModuleDef { body, name, .. } => {
                 // Independent scope: fresh local env, inherited suppression flag.
                 // Extend the lexical self-qualified name so a nested class/module's
-                // implicit-self calls resolve against the right owner; a body-level
-                // call defaults to instance kind until a `def self.x` flips it.
+                // implicit-self calls resolve against the right owner. A
+                // class/module body statement's `self` IS the class object —
+                // `self_type_for_class_body` → `Singleton[path]` — so the
+                // body-level kind is `Singleton` (a `def` re-derives its own
+                // kind from its lexical position via `call_self`).
                 let (body, child_qual) = (body.clone(), qualify_self(self_qual, name));
                 let mut fresh = TypeEnv::new();
                 self.flow_eval_scope(
-                    ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Instance, writes, rebinds, mutations, indexed, interner, out,
+                    ast, &body, &mut fresh, in_loop_or_block, Some(&child_qual), DefKind::Singleton, writes, rebinds, mutations, indexed, interner, out,
                 );
             }
             // A `begin`/`rescue` DOES get its bodies evaluated on the
@@ -1531,23 +1545,64 @@ impl<'i> Typer<'i> {
                 main_body,
                 clauses,
                 ensure_body,
+                span: begin_span,
                 ..
             } => {
-                let (main_body, clauses, ensure_body) =
-                    (main_body.clone(), clauses.clone(), ensure_body.clone());
+                let (main_body, clauses, ensure_body, begin_span) =
+                    (main_body.clone(), clauses.clone(), ensure_body.clone(), *begin_span);
                 if !in_loop_or_block {
                     let mut scratch = env.clone();
                     self.flow_eval_scope(
                         ast, &main_body, &mut scratch, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
                     );
+                    let mut arm_envs = Vec::with_capacity(clauses.len());
                     for c in &clauses {
-                        let mut cenv = scratch.clone();
+                        // The arm's entry scope is the `begin`'s ENTRY scope —
+                        // the exception may fire before ANY try statement runs,
+                        // so try-body writes never flow in (probed: `timed =
+                        // nil; begin; timed = true; rescue; if timed` warns
+                        // FALSEY on the oracle, not truthy). A `retry` inside
+                        // the arm re-runs the `begin`, carrying the arm's own
+                        // writes back round — widened, since the re-entry order
+                        // is not the straight line (`retried = false; begin;
+                        // rescue; return if retried; retried = true; retry` is
+                        // silent on the oracle). The carrier spans the WHOLE
+                        // `begin`, not just the arm: `retry` re-runs the try
+                        // body before the clause executes again, so try-body
+                        // writes carry round too (`attempts += 1` under
+                        // `begin` then `retry if attempts < MAX` —
+                        // gitlab-foss `migrator.rb#with_retry`,
+                        // `source_internal_user_finder.rb#fetch_ghost_user`).
+                        let mut cenv = env.clone();
+                        if self.clause_retries(ast, c.span) {
+                            widen_flow_writes(rebinds, begin_span, &mut cenv, interner);
+                        }
                         self.flow_eval_scope(
                             ast, &c.body, &mut cenv, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
                         );
+                        arm_envs.push(cenv);
                     }
+                    // `ensure` runs on EVERY exit path — with rescue clauses
+                    // its entry env is the JOIN of the `begin` entry scope,
+                    // the post-try env and every arm's exit env, so a write
+                    // from any one path widens rather than folds (probed:
+                    // `r = nil; begin; r = true; rescue; ensure; if r` is
+                    // SILENT on the oracle; so are the rescue-arm-only and
+                    // unbound variants). With NO rescue clause the only
+                    // pre-ensure path is the try body — `begin; r = true;
+                    // ensure; if r` warns TRUTHY on the oracle — so `ensure`
+                    // there sees the post-try env directly.
+                    let mut eenv = if clauses.is_empty() {
+                        scratch
+                    } else {
+                        let mut j = join_flow_envs(env, &scratch, interner);
+                        for cenv in &arm_envs {
+                            j = join_flow_envs(&j, cenv, interner);
+                        }
+                        j
+                    };
                     self.flow_eval_scope(
-                        ast, &ensure_body, &mut scratch, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
+                        ast, &ensure_body, &mut eenv, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
                     );
                 }
                 let span = ast.get(id).span();
@@ -1606,7 +1661,7 @@ impl<'i> Typer<'i> {
                 // would fold a predicate the oracle does not (fixture 111's
                 // `if upcased == "ab"`).
                 if let Some(scalar) =
-                    self.file_def_literal(ast, &method, &mut Vec::new())
+                    self.file_def_literal(ast, &method, ast.get(predicate).span(), &mut Vec::new())
                 {
                     return interner.intern(Type::Constant(scalar));
                 }

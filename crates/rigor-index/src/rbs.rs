@@ -1029,6 +1029,18 @@ impl CoreData {
             .is_some_and(|entry| entry.singleton_methods.contains_key(method))
     }
 
+    /// Whether `class_name`'s OWN RBS entry — short-key or qualified —
+    /// declares `method` as a singleton (`def self.x`), with NO
+    /// ancestor-chain walk. Mirrors the reference's
+    /// `rbs_declared_on_class?(method_definition(name, m, :singleton), name)`
+    /// own-class question (`singleton_self_answers?`'s RBS arm).
+    pub fn singleton_declared_own(&self, class_name: &str, method: &str) -> bool {
+        self.classes
+            .get(class_name)
+            .is_some_and(|entry| entry.singleton_methods.contains_key(method))
+            || self.qualified_declares_singleton(class_name, method)
+    }
+
     /// ADR-0042 Slice 1: the instance-method twin of
     /// [`Self::qualified_declares_singleton`] — checks ONLY the qualified
     /// entry's own `methods`, no ancestor-chain walk. `false` for an unknown

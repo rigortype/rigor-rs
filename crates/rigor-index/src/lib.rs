@@ -263,6 +263,14 @@ impl CoreIndex {
         self.data.class_has_singleton_method(class_name, method)
     }
 
+    /// Whether `class_name`'s OWN RBS entry declares `method` as a singleton
+    /// method (`def self.x`), no ancestor walk — the reference's
+    /// `rbs_declared_on_class?` on the `:singleton` definition. See
+    /// [`rbs::CoreData::singleton_declared_own`].
+    pub fn singleton_declared_own(&self, class_name: &str, method: &str) -> bool {
+        self.data.singleton_declared_own(class_name, method)
+    }
+
     /// The subtyping relation of two RBS-known class names — a faithful port of
     /// the reference `Environment#class_ordering`. See
     /// [`rbs::CoreData::class_ordering`]. Read by `call.raise-non-exception`.

@@ -246,6 +246,21 @@ impl SourceIndex {
                     h.rbs_constant_names.push(name.clone());
                 }
             }
+            // rigor-rs#368 — a bare `rescue => e` binds `e` to `StandardError`
+            // (`rescue_exception_type`, `statement_evaluator.rb:5115`), but no
+            // `ConstantRead` names it, so without this it never gets a registry
+            // id and the replayed binding degrades to `Dynamic[top]`.
+            if let Node::BeginRescue { clauses, .. } = node {
+                for c in clauses {
+                    if c.bound_name.is_some()
+                        && c.exceptions.is_empty()
+                        && core.knows_class("StandardError")
+                        && seen_names.insert("StandardError")
+                    {
+                        h.rbs_constant_names.push("StandardError".to_string());
+                    }
+                }
+            }
         }
 
         // Pass 4a (ADR-0038): every project instance + singleton `def` body by
@@ -341,6 +356,7 @@ impl SourceIndex {
                     &oc.methods,
                     &oc.method_visibilities,
                     &oc.includes,
+                    &oc.extends,
                     oc.is_module,
                 );
             }

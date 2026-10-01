@@ -363,11 +363,12 @@ pub(crate) fn check_call(
 /// - `safe_navigation?` declines outright;
 /// - any nil arm (`Constant[nil]` / `NilClass`) keeps `T | nil` silent — the
 ///   deliberate N3 decision (ADR-62);
-/// - any UNANSWERABLE arm — `class_name_of` resolving `None` (Dynamic / Top /
-///   Bot / Singleton / a non-core surface; `Singleton` covers the reference's
-///   explicit singleton bail), a metaclass (`Class` / `Module`), or an RBS
-///   module mixin — declines, since no sound "absent on every arm" verdict
-///   exists there;
+/// - any UNANSWERABLE arm — neither `class_name_of` nor the source-registry
+///   `class_name_for_id_of` resolving a name (Dynamic / Top / Bot /
+///   Singleton — the reference's explicit singleton bail), a metaclass
+///   (`Class` / `Module`), an RBS module mixin, or a registry name that fails
+///   the scalar path's witness gates — declines, since no sound "absent on
+///   every arm" verdict exists there;
 /// - a class the bundled surface does not model (`!knows_class`) is likewise
 ///   unanswerable — the reference's permissive `return true` from
 ///   `method_present_anywhere?`;
@@ -391,33 +392,84 @@ fn check_union_call(
     if safe_nav {
         return None;
     }
-    let mut arm_classes: Vec<&'static str> = Vec::new();
+    let mut arm_classes: Vec<String> = Vec::new();
     for member in members {
         let is_nil_member = matches!(interner.get(member), Type::Constant(Scalar::Nil))
             || index.class_name_of(interner, member) == Some("NilClass");
         if is_nil_member {
             return None;
         }
-        let class_name = index.class_name_of(interner, member)?;
-        if unenumerable_instance_receiver(index, class_name) {
-            return None;
+        // A member's class resolves two ways: a core-id name (`class_name_of`)
+        // or a source-registry `Nominal` (`class_name_for_id_of`) — the latter
+        // is what `rescue A, B => e` mints for a named RBS class
+        // (`rescue ArgumentError, TypeError => e` binds `e` to
+        // `ArgumentError | TypeError` on the oracle, and `e.w` fires the
+        // union diagnostic).
+        match index
+            .class_name_of(interner, member)
+            .map(|n| (n.to_string(), false))
+            .or_else(|| {
+                typer
+                    .source()
+                    .class_name_for_id_of(interner, member)
+                    .map(|n| (n.to_string(), true))
+            }) {
+            None => return None,
+            Some((class_name, registry_arm)) => {
+                if unenumerable_instance_receiver(index, &class_name) {
+                    return None;
+                }
+                if registry_arm {
+                    // The scalar path's source-registry gate: witness only a
+                    // bundled toplevel class the use site does not shadow, a
+                    // project-sig class, or a declaration-only qualified one.
+                    let use_prefix = typer.enclosing_prefix(message_span);
+                    let witnessable = (index.knows_toplevel_class(&class_name)
+                        && !typer
+                            .source()
+                            .constant_shadowed(&class_name, use_prefix))
+                        || index.is_qualified_project_sig_class(&class_name)
+                        || (index.knows_qualified_class(&class_name)
+                            && typer.source().is_declaration_only_class(&class_name));
+                    if !witnessable
+                        || index.qualified_class_has_method(&class_name, method)
+                        || typer.source().project_declares_method(
+                            typer.file_key(),
+                            &class_name,
+                            method,
+                        )
+                        || typer.source().project_declares_method_through_ancestors(
+                            typer.file_key(),
+                            &class_name,
+                            method,
+                        )
+                    {
+                        return None;
+                    }
+                } else {
+                    if !index.knows_class(&class_name) {
+                        return None;
+                    }
+                    if typer.source().project_declares_method(
+                        typer.file_key(),
+                        &class_name,
+                        method,
+                    ) || index.class_has_method(&class_name, method)
+                        || typer.source().project_declares_method_through_ancestors(
+                            typer.file_key(),
+                            &class_name,
+                            method,
+                        )
+                    {
+                        return None;
+                    }
+                }
+                arm_classes.push(class_name);
+            }
         }
-        if !index.knows_class(class_name) {
-            return None;
-        }
-        if typer.source().project_declares_method(typer.file_key(), class_name, method)
-            || index.class_has_method(class_name, method)
-            || typer
-                .source()
-                .project_declares_method_through_ancestors(typer.file_key(), class_name, method)
-        {
-            return None;
-        }
-        arm_classes.push(class_name);
     }
     if arm_classes
         .iter()
-        .copied()
         .collect::<std::collections::HashSet<_>>()
         .len()
         < 2
