@@ -3,6 +3,7 @@
 
 use crate::ruby_prism::{self, Node as PrismNode};
 
+use super::operand_effects::{self, OperandMode};
 use super::{
     all_param_names, block_param_names, body_has_explicit_return, collect_defined_operand_children,
     collect_recoverable_children, constant_node_name, constant_path_string, constant_string,
@@ -70,19 +71,30 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`Recovered::suppressed`]: super::Recovered::suppressed
     pub(crate) recovery_suppressed: u32,
-    /// Depth of pure `type_of` operand positions the lowering sits inside
-    /// — a call receiver or argument, a splat's contents, a literal-
-    /// container element, an interpolation part, a `return` operand, an
-    /// `in` pattern, a `rescue`-modifier operand. The reference TYPES
-    /// these rather than `evaluate`-ing them, and `OperandEffects`
-    /// deliberately does NOT list the `Call*WriteNode`s as outliving
-    /// writes (unlike the `Index*WriteNode` pair), so a compound
-    /// ATTRIBUTE write lowered here runs `type_of` only: its
-    /// `widen_attribute_write` never reaches this scope. `Node::AttrWrite`'s
-    /// `evaluated` flag is `false` at depth > 0 (rigor-rs#343).
+    /// Depth of typed-operand positions the lowering sits inside — a call
+    /// receiver or argument, a splat's contents, a literal-container
+    /// element, an interpolation part, a `rescue`-modifier operand. The
+    /// reference gates each such ELEMENT on `OperandEffects.any?`
+    /// (`thread_operand`, `statement_evaluator.rb:2509-2535`): an element
+    /// whose subtree carries an outliving effect is `evaluate`d, the rest
+    /// `type_of`'d. `lower_typed_operand` applies that gate per operand
+    /// child, so this depth only reads > 0 while a GATED-IN container,
+    /// sequence or call operand lowers (rigor-rs#343, #361).
     ///
     /// [`Recovered::typed`]: super::Recovered::typed
     pub(crate) typed_depth: u32,
+    /// Depth of never-evaluated operand positions the lowering sits
+    /// inside — the `dead` half of `thread_operand`'s gate: an operand
+    /// element without an outliving effect, plus the children an
+    /// evaluator `type_of`s even when it runs (a `return` operand's
+    /// `jump_value_type`, an `in` pattern's captured bindings, an index
+    /// write's receiver/indices, a compound attribute write's own
+    /// receiver and value). No `eval_*` handler ever runs inside one, so
+    /// `Node::AttrWrite`'s `evaluated` flag is `false` at depth > 0 and
+    /// `OperandEffects.any?` cannot rescue it (rigor-rs#361).
+    ///
+    /// [`Recovered::dead`]: super::Recovered::dead
+    pub(crate) dead_operand: u32,
     /// Depth of DEFERRED bodies the lowering sits inside — a literal
     /// block or lambda body. A compound attribute write there still
     /// evaluates, but `widen_attribute_write` lands on the block's own
@@ -264,12 +276,16 @@ impl<'src> Builder<'src> {
             // `eval_index_or_write` reads `scope.type_of(node.receiver)` and
             // `index_write_arg_types` types the indices; only the RHS value is
             // `sub_eval`'d (`statement_evaluator.rb:754-789`, rigor-rs#343).
-            self.typed_depth += 1;
+            // `type_of` is the dead half of the operand gate: no
+            // `OperandEffects.any?` can re-enter it, so a compound attribute
+            // write buried in `h[h.default ||= (y = 1)] ||= 0` stays
+            // `evaluated: false` (rigor-rs#361).
+            self.dead_operand += 1;
             let receiver = receiver.as_ref().map(|r| self.lower_node(r));
             let indices = arguments
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
-            self.typed_depth -= 1;
+            self.dead_operand -= 1;
             let value = self.lower_node(&value);
             // `operand`: the write lowered where it EVALUATES inline —
             // straight-line code or a scope-transparent recovery position
@@ -340,29 +356,40 @@ impl<'src> Builder<'src> {
             });
         if let Some((compound, receiver, value, read_name, write_name, safe_nav)) = attr_write {
             // `evaluated`: whether the occurrence sits where
-            // `eval_attribute_compound_write` can run — NOT under a pure
-            // `type_of` operand (`typed_depth`: call receiver/args, splat,
-            // container, interpolation, `return`, `in` pattern, `rescue`
-            // modifier — `OperandEffects` does not list the `Call*WriteNode`s
-            // as outliving), a `defined?`/`super`/`yield` suppression carrier
-            // (`suppressed`), or a literal block/lambda body (`closure_depth`:
-            // `evaluate_invocation`'s `OperandEffects.any?` writeback check
-            // excludes them too — `x.each { h.default ||= 0 }` keeps `h`'s
-            // indexed narrowings). Joined/blocked/iterated/`for` positions
-            // all still EVALUATE (measured: an `if` arm, a `while` predicate
-            // or body, a `when` condition, an `ensure` body all land the
-            // writer's widening).
-            let evaluated = self.typed_depth == 0
+            // `eval_attribute_compound_write` can run — NOT under a
+            // never-evaluated position (`dead_operand`: an
+            // `OperandEffects`-free operand element, a `return` operand's
+            // `jump_value_type`, an `in` pattern, another write's
+            // receiver/indices/value), a `defined?`/`super`/`yield`
+            // suppression carrier (`suppressed`), or a literal
+            // block/lambda body (`closure_depth`: `evaluate_invocation`'s
+            // `OperandEffects.any?` writeback check excludes them too —
+            // `x.each { h.default ||= 0 }` keeps `h`'s indexed
+            // narrowings). Under a TYPED operand (`typed_depth`,
+            // rigor-rs#343) the reference's `thread_operand` gates the
+            // write on `OperandEffects.any?(subtree)` — an outliving
+            // effect inside (a local/ivar/gvar write, a compound index
+            // write, a targeted `next`/`break`, a shape-mutator call on
+            // an outliving receiver) keeps it EVALUATED so the widening
+            // still lands: `puts(h.default ||= (y = 1))` is silent on
+            // the oracle while `puts(h.default ||= 0)` keeps the `(h, k)`
+            // narrowing (rigor-rs#361). Joined/blocked/iterated/`for`
+            // positions all still EVALUATE (measured: an `if` arm, a
+            // `while` predicate or body, a `when` condition, an `ensure`
+            // body all land the writer's widening).
+            let evaluated = self.dead_operand == 0
                 && self.closure_depth == 0
-                && self.recovery_suppressed == 0;
+                && self.recovery_suppressed == 0
+                && (self.typed_depth == 0
+                    || operand_effects::any(node));
             // The receiver and RHS are `type_of` operands of the write —
             // `call_or_write_type_for` types them; a compound attribute write
             // nested inside never evaluates (`h.default ||= (h.x ||= 1)`
             // widens `h` once, through the outer `default=`).
-            self.typed_depth += 1;
+            self.dead_operand += 1;
             let receiver = receiver.as_ref().map(|r| self.lower_node(r));
             let value = self.lower_node(&value);
-            self.typed_depth -= 1;
+            self.dead_operand -= 1;
             return self.push(Node::AttrWrite {
                 receiver,
                 read_name: constant_string(read_name.as_slice()),
@@ -458,12 +485,14 @@ impl<'src> Builder<'src> {
         if let Some(call) = node.as_call_node() {
             // The receiver, the positional arguments and the `&expr`
             // block-pass are OPERAND positions — `OperandWalk.thread_operand`
-            // types each (`operand.type`) unless `OperandEffects.any?` sends
-            // it to `evaluate` — and a compound ATTRIBUTE write inside is not
-            // an outliving effect, so it is only ever typed here
-            // (`typed_depth` → `evaluated: false`, rigor-rs#343).
+            // gates each on `OperandEffects.any?` (`lower_typed_operand`):
+            // an element carrying an outliving effect keeps evaluating, so a
+            // compound attribute write inside it still lands its widening —
+            // `puts(h.default ||= (y = 1))` is silent on the oracle; an
+            // element without one is `type_of`'d whole — `puts(h.default ||=
+            // 0)` keeps the `(h, k)` narrowing (rigor-rs#343, #361).
             self.typed_depth += 1;
-            let receiver = call.receiver().map(|r| self.lower_node(&r));
+            let receiver = call.receiver().map(|r| self.lower_typed_operand(&r));
             let method = constant_string(call.name().as_slice());
             // Lower positional arguments in source order (ADR-0023: argument
             // contracts + arg-dependent folding). Splat/keyword/forwarding args
@@ -535,10 +564,15 @@ impl<'src> Builder<'src> {
                         // compound ATTRIBUTE write: `OperandEffects.any?`
                         // does not list `Call*WriteNode`s, so
                         // `x.each { h.default ||= 0 }` keeps `h`'s indexed
-                        // narrowings (rigor-rs#343).
+                        // narrowings (rigor-rs#343). And it is NOT an
+                        // operand position — `call_operand_scope` threads
+                        // receiver/args/`&expr` only — so the operand gate
+                        // is cleared while its body lowers.
                         self.recovery_iterative += 1;
                         self.closure_depth += 1;
+                        let operand_typed = std::mem::replace(&mut self.typed_depth, 0);
                         let body = self.lower_optional_body(bn.body().as_ref());
+                        self.typed_depth = operand_typed;
                         self.recovery_iterative -= 1;
                         self.closure_depth -= 1;
                         body
@@ -547,7 +581,7 @@ impl<'src> Builder<'src> {
                         self.typed_depth += 1;
                         let pass = ba
                             .expression()
-                            .map(|e| vec![self.lower_node(&e)])
+                            .map(|e| vec![self.lower_typed_operand(&e)])
                             .unwrap_or_default();
                         self.typed_depth -= 1;
                         pass
@@ -924,10 +958,12 @@ impl<'src> Builder<'src> {
                 span: span_of(&in_node.location()),
             });
             // The pattern is matched in `in_arm_position` — typed, never
-            // evaluated (rigor-rs#343).
-            self.typed_depth += 1;
+            // evaluated (rigor-rs#343); it is the dead half of the operand
+            // gate — `Narrowing.case_when_scopes` types it only, so no
+            // `OperandEffects.any?` rescues a write inside (rigor-rs#361).
+            self.dead_operand += 1;
             let pattern = self.lower_node(&in_node.pattern());
-            self.typed_depth -= 1;
+            self.dead_operand -= 1;
             let mut body = vec![pattern];
             if let Some(s) = in_node.statements() {
                 body.extend(self.lower_body(&s.body()));
@@ -1127,16 +1163,16 @@ impl<'src> Builder<'src> {
             let dup_keys = self.hash_keys_of(&hash.elements());
             let mut elements = Vec::new();
             let mut all_assoc = true;
-            // Assoc keys/values are `eval_value_container` operands — TYPED
-            // (rigor-rs#343).
+            // Assoc keys/values are `eval_value_container` operand elements —
+            // each re-gated on `OperandEffects.any?` (rigor-rs#343, #361).
             self.typed_depth += 1;
             for el in hash.elements().iter() {
                 if let Some(assoc) = el.as_assoc_node() {
-                    elements.push(self.lower_node(&assoc.key()));
-                    elements.push(self.lower_node(&assoc.value()));
+                    elements.push(self.lower_typed_operand(&assoc.key()));
+                    elements.push(self.lower_typed_operand(&assoc.value()));
                 } else {
                     all_assoc = false;
-                    elements.push(self.lower_node(&el));
+                    elements.push(self.lower_typed_operand(&el));
                 }
             }
             self.typed_depth -= 1;
@@ -1154,10 +1190,11 @@ impl<'src> Builder<'src> {
             // its bounds unconditionally in order (the reference's
             // `OPERAND_CONTAINERS` includes `RangeNode`), which the flow
             // replay reads (rigor-rs#306). The bounds are TYPED operands —
-            // `eval_value_container` — not `evaluate`d (rigor-rs#343).
+            // `eval_value_container` — `thread_operand`-gated per bound on
+            // `OperandEffects.any?` (rigor-rs#343, #361).
             self.typed_depth += 1;
-            let left = range.left().map(|l| self.lower_node(&l));
-            let right = range.right().map(|r| self.lower_node(&r));
+            let left = range.left().map(|l| self.lower_typed_operand(&l));
+            let right = range.right().map(|r| self.lower_typed_operand(&r));
             self.typed_depth -= 1;
             return self.push(Node::Range {
                 left,
@@ -1175,14 +1212,15 @@ impl<'src> Builder<'src> {
             // — Prism's KeywordHashNode, same `-w` warning as a braced literal).
             let dup_keys = self.hash_keys_of(&khash.elements());
             let mut elements = Vec::new();
-            // Keyword arguments are `type_of` operands too (rigor-rs#343).
+            // Keyword arguments are `type_of` operands too (rigor-rs#343) —
+            // gated per element on `OperandEffects.any?` (rigor-rs#361).
             self.typed_depth += 1;
             for el in khash.elements().iter() {
                 if let Some(assoc) = el.as_assoc_node() {
-                    elements.push(self.lower_node(&assoc.key()));
-                    elements.push(self.lower_node(&assoc.value()));
+                    elements.push(self.lower_typed_operand(&assoc.key()));
+                    elements.push(self.lower_typed_operand(&assoc.value()));
                 } else {
-                    elements.push(self.lower_node(&el));
+                    elements.push(self.lower_typed_operand(&el));
                 }
             }
             self.typed_depth -= 1;
@@ -1312,12 +1350,13 @@ impl<'src> Builder<'src> {
             // Lower every interpolation part (`#{call}`) so its calls are walked,
             // and keep the ids: the node types as a `String` instance, with the
             // parts as the reachability carrier. Parts are `type_of` operands —
-            // `eval_interpolation` types each part (rigor-rs#343).
+            // `eval_interpolation` types each part (rigor-rs#343) — gated
+            // per element on `OperandEffects.any?` (rigor-rs#361).
             self.typed_depth += 1;
             let parts: Vec<NodeId> = interp
                 .parts()
                 .iter()
-                .map(|p| self.lower_node(&p))
+                .map(|p| self.lower_typed_operand(&p))
                 .collect();
             self.typed_depth -= 1;
             return self.push(Node::InterpolatedString {
@@ -1336,12 +1375,13 @@ impl<'src> Builder<'src> {
             // is kept as the reachability carrier so a local read inside the
             // interpolation stays visible to structural walks like
             // `flow.dead-assignment`, exactly as `InterpolatedString` does.
-            // Parts are `type_of` operands (rigor-rs#343).
+            // Parts are `type_of` operands (rigor-rs#343), gated per element
+            // on `OperandEffects.any?` (rigor-rs#361).
             self.typed_depth += 1;
             let parts: Vec<NodeId> = interp
                 .parts()
                 .iter()
-                .map(|p| self.lower_node(&p))
+                .map(|p| self.lower_typed_operand(&p))
                 .collect();
             self.typed_depth -= 1;
             return self.push(Node::InterpolatedSymbol {
@@ -1377,9 +1417,13 @@ impl<'src> Builder<'src> {
             // even when the lambda is never called (rigor-rs#312). A compound
             // ATTRIBUTE write's scope effect does NOT cross the closure —
             // `OperandEffects.any?` excludes `Call*WriteNode`s (rigor-rs#343).
+            // The body is not an operand position either — clear the gate
+            // while it lowers (rigor-rs#361).
             self.recovery_iterative += 1;
             self.closure_depth += 1;
+            let operand_typed = std::mem::replace(&mut self.typed_depth, 0);
             let body = self.lower_optional_body(lambda.body().as_ref());
+            self.typed_depth = operand_typed;
             self.recovery_iterative -= 1;
             self.closure_depth -= 1;
             return self.push(Node::Lambda {
@@ -1400,13 +1444,18 @@ impl<'src> Builder<'src> {
             // `Dynamic[top]` exactly like the `Statements` carrier it replaces.
             // The values are `jump_value_type` operands — TYPED, never
             // `evaluate`d (`return h.default ||= 0` keeps `h`'s indexed
-            // narrowings on the oracle, rigor-rs#343).
-            self.typed_depth += 1;
+            // narrowings on the oracle, rigor-rs#343). Dead, not gated:
+            // `jump_value_type` types the operand for the jump value only
+            // and its scope is discarded outright, so no
+            // `OperandEffects.any?` rescues a write inside — even
+            // `return (h.default ||= (y = 1))` keeps the narrowing
+            // (rigor-rs#361).
+            self.dead_operand += 1;
             let values = ret
                 .arguments()
                 .map(|a| self.lower_body(&a.arguments()))
                 .unwrap_or_default();
-            self.typed_depth -= 1;
+            self.dead_operand -= 1;
             return self.push(Node::Return { values, span });
         }
 
@@ -1602,8 +1651,62 @@ impl<'src> Builder<'src> {
 
     /// Lower a Prism `NodeList` body (statement sequence) into owned ids in
     /// source order — the order inference relies on to populate the env.
+    ///
+    /// Inside a typed operand (`typed_depth > 0`) the list is a
+    /// `thread_operand` element list — a call's arguments, a container's
+    /// elements, a sequence's statements — so each element is gated on
+    /// `OperandEffects.any?` individually (`x = [h.default ||= 0, y = 1]`
+    /// keeps the write's narrowing while `y = 1` still evaluates —
+    /// rigor-rs#361).
     fn lower_body(&mut self, body: &ruby_prism::NodeList<'_>) -> Vec<NodeId> {
+        if self.typed_depth > 0 {
+            return body
+                .iter()
+                .map(|n| self.lower_typed_operand(&n))
+                .collect();
+        }
         body.iter().map(|n| self.lower_node(&n)).collect()
+    }
+
+    /// `thread_operand` (`statement_evaluator.rb:2509-2535`): lower one
+    /// operand ELEMENT of a typed position — a call receiver/argument, a
+    /// container element, a splat's contents, an interpolation part, a
+    /// `rescue`-modifier operand — through the `OperandEffects.any?` gate.
+    /// [`OperandMode::Dead`] subtrees (`type_of` — never evaluated) are
+    /// marked `dead_operand`; [`OperandMode::Gate`] subtrees (an
+    /// effect-bearing call, container or sequence) re-gate their own
+    /// operand children via the `typed_depth` bump; an
+    /// [`OperandMode::Eval`] element (any other effect-bearing node with
+    /// an `eval_*` handler) is `operand.evaluate`d whole — a fresh
+    /// evaluated context, `typed_depth` cleared.
+    ///
+    /// [`OperandMode`]: super::operand_effects::OperandMode
+    fn lower_typed_operand(&mut self, node: &PrismNode<'_>) -> NodeId {
+        // A never-evaluated position stays never-evaluated all the way
+        // down: `type_of` runs no handlers on any descendant.
+        if self.dead_operand > 0 {
+            return self.lower_node(node);
+        }
+        match operand_effects::operand_mode(node) {
+            OperandMode::Dead => {
+                self.dead_operand += 1;
+                let id = self.lower_node(node);
+                self.dead_operand -= 1;
+                id
+            }
+            OperandMode::Gate => {
+                self.typed_depth += 1;
+                let id = self.lower_node(node);
+                self.typed_depth -= 1;
+                id
+            }
+            OperandMode::Eval => {
+                let typed = std::mem::replace(&mut self.typed_depth, 0);
+                let id = self.lower_node(node);
+                self.typed_depth = typed;
+                id
+            }
+        }
     }
 
     /// The enclosing scope-landing marks for a fresh recovery collect —
@@ -1616,6 +1719,7 @@ impl<'src> Builder<'src> {
             next_sink: self.recovery_next_sink > 0,
             suppressed: self.recovery_suppressed > 0,
             typed: self.typed_depth > 0,
+            dead: self.dead_operand > 0,
             closure: self.closure_depth > 0,
         }
     }
@@ -1638,6 +1742,7 @@ impl<'src> Builder<'src> {
                      next_sink,
                      suppressed,
                      typed,
+                     dead,
                      closure,
                  }| {
                 let child_span = span_of(&node.location());
@@ -1652,15 +1757,24 @@ impl<'src> Builder<'src> {
                 self.recovery_iterative += u32::from(iterative);
                 self.recovery_next_sink += u32::from(next_sink);
                 self.recovery_suppressed += u32::from(suppressed);
-                self.typed_depth += u32::from(typed);
+                self.dead_operand += u32::from(dead);
                 self.closure_depth += u32::from(closure);
-                let id = self.lower_node(&node);
+                // A `typed`-marked recovered node is an operand ELEMENT —
+                // `thread_operand` re-gates it on `OperandEffects.any?`
+                // rather than forcing `evaluated: false` outright
+                // (rigor-rs#361). `lower_typed_operand` no-ops the gate
+                // when `dead_operand` already dominates.
+                let id = if typed {
+                    self.lower_typed_operand(&node)
+                } else {
+                    self.lower_node(&node)
+                };
                 self.recovery_joined -= u32::from(joined);
                 self.recovery_blocked -= u32::from(blocked);
                 self.recovery_iterative -= u32::from(iterative);
                 self.recovery_next_sink -= u32::from(next_sink);
                 self.recovery_suppressed -= u32::from(suppressed);
-                self.typed_depth -= u32::from(typed);
+                self.dead_operand -= u32::from(dead);
                 self.closure_depth -= u32::from(closure);
                 if !bound.is_empty() {
                     self.closure_bindings.push((id, bound));
@@ -1675,12 +1789,19 @@ impl<'src> Builder<'src> {
     /// its statement ids so each lands in the arena individually; a `BeginNode`
     /// body (present when the method has an inline `rescue`/`ensure`) or any
     /// other single node is lowered as one id. `None` (empty body) yields `[]`.
+    ///
+    /// Inside a typed operand (`typed_depth > 0` — e.g. a `ParenthesesNode`
+    /// operand element, an `OPERAND_SEQUENCES` member) a single-node body is
+    /// itself an operand element and re-gates on `OperandEffects.any?`
+    /// (rigor-rs#361).
     fn lower_optional_body(&mut self, body: Option<&PrismNode<'_>>) -> Vec<NodeId> {
         match body {
             None => Vec::new(),
             Some(node) => {
                 if let Some(stmts) = node.as_statements_node() {
                     self.lower_body(&stmts.body())
+                } else if self.typed_depth > 0 {
+                    vec![self.lower_typed_operand(node)]
                 } else {
                     vec![self.lower_node(node)]
                 }

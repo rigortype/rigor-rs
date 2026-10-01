@@ -169,11 +169,16 @@ pub enum Node {
     /// `evaluated` is the position flag: `true` when the write lowered where
     /// the reference *evaluates* it (a statement, a predicate, a write RHS,
     /// an `if` arm — all probed to drop prior indexed narrowings), `false`
-    /// where it is only typed — a call argument or receiver, a splat
-    /// operand, a container element, an interpolation, a `return` operand, a
-    /// `when` condition, a block/lambda body — where the reference's
-    /// `ExpressionTyper` applies no scope effects and the narrowing
-    /// survives. Mirroring `widen_attribute_write` without the flag would
+    /// where it is only typed or its scope is discarded — a `return`
+    /// operand, an `in` pattern, a `defined?` operand, a block/lambda body —
+    /// where the reference's `ExpressionTyper` applies no scope effects and
+    /// the narrowing survives. Inside a TYPED operand (a call argument or receiver, a
+    /// splat operand, a container element, an interpolation part, a
+    /// `rescue`-modifier operand) the flag is `thread_operand`'s
+    /// `OperandEffects.any?` gate (rigor-rs#361): `puts(h.default ||=
+    /// (y = 1))` evaluates — the `y = 1` outlives the operand, so the
+    /// `default=` widening lands — while `puts(h.default ||= 0)` keeps the
+    /// narrowing. Mirroring `widen_attribute_write` without the flag would
     /// drop `h[:a] ||= "s"`'s record inside `puts(h.default ||= 0)` and
     /// silence `h[:a].upcase` the reference fires on.
     AttrWrite {

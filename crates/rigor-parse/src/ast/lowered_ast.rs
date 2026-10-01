@@ -312,6 +312,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         recovery_next_sink: 0,
         recovery_suppressed: 0,
         typed_depth: 0,
+        dead_operand: 0,
         closure_depth: 0,
         scanned_inert_spans: Vec::new(),
         blocked_spans: Vec::new(),
