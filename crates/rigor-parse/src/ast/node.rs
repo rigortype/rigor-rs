@@ -172,7 +172,8 @@ pub enum Node {
     /// where it is only typed or its scope is discarded — a `return`
     /// operand, an `in` pattern, a `defined?` operand, a block/lambda body —
     /// where the reference's `ExpressionTyper` applies no scope effects and
-    /// the narrowing survives. Inside a TYPED operand (a call argument or receiver, a
+    /// the OUTER scope's narrowing survives (the block's own scope still
+    /// drops it — `closure_evaluated`, rigor-rs#366). Inside a TYPED operand (a call argument or receiver, a
     /// splat operand, a container element, an interpolation part, a
     /// `rescue`-modifier operand) the flag is `thread_operand`'s
     /// `OperandEffects.any?` gate (rigor-rs#361): `puts(h.default ||=
@@ -203,6 +204,17 @@ pub enum Node {
         /// block/lambda body — where the write's scope effect never reaches
         /// the enclosing bindings.
         evaluated: bool,
+        /// `evaluated` minus its `closure_depth` clause: `true` when the
+        /// INNERMOST enclosing deferred scope — the literal block/lambda
+        /// body the write sits in — evaluates it. `x.each { h.default ||=
+        /// 0; h[:a].m }` runs `widen_attribute_write` in the block's own
+        /// scope, dropping `h`'s indexed narrowings for the later in-body
+        /// reads while the OUTER env's records survive (rigor-rs#366). The
+        /// flag stays `false` for the positions that never evaluate even
+        /// inside the body — a typed operand without an outliving effect
+        /// (`puts(h.default ||= 0)` keeps the record), a `dead`/`suppressed`
+        /// subtree.
+        closure_evaluated: bool,
         /// The right-hand side (Prism `value`).
         value: NodeId,
         span: Span,

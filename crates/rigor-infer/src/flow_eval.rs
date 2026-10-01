@@ -11,9 +11,9 @@ use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
-    collect_flow_writes, indexed_flow_writes, join_flow_envs, multi_target_binder, qualify_self,
-    toplevel_mutations, toplevel_rebinds, widen_flow_writes, DefKind, TypeEnv, Typer,
-    ARRAY_MUTATORS, HASH_MUTATORS,
+    closure_mutations, collect_flow_writes, indexed_flow_writes, join_flow_envs,
+    multi_target_binder, qualify_self, toplevel_mutations, toplevel_rebinds, widen_flow_writes,
+    DefKind, TypeEnv, Typer, ARRAY_MUTATORS, HASH_MUTATORS,
 };
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, IndexedFlow,
@@ -85,16 +85,21 @@ impl<'i> Typer<'i> {
                     boundaries: Vec::new(),
                     rebinds: Vec::new(),
                     mutations: Vec::new(),
+                    closure_mutations: Vec::new(),
                     indexed: IndexedFlow::default(),
                 }
             }
         };
         let rebinds = toplevel_rebinds(ast);
         let mutations = toplevel_mutations(ast);
+        let closure_muts = closure_mutations(ast);
         let indexed = collect_indexed_flow(ast);
         // Boundaries only matter while a recorded effect could postdate a use
-        // site; a file with none gets the flat env for every site.
-        let record = !(rebinds.is_empty() && mutations.is_empty());
+        // site; a file with none gets the flat env for every site. An
+        // in-closure attribute write is an effect only a site inside that
+        // body can observe (rigor-rs#366), but it still requires the
+        // boundary + replay path to reach the site at all.
+        let record = !(rebinds.is_empty() && mutations.is_empty() && closure_muts.is_empty());
         let mut boundaries = Vec::new();
         for stmt in body {
             if record {
@@ -107,6 +112,7 @@ impl<'i> Typer<'i> {
             boundaries,
             rebinds,
             mutations,
+            closure_mutations: closure_muts,
             indexed,
         }
     }
@@ -139,7 +145,11 @@ impl<'i> Typer<'i> {
         };
         let stmt_span = ast.get(stmt).span();
         let later = flow.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
-            || flow.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0);
+            || flow.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0)
+            || flow
+                .closure_mutations
+                .iter()
+                .any(|(_, w, _)| w.0 >= stmt_span.0);
         if !later {
             return Cow::Borrowed(&flow.env);
         }
@@ -237,11 +247,14 @@ impl<'i> Typer<'i> {
                 self.apply_subtree_effects(ast, id, false, env, flow, interner);
             }
             // A closure body or class/module body captures the whole env —
-            // today's `ScopedEnv::at` answer, kept verbatim.
-            Node::Lambda { .. }
-            | Node::Definition { .. }
-            | Node::ClassDef { .. }
-            | Node::ModuleDef { .. } => {
+            // today's `ScopedEnv::at` answer, kept verbatim. A lambda body
+            // is also a deferred scope with its OWN evaluated attribute
+            // writes: replay them positionally inside it (rigor-rs#366).
+            Node::Lambda { .. } => {
+                *env = flow.env.clone();
+                self.closure_descend(ast, id, site, env, flow, id);
+            }
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
                 *env = flow.env.clone();
             }
             _ => self.entry_children(ast, id, site, uncond, env, flow, interner),
@@ -271,6 +284,14 @@ impl<'i> Typer<'i> {
             if cspan.0 <= site.0 && site.0 < cspan.1 {
                 if edge == FlowEdge::Barrier {
                     *env = flow.env.clone();
+                    // A literal block body's scope is the captured env —
+                    // then the body's own evaluated attribute writes drop
+                    // their indexed narrowings positionally inside it
+                    // (rigor-rs#366). A `def`/`class`/`module` body is a
+                    // fresh local scope the flat env already stands for.
+                    if matches!(ast.get(id), Node::Call { .. }) {
+                        self.closure_descend(ast, id, site, env, flow, id);
+                    }
                 } else {
                     self.entry_descend(
                         ast,
@@ -338,6 +359,150 @@ impl<'i> Typer<'i> {
         for m in &flow.indexed.slot_mutations {
             if m.span.0 >= span.0 && m.span.1 <= span.1 {
                 self.apply_slot_mutation(ast, id, m, env, interner);
+            }
+        }
+    }
+
+    /// Replay `owner`'s own [`closure_mutations`](crate::closure_mutations)
+    /// into `env` in the deferred body's evaluation order until `site` — the
+    /// block-scope `widen_attribute_write` (`x.each { h.default ||= 0;
+    /// h[:a].m }` drops `h`'s indexed narrowings for the in-body reads that
+    /// follow it) the flat env cannot see, while the outer scope's records
+    /// survive (rigor-rs#366). Called at the `FlowEdge::Barrier` boundary —
+    /// `id` is the `Node::Call`/`Node::Lambda` whose body holds the site and
+    /// IS `owner`; recursion into a nested barrier re-keys `owner` to the
+    /// inner body.
+    ///
+    /// The ordering is EVALUATION order through `flow_children`, not source
+    /// order — `h[:a].m if h.default ||= 0` inside a body evaluates the
+    /// predicate first, so the write still lands before the read's scope.
+    /// A write in a subtree that completes before the site drops outright:
+    /// the reference joins each conditional arm's post-scope and a record
+    /// absent on any path is gone. A write in a SIBLING conditional arm —
+    /// the other `if`/`case`/`when` arm, a `rescue` clause beside the
+    /// site's, a recovery carrier's other children — evaluates on a path
+    /// that never reaches the site's scope, so [`Self::same_cond_path`]
+    /// declines it.
+    fn closure_descend(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        site: rigor_parse::Span,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        owner: NodeId,
+    ) {
+        let children = self.flow_children(ast.get(id));
+        for (i, &(child, edge)) in children.iter().enumerate() {
+            let cspan = ast.get(child).span();
+            if cspan.0 <= site.0 && site.0 < cspan.1 {
+                for &(sib, sedge) in &children[..i] {
+                    if sedge == FlowEdge::Uncond
+                        || self.same_cond_path(ast.get(id), sib, child)
+                    {
+                        self.apply_closure_mutations(ast, sib, env, flow, owner);
+                    }
+                }
+                if edge == FlowEdge::Barrier {
+                    // A nested literal block/lambda: its own writes belong
+                    // to ITS body — `id` becomes the owner. Any other
+                    // barrier (a `def`/`class`/`module` body) is a fresh
+                    // local scope the replay does not enter.
+                    if matches!(
+                        ast.get(id),
+                        Node::Call {
+                            block_span: Some(_),
+                            ..
+                        } | Node::Lambda { .. }
+                    ) {
+                        self.closure_descend(ast, child, site, env, flow, id);
+                    }
+                    return;
+                }
+                self.closure_descend(ast, child, site, env, flow, owner);
+                return;
+            }
+        }
+    }
+
+    /// Whether `earlier` and `later` — both `Cond`-edged children of
+    /// `parent` — lie on one evaluation path, so `earlier`'s post-scope
+    /// reaches `later`'s entry. True except across branch alternatives:
+    /// an `if`'s two arms, a `case`'s `when`/`else` arms, a `begin`'s
+    /// protected body versus its `rescue` clauses, and a recovery
+    /// carrier's children each run exclusively — a write in one never
+    /// lands in another's scope. An `ensure` body runs after whichever
+    /// path completed, on the joined scope — a record absent on any path
+    /// is gone — so every earlier child reaches it.
+    fn same_cond_path(&self, parent: &Node, earlier: NodeId, later: NodeId) -> bool {
+        match parent {
+            Node::If {
+                then_body,
+                else_body,
+                ..
+            } => !(then_body.contains(&earlier) && else_body.contains(&later)),
+            Node::Case {
+                branches,
+                else_body,
+                ..
+            } => {
+                // Each `when` arm is its own path, as is the `else` arm;
+                // only statements sharing `else_body` stay on one path.
+                let earlier_else = else_body.contains(&earlier);
+                let later_else = else_body.contains(&later);
+                earlier_else && later_else
+                    || !(earlier_else
+                        || later_else
+                        || branches.contains(&earlier)
+                        || branches.contains(&later))
+            }
+            Node::BeginRescue {
+                ensure_body,
+                clauses,
+                ..
+            } => {
+                if ensure_body.contains(&later) {
+                    return true;
+                }
+                // The protected body and the `else` arm share the
+                // normal-completion path; each `rescue` clause is an
+                // alternative to them and to each other.
+                let clause = |c: NodeId| {
+                    clauses
+                        .iter()
+                        .position(|cl| cl.body.contains(&c))
+                };
+                clause(earlier) == clause(later)
+            }
+            // A recovery carrier's (`Recovered`/`Jump`/`Inert`) children are
+            // mutually conditional — none's effects reach a sibling.
+            Node::Statements { kind, .. } if !matches!(kind, StatementsKind::Sequence) => false,
+            // Sequential: a `while`/`for`/`when` predicate or condition
+            // before its body, an operand list, `&&`'s left — and every
+            // other shape carries `Uncond` children only.
+            _ => true,
+        }
+    }
+
+    /// Every `owner`-keyed attribute write inside `id`'s span drops its
+    /// receiver's indexed narrowings — the block-scope sibling of
+    /// [`Self::apply_subtree_effects`]' mutation half. The write drops
+    /// unconditionally on the post-subtree scope: the reference joins every
+    /// arm and a record absent on any path is gone. `method` is not carried
+    /// — every collected writer is a shape mutator, never `[]=`, so the
+    /// drop is always the receiver's whole record set.
+    fn apply_closure_mutations(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        owner: NodeId,
+    ) {
+        let span = ast.get(id).span();
+        for (o, wspan, name) in &flow.closure_mutations {
+            if *o == owner && wspan.0 >= span.0 && wspan.1 <= span.1 {
+                drop_indexed_narrowings(env, name);
             }
         }
     }
@@ -1485,6 +1650,10 @@ pub struct CheckFlow {
     /// [`toplevel_mutations`]: every `local.<mutator>` call
     /// `(call span, name, method, drop_key)`.
     mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+    /// [`closure_mutations`]: every `h.attr op= v` a literal block/lambda
+    /// body's own scope evaluates — `(body owner node, write span, receiver
+    /// name)` — replayed only for a site inside that body (rigor-rs#366).
+    closure_mutations: Vec<(NodeId, rigor_parse::Span, String)>,
     /// [`collect_indexed_flow`]: the indexed-narrowing side table
     /// (rigor-rs#325) — `operand` `h[k] ||= v` records, their spans, and
     /// element-mutator calls.

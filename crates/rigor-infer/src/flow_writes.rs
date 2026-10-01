@@ -628,6 +628,93 @@ pub(crate) fn toplevel_mutations(
         .collect()
 }
 
+/// Every compound ATTRIBUTE write a literal block/lambda body's OWN scope
+/// evaluates — `(owning body node, write span, receiver name)` — for the
+/// use-site replay `check_env_at` runs inside a barrier scope
+/// (rigor-rs#366). `x.each { h.default ||= 0; h[:a].m }` still runs
+/// `widen_attribute_write` — inside the block's scope — dropping every
+/// indexed narrowing rooted at `h` for the in-body reads that follow it,
+/// while the OUTER env's records survive. `evaluated` is `false` there (the
+/// effect never lands on the enclosing scope, rigor-rs#343), so these live
+/// in a separate side table keyed by the INNERMOST deferred body: a write
+/// in a nested block belongs to the inner body, and one in a
+/// `def`/`class`/`module` body to no closure's scope — its `h` is a
+/// different local entirely.
+///
+/// The writer must be a shape mutator exactly as `toplevel_mutations`
+/// requires (`IndexedNarrowing.mutator?` — `h.foo ||= 0` drops nothing), and
+/// the receiver a bare local, as `widen_attribute_write`'s
+/// `local_variable_node?` gate requires. `None`-owner writes (top level or
+/// a fresh scope) are `toplevel_mutations`' business.
+pub(crate) fn closure_mutations(
+    ast: &LoweredAst,
+) -> Vec<(NodeId, rigor_parse::Span, String)> {
+    let mut out = Vec::new();
+    // (node, innermost deferred body it belongs to). `NodeId` suffices —
+    // the owner's identity is what the replay matches, never its span.
+    let mut stack: Vec<(NodeId, Option<NodeId>)> = vec![(ast.root(), None)];
+    while let Some((id, owner)) = stack.pop() {
+        let n = ast.get(id);
+        if owner.is_some() {
+            if let Node::AttrWrite {
+                receiver: Some(r),
+                write_name,
+                closure_evaluated: true,
+                span,
+                ..
+            } = n
+            {
+                if is_shape_mutator(write_name)
+                    && let Node::LocalVariableRead { name, .. } = ast.get(*r)
+                {
+                    out.push((owner.unwrap(), *span, name.clone()));
+                }
+            }
+        }
+        match n {
+            Node::Call {
+                receiver,
+                args,
+                block_body,
+                block_span,
+                ..
+            } => {
+                // A `&expr` block-pass (`block_span` `None`) is an operand
+                // evaluated in the CALL's scope — its writes stay owned by
+                // the enclosing body; a literal block body is the next
+                // innermost deferred scope.
+                let inner = if block_span.is_some() { Some(id) } else { owner };
+                for &c in receiver.iter().chain(args.iter()) {
+                    stack.push((c, owner));
+                }
+                for &c in block_body {
+                    stack.push((c, inner));
+                }
+            }
+            Node::Lambda { body, .. } => {
+                for &c in body {
+                    stack.push((c, Some(id)));
+                }
+            }
+            Node::Definition { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => {
+                for &c in body {
+                    stack.push((c, None));
+                }
+            }
+            _ => {
+                let mut children = Vec::new();
+                node_child_ids(n, &mut children);
+                for c in children {
+                    stack.push((c, owner));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Every literal block/lambda SHADOW scope — `(structural body descendants,
 /// bound names)` — as an OWNED table for use-site lookups outside the
 /// rebind/mutation filters (rigor-rs#137, upstream rigor#1245). A local a

@@ -382,6 +382,18 @@ impl<'src> Builder<'src> {
                 && self.recovery_suppressed == 0
                 && (self.typed_depth == 0
                     || operand_effects::any(node));
+            // `closure_evaluated` — `evaluated` minus the `closure_depth`
+            // clause: whether the INNERMOST deferred body (a literal
+            // block/lambda — `typed_depth` restarts at its boundary) runs
+            // this write in its own scope. The block-scope
+            // `widen_attribute_write` still drops the receiver's indexed
+            // narrowings for the reads that follow it in the body
+            // (rigor-rs#366) even though the effect never lands on the
+            // enclosing scope.
+            let closure_evaluated = self.dead_operand == 0
+                && self.recovery_suppressed == 0
+                && (self.typed_depth == 0
+                    || operand_effects::any(node));
             // The receiver and RHS are `type_of` operands of the write —
             // `call_or_write_type_for` types them; a compound attribute write
             // nested inside never evaluates (`h.default ||= (h.x ||= 1)`
@@ -397,6 +409,7 @@ impl<'src> Builder<'src> {
                 compound,
                 safe_nav,
                 evaluated,
+                closure_evaluated,
                 value,
                 span,
             });
@@ -564,7 +577,10 @@ impl<'src> Builder<'src> {
                         // compound ATTRIBUTE write: `OperandEffects.any?`
                         // does not list `Call*WriteNode`s, so
                         // `x.each { h.default ||= 0 }` keeps `h`'s indexed
-                        // narrowings (rigor-rs#343). And it is NOT an
+                        // narrowings on the OUTER scope (rigor-rs#343) —
+                        // the block's own scope still drops them via
+                        // `AttrWrite::closure_evaluated` (rigor-rs#366).
+                        // And it is NOT an
                         // operand position — `call_operand_scope` threads
                         // receiver/args/`&expr` only — so the operand gate
                         // is cleared while its body lowers.
