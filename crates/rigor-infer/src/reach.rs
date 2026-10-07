@@ -240,17 +240,24 @@ impl<'i> Typer<'i> {
                     None
                 }
             }
-            // `!q` negates the pin's truthiness — folds for EVERY scalar on
-            // this deadness path (`!"x"` is `false`), unlike
-            // `folding::fold` where `!` stays Bool/Nil-only so the
-            // always-truthy TYPING does not mint a `Constant` the oracle
-            // does not warn on (`q = "x"; if !q` — the arm is dead AND the
-            // predicate silent).
+            // `!q` folds ONLY through the oracle's BOOL_UNARY / NIL_UNARY
+            // boundary (`constant_folding.rb:174-175`): a Bool/Nil pin
+            // negates to the opposite `Constant` (`!true`, `!nil`), while
+            // every other scalar receiver falls to the universal dispatch's
+            // `:! => BOOL` NOMINAL (`universal_object_dispatch.rb:63`) — so
+            // `predicate_certainty` declines and BOTH arms stay live:
+            // `q = "x"; if !q` dead-folds nothing on the oracle (probed:
+            // the arm is live AND the predicate silent). `folding::fold`
+            // already holds exactly that boundary, so this path delegates
+            // rather than negating raw truthiness — the round-2 #368 review
+            // caught the previous `matches!(s, Nil | Bool(false))` version
+            // minting `Constant[false]` for `!"x"` (arm wrongly dead, plus
+            // the `def neg; !"x"; end` strict-subset FP).
             Node::Call { receiver: Some(recv), method, args, .. }
                 if method == "!" && args.is_empty() =>
             {
                 self.expr_scalar(ast, *recv, seen)
-                    .map(|s| Scalar::Bool(matches!(s, Scalar::Nil | Scalar::Bool(false))))
+                    .and_then(|s| folding::fold(&s, "!", &[]))
             }
             // `q.is_a?(C)` / `kind_of?` / `instance_of?` on a pinned scalar
             // against a `ConstantRead` class. The generic `fold` path cannot

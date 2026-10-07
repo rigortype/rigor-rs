@@ -39,10 +39,10 @@ pub fn fold(receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar> 
     match (method, args) {
         // `nil?` answers from the pin's identity alone — `nil.nil?` is
         // `true`, every other scalar `false`. (`!` stays per-receiver —
-        // `fold_bool`/`fold_nil` — because the oracle's always-truthy
-        // TYPING declines `!` on a non-falsey scalar: `q = "x"; if !q` warns
-        // nothing, though the certainty fold still dead-folds the arm —
-        // that half lives in `expr_scalar`, which does not type predicates.)
+        // `fold_bool`/`fold_nil` — matching the oracle's BOOL_UNARY /
+        // NIL_UNARY boundary: `!"x"` types `bool` NOMINAL there, so both
+        // the predicate fold AND the certainty fold decline — `q = "x";
+        // if !q` is live on both arms and silent on the predicate.)
         ("nil?", []) => return Some(Scalar::Bool(matches!(receiver, Scalar::Nil))),
         // `!=` is the `==` fold negated — sharing the arm keeps the same
         // operand-kind declines.

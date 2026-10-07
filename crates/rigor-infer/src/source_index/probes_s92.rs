@@ -945,7 +945,11 @@ fn legacy_fold_expr(
                     closures,
                     depth + 1,
                 )?;
-                return Some(Scalar::Bool(!scalar_truthy(&s)));
+                // Post-#368-review fix, kept in lockstep with `fold_tail`'s
+                // `FoldExpr::Not`: `!` folds only through the Bool/Nil
+                // boundary (`folding::fold`), not raw truthiness — `!"x"`
+                // declines so `if !q`-style deadness matches the oracle.
+                return crate::folding::fold(&s, "!", &[]);
             }
             if args.is_empty() {
                 if let Node::ConstantRead { name, .. } = ast.get(r) {

@@ -284,12 +284,18 @@ impl SourceIndex {
                 visiting,
                 closures,
             ),
-            // `!expr`: fold the receiver and invert its Ruby truthiness (this is
-            // what turns `read_write? = !read_only?` into `true`).
+            // `!expr`: the oracle folds `!` only through BOOL_UNARY /
+            // NIL_UNARY (`constant_folding.rb:174-175`) — `read_write? =
+            // !read_only?` still folds because its operand resolves to a
+            // Bool scalar, but `def neg; !"x"; end` must DECLINE: the
+            // reference types that tail `bool` NOMINAL (universal dispatch),
+            // so `if neg` keeps both arms live and pinning `Constant[false]`
+            // here mints a `flow.always-truthy-condition` the oracle never
+            // emits. `folding::fold` holds exactly that boundary.
             FoldExpr::Not { operand } => {
                 let s =
                     self.fold_tail(operand, self_qual, self_kind, defs, memo, visiting, closures)?;
-                Some(Scalar::Bool(!scalar_truthy(&s)))
+                crate::folding::fold(&s, "!", &[])
             }
             // A core fold on a value-pinned receiver + args (`1 + 1`, `"x" ==
             // "y"`). Declines unless every part folds.
@@ -479,11 +485,6 @@ impl SourceIndex {
         }
         false
     }
-}
-
-/// Ruby truthiness of a folded scalar: only `nil` / `false` are falsey.
-pub(crate) fn scalar_truthy(s: &Scalar) -> bool {
-    !matches!(s, Scalar::Nil | Scalar::Bool(false))
 }
 
 /// ADR-0038 — harvest ONE FILE's project instance + singleton `def` bodies by
