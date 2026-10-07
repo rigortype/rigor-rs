@@ -72,7 +72,9 @@ pub(crate) enum CallSelf {
 /// begin" and "inside the ensure body".
 #[derive(Debug, Clone)]
 struct RescueArm {
-    /// The clause's own span (header + body).
+    /// The clause's own extent (header + body) — clipped at the next
+    /// clause's `rescue` keyword / the `else` / `ensure` / `end` boundary,
+    /// since Prism's `RescueNode#location` runs to the LAST clause's end.
     span: Span,
     /// The arm contributes to the continuation only when it falls through —
     /// `false` once `branch_terminates?` drops it from `live_rescues`.
@@ -85,12 +87,42 @@ struct RescueArm {
     ensure: Option<Span>,
 }
 
+/// How one local under a folded-dead predicate narrows on the arm's edge —
+/// the scope `propagate` fills the arm with (`flow_eval.rs` applies it). The
+/// boolean is the polarity the sub-expression holds at on that edge: the arm
+/// would have run on the OPPOSITE of the predicate's folded truthiness, and
+/// `!` flips it descending.
+#[derive(Clone, Debug)]
+pub(crate) enum DeadOp {
+    /// Bare-local operand — keep the env value's members consistent with the
+    /// edge: the truthy edge strips `nil`|`false`, the falsey keeps ONLY
+    /// them. `a = "x"; b = nil; if a && b` reads `a` `"x"` and `b` `Bot` on
+    /// the oracle — both pinned on `&&`'s truthy edge — while `a || b`'s
+    /// truthy edge narrows neither (which one held is ambiguous).
+    Bare(bool),
+    /// `==`/`!=`/`eql?`/`equal?`/`===` operand — keep iff `scalar == peer`'s
+    /// pin matches `eq` (the `==` family collects `eq: polarity`, `!=`
+    /// flips). A peer that does not pin declines — keeps the env value.
+    Cmp { peer: NodeId, eq: bool },
+    /// `q.nil?` receiver — keep iff `scalar is Nil` matches the polarity.
+    NilQ(bool),
+    /// `q.is_a?(C)`/`kind_of?`/`instance_of?` receiver — keep iff the
+    /// carrier's class bears `class` (`instance_of?` exact) matching `holds`.
+    Isa {
+        class: String,
+        exact: bool,
+        holds: bool,
+    },
+}
+
 /// The file's provably-dead positions.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DeadPositions {
-    /// `(arm-body hull, predicate-subject locals)` per folded `if`/`unless`
-    /// arm the reference never evaluates.
-    folded: Vec<(Span, Vec<String>)>,
+    /// `(dead arm hull, subjects)` — each subject is a local under the
+    /// folded predicate paired with the edge narrowing the arm's polarity
+    /// gives it ([`DeadOp`]). Per folded `if`/`unless` arm the reference
+    /// never evaluates.
+    folded: Vec<(Span, Vec<(String, DeadOp)>)>,
     /// One entry per `rescue` clause of every real `begin`/`rescue`.
     rescue: Vec<RescueArm>,
 }
@@ -147,9 +179,11 @@ impl DeadPositions {
         self.rescue.iter().any(|a| contains(a.span, site))
     }
 
-    /// The predicate-subject locals a site inside a folded-dead arm reads as
-    /// `Bot` — the reference's `propagate` fill of the dead edge's scope.
-    pub(crate) fn subjects_at(&self, site: Span) -> Option<&[String]> {
+    /// The predicate-subject locals a site inside a folded-dead arm narrows
+    /// — the reference's `propagate` fill of the dead edge's scope, as
+    /// `(name, op)` pairs [`flow_eval`][crate::flow_eval] applies against
+    /// the arm's env.
+    pub(crate) fn subjects_at(&self, site: Span) -> Option<&[(String, DeadOp)]> {
         self.folded
             .iter()
             .find(|(d, _)| contains(*d, site))
@@ -179,7 +213,7 @@ impl<'i> Typer<'i> {
         &self,
         ast: &LoweredAst,
         seen: &mut Vec<String>,
-    ) -> DeadPositions {
+    ) -> std::rc::Rc<DeadPositions> {
         let key = ast as *const LoweredAst as usize;
         if let Some((cached_key, cached)) = &*self.dead_cache.borrow() {
             if *cached_key == key {
@@ -187,9 +221,28 @@ impl<'i> Typer<'i> {
             }
         }
         if self.dead_in_flight.replace(true) {
-            return DeadPositions::default();
+            // A re-entrant fold sees the arms ALREADY recorded — the walk is
+            // source-ordered, so a dead arm whose write can pin a later
+            // predicate is in the accumulator by then. Answering empty
+            // instead let the dead write reach the pin anyway (`if false;
+            // q = nil; end; if q` folded `q` `nil` and killed the LIVE `then`
+            // arm — `if q; s = 1; end; Float(s).w` stayed silent while the
+            // oracle fires `w` for `Float`). `Rc` clone — O(1) per re-entry.
+            return self.dead_partial.borrow().clone();
         }
         let mut dead = DeadPositions::default();
+        *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());
+        // Publish the accumulator to re-entrant callers only where a recursion
+        // point follows AND it changed — the publish clones the recorded arms,
+        // so doing it per node is O(nodes x arms) on generated-parser files;
+        // per recursion point it stays proportional to the fold's own work.
+        let mut dirty = false;
+        let publish = |dead: &DeadPositions, dirty: &mut bool| {
+            if *dirty {
+                *self.dead_partial.borrow_mut() = std::rc::Rc::new(dead.clone());
+                *dirty = false;
+            }
+        };
         for (_, n) in ast.iter() {
             match n {
                 Node::If {
@@ -199,6 +252,7 @@ impl<'i> Typer<'i> {
                     is_unless,
                     ..
                 } => {
+                    publish(&dead, &mut dirty);
                     let Some(truthy) = self.expr_truthiness(ast, *predicate, seen) else {
                         continue;
                     };
@@ -210,31 +264,70 @@ impl<'i> Typer<'i> {
                         then_body
                     };
                     if let Some(hull) = body_hull(ast, dead_body) {
+                        // The dead arm would have run on the OPPOSITE of the
+                        // folded truthiness — `if`'s dead `then` is the
+                        // truthy edge's scope.
                         let mut subjects = Vec::new();
-                        self.predicate_locals(ast, *predicate, &mut subjects, 4);
+                        Self::predicate_edge_locals(ast, *predicate, !truthy, &mut subjects);
                         dead.folded.push((hull, subjects));
+                        dirty = true;
                     }
                 }
                 Node::BeginRescue {
+                    body,
+                    main_body,
                     clauses,
                     ensure_body,
                     span,
                     ..
                 } if !clauses.is_empty() => {
                     let ensure = body_hull(ast, ensure_body);
-                    for c in clauses {
+                    // Prism's `RescueNode#location` covers the whole clause
+                    // TAIL — clause 1 of two ends at the LAST clause's `end`
+                    // — so clip each arm's span to its own extent: the next
+                    // clause's `rescue` keyword, else the first `else` or
+                    // `ensure` statement, else the `begin`'s own end. Without
+                    // the clip a write in a LATER clause `find`s an earlier
+                    // clause here and is judged by the earlier arm's `live`.
+                    // The flat `body` layout is `main | per-clause
+                    // (exceptions then body) | else | ensure`, so the `else`
+                    // statements are the span between the clause ids and the
+                    // ensure ids.
+                    let clause_ids: usize = clauses
+                        .iter()
+                        .map(|c| c.exceptions.len() + c.body.len())
+                        .sum();
+                    let else_start = body
+                        .get(main_body.len() + clause_ids..body.len() - ensure_body.len())
+                        .and_then(|ids| ids.first())
+                        .map(|&id| ast.get(id).span().0);
+                    for (i, c) in clauses.iter().enumerate() {
+                        publish(&dead, &mut dirty);
+                        let own_end = clauses
+                            .get(i + 1)
+                            .map(|n| n.span.0)
+                            .or(else_start)
+                            .or_else(|| ensure.map(|e| e.0))
+                            .unwrap_or(span.1);
                         dead.rescue.push(RescueArm {
-                            span: c.span,
+                            span: (c.span.0, own_end),
                             live: !self.arm_exits(ast, &c.body, seen),
                             end: span.1,
                             ensure,
                         });
+                        dirty = true;
                     }
                 }
                 _ => {}
             }
         }
         self.dead_in_flight.set(false);
+        // Evict the scan-time truthiness answers: they read the PARTIAL dead
+        // set, so post-scan callers refold against the settled one.
+        for key in self.truthy_provisional.borrow_mut().drain() {
+            self.truthy_memo.borrow_mut().remove(&key);
+        }
+        let dead = std::rc::Rc::new(dead);
         *self.dead_cache.borrow_mut() = Some((key, dead.clone()));
         dead
     }
@@ -266,7 +359,15 @@ impl<'i> Typer<'i> {
         }
         let out = self.expr_truthiness_fold(ast, pred, seen);
         self.truthy_in_flight.borrow_mut().remove(&key);
+        // A fold run inside `dead_positions` read the PARTIAL dead set —
+        // cache it for the scan's own reuse, but stamp it provisional so the
+        // scan's end evicts it and post-scan callers refold against the
+        // settled set. Without the in-scan memo the re-entrant fanout is
+        // exponential (mail's generated parsers: 1 s to >60 s per file).
         self.truthy_memo.borrow_mut().insert(key, out);
+        if self.dead_in_flight.get() {
+            self.truthy_provisional.borrow_mut().insert(key);
+        }
         out
     }
 
@@ -283,9 +384,12 @@ impl<'i> Typer<'i> {
                 return self.expr_truthiness(ast, *value, seen);
             }
             // `a && b` / `a || b` — `Node::Logical`; the short-circuit folds:
-            // `&&` is falsey when the left folds falsey, or the right does
-            // after a truthy left; `||` mirrors. An unresolved left keeps the
-            // value unknown (`u && nil` is `u | nil`, not falsey).
+            // `&&` is falsey when either side folds falsey (`u && false` is
+            // falsey whatever `u` is — a falsey `u` is itself falsey) and
+            // truthy only when both do; `||` mirrors — truthy on either
+            // (`u || true` folds truthy), falsey only when both are. An
+            // unresolved side keeps the value unknown otherwise (`u && nil`
+            // is `u | nil`, not falsey).
             Node::Logical {
                 left,
                 right,
@@ -298,15 +402,15 @@ impl<'i> Typer<'i> {
                 );
                 return if *is_and {
                     match (l, r) {
-                        (Some(false), _) | (Some(true), Some(false)) => Some(false),
-                        (Some(true), Some(true)) => Some(true),
-                        _ => None,
+                        (Some(false), _) | (_, Some(false)) => Some(false),
+                        (Some(true), rr) => rr,
+                        (None, _) => None,
                     }
                 } else {
                     match (l, r) {
-                        (Some(true), _) | (Some(false), Some(true)) => Some(true),
-                        (Some(false), Some(false)) => Some(false),
-                        _ => None,
+                        (Some(true), _) | (_, Some(true)) => Some(true),
+                        (Some(false), rr) => rr,
+                        (None, _) => None,
                     }
                 };
             }
@@ -648,31 +752,43 @@ impl<'i> Typer<'i> {
         self.index.singleton_declared_own(qual, name)
     }
 
-    /// The locals a predicate NARROWS on the dead edge, floored to `Bot` for
-    /// a site inside the folded arm. Bare-local subjects are the reference's
-    /// edge-narrow (`if q` with `q` folded falsey types `q` `Bot` inside the
-    /// arm); the comparison/guard receivers (`==`, `!=`, `nil?`, `is_a?`, …)
-    /// and `!`/`&&`/`||` compounds narrow those locals the same way or
-    /// decline — `Bot` is never above the reference's edge scope.
-    pub(crate) fn predicate_locals(
-        &self,
+    /// The locals a folded-dead predicate narrows on the ARM's edge —
+    /// `polarity` is the edge the arm runs on (the opposite of the folded
+    /// truthiness, `!`-flipped descending) — each as a `(name, op)` pair
+    /// whose [`DeadOp`] `flow_eval` applies against the arm's env.
+    ///
+    /// The collection mirrors the reference's edge narrowing rather than
+    /// flooring every subject to `Bot`: a bare operand narrows by the
+    /// edge's truthiness (`a = "x"; b = nil; if a && b` — the dead `then` is
+    /// `&&`'s truthy edge — reads `a` `"x"`, `b` `Bot`; `a || b`'s TRUTHY
+    /// edge is ambiguous — either operand may have held — so neither
+    /// narrows, and `a = nil; b = nil; if a || b; a.w` fires `w for nil` on
+    /// the oracle). `!x` swaps the polarity; `==`-family, `nil?` and
+    /// `is_a?` operands narrow against the pinned peer / `nil` / the named
+    /// class. `respond_to?` and every other call narrow nothing — the
+    /// oracle keeps the carrier (`q = "x"; …; if q.respond_to?(:upcase) ||
+    /// r; else; q.w` fires `w for "x"`).
+    pub(crate) fn predicate_edge_locals(
         ast: &LoweredAst,
         pred: NodeId,
-        out: &mut Vec<String>,
-        depth: u32,
+        polarity: bool,
+        out: &mut Vec<(String, DeadOp)>,
     ) {
-        if depth == 0 {
-            return;
-        }
-        match ast.get(pred) {
-            Node::LocalVariableRead { name, .. } | Node::LocalVariableWrite { name, .. }
-                if !out.contains(name) =>
-            {
-                out.push(name.clone());
+        let push = |out: &mut Vec<(String, DeadOp)>, name: &str, op: DeadOp| {
+            if !out.iter().any(|(n, _)| n == name) {
+                out.push((name.to_string(), op));
             }
-            Node::Logical { left, right, .. } => {
-                self.predicate_locals(ast, *left, out, depth - 1);
-                self.predicate_locals(ast, *right, out, depth - 1);
+        };
+        match ast.get(pred) {
+            Node::LocalVariableRead { name, .. } | Node::LocalVariableWrite { name, .. } => {
+                push(out, name, DeadOp::Bare(polarity));
+            }
+            // `a && b` pins BOTH operands on the truthy edge; on the falsey
+            // edge either may have failed, so neither narrows. `a || b`
+            // mirrors — both narrow on the falsey edge only.
+            Node::Logical { left, right, is_and, .. } if *is_and == polarity => {
+                Self::predicate_edge_locals(ast, *left, polarity, out);
+                Self::predicate_edge_locals(ast, *right, polarity, out);
             }
             Node::Call {
                 receiver,
@@ -684,23 +800,70 @@ impl<'i> Typer<'i> {
             } if block_body.is_empty() && !*safe_nav => match method.as_str() {
                 "!" if args.is_empty() => {
                     if let Some(r) = receiver {
-                        self.predicate_locals(ast, *r, out, depth - 1);
+                        Self::predicate_edge_locals(ast, *r, !polarity, out);
                     }
                 }
-                "==" | "!=" | "eql?" | "equal?" | "nil?" | "is_a?" | "kind_of?"
-                | "instance_of?" | "===" | "respond_to?" => {
+                "==" | "!=" | "eql?" | "equal?" | "===" if args.len() == 1 => {
+                    // `q == p` holds on the `polarity` edge: the local keeps
+                    // iff `local == peer` matches the expected equality.
+                    let eq = if method == "!=" { !polarity } else { polarity };
                     if let Some(r) = receiver {
-                        self.predicate_locals(ast, *r, out, depth - 1);
+                        Self::predicate_cmp_local(ast, *r, args[0], eq, out);
                     }
-                    if matches!(method.as_str(), "==" | "!=" | "eql?" | "equal?" | "===") {
-                        for &a in args {
-                            self.predicate_locals(ast, a, out, depth - 1);
+                    if let Some(r) = receiver {
+                        Self::predicate_cmp_local(ast, args[0], *r, eq, out);
+                    }
+                }
+                "nil?" if args.is_empty() => {
+                    if let Some(r) = receiver {
+                        if let Node::LocalVariableRead { name, .. }
+                        | Node::LocalVariableWrite { name, .. } = ast.get(*r)
+                        {
+                            push(out, name, DeadOp::NilQ(polarity));
+                        }
+                    }
+                }
+                "is_a?" | "kind_of?" | "instance_of?" if args.len() == 1 => {
+                    if let Some(r) = receiver {
+                        if let Node::LocalVariableRead { name, .. }
+                        | Node::LocalVariableWrite { name, .. } = ast.get(*r)
+                        {
+                            let op = match ast.get(args[0]) {
+                                Node::ConstantRead { name: class, .. } => DeadOp::Isa {
+                                    class: class.clone(),
+                                    exact: method == "instance_of?",
+                                    holds: polarity,
+                                },
+                                // A non-constant class operand — the
+                                // reference declines to narrow; the local
+                                // keeps its env value (omit the subject).
+                                _ => return,
+                            };
+                            push(out, name, op);
                         }
                     }
                 }
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Collect `id` as a `==`-family comparison operand against `peer`,
+    /// when `id` is a bare local.
+    fn predicate_cmp_local(
+        ast: &LoweredAst,
+        id: NodeId,
+        peer: NodeId,
+        eq: bool,
+        out: &mut Vec<(String, DeadOp)>,
+    ) {
+        if let Node::LocalVariableRead { name, .. } | Node::LocalVariableWrite { name, .. } =
+            ast.get(id)
+        {
+            if !out.iter().any(|(n, _)| n == name) {
+                out.push((name.clone(), DeadOp::Cmp { peer, eq }));
+            }
         }
     }
 

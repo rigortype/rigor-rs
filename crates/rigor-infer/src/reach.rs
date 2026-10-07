@@ -240,6 +240,48 @@ impl<'i> Typer<'i> {
                     None
                 }
             }
+            // `!q` negates the pin's truthiness — folds for EVERY scalar on
+            // this deadness path (`!"x"` is `false`), unlike
+            // `folding::fold` where `!` stays Bool/Nil-only so the
+            // always-truthy TYPING does not mint a `Constant` the oracle
+            // does not warn on (`q = "x"; if !q` — the arm is dead AND the
+            // predicate silent).
+            Node::Call { receiver: Some(recv), method, args, .. }
+                if method == "!" && args.is_empty() =>
+            {
+                self.expr_scalar(ast, *recv, seen)
+                    .map(|s| Scalar::Bool(matches!(s, Scalar::Nil | Scalar::Bool(false))))
+            }
+            // `q.is_a?(C)` / `kind_of?` / `instance_of?` on a pinned scalar
+            // against a `ConstantRead` class. The generic `fold` path cannot
+            // reach it (the class operand is a constant, not a scalar), but
+            // the predicate fold needs it — `q = "x"; if q.is_a?(Integer)`
+            // is certainty-dead on the oracle.
+            Node::Call { receiver: Some(recv), method, args, .. }
+                if matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?") =>
+            {
+                let recv_scalar = self.expr_scalar(ast, *recv, seen)?;
+                let [arg] = args.as_slice() else {
+                    return None;
+                };
+                let Node::ConstantRead { name: class, .. } = ast.get(*arg) else {
+                    return None;
+                };
+                let own = folding::scalar_class(&recv_scalar);
+                if own == class.as_str() {
+                    Some(Scalar::Bool(true))
+                } else if method == "instance_of?" {
+                    // `instance_of?` is exact-class only.
+                    Some(Scalar::Bool(false))
+                } else {
+                    // `is_a?`/`kind_of?` answer through ancestors
+                    // (`1.is_a?(Numeric)` is true); an unmodelled hierarchy
+                    // declines rather than fold false.
+                    self.index
+                        .ancestor_names(own)
+                        .map(|anc| Scalar::Bool(anc.contains(&class.as_str())))
+                }
+            }
             Node::Call { receiver: Some(recv), method, args, .. } => {
                 let recv_scalar = self.expr_scalar(ast, *recv, seen)?;
                 let arg_scalars = args
@@ -1367,9 +1409,23 @@ fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
             .collect(),
         Node::Loop { body, .. }
         | Node::Statements { body, kind: StatementsKind::Sequence, .. } => vec![body],
-        Node::BeginRescue { body, ensure_body, clauses, .. } => [body.as_slice(), ensure_body]
-            .into_iter()
+        // NOT the flat `body`: it merges main + per-clause + else + ensure
+        // ids into one source-ordered list, so `latest_definite_assignment`'s
+        // prefix scan would let a `rescue` clause's write pose as a definite
+        // assignment "before" an `ensure` or sibling-clause read — the oracle
+        // evaluates each section from the `begin`'s ENTRY scope
+        // (`collect_rescue_chain_results`, `statement_evaluator.rb:1673`),
+        // and only the section's own prefix orders against the read. For the
+        // reused carriers (empty `clauses`/`ensure_body`) `main_body` IS
+        // `body`, so nothing changes there.
+        Node::BeginRescue {
+            main_body,
+            ensure_body,
+            clauses,
+            ..
+        } => std::iter::once(main_body.as_slice())
             .chain(clauses.iter().map(|c| c.body.as_slice()))
+            .chain(std::iter::once(ensure_body.as_slice()))
             .collect(),
         Node::Call { block_body, .. } => vec![block_body],
         _ => Vec::new(),

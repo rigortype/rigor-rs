@@ -15,6 +15,7 @@ use crate::{
     multi_target_binder, qualify_self, toplevel_mutations, toplevel_rebinds, widen_flow_writes,
     DefKind, TypeEnv, Typer, ARRAY_MUTATORS, HASH_MUTATORS,
 };
+use crate::dead::DeadOp;
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, IndexedFlow,
     MUTATOR_METHODS, STRING_MUTATORS,
@@ -87,7 +88,7 @@ impl<'i> Typer<'i> {
                     mutations: Vec::new(),
                     closure_mutations: Vec::new(),
                     indexed: IndexedFlow::default(),
-                    dead: crate::dead::DeadPositions::default(),
+                    dead: std::rc::Rc::new(crate::dead::DeadPositions::default()),
                 }
             }
         };
@@ -188,9 +189,13 @@ impl<'i> Typer<'i> {
         // `Case` — `apply_subtree_effects` is flat there).
         if let Some(subjects) = flow.dead.subjects_at(site) {
             let mut env = base.into_owned();
-            let bot = interner.bottom();
-            for name in subjects {
-                env.insert(name.clone(), bot);
+            for (name, op) in subjects {
+                let cur = env
+                    .get(name)
+                    .copied()
+                    .unwrap_or_else(|| interner.untyped());
+                let narrowed = self.dead_subject_type(ast, cur, op, interner);
+                env.insert(name.clone(), narrowed);
             }
             return Cow::Owned(env);
         }
@@ -236,7 +241,7 @@ impl<'i> Typer<'i> {
                     self.entry_descend(ast, predicate, site, uncond, env, flow, interner);
                     return;
                 }
-                self.apply_subtree_effects(ast, predicate, uncond, env, flow, interner);
+                self.apply_subtree_effects(ast, predicate, site, uncond, env, flow, interner);
                 let branch: &[NodeId] = if then_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
@@ -265,7 +270,7 @@ impl<'i> Typer<'i> {
                         return;
                     }
                     if sspan.1 <= site.0 {
-                        self.apply_subtree_effects(ast, s, false, env, flow, interner);
+                        self.apply_subtree_effects(ast, s, site, false, env, flow, interner);
                     }
                 }
             }
@@ -312,16 +317,16 @@ impl<'i> Typer<'i> {
                         return;
                     }
                 }
-                self.apply_subtree_effects(ast, id, false, env, flow, interner);
+                self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
             }
             // Conditional container: nothing inside orders against the site
             // (recovery carrier, loop, case/when), so apply every contained
             // effect conservatively — byte-identical to the flat env.
             Node::Statements { kind, .. } if !matches!(kind, StatementsKind::Sequence) => {
-                self.apply_subtree_effects(ast, id, false, env, flow, interner);
+                self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
             }
             Node::Loop { .. } | Node::Case { .. } | Node::When { .. } => {
-                self.apply_subtree_effects(ast, id, false, env, flow, interner);
+                self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
             }
             // A closure body or class/module body captures the whole env —
             // today's `ScopedEnv::at` answer, kept verbatim. A lambda body
@@ -417,6 +422,7 @@ impl<'i> Typer<'i> {
                 self.apply_subtree_effects(
                     ast,
                     child,
+                    site,
                     uncond && edge == FlowEdge::Uncond,
                     env,
                     flow,
@@ -426,15 +432,146 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// The value a [`DeadOp`] subject local reads inside a folded-dead arm —
+    /// the reference's `propagate` edge scope (`dead.rs` has the shapes). An
+    /// unbound local reads `untyped` (the reference's `dynamic_top`); a
+    /// carrier member the op cannot decide keeps its env value rather than
+    /// invent `Bot` where the oracle does not narrow.
+    fn dead_subject_type(
+        &self,
+        ast: &LoweredAst,
+        ty: TypeId,
+        op: &DeadOp,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match op {
+            // A bare operand keeps the edge-consistent members only —
+            // `q = nil; if q; q.w` reads `Bot`, but `a = "x"; …; if a && b`
+            // keeps `a` `"x"` (its truthy part is nonempty).
+            DeadOp::Bare(edge) => {
+                let edge = *edge;
+                self.narrow_type_members(
+                    ty,
+                    |t| match t {
+                        Type::Constant(s) => {
+                            matches!(s, Scalar::Nil | Scalar::Bool(false)) != edge
+                        }
+                        // `Dynamic`/`Top` may hold either and keep both
+                        // ways (the decline side); `Bottom` stays `Bottom`.
+                        Type::Top | Type::Dynamic(_) | Type::Bottom => true,
+                        // Every other carrier (`Nominal`, `Singleton`,
+                        // shapes, `Void`, …) is non-`nil`/`false`.
+                        _ => edge,
+                    },
+                    interner,
+                )
+            }
+            // `q == p` on the arm's edge: the local keeps iff its pin
+            // compares as the edge requires. An unpinned peer declines —
+            // the fold that made the arm dead came from a sibling operand.
+            DeadOp::Cmp { peer, eq } => {
+                let eq = *eq;
+                match self.expr_scalar(ast, *peer, &mut Vec::new()) {
+                    Some(lit) => self.narrow_type_members(
+                        ty,
+                        |t| match t {
+                            Type::Constant(s) => (*s == lit) == eq,
+                            _ => true,
+                        },
+                        interner,
+                    ),
+                    None => ty,
+                }
+            }
+            DeadOp::NilQ(want) => {
+                let want = *want;
+                self.narrow_type_members(
+                    ty,
+                    |t| match t {
+                        Type::Constant(s) => matches!(s, Scalar::Nil) == want,
+                        _ => true,
+                    },
+                    interner,
+                )
+            }
+            DeadOp::Isa {
+                class,
+                exact,
+                holds,
+            } => {
+                let (class, exact, holds) = (class.as_str(), *exact, *holds);
+                self.narrow_type_members(
+                    ty,
+                    |t| {
+                        let own = match t {
+                            Type::Constant(s) => Some(crate::folding::scalar_class(s)),
+                            Type::Nominal { class: c, .. } => self.index.class_name_for_id(*c),
+                            _ => None,
+                        };
+                        match own {
+                            Some(own) => {
+                                let is = own == class
+                                    || (!exact
+                                        && self.index.ancestor_names(own).is_some_and(
+                                            |anc| anc.contains(&class),
+                                        ));
+                                is == holds
+                            }
+                            // `Dynamic`/shapes/etc — the class test is
+                            // undecidable; keep the member.
+                            None => true,
+                        }
+                    },
+                    interner,
+                )
+            }
+        }
+    }
+
+    /// `keep` a type's members individually — a `Union` narrows memberwise
+    /// and collapses to `Bottom` when none survive; a lone carrier keeps or
+    /// empties as a whole. Shared by [`Self::dead_subject_type`]'s edge
+    /// narrowing.
+    fn narrow_type_members(
+        &self,
+        ty: TypeId,
+        keep: impl Fn(&Type) -> bool,
+        interner: &mut Interner,
+    ) -> TypeId {
+        match interner.get(ty) {
+            Type::Union(members) => {
+                let members = members.clone();
+                let kept: Vec<TypeId> = members
+                    .into_iter()
+                    .filter(|m| keep(interner.get(*m)))
+                    .collect();
+                match kept.as_slice() {
+                    [] => interner.bottom(),
+                    [only] => *only,
+                    _ => interner.intern(Type::Union(kept)),
+                }
+            }
+            t => {
+                if keep(t) {
+                    ty
+                } else {
+                    interner.bottom()
+                }
+            }
+        }
+    }
+
     /// Apply every recorded effect inside `id`'s span to `env`: a rebind
     /// always widens `Dynamic` (the flat env's own envelope); a mutation
     /// mints the unconditional nominal only when it sits on an
     /// all-`Uncond` descent from `id` — a conditional position widens
     /// `Dynamic`, byte-identical to the flat env.
+    #[allow(clippy::too_many_arguments)]
     fn apply_subtree_effects(
         &self,
         ast: &LoweredAst,
         id: NodeId,
+        site: rigor_parse::Span,
         uncond: bool,
         env: &mut TypeEnv,
         flow: &CheckFlow,
@@ -442,14 +579,20 @@ impl<'i> Typer<'i> {
     ) {
         let span = ast.get(id).span();
         for (wspan, name) in &flow.rebinds {
-            if wspan.0 >= span.0 && wspan.1 <= span.1 {
+            if wspan.0 >= span.0
+                && wspan.1 <= span.1
+                && flow.dead.write_reaches(*wspan, site)
+            {
                 let u = interner.untyped();
                 env.insert(name.clone(), u);
                 drop_indexed_narrowings(env, name);
             }
         }
         for (wspan, name, method, drop_key) in &flow.mutations {
-            if wspan.0 >= span.0 && wspan.1 <= span.1 {
+            if wspan.0 >= span.0
+                && wspan.1 <= span.1
+                && flow.dead.write_reaches(*wspan, site)
+            {
                 self.apply_mutation_effects(
                     ast,
                     &flow.indexed,
@@ -465,7 +608,10 @@ impl<'i> Typer<'i> {
             }
         }
         for m in &flow.indexed.slot_mutations {
-            if m.span.0 >= span.0 && m.span.1 <= span.1 {
+            if m.span.0 >= span.0
+                && m.span.1 <= span.1
+                && flow.dead.write_reaches(m.span, site)
+            {
                 self.apply_slot_mutation(ast, id, m, env, interner);
             }
         }
@@ -1625,15 +1771,23 @@ impl<'i> Typer<'i> {
                             (&else_body, &then_body)
                         };
                         // The reference fills the dead arm's scope from the
-                        // dead EDGE — the predicate's subjects are `Bot`
-                        // there (`q = nil; if q; if q; end` warns on neither
-                        // on the oracle, the inner predicate typing `Bot`).
+                        // dead EDGE — the arm would have run on the opposite
+                        // of the folded truthiness, and each predicate-
+                        // subject local narrows to the members consistent
+                        // with that edge (`q = nil; if q; if q; end` warns
+                        // on neither on the oracle — the inner `q` is `Bot`;
+                        // `a = "x"; b = nil; if a && b; a.w` fires `w` for
+                        // `"x"`, `&&`'s truthy edge keeping `a`).
                         let mut dead_env = env.clone();
                         let mut subjects = Vec::new();
-                        self.predicate_locals(ast, predicate, &mut subjects, 4);
-                        let bot = interner.bottom();
-                        for name in subjects {
-                            dead_env.insert(name, bot);
+                        Self::predicate_edge_locals(ast, predicate, !truthy, &mut subjects);
+                        for (name, op) in subjects {
+                            let cur = dead_env
+                                .get(&name)
+                                .copied()
+                                .unwrap_or_else(|| interner.untyped());
+                            let narrowed = self.dead_subject_type(ast, cur, &op, interner);
+                            dead_env.insert(name, narrowed);
                         }
                         self.flow_eval_scope(
                             ast, dead_arm, &mut dead_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
@@ -1748,24 +1902,40 @@ impl<'i> Typer<'i> {
                         );
                         arm_envs.push(cenv);
                     }
-                    // `ensure` runs on EVERY exit path — with rescue clauses
-                    // its entry env is the JOIN of the `begin` entry scope,
-                    // the post-try env and every arm's exit env, so a write
-                    // from any one path widens rather than folds (probed:
-                    // `r = nil; begin; r = true; rescue; ensure; if r` is
-                    // SILENT on the oracle; so are the rescue-arm-only and
-                    // unbound variants). With NO rescue clause the only
-                    // pre-ensure path is the try body — `begin; r = true;
-                    // ensure; if r` warns TRUTHY on the oracle — so `ensure`
-                    // there sees the post-try env directly.
-                    let mut eenv = if clauses.is_empty() {
-                        scratch
-                    } else {
-                        let mut j = join_flow_envs(env, &scratch, interner);
-                        for cenv in &arm_envs {
-                            j = join_flow_envs(&j, cenv, interner);
+                    // `ensure` runs on EVERY exit path — its entry env is
+                    // the oracle's `exit_scope`:
+                    // `reduce_scopes_with_nil_injection([primary_scope,
+                    // *live_rescues])` (`statement_evaluator.rb:1331`) — the
+                    // post-try env joined with every LIVE arm's exit env, so
+                    // a write from any one path widens rather than folds
+                    // (probed: `r = nil; begin; r = true; rescue; ensure;
+                    // if r` is SILENT on the oracle; so are the
+                    // rescue-arm-only and unbound variants). A terminating
+                    // arm drops from `live_rescues` — its writes never reach
+                    // `ensure` (`rescue; q = 1; raise; ensure; Float(q).w` is
+                    // silent on the oracle; `q = 1; … rescue; q = 2; raise;
+                    // ensure; if q` warns TRUTHY — the post-try `q` survives
+                    // alone). With NO live arm (and with no clause at all)
+                    // `exit_scope` IS the post-try env — `begin; r = true;
+                    // ensure; if r` warns TRUTHY.
+                    let mut eenv = {
+                        let mut live = clauses
+                            .iter()
+                            .zip(arm_envs.iter())
+                            .filter(|(c, _)| {
+                                !self.arm_exits(ast, &c.body, &mut Vec::new())
+                            })
+                            .map(|(_, e)| e);
+                        match live.next() {
+                            None => scratch,
+                            Some(first) => {
+                                let mut j = join_flow_envs(&scratch, first, interner);
+                                for cenv in live {
+                                    j = join_flow_envs(&j, cenv, interner);
+                                }
+                                j
+                            }
                         }
-                        j
                     };
                     self.flow_eval_scope(
                         ast, &ensure_body, &mut eenv, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
@@ -1809,6 +1979,49 @@ impl<'i> Typer<'i> {
         self_kind: DefKind,
         interner: &mut Interner,
     ) -> TypeId {
+        // `l && r` / `l || r`: a bare `type_of` declines a `Logical` to
+        // `Dynamic`, but the oracle's `scope.evaluate` (`expression_typer.rb:
+        // type_of_and_or`) gives the RESULT type — an elided edge contributes
+        // its operand (`a = "x"; b = nil; if a && b` → `Constant[nil]`:
+        // falsey `"x"` is `Bot` so the result is `b`'s), a live left edge
+        // unions its surviving fragment with `r`'s type (`u = ENV["K"]; if u
+        // && false` → `u | false` — NOT a Constant, so the oracle stays
+        // silent there). Computing the union — not a minted `bool` — is what
+        // keeps `check_always_truthy` firing exactly on the oracle's rows.
+        // `r` is typed against the UN-narrowed env: the true port of
+        // `evaluate` would narrow it by the left edge, a precision this
+        // slice leaves to `type_of`'s own `Logical` coverage.
+        if let Node::Logical { left, right, is_and, .. } = ast.get(predicate) {
+            let lt = self.type_of(ast, *left, env, interner);
+            let rt = self.type_of(ast, *right, env, interner);
+            // The left edge's certainty: env type first, then the reach-fold
+            // (`q = "x"; q.is_a?(Integer) || r` — `type_of` leaves the guard
+            // call untyped but `expr_scalar` pins it `false`, so the result
+            // IS `r`'s, exactly as the oracle's `eval_with_edges` reads the
+            // pinned scope).
+            let lc = self
+                .predicate_certainty(lt, interner)
+                .or_else(|| {
+                    self.expr_scalar(ast, *left, &mut Vec::new())
+                        .map(|s| !matches!(s, Scalar::Nil | Scalar::Bool(false)))
+                });
+            let res = match (lc, *is_and) {
+                // Left edge is certain: the result is the decided operand —
+                // `&&` on always-falsey keeps `l`, on always-truthy is `r`.
+                (Some(false), true) | (Some(true), false) => lt,
+                (Some(true), true) | (Some(false), false) => rt,
+                // Both edges live: `falsey(l) | r` / `truthy(l) | r`.
+                (None, true) => {
+                    let fragment = self.narrow_falsey(lt, interner);
+                    self.union_members(vec![fragment, rt], interner)
+                }
+                (None, false) => {
+                    let fragment = self.narrow_truthy(lt, interner);
+                    self.union_members(vec![fragment, rt], interner)
+                }
+            };
+            return res;
+        }
         if let Node::Call { receiver: None, method, block_body, .. } = ast.get(predicate) {
             if block_body.is_empty() {
                 let method = method.clone();
@@ -1978,6 +2191,7 @@ pub struct CheckFlow {
     /// `if`/`unless` arms and terminating `rescue` arms); `check_env_at`
     /// floors a dead arm's predicate subjects to `Bot` and `entry_descend`
     /// skips a dead arm's internal effects — the reference never evaluates
-    /// the arm (`live_branch_for_if` / `live_rescues`).
-    dead: crate::dead::DeadPositions,
+    /// the arm (`live_branch_for_if` / `live_rescues`). Shared with the
+    /// `Typer`'s `dead_cache` entry — `Rc` so neither clones the set.
+    dead: std::rc::Rc<crate::dead::DeadPositions>,
 }

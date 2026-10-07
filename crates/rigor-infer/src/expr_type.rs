@@ -696,7 +696,7 @@ impl<'i> Typer<'i> {
 
     /// `Type::Combinator.union` over a member list — `Bot` folds away
     /// through `Algebra::join`.
-    fn union_members(&self, members: Vec<TypeId>, interner: &mut Interner) -> TypeId {
+    pub(crate) fn union_members(&self, members: Vec<TypeId>, interner: &mut Interner) -> TypeId {
         let mut it = members.into_iter();
         let Some(first) = it.next() else {
             return interner.intern(Type::Bottom);

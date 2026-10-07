@@ -212,6 +212,10 @@ impl SourceIndex {
     }
 
     /// Fold one (re)definition of a QUALIFIED override class into the index.
+    // too_many_arguments: the folded surface (methods, visibilities,
+    // ancestors, kind) is one record's fields — a bundle struct would just
+    // rename the argument list.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ingest_override_class(
         &mut self,
         qualified: &str,
