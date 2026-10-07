@@ -330,6 +330,7 @@ fn nearest_ancestor_returns_unknown_visibility_for_methods_only_entry() {
         OverrideClass {
             superclass: None,
             includes: Vec::new(),
+            extends: Vec::new(),
             method_visibilities: HashMap::new(),
             methods: ["foo".to_string()].into_iter().collect(),
             is_module: false,

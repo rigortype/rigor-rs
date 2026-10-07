@@ -36,6 +36,24 @@ use rigor_types::Scalar;
 /// (overflow, divide-by-zero, non-ASCII string) where Rust's result could
 /// diverge from Ruby's.
 pub fn fold(receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar> {
+    match (method, args) {
+        // `nil?` answers from the pin's identity alone — `nil.nil?` is
+        // `true`, every other scalar `false`. (`!` stays per-receiver —
+        // `fold_bool`/`fold_nil` — matching the oracle's BOOL_UNARY /
+        // NIL_UNARY boundary: `!"x"` types `bool` NOMINAL there, so both
+        // the predicate fold AND the certainty fold decline — `q = "x";
+        // if !q` is live on both arms and silent on the predicate.)
+        ("nil?", []) => return Some(Scalar::Bool(matches!(receiver, Scalar::Nil))),
+        // `!=` is the `==` fold negated — sharing the arm keeps the same
+        // operand-kind declines.
+        ("!=", [_]) => {
+            return match fold(receiver, "==", args) {
+                Some(Scalar::Bool(b)) => Some(Scalar::Bool(!b)),
+                _ => None,
+            };
+        }
+        _ => {}
+    }
     match receiver {
         Scalar::Int(a) => fold_int(*a, method, args),
         // A Bignum: every fold declines. The decimal spelling carries no `i64`

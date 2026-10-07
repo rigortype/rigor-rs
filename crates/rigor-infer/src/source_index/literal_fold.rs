@@ -111,12 +111,43 @@ impl SourceIndex {
         method: &str,
     ) -> Option<Scalar> {
         let (owner, kind) = match self_kind {
-            DefKind::Singleton => (self_qual.to_string(), DefKind::Singleton),
+            DefKind::Singleton => self.resolve_singleton_slot(self_qual, method)?,
             DefKind::Instance => (self.resolve_instance_owner(self_qual, method)?, DefKind::Instance),
         };
         self.literal_returns
             .get(&(owner, method.to_string(), kind))
             .cloned()
+    }
+
+    /// The `(owner, kind)` an implicit-self call inside a SINGLETON self
+    /// (`def self.x`, `class <<`, a class/module body statement) resolves
+    /// `method` against — the reference's `singleton_def_through_ancestors`
+    /// (`scope.rb`): the class's own singleton table first, then each
+    /// `extend`ed module's INSTANCE surface (ScopeIndexer folds `extend M`
+    /// into the extender's own singleton), then the SUPERCLASS chain alone —
+    /// an `include`d module's `def self.x` is not callable on the includer.
+    fn resolve_singleton_slot(&self, qual: &str, method: &str) -> Option<(String, DefKind)> {
+        let mut current = qual.to_string();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut visited = 0usize;
+        loop {
+            if !seen.insert(current.clone()) {
+                return None;
+            }
+            visited += 1;
+            if visited > OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return None;
+            }
+            if self.owner_defines(&current, method, DefKind::Singleton) {
+                return Some((current, DefKind::Singleton));
+            }
+            for ext in self.extended_names(&current) {
+                if self.owner_defines(&ext, method, DefKind::Instance) {
+                    return Some((ext, DefKind::Instance));
+                }
+            }
+            current = self.project_superclass(&current)?;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -238,7 +269,7 @@ impl SourceIndex {
             // recursive fold declines on that param leaf.
             FoldExpr::SelfCall { method } => {
                 let (owner, kind) = match self_kind {
-                    DefKind::Singleton => (self_qual.to_string(), DefKind::Singleton),
+                    DefKind::Singleton => self.resolve_singleton_slot(self_qual, method)?,
                     DefKind::Instance => {
                         (self.resolve_instance_owner(self_qual, method)?, DefKind::Instance)
                     }
@@ -253,12 +284,18 @@ impl SourceIndex {
                 visiting,
                 closures,
             ),
-            // `!expr`: fold the receiver and invert its Ruby truthiness (this is
-            // what turns `read_write? = !read_only?` into `true`).
+            // `!expr`: the oracle folds `!` only through BOOL_UNARY /
+            // NIL_UNARY (`constant_folding.rb:174-175`) — `read_write? =
+            // !read_only?` still folds because its operand resolves to a
+            // Bool scalar, but `def neg; !"x"; end` must DECLINE: the
+            // reference types that tail `bool` NOMINAL (universal dispatch),
+            // so `if neg` keeps both arms live and pinning `Constant[false]`
+            // here mints a `flow.always-truthy-condition` the oracle never
+            // emits. `folding::fold` holds exactly that boundary.
             FoldExpr::Not { operand } => {
                 let s =
                     self.fold_tail(operand, self_qual, self_kind, defs, memo, visiting, closures)?;
-                Some(Scalar::Bool(!scalar_truthy(&s)))
+                crate::folding::fold(&s, "!", &[])
             }
             // A core fold on a value-pinned receiver + args (`1 + 1`, `"x" ==
             // "y"`). Declines unless every part folds.
@@ -309,7 +346,7 @@ impl SourceIndex {
     }
 
     /// Whether the qualified `owner` has its OWN project `def` of `(method, kind)`.
-    fn owner_defines(&self, owner: &str, method: &str, kind: DefKind) -> bool {
+    pub(crate) fn owner_defines(&self, owner: &str, method: &str, kind: DefKind) -> bool {
         self.definers
             .get(&(method.to_string(), kind))
             .is_some_and(|owners| owners.iter().any(|o| o == owner))
@@ -450,11 +487,6 @@ impl SourceIndex {
     }
 }
 
-/// Ruby truthiness of a folded scalar: only `nil` / `false` are falsey.
-pub(crate) fn scalar_truthy(s: &Scalar) -> bool {
-    !matches!(s, Scalar::Nil | Scalar::Bool(false))
-}
-
 /// ADR-0038 — harvest ONE FILE's project instance + singleton `def` bodies by
 /// QUALIFIED owner name (the same lexical walk `collect_override_classes` uses,
 /// so `module Gitlab; module Database` keys `Gitlab::Database`), appending each
@@ -483,33 +515,56 @@ pub(crate) fn walk_fold_defs(
             }
             let qualified = qualify(prefix, name);
             for &child in body {
-                if let Node::Definition {
-                    name,
-                    singleton_name,
-                    body: def_body,
-                    has_explicit_return,
-                    ..
-                } = ast.get(child)
-                {
-                    let entry = match (name, singleton_name) {
-                        (Some(m), _) => Some((m.clone(), DefKind::Instance)),
-                        (None, Some(m)) => Some((m.clone(), DefKind::Singleton)),
-                        _ => None,
-                    };
-                    if let Some((method, kind)) = entry {
-                        if let Some(&tail) = def_body.last() {
-                            out.push(HarvestedFoldDef {
-                                owner: qualified.clone(),
-                                method,
-                                kind,
-                                // Depth 0: `fold_key_sites` always entered
-                                // `fold_expr` at 0, so the cap resets per SITE
-                                // exactly as it did per key.
-                                tail: capture_fold_tail(ast, tail, 0),
-                                has_explicit_return: *has_explicit_return,
-                            });
+                match ast.get(child) {
+                    // `class << <operand>` — its `def`s file on the
+                    // operand's SINGLETON (`singleton_context_for`):
+                    // `self` keeps the enclosing owner, a constant names
+                    // itself, anything else names nothing.
+                    Node::Definition {
+                        is_singleton_class: true,
+                        singleton_operand,
+                        body: sclass_body,
+                        ..
+                    } => {
+                        let sowner = match singleton_operand.map(|op| ast.get(op)) {
+                            Some(Node::SelfExpr { .. }) => Some(qualified.clone()),
+                            Some(Node::ConstantRead { name, .. }) if !name.is_empty() => {
+                                Some(name.strip_prefix("::").unwrap_or(name).to_string())
+                            }
+                            _ => None,
+                        };
+                        if let Some(sowner) = sowner {
+                            walk_singleton_fold_defs(ast, sclass_body, &sowner, out);
                         }
                     }
+                    Node::Definition {
+                        name,
+                        singleton_name,
+                        body: def_body,
+                        has_explicit_return,
+                        ..
+                    } => {
+                        let entry = match (name, singleton_name) {
+                            (Some(m), _) => Some((m.clone(), DefKind::Instance)),
+                            (None, Some(m)) => Some((m.clone(), DefKind::Singleton)),
+                            _ => None,
+                        };
+                        if let Some((method, kind)) = entry {
+                            if let Some(&tail) = def_body.last() {
+                                out.push(HarvestedFoldDef {
+                                    owner: qualified.clone(),
+                                    method,
+                                    kind,
+                                    // Depth 0: `fold_key_sites` always entered
+                                    // `fold_expr` at 0, so the cap resets per SITE
+                                    // exactly as it did per key.
+                                    tail: capture_fold_tail(ast, tail, 0),
+                                    has_explicit_return: *has_explicit_return,
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             }
             let child_prefix = split_qualified(&qualified);
@@ -518,6 +573,57 @@ pub(crate) fn walk_fold_defs(
             }
         }
         _ => {}
+    }
+}
+
+/// The `def` children of a `class << <operand>` body — each files on the
+/// resolved singleton owner ([`walk_fold_defs`]'s sclass arm) as
+/// `DefKind::Singleton`. Nested `class <<` bodies re-resolve their operand
+/// the same way; a `def self.x` / `def <recv>.x` inside one is a
+/// singleton-of-singleton and stays out of scope.
+fn walk_singleton_fold_defs(
+    ast: &LoweredAst,
+    body: &[NodeId],
+    owner: &str,
+    out: &mut Vec<HarvestedFoldDef>,
+) {
+    for &child in body {
+        match ast.get(child) {
+            Node::Definition {
+                is_singleton_class: true,
+                singleton_operand,
+                body: inner,
+                ..
+            } => {
+                let inner_owner = match singleton_operand.map(|op| ast.get(op)) {
+                    Some(Node::SelfExpr { .. }) => Some(owner.to_string()),
+                    Some(Node::ConstantRead { name, .. }) if !name.is_empty() => {
+                        Some(name.strip_prefix("::").unwrap_or(name).to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(inner_owner) = inner_owner {
+                    walk_singleton_fold_defs(ast, inner, &inner_owner, out);
+                }
+            }
+            Node::Definition {
+                name: Some(m),
+                body: def_body,
+                has_explicit_return,
+                ..
+            } => {
+                if let Some(&tail) = def_body.last() {
+                    out.push(HarvestedFoldDef {
+                        owner: owner.to_string(),
+                        method: m.clone(),
+                        kind: DefKind::Singleton,
+                        tail: capture_fold_tail(ast, tail, 0),
+                        has_explicit_return: *has_explicit_return,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
 }
 

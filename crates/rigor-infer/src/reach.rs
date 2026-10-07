@@ -3,9 +3,10 @@
 //! cvar / gvar / chain arms) — the gate of the #521 / #1021 untyped-argument
 //! declines — with the definite-assignment and untyped-root helpers behind it.
 
-use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
+use rigor_parse::{LoweredAst, Node, NodeId, Span, StatementsKind};
 use rigor_types::Scalar;
 
+use crate::dead::DeadPositions;
 use crate::folding;
 use crate::Typer;
 
@@ -67,9 +68,29 @@ impl<'i> Typer<'i> {
     /// root ([`Typer::chain_reach`]).
     fn expr_reach(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Reach {
         match ast.get(id) {
-            Node::If { then_body, else_body, .. } => self
-                .body_value_reach(ast, then_body, seen)
-                .join(self.body_value_reach(ast, else_body, seen)),
+            Node::If {
+                predicate,
+                then_body,
+                else_body,
+                is_unless,
+                ..
+            } => match self.expr_truthiness(ast, *predicate, seen) {
+                // rigor-rs#368 — `live_branch_for_if`: a folded predicate
+                // contributes only the live arm's value; the dead arm's
+                // writes and expressions are never evaluated.
+                Some(truthy) => self.body_value_reach(
+                    ast,
+                    if truthy != *is_unless {
+                        then_body
+                    } else {
+                        else_body
+                    },
+                    seen,
+                ),
+                None => self
+                    .body_value_reach(ast, then_body, seen)
+                    .join(self.body_value_reach(ast, else_body, seen)),
+            },
             Node::Logical { left, right, .. } => {
                 self.expr_reach(ast, *left, seen).join(self.expr_reach(ast, *right, seen))
             }
@@ -83,6 +104,11 @@ impl<'i> Typer<'i> {
             Node::BeginRescue { body, clauses, .. } => {
                 let mut reach = self.body_value_reach(ast, body, seen);
                 for c in clauses {
+                    // rigor-rs#368 — `live_rescues`: a terminating arm's value
+                    // does not join the `begin`'s type.
+                    if self.arm_exits(ast, &c.body, seen) {
+                        continue;
+                    }
                     reach = reach.join(self.body_value_reach(ast, &c.body, seen));
                 }
                 reach
@@ -187,7 +213,12 @@ impl<'i> Typer<'i> {
     /// Shares `seen` with the reach walk — a local's read is keyed exactly as
     /// [`Typer::root_reach`] keys a `Local` root, so a self-referential write
     /// (`while c; v = "abc"[v]; end`) terminates on the decline side.
-    fn expr_scalar(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Option<Scalar> {
+    pub(crate) fn expr_scalar(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+    ) -> Option<Scalar> {
         if let Some(scalar) = literal_scalar(ast, id) {
             return Some(scalar);
         }
@@ -207,6 +238,55 @@ impl<'i> Typer<'i> {
                     pin
                 } else {
                     None
+                }
+            }
+            // `!q` folds ONLY through the oracle's BOOL_UNARY / NIL_UNARY
+            // boundary (`constant_folding.rb:174-175`): a Bool/Nil pin
+            // negates to the opposite `Constant` (`!true`, `!nil`), while
+            // every other scalar receiver falls to the universal dispatch's
+            // `:! => BOOL` NOMINAL (`universal_object_dispatch.rb:63`) — so
+            // `predicate_certainty` declines and BOTH arms stay live:
+            // `q = "x"; if !q` dead-folds nothing on the oracle (probed:
+            // the arm is live AND the predicate silent). `folding::fold`
+            // already holds exactly that boundary, so this path delegates
+            // rather than negating raw truthiness — the round-2 #368 review
+            // caught the previous `matches!(s, Nil | Bool(false))` version
+            // minting `Constant[false]` for `!"x"` (arm wrongly dead, plus
+            // the `def neg; !"x"; end` strict-subset FP).
+            Node::Call { receiver: Some(recv), method, args, .. }
+                if method == "!" && args.is_empty() =>
+            {
+                self.expr_scalar(ast, *recv, seen)
+                    .and_then(|s| folding::fold(&s, "!", &[]))
+            }
+            // `q.is_a?(C)` / `kind_of?` / `instance_of?` on a pinned scalar
+            // against a `ConstantRead` class. The generic `fold` path cannot
+            // reach it (the class operand is a constant, not a scalar), but
+            // the predicate fold needs it — `q = "x"; if q.is_a?(Integer)`
+            // is certainty-dead on the oracle.
+            Node::Call { receiver: Some(recv), method, args, .. }
+                if matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?") =>
+            {
+                let recv_scalar = self.expr_scalar(ast, *recv, seen)?;
+                let [arg] = args.as_slice() else {
+                    return None;
+                };
+                let Node::ConstantRead { name: class, .. } = ast.get(*arg) else {
+                    return None;
+                };
+                let own = folding::scalar_class(&recv_scalar);
+                if own == class.as_str() {
+                    Some(Scalar::Bool(true))
+                } else if method == "instance_of?" {
+                    // `instance_of?` is exact-class only.
+                    Some(Scalar::Bool(false))
+                } else {
+                    // `is_a?`/`kind_of?` answer through ancestors
+                    // (`1.is_a?(Numeric)` is true); an unmodelled hierarchy
+                    // declines rather than fold false.
+                    self.index
+                        .ancestor_names(own)
+                        .map(|anc| Scalar::Bool(anc.contains(&class.as_str())))
                 }
             }
             Node::Call { receiver: Some(recv), method, args, .. } => {
@@ -239,8 +319,48 @@ impl<'i> Typer<'i> {
     /// `Float(kwargs[:upload_duration])` — and a chain over a union keeps that
     /// untyped member beside whatever the precise members answer. A chain over
     /// a precise root is precise, but never a `rand`-safe literal. An
-    /// expression with no root (an implicit-self call, `self`) is precise.
+    /// expression with no root (an implicit-self call, `self`) is precise —
+    /// UNLESS the link itself is `dynamic_top` on the reference
+    /// (rigor-rs#368): an unresolved implicit-self call (`Float(q)` with `q`
+    /// never bound — `call.unresolved-toplevel` already names it at file
+    /// scope), a bare `self` outside any class/module, or a call whose
+    /// pinned receiver's class lacks the method (`Float(x.no_such)` — the
+    /// inner `call.undefined-method` fires, but the value it feeds is
+    /// `dynamic_top`, so the `Float` declines).
     fn chain_reach(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Reach {
+        let mut cur = id;
+        for _ in 0..8 {
+            let Node::Call {
+                receiver, method, ..
+            } = ast.get(cur)
+            else {
+                break;
+            };
+            match receiver {
+                Some(r) => {
+                    if let Some(cls) = self.expr_receiver_class(ast, *r, seen) {
+                        // `cls`'s whole chain is loaded and lacks `method` ⇒
+                        // witnessed-absent ⇒ the link types `dynamic_top`.
+                        if !self.index.class_has_method(cls, method) {
+                            return Reach::UNTYPED;
+                        }
+                    }
+                    cur = *r;
+                }
+                None => {
+                    if !self.implicit_self_resolves(ast, cur, method) {
+                        return Reach::UNTYPED;
+                    }
+                    break;
+                }
+            }
+        }
+        if let Node::SelfExpr { span } = ast.get(cur) {
+            if self.enclosing_prefix(*span).is_empty() {
+                return Reach::UNTYPED;
+            }
+            return Reach::OPAQUE;
+        }
         let Some(root) = untyped_expr_root(ast, id, 8) else { return Reach::OPAQUE };
         let reach = self.root_reach(ast, &root, ast.get(id).span(), seen);
         if matches!(ast.get(id), Node::Call { .. }) {
@@ -258,6 +378,74 @@ impl<'i> Typer<'i> {
         } else {
             reach
         }
+    }
+
+    /// The class a pinned receiver dispatches on for the missing-method link
+    /// check — `expr_scalar` carries the value, [`folding::scalar_class`] the
+    /// class that value's calls dispatch against.
+    fn expr_receiver_class(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+    ) -> Option<&'static str> {
+        self.expr_scalar(ast, id, seen)
+            .map(|s| folding::scalar_class(&s))
+    }
+
+    /// Whether the receiverless (`implicit-self`) call `call_id` resolves to
+    /// anything the reference could type. The gates mirror
+    /// `call.unresolved-toplevel`'s silence envelope: at file scope a
+    /// toplevel `def`, an `Object`/`Kernel` surface name, or `gem`; inside a
+    /// class/module body additionally the enclosing class's own project
+    /// methods (and any core class surface the qualified name loads). An
+    /// unresolved call types `dynamic_top` on the reference — never a
+    /// dispatchable value — so `chain_reach` answers untyped.
+    fn implicit_self_resolves(&self, ast: &LoweredAst, call_id: NodeId, method: &str) -> bool {
+        if method == "gem" {
+            return true;
+        }
+        // `puts`/`raise`/`p` and friends live on Object's (Kernel-included)
+        // instance surface at every scope.
+        if self.index.class_has_method("Object", method) {
+            return true;
+        }
+        if self.source.is_toplevel_def(Some(ast.file_key()), method)
+            || self.toplevel_def_in_file(ast, method)
+        {
+            return true;
+        }
+        let prefix = self.enclosing_prefix(ast.get(call_id).span());
+        if prefix.is_empty() {
+            return false;
+        }
+        let qual = prefix.join("::");
+        self.source
+            .project_declares_method(self.file_key(), &qual, method)
+            || self.index.class_has_method(&qual, method)
+    }
+
+    /// A `def <name>` at FILE scope in this AST — the same-file fallback for
+    /// `is_toplevel_def` when the `Typer` was built on an empty
+    /// [`crate::SourceIndex`] (unit tests). Definitions nested inside a
+    /// class/module/def are not file-scope.
+    fn toplevel_def_in_file(&self, ast: &LoweredAst, name: &str) -> bool {
+        let containers: Vec<Span> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::ClassDef { span, .. }
+                | Node::ModuleDef { span, .. }
+                | Node::Definition { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        ast.iter().any(|(_, n)| {
+            matches!(n, Node::Definition { name: Some(m), span, .. }
+                if m == name
+                    && !containers
+                        .iter()
+                        .any(|&c| c != *span && c.0 <= span.0 && span.1 <= c.1))
+        })
     }
 
     /// Dispatch a root to its arm. `seen` carries the `(root, position)` pairs
@@ -403,6 +591,22 @@ impl<'i> Typer<'i> {
                     note_binder(*span, true);
                 }
                 Node::Loop { span, .. } if contains(*span, use_span) => loop_spans.push(*span),
+                // `retry` re-enters the `begin`: a rescue arm's own writes can
+                // reach reads earlier in the arm on the next pass — the same
+                // carrier a loop is (rigor-rs#368; `retried = false; begin;
+                // rescue; return if retried; retried = true; retry` does not
+                // pin `retried` on the oracle). The carrier is the WHOLE
+                // `begin` span, not just the arm: the try body re-runs first,
+                // so its writes reach the arm's reads on the retried pass
+                // (`attempts += 1` above `rescue; if attempts < MAX; retry` —
+                // gitlab-foss `migrator.rb`).
+                Node::BeginRescue { clauses, span, .. } => {
+                    for c in clauses {
+                        if contains(c.span, use_span) && self.clause_retries(ast, c.span) {
+                            loop_spans.push(*span);
+                        }
+                    }
+                }
                 Node::Call { receiver, method, block_body, .. } if !block_body.is_empty() => {
                     // A call's own span covers its receiver and arguments too, so
                     // the binder region is the BLOCK BODY's extent.
@@ -489,6 +693,12 @@ impl<'i> Typer<'i> {
         // excluded identically (rigor-rs#357).
         let case_clauses = unevaluated_case_clause_spans(ast);
         let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
+        // rigor-rs#368 — provably-dead positions: a folded `if`/`unless` arm's
+        // writes reach nothing at all, and a `rescue` arm's write reaches a
+        // read inside its own arm or `ensure`, plus the post-`begin` scope —
+        // only when the arm falls through (`live_rescues`,
+        // `branch_terminates?`). The position rule is `dead.write_reaches`.
+        let dead = self.dead_positions(ast, seen);
         let in_region = |s: rigor_parse::Span| {
             if !contains(region, s) || in_case_clause(s) || ast.in_blocked_carrier(s) {
                 return false;
@@ -534,6 +744,7 @@ impl<'i> Typer<'i> {
                 Node::LocalVariableWrite { name, value, span, .. }
                     if name == root
                         && in_region(*span)
+                        && dead.write_reaches(*span, use_span)
                         && !closure_bound_elsewhere(ast, *span, root, use_span) =>
                 {
                     writes.push((*span, LocalWrite::Plain(*value)));
@@ -541,19 +752,23 @@ impl<'i> Typer<'i> {
                 // A `for` index binds the element type, which this analysis
                 // cannot see into: decline (rigor-rs#151).
                 Node::Loop { index, .. }
-                    if index.iter().any(|(n, s)| n == root && in_region(*s)) =>
+                    if index.iter().any(|(n, s)| {
+                        n == root && in_region(*s) && dead.write_reaches(*s, use_span)
+                    }) =>
                 {
                     return (Reach::UNKNOWN, None);
                 }
                 Node::LocalVariableOpWrite { name, value, span }
                     if name == root
                         && in_region(*span)
+                        && dead.write_reaches(*span, use_span)
                         && !closure_bound_elsewhere(ast, *span, root, use_span) =>
                 {
                     writes.push((*span, LocalWrite::Op(*value)));
                 }
                 Node::MultiWrite { targets, value, span, .. }
                     if in_region(*span)
+                        && dead.write_reaches(*span, use_span)
                         && !closure_bound_elsewhere(ast, *span, root, use_span)
                         && targets.bound_names().iter().any(|(n, _)| n == root) =>
                 {
@@ -561,7 +776,10 @@ impl<'i> Typer<'i> {
                 }
                 Node::BeginRescue { clauses, span, .. }
                     if in_region(*span)
-                        && clauses.iter().any(|c| c.bound_name.as_deref() == Some(root)) =>
+                        && clauses.iter().any(|c| {
+                            c.bound_name.as_deref() == Some(root)
+                                && dead.write_reaches(c.span, use_span)
+                        }) =>
                 {
                     return (Reach::OPAQUE, None);
                 }
@@ -601,7 +819,8 @@ impl<'i> Typer<'i> {
         // closure's own POSITION, not the read's: the definite-assignment cut
         // runs to the closure-bearing statement and no further into its body.
         let kill_span = operand.map(|(b, _)| ast.get(b).span()).unwrap_or(use_span);
-        let kill = latest_definite_assignment(ast, flow_body, kill_span, &is_target);
+        let kill =
+            self.latest_definite_assignment(ast, flow_body, kill_span, &is_target, &dead, seen);
         // The pin runs beside the reach join: `None` until a value
         // contributes, `Some(Some(s))` while every contributor folds to the
         // same scalar, `Some(None)` once one does not (`pin_join`).
@@ -715,6 +934,10 @@ impl<'i> Typer<'i> {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
         let scope = self.class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
+        // rigor-rs#368 — same dead-position rule as `local_reach`, applied to
+        // the class-body / top-level writes (a `def`-interior write is the
+        // text-scanned census entry the reference's class-ivar index keeps).
+        let dead = self.dead_positions(ast, seen);
         let case_clauses = unevaluated_case_clause_spans(ast);
         let in_case_clause =
             |s: rigor_parse::Span| case_clauses.iter().any(|&c| c.0 <= s.0 && s.1 <= c.1);
@@ -728,31 +951,31 @@ impl<'i> Typer<'i> {
                 {
                     return Reach::OPAQUE;
                 }
+                // A `def`-body write is what the class-ivar table collects —
+                // a TEXT scan, so it sees a write inside a `when` condition
+                // too (`case v when (@x = 1; Integer) then …` inside a `def`
+                // fires on the reference) — while a class-body/top-level
+                // write binds only inside that same body, which a
+                // never-evaluated condition extent does not reach
+                // (rigor-rs#341), and neither does an extent recovered
+                // under a blocked wrapper position (rigor-rs#357).
                 Node::InstanceVariableWrite { name, value, span, .. }
-                    if name == root && scope.contains(*span) =>
+                    if name == root
+                        && scope.contains(*span)
+                        && (scope.def_of(*span).is_some()
+                            || (!use_in_def
+                                && !in_case_clause(*span)
+                                && !ast.in_blocked_carrier(*span)
+                                && dead.write_reaches(*span, use_span))) =>
                 {
-                    // A `def`-body write is what the class-ivar table collects —
-                    // a TEXT scan, so it sees a write inside a `when` condition
-                    // too (`case v when (@x = 1; Integer) then …` inside a `def`
-                    // fires on the reference) — while a class-body/top-level
-                    // write binds only inside that same body, which a
-                    // never-evaluated condition extent does not reach
-                    // (rigor-rs#341), and neither does an extent recovered
-                    // under a blocked wrapper position (rigor-rs#357).
-                    if scope.def_of(*span).is_some()
-                        || (!use_in_def
-                            && !in_case_clause(*span)
-                            && !ast.in_blocked_carrier(*span))
-                    {
-                        writes.push((*span, *value));
-                    }
+                    writes.push((*span, *value));
                 }
                 Node::Definition { span, is_singleton_class: false, .. }
-                    if contains(*span, use_span) && scope.contains(*span) =>
+                    if contains(*span, use_span)
+                        && scope.contains(*span)
+                        && def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0) =>
                 {
-                    if def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0) {
-                        def = Some((*span, id));
-                    }
+                    def = Some((*span, id));
                 }
                 Node::Loop { span, .. } if contains(*span, use_span) => loopy = true,
                 Node::Lambda { span, .. } if contains(*span, use_span) => loopy = true,
@@ -772,12 +995,15 @@ impl<'i> Typer<'i> {
             if let Node::Definition { body, .. } = ast.get(id) {
                 let is_target =
                     |n: &Node| matches!(n, Node::InstanceVariableWrite { name, .. } if name == root);
-                if let Some(kill) = latest_definite_assignment(ast, body, use_span, &is_target) {
+                if let Some(kill) =
+                    self.latest_definite_assignment(ast, body, use_span, &is_target, &dead, seen)
+                {
                     let mut reach = Reach::NONE;
                     for &(span, value) in &writes {
                         if contains(d, span)
                             && span.0 >= kill.0
                             && (loopy || span.1 <= use_span.0)
+                            && dead.write_reaches(span, use_span)
                         {
                             reach = reach.join(self.expr_reach(ast, value, seen));
                         }
@@ -813,6 +1039,8 @@ impl<'i> Typer<'i> {
     ) -> Reach {
         let scope = self.class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
+        // rigor-rs#368 — same dead-position rule as `ivar_reach`.
+        let dead = self.dead_positions(ast, seen);
         let mut writes: Vec<NodeId> = Vec::new();
         for (_, n) in ast.iter() {
             if let Node::VariableWrite { name, value, span } = n {
@@ -822,7 +1050,9 @@ impl<'i> Typer<'i> {
                 if name == root
                     && scope.contains(*span)
                     && (scope.def_of(*span).is_some()
-                        || (!use_in_def && !ast.in_blocked_carrier(*span)))
+                        || (!use_in_def
+                            && !ast.in_blocked_carrier(*span)
+                            && dead.write_reaches(*span, use_span)))
                 {
                     writes.push(*value);
                 }
@@ -838,6 +1068,10 @@ impl<'i> Typer<'i> {
     /// or `$g = "s"` in a def keeps firing (rows r15/g3), and a gvar with any
     /// untyped write is imprecise (rows n4, g01/g02).
     fn gvar_reach(&self, ast: &LoweredAst, root: &str, seen: &mut Vec<String>) -> Reach {
+        // rigor-rs#368 — NOT dead-position filtered: `build_program_global_index`
+        // is a program-wide TEXT census, so `$g = 1` inside a folded-dead arm or
+        // a terminating rescue arm still reaches the read (probed: `if false;
+        // $g = 1; end; Float($g).w` fires `for 1.0` on the oracle).
         let writes: Vec<NodeId> = ast
             .iter()
             .filter_map(|(_, n)| match n {
@@ -1091,12 +1325,17 @@ enum LocalWrite {
 /// definitely assigns or ends in `return` (row l05), or a sequence containing
 /// such a statement. A `begin` body with a `rescue` does not count — the
 /// `rescue` path may skip the write (row l24, reference-silent).
-fn latest_definite_assignment(
-    ast: &LoweredAst,
-    body: &[NodeId],
-    use_span: rigor_parse::Span,
-    is_target: &dyn Fn(&Node) -> bool,
-) -> Option<rigor_parse::Span> {
+impl<'i> Typer<'i> {
+    #[allow(clippy::too_many_arguments)]
+    fn latest_definite_assignment(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        use_span: rigor_parse::Span,
+        is_target: &dyn Fn(&Node) -> bool,
+        dead: &DeadPositions,
+        seen: &mut Vec<String>,
+    ) -> Option<rigor_parse::Span> {
     let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
     let holds = |b: &[NodeId]| b.iter().any(|&s| contains(ast.get(s).span(), use_span));
     // A `when` clause's conditions / an `in` clause's pattern are never
@@ -1113,7 +1352,7 @@ fn latest_definite_assignment(
             break;
         };
         for &s in &body[..pos] {
-            if definitely_assigns(ast, s, is_target, &case_clauses) {
+            if self.definitely_assigns(ast, s, is_target, &case_clauses, dead, seen) {
                 kill = Some(ast.get(s).span());
             }
         }
@@ -1157,6 +1396,7 @@ fn latest_definite_assignment(
         }
     }
     kill
+    }
 }
 
 /// The statement lists a node sequences — an `if`'s arms, a `case`'s `when`
@@ -1176,83 +1416,131 @@ fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
             .collect(),
         Node::Loop { body, .. }
         | Node::Statements { body, kind: StatementsKind::Sequence, .. } => vec![body],
-        Node::BeginRescue { body, ensure_body, clauses, .. } => [body.as_slice(), ensure_body]
-            .into_iter()
+        // NOT the flat `body`: it merges main + per-clause + else + ensure
+        // ids into one source-ordered list, so `latest_definite_assignment`'s
+        // prefix scan would let a `rescue` clause's write pose as a definite
+        // assignment "before" an `ensure` or sibling-clause read — the oracle
+        // evaluates each section from the `begin`'s ENTRY scope
+        // (`collect_rescue_chain_results`, `statement_evaluator.rb:1673`),
+        // and only the section's own prefix orders against the read. For the
+        // reused carriers (empty `clauses`/`ensure_body`) `main_body` IS
+        // `body`, so nothing changes there.
+        Node::BeginRescue {
+            main_body,
+            ensure_body,
+            clauses,
+            ..
+        } => std::iter::once(main_body.as_slice())
             .chain(clauses.iter().map(|c| c.body.as_slice()))
+            .chain(std::iter::once(ensure_body.as_slice()))
             .collect(),
         Node::Call { block_body, .. } => vec![block_body],
         _ => Vec::new(),
     }
 }
 
-/// Whether statement `id` is a `return`, possibly wrapped in the clause-less
-/// carrier an `else` clause lowers to — an `if` arm that never falls through.
-fn ends_in_return(ast: &LoweredAst, id: NodeId) -> bool {
-    match ast.get(id) {
-        Node::Return { .. } => true,
-        Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
-            body.last().is_some_and(|&l| ends_in_return(ast, l))
-        }
-        Node::Statements { body, .. } => body.last().is_some_and(|&l| ends_in_return(ast, l)),
-        _ => false,
-    }
-}
-
-/// Whether statement `id` assigns on every path that falls through it — see
-/// [`latest_definite_assignment`].
-fn definitely_assigns(
-    ast: &LoweredAst,
-    id: NodeId,
-    is_target: &dyn Fn(&Node) -> bool,
-    case_clauses: &[rigor_parse::Span],
-) -> bool {
+impl<'i> Typer<'i> {
+    /// Whether statement `id` assigns on every path that falls through it —
+    /// see [`Typer::latest_definite_assignment`]. A folded-dead position
+    /// assigns nothing (rigor-rs#368), and a folded `if`/`unless` asks only
+    /// its live arm; the terminating-arm test is the reference's
+    /// `branch_unconditionally_exits?` port ([`Typer::stmt_exits`]).
+    fn definitely_assigns(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        is_target: &dyn Fn(&Node) -> bool,
+        case_clauses: &[rigor_parse::Span],
+        dead: &DeadPositions,
+        seen: &mut Vec<String>,
+    ) -> bool {
     let node = ast.get(id);
     let span = node.span();
     // A statement inside a `when` condition / `in` pattern is never
     // scope-evaluated — it assigns nothing on the reference
     // ([`unevaluated_case_clause_spans`], rigor-rs#341), and neither does
     // one recovered under a blocked wrapper position (a modifier rescue's
-    // flattened `case` — rigor-rs#357).
+    // flattened `case` — rigor-rs#357) or one inside a folded-dead arm
+    // (rigor-rs#368).
     if case_clauses
         .iter()
         .any(|&c| c.0 <= span.0 && span.1 <= c.1)
         || ast.in_blocked_carrier(span)
+        || dead.covers(span)
     {
         return false;
     }
     if is_target(node) {
         return true;
     }
-    let arm = |b: &[NodeId]| {
-        b.iter().any(|&s| definitely_assigns(ast, s, is_target, case_clauses))
-            || b.last().is_some_and(|&l| ends_in_return(ast, l))
-    };
     match node {
-        Node::If { predicate, then_body, else_body, .. } => {
-            definitely_assigns(ast, *predicate, is_target, case_clauses)
-                || (arm(then_body) && arm(else_body))
+        Node::If { predicate, then_body, else_body, is_unless, .. } => {
+            self.definitely_assigns(ast, *predicate, is_target, case_clauses, dead, seen)
+                || match self.expr_truthiness(ast, *predicate, seen) {
+                    // The fold keeps one arm (`live_branch_for_if`) — only it
+                    // can definitely assign.
+                    Some(truthy) => self.arm_assigns(
+                        ast,
+                        if truthy != *is_unless {
+                            then_body
+                        } else {
+                            else_body
+                        },
+                        is_target,
+                        case_clauses,
+                        dead,
+                        seen,
+                    ),
+                    None => {
+                        self.arm_assigns(ast, then_body, is_target, case_clauses, dead, seen)
+                            && self
+                                .arm_assigns(ast, else_body, is_target, case_clauses, dead, seen)
+                    }
+                }
         }
         Node::Case { predicate, branches, else_body, .. } => {
-            predicate.is_some_and(|p| definitely_assigns(ast, p, is_target, case_clauses))
-                || (!else_body.is_empty()
-                    && arm(else_body)
-                    && branches.iter().all(|&w| match ast.get(w) {
-                        Node::When { body, .. } => arm(body),
-                        _ => false,
-                    }))
+            predicate.is_some_and(|p| {
+                self.definitely_assigns(ast, p, is_target, case_clauses, dead, seen)
+            }) || (!else_body.is_empty()
+                && self.arm_assigns(ast, else_body, is_target, case_clauses, dead, seen)
+                && branches.iter().all(|&w| match ast.get(w) {
+                    Node::When { body, .. } => {
+                        self.arm_assigns(ast, body, is_target, case_clauses, dead, seen)
+                    }
+                    _ => false,
+                }))
         }
         // Only a real sequence: a write in a `rescue` modifier or another
         // recovery carrier may be skipped, and one under `defined?` / `END`
         // never runs in sequence (rigor-rs#153).
         Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
-            body.iter().any(|&s| definitely_assigns(ast, s, is_target, case_clauses))
+            body.iter()
+                .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
         }
         // A clause-less `begin` — which is also the carrier an `if`'s `else`
         // clause lowers to — runs its body to the end.
         Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
-            body.iter().any(|&s| definitely_assigns(ast, s, is_target, case_clauses))
+            body.iter()
+                .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
         }
         _ => false,
+    }
+    }
+
+    /// An arm "holds" a definite assignment when some statement in it assigns
+    /// or its tail exits — `latest_definite_assignment`'s `arm` half.
+    fn arm_assigns(
+        &self,
+        ast: &LoweredAst,
+        b: &[NodeId],
+        is_target: &dyn Fn(&Node) -> bool,
+        case_clauses: &[rigor_parse::Span],
+        dead: &DeadPositions,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        b.iter()
+            .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
+            || self.arm_exits(ast, b, seen)
     }
 }
 

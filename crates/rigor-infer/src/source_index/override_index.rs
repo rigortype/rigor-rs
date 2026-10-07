@@ -142,6 +142,51 @@ impl SourceIndex {
         names
     }
 
+    /// The WRITTEN ancestor names of `class` — `include`s/`prepend`s in
+    /// source order, then the written `superclass` — UNRESOLVED (the raw
+    /// spelling, `::`-prefix stripped). Unlike [`Self::override_ancestor_names`]
+    /// nothing is dropped: a name with no project class is kept so the caller
+    /// can ask it of the RBS surface — `rbs_ancestor_answers?`'s half of
+    /// `self_type_answers?` (rigor-rs#368) needs `class C < StandardError` to
+    /// see `StandardError`.
+    pub(crate) fn written_ancestor_names(&self, class: &str) -> Vec<String> {
+        let Some(entry) = self.override_classes.get(class) else {
+            return Vec::new();
+        };
+        entry
+            .includes
+            .iter()
+            .cloned()
+            .chain(entry.superclass.iter().cloned())
+            .map(|n| n.strip_prefix("::").unwrap_or(&n).to_string())
+            .collect()
+    }
+
+    /// The WRITTEN `superclass` of `class` resolved to a project class, or
+    /// `None` — the `mixins: false` ancestor edge the reference's
+    /// `singleton_def_through_ancestors` follows: a subclass inherits its
+    /// parent's class methods through the superclass link alone.
+    pub(crate) fn project_superclass(&self, class: &str) -> Option<String> {
+        let entry = self.override_classes.get(class)?;
+        let sup = entry.superclass.as_ref()?;
+        self.resolve_override_ancestor(class, sup)
+    }
+
+    /// The project classes `class`'s body `extend`s, resolved like an
+    /// ancestor name — the reference's ScopeIndexer folds each into the
+    /// extender's OWN singleton surface, so `extend M` makes `M`'s INSTANCE
+    /// methods callable on `C` the class object.
+    pub(crate) fn extended_names(&self, class: &str) -> Vec<String> {
+        let Some(entry) = self.override_classes.get(class) else {
+            return Vec::new();
+        };
+        entry
+            .extends
+            .iter()
+            .filter_map(|raw| self.resolve_override_ancestor(class, raw))
+            .collect()
+    }
+
     /// Resolve an as-written ancestor name against the subclass's lexical
     /// nesting, returning the QUALIFIED project class name it names, or `None` if
     /// it names no project class. Mirrors the reference's
@@ -167,6 +212,10 @@ impl SourceIndex {
     }
 
     /// Fold one (re)definition of a QUALIFIED override class into the index.
+    // too_many_arguments: the folded surface (methods, visibilities,
+    // ancestors, kind) is one record's fields — a bundle struct would just
+    // rename the argument list.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn ingest_override_class(
         &mut self,
         qualified: &str,
@@ -174,6 +223,7 @@ impl SourceIndex {
         methods: &[String],
         method_visibilities: &[(String, Visibility)],
         includes: &[String],
+        extends: &[String],
         is_module: bool,
     ) {
         // `or_insert_with` (not `or_default`) so `is_module` is FIRST-WRITE-WINS
@@ -195,6 +245,11 @@ impl SourceIndex {
         for inc in includes {
             if !entry.includes.contains(inc) {
                 entry.includes.push(inc.clone());
+            }
+        }
+        for ext in extends {
+            if !entry.extends.contains(ext) {
+                entry.extends.push(ext.clone());
             }
         }
     }
@@ -243,6 +298,7 @@ pub(crate) fn collect_override_classes(
                 methods: methods.to_vec(),
                 method_visibilities: method_visibilities.to_vec(),
                 includes: includes.to_vec(),
+                extends: collect_body_extends(ast, body),
                 is_module: false,
             });
             let child_prefix = split_qualified(&qualified);
@@ -261,6 +317,7 @@ pub(crate) fn collect_override_classes(
                 methods: methods.to_vec(),
                 method_visibilities: method_visibilities.to_vec(),
                 includes: includes.to_vec(),
+                extends: collect_body_extends(ast, body),
                 is_module: true,
             });
             let child_prefix = split_qualified(&qualified);
@@ -275,6 +332,36 @@ pub(crate) fn collect_override_classes(
         // bodies / control flow — a def-nested class is out of slice-1 scope.
         _ => {}
     }
+}
+
+/// The CONSTANT names a class/module body's direct `extend <Const>` calls
+/// take — the `extend` half of the singleton ancestor surface the reference's
+/// ScopeIndexer folds into the extender's own singleton entries. Same
+/// direct-statement discipline as the parser's `include`/`prepend` capture.
+fn collect_body_extends(ast: &LoweredAst, body: &[NodeId]) -> Vec<String> {
+    let mut out = Vec::new();
+    for &child in body {
+        let Node::Call {
+            receiver: None,
+            method,
+            args,
+            ..
+        } = ast.get(child)
+        else {
+            continue;
+        };
+        if method != "extend" {
+            continue;
+        }
+        for &arg in args {
+            if let Node::ConstantRead { name, .. } = ast.get(arg) {
+                if !name.is_empty() {
+                    out.push(name.strip_prefix("::").unwrap_or(name).to_string());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// ADR-35 slice 1: join a lexical `prefix` and a (possibly already-namespaced)
