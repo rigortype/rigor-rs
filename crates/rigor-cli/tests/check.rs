@@ -471,3 +471,89 @@ fn container_nested_block_keeps_flat_env() {
         "expected `upcase` reported `for 1`, got {diags:?}"
     );
 }
+
+/// rigor-rs#388: a `local[k]` index write inside a content write-back
+/// position — a literal block/lambda body or a `while`/`until` body —
+/// REBINDS the receiver on the reference
+/// (`content_writeback_block_captures` / `loop_content_writeback`), so
+/// every indexed narrowing rooted at it dies and the post-block read is
+/// silent. The port kept the pre-block record: `h[:a] ||= "t"` inside
+/// `each` widened `h` but left `h[:a]` -> `"s" | 1` live, and the later
+/// `h[:a].frobnicate` fired where the oracle never emits.
+///
+/// Every row below is fully silent on BOTH engines.
+#[test]
+fn writeback_index_write_drops_indexed_narrowing() {
+    for src in [
+        // The issue row — and the `&&=` / `op=` compound forms.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { h[:a] ||= \"t\" }\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { h[:a] &&= \"t\" }\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { h[:a] += 1 }\nh[:a].frobnicate\n"[..],
+        // A plain `h[k] = v` drops the whole record set the same way —
+        // the write-back rebind is not slot-scoped (a `h[:b]` write also
+        // kills the `h[:a]` record).
+        &b"h = {a: 1, b: 2}\nh[:a] ||= \"s\"\nh[:b] ||= \"x\"\n[1].each { h[:b] = \"t\" }\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\nwhile x\n  h[:a] = \"t\"\n  break\nend\nh[:a].frobnicate\n"[..],
+        // Nested deferred bodies and `while`/`until`/`loop do` bodies.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { h[:a] ||= \"t\" } }\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\nwhile x\n  h[:a] ||= \"t\"\n  break\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\nuntil x\n  h[:a] ||= \"t\"\n  break\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nloop do\n  h[:a] ||= \"t\"\n  break\nend\nh[:a].frobnicate\n"[..],
+        // `while` stays a write-back boundary under an `if` arm, and a
+        // block stays one under a `for` body.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\nwhile x\n  if x\n    h[:a] ||= \"t\"\n  end\n  break\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nfor _i in [1]\n  [1].each { h[:a] ||= \"t\" }\nend\nh[:a].frobnicate\n"[..],
+        // Lambda and `proc`/`lambda` bodies capture the same way, even
+        // unassigned or passed to an unresolved receiver.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n->() { h[:a] ||= \"t\" }\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nproc { h[:a] ||= \"t\" }\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ->() { h[:a] ||= \"t\" }\nh[:a].frobnicate\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected silence — the write-back rebind drops the record — for {src:?}, got {diags:?}"
+        );
+    }
+}
+
+/// #388 controls — JOINED positions keep the record (the arm's own eval
+/// re-records the slot into the join), so the post-statement read still
+/// fires: an `if`/`case` arm, a `&&`/`?:` operand, a `rescue`/`ensure`
+/// clause, a `rescue`-modifier operand, a `for` body and a `while`
+/// predicate. A straight-line `h[k] ||= v` keeps updating the slot to
+/// `narrow_truthy(old) | rhs` — `for "s" | "t" | 1` — unchanged.
+#[test]
+fn joined_index_write_keeps_indexed_narrowing() {
+    for src in [
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\nif x\n  h[:a] ||= \"t\"\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\ncase 1\nwhen Integer\n  h[:a] ||= \"t\"\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\nx && (h[:a] ||= \"t\")\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\nx ? (h[:a] ||= \"t\") : nil\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  nil\nensure\n  h[:a] ||= \"t\"\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = (h[:a] ||= \"t\") rescue nil\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nfor _i in [1]\n  h[:a] ||= \"t\"\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nwhile (h[:a] ||= \"t\")\n  break\nend\nh[:a].frobnicate\n"[..],
+    ] {
+        let diags = check(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected the joined record to keep the read firing for {src:?}, got {diags:?}"
+        );
+        assert!(
+            diags[0].message.contains("frobnicate"),
+            "expected `frobnicate` on the post-statement read for {src:?}, got {diags:?}"
+        );
+    }
+    // Straight-line `h[k] ||= v` still records the narrowed slot — the
+    // exact union is the parity surface (`"s" | "t" | 1`).
+    let diags =
+        check(b"h = {a: 1}\nh[:a] ||= \"s\"\nh[:a] ||= \"t\"\nh[:a].frobnicate\n");
+    assert_eq!(diags.len(), 1, "expected one diagnostic: {diags:?}");
+    assert!(
+        diags[0].message.contains("\"s\" | \"t\" | 1"),
+        "expected the `||=` stored-slot union `for \"s\" | \"t\" | 1`, got {diags:?}"
+    );
+}
