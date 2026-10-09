@@ -11,7 +11,7 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT: pin `e59b7b89`, 0 FP / 9,337 / 818 gaps.**
+▶ **NEXT: pin `e59b7b89`, 0 FP / 9,337 / 815 gaps.**
 CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
@@ -22,9 +22,9 @@ CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
   standing exception tables EMPTY; new entries are real findings
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
 
-State (verified 2026-09-26, at `e59b7b89`): harness **118 fixtures / 0
+State (verified 2026-10-10, at `e59b7b89`): harness **118 fixtures / 0
 unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
-9,337 files / 818 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
+9,337 files / 815 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
 Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
@@ -77,13 +77,14 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-30 #155 CLOSED** (PR #359): OptionParser parity for all subcommands — unknown flags 64, abbrev/`=`/`--`/POSIXLY_CORRECT, per-cmd tables. → #360. [note](notes/20260930-issue-155-optparse.md)
 - **2026-09-30 #343 CLOSED** (PR #358): `h.attr op=` own-lowered; evaluated-position attr writes on mutator names drop IndexedFlow records. 0 FP; → #361–#366. [note](notes/20260930-issue-343-attr-writes.md)
 - **2026-09-30 #357 CLOSED** (PR #367): blocked-extent writes stay out of reach/rebinds/binding — modifier `rescue` leak + dead-arm condition fix. 0 FP; → #368. [note](notes/20260930-i357-rescue-mod.md)
-- **2026-09-30 #361 CLOSED** (PR #369): `OperandEffects.any?` ported into the `evaluated` decision (Dead/Gate/Eval operand modes). 0 FP; → #372/#373. [note](notes/20261001-i361.md)
+- **2026-09-30 #361 CLOSED** (PR #369): `OperandEffects.any?` ported into the `evaluated` decision (Dead/Gate/Eval modes). 0 FP; → #372/#373. [note](notes/20261001-i361.md)
 - **2026-09-30 #157 CLOSED** (PR #371): config value validation — `Integer()` grammar, `enabled:false`-only, `target_ruby` split, plugin load-error rows. → #360. [note](notes/20260930-i157-config-values.md)
 - **2026-10-01 #352 CLOSED** (PR #370): `String#[]` post-`[]=` reads non-firing + `T|nil` retry + rebind-gated index-target widening; `UnmodeledWrite` carries pattern-bound names. 0 FP; → #374. [note](notes/20261001-i352-string-index.md)
 - **2026-10-01 #360 CLOSED** (PR #375): deferred `plugin path|print`/`skill --*` argument-boundary grammar — missing name → 64+usage, unknown → 1+`Unknown X`; bundled-name tables. → #376 (pin-drift). [note](notes/20261001-i360-deferred-grammar.md)
 - **2026-10-01 #366 CLOSED** (PR #377): in-block attr writes drop indexed records — `closure_evaluated` + `closure_mutations`/`closure_descend` replay. 0 FP; → #379–#381. [note](notes/20261001-i366-block-attr-drop.md)
 - **2026-10-01 #304 CLOSED** (PR #378): `RetainedParamType` keeps generic args — `Range[::int]` byte-identical both channels; `stub_typed_param` gate (kills a master FP). → #382–#384. [note](notes/20261001-i304-range-render.md)
 - **2026-10-08 #368 CLOSED** (PR #385): `dead.rs` dead-position exclusion — folded if-arms, dead rescue clauses, modifier-under blocks; `RescueArm.span` clip; live-only ensure join; `!` fold Nil|Bool only. → #386. [note](notes/20261008-i368-dead-positions.md)
+- **2026-10-10 #379 CLOSED** (PR #387): nested-body Barrier siblings apply under `owner=id` (re-key one level late); shared `owns_deferred_body`. 0 FP / 815; → #388, #381. [note](notes/20261010-i379.md)
 - **2026-09-30 #332 CLOSED** (PR #334): pin-value threading (`local_reach` → `(Reach, Option<Scalar>)`); nominal multi-arg + `when`-pattern FPs. 0 FP / 818; → #340/#341. [note](notes/20260930-issue-332-multi-arg.md)
 - **2026-09-30 #312 CLOSED** (PR #324): recovery collector models `joined`/`blocked`/loop-writeback marks — compound index writes widen exactly where the reference joins. 0 FP; → #325. [note](notes/20260930-issue-312-recovery.md)
 - **2026-09-30 #146 CLOSED** (PR #318): `Reach::multi` + tier-3 decline for multi-valued args; unentered closures floor to untyped. 0 FP / 818; → #330–#332. [note](notes/20260930-issue-146-untyped-args.md)
@@ -95,9 +96,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-29 #134 CLOSED** (PR #295): index-target stores (multi-assign/`for`/`rescue`) widen receivers via `MultiTarget::Index`. 0 FP; → #298–#304. [note](notes/20260929-issue-134-index-widening.md)
 - **2026-09-29 #194 CLOSED** (PR #291): symbol/BigInt/float witness spelling; literal-tuple block fold + write gate. 0 FP / 818; → #292–#294. [note](notes/20260929-issue-194-witness-rendering.md)
 - **2026-09-29 #168 CLOSED** (PR #289): project-`sig/` `use` + `resolve-type-names` + missing-name stubs; alias-aware head-first resolver. 0 FP / 818; → #286–#290. [note](notes/20260929-issue-168-rbs-use.md)
-- **2026-09-28 #201 CLOSED** (PR #285): `exclude:` + `BUILTIN_EXCLUDES` moved inside directory expansion (explicit `.rb` roots verbatim); exact `dir.c` `fnmatch` flags-0 port; LSP gate exclusion-immunity for verbatim roots. 0 FP / sweep. [note](notes/20260928-issue-201-excludes.md)
+- **2026-09-28 #201 CLOSED** (PR #285): `exclude:` + `BUILTIN_EXCLUDES` moved inside directory expansion (explicit `.rb` roots verbatim); exact `dir.c` `fnmatch` port; LSP exclusion-immunity for verbatim roots. 0 FP / sweep. [note](notes/20260928-issue-201-excludes.md)
 - **2026-09-28 #139 CLOSED** (PR #284): `[]=` splice writes + top-level mutation widening (unconditional → `Nominal`, conditional → `Dynamic`, coll pass joins); `BeginRescue` flow arm; coll rule reads the widened env. 0 FP / sweep. [note](notes/20260928-issue-139-splice-write.md)
-- **2026-09-28 #163 CLOSED** (PR #282): `text`/`github`/`sarif` byte-matched (`[rule]` suffix, `N error(s)` summary, `title=`, serde key-order); SARIF `driver.version` deliberately the port's own. 0 FP; `output_formats.rs` pin. [note](notes/20260928-issue-163-output-formats.md)
+- **2026-09-28 #163 CLOSED** (PR #282): `text`/`github`/`sarif` byte-matched (`[rule]` suffix, `N error(s)` summary, `title=`, serde key-order); SARIF `driver.version` is the port's own. 0 FP; `output_formats.rs` pin. [note](notes/20260928-issue-163-output-formats.md)
 - **2026-09-28 #164 CLOSED** (PR #283): `getbyte`/`rindex`/`byteindex`/`byterindex`/`Float#<=>` literal folds incl. nil; Dynamic decline via `declines_unfolded`, stale guard widened. 0 FP; fx 119. [note](notes/20260928-issue-164-nilable-fold.md)
 - **2026-09-28 #199 CLOSED** (PR #281): list config keys read with `Array().map(&:to_s)` semantics — a scalar no longer drops the file to `Config::default()`; `signature_paths: ~` keeps reference nil→default. 0 FP; satisfies #157's scalar-`signature_paths` item. [note](notes/20260928-issue-199-scalar-list-keys.md)
 - **2026-09-27/28 splits** #204/#234/#258/#260: lib.rs infer 14,084→144, rules 4,497→95; ast.rs 3,756→80; source_index.rs 4,650→668. [note](notes/20260928-ast-index-split-outcome.md)
@@ -108,15 +109,15 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-26 #165 CLOSED** (PR #175): `wrong-arity` declines on splat/kwarg/`...`; `&b`→#176. 0 FP; fx 116. [note](notes/20260926-issue-165-splat-arity.md).
 - **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 4 review rounds found 39 FP families; **0 FP / 9,337**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
 - **2026-09-25 #151 CLOSED + #153 rows 1–3** (PR #154): `Statements` carriers gain a kind (`Inert` = `defined?`/`END`/`BEGIN`/`super`/`yield`, writes dropped; `Recovered` widens); `for` index is a rebind. **0 FP / 9,337, = master**; fixture 114 exact. Review: 0 new keys. [note](notes/20260925-issues-151-153-binder-writes.md).
-- **2026-09-25 #121 CLOSED** (PR #149): String `[]`/`slice`/`byteslice`/`index` fold on literals; a class-guarded param drops the nilable slot (10 FPs). Review BLOCKed a stale-top-local nil fold (now declines) and found `i32`→`0` literal lowering and `nil&.m`, both fixed. **0 FP / 9,337, gaps = master**; fixture 113. [note](notes/20260925-string-lookup-fold-guarded-arg.md).
-- **2026-09-25 #133 CLOSED by a decline** (PR #148): the flat top-level binder never saw a nested rebind; rules now widen such locals, Dynamic-only gates keep the old env. **0 FP / 9,337, = master**; fixture 112 7→0 FPs. Folded-message drift + lost rows → #152. [note](notes/20260925-issue-133-jump-path-rebind.md).
+- **2026-09-25 #121 CLOSED** (PR #149): String `[]`/`slice`/`byteslice`/`index` fold on literals; a class-guarded param drops the nilable slot (10 FPs). Review caught a stale-top-local nil fold + `i32`→`0` lowering + `nil&.m`, all fixed. **0 FP / 9,337, gaps = master**; fixture 113. [note](notes/20260925-string-lookup-fold-guarded-arg.md).
+- **2026-09-25 #133 CLOSED by a decline** (PR #148): the flat top-level binder never saw a nested rebind; rules now widen such locals, Dynamic-only gates keep the old env. **0 FP / 9,337, = master**; fixture 112 7→0 FPs. → #152. [note](notes/20260925-issue-133-jump-path-rebind.md).
 - **2026-09-25 re-pin `v0.3.9 → e59b7b89` (master, 1,030 commits)**: **0 FP / 9,337, 111 fixtures**, effects 0 OVER. The raw bump had 8 fixture FPs and 9 sweep FPs in two families: #1021 `imprecise_arg?` (now a reach analysis) and #1135's eval-block carve-out (its companion `fb781023` is unported = +3,002 gaps, #141). Re-synced `core_overlay/` (`hash_rbs3` excluded), the plugin sig (23 FPs) and the mutator sets (hash **20**). The fragment probe found 10 invisible retractions (#133–#138). [note](notes/20260925-repin-e59b7b89.md).
-- **2026-09-21 #128 CLOSED — store values named by their TYPED answer** (PR #131) — member is the erased class of the value's `stmt_value_type` off its sparse env; union-carrier stores widen per-arm. **0 FP / 9,337**; #132. [note](notes/20260921-issue-128-store-value-typing.md).
+- **2026-09-21 #128 CLOSED — store values named by their TYPED answer** (PR #131) — member is the erased class of the value's `stmt_value_type`; union-carrier stores widen per-arm. **0 FP / 9,337**; #132. [note](notes/20260921-issue-128-store-value-typing.md).
 - **2026-09-21 upstream re-pin `v0.3.8 → v0.3.9`** (447 commits): **0 FP / 9,337, gaps 799→892**, 108 fixtures, 0 OVER. Raw bump: 4 FPs in three families (`declines_bot?` shaped carriers, rooted `::RUBY_VERSION`, `MutationRejoin`). Residues: #128–#130. [note](notes/20260921-repin-v039.md).
-- **2026-09-09 #123 CLOSED — 26 holes = THREE defects** — `overlay/` loads LAST, chain built LAZILY: **22** `module ::Kernel` keyed `Gem::Kernel`; **5** `prepend` uningested; **6** module SELF-TYPE unrecorded. **26→0**, 0 FP / 9204 — DORMANT until `check_call`'s declaration-only conjunct drops. [note](notes/20260909-qualified-ancestor-closure-holes.md).
-- **2026-09-09 the 799 gaps ADJUDICATED** — partitioned by MECHANISM: **395 sit behind decisions**; the 71-row bucket rests on ONE over-narrow rbs signature. Two findings beat coverage: `check` exited 0 on unparseable files (PR #125); ADR-0033's leniency premise expired (29 rows = FOUR mechanisms → #123/#124). [799](notes/20260909-gap-adjudication-799.md) / [gems](notes/20260909-declared-unwitnessed-gem-classes.md).
+- **2026-09-09 #123 CLOSED — 26 holes = THREE defects** — `overlay/` loads LAST, chain LAZY: **22** `module ::Kernel` keyed `Gem::Kernel`; **5** `prepend` uningested; **6** SELF-TYPE unrecorded. **26→0**, 0 FP / 9204 — DORMANT until `check_call`'s declaration-only conjunct drops. [note](notes/20260909-qualified-ancestor-closure-holes.md).
+- **2026-09-09 the 799 gaps ADJUDICATED** — partitioned by MECHANISM: **395 sit behind decisions**; the 71-row bucket rests on ONE over-narrow rbs signature. `check` exited 0 on unparseable files (PR #125); ADR-0033's leniency premise expired → #123/#124. [799](notes/20260909-gap-adjudication-799.md) / [gems](notes/20260909-declared-unwitnessed-gem-classes.md).
 - **2026-09-09 #118 CLOSED** (PR #120) — generic dispatch declines to `Dynamic[top]` when the join is at risk AND an argument is reference-untyped: **13 FPs closed, 0 matched lost**. Blanket "nilable declines" cost TEN folded rows — untypedness is what stops folding. [note](notes/20260909-generic-dispatch-untyped-arg.md).
-- **2026-09-09 upstream re-pin `v0.3.4 → v0.3.8`** (924 commits / 4 releases) — **0 FP / 9204, gaps 820→799**, harness 98→**105** fixtures. Raw bump = 7 fixture retractions + 12 sweep FPs = **SIX families**, each bisected + ported by four worktree agents. **Three spec claims were wrong; must-fire controls caught them.** Residues: 20 resolvable-`super` rows. [note](notes/20260909-repin-v038.md) / [spec](notes/20260909-repin-v038-port-spec.md) / [feedback 4](notes/20260909-upstream-feedback-batch4.md).
+- **2026-09-09 upstream re-pin `v0.3.4 → v0.3.8`** (924 commits / 4 releases) — **0 FP / 9204, gaps 820→799**, harness 98→**105** fixtures. Raw bump = 7 fixture retractions + 12 sweep FPs = **SIX families**, each bisected+ported. **Three spec claims were wrong; must-fire controls caught them.** Residues: 20 resolvable-`super` rows. [note](notes/20260909-repin-v038.md) / [spec](notes/20260909-repin-v038-port-spec.md) / [feedback 4](notes/20260909-upstream-feedback-batch4.md).
 - **2026-08-26/28 the effects GATE was lying, three times** (PRs #112/#115/#117) — deleted-arm byte-identity, `methods:{}` covering 2 of 4 producers, `omit?` inverting ADR-0043 §2. [s112](notes/20260826-s112-effects-instrument.md) / [s5](notes/20260826-effects-s5-probe.md) / [s116](notes/20260826-s116-snapshot-gate.md).
 
 
