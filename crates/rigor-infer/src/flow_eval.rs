@@ -883,6 +883,16 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         self.drop_indexed_mutation(name, method, drop_key, env);
+        // A `[]=` replayed through a content write-back boundary drops
+        // EVERY narrowing rooted at the receiver, whatever `drop_key`
+        // says: `content_writeback_block_captures` /
+        // `loop_content_writeback` rebind the captured local on those
+        // paths, and the rebind invalidates its records — the compound
+        // `h[k] op= v` a `drop_key == None` entry otherwise keeps alive
+        // is exactly the stale record of rigor-rs#388.
+        if method == "[]=" && self.path_content_writeback(ast, root, wspan) {
+            drop_indexed_narrowings(env, name);
+        }
         let evaluated = uncond
             && (self.path_unconditional(ast, root, wspan)
                 || (indexed.operand_spans.contains(&wspan)
@@ -1001,6 +1011,55 @@ impl<'i> Typer<'i> {
             _ => {}
         }
         true
+    }
+
+    /// Whether `wspan`'s position inside `id` descends through a content
+    /// write-back boundary — a literal block/lambda body
+    /// ([`FlowEdge::Barrier`]) or a `while`/`until` body. The reference
+    /// rebinds the captured receiver on those paths
+    /// (`content_writeback_block_captures` for the non-escaping-block call,
+    /// `loop_content_writeback` for the iterated body), and the rebind
+    /// drops every indexed narrowing rooted at it (rigor-rs#388). A
+    /// `for` body (`predicate` `None`) joins scopes rather than writing
+    /// back — the record an arm's own eval re-recorded survives the join,
+    /// the same way an `if`/`case`/`rescue` arm keeps it.
+    fn path_content_writeback(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        wspan: rigor_parse::Span,
+    ) -> bool {
+        let node = ast.get(id);
+        if node.span() == wspan {
+            return false;
+        }
+        for (child, edge) in self.flow_children(node) {
+            let cspan = ast.get(child).span();
+            if cspan.0 <= wspan.0 && wspan.1 <= cspan.1 {
+                // A `for` body JOINS its scope rather than writing back
+                // (`eval_for` has no `loop_content_writeback` — the arm's
+                // own eval re-records the slot), so only `while`/`until`
+                // count: `for` lowers its collection into `predicate` too,
+                // and a `for` whose target binds no local and stores no
+                // index (`for @a in xs`) misreads as `while` — a decline
+                // toward silence, never a new fire.
+                let writeback = edge == FlowEdge::Barrier
+                    || matches!(
+                        node,
+                        Node::Loop {
+                            predicate: Some(_),
+                            index,
+                            index_writes,
+                            body,
+                            ..
+                        } if body.contains(&child)
+                            && index.is_empty()
+                            && index_writes.is_empty()
+                    );
+                return writeback || self.path_content_writeback(ast, child, wspan);
+            }
+        }
+        false
     }
 
     /// The lenient sibling of [`Self::path_unconditional`] for a recovery-
