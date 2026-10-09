@@ -177,7 +177,7 @@ impl<'i> Typer<'i> {
                 break 'env Cow::Borrowed(&flow.env);
             }
             let mut env = pre.clone();
-            self.entry_descend(ast, stmt, site, true, &mut env, flow, interner);
+            self.entry_descend(ast, stmt, site, true, false, &mut env, flow, interner);
             Cow::Owned(env)
         };
         // rigor-rs#368 — a site inside a folded-dead `if`/`unless` arm reads
@@ -208,6 +208,11 @@ impl<'i> Typer<'i> {
     /// mints the widened nominal (the flat env's own answer for a
     /// same-statement mutator call); anything else widens `Dynamic`, the
     /// flat env's conservative decline for a conditional position.
+    /// `preserve_env` says `env` already holds this position's flat scope —
+    /// descent under a non-descending container (`loop`/`case`/`when`,
+    /// `begin`'s else/ensure; rigor-rs#380) — so the barrier captures that
+    /// would overwrite it with `flow.env` (the end-of-FILE env, which
+    /// resurrects post-statement rebinds) are skipped.
     // too_many_arguments: the replay context (ast, flow, env, interner) is
     // threaded through each recursive step; bundling into a struct would
     // obscure the recursion.
@@ -218,6 +223,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         site: rigor_parse::Span,
         uncond: bool,
+        preserve_env: bool,
         env: &mut TypeEnv,
         flow: &CheckFlow,
         interner: &mut Interner,
@@ -238,7 +244,7 @@ impl<'i> Typer<'i> {
                     (*predicate, then_body.clone(), else_body.clone());
                 let pspan = ast.get(predicate).span();
                 if pspan.0 <= site.0 && site.1 <= pspan.1 {
-                    self.entry_descend(ast, predicate, site, uncond, env, flow, interner);
+                    self.entry_descend(ast, predicate, site, uncond, preserve_env, env, flow, interner);
                     return;
                 }
                 self.apply_subtree_effects(ast, predicate, site, uncond, env, flow, interner);
@@ -266,7 +272,7 @@ impl<'i> Typer<'i> {
                 for &s in branch {
                     let sspan = ast.get(s).span();
                     if sspan.0 <= site.0 && site.0 < sspan.1 {
-                        self.entry_descend(ast, s, site, false, env, flow, interner);
+                        self.entry_descend(ast, s, site, false, preserve_env, env, flow, interner);
                         return;
                     }
                     if sspan.1 <= site.0 {
@@ -286,7 +292,7 @@ impl<'i> Typer<'i> {
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
                 {
-                    self.entry_children(ast, id, site, uncond, env, flow, interner);
+                    self.entry_children(ast, id, site, uncond, preserve_env, env, flow, interner);
                     return;
                 }
                 // rigor-rs#368 — a site inside a `rescue` clause replays the
@@ -313,7 +319,7 @@ impl<'i> Typer<'i> {
                                 ast, pre_s, env, &flow.rebinds, &flow.mutations, &flow.indexed, &flow.dead, interner,
                             );
                         }
-                        self.entry_descend(ast, s, site, false, env, flow, interner);
+                        self.entry_descend(ast, s, site, false, preserve_env, env, flow, interner);
                         return;
                     }
                 }
@@ -347,23 +353,29 @@ impl<'i> Typer<'i> {
                 for &s in body.clone().iter() {
                     let sspan = ast.get(s).span();
                     if sspan.0 <= site.0 && site.0 < sspan.1 {
-                        self.entry_descend(ast, s, site, false, env, flow, interner);
+                        self.entry_descend(ast, s, site, false, preserve_env, env, flow, interner);
                         return;
                     }
                 }
             }
             // A closure body or class/module body captures the whole env —
-            // today's `ScopedEnv::at` answer, kept verbatim. A lambda body
-            // is also a deferred scope with its OWN evaluated attribute
-            // writes: replay them positionally inside it (rigor-rs#366).
+            // today's `ScopedEnv::at` answer, kept verbatim — unless the
+            // descent came from a non-descending container, whose flat env
+            // is already in place (`preserve_env`). A lambda body is also a
+            // deferred scope with its OWN evaluated attribute writes:
+            // replay them positionally inside it (rigor-rs#366).
             Node::Lambda { .. } => {
-                *env = flow.env.clone();
+                if !preserve_env {
+                    *env = flow.env.clone();
+                }
                 self.closure_descend(ast, id, site, env, flow, id);
             }
             Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
-                *env = flow.env.clone();
+                if !preserve_env {
+                    *env = flow.env.clone();
+                }
             }
-            _ => self.entry_children(ast, id, site, uncond, env, flow, interner),
+            _ => self.entry_children(ast, id, site, uncond, preserve_env, env, flow, interner),
         }
     }
 
@@ -412,6 +424,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         site: rigor_parse::Span,
         uncond: bool,
+        preserve_env: bool,
         env: &mut TypeEnv,
         flow: &CheckFlow,
         interner: &mut Interner,
@@ -420,12 +433,19 @@ impl<'i> Typer<'i> {
             let cspan = ast.get(child).span();
             if cspan.0 <= site.0 && site.0 < cspan.1 {
                 if edge == FlowEdge::Barrier {
-                    *env = flow.env.clone();
                     // A literal block body's scope is the captured env —
-                    // then the body's own evaluated attribute writes drop
-                    // their indexed narrowings positionally inside it
-                    // (rigor-rs#366). A `def`/`class`/`module` body is a
-                    // fresh local scope the flat env already stands for.
+                    // skipped when the descent came from a non-descending
+                    // container, whose flat env already stands
+                    // (`preserve_env`; `flow.env` is the end-of-file env
+                    // and would resurrect post-statement rebinds —
+                    // rigor-rs#380). Then the body's own evaluated
+                    // attribute writes drop their indexed narrowings
+                    // positionally inside it (rigor-rs#366). A
+                    // `def`/`class`/`module` body is a fresh local scope
+                    // the flat env already stands for.
+                    if !preserve_env {
+                        *env = flow.env.clone();
+                    }
                     if matches!(ast.get(id), Node::Call { .. }) {
                         self.closure_descend(ast, id, site, env, flow, id);
                     }
@@ -435,6 +455,7 @@ impl<'i> Typer<'i> {
                         child,
                         site,
                         uncond && edge == FlowEdge::Uncond,
+                        preserve_env,
                         env,
                         flow,
                         interner,
@@ -474,7 +495,10 @@ impl<'i> Typer<'i> {
         for (child, _edge) in self.flow_children(ast.get(id)) {
             let cspan = ast.get(child).span();
             if cspan.0 <= site.0 && site.0 < cspan.1 {
-                self.entry_descend(ast, child, site, false, env, flow, interner);
+                // `preserve_env`: the container's flat pass already built
+                // this position's env; a barrier capture would replace it
+                // with the end-of-file `flow.env`.
+                self.entry_descend(ast, child, site, false, true, env, flow, interner);
                 return;
             }
         }
