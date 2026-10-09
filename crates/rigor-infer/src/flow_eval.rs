@@ -334,9 +334,23 @@ impl<'i> Typer<'i> {
             // flat — `Recovered`/`Jump`/`Inert` children never evaluate on
             // the reference (`x = (each { w; r }) rescue nil` and
             // `break each { w; r }` both fire there).
-            Node::Loop { .. } | Node::Case { .. } | Node::When { .. } => {
+            Node::Loop { .. } | Node::Case { .. } => {
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
                 self.entry_descend_site_child(ast, id, site, env, flow, interner);
+            }
+            // A `when`/`in` arm descends into its BODY only: the oracle
+            // keeps a condition-position block's writes out of the in-body
+            // read's scope (`when [1].each { h.default ||= 0; h[:a].m }`
+            // fires there), so `conditions` stays flat.
+            Node::When { body, .. } => {
+                self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                for &s in body.clone().iter() {
+                    let sspan = ast.get(s).span();
+                    if sspan.0 <= site.0 && site.0 < sspan.1 {
+                        self.entry_descend(ast, s, site, false, env, flow, interner);
+                        return;
+                    }
+                }
             }
             // A closure body or class/module body captures the whole env —
             // today's `ScopedEnv::at` answer, kept verbatim. A lambda body

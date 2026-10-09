@@ -417,4 +417,14 @@ fn container_nested_block_attr_write_drops_indexed_narrowing() {
             "expected both reads to fire for {src:?}, got {diags:?}"
         );
     }
+    // A block inside a `when`/`in` CONDITION does not replay on the
+    // oracle either — the in-body read keeps firing.
+    let diags = check(
+        b"h = {a: 1}\nh[:a] ||= \"s\"\ncase 1\nwhen [1].each { h.default ||= 0; h[:a].frobnicate }\n  nil\nend\n",
+    );
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected the when-condition's in-body read to fire, got {diags:?}"
+    );
 }
