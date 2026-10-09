@@ -359,3 +359,62 @@ fn nested_block_attr_write_drops_indexed_narrowing() {
         );
     }
 }
+
+#[test]
+fn container_nested_block_attr_write_drops_indexed_narrowing() {
+    // rigor-rs#380 — a literal block under a non-descending container
+    // (`while`/`until`/`for`, `case`/`when`/`in`, `begin`'s else/ensure
+    // arms) still replays its own closure mutations: the in-body read
+    // drops `h`'s indexed narrowing and only the post-container read
+    // fires.
+    for src in [
+        // `while`/`until` statement + modifier forms.
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\nwhile c\n  [1].each { h.default ||= 0; h[:a].frobnicate }\n  break\nend\nh[:a].frobnicate\n"[..],
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\nuntil c\n  [1].each { h.default ||= 0; h[:a].frobnicate }\n  break\nend\nh[:a].frobnicate\n"[..],
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\n[1].each { h.default ||= 0; h[:a].frobnicate } while c\nh[:a].frobnicate\n"[..],
+        // `for` lowers to `Node::Loop` too.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nfor i in [1]\n  [1].each { h.default ||= 0; h[:a].frobnicate }\nend\nh[:a].frobnicate\n"[..],
+        // `case`/`when` and `case`/`in` arms.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\ncase 1\nwhen Integer\n  [1].each { h.default ||= 0; h[:a].frobnicate }\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\ncase 1\nin Integer\n  [1].each { h.default ||= 0; h[:a].frobnicate }\nend\nh[:a].frobnicate\n"[..],
+        // `begin`'s `else` and `ensure` arms.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  nil\nrescue\n  nil\nelse\n  [1].each { h.default ||= 0; h[:a].frobnicate }\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  nil\nensure\n  [1].each { h.default ||= 0; h[:a].frobnicate }\nend\nh[:a].frobnicate\n"[..],
+        // Containers compose — nested `while`, `if` inside `while`.
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\nwhile c\n  while c\n    [1].each { h.default ||= 0; h[:a].frobnicate }\n    break\n  end\n  break\nend\nh[:a].frobnicate\n"[..],
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\nwhile c\n  if c\n    [1].each { h.default ||= 0; h[:a].frobnicate }\n  end\n  break\nend\nh[:a].frobnicate\n"[..],
+        // A lambda body under a container descends the same way.
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\nuntil c\n  -> { h.default ||= 0; h[:a].frobnicate }\n  break\nend\nh[:a].frobnicate\n"[..],
+        // A `rescue` clause's own replay path already descended.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"x\"\nrescue\n  [1].each { h.default ||= 0; h[:a].frobnicate }\nend\nh[:a].frobnicate\n"[..],
+    ] {
+        let diags = check(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only the post-container read to fire for {src:?}, got {diags:?}"
+        );
+        assert!(
+            diags[0].message.contains("frobnicate"),
+            "expected `frobnicate` on the post-container read for {src:?}, got {diags:?}"
+        );
+    }
+    // Controls — carriers the oracle does NOT evaluate as call sites keep
+    // the in-body diagnostic: a `rescue`-modifier operand, a `break`
+    // argument, an `END {}` body (inert). And the in-body read before the
+    // write still fires under a `while` (positional replay). Each row
+    // reports TWO diagnostics.
+    for src in [
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ([1].each { h.default ||= 0; h[:a].frobnicate }) rescue nil\nh[:a].frobnicate\n"[..],
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\nwhile c\n  break [1].each { h.default ||= 0; h[:a].frobnicate }\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nEND { [1].each { h.default ||= 0; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        &b"c = true\nh = {a: 1}\nh[:a] ||= \"s\"\nwhile c\n  [1].each { h[:a].frobnicate; h.default ||= 0 }\n  break\nend\nh[:a].frobnicate\n"[..],
+    ] {
+        let diags = check(src);
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected both reads to fire for {src:?}, got {diags:?}"
+        );
+    }
+}

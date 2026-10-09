@@ -318,6 +318,7 @@ impl<'i> Typer<'i> {
                     }
                 }
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                self.entry_descend_site_child(ast, id, site, env, flow, interner);
             }
             // Conditional container: nothing inside orders against the site
             // (recovery carrier, loop, case/when), so apply every contained
@@ -325,8 +326,17 @@ impl<'i> Typer<'i> {
             Node::Statements { kind, .. } if !matches!(kind, StatementsKind::Sequence) => {
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
             }
+            // …but the flat pass cannot cross a deferred body's barrier: a
+            // literal block/lambda nested under a `loop`/`case`/`when`
+            // still evaluates its own attribute writes positionally on the
+            // oracle, so descend into the child holding the site as well
+            // (rigor-rs#380). The non-Sequence `Statements` carriers stay
+            // flat — `Recovered`/`Jump`/`Inert` children never evaluate on
+            // the reference (`x = (each { w; r }) rescue nil` and
+            // `break each { w; r }` both fire there).
             Node::Loop { .. } | Node::Case { .. } | Node::When { .. } => {
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                self.entry_descend_site_child(ast, id, site, env, flow, interner);
             }
             // A closure body or class/module body captures the whole env —
             // today's `ScopedEnv::at` answer, kept verbatim. A lambda body
@@ -428,6 +438,30 @@ impl<'i> Typer<'i> {
                     flow,
                     interner,
                 );
+            }
+        }
+    }
+
+    /// After a non-descending container's flat
+    /// [`Self::apply_subtree_effects`], descend into the one child holding
+    /// `site` so a deferred body nested under it still reaches the
+    /// `FlowEdge::Barrier` handling that replays its `closure_mutations`
+    /// (rigor-rs#380). No child containing the site — or a descent that
+    /// never crosses a barrier — leaves the flat env as it stands.
+    fn entry_descend_site_child(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        site: rigor_parse::Span,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        interner: &mut Interner,
+    ) {
+        for (child, _edge) in self.flow_children(ast.get(id)) {
+            let cspan = ast.get(child).span();
+            if cspan.0 <= site.0 && site.0 < cspan.1 {
+                self.entry_descend(ast, child, site, false, env, flow, interner);
+                return;
             }
         }
     }
