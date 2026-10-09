@@ -17,8 +17,8 @@ use crate::{
 };
 use crate::dead::DeadOp;
 use crate::flow_writes::{
-    collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, IndexedFlow,
-    MUTATOR_METHODS, STRING_MUTATORS,
+    collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
+    IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -657,13 +657,7 @@ impl<'i> Typer<'i> {
         // (rigor-rs#379 — `[1].each { [2].each { h.a ||= 0; h[:b].m } }`
         // applies the write under the inner `each`, one level late
         // otherwise).
-        let body_owning = matches!(
-            node,
-            Node::Call {
-                block_span: Some(_),
-                ..
-            } | Node::Lambda { .. }
-        );
+        let body_owning = owns_deferred_body(node);
         for (i, &(child, edge)) in children.iter().enumerate() {
             let cspan = ast.get(child).span();
             if cspan.0 <= site.0 && site.0 < cspan.1 {
