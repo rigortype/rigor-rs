@@ -682,8 +682,10 @@ impl<'i> Typer<'i> {
                 if edge == FlowEdge::Barrier {
                     // A nested literal block/lambda: its own writes belong
                     // to ITS body — `id` becomes the owner. Any other
-                    // barrier (a `def`/`class`/`module` body) is a fresh
-                    // local scope the replay does not enter.
+                    // barrier child (`def`/`class`/`module` — a fresh local
+                    // scope) is still descended into, but nothing inside it
+                    // keys to `id` (its writes key to `None` or an inner
+                    // body), so no mutation replays there.
                     if body_owning {
                         self.closure_descend(ast, child, site, env, flow, id);
                     }

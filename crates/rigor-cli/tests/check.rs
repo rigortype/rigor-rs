@@ -344,6 +344,12 @@ fn nested_block_attr_write_drops_indexed_narrowing() {
         // The operand-effects gate: `puts(h.default ||= 0)` keeps the
         // narrowing (rigor-rs#361).
         &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { puts(h.default ||= 0); h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // A write in a block-parameter default does not order against
+        // the body statements.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { |a = (h.default ||= 0)| h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // A write in a receiver-position block (`[3].map { … }`) keys to
+        // that call, not to the `.each` body holding the read.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [3].map { h.default ||= 0 }.each { h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
     ] {
         let diags = check(src);
         assert_eq!(
