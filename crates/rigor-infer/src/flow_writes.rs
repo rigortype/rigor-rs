@@ -646,6 +646,22 @@ pub(crate) fn toplevel_mutations(
 /// the receiver a bare local, as `widen_attribute_write`'s
 /// `local_variable_node?` gate requires. `None`-owner writes (top level or
 /// a fresh scope) are `toplevel_mutations`' business.
+/// Whether `node` owns a deferred body whose writes
+/// [`closure_mutations`] keys to the node itself — a `Call` with a
+/// literal block (`block_span` set) or a `Lambda`. Shared with
+/// `flow_eval`'s `closure_descend`, which re-keys the replay owner on
+/// exactly this predicate: the collection key and the replay must agree
+/// (rigor-rs#379).
+pub(crate) fn owns_deferred_body(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::Call {
+            block_span: Some(_),
+            ..
+        } | Node::Lambda { .. }
+    )
+}
+
 pub(crate) fn closure_mutations(
     ast: &LoweredAst,
 ) -> Vec<(NodeId, rigor_parse::Span, String)> {
@@ -676,14 +692,13 @@ pub(crate) fn closure_mutations(
                 receiver,
                 args,
                 block_body,
-                block_span,
                 ..
             } => {
                 // A `&expr` block-pass (`block_span` `None`) is an operand
                 // evaluated in the CALL's scope — its writes stay owned by
                 // the enclosing body; a literal block body is the next
                 // innermost deferred scope.
-                let inner = if block_span.is_some() { Some(id) } else { owner };
+                let inner = if owns_deferred_body(n) { Some(id) } else { owner };
                 for &c in receiver.iter().chain(args.iter()) {
                     stack.push((c, owner));
                 }

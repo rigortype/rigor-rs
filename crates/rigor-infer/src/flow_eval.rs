@@ -17,8 +17,8 @@ use crate::{
 };
 use crate::dead::DeadOp;
 use crate::flow_writes::{
-    collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, IndexedFlow,
-    MUTATOR_METHODS, STRING_MUTATORS,
+    collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
+    IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -625,7 +625,9 @@ impl<'i> Typer<'i> {
     /// survive (rigor-rs#366). Called at the `FlowEdge::Barrier` boundary —
     /// `id` is the `Node::Call`/`Node::Lambda` whose body holds the site and
     /// IS `owner`; recursion into a nested barrier re-keys `owner` to the
-    /// inner body.
+    /// inner body, and a body-owning `id`'s earlier Barrier-edged siblings
+    /// (its own body statements) apply under `id` as well — their writes
+    /// key there, not to `owner` (rigor-rs#379).
     ///
     /// The ordering is EVALUATION order through `flow_children`, not source
     /// order — `h[:a].m if h.default ||= 0` inside a body evaluates the
@@ -646,29 +648,39 @@ impl<'i> Typer<'i> {
         flow: &CheckFlow,
         owner: NodeId,
     ) {
-        let children = self.flow_children(ast.get(id));
+        let node = ast.get(id);
+        let children = self.flow_children(node);
+        // Whether `id` itself owns a deferred body — a literal block or
+        // lambda — whose writes `closure_mutations` keys to `id`. Its
+        // Barrier-edged children are that body's own statements: an
+        // earlier one must apply under `id`, not the inherited `owner`
+        // (rigor-rs#379 — `[1].each { [2].each { h.a ||= 0; h[:b].m } }`
+        // applies the write under the inner `each`, one level late
+        // otherwise).
+        let body_owning = owns_deferred_body(node);
         for (i, &(child, edge)) in children.iter().enumerate() {
             let cspan = ast.get(child).span();
             if cspan.0 <= site.0 && site.0 < cspan.1 {
                 for &(sib, sedge) in &children[..i] {
                     if sedge == FlowEdge::Uncond
-                        || self.same_cond_path(ast.get(id), sib, child)
+                        || self.same_cond_path(node, sib, child)
                     {
-                        self.apply_closure_mutations(ast, sib, env, flow, owner);
+                        let sib_owner = if sedge == FlowEdge::Barrier && body_owning {
+                            id
+                        } else {
+                            owner
+                        };
+                        self.apply_closure_mutations(ast, sib, env, flow, sib_owner);
                     }
                 }
                 if edge == FlowEdge::Barrier {
                     // A nested literal block/lambda: its own writes belong
                     // to ITS body — `id` becomes the owner. Any other
-                    // barrier (a `def`/`class`/`module` body) is a fresh
-                    // local scope the replay does not enter.
-                    if matches!(
-                        ast.get(id),
-                        Node::Call {
-                            block_span: Some(_),
-                            ..
-                        } | Node::Lambda { .. }
-                    ) {
+                    // barrier child (`def`/`class`/`module` — a fresh local
+                    // scope) is still descended into, but nothing inside it
+                    // keys to `id` (its writes key to `None` or an inner
+                    // body), so no mutation replays there.
+                    if body_owning {
                         self.closure_descend(ast, child, site, env, flow, id);
                     }
                     return;

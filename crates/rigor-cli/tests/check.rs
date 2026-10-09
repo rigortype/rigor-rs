@@ -283,3 +283,79 @@ fn block_attr_write_keeps_narrowing_for_reads_it_does_not_reach() {
         "expected only the post-block read to fire for {src:?}, got {diags:?}"
     );
 }
+
+/// rigor-rs#379: inside a NESTED deferred body — a block in a block, a
+/// lambda in a lambda — an earlier body statement's attr write still
+/// drops `h`'s indexed narrowings for the reads that follow it in the
+/// same inner body. `closure_mutations` keys the write to the innermost
+/// body, but `closure_descend` applied earlier siblings under the
+/// inherited (outer) owner — the re-key to `id` happened only on descent
+/// into the site-holding child — so an inner-body write one statement
+/// earlier than the read never matched.
+///
+/// Every row ends with a post-block `h[:a].frobnicate`, so a passing row
+/// reports exactly ONE diagnostic — the post-block read.
+#[test]
+fn nested_block_attr_write_drops_indexed_narrowing() {
+    for src in [
+        // The issue row.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { h.default ||= 0; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // Nested lambdas.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n-> { -> { h.default ||= 0; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // The nested block sits under another statement of the outer body.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = [1].each { [2].each { h.default ||= 0; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // Three levels — the write keys to the innermost body.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { [3].each { h.default ||= 0; h[:a].frobnicate } } }\nh[:a].frobnicate\n"[..],
+        // A write in a completing container's subtree still drops — the
+        // joined post-scope has no record on the zero-iteration path.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\n[1].each { [2].each { while x.nil?; h.default ||= 0; break; end; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\n[1].each { [2].each { case x; when 1; h.default ||= 0; else; 2; end; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // Evaluation order inside the inner body — the modifier
+        // predicate runs before its body.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { h[:a].frobnicate if h.default ||= 0 } }\nh[:a].frobnicate\n"[..],
+    ] {
+        let diags = check(src);
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected only the post-block read to fire for {src:?}, got {diags:?}"
+        );
+        assert!(
+            diags[0].message.contains("frobnicate"),
+            "expected `frobnicate` on the post-block read for {src:?}, got {diags:?}"
+        );
+    }
+    // Controls — inner-body writes that must NOT reach the read keep the
+    // narrowing: each row reports TWO diagnostics.
+    for src in [
+        // Read before the write in the inner body.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { h[:a].frobnicate; h.default ||= 0 } }\nh[:a].frobnicate\n"[..],
+        // An inner-block write does not reach the outer body's later
+        // read (the deferred body may never run).
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { h.default ||= 0 }; h[:a].frobnicate }\nh[:a].frobnicate\n"[..],
+        // … nor a sibling inner block's read.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { h.default ||= 0 }; [3].each { h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // A write inside a nested lambda is deferred past the read.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { -> { h.default ||= 0 }; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // Sibling `if` arms are alternative paths.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nx = ENV[\"K\"]\n[1].each { [2].each { if x; h[:a].frobnicate; else; h.default ||= 0; end } }\nh[:a].frobnicate\n"[..],
+        // A non-mutator writer drops nothing.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { h.foo ||= 0; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // The operand-effects gate: `puts(h.default ||= 0)` keeps the
+        // narrowing (rigor-rs#361).
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { puts(h.default ||= 0); h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // A write in a block-parameter default does not order against
+        // the body statements.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { |a = (h.default ||= 0)| h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // A write in a receiver-position block (`[3].map { … }`) keys to
+        // that call, not to the `.each` body holding the read.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [3].map { h.default ||= 0 }.each { h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+    ] {
+        let diags = check(src);
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected both reads to fire for {src:?}, got {diags:?}"
+        );
+    }
+}
