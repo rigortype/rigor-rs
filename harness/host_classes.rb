@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 
-# Regenerate `crates/rigor-index/src/host_resolvable.rs` — the TOP-LEVEL
-# constants the reference's `check` host process resolves at analysis time.
+# Regenerate `crates/rigor-index/src/rbs/host_resolvable.rs` — the constants
+# (top-level and nested) the reference's `check` host process resolves at
+# analysis time.
 # `class_subtype_result` (acceptance.rb) asks `resolve_class(name)`, which
 # const-gets a name WITHOUT triggering autoload or const_missing, so a param
 # mismatch can only be proven when the ARGUMENT's class name is in this set —
