@@ -30,6 +30,10 @@ use ruby_rbs::node::{
 // index; sorted is chosen for reproducibility.
 include!(concat!(env!("OUT_DIR"), "/embedded_rbs.rs"));
 
+// Issue #382: the reference host's resolvable-constant table (generated).
+mod host_resolvable;
+use host_resolvable::host_resolvable_class;
+
 // `%a{rigor:v1:conforms-to _Interface}` (issue #129, ADR-0044).
 mod conformance;
 pub use conformance::{
@@ -3252,9 +3256,11 @@ impl CoreData {
     ///
     /// - `ClassInstance(name)` ⇒ decided by [`Self::class_ordering`]`(arg_class,
     ///   name)`: `Equal`/`Subclass` (the arg is the param class or a descendant)
-    ///   accept; `Disjoint` (provably unrelated) is the sole rejection (`false`);
-    ///   `Superclass` (the arg is broader — a runtime value MIGHT be the param
-    ///   class) and `Unknown` (either class unloaded) admit conservatively.
+    ///   and `Unknown` (either class unloaded) accept; `Disjoint`/`Superclass`
+    ///   reject — BUT only when the argument class resolves in the reference's
+    ///   host process (`resolve_class` inside `class_subtype_result`, #382): a
+    ///   sig-only, project-source or vendored-but-unloaded class is a `maybe`,
+    ///   so [`host_resolvable_class`] gates the proven `no`.
     /// - `Alias` ⇒ bounded expansion; an unresolvable alias accepts.
     /// - `Interface` ⇒ accepted iff `arg_class` implements every required method
     ///   (mirror of [`Self::interface_admits_nil`], asking the arg class); an
@@ -3274,13 +3280,19 @@ impl CoreData {
     ) -> bool {
         match t {
             RetainedParamType::ClassInstance(name, _) => {
-                matches!(
-                    self.class_ordering(arg_class, name),
-                    ClassOrdering::Equal
-                        | ClassOrdering::Subclass
-                        | ClassOrdering::Superclass
-                        | ClassOrdering::Unknown
-                )
+                match self.class_ordering(arg_class, name) {
+                    // A proven `no` in the reference's `class_subtype_result`
+                    // (acceptance.rb) requires the ARGUMENT's class to resolve
+                    // against the host process (`resolve_class` → `const_get`,
+                    // no autoload): a sig-only, project-source or vendored-but-
+                    // unloaded class answers `maybe`, so it can never carry a
+                    // rejection. `Superclass` rejects for the same reason as
+                    // `Disjoint` — `actual <= target` is false either way.
+                    ClassOrdering::Disjoint | ClassOrdering::Superclass => {
+                        !host_resolvable_class(arg_class)
+                    }
+                    ClassOrdering::Equal | ClassOrdering::Subclass | ClassOrdering::Unknown => true,
+                }
             }
             RetainedParamType::Alias(name, _) => {
                 if depth >= Self::ALIAS_EXPANSION_CAP {

@@ -669,8 +669,9 @@ fn atm_param_admits_nil_string_int_aliases() {
     assert!(idx.param_admits_nil(&RetainedParamType::Interface("_NoSuchIfaceZzz", vec![])));
 }
 
-/// `ClassInstance` argument acceptance via `class_ordering`: Equal / Subclass
-/// / Superclass / Unknown accept, only a provable `Disjoint` rejects.
+/// `ClassInstance` argument acceptance via `class_ordering`: Equal / Subclass /
+/// Unknown accept; `Disjoint` and `Superclass` reject ONLY when the argument
+/// class resolves in the reference's host process (`resolve_class` — #382).
 #[test]
 fn atm_param_accepts_arg_class_instance() {
     let idx = CoreData::load();
@@ -681,9 +682,10 @@ fn atm_param_accepts_arg_class_instance() {
         &RetainedParamType::ClassInstance("Exception", vec![]),
         "ArgumentError"
     ));
-    // Superclass: arg Numeric is broader than param Integer — a runtime value
-    // MIGHT be an Integer, so admit (never a provable reject).
-    assert!(idx.param_accepts_arg_class(
+    // Superclass: arg Numeric is broader than param Integer — `actual <= target`
+    // is false, so the reference's `class_subtype_result` answers `no` (it fires
+    // `expected Integer, got Numeric` — issue #382 probe).
+    assert!(!idx.param_accepts_arg_class(
         &RetainedParamType::ClassInstance("Integer", vec![]),
         "Numeric"
     ));
@@ -692,11 +694,17 @@ fn atm_param_accepts_arg_class_instance() {
         &RetainedParamType::ClassInstance("NoSuchClassZzz", vec![]),
         "String"
     ));
-    // Disjoint: the sole rejection.
+    // Disjoint: rejection — but ONLY when the arg class resolves in the
+    // reference's host process. `Symbol`/`String`/`Integer` are core-loaded;
+    // `BigDecimal` is index-known yet unloaded there (`maybe` ⇒ admit).
     assert!(!idx.param_accepts_arg_class(&RetainedParamType::ClassInstance("String", vec![]), "Symbol"));
     assert!(!idx.param_accepts_arg_class(
         &RetainedParamType::ClassInstance("Integer", vec![]),
         "String"
+    ));
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("String", vec![]),
+        "BigDecimal"
     ));
 }
 
