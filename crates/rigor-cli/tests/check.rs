@@ -557,3 +557,41 @@ fn joined_index_write_keeps_indexed_narrowing() {
         "expected the `||=` stored-slot union `for \"s\" | \"t\" | 1`, got {diags:?}"
     );
 }
+
+/// rigor-rs#382: `call.argument-type-mismatch`'s class-level rejection is the
+/// reference's `class_subtype_result`, which resolves BOTH names via
+/// `const_get` on the host process (acceptance.rb `resolve_class`). An arg
+/// class that is index-known but never host-loaded — a project-`sig/` class,
+/// vendored-but-unrequired stdlib — answers `maybe`, never a proven `no`, so
+/// `String`/`String?` params stay silent on it; host-resolvable args still
+/// reject (including `Superclass`, `actual <= target` being false).
+#[test]
+fn argument_mismatch_requires_host_resolvable_arg_class() {
+    let dir = std::env::temp_dir().join("rigor_i382_sig");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("w.rbs"),
+        "class Widget\n  def take_optstr: (String? x) -> void\n  def take_string: (String x) -> void\n  def take_widget: (Widget w) -> void\nend\n",
+    )
+    .unwrap();
+    let index = CoreIndex::for_project(&[], std::slice::from_ref(&dir));
+    let mut interner = Interner::new();
+
+    let src = b"w = Widget.new\nw.take_optstr(w)\nw.take_string(w)\nw.take_widget(\"s\")\nw.take_string(42)\n";
+    let diags = analyze(&lower(&parse(src)), &mut interner, &index);
+    assert_eq!(
+        diags.len(),
+        2,
+        "sig-only `Widget` args must not reject; resolvable args still fire: {diags:?}"
+    );
+    assert!(
+        diags.iter().any(|d| d.message.contains("expected Widget, got \"s\"")),
+        "host-resolvable `String` arg into sig-only `Widget` param still fires: {diags:?}"
+    );
+    assert!(
+        diags.iter().any(|d| d.message.contains("expected String, got 42")),
+        "core `Integer` arg into `String` param still fires: {diags:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
