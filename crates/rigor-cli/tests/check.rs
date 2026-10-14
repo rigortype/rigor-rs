@@ -621,6 +621,14 @@ fn dead_position_writes_do_not_leak() {
         // (`widen_entry_for_retry` carries only entry-bound names).
         &b"begin\n  q = 1\nrescue\n  Float(q).w\nend\n"[..],
         &b"tries = 0\nbegin\n  q = 1\nrescue\n  tries += 1\n  retry if tries < 2\n  Float(q).w\nend\n"[..],
+        // …but a loop holding BOTH the write and the clause read is a
+        // carrier: a later pass's protected-body write lands in the
+        // clause's entry scope, so `q` is `nil | 1` there and the call
+        // declines (rigor-rs#386 review — the clause-boundary rule must
+        // not fire across a loop back-edge).
+        &b"q = nil\nwhile c\n  begin\n    q = 1\n  rescue\n    q.frobnicate\n  end\nend\n"[..],
+        &b"q = nil\nuntil c\n  begin\n    q = 1\n  rescue\n    q.frobnicate\n  end\nend\n"[..],
+        &b"q = nil\nwhile true\n  begin\n    q = 1\n  rescue\n    q.frobnicate\n  end\nend\n"[..],
         // `begin q = 1 rescue Float(q).w end` lowers as
         // `q = (1 rescue Float(q).w)` — the write's own RHS is evaluated
         // BEFORE the binding lands, so its `q` read sees nothing.
@@ -663,6 +671,10 @@ fn dead_position_writes_do_not_leak() {
         &b"[1].each do\n  1 rescue q = 1\n  Float(q).w\nend\n"[..],
         // A `begin` main write still binds in `ensure` and post-`begin`.
         &b"begin\n  q = 1\nrescue\nensure\n  Float(q).w\nend\n"[..],
+        // A `class << C` reopen after the `if` counts as a second site
+        // for `(C, off?, Singleton)` — disagreeing folds decline, so the
+        // arm stays live and `q`'s write binds (rigor-rs#386 review).
+        &b"class C\n  def self.off? = false\nend\nif C.off?\n  q = 1\nend\nFloat(q).w\nclass << C\n  def off? = true\nend\n"[..],
     ] {
         let diags = check(src);
         assert!(

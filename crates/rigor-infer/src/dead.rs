@@ -133,6 +133,10 @@ pub(crate) struct DeadPositions {
     folded: Vec<(Span, Vec<(String, DeadOp)>)>,
     /// One entry per `rescue` clause of every real `begin`/`rescue`.
     rescue: Vec<RescueArm>,
+    /// Every `loop`/`while`/`until`/`for` span — a back-edge carrier: a
+    /// write it contains reaches a read it contains on a LATER pass even
+    /// when the same-pass scope ordering would drop it.
+    loops: Vec<Span>,
 }
 
 impl DeadPositions {
@@ -154,14 +158,26 @@ impl DeadPositions {
         // the entry scope, so it binds nothing there (`begin q=1 rescue
         // Float(q).w end`, rigor-rs#386); a `retry` carries only
         // entry-bound names (`widen_entry_for_retry`), which arrive via
-        // their own pre-`begin` writes anyway. The use must START inside
-        // the clause: the last clause's clipped span ends at the `begin`'s
-        // own end, so a zero-width probe at (end, end) — the post-`begin`
-        // continuation site flow_eval queries — would otherwise count as
-        // "inside the clause" and suppress the main hull's mutations from
-        // widening the post-`begin` state.
+        // their own pre-`begin` writes anyway. Two refinements:
+        //   - The use must START inside the clause: the last clause's
+        //     clipped span ends at the `begin`'s own end, so a zero-width
+        //     probe at (end, end) — the post-`begin` continuation site
+        //     flow_eval queries — would otherwise count as "inside the
+        //     clause" and suppress the main hull's mutations from widening
+        //     the post-`begin` state.
+        //   - A loop back-edge reopens the boundary: when a `loop`/`while`/
+        //     `until`/`for` holds BOTH the write and the clause read, the
+        //     write lands in the NEXT pass's entry scope (`while c; begin
+        //     q=1 rescue q.f end; end` — `q` is `nil | 1` there and
+        //     declines, rigor-rs#386 review).
         if self.rescue.iter().any(|a| {
-            a.span.0 <= use_.0 && use_.0 < a.span.1 && a.main.is_some_and(|m| contains(m, write))
+            a.span.0 <= use_.0
+                && use_.0 < a.span.1
+                && a.main.is_some_and(|m| contains(m, write))
+                && !self
+                    .loops
+                    .iter()
+                    .any(|&l| contains(l, write) && contains(l, use_))
         }) {
             return false;
         }
@@ -353,6 +369,7 @@ impl<'i> Typer<'i> {
                         dirty = true;
                     }
                 }
+                Node::Loop { span, .. } => dead.loops.push(*span),
                 _ => {}
             }
         }
