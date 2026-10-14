@@ -4044,24 +4044,28 @@ impl<'i> Typer<'i> {
                 };
                 (class, false, args)
             }
-            Type::HashShape(members) => {
+            Type::HashShape { members, open } => {
                 let Some(class) = self.index.class_id("Hash") else {
                     return interner.untyped();
                 };
                 // `hash_shape_type_args` — `[union(constant keys),
-                // union(values)]`; an open shape's `untyped` arms have no
-                // port analogue (HashShape carries no open mark).
+                // union(values)]`; an open shape adds a `Dynamic[top]` arm to
+                // BOTH unions (unseen keys may hold any value).
                 let args = if members.is_empty() {
                     Vec::new()
                 } else {
-                    let mut keys: Vec<TypeId> = Vec::with_capacity(members.len());
+                    let mut keys: Vec<TypeId> = Vec::with_capacity(members.len() + 1);
                     for m in &members {
                         keys.push(match shape_key_to_scalar(&m.key) {
                             Some(s) => interner.intern(Type::Constant(s)),
                             None => interner.untyped(),
                         });
                     }
-                    let vals: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                    let mut vals: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                    if open {
+                        keys.push(interner.untyped());
+                        vals.push(interner.untyped());
+                    }
                     vec![
                         keys.into_iter()
                             .reduce(|a, b| rigor_types::Algebra::join(interner, a, b))
@@ -4623,15 +4627,22 @@ impl<'i> Typer<'i> {
                 let pre = env.clone();
                 widen_flow_writes(rebinds, vspan, env, interner);
                 let live_base = env.clone();
-                self.apply_lookup_mutations_in(
-                    ast, id, lookup, &pre, env, interner, Some((snaps, stmt_span, &live_base)),
+                let (applied, live) = self.lookup_mutation_effects(
+                    ast, id, lookup, &pre, interner, Some((snaps, stmt_span, &live_base)),
                 );
-                // The RHS evaluated at statement ENTRY — a mutation inside it
-                // does not change what it evaluated to (`x = (h.default ||=
-                // 0)` binds `0`, not the opened shape's `default` read), and
-                // `x = (h.default = h[:b])` binds `nil` from the pre-dispatch
-                // `[]` — so the binding types the value against `pre`.
-                let ty = self.type_of(ast, value, &pre, interner);
+                for (name, ty) in applied {
+                    env.insert(name, ty);
+                }
+                // The RHS's OWN sequenced writes and mutations feed its later
+                // reads, so type it against the replayed `live` env, not the
+                // statement-entry one: `x = (y = "s"; y)` binds `"s"`, `x =
+                // (h.default = 0; h[:b])` binds the open shape's `[]` result,
+                // and `x = (s.compare_by_identity; s.fetch("k"))` binds the
+                // widened fetch. A read EARLIER than a write inside the value
+                // still declines toward the join (`x = [h[:b], (h.default =
+                // 0)]` reads the open shape at `[0]` — the reference's `nil`
+                // fold is the precision lost, never an FP).
+                let ty = self.type_of(ast, value, &live, interner);
                 env.insert(name, ty);
             }
             Node::MultiWrite { targets, value, .. } => {
@@ -4646,10 +4657,13 @@ impl<'i> Typer<'i> {
                 // `bound.apply_to` / `widen_attribute_targets` order), while
                 // `x, h.default = 1, 0` widens the untouched `h`.
                 let live_base = env.clone();
-                let applied = self.lookup_mutation_effects(
+                let (applied, live) = self.lookup_mutation_effects(
                     ast, id, lookup, &pre, interner, Some((snaps, stmt_span, &live_base)),
                 );
-                let rhs = self.type_of(ast, value, &pre, interner);
+                // The RHS types against the replayed `live` env, exactly as
+                // the single-write arm — `x, z = (y = "s"; [y, 2])`
+                // destructures `["s", 2]`, never the statement-entry `y`.
+                let rhs = self.type_of(ast, value, &live, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     env.insert(name, ty);
                 }
@@ -4820,6 +4834,26 @@ impl<'i> Typer<'i> {
                         ast, p, lookup, &benv_pre, &mut benv, interner, None,
                     );
                 }
+                // `while`/`until`/`begin…end while` re-run the body and the
+                // predicate, so every local written inside the loop joins the
+                // entry binding — the flat env's widen, without which
+                // `y = 1; while c; y.upcase; y = "s"; end` reads the stale
+                // `1`. `for` runs the body exactly once and keeps the
+                // single-pass env. The predicate region gets the same joined
+                // seed — a `y.foo` in `while y.foo` reads the join, not the
+                // first-pass entry env.
+                if index.is_empty() {
+                    widen_reentrant_writes(
+                        rebinds,
+                        lookup,
+                        ast.get(id).span(),
+                        &mut benv,
+                        interner,
+                    );
+                    if let Some(p) = predicate {
+                        snaps.push((ast.get(p).span(), benv.clone()));
+                    }
+                }
                 // `for w in xs` binds the index per iteration
                 // (`bind_for_index`) — the body must not read the OUTER local
                 // of the same name (`for f3 in [1]; f3.even?` sees the
@@ -4836,7 +4870,24 @@ impl<'i> Typer<'i> {
                 let (body, ensure_body, clauses) =
                     (body.clone(), ensure_body.clone(), clauses.clone());
                 let mut env = check_env_at(snaps, ast.get(id).span());
-                for &s in begin_value_body(&body, &ensure_body) {
+                let protected = begin_value_body(&body, &ensure_body);
+                // `retry` restarts the protected body — a local written
+                // there joins the entry binding exactly like a loop body's
+                // writes (`y = 1; begin; y.upcase; y = "s"; rescue; retry;
+                // end` reads the join). No `retry` — the body runs once.
+                if clauses.iter().any(|c| contains_retry(ast, &c.body)) {
+                    let hull = protected.iter().fold(None, |acc: Option<rigor_parse::Span>, &s| {
+                        let s = ast.get(s).span();
+                        Some(match acc {
+                            None => s,
+                            Some((a, b)) => (a.min(s.0), b.max(s.1)),
+                        })
+                    });
+                    if let Some(h) = hull {
+                        widen_reentrant_writes(rebinds, lookup, h, &mut env, interner);
+                    }
+                }
+                for &s in protected {
                     self.bind_check_statement(ast, s, &mut env, rebinds, lookup, interner, snaps);
                 }
                 // A rescue clause runs from the scope the protected body left
@@ -4856,13 +4907,14 @@ impl<'i> Typer<'i> {
                 }
             }
             Node::Call { receiver, args, block_body, block_locals, block_span, .. } => {
-                let (receiver, args, block_body, block_locals, literal) = (
+                let (receiver, args, block_body, block_locals, block_span) = (
                     *receiver,
                     args.clone(),
                     block_body.clone(),
                     block_locals.clone(),
-                    block_span.is_some(),
+                    *block_span,
                 );
+                let literal = block_span.is_some();
                 for &k in receiver.iter().chain(&args) {
                     self.record_nested_check_envs(ast, k, rebinds, lookup, interner, snaps);
                 }
@@ -4901,6 +4953,21 @@ impl<'i> Typer<'i> {
                     );
                     scoped_lookup.extend(
                         scoped_calls.into_iter().map(|(_, s, n, m)| (s, n, m)),
+                    );
+                    // The block may iterate or never run — every local the
+                    // body writes joins the entry binding (`y = 1;
+                    // [1,2].each { y.upcase; y = "s" }` reads the join, not
+                    // the stale `1`, and a stale `nil` no longer defeats the
+                    // `if y` arm's read either). Mutation pseudo-writes stay
+                    // out of the join — `h[:b] + 1` before `h.default = 0`
+                    // inside the block still folds `nil` on the reference.
+                    // `block_span` covers the parameters' defaults too.
+                    widen_reentrant_writes(
+                        &scoped_rebinds,
+                        &scoped_lookup,
+                        block_span.unwrap(),
+                        &mut benv,
+                        interner,
                     );
                     for &s in &block_body {
                         self.bind_check_statement(
@@ -5089,7 +5156,7 @@ impl<'i> Typer<'i> {
                 let vspan = ast.get(value).span();
                 let pre = env.clone();
                 widen_flow_writes(writes, vspan, env, interner);
-                let applied =
+                let (applied, _live) =
                     self.lookup_mutation_effects(ast, id, lookup, &pre, interner, None);
                 let rhs = self.type_of(ast, value, &pre, interner);
                 // `bound.apply_to` before `widen_attribute_targets` — the
@@ -5398,7 +5465,8 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
         tails: Option<TailRegions<'_>>,
     ) {
-        for (name, ty) in self.lookup_mutation_effects(ast, id, lookup, pre, interner, tails) {
+        let (effects, _live) = self.lookup_mutation_effects(ast, id, lookup, pre, interner, tails);
+        for (name, ty) in effects {
             env.insert(name, ty);
         }
     }
@@ -5417,6 +5485,13 @@ impl<'i> Typer<'i> {
     /// stays declined (`x = [c ? h.default = 0 : nil, h[:b] + 1]` reads the
     /// joined `h`, not the pre-statement closed shape) while a replayed
     /// unconditional event overwrites it (`p(x = 5, x.foo)` reads `5`).
+    ///
+    /// Returns `(mutations, live)`: the `(name, type)` pairs a non-conditional
+    /// mutator dispatch leaves, plus the env the statement's LAST evaluated
+    /// position reads — the post-widen base with every unconditional event
+    /// replayed. A write statement types its value against `live` so
+    /// sequenced writes inside the value are not lost: `x = (y = "s"; y)`
+    /// binds `"s"`, not the statement-entry `y` (`bind_check_statement`).
     fn lookup_mutation_effects(
         &self,
         ast: &LoweredAst,
@@ -5425,10 +5500,10 @@ impl<'i> Typer<'i> {
         pre: &TypeEnv,
         interner: &mut Interner,
         mut tails: Option<TailRegions<'_>>,
-    ) -> Vec<(String, TypeId)> {
+    ) -> (Vec<(String, TypeId)>, TypeEnv) {
         let span = ast.get(id).span();
         if tails.is_none() && !lookup.iter().any(|(s, _, _)| span.0 <= s.0 && s.1 <= span.1) {
-            return Vec::new();
+            return (Vec::new(), TypeEnv::new());
         }
         // Replay the statement's evaluated positions in EVALUATION order
         // (receiver → arguments → the call's own dispatch → the block it
@@ -5444,11 +5519,6 @@ impl<'i> Typer<'i> {
         let mut events = Vec::new();
         let mut conditional = HashSet::new();
         collect_apply_events(ast, id, false, &mut events, &mut conditional);
-        if events.is_empty()
-            || (tails.is_none() && !events.iter().any(|e| matches!(e, ApplyEvent::Mutate(_))))
-        {
-            return Vec::new();
-        }
         let mut work = pre.clone();
         let mut live = match &tails {
             Some((_, _, base)) => (*base).clone(),
@@ -5460,6 +5530,11 @@ impl<'i> Typer<'i> {
                 l
             }
         };
+        if events.is_empty()
+            || (tails.is_none() && !events.iter().any(|e| matches!(e, ApplyEvent::Mutate { .. })))
+        {
+            return (Vec::new(), live);
+        }
         let mut mutated: Vec<String> = Vec::new();
         for ev in &events {
             match ev {
@@ -5493,7 +5568,7 @@ impl<'i> Typer<'i> {
                 // caller's post-widen `live` base — the marker only splits
                 // the region record.
                 ApplyEvent::Conditional(_) => {}
-                ApplyEvent::Mutate(mspan) => {
+                ApplyEvent::Mutate { span: mspan, .. } => {
                     for (_, name, method) in lookup.iter().filter(|(ls, _, _)| ls == mspan) {
                         if !mutated.contains(name) {
                             mutated.push(name.clone());
@@ -5520,16 +5595,20 @@ impl<'i> Typer<'i> {
                 snaps.push(((event_end(ast, ev), sspan.1), live.clone()));
             }
         }
-        mutated
-            .into_iter()
-            // A write to the same local in a position the event walk could not
-            // prove unconditional (a branch arm, a block body, an `&&`/`||`
-            // right operand, a rescue clause) means the binding at dispatch
-            // time is a join — the caller's span-widen already models it as
-            // `Dynamic`; keep that rather than landing the replayed carrier.
-            .filter(|name| !conditional.contains(name))
-            .filter_map(|name| work.get(&name).map(|&ty| (name, ty)))
-            .collect()
+        (
+            mutated
+                .into_iter()
+                // A write to the same local in a position the event walk could
+                // not prove unconditional (a branch arm, a block body, an
+                // `&&`/`||` right operand, a rescue clause) means the binding
+                // at dispatch time is a join — the caller's span-widen already
+                // models it as `Dynamic`; keep that rather than landing the
+                // replayed carrier.
+                .filter(|name| !conditional.contains(name))
+                .filter_map(|name| work.get(&name).map(|&ty| (name, ty)))
+                .collect(),
+            live,
+        )
     }
 
     /// `HashLookupMutation.identity_widening` (`hash_lookup_mutation.rb:73`):
@@ -10724,8 +10803,14 @@ enum ApplyEvent {
     /// destructures the RHS and a `Mutate` that follows sees the post-bind
     /// carrier (`h.default, h = 0, {b: 1}` opens the just-bound `{b: 1}`).
     MultiBind { targets: rigor_parse::MultiTargets, value: NodeId },
-    /// A `local.<lookup-mutator>` call dispatch — the span keys into `lookup`.
-    Mutate(rigor_parse::Span),
+    /// A `local.<lookup-mutator>` call dispatch — `span` keys into `lookup`,
+    /// `opens_at` is the byte offset the dispatch's tail region opens at.
+    /// Everywhere but a multi-write attribute target that is the call's own
+    /// end; a `CallTargetNode` writer (`x, h.default = h.foo2, 0`) dispatches
+    /// only after the WHOLE right-hand side evaluates, so its region opens at
+    /// the [`ApplyEvent::MultiBind`]'s end — otherwise the RHS positions would
+    /// read the already-open carrier.
+    Mutate { span: rigor_parse::Span, opens_at: usize },
     /// A subtree whose writes/mutations MAY not have run (a branch arm, an
     /// `&&`/`||` right operand, a safe-nav call's arguments, a rescue
     /// clause). No binding replay — the event only opens the tail region so
@@ -10742,7 +10827,8 @@ fn event_end(ast: &LoweredAst, ev: &ApplyEvent) -> usize {
         ApplyEvent::Write { value, .. }
         | ApplyEvent::OpWrite { value, .. }
         | ApplyEvent::MultiBind { value, .. } => ast.get(*value).span().1,
-        ApplyEvent::Mutate(span) | ApplyEvent::Conditional(span) => span.1,
+        ApplyEvent::Mutate { opens_at, .. } => *opens_at,
+        ApplyEvent::Conditional(span) => span.1,
     }
 }
 
@@ -10790,7 +10876,7 @@ fn collect_apply_events(
                 let mut names = Vec::new();
                 receiver_alias_local_candidates(ast, *r, 0, &mut names);
                 if !names.is_empty() {
-                    events.push(ApplyEvent::Mutate(*span));
+                    events.push(ApplyEvent::Mutate { span: *span, opens_at: span.1 });
                 }
             }
         }
@@ -10861,7 +10947,15 @@ fn collect_apply_events(
             });
             for (tspan, writer, _) in targets.call_targets() {
                 if HASH_LOOKUP_MUTATORS.contains(&writer.as_str()) {
-                    events.push(ApplyEvent::Mutate(tspan));
+                    // The writer dispatches after the whole RHS evaluated, so
+                    // the tail region opens at the VALUE's end, not at the
+                    // target's — `x, h.default = h.foo2, 0` types `h.foo2`
+                    // against the pre-write `{ a: 1 }`, and `h.default, x =
+                    // 0, h[:b] + 1` still folds the `nil` read.
+                    events.push(ApplyEvent::Mutate {
+                        span: tspan,
+                        opens_at: ast.get(*value).span().1,
+                    });
                 }
             }
         }
@@ -10874,7 +10968,7 @@ fn collect_apply_events(
         // `widen_attribute_write` applies unconditionally).
         Node::AttributeCompoundWrite { write_name, span, .. } => {
             if HASH_LOOKUP_MUTATORS.contains(&write_name.as_str()) {
-                events.push(ApplyEvent::Mutate(*span));
+                events.push(ApplyEvent::Mutate { span: *span, opens_at: span.1 });
             }
         }
         Node::Call { receiver, args, block_body, block_span, safe_nav, method, span, .. } => {
@@ -10907,7 +11001,7 @@ fn collect_apply_events(
                     !names.is_empty()
                 })
             {
-                events.push(ApplyEvent::Mutate(*span));
+                events.push(ApplyEvent::Mutate { span: *span, opens_at: span.1 });
             }
             if !*safe_nav {
                 // A LITERAL block (`{ … }` / `do … end`, `block_span` set) is
@@ -11378,6 +11472,49 @@ fn widen_flow_writes(
             env.insert(name.clone(), u);
         }
     }
+}
+
+/// The re-entrant join [`Typer::record_nested_check_envs`] seeds a re-running
+/// section with — [`widen_flow_writes`] restricted to LOCAL writes. A loop
+/// body, a literal block body and a `retry`-able protected body may run more
+/// than once, so a local rebind inside joins the entry binding: `y = 1;
+/// while c; y.upcase; y = "s"; end` reads the join, never the stale `1`. A
+/// hash lookup mutation does NOT join this way — the reference keeps
+/// in-order reads folded (`while c; h[:b] + 1; h.default = 0; end` still
+/// answers `+ for nil` — the open never leaks to an earlier body position),
+/// so entries whose span is a `lookup` mutator call (the pseudo-writes
+/// [`lookup_pseudo_writes`] merged into `rebinds`) are skipped.
+fn widen_reentrant_writes(
+    rebinds: &[(rigor_parse::Span, String)],
+    lookup: &[(rigor_parse::Span, String, String)],
+    span: rigor_parse::Span,
+    env: &mut TypeEnv,
+    interner: &mut Interner,
+) {
+    let u = interner.untyped();
+    for (wspan, name) in rebinds {
+        if span.0 <= wspan.0
+            && wspan.1 <= span.1
+            && !lookup.iter().any(|(ls, _, _)| *ls == *wspan)
+        {
+            env.insert(name.clone(), u);
+        }
+    }
+}
+
+/// Whether `roots` reaches a `retry` jump — a `rescue` clause that restarts
+/// the protected body makes that body re-entrant the way a loop's is, so its
+/// writes join the entry binding ([`widen_reentrant_writes`]).
+fn contains_retry(ast: &LoweredAst, roots: &[NodeId]) -> bool {
+    descendants_of(ast, roots).iter().any(|&d| {
+        matches!(
+            ast.get(d),
+            Node::Statements {
+                kind: StatementsKind::Jump(JumpKind::Retry),
+                ..
+            }
+        )
+    })
 }
 
 /// Drop the `Array.new`-provenance of every local whose write span is contained
