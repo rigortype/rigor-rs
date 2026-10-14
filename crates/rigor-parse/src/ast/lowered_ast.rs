@@ -141,8 +141,18 @@ struct CarrierSpans {
     /// only, so a scope effect there (an attribute write's
     /// indexed-record drop, a slot-mutator widening) never propagates,
     /// not even to reads inside the argument (rigor-rs#363;
-    /// [`LoweredAst::in_locals_only_carrier`]).
+    /// [`LoweredAst::in_locals_only_carrier`]). This half holds the
+    /// spans descended from an iterated (`while`/`until`) body, where
+    /// `loop_content_writeback` text-scans the whole body and re-joins
+    /// a CONTENT_ADDERS mutator's stored arguments into the receiver
+    /// binding — so a later element read declines even though the
+    /// record survives (`locals_only_suppresses` keeps their drops).
     locals_only: Vec<Span>,
+    /// `break` argument spans under no iterated body — a bare `for`'s
+    /// `join_break_scopes` with no `loop_content_writeback` to re-join
+    /// anything. Every scope effect is suppressed here, adders included
+    /// (rigor-rs#363).
+    bare_locals_only: Vec<Span>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -262,13 +272,32 @@ impl LoweredAst {
     /// rigor-rs#363). The mutation replay consumes it: an attribute
     /// write's indexed-record drop or a slot mutation's widening inside
     /// one applies nowhere — the narrowing table is not part of the
-    /// joined locals — while a `[]=`/mutator mark's own invalidation and
-    /// any local rebind still join as before.
+    /// joined locals — while any local rebind still joins as before.
     pub fn in_locals_only_carrier(&self, span: Span) -> bool {
         self.carrier_spans
             .locals_only
             .iter()
+            .chain(self.carrier_spans.bare_locals_only.iter())
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
+    /// Whether a shape mutator's record drop at `span` lands on a
+    /// locals-only break join and so applies nowhere (rigor-rs#363).
+    /// The exception: a CONTENT_ADDERS method (`[]=`/`store`/`replace`/
+    /// `<<`/`push` …) inside an iterated body — `loop_content_writeback`
+    /// text-scans the whole `while`/`until` body, finds the call, and
+    /// re-joins its stored arguments into the receiver binding as
+    /// element evidence, so the read declines anyway. The flat env
+    /// cannot express "record present, read declined", so the port
+    /// keeps the drop instead. `bare_locals_only` spans (a `for`'s
+    /// break argument — `eval_for` runs no writeback) suppress
+    /// everything.
+    pub fn locals_only_suppresses(&self, span: Span, content_adder: bool) -> bool {
+        self.carrier_spans
+            .bare_locals_only
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+            || (!content_adder && self.in_locals_only_carrier(span))
     }
 
     /// Whether `id` is a node a `(e)` single-statement parens unwrapped to —
@@ -374,6 +403,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         blocked_iterative_spans: Vec::new(),
         lexical_loop: 0,
         locals_only_spans: Vec::new(),
+        bare_locals_only_spans: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -400,6 +430,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         iterative_blocked: builder.blocked_iterative_spans,
         discarded: builder.discarded_spans,
         locals_only: builder.locals_only_spans,
+        bare_locals_only: builder.bare_locals_only_spans,
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();

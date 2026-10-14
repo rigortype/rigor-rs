@@ -920,17 +920,16 @@ impl<'i> Typer<'i> {
         // LOCALS-only union — so an indexed-record drop there (a scope
         // effect, not a binding) never propagates, not even to reads
         // inside the argument (rigor-rs#363). The exception is the
-        // CONTENT_ADDERS family (`<<`/`push`/`[]=`/`store`/`replace` …):
-        // the reference joins their stored arguments into the
-        // continuation binding as element evidence, so every later
-        // element lookup declines even though the record survives the
-        // join. The flat env cannot express "record present, read
-        // declined", so the port keeps the drop for those methods —
-        // `break h[:a] = 9`, `break a << 2` and `break h.store(k, v)`
-        // stay silent, while `break h.merge!(…)`, `break h.clear` and
-        // `break a.pop` keep their records and fire, exactly as the
-        // oracle reports them.
-        if !(ast.in_locals_only_carrier(wspan) && !CONTENT_ADDERS.contains(&method)) {
+        // CONTENT_ADDERS family (`<<`/`push`/`[]=`/`store`/`replace` …)
+        // under an iterated body: `loop_content_writeback` text-scans
+        // it and re-joins the stored arguments as element evidence, so
+        // the read declines anyway — the flat env cannot express
+        // "record present, read declined", so the port keeps the drop.
+        // `break h[:a] = 9` under `while` stays silent; under a bare
+        // `for` (no writeback) or any non-adder mutator — `break
+        // h.merge!(…)`, `break a.pop` — the record survives and fires,
+        // exactly as the oracle reports.
+        if !ast.locals_only_suppresses(wspan, CONTENT_ADDERS.contains(&method)) {
             self.drop_indexed_mutation(name, method, drop_key, env);
         }
         // A `[]=` replayed through a content write-back boundary drops
@@ -1662,11 +1661,10 @@ impl<'i> Typer<'i> {
                     // The `apply_mutation_effects` locals-only gate
                     // (rigor-rs#363): a `break` argument's scope lands on
                     // the locals-only break join, so the record drop
-                    // applies nowhere — except the CONTENT_ADDERS family,
-                    // whose joined store evidence declines the read
-                    // anyway, emulated by keeping the drop.
-                    if !(ast.in_locals_only_carrier(*wspan)
-                        && !CONTENT_ADDERS.contains(&method.as_str()))
+                    // applies nowhere — except an iterated-body
+                    // CONTENT_ADDERS call, whose writeback-joined store
+                    // evidence declines the read anyway.
+                    if !ast.locals_only_suppresses(*wspan, CONTENT_ADDERS.contains(&method.as_str()))
                     {
                         self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
                     }

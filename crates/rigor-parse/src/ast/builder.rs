@@ -151,11 +151,23 @@ pub(crate) struct Builder<'src> {
     pub(crate) lexical_loop: u32,
     /// The spans of `break` nodes whose argument scope lands on a
     /// lexical loop's locals-only break join ([`Self::lexical_loop`] —
-    /// rigor-rs#363; [`LoweredAst::in_locals_only_carrier`]).
+    /// rigor-rs#363; [`LoweredAst::in_locals_only_carrier`]). Split by
+    /// whether an iterated body encloses the span: `while`/`until` run
+    /// `loop_content_writeback`, which text-scans the whole body — even
+    /// inside a nested `for` — and re-joins the CONTENT_ADDERS
+    /// mutators' stored arguments into the continuation binding, so a
+    /// later element read declines anyway. `for` alone collects no
+    /// writeback, so `bare_locals_only_spans` (no enclosing iterated
+    /// body) suppresses every mutator's drop.
     ///
     /// [`LoweredAst::in_locals_only_carrier`]:
     ///     crate::ast::LoweredAst::in_locals_only_carrier
     pub(crate) locals_only_spans: Vec<Span>,
+    /// [`Self::locals_only_spans`] under no iterated body — `eval_for`
+    /// joins break scopes through `join_break_scopes` but runs no
+    /// `loop_content_writeback`, so nothing re-joins an adder mark's
+    /// store evidence (rigor-rs#363).
+    pub(crate) bare_locals_only_spans: Vec<Span>,
 }
 
 impl<'src> Builder<'src> {
@@ -1768,9 +1780,17 @@ impl<'src> Builder<'src> {
                     // indexed-record drop) never propagates, not even to
                     // reads inside the argument itself (rigor-rs#363).
                     // A block/lambda body masks `lexical_loop`: a `break`
-                    // there targets the yielding call instead.
+                    // there targets the yielding call instead. With no
+                    // iterated body enclosing it (`recovery_iterative`),
+                    // the loop is a bare `for` — `eval_for` runs no
+                    // `loop_content_writeback`, so nothing re-joins an
+                    // adder mark's store evidence.
                     if self.lexical_loop > 0 {
-                        self.locals_only_spans.push(span);
+                        if self.recovery_iterative > 0 {
+                            self.locals_only_spans.push(span);
+                        } else {
+                            self.bare_locals_only_spans.push(span);
+                        }
                     }
                     let body = self.lower_body(&args.arguments());
                     self.push(Node::Statements {

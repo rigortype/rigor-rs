@@ -473,14 +473,14 @@ impl<'i> Typer<'i> {
                         // A lexical `break` argument's scope lands on the
                         // locals-only break join — a shape mutator's
                         // record drop there applies nowhere (rigor-rs#363;
-                        // the flow_eval gate mirrors this). The
-                        // CONTENT_ADDERS family is the exception: their
-                        // stored arguments join as element evidence, so
-                        // the joined binding's lookups decline anyway and
-                        // the port keeps the drop.
+                        // the flow_eval gate mirrors this). The iterated-
+                        // body CONTENT_ADDERS family is the exception:
+                        // `loop_content_writeback` re-joins their stored
+                        // arguments as element evidence, so the read
+                        // declines anyway and the port keeps the drop.
                         if is_shape_mutator(&method)
-                            && (!ast.in_locals_only_carrier(call_span)
-                                || CONTENT_ADDERS.contains(&method.as_str()))
+                            && !ast
+                                .locals_only_suppresses(call_span, CONTENT_ADDERS.contains(&method.as_str()))
                         {
                             // `IndexedNarrowing.invalidate_after_call` rides
                             // first: a stable-key `s[k] = v` drops that slot's

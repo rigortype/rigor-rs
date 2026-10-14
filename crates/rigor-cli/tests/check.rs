@@ -872,6 +872,11 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         "while c; break h.delete_if { |k, _| k == :a }; end\n",
         "while c; break h.keep_if { |k, _| k == :a }; end\n",
         "while c; break h.transform_values! { |v| v }; end\n",
+        // `for` runs `join_break_scopes` with no `loop_content_writeback`
+        // — even the adder family keeps its record.
+        "for i in [1]; break h[:a] = 9; end\n",
+        "for i in [1]; break h.store(:a, 9); end\n",
+        "for i in [1]; break h.replace({b: 2}); end\n",
         // `break` inside a block targets the yielding call, whose scope
         // the flat env models as dropped — but the block body's own
         // write is a closure mutation, so the record survives anyway.
@@ -923,6 +928,12 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         "while c; break h.replace({b: 2}); end\n",
         "while c; break (h = {}); end\n",
         "while c; h.default ||= 0; break; end\n",
+        // A `for` nested under a `while` is still writeback-scanned
+        // (the scan is textual over the whole body), and a `while` under
+        // a `for` shadows via its own writeback — `[]=` declines the
+        // read in both.
+        "while c; for i in [1]; break h[:a] = 9; end; end\n",
+        "for i in [1]; while c; break h[:a] = 9; end; end\n",
     ] {
         let src = format!("{prelude}{tail}h[:a].frobnicate\n");
         let diags = check(src.as_bytes());
