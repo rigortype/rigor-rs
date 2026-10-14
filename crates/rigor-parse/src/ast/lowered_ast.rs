@@ -167,6 +167,13 @@ struct CarrierSpans {
     /// [`LoweredAst::iterated_body_spans`]:
     ///     crate::ast::LoweredAst::iterated_body_spans
     iterated_bodies: Vec<Span>,
+    /// `(argument span, owning lexical-loop body span)` for every valued
+    /// `next` under a lexical loop — [`DeadPositions::mutation_reaches`]
+    /// consumes the pair (rigor-rs#363 review).
+    ///
+    /// [`DeadPositions::mutation_reaches`]:
+    ///     rigor_infer::dead::DeadPositions::mutation_reaches
+    next_args: Vec<(Span, Span)>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -351,6 +358,24 @@ impl LoweredAst {
         &self.carrier_spans.iterated_bodies
     }
 
+    /// The inert carriers an iterated body's writeback TEXT SCAN covers —
+    /// `DeadPositions` consumes them to positionally reach a scan-visible
+    /// mutation inside one past the body's join and nowhere else
+    /// (`while c; END { h[:a] = 9 }; break; end` declines post-loop but
+    /// keeps the record in-body — rigor-rs#363 review).
+    pub fn scanned_inert_spans(&self) -> &[Span] {
+        &self.carrier_spans.scanned_inert
+    }
+
+    /// The `(argument, owning body)` span pairs of valued `next`s under
+    /// a lexical loop — `DeadPositions::mutation_reaches` consumes them:
+    /// the argument's marks land post-loop through the fixpoint join but
+    /// never reach a use the owning body still contains
+    /// (rigor-rs#363 review).
+    pub fn next_arg_spans(&self) -> &[(Span, Span)] {
+        &self.carrier_spans.next_args
+    }
+
     /// Whether `id` is a node a `(e)` single-statement parens unwrapped to —
     /// the reference's syntax-level test (`ParenthesesNode` is not `NilNode`)
     /// a literal-discriminating consumer must honor. See
@@ -456,6 +481,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         locals_only_spans: Vec::new(),
         bare_locals_only_spans: Vec::new(),
         iterated_body_spans: Vec::new(),
+        lexical_loop_bodies: Vec::new(),
+        next_arg_spans: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -484,6 +511,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         locals_only: builder.locals_only_spans,
         bare_locals_only: builder.bare_locals_only_spans,
         iterated_bodies: builder.iterated_body_spans,
+        next_args: builder.next_arg_spans,
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();

@@ -608,8 +608,16 @@ pub(crate) fn toplevel_mutations(
             }
         }
     }
-    out.retain(|(id, w, name, ..)| {
-        !ast.in_inert_carrier(*w)
+    out.retain(|(id, w, name, method, _)| {
+        (!ast.in_inert_carrier(*w)
+            // …unless an iterated body's writeback TEXT SCAN covers the
+            // position — `while c; END { h[:a] = 9 }; break; end` still
+            // drops `h[:a]` post-loop on the oracle (rigor-rs#363
+            // review). The operand never evaluates, so only a
+            // CONTENT_MUTATORS mark survives here — a compound ATTRIBUTE
+            // write's widening stays suppressed (`END { h.default ||=
+            // 0 }` keeps the record on both).
+            || (is_content_mutator(method) && ast.in_scanned_inert_carrier(*w)))
             // A mutation mark under a `Recovered::blocked` position never
             // lands — unless an ITERATED body's writeback text scan covers
             // it (rigor-rs#312) or the mark is a compound ATTRIBUTE write,

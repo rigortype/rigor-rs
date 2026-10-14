@@ -981,13 +981,18 @@ impl<'i> Typer<'i> {
             None
         };
         // The receiver-binding widen is a scope effect too: inside a
-        // locals-only `break` argument it lands nowhere — `break
-        // h.clear` leaves `h` at `Hash[Symbol|Dynamic, Integer|Dynamic]`
-        // on the oracle, not Dynamic, so `h.frobnicate` still fires
-        // (rigor-rs#363 review). For a scanned mutator the writeback
-        // rebind keeps `h` near its original shape as well; the flat
-        // env's closest standing binding is the pre-mutation one.
-        if MUTATOR_METHODS.contains(&method) && !ast.in_locals_only_carrier(wspan) {
+        // locals-only `break` argument it lands nowhere for a
+        // NON-scanned mutator — `break h.clear` leaves `h` at its
+        // literal carrier on the oracle, so `h[:a]` still answers `1`
+        // (rigor-rs#363 review) — and under a bare `for` at all. A
+        // SCANNED mutator's writeback DOES rejoin the receiver to a
+        // different carrier (`Hash[:a | Symbol, 1 | 9]`), so its widen
+        // must still land: keeping the `{a: 1}` literal there would let
+        // a post-loop `h[:a]` read serve stale `1` evidence the oracle
+        // does not emit.
+        if MUTATOR_METHODS.contains(&method)
+            && !ast.locals_only_suppresses(wspan, is_content_mutator(method))
+        {
             if let Some(&pre) = env.get(name) {
                 if evaluated {
                     if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {

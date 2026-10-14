@@ -178,6 +178,21 @@ pub(crate) struct Builder<'src> {
     /// `rescue` clause — because the scan reads the body textually
     /// (rigor-rs#363 review).
     pub(crate) iterated_body_spans: Vec<Span>,
+    /// The STACK of enclosing lexical-loop body spans — pushed on each
+    /// `while`/`until`/`for` `lexical_loop` bump — so a valued `next`
+    /// pairs its argument with the INNERMOST body's join it lands on
+    /// (`while c; for i; next w; end; h[:a].m` reaches the in-body read
+    /// past the `for` — rigor-rs#363 review). A body-less loop pushes a
+    /// degenerate span so the stack stays aligned with the counter.
+    pub(crate) lexical_loop_bodies: Vec<Span>,
+    /// `(argument span, owning lexical-loop body span)` for every valued
+    /// `next` under a lexical loop — `DeadPositions::mutation_reaches`
+    /// consumes the pair: a `next` argument joins the iteration fixpoint
+    /// (its marks DO land post-loop, unlike `break`'s locals-only join),
+    /// but a use the owning body still contains evaluates pre-join and
+    /// keeps the record — `next (h[:a] = 9; h[:a].m)` fires in-argument
+    /// on the oracle (rigor-rs#363 review).
+    pub(crate) next_arg_spans: Vec<(Span, Span)>,
 }
 
 impl<'src> Builder<'src> {
@@ -1209,13 +1224,19 @@ impl<'src> Builder<'src> {
             // whatever position or jump it sits under (rigor-rs#312).
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
-            if let Some(s) = while_node.statements() {
-                self.iterated_body_spans.push(span_of(&s.location()));
-            }
+            let body_span = if let Some(s) = while_node.statements() {
+                let b = span_of(&s.location());
+                self.iterated_body_spans.push(b);
+                b
+            } else {
+                (span.0, span.0)
+            };
+            self.lexical_loop_bodies.push(body_span);
             let body = while_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
             self.lexical_loop -= 1;
             return self.push(Node::Loop {
@@ -1231,13 +1252,19 @@ impl<'src> Builder<'src> {
             let predicate = Some(self.lower_node(&until_node.predicate()));
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
-            if let Some(s) = until_node.statements() {
-                self.iterated_body_spans.push(span_of(&s.location()));
-            }
+            let body_span = if let Some(s) = until_node.statements() {
+                let b = span_of(&s.location());
+                self.iterated_body_spans.push(b);
+                b
+            } else {
+                (span.0, span.0)
+            };
+            self.lexical_loop_bodies.push(body_span);
             let body = until_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
             self.lexical_loop -= 1;
             return self.push(Node::Loop {
@@ -1269,10 +1296,20 @@ impl<'src> Builder<'src> {
             // so a `break` argument's scope effects never propagate
             // here either (rigor-rs#363).
             self.lexical_loop += 1;
+            // `for` bodies are NOT `iterated_body_spans` (no writeback
+            // scan) — the stack entry exists only to pair a valued
+            // `next` inside with the body it lands under.
+            self.lexical_loop_bodies.push(
+                for_node
+                    .statements()
+                    .map(|s| span_of(&s.location()))
+                    .unwrap_or((span.0, span.0)),
+            );
             let body = for_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.lexical_loop_bodies.pop();
             self.recovery_joined -= 1;
             self.recovery_next_sink -= 1;
             self.lexical_loop -= 1;
@@ -1783,6 +1820,24 @@ impl<'src> Builder<'src> {
             return match n.arguments() {
                 None => self.push(Node::Other { span, jump: Some(JumpKind::Next) }),
                 Some(args) => {
+                    // A valued `next` under a lexical loop joins the
+                    // iteration fixpoint rather than `join_break_scopes`
+                    // — its marks land on the post-loop scope — but a
+                    // use the owning body still contains evaluates
+                    // pre-join and keeps the record
+                    // (`while c; next (h[:a] = 9; h[:a].m); end` fires
+                    // in-argument on the oracle — rigor-rs#363 review).
+                    // `lexical_loop` is masked inside a block/lambda:
+                    // a `next` there targets the block itself.
+                    if self.lexical_loop > 0 {
+                        self.next_arg_spans.push((
+                            span,
+                            self.lexical_loop_bodies
+                                .last()
+                                .copied()
+                                .unwrap_or((0, 0)),
+                        ));
+                    }
                     let body = self.lower_body(&args.arguments());
                     self.push(Node::Statements {
                         body,

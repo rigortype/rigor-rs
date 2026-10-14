@@ -916,6 +916,45 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
             "expected both reads to keep `\"s\" | 1` for {tail:?}, got {diags:?}"
         );
     }
+    // The positional edge extends to every use the iterated body still
+    // contains: a scanned `[]=` inside a `break` argument drops the
+    // record ONLY past the join — a sibling `break` argument, a later
+    // in-body read, an `ensure` read and in-argument reads all keep it.
+    // `next`'s argument DOES join the fixpoint (post-loop it drops),
+    // but body/argument reads keep the record the same way. And a
+    // scan-visible `END { }` operand never evaluates, so only the
+    // post-loop read declines.
+    for (tail, expected) in [
+        ("while c; break (h[:a] = 9; h[:a].frobnicate); break (h[:a] = 8; h[:a].frobnicate); end\n", 2),
+        ("while c; if d; break h[:a] = 9; end; h[:a].frobnicate; end\n", 1),
+        ("while c; h[:a].frobnicate; break h[:a] = 9; end\n", 1),
+        ("while c; begin; break h[:a] = 9; ensure; h[:a].frobnicate; end; end\n", 1),
+        ("while c; next (h[:a] = 9; h[:a].frobnicate); end\n", 1),
+        ("while c; h[:a].frobnicate; next h[:a] = 9; end\n", 1),
+        ("while c; next h[:a] = 9; h[:a].frobnicate; end\n", 1),
+        ("for i in [1]; next (h[:a] = 9; h[:a].frobnicate); end\n", 1),
+        ("while c; END { h[:a] = 9; h[:a].frobnicate }; break; end\n", 1),
+        ("while c; END { h[:a] = 9 }; h[:a].frobnicate; break; end\n", 1),
+        // Controls: never-evaluated writes the scan does NOT cover keep
+        // the record even post-loop — a top-level `END`, an `END`
+        // inside a `for` (no writeback), and a compound attribute write
+        // (not a CONTENT_MUTATORS call).
+        ("END { h[:a] = 9 }\n", 1),
+        ("for i in [1]; END { h[:a] = 9 }; end\n", 1),
+        ("while c; END { h.default ||= 9 }; break; end\n", 1),
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message.contains("\"s\" | 1"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            expected,
+            "expected {expected} `\"s\" | 1` diagnostic(s) for {tail:?}, got {diags:?}"
+        );
+    }
     // Must-still-land controls — effects the reference DOES join still
     // drop or shadow the record: a `next` argument feeds the loop
     // fixpoint carrying the drop; the CONTENT_ADDERS family joins stored
@@ -952,6 +991,16 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         // read in both.
         "while c; for i in [1]; break h[:a] = 9; end; end\n",
         "for i in [1]; while c; break h[:a] = 9; end; end\n",
+        // A scan-visible mutation inside a never-EVALUATED operand
+        // still lands past the body's join — `END { }` (and `BEGIN`,
+        // `super`, `yield`) bodies are textually read by
+        // `loop_content_writeback` / `content_writeback_block_captures`
+        // even under a `break` argument.
+        "while c; END { h[:a] = 9 }; break; end\n",
+        "until c; END { h[:a] = 9 }; end\n",
+        "loop do; END { h[:a] = 9 }; break; end\n",
+        "[1].each { END { h[:a] = 9 } }\n",
+        "while c; END { if false; h[:a] = 9; end }; break; end\n",
     ] {
         let src = format!("{prelude}{tail}h[:a].frobnicate\n");
         let diags = check(src.as_bytes());
