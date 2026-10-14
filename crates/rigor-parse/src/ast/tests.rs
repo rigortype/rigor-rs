@@ -689,7 +689,9 @@ h.name ||= \"s\"\n"[..], "name", "name="),
     // `widen_attribute_write` lands): straight-line and every
     // `sub_eval`'d position — write RHS, `&&`/`||` operands, `if`/`case`
     // arms (operand-position or not), predicates, loop bodies, rescue
-    // arms, `ensure`, `when` conditions, parenthesised statements.
+    // arms, `ensure`, parenthesised statements. `when`/`in`
+    // conditions are NOT evaluated — `case_when_scopes` shape-narrows
+    // them without `sub_eval` (rigor-rs#362).
     for src in [
         &b"h = {}
 x = h.default ||= 0\n"[..],
@@ -707,8 +709,6 @@ x = (if h; h.default ||= 0; end)\n"[..],
 unless h.nil?; h.default ||= 0; end\n"[..],
         &b"h = {}
 case 1; when 1; h.default ||= 0; end\n"[..],
-        &b"h = {}
-case h; when h.default ||= 0; end\n"[..],
         &b"h = {}
 if h.default ||= 0; end\n"[..],
         &b"h = {}
@@ -759,6 +759,8 @@ def m; return h.default ||= 0; end\n"[..], // return operand
 x = (h.default ||= 0) rescue nil\n"[..],   // rescue modifier
         &b"h = {}
 case h; in {a: x} if (h.default ||= 0); end\n"[..], // in-pattern guard
+        &b"h = {}
+case h; when h.default ||= 0; end\n"[..],          // when condition (rigor-rs#362)
         &b"h = {}
 x = h.default ||= 0, h[:a]\n"[..],        // multi-assign RHS is a `type_of` operand
         &b"h = {}

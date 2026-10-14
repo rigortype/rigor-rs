@@ -72,9 +72,11 @@ fn compound_attr_write_on_hash_mutator_invalidates_indexed_narrowing() {
 
 /// #343 — the write's widening lands from every position the reference
 /// `eval`s: write RHS, `&&`/`||` operands, `if`/`unless`/`case` arms,
-/// predicates, loop/`for` bodies, rescue clauses, `ensure`, `when`
-/// conditions, parenthesised statements — including under a splat that
-/// types the whole expression.
+/// predicates, loop/`for` bodies, rescue clauses, `ensure`,
+/// parenthesised statements — including under a splat that
+/// types the whole expression. (`when`/`in` conditions are NOT here:
+/// `Narrowing.case_when_scopes` shape-narrows them without `sub_eval` —
+/// rigor-rs#362 moved that row to the keeps test.)
 #[test]
 fn compound_attr_write_evaluated_positions_land_the_widening() {
     let probe = |write: &str| -> Vec<u8> {
@@ -92,7 +94,6 @@ fn compound_attr_write_evaluated_positions_land_the_widening() {
         "x = (if h; h.default ||= 0; end)",
         "unless h.nil?; h.default ||= 0; end",
         "case 1; when 1; h.default ||= 0; end",
-        "case h; when h.default ||= 0; end",
         "if h.default ||= 0; end",
         "while h[:b]; h.default ||= 0; end",
         "for i in [1]; h.default ||= 0; end",
@@ -133,6 +134,7 @@ fn compound_attr_write_typed_positions_keep_the_narrowing() {
         "x = h.default ||= 0, h[:a]",            // multi-assign RHS
         "x = (h.default ||= 0) rescue nil",      // rescue modifier
         "case h; in {a: x} if (h.default ||= 0); end", // in-pattern guard
+        "case h; when h.default ||= 0; end",           // when condition (rigor-rs#362)
         "x = defined?(h.default ||= 0)",         // never evaluated
         "[1].each { h.default ||= 0 }",          // deferred block body
         "l = -> { h.default ||= 0 }",            // lambda body
@@ -747,4 +749,91 @@ fn write_predicates_fold_to_their_rhs() {
         diags.is_empty(),
         "op-write predicate must not fold to the RHS: {diags:?}"
     );
+}
+
+/// rigor-rs#362 — an attr write in a position whose scope the reference
+/// DISCARDS lands no `widen_attribute_write`, so the receiver's indexed
+/// narrowing survives: `Narrowing.case_when_scopes` shape-narrows
+/// `when`/`in` conditions without `sub_eval`; `eval_if`/`eval_unless`
+/// returns the surviving edge when the only alternative arm terminates
+/// and no `else` remains; `eval_case`'s `join_case_branch_scopes`
+/// filters `branch_terminates?` arms even with an `else`; `eval_begin`'s
+/// `live_rescue_results` drops a clause whose body exits; `and_or`'s
+/// terminating right side never rejoins; and the rescue modifier's
+/// exiting arm is a typed position. Every row keeps `h[:a]` = `"s" | 1`,
+/// so the post read fires `call.undefined-method`.
+#[test]
+fn blocked_position_attr_write_keeps_indexed_narrowing() {
+    // `def`s keep `c`/`d`/`y` resolvable (no unresolved-toplevel noise)
+    // without making the predicates foldable constants.
+    let prelude = "def c; rand(2).even?; end\ndef d; rand(2).odd?; end\nh = {a: 1}\nh[:a] ||= \"s\"\n";
+    for tail in [
+        // The issue rows.
+        "case c; when (h.default ||= 0); end\n",
+        "case c; when (h.default ||= 0), 2; end\n",
+        "if c; h.default ||= 0; return; end\n",
+        "case c; when 1; h.default ||= 0; return; end\n",
+        "begin; rescue; h.default ||= 0; raise; end\n",
+        "c && (h.default ||= 0; return)\n",
+        "x = y rescue (h.default ||= 0; raise)\n",
+        // Boundary rows — same discard on each sibling position.
+        "unless c; h.default ||= 0; return; end\n",
+        "c || (h.default ||= 0; return)\n",
+        "case c; in Integer if (h.default ||= 0); end\n",
+        "if c; nil; elsif d; h.default ||= 0; return; end\n",
+        "if true; nil; else; h.default ||= 0; end\n",
+        "case c; when 1; h.default ||= 0; return; else; nil; end\n",
+        "if c; nil; else; h.default ||= 0; return; end\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected the post read to keep `\"s\" | 1` for {tail:?}, got {diags:?}"
+        );
+        assert!(
+            errors[0].message.contains("\"s\" | 1"),
+            "expected the record's union in the message for {tail:?}, got {diags:?}"
+        );
+    }
+    // The same suppression inside a deferred block — `closure_evaluated`
+    // also gates on `blocked`: the in-body AND post-block reads both
+    // keep the record.
+    let src = b"def c; rand(2).even?; end\nh = {a: 1}\nh[:a] ||= \"s\"\n[1].each { case c; when (h.default ||= 0); end; h[:a].frobnicate }\nh[:a].frobnicate\n";
+    let diags = check(src);
+    let errors: Vec<_> = diags
+        .iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .collect();
+    assert_eq!(
+        errors.len(),
+        2,
+        "expected both reads to keep `\"s\" | 1`, got {diags:?}"
+    );
+    // Must-still-land controls — positions the reference DOES scope-
+    // evaluate drop the narrowing, so no `\"s\" | 1` survives: a live
+    // `if` arm (its scope joins via nil-injection), a `case` `when` arm
+    // that doesn't exit, a `begin` main body, and a `while` body.
+    for tail in [
+        "if c; h.default ||= 0; end\n",
+        "if c; h.default ||= 0; else; nil; end\n",
+        "case c; when 1; h.default ||= 0; end\n",
+        "begin; h.default ||= 0; rescue; end\n",
+        "while c; h.default ||= 0; break; end\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.rule_id == CALL_UNDEFINED_METHOD
+                    && d.message.contains("\"s\" | 1")),
+            "expected the evaluated write to drop the record for {tail:?}, got {diags:?}"
+        );
+    }
 }

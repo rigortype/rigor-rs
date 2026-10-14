@@ -9,6 +9,7 @@ use super::{
     collect_recoverable_children, constant_node_name, constant_path_string, constant_string,
     direct_method_names, discover_visibilities_and_includes, for_index_writes, lower_multi_targets,
     rescue_reference_index_writes,
+    case_arm_exits, has_targeted_break, has_targeted_next, literal_truthiness, unconditional_exit,
     param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
     span_of, strict_constant_path_string, Compound, JumpKind, Node, NodeId, ParamShape,
     Recovered, RescueClause, ScopeMarks, Span, StatementsKind,
@@ -373,13 +374,24 @@ impl<'src> Builder<'src> {
             // an outliving receiver) keeps it EVALUATED so the widening
             // still lands: `puts(h.default ||= (y = 1))` is silent on
             // the oracle while `puts(h.default ||= 0)` keeps the `(h, k)`
-            // narrowing (rigor-rs#361). Joined/blocked/iterated/`for`
-            // positions all still EVALUATE (measured: an `if` arm, a
-            // `while` predicate or body, a `when` condition, an `ensure`
-            // body all land the writer's widening).
+            // narrowing (rigor-rs#361). Joined/iterated/`for` positions
+            // still EVALUATE (measured: a joining `if` arm, a `while`
+            // predicate or body, an `ensure` body all land the writer's
+            // widening) — a `Recovered::blocked` position does not:
+            // `Narrowing.case_when_scopes` shape-narrows `when`/`in`
+            // conditions without `sub_eval` (so
+            // `eval_attribute_compound_write` never runs there), and a
+            // terminated arm's scope is discarded before the join —
+            // `when (h.default ||= 0)`, `if c; h.default ||= 0; return;
+            // end`, `rescue; h.default ||= 0; raise; end` all keep the
+            // receiver's indexed narrowings on the oracle (rigor-rs#362).
+            // The iterated-body content-writeback scan covers `[]=`/
+            // mutator `CallNode`s only — never this node — so `blocked`
+            // excludes unconditionally.
             let evaluated = self.dead_operand == 0
                 && self.closure_depth == 0
                 && self.recovery_suppressed == 0
+                && self.recovery_blocked == 0
                 && (self.typed_depth == 0
                     || operand_effects::any(node));
             // `closure_evaluated` — `evaluated` minus the `closure_depth`
@@ -389,9 +401,13 @@ impl<'src> Builder<'src> {
             // `widen_attribute_write` still drops the receiver's indexed
             // narrowings for the reads that follow it in the body
             // (rigor-rs#366) even though the effect never lands on the
-            // enclosing scope.
+            // enclosing scope. A blocked position stays blocked inside
+            // the block's own scope too — `each { case c; when (h.default
+            // ||= 0); end; h[:a].m }` keeps the record in-body on the
+            // oracle (rigor-rs#401).
             let closure_evaluated = self.dead_operand == 0
                 && self.recovery_suppressed == 0
+                && self.recovery_blocked == 0
                 && (self.typed_depth == 0
                     || operand_effects::any(node));
             // The receiver and RHS are `type_of` operands of the write —
@@ -849,40 +865,112 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(if_node) = node.as_if_node() {
-            // `if` / ternary. Prism's ternary is also an IfNode.
+            // `if` / ternary. Prism's ternary is also an IfNode. Arms whose
+            // scope the join discards are `blocked`, mirroring the
+            // Collector's `visit_if_node` (rigor-rs#362): a constant-folded
+            // predicate's dead arm never exists, and an arm that exits
+            // unconditionally while the other side lives contributes no
+            // scope downstream — `if c; h.default ||= 0; return; end`
+            // keeps the receiver's indexed narrowings on the oracle.
             let predicate = self.lower_node(&if_node.predicate());
-            let then_body = if_node
-                .statements()
-                .map(|s| self.lower_body(&s.body()))
-                .unwrap_or_default();
+            let statements = if_node.statements();
             // `subsequent` is the `elsif`/`else` chain (an IfNode or ElseNode).
-            let else_body = if_node
-                .subsequent()
-                .map(|sub| vec![self.lower_node(&sub)])
-                .unwrap_or_default();
+            let subsequent = if_node.subsequent();
+            let (then_body, else_body) = match literal_truthiness(&if_node.predicate()) {
+                Some(true) => (
+                    statements.map(|s| self.lower_body(&s.body())),
+                    subsequent.map(|sub| vec![self.lower_blocked(&sub)]),
+                ),
+                Some(false) => (
+                    statements.map(|s| self.lower_body_blocked(&s.body())),
+                    subsequent.map(|sub| vec![self.lower_node(&sub)]),
+                ),
+                None => {
+                    let then_dropped = statements
+                        .as_ref()
+                        .is_some_and(|s| {
+                            unconditional_exit(&s.as_node()) && !self.arm_lands(&s.as_node())
+                        })
+                        && subsequent.is_none();
+                    let else_dropped = subsequent
+                        .as_ref()
+                        .is_some_and(|s| unconditional_exit(s) && !self.arm_lands(s))
+                        && statements.is_some();
+                    let then_body = statements.map(|s| {
+                        if then_dropped {
+                            self.lower_body_blocked(&s.body())
+                        } else {
+                            self.lower_body(&s.body())
+                        }
+                    });
+                    let else_body = subsequent.map(|sub| {
+                        if else_dropped {
+                            vec![self.lower_blocked(&sub)]
+                        } else {
+                            vec![self.lower_node(&sub)]
+                        }
+                    });
+                    (then_body, else_body)
+                }
+            };
             return self.push(Node::If {
                 predicate,
-                then_body,
-                else_body,
+                then_body: then_body.unwrap_or_default(),
+                else_body: else_body.unwrap_or_default(),
                 is_unless: false,
                 span: span_of(&if_node.location()),
             });
         }
 
         if let Some(unless_node) = node.as_unless_node() {
+            // Same as `if` with the truthy/falsey edges swapped — `unless`
+            // runs its body when the predicate is FALSEY.
             let predicate = self.lower_node(&unless_node.predicate());
-            let then_body = unless_node
-                .statements()
-                .map(|s| self.lower_body(&s.body()))
-                .unwrap_or_default();
-            let else_body = unless_node
-                .else_clause()
-                .map(|e| vec![self.lower_node(&e.as_node())])
-                .unwrap_or_default();
+            let statements = unless_node.statements();
+            let else_clause = unless_node.else_clause();
+            let (then_body, else_body) = match literal_truthiness(&unless_node.predicate()) {
+                Some(false) => (
+                    statements.map(|s| self.lower_body(&s.body())),
+                    else_clause.map(|e| vec![self.lower_blocked(&e.as_node())]),
+                ),
+                Some(true) => (
+                    statements.map(|s| self.lower_body_blocked(&s.body())),
+                    else_clause.map(|e| vec![self.lower_node(&e.as_node())]),
+                ),
+                None => {
+                    let body_dropped = statements
+                        .as_ref()
+                        .is_some_and(|s| {
+                            unconditional_exit(&s.as_node()) && !self.arm_lands(&s.as_node())
+                        })
+                        && else_clause.is_none();
+                    let else_dropped = else_clause
+                        .as_ref()
+                        .is_some_and(|e| {
+                            unconditional_exit(&e.as_node()) && !self.arm_lands(&e.as_node())
+                        })
+                        && statements.is_some();
+                    let then_body = statements.map(|s| {
+                        if body_dropped {
+                            self.lower_body_blocked(&s.body())
+                        } else {
+                            self.lower_body(&s.body())
+                        }
+                    });
+                    let else_body = else_clause.map(|e| {
+                        if else_dropped {
+                            vec![self.lower_blocked(&e.as_node())]
+                        } else {
+                            vec![self.lower_node(&e.as_node())]
+                        }
+                    });
+                    (then_body, else_body)
+                }
+            };
             return self.push(Node::If {
                 predicate,
-                then_body,
-                else_body,
+                then_body: then_body.unwrap_or_default(),
+                else_body: else_body.unwrap_or_default(),
                 is_unless: true,
                 span: span_of(&unless_node.location()),
             });
@@ -906,16 +994,41 @@ impl<'src> Builder<'src> {
 
         if let Some(case_node) = node.as_case_node() {
             // `case`/`when`. Lower the subject, every `when` (conditions + body),
-            // and the `else`.
+            // and the `else`. `visit_case_arms`'s live/dead split applies
+            // here too (`no_match_path = true`: an absent `else` is a real
+            // fall-through arm): a terminated arm contributes no scope to
+            // the post-`case` join, so its writes are `blocked` — unless it
+            // still lands downstream (`arm_lands`) or no arm lives at all.
             let predicate = case_node.predicate().map(|p| self.lower_node(&p));
+            let arms: Vec<PrismNode> = case_node.conditions().iter().collect();
+            let else_dead = case_node
+                .else_clause()
+                .is_some_and(|e| case_arm_exits(&e.as_node()) && !self.arm_lands(&e.as_node()));
+            let live = arms
+                .iter()
+                .filter(|a| !(case_arm_exits(a) && !self.arm_lands(a)))
+                .count()
+                + usize::from(!else_dead);
             let mut branches = Vec::new();
-            for cond in case_node.conditions().iter() {
-                branches.push(self.lower_node(&cond));
+            for arm in &arms {
+                let dead = case_arm_exits(arm) && !self.arm_lands(arm);
+                if dead && live != 0 {
+                    branches.push(self.lower_blocked(arm));
+                } else {
+                    branches.push(self.lower_node(arm));
+                }
             }
+            let else_dead_and_dropped = else_dead && live != 0;
             let else_body = case_node
                 .else_clause()
                 .and_then(|e| e.statements())
-                .map(|s| self.lower_body(&s.body()))
+                .map(|s| {
+                    if else_dead_and_dropped {
+                        self.lower_body_blocked(&s.body())
+                    } else {
+                        self.lower_body(&s.body())
+                    }
+                })
                 .unwrap_or_default();
             return self.push(Node::Case {
                 predicate,
@@ -926,16 +1039,41 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(case_match) = node.as_case_match_node() {
-            // `case`/`in` pattern matching. Same shape as CaseNode.
+            // `case`/`in` pattern matching. Same shape as CaseNode — with
+            // `no_match_path = false` (`case`/`in` without `else` raises
+            // `NoMatchingPatternError` on no match, so an absent `else`
+            // contributes no live arm).
             let predicate = case_match.predicate().map(|p| self.lower_node(&p));
+            let arms: Vec<PrismNode> = case_match.conditions().iter().collect();
+            let else_dead = match case_match.else_clause() {
+                Some(e) => case_arm_exits(&e.as_node()) && !self.arm_lands(&e.as_node()),
+                None => true,
+            };
+            let live = arms
+                .iter()
+                .filter(|a| !(case_arm_exits(a) && !self.arm_lands(a)))
+                .count()
+                + usize::from(!else_dead);
             let mut branches = Vec::new();
-            for cond in case_match.conditions().iter() {
-                branches.push(self.lower_node(&cond));
+            for arm in &arms {
+                let dead = case_arm_exits(arm) && !self.arm_lands(arm);
+                if dead && live != 0 {
+                    branches.push(self.lower_blocked(arm));
+                } else {
+                    branches.push(self.lower_node(arm));
+                }
             }
+            let else_dead_and_dropped = else_dead && live != 0;
             let else_body = case_match
                 .else_clause()
                 .and_then(|e| e.statements())
-                .map(|s| self.lower_body(&s.body()))
+                .map(|s| {
+                    if else_dead_and_dropped {
+                        self.lower_body_blocked(&s.body())
+                    } else {
+                        self.lower_body(&s.body())
+                    }
+                })
                 .unwrap_or_default();
             return self.push(Node::Case {
                 predicate,
@@ -948,11 +1086,15 @@ impl<'src> Builder<'src> {
         if let Some(when_node) = node.as_when_node() {
             // A `when` branch: lower its condition expressions and body into the
             // dedicated `When` variant's SEPARATE lists (pre-split, both were
-            // concatenated into a reused `BeginRescue` carrier's body).
+            // concatenated into a reused `BeginRescue` carrier's body). The
+            // conditions are `blocked` — `Narrowing.case_when_scopes`
+            // shape-narrows them without `sub_eval`, so a write inside lands
+            // no scope effect (rigor-rs#362); the Collector's
+            // `visit_case_arm_parts` marks them the same way.
             let conditions: Vec<NodeId> = when_node
                 .conditions()
                 .iter()
-                .map(|c| self.lower_node(&c))
+                .map(|c| self.lower_blocked(&c))
                 .collect();
             let body = when_node
                 .statements()
@@ -982,8 +1124,9 @@ impl<'src> Builder<'src> {
             // evaluated (rigor-rs#343); it is the dead half of the operand
             // gate — `Narrowing.case_when_scopes` types it only, so no
             // `OperandEffects.any?` rescues a write inside (rigor-rs#361).
+            // Also `blocked`, the Collector's mark for the same position.
             self.dead_operand += 1;
-            let pattern = self.lower_node(&in_node.pattern());
+            let pattern = self.lower_blocked(&in_node.pattern());
             self.dead_operand -= 1;
             let mut body = vec![pattern];
             if let Some(s) = in_node.statements() {
@@ -1088,15 +1231,32 @@ impl<'src> Builder<'src> {
             let mut clauses: Vec<RescueClause> = Vec::new();
             let mut rescue = begin_node.rescue_clause();
             while let Some(r) = rescue {
+                // A clause whose body exits unconditionally contributes no
+                // scope to the post-`begin` join (`live_rescue_results`
+                // filters it) — `blocked`, the Collector's `visit_begin_node`
+                // mark (rigor-rs#362); a `retry` arm stays live.
+                let arm_dead = r
+                    .statements()
+                    .is_some_and(|s| {
+                        unconditional_exit(&s.as_node()) && !self.arm_lands(&s.as_node())
+                    });
                 let mut exceptions = Vec::new();
                 for exc in r.exceptions().iter() {
-                    let id = self.lower_node(&exc);
+                    let id = if arm_dead {
+                        self.lower_blocked(&exc)
+                    } else {
+                        self.lower_node(&exc)
+                    };
                     body.push(id);
                     exceptions.push(id);
                 }
                 let mut clause_body = Vec::new();
                 if let Some(s) = r.statements() {
-                    let ids = self.lower_body(&s.body());
+                    let ids = if arm_dead {
+                        self.lower_body_blocked(&s.body())
+                    } else {
+                        self.lower_body(&s.body())
+                    };
                     body.extend(ids.iter().copied());
                     clause_body = ids;
                 }
@@ -1143,7 +1303,15 @@ impl<'src> Builder<'src> {
 
         if let Some(and_node) = node.as_and_node() {
             let left = self.lower_node(&and_node.left());
-            let right = self.lower_node(&and_node.right());
+            // The right joins — unless it terminates: the skipped edge alone
+            // returns and the right's scope is discarded (`blocked`,
+            // rigor-rs#362 — `c && (h.default ||= 0; return)` lands nothing).
+            let right_node = and_node.right();
+            let right = if unconditional_exit(&right_node) && !self.arm_lands(&right_node) {
+                self.lower_blocked(&right_node)
+            } else {
+                self.lower_node(&right_node)
+            };
             return self.push(Node::Logical {
                 left,
                 right,
@@ -1154,7 +1322,12 @@ impl<'src> Builder<'src> {
 
         if let Some(or_node) = node.as_or_node() {
             let left = self.lower_node(&or_node.left());
-            let right = self.lower_node(&or_node.right());
+            let right_node = or_node.right();
+            let right = if unconditional_exit(&right_node) && !self.arm_lands(&right_node) {
+                self.lower_blocked(&right_node)
+            } else {
+                self.lower_node(&right_node)
+            };
             return self.push(Node::Logical {
                 left,
                 right,
@@ -1819,6 +1992,59 @@ impl<'src> Builder<'src> {
                 id
             })
             .collect()
+    }
+
+    /// Lower `node` under the `blocked` recovery mark — the handled path's
+    /// `blocked_subtree`: the position's post-scope is discarded before any
+    /// join or never scope-evaluates (a `when`/`in` condition, a terminated
+    /// or folded-dead arm, an `and`/`or` right side that exits), so its
+    /// writes land no bindings, widenings or narrowing drops downstream.
+    /// `lower_recovered` records the same span pair for `Recovered`
+    /// children; this is the `lower_node` counterpart.
+    fn lower_blocked(&mut self, node: &PrismNode<'_>) -> NodeId {
+        let span = span_of(&node.location());
+        self.blocked_spans.push(span);
+        if self.recovery_iterative > 0 {
+            self.blocked_iterative_spans.push(span);
+        }
+        self.recovery_blocked += 1;
+        let id = self.lower_node(node);
+        self.recovery_blocked -= 1;
+        id
+    }
+
+    /// [`Self::lower_blocked`] for a `StatementsNode`'s body list — one
+    /// `blocked` span per statement, matching `lower_recovered`'s
+    /// per-child recording.
+    fn lower_body_blocked(&mut self, body: &ruby_prism::NodeList<'_>) -> Vec<NodeId> {
+        self.recovery_blocked += 1;
+        let ids = body
+            .iter()
+            .map(|n| {
+                let span = span_of(&n.location());
+                self.blocked_spans.push(span);
+                if self.recovery_iterative > 0 {
+                    self.blocked_iterative_spans.push(span);
+                }
+                self.lower_node(&n)
+            })
+            .collect();
+        self.recovery_blocked -= 1;
+        ids
+    }
+
+    /// Whether a syntactically-exiting arm still lands its scope downstream —
+    /// the Collector's `arm_lands`: an arm holding a `next` that targets the
+    /// iterated/`for` body it lives in merges back through `loop_iteration`'s
+    /// join (`for`'s `next_sink`, `while`/`until`/block/lambda's `iterative`
+    /// — `eval_loop` merges the scope at every targeting `next` for all of
+    /// them); an arm holding a `break` targeting an iterated body lands its
+    /// locals through `join_break_scopes` — a `for` body's `break` does NOT
+    /// land (`eval_for` collects no break scopes).
+    fn arm_lands(&self, node: &PrismNode<'_>) -> bool {
+        let iterated = self.recovery_next_sink > 0 || self.recovery_iterative > 0;
+        (iterated && has_targeted_next(node))
+            || (self.recovery_iterative > 0 && has_targeted_break(node))
     }
 
     /// Lower an *optional* body node (a `def`/`class`/`module`/block body, which

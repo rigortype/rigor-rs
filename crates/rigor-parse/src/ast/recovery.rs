@@ -320,15 +320,18 @@ fn collect_recoverable<'pr>(
         }
 
         /// Whether a syntactically-exiting arm still lands its scope
-        /// downstream: inside a `next`-sink body (a `for` body's
-        /// `loop_iteration` join — unlike `while`/`until`/block/lambda
-        /// bodies it has no content writeback, so only `next` arms
-        /// survive) an arm holding a `next` that targets the construct
-        /// merges back. Under `iterative` this is moot —
-        /// `index_write_joined` ignores `blocked` there — so only
-        /// `next_sink` is consulted.
+        /// downstream: an arm holding a `next` that targets the
+        /// iterated/`for` body it lives in merges back through
+        /// `loop_iteration`'s join — inside a `for` body's `next_sink`
+        /// and inside `while`/`until`/block/lambda bodies alike
+        /// (`eval_loop` merges the scope at every targeting `next`) — and
+        /// an arm holding a `break` targeting an iterated body lands its
+        /// locals through `join_break_scopes`. A `for` body's `break`
+        /// does NOT land — `eval_for` collects no break scopes.
         fn arm_lands(&self, node: &PrismNode<'_>) -> bool {
-            self.next_sink > 0 && has_targeted_next(node)
+            let iterated = self.next_sink > 0 || self.iterative > 0;
+            (iterated && has_targeted_next(node))
+                || (self.iterative > 0 && has_targeted_break(node))
         }
 
         /// One rescue arm's non-chain children — exceptions, `rescue => x`
@@ -1080,7 +1083,7 @@ fn collect_recoverable<'pr>(
 /// `Bot`: their scope lands anyway — `retry` re-enters through
 /// `retry_edge_for`, and `redo` is only legal inside an iterated body
 /// whose writeback re-merges it.
-fn unconditional_exit(node: &PrismNode<'_>) -> bool {
+pub(crate) fn unconditional_exit(node: &PrismNode<'_>) -> bool {
     if node.as_return_node().is_some()
         || node.as_next_node().is_some()
         || node.as_break_node().is_some()
@@ -1137,7 +1140,7 @@ fn unconditional_exit(node: &PrismNode<'_>) -> bool {
 /// truthy/falsey. Anything needing an inferred type is `None` here —
 /// including non-falsey nominal carriers the reference still folds (a
 /// coverage-gap limitation, not an FP source).
-fn literal_truthiness(node: &PrismNode<'_>) -> Option<bool> {
+pub(crate) fn literal_truthiness(node: &PrismNode<'_>) -> Option<bool> {
     if node.as_true_node().is_some() {
         return Some(true);
     }
@@ -1183,7 +1186,7 @@ fn literal_truthiness(node: &PrismNode<'_>) -> Option<bool> {
 /// `eval_when_or_in` returns `sub_eval(node.statements)`, whose type is
 /// `Bot` exactly when the body exits (the `branch_terminates?` test
 /// `join_case_branch_scopes` applies to each arm).
-fn case_arm_exits(arm: &PrismNode<'_>) -> bool {
+pub(crate) fn case_arm_exits(arm: &PrismNode<'_>) -> bool {
     let statements = if let Some(when) = arm.as_when_node() {
         when.statements().map(|s| s.as_node())
     } else if let Some(in_node) = arm.as_in_node() {
@@ -1268,16 +1271,34 @@ fn is_jump_boundary(node: &PrismNode<'_>) -> bool {
 /// `JumpTargets.any?(node, Prism::NextNode)` — whether `node` holds a
 /// `next` targeting the construct whose body it lives in, i.e. one
 /// reachable without crossing a [`is_jump_boundary`] construct.
-fn has_targeted_next(node: &PrismNode<'_>) -> bool {
+pub(crate) fn has_targeted_next(node: &PrismNode<'_>) -> bool {
+    node.as_next_node().is_some() || has_targeted_jump(node, false)
+}
+
+/// `JumpTargets.any?(node, Prism::BreakNode)` — the `break` counterpart
+/// of [`has_targeted_next`]: a `break` inside a `while`/`until`/block
+/// body lands its scope on the construct's break-edge
+/// (`join_break_scopes` unions the break-path locals into the
+/// continuation); a `for` body's `break` does NOT land — `eval_for`
+/// collects no break scopes.
+pub(crate) fn has_targeted_break(node: &PrismNode<'_>) -> bool {
+    node.as_break_node().is_some() || has_targeted_jump(node, true)
+}
+
+fn has_targeted_jump(node: &PrismNode<'_>, want_break: bool) -> bool {
     use ruby_prism::Visit;
-    struct NextScan {
+    struct Scan {
         found: bool,
+        want_break: bool,
     }
-    impl<'pr> Visit<'pr> for NextScan {
+    impl<'pr> Visit<'pr> for Scan {
         fn visit_next_node(&mut self, _node: &ruby_prism::NextNode<'pr>) {
-            self.found = true;
+            self.found |= !self.want_break;
         }
-        // Boundaries retarget the `next`s below them — do not descend.
+        fn visit_break_node(&mut self, _node: &ruby_prism::BreakNode<'pr>) {
+            self.found |= self.want_break;
+        }
+        // Boundaries retarget the jumps below them — do not descend.
         fn visit_block_node(&mut self, _node: &ruby_prism::BlockNode<'pr>) {}
         fn visit_lambda_node(&mut self, _node: &ruby_prism::LambdaNode<'pr>) {}
         fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
@@ -1292,13 +1313,13 @@ fn has_targeted_next(node: &PrismNode<'_>) -> bool {
         ) {
         }
     }
-    if node.as_next_node().is_some() {
-        return true;
-    }
     if is_jump_boundary(node) {
         return false;
     }
-    let mut scan = NextScan { found: false };
+    let mut scan = Scan {
+        found: false,
+        want_break,
+    };
     scan.visit(node);
     scan.found
 }
