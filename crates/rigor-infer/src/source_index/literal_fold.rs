@@ -504,7 +504,37 @@ pub(crate) fn walk_fold_defs(
     out: &mut Vec<HarvestedFoldDef>,
 ) {
     match ast.get(node) {
-        Node::Program { body, .. } | Node::Statements { body, .. } => {
+        Node::Program { body, .. } => {
+            for &child in body {
+                // A top-level `class << C` is a direct program statement, so
+                // its `def`s file on C's SINGLETON under the same key a
+                // `def self.x` inside `class C` uses — missing it let a later
+                // singleton reopen go unseen by the disagree-decline merge
+                // (`class C; def self.off? = false; end; …; class << C; def
+                // off? = true; end` folded `false` where the reference's last
+                // definition binds `true`, rigor-rs#386 review).
+                if let Node::Definition {
+                    is_singleton_class: true,
+                    singleton_operand,
+                    body: sclass_body,
+                    ..
+                } = ast.get(child)
+                {
+                    let sowner = match singleton_operand.map(|op| ast.get(op)) {
+                        Some(Node::ConstantRead { name, .. }) if !name.is_empty() => {
+                            Some(name.strip_prefix("::").unwrap_or(name).to_string())
+                        }
+                        _ => None,
+                    };
+                    if let Some(sowner) = sowner {
+                        walk_singleton_fold_defs(ast, sclass_body, &sowner, out);
+                    }
+                } else {
+                    walk_fold_defs(ast, child, prefix, out);
+                }
+            }
+        }
+        Node::Statements { body, .. } => {
             for &child in body {
                 walk_fold_defs(ast, child, prefix, out);
             }

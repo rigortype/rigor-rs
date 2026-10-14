@@ -595,3 +595,117 @@ fn argument_mismatch_requires_host_resolvable_arg_class() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// rigor-rs#386 — dead-position leaks: writes the oracle never lets bind
+/// must not reach the reads `local_reach` scans, and an arm that provably
+/// never returns keeps its writes out of the post-`begin` scope. Every row
+/// is oracle-SILENT; each was a `call.undefined-method` FP on master.
+#[test]
+fn dead_position_writes_do_not_leak() {
+    for src in [
+        // `branch_terminates?`'s Bot half: a clause ending in a
+        // non-returning call contributes nothing to the post-`begin`
+        // scope — `Kernel.raise`, and a same-file toplevel `def` whose
+        // body is provably bot (`def die; raise; end`).
+        &b"def die\n  raise\nend\nbegin\n  1\nrescue\n  q = 1\n  die\nend\nFloat(q).w\n"[..],
+        &b"begin\n  1\nrescue\n  q = 1\n  Kernel.raise\nend\nFloat(q).w\n"[..],
+        // A write in a folded-dead `if` arm inside an iterated body
+        // (`loop do`/`while`) reaches no read: the loop is not a carrier
+        // for a dead write, and the post-loop `q = 1` cannot loop back
+        // into the body's `if q` predicate.
+        &b"loop do\n  if false\n    q = 1\n  end\n  Float(q).w\n  break\nend\n"[..],
+        &b"q = nil\nwhile c\n  if q\n    [1].each { q.frobnicate }\n  end\n  break\nend\nq = 1\n"[..],
+        // A `rescue` clause evaluates from the `begin`'s ENTRY scope —
+        // a write in the protected body never reaches a read inside a
+        // clause, whether the clause retries or not
+        // (`widen_entry_for_retry` carries only entry-bound names).
+        &b"begin\n  q = 1\nrescue\n  Float(q).w\nend\n"[..],
+        &b"tries = 0\nbegin\n  q = 1\nrescue\n  tries += 1\n  retry if tries < 2\n  Float(q).w\nend\n"[..],
+        // …but a loop holding BOTH the write and the clause read is a
+        // carrier: a later pass's protected-body write lands in the
+        // clause's entry scope, so `q` is `nil | 1` there and the call
+        // declines (rigor-rs#386 review — the clause-boundary rule must
+        // not fire across a loop back-edge).
+        &b"q = nil\nwhile c\n  begin\n    q = 1\n  rescue\n    q.frobnicate\n  end\nend\n"[..],
+        &b"q = nil\nuntil c\n  begin\n    q = 1\n  rescue\n    q.frobnicate\n  end\nend\n"[..],
+        &b"q = nil\nwhile true\n  begin\n    q = 1\n  rescue\n    q.frobnicate\n  end\nend\n"[..],
+        // `begin q = 1 rescue Float(q).w end` lowers as
+        // `q = (1 rescue Float(q).w)` — the write's own RHS is evaluated
+        // BEFORE the binding lands, so its `q` read sees nothing.
+        &b"begin q = 1 rescue Float(q).w end\n"[..],
+        // `Const.method` predicates fold through the singleton
+        // literal-tail table (`def self.off? = !on?`), so the then-arm
+        // is dead and its write reaches nothing.
+        &b"class C\n  def self.on? = true\n  def self.off? = !on?\nend\nif C.off?\n  q = 1\nend\nFloat(q).w\n"[..],
+        &b"class C\n  def self.off? = false\nend\nif C.off?\n  q = 1\nend\nFloat(q).w\n"[..],
+        &b"[1].each do\n  begin\n    raise\n  rescue\n    q = 1\n    raise\n  end\n  Float(q).w\nend\n"[..],
+        // A statement-level block's own PARAMETER binds the name — `v`
+        // reads the yielded value (the untyped carrier for `h.each`), so
+        // neither an outer write nor a conditional in-block write lands a
+        // literal `Float` could accept (the `u18` row of corpus
+        // `99_untyped_arg_overloads.rb`).
+        &b"def u(h)\n  h.each do |_k, v|\n    v = \"x\" if v.nil?\n    Float(v).frobnicate\n  end\nend\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(
+            diags.iter().all(|d| d.rule_id != CALL_UNDEFINED_METHOD),
+            "expected no call.undefined-method for {src:?}, got {diags:?}"
+        );
+    }
+    // Must-still-fire controls — neighbouring shapes whose reads DO see a
+    // binding on the oracle.
+    for src in [
+        // The clause's own writes reach its own reads.
+        &b"begin\n  1\nrescue\n  q = 1\n  Float(q).w\nend\n"[..],
+        // A live (falling-through) clause contributes to the post-begin
+        // scope — `q` is `1 | nil` there.
+        &b"begin\n  1\nrescue\n  q = 1\nend\nFloat(q).w\n"[..],
+        // `die` returning normally keeps the arm live.
+        &b"def die\n  nil\nend\nbegin\n  1\nrescue\n  q = 1\n  die\nend\nFloat(q).w\n"[..],
+        // A redefinition replaces the binding — the LAST `def die` wins.
+        &b"def die\n  raise\nend\ndef die\n  nil\nend\nbegin\n  1\nrescue\n  q = 1\n  die\nend\nFloat(q).w\n"[..],
+        // A write bound at the `begin` entry is what the clause sees.
+        &b"q = 0\nbegin\n  q = 1\nrescue\n  Float(q).w\nend\n"[..],
+        // In-block reads of a name the same block writes bind there.
+        &b"[1].each do\n  if c\n    q = 1\n  end\n  Float(q).w\nend\n"[..],
+        &b"[1].each do\n  1 rescue q = 1\n  Float(q).w\nend\n"[..],
+        // A `begin` main write still binds in `ensure` and post-`begin`.
+        &b"begin\n  q = 1\nrescue\nensure\n  Float(q).w\nend\n"[..],
+        // A `class << C` reopen after the `if` counts as a second site
+        // for `(C, off?, Singleton)` — disagreeing folds decline, so the
+        // arm stays live and `q`'s write binds (rigor-rs#386 review).
+        &b"class C\n  def self.off? = false\nend\nif C.off?\n  q = 1\nend\nFloat(q).w\nclass << C\n  def off? = true\nend\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.rule_id == CALL_UNDEFINED_METHOD),
+            "expected call.undefined-method for {src:?}, got {diags:?}"
+        );
+    }
+}
+
+/// rigor-rs#386 — a plain write AS A PREDICATE folds to its RHS
+/// (`type_of_assignment_write`): `if (q = nil)` warns always-falsey and
+/// `if (q = 1)` warns always-truthy. Op-writes decline (`q ||= nil`
+/// evaluates the old value on one edge, not the RHS).
+#[test]
+fn write_predicates_fold_to_their_rhs() {
+    for (src, polarity) in [
+        (&b"if (q = nil)\n  1\nend\n"[..], "falsey"),
+        (&b"if (@q = nil)\n  1\nend\n"[..], "falsey"),
+        (&b"if (Q = nil)\n  1\nend\n"[..], "falsey"),
+        (&b"if (q = 1)\n  1\nend\n"[..], "truthy"),
+    ] {
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "expected one warning for {src:?}: {diags:?}");
+        assert!(
+            diags[0].message.contains(polarity),
+            "expected an always-{polarity} warning for {src:?}, got {diags:?}"
+        );
+    }
+    let diags = check(b"q = 0\nif (q ||= nil)\n  1\nend\n");
+    assert!(
+        diags.is_empty(),
+        "op-write predicate must not fold to the RHS: {diags:?}"
+    );
+}
