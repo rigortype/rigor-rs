@@ -298,8 +298,10 @@ impl<'i> Typer<'i> {
             // oracle fires `w` for `Float`). `Rc` clone — O(1) per re-entry.
             return self.dead_partial.borrow().clone();
         }
-        let mut dead = DeadPositions::default();
-        dead.dropped = ast.discarded_spans().to_vec();
+        let mut dead = DeadPositions {
+            dropped: ast.discarded_spans().to_vec(),
+            ..Default::default()
+        };
         *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());
         // Publish the accumulator to re-entrant callers only where a recursion
         // point follows AND it changed — the publish clones the recorded arms,
