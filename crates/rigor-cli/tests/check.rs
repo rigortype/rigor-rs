@@ -837,3 +837,85 @@ fn blocked_position_attr_write_keeps_indexed_narrowing() {
         );
     }
 }
+
+/// rigor-rs#363 — `break`'s argument scope lands on `join_break_scopes`,
+/// a LOCALS-only union: an attribute write's indexed-record drop there
+/// (a scope effect, not a binding) never propagates — not to the
+/// post-loop scope, not to a later in-body read, not even to a read
+/// inside the argument itself. `for` collects no break scopes at all,
+/// so the same holds there. Every row keeps `h[:a]` = `"s" | 1`.
+#[test]
+fn break_arg_attr_write_keeps_indexed_narrowing() {
+    let prelude =
+        "def c; rand(2).even?; end\ndef d; rand(2).odd?; end\nh = {a: 1}\nh[:a] ||= \"s\"\n";
+    // One `"s" | 1` diagnostic each — the post-loop read.
+    for tail in [
+        // The issue rows: lexical while / until / for.
+        "while c; break h.default ||= 0; end\n",
+        "until c; break h.default ||= 0; end\n",
+        "for i in [1]; break h.default ||= 0; end\n",
+        // Nested under an arm still targets the loop.
+        "while c; if d; break h.default ||= 0; end; end\n",
+        "while c; case d; when 1; break h.default ||= 0; end; end\n",
+        // A slot mutation joins the same way.
+        "while c; break (h[:a] << 2); end\n",
+        // `break` inside a block targets the yielding call, whose scope
+        // the flat env models as dropped — but the block body's own
+        // write is a closure mutation, so the record survives anyway.
+        "[1].each { break h.default ||= 0 }\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message.contains("\"s\" | 1"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected the post-loop read to keep `\"s\" | 1` for {tail:?}, got {diags:?}"
+        );
+    }
+    // The suppression is positional, not post-loop only: a read after
+    // the `break` in the same body and a read inside the argument
+    // itself both keep the record — two diagnostics each.
+    for tail in [
+        "while c; if d; break h.default ||= 0; end; h[:a].frobnicate; end\n",
+        "while c; break (h.default ||= 0; h[:a].frobnicate); end\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message.contains("\"s\" | 1"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected both reads to keep `\"s\" | 1` for {tail:?}, got {diags:?}"
+        );
+    }
+    // Must-still-land controls — effects the reference DOES join still
+    // drop or shadow the record: a `next` argument feeds the loop
+    // fixpoint carrying the drop; `[]=` invalidates the table itself;
+    // an operand `||=` mints and widens through the same table; a
+    // rebind rewrites the binding; and a body write lands on the joined
+    // iteration scope.
+    for tail in [
+        "while c; next h.default ||= 0; end\n",
+        "while c; break h[:a] = 9; end\n",
+        "while c; break (h[:a] ||= 9); end\n",
+        "while c; break (h = {}); end\n",
+        "while c; h.default ||= 0; break; end\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.rule_id == CALL_UNDEFINED_METHOD
+                    && d.message.contains("\"s\" | 1")),
+            "expected the joined write to drop the record for {tail:?}, got {diags:?}"
+        );
+    }
+}

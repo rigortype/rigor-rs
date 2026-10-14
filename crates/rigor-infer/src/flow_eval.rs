@@ -870,6 +870,9 @@ impl<'i> Typer<'i> {
                 && wspan.0 >= span.0
                 && wspan.1 <= span.1
                 && flow.dead.write_reaches(*wspan, site)
+                // A block body's `break` argument lands on the locals-only
+                // break join — its drop applies nowhere (rigor-rs#363).
+                && !ast.in_locals_only_carrier(*wspan)
             {
                 drop_indexed_narrowings(env, name);
             }
@@ -913,7 +916,21 @@ impl<'i> Typer<'i> {
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
-        self.drop_indexed_mutation(name, method, drop_key, env);
+        // `break`'s argument scope lands on `join_break_scopes` — a
+        // LOCALS-only union — so an attribute write's indexed-record drop
+        // (a scope effect, not a binding) never propagates, not even to
+        // reads inside the argument (rigor-rs#363). `[]=` and mutator-call
+        // marks are not attribute writes: the `[]=` invalidation rides the
+        // narrowing table itself and a mutator's binding widening still
+        // joins, so keeping their drop is the zero-FP side (`break
+        // h[:a] = 9` and `break h << 2` stay silent, as the oracle
+        // reports them).
+        if !(ast.in_locals_only_carrier(wspan)
+            && method != "[]="
+            && !MUTATOR_METHODS.contains(&method))
+        {
+            self.drop_indexed_mutation(name, method, drop_key, env);
+        }
         // A `[]=` replayed through a content write-back boundary drops
         // EVERY narrowing rooted at the receiver, whatever `drop_key`
         // says: `content_writeback_block_captures` /
@@ -973,6 +990,13 @@ impl<'i> Typer<'i> {
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
+        // A slot mutation inside a lexical `break` argument lands on the
+        // locals-only break join — its record widening or drop never
+        // propagates: `break h[:a] << 2` keeps `h[:a]`'s `"s" | 1`
+        // (rigor-rs#363).
+        if ast.in_locals_only_carrier(m.span) {
+            return;
+        }
         let lookup = indexed_narrowing_key(&m.name, &m.key);
         let Some(&recorded) = env.get(&lookup) else {
             return;
@@ -1632,8 +1656,17 @@ impl<'i> Typer<'i> {
         for (_, ev) in events {
             match ev {
                 Ev::Drop(i) => {
-                    let (_, name, method, drop_key) = &mutations[i];
-                    self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
+                    let (wspan, name, method, drop_key) = &mutations[i];
+                    // The `apply_mutation_effects` locals-only gate
+                    // (rigor-rs#363): a `break` argument's scope lands on
+                    // the locals-only break join, so an attribute write's
+                    // drop there applies nowhere.
+                    if !(ast.in_locals_only_carrier(*wspan)
+                        && method != "[]="
+                        && !MUTATOR_METHODS.contains(&method.as_str()))
+                    {
+                        self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
+                    }
                 }
                 Ev::Insert(i) => {
                     env.insert(stored[i].1.clone(), stored[i].2);

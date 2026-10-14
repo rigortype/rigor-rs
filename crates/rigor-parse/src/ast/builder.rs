@@ -140,6 +140,22 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`Recovered::iterative`]: crate::ast::Recovered::iterative
     pub(crate) blocked_iterative_spans: Vec<Span>,
+    /// Depth of `while`/`until`/`for` bodies the lowering sits inside —
+    /// counted so a `break` argument under one is known to land its
+    /// scope on the loop's break join. `join_break_scopes`
+    /// (`statement_evaluator.rb`) unions the break scope's LOCAL
+    /// bindings only: the indexed-narrowing table is not part of the
+    /// join, so an attribute write's record drop in that scope never
+    /// propagates (rigor-rs#363). Masked inside block/lambda bodies —
+    /// a `break` there targets the yielding call, not the loop.
+    pub(crate) lexical_loop: u32,
+    /// The spans of `break` nodes whose argument scope lands on a
+    /// lexical loop's locals-only break join ([`Self::lexical_loop`] —
+    /// rigor-rs#363; [`LoweredAst::in_locals_only_carrier`]).
+    ///
+    /// [`LoweredAst::in_locals_only_carrier`]:
+    ///     crate::ast::LoweredAst::in_locals_only_carrier
+    pub(crate) locals_only_spans: Vec<Span>,
 }
 
 impl<'src> Builder<'src> {
@@ -612,8 +628,14 @@ impl<'src> Builder<'src> {
                         self.recovery_iterative += 1;
                         self.closure_depth += 1;
                         let operand_typed = std::mem::replace(&mut self.typed_depth, 0);
+                        // A `break` inside the block targets the yielding
+                        // call, not an enclosing lexical loop — its
+                        // argument scope never lands on `join_break_scopes`
+                        // (rigor-rs#363).
+                        let lexical_loop = std::mem::replace(&mut self.lexical_loop, 0);
                         let body = self.lower_optional_body(bn.body().as_ref());
                         self.typed_depth = operand_typed;
+                        self.lexical_loop = lexical_loop;
                         self.recovery_iterative -= 1;
                         self.closure_depth -= 1;
                         body
@@ -1161,11 +1183,13 @@ impl<'src> Builder<'src> {
             // wrapped compound index write inside widens its receiver
             // whatever position or jump it sits under (rigor-rs#312).
             self.recovery_iterative += 1;
+            self.lexical_loop += 1;
             let body = while_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
             self.recovery_iterative -= 1;
+            self.lexical_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -1178,11 +1202,13 @@ impl<'src> Builder<'src> {
         if let Some(until_node) = node.as_until_node() {
             let predicate = Some(self.lower_node(&until_node.predicate()));
             self.recovery_iterative += 1;
+            self.lexical_loop += 1;
             let body = until_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
             self.recovery_iterative -= 1;
+            self.lexical_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -1207,12 +1233,17 @@ impl<'src> Builder<'src> {
             // (rigor-rs#312).
             self.recovery_joined += 1;
             self.recovery_next_sink += 1;
+            // `for` collects no break scopes at all — a `break` argument's
+            // scope lands nowhere, so it shares the locals-only treatment
+            // (rigor-rs#363).
+            self.lexical_loop += 1;
             let body = for_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
             self.recovery_joined -= 1;
             self.recovery_next_sink -= 1;
+            self.lexical_loop -= 1;
             let (index, index_writes) = for_index_writes(&for_node.index());
             return self.push(Node::Loop {
                 predicate,
@@ -1650,8 +1681,10 @@ impl<'src> Builder<'src> {
             self.recovery_iterative += 1;
             self.closure_depth += 1;
             let operand_typed = std::mem::replace(&mut self.typed_depth, 0);
+            let lexical_loop = std::mem::replace(&mut self.lexical_loop, 0);
             let body = self.lower_optional_body(lambda.body().as_ref());
             self.typed_depth = operand_typed;
+            self.lexical_loop = lexical_loop;
             self.recovery_iterative -= 1;
             self.closure_depth -= 1;
             return self.push(Node::Lambda {
@@ -1728,6 +1761,16 @@ impl<'src> Builder<'src> {
             return match n.arguments() {
                 None => self.push(Node::Other { span, jump: Some(JumpKind::Break) }),
                 Some(args) => {
+                    // Under a lexical loop the argument's scope lands on
+                    // `join_break_scopes` — a LOCALS-only union, so a scope
+                    // effect the argument performs (an attribute write's
+                    // indexed-record drop) never propagates, not even to
+                    // reads inside the argument itself (rigor-rs#363).
+                    // A block/lambda body masks `lexical_loop`: a `break`
+                    // there targets the yielding call instead.
+                    if self.lexical_loop > 0 {
+                        self.locals_only_spans.push(span);
+                    }
                     let body = self.lower_body(&args.arguments());
                     self.push(Node::Statements {
                         body,

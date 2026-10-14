@@ -14,6 +14,7 @@ use crate::{
     is_shape_mutator, local_rebinds, multi_target_binder, rebound_within, widen_flow_writes,
     widen_penv_writes, TypeEnv, Typer,
 };
+use crate::flow_writes::MUTATOR_METHODS;
 
 /// The reference's `Array.new(n)` tuple-lift cap (`ARRAY_NEW_TUPLE_LIMIT`,
 /// `method_dispatcher.rb`): a constant size `n ≤ 16` lifts to a `Tuple`; a size
@@ -469,7 +470,16 @@ impl<'i> Typer<'i> {
                         // silent). Only the carriers `widen_mutated_binding`
                         // widens change here; a `Nominal`/`Dynamic` binding is
                         // already mutation-safe.
-                        if is_shape_mutator(&method) {
+                        // A lexical `break` argument's scope lands on the
+                        // locals-only break join — an attribute writer's
+                        // record drop there applies nowhere (rigor-rs#363;
+                        // the flow_eval gate mirrors this: `[]=`/mutator
+                        // calls keep theirs).
+                        if is_shape_mutator(&method)
+                            && (method == "[]="
+                                || MUTATOR_METHODS.contains(&method.as_str())
+                                || !ast.in_locals_only_carrier(call_span))
+                        {
                             // `IndexedNarrowing.invalidate_after_call` rides
                             // first: a stable-key `s[k] = v` drops that slot's
                             // `||=` record, every other shape mutator drops

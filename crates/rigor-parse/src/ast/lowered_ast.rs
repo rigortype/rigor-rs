@@ -136,6 +136,13 @@ struct CarrierSpans {
     ///
     /// [`DeadPositions::write_reaches`]: rigor_infer::dead::DeadPositions::write_reaches
     discarded: Vec<Span>,
+    /// The spans of `break` nodes whose argument scope lands on a lexical
+    /// loop's break join — `join_break_scopes` unions LOCAL bindings
+    /// only, so a scope effect there (an attribute write's
+    /// indexed-record drop, a slot-mutator widening) never propagates,
+    /// not even to reads inside the argument (rigor-rs#363;
+    /// [`LoweredAst::in_locals_only_carrier`]).
+    locals_only: Vec<Span>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -250,6 +257,20 @@ impl LoweredAst {
         &self.carrier_spans.discarded
     }
 
+    /// Whether `span` lies inside a `break` argument whose scope lands on
+    /// a lexical loop's locals-only break join (`join_break_scopes`,
+    /// rigor-rs#363). The mutation replay consumes it: an attribute
+    /// write's indexed-record drop or a slot mutation's widening inside
+    /// one applies nowhere — the narrowing table is not part of the
+    /// joined locals — while a `[]=`/mutator mark's own invalidation and
+    /// any local rebind still join as before.
+    pub fn in_locals_only_carrier(&self, span: Span) -> bool {
+        self.carrier_spans
+            .locals_only
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
     /// Whether `id` is a node a `(e)` single-statement parens unwrapped to —
     /// the reference's syntax-level test (`ParenthesesNode` is not `NilNode`)
     /// a literal-discriminating consumer must honor. See
@@ -351,6 +372,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         blocked_spans: Vec::new(),
         discarded_spans: Vec::new(),
         blocked_iterative_spans: Vec::new(),
+        lexical_loop: 0,
+        locals_only_spans: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -376,6 +399,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         blocked: builder.blocked_spans,
         iterative_blocked: builder.blocked_iterative_spans,
         discarded: builder.discarded_spans,
+        locals_only: builder.locals_only_spans,
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
