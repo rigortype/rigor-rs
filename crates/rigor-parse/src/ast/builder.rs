@@ -9,7 +9,8 @@ use super::{
     collect_recoverable_children, constant_node_name, constant_path_string, constant_string,
     direct_method_names, discover_visibilities_and_includes, for_index_writes, lower_multi_targets,
     rescue_reference_index_writes,
-    case_arm_exits, has_targeted_break, has_targeted_next, literal_truthiness, unconditional_exit,
+    case_arm_exits, has_targeted_break, has_targeted_next, has_targeted_retry,
+    literal_truthiness, unconditional_exit,
     param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
     span_of, strict_constant_path_string, Compound, JumpKind, Node, NodeId, ParamShape,
     Recovered, RescueClause, ScopeMarks, Span, StatementsKind,
@@ -2051,11 +2052,15 @@ impl<'src> Builder<'src> {
     /// — `eval_loop` merges the scope at every targeting `next` for all of
     /// them); an arm holding a `break` targeting an iterated body lands its
     /// locals through `join_break_scopes` — a `for` body's `break` does NOT
-    /// land (`eval_for` collects no break scopes).
+    /// land (`eval_for` collects no break scopes); and an arm holding a
+    /// `retry` lands its scope on the retry edge (`retry_edge_for` re-enters
+    /// the `begin` carrying it — `rescue; unless r; r = ex; retry; end;
+    /// raise; end` keeps `r` bound).
     fn arm_lands(&self, node: &PrismNode<'_>) -> bool {
         let iterated = self.recovery_next_sink > 0 || self.recovery_iterative > 0;
         (iterated && has_targeted_next(node))
             || (self.recovery_iterative > 0 && has_targeted_break(node))
+            || has_targeted_retry(node)
     }
 
     /// Lower an *optional* body node (a `def`/`class`/`module`/block body, which
