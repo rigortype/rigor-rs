@@ -166,7 +166,7 @@ fn compound_attr_write_nil_receiver_still_fires() {
 
 /// rigor-rs#366: a compound attribute write inside a literal block body is
 /// still EVALUATED — in the block's own scope — so
-/// `x.each { h.default ||= 0; h[:a].m }` runs `widen_attribute_write`
+/// `[1].each { h.default ||= 0; h[:a].m }` runs `widen_attribute_write`
 /// there and drops `h`'s indexed narrowings for the in-body reads that
 /// follow it, while the OUTER scope's records survive and fire
 /// post-block. Before `closure_evaluated` fed the in-block replay the
@@ -843,11 +843,12 @@ fn blocked_position_attr_write_keeps_indexed_narrowing() {
 /// a slot mutation) never propagates — not to the post-loop scope, not
 /// to a later in-body read, not even to a read inside the argument
 /// itself. `eval_for` joins break scopes the same way. The exception is
-/// the CONTENT_ADDERS family (`[]=`/`store`/`replace`/`<<`/`push` …):
-/// the reference joins their stored arguments into the continuation
-/// binding as element evidence, so a later element read declines even
-/// though the record survives — the port emulates that by keeping the
-/// drop. Every other row keeps `h[:a]` = `"s" | 1`.
+/// the `CONTENT_MUTATORS` family (`CONTENT_ADDERS` — `[]=`/`store`/
+/// `replace`/`<<`/`push` … — plus the String-only mutators such as
+/// `upcase!`/`gsub!`): the reference joins their stored arguments into
+/// the continuation binding as element evidence, so a later element
+/// read declines even though the record survives — the port emulates
+/// that by keeping the drop. Every other row keeps `h[:a]` = `"s" | 1`.
 #[test]
 fn break_arg_attr_write_keeps_indexed_narrowing() {
     let prelude =
@@ -873,10 +874,12 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         "while c; break h.keep_if { |k, _| k == :a }; end\n",
         "while c; break h.transform_values! { |v| v }; end\n",
         // `for` runs `join_break_scopes` with no `loop_content_writeback`
-        // — even the adder family keeps its record.
+        // — even the adder family keeps its record, and so does a
+        // content write nested in a block inside the argument.
         "for i in [1]; break h[:a] = 9; end\n",
         "for i in [1]; break h.store(:a, 9); end\n",
         "for i in [1]; break h.replace({b: 2}); end\n",
+        "for i in [1]; break ([1].each { h[:a] = 9 }); end\n",
         // `break` inside a block targets the yielding call, whose scope
         // the flat env models as dropped — but the block body's own
         // write is a closure mutation, so the record survives anyway.
@@ -928,6 +931,21 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         "while c; break h.replace({b: 2}); end\n",
         "while c; break (h = {}); end\n",
         "while c; h.default ||= 0; break; end\n",
+        // String-only mutators are `CONTENT_MUTATORS` too — the writeback
+        // scan covers them.
+        "while c; break h.upcase!; end\n",
+        "while c; break h.gsub!(\"x\", \"y\"); end\n",
+        "while c; break h.force_encoding(\"utf-8\"); end\n",
+        // The scan is textual over the whole iterated body: a content
+        // mutation in a dead `rescue` clause, a folded `if` arm or a
+        // nested block still lands on the post-body scope.
+        "while c; begin; raise; rescue; break h[:a] = 9; end; end\n",
+        "while c; begin; raise; rescue; h[:a] = 9; break; end; end\n",
+        "while c; if false; h[:a] = 9; end; end\n",
+        "while c; if nil; h[:a] = 9; end; end\n",
+        "while c; if d; h[:a] = 9; return; end; end\n",
+        "while c; break ([1].each { h[:a] = 9 }); end\n",
+        "while c; break ([1].each { if d; h[:a] = 9; return; end }); end\n",
         // A `for` nested under a `while` is still writeback-scanned
         // (the scan is textual over the whole body), and a `while` under
         // a `for` shadows via its own writeback — `[]=` declines the

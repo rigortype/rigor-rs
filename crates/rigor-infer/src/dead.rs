@@ -142,6 +142,27 @@ pub(crate) struct DeadPositions {
     /// exiting `and`/`or` right side. Unlike `folded`, the region RUNS —
     /// its writes reach reads inside it and die with it at the join.
     dropped: Vec<Span>,
+    /// Every `while`/`until`/block/lambda body span — a region the
+    /// reference's content-writeback TEXT scans cover
+    /// (`loop_content_writeback`, `content_writeback_block_captures`). A
+    /// scan-visible content mutation inside one lands its drop on the
+    /// post-region scope even when the write's own position never lands —
+    /// a folded `if` arm, a join-dropped `break`-terminated `rescue`
+    /// clause — because the scan reads the body textually
+    /// (rigor-rs#363 review; [`Self::mutation_reaches`]).
+    iterated: Vec<Span>,
+    /// The `bare_locals_only` spans `LoweredAst` recorded — a `for`'s
+    /// `break` argument, whose scope lands on `join_break_scopes` with
+    /// NO writeback pass to rescue it: an iterated body nested inside
+    /// the argument (a block in `break (xs.each { h[:a] = 9 })`) must
+    /// not un-suppress the write.
+    bare: Vec<Span>,
+    /// The iterated `locals_only` spans — `while`/`until` `break`
+    /// argument positions. A scanned write inside one lands its drop on
+    /// the post-join scope only: a read inside the argument still sees
+    /// the record (`break (h[:a] ||= 9; h[:a].m)` fires `"s" | 1`
+    /// in-argument, declines post-loop — rigor-rs#363 review).
+    locals_only: Vec<Span>,
 }
 
 impl DeadPositions {
@@ -214,6 +235,48 @@ impl DeadPositions {
                     && (use_.0 >= arm.end || arm.ensure.is_some_and(|e| contains(e, use_))));
         }
         true
+    }
+
+    /// `write_reaches` for a content-writeback-SCANNED mutation (a
+    /// `CONTENT_MUTATORS` call or an index-write form on a bare local —
+    /// `content_mutation_target`): the write's own position may never
+    /// land — a folded arm, a join-dropped `break`-terminated clause —
+    /// but an enclosing iterated body's textual scan applies its drop
+    /// to the post-body scope anyway (`while c; begin; raise; rescue;
+    /// break h[:a] = 9; end; end` drops `h[:a]` on the oracle —
+    /// rigor-rs#363 review). A read inside the same body evaluates
+    /// normally and keeps the prior record, so the exemption only holds
+    /// for a `use_` the body does not contain.
+    pub(crate) fn mutation_reaches(&self, write: Span, use_: Span, scanned: bool) -> bool {
+        // A write inside a locals-only `break` argument never reaches a
+        // use inside the same argument: the drop is a scope effect and
+        // the argument's scope lands on the post-join union, so in-
+        // argument reads keep the record the join discards. The
+        // `locals_only_suppresses` gate would keep it for every mutator
+        // anyway; this return additionally spares the scanned family
+        // (`h[:a] ||= 9`'s `[]=` drop must stay off for the in-argument
+        // read but on for the post-loop one — rigor-rs#363 review).
+        if self
+            .locals_only
+            .iter()
+            .any(|&l| contains(l, write) && contains(l, use_))
+        {
+            return false;
+        }
+        self.write_reaches(write, use_)
+            || (scanned
+                && !self.bare.iter().any(|&s| contains(s, write))
+                && self
+                    .iterated
+                    .iter()
+                    .any(|&b| contains(b, write) && !contains(b, use_)))
+    }
+
+    /// Whether `span` lies inside an iterated body's writeback-scan
+    /// region (see `iterated`) — for the keep-the-mark question the
+    /// folded-arm retain asks before any use site is known.
+    pub(crate) fn inside_iterated(&self, span: Span) -> bool {
+        self.iterated.iter().any(|&b| contains(b, span))
     }
 
     /// Whether `span` sits inside a folded-dead arm — for questions with no
@@ -300,6 +363,9 @@ impl<'i> Typer<'i> {
         }
         let mut dead = DeadPositions {
             dropped: ast.discarded_spans().to_vec(),
+            iterated: ast.iterated_body_spans().to_vec(),
+            bare: ast.bare_locals_only_spans().to_vec(),
+            locals_only: ast.locals_only_spans().to_vec(),
             ..Default::default()
         };
         *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());

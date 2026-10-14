@@ -144,7 +144,7 @@ struct CarrierSpans {
     /// [`LoweredAst::in_locals_only_carrier`]). This half holds the
     /// spans descended from an iterated (`while`/`until`) body, where
     /// `loop_content_writeback` text-scans the whole body and re-joins
-    /// a CONTENT_ADDERS mutator's stored arguments into the receiver
+    /// a CONTENT_MUTATORS mutator's stored arguments into the receiver
     /// binding — so a later element read declines even though the
     /// record survives (`locals_only_suppresses` keeps their drops).
     locals_only: Vec<Span>,
@@ -153,6 +153,20 @@ struct CarrierSpans {
     /// anything. Every scope effect is suppressed here, adders included
     /// (rigor-rs#363).
     bare_locals_only: Vec<Span>,
+    /// Every body span lowered under `Recovered::iterative` —
+    /// `while`/`until` bodies and block/lambda bodies: the regions the
+    /// reference's content-writeback TEXT scans cover
+    /// (`loop_content_writeback`, `content_writeback_block_captures`).
+    /// A scan-visible content mutation inside one lands its drop on the
+    /// post-region scope even when the write's own position is
+    /// never-evaluated or join-dropped — a folded `if` arm, a dead
+    /// `rescue` clause — because the scan reads the body textually
+    /// (rigor-rs#363 review;
+    /// [`LoweredAst::iterated_body_spans`]).
+    ///
+    /// [`LoweredAst::iterated_body_spans`]:
+    ///     crate::ast::LoweredAst::iterated_body_spans
+    iterated_bodies: Vec<Span>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -281,23 +295,60 @@ impl LoweredAst {
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
 
-    /// Whether a shape mutator's record drop at `span` lands on a
-    /// locals-only break join and so applies nowhere (rigor-rs#363).
-    /// The exception: a CONTENT_ADDERS method (`[]=`/`store`/`replace`/
-    /// `<<`/`push` …) inside an iterated body — `loop_content_writeback`
-    /// text-scans the whole `while`/`until` body, finds the call, and
-    /// re-joins its stored arguments into the receiver binding as
-    /// element evidence, so the read declines anyway. The flat env
-    /// cannot express "record present, read declined", so the port
-    /// keeps the drop instead. `bare_locals_only` spans (a `for`'s
-    /// break argument — `eval_for` runs no writeback) suppress
-    /// everything.
-    pub fn locals_only_suppresses(&self, span: Span, content_adder: bool) -> bool {
+    /// Whether `span` lies inside a `for`-only `break` argument — the
+    /// `bare_locals_only` half where `eval_for` runs no content
+    /// writeback, so even a scan-visible mutation's drop stays
+    /// suppressed (rigor-rs#363 review).
+    pub fn in_bare_locals_only_carrier(&self, span: Span) -> bool {
         self.carrier_spans
             .bare_locals_only
             .iter()
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
-            || (!content_adder && self.in_locals_only_carrier(span))
+    }
+
+    /// The `bare_locals_only` spans — `DeadPositions` consumes them to
+    /// keep an iterated body nested inside a `for` `break` argument
+    /// from un-suppressing a scanned write (rigor-rs#363 review).
+    pub fn bare_locals_only_spans(&self) -> &[Span] {
+        &self.carrier_spans.bare_locals_only
+    }
+
+    /// The iterated `locals_only` spans — `DeadPositions` consumes them
+    /// for the positional drop rule: a scanned write inside a `break`
+    /// argument lands only past the join, so a read inside the argument
+    /// still sees the record (`break (h[:a] ||= 9; h[:a].m)` fires
+    /// `"s" | 1` in-argument, declines post-loop — rigor-rs#363 review).
+    pub fn locals_only_spans(&self) -> &[Span] {
+        &self.carrier_spans.locals_only
+    }
+
+    /// Whether a shape mutator's record drop at `span` lands on a
+    /// locals-only break join and so applies nowhere (rigor-rs#363).
+    /// The exception: a CONTENT_MUTATORS method (`[]=`/`store`/`replace`/
+    /// `<<`/`push`/… plus the String-only mutators the writeback scan
+    /// counts, `upcase!`/`sub!`/…) inside an iterated body —
+    /// `loop_content_writeback` text-scans the whole `while`/`until`
+    /// body, finds the call, and re-joins the receiver binding so the
+    /// read declines anyway. The flat env cannot express "record
+    /// present, read declined", so the port keeps the drop instead.
+    /// `bare_locals_only` spans (a `for`'s break argument — `eval_for`
+    /// runs no writeback) suppress everything.
+    pub fn locals_only_suppresses(&self, span: Span, content_scanned: bool) -> bool {
+        self.carrier_spans
+            .bare_locals_only
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+            || (!content_scanned && self.in_locals_only_carrier(span))
+    }
+
+    /// Every `while`/`until`/block/lambda body span — the regions the
+    /// reference's content-writeback text scans cover
+    /// (`loop_content_writeback`, `content_writeback_block_captures`).
+    /// `DeadPositions` consumes them: a scan-visible content mutation
+    /// inside one lands its drop on the post-region scope even from a
+    /// never-evaluated or join-dropped position (rigor-rs#363 review).
+    pub fn iterated_body_spans(&self) -> &[Span] {
+        &self.carrier_spans.iterated_bodies
     }
 
     /// Whether `id` is a node a `(e)` single-statement parens unwrapped to —
@@ -404,6 +455,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         lexical_loop: 0,
         locals_only_spans: Vec::new(),
         bare_locals_only_spans: Vec::new(),
+        iterated_body_spans: Vec::new(),
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
@@ -431,6 +483,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         discarded: builder.discarded_spans,
         locals_only: builder.locals_only_spans,
         bare_locals_only: builder.bare_locals_only_spans,
+        iterated_bodies: builder.iterated_body_spans,
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();

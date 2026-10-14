@@ -154,7 +154,7 @@ pub(crate) struct Builder<'src> {
     /// rigor-rs#363; [`LoweredAst::in_locals_only_carrier`]). Split by
     /// whether an iterated body encloses the span: `while`/`until` run
     /// `loop_content_writeback`, which text-scans the whole body — even
-    /// inside a nested `for` — and re-joins the CONTENT_ADDERS
+    /// inside a nested `for` — and re-joins the CONTENT_MUTATORS
     /// mutators' stored arguments into the continuation binding, so a
     /// later element read declines anyway. `for` alone collects no
     /// writeback, so `bare_locals_only_spans` (no enclosing iterated
@@ -168,6 +168,16 @@ pub(crate) struct Builder<'src> {
     /// `loop_content_writeback`, so nothing re-joins an adder mark's
     /// store evidence (rigor-rs#363).
     pub(crate) bare_locals_only_spans: Vec<Span>,
+    /// Every body span lowered under `recovery_iterative` — `while`/
+    /// `until` bodies and block/lambda bodies: the regions the
+    /// reference's content-writeback TEXT scans cover
+    /// (`loop_content_writeback`, `content_writeback_block_captures`).
+    /// A scan-visible content mutation inside one lands its drop on the
+    /// post-region scope even when the write's own position is
+    /// never-evaluated or join-dropped — a folded `if` arm, a dead
+    /// `rescue` clause — because the scan reads the body textually
+    /// (rigor-rs#363 review).
+    pub(crate) iterated_body_spans: Vec<Span>,
 }
 
 impl<'src> Builder<'src> {
@@ -645,6 +655,9 @@ impl<'src> Builder<'src> {
                         // argument scope never lands on `join_break_scopes`
                         // (rigor-rs#363).
                         let lexical_loop = std::mem::replace(&mut self.lexical_loop, 0);
+                        if let Some(b) = bn.body() {
+                            self.iterated_body_spans.push(span_of(&b.location()));
+                        }
                         let body = self.lower_optional_body(bn.body().as_ref());
                         self.typed_depth = operand_typed;
                         self.lexical_loop = lexical_loop;
@@ -1196,6 +1209,9 @@ impl<'src> Builder<'src> {
             // whatever position or jump it sits under (rigor-rs#312).
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
+            if let Some(s) = while_node.statements() {
+                self.iterated_body_spans.push(span_of(&s.location()));
+            }
             let body = while_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
@@ -1215,6 +1231,9 @@ impl<'src> Builder<'src> {
             let predicate = Some(self.lower_node(&until_node.predicate()));
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
+            if let Some(s) = until_node.statements() {
+                self.iterated_body_spans.push(span_of(&s.location()));
+            }
             let body = until_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
@@ -1695,6 +1714,9 @@ impl<'src> Builder<'src> {
             self.closure_depth += 1;
             let operand_typed = std::mem::replace(&mut self.typed_depth, 0);
             let lexical_loop = std::mem::replace(&mut self.lexical_loop, 0);
+            if let Some(b) = lambda.body() {
+                self.iterated_body_spans.push(span_of(&b.location()));
+            }
             let body = self.lower_optional_body(lambda.body().as_ref());
             self.typed_depth = operand_typed;
             self.lexical_loop = lexical_loop;

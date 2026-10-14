@@ -35,7 +35,7 @@ pub(crate) fn span_hull(ast: &LoweredAst, ids: &[NodeId]) -> Option<rigor_parse:
 // cannot depend on this crate. Re-exported so the existing
 // `crate::flow_writes::…` / `crate::{ARRAY_MUTATORS,…}` paths keep working.
 pub(crate) use rigor_parse::mutators::{
-    ARRAY_MUTATORS, CONTENT_ADDERS, HASH_MUTATORS, STRING_MUTATORS, is_shape_mutator,
+    ARRAY_MUTATORS, HASH_MUTATORS, STRING_MUTATORS, is_content_mutator, is_shape_mutator,
 };
 // `HASH_LOOKUP_MUTATORS` is exercised from `tests.rs` only today.
 #[cfg(test)]
