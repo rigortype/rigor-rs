@@ -137,6 +137,11 @@ pub(crate) struct DeadPositions {
     /// write it contains reaches a read it contains on a LATER pass even
     /// when the same-pass scope ordering would drop it.
     loops: Vec<Span>,
+    /// The evaluated-but-join-dropped spans `LoweredAst` recorded
+    /// (rigor-rs#362): a terminated `if`/`case`/`in`/rescue-clause arm or an
+    /// exiting `and`/`or` right side. Unlike `folded`, the region RUNS —
+    /// its writes reach reads inside it and die with it at the join.
+    dropped: Vec<Span>,
 }
 
 impl DeadPositions {
@@ -151,6 +156,22 @@ impl DeadPositions {
     /// from the arm's entry scope.
     pub(crate) fn write_reaches(&self, write: Span, use_: Span) -> bool {
         if self.folded.iter().any(|(d, _)| contains(*d, write)) {
+            return false;
+        }
+        // rigor-rs#362 — a write in an evaluated-but-join-dropped position
+        // reaches reads inside its own region (the arm evaluates —
+        // `if c; h.default ||= 0; h[:a].f; return; end` sees the widening
+        // in-arm) but nothing outside it: the join drops the arm's scope,
+        // so the continuation keeps the prior narrowing. "Inside" must
+        // START before the region's end — a zero-width continuation probe
+        // at (end, end) would otherwise count as in-region and let the
+        // dead arm's writes reach the post-scope (`c && (w; return)`,
+        // where the dropped RHS ends at the statement's own end).
+        if self
+            .dropped
+            .iter()
+            .any(|&d| contains(d, write) && !(d.0 <= use_.0 && use_.0 < d.1))
+        {
             return false;
         }
         // A write in a `begin`'s protected body never reaches a read inside
@@ -182,7 +203,13 @@ impl DeadPositions {
             return false;
         }
         if let Some(arm) = self.rescue.iter().find(|a| contains(a.span, write)) {
-            return contains(arm.span, use_)
+            // "Inside the arm" must start BEFORE its clipped end: the last
+            // clause's span runs to the `begin`'s own `end`, so a zero-width
+            // post-`begin` probe at (end, end) would otherwise count as
+            // in-arm and let a dead arm's write reach the continuation
+            // (`x = 1; begin 2 rescue x = "s" raise end; x.w` fires
+            // `for 1` on the oracle — the arm never lands, rigor-rs#362).
+            return (use_.0 < arm.span.1 && contains(arm.span, use_))
                 || (arm.live
                     && (use_.0 >= arm.end || arm.ensure.is_some_and(|e| contains(e, use_))));
         }
@@ -271,7 +298,10 @@ impl<'i> Typer<'i> {
             // oracle fires `w` for `Float`). `Rc` clone — O(1) per re-entry.
             return self.dead_partial.borrow().clone();
         }
-        let mut dead = DeadPositions::default();
+        let mut dead = DeadPositions {
+            dropped: ast.discarded_spans().to_vec(),
+            ..Default::default()
+        };
         *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());
         // Publish the accumulator to re-entrant callers only where a recursion
         // point follows AND it changed — the publish clones the recorded arms,
