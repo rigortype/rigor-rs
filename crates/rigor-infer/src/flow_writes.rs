@@ -680,7 +680,15 @@ pub(crate) fn closure_mutations(
                 ..
             } = n
             {
-                if is_shape_mutator(write_name)
+                // `toplevel_mutations`' `in_inert_carrier` retain, mirrored:
+                // a write inside a `defined?` operand / `END { }` /
+                // `BEGIN { }` / `super`/`yield` operand never evaluates, so
+                // replaying it inside the block's scope drops indexed
+                // records the reference keeps — `each { END {
+                // h.default ||= 0 }; h[:a].frobnicate }` must keep
+                // `h[:a]`'s `"s" | 1` (rigor-rs#381).
+                if !ast.in_inert_carrier(*span)
+                    && is_shape_mutator(write_name)
                     && let Node::LocalVariableRead { name, .. } = ast.get(*r)
                 {
                     out.push((owner.unwrap(), *span, name.clone()));
