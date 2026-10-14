@@ -924,9 +924,10 @@ fn collect_recoverable<'pr>(
                 cur = r.subsequent();
             }
             // `live_rescues.empty?` — the exit scope is the primary scope
-            // alone, unjoined; dead arms are dropped outright (a `retry`
-            // arm is not dead — `unconditional_exit` excludes it — since
-            // `retry_edge_for` lands its scope back in the primary frame).
+            // alone, unjoined; dead arms are dropped outright. An arm
+            // whose TAIL exits still counts live when it holds a `retry`:
+            // `arm_lands` lets it through (`retry_edge_for` lands its
+            // scope back in the primary frame).
             if let Some(statements) = node.statements() {
                 if live == 0 {
                     self.visit(&statements.as_node());

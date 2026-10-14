@@ -134,7 +134,7 @@ fn compound_attr_write_typed_positions_keep_the_narrowing() {
         "x = h.default ||= 0, h[:a]",            // multi-assign RHS
         "x = (h.default ||= 0) rescue nil",      // rescue modifier
         "case h; in {a: x} if (h.default ||= 0); end", // in-pattern guard
-        "case h; when h.default ||= 0; end",           // when condition (rigor-rs#362)
+        "case c; when h.default ||= 0; end",           // when condition (rigor-rs#362)
         "x = defined?(h.default ||= 0)",         // never evaluated
         "[1].each { h.default ||= 0 }",          // deferred block body
         "l = -> { h.default ||= 0 }",            // lambda body

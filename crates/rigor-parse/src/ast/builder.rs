@@ -867,12 +867,15 @@ impl<'src> Builder<'src> {
 
         if let Some(if_node) = node.as_if_node() {
             // `if` / ternary. Prism's ternary is also an IfNode. Arms whose
-            // scope the join discards are `blocked`, mirroring the
-            // Collector's `visit_if_node` (rigor-rs#362): a constant-folded
-            // predicate's dead arm never exists, and an arm that exits
+            // scope the join discards carry the blocked counter, mirroring
+            // the Collector's `visit_if_node` (rigor-rs#362): a
+            // constant-folded predicate's dead arm never exists
+            // (`lower_blocked` — never evaluated), and an arm that exits
             // unconditionally while the other side lives contributes no
-            // scope downstream — `if c; h.default ||= 0; return; end`
-            // keeps the receiver's indexed narrowings on the oracle.
+            // scope downstream (`lower_discarded` — evaluated, so in-arm
+            // reads still witness its writes) — `if c; h.default ||= 0;
+            // return; end` keeps the receiver's indexed narrowings on the
+            // oracle.
             let predicate = self.lower_node(&if_node.predicate());
             let statements = if_node.statements();
             // `subsequent` is the `elsif`/`else` chain (an IfNode or ElseNode).
